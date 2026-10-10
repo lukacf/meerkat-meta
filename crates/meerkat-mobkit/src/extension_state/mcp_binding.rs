@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use meerkat_core::mcp_config::McpTransportConfig;
 use meerkat_core::types::ToolCallView;
 use meerkat_core::{AgentToolDispatcher, McpServerConfig, ToolDispatchContext, ToolMutationClass};
-use meerkat_mcp::{McpCallContext, McpCallContextError, McpCallContextProvider, McpCallTarget};
+use meerkat_mcp::{
+    McpCallContext, McpCallContextError, McpCallContextProvider, McpCallTarget, McpResourceTarget,
+};
 
 use super::{ToolBundleFactory, ToolBundleRequirements};
 
@@ -228,8 +230,45 @@ pub(crate) struct DocumentMcpContextProvider {
     pub(crate) fallback: Option<Arc<dyn McpCallContextProvider>>,
 }
 
+impl DocumentMcpContextProvider {
+    fn is_document_resource_destination(&self, config: &McpServerConfig) -> bool {
+        self.bindings
+            .iter()
+            .any(|binding| binding.runtime_config.name == config.name)
+            || is_document_descriptor(config)
+    }
+}
+
 #[async_trait]
 impl McpCallContextProvider for DocumentMcpContextProvider {
+    async fn prepare_resource(
+        &self,
+        target: McpResourceTarget<'_>,
+        context: &ToolDispatchContext,
+    ) -> Result<Option<McpCallContext>, McpCallContextError> {
+        // Document bindings support the validated tool pair, not resource reads.
+        // Route by the selected server, never by a URI or a tool's credentials.
+        if self.is_document_resource_destination(target.config) {
+            return Err(McpCallContextError::Unavailable);
+        }
+        match &self.fallback {
+            Some(provider) => provider.prepare_resource(target, context).await,
+            None => Ok(None),
+        }
+    }
+
+    fn resource_authorization_target(
+        &self,
+        target: McpResourceTarget<'_>,
+    ) -> Option<meerkat_core::authorization::OwnerQualifiedTarget> {
+        if self.is_document_resource_destination(target.config) {
+            return None;
+        }
+        self.fallback
+            .as_ref()
+            .and_then(|provider| provider.resource_authorization_target(target))
+    }
+
     async fn prepare(
         &self,
         target: McpCallTarget<'_>,
@@ -581,6 +620,219 @@ mod tests {
             provider.tool_mutation_class(binding.public_config(), "documents_read"),
             ToolMutationClass::Unknown
         );
+    }
+
+    // Obtain the opaque id from an actual native connection, not a fabricated
+    // resource authority. This fixture only implements the MCP handshake.
+    async fn resource_connection(name: &str) -> meerkat_mcp::McpConnection {
+        let script = r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    result = {"protocolVersion": "2024-11-05", "capabilities": {},
+              "serverInfo": {"name": "resource-routing-fixture", "version": "1"}}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"#;
+        let mut config = McpServerConfig::stdio(
+            name,
+            "python3",
+            vec!["-u".into(), "-c".into(), script.into()],
+            HashMap::new(),
+        );
+        config.connect_timeout_secs = Some(5);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            meerkat_mcp::McpConnection::connect(&config),
+        )
+        .await
+        .expect("resource fixture handshake must finish")
+        .expect("native resource fixture connects")
+    }
+
+    async fn close_resource_connection(connection: meerkat_mcp::McpConnection) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), connection.close())
+            .await
+            .expect("resource fixture close must finish")
+            .expect("native resource fixture closes");
+    }
+
+    struct ResourceFallback {
+        config: McpServerConfig,
+        connection_id: meerkat_mcp::McpConnectionId,
+        context_address: usize,
+        preparations: std::sync::atomic::AtomicUsize,
+        authorizations: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ResourceFallback {
+        fn verify_destination(&self, target: &McpResourceTarget<'_>) {
+            assert_eq!(target.config, &self.config);
+            assert_eq!(target.connection_id, self.connection_id);
+            assert_eq!(target.uri, "ui://documents/panel");
+        }
+    }
+
+    #[async_trait]
+    impl McpCallContextProvider for ResourceFallback {
+        async fn prepare(
+            &self,
+            _: McpCallTarget<'_>,
+            _: ToolCallView<'_>,
+            _: &ToolDispatchContext,
+        ) -> Result<Option<McpCallContext>, McpCallContextError> {
+            panic!("resource reads must not borrow tool preparation")
+        }
+
+        async fn prepare_resource(
+            &self,
+            target: McpResourceTarget<'_>,
+            context: &ToolDispatchContext,
+        ) -> Result<Option<McpCallContext>, McpCallContextError> {
+            self.verify_destination(&target);
+            assert_eq!(std::ptr::from_ref(context) as usize, self.context_address);
+            self.preparations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(McpCallContext::new(Default::default(), ())))
+        }
+
+        fn resource_authorization_target(
+            &self,
+            target: McpResourceTarget<'_>,
+        ) -> Option<meerkat_core::authorization::OwnerQualifiedTarget> {
+            self.verify_destination(&target);
+            self.authorizations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(meerkat_core::authorization::OwnerQualifiedTarget {
+                authority: meerkat_core::auth::PrincipalRef::in_domain(
+                    meerkat_core::auth::PrincipalKind::ServiceAccount,
+                    "resource-owner",
+                    meerkat_core::auth::TrustDomainId::new("fixture-domain").unwrap(),
+                )
+                .unwrap(),
+                namespace: "fixture-resource".into(),
+                id: "owner-selected-resource".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_document_resources_refuse_without_tool_or_fallback_preparation() {
+        let connection = resource_connection("documents").await;
+        let (public, runtime) = configs("secret");
+        let binding = Arc::new(binding(public, runtime.clone()).unwrap());
+        let context = ToolDispatchContext::default();
+        let fallback = Arc::new(ResourceFallback {
+            config: connection.config().clone(),
+            connection_id: connection.connection_id(),
+            context_address: std::ptr::from_ref(&context) as usize,
+            preparations: Default::default(),
+            authorizations: Default::default(),
+        });
+        let provider = DocumentMcpContextProvider {
+            bindings: vec![binding.clone()],
+            fallback: Some(fallback.clone()),
+        };
+        // Exact runtime, public marker, and same-name changed destination all
+        // stay refused. None can acquire resource authority from the fallback.
+        for config in [&runtime, binding.public_config(), connection.config()] {
+            let target = || McpResourceTarget {
+                config,
+                connection_id: connection.connection_id(),
+                uri: "ui://documents/panel",
+            };
+            assert!(matches!(
+                provider.prepare_resource(target(), &context).await,
+                Err(McpCallContextError::Unavailable)
+            ));
+            assert!(provider.resource_authorization_target(target()).is_none());
+        }
+        assert_eq!(
+            fallback
+                .preparations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            fallback
+                .authorizations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        close_resource_connection(connection).await;
+    }
+
+    #[tokio::test]
+    async fn unrelated_resource_destination_preserves_both_fallback_methods() {
+        let connection = resource_connection("ordinary").await;
+        let (public, runtime) = configs("secret");
+        let context = ToolDispatchContext::default();
+        let fallback = Arc::new(ResourceFallback {
+            config: connection.config().clone(),
+            connection_id: connection.connection_id(),
+            context_address: std::ptr::from_ref(&context) as usize,
+            preparations: Default::default(),
+            authorizations: Default::default(),
+        });
+        let provider = DocumentMcpContextProvider {
+            bindings: vec![Arc::new(binding(public, runtime).unwrap())],
+            fallback: Some(fallback.clone()),
+        };
+        // A document-shaped URI on an unrelated physical destination belongs
+        // to its fallback owner, not the registered document service.
+        let target = || McpResourceTarget {
+            config: connection.config(),
+            connection_id: connection.connection_id(),
+            uri: "ui://documents/panel",
+        };
+        assert!(
+            provider
+                .prepare_resource(target(), &context)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let authority = provider.resource_authorization_target(target()).unwrap();
+        assert_eq!(authority.authority.id.as_str(), "resource-owner");
+        assert_eq!(authority.namespace.as_ref(), "fixture-resource");
+        assert_eq!(authority.id.as_ref(), "owner-selected-resource");
+        assert_eq!(
+            fallback
+                .preparations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            fallback
+                .authorizations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        close_resource_connection(connection).await;
+    }
+
+    #[tokio::test]
+    async fn unrelated_resource_without_fallback_keeps_no_metadata_and_no_authority() {
+        let connection = resource_connection("ordinary").await;
+        let (public, runtime) = configs("secret");
+        let provider = DocumentMcpContextProvider {
+            bindings: vec![Arc::new(binding(public, runtime).unwrap())],
+            fallback: None,
+        };
+        let target = || McpResourceTarget {
+            config: connection.config(),
+            connection_id: connection.connection_id(),
+            uri: "ui://documents/panel",
+        };
+        assert!(
+            provider
+                .prepare_resource(target(), &ToolDispatchContext::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(provider.resource_authorization_target(target()).is_none());
+        close_resource_connection(connection).await;
     }
 
     #[tokio::test]
