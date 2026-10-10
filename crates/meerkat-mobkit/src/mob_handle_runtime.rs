@@ -6337,6 +6337,17 @@ macro_rules! delegate_mob_session_service {
     ($wrapper:ty) => {
         #[async_trait]
         impl meerkat_core::service::SessionService for $wrapper {
+            async fn read_tool_application_observations(
+                &self,
+                id: &meerkat_core::SessionId,
+            ) -> Result<Vec<meerkat_core::ToolApplicationObservation>, SessionError> {
+                self.inner.read_tool_application_observations(id).await
+            }
+
+            async fn tool_application(self: Arc<Self>, control: Arc<meerkat_core::ToolApplicationControlRequest>) -> Result<serde_json::Value, SessionError> {
+                Arc::clone(&self.inner).tool_application(control).await
+            }
+
             async fn create_session(
                 &self,
                 req: CreateSessionRequest,
@@ -7538,6 +7549,20 @@ impl AfterCreateMobSessionService {
 
 #[async_trait]
 impl meerkat_core::service::SessionService for AfterCreateMobSessionService {
+    async fn read_tool_application_observations(
+        &self,
+        id: &meerkat_core::SessionId,
+    ) -> Result<Vec<meerkat_core::ToolApplicationObservation>, SessionError> {
+        self.inner.read_tool_application_observations(id).await
+    }
+
+    async fn tool_application(
+        self: Arc<Self>,
+        control: Arc<meerkat_core::ToolApplicationControlRequest>,
+    ) -> Result<serde_json::Value, SessionError> {
+        Arc::clone(&self.inner).tool_application(control).await
+    }
+
     async fn create_session(
         &self,
         req: CreateSessionRequest,
@@ -9389,7 +9414,8 @@ impl MobBootstrapSpec {
             .shell(caps.shell)
             .mob(caps.mob)
             .comms(caps.comms)
-            .memory(caps.memory);
+            .memory(caps.memory)
+            .mcp_apps(caps.mcp_apps);
         if let Some(provider) = mcp_call_context_provider {
             factory = factory.mcp_call_context_provider(provider);
         }
@@ -9803,7 +9829,8 @@ impl MobBootstrapSpec {
             .shell(caps.shell)
             .mob(caps.mob)
             .comms(caps.comms)
-            .memory(caps.memory);
+            .memory(caps.memory)
+            .mcp_apps(caps.mcp_apps);
         if let Some(provider) = mcp_call_context_provider {
             factory = factory.mcp_call_context_provider(provider);
         }
@@ -10176,7 +10203,8 @@ impl MobBootstrapSpec {
             .shell(caps.shell)
             .mob(caps.mob)
             .comms(caps.comms)
-            .memory(caps.memory);
+            .memory(caps.memory)
+            .mcp_apps(caps.mcp_apps);
         if let Some(provider) = mcp_call_context_provider {
             factory = factory.mcp_call_context_provider(provider);
         }
@@ -10520,6 +10548,8 @@ pub struct CapabilityFlags {
     pub comms: bool,
     pub memory: bool,
     pub image_generation: bool,
+    /// Advertise standard MCP Apps support only when a presentation host exists.
+    pub mcp_apps: bool,
 }
 
 impl Default for CapabilityFlags {
@@ -10531,6 +10561,7 @@ impl Default for CapabilityFlags {
             comms: true,
             memory: true,
             image_generation: false,
+            mcp_apps: false,
         }
     }
 }
@@ -11655,6 +11686,26 @@ impl MobRuntime {
         )
         .await
         .map_err(|err| MobRuntimeError::Mob(MobError::Internal(err.to_string())))
+    }
+
+    /// Read host-only observations from the exact native session owner.
+    /// These records supply display data, never permission for new tool IO.
+    pub async fn read_tool_application_observations(
+        &self,
+        session_id_str: &str,
+    ) -> Result<Vec<meerkat_core::ToolApplicationObservation>, MobRuntimeError> {
+        let service = self
+            .session_service
+            .as_ref()
+            .ok_or(MobRuntimeError::InvalidInput(
+                "tool application observations unavailable for this runtime",
+            ))?;
+        let session_id = meerkat_core::SessionId::parse(session_id_str)
+            .map_err(|_| MobRuntimeError::InvalidInput("invalid session_id format"))?;
+        service
+            .read_tool_application_observations(&session_id)
+            .await
+            .map_err(|error| MobRuntimeError::Mob(MobError::Internal(error.to_string())))
     }
 
     /// Observe whether an exact previous append attempt can still be applying.
@@ -13053,6 +13104,7 @@ mod tests {
                     .into_iter()
                     .map(|name| {
                         Arc::new(meerkat_core::types::ToolDef {
+                            audience: Default::default(),
                             name: name.into(),
                             description: String::new(),
                             input_schema: serde_json::json!({"type": "object", "properties": {}}),
@@ -22228,8 +22280,8 @@ comms = true
         );
     }
 
-    /// H1: the ephemeral-by-design mode records its declaration; H2 is not
-    /// applicable without a persistent session service.
+    /// The memory-backed mode records its ephemeral declaration. There is no
+    /// caller-owned durable session store for the H2 probe.
     #[test]
     fn ephemeral_runtime_backed_spec_reports_declared_ephemeral() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
@@ -22946,6 +22998,10 @@ comms = true
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         let mut resume_spec = SpawnMemberSpec::new(ProfileName::from("worker"), mid.clone());
+        // Ordinary autonomous Resume starts a new kickoff even without an
+        // explicit initial message. This fixture checks turnless restoration,
+        // so select the public turn-driven mode and leave initial_message None.
+        resume_spec.runtime_mode = Some(meerkat_mob::MobRuntimeMode::TurnDriven);
         resume_spec.launch_mode = meerkat_mob::MemberLaunchMode::Resume {
             // 0.8.25: no migration authority on this path; a declaration is
             // attached only where resume_session detects a genuine role divergence.
@@ -22962,6 +23018,27 @@ comms = true
             .await
             .unwrap_or_else(|| panic!("resumed worker has no bridge session id"));
         assert_eq!(resumed_session_id, session_id);
+        let resumed_members = restarted.handle.list_members().await;
+        let [resumed_member] = resumed_members.as_slice() else {
+            panic!("restart fixture must resume exactly one worker");
+        };
+        assert_eq!(resumed_member.agent_identity, mid);
+        assert_eq!(resumed_member.role, ProfileName::from("worker"));
+        assert_eq!(
+            resumed_member.runtime_mode,
+            meerkat_mob::MobRuntimeMode::TurnDriven
+        );
+        assert!(
+            resumed_member.kickoff.is_none(),
+            "turnless resume must not admit an autonomous kickoff: {resumed_member:?}"
+        );
+        // Compare after teardown so a late write cannot hide behind an early
+        // read of the predecessor's still-unchanged durable projection.
+        restarted
+            .handle
+            .shutdown()
+            .await
+            .unwrap_or_else(|e| panic!("failed to quiesce resumed runtime: {e}"));
         let after_restart = custom_store
             .load(&session_id)
             .await
@@ -22970,7 +23047,7 @@ comms = true
         assert_eq!(
             after_restart.messages().len(),
             before_restart_message_count,
-            "turnless resume must not shrink the durable transcript"
+            "turnless resume must preserve the durable transcript length"
         );
         assert_eq!(
             meerkat_core::transcript_messages_digest(after_restart.messages())
@@ -22978,11 +23055,6 @@ comms = true
             before_restart_revision,
             "turnless resume must preserve the exact durable transcript"
         );
-        restarted
-            .handle
-            .shutdown()
-            .await
-            .unwrap_or_else(|e| panic!("failed to quiesce resumed runtime: {e}"));
     }
 
     /// Regression: public ephemeral builds without image generation retain the

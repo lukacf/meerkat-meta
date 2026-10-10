@@ -2667,6 +2667,53 @@ impl ContinuityStore for LocalContinuityStore {
         .await
     }
 
+    async fn session_owner(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<Option<AgentIdentity>, ContinuityStoreError> {
+        let session_id = session_id.clone();
+        self.run_blocking("session_owner", move |inner| {
+            inner.with_reader(|connection| {
+                // Rotation changes the current binding, but retained snapshot and
+                // head rows keep the original session owner. Read all available
+                // owner facts in one statement and refuse inconsistent storage.
+                let sql = if inner.head_tables_available(connection)? {
+                    "SELECT identity FROM session_snapshots WHERE session_id = ?1 \
+                     UNION ALL SELECT identity FROM continuity_session_heads WHERE session_id = ?1 \
+                     UNION ALL SELECT identity FROM continuity_records WHERE session_id = ?1"
+                } else {
+                    "SELECT identity FROM session_snapshots WHERE session_id = ?1 \
+                     UNION ALL SELECT identity FROM continuity_records WHERE session_id = ?1"
+                };
+                let mut statement = connection
+                    .prepare_cached(sql)
+                    .map_err(|e| sqlite_err("prepare session owner", e))?;
+                let rows = statement
+                    .query_map(rusqlite::params![session_id.to_string()], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(|e| sqlite_err("query session owner", e))?;
+                let mut owner = None;
+                for row in rows {
+                    let identity = row.map_err(|e| sqlite_err("read session owner", e))?;
+                    let identity = AgentIdentity::parse(&identity).map_err(|e| {
+                        ContinuityStoreError::Corruption(format!(
+                            "invalid session owner in store: {e}"
+                        ))
+                    })?;
+                    if owner.as_ref().is_some_and(|existing| existing != &identity) {
+                        return Err(ContinuityStoreError::Corruption(format!(
+                            "conflicting owners for session {session_id}"
+                        )));
+                    }
+                    owner = Some(identity);
+                }
+                Ok(owner)
+            })
+        })
+        .await
+    }
+
     async fn load_session_snapshot(
         &self,
         session_id: &meerkat_core::types::SessionId,
@@ -4691,6 +4738,77 @@ mod tests {
         };
         assert_eq!(record.session_id, new_session_id);
         assert_eq!(record.checkpoint_version, CheckpointVersion::new(11));
+        assert!(
+            store
+                .resolve_record_by_session(&old_session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.session_owner(&old_session_id).await.unwrap(),
+            Some(identity.clone())
+        );
+        assert_eq!(
+            store.session_owner(&new_session_id).await.unwrap(),
+            Some(identity)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_owner_reads_retained_heads_and_rejects_conflicting_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("continuity.sqlite3");
+        let store = LocalContinuityStore::open(&path).unwrap();
+        let session_id = meerkat_core::types::SessionId::new();
+        assert_eq!(store.session_owner(&session_id).await.unwrap(), None);
+        let owner = AgentIdentity::parse("triage:main").unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(SCHEMA_HEAD_CANONICAL).unwrap();
+        connection
+            .execute(
+                "INSERT INTO continuity_session_heads \
+             (session_id, identity, generation, checkpoint_version, fencing_token, \
+              head_revision, message_count, rewrite_count, head_json, cas_token) \
+             VALUES (?1, ?2, 0, 1, 1, 'revision', 0, 0, X'7B7D', 'cas')",
+                rusqlite::params![session_id.to_string(), owner.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            store.session_owner(&session_id).await.unwrap(),
+            Some(owner.clone())
+        );
+        connection
+            .execute(
+                "INSERT INTO session_snapshots \
+             (session_id, identity, generation, checkpoint_version, fencing_token, data) \
+             VALUES (?1, 'different:owner', 0, 1, 1, X'7B7D')",
+                rusqlite::params![session_id.to_string()],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.session_owner(&session_id).await,
+            Err(ContinuityStoreError::Corruption(_))
+        ));
+        connection
+            .execute(
+                "UPDATE session_snapshots SET identity = ?1 WHERE session_id = ?2",
+                rusqlite::params![owner.as_str(), session_id.to_string()],
+            )
+            .unwrap();
+        assert_eq!(store.session_owner(&session_id).await.unwrap(), Some(owner));
+        connection
+            .execute(
+                "INSERT INTO continuity_records (identity, agent_runtime_id, session_id, \
+             generation, checkpoint_version, fencing_token) \
+             VALUES ('different:owner', 'rt-001', ?1, 0, 1, 1)",
+                rusqlite::params![session_id.to_string()],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.session_owner(&session_id).await,
+            Err(ContinuityStoreError::Corruption(_))
+        ));
     }
 
     #[tokio::test]

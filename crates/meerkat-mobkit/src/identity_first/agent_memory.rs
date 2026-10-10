@@ -1037,6 +1037,7 @@ fn memory_tool_input_schema() -> serde_json::Value {
 
 fn memory_tool_def() -> meerkat_core::ToolDef {
     meerkat_core::ToolDef {
+        audience: Default::default(),
         name: MEMORY_TOOL_NAME.into(),
         description: memory_tool_description(),
         input_schema: memory_tool_input_schema(),
@@ -1361,6 +1362,15 @@ pub(crate) struct RecorderToolDispatcher {
 }
 
 impl RecorderToolDispatcher {
+    fn wrapped_owner(
+        &self,
+        tool_name: &str,
+    ) -> Option<&Arc<dyn meerkat_core::AgentToolDispatcher>> {
+        (tool_name != MEMORY_TOOL_NAME)
+            .then_some(self.inner.as_ref())
+            .flatten()
+    }
+
     pub(crate) fn new(
         inner: Option<Arc<dyn meerkat_core::agent::AgentToolDispatcher>>,
         recorder: MemoryRecorder,
@@ -1390,6 +1400,143 @@ impl RecorderToolDispatcher {
 
 #[async_trait]
 impl meerkat_core::agent::AgentToolDispatcher for RecorderToolDispatcher {
+    async fn resolve_tool_application(
+        &self,
+        source_tool: &str,
+        request: &meerkat_core::ToolApplicationRequest,
+        invocation: &serde_json::Value,
+        context: &meerkat_core::ToolDispatchContext,
+    ) -> Result<meerkat_core::tool_application::ToolApplicationResolution, meerkat_core::ToolError>
+    {
+        let owner = self
+            .wrapped_owner(source_tool)
+            .ok_or_else(|| meerkat_core::ToolError::access_denied(source_tool))?;
+        let result = owner
+            .resolve_tool_application(source_tool, request, invocation, context)
+            .await?;
+        if let meerkat_core::tool_application::ToolApplicationResolution::Call { name, .. } =
+            &result
+            && name == MEMORY_TOOL_NAME
+        {
+            return Err(meerkat_core::ToolError::access_denied(name));
+        }
+        Ok(result)
+    }
+
+    fn tool_mutation_class(&self, tool_name: &str) -> meerkat_core::ToolMutationClass {
+        self.wrapped_owner(tool_name)
+            .map(|owner| owner.tool_mutation_class(tool_name))
+            .unwrap_or_default()
+    }
+
+    fn live_bridge_effect_kind(&self, tool_name: &str) -> meerkat_core::LiveBridgeEffectKind {
+        self.wrapped_owner(tool_name)
+            .map(|owner| owner.live_bridge_effect_kind(tool_name))
+            .unwrap_or(meerkat_core::LiveBridgeEffectKind::ExternalIo)
+    }
+
+    fn review_entry_support(
+        &self,
+        tool_name: &str,
+    ) -> meerkat_core::approval::review::ReviewEntrySupport {
+        self.wrapped_owner(tool_name)
+            .map(|owner| owner.review_entry_support(tool_name))
+            .unwrap_or_default()
+    }
+
+    fn execution_binding_epoch(&self, tool_name: &str) -> u64 {
+        self.wrapped_owner(tool_name)
+            .map_or(0, |owner| owner.execution_binding_epoch(tool_name))
+    }
+
+    fn execution_binding_fingerprint(
+        &self,
+        tool_name: &str,
+    ) -> Result<
+        meerkat_core::EphemeralToolBindingFingerprint,
+        meerkat_core::ToolExecutionResolutionError,
+    > {
+        if let Some(owner) = self.wrapped_owner(tool_name) {
+            return owner.execution_binding_fingerprint(tool_name);
+        }
+        let catalog = self.tool_catalog();
+        let entry = catalog
+            .iter()
+            .find(|entry| entry.tool.name == tool_name)
+            .ok_or_else(|| meerkat_core::ToolExecutionResolutionError::NotFound {
+                tool_name: tool_name.to_string(),
+            })?;
+        Ok(meerkat_core::ephemeral_tool_catalog_binding_fingerprint(
+            entry,
+        ))
+    }
+
+    fn resolve_execution_plan(
+        &self,
+        call: meerkat_core::types::ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+        resolution_context: &meerkat_core::ToolExecutionResolutionContext,
+    ) -> Result<meerkat_core::ResolvedToolExecutionPlan, meerkat_core::ToolExecutionResolutionError>
+    {
+        if let Some(owner) = self.wrapped_owner(call.name) {
+            return owner.resolve_execution_plan(call, context, resolution_context);
+        }
+        let catalog = self.tool_catalog();
+        let entry = catalog
+            .iter()
+            .find(|entry| entry.tool.name == call.name)
+            .ok_or_else(|| meerkat_core::ToolExecutionResolutionError::NotFound {
+                tool_name: call.name.to_string(),
+            })?;
+        entry
+            .execution
+            .resolve_default(resolution_context.deadlines().clone())
+            .map_err(Into::into)
+    }
+
+    fn validate_resolved_execution_plan(
+        &self,
+        call: meerkat_core::types::ToolCallView<'_>,
+        resolution_context: &meerkat_core::ToolExecutionResolutionContext,
+        plan: &meerkat_core::ResolvedToolExecutionPlan,
+    ) -> Result<(), meerkat_core::ToolExecutionResolutionError> {
+        if let Some(owner) = self.wrapped_owner(call.name) {
+            return owner.validate_resolved_execution_plan(call, resolution_context, plan);
+        }
+        resolution_context.validate_resolved_plan(plan)?;
+        let catalog = self.tool_catalog();
+        let entry = catalog
+            .iter()
+            .find(|entry| entry.tool.name == call.name)
+            .ok_or_else(|| meerkat_core::ToolExecutionResolutionError::NotFound {
+                tool_name: call.name.to_string(),
+            })?;
+        entry
+            .execution
+            .validate_resolved_plan(plan)
+            .map_err(Into::into)
+    }
+
+    async fn dispatch_resolved_with_context(
+        &self,
+        call: meerkat_core::types::ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+        plan: &meerkat_core::ResolvedToolExecutionPlan,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+        if let Some(owner) = self.wrapped_owner(call.name) {
+            return owner
+                .dispatch_resolved_with_context(call, context, plan)
+                .await;
+        }
+        if plan.mode() != meerkat_core::ToolExecutionMode::Fast {
+            return Err(meerkat_core::ToolError::unavailable(
+                call.name,
+                meerkat_core::ToolUnavailableReason::ExecutionModeOwnerUnavailable,
+            ));
+        }
+        self.dispatch_with_context(call, context).await
+    }
+
     fn tools(&self) -> Arc<[Arc<meerkat_core::ToolDef>]> {
         self.tools.clone()
     }
@@ -1469,10 +1616,11 @@ impl meerkat_core::agent::AgentToolDispatcher for RecorderToolDispatcher {
             Err(text) => (text, true),
         };
         Ok(meerkat_core::ToolResult {
+            host_metadata: Default::default(),
+            settlement_failures: Default::default(),
             tool_use_id: call.id.to_string(),
             content: vec![meerkat_core::ContentBlock::Text { text }],
             is_error,
-            settlement_failures: Vec::new(),
         }
         .into())
     }
@@ -2751,6 +2899,7 @@ memory = false
     impl AgentToolDispatcher for EchoDispatcher {
         fn tools(&self) -> Arc<[Arc<meerkat_core::ToolDef>]> {
             vec![Arc::new(meerkat_core::ToolDef {
+                audience: Default::default(),
                 name: "echo".into(),
                 description: "echo".to_string(),
                 input_schema: serde_json::json!({"type": "object"}),
@@ -2777,6 +2926,10 @@ memory = false
         let customizer = AgentMemoryCustomizer::new(provider, AgentMemoryConfig::default());
         let mut draft = draft();
         let mut result = meerkat_core::ToolResult::new("call-echo".into(), "echoed".into(), false);
+        result.host_metadata.insert(
+            "test:application".into(),
+            serde_json::json!({"result": {"_meta": {"private": "original"}}}),
+        );
         let first = crate::test_diagnostics::settlement_failure(false);
         let mut second = first.clone();
         second.admission_source = meerkat_core::ops::ToolDispatchAdmissionSource::ContextGate;
@@ -2824,6 +2977,111 @@ memory = false
         assert_eq!(outcome.async_ops, expected.async_ops);
         assert_eq!(outcome.session_effects, expected.session_effects);
         assert_eq!(outcome.terminal_cause(), expected.terminal_cause());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recorder_preserves_application_context_and_leaf_execution_but_shadows_memory()
+    -> Result<(), Box<dyn Error>> {
+        use crate::tool_application_test_support::{
+            ApplicationProbe, application_request, native_context, resolution,
+        };
+        let dir = tempfile::tempdir()?;
+        let provider: Arc<dyn AgentMemoryProvider> =
+            Arc::new(SqliteAgentMemoryStore::open(dir.path())?);
+        let customizer = AgentMemoryCustomizer::new(provider, AgentMemoryConfig::default());
+        let inner = ApplicationProbe::new(vec!["view", "app_refresh", MEMORY_TOOL_NAME]);
+        let mut draft = draft();
+        draft.local_external_tools = LocalExternalToolOverlay::new(inner.clone());
+        customizer
+            .customize_build(&build_context()?, &durable_spec()?, &mut draft)
+            .await?;
+        let dispatcher = draft
+            .local_external_tools
+            .dispatcher()
+            .ok_or("dispatcher present")?;
+        let request = application_request();
+        let context = native_context(request.clone());
+        let invocation = serde_json::json!({"physical": "original", "_meta": {"private": [1,2]}});
+        let meerkat_core::tool_application::ToolApplicationResolution::Call {
+            name, binding, ..
+        } = dispatcher
+            .resolve_tool_application("view", &request, &invocation, &context)
+            .await?
+        else {
+            return Err("expected app call".into());
+        };
+        assert_eq!(
+            binding.payload,
+            serde_json::json!({"source": "view", "request": request, "invocation": invocation})
+        );
+        assert_eq!(
+            inner.context_address.load(Ordering::SeqCst),
+            std::ptr::from_ref(&context) as usize
+        );
+        assert_eq!(
+            dispatcher.tool_mutation_class(&name),
+            meerkat_core::ToolMutationClass::ReadOnly
+        );
+        assert_eq!(
+            dispatcher.live_bridge_effect_kind(&name),
+            meerkat_core::LiveBridgeEffectKind::ReadOnlyMemorySnapshot
+        );
+        assert_eq!(
+            dispatcher.review_entry_support(&name),
+            meerkat_core::approval::review::ReviewEntrySupport::ConsumesAtEntry
+        );
+        assert_eq!(dispatcher.execution_binding_epoch(&name), 1);
+        assert_eq!(
+            dispatcher.execution_binding_fingerprint(&name)?,
+            inner.execution_binding_fingerprint(&name)?
+        );
+        let args = serde_json::value::RawValue::from_string("{}".into())?;
+        let call = meerkat_core::types::ToolCallView {
+            id: "fresh-action",
+            name: &name,
+            args: &args,
+        };
+        let plan = dispatcher.resolve_execution_plan(call, &context, &resolution())?;
+        assert!(plan.owner_witness("test:app-leaf").is_some());
+        dispatcher
+            .dispatch_resolved_with_context(call, &context, &plan)
+            .await?;
+        assert_eq!(inner.dispatched.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            inner.context_address.load(Ordering::SeqCst),
+            std::ptr::from_ref(&context) as usize
+        );
+        assert!(matches!(
+            dispatcher
+                .resolve_tool_application(MEMORY_TOOL_NAME, &request, &invocation, &context)
+                .await,
+            Err(meerkat_core::ToolError::AccessDenied { .. })
+        ));
+        assert_eq!(inner.resolved.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            dispatcher.review_entry_support(MEMORY_TOOL_NAME),
+            meerkat_core::approval::review::ReviewEntrySupport::Unsupported
+        );
+
+        let source =
+            ApplicationProbe::with_action(vec!["view", MEMORY_TOOL_NAME], MEMORY_TOOL_NAME);
+        draft.local_external_tools = LocalExternalToolOverlay::new(source.clone());
+        customizer
+            .customize_build(&build_context()?, &durable_spec()?, &mut draft)
+            .await?;
+        let dispatcher = draft
+            .local_external_tools
+            .dispatcher()
+            .ok_or("dispatcher present")?;
+        assert!(matches!(
+            dispatcher
+                .resolve_tool_application("view", &request, &invocation, &context)
+                .await,
+            Err(meerkat_core::ToolError::AccessDenied { .. })
+        ));
+        assert_eq!(source.resolved.load(Ordering::SeqCst), 1);
+        assert_eq!(source.dispatched.load(Ordering::SeqCst), 0);
         Ok(())
     }
 

@@ -152,6 +152,6 @@ fn ephemeral_gateway_reports_declared_ephemeral_blobs() {
     assert_eq!(storage["blob_store_persistent"], json!(false));
     assert!(
         storage["session_store_incremental"].is_null(),
-        "no persistent session service on the default ephemeral launch: {storage}"
+        "the default ephemeral launch has no durable session-store declaration: {storage}"
     );
 }

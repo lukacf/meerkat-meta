@@ -66,6 +66,7 @@ function experience() {
   return {
     contract_version: "bench",
     runtime_id: "bench-runtime",
+    storage_scope: "bench-principal",
     console_config: {},
     console_policy: {},
     agent_sidebar: {
@@ -142,7 +143,7 @@ function seedDockedChat(panelCount = 1): void {
   // Mirrors ConsoleApp's dock persistence key and ConsoleDockState shape so the
   // app restores focused chat panel(s) at mount: panel-1 for CHAT_IDENTITY,
   // further panels for the next agents in the roster, laid out as a grid.
-  const key = `mobkit-console-dock-state:bench-runtime`;
+  const key = `mobkit-console-dock-state:${JSON.stringify(["", "bench-principal"])}`;
   const panels = Array.from({ length: panelCount }, (_, i) => {
     const identity = i === 0 ? CHAT_IDENTITY : agentRow(i).identity;
     return {

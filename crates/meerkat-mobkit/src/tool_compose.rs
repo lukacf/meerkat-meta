@@ -17,6 +17,7 @@
 //! attention-scope bypass in an earlier wrapper.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use meerkat_core::agent::OpsLifecycleBindError;
 use meerkat_core::types::{ToolCallView, ToolDef};
@@ -30,7 +31,10 @@ use meerkat_core::{
 pub struct ComposedExternalTools {
     primary: Arc<dyn AgentToolDispatcher>,
     fallback: Arc<dyn AgentToolDispatcher>,
+    execution_authority_id: usize,
 }
+
+static NEXT_EXECUTION_AUTHORITY_ID: AtomicUsize = AtomicUsize::new(1);
 
 impl ComposedExternalTools {
     /// Compose `primary` over an optional pre-existing dispatcher. With no
@@ -50,7 +54,12 @@ impl ComposedExternalTools {
         match fallback {
             None => primary,
             Some(fallback) => {
-                let composed = Self { primary, fallback };
+                let composed = Self {
+                    primary,
+                    fallback,
+                    execution_authority_id: NEXT_EXECUTION_AUTHORITY_ID
+                        .fetch_add(1, Ordering::Relaxed),
+                };
                 let shadowed = composed.shadowed_fallback_names();
                 if !shadowed.is_empty() {
                     tracing::warn!(
@@ -86,10 +95,172 @@ impl ComposedExternalTools {
             .iter()
             .any(|tool| tool.name.as_ref() == name)
     }
+
+    fn owner(&self, name: &str) -> (&'static str, &Arc<dyn AgentToolDispatcher>) {
+        if self.primary_advertises(name) {
+            ("primary", &self.primary)
+        } else {
+            ("fallback", &self.fallback)
+        }
+    }
+
+    fn execution_authority_key(&self) -> String {
+        format!(
+            "mobkit:composed-external-tools:{}",
+            self.execution_authority_id
+        )
+    }
 }
 
 #[async_trait::async_trait]
 impl AgentToolDispatcher for ComposedExternalTools {
+    async fn resolve_tool_application(
+        &self,
+        source_tool: &str,
+        request: &meerkat_core::ToolApplicationRequest,
+        invocation: &serde_json::Value,
+        context: &meerkat_core::ToolDispatchContext,
+    ) -> Result<meerkat_core::tool_application::ToolApplicationResolution, ToolError> {
+        let (route, owner) = self.owner(source_tool);
+        let changed = || {
+            ToolError::unavailable(
+                source_tool,
+                meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+            )
+        };
+        let before = owner
+            .execution_binding_fingerprint(source_tool)
+            .map_err(|_| changed())?;
+        let mut result = owner
+            .resolve_tool_application(source_tool, request, invocation, context)
+            .await?;
+        if self.owner(source_tool).0 != route
+            || owner.execution_binding_fingerprint(source_tool).as_ref() != Ok(&before)
+        {
+            return Err(changed());
+        }
+        // A resolved app action belongs to the same leaf as its source. A
+        // colliding host tool must not receive another leaf's native binding.
+        if let meerkat_core::tool_application::ToolApplicationResolution::Call {
+            name,
+            binding,
+            ..
+        } = &mut result
+        {
+            let (target_route, target_owner) = self.owner(name);
+            if target_route != route {
+                return Err(ToolError::access_denied(name.as_str()));
+            }
+            let witness = meerkat_core::ToolExecutionOwnerWitness::new(
+                self.execution_authority_key(),
+                target_route,
+                target_owner
+                    .execution_binding_fingerprint(name)
+                    .map_err(ToolError::from)?,
+            )
+            .map_err(|_| changed())?;
+            *binding = binding
+                .clone()
+                .with_owner_witness(witness)
+                .map_err(ToolError::from)?;
+        }
+        Ok(result)
+    }
+
+    fn tool_mutation_class(&self, tool_name: &str) -> meerkat_core::ToolMutationClass {
+        self.owner(tool_name).1.tool_mutation_class(tool_name)
+    }
+
+    fn live_bridge_effect_kind(&self, tool_name: &str) -> meerkat_core::LiveBridgeEffectKind {
+        self.owner(tool_name).1.live_bridge_effect_kind(tool_name)
+    }
+
+    fn review_entry_support(
+        &self,
+        tool_name: &str,
+    ) -> meerkat_core::approval::review::ReviewEntrySupport {
+        self.owner(tool_name).1.review_entry_support(tool_name)
+    }
+
+    fn execution_binding_epoch(&self, tool_name: &str) -> u64 {
+        self.owner(tool_name).1.execution_binding_epoch(tool_name)
+    }
+
+    fn execution_binding_fingerprint(
+        &self,
+        tool_name: &str,
+    ) -> Result<
+        meerkat_core::EphemeralToolBindingFingerprint,
+        meerkat_core::ToolExecutionResolutionError,
+    > {
+        let (route, owner) = self.owner(tool_name);
+        let child = owner.execution_binding_fingerprint(tool_name)?;
+        Ok(child.with_live_authority(self.execution_authority_id, u64::from(route == "primary")))
+    }
+
+    fn resolve_execution_plan(
+        &self,
+        call: ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+        resolution_context: &meerkat_core::ToolExecutionResolutionContext,
+    ) -> Result<meerkat_core::ResolvedToolExecutionPlan, meerkat_core::ToolExecutionResolutionError>
+    {
+        let (route, owner) = self.owner(call.name);
+        let before = owner.execution_binding_fingerprint(call.name)?;
+        let plan = owner.resolve_execution_plan(call, context, resolution_context)?;
+        if self.owner(call.name).0 != route
+            || owner.execution_binding_fingerprint(call.name).as_ref() != Ok(&before)
+        {
+            return Err(meerkat_core::ToolExecutionResolutionError::Unavailable {
+                tool_name: call.name.to_string(),
+                reason: meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+            });
+        }
+        plan.with_owner_witness(meerkat_core::ToolExecutionOwnerWitness::new(
+            self.execution_authority_key(),
+            route,
+            before,
+        )?)
+    }
+
+    fn validate_resolved_execution_plan(
+        &self,
+        call: ToolCallView<'_>,
+        context: &meerkat_core::ToolExecutionResolutionContext,
+        plan: &meerkat_core::ResolvedToolExecutionPlan,
+    ) -> Result<(), meerkat_core::ToolExecutionResolutionError> {
+        self.owner(call.name)
+            .1
+            .validate_resolved_execution_plan(call, context, plan)
+    }
+
+    async fn dispatch_resolved_with_context(
+        &self,
+        call: ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+        plan: &meerkat_core::ResolvedToolExecutionPlan,
+    ) -> Result<ToolDispatchOutcome, ToolError> {
+        let (route, owner) = self.owner(call.name);
+        let changed = || {
+            ToolError::unavailable(
+                call.name,
+                meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+            )
+        };
+        let witness = plan
+            .owner_witness(&self.execution_authority_key())
+            .ok_or_else(changed)?;
+        if witness.owner_key() != route
+            || owner.execution_binding_fingerprint(call.name).as_ref()
+                != Ok(witness.binding_fingerprint())
+        {
+            return Err(changed());
+        }
+        owner
+            .dispatch_resolved_with_context(call, context, plan)
+            .await
+    }
+
     fn tools(&self) -> Arc<[Arc<ToolDef>]> {
         let primary = self.primary.tools();
         let mut merged: Vec<Arc<ToolDef>> = primary.iter().cloned().collect();
@@ -166,7 +337,11 @@ impl AgentToolDispatcher for ComposedExternalTools {
         };
         let primary = bind_half(owned.primary)?;
         let fallback = bind_half(owned.fallback)?;
-        let rebound: Arc<dyn AgentToolDispatcher> = Arc::new(Self { primary, fallback });
+        let rebound: Arc<dyn AgentToolDispatcher> = Arc::new(Self {
+            primary,
+            fallback,
+            execution_authority_id: owned.execution_authority_id,
+        });
         Ok(if any_bound {
             BindOutcome::Bound(rebound)
         } else {
@@ -196,7 +371,7 @@ impl AgentToolDispatcher for ComposedExternalTools {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -231,6 +406,7 @@ mod tests {
                 .iter()
                 .map(|name| {
                     Arc::new(ToolDef {
+                        audience: Default::default(),
                         name: (*name).into(),
                         description: String::new(),
                         input_schema: json!({"type": "object"}),
@@ -269,6 +445,249 @@ mod tests {
             name,
             args,
         }
+    }
+
+    #[tokio::test]
+    async fn application_resolution_preserves_selected_source_raw_data_and_native_context() {
+        use crate::tool_application_test_support::{
+            ApplicationProbe, application_request, native_context,
+        };
+        let primary = ApplicationProbe::with_action(
+            vec!["primary_view", "primary_refresh"],
+            "primary_refresh",
+        );
+        let fallback = ApplicationProbe::new(vec!["fallback_view", "app_refresh"]);
+        let composed = ComposedExternalTools::over(primary.clone(), Some(fallback.clone()));
+        let request = application_request();
+        let context = native_context(request.clone());
+        let invocation =
+            json!({"registration": "original-physical", "result": {"_meta": {"ui_only": [1,2,3]}}});
+        for (source, owner) in [("primary_view", &primary), ("fallback_view", &fallback)] {
+            let meerkat_core::tool_application::ToolApplicationResolution::Call {
+                name,
+                binding,
+                project_result,
+            } = composed
+                .resolve_tool_application(source, &request, &invocation, &context)
+                .await
+                .unwrap()
+            else {
+                panic!("expected call")
+            };
+            assert_eq!(name, owner.action_name);
+            assert_eq!(binding.extension, request.extension);
+            assert_eq!(
+                binding.payload,
+                json!({"source": source, "request": request, "invocation": invocation})
+            );
+            assert_eq!(
+                owner.context_address.load(Ordering::SeqCst),
+                std::ptr::from_ref(&context) as usize
+            );
+            let mut result =
+                meerkat_core::ToolResult::new("result".into(), "fallback".into(), false);
+            result
+                .host_metadata
+                .insert("opaque".into(), invocation.clone());
+            assert_eq!(
+                project_result(&result).unwrap(),
+                json!({"opaque": invocation})
+            );
+        }
+        assert_eq!(primary.resolved.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback.resolved.load(Ordering::SeqCst), 1);
+
+        let args = serde_json::value::RawValue::from_string("{}".into()).unwrap();
+        let call = call("app_refresh", &args);
+        let resolution = crate::tool_application_test_support::resolution();
+        let plan = composed
+            .resolve_execution_plan(call, &context, &resolution)
+            .unwrap();
+        assert!(plan.owner_witness("test:app-leaf").is_some());
+        composed
+            .dispatch_resolved_with_context(call, &context, &plan)
+            .await
+            .unwrap();
+        assert_eq!(fallback.dispatched.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fallback.context_address.load(Ordering::SeqCst),
+            std::ptr::from_ref(&context) as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn application_shadowing_never_falls_back_after_primary_refusal() {
+        use crate::tool_application_test_support::{
+            ApplicationProbe, application_request, native_context,
+        };
+        let fallback = ApplicationProbe::new(vec!["shared"]);
+        let composed =
+            ComposedExternalTools::over(Probe::new(vec!["shared"]), Some(fallback.clone()));
+        let request = application_request();
+        assert!(matches!(
+            composed
+                .resolve_tool_application(
+                    "shared",
+                    &request,
+                    &json!({}),
+                    &native_context(request.clone())
+                )
+                .await,
+            Err(ToolError::AccessDenied { .. })
+        ));
+        assert_eq!(fallback.resolved.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            composed.tool_mutation_class("shared"),
+            meerkat_core::ToolMutationClass::Unknown
+        );
+        assert_eq!(
+            composed.review_entry_support("shared"),
+            meerkat_core::approval::review::ReviewEntrySupport::Unsupported
+        );
+
+        let source = ApplicationProbe::new(vec!["view", "app_refresh"]);
+        let composed =
+            ComposedExternalTools::over(Probe::new(vec!["app_refresh"]), Some(source.clone()));
+        assert!(matches!(
+            composed
+                .resolve_tool_application(
+                    "view",
+                    &request,
+                    &json!({}),
+                    &native_context(request.clone())
+                )
+                .await,
+            Err(ToolError::AccessDenied { .. })
+        ));
+        assert_eq!(source.resolved.load(Ordering::SeqCst), 1);
+        assert_eq!(source.dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn application_resolution_refuses_stable_route_with_changed_leaf_binding() {
+        use crate::tool_application_test_support::{
+            ApplicationProbe, application_request, native_context,
+        };
+        let source = ApplicationProbe::new(vec!["view", "app_refresh"]);
+        source.block.store(true, Ordering::SeqCst);
+        let composed = ComposedExternalTools::over(source.clone(), Some(Probe::new(vec!["host"])));
+        let request = application_request();
+        let context = native_context(request.clone());
+        let invocation = json!({"physical": "original"});
+        let pending = composed.resolve_tool_application("view", &request, &invocation, &context);
+        tokio::pin!(pending);
+        tokio::select! {
+            _ = &mut pending => panic!("resolution completed before release"),
+            permit = source.entered.acquire() => permit.unwrap().forget(),
+        }
+        source.epoch.fetch_add(1, Ordering::SeqCst);
+        source.release.add_permits(1);
+        assert!(matches!(
+            pending.await,
+            Err(ToolError::Unavailable {
+                reason: meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+                ..
+            })
+        ));
+        assert_eq!(source.dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn application_selection_cannot_be_captured_before_execution_plan_resolution() {
+        use crate::tool_application_test_support::{
+            ApplicationProbe, application_request, native_context, resolution,
+        };
+        let primary = ApplicationProbe::new(vec!["app_refresh"]);
+        primary.active.store(false, Ordering::SeqCst);
+        let fallback = ApplicationProbe::new(vec!["view", "app_refresh"]);
+        let composed = ComposedExternalTools::over(primary.clone(), Some(fallback.clone()));
+        let request = application_request();
+        let context = native_context(request.clone());
+        let meerkat_core::tool_application::ToolApplicationResolution::Call {
+            name, binding, ..
+        } = composed
+            .resolve_tool_application("view", &request, &json!({"physical":"original"}), &context)
+            .await
+            .unwrap()
+        else {
+            panic!("expected app action")
+        };
+        let args = serde_json::value::RawValue::from_string("{}".into()).unwrap();
+        let call = call(&name, &args);
+        let original_plan = composed
+            .resolve_execution_plan(call, &context, &resolution())
+            .unwrap();
+        binding
+            .validate_execution_plan(&name, &original_plan)
+            .unwrap();
+
+        // The source stays on fallback, but a new primary action is published
+        // after app resolution and before the ordinary fresh plan is selected.
+        primary.active.store(true, Ordering::SeqCst);
+        let captured_plan = composed
+            .resolve_execution_plan(call, &context, &resolution())
+            .unwrap();
+        assert!(matches!(
+            binding.validate_execution_plan(&name, &captured_plan),
+            Err(meerkat_core::ToolExecutionResolutionError::Unavailable {
+                reason: meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+                ..
+            })
+        ));
+        assert_eq!(primary.dispatched.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback.dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn application_execution_retains_leaf_facts_and_refuses_changed_winner_or_binding() {
+        use crate::tool_application_test_support::{
+            ApplicationProbe, application_request, native_context, resolution,
+        };
+        let primary = ApplicationProbe::new(vec!["shared"]);
+        let fallback = ApplicationProbe::new(vec!["shared"]);
+        let composed = ComposedExternalTools::over(primary.clone(), Some(fallback.clone()));
+        assert_eq!(
+            composed.tool_mutation_class("shared"),
+            meerkat_core::ToolMutationClass::ReadOnly
+        );
+        assert_eq!(
+            composed.live_bridge_effect_kind("shared"),
+            meerkat_core::LiveBridgeEffectKind::ReadOnlyMemorySnapshot
+        );
+        assert_eq!(
+            composed.review_entry_support("shared"),
+            meerkat_core::approval::review::ReviewEntrySupport::ConsumesAtEntry
+        );
+        let context = native_context(application_request());
+        let args = serde_json::value::RawValue::from_string("{}".into()).unwrap();
+        let call = call("shared", &args);
+        let fingerprint = composed.execution_binding_fingerprint("shared").unwrap();
+        let plan = composed
+            .resolve_execution_plan(call, &context, &resolution())
+            .unwrap();
+        primary.epoch.fetch_add(1, Ordering::SeqCst);
+        assert_ne!(
+            composed.execution_binding_fingerprint("shared").unwrap(),
+            fingerprint
+        );
+        assert!(
+            composed
+                .dispatch_resolved_with_context(call, &context, &plan)
+                .await
+                .is_err()
+        );
+        let plan = composed
+            .resolve_execution_plan(call, &context, &resolution())
+            .unwrap();
+        primary.active.store(false, Ordering::SeqCst);
+        assert!(
+            composed
+                .dispatch_resolved_with_context(call, &context, &plan)
+                .await
+                .is_err()
+        );
+        assert_eq!(primary.dispatched.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback.dispatched.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -353,18 +772,21 @@ mod tests {
         let composed = ComposedExternalTools {
             primary: Probe::new(vec!["shared", "python_tool"]),
             fallback: Probe::new(vec!["shared", "memory"]),
+            execution_authority_id: 0,
         };
         assert_eq!(composed.shadowed_fallback_names(), vec!["shared"]);
 
         let recorder_shadowed = ComposedExternalTools {
             primary: Probe::new(vec!["memory"]),
             fallback: Probe::new(vec!["memory"]),
+            execution_authority_id: 0,
         };
         assert_eq!(recorder_shadowed.shadowed_fallback_names(), vec!["memory"]);
 
         let disjoint = ComposedExternalTools {
             primary: Probe::new(vec!["python_tool"]),
             fallback: Probe::new(vec!["memory"]),
+            execution_authority_id: 0,
         };
         assert!(disjoint.shadowed_fallback_names().is_empty());
     }
@@ -430,6 +852,7 @@ mod tests {
                 .iter()
                 .map(|name| {
                     Arc::new(ToolDef {
+                        audience: Default::default(),
                         name: (*name).into(),
                         description: String::new(),
                         input_schema: json!({"type": "object"}),
@@ -509,6 +932,56 @@ mod tests {
             .iter()
             .map(|tool| tool.name.to_string())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn ops_rebinding_preserves_application_selected_owner_and_context() {
+        use crate::tool_application_test_support::{
+            ApplicationProbe, application_request, native_context, resolution,
+        };
+        let source = ApplicationProbe::new(vec!["view", "app_refresh"]);
+        let (ops, seen) = OpsHalf::observed(vec!["ops_tool"]);
+        let composed = ComposedExternalTools::over(source.clone(), Some(ops));
+        let request = application_request();
+        let context = native_context(request.clone());
+        let invocation = json!({"physical": "original", "_meta": {"private": [1, 2]}});
+        let meerkat_core::tool_application::ToolApplicationResolution::Call {
+            name, binding, ..
+        } = composed
+            .resolve_tool_application("view", &request, &invocation, &context)
+            .await
+            .expect("native app resolution")
+        else {
+            panic!("expected app action");
+        };
+        let registry = registry();
+        let owner = meerkat_core::types::SessionId::new();
+        let rebound = composed
+            .bind_ops_lifecycle(Arc::clone(&registry), owner.clone())
+            .expect("exclusive ops lifecycle binding")
+            .into_dispatcher();
+        assert_bound_to(&seen, &registry, &owner);
+        let args = serde_json::value::RawValue::from_string("{}".into()).expect("raw args");
+        let call = call(&name, &args);
+        let plan = rebound
+            .resolve_execution_plan(call, &context, &resolution())
+            .expect("selected execution plan after binding");
+        binding
+            .validate_execution_plan(&name, &plan)
+            .expect("same selected execution owner survives binding");
+        rebound
+            .dispatch_resolved_with_context(call, &context, &plan)
+            .await
+            .expect("dispatch to original app owner");
+        assert_eq!(source.dispatched.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            source.context_address.load(Ordering::SeqCst),
+            std::ptr::from_ref(&context) as usize
+        );
+        assert_eq!(
+            binding.payload,
+            json!({"source": "view", "request": request, "invocation": invocation})
+        );
     }
 
     /// The composition reports an ops-capable FALLBACK and rebinds it,

@@ -301,6 +301,117 @@
             }
           }
         ]
+      },
+      "mcp_apps_resolve": {
+        "method": "POST",
+        "path": "/console/mcp-apps/resolve",
+        "request": {
+          "required_fields": [
+            "identity",
+            "sessionId",
+            "toolCallId"
+          ],
+          "validation": "Unknown fields are refused. identity, sessionId and toolCallId must identify the original native invocation. Malformed JSON extraction errors are distinct from operation refusals."
+        },
+        "response": {
+          "required_top_level_fields": [
+            "tool",
+            "arguments",
+            "result",
+            "resource",
+            "canCallTools"
+          ]
+        },
+        "admission": "Requires enabled effective MCP Apps and sandbox configuration. Retained invocation and renderer; requires current viewer and member/session access. canCallTools describes the host action surface, not permission for a particular tool.",
+        "cache_control": "HTTP 200 responses and HTTP 403 operation refusals use no-store.",
+        "privacy": "Host-only metadata is delivered only to the authorized App view; it is excluded from model input and public transcripts.",
+        "errors": [
+          {
+            "status": 401,
+            "shape": {
+              "error": "unauthorized",
+              "message": "Console app access requires authorization"
+            }
+          },
+          {
+            "status": 403,
+            "shape": {
+              "error": "mcp_app_unavailable",
+              "message": "This tool app is unavailable for the current viewer or member"
+            }
+          }
+        ]
+      },
+      "mcp_apps_read_resource": {
+        "method": "POST",
+        "path": "/console/mcp-apps/read-resource",
+        "request": {
+          "required_fields": [
+            "identity",
+            "sessionId",
+            "toolCallId",
+            "uri"
+          ],
+          "validation": "Unknown fields are refused. identity, sessionId and toolCallId must identify the original native invocation. Malformed JSON extraction errors are distinct from operation refusals."
+        },
+        "response": {
+          "protocol": "MCP ReadResourceResult"
+        },
+        "admission": "Requires enabled effective MCP Apps and sandbox configuration. The exact retained renderer may be read with view permission. A cache miss requires agent.send, an editable Console, fresh native admission and the original negotiated MCP connection.",
+        "cache_control": "HTTP 200 responses and HTTP 403 operation refusals use no-store.",
+        "privacy": "Host-only metadata is delivered only to the authorized App view; it is excluded from model input and public transcripts.",
+        "errors": [
+          {
+            "status": 401,
+            "shape": {
+              "error": "unauthorized",
+              "message": "Console app access requires authorization"
+            }
+          },
+          {
+            "status": 403,
+            "shape": {
+              "error": "mcp_app_unavailable",
+              "message": "This tool app is unavailable for the current viewer or member"
+            }
+          }
+        ]
+      },
+      "mcp_apps_call_tool": {
+        "method": "POST",
+        "path": "/console/mcp-apps/call-tool",
+        "request": {
+          "required_fields": [
+            "identity",
+            "sessionId",
+            "toolCallId",
+            "name",
+            "arguments"
+          ],
+          "validation": "Unknown fields are refused. identity, sessionId and toolCallId must identify the original native invocation. Malformed JSON extraction errors are distinct from operation refusals."
+        },
+        "response": {
+          "protocol": "MCP CallToolResult"
+        },
+        "admission": "Requires enabled effective MCP Apps and sandbox configuration, agent.send, an editable Console, fresh native authorization and pre/post-tool hooks, current app tool visibility and the original negotiated MCP connection.",
+        "cache_control": "HTTP 200 responses and HTTP 403 operation refusals use no-store.",
+        "privacy": "Host-only metadata is delivered only to the authorized App view; it is excluded from model input and public transcripts.",
+        "errors": [
+          {
+            "status": 401,
+            "shape": {
+              "error": "unauthorized",
+              "message": "Console app access requires authorization"
+            }
+          },
+          {
+            "status": 403,
+            "shape": {
+              "error": "mcp_app_unavailable",
+              "message": "This tool app is unavailable for the current viewer or member"
+            }
+          }
+        ]
       }
     },
     "rpc": {

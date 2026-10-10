@@ -413,6 +413,33 @@ export class CallbackDispatcher {
       };
     }
 
+    if (method === "callback/continuity_store/session_owner") {
+      if (this._continuityStore === null) {
+        throw new Error("no ContinuityStore registered");
+      }
+      const sessionId = String(params.session_id ?? "");
+      const handler = this._continuityStore.sessionOwner;
+      if (handler) {
+        const owner = await handler.call(this._continuityStore, sessionId, callbackContext);
+        if (owner !== null && typeof owner !== "string") {
+          throw new Error("ContinuityStore.sessionOwner must return an identity string or null");
+        }
+        return owner;
+      }
+      // Older providers support current bindings only. Historical ownership
+      // requires the explicit sessionOwner capability described by the API.
+      const resolver = this._continuityStore.resolveRecordBySession;
+      if (!resolver) {
+        throw new Error("ContinuityStore cannot resolve session ownership");
+      }
+      const bound = await resolver.call(this._continuityStore, sessionId, callbackContext);
+      if (bound === null) return null;
+      if (bound.record.sessionId !== sessionId) {
+        throw new Error("session owner lookup returned a different session");
+      }
+      return bound.record.identity;
+    }
+
     if (method === "callback/continuity_store/delete_session_snapshot_if_current_revision") {
       if (this._continuityStore === null) {
         throw new Error("no ContinuityStore registered");

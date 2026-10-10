@@ -4,7 +4,10 @@ import { ConsoleApp } from "./ConsoleApp";
 import { parseSseFrames } from "./lib/network";
 import type { MarkdownUrlPolicy } from "@console-components";
 
-interface CreateConsoleAppOptions {
+export interface CreateConsoleAppOptions {
+  mcpAppsHost?: import("@console-components").ConsoleMcpAppsHost;
+  customPanels?: readonly import("@console-core").ConsolePanelDefinition[];
+  panelService?: import("@console-core").ConsolePanelService;
   baseUrl?: string;
   /** Opaque host scope covering authority/runtime, realm and principal. */
   storageNamespace?: string;
@@ -22,7 +25,7 @@ export function createConsoleApp(
 
   const baseUrl = options.baseUrl || "";
   const root = createRoot(target);
-  root.render(<ConsoleApp baseUrl={baseUrl} storageNamespace={options.storageNamespace} markdownUrlPolicy={options.markdownUrlPolicy} />);
+  root.render(<ConsoleApp mcpAppsHost={options.mcpAppsHost} customPanels={options.customPanels} panelService={options.panelService} baseUrl={baseUrl} storageNamespace={options.storageNamespace} markdownUrlPolicy={options.markdownUrlPolicy} />);
 
   return {
     unmount() {
@@ -32,3 +35,7 @@ export function createConsoleApp(
 }
 
 export { ConsoleApp, parseSseFrames };
+export type { ConsolePanelDefinition, ConsolePanelContext, ConsolePanelMount, ConsolePanelOpenOptions, ConsoleConversationTarget, ConsolePanelService, ConsolePanelRequest, ConsoleJsonValue } from "@console-core";
+
+export { ConsoleMcpAppView, ConsoleMcpAppsProvider } from "@console-components";
+export type { ConsoleMcpAppsHost, ConsoleMcpAppSession, McpAppLocator } from "@console-components";

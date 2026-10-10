@@ -454,17 +454,19 @@ mod tests {
 
     fn tool_results(id: &str, text: &str) -> Message {
         Message::tool_results(vec![ToolResult {
+            host_metadata: Default::default(),
+            settlement_failures: Default::default(),
             tool_use_id: id.to_string(),
             content: vec![ContentBlock::Text {
                 text: text.to_string(),
             }],
             is_error: false,
-            settlement_failures: Vec::new(),
         }])
     }
 
     fn mcp_tool(name: &str, server: &str) -> Arc<ToolDef> {
         Arc::new(ToolDef {
+            audience: Default::default(),
             name: name.into(),
             description: String::new(),
             input_schema: serde_json::json!({"type": "object"}),
@@ -528,6 +530,7 @@ mod tests {
         );
 
         let plain = Arc::new(ToolDef {
+            audience: Default::default(),
             name: "lookup".into(),
             description: String::new(),
             input_schema: serde_json::json!({"type": "object"}),

@@ -12,7 +12,7 @@ import { ACCEPTANCE_NOTICE_GRACE_MS, PendingStack, type PendingItem } from "../p
 const identity = "identity:queue-agent";
 function seed(twoPanes = false) {
   const target = { id: `chat:${identity}`, kind: "agent-chat", title: "Queue agent", identity, memberId: identity };
-  window.localStorage.setItem("mobkit-console-dock-state:queue-test", JSON.stringify({
+  window.localStorage.setItem("mobkit-console-dock-state:runtime/realm/principal", JSON.stringify({
     tabs: [{ id: "tab-1", presetId: "single", layout: twoPanes ? { kind: "split", id: "split-1", direction: "horizontal", ratio: 0.5, first: { kind: "panel", panelId: "panel-1" }, second: { kind: "panel", panelId: "panel-2" } } : { kind: "panel", panelId: "panel-1" } }],
     panels: [{ id: "panel-1", mode: "console", target }, ...(twoPanes ? [{ id: "panel-2", mode: "console", target }] : [])],
     activeTabId: "tab-1", focusedPanelId: "panel-1",
@@ -20,7 +20,7 @@ function seed(twoPanes = false) {
 }
 function transport(send: MobKitConsoleTransport["send"]): MobKitConsoleTransport {
   return {
-    loadExperience: async () => ({ runtime_id: "queue-test", console_config: {}, agent_sidebar: { live_snapshot: { agents: [{ identity, member_id: identity, agent_id: identity, label: "Queue agent", kind: "member", state: "running", addressable: true, affordances: { can_send_message: true }, model_capabilities: { image_input: false } }] } }, activity_feed: { filter_presets: [], active_preset_id: "all" } }) as never,
+    loadExperience: async () => ({ runtime_id: "queue-test", console_config: { layout: { initial_agent: identity } }, agent_sidebar: { live_snapshot: { agents: [{ identity, member_id: identity, agent_id: identity, label: "Queue agent", kind: "member", state: "running", addressable: true, affordances: { can_send_message: true }, model_capabilities: { image_input: false } }] } }, activity_feed: { filter_presets: [], active_preset_id: "all" } }) as never,
     loadModules: async () => ({ modules: [] }) as never,
     capabilities: async () => ({ version: "test", methods: ["mobkit/console/send", "mobkit/console/timeline"] }) as never,
     queryTimeline: async () => ({ frames: [], available: true }),
@@ -479,7 +479,7 @@ describe("stock durable queue integration", () => {
     await act(async () => { oldReceive?.({ id: "late-old-frame", event: "interaction_complete", identity, interactionId: "late-private", timestampMs: 2, data: { text: "Late previous authority transcript" } } as never); });
     expect(screen.queryByText("Late previous authority transcript")).toBeNull();
     await waitFor(() => expect(next.loadExperience).toHaveBeenCalledTimes(1));
-    await act(async () => { finish({ runtime_id: "queue-test", console_config: {}, agent_sidebar: { live_snapshot: { agents: [] } }, activity_feed: { filter_presets: [], active_preset_id: "all" } } as never); });
+    await act(async () => { finish({ runtime_id: "queue-test", console_config: { layout: { initial_agent: identity } }, agent_sidebar: { live_snapshot: { agents: [] } }, activity_feed: { filter_presets: [], active_preset_id: "all" } } as never); });
     await waitFor(() => expect(screen.queryByTestId("console-loading")).toBeNull());
     expect(screen.queryByTestId(`sidebar-agent:${identity}`)).toBeNull();
     expect(screen.queryByTestId(`chat-composer:${identity}`)).toBeNull();
@@ -1367,7 +1367,7 @@ describe("dock layout hydration", () => {
   // runs before any later task) and require the click to win.
   it("keeps a nav click made as soon as the experience renders", async () => {
     // The restore race needs a saved layout; the file's beforeEach seeds it.
-    expect(window.localStorage.getItem("mobkit-console-dock-state:queue-test")).not.toBeNull();
+    expect(window.localStorage.getItem("mobkit-console-dock-state:runtime/realm/principal")).not.toBeNull();
     const fake = transport(vi.fn());
     const initial = await fake.loadExperience();
     fake.loadExperience = async () => ({ ...initial, access: { available: true, enabled: true, can_administer: true, subject: "first-admin" } }) as never;
@@ -1387,7 +1387,7 @@ describe("dock layout hydration", () => {
     });
     observer.observe(document.body, { childList: true, subtree: true });
     try {
-      render(<ConsoleApp baseUrl="" transport={fake} />);
+      render(<ConsoleApp baseUrl="" storageNamespace="runtime/realm/principal" transport={fake} />);
       await waitFor(() => expect(clicked).toBe(true));
     } finally {
       observer.disconnect();
@@ -1541,12 +1541,12 @@ describe("checked access saves", () => {
   // Restore a saved layout with Access already open, so no nav click can race
   // the dock layout hydration.
   async function openAccess(fake: MobKitConsoleTransport) {
-    window.localStorage.setItem("mobkit-console-dock-state:queue-test", JSON.stringify({
+    window.localStorage.setItem("mobkit-console-dock-state:runtime/realm/principal", JSON.stringify({
       tabs: [{ id: "tab-1", presetId: "single", layout: { kind: "panel", panelId: "panel-1" } }],
       panels: [{ id: "panel-1", mode: "console", target: { id: "access", kind: "access", title: "Access" } }],
       activeTabId: "tab-1", focusedPanelId: "panel-1",
     }));
-    const view = render(<ConsoleApp baseUrl="" transport={fake} />);
+    const view = render(<ConsoleApp baseUrl="" storageNamespace="runtime/realm/principal" transport={fake} />);
     await screen.findByText("alice@example.test", { exact: true });
     return view;
   }

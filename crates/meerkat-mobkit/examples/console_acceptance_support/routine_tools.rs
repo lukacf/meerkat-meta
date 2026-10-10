@@ -214,8 +214,8 @@ impl AgentCustomizer for RoutineCustomizer {
 impl AgentToolDispatcher for RoutineTools {
     fn tools(&self) -> Arc<[Arc<ToolDef>]> {
         [
-            ToolDef { name: "read_file".into(), description: "Read one file from the acceptance workspace.".into(), input_schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}), provenance: None },
-            ToolDef { name: "list_files".into(), description: "List the acceptance workspace files.".into(), input_schema: json!({"type":"object","properties":{},"additionalProperties":false}), provenance: None },
+            ToolDef { audience: Default::default(), name: "read_file".into(), description: "Read one file from the acceptance workspace.".into(), input_schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}), provenance: None },
+            ToolDef { audience: Default::default(), name: "list_files".into(), description: "List the acceptance workspace files.".into(), input_schema: json!({"type":"object","properties":{},"additionalProperties":false}), provenance: None },
         ].into_iter().map(Arc::new).collect::<Vec<_>>().into()
     }
 

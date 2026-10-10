@@ -56,6 +56,8 @@ interface SidebarProps {
   collapsed: boolean;
   visibleControls?: NavKind[];
   customButtons?: ConsoleSidebarButtonConfig[];
+  customPanels?: readonly import("@console-core").ConsolePanelDefinition[];
+  onOpenCustomPanel?: (id: string) => void;
   grouping?: ConsoleAgentListConfig;
   storageNamespace?: string;
   pinnedAgentIds?: Set<string>;
@@ -1252,6 +1254,8 @@ export const Sidebar = React.memo(function Sidebar({
   collapsed,
   visibleControls,
   customButtons,
+  customPanels = [],
+  onOpenCustomPanel,
   grouping,
   storageNamespace,
   pinnedAgentIds,
@@ -1644,7 +1648,7 @@ export const Sidebar = React.memo(function Sidebar({
         </div>
       </div>
 
-      {(navKinds.length > 0 || customSidebarButtons.length > 0) && (
+      {(navKinds.length > 0 || customSidebarButtons.length > 0 || customPanels.length > 0) && (
           <div className="sidebar__section sidebar__section--nav">
             <div className="sidebar__sec-head">
             <span className="sidebar__sec-label">Workbench</span>
@@ -1660,6 +1664,10 @@ export const Sidebar = React.memo(function Sidebar({
               {NAV_LABEL[kind]}
             </button>
           ))}
+          {customPanels.map(panel => <button key={panel.id} className="sidebar__navitem"
+            data-testid={`nav-custom-panel:${panel.id}`} onClick={() => onOpenCustomPanel?.(panel.id)}>
+            {panel.title}
+          </button>)}
           {customSidebarButtons.map((button) => {
             const control = normalizeNavKind(button.control);
             if (control) {

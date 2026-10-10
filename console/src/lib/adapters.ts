@@ -1,4 +1,5 @@
 import { operationFeedbackFromFrame } from "../../../packages/console-core/src/operation-feedback";
+import { mcpAppEntryFromFrame } from "../../../packages/console-core/src/mcp-app-projection";
 import { assistantPresenter, assistantToolOwnership, conversationPresentationRows, extendAssistantToolOwnership, type AssistantPresenterState } from "../../../packages/console-core/src/assistant-presentation";
 import { userMessageRenderKey } from "../../../packages/console-core/src/user-message-identity";
 import { realtimeMessageOrigin, isRealtimeHistoryMessage } from "../../../packages/console-core/src/realtime-message-identity";
@@ -73,7 +74,8 @@ export type MobKitDockTarget =
   | LogsPanelTarget
   | AccessPanelTarget
   | MemoryPanelTarget
-  | WorkGraphPanelTarget;
+  | WorkGraphPanelTarget
+  | import("@console-core").ConsoleCustomPanelTarget;
 
 export interface AgentChatTarget extends ConsoleDockTarget {
   kind: "agent-chat";
@@ -865,6 +867,7 @@ function reasoningFrameText(frame: ConsoleFrame): string {
 
 const ACTIVITY_HIDDEN_EVENTS = new Set([
   ...HIDDEN_EVENTS,
+  "mcp_app",
   "text_delta",
   "tool_call_requested",
   "tool_call",
@@ -5070,6 +5073,7 @@ function createTimelineFold(
   // council is a single call, so a seen-set is enough.
   const emittedCouncilIds = new Set<string>();
   const emittedOperationFeedback = new Set<string>();
+  const emittedMcpApps = new Set<string>();
   const { entriesByAnchor: workGraphEntriesByAnchor, representedToolCallIds: cardToolCallIds } =
     buildWorkGraphEntries(agent, orderedFrames, workGraphNamesByCallId);
   const toolBlocks = buildToolBlocks(orderedFrames, cardToolCallIds);
@@ -5253,6 +5257,16 @@ function createTimelineFold(
     const frame = orderedFrames[i];
     // Canonical frame identity must survive insertion of older history.
     const entryId = frame.id || `${frame.event || "frame"}:${i}`;
+
+    if (frame.event === "mcp_app") {
+      const entry = mcpAppEntryFromFrame(frame, entryId, agentIdentity(agent));
+      if (!entry || emittedMcpApps.has(entry.renderKey)) return;
+      emittedMcpApps.add(entry.renderKey);
+      flushPendingReasoning(true);
+      flushPendingText();
+      entries.push(entry);
+      return;
+    }
 
     // These events bound the assistant response's tool/turn lifecycle.
     // They also close a message when TextComplete was omitted; user/steer inputs,

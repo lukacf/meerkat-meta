@@ -12,6 +12,12 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsoleUiConfig {
+    /// Trusted same-origin JavaScript modules exporting custom panel arrays.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub panel_modules: Vec<String>,
+    /// Dedicated MCP Apps sandbox URL, on an origin without Console APIs or cookies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_apps_sandbox_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "ConsoleBrandingConfig::is_default")]
@@ -37,7 +43,48 @@ impl ConsoleUiConfig {
         value == &Self::default()
     }
 
+    /// Validate before advertising MCP Apps to connected servers. A gateway
+    /// supplies its actual bound or declared public origin once it knows it.
+    pub fn validate_mcp_apps_sandbox(
+        &self,
+        console_url: Option<&str>,
+    ) -> Result<(), ConsoleConfigError> {
+        let Some(value) = &self.mcp_apps_sandbox_url else {
+            return Ok(());
+        };
+        let invalid = || {
+            ConsoleConfigError::Invalid(
+                "mcp_apps_sandbox_url requires an absolute HTTP(S) URL \
+                 without credentials or a fragment"
+                    .into(),
+            )
+        };
+        let sandbox = reqwest::Url::parse(value).map_err(|_| invalid())?;
+        if !matches!(sandbox.scheme(), "http" | "https")
+            || sandbox.host_str().is_none()
+            || !sandbox.username().is_empty()
+            || sandbox.password().is_some()
+            || sandbox.fragment().is_some()
+            || value.chars().any(char::is_whitespace)
+        {
+            return Err(invalid());
+        }
+        if let Some(console_url) = console_url {
+            let console = reqwest::Url::parse(console_url).map_err(|_| {
+                ConsoleConfigError::Invalid("Console origin is not an absolute URL".into())
+            })?;
+            if sandbox.origin() == console.origin() {
+                return Err(ConsoleConfigError::Invalid(
+                    "mcp_apps_sandbox_url must use an origin separate from the Console".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn normalized(mut self) -> Self {
+        self.panel_modules = normalize_string_vec(self.panel_modules);
+        self.mcp_apps_sandbox_url = normalize_optional_string(self.mcp_apps_sandbox_url);
         self.title = normalize_optional_string(self.title);
         self.brand = self.brand.normalized();
         self.appearance = self.appearance.normalized();
@@ -408,6 +455,7 @@ impl ConsoleActionsUiConfig {
 pub enum ConsoleConfigError {
     Io(String),
     TomlParse(String),
+    Invalid(String),
 }
 
 impl std::fmt::Display for ConsoleConfigError {
@@ -415,6 +463,7 @@ impl std::fmt::Display for ConsoleConfigError {
         match self {
             Self::Io(message) => write!(f, "I/O error: {message}"),
             Self::TomlParse(message) => write!(f, "TOML parse error: {message}"),
+            Self::Invalid(message) => write!(f, "invalid Console configuration: {message}"),
         }
     }
 }
@@ -423,6 +472,10 @@ impl std::error::Error for ConsoleConfigError {}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ConsoleUiConfigPatch {
+    #[serde(default)]
+    panel_modules: Option<Vec<String>>,
+    #[serde(default)]
+    mcp_apps_sandbox_url: Option<String>,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
@@ -447,6 +500,12 @@ struct ConsoleUiConfigPatch {
 
 impl ConsoleUiConfigPatch {
     fn apply_to(&self, config: &mut ConsoleUiConfig) {
+        if let Some(modules) = &self.panel_modules {
+            config.panel_modules = normalize_string_vec(modules.clone());
+        }
+        if let Some(url) = &self.mcp_apps_sandbox_url {
+            config.mcp_apps_sandbox_url = normalize_optional_string(Some(url.clone()));
+        }
         if let Some(title) = &self.title {
             config.title = normalize_optional_string(Some(title.clone()));
         }
@@ -779,7 +838,9 @@ pub fn load_console_ui_config_from_toml_for_realm(
     {
         overlay.apply_to(&mut config);
     }
-    Ok(config.normalized())
+    let config = config.normalized();
+    config.validate_mcp_apps_sandbox(None)?;
+    Ok(config)
 }
 
 pub fn load_console_ui_config_from_path_for_realm(
@@ -810,6 +871,118 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_apps_sandbox_rejects_invalid_urls_before_capability_bootstrap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for value in [
+            "/sandbox.html",
+            "//apps.example.test/sandbox.html",
+            "file:///sandbox.html",
+            "javascript:alert(1)",
+            "https://user:private@apps.example.test/sandbox.html",
+            "https://apps.example.test/sandbox.html#fragment",
+            "https://apps.example.test/sandbox.html#",
+        ] {
+            let source = format!("mcp_apps_sandbox_url = {}", serde_json::json!(value));
+            let error = load_console_ui_config_from_toml(&source)
+                .err()
+                .ok_or("invalid sandbox URL unexpectedly accepted")?;
+            assert!(matches!(error, ConsoleConfigError::Invalid(_)));
+            assert!(!error.to_string().contains("private"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_apps_sandbox_compares_only_actual_known_console_origins() {
+        let config = ConsoleUiConfig {
+            mcp_apps_sandbox_url: Some("https://console.example.test:443/sandbox.html".into()),
+            ..Default::default()
+        };
+        assert!(config.validate_mcp_apps_sandbox(None).is_ok());
+        assert!(
+            config
+                .validate_mcp_apps_sandbox(Some("https://console.example.test/console"))
+                .is_err()
+        );
+        assert!(
+            config
+                .validate_mcp_apps_sandbox(Some("https://console.example.test:8443"))
+                .is_ok()
+        );
+        assert!(
+            config
+                .validate_mcp_apps_sandbox(Some("http://127.0.0.1:5000"))
+                .is_ok()
+        );
+        assert!(
+            ConsoleUiConfig::default()
+                .validate_mcp_apps_sandbox(Some("https://console.example.test"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn mcp_apps_sandbox_is_projected_and_realm_overridable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+mcp_apps_sandbox_url = " https://apps.example.test/sandbox.html "
+[realms.demo]
+mcp_apps_sandbox_url = "http://127.0.0.1:5001/sandbox.html"
+[realms.disabled]
+mcp_apps_sandbox_url = " "
+"#;
+        let base = load_console_ui_config_from_toml(source)?;
+        assert_eq!(
+            base.mcp_apps_sandbox_url.as_deref(),
+            Some("https://apps.example.test/sandbox.html")
+        );
+        assert_eq!(
+            serde_json::to_value(&base)?["mcp_apps_sandbox_url"],
+            "https://apps.example.test/sandbox.html"
+        );
+        let demo = load_console_ui_config_from_toml_for_realm(source, Some("demo"))?;
+        assert_eq!(
+            demo.mcp_apps_sandbox_url.as_deref(),
+            Some("http://127.0.0.1:5001/sandbox.html")
+        );
+        let disabled = load_console_ui_config_from_toml_for_realm(source, Some("disabled"))?;
+        assert!(
+            serde_json::to_value(disabled)?
+                .get("mcp_apps_sandbox_url")
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn panel_modules_are_projected_and_realm_overridable() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let source = r#"
+panel_modules = [" /assets/base.js ", ""]
+[realms.demo]
+panel_modules = ["/assets/demo.js"]
+[realms.disabled]
+panel_modules = []
+"#;
+        let base = load_console_ui_config_from_toml(source)?;
+        assert_eq!(base.panel_modules, vec!["/assets/base.js"]);
+        assert_eq!(
+            serde_json::to_value(&base)?["panel_modules"],
+            serde_json::json!(["/assets/base.js"])
+        );
+        let demo = load_console_ui_config_from_toml_for_realm(source, Some("demo"))?;
+        assert_eq!(demo.panel_modules, vec!["/assets/demo.js"]);
+        let disabled = load_console_ui_config_from_toml_for_realm(source, Some("disabled"))?;
+        assert!(disabled.panel_modules.is_empty());
+        assert!(
+            serde_json::to_value(disabled)?
+                .get("panel_modules")
+                .is_none()
+        );
+        Ok(())
+    }
 
     #[test]
     fn loads_console_toml_with_sidebar_buttons_and_agent_selectors()

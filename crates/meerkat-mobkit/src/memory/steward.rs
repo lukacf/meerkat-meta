@@ -3989,6 +3989,7 @@ pub async fn complete_text(
                 operation_id,
                 phase,
             } => {
+                // Observation failure does not change the provider's physical outcome.
                 tracing::warn!(%operation_id, ?phase, "LLM operation observation failed");
             }
             LlmEvent::ReasoningDelta { .. }
@@ -4242,6 +4243,10 @@ mod tests {
                         meta: None,
                     });
                 }
+                events.push(LlmEvent::OperationObservationFailed {
+                    operation_id: meerkat_core::OperationId::new(),
+                    phase: meerkat_core::authorization::OperationObservationPhase::Outcome,
+                });
                 events.push(LlmEvent::AssistantOutput { blocks });
                 events.push(LlmEvent::Done {
                     outcome: LlmDoneOutcome::Success {

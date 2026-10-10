@@ -191,6 +191,7 @@ struct IngestTool {
 impl meerkat_core::agent::AgentToolDispatcher for IngestTool {
     fn tools(&self) -> Arc<[Arc<meerkat_core::ToolDef>]> {
         vec![Arc::new(meerkat_core::ToolDef {
+            audience: Default::default(),
             name: self.name.into(),
             description: "test ingestion tool".to_string(),
             input_schema: json!({"type": "object"}),

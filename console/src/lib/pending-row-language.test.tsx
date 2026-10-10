@@ -17,7 +17,7 @@ const scope = "runtime/realm/principal";
 
 function seed() {
   const target = { id: `chat:${identity}`, kind: "agent-chat", title: agentLabel, identity, memberId: identity };
-  window.localStorage.setItem("mobkit-console-dock-state:queue-test", JSON.stringify({
+  window.localStorage.setItem(`mobkit-console-dock-state:${scope}`, JSON.stringify({
     tabs: [{ id: "tab-1", presetId: "single", layout: { kind: "panel", panelId: "panel-1" } }],
     panels: [{ id: "panel-1", mode: "console", target }], activeTabId: "tab-1", focusedPanelId: "panel-1",
   }));

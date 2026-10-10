@@ -71,6 +71,9 @@ test("console contract constants stay synchronized with docs/rct contract v0.5.0
   assert.equal(CONSOLE_REST_PATHS.identities, schema.surfaces.rest.identities.path);
   assert.equal(CONSOLE_REST_PATHS.timeline, schema.surfaces.rest.timeline.path);
   assert.equal(CONSOLE_REST_PATHS.legacySend, schema.surfaces.rest.legacy_send.path);
+  assert.equal(CONSOLE_REST_PATHS.mcpAppsResolve, schema.surfaces.rest.mcp_apps_resolve.path);
+  assert.equal(CONSOLE_REST_PATHS.mcpAppsReadResource, schema.surfaces.rest.mcp_apps_read_resource.path);
+  assert.equal(CONSOLE_REST_PATHS.mcpAppsCallTool, schema.surfaces.rest.mcp_apps_call_tool.path);
   assert.equal(CONSOLE_BLOB_PATH_PREFIX, schema.surfaces.rest.blob.path_prefix);
   assert.equal(CONSOLE_REST_PATHS.timelineStream, (schema.surfaces.sse.timeline as { path: string }).path);
   assert.equal(

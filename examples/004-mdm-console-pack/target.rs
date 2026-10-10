@@ -65,6 +65,7 @@ struct TargetRuntimeSurface {
     runtime_adapter: Arc<MeerkatMachine>,
     jsonl_store: Arc<JsonlStore>,
     mob_state: Arc<MobMcpState>,
+    _delivery_owner: meerkat::RuntimeDeliveryOwnerHandle,
     _factory: Arc<AgentFactory>,
     _config: Config,
 }
@@ -534,7 +535,7 @@ async fn build_target_runtime_surface(
         .unwrap_or_default();
     let shared_factory = Arc::new(factory.clone());
     let shared_config = config.clone();
-    let builder = FactoryAgentBuilder::new(factory, config);
+    let mut builder = FactoryAgentBuilder::new(factory, config);
     let mob_tools_slot = Arc::clone(&builder.default_mob_tools);
 
     let jsonl_store = Arc::new(JsonlStore::new(session_dir.to_path_buf()));
@@ -545,19 +546,32 @@ async fn build_target_runtime_surface(
         Arc::new(MemoryBlobStore::new()),
     )?;
     let runtime_adapter = persistence.runtime_adapter();
+    let job_store = persistence.job_store();
+    builder.default_detached_job_store = Some(job_store.clone());
+    let continuation_bindings = persistence.continuation_bindings();
+    let delivery_inbox = persistence.runtime_delivery_inbox();
+    let delivery_owner = persistence.runtime_delivery_owner();
     let (session_store, runtime_store, blob_store) = persistence.into_parts();
-    let service = Arc::new(PersistentSessionService::new(
-        builder,
-        10,
-        session_store,
-        runtime_store,
-        blob_store,
-    ));
+    let service = Arc::new(
+        PersistentSessionService::new(builder, 10, session_store, runtime_store, blob_store)
+            .with_canonical_runtime_adapter(Arc::clone(&runtime_adapter)),
+    );
     let mob_state = Arc::new(MobMcpState::new_with_runtime_adapter(
         service.clone(),
         Some(runtime_adapter.clone()),
         meerkat_mob::MobControlPrincipal::Owner,
     )?);
+    mob_state.bind_continuations(delivery_inbox, &continuation_bindings)?;
+    let delivery_host = Arc::new(
+        meerkat::surface::SessionServiceDeliveryHost::new(
+            &service,
+            &runtime_adapter,
+            meerkat::DetachedJobService::new(job_store),
+            None,
+        )
+        .with_continuation_bindings(continuation_bindings),
+    );
+    let delivery_owner = delivery_owner.arm(delivery_host)?;
     *mob_tools_slot
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
@@ -568,6 +582,7 @@ async fn build_target_runtime_surface(
         runtime_adapter,
         jsonl_store,
         mob_state,
+        _delivery_owner: delivery_owner,
         _factory: shared_factory,
         _config: shared_config,
     })

@@ -6382,6 +6382,7 @@ comms = true
     impl meerkat_core::AgentToolDispatcher for ObservedOpsSource {
         fn tools(&self) -> Arc<[Arc<meerkat_core::ToolDef>]> {
             Arc::from([Arc::new(meerkat_core::ToolDef {
+                audience: Default::default(),
                 name: "ops_probe".into(),
                 description: String::new(),
                 input_schema: json!({"type": "object"}),
@@ -10736,6 +10737,7 @@ impl CallbackToolDispatcher {
             .map(|tool| {
                 (
                     Arc::new(ToolDef {
+                        audience: Default::default(),
                         name: tool.name.into(),
                         description: tool
                             .description
@@ -11336,6 +11338,7 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
         });
         match self.bridge.call("callback/call_tool", params).await {
             Ok(result) => Ok(ToolResult {
+                host_metadata: Default::default(),
                 tool_use_id: call.id.to_string(),
                 content:
                     meerkat_mobkit::identity_first::gateway_bridges::callback_result_to_content(
@@ -11346,6 +11349,7 @@ impl AgentToolDispatcher for CallbackToolDispatcher {
             }
             .into()),
             Err(err) => Ok(ToolResult {
+                host_metadata: Default::default(),
                 tool_use_id: call.id.to_string(),
                 content: vec![ContentBlock::Text {
                     text: format!("Tool execution failed: {err}"),
@@ -13163,6 +13167,18 @@ external_addressable = true
     let http_reachable_addr = http_binding.reachable_addr();
     let http_base_url = http_binding.http_base_url();
     let http_public_base_url = http_binding.advertised_base_url().map(str::to_string);
+    for origin in [
+        Some(http_base_url.as_str()),
+        http_public_base_url.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        gateway_options
+            .console_ui
+            .validate_mcp_apps_sandbox(Some(origin))
+            .unwrap_or_else(|error| fail_init(&request_id, -32602, error.to_string()));
+    }
     // Provider-annotated profiles pass meerkat's init rule whatever their
     // model string says; say so once per such profile, with the hint, so a
     // dated id does not first appear as a failed LLM call.
@@ -13708,7 +13724,8 @@ external_addressable = true
         let mut factory = AgentFactory::new(state_path)
             .builtins(false)
             .shell(shell)
-            .comms(true);
+            .comms(true)
+            .mcp_apps(gateway_options.console_ui.mcp_apps_sandbox_url.is_some());
         if image_generation {
             factory = factory.with_image_generation_machine(adapter.clone());
         }
@@ -14145,6 +14162,7 @@ external_addressable = true
             .builtins(false)
             .shell(shell)
             .comms(true)
+            .mcp_apps(gateway_options.console_ui.mcp_apps_sandbox_url.is_some())
             .session_store(process_local_session_store.clone());
         if image_generation {
             factory = factory.with_image_generation_machine(adapter.clone());
@@ -14277,6 +14295,7 @@ external_addressable = true
                     .builtins(false)
                     .shell(shell)
                     .comms(true)
+                    .mcp_apps(gateway_options.console_ui.mcp_apps_sandbox_url.is_some())
                     .session_store(Arc::new(meerkat::MemoryStore::new()));
                 if image_generation {
                     factory = factory.with_image_generation_machine(adapter.clone());

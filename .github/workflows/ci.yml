@@ -219,6 +219,19 @@ jobs:
           target_dir="$(scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')"
           echo "MOBKIT_EXAMPLE_BIN_DIR=${target_dir}/debug/examples" >> "$GITHUB_ENV"
       - run: scripts/repo-cargo test -p meerkat-mobkit --example console_acceptance_fixture
+      - name: Native MCP Apps rendering and reload
+        timeout-minutes: 5
+        run: npm --prefix console run e2e:mcp-apps --silent
+        env:
+          MOBKIT_BROWSER_EVIDENCE: ${{ github.workspace }}/output/playwright/console-acceptance/mcp-apps
+      # The model remains held for more than the native HTTP action timeout.
+      # Three mounted Apps must keep polling through the same MCP connection.
+      - name: Native MCP Apps polling during an active model turn
+        timeout-minutes: 5
+        run: npm --prefix console run e2e:mcp-apps --silent
+        env:
+          MOBKIT_MCP_APPS_LONG_POLL: "1"
+          MOBKIT_BROWSER_EVIDENCE: ${{ github.workspace }}/output/playwright/console-acceptance/mcp-apps
       - run: node console/api-e2e.cjs
       - run: node console/browser-e2e.cjs
       - run: node console/voice-e2e.cjs

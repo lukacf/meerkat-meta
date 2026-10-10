@@ -208,6 +208,11 @@ class LeaseRenewResult:
 
 @runtime_checkable
 class ContinuityStoreProvider(Protocol):
+    """Continuity provider; retained historical owners also implement SessionOwnershipProvider.
+
+    Without that optional capability, owner lookup supports current bindings only.
+    """
+
     async def resolve_many(
         self, identities: list[str],
     ) -> dict[str, ContinuityResolveState]: ...
@@ -250,6 +255,20 @@ class ContinuityStoreProvider(Protocol):
     async def delete_continuity_record(
         self, identity: str, fencing_token: int,
     ) -> None: ...
+
+
+@runtime_checkable
+class SessionOwnershipProvider(Protocol):
+    """Optional historical ownership capability of a ContinuityStoreProvider."""
+
+    async def session_owner(self, session_id: str) -> str | None:
+        """Return the immutable owner of the exact session, including retained history.
+
+        Return None for an authoritative absence. Raise on conflicting ownership
+        or when the store cannot answer. Current bindings are not a substitute
+        for retained ownership after a session rotates away.
+        """
+        ...
 
 
 @runtime_checkable

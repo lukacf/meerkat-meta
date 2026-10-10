@@ -203,6 +203,10 @@ export interface ConsoleActionsUiConfig {
 }
 
 export interface ConsoleUiConfig {
+  /** Trusted same-origin ES modules exporting a ConsolePanel. */
+  panel_modules?: string[];
+  /** Isolated MCP Apps proxy origin. Omit to retain text-only tool results. */
+  mcp_apps_sandbox_url?: string;
   title?: string;
   brand?: ConsoleBrandingConfig;
   appearance?: ConsoleAppearanceConfig;

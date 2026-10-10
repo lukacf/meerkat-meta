@@ -1,3 +1,4 @@
+import { ConsoleMcpAppView } from "../mcp-apps";
 import type { MarkdownUrlPolicy } from "./conversation-markdown";
 import { Fragment } from "react";
 
@@ -183,6 +184,7 @@ export function ConversationMessageView({
     return <SummaryCard entry={entry} />;
   }
 
+  if (entry.mcpApp) return <ConsoleMcpAppView locator={{ ...entry.mcpApp, identity: entry.identity.id }} fallback={entry.text ?? "Tool result"} />;
   if (entry.operationFeedback) {
     return <OperationFeedbackView feedback={entry.operationFeedback} createdAt={entry.createdAt} />;
   }

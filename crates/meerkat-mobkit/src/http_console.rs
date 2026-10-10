@@ -1,5 +1,8 @@
 //! HTTP routes for the admin console REST API.
 
+mod mcp_apps;
+pub use mcp_apps::ConsoleToolApplicationIngress;
+
 use async_stream::stream;
 use axum::extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
@@ -473,6 +476,12 @@ fn console_json_router_with_state(state: ConsoleJsonState) -> Router {
         .route("/console/modules", get(console_json_handler))
         .route("/console/identities", get(console_identities_handler))
         .route("/console/timeline", get(console_timeline_handler))
+        .route("/console/mcp-apps/resolve", post(mcp_apps::resolve))
+        .route(
+            "/console/mcp-apps/read-resource",
+            post(mcp_apps::read_resource),
+        )
+        .route("/console/mcp-apps/call-tool", post(mcp_apps::call_tool))
         .route(
             "/console/timeline/stream",
             get(console_timeline_stream_handler),
@@ -11484,6 +11493,38 @@ async fn prime_access_cache_from_handle_with_registry(
     access: &AccessController,
     registered: &BTreeMap<String, BTreeMap<String, String>>,
 ) {
+    prime_access_cache_from_handle_with_registry_namespace(handle, access, registered, "").await;
+}
+
+fn namespace_console_identity(identity: &str, namespace: &str) -> String {
+    let namespace = namespace.trim().trim_matches('/');
+    if namespace.is_empty() || identity.starts_with(&format!("{namespace}/")) {
+        identity.to_string()
+    } else {
+        format!("{namespace}/{identity}")
+    }
+}
+
+fn namespace_console_attributes(
+    mut attributes: AgentResourceAttributes,
+    namespace: &str,
+) -> AgentResourceAttributes {
+    attributes.identity = namespace_console_identity(&attributes.identity, namespace);
+    attributes.agent_id = attributes
+        .agent_id
+        .map(|id| namespace_console_identity(&id, namespace));
+    if let Some(parent) = attributes.labels.get_mut("spawned_by") {
+        *parent = namespace_console_identity(parent, namespace);
+    }
+    attributes
+}
+
+async fn prime_access_cache_from_handle_with_registry_namespace(
+    handle: &MobHandle,
+    access: &AccessController,
+    registered: &BTreeMap<String, BTreeMap<String, String>>,
+    namespace: &str,
+) {
     let mut registry_only: BTreeMap<&String, &BTreeMap<String, String>> =
         registered.iter().collect();
     for entry in handle.list_all_members().await {
@@ -11503,20 +11544,26 @@ async fn prime_access_cache_from_handle_with_registry(
         if let Some(spawn_labels) = registry_only.remove(&console_identity) {
             crate::console_spawn::merge_registered_labels(&mut labels, spawn_labels);
         }
-        access.record_agent_attributes(AgentResourceAttributes {
-            identity: console_identity,
-            agent_id: Some(member_identity),
-            role: Some(entry.role.to_string()),
-            labels,
-        });
+        access.record_agent_attributes(namespace_console_attributes(
+            AgentResourceAttributes {
+                identity: console_identity,
+                agent_id: Some(member_identity),
+                role: Some(entry.role.to_string()),
+                labels,
+            },
+            namespace,
+        ));
     }
     for (identity, spawn_labels) in registry_only {
-        access.record_agent_attributes(AgentResourceAttributes {
-            identity: identity.clone(),
-            agent_id: None,
-            role: spawn_labels.get("role").cloned(),
-            labels: spawn_labels.clone(),
-        });
+        access.record_agent_attributes(namespace_console_attributes(
+            AgentResourceAttributes {
+                identity: identity.clone(),
+                agent_id: None,
+                role: spawn_labels.get("role").cloned(),
+                labels: spawn_labels.clone(),
+            },
+            namespace,
+        ));
     }
 }
 
@@ -12429,7 +12476,7 @@ comms = true
         Ok((temp_dir, runtime))
     }
 
-    async fn spawn_identity_control_test_member(
+    pub(super) async fn spawn_identity_control_test_member(
         runtime: &MobRuntime,
         runtime_member_id: &str,
         projected_identity: &str,
@@ -12453,7 +12500,7 @@ comms = true
         Ok(())
     }
 
-    fn empty_identity_control_test_runtime(
+    pub(super) fn empty_identity_control_test_runtime(
         runtime_instance_id: &str,
     ) -> Result<Arc<IdentityRuntime>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
@@ -12467,7 +12514,7 @@ comms = true
         })))
     }
 
-    async fn register_identity_control_test_binding(
+    pub(super) async fn register_identity_control_test_binding(
         identity_runtime: &IdentityRuntime,
         identity: &str,
         runtime_member_id: &str,

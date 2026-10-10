@@ -182,6 +182,49 @@ impl IdentityCustomizerTools {
 
 #[async_trait::async_trait]
 impl AgentToolDispatcher for IdentityCustomizerTools {
+    async fn resolve_tool_application(
+        &self,
+        source_tool: &str,
+        request: &meerkat_core::ToolApplicationRequest,
+        invocation: &serde_json::Value,
+        context: &ToolDispatchContext,
+    ) -> Result<meerkat_core::tool_application::ToolApplicationResolution, ToolError> {
+        let published = self.snapshot();
+        let owner = Self::owner_for(&published, source_tool)
+            .ok_or_else(|| self.not_advertised(source_tool))?;
+        let changed =
+            || ToolError::unavailable(source_tool, ToolUnavailableReason::ExecutionOwnerChanged);
+        let before =
+            Self::binding_fingerprint_in(&published, source_tool).map_err(|_| changed())?;
+        let mut result = owner
+            .resolve_tool_application(source_tool, request, invocation, context)
+            .await?;
+        let current = self.snapshot();
+        if current.generation != published.generation
+            || Self::binding_fingerprint_in(&current, source_tool).as_ref() != Ok(&before)
+        {
+            return Err(changed());
+        }
+        if let meerkat_core::tool_application::ToolApplicationResolution::Call {
+            name,
+            binding,
+            ..
+        } = &mut result
+        {
+            let witness = ToolExecutionOwnerWitness::new(
+                self.execution_authority_key(),
+                published.generation.to_string(),
+                Self::binding_fingerprint_in(&published, name).map_err(ToolError::from)?,
+            )
+            .map_err(|_| changed())?;
+            *binding = binding
+                .clone()
+                .with_owner_witness(witness)
+                .map_err(ToolError::from)?;
+        }
+        Ok(result)
+    }
+
     fn tools(&self) -> Arc<[Arc<ToolDef>]> {
         match self.snapshot().dispatcher {
             Some(dispatcher) => dispatcher.tools(),
@@ -219,6 +262,15 @@ impl AgentToolDispatcher for IdentityCustomizerTools {
             Some(owner) => owner.live_bridge_effect_kind(tool_name),
             None => meerkat_core::LiveBridgeEffectKind::ExternalIo,
         }
+    }
+
+    fn review_entry_support(
+        &self,
+        tool_name: &str,
+    ) -> meerkat_core::approval::review::ReviewEntrySupport {
+        Self::owner_for(&self.snapshot(), tool_name)
+            .map(|owner| owner.review_entry_support(tool_name))
+            .unwrap_or_default()
     }
 
     /// A mutable authority: every publication advances the epoch, including

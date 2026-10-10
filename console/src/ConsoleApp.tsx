@@ -1,3 +1,8 @@
+import { ConsoleMcpAppsProvider, type ConsoleMcpAppsHost } from "@console-components";
+import { createNativeMcpAppsHost } from "./mcp-apps/native-host";
+import { useConsolePanels, createConsolePanelService, bindConsolePanelService } from "./lib/custom-panels";
+import { ConsolePanelsProvider, ConsoleCustomPanel } from "@console-components";
+import { consoleCustomPanelTarget, type ConsolePanelDefinition, type ConsolePanelContext, type ConsolePanelService } from "@console-core";
 import { withConsoleSendStorageLock } from "./lib/send-storage-lock";
 import React from "react";
 import "@console-components/styles";
@@ -204,7 +209,10 @@ import {
 } from "./lib/use-voice-readiness";
 import { countRender } from "./lib/render-counts";
 
-interface ConsoleAppProps {
+export interface ConsoleAppProps {
+  customPanels?: readonly ConsolePanelDefinition[];
+  mcpAppsHost?: ConsoleMcpAppsHost;
+  panelService?: ConsolePanelService;
   baseUrl: string;
   /** Opaque host scope covering authority/runtime, realm and authenticated principal. */
   storageNamespace?: string;
@@ -398,13 +406,8 @@ function createIdempotencyKey(): string {
   return createConsoleId("console");
 }
 
-function dockLayoutStorageKey(
-  baseUrl: string,
-  experience: ConsoleExperience | null,
-): string {
-  const runtimeId = experience?.runtime_id?.trim();
-  const title = experience?.console_config?.title?.trim();
-  return `${DOCK_LAYOUT_STORAGE_PREFIX}:${runtimeId || title || baseUrl}`;
+function dockLayoutStorageKey(authorityScope: string): string {
+  return `${DOCK_LAYOUT_STORAGE_PREFIX}:${authorityScope}`;
 }
 
 function stableHash(value: string): string {
@@ -617,6 +620,7 @@ function internAgents(current: ConsoleAgent[], next: ConsoleAgent[]): ConsoleAge
 }
 
 const PANEL_ROUTABLE_EVENTS = new Set([
+  "mcp_app",
   "user_input",
   "interaction_started",
   "interaction_complete",
@@ -654,6 +658,7 @@ const HISTORY_REFRESH_EVENTS = new Set([
 ]);
 // Events filtered from the activity rail — don't buffer them
 const ACTIVITY_SKIP_EVENTS = new Set([
+  "mcp_app",
   "subscribed",
   "run_started",
   "run_completed",
@@ -685,7 +690,7 @@ const ACTIVITY_SKIP_EVENTS = new Set([
 export function ConsoleApp(props: ConsoleAppProps): React.JSX.Element {
   // All authorized state belongs to one host authority and transport lifetime.
   // A keyed instance clears it in the same commit as the host scope change.
-  const instanceKey = React.useMemo(() => createConsoleId("console-instance"), [props.baseUrl, props.transport, props.storageNamespace]);
+  const instanceKey = React.useMemo(() => createConsoleId("console-instance"), [props.baseUrl, props.transport, props.storageNamespace, props.panelService, props.mcpAppsHost]);
   return <ConsoleAppAuthority key={instanceKey} {...props} />;
 }
 
@@ -706,7 +711,7 @@ function ConsoleAppAuthority(props: ConsoleAppProps): React.JSX.Element {
   return <ConsoleAppInstance key={generation} {...props} observeScope={observeScope} />;
 }
 
-function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlPolicy, observeScope }: ConsoleAppProps & { observeScope: (scope: string | undefined) => boolean }): React.JSX.Element {
+function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlPolicy, customPanels: suppliedPanels, panelService, mcpAppsHost, observeScope }: ConsoleAppProps & { observeScope: (scope: string | undefined) => boolean }): React.JSX.Element {
   countRender("ConsoleApp");
   const lifetimeRef = React.useRef({ active: true, generation: 0 });
   React.useLayoutEffect(() => {
@@ -2057,8 +2062,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     }),
   });
   const currentDockLayoutStorageKey = React.useMemo(
-    () => dockLayoutStorageKey(baseUrl, experience),
-    [baseUrl, experience?.runtime_id, experience?.console_config?.title],
+    () => dockLayoutStorageKey(sendScope),
+    [sendScope],
   );
 
   // A layout effect, so the saved layout lands in a synchronous follow-up
@@ -4212,6 +4217,65 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     }
   }
 
+  // Application extension state stays scoped to this console authority.
+  const panelState = useConsolePanels(suppliedPanels, experience?.console_config?.panel_modules, baseUrl);
+  const customPanels = panelState.panels;
+  const panelDockRef = React.useRef(dock.openTarget);
+  panelDockRef.current = dock.openTarget;
+  const panelVisibleIdentities = React.useMemo(() => agents.flatMap(agent => [agent.identity, agent.member_id, agent.agent_id]).filter((id): id is string => Boolean(id)), [agents]);
+  const panelSelectionRef = React.useRef<string | null>(null);
+  if (dock.focusedTarget?.kind === "agent-chat" && panelVisibleIdentities.includes(dock.focusedTarget.identity)) {
+    panelSelectionRef.current = dock.focusedTarget.identity;
+  } else if (panelSelectionRef.current && !panelVisibleIdentities.includes(panelSelectionRef.current)) {
+    panelSelectionRef.current = null;
+  }
+  const selectedPanelIdentity = panelSelectionRef.current;
+  const panelSelection = React.useMemo(() => selectedPanelIdentity
+    ? { scopeKey: sendScope, identity: selectedPanelIdentity } : null, [sendScope, selectedPanelIdentity]);
+  const panelAuthority = React.useMemo(() => ({ key: sendScope, runtimeId: experience?.runtime_id }), [sendScope, experience?.runtime_id]);
+  const panelLifetime = React.useMemo(() => ({ abort: new AbortController() }), [sendScope]);
+  React.useLayoutEffect(() => {
+    // React's development effect replay starts a fresh authority lifetime.
+    if (panelLifetime.abort.signal.aborted) panelLifetime.abort = new AbortController();
+    return () => panelLifetime.abort.abort();
+  }, [panelLifetime]);
+  const panelHostService = React.useMemo<ConsolePanelService>(() => {
+    const service = panelService ?? createConsolePanelService(baseUrl);
+    return (request, scope, signal) => bindConsolePanelService(service, panelLifetime.abort.signal)(request, scope, signal);
+  }, [panelService, baseUrl, panelLifetime]);
+  const openCustomPanel = React.useCallback<ConsolePanelContext["openPanel"]>((id, options) => {
+    const panel = customPanels.find(panel => panel.id === id);
+    if (!panel) return;
+    const input = typeof options === "string" ? { intent: options } : options ?? {};
+    const conversation = input.conversation === undefined ? panelSelection : input.conversation;
+    if (conversation && (conversation.scopeKey !== sendScope || !panelVisibleIdentities.includes(conversation.identity))) throw new Error("Conversation is not visible in this console");
+    panelDockRef.current(consoleCustomPanelTarget(panel, {
+      ...input, scopeKey: sendScope, conversation,
+    }), input.intent);
+  }, [customPanels, panelSelection, panelVisibleIdentities, sendScope]);
+  const panelContext = React.useMemo<ConsolePanelContext>(() => ({
+    baseUrl, readOnly: consoleReadOnly, experience, openPanel: openCustomPanel,
+    visibleIdentities: panelVisibleIdentities, authority: panelAuthority, selection: panelSelection, conversation: panelSelection,
+    request: (request, signal, conversation = panelSelection) => {
+      if (conversation && (conversation.scopeKey !== sendScope || !panelVisibleIdentities.includes(conversation.identity))) return Promise.reject(new Error("Conversation is not visible in this console"));
+      return panelHostService(request, { authority: panelAuthority, conversation, readOnly: consoleReadOnlyRef.current }, signal);
+    },
+  }), [baseUrl, consoleReadOnly, experience, openCustomPanel, panelAuthority, panelSelection, panelHostService, panelVisibleIdentities, sendScope]);
+  const panelProvider = React.useMemo(() => ({ panels: panelState.panels, context: panelContext }), [panelState.panels, panelContext]);
+  const effectiveMcpAppsHost = React.useMemo(() => {
+    if (mcpAppsHost) return mcpAppsHost;
+    const sandboxProxyUrl = experience?.console_config?.mcp_apps_sandbox_url;
+    if (!sandboxProxyUrl) return undefined;
+    try {
+      return createNativeMcpAppsHost({ baseUrl, sandboxProxyUrl, authority: sendScope,
+        runtimeId: experience?.runtime_id, readOnly: consoleReadOnly,
+        requestTimeoutMs: consoleFetchTimeoutMsRef.current });
+    } catch {
+      // A missing or invalid isolated sandbox retains the ordinary transcript.
+      return undefined;
+    }
+  }, [mcpAppsHost, baseUrl, experience?.console_config?.mcp_apps_sandbox_url, experience?.runtime_id, sendScope, consoleReadOnly]);
+
   // =========================================================================
   // WORKGRAPH OPERATOR ACTIONS (inline card + panel)
   // =========================================================================
@@ -5075,6 +5139,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   }) {
     const target = panel.target as MobKitDockTarget | null;
     if (!target) return <div className="console-panel">No panel target</div>;
+    if (target.kind === "custom/panel") return <ConsoleCustomPanel target={target} focused={dock.viewState.focusedPanelId === panel.id} />;
     if (target.kind === "agent-chat") return renderChatPanel(panel);
     if (target.kind === "identity-inspect") {
       return renderInspectPanel(target);
@@ -5276,6 +5341,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   }
 
   return (
+    <ConsoleMcpAppsProvider value={effectiveMcpAppsHost ? { host: effectiveMcpAppsHost, authority: sendScope, readOnly: consoleReadOnly } : null}>
+    <ConsolePanelsProvider value={panelProvider}>
     <div
       className="cc-theme-scope mobkit-shell"
       data-cc-theme={theme}
@@ -5283,6 +5350,9 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       data-testid="meerkat-console"
     >
       <SpriteSheet />
+      {panelState.errors.length > 0 ? <div className="mobkit-action-error" role="alert">
+        Custom panels could not load: {panelState.errors.join("; ")}
+      </div> : null}
       {actionError && (
         <div className="mobkit-action-error" data-testid="console-action-error" role="alert">
           <span>{actionError}</span>
@@ -5325,6 +5395,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           collapsed={sidebarCollapsed}
           visibleControls={visibleControls}
           customButtons={experience?.console_config?.sidebar?.buttons}
+          customPanels={customPanels}
+          onOpenCustomPanel={openCustomPanel}
           grouping={experience?.console_config?.agent_list}
           storageNamespace={sidebarStorageNamespace}
           pinnedAgentIds={pinnedAgentIds}
@@ -5345,6 +5417,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
             viewState={dock.viewState}
             agents={agents}
             renderPanelBody={renderPanelBody}
+            customPanels={customPanels}
             visibleControls={visibleControls}
             onSelectTab={(id) => dock.selectTab(id)}
             onCloseTab={(id) => dock.closeTab(id)}
@@ -5355,7 +5428,12 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
             onResizeSplit={(id, ratio) => dock.resizeSplit(id, ratio)}
             onOpenTargetInPanel={(panelId, target) => {
               dock.focusPanel(panelId);
-              openDockTarget(target);
+              // Pane-picker registrations are unbound until the host supplies
+              // its current conversation context.
+              if (target.kind === "custom/panel") {
+                const definition = customPanels.find(panel => panel.id === target.payload.panelId);
+                if (definition) openDockTarget(consoleCustomPanelTarget(definition, { conversation: panelSelection, scopeKey: sendScope }));
+              } else openDockTarget(target);
             }}
           />
           {dock.focusedTarget?.kind !== "agent-chat" ? voiceBar : null}
@@ -5384,5 +5462,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         ) : null}
       </div>
     </div>
+    </ConsolePanelsProvider>
+    </ConsoleMcpAppsProvider>
   );
 }

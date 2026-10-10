@@ -181,7 +181,7 @@ window.__perf = {
 };
 window.localStorage.clear();
 seedDockedChat();
-createRoot(document.getElementById("root")!).render(<ConsoleApp baseUrl="" transport={transport} />);
+createRoot(document.getElementById("root")!).render(<ConsoleApp baseUrl="" transport={transport} storageNamespace={RUNTIME_ID} />);
 }
 
 void boot();

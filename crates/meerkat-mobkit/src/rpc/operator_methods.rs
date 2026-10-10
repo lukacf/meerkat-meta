@@ -1246,10 +1246,11 @@ mod tests {
             meerkat_core::types::StopReason::ToolUse,
         ));
         let results = Message::tool_results(vec![ToolResult {
+            host_metadata: Default::default(),
+            settlement_failures: Default::default(),
             tool_use_id: id.to_string(),
             content: vec![],
             is_error: false,
-            settlement_failures: Vec::new(),
         }]);
         (assistant, results)
     }
@@ -1824,15 +1825,18 @@ mod tests {
                 Arc::clone(&runtime_store),
                 Arc::clone(&blob_store),
             )
-            .expect("acquire the operator fixture runtime machine"),
+            .expect("runtime owner"),
         );
-        let concrete = Arc::new(meerkat_session::PersistentSessionService::new(
-            inner_builder,
-            16,
-            session_store.clone(),
-            runtime_store,
-            blob_store,
-        ));
+        let concrete = Arc::new(
+            meerkat_session::PersistentSessionService::new(
+                inner_builder,
+                16,
+                session_store.clone(),
+                runtime_store,
+                blob_store,
+            )
+            .with_canonical_runtime_adapter(adapter.clone()),
+        );
 
         let gate_armed = Arc::new(AtomicBool::new(false));
         let in_call = Arc::new(AtomicBool::new(false));

@@ -1,5 +1,6 @@
 mod assistant_history_refresh;
 use assistant_history_refresh::AssistantHistoryRefreshReason;
+mod tool_application_projection;
 
 #[cfg(test)]
 mod assistant_message_identity_tests;
@@ -157,6 +158,10 @@ struct AggregatorInner {
     // Pending targets retain the latest requested registration incarnation.
     targeted_session_backfills: tokio::sync::Mutex<BTreeMap<String, Option<SessionBackfillTarget>>>,
     opportunistic_session_backfills: tokio::sync::Mutex<BTreeSet<String>>,
+    // Coalesce live host observations independently of blocking history reads.
+    // Keys and pending native targets contain no tool result or UI data.
+    tool_application_projections:
+        tokio::sync::Mutex<BTreeMap<(uuid::Uuid, String, String), Option<SessionBackfillTarget>>>,
     session_backfill_permits: Arc<Semaphore>,
     // Serialize each session's current-image read and publication. These locks
     // contain no transcript or lifecycle authority.
@@ -330,6 +335,28 @@ struct RuntimeEntry {
     identity_runtime: Option<Arc<crate::identity_first::IdentityRuntime>>,
     console_events: ConsoleEventStore,
     visibility_policy: Arc<dyn ConsoleVisibilityPolicy>,
+}
+
+/// Current native route candidate, never derived from a transcript frame.
+#[derive(Clone)]
+pub(crate) struct ConsoleApplicationRuntime {
+    entry: RuntimeEntry,
+    pub(crate) identity: String,
+}
+
+impl ConsoleApplicationRuntime {
+    pub(crate) fn runtime(&self) -> &MobRuntime {
+        &self.entry.runtime
+    }
+    pub(crate) fn identity_runtime(&self) -> Option<Arc<crate::identity_first::IdentityRuntime>> {
+        self.entry.identity_runtime.clone()
+    }
+    pub(crate) fn visibility_policy(&self) -> Arc<dyn ConsoleVisibilityPolicy> {
+        self.entry.visibility_policy.clone()
+    }
+    pub(crate) fn namespace(&self) -> &str {
+        &self.entry.identity_namespace
+    }
 }
 
 #[derive(Clone)]
@@ -708,6 +735,7 @@ impl MobKitConsoleAggregator {
                 session_backfill_epochs: std::sync::Mutex::new(BTreeMap::new()),
                 session_pending_read_epochs: std::sync::Mutex::new(BTreeMap::new()),
                 session_history_projection_locks: std::sync::Mutex::new(BTreeMap::new()),
+                tool_application_projections: tokio::sync::Mutex::new(BTreeMap::new()),
                 member_provenance: std::sync::Mutex::new(MemberProvenanceCache::new(
                     MEMBER_PROVENANCE_CACHE_LIMIT,
                 )),
@@ -797,6 +825,7 @@ impl MobKitConsoleAggregator {
                 session_backfill_epochs: std::sync::Mutex::new(BTreeMap::new()),
                 session_pending_read_epochs: std::sync::Mutex::new(BTreeMap::new()),
                 session_history_projection_locks: std::sync::Mutex::new(BTreeMap::new()),
+                tool_application_projections: tokio::sync::Mutex::new(BTreeMap::new()),
                 member_provenance: std::sync::Mutex::new(MemberProvenanceCache::new(
                     MEMBER_PROVENANCE_CACHE_LIMIT,
                 )),
@@ -918,6 +947,38 @@ impl MobKitConsoleAggregator {
             registration.runtime.console_events(),
             registration.visibility_policy,
         );
+    }
+
+    /// Namespace resolution only. The caller must validate native identity and
+    /// session ownership for each candidate and reject ambiguous matches.
+    pub(crate) fn application_runtime_candidates(
+        &self,
+        identity: &str,
+    ) -> Vec<ConsoleApplicationRuntime> {
+        self.inner
+            .runtimes
+            .read()
+            .map(|entries| {
+                entries
+                    .values()
+                    .flat_map(|entry| {
+                        namespace_match_candidates(identity, &entry.identity_namespace)
+                            .into_iter()
+                            .map(|identity| ConsoleApplicationRuntime {
+                                entry: entry.clone(),
+                                identity,
+                            })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn application_runtime_is_current(
+        &self,
+        runtime: &ConsoleApplicationRuntime,
+    ) -> bool {
+        runtime_entry_is_current(&self.inner, &runtime.entry)
     }
 
     pub(crate) fn register_runtime_handles_with_policy(
@@ -6954,6 +7015,8 @@ async fn project_console_event(
     } else {
         None
     };
+    let application_refresh_identity =
+        (frame.kind == "turn_started").then(|| frame.identity.clone());
     let opportunistic_refresh_identity = if refresh_identity.is_none()
         && console_event_should_start_session_history_backfill(&frame)
     {
@@ -6979,6 +7042,9 @@ async fn project_console_event(
         );
     } else if let Some(identity) = opportunistic_refresh_identity {
         spawn_opportunistic_session_history_backfill_for_identity(inner.clone(), identity);
+    }
+    if let Some(identity) = application_refresh_identity {
+        tool_application_projection::spawn_for_identity(inner, identity);
     }
     Ok(())
 }
@@ -7415,6 +7481,23 @@ fn frames_from_session_history_message_with_namespace(
                     parent_frame_id: None,
                     caused_by_frame_id: None,
                 }];
+                // Only the native, committed host carrier can create an app
+                // locator. Standard result bodies and UI bytes stay behind
+                // the authenticated session lookup and out of this frame log.
+                if result.host_metadata.get(meerkat_mcp::apps::MCP_APPS_EXTENSION)
+                    .and_then(|value| serde_json::from_value::<meerkat_mcp::apps::McpAppInvocation>(value.clone()).ok())
+                    .is_some_and(|invocation| meerkat_mcp::apps::tool_ui_resource_uri(&invocation.tool).is_some())
+                {
+                    let mut app = frames[0].clone();
+                    app.dedupe_key = format!("session-history-app:{runtime_key}:{session_id}:{offset}:{idx}:{payload_hash}");
+                    app.kind = "mcp_app".to_string();
+                    app.payload = json!({
+                        "session_id": session_id,
+                        "tool_call_id": tool_use_id,
+                        "fallback": result_text,
+                    });
+                    frames.push(app);
+                }
                 // Backfill parity with the live ingest edge: a generate_image
                 // tool result serializes an `ImageGenerationToolResult` into the
                 // result text (which carries NO tool name on meerkat 0.7.x). The
@@ -9153,10 +9236,13 @@ mod tests {
         inner: Arc<dyn MobSessionService>,
         delay: Duration,
         read_calls: Arc<AtomicUsize>,
+        application_read_calls: Arc<AtomicUsize>,
         active_reads: Arc<AtomicUsize>,
         max_active_reads: Arc<AtomicUsize>,
         first_read_wave: Arc<std::sync::Mutex<Option<HistoryReadWave>>>,
         scripted_reads: Arc<std::sync::Mutex<std::collections::VecDeque<ScriptedHistoryRead>>>,
+        scripted_application_reads:
+            Arc<std::sync::Mutex<std::collections::VecDeque<ScriptedApplicationRead>>>,
     }
 
     #[derive(Clone)]
@@ -9168,6 +9254,11 @@ mod tests {
     pub(super) struct ScriptedHistoryRead {
         pub(super) page: Option<SessionHistoryPage>,
         pub(super) gate: Option<Arc<HistoryReadGate>>,
+    }
+
+    pub(super) struct ScriptedApplicationRead {
+        pub(super) observations: Vec<meerkat_core::ToolApplicationObservation>,
+        pub(super) gate: Arc<HistoryReadGate>,
     }
 
     pub(super) struct HistoryReadGate {
@@ -9202,10 +9293,14 @@ mod tests {
                 inner,
                 delay,
                 read_calls: Arc::new(AtomicUsize::new(0)),
+                application_read_calls: Arc::new(AtomicUsize::new(0)),
                 active_reads: Arc::new(AtomicUsize::new(0)),
                 max_active_reads: Arc::new(AtomicUsize::new(0)),
                 first_read_wave: Arc::new(std::sync::Mutex::new(None)),
                 scripted_reads: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+                scripted_application_reads: Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
             }
         }
 
@@ -9218,6 +9313,17 @@ mod tests {
 
         pub(super) fn read_calls(&self) -> usize {
             self.read_calls.load(Ordering::SeqCst)
+        }
+
+        pub(super) fn script_application_observations(&self, read: ScriptedApplicationRead) {
+            self.scripted_application_reads
+                .lock()
+                .expect("scripted application read lock")
+                .push_back(read);
+        }
+
+        pub(super) fn application_read_calls(&self) -> usize {
+            self.application_read_calls.load(Ordering::SeqCst)
         }
 
         fn max_active_reads(&self) -> usize {
@@ -9235,6 +9341,30 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SessionService for DelayedHistorySessionService {
+        async fn read_tool_application_observations(
+            &self,
+            id: &SessionId,
+        ) -> Result<Vec<meerkat_core::ToolApplicationObservation>, SessionError> {
+            self.application_read_calls.fetch_add(1, Ordering::SeqCst);
+            let scripted = self
+                .scripted_application_reads
+                .lock()
+                .expect("scripted application read lock")
+                .pop_front();
+            if let Some(scripted) = scripted {
+                scripted.gate.entered.add_permits(1);
+                scripted
+                    .gate
+                    .release
+                    .acquire()
+                    .await
+                    .expect("release gate open")
+                    .forget();
+                return Ok(scripted.observations);
+            }
+            self.inner.read_tool_application_observations(id).await
+        }
+
         async fn create_session(
             &self,
             req: meerkat_core::CreateSessionRequest,
@@ -15752,6 +15882,67 @@ comms = true
         const MEMBER_COUNT: usize = 32;
         let (_temp, runtime, delayed_service) =
             build_stress_runtime(MEMBER_COUNT, Duration::ZERO).await;
+        // Spawn acknowledges admission, not completion of the initial turn.
+        // A recovery correctly defers reads while durable work is draining;
+        // settle the fixture before measuring the history-read concurrency.
+        let handle = runtime.mob_handle();
+        let members = handle.list_members_observation_snapshot().await;
+        assert_eq!(members.len(), MEMBER_COUNT);
+        let mut sessions = Vec::with_capacity(MEMBER_COUNT);
+        let mut unique_sessions = BTreeSet::new();
+        for member in members {
+            let session = handle
+                .resolve_bridge_session_id_observation(&member.agent_identity)
+                .await
+                .expect("spawned member has its own bound session");
+            assert!(
+                unique_sessions.insert(session.to_string()),
+                "each stress member must own a distinct session"
+            );
+            sessions.push((member.agent_identity, session));
+        }
+        let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        tokio::time::timeout_at(readiness_deadline, async {
+            for (member, session) in &sessions {
+                let session_id = session.to_string();
+                loop {
+                    let execution = delayed_service
+                        .execution_snapshot(session)
+                        .await
+                        .expect("initial run execution is observable");
+                    let status = crate::member_status_observation::observe_member_status_until(
+                        &handle,
+                        member,
+                        readiness_deadline,
+                    )
+                    .await
+                    .expect("spawned member status is observable");
+                    if execution.as_ref().is_some_and(|snapshot| {
+                        snapshot.turn_terminal && snapshot.terminal_run_id.is_some()
+                    }) && status.current_session_id.as_ref() == Some(session)
+                        && status.progress.as_ref().is_some_and(|progress| {
+                            progress.run_state == meerkat_mob::MemberRunState::Idle
+                                && progress.in_flight_work == 0
+                        })
+                        && runtime
+                            .mob_runtime()
+                            .session_commit_pending(&session_id)
+                            .await
+                            == Some(false)
+                        && runtime
+                            .mob_runtime()
+                            .session_has_active_inputs(&session_id)
+                            .await
+                            == Some(false)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        })
+        .await
+        .expect("every initial turn settles before the concurrency measurement");
         let aggregator = MobKitConsoleAggregator::in_memory();
         let permit_limit = ConsoleAggregatorOptions::default().max_concurrent_session_backfills;
         assert!(
@@ -18261,6 +18452,55 @@ comms = true
                 assert_eq!(frame.timestamp_ms, 50);
             }
         }
+    }
+
+    #[test]
+    fn session_history_projects_only_native_mcp_app_locators() {
+        let record = json!({
+            "registration": { "server": "charts", "connection": "physical-1" },
+            "tool": { "name": "show_chart", "inputSchema": { "type": "object" },
+                "_meta": { "ui": { "resourceUri": "ui://charts/view" } } },
+            "arguments": {},
+            "result": { "content": [{ "type": "text", "text": "Chart ready" }],
+                "_meta": { "private_host_value": "do-not-project" } },
+            "resource": { "contents": [{ "uri": "ui://charts/view", "text": "<html>private resource</html>",
+                "mimeType": "text/html;profile=mcp-app" }] }
+        });
+        let message = json!({
+            "role": "tool_results", "created_at": "1970-01-01T00:00:00.050Z",
+            "results": [{ "tool_use_id": "call-chart", "content": "Chart ready", "is_error": false,
+                "host_metadata": { "io.modelcontextprotocol/ui": record } }]
+        });
+        let frames = frames_from_session_history_message(
+            "runtime-a",
+            "agent-a",
+            "session-a",
+            5,
+            message.clone(),
+        );
+        let apps = frames
+            .iter()
+            .filter(|frame| frame.kind == "mcp_app")
+            .collect::<Vec<_>>();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(
+            apps[0].payload,
+            json!({ "session_id": "session-a", "tool_call_id": "call-chart", "fallback": "Chart ready" })
+        );
+        assert_eq!(apps[0].source.kind, ConsoleFrameSourceKind::SessionHistory);
+        let projected = serde_json::to_string(&frames).expect("history frames should serialize");
+        assert!(!projected.contains("do-not-project"));
+        assert!(!projected.contains("private resource"));
+        assert!(!projected.contains("physical-1"));
+
+        let mut forged = message;
+        let record = forged["results"][0]["host_metadata"].take();
+        forged["results"][0]["content"] = Value::String(record.to_string());
+        assert!(
+            frames_from_session_history_message("runtime-a", "agent-a", "session-a", 5, forged)
+                .iter()
+                .all(|frame| frame.kind != "mcp_app")
+        );
     }
 
     #[test]

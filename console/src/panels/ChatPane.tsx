@@ -1,3 +1,5 @@
+import { ConsoleMcpAppView } from "@console-components";
+import type { ConversationMessageEntry } from "@console-core";
 import { OperationFeedbackView } from "../../../packages/console-components/src/conversation/conversation-message-view";
 import { QuoteSelectionAction } from "../../../packages/console-components/src/conversation/quote-selection-action";
 import { DeliveredContextMessage } from "../../../packages/console-components/src/conversation/delivered-context-message";
@@ -174,6 +176,7 @@ interface Msg {
   contextMessage?: ConsoleContextMessage;
   blocks?: ConversationRichBlock[];
   workGraphEntry?: ConversationWorkGraphEntry;
+  mcpAppEntry?: ConversationMessageEntry;
   councilEntry?: ConversationCouncilEntry;
   workedFor?: string;
   workedForCopyText?: string;
@@ -584,6 +587,9 @@ function flattenEntryRows(entry: ConversationTimelineEntry): Msg[] {
       workGraphEntry: entry,
     }];
   }
+
+  if (entry.kind === "message" && entry.mcpApp) return [{ id: entry.id, kind: "agent", time: formatTime(entry.createdAt),
+    createdAt: entry.createdAt, text: entry.text, mcpAppEntry: entry }];
 
   if (entry.variant === "meta") {
     return [{
@@ -1121,6 +1127,7 @@ function msgSignature(message: Msg): string {
     textMark(message.copyText),
     message.operationFeedback ? JSON.stringify(message.operationFeedback) : "",
     message.contextMessage ? JSON.stringify(message.contextMessage) : "",
+    message.mcpAppEntry ? JSON.stringify([message.mcpAppEntry.identity.id, message.mcpAppEntry.mcpApp]) : "",
     message.workedFor ?? "",
     textMark(message.workedForCopyText),
   ];
@@ -1268,6 +1275,7 @@ function MessageRowBody({
   workGraphActions,
   markdownUrlPolicy,
 }: MessageRowProps) {
+  if (m.mcpAppEntry?.mcpApp) return <ConsoleMcpAppView locator={{ ...m.mcpAppEntry.mcpApp, identity: m.mcpAppEntry.identity.id }} fallback={m.text ?? "Tool result"} />;
   if (m.kind === "event" || m.kind === "origin") {
     return <EventRow message={m} />;
   }

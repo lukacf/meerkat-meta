@@ -96,6 +96,7 @@ struct HostTools;
 impl AgentToolDispatcher for HostTools {
     fn tools(&self) -> Arc<[Arc<ToolDef>]> {
         vec![Arc::new(ToolDef {
+            audience: Default::default(),
             name: TOOL.into(),
             description: "Look up the workspace record.".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
@@ -106,6 +107,7 @@ impl AgentToolDispatcher for HostTools {
 
     async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
         Ok(meerkat_core::ToolResult {
+            host_metadata: Default::default(),
             tool_use_id: call.id.to_string(),
             content: vec![],
             is_error: false,

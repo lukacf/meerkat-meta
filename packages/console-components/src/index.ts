@@ -1,3 +1,6 @@
+export { ConsoleMcpAppView, ConsoleMcpAppsProvider } from "./mcp-apps";
+export type { ConsoleMcpAppsHost, ConsoleMcpAppSession, McpAppLocator } from "./mcp-apps";
+export { ConsolePanelsProvider, ConsoleCustomPanel, ConsolePanelSurface } from "./custom-panels";
 export { ConsoleActivityRail } from "./activity/console-activity-rail";
 export { CopyButton } from "./copy-button";
 export { CopyGlyph } from "./copy-glyph";

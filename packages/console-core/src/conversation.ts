@@ -92,6 +92,8 @@ export interface ConversationRealtimeOrigin {
 export interface ConversationMessageEntry extends ConversationTimelineEntryBase {
   kind: "message";
   variant: "plain" | "rich" | "meta";
+  /** Runtime-owned MCP invocation locator; UI data is resolved through the authenticated host. */
+  mcpApp?: { sessionId: string; toolCallId: string };
   text?: string;
   blocks?: ConversationRichBlock[];
   /** Stable display rows for live segments and a bundled canonical message. */

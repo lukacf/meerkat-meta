@@ -10,7 +10,7 @@ const source = "[Review](/release/review) [App review](mobkit:review) [Denied](h
 
 function transport(): MobKitConsoleTransport {
   return {
-    loadExperience: async () => ({ runtime_id: "policy-test", console_config: {}, agent_sidebar: { live_snapshot: { agents: [{ identity, member_id: identity, agent_id: identity, label: "Policy agent", kind: "member", state: "running", addressable: true, affordances: { can_send_message: true } }] } }, activity_feed: { filter_presets: [], active_preset_id: "all" } }) as never,
+    loadExperience: async () => ({ runtime_id: "policy-test", storage_scope: "policy-principal", console_config: {}, agent_sidebar: { live_snapshot: { agents: [{ identity, member_id: identity, agent_id: identity, label: "Policy agent", kind: "member", state: "running", addressable: true, affordances: { can_send_message: true } }] } }, activity_feed: { filter_presets: [], active_preset_id: "all" } }) as never,
     loadModules: async () => ({ modules: [] }) as never,
     capabilities: async () => ({ methods: [] }) as never,
     queryTimeline: async () => ({ available: true, frames: [{ id: "policy-frame", event: "interaction_complete", identity, interactionId: "policy-turn", timestampMs: 1, data: { text: source } }] }),
@@ -23,7 +23,7 @@ beforeEach(() => {
   vi.stubGlobal("localStorage", window.localStorage);
   window.localStorage.clear(); window.sessionStorage.clear();
   const target = { id: "chat:policy-agent", kind: "agent-chat", title: "Policy agent", identity, memberId: identity };
-  window.localStorage.setItem("mobkit-console-dock-state:policy-test", JSON.stringify({
+  window.localStorage.setItem(`mobkit-console-dock-state:${JSON.stringify(["", "policy-principal"])}`, JSON.stringify({
     tabs: [{ id: "tab", presetId: "single", layout: { kind: "panel", panelId: "panel" } }],
     panels: [{ id: "panel", mode: "console", target }], activeTabId: "tab", focusedPanelId: "panel",
   }));

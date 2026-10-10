@@ -1761,6 +1761,7 @@ mod tests {
         impl meerkat_core::AgentToolDispatcher for ExactInner {
             fn tools(&self) -> Arc<[Arc<meerkat_core::types::ToolDef>]> {
                 vec![Arc::new(meerkat_core::types::ToolDef {
+                    audience: Default::default(),
                     name: "meerkat_schedule_list".into(),
                     description: String::new(),
                     input_schema: serde_json::json!({"type": "object"}),

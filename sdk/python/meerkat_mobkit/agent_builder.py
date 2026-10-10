@@ -678,6 +678,27 @@ class CallbackDispatcher:
                 "checkpoint_version": checkpoint_version,
             }
 
+        if op == "session_owner":
+            session_id = params["session_id"]
+            handler = getattr(store, "session_owner", None)
+            if handler is not None:
+                owner = await handler(session_id)
+                if owner is not None and not isinstance(owner, str):
+                    raise ValueError("session_owner must return an identity string or None")
+                return owner
+            # Older providers can answer current bindings only. Retained history
+            # requires the explicit session_owner capability described by the API.
+            resolver = getattr(store, "resolve_record_by_session", None)
+            if resolver is None:
+                raise ValueError("continuity store provider cannot resolve session ownership")
+            bound = await resolver(session_id)
+            if bound is None:
+                return None
+            record, _, _ = bound
+            if record.session_id != session_id:
+                raise ValueError("session owner lookup returned a different session")
+            return record.identity
+
         if op == "delete_session_snapshot_if_current_revision":
             handler = getattr(
                 store, "delete_session_snapshot_if_current_revision", None

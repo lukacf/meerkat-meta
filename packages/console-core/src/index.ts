@@ -1,3 +1,4 @@
+export * from "./custom-panels";
 export { realtimeMessageOrigin, hasRealtimeMessageOriginCarrier, isRealtimeHistoryMessage } from "./realtime-message-identity";
 export { conversationPresentationRows } from "./assistant-presentation";
 export { assistantMessageId, assistantMessageKey, hasAssistantMessageIdCarrier, assistantMessageCursorSequence, assistantHistorySnapshot } from "./assistant-message-identity";

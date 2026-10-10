@@ -26,6 +26,10 @@ struct BarrierPlan {
     id: String,
     match_text: String,
     source: String,
+    /// Hold a later model request only after this exact native tool result.
+    /// Existing peer barriers omit this and retain their workgraph handshake.
+    #[serde(default)]
+    after_tool_result: Option<String>,
 }
 
 struct BarrierRun {
@@ -39,6 +43,19 @@ struct BarrierProgress {
     entered: bool,
     released: bool,
     requests: usize,
+    waiting_requests: usize,
+}
+
+struct BarrierWaitGuard<'a>(&'a BarrierRun);
+
+impl Drop for BarrierWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiting_requests -= 1;
+    }
 }
 
 impl ModelBarrier {
@@ -57,6 +74,10 @@ impl ModelBarrier {
                         .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
                     || plan.match_text.is_empty()
                     || plan.source.is_empty()
+                    || plan
+                        .after_tool_result
+                        .as_ref()
+                        .is_some_and(String::is_empty)
                 {
                     return Err("barrier needs a valid id, nonempty match_text and source".into());
                 }
@@ -107,9 +128,21 @@ impl ModelBarrier {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let run = current.as_ref()?;
-        input
-            .contains(&run.plan.match_text)
-            .then(|| (run.clone(), start))
+        if !input.contains(&run.plan.match_text) {
+            return None;
+        }
+        if let Some(expected) = &run.plan.after_tool_result {
+            let results = messages[start..].iter().flat_map(|message| match message {
+                Message::ToolResults { results, .. } => results.as_slice(),
+                _ => &[],
+            });
+            let mut matching = results.filter(|result| result.tool_use_id == *expected);
+            let result = matching.next()?;
+            if result.is_error || matching.next().is_some() {
+                return None;
+            }
+        }
+        Some((run.clone(), start))
     }
 }
 
@@ -153,6 +186,7 @@ impl BarrierRun {
             "id": self.plan.id, "match_text": self.plan.match_text,
             "phase": if progress.released { "released" } else if progress.entered { "entered" } else { "armed" },
             "entered": progress.entered, "released": progress.released, "requests": progress.requests,
+            "waiting_requests": progress.waiting_requests,
         })
     }
 
@@ -164,7 +198,11 @@ impl BarrierRun {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             progress.entered = true;
             progress.requests += 1;
+            progress.waiting_requests += 1;
         }
+        // The fixture must not mistake a cancelled model stream for a live
+        // held request. Dropping the stream releases this observation too.
+        let _waiting = BarrierWaitGuard(self);
         loop {
             let released = self.release.notified();
             tokio::pin!(released);
@@ -185,6 +223,9 @@ impl BarrierRun {
 }
 
 fn barrier_turn(plan: &BarrierPlan, messages: &[Message]) -> Result<Turn, String> {
+    if plan.after_tool_result.is_some() {
+        return Ok(Turn::Text(plan.source.clone()));
+    }
     let id = format!("fixture-{}-peer-ready", plan.id);
     for message in messages.iter().rev() {
         if let Message::ToolResults { results, .. } = message
@@ -235,6 +276,8 @@ pub enum ScenarioKind {
     Image,
     Routine,
     AssistantIdentity,
+    McpApps,
+    McpAppsPolling,
 }
 
 /// A unique run id also supplies the explicit trigger in the user message:
@@ -528,7 +571,47 @@ fn scenario_turn(scenario: &ScenarioPlan, messages: &[Message]) -> Result<Turn, 
         ScenarioKind::Image => image_turn(&recorded),
         ScenarioKind::Routine => routine_turn(&recorded),
         ScenarioKind::AssistantIdentity => assistant_identity_turn(&recorded),
+        ScenarioKind::McpApps => mcp_apps_turn(&recorded),
+        ScenarioKind::McpAppsPolling => mcp_apps_polling_turn(&recorded),
     }
+}
+
+fn mcp_apps_turn(recorded: &RecordedTurn<'_>) -> Result<Turn, String> {
+    mcp_apps_views_turn(recorded, &["display"])
+}
+
+fn mcp_apps_polling_turn(recorded: &RecordedTurn<'_>) -> Result<Turn, String> {
+    mcp_apps_views_turn(recorded, &["display", "display-two", "display-three"])
+}
+
+fn mcp_apps_views_turn(recorded: &RecordedTurn<'_>, views: &[&str]) -> Result<Turn, String> {
+    let Some(loaded) = recorded.result("load-display")? else {
+        return Ok(Turn::Tools(vec![recorded.call(
+            "load-display",
+            "tool_catalog_load",
+            json!({"names": ["display"]}),
+        )]));
+    };
+    let admitted = ["accepted_names", "noop_names"].iter().any(|field| {
+        loaded
+            .get(field)
+            .and_then(Value::as_array)
+            .is_some_and(|names| names.iter().any(|name| name == "display"))
+    });
+    if loaded.get("catalog_exact") != Some(&Value::Bool(true)) || !admitted {
+        return Err(format!("native catalog did not stage display: {loaded}"));
+    }
+    for view in views {
+        if recorded.result(view)?.is_none() {
+            let arguments = if views.len() == 1 {
+                json!({"query": "records"})
+            } else {
+                json!({"query": "records", "viewId": view})
+            };
+            return Ok(Turn::Tools(vec![recorded.call(view, "display", arguments)]));
+        }
+    }
+    Ok(Turn::Text("The MCP App is ready.".into()))
 }
 
 const ASSISTANT_IDENTITY_SOURCE: &str = "## Release evidence\n\nKeep A\u{030a}, å and 🚀 exactly.\n\n| Check | Result |\n| --- | --- |\n| WorkGraph | Reviewed through the runtime |";
@@ -1060,6 +1143,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn barrier_after_tool_result_holds_only_the_matching_completed_turn() {
+        let barrier = Arc::new(ModelBarrier::default());
+        barrier
+            .control(&json!({"action": "arm", "plan": {
+                "id": "apps-hold", "match_text": "[fixture:apps-hold]",
+                "source": "Held response complete.", "after_tool_result": "native-display"
+            }}))
+            .unwrap();
+        let input = Message::User(UserMessage::text("[fixture:apps-hold] Show records."));
+        assert!(
+            barrier
+                .matching_request(std::slice::from_ref(&input))
+                .is_none()
+        );
+        let native_result = Message::tool_results(vec![ToolResult::new(
+            "native-display".into(),
+            "{}".into(),
+            false,
+        )]);
+        let messages = vec![input.clone(), native_result.clone()];
+        assert!(barrier.matching_request(&messages).is_some());
+        assert!(
+            barrier
+                .matching_request(&[input.clone(), native_result.clone(), native_result,])
+                .is_none()
+        );
+        assert!(
+            barrier
+                .matching_request(&[
+                    input.clone(),
+                    Message::tool_results(vec![ToolResult::new(
+                        "native-display".into(),
+                        "{}".into(),
+                        true,
+                    )]),
+                ])
+                .is_none()
+        );
+        let mut superseded = messages.clone();
+        superseded.push(Message::User(UserMessage::text("A different request.")));
+        assert!(barrier.matching_request(&superseded).is_none());
+
+        let client = RecordingClient::new(
+            Arc::new(Mutex::new(ModelPlan {
+                source: "Ordinary reply".into(),
+                delay_ms: 0,
+                chunk_chars: 64,
+                reasoning_blocks: Vec::new(),
+                scenario: None,
+            })),
+            Arc::new(Mutex::new(Vec::new())),
+            barrier.clone(),
+        );
+        let request = LlmRequest::new("gpt-5.5", messages);
+        let mut stream = client.stream(&request);
+        let first = stream.next();
+        tokio::pin!(first);
+        assert!(matches!(
+            futures::poll!(first.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(
+            barrier
+                .control(&json!({"action": "status", "id": "apps-hold"}))
+                .unwrap()["phase"],
+            "entered"
+        );
+        barrier
+            .control(&json!({"action": "release", "id": "apps-hold"}))
+            .unwrap();
+        assert!(
+            matches!(first.await, Some(Ok(LlmEvent::TextDelta { delta, .. }))
+            if delta == "Held response complete.")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_barrier_wait_is_not_reported_as_a_live_model_request() {
+        let run = BarrierRun {
+            plan: BarrierPlan {
+                id: "cancelled".into(),
+                match_text: "marker".into(),
+                source: "Ready.".into(),
+                after_tool_result: None,
+            },
+            progress: Mutex::new(BarrierProgress::default()),
+            release: Notify::new(),
+        };
+        let mut waiting = Box::pin(run.wait_for_release());
+        assert!(matches!(
+            futures::poll!(waiting.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(run.snapshot()["waiting_requests"], 1);
+        drop(waiting);
+        assert_eq!(run.snapshot()["waiting_requests"], 0);
+        assert_eq!(run.snapshot()["released"], false);
+    }
+
+    #[tokio::test]
     async fn barrier_release_is_not_lost_and_old_peer_message_cannot_capture_new_operator() {
         let barrier = ModelBarrier::default();
         barrier
@@ -1323,6 +1506,66 @@ mod tests {
             value.to_string(),
             false,
         )])
+    }
+
+    #[test]
+    fn mcp_apps_script_stages_only_the_model_tool_and_preserves_catalog_refusal() {
+        let scenario = scenario(ScenarioKind::McpApps);
+        let mut messages = start(&scenario);
+        let initial = calls(scenario_turn(&scenario, &messages).unwrap());
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].name, "tool_catalog_load");
+        assert_eq!(initial[0].args, json!({"names": ["display"]}));
+        messages.push(result(
+            &scenario,
+            "load-display",
+            json!({"catalog_exact": true, "accepted_names": ["display"], "noop_names": []}),
+        ));
+        let display = calls(scenario_turn(&scenario, &messages).unwrap());
+        assert_eq!(display.len(), 1);
+        assert_eq!(display[0].name, "display");
+        messages.push(result(&scenario, "display", json!({"count": 7})));
+        assert!(matches!(scenario_turn(&scenario, &messages).unwrap(),
+            Turn::Text(text) if text == "The MCP App is ready."));
+
+        let mut refused = start(&scenario);
+        refused.push(result(
+            &scenario,
+            "load-display",
+            json!({"catalog_exact": true, "accepted_names": [], "noop_names": []}),
+        ));
+        assert!(
+            scenario_turn(&scenario, &refused)
+                .unwrap_err()
+                .contains("native catalog did not stage display")
+        );
+    }
+
+    #[test]
+    fn mcp_apps_polling_script_requires_three_distinct_native_results() {
+        let scenario = scenario(ScenarioKind::McpAppsPolling);
+        let mut messages = start(&scenario);
+        assert_eq!(
+            calls(scenario_turn(&scenario, &messages).unwrap())[0].name,
+            "tool_catalog_load"
+        );
+        messages.push(result(
+            &scenario,
+            "load-display",
+            json!({
+                "catalog_exact": true, "accepted_names": ["display"], "noop_names": []
+            }),
+        ));
+        for view in ["display", "display-two", "display-three"] {
+            let display = calls(scenario_turn(&scenario, &messages).unwrap());
+            assert_eq!(display.len(), 1);
+            assert_eq!(display[0].id, scenario.call_id(view));
+            assert_eq!(display[0].name, "display");
+            assert_eq!(display[0].args, json!({"query": "records", "viewId": view}));
+            messages.push(result(&scenario, view, json!({"count": 7, "viewId": view})));
+        }
+        assert!(matches!(scenario_turn(&scenario, &messages).unwrap(),
+            Turn::Text(text) if text == "The MCP App is ready."));
     }
 
     #[test]

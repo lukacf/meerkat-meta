@@ -168,6 +168,13 @@ pub struct UnifiedRuntimeBuilder {
 }
 
 impl UnifiedRuntimeBuilder {
+    /// Enable standard MCP Apps capabilities for a host with an isolated UI
+    /// renderer. The stock Console also needs `mcp_apps_sandbox_url` configured.
+    pub fn mcp_apps(mut self, enabled: bool) -> Self {
+        self.capability_flags.mcp_apps = enabled;
+        self
+    }
+
     // -----------------------------------------------------------------------
     // New convenience API
     // -----------------------------------------------------------------------

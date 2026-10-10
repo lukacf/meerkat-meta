@@ -70,3 +70,30 @@ const invalidTransport: ConsoleTransportState = { ...transportState, phase: "pro
 void invalidMarkdown; void invalidRange; void invalidTransport;
 void controller.transport.send({ identity: viewportKey.identity, content, origin: "console:fixture", idempotencyKey: "key:fixture", handlingMode: "steer" });
 void createConsoleApp(document.createElement("div"), { baseUrl: "/console", storageNamespace: viewportKey.authority, markdownUrlPolicy: urlPolicy });
+
+// Developers contribute sidebar panels independently of MCP Apps.
+const panel: import("../src/index").ConsolePanelDefinition = {
+  id: "example/overview", title: "Overview", mount(element, context, signal) {
+    element.textContent = context.readOnly ? "View only" : "Ready";
+    signal.throwIfAborted();
+    return { update(next) { element.textContent = next.baseUrl; }, dispose() { element.replaceChildren(); } };
+  },
+};
+createConsoleApp(document.createElement("div"), { customPanels: [panel],
+  panelService: async (request, scope, signal) => {
+    const original: string | undefined = scope.conversation?.identity;
+    signal.throwIfAborted();
+    return { original, method: request.method };
+  },
+});
+
+// MCP Apps is a separate host adapter. App authors supply standard tools/resources.
+const mcpAppsHost: import("../src/index").ConsoleMcpAppsHost = {
+  sandboxProxyUrl: "https://sandbox.example.test/sandbox.html",
+  async resolve(locator, signal) {
+    signal.throwIfAborted();
+    void locator.sessionId;
+    return null;
+  },
+};
+createConsoleApp(document.createElement("div"), { mcpAppsHost });

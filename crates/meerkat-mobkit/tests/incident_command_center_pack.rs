@@ -241,6 +241,7 @@ async fn incident_dispatcher_composes_inner_external_tools() {
     impl AgentToolDispatcher for FakeInner {
         fn tools(&self) -> Arc<[Arc<ToolDef>]> {
             vec![Arc::new(ToolDef {
+                audience: Default::default(),
                 name: "memory".into(),
                 description: "stand-in recorder".to_string(),
                 input_schema: json!({"type": "object"}),
@@ -363,6 +364,7 @@ struct RecorderMarkerDispatcher;
 impl AgentToolDispatcher for RecorderMarkerDispatcher {
     fn tools(&self) -> Arc<[Arc<meerkat_core::types::ToolDef>]> {
         vec![Arc::new(meerkat_core::types::ToolDef {
+            audience: Default::default(),
             name: "memory-marker".into(),
             description: "stand-in recorder".to_string(),
             input_schema: json!({"type": "object"}),

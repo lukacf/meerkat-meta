@@ -555,6 +555,7 @@ fn build_persistent_session_service(
     project_root: PathBuf,
     context_root: Option<PathBuf>,
     image_generation: bool,
+    mcp_apps: bool,
     realm_id: &str,
     host_config: Option<&Config>,
     compaction: Option<&meerkat_core::config::CompactionRuntimeConfig>,
@@ -629,7 +630,8 @@ fn build_persistent_session_service(
         .shell(true)
         .mob(true)
         .comms(true)
-        .memory(true);
+        .memory(true)
+        .mcp_apps(mcp_apps);
     if image_generation {
         factory = factory.with_image_generation_machine(adapter.clone());
     }
@@ -745,6 +747,10 @@ fn build_persistent_session_service(
         meerkat_mobkit::storage_health::StorageSlotSummary::persistent(
             "runtime",
             "SqliteRuntimeStore",
+        ),
+        meerkat_mobkit::storage_health::StorageSlotSummary::persistent(
+            "jobs",
+            "SqliteDetachedJobStore",
         ),
         meerkat_mobkit::storage_health::blob_slot_summary(
             meerkat_mobkit::storage_health::BlobDurability::PersistentDisk,
@@ -1713,6 +1719,17 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             .with_context(|| format!("failed to load {}", path.display()))?,
         None => ConsoleUiConfig::default(),
     };
+    for origin in [
+        Some(http_base_url.as_str()),
+        http_public_base_url.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        console_ui
+            .validate_mcp_apps_sandbox(Some(origin))
+            .map_err(|error| refuse_init(&request_id, -32602, error.to_string()))?;
+    }
     let runtime_id = definition.id.to_string();
     let image_generation = mob_definition_may_use_image_generation(&definition);
 
@@ -1735,6 +1752,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             project_root.clone(),
             context_root.clone(),
             image_generation,
+            console_ui.mcp_apps_sandbox_url.is_some(),
             &runtime_id,
             host_config.as_ref(),
             compaction_policy.as_ref(),
@@ -1836,7 +1854,8 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             .shell(true)
             .mob(true)
             .comms(true)
-            .memory(true);
+            .memory(true)
+            .mcp_apps(console_ui.mcp_apps_sandbox_url.is_some());
         if image_generation {
             factory = factory.with_image_generation_machine(adapter.clone());
         }
@@ -1911,6 +1930,11 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             meerkat_mobkit::storage_health::StorageSlotSummary::declared_ephemeral(
                 "runtime",
                 "InMemoryRuntimeStore",
+                "declared by the default ephemeral launch",
+            ),
+            meerkat_mobkit::storage_health::StorageSlotSummary::declared_ephemeral(
+                "jobs",
+                "MemoryDetachedJobStore",
                 "declared by the default ephemeral launch",
             ),
             meerkat_mobkit::storage_health::blob_slot_summary(

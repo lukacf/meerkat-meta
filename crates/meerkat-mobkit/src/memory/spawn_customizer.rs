@@ -347,6 +347,7 @@ mod tests {
         impl AgentToolDispatcher for EchoDispatcher {
             fn tools(&self) -> Arc<[Arc<meerkat_core::ToolDef>]> {
                 vec![Arc::new(meerkat_core::ToolDef {
+                    audience: Default::default(),
                     name: "echo".into(),
                     description: "echo".to_string(),
                     input_schema: serde_json::json!({"type": "object"}),
@@ -360,10 +361,11 @@ mod tests {
             ) -> Result<meerkat_core::ops::ToolDispatchOutcome, meerkat_core::error::ToolError>
             {
                 Ok(meerkat_core::ToolResult {
+                    host_metadata: Default::default(),
+                    settlement_failures: Default::default(),
                     tool_use_id: call.id.to_string(),
                     content: vec![],
                     is_error: false,
-                    settlement_failures: Vec::new(),
                 }
                 .into())
             }

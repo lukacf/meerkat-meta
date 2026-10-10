@@ -36,6 +36,157 @@ cd console
 npm run dev    # starts Vite at http://localhost:5199 with proxy to gateway
 ```
 
+## Developer custom panels
+
+Products embedding Console can add panels directly to its sidebar. A panel is
+trusted application code and is independent of MCP Apps inline widgets.
+
+```tsx
+const customPanels = [{
+  id: "inventory/overview",
+  title: "Inventory",
+  mount(element, context, signal) {
+    element.textContent = "Product inventory";
+    return { dispose() { element.replaceChildren(); } };
+  },
+}];
+createConsoleApp(root, { baseUrl: "/console", customPanels });
+// Or: <ConsoleApp baseUrl="/console" customPanels={customPanels} />
+```
+
+A mount owns its container and may mount React, Vue or another framework inside
+it. Return `dispose()` to release resources, and optionally `update(context)`
+to receive context changes without remounting. The host aborts the mount's signal
+on disposal. A failing panel shows a local fallback while stock views remain
+available. Keep the registration array stable across React renders.
+
+For the stock served bundle, list developer-hosted modules at the top level of
+`console.toml`. Each module's default export is an array of panel definitions:
+
+```toml
+panel_modules = ["/panels/inventory.js"]
+```
+
+The application or reverse proxy serves the module with a JavaScript MIME type
+on the Console origin. Relative paths resolve against `baseUrl`. Realm overlays
+can replace the list, including `panel_modules = []`. Reload after changing it.
+This is a frontend loading option; tools do not supply these modules. The
+application host owns module integrity and should serve versioned, audited assets.
+
+Each panel needs a unique namespaced `id`, a `title`, and a `mount` function.
+Console adds its sidebar button and pane-menu entry and owns tabs, splits and
+layout restoration. Removing a registration leaves a restored unavailable
+placeholder. It does not execute missing code or call a tool.
+
+`ConsolePanelContext` supplies `baseUrl`, `experience`, `readOnly`, the host's
+`authority`, current `selection`, and the panel's pinned `conversation`. Use
+`openPanel(id, { intent: "split_right" })` for another registered developer panel.
+Optional `instanceKey`, JSON `params`, and a pure `validateParams` function allow
+multiple instances. Layout storage contains selectors only: never put private
+results or secrets in panel parameters. Set `followSelection: true` to follow the
+selected conversation instead of pinning it. Context and pending requests are
+discarded when the host authority changes. Layout keys include the authority
+and principal scope; opening and restoring conversation
+panels checks current visibility.
+
+Panels can use `context.request({ path, method, body }, signal)`. The default
+service uses same-origin authenticated requests, rejects redirects, blocks
+non-GET operations in view-only mode, and never retries a request. It sends
+`X-Console-Authority` and `X-Console-Conversation` as URI-encoded JSON locators.
+These headers are not authorization proof: the application must derive the viewer
+from its authenticated session and enforce access on every request. Panels are
+trusted application code, so browser checks do not replace server policy.
+
+Embedded hosts may inject `panelService(request, scope, signal)` to use their
+existing application service, forwarding the scope locators through its own
+authenticated API. The host still applies view-only and lifetime
+checks. The request scope includes the original panel conversation, not whichever
+conversation happens to be focused later.
+
+See `examples/console-extensions` for a module and local stock Console preview.
+
+## Inline MCP Apps
+
+Inline widgets use the [MCP Apps standard](https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx).
+An MCP server supplies tool metadata, a `ui://` HTML resource, and the original
+tool result. No panel module or Console-specific app manifest is needed.
+
+Enable the stock host in `config/console.toml`:
+
+```toml
+mcp_apps_sandbox_url = "http://127.0.0.1:5001/sandbox.html"
+```
+
+Run the sandbox on a separate origin, with the exact Console origin allowed:
+
+```sh
+MCP_APPS_HOST_ORIGIN=http://127.0.0.1:5000 MCP_APPS_SANDBOX_PORT=5001 npm --prefix console run mcp-apps:sandbox
+```
+
+The originating member profile selects its MCP servers through
+`tools.mcp_servers`, or uses its existing host tool provider. Global server
+configuration alone does not grant every member access to those tools.
+The bundled gateways enable native MCP Apps negotiation when this sandbox URL
+is configured. Rust library hosts opt in with `UnifiedRuntime::builder().mcp_apps(true)`
+and set `ConsolePolicy.ui.mcp_apps_sandbox_url` on their Console policy.
+Hosts that create their own external MCP connections must also negotiate the
+standard UI extension, for example with `McpAppsClientServiceFactory`; this
+cannot be added after a connection's handshake.
+Headless hosts omit the capability. An unavailable widget retains its ordinary
+text tool result.
+
+The host retains the original tool, arguments, complete result and available UI
+resource with the canonical session. The declared HTML is preloaded before tool
+execution; the app receives invocation inputs and results through MCP Apps
+messages. Reopening a retained view never repeats
+its original tool call or waits for the current agent turn. The resolved
+`canCallTools` capability describes access to the live host action surface;
+actual calls still require fresh native admission and the original connection.
+During a continuing model turn, an actor- and run-bound native observation
+exposes accepted tool results for display without changing committed history.
+Completed-run replay uses the runtime's committed session. These observations
+carry no action authority. UI-only `_meta` is excluded from model requests and the
+public transcript. Timeline frames carry locators, not private HTML or metadata.
+Every lookup rechecks the authenticated viewer and session ownership. Uncached
+resource reads and app actions also require `agent.send`, an editable Console
+and the original live MCP connection with negotiated MCP Apps; replacing or
+retiring it cannot silently redirect an old widget. View-only users can read
+the exact retained renderer without fresh member-credential IO. Disabling the
+sandbox URL also disables the Console's app HTTP operations.
+
+Tool visibility follows `_meta.ui.visibility`: omitted permits model and app,
+`["model"]` permits only the model, `["app"]` permits only the app, and `[]`
+permits neither. A model-only launch tool can still own a view. App actions use
+fresh native authorization, pre- and post-tool hooks and normal execution
+policy, including review when required. A post-hook refusal withholds the result
+while preserving already settled effects. View-only users cannot invoke them.
+
+App resource reads and tool execution can proceed while the model turn is still
+running. A response with no session effects or hook notices does not wait for
+that turn or trigger a session save, so several mounted widgets can poll for
+fresh data. If the call produces session effects or hook notices, the native
+actor applies and persists them before publishing the response; this settlement
+can wait for the active turn. This distinction follows the actual execution
+outcome, not a tool's `readOnlyHint`. Each request still requires fresh admission
+and the original actor and MCP connection.
+
+The current host profile supports inline rendering, resource reads and tool
+calls. It does not advertise conversation handoff, model-context updates,
+external links or downloads. The sandbox restricts fetches and frames through
+CSP and denies sensitive browser permissions. It rejects CSP grants covering
+configured Console hostnames. Browser support limits network containment:
+Chromium 140 ignores the emitted standard `webrtc 'block'` directive. Navigation
+retirement is best-effort lifecycle handling, with every fresh action still
+subject to native admission. Serve the sandbox without Console cookies or
+application APIs; production hosts should use a dedicated HTTPS origin.
+
+An ordinary MCP App can render a versioned generated document from its result
+data today. The app supplies the renderer; the runtime does not impose a
+component language. Keep generated content inside the app sandbox, separate
+from trusted developer panels, and route external actions through the same
+native admission path. Streaming updates and conversation handoff require their
+own explicit lifecycle and provenance contracts when added.
+
 ## Runtime contract
 
 The bundled console uses a small set of stable protocol surfaces:
@@ -48,6 +199,7 @@ The bundled console uses a small set of stable protocol surfaces:
 | `GET /console/timeline` | Replayable console frames for initial load and older-history paging. |
 | `GET /console/timeline/stream` | Bounded replay followed by live timeline frames. |
 | `GET /console/identity/{identity}/stream` | Identity-filtered timeline stream convenience route. |
+| `POST /console/mcp-apps/{resolve,read-resource,call-tool}` | Authenticated operations bound to the originating tool invocation. |
 | `POST /console/rpc` | JSON-RPC 2.0 endpoint for console commands. |
 | `POST /console/rpc/multipart` | Multipart JSON-RPC for image send/upload. |
 | `GET /blobs/{blob_id}` | Blob/image retrieval for rendered media. |

@@ -8,6 +8,9 @@ export const CONSOLE_REST_PATHS = {
   timelineStream: "/console/timeline/stream",
   identityTimelineStreamTemplate: "/console/identity/{identity}/stream",
   legacySend: "/console/send",
+  mcpAppsResolve: "/console/mcp-apps/resolve",
+  mcpAppsReadResource: "/console/mcp-apps/read-resource",
+  mcpAppsCallTool: "/console/mcp-apps/call-tool",
 } as const;
 
 export const CONSOLE_RPC_PATHS = {

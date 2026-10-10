@@ -66,36 +66,36 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 futures = "0.3"
 fs2 = "0.4"
 object_store = { version = "0.13", features = ["fs"] }
-meerkat-core = { version = "=0.8.52" }
-meerkat-client = { version = "=0.8.52" }
-meerkat-comms = { version = "=0.8.52" }
-meerkat-contracts = { version = "=0.8.52" }
-meerkat-mob = { version = "=0.8.52" }
-meerkat-mob-mcp = { version = "=0.8.52" }
-meerkat-mcp = { version = "=0.8.52" }
-meerkat-models = { version = "=0.8.52" }
+meerkat-core = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547" }
+meerkat-client = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547" }
+meerkat-comms = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547" }
+meerkat-contracts = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547" }
+meerkat-mob = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547" }
+meerkat-mob-mcp = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547" }
+meerkat-mcp = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547" }
+meerkat-models = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547" }
 # Meerkat split session memory out of `memory-store` (which now only maps
 # to meerkat-store/memory); explicit `memory` enables need `memory-store-session`.
-meerkat = { version = "=0.8.52", features = ["comms", "skills", "mcp", "memory-store", "memory-store-session", "jsonl-store", "session-store", "sqlite-store", "live", "openai-realtime"] }
-meerkat-openai = { version = "=0.8.52", optional = true }
+meerkat = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547", features = ["comms", "skills", "mcp", "memory-store", "memory-store-session", "jsonl-store", "session-store", "sqlite-store", "live", "openai-realtime"] }
+meerkat-openai = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547", optional = true }
 # READ-ONLY host-side access to meerkat's OWN session semantic memory for the
 # Distiller's post-compaction harvest (§8.4: `MemoryStore::search` over the
 # discard range). This reads meerkat's store; the §12 bright line governs the
 # bundled agent-memory store, which stays plain B-tree SQLite.
-meerkat-memory = { version = "=0.8.52" }
+meerkat-memory = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547" }
 # Live (realtime) member sessions: `live_wiring` hosts the projection sink,
 # the WS transport state, and the mobkit/live/* handlers on top of this crate.
-meerkat-live = { version = "=0.8.52" }
-meerkat-runtime = { version = "=0.8.52", features = ["sqlite-store", "live"] }
-meerkat-session = { version = "=0.8.52", features = ["session-store"] }
+meerkat-live = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547" }
+meerkat-runtime = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547", features = ["sqlite-store", "live"] }
+meerkat-session = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547", features = ["session-store"] }
 # Shared SQLite mechanics (storage-unification): named connection profiles,
 # the per-file migration ledger, per-operation maintenance fence guards
 # (every in-crate opener, M3), and the doctor's read-only ledger reads (M1).
-meerkat-sqlite = { version = "=0.8.52" }
+meerkat-sqlite = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547" }
 # `memory` is the parked-delta backend for pre-registration incremental
 # writes in the continuity adapter (nothing parked is ever durable).
-meerkat-store = { version = "=0.8.52", features = ["sqlite", "memory"] }
-meerkat-tools = { version = "=0.8.52" }
+meerkat-store = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547", features = ["sqlite", "memory"] }
+meerkat-tools = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547" }
 tempfile = "3"
 async-trait = "0.1"
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -190,22 +190,22 @@ futures = "0.3"
 tower = { version = "0.5", features = ["util"] }
 jsonwebtoken = "9"
 async-trait = "0.1"
-meerkat-schedule = { version = "=0.8.52" }
+meerkat-schedule = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547" }
 # `schema` feature (test-only) exposes `meerkat_mob::adaptive::layer_decision_schema()`
 # so a parity guard can assert the bundled adaptive layer-decision schema stays
 # Value-equal to meerkat's canonical one. Dev-dependency: not enabled in release
 # builds, so the production binary keeps the lean (no-schemars) meerkat-mob.
-meerkat-mob = { version = "=0.8.52", features = ["schema"] }
+meerkat-mob = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547", features = ["schema"] }
 # `test-realtime-fixtures` (test-only) exposes meerkat's shared
 # ScriptedRealtimeSessionFactory so the live-open cross-provider regression
 # tests (tests/gateway_live.rs) can observe the exact channel identity handed
 # to the provider lane without a provider socket or credential.
-meerkat = { version = "=0.8.52", features = ["test-realtime-fixtures"] }
+meerkat = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547", features = ["test-realtime-fixtures"] }
 # `test-support` (test-only) exposes meerkat-core's per-session WholeBlob
 # decode counter, so decode assertions attribute decodes to the test's own
 # session instead of the process-wide count every parallel test moves.
-meerkat-core = { version = "=0.8.52", features = ["test-support"] }
+meerkat-core = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547", features = ["test-support"] }
 # `test-support` (test-only) exposes meerkat-runtime's run-start hold read, so
 # the restart test can assert a restored member without its customizer tools
 # is held, and released once they publish.
-meerkat-runtime = { version = "=0.8.52", features = ["sqlite-store", "live", "test-support"] }
+meerkat-runtime = { version = "=0.8.52", git = "https://github.com/lukacf/meerkat", rev = "ac411ddf3eec780a74bdd204ffcf0b96b1ff5547", features = ["sqlite-store", "live", "test-support"] }

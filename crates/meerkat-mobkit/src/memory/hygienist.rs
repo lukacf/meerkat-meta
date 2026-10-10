@@ -1651,6 +1651,7 @@ pub async fn complete_text(
                 operation_id,
                 phase,
             } => {
+                // Observation failure does not change the provider's physical outcome.
                 tracing::warn!(%operation_id, ?phase, "LLM operation observation failed");
             }
             LlmEvent::ReasoningDelta { .. }
@@ -1723,6 +1724,10 @@ mod tests {
                         meta: None,
                     });
                 }
+                events.push(LlmEvent::OperationObservationFailed {
+                    operation_id: meerkat_core::OperationId::new(),
+                    phase: meerkat_core::authorization::OperationObservationPhase::Outcome,
+                });
                 events.push(LlmEvent::AssistantOutput { blocks });
                 events.push(LlmEvent::Done {
                     outcome: LlmDoneOutcome::Success {
@@ -2238,6 +2243,10 @@ mod tests {
         for is_error in [false, true] {
             let mut messages = transcript();
             let failures = vec![crate::test_diagnostics::settlement_failure(is_error)];
+            let host_metadata = std::collections::BTreeMap::from([(
+                "test:application".into(),
+                serde_json::json!({"result": {"_meta": {"private": "original"}}}),
+            )]);
             let original_timestamp = match &mut messages[2] {
                 Message::ToolResults {
                     results,
@@ -2245,6 +2254,7 @@ mod tests {
                 } => {
                     results[0].is_error = is_error;
                     results[0].settlement_failures = failures.clone();
+                    results[0].host_metadata = host_metadata.clone();
                     *created_at
                 }
                 other => panic!("expected source tool results, got {other:?}"),
@@ -2264,6 +2274,7 @@ mod tests {
                     assert_eq!(results[0].tool_use_id, "call-1");
                     assert_eq!(results[0].is_error, is_error);
                     assert_eq!(results[0].settlement_failures, failures);
+                    assert_eq!(results[0].host_metadata, host_metadata);
                     assert_eq!(*created_at, original_timestamp);
                     let text = meerkat_core::types::text_content(&results[0].content);
                     assert!(text.contains("[pruned by hygienist"), "{text}");

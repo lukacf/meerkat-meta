@@ -154,6 +154,22 @@ impl ContinuityStore for GatewayContinuityStore {
         )))
     }
 
+    async fn session_owner(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<Option<AgentIdentity>, ContinuityStoreError> {
+        let result = self
+            .bridge
+            .call(
+                "callback/continuity_store/session_owner",
+                json!({ "session_id": session_id.to_string() }),
+            )
+            .await
+            .map_err(ContinuityStoreError::Io)?;
+        serde_json::from_value(result)
+            .map_err(|e| ContinuityStoreError::Io(format!("deserialize session owner: {e}")))
+    }
+
     async fn load_session_snapshot(
         &self,
         session_id: &meerkat_core::types::SessionId,
@@ -509,6 +525,7 @@ impl GatewayCallbackToolDispatcher {
             .into_iter()
             .map(|tool| {
                 Arc::new(ToolDef {
+                    audience: Default::default(),
                     name: tool.name.into(),
                     description: tool.description,
                     input_schema: tool.input_schema,
@@ -564,19 +581,21 @@ impl AgentToolDispatcher for GatewayCallbackToolDispatcher {
         });
         match self.bridge.call("callback/call_tool", params).await {
             Ok(result) => Ok(ToolResult {
+                host_metadata: Default::default(),
+                settlement_failures: Default::default(),
                 tool_use_id: call.id.to_string(),
                 content: callback_result_to_content(&result),
                 is_error: false,
-                settlement_failures: Vec::new(),
             }
             .into()),
             Err(err) => Ok(ToolResult {
+                host_metadata: Default::default(),
+                settlement_failures: Default::default(),
                 tool_use_id: call.id.to_string(),
                 content: vec![ContentBlock::Text {
                     text: format!("Tool execution failed: {err}"),
                 }],
                 is_error: true,
-                settlement_failures: Vec::new(),
             }
             .into()),
         }
@@ -786,6 +805,34 @@ mod tests {
             })
         ));
         assert_eq!(mock.call_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn continuity_session_owner_callback_preserves_exact_session_and_errors() {
+        let mock = Arc::new(MockBridge::new());
+        let store = GatewayContinuityStore::new(mock.clone());
+        let session_id = meerkat_core::types::SessionId::new();
+        let method = "callback/continuity_store/session_owner";
+        mock.set_response(method, Ok(json!("triage:main"))).await;
+        assert_eq!(
+            store.session_owner(&session_id).await.unwrap(),
+            Some(AgentIdentity::parse("triage:main").unwrap())
+        );
+        assert_eq!(
+            mock.last_call().await,
+            (
+                method.to_string(),
+                json!({ "session_id": session_id.to_string() })
+            )
+        );
+        mock.set_response(method, Ok(Value::Null)).await;
+        assert_eq!(store.session_owner(&session_id).await.unwrap(), None);
+        mock.set_response(method, Ok(json!({"identity":"triage:main"})))
+            .await;
+        assert!(store.session_owner(&session_id).await.is_err());
+        mock.set_response(method, Err("unsupported ownership lookup".to_string()))
+            .await;
+        assert!(store.session_owner(&session_id).await.is_err());
     }
 
     #[tokio::test]

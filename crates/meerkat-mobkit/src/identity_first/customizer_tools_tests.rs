@@ -36,6 +36,7 @@ impl AgentToolDispatcher for Scope {
             .iter()
             .map(|name| {
                 Arc::new(ToolDef {
+                    audience: Default::default(),
                     name: (*name).into(),
                     description: String::new(),
                     input_schema: json!({"type": "object"}),
@@ -49,12 +50,13 @@ impl AgentToolDispatcher for Scope {
     async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
         self.dispatched.fetch_add(1, Ordering::SeqCst);
         Ok(meerkat_core::ToolResult {
+            host_metadata: Default::default(),
+            settlement_failures: Default::default(),
             tool_use_id: call.id.to_string(),
             content: vec![meerkat_core::types::ContentBlock::Text {
                 text: format!("{}:{}", self.scope, call.name),
             }],
             is_error: false,
-            settlement_failures: Vec::new(),
         }
         .into())
     }
@@ -85,6 +87,114 @@ fn served_by(outcome: &ToolDispatchOutcome) -> String {
 
 fn identity(value: &str) -> AgentIdentity {
     AgentIdentity::parse(value).expect("identity")
+}
+
+#[tokio::test]
+async fn application_resolution_uses_current_publication_without_losing_native_context() {
+    use crate::tool_application_test_support::{
+        ApplicationProbe, application_request, native_context,
+    };
+    let registry = CustomizerToolRegistry::new();
+    let id = identity("domain:application");
+    let inner = ApplicationProbe::new(vec!["view", "app_refresh"]);
+    let entry = registry.publish(&id, Some(inner.clone()));
+    let request = application_request();
+    let context = native_context(request.clone());
+    let invocation = json!({"physical": "original", "_meta": {"private": 42}});
+    let meerkat_core::tool_application::ToolApplicationResolution::Call { name, binding, .. } =
+        entry
+            .resolve_tool_application("view", &request, &invocation, &context)
+            .await
+            .unwrap()
+    else {
+        panic!("expected app call")
+    };
+    assert_eq!(name, "app_refresh");
+    assert_eq!(
+        binding.payload,
+        json!({"source": "view", "request": request, "invocation": invocation})
+    );
+    assert_eq!(
+        inner.context_address.load(Ordering::SeqCst),
+        std::ptr::from_ref(&context) as usize
+    );
+    assert_eq!(
+        entry.review_entry_support(&name),
+        meerkat_core::approval::review::ReviewEntrySupport::ConsumesAtEntry
+    );
+    assert_eq!(
+        entry.review_entry_support("missing"),
+        meerkat_core::approval::review::ReviewEntrySupport::Unsupported
+    );
+    assert!(
+        entry
+            .resolve_tool_application("missing", &request, &invocation, &context)
+            .await
+            .is_err()
+    );
+    assert_eq!(inner.resolved.load(Ordering::SeqCst), 1);
+
+    let args = serde_json::value::RawValue::from_string("{}".into()).unwrap();
+    let call = call(&name, &args);
+    let plan = entry
+        .resolve_execution_plan(call, &context, &resolution())
+        .unwrap();
+    binding.validate_execution_plan(&name, &plan).unwrap();
+    entry
+        .dispatch_resolved_with_context(call, &context, &plan)
+        .await
+        .unwrap();
+    assert_eq!(inner.dispatched.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        inner.context_address.load(Ordering::SeqCst),
+        std::ptr::from_ref(&context) as usize
+    );
+    let replacement = ApplicationProbe::new(vec!["view", "app_refresh"]);
+    registry.publish(&id, Some(replacement.clone()));
+    let new_plan = entry
+        .resolve_execution_plan(call, &context, &resolution())
+        .unwrap();
+    assert!(matches!(
+        binding.validate_execution_plan(&name, &new_plan),
+        Err(meerkat_core::ToolExecutionResolutionError::Unavailable {
+            reason: meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+            ..
+        })
+    ));
+    assert_eq!(replacement.dispatched.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn application_resolution_refuses_identical_publication_replacement_during_await() {
+    use crate::tool_application_test_support::{
+        ApplicationProbe, application_request, native_context,
+    };
+    let registry = CustomizerToolRegistry::new();
+    let id = identity("domain:application");
+    let original = ApplicationProbe::new(vec!["view", "app_refresh"]);
+    original.block.store(true, Ordering::SeqCst);
+    let entry = registry.publish(&id, Some(original.clone()));
+    let request = application_request();
+    let context = native_context(request.clone());
+    let invocation = json!({"physical": "original"});
+    let pending = entry.resolve_tool_application("view", &request, &invocation, &context);
+    tokio::pin!(pending);
+    tokio::select! {
+        _ = &mut pending => panic!("resolution completed before release"),
+        permit = original.entered.acquire() => permit.unwrap().forget(),
+    }
+    let replacement = ApplicationProbe::new(vec!["view", "app_refresh"]);
+    registry.publish(&id, Some(replacement.clone()));
+    original.release.add_permits(1);
+    assert!(matches!(
+        pending.await,
+        Err(ToolError::Unavailable {
+            reason: meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+            ..
+        })
+    ));
+    assert_eq!(replacement.resolved.load(Ordering::SeqCst), 0);
+    assert_eq!(replacement.dispatched.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -277,6 +387,7 @@ impl HybridScope {
         Arc::new(Self {
             catalog: Arc::from([meerkat_core::ToolCatalogEntry::session_inline(
                 Arc::new(ToolDef {
+                    audience: Default::default(),
                     name: name.into(),
                     description: "hybrid".to_string(),
                     input_schema: json!({"type": "object"}),

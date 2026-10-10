@@ -214,14 +214,16 @@ async fn converged_idle_gateway_consumes_near_zero_cpu() {
         .comms(true);
     let mut agent_builder = FactoryAgentBuilder::new(factory, Config::default());
     agent_builder.default_blob_store = Some(blob_store.clone());
-    let session_service: Arc<dyn meerkat_mob::MobSessionService> =
-        Arc::new(PersistentSessionService::new(
+    let session_service: Arc<dyn meerkat_mob::MobSessionService> = Arc::new(
+        PersistentSessionService::new(
             agent_builder,
             64,
             session_store,
             Arc::clone(&runtime_store),
             blob_store,
-        ));
+        )
+        .with_canonical_runtime_adapter(adapter.clone()),
+    );
     let mob_spec = MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
         .with_session_write_epochs(&session_write_epochs)
         .with_session_runtime_adapter(adapter)

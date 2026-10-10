@@ -77,6 +77,7 @@ impl ConsoleFrameStatus {
 pub enum ConsoleFrameSourceKind {
     ConsoleEvent,
     SessionHistory,
+    ToolApplication,
     Send,
     Synthetic,
 }
@@ -86,6 +87,7 @@ impl ConsoleFrameSourceKind {
         match self {
             Self::ConsoleEvent => "console_event",
             Self::SessionHistory => "session_history",
+            Self::ToolApplication => "tool_application",
             Self::Send => "send",
             Self::Synthetic => "synthetic",
         }
@@ -94,6 +96,7 @@ impl ConsoleFrameSourceKind {
     pub(crate) fn from_str(value: &str) -> Self {
         match value {
             "console_event" => Self::ConsoleEvent,
+            "tool_application" => Self::ToolApplication,
             "session_history" => Self::SessionHistory,
             "send" => Self::Send,
             _ => Self::Synthetic,

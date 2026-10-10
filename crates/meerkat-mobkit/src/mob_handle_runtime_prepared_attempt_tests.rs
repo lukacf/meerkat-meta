@@ -178,6 +178,7 @@ fn untrusted_request() -> (Arc<Vec<Message>>, Arc<[Arc<ToolDef>]>) {
         )]),
     ];
     let tools = vec![Arc::new(ToolDef {
+        audience: Default::default(),
         name: "scrape_page".into(),
         description: "Fetch page".into(),
         input_schema: serde_json::json!({"type": "object"}),

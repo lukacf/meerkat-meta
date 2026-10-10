@@ -61,7 +61,7 @@ content = "For the initial message containing 'You have been spawned as' or a li
     } else {
         ""
     };
-    let definition = MobDefinition::from_toml(&format!(
+    let mut definition = MobDefinition::from_toml(&format!(
         r#"
 [mob]
 id = "console-acceptance"
@@ -98,10 +98,41 @@ image_generation = {live_images}
     };
     let store = Arc::new(FaultStore::new(inner));
     let access = meerkat_mobkit::AccessController::disabled();
+    // The durable profile selects this connection for its own members. The
+    // model only selects the tool; native dispatch owns its result and UI.
+    let mcp_apps = if let Ok(server) = std::env::var("MOBKIT_FIXTURE_MCP_APPS_SERVER") {
+        definition
+            .profiles
+            .get_mut(&ProfileName::from("lead"))
+            .expect("fixture lead profile")
+            .as_inline_mut()
+            .expect("fixture inline lead profile")
+            .tools
+            .mcp_servers
+            .push(meerkat_core::mcp_config::McpServerConfig::stdio(
+                "apps-fixture",
+                std::env::var("MOBKIT_FIXTURE_NODE").unwrap_or_else(|_| "node".into()),
+                vec![server],
+                std::collections::HashMap::from([
+                    (
+                        "MOBKIT_FIXTURE_APP_HTML".into(),
+                        std::env::var("MOBKIT_FIXTURE_APP_HTML")?,
+                    ),
+                    (
+                        "MOBKIT_FIXTURE_APP_LOG".into(),
+                        std::env::var("MOBKIT_FIXTURE_APP_LOG")?,
+                    ),
+                ]),
+            ));
+        true
+    } else {
+        false
+    };
     let mut builder = UnifiedRuntime::builder()
         .definition(definition)
         .access_controller(access.clone())
-        .with_console_log_store(store.clone());
+        .with_console_log_store(store.clone())
+        .mcp_apps(mcp_apps);
     if !live_model {
         builder = builder.default_llm_client(Arc::new(RecordingClient::new(
             plan.clone(),
@@ -221,13 +252,14 @@ image_generation = {live_images}
     if wired.wired.len() + wired.already_wired.len() != 1 {
         return Err("fixture peer wiring omitted requested edge".into());
     }
-    let open = RuntimeDecisionState::local_console(
+    let mut open = RuntimeDecisionState::local_console(
         ConsolePolicy {
             require_app_auth: false,
             ..Default::default()
         },
         None,
     );
+    open.console.ui.mcp_apps_sandbox_url = std::env::var("MOBKIT_FIXTURE_APP_SANDBOX").ok();
     let authenticated = RuntimeDecisionState::local_console(ConsolePolicy::default(), None);
     let aggregate = console_json_router_with_aggregator(
         open.clone(),

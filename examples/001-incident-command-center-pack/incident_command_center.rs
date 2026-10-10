@@ -1219,6 +1219,7 @@ impl AgentToolDispatcher for IncidentToolDispatcher {
         let provenance = incident_tool_provenance();
         let mut tools = vec![
             Arc::new(ToolDef {
+                audience: Default::default(),
                 name: "inspect_service".into(),
                 description: "Inspect the current health and saturation of a named service"
                     .to_string(),
@@ -1226,6 +1227,7 @@ impl AgentToolDispatcher for IncidentToolDispatcher {
                 provenance: Some(provenance.clone()),
             }),
             Arc::new(ToolDef {
+                audience: Default::default(),
                 name: "analyze_customer_impact".into(),
                 description: "Estimate customer-facing impact for a named merchant cohort"
                     .to_string(),

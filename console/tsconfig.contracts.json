@@ -12,6 +12,7 @@
     "allowSyntheticDefaultImports": true,
     "types": [],
     "paths": {
+      "@modelcontextprotocol/ext-apps/app-bridge": ["./node_modules/@modelcontextprotocol/ext-apps/dist/src/app-bridge.d.ts"],
       "@console-core": ["../packages/console-core/src/index.ts"],
       "@console-core/*": ["../packages/console-core/src/*"],
       "@console-components": ["../packages/console-components/src/index.ts"],

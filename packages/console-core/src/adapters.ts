@@ -1,4 +1,5 @@
 import { operationFeedbackFromFrame } from "./operation-feedback";
+import { mcpAppEntryFromFrame } from "./mcp-app-projection";
 import { assistantPresentationEntries, conversationPresentationRows } from "./assistant-presentation";
 import { userMessageRenderKey } from "./user-message-identity";
 import { realtimeMessageOrigin, isRealtimeHistoryMessage } from "./realtime-message-identity";
@@ -815,6 +816,7 @@ function reasoningFrameText(frame: ConsoleFrame): string {
 
 const ACTIVITY_HIDDEN_EVENTS = new Set([
   ...HIDDEN_EVENTS,
+  "mcp_app",
   "text_delta",
   "tool_call_requested",
   "tool_call",
@@ -3573,6 +3575,7 @@ export function mapFramesToTimelineEntries(
   const realtimeHistoryIds = new Set(orderedFrames.filter(isRealtimeHistoryMessage).map(frame => frame.id));
   const entries: ConversationTimelineEntry[] = [];
   const emittedOperationFeedback = new Set<string>();
+  const emittedMcpApps = new Set<string>();
   const toolBlocks = buildToolBlocks(orderedFrames);
   const peerRegistry = buildPeerRegistry(orderedFrames);
   const sessionToolResults = historyToolResults(orderedFrames);
@@ -3750,6 +3753,16 @@ export function mapFramesToTimelineEntries(
     const frame = orderedFrames[i];
     // Canonical frame identity must survive insertion of older history.
     const entryId = frame.id || `${frame.event || "frame"}:${i}`;
+
+    if (frame.event === "mcp_app") {
+      const entry = mcpAppEntryFromFrame(frame, entryId, agentIdentity(agent));
+      if (!entry || emittedMcpApps.has(entry.renderKey)) continue;
+      emittedMcpApps.add(entry.renderKey);
+      flushPendingReasoning(true);
+      flushPendingText();
+      entries.push(entry);
+      continue;
+    }
 
     // These events bound the assistant response's tool/turn lifecycle.
     // They also close a message when TextComplete was omitted; user/steer inputs,

@@ -885,6 +885,25 @@ mod tests {
         assert_eq!(extract_structural_fields(&kind), (None, None, None));
     }
 
+    #[test]
+    fn fork_terminal_projects_the_child_without_inventing_a_flow_run() {
+        let kind = MobEventKind::ForkJobTerminal(meerkat_mob::event::ForkJobTerminalEvent {
+            job_id: "fork-job".into(),
+            child: AgentIdentity::from("mk--rt_creview_csingleton_c0"),
+            owner_session_id: meerkat_core::SessionId::new(),
+            retained_work: None,
+            status: meerkat_core::event::BackgroundJobTerminalStatus::Completed,
+            outcome: serde_json::json!({"text": "done"}),
+            result_digest: "retained-digest".into(),
+        });
+        let wire = serde_json::to_value(&kind).expect("fork terminal serializes");
+        assert_eq!(wire["type"], event_kind_label(&kind));
+        assert_eq!(
+            extract_structural_fields(&kind),
+            (None, None, Some("rt:review:singleton:0".to_string()))
+        );
+    }
+
     #[tokio::test]
     async fn projects_fork_terminal_for_child_without_inventing_authority() {
         let alias = "rt:fork-child:singleton:0";

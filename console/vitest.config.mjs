@@ -8,6 +8,9 @@ const consoleRoot = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(consoleRoot, "..");
 const require = createRequire(import.meta.url);
 const consoleDependencies = [
+  "@modelcontextprotocol/ext-apps/app-bridge",
+  "@modelcontextprotocol/core",
+  "@modelcontextprotocol/client",
   "@testing-library/react",
   "clsx",
   "d3-force",
@@ -65,6 +68,12 @@ export default defineConfig({
     environment: "jsdom",
     globals: true,
     include: [
+      "console/src/lib/custom-panels.test.tsx",
+      "console/src/mcp-apps/host.test.tsx",
+      "console/src/mcp-apps/native-host.test.ts",
+      "console/src/mcp-apps/projection.test.ts",
+      "console/src/mcp-apps/stock-host.test.tsx",
+      "packages/console-components/src/custom-panels.test.tsx",
       "packages/console-components/src/copy-button.test.tsx",
       "packages/console-core/src/send-attempt.test.ts",
       "packages/console-core/src/context-record.test.ts",

@@ -160,6 +160,27 @@ pub trait ContinuityStore: Send + Sync {
         session_id: &meerkat_core::types::SessionId,
     ) -> Result<Option<(ContinuityRecord, FencingToken, CheckpointVersion)>, ContinuityStoreError>;
 
+    /// Return the immutable owner of this exact session, including retained history.
+    ///
+    /// The default supports current bindings only. Stores retaining rotated-away
+    /// sessions must override this method using their durable session ownership
+    /// records; a missing current binding does not establish a historical owner.
+    /// Conflicting ownership records must fail rather than select one identity.
+    async fn session_owner(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<Option<AgentIdentity>, ContinuityStoreError> {
+        let Some((record, _, _)) = self.resolve_record_by_session(session_id).await? else {
+            return Ok(None);
+        };
+        if record.session_id != *session_id {
+            return Err(ContinuityStoreError::Corruption(
+                "session owner lookup returned a different session".to_string(),
+            ));
+        }
+        Ok(Some(record.identity))
+    }
+
     /// Load a previously saved session snapshot.
     async fn load_session_snapshot(
         &self,

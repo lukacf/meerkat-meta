@@ -23,6 +23,7 @@ function experience() {
   return {
     contract_version: "test",
     runtime_id: "refresh-runtime",
+    storage_scope: "refresh-principal",
     console_config: {},
     console_policy: {},
     agent_sidebar: {
@@ -91,7 +92,7 @@ function seedDock(topologyVisible: boolean): void {
     mode: "console",
     target: { id: `chat:${CHAT}`, kind: "agent-chat", title: "Agent 0", identity: CHAT, memberId: CHAT },
   };
-  window.localStorage.setItem("mobkit-console-dock-state:refresh-runtime", JSON.stringify({
+  window.localStorage.setItem(`mobkit-console-dock-state:${JSON.stringify(["", "refresh-principal"])}`, JSON.stringify({
     tabs: [
       { id: "tab-1", presetId: "single", layout: { kind: "panel", panelId: "panel-1" } },
       { id: "tab-2", presetId: "single", layout: { kind: "panel", panelId: "panel-2" } },

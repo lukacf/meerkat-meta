@@ -98,18 +98,10 @@ fn assert_bootstraps(persistent_sessions: bool) {
 
     let resp: Value = serde_json::from_str(line.trim())
         .unwrap_or_else(|e| panic!("non-JSON init response {:?}: {}", line, e));
-    // The share-authority bug failed `UnifiedRuntime::bootstrap` with exactly
-    // "failed to bootstrap local runtime". A `result` (the normal case with the
-    // dummy secret), or any later/unrelated error, means the local runtime
-    // bootstrapped past meerkat 0.7's persistence-authority check — which is what
-    // this regression guards.
-    let err_msg = resp
-        .get("error")
-        .and_then(|e| e.get("message"))
-        .and_then(|m| m.as_str())
-        .unwrap_or("");
+    // Boot evidence requires a usable gateway, including any failure surfaced
+    // before or after the canonical runtime-owner check.
     assert!(
-        resp.get("result").is_some() || !err_msg.contains("failed to bootstrap local runtime"),
+        resp.get("error").is_none() && resp["result"]["http_base_url"].is_string(),
         "mobkit_gateway failed to bootstrap a local runtime (persistent_sessions={}): {}",
         persistent_sessions,
         resp

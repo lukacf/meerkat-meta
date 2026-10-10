@@ -3474,6 +3474,16 @@ export interface ContinuityStore {
     fencingToken: number;
     checkpointVersion: number;
   } | null>;
+  /**
+   * Return the immutable owner of this exact session, including retained history.
+   * Providers retaining rotated-away sessions must implement this method and
+   * throw on conflicting ownership. When omitted, only current bindings can be
+   * resolved through resolveRecordBySession.
+   */
+  sessionOwner?(
+    sessionId: string,
+    context?: ProviderCallbackContext,
+  ): Promise<string | null>;
   /** Save only if fencingToken is current and version advances the identity/generation head. */
   saveSessionSnapshot(
     identity: string,
