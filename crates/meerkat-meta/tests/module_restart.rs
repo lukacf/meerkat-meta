@@ -15,13 +15,13 @@
     clippy::unwrap_in_result,
     clippy::useless_vec
 )]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use meerkat_meta::{
-    DiscoverySpec, LifecycleStage, MetaConfig, ModuleConfig, ModuleHealthState,
+    DiscoverySpec, LifecycleStage, MetaConfig, ModuleCleanupPhase, ModuleConfig, ModuleHealthState,
     ProcessBoundaryError, RestartPolicy, RuntimeBoundaryError, RuntimeMutationError,
     RuntimeOptions, UnifiedEvent, start_meta_runtime_with_options,
 };
@@ -71,9 +71,30 @@ fn forced_crash_mutation_config(forced_script: &str, failing_script: &str) -> Me
     }
 }
 
+/// Each attempt records its pid at `<state file>.pid<attempt>` before its
+/// ready line, so an attempt whose ready event is withheld is still found.
 fn respawn_probe_script(state_file: &Path) -> String {
-    let template = r#"attempt_file='__STATE_FILE__'; attempt=0; if [ -f "$attempt_file" ]; then attempt=$(cat "$attempt_file"); fi; attempt=$((attempt + 1)); echo "$attempt" > "$attempt_file"; printf '{"event_id":"evt-respawn-%s","source":"module","timestamp_ms":52,"event":{"kind":"module","module":"respawn-probe","event_type":"ready","payload":{"attempt":%s,"pid":%s}}}\n' "$attempt" "$attempt" "$$"; exec sleep 30"#;
+    let template = r#"attempt_file='__STATE_FILE__'; attempt=0; if [ -f "$attempt_file" ]; then attempt=$(cat "$attempt_file"); fi; attempt=$((attempt + 1)); echo "$attempt" > "$attempt_file"; echo "$$" > "$attempt_file.pid$attempt"; printf '{"event_id":"evt-respawn-%s","source":"module","timestamp_ms":52,"event":{"kind":"module","module":"respawn-probe","event_type":"ready","payload":{"attempt":%s,"pid":%s}}}\n' "$attempt" "$attempt" "$$"; exec sleep 30"#;
     template.replace("__STATE_FILE__", &state_file.display().to_string())
+}
+
+fn respawn_probe_pid(state_file: &Path, attempt: u32) -> i64 {
+    let pid_file = PathBuf::from(format!("{}.pid{attempt}", state_file.display()));
+    std::fs::read_to_string(&pid_file)
+        .unwrap_or_else(|err| panic!("attempt {attempt} recorded no pid: {err}"))
+        .trim()
+        .parse()
+        .expect("pid")
+}
+
+/// `kill -0` also succeeds for an unreaped zombie child of this test process,
+/// so false means terminated and reaped.
+fn running_or_unreaped(pid: i64) -> bool {
+    Command::new("sh")
+        .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
+        .status()
+        .expect("run kill -0")
+        .success()
 }
 
 fn respawn_probe_config(script: &str) -> MetaConfig {
@@ -475,6 +496,7 @@ fn phase_d_respawn_terminate_failure_keeps_existing_child_tracked_and_aborts_swa
         .expect("initial respawn-probe payload");
     assert_eq!(initial_payload["attempt"], 1);
     let initial_pid = initial_payload["pid"].as_i64().expect("initial pid");
+    assert_eq!(respawn_probe_pid(&state_file, 1), initial_pid);
 
     let error = runtime
         .spawn_member("respawn-probe", Duration::from_secs(1))
@@ -486,6 +508,26 @@ fn phase_d_respawn_terminate_failure_keeps_existing_child_tracked_and_aborts_swa
         other => panic!("unexpected error shape: {other:?}"),
     };
     assert!(message.contains("failed to terminate existing child before respawn"));
+
+    // Attempt 2 started; the refused swap keeps the original child running
+    // and terminates and reaps the replacement.
+    assert_eq!(
+        std::fs::read_to_string(&state_file)
+            .expect("attempt file")
+            .trim(),
+        "2",
+        "the replacement attempt started"
+    );
+    let replacement_pid = respawn_probe_pid(&state_file, 2);
+    assert_ne!(replacement_pid, initial_pid);
+    assert!(
+        running_or_unreaped(initial_pid),
+        "the original child {initial_pid} keeps running after the refused swap"
+    );
+    assert!(
+        !running_or_unreaped(replacement_pid),
+        "the replacement {replacement_pid} is terminated and reaped when the swap is refused"
+    );
 
     let merged_events = runtime.merged_events();
     assert!(
@@ -501,13 +543,14 @@ fn phase_d_respawn_terminate_failure_keeps_existing_child_tracked_and_aborts_swa
         shutdown.terminated_modules,
         vec!["respawn-probe".to_string()]
     );
-
-    let kill_status = Command::new("sh")
-        .args(["-c", &format!("kill -0 {initial_pid}")])
-        .status()
-        .expect("run kill -0");
+    assert_eq!(
+        shutdown.physical_cleanup.phase,
+        ModuleCleanupPhase::Settled,
+        "{:?}",
+        shutdown.physical_cleanup
+    );
     assert!(
-        !kill_status.success(),
+        !running_or_unreaped(initial_pid),
         "existing child {initial_pid} should still be tracked and terminated on shutdown"
     );
 }
