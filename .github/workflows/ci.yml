@@ -11,6 +11,15 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Swatinem/rust-cache restores and saves <workspace>/target, while
+  # scripts/repo-cargo defaults to a per-worktree target under ~/.cache, so no
+  # job cached a compiled artifact: test-voice in run 38020666512 restored
+  # 538 MB, none of it build output, then spent 15m09 in clippy and 25m43
+  # building tests. repo-cargo keeps an explicit CARGO_TARGET_DIR, so CI names
+  # the directory rust-cache covers. CONTRIBUTING.md keeps local custom roots
+  # outside the checkout; a disposable CI checkout has no such need. Local
+  # runs set nothing and keep their per-worktree targets.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
 jobs:
   fmt-lint:

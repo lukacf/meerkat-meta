@@ -32,6 +32,21 @@ class CiWorkflowTests(unittest.TestCase):
             self.assertTrue(installs, f"{name} must install its build toolchain")
             self.assertEqual(set(installs), {version}, name)
 
+    def test_rust_cache_covers_the_wrapper_target(self):
+        """rust-cache saves `<workspace>/target`; repo-cargo must build there.
+
+        Without an explicit CARGO_TARGET_DIR, scripts/repo-cargo builds under
+        ~/.cache, so every rust-cache step restored and saved a directory
+        nothing was built in. Nothing failed - jobs were only slow - so pin the
+        single workflow-wide target and refuse remaps that would split the two
+        paths again.
+        """
+        source = CI_WORKFLOW.read_text()
+        header = source.split("\njobs:\n", 1)[0]
+        self.assertIn("\n  CARGO_TARGET_DIR: ${{ github.workspace }}/target\n", header)
+        self.assertEqual(len(re.findall(r"(?m)^\s+CARGO_TARGET_DIR:", source)), 1)
+        self.assertIsNone(re.search(r"(?m)^\s+(workspaces|cache-targets):", source))
+
     def test_workspace_nextest_preserves_all_failure_evidence(self):
         commands = [
             line.strip()
