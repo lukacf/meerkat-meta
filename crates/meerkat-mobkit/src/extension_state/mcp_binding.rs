@@ -717,7 +717,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn selected_document_resources_refuse_without_tool_or_fallback_preparation() {
+    async fn extension_selected_document_resources_refuse_without_tool_or_fallback_preparation() {
         let connection = resource_connection("documents").await;
         let (public, runtime) = configs("secret");
         let binding = Arc::new(binding(public, runtime.clone()).unwrap());
@@ -763,7 +763,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn unrelated_resource_destination_preserves_both_fallback_methods() {
+    async fn extension_unrelated_resource_destination_preserves_both_fallback_methods() {
         let connection = resource_connection("ordinary").await;
         let (public, runtime) = configs("secret");
         let context = ToolDispatchContext::default();
@@ -812,7 +812,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn unrelated_resource_without_fallback_keeps_no_metadata_and_no_authority() {
+    async fn extension_unrelated_resource_without_fallback_keeps_no_metadata_and_no_authority() {
         let connection = resource_connection("ordinary").await;
         let (public, runtime) = configs("secret");
         let provider = DocumentMcpContextProvider {
