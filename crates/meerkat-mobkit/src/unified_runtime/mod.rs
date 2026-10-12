@@ -239,6 +239,8 @@ pub type UnifiedRuntimeBootstrapPhaseObserver =
     Arc<dyn Fn(UnifiedRuntimeBootstrapPhase) + Send + Sync>;
 
 pub struct UnifiedRuntime {
+    #[cfg(feature = "extension-state")]
+    extension_authority: Option<Arc<crate::extension_state::NativeAuthorityRegistry>>,
     // Immutable after construction — &self access
     mob_runtime: MobRuntime,
     post_spawn_hook: Option<PostSpawnHook>,
@@ -549,6 +551,8 @@ impl UnifiedRuntime {
             .map(|policy| Arc::new(policy) as Arc<dyn EdgeDiscovery>);
         Self {
             mob_runtime,
+            #[cfg(feature = "extension-state")]
+            extension_authority: None,
             post_spawn_hook: None,
             post_reconcile_hook: None,
             error_hook,

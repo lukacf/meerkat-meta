@@ -34,6 +34,7 @@ ignored = ["meerkat-openai"]
 workspace = true
 
 [dependencies]
+mobkit-extension-state = { version = "=0.8.49", path = "../mobkit-extension-state", optional = true }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
@@ -106,6 +107,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustix = { version = "1.1.4", features = ["fs", "event", "process"] }
 
 [features]
+extension-state = ["dep:mobkit-extension-state"]
 integration-real-tests = []
 # Public OpenAI Live (`gpt-live-1`) execution path: the neutral GPT Live
 # runtime machinery (WebRTC answer transport, mob live bridge, Mob MCP live

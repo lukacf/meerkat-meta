@@ -125,6 +125,9 @@ pub enum UnifiedRuntimeBuilderError {
     DefinitionLoad(String),
     /// Conflicting builder configuration (e.g., persistent_state + scratch_dir).
     ConflictingConfiguration(String),
+    /// Extension activation requires authoritative retained identity history.
+    #[cfg(feature = "extension-state")]
+    ExtensionAuthorityUnavailable(crate::identity_first::ContinuityStoreError),
     /// Storage layout refusal (file-name twins in the state directory).
     StorageLayout(crate::storage_layout::StorageLayoutError),
     /// A storage provider failed to open the realm's store set, or the
@@ -172,6 +175,10 @@ impl Display for UnifiedRuntimeBuilderError {
             Self::Io(msg) => write!(f, "{msg}"),
             Self::DefinitionLoad(msg) => write!(f, "{msg}"),
             Self::ConflictingConfiguration(msg) => write!(f, "conflicting configuration: {msg}"),
+            #[cfg(feature = "extension-state")]
+            Self::ExtensionAuthorityUnavailable(error) => {
+                write!(f, "extension identity authority unavailable: {error}")
+            }
             Self::StorageLayout(err) => write!(f, "{err}"),
             Self::StorageProvider(err) => write!(f, "{err}"),
             Self::LiveCompose(err) => write!(f, "{err}"),

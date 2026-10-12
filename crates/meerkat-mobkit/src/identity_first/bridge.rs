@@ -3250,6 +3250,16 @@ pub trait SessionBridge: Send + Sync {
         Err(BridgeError::Mob("inspect not supported".to_string()))
     }
 
+    /// Optional readiness fence for extension tools during identity materialization.
+    /// The owner publishes only after the actual continuity binding commits.
+    #[cfg(feature = "extension-state")]
+    fn begin_extension_identity_publication(
+        &self,
+        _identity: &AgentIdentity,
+    ) -> Result<Option<crate::extension_state::IdentityPublication>, BridgeError> {
+        Ok(None)
+    }
+
     /// Register identity ownership for a concrete bridge session.
     ///
     /// Bridges that install a continuity-backed session store use this to
@@ -3500,6 +3510,9 @@ impl CompactionFloorRegistry {
 }
 
 pub struct MobSessionBridge {
+    #[cfg(feature = "extension-state")]
+    extension_identity_publications:
+        Option<Arc<crate::extension_state::identity_publication::IdentityPublications>>,
     handle: MobHandle,
     /// Session store used for checkpoint (loading session data to serialize).
     session_store: Option<Arc<dyn meerkat::SessionStore>>,
@@ -3688,6 +3701,8 @@ impl MobSessionBridge {
             session_store: None,
             session_service: None,
             continuity_session_store: None,
+            #[cfg(feature = "extension-state")]
+            extension_identity_publications: None,
             runtime_members: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             runtime_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             generated_external_owner_session: std::sync::OnceLock::new(),
@@ -3711,6 +3726,8 @@ impl MobSessionBridge {
             session_store: None,
             session_service: Some(session_service),
             continuity_session_store: None,
+            #[cfg(feature = "extension-state")]
+            extension_identity_publications: None,
             runtime_members: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             runtime_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             generated_external_owner_session: std::sync::OnceLock::new(),
@@ -3734,6 +3751,8 @@ impl MobSessionBridge {
             session_store: Some(session_store),
             session_service: None,
             continuity_session_store: None,
+            #[cfg(feature = "extension-state")]
+            extension_identity_publications: None,
             runtime_members: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             runtime_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             generated_external_owner_session: std::sync::OnceLock::new(),
@@ -3758,6 +3777,8 @@ impl MobSessionBridge {
             session_store: Some(session_store),
             session_service: Some(session_service),
             continuity_session_store: None,
+            #[cfg(feature = "extension-state")]
+            extension_identity_publications: None,
             runtime_members: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             runtime_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             generated_external_owner_session: std::sync::OnceLock::new(),
@@ -3782,6 +3803,8 @@ impl MobSessionBridge {
             session_store: Some(session_store.clone()),
             session_service,
             continuity_session_store: Some(session_store),
+            #[cfg(feature = "extension-state")]
+            extension_identity_publications: None,
             runtime_members: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             runtime_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             generated_external_owner_session: std::sync::OnceLock::new(),
@@ -3793,6 +3816,29 @@ impl MobSessionBridge {
             runtime_ingress_authority: None,
             compaction_floors: Arc::new(CompactionFloorRegistry::default()),
         }
+    }
+
+    #[cfg(feature = "extension-state")]
+    pub(crate) fn with_extension_identity_publication(
+        mut self,
+        publications: Arc<crate::extension_state::identity_publication::IdentityPublications>,
+    ) -> Self {
+        self.extension_identity_publications = Some(publications);
+        self
+    }
+
+    #[cfg(feature = "extension-state")]
+    async fn bind_extension_identity_publication(
+        &self,
+        identity: &AgentIdentity,
+        spec: &mut SpawnMemberSpec,
+    ) -> Result<(), BridgeError> {
+        if let Some(publications) = &self.extension_identity_publications {
+            publications
+                .bind(identity, self.handle.read_handle(), &spec.identity)
+                .await?;
+        }
+        Ok(())
     }
 
     /// The shared per-identity compaction-floor registry this bridge consults
@@ -5501,7 +5547,11 @@ pub(crate) fn build_spawn_spec(
     base_profile: Option<&meerkat_mob::Profile>,
 ) -> Result<SpawnMemberSpec, BridgeError> {
     let mid = member_id_for_spawn_spec(runtime_id, spec);
-    let mut spawn_spec = SpawnMemberSpec::new(spec.profile.clone(), mid);
+    // A DurableAgentSpec is the trusted host roster's identity declaration.
+    // This ingress creates that identity, not an agent-requested descendant.
+    // Fresh creation is therefore an explicit Root fact. Resume and reset
+    // still go through native transitions that preserve predecessor proof.
+    let mut spawn_spec = SpawnMemberSpec::host_root(spec.profile.clone(), mid);
 
     if let Some(message) = spec.initial_message.as_ref() {
         spawn_spec = spawn_spec.with_initial_message(message.clone());
@@ -5834,6 +5884,9 @@ impl SessionBridge for MobSessionBridge {
                 ))
             })?;
         successor.identity = roster_id.clone();
+        #[cfg(feature = "extension-state")]
+        self.bind_extension_identity_publication(identity, &mut successor)
+            .await?;
         // Required by the operation: a successor always receives a newly minted
         // session, so Resume and Fork are rejected upstream. Parent auto-wiring
         // is likewise rejected - existing topology is restored, not re-derived.
@@ -5898,6 +5951,10 @@ impl SessionBridge for MobSessionBridge {
             .await;
         self.remember_runtime_session(&agent_runtime_id, &session_id)
             .await;
+        #[cfg(feature = "extension-state")]
+        if let Some(publications) = &self.extension_identity_publications {
+            publications.bind_session(identity, &session_id)?;
+        }
         Ok(ResetSuccessorBinding {
             agent_runtime_id,
             session_id,
@@ -5920,6 +5977,9 @@ impl SessionBridge for MobSessionBridge {
             self.base_profile_for_spec(spec).as_ref(),
         )?;
         self.apply_compaction_floor(identity, spec, &mut spawn_spec)?;
+        #[cfg(feature = "extension-state")]
+        self.bind_extension_identity_publication(identity, &mut spawn_spec)
+            .await?;
 
         self.spawn_member_spec(spawn_spec)
             .await
@@ -5927,13 +5987,19 @@ impl SessionBridge for MobSessionBridge {
         self.remember_runtime_member(runtime_id, &mid).await;
         self.remember_runtime_session(runtime_id, session_id).await;
 
-        self.resolve_runtime_session_id(
-            runtime_id,
-            &mid,
-            "member spawned but has no session ID",
-            &self.admission_deadline(),
-        )
-        .await
+        let actual = self
+            .resolve_runtime_session_id(
+                runtime_id,
+                &mid,
+                "member spawned but has no session ID",
+                &self.admission_deadline(),
+            )
+            .await?;
+        #[cfg(feature = "extension-state")]
+        if let Some(publications) = &self.extension_identity_publications {
+            publications.bind_session(identity, &actual)?;
+        }
+        Ok(actual)
     }
 
     async fn resume_session(
@@ -5963,6 +6029,9 @@ impl SessionBridge for MobSessionBridge {
                 self.declared_role_migration(identity),
             )?;
             self.apply_compaction_floor(identity, spec, &mut spawn_spec)?;
+            #[cfg(feature = "extension-state")]
+            self.bind_extension_identity_publication(identity, &mut spawn_spec)
+                .await?;
             let mid = member_id_for_spawn_spec(runtime_id, spec);
             self.spawn_member_spec(spawn_spec).await.map_err(|error| {
                 resume_rejected(identity, session_id, &error, "external-binding resume")
@@ -5985,6 +6054,9 @@ impl SessionBridge for MobSessionBridge {
             self.declared_role_migration(identity),
         )?;
         self.apply_compaction_floor(identity, spec, &mut spawn_spec)?;
+        #[cfg(feature = "extension-state")]
+        self.bind_extension_identity_publication(identity, &mut spawn_spec)
+            .await?;
 
         let mid = member_id_for_spawn_spec(runtime_id, spec);
         let declared_migration = DeclaredRoleMigration::of(&spawn_spec);
@@ -6719,6 +6791,17 @@ impl SessionBridge for MobSessionBridge {
             peer_reachable_count,
             preview_unavailable: snap.preview_unavailable,
         })
+    }
+
+    #[cfg(feature = "extension-state")]
+    fn begin_extension_identity_publication(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<crate::extension_state::IdentityPublication>, BridgeError> {
+        self.extension_identity_publications
+            .as_ref()
+            .map(|publications| publications.begin(identity))
+            .transpose()
     }
 
     async fn register_session_runtime_state(

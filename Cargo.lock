@@ -2777,6 +2777,7 @@ dependencies = [
  "meerkat-sqlite",
  "meerkat-store",
  "meerkat-tools",
+ "mobkit-extension-state",
  "object_store",
  "rand_core 0.6.4",
  "reqwest 0.12.28",
@@ -3150,6 +3151,20 @@ dependencies = [
  "thiserror 2.0.19",
  "widestring",
  "windows 0.48.0",
+]
+
+[[package]]
+name = "mobkit-extension-state"
+version = "0.8.49"
+dependencies = [
+ "async-trait",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

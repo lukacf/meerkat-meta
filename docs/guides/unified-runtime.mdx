@@ -51,6 +51,85 @@ If neither definition source nor `mob_spec` is present, the builder returns
 `MissingRequiredField(MobSpec)`. On the legacy path, omitting
 `module_config` or `timeout` returns the corresponding missing-field error.
 
+## Optional extension documents
+
+Rust hosts can enable the default-off `extension-state` Cargo feature and
+register an external `ToolBundleFactory`. The extension package owns its tools
+and payload schema; MobKit supplies durable storage and caller authority. The
+following example uses a `durable-documents-test` factory with read and edit
+tools. Profile selection keeps the tools off agents that do not need them:
+
+```toml
+[profiles.worker.tools]
+rust_bundles = ["durable-documents-test"]
+```
+
+Register the package's factory on the host's configured persistent builder:
+
+```rust
+use meerkat_mobkit::extension_state::ToolBundleRequirements;
+
+let runtime = persistent_builder
+    .register_tool_bundle_factory(
+        "durable-documents-test",
+        ToolBundleRequirements::durable_documents(
+            "durable-documents-test", "documents_read", "documents_apply",
+        ),
+        external_factory, // Arc<dyn ToolBundleFactory> supplied by the package
+    )
+    .build()
+    .await?;
+```
+
+The configured storage provider must support durable extension documents.
+The disk provider supplies this capability. No factory means no extension
+store or tool registration, even if the feature is compiled.
+
+Documents start private to the executing agent. Forks inherit the owner's
+data access by default; ordinary spawned helpers need an explicit grant or
+descendant sharing. Reader grants remain read-only through forks, and
+inherited access never permits changing grants, transferring or deleting a
+document. Revocation is checked on the next access. Native policy always
+applies; an enabled host access controller additionally checks
+`extension.read`, `extension.edit` and `extension.manage`. With host ABAC
+disabled or unconfigured, that layer adds no restriction. See
+[Access control](/concepts/access-control) for host rules.
+
+Document persistence does not change native member lifetime. In the current
+MobKit composition, `delegate` uses an ephemeral child mob and retires the
+helper and its fork descendants when delegation completes. Such members
+cannot be resumed after restart. Persistent root-mob members retain their
+native identity and lineage through the configured durable mob storage.
+The convenience `persistent_state(...)` path persists sessions and other
+stores but leaves the native mob journal in memory. To retain member identity
+and lineage across process restarts, supply `mob_spec(...)` using
+`MobBootstrapSpec::persistent(...)` with `persistent_mob_storage(...)` and its
+storage provenance. Durable document rows or continuity records alone cannot
+reconstruct missing native creation facts; the extension refuses unavailable
+authority.
+
+The SDK callback-backed `GatewayContinuityStore` currently lacks the required
+retained identity-history capability. Registering this extension on such a
+host fails before activation with typed `ExtensionAuthorityUnavailable`.
+Use the local continuity store or an implementation of the complete history
+contract; an unavailable history is never interpreted as an unrelated Worker.
+
+Local identity history is a one-way opt-in to continuity schema version 3.
+Enabling it atomically installs retention triggers and backfills existing
+bindings. Older binaries refuse the database after this opt-in, because they
+cannot preserve the ancestry proof. Ordinary opens and head-only migrations
+do not enable history or incur this additional downgrade barrier.
+
+Current binaries continue retaining bindings even with extension tools
+disabled or the extension feature compiled out, so a later re-enable can
+safely resolve ancestors. Disabling the factory does not remove stored
+documents, identity history or those triggers.
+
+The extension integration requires the published Meerkat 0.8.52 crate family,
+with exact versions declared in the repository manifests. Applications using
+the MobKit Git dependency should pin the reviewed revision and resolve their
+committed lockfile against those registry packages.
+
 ## Bootstrap sequence
 
 <Steps>

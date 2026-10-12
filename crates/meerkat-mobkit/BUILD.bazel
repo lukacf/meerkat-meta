@@ -2666,6 +2666,87 @@ rust_test(
 )
 
 rust_test(
+    name = "extension_state_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-mobkit",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "extension_state",
+    crate_root = "tests/extension_state.rs",
+    crate_features = [],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+        "assets/release-targets.json",
+        "console-dist/console-app.css",
+        "console-dist/console-app.js",
+        "console-dist/index.html",
+        "examples/library_mode_reference.rs",
+        "flow-editor-dist/flow-editor.css",
+        "flow-editor-dist/flow-editor.js",
+        "flow-editor-dist/index.html",
+        "flow-editor-dist/react-globals.js",
+        "src/adaptive_layer_decision.schema.json",
+        "src/bin/mobkit_gateway.rs",
+        "src/bin/rpc_gateway.rs",
+        "src/identity_first/agent_memory.rs",
+        "src/identity_first/mod.rs",
+        "src/lib.rs",
+        "src/memory/distiller_prompt_v0.md",
+        "src/memory/hygienist_prompt_v0.md",
+        "src/memory/sqlite_store.rs",
+        "src/memory/steward_prompt_v0.md",
+        "src/mob_handle_runtime.rs",
+        "src/unified_runtime/builder.rs",
+        "src/unified_runtime/http.rs",
+        "src/unified_runtime/lifecycle.rs",
+        "tests/fixtures/console_voice_v1.json",
+        "tests/fixtures/homecore_ledgerv1_closure/calendar-continuity-closure.json",
+        "tests/fixtures/homecore_ledgerv1_closure/continuity-schema.sql",
+        "tests/fixtures/homecore_security_idempotency/security-head-evolution.json",
+        "tests/fixtures/live_contracts_v1.json",
+        "tests/fixtures/role_migrations_init_params.json",
+        "tests/fixtures/v0_8_10_released_session.json",
+        "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+    ],
+    srcs = [
+        "tests/extension_state.rs",
+        "tests/support/extension_cross_mob.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.8.49",
+        "CARGO_BIN_NAME": "extension_state",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-mobkit",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "crates/meerkat-mobkit",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-mobkit:meerkat_mobkit",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-mobkit",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "external_boundary_test",
     aliases = aliases(
         package_name = "crates/meerkat-mobkit",
@@ -11371,6 +11452,7 @@ test_suite(
         ":distiller_eval_harness_test",
         ":edge_wiring_reconcile_test",
         ":event_log_recovery_test",
+        ":extension_state_test",
         ":external_boundary_test",
         ":forker_owns_fork_child_test",
         ":gateway_composition_root_test",

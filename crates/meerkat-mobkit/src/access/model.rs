@@ -85,6 +85,12 @@ pub const ACTION_ACCESS_ADMIN: &str = "access.admin";
 
 /// The full action vocabulary, in display order.
 pub const ACCESS_ACTIONS: &[&str] = &[
+    #[cfg(feature = "extension-state")]
+    "extension.read",
+    #[cfg(feature = "extension-state")]
+    "extension.edit",
+    #[cfg(feature = "extension-state")]
+    "extension.manage",
     ACTION_AGENT_VIEW,
     ACTION_AGENT_SEND,
     ACTION_AGENT_MEMORY_WRITE,

@@ -60,6 +60,66 @@ pub struct SessionSnapshotMatchCandidate {
 /// entries are treated as a provider error, not implicit `Uninitialized`.
 #[async_trait]
 pub trait ContinuityStore: Send + Sync {
+    /// Enable immutable identity binding history before extension tools run.
+    /// Repeated calls must preserve the same history and succeed idempotently.
+    /// Unsupported providers must refuse rather than classify history as workers.
+    #[cfg(feature = "extension-state")]
+    async fn enable_identity_binding_history(&self) -> Result<(), ContinuityStoreError> {
+        Err(ContinuityStoreError::UnsupportedAuthority {
+            capability: "identity binding history",
+        })
+    }
+
+    /// The identity authority's retained binding, including rotated or deleted
+    /// session executions. None proves no retained binding; it does not prove a
+    /// historical session was a worker. Callers must distinguish live absence.
+    #[cfg(feature = "extension-state")]
+    async fn historical_identity_binding(
+        &self,
+        _session_id: &meerkat_core::SessionId,
+    ) -> Result<Option<AgentIdentity>, ContinuityStoreError> {
+        Err(ContinuityStoreError::UnsupportedAuthority {
+            capability: "identity binding history",
+        })
+    }
+
+    /// Stable identity intent retained even when a provisional session launch
+    /// never published its actual session binding. This only excludes a target
+    /// from Worker classification; it never proves an exact-session principal.
+    #[cfg(feature = "extension-state")]
+    async fn has_historical_identity(
+        &self,
+        _identity: &AgentIdentity,
+    ) -> Result<bool, ContinuityStoreError> {
+        Err(ContinuityStoreError::UnsupportedAuthority {
+            capability: "identity target reservation",
+        })
+    }
+
+    /// Establish the earliest covered journal cursor once, after history is
+    /// enabled and before members can execute. Restart preserves the anchor.
+    #[cfg(feature = "extension-state")]
+    async fn establish_identity_history_coverage(
+        &self,
+        _mob: &str,
+        _cursor: u64,
+    ) -> Result<(), ContinuityStoreError> {
+        Err(ContinuityStoreError::UnsupportedAuthority {
+            capability: "identity history coverage",
+        })
+    }
+
+    /// True proves binding history covers the session's canonical birth event.
+    #[cfg(feature = "extension-state")]
+    async fn identity_history_covers_birth(
+        &self,
+        _mob: &str,
+        _birth_cursor: u64,
+    ) -> Result<bool, ContinuityStoreError> {
+        Err(ContinuityStoreError::UnsupportedAuthority {
+            capability: "identity history coverage",
+        })
+    }
     /// Resolve continuity state for the given identities.
     ///
     /// Returns a `BTreeMap` with one entry per input identity.

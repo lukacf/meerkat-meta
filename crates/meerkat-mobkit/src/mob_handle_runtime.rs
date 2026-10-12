@@ -8640,6 +8640,8 @@ pub struct MobBootstrapSpec {
     /// What the agent mob tools were installed with, so bootstrap can
     /// reinstall them with the final child policy.
     pub(crate) agent_mob_tools_install: Option<AgentMobToolsInstall>,
+    #[cfg(feature = "extension-state")]
+    pub(crate) before_activation: Option<meerkat_mob::MobBeforeActivation>,
     /// Realm-scoped WorkGraph service, forwarded to
     /// `MobBuilder::with_workgraph_service` so every mob-executor turn gets
     /// apply-time attention overlay injection, and to the agent mob-tool
@@ -8756,6 +8758,8 @@ impl MobBootstrapSpec {
             child_tool_bundle_availability: BTreeMap::new(),
             child_application_tool_policy: None,
             agent_mob_tools_install: None,
+            #[cfg(feature = "extension-state")]
+            before_activation: None,
             workgraph_service: None,
             workgraph_admission_slots: Vec::new(),
             workgraph_admission_sidecar: None,
@@ -10930,6 +10934,13 @@ impl MobRuntime {
         }
         spec.apply_agent_mob_child_policy()
             .map_err(MobRuntimeError::Delivery)?;
+        #[cfg(feature = "extension-state")]
+        if let (Some(state), Some(callback)) = (&spec.agent_mob_mcp_state, &spec.before_activation)
+        {
+            state
+                .set_before_activation(Arc::clone(callback))
+                .map_err(|error| MobRuntimeError::InvalidConfig(error.to_string()))?;
+        }
         auto_mark_declared_resume_overrides(&mut spec.definition);
         let ephemeral_dir = spec._ephemeral_dir.clone();
         let session_service = spec.session_service.clone();
@@ -11199,6 +11210,10 @@ impl MobRuntime {
         }
         for (name, dispatcher) in &spec.tool_bundles {
             builder = builder.register_tool_bundle(name.clone(), Arc::clone(dispatcher));
+        }
+        #[cfg(feature = "extension-state")]
+        if let Some(callback) = &spec.before_activation {
+            builder = builder.before_activation(Arc::clone(callback));
         }
 
         // Apply-time WorkGraph attention overlays: the provisioner's
@@ -17292,6 +17307,49 @@ comms = true
         assert_eq!(
             probe.calls(),
             vec!["subscribe_session_activity", "subscribe_session_activity"],
+            "each wrapper forwards exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn extension_wrappers_forward_retained_metadata_errors_and_exact_session() {
+        let probe = Arc::new(ForwardingProbe::default());
+        let inner: Arc<dyn MobSessionService> = probe.clone();
+        let pre_build: Arc<dyn MobSessionService> = Arc::new(PreBuildMobSessionService {
+            inner: Arc::clone(&inner),
+            hook: no_op_pre_build_hook(),
+            dispatch_taint: None,
+            after_create_hook: None,
+            runtime_adapter_override: None,
+            session_read_absorber: None,
+            archived_terminal_authority: None,
+        });
+        let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
+            inner: Arc::clone(&inner),
+            after_hook: Arc::new(|_, _| Box::pin(async {})),
+        });
+        let session_id = meerkat_core::SessionId::new();
+        for wrapper in [pre_build, after_create] {
+            *probe
+                .retained_metadata_reply
+                .lock()
+                .expect("retained reply") = Some(Err(SessionError::NotFound {
+                id: session_id.clone(),
+            }));
+            let result = wrapper.load_retained_session_metadata(&session_id).await;
+            assert!(matches!(result, Err(SessionError::NotFound { id }) if id == session_id));
+        }
+        assert_eq!(
+            *probe.retained_metadata_requests.lock().expect("requests"),
+            vec![session_id.clone(), session_id],
+            "both wrappers preserve the exact requested session"
+        );
+        assert_eq!(
+            probe.calls(),
+            vec![
+                "load_retained_session_metadata",
+                "load_retained_session_metadata"
+            ],
             "each wrapper forwards exactly once"
         );
     }

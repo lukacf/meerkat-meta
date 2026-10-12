@@ -91,6 +91,25 @@ jobs:
       # saturation uses a deterministic read barrier and runs in this gate.
       - run: scripts/repo-cargo nextest run --workspace -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)' --no-fail-fast
 
+  test-extension-state:
+    name: test-extension-state
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/repo-cargo test -p mobkit-extension-state --locked
+      - run: scripts/repo-cargo check -p meerkat-mobkit --locked --no-default-features
+      - run: scripts/repo-cargo clippy -p meerkat-mobkit --locked --features extension-state --lib --test extension_state -- -D warnings
+      - run: scripts/repo-cargo test -p meerkat-mobkit --locked --features extension-state --test extension_state
+      - run: scripts/repo-cargo test -p meerkat-mobkit --locked --features extension-state --lib extension_
+
   test-voice:
     name: test-voice
     runs-on: ubuntu-24.04

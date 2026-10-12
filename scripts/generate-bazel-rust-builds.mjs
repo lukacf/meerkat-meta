@@ -175,7 +175,7 @@ function localDeps(
   procMacroOnly,
   includeDev = false,
   consumerKey = packageKey(pkg),
-  enabledFeatures = null,
+  enabledFeatures = crateFeaturesFor(consumerKey, pkg),
 ) {
   const enabledOptionalDeps = optionalDependencyNamesEnabledByFeatures(pkg, enabledFeatures);
   const labels = [];

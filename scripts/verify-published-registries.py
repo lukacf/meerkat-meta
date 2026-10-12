@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 
 
 CRATE_NAME = "meerkat-mobkit"
+EXTENSION_CRATE_NAME = "mobkit-extension-state"
 PYPI_NAME = "meerkat-mobkit"
 NPM_NAME = "@rkat/mobkit-sdk"
 
@@ -65,12 +66,12 @@ def _required_text(value: Any, *, field: str) -> str:
 
 
 def _verify_crates_payload(
-    payload: dict[str, Any], version: str
+    payload: dict[str, Any], version: str, crate_name: str = CRATE_NAME
 ) -> list[PublishedArtifact]:
     published = payload.get("version")
     if not isinstance(published, dict):
         raise RegistryVerificationError("crates.io response is missing version metadata")
-    if published.get("crate") != CRATE_NAME or published.get("num") != version:
+    if published.get("crate") != crate_name or published.get("num") != version:
         raise RegistryVerificationError(
             "crates.io returned unexpected package/version metadata"
         )
@@ -162,6 +163,7 @@ def _registry_checks(
     ...,
 ]:
     encoded_crate = quote(CRATE_NAME, safe="")
+    encoded_extension = quote(EXTENSION_CRATE_NAME, safe="")
     encoded_pypi = quote(PYPI_NAME, safe="")
     encoded_npm = quote(NPM_NAME, safe="")
     encoded_version = quote(version, safe="")
@@ -170,6 +172,11 @@ def _registry_checks(
             "crates.io",
             f"https://crates.io/api/v1/crates/{encoded_crate}/{encoded_version}",
             _verify_crates_payload,
+        ),
+        (
+            "crates.io extension-state",
+            f"https://crates.io/api/v1/crates/{encoded_extension}/{encoded_version}",
+            lambda payload, version: _verify_crates_payload(payload, version, EXTENSION_CRATE_NAME),
         ),
         (
             "PyPI",
@@ -246,7 +253,7 @@ def verify_with_retries(
         else:
             print(
                 f"Verified exact registry metadata and checksummed artifacts for "
-                f"{CRATE_NAME} {version} on crates.io, {PYPI_NAME} {version} "
+                f"{CRATE_NAME} and {EXTENSION_CRATE_NAME} {version} on crates.io, {PYPI_NAME} {version} "
                 f"wheel+sdist on PyPI, and {NPM_NAME} {version} on npm"
             )
             return

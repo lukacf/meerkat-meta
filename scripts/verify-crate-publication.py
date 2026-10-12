@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Every workspace member must be explicitly published or explicitly not.
 
-MobKit publishes exactly one crate, `meerkat-mobkit`, named in a hand-written
-`-p` flag in release.yml. `mobkit-store-conformance` carried no `publish` key at
+Published workspace crates are named in hand-written `-p` flags in release.yml. `mobkit-store-conformance` carried no `publish` key at
 all, so it read as publishable to every tool and every reader while never having
 been published at any version. Nothing could tell that apart from an accidental
 omission, in either direction.

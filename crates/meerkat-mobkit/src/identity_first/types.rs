@@ -2039,6 +2039,10 @@ pub struct TopologyContext {
 /// Error from the continuity store.
 #[derive(Debug)]
 pub enum ContinuityStoreError {
+    #[cfg(feature = "extension-state")]
+    UnsupportedAuthority {
+        capability: &'static str,
+    },
     StaleFencingToken {
         identity: AgentIdentity,
         presented: FencingToken,
@@ -2072,6 +2076,10 @@ pub enum ContinuityStoreError {
 impl fmt::Display for ContinuityStoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(feature = "extension-state")]
+            Self::UnsupportedAuthority { capability } => {
+                write!(f, "continuity authority does not support {capability}")
+            }
             Self::StaleFencingToken {
                 identity,
                 presented,

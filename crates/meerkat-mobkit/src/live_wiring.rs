@@ -4675,7 +4675,10 @@ async fn handle_live_close(
 
         match ctx
             .host
-            .reserve_channel_close_observation(&channel_id)
+            .reserve_channel_close_observation(
+                &channel_id,
+                meerkat_core::LiveChannelCloseReason::ClientRequested,
+            )
             .await
         {
             Ok(observation) => {

@@ -104,15 +104,20 @@ const SCHEMA_HEAD_CANONICAL: &str = "CREATE TABLE IF NOT EXISTS continuity_sessi
 /// see [`LocalContinuityStore::open`].
 pub const HEAD_CANONICAL_SCHEMA_VERSION: i64 = 2;
 
+/// Explicit identity-history opt-in also refuses older binaries that cannot
+/// preserve complete bindings through later disabled-extension intervals.
+const IDENTITY_HISTORY_SCHEMA_VERSION: i64 = 3;
+
 /// The continuity store's schema domain in the per-file migration ledger.
 /// Migration 0001 is the historical two-table DDL (all `CREATE ... IF NOT
 /// EXISTS`, so a pre-ledger file converges without its rows being touched);
 /// migration 0002 adds the head-canonical trio (DDL-only, additive, zero row
-/// rewrites).
+/// rewrites). Migration 0003 retains exact identity bindings and native birth
+/// coverage; only explicit extension activation applies it.
 ///
 /// **This domain is NEVER applied by a plain [`LocalContinuityStore::open`].**
-/// Applying it stamps v2, which locks every `<= 0.8.5` binary out of the file
-/// (`SqliteStoreError::SchemaFromTheFuture`). That lockout is load-bearing
+/// The head-only routes target frozen v2, which locks every `<= 0.8.5` binary
+/// out of the file (`SqliteStoreError::SchemaFromTheFuture`). That lockout is load-bearing
 /// only once a head row exists, so it is committed at exactly two moments:
 /// by a delta write that actually creates head state (armed inside that
 /// write's own transaction, so a REFUSED write leaves the file at v1), and
@@ -123,6 +128,9 @@ pub const HEAD_CANONICAL_SCHEMA_VERSION: i64 = 2;
 /// whole one-way cost and received an unconverted corpus; the stamp now
 /// rides on complete conversion and a partial crossing stays at v1. Merely
 /// launching a new gateway leaves rollback to the previous release intact.
+/// Explicit history activation instead stamps v3 atomically with its retained
+/// bindings. Older writers must then refuse: missing bindings during a
+/// downgrade interval would invalidate the persisted native-birth coverage.
 pub(crate) const MOBKIT_CONTINUITY_DOMAIN: meerkat_sqlite::SchemaDomain =
     meerkat_sqlite::SchemaDomain {
         name: "mobkit-continuity",
@@ -137,17 +145,28 @@ pub(crate) const MOBKIT_CONTINUITY_DOMAIN: meerkat_sqlite::SchemaDomain =
                 name: "head-canonical-sessions",
                 apply: migration_0002_head_canonical_sessions,
             },
+            meerkat_sqlite::Migration {
+                version: IDENTITY_HISTORY_SCHEMA_VERSION,
+                name: "retained-identity-bindings",
+                apply: migration_0003_identity_history,
+            },
         ],
         initialize_current: initialize_current_continuity_schema,
-        allowed_existing_versions: &[1, 2],
+        allowed_existing_versions: &[1, 2, 3],
         // Unledgered mobkit files are refused at open (below the 0.8.8 ledger
         // floor) and mobkit never runs the offline bridge, so no source
         // version is inferable.
         bridge_recoverable_versions: &[],
-        released_predecessors: &[meerkat_sqlite::SchemaPredecessor {
-            version: 1,
-            verify: verify_released_v1_continuity_schema,
-        }],
+        released_predecessors: &[
+            meerkat_sqlite::SchemaPredecessor {
+                version: 1,
+                verify: verify_released_v1_continuity_schema,
+            },
+            meerkat_sqlite::SchemaPredecessor {
+                version: 2,
+                verify: verify_released_v2_continuity_schema,
+            },
+        ],
         owned_objects: CONTINUITY_OWNED_OBJECTS,
         retired_objects: &[],
     };
@@ -160,6 +179,45 @@ const RELEASED_V1_CONTINUITY_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
     meerkat_sqlite::SchemaObject {
         kind: meerkat_sqlite::SchemaObjectKind::Table,
         name: "session_snapshots",
+    },
+];
+
+const RELEASED_V2_CONTINUITY_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "continuity_records",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "session_snapshots",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "continuity_session_heads",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "continuity_strand_messages",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "continuity_session_rewrites",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "continuity_records_session_idx",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "continuity_heads_identity_gen_idx",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "continuity_strands_identity_gen_idx",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "continuity_rewrites_identity_gen_idx",
     },
 ];
 
@@ -200,19 +258,76 @@ const CONTINUITY_OWNED_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
         kind: meerkat_sqlite::SchemaObjectKind::Index,
         name: "continuity_rewrites_identity_gen_idx",
     },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "continuity_identity_history",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "continuity_identity_history_identity_idx",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "continuity_identity_coverage",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Trigger,
+        name: "continuity_identity_history_immutable",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Trigger,
+        name: "continuity_identity_history_insert",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Trigger,
+        name: "continuity_identity_history_update",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Trigger,
+        name: "continuity_identity_snapshot_insert",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Trigger,
+        name: "continuity_identity_snapshot_update",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Trigger,
+        name: "continuity_identity_head_insert",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Trigger,
+        name: "continuity_identity_head_update",
+    },
 ];
 
 fn initialize_current_continuity_schema(
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<(), rusqlite::Error> {
+    initialize_released_v2_continuity_schema(tx)?;
+    migration_0003_identity_history(tx)
+}
+
+/// Frozen initializer for both released v2 and v1 with deferred head DDL.
+fn initialize_released_v2_continuity_schema(
     tx: &rusqlite::Transaction<'_>,
 ) -> Result<(), rusqlite::Error> {
     migration_0001_continuity_schema(tx)?;
     migration_0002_head_canonical_sessions(tx)
 }
 
+fn verify_released_v2_continuity_schema(conn: &rusqlite::Connection) -> Result<(), String> {
+    meerkat_sqlite::verify_released_schema_fingerprint(
+        conn,
+        &MOBKIT_CONTINUITY_DOMAIN,
+        RELEASED_V2_CONTINUITY_OBJECTS,
+        initialize_released_v2_continuity_schema,
+    )
+}
+
 /// Frozen v1 verifier honoring the deferred-stamp design: a delta write may
 /// commit the head-canonical DDL inside its own transaction and leave the
 /// ledger at v1 until head state actually exists, so a v1 file legally
-/// carries either the plain two-table v1 catalog or the complete current DDL.
+/// carries either the plain two-table v1 catalog or the frozen v2 DDL.
 fn verify_released_v1_continuity_schema(conn: &rusqlite::Connection) -> Result<(), String> {
     meerkat_sqlite::verify_released_schema_fingerprint(
         conn,
@@ -224,8 +339,8 @@ fn verify_released_v1_continuity_schema(conn: &rusqlite::Connection) -> Result<(
         meerkat_sqlite::verify_released_schema_fingerprint(
             conn,
             &MOBKIT_CONTINUITY_DOMAIN,
-            CONTINUITY_OWNED_OBJECTS,
-            initialize_current_continuity_schema,
+            RELEASED_V2_CONTINUITY_OBJECTS,
+            initialize_released_v2_continuity_schema,
         )
         .map_err(|full| {
             format!("v1 catalog: {plain}; v1 + deferred head-canonical DDL catalog: {full}")
@@ -256,6 +371,33 @@ const MOBKIT_CONTINUITY_BASELINE_DOMAIN: meerkat_sqlite::SchemaDomain =
         retired_objects: &[],
     };
 
+/// Head-only operator migration. Its released v2 target never installs
+/// optional identity history or pays the v3 downgrade barrier.
+const MOBKIT_CONTINUITY_HEAD_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDomain {
+    name: "mobkit-continuity",
+    migrations: &[
+        meerkat_sqlite::Migration {
+            version: 1,
+            name: "base-schema",
+            apply: migration_0001_continuity_schema,
+        },
+        meerkat_sqlite::Migration {
+            version: 2,
+            name: "head-canonical-sessions",
+            apply: migration_0002_head_canonical_sessions,
+        },
+    ],
+    initialize_current: initialize_released_v2_continuity_schema,
+    allowed_existing_versions: &[1, 2],
+    bridge_recoverable_versions: &[],
+    released_predecessors: &[meerkat_sqlite::SchemaPredecessor {
+        version: 1,
+        verify: verify_released_v1_continuity_schema,
+    }],
+    owned_objects: RELEASED_V2_CONTINUITY_OBJECTS,
+    retired_objects: &[],
+};
+
 fn migration_0001_continuity_schema(tx: &rusqlite::Transaction<'_>) -> Result<(), rusqlite::Error> {
     tx.execute_batch(SCHEMA)
 }
@@ -264,6 +406,62 @@ fn migration_0002_head_canonical_sessions(
     tx: &rusqlite::Transaction<'_>,
 ) -> Result<(), rusqlite::Error> {
     tx.execute_batch(SCHEMA_HEAD_CANONICAL)
+}
+
+/// The history is owned by the continuity domain: every trigger target
+/// exists in its empty-database oracle. Backfill and the v3 compatibility
+/// barrier commit together, or both roll back on conflicting exact bindings.
+/// An outer UPSERT can override a trigger's OR IGNORE conflict policy. Skip
+/// only an existing exact pair before inserting instead; a different owner
+/// still reaches the immutable-binding trigger and aborts the outer write.
+fn migration_0003_identity_history(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    tx.execute_batch(
+        "CREATE TABLE continuity_identity_history(session_id TEXT PRIMARY KEY, identity TEXT NOT NULL);
+         CREATE INDEX continuity_identity_history_identity_idx ON continuity_identity_history(identity);
+         CREATE TABLE continuity_identity_coverage(mob_id TEXT PRIMARY KEY, after_cursor INTEGER NOT NULL);
+         CREATE TRIGGER continuity_identity_history_immutable BEFORE INSERT ON continuity_identity_history
+         WHEN EXISTS(SELECT 1 FROM continuity_identity_history WHERE session_id=NEW.session_id AND identity<>NEW.identity)
+         BEGIN SELECT RAISE(ABORT, 'conflicting historical identity binding'); END;
+         CREATE TRIGGER continuity_identity_history_insert AFTER INSERT ON continuity_records
+         BEGIN
+             INSERT INTO continuity_identity_history(session_id,identity)
+             SELECT NEW.session_id,NEW.identity
+             WHERE NOT EXISTS(SELECT 1 FROM continuity_identity_history WHERE session_id=NEW.session_id AND identity=NEW.identity);
+         END;
+         CREATE TRIGGER continuity_identity_history_update AFTER UPDATE OF session_id,identity ON continuity_records
+         BEGIN
+             INSERT INTO continuity_identity_history(session_id,identity)
+             SELECT NEW.session_id,NEW.identity
+             WHERE NOT EXISTS(SELECT 1 FROM continuity_identity_history WHERE session_id=NEW.session_id AND identity=NEW.identity);
+         END;
+         CREATE TRIGGER continuity_identity_snapshot_insert AFTER INSERT ON session_snapshots
+         BEGIN
+             INSERT INTO continuity_identity_history(session_id,identity)
+             SELECT NEW.session_id,NEW.identity
+             WHERE NOT EXISTS(SELECT 1 FROM continuity_identity_history WHERE session_id=NEW.session_id AND identity=NEW.identity);
+         END;
+         CREATE TRIGGER continuity_identity_snapshot_update AFTER UPDATE OF session_id,identity ON session_snapshots
+         BEGIN
+             INSERT INTO continuity_identity_history(session_id,identity)
+             SELECT NEW.session_id,NEW.identity
+             WHERE NOT EXISTS(SELECT 1 FROM continuity_identity_history WHERE session_id=NEW.session_id AND identity=NEW.identity);
+         END;
+         CREATE TRIGGER continuity_identity_head_insert AFTER INSERT ON continuity_session_heads
+         BEGIN
+             INSERT INTO continuity_identity_history(session_id,identity)
+             SELECT NEW.session_id,NEW.identity
+             WHERE NOT EXISTS(SELECT 1 FROM continuity_identity_history WHERE session_id=NEW.session_id AND identity=NEW.identity);
+         END;
+         CREATE TRIGGER continuity_identity_head_update AFTER UPDATE OF session_id,identity ON continuity_session_heads
+         BEGIN
+             INSERT INTO continuity_identity_history(session_id,identity)
+             SELECT NEW.session_id,NEW.identity
+             WHERE NOT EXISTS(SELECT 1 FROM continuity_identity_history WHERE session_id=NEW.session_id AND identity=NEW.identity);
+         END;
+         INSERT OR IGNORE INTO continuity_identity_history(session_id,identity) SELECT session_id,identity FROM continuity_records;
+         INSERT OR IGNORE INTO continuity_identity_history(session_id,identity) SELECT session_id,identity FROM session_snapshots;
+         INSERT OR IGNORE INTO continuity_identity_history(session_id,identity) SELECT session_id,identity FROM continuity_session_heads;",
+    )
 }
 
 /// Refuse a file whose `mobkit-continuity` ledger is ahead of this binary.
@@ -303,6 +501,11 @@ fn converge_schema_at_open(conn: &mut Connection) -> Result<bool, ContinuityStor
     let version = meerkat_sqlite::domain_version(conn, MOBKIT_CONTINUITY_DOMAIN.name)
         .map_err(|e| mechanics_err("read continuity ledger", e))?;
     match version {
+        Some(version) if version >= IDENTITY_HISTORY_SCHEMA_VERSION => {
+            meerkat_sqlite::preflight_schema_eligibility(conn, &MOBKIT_CONTINUITY_DOMAIN)
+                .map_err(|e| mechanics_err("identity history schema preflight", e))?;
+            Ok(true)
+        }
         Some(version) if version >= HEAD_CANONICAL_SCHEMA_VERSION => Ok(true),
         Some(_) => Ok(false),
         None => {
@@ -342,7 +545,9 @@ fn converge_head_canonical_schema_in_txn(tx: &Transaction<'_>) -> Result<(), Con
     for migration in MOBKIT_CONTINUITY_DOMAIN
         .migrations
         .iter()
-        .filter(|migration| migration.version > current)
+        .filter(|migration| {
+            migration.version > current && migration.version <= HEAD_CANONICAL_SCHEMA_VERSION
+        })
     {
         (migration.apply)(tx).map_err(|e| sqlite_err("apply head-canonical schema", e))?;
     }
@@ -395,16 +600,12 @@ fn session_head_exists_in_txn(
 /// refused the file.
 ///
 /// Written last, so it commits atomically with the head state that earns
-/// it. A no-op stamp (file already at v2) is harmless: the row already
-/// carries this value.
+/// it. It must never downgrade an explicitly enabled v3 history database.
 fn stamp_head_canonical_ledger_in_txn(tx: &Transaction<'_>) -> Result<(), ContinuityStoreError> {
     tx.execute(
         "INSERT INTO main.meerkat_schema (domain, version) VALUES (?1, ?2)
-         ON CONFLICT(domain) DO UPDATE SET version = excluded.version",
-        rusqlite::params![
-            MOBKIT_CONTINUITY_DOMAIN.name,
-            MOBKIT_CONTINUITY_DOMAIN.supported_version()
-        ],
+         ON CONFLICT(domain) DO UPDATE SET version = MAX(meerkat_schema.version, excluded.version)",
+        rusqlite::params![MOBKIT_CONTINUITY_DOMAIN.name, HEAD_CANONICAL_SCHEMA_VERSION],
     )
     .map_err(|e| sqlite_err("stamp head-canonical ledger", e))?;
     Ok(())
@@ -421,7 +622,13 @@ fn stamp_head_canonical_ledger_in_txn(tx: &Transaction<'_>) -> Result<(), Contin
 pub(crate) fn apply_head_canonical_schema(
     conn: &mut Connection,
 ) -> Result<meerkat_sqlite::LedgerReport, meerkat_sqlite::SqliteStoreError> {
-    meerkat_sqlite::apply_domain_migrations(conn, &MOBKIT_CONTINUITY_DOMAIN)
+    let version = meerkat_sqlite::domain_version(conn, MOBKIT_CONTINUITY_DOMAIN.name)?;
+    let domain = if version.is_some_and(|version| version >= IDENTITY_HISTORY_SCHEMA_VERSION) {
+        &MOBKIT_CONTINUITY_DOMAIN
+    } else {
+        &MOBKIT_CONTINUITY_HEAD_DOMAIN
+    };
+    meerkat_sqlite::apply_domain_migrations(conn, domain)
 }
 
 /// Classify a raw SQLite failure at the store boundary: busy/locked is
@@ -2237,6 +2444,93 @@ fn delete_head_canonical_rows_in_txn(
 
 #[async_trait]
 impl ContinuityStore for LocalContinuityStore {
+    #[cfg(feature = "extension-state")]
+    async fn establish_identity_history_coverage(
+        &self,
+        mob: &str,
+        cursor: u64,
+    ) -> Result<(), ContinuityStoreError> {
+        let mob = mob.to_string();
+        self.run_blocking("identity history coverage", move |inner| inner.with_writer(|connection| {
+            connection.execute("INSERT OR IGNORE INTO continuity_identity_coverage(mob_id,after_cursor) VALUES(?1,?2)", rusqlite::params![mob, cursor]).map_err(|e| sqlite_err("coverage anchor", e))?;
+            Ok(())
+        })).await
+    }
+
+    #[cfg(feature = "extension-state")]
+    async fn identity_history_covers_birth(
+        &self,
+        mob: &str,
+        birth_cursor: u64,
+    ) -> Result<bool, ContinuityStoreError> {
+        let mob = mob.to_string();
+        self.run_blocking("identity history covers birth", move |inner| {
+            inner.with_reader(|connection| {
+                let anchor: Option<u64> = connection
+                    .query_row(
+                        "SELECT after_cursor FROM continuity_identity_coverage WHERE mob_id=?1",
+                        [mob],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| sqlite_err("coverage read", e))?;
+                Ok(anchor.is_some_and(|cursor| birth_cursor > cursor))
+            })
+        })
+        .await
+    }
+    #[cfg(feature = "extension-state")]
+    async fn enable_identity_binding_history(&self) -> Result<(), ContinuityStoreError> {
+        self.run_blocking("identity binding history", |inner| {
+            inner.with_writer(|connection| {
+                meerkat_sqlite::apply_domain_migrations(connection, &MOBKIT_CONTINUITY_DOMAIN)
+                    .map_err(|e| mechanics_err("identity history schema", e))?;
+                inner.head_canonical_schema.store(true, Ordering::Release);
+                inner.head_canonical_ledger.store(true, Ordering::Release);
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    #[cfg(feature = "extension-state")]
+    async fn has_historical_identity(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<bool, ContinuityStoreError> {
+        let identity = identity.to_string();
+        self.run_blocking("historical identity intent", move |inner| inner.with_reader(|connection| {
+            connection.query_row("SELECT EXISTS(SELECT 1 FROM continuity_identity_history WHERE identity=?1)", [identity], |row| row.get(0))
+                .map_err(|e| sqlite_err("identity intent history", e))
+        })).await
+    }
+
+    #[cfg(feature = "extension-state")]
+    async fn historical_identity_binding(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> Result<Option<AgentIdentity>, ContinuityStoreError> {
+        let id = session_id.to_string();
+        self.run_blocking("historical identity binding", move |inner| {
+            inner.with_reader(|connection| {
+                let identity: Option<String> = connection
+                    .query_row(
+                        "SELECT identity FROM continuity_identity_history WHERE session_id=?1",
+                        [id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| sqlite_err("identity history read", e))?;
+                identity
+                    .map(|identity| {
+                        AgentIdentity::parse(&identity)
+                            .map_err(|e| ContinuityStoreError::Corruption(e.to_string()))
+                    })
+                    .transpose()
+            })
+        })
+        .await
+    }
     async fn resolve_many(
         &self,
         identities: &[AgentIdentity],
@@ -3690,6 +3984,473 @@ impl ContinuityIncrementalSessions for LocalContinuityStore {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extension_history_schema_is_self_contained_and_refuses_old_writers() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        meerkat_sqlite::apply_domain_migrations(&mut connection, &MOBKIT_CONTINUITY_DOMAIN)
+            .unwrap();
+        assert_eq!(
+            meerkat_sqlite::domain_version(&connection, MOBKIT_CONTINUITY_DOMAIN.name).unwrap(),
+            Some(IDENTITY_HISTORY_SCHEMA_VERSION)
+        );
+        assert!(matches!(
+            meerkat_sqlite::preflight_schema_eligibility(
+                &connection,
+                &MOBKIT_CONTINUITY_HEAD_DOMAIN
+            ),
+            Err(meerkat_sqlite::SqliteStoreError::SchemaFromTheFuture {
+                found: 3,
+                supported: 2,
+                ..
+            })
+        ));
+        let tx = connection.transaction().unwrap();
+        stamp_head_canonical_ledger_in_txn(&tx).unwrap();
+        tx.commit().unwrap();
+        assert!(
+            !apply_head_canonical_schema(&mut connection)
+                .unwrap()
+                .migrated()
+        );
+        assert_eq!(
+            meerkat_sqlite::domain_version(&connection, MOBKIT_CONTINUITY_DOMAIN.name).unwrap(),
+            Some(IDENTITY_HISTORY_SCHEMA_VERSION)
+        );
+    }
+
+    #[tokio::test]
+    async fn extension_history_opt_in_preserves_released_schema_boundaries() {
+        // The middle case is v1 with legitimately deferred v2 DDL.
+        for (version, deferred_heads) in [(1, false), (1, true), (2, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("continuity.sqlite3");
+            let store = LocalContinuityStore::open(&path).unwrap();
+            let identity = AgentIdentity::parse("existing-owner").unwrap();
+            let session = meerkat_core::SessionId::new();
+            store
+                .upsert_continuity_record(&record(&identity, &session), FencingToken::new(1))
+                .await
+                .unwrap();
+            let mut connection = Connection::open(&path).unwrap();
+            if version == 2 {
+                apply_head_canonical_schema(&mut connection).unwrap();
+            } else if deferred_heads {
+                let tx = connection.transaction().unwrap();
+                converge_head_canonical_schema_in_txn(&tx).unwrap();
+                tx.commit().unwrap();
+            }
+            drop(store);
+            let _reopened = LocalContinuityStore::open(&path).unwrap();
+            assert_eq!(continuity_domain_version(&path), Some(version));
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'continuity_identity_%'",
+                        [],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .unwrap(),
+                0,
+                "opening or head-only migration must not opt into history"
+            );
+            meerkat_sqlite::apply_domain_migrations(&mut connection, &MOBKIT_CONTINUITY_DOMAIN)
+                .unwrap();
+            assert_eq!(continuity_domain_version(&path), Some(3));
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT identity FROM continuity_identity_history WHERE session_id=?1",
+                        [session.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                identity.as_str()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn extension_history_conflicting_backfill_rolls_back_ddl_and_stamp() {
+        for version in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("continuity.sqlite3");
+            let store = LocalContinuityStore::open(&path).unwrap();
+            let session = meerkat_core::SessionId::new();
+            for name in ["first-owner", "conflicting-owner"] {
+                let identity = AgentIdentity::parse(name).unwrap();
+                store
+                    .upsert_continuity_record(&record(&identity, &session), FencingToken::new(1))
+                    .await
+                    .unwrap();
+            }
+            let mut connection = Connection::open(&path).unwrap();
+            if version == 2 {
+                apply_head_canonical_schema(&mut connection).unwrap();
+            }
+            assert!(
+                meerkat_sqlite::apply_domain_migrations(&mut connection, &MOBKIT_CONTINUITY_DOMAIN)
+                    .is_err()
+            );
+            assert_eq!(continuity_domain_version(&path), Some(version));
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'continuity_identity_%'",
+                        [],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+            if version == 1 {
+                verify_released_v1_continuity_schema(&connection).unwrap();
+            } else {
+                verify_released_v2_continuity_schema(&connection).unwrap();
+            }
+            assert_eq!(
+                connection
+                    .query_row("SELECT COUNT(*) FROM continuity_records", [], |row| {
+                        row.get::<_, usize>(0)
+                    })
+                    .unwrap(),
+                2
+            );
+        }
+    }
+
+    // Unconditional test: feature-off binaries also understand the opted-in
+    // schema and preserve history without constructing extension factories.
+    #[tokio::test]
+    async fn extension_history_retains_disabled_writes_and_rollback_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("continuity.sqlite3");
+        let store = LocalContinuityStore::open(&path).unwrap();
+        let identity = AgentIdentity::parse("retained-owner").unwrap();
+        let original = meerkat_core::SessionId::new();
+        let attempted = meerkat_core::SessionId::new();
+        let snapshot_only = meerkat_core::SessionId::new();
+        let previous = record(&identity, &original);
+        store
+            .upsert_continuity_record(&previous, FencingToken::new(1))
+            .await
+            .unwrap();
+        {
+            let mut connection = Connection::open(&path).unwrap();
+            meerkat_sqlite::apply_domain_migrations(&mut connection, &MOBKIT_CONTINUITY_DOMAIN)
+                .unwrap();
+        }
+        // This writer was opened before another connection opted in.
+        let mut provisional = record(&identity, &attempted);
+        provisional.generation = ContinuityGeneration::new(1);
+        store
+            .upsert_continuity_record(&provisional, FencingToken::new(2))
+            .await
+            .unwrap();
+        store
+            .rollback_continuity_record(&provisional, Some(&previous), FencingToken::new(2))
+            .await
+            .unwrap();
+        store
+            .delete_continuity_record(&identity, FencingToken::new(2))
+            .await
+            .unwrap();
+        drop(store);
+        let reopened = LocalContinuityStore::open(&path).unwrap();
+        reopened
+            .save_session_snapshot(
+                &identity,
+                &snapshot_only,
+                ContinuityGeneration::new(0),
+                CheckpointVersion::new(1),
+                FencingToken::new(3),
+                &SessionSnapshot { data: vec![1] },
+            )
+            .await
+            .unwrap();
+        let head_session = Session::new();
+        let head = SessionHead::from_session(&head_session, TranscriptStrandId::root(), 0).unwrap();
+        reopened
+            .as_incremental_sessions()
+            .unwrap()
+            .save_head(&cursor(&identity, 0, 1, 3), &head, SessionHeadCas::Create)
+            .await
+            .unwrap();
+        reopened
+            .delete_continuity_record(&identity, FencingToken::new(3))
+            .await
+            .unwrap();
+        let connection = Connection::open(&path).unwrap();
+        for session in [&original, &attempted, &snapshot_only, head_session.id()] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT identity FROM continuity_identity_history WHERE session_id=?1",
+                        [session.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                identity.as_str()
+            );
+        }
+        assert_eq!(continuity_domain_version(&path), Some(3));
+    }
+
+    #[test]
+    fn extension_history_reopen_refuses_missing_retention_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("continuity.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        meerkat_sqlite::apply_domain_migrations(&mut connection, &MOBKIT_CONTINUITY_DOMAIN)
+            .unwrap();
+        connection
+            .execute_batch("DROP TRIGGER continuity_identity_history_insert")
+            .unwrap();
+        assert!(LocalContinuityStore::open(&path).is_err());
+    }
+
+    #[test]
+    fn extension_history_trigger_retries_and_conflicts_under_outer_upsert() {
+        // Exercise both INSERT and UPDATE triggers on each producer. In
+        // particular, an outer DO UPDATE overrides an inner OR IGNORE, so
+        // duplicate history must be skipped without invoking a constraint.
+        for (table, upsert) in [
+            (
+                "continuity_records",
+                "INSERT INTO continuity_records(session_id,identity,agent_runtime_id,generation,checkpoint_version,fencing_token)
+                 VALUES(?1,?2,'runtime',0,1,1)
+                 ON CONFLICT(identity) DO UPDATE SET session_id=excluded.session_id,identity=excluded.identity,checkpoint_version=excluded.checkpoint_version",
+            ),
+            (
+                "session_snapshots",
+                "INSERT INTO session_snapshots(session_id,identity,generation,checkpoint_version,fencing_token,data)
+                 VALUES(?1,?2,0,1,1,X'00')
+                 ON CONFLICT(session_id) DO UPDATE SET session_id=excluded.session_id,identity=excluded.identity,checkpoint_version=excluded.checkpoint_version",
+            ),
+            (
+                "continuity_session_heads",
+                "INSERT INTO continuity_session_heads(session_id,identity,generation,checkpoint_version,fencing_token,head_revision,message_count,rewrite_count,head_json,cas_token)
+                 VALUES(?1,?2,0,1,1,'revision',0,0,X'00','token')
+                 ON CONFLICT(session_id) DO UPDATE SET session_id=excluded.session_id,identity=excluded.identity,checkpoint_version=excluded.checkpoint_version",
+            ),
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            meerkat_sqlite::apply_domain_migrations(&mut connection, &MOBKIT_CONTINUITY_DOMAIN)
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO continuity_identity_history(session_id,identity) VALUES('first','owner'),('reserved','reserved-owner')",
+                    [],
+                )
+                .unwrap();
+            // Identical retained binding, first through AFTER INSERT and
+            // then through AFTER UPDATE, must be idempotent.
+            for _ in 0..2 {
+                connection.execute(upsert, ["first", "owner"]).unwrap();
+            }
+            let read_producer = || {
+                connection
+                    .prepare(&format!(
+                        "SELECT session_id,identity,checkpoint_version FROM {table} ORDER BY session_id"
+                    ))
+                    .unwrap()
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, u64>(2)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            let expected = vec![("first".to_owned(), "owner".to_owned(), 1)];
+            assert_eq!(read_producer(), expected);
+            let conflicting_update = if table == "continuity_records" {
+                ["reserved", "owner"]
+            } else {
+                ["first", "update-impostor"]
+            };
+            for binding in [["reserved", "insert-impostor"], conflicting_update] {
+                let error = connection.execute(upsert, binding).unwrap_err();
+                assert_eq!(
+                    error.sqlite_error().unwrap().extended_code,
+                    rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER,
+                    "{table}: {error}"
+                );
+                assert_eq!(read_producer(), expected, "{table} rolled back");
+            }
+            assert_eq!(
+                connection
+                    .prepare("SELECT session_id,identity FROM continuity_identity_history ORDER BY session_id")
+                    .unwrap()
+                    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                vec![("first".into(), "owner".into()), ("reserved".into(), "reserved-owner".into())]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn extension_history_record_retry_and_session_revisit_are_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("continuity.sqlite3");
+        let store = LocalContinuityStore::open(&path).unwrap();
+        let identity = AgentIdentity::parse("retry-owner").unwrap();
+        let original = meerkat_core::SessionId::new();
+        let successor = meerkat_core::SessionId::new();
+        let token = FencingToken::new(1);
+        {
+            let mut connection = Connection::open(&path).unwrap();
+            meerkat_sqlite::apply_domain_migrations(&mut connection, &MOBKIT_CONTINUITY_DOMAIN)
+                .unwrap();
+        }
+        for session in [&original, &original, &successor, &successor, &original] {
+            store
+                .upsert_continuity_record(&record(&identity, session), token)
+                .await
+                .unwrap();
+        }
+        drop(store);
+        let reopened = LocalContinuityStore::open(&path).unwrap();
+        reopened
+            .upsert_continuity_record(&record(&identity, &original), token)
+            .await
+            .unwrap();
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM continuity_identity_history",
+                    [],
+                    |row| row.get::<_, u64>(0)
+                )
+                .unwrap(),
+            2
+        );
+    }
+
+    #[cfg(feature = "extension-state")]
+    #[tokio::test]
+    async fn extension_history_survives_rotation_deletion_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("continuity.sqlite3");
+        let store = LocalContinuityStore::open(&path).unwrap();
+        let identity = AgentIdentity::parse("writer").unwrap();
+        let original = meerkat_core::SessionId::new();
+        let successor = meerkat_core::SessionId::new();
+        let token = FencingToken::new(1);
+        store
+            .upsert_continuity_record(&record(&identity, &original), token)
+            .await
+            .unwrap();
+        store.enable_identity_binding_history().await.unwrap();
+        assert_eq!(
+            store.historical_identity_binding(&original).await.unwrap(),
+            Some(identity.clone())
+        );
+        store
+            .establish_identity_history_coverage("mob", 10)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .identity_history_covers_birth("mob", 10)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .identity_history_covers_birth("mob", 11)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .identity_history_covers_birth("unknown-mob", 11)
+                .await
+                .unwrap()
+        );
+        store
+            .upsert_continuity_record(&record(&identity, &successor), token)
+            .await
+            .unwrap();
+        store
+            .delete_continuity_record(&identity, token)
+            .await
+            .unwrap();
+        drop(store);
+        let reopened = LocalContinuityStore::open(&path).unwrap();
+        reopened.enable_identity_binding_history().await.unwrap();
+        assert!(reopened.has_historical_identity(&identity).await.unwrap());
+        assert!(
+            !reopened
+                .has_historical_identity(&AgentIdentity::parse("never-declared").unwrap())
+                .await
+                .unwrap()
+        );
+        reopened
+            .establish_identity_history_coverage("mob", 99)
+            .await
+            .unwrap();
+        for session in [original, successor] {
+            assert_eq!(
+                reopened
+                    .historical_identity_binding(&session)
+                    .await
+                    .unwrap(),
+                Some(identity.clone())
+            );
+        }
+        assert!(
+            reopened
+                .identity_history_covers_birth("mob", 11)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[cfg(feature = "extension-state")]
+    #[tokio::test]
+    async fn extension_history_refuses_exact_session_identity_borrowing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("continuity.sqlite3");
+        let store = LocalContinuityStore::open(&path).unwrap();
+        store.enable_identity_binding_history().await.unwrap();
+        let original = AgentIdentity::parse("original").unwrap();
+        let impostor = AgentIdentity::parse("impostor").unwrap();
+        let session = meerkat_core::SessionId::new();
+        let token = FencingToken::new(1);
+        store
+            .upsert_continuity_record(&record(&original, &session), token)
+            .await
+            .unwrap();
+        store
+            .delete_continuity_record(&original, token)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .upsert_continuity_record(&record(&impostor, &session), token)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.historical_identity_binding(&session).await.unwrap(),
+            Some(original)
+        );
+        assert!(matches!(
+            store
+                .resolve_many(&[impostor.clone()])
+                .await
+                .unwrap()
+                .get(&impostor),
+            Some(ContinuityResolveState::Uninitialized)
+        ));
+    }
 
     fn record(
         identity: &AgentIdentity,

@@ -18,6 +18,7 @@ SPEC.loader.exec_module(registries)
 
 ARTIFACTS = {
     "https://crates.example/meerkat-mobkit-0.8.0.crate": b"crate archive",
+    "https://crates.example/mobkit-extension-state-0.8.0.crate": b"extension crate archive",
     "https://files.example/meerkat_mobkit-0.8.0-py3-none-any.whl": b"wheel",
     "https://files.example/meerkat_mobkit-0.8.0.tar.gz": b"sdist",
     "https://npm.example/rkat-mobkit-sdk-0.8.0.tgz": b"npm tarball",
@@ -30,10 +31,11 @@ def artifact_digest(url: str, algorithm: str) -> str:
 
 def exact_payload(url: str) -> dict:
     if "crates.io" in url:
-        artifact = "https://crates.example/meerkat-mobkit-0.8.0.crate"
+        crate = "mobkit-extension-state" if "mobkit-extension-state" in url else "meerkat-mobkit"
+        artifact = f"https://crates.example/{crate}-0.8.0.crate"
         return {
             "version": {
-                "crate": "meerkat-mobkit",
+                "crate": crate,
                 "num": "0.8.0",
                 "yanked": False,
                 "dl_path": artifact,
@@ -146,7 +148,7 @@ class PublishedRegistryTests(unittest.TestCase):
 
         def propagating(url: str) -> dict:
             nonlocal calls
-            attempt = calls // 3
+            attempt = calls // 4
             calls += 1
             payload = exact_payload(url)
             if attempt == 0 and "pypi.org" in url:
@@ -162,7 +164,7 @@ class PublishedRegistryTests(unittest.TestCase):
             sleeper=sleeps.append,
         )
 
-        self.assertEqual(calls, 6)
+        self.assertEqual(calls, 8)
         self.assertEqual(sleeps, [0.25])
 
     def test_retry_exhaustion_fails_the_release(self):

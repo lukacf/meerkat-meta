@@ -7362,6 +7362,25 @@ impl IdentityRuntime {
             self.publish_customizer_tools(identity, &mut draft).await;
         }
 
+        #[cfg(feature = "extension-state")]
+        let extension_publication = match self
+            .bridge
+            .as_ref()
+            .map(|bridge| bridge.begin_extension_identity_publication(identity))
+            .transpose()
+        {
+            Ok(publication) => publication.flatten(),
+            Err(error) => {
+                let cleanup = self.release_uninstalled_materialize_lease(&grant).await;
+                return Err(IdentityRuntimeError::Internal(format!(
+                    "identity publication preparation: {error}{}",
+                    cleanup
+                        .map(|error| format!("; lease cleanup failed: {error}"))
+                        .unwrap_or_default()
+                )));
+            }
+        };
+
         let mut abandoned_session_registrations: Vec<SessionId> = Vec::new();
         let mut resumed = false;
         let mut record = if let Some(mut record) = continuity {
@@ -7964,6 +7983,10 @@ impl IdentityRuntime {
         )
         .await;
         self.clear_materialization_backoff(identity).await;
+        #[cfg(feature = "extension-state")]
+        if let Some(publication) = extension_publication {
+            publication.publish();
+        }
         Ok(EmbodimentOutcome {
             already_active: false,
             record,
@@ -13015,6 +13038,23 @@ impl IdentityRuntime {
             }
         }
 
+        #[cfg(feature = "extension-state")]
+        let extension_publication = match self
+            .bridge
+            .as_ref()
+            .map(|bridge| bridge.begin_extension_identity_publication(identity))
+            .transpose()
+        {
+            Ok(publication) => publication.flatten(),
+            Err(error) => {
+                self.restore_entry_with_grant(identity, registered_entry, &grant)
+                    .await;
+                return Err(IdentityRuntimeError::Internal(format!(
+                    "identity publication preparation: {error}"
+                )));
+            }
+        };
+
         // Bridge: ONE authoritative successor transition. This used to retire the
         // old mob member and then create a fresh one, which the durable-roster
         // contract makes impossible - the successor occupies the same roster row,
@@ -13395,6 +13435,10 @@ impl IdentityRuntime {
                 "reset old bridge cleanup debt recorded after continuity commit",
             );
             self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Active, None);
+            #[cfg(feature = "extension-state")]
+            if let Some(publication) = extension_publication {
+                publication.publish();
+            }
             return Ok(new_record);
         }
 

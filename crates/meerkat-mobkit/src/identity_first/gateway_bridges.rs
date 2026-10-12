@@ -77,6 +77,15 @@ impl GatewayContinuityStore {
 
 #[async_trait]
 impl ContinuityStore for GatewayContinuityStore {
+    // The SDK callback protocol has no retained-history/coverage contract.
+    // Refuse extension activation explicitly, before any member can execute.
+    #[cfg(feature = "extension-state")]
+    async fn enable_identity_binding_history(&self) -> Result<(), ContinuityStoreError> {
+        Err(ContinuityStoreError::UnsupportedAuthority {
+            capability: "SDK-hosted identity binding history",
+        })
+    }
+
     async fn resolve_many(
         &self,
         identities: &[AgentIdentity],
@@ -783,6 +792,20 @@ mod tests {
     // -----------------------------------------------------------------------
     // REQ-34: Structured RPC — error propagation
     // -----------------------------------------------------------------------
+
+    #[cfg(feature = "extension-state")]
+    #[tokio::test]
+    async fn extension_gateway_continuity_refuses_unimplemented_history_without_callbacks() {
+        let mock = Arc::new(MockBridge::new());
+        let store = GatewayContinuityStore::new(mock.clone());
+        assert!(matches!(
+            store.enable_identity_binding_history().await,
+            Err(ContinuityStoreError::UnsupportedAuthority {
+                capability: "SDK-hosted identity binding history"
+            })
+        ));
+        assert_eq!(mock.call_count().await, 0);
+    }
 
     #[tokio::test]
     async fn continuity_session_owner_callback_preserves_exact_session_and_errors() {

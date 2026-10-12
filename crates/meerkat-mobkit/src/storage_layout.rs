@@ -96,11 +96,13 @@ pub enum DatabaseSlot {
     AgentMemory,
     EventLog,
     Council,
+    #[cfg(feature = "extension-state")]
+    ExtensionState,
 }
 
 impl DatabaseSlot {
     /// Every slot, in the order the layout summary reports them.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 10 + cfg!(feature = "extension-state") as usize] = [
         Self::Sessions,
         Self::Runtime,
         Self::Schedule,
@@ -111,6 +113,8 @@ impl DatabaseSlot {
         Self::AgentMemory,
         Self::EventLog,
         Self::Council,
+        #[cfg(feature = "extension-state")]
+        Self::ExtensionState,
     ];
 
     /// The canonical file (or directory) name for this slot.
@@ -126,6 +130,8 @@ impl DatabaseSlot {
             Self::AgentMemory => CANONICAL_AGENT_MEMORY_DIR_NAME,
             Self::EventLog => EVENT_LOG_DB_FILE_NAME,
             Self::Council => COUNCIL_STORE_FILE,
+            #[cfg(feature = "extension-state")]
+            Self::ExtensionState => "extension_state.sqlite3",
         }
     }
 
@@ -137,6 +143,8 @@ impl DatabaseSlot {
             Self::Metadata => &["mobkit_metadata.sqlite"],
             Self::Console => &["mobkit_console.sqlite"],
             Self::AgentMemory => &["agent-memory-sqlite"],
+            #[cfg(feature = "extension-state")]
+            Self::ExtensionState => &[],
             Self::Runtime | Self::Schedule | Self::Workgraph | Self::EventLog | Self::Council => {
                 &[]
             }
@@ -157,6 +165,8 @@ impl Display for DatabaseSlot {
             Self::AgentMemory => "agent-memory",
             Self::EventLog => "event-log",
             Self::Council => "council",
+            #[cfg(feature = "extension-state")]
+            Self::ExtensionState => "extension-state",
         };
         f.write_str(name)
     }
@@ -450,6 +460,11 @@ impl MobKitStorageLayout {
     /// existing as a durable file nothing here enumerates.
     pub fn council_db(&self) -> PathBuf {
         self.state_dir.join(COUNCIL_STORE_FILE)
+    }
+
+    #[cfg(feature = "extension-state")]
+    pub fn extension_state_db(&self) -> Result<ResolvedDatabase, StorageLayoutError> {
+        self.resolve_database(DatabaseSlot::ExtensionState)
     }
 
     /// Canonical Meerkat-level detached-job database inherited by MobKit's

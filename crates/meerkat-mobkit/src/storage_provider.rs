@@ -108,6 +108,8 @@ pub struct MobKitRealmStoreSet {
 /// Typed failure opening or validating a realm's MobKit store set.
 #[derive(Debug)]
 pub enum MobKitStorageProviderError {
+    #[cfg(feature = "extension-state")]
+    Unsupported { capability: &'static str },
     /// A slot's backend failed to open.
     Open { slot: String, message: String },
     /// The fail-closed durability rule refused the set: a `Durable` slot
@@ -118,6 +120,10 @@ pub enum MobKitStorageProviderError {
 impl std::fmt::Display for MobKitStorageProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(feature = "extension-state")]
+            Self::Unsupported { capability } => {
+                write!(f, "storage provider does not support {capability}")
+            }
             Self::Open { slot, message } => {
                 write!(f, "failed to open the {slot} store: {message}")
             }
@@ -139,6 +145,17 @@ impl std::error::Error for MobKitStorageProviderError {}
 /// downstream backend implements.
 #[async_trait]
 pub trait MobKitStorageProvider: Send + Sync {
+    /// Optional durable document capability. It is opened only when a native
+    /// package explicitly declares this requirement; no local fallback exists.
+    #[cfg(feature = "extension-state")]
+    async fn open_extension_state(
+        &self,
+        _ctx: &MobKitRealmOpenContext,
+    ) -> Result<OpenedExtensionState, MobKitStorageProviderError> {
+        Err(MobKitStorageProviderError::Unsupported {
+            capability: "extension-state",
+        })
+    }
     /// Stable provider name (`"disk"` for the built-in implementation).
     fn name(&self) -> &str;
 
@@ -368,6 +385,33 @@ impl DiskMobKitStorageProvider {
 
 #[async_trait]
 impl MobKitStorageProvider for DiskMobKitStorageProvider {
+    #[cfg(feature = "extension-state")]
+    async fn open_extension_state(
+        &self,
+        ctx: &MobKitRealmOpenContext,
+    ) -> Result<OpenedExtensionState, MobKitStorageProviderError> {
+        if ctx.layout.is_declared_ephemeral() || ctx.is_declared_ephemeral("extension-state") {
+            return Err(MobKitStorageProviderError::DurabilityViolation {
+                domain: "extension-state (package requires persistent storage)".into(),
+            });
+        }
+        std::fs::create_dir_all(&ctx.state_dir)
+            .map_err(|e| Self::open_error("extension-state", e))?;
+        let path = ctx
+            .layout
+            .extension_state_db()
+            .map_err(|e| Self::open_error("extension-state", e))?
+            .path;
+        let store = crate::extension_state::open_disk_store(path)
+            .map_err(|e| Self::open_error("extension-state", e))?;
+        Ok(OpenedExtensionState {
+            store: Arc::new(store),
+            durability: DurabilityDeclaration::durable(
+                "extension-state",
+                DurabilityResolution::Persistent,
+            ),
+        })
+    }
     fn name(&self) -> &'static str {
         "disk"
     }
@@ -469,6 +513,12 @@ impl MobKitStorageProvider for DiskMobKitStorageProvider {
         static MIGRATOR: MobKitStorageMigrator = MobKitStorageMigrator;
         Some(&MIGRATOR)
     }
+}
+
+#[cfg(feature = "extension-state")]
+pub struct OpenedExtensionState {
+    pub store: Arc<dyn mobkit_extension_state::ExtensionDocumentStore>,
+    pub durability: DurabilityDeclaration,
 }
 
 #[cfg(test)]
