@@ -17,6 +17,7 @@ use crate::identity_first::{
     DurabilityPolicy, IdentityFirstRuntimeContext, IdentityRuntime, IdentityRuntimeConfig,
     LocalContinuityStore, LocalLeaseProvider, RosterContext, RosterProvider, TopologyProvider,
 };
+use crate::mob_composition_manifest::MobStorageProvenance;
 use crate::mob_handle_runtime::{
     CapabilityFlags, MobBootstrapOptions, MobBootstrapSpec, SessionHook,
 };
@@ -55,6 +56,7 @@ pub struct UnifiedRuntimeBuilder {
     // --- New convenience path ---
     definition_source: Option<DefinitionSource>,
     persistent_state_path: Option<PathBuf>,
+    mob_storage: Option<(MobStorage, MobStorageProvenance)>,
     /// Host-declared `rkat` scope for `SessionRepairRequired` commands.
     session_repair_scope: Option<crate::identity_first::SessionRepairScope>,
     /// Root `continuity_from_state_dir` opened — pinned in CANONICAL form at
@@ -69,6 +71,7 @@ pub struct UnifiedRuntimeBuilder {
     session_hook: Option<Arc<dyn SessionHook>>,
     custom_session_store: Option<Arc<dyn meerkat::SessionStore>>,
     meerkat_config: Option<meerkat::Config>,
+    mcp_call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
     /// Host-level compaction policy composed over `meerkat_config`'s
     /// compaction slot at spec-resolve time. Separate from `meerkat_config`
     /// so tuning compaction does not require an embedder to author a whole
@@ -112,6 +115,8 @@ pub struct UnifiedRuntimeBuilder {
             Arc<dyn crate::extension_state::ToolBundleFactory>,
         ),
     >,
+    #[cfg(feature = "extension-state")]
+    mcp_document_bindings: Vec<Arc<crate::extension_state::HostMcpDocumentBinding>>,
     #[cfg(feature = "extension-state")]
     extension_store: Option<crate::storage_provider::OpenedExtensionState>,
     agent_memory_engines: Option<crate::memory_wiring::MemoryEnginesConfig>,
@@ -189,10 +194,26 @@ impl UnifiedRuntimeBuilder {
     /// Enable persistent state at the given path. When set, the builder
     /// creates a `SqliteSessionStore`, runtime store, metadata store, console
     /// log store, and binary blob store under this directory. Mob storage stays
-    /// in-memory. When not set, the builder uses an ephemeral session service
-    /// with an auto-created temp directory.
+    /// in-memory unless supplied through [`mob_storage`](Self::mob_storage).
+    /// When not set, the builder uses an ephemeral session service with an
+    /// auto-created temp directory.
     pub fn persistent_state(mut self, path: impl Into<PathBuf>) -> Self {
         self.persistent_state_path = Some(path.into());
+        self
+    }
+
+    /// Supply the complete per-mob storage and its composition provenance for
+    /// builder-created session services. Use the pair returned by
+    /// [`crate::mob_composition_manifest::persistent_mob_storage`] to retain
+    /// the mob journal, identity state, and fork records across restarts.
+    ///
+    /// This slot is separate from the realm stores selected by
+    /// [`storage_provider`](Self::storage_provider) and does not change session
+    /// persistence. Without an override, mob storage remains in-memory. A
+    /// pre-built [`mob_spec`](Self::mob_spec) already owns this slot and cannot
+    /// be combined with this override.
+    pub fn mob_storage(mut self, storage: MobStorage, provenance: MobStorageProvenance) -> Self {
+        self.mob_storage = Some((storage, provenance));
         self
     }
 
@@ -459,6 +480,42 @@ impl UnifiedRuntimeBuilder {
         self.tool_bundle_factories
             .insert(name.into(), (requirements, factory));
         self
+    }
+
+    /// Install a process-local context provider on every builder-owned agent
+    /// factory. A supplied, already-erased mob_spec cannot accept this override.
+    pub fn mcp_call_context_provider(
+        mut self,
+        provider: Arc<dyn meerkat_mcp::McpCallContextProvider>,
+    ) -> Self {
+        self.mcp_call_context_provider = Some(provider);
+        self
+    }
+
+    /// Bind provider-owned documents to an external MCP host. Profiles select
+    /// the binding's public descriptor; no native tool bundle is installed.
+    #[cfg(feature = "extension-state")]
+    pub fn register_mcp_tool_bundle_factory(
+        mut self,
+        binding: crate::extension_state::HostMcpDocumentBinding,
+    ) -> Self {
+        self.mcp_document_bindings.push(Arc::new(binding));
+        self
+    }
+
+    fn effective_mcp_call_context_provider(
+        &self,
+    ) -> Option<Arc<dyn meerkat_mcp::McpCallContextProvider>> {
+        #[cfg(feature = "extension-state")]
+        if !self.mcp_document_bindings.is_empty() {
+            return Some(Arc::new(
+                crate::extension_state::mcp_binding::DocumentMcpContextProvider {
+                    bindings: self.mcp_document_bindings.clone(),
+                    fallback: self.mcp_call_context_provider.clone(),
+                },
+            ));
+        }
+        self.mcp_call_context_provider.clone()
     }
 
     /// Set the identity-first build customizer.
@@ -964,6 +1021,18 @@ impl UnifiedRuntimeBuilder {
     pub async fn build(mut self) -> Result<UnifiedRuntime, UnifiedRuntimeBuilderError> {
         // --- Identity-first builder validation ---
 
+        if self.mob_spec.is_some() && self.mob_storage.is_some() {
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                "mob_storage() and mob_spec() are mutually exclusive: the supplied spec already owns mob storage".into(),
+            ));
+        }
+
+        if self.mob_spec.is_some() && self.effective_mcp_call_context_provider().is_some() {
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                "MCP context provider and document bindings require builder-owned session services; mob_spec() is already erased".into(),
+            ));
+        }
+
         self.identity_bootstrap_mode
             .validate()
             .map_err(UnifiedRuntimeBuilderError::ConflictingConfiguration)?;
@@ -1087,7 +1156,7 @@ impl UnifiedRuntimeBuilder {
         }
 
         #[cfg(feature = "extension-state")]
-        if !self.tool_bundle_factories.is_empty()
+        if (!self.tool_bundle_factories.is_empty() || !self.mcp_document_bindings.is_empty())
             && wants_identity_first
             && self.continuity_store.is_none()
         {
@@ -1930,7 +1999,7 @@ impl UnifiedRuntimeBuilder {
             NativeAuthorityRegistry, NativeCallerResolver, ToolBundleContext,
         };
         use crate::storage_provider::MobKitStorageProvider;
-        if self.tool_bundle_factories.is_empty() {
+        if self.tool_bundle_factories.is_empty() && self.mcp_document_bindings.is_empty() {
             return Ok(None);
         }
         if let Some(continuity) = &self.continuity_store {
@@ -1979,10 +2048,13 @@ impl UnifiedRuntimeBuilder {
             self.access_controller.clone(),
         );
         let mut namespaces = std::collections::BTreeSet::new();
+        let mut document_tools = std::collections::BTreeSet::new();
         for (name, (requirements, factory)) in std::mem::take(&mut self.tool_bundle_factories) {
             if spec.tool_bundles.contains_key(&name)
                 || self.tool_bundles.contains_key(&name)
                 || !namespaces.insert(requirements.namespace.clone())
+                || !document_tools.insert(requirements.read_tool.clone())
+                || !document_tools.insert(requirements.edit_tool.clone())
             {
                 return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
                     format!("extension bundle or namespace registered more than once: {name}"),
@@ -1999,6 +2071,7 @@ impl UnifiedRuntimeBuilder {
             let resolver = Arc::new(NativeCallerResolver {
                 registry: Arc::downgrade(&registry),
                 requirements: requirements.clone(),
+                child_availability: None,
             });
             let dispatcher = factory
                 .build(ToolBundleContext {
@@ -2006,28 +2079,74 @@ impl UnifiedRuntimeBuilder {
                     caller_resolver: resolver,
                 })
                 .map_err(UnifiedRuntimeBuilderError::ConflictingConfiguration)?;
-            let names = dispatcher.tools();
-            if !names.iter().any(|tool| tool.name == requirements.read_tool)
-                || !names.iter().any(|tool| tool.name == requirements.edit_tool)
-                || dispatcher.tool_mutation_class(&requirements.read_tool)
-                    != meerkat_core::ToolMutationClass::ReadOnly
-                || dispatcher.tool_mutation_class(&requirements.edit_tool)
-                    != meerkat_core::ToolMutationClass::Mutating
-            {
-                return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
-                    format!(
-                        "extension bundle {name} must declare its read and edit tools accurately"
-                    ),
-                ));
-            }
+            crate::extension_state::mcp_binding::validate_document_dispatcher(
+                dispatcher.as_ref(),
+                &requirements,
+            )
+            .map_err(UnifiedRuntimeBuilderError::ConflictingConfiguration)?;
             spec.child_tool_bundle_availability.insert(
                 name.clone(),
                 meerkat_mob_mcp::ChildToolBundleAvailability::ChildAvailable,
             );
             spec.tool_bundles.insert(name, dispatcher);
         }
-        // Bootstrap installs this on the final agent mob-tool state, after
-        // composing its child policy and the bundles registered above.
+        let mut child_mcp_servers = meerkat_mob_mcp::ChildMcpServers::new();
+        let mut server_names = std::collections::BTreeSet::new();
+        for binding in &self.mcp_document_bindings {
+            let requirements = &binding.requirements;
+            if !server_names.insert(binding.public_config().name.clone())
+                || !namespaces.insert(requirements.namespace.clone())
+                || !document_tools.insert(requirements.read_tool.clone())
+                || !document_tools.insert(requirements.edit_tool.clone())
+                || spec
+                    .tool_bundles
+                    .values()
+                    .chain(self.tool_bundles.values().map(|(dispatcher, _)| dispatcher))
+                    .any(|dispatcher| {
+                        dispatcher.tools().iter().any(|tool| {
+                            tool.name == requirements.read_tool
+                                || tool.name == requirements.edit_tool
+                        })
+                    })
+            {
+                return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                    "document MCP server, namespace or tool registered more than once".into(),
+                ));
+            }
+            let documents = mobkit_extension_state::DocumentService::new(
+                crate::storage_provider::MEERKAT_LEVEL_REALM_ID,
+                requirements.namespace.clone(),
+                Arc::clone(&opened.store),
+            )
+            .map_err(|error| {
+                UnifiedRuntimeBuilderError::ConflictingConfiguration(error.to_string())
+            })?;
+            let resolver = Arc::new(NativeCallerResolver {
+                registry: Arc::downgrade(&registry),
+                requirements: requirements.clone(),
+                child_availability: Some(binding.child_availability),
+            });
+            let dispatcher = binding
+                .factory
+                .build(ToolBundleContext {
+                    documents,
+                    caller_resolver: resolver,
+                })
+                .map_err(UnifiedRuntimeBuilderError::ConflictingConfiguration)?;
+            binding
+                .validate_dispatcher(dispatcher)
+                .map_err(UnifiedRuntimeBuilderError::ConflictingConfiguration)?;
+            child_mcp_servers = child_mcp_servers
+                .register(binding.public_config().clone(), binding.child_availability)
+                .map_err(|error| {
+                    UnifiedRuntimeBuilderError::ConflictingConfiguration(error.to_string())
+                })?;
+        }
+        if !self.mcp_document_bindings.is_empty() {
+            spec.child_mcp_servers = Some(child_mcp_servers);
+        }
+        // Bootstrap installs these on the final agent mob-tool state, after
+        // composing its child application policy and native tool bundles.
         spec.before_activation = Some(registry.before_activation());
         Ok(Some(registry))
     }
@@ -2110,7 +2229,7 @@ impl UnifiedRuntimeBuilder {
         // composition re-checks because the rule is the composition's.
         crate::storage_provider::enforce_fail_closed_store_set(&set, &ctx)?;
         #[cfg(feature = "extension-state")]
-        if !self.tool_bundle_factories.is_empty() {
+        if !self.tool_bundle_factories.is_empty() || !self.mcp_document_bindings.is_empty() {
             set.continuity_store
                 .enable_identity_binding_history()
                 .await
@@ -2299,6 +2418,27 @@ impl UnifiedRuntimeBuilder {
                 })
             });
 
+        // The session service calls this after the user hook and before its
+        // capability invariant, on every create/resume variant. Only the
+        // process-local launch vector is resolved; profiles remain public.
+        #[cfg(feature = "extension-state")]
+        let hook = Some(crate::extension_state::mcp_binding::pre_build_hook(
+            hook,
+            self.mcp_document_bindings.clone(),
+        ));
+
+        // Native inherited Allow policies intersect the mounted tool catalog.
+        // Document-bound hosts must finish MCP connection attempts first.
+        #[cfg(feature = "extension-state")]
+        let wait_for_document_mcp = !self.mcp_document_bindings.is_empty();
+        #[cfg(not(feature = "extension-state"))]
+        let wait_for_document_mcp = false;
+
+        let (mob_storage, mob_storage_provenance) = self
+            .mob_storage
+            .clone()
+            .unwrap_or_else(|| (MobStorage::in_memory(), MobStorageProvenance::default()));
+
         // Note: blocking I/O (fs, SQLite) — acceptable at startup.
         let mut spec = if let Some(ref state_path) = self.persistent_state_path {
             std::fs::create_dir_all(state_path).map_err(|e| {
@@ -2329,8 +2469,6 @@ impl UnifiedRuntimeBuilder {
                         })?,
                     )
                 };
-            let mob_storage = MobStorage::in_memory();
-
             MobBootstrapSpec::persistent_inner_with_provider_stores(
                 definition,
                 mob_storage,
@@ -2348,6 +2486,8 @@ impl UnifiedRuntimeBuilder {
                 after_hook.clone(),
                 agent_config,
                 self.provider_meerkat_stores.clone(),
+                self.effective_mcp_call_context_provider(),
+                wait_for_document_mcp,
             )
             .map_err(storage_resolution_builder_error)?
         } else if let Some(ref scratch_dir) = self.scratch_dir {
@@ -2360,7 +2500,7 @@ impl UnifiedRuntimeBuilder {
 
             MobBootstrapSpec::ephemeral_runtime_backed_with_provider_stores(
                 definition,
-                MobStorage::in_memory(),
+                mob_storage,
                 scratch_dir.clone(),
                 max_sessions,
                 self.custom_session_store.clone(),
@@ -2373,6 +2513,8 @@ impl UnifiedRuntimeBuilder {
                 after_hook,
                 agent_config,
                 self.provider_meerkat_stores.clone(),
+                self.effective_mcp_call_context_provider(),
+                wait_for_document_mcp,
             )
             .map_err(storage_resolution_builder_error)?
         } else {
@@ -2382,9 +2524,9 @@ impl UnifiedRuntimeBuilder {
             })?;
             let store_path = temp_dir.path().to_path_buf();
 
-            let mut spec = MobBootstrapSpec::ephemeral_runtime_backed_inner(
+            let mut spec = MobBootstrapSpec::ephemeral_runtime_backed_with_provider_stores(
                 definition,
-                MobStorage::in_memory(),
+                mob_storage,
                 store_path,
                 max_sessions,
                 self.custom_session_store.clone(),
@@ -2396,12 +2538,16 @@ impl UnifiedRuntimeBuilder {
                 caps,
                 after_hook,
                 agent_config,
+                None,
+                self.effective_mcp_call_context_provider(),
+                wait_for_document_mcp,
             )
             .map_err(storage_resolution_builder_error)?;
             spec._ephemeral_dir = Some(Arc::new(temp_dir));
             spec
         };
 
+        spec = spec.with_mob_storage_provenance(mob_storage_provenance);
         spec.options = MobBootstrapOptions {
             allow_ephemeral_sessions: true,
             notify_orchestrator_on_resume: true,
@@ -2492,6 +2638,136 @@ mod tests {
     use meerkat_core::service::{
         CreateSessionRequest, DeferredPromptPolicy, InitialTurnPolicy, SessionService,
     };
+
+    #[tokio::test]
+    async fn supplied_mob_storage_keeps_its_owner_and_provenance_in_every_storage_arm() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let (storage, provenance) =
+            crate::mob_composition_manifest::persistent_mob_storage(dir.path().join("mob.sqlite3"))
+                .expect("persistent mob storage");
+        let fork_store = storage
+            .forked_participant_store()
+            .expect("complete mob storage includes fork custody")
+            .clone();
+
+        for arm in ["persistent", "scratch", "temporary"] {
+            let definition = MobDefinition::from_toml("[mob]\nid = \"builder-mob-storage\"\n")
+                .expect("fixture definition");
+            let builder = UnifiedRuntimeBuilder::default()
+                .definition(definition)
+                .mob_storage(storage.clone(), provenance.clone());
+            let builder = match arm {
+                "persistent" => builder.persistent_state(dir.path().join("state")),
+                "scratch" => builder.scratch_dir(dir.path().join("scratch")),
+                _ => builder,
+            };
+            let spec = builder.resolve_mob_spec().await.expect("spec resolves");
+            assert_eq!(spec.mob_storage_provenance, provenance, "{arm}");
+            assert!(
+                Arc::ptr_eq(
+                    spec.storage
+                        .forked_participant_store()
+                        .expect("the complete supplied storage survives"),
+                    &fork_store,
+                ),
+                "{arm} must retain the supplied storage owner",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_state_without_mob_storage_keeps_the_ephemeral_mob_default() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let definition = MobDefinition::from_toml("[mob]\nid = \"builder-mob-default\"\n")
+            .expect("fixture definition");
+        let builder = UnifiedRuntimeBuilder::default()
+            .definition(definition)
+            .persistent_state(dir.path());
+        let first = builder.resolve_mob_spec().await.expect("first spec");
+        let first_store = first
+            .storage
+            .forked_participant_store()
+            .expect("default fork store")
+            .clone();
+        assert_eq!(
+            first.mob_storage_provenance,
+            MobStorageProvenance::default()
+        );
+        drop(first);
+        let second = builder.resolve_mob_spec().await.expect("second spec");
+        assert_eq!(
+            second.mob_storage_provenance,
+            MobStorageProvenance::default()
+        );
+        assert!(
+            !Arc::ptr_eq(
+                &first_store,
+                second
+                    .storage
+                    .forked_participant_store()
+                    .expect("default fork store"),
+            ),
+            "persistent_state alone must not reuse a mob storage owner",
+        );
+    }
+
+    #[tokio::test]
+    async fn supplied_erased_spec_refuses_mob_storage_override_before_materialization() {
+        let definition = MobDefinition::from_toml("[mob]\nid = \"mob-storage-override\"\n")
+            .expect("fixture definition");
+        let spec = UnifiedRuntimeBuilder::default()
+            .definition(definition)
+            .resolve_mob_spec()
+            .await
+            .expect("empty fixture spec");
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let state_path = dir.path().join("unopened-state");
+        let result = UnifiedRuntimeBuilder::default()
+            .mob_spec(spec)
+            .mob_storage(
+                MobStorage::in_memory(),
+                MobStorageProvenance::declared_ephemeral(),
+            )
+            .persistent_state(&state_path)
+            .build()
+            .await;
+        assert!(matches!(result,
+            Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(detail))
+                if detail.contains("mob_storage() and mob_spec() are mutually exclusive")));
+        assert!(!state_path.exists(), "refusal must precede storage setup");
+    }
+
+    #[tokio::test]
+    async fn supplied_erased_spec_refuses_mcp_provider_override_before_bootstrap() {
+        struct Provider;
+        #[async_trait::async_trait]
+        impl meerkat_mcp::McpCallContextProvider for Provider {
+            async fn prepare(
+                &self,
+                _: meerkat_mcp::McpCallTarget<'_>,
+                _: meerkat_core::types::ToolCallView<'_>,
+                _: &meerkat_core::ToolDispatchContext,
+            ) -> Result<Option<meerkat_mcp::McpCallContext>, meerkat_mcp::McpCallContextError>
+            {
+                panic!("erased spec override must refuse before preparing a call")
+            }
+        }
+        let definition =
+            MobDefinition::from_toml("[mob]\nid = \"mcp-override\"\n").expect("fixture definition");
+        let spec = UnifiedRuntimeBuilder::default()
+            .definition(definition)
+            .resolve_mob_spec()
+            .await
+            .expect("empty fixture spec");
+        let result = UnifiedRuntimeBuilder::default()
+            .mob_spec(spec)
+            .mcp_call_context_provider(Arc::new(Provider))
+            .build()
+            .await;
+        assert!(matches!(result,
+            Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(detail))
+                if detail.contains("mob_spec() is already erased")));
+    }
 
     #[cfg(feature = "extension-state")]
     #[tokio::test]

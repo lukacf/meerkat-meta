@@ -343,13 +343,14 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [fmt-lint, test, test-voice, test-python, test-typescript, console, console-fixtures, console-acceptance, flow-editor, audit]
+    needs: [fmt-lint, test, test-extension-state, test-voice, test-python, test-typescript, console, console-fixtures, console-acceptance, flow-editor, audit]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results
         run: |
           if [[ "${{ needs.fmt-lint.result }}" != "success" ||
                 "${{ needs.test.result }}" != "success" ||
+                "${{ needs.test-extension-state.result }}" != "success" ||
                 "${{ needs.test-voice.result }}" != "success" ||
                 "${{ needs.test-python.result }}" != "success" ||
                 "${{ needs.test-typescript.result }}" != "success" ||
@@ -361,6 +362,7 @@ jobs:
             echo "One or more jobs failed or were cancelled."
             echo "  fmt-lint:     ${{ needs.fmt-lint.result }}"
             echo "  test:         ${{ needs.test.result }}"
+            echo "  test-extension-state: ${{ needs.test-extension-state.result }}"
             echo "  test-voice:   ${{ needs.test-voice.result }}"
             echo "  test-python:  ${{ needs.test-python.result }}"
           echo "  test-typescript:    ${{ needs.test-typescript.result }}"

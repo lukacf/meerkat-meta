@@ -106,7 +106,6 @@ fn unified_builder_roots_funnel_through_wrapped_stock_constructors() {
     for constructor in [
         "MobBootstrapSpec::persistent_inner_with_provider_stores(",
         "MobBootstrapSpec::ephemeral_runtime_backed_with_provider_stores(",
-        "MobBootstrapSpec::ephemeral_runtime_backed_inner(",
     ] {
         assert!(
             BUILDER_SOURCE.contains(constructor),

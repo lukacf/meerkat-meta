@@ -81,6 +81,14 @@ let runtime = persistent_builder
     .await?;
 ```
 
+Hosts with document MCP bindings wait for configured MCP connection attempts
+before native inherited tool visibility is resolved. This includes every MCP
+server configured for the agent, using each server's `connect_timeout_secs`;
+a failed connection completes the wait but does not make its tools available.
+The wait is enabled only for document-bound hosts and can increase startup
+latency. Hosts without document bindings retain the default asynchronous MCP
+startup behavior.
+
 The configured storage provider must support durable extension documents.
 The disk provider supplies this capability. No factory means no extension
 store or tool registration, even if the feature is compiled.

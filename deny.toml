@@ -100,7 +100,19 @@ feature-depth = 1
 # carries the build fix - or vendor the CMake correction. Remove this waiver
 # then. Re-evaluate sooner if any build host adopts CMake 4, because at that
 # point this stops being informational and starts breaking builds.
+# RUSTSEC-2024-0449: unsafe-libyaml 0.2.11 is archived and unmaintained.
+# Retained serde_yaml 0.9.34+deprecated is used by MobKit's governance YAML
+# parser and by meerkat-skills at the accepted native Git revision ac411ddf.
+# The advisory lists no patched release. This accepts the maintenance risk;
+# it does not establish parser safety or rule out security defects.
+# Removal requires a coherent migration of both YAML paths, followed by a
+# resolved-graph audit showing unsafe-libyaml absent. Reassess this exception
+# if the advisory, dependency graph, or accepted native source changes.
+# Native skills parsing and local governance parsing require separate owner
+# migration and behavior qualification; a local-only replacement is incomplete.
+# Reassess immediately if a concrete vulnerability is reported.
 ignore = [
+    { id = "RUSTSEC-2024-0449", reason = "Temporary acceptance of archived unsafe-libyaml retained by MobKit governance and native ac411 meerkat-skills through serde_yaml; no patched release is listed. Migrate both YAML paths and remove this exception when the audited graph no longer contains unsafe-libyaml; reassess immediately on a concrete vulnerability, and on advisory, graph, or native-source change." },
     "RUSTSEC-2026-0049",
     "RUSTSEC-2025-0141",
     "RUSTSEC-2026-0189",

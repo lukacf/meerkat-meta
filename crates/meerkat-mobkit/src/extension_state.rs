@@ -3,6 +3,8 @@
 //! this feature is compiled and a factory is explicitly registered.
 pub(crate) mod identity_publication;
 pub use identity_publication::IdentityPublication;
+pub(crate) mod mcp_binding;
+pub use mcp_binding::{ChildMcpAvailability, HostMcpDocumentBinding};
 
 use async_trait::async_trait;
 use documents::{EdgeKind, HostPolicy, LineageLink, Principal, Role, VerifiedLineage};
@@ -334,6 +336,7 @@ impl NativeAuthorityRegistry {
 pub(crate) struct NativeCallerResolver {
     pub(crate) registry: std::sync::Weak<NativeAuthorityRegistry>,
     pub(crate) requirements: ToolBundleRequirements,
+    pub(crate) child_availability: Option<ChildMcpAvailability>,
 }
 impl NativeCallerResolver {
     fn policy(
@@ -437,6 +440,13 @@ impl ToolCallerResolver for NativeCallerResolver {
             .mob_member_binding
             .ok_or(documents::Error::AuthorityUnavailable)?;
         let handle = registry.handle(&binding.mob_id)?;
+        if self.child_availability == Some(ChildMcpAvailability::HostOnly)
+            && handle
+                .owner_bridge_session_lifecycle_authority()
+                .is_some_and(|authority| authority.destroy_on_owner_archive)
+        {
+            return Err(documents::Error::NotFound);
+        }
         let entry = handle
             .get_member(&meerkat_mob::AgentIdentity::from(binding.member.as_str()))
             .await
@@ -623,6 +633,42 @@ comms = true
             .bridge_session_id()
             .unwrap()
             .clone();
+        // Spawn returns before its autonomous initial turn has completed.
+        // This fixture edits retained metadata outside that actor, so first
+        // settle the native kickoff and prove no turn still owns a checkpoint.
+        let kickoffs = handle
+            .wait_for_members_kickoff_complete(
+                std::slice::from_ref(&identity),
+                Some(std::time::Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+        let [(member, kickoff)] = kickoffs.as_slice() else {
+            panic!("fixture requires the source's completed kickoff");
+        };
+        assert_eq!(member, &identity);
+        assert_eq!(
+            kickoff.kickoff.as_ref().map(|kickoff| kickoff.phase),
+            Some(meerkat_mob::MobMemberKickoffPhase::Started)
+        );
+        let activity = sessions
+            .subscribe_session_activity(&session_id)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            activity.clone().wait_inactive(),
+        )
+        .await
+        .expect("the native source activity must settle before external policy commits");
+        assert!(
+            !activity.is_active(),
+            "external retained-policy edits require an idle native source actor"
+        );
+        // Native cleanup fencing waits out checkpoint writers and disables
+        // later saves of the actor's old metadata during the raw commit loop.
+        // No turn is admitted until the fixture restores the gates below.
+        sessions.cancel_all_checkpointers().await;
         let snapshot = handle
             .member_creation_for_session(&session_id)
             .await
@@ -637,6 +683,7 @@ comms = true
         );
         let resolver = NativeCallerResolver {
             registry: Arc::downgrade(&registry),
+            child_availability: None,
             requirements: ToolBundleRequirements::durable_documents(
                 "durable-documents-test",
                 "documents_read",
@@ -658,6 +705,18 @@ comms = true
                 Some(meerkat_core::ops::ToolAccessPolicy::ReadOnly),
                 Some(Role::Reader),
             ),
+            (
+                Some(meerkat_core::ops::ToolAccessPolicy::DenyList(
+                    ["documents_apply"].into_iter().collect(),
+                )),
+                Some(Role::Reader),
+            ),
+            (
+                Some(meerkat_core::ops::ToolAccessPolicy::DenyList(
+                    ["documents_read"].into_iter().collect(),
+                )),
+                None,
+            ),
             (None, Some(Role::Editor)),
         ] {
             metadata.tooling.tool_access_policy = policy;
@@ -671,11 +730,83 @@ comms = true
                 )
                 .await
                 .unwrap();
+            let retained = sessions
+                .load_retained_session_metadata(&session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained.session_id, session_id);
+            assert_eq!(
+                serde_json::to_value(
+                    retained
+                        .session_metadata
+                        .unwrap()
+                        .tooling
+                        .tool_access_policy
+                )
+                .unwrap(),
+                serde_json::to_value(&metadata.tooling.tool_access_policy).unwrap(),
+                "the native retained authority must observe this exact policy commit"
+            );
             assert_eq!(
                 resolver.source_ceiling(&registry, &snapshot).await.unwrap(),
                 expected
             );
         }
+        sessions.rearm_all_checkpointers().await;
+        registry.before_activation()(handle.read_handle())
+            .await
+            .unwrap();
+        let host_only = NativeCallerResolver {
+            registry: Arc::downgrade(&registry),
+            requirements: resolver.requirements.clone(),
+            child_availability: Some(ChildMcpAvailability::HostOnly),
+        };
+        let root_context =
+            ToolDispatchContext::default().with_runtime_identity(session_id.clone(), None);
+        assert!(host_only.resolve(&root_context, None).await.is_ok());
+
+        // Scope comes from the native owner bridge authority. A copied
+        // descriptor or a root-looking profile name cannot change it.
+        let mut child_definition = handle.definition().clone();
+        child_definition.id = "document-child-scope".into();
+        let child =
+            meerkat_mob::MobBuilder::new(child_definition, meerkat_mob::MobStorage::in_memory())
+                .with_session_service(sessions.clone())
+                .with_default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+                .before_activation(registry.before_activation())
+                .with_owner_bridge_session_create_authority(session_id, true, false)
+                .create()
+                .await
+                .unwrap();
+        let child_identity = meerkat_mob::AgentIdentity::from("child");
+        child
+            .spawn_spec(meerkat_mob::SpawnMemberSpec::host_root(
+                "worker",
+                child_identity.clone(),
+            ))
+            .await
+            .unwrap();
+        let child_session = child
+            .get_member(&child_identity)
+            .await
+            .unwrap()
+            .unwrap()
+            .bridge_session_id()
+            .unwrap()
+            .clone();
+        let child_context =
+            ToolDispatchContext::default().with_runtime_identity(child_session, None);
+        assert!(matches!(
+            host_only.resolve(&child_context, None).await,
+            Err(documents::Error::NotFound)
+        ));
+        let child_available = NativeCallerResolver {
+            child_availability: Some(ChildMcpAvailability::ChildAvailable),
+            ..host_only
+        };
+        assert!(child_available.resolve(&child_context, None).await.is_ok());
+        child.stop().await.unwrap();
         handle.stop().await.unwrap();
     }
 }
