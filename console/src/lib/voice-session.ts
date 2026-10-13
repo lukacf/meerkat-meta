@@ -79,7 +79,7 @@ export interface VoiceSessionSnapshot {
    * never persisted or sent anywhere, and dropped on every call end. User items come
    * from item-keyed input transcript deltas on the WebRTC data channel. Assistant
    * items come only from the gateway's provisional captions
-   * (`mobkit/console/voice/captions`), keyed by the segment item id the committed
+   * (`meta/console/voice/captions`), keyed by the segment item id the committed
    * row later lists in `realtime_origin.provider_item_ids`; data-channel output
    * transcript deltas carry no such id and are not used. The console renders
    * unmatched items as distinct "live" rows. Canonical history replaces items only
@@ -177,7 +177,7 @@ export async function queryVoiceReadiness(
   let readiness: ReadinessWire;
   try {
     readiness = await callConsoleRpc<ReadinessWire>(
-      baseUrl, "mobkit/console/voice/readiness", { identity }, VOICE_TEARDOWN_TIMEOUT_MS, signal,
+      baseUrl, "meta/console/voice/readiness", { identity }, VOICE_TEARDOWN_TIMEOUT_MS, signal,
     );
   } catch (error) {
     return {
@@ -255,7 +255,7 @@ function browserEnvironment(baseUrl: string): VoiceSessionEnvironment {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          jsonrpc: "2.0", id: "voice-pagehide", method: "mobkit/console/voice/close", params,
+          jsonrpc: "2.0", id: "voice-pagehide", method: "meta/console/voice/close", params,
         }),
         keepalive: true,
       }).catch(() => {});
@@ -617,7 +617,7 @@ export function createVoiceSession(
       if (index > 0) await delay(VOICE_CLOSE_RETRY_DELAYS_MS[index - 1]);
       try {
         const raw = await bounded(
-          env.rpc("mobkit/console/voice/close", closeParams(attempt), VOICE_TEARDOWN_TIMEOUT_MS),
+          env.rpc("meta/console/voice/close", closeParams(attempt), VOICE_TEARDOWN_TIMEOUT_MS),
           VOICE_TEARDOWN_TIMEOUT_MS,
         );
         const result = parseExperimentalLiveChannelStatus(raw);
@@ -799,7 +799,7 @@ export function createVoiceSession(
 
   async function reportActivity(attempt: Attempt) {
     try {
-      const result = await controlPlaneCall(attempt, "mobkit/console/voice/activity", closeParams(attempt));
+      const result = await controlPlaneCall(attempt, "meta/console/voice/activity", closeParams(attempt));
       assertOwns(attempt);
       if (
         !result || typeof result !== "object" || Array.isArray(result) ||
@@ -884,7 +884,7 @@ export function createVoiceSession(
       let delay: number | undefined;
       try {
         const raw = await bounded(
-          env.rpc("mobkit/console/voice/context_status", {
+          env.rpc("meta/console/voice/context_status", {
             ...closeParams(attempt), channel_id: channelId,
           }, VOICE_TEARDOWN_TIMEOUT_MS),
           VOICE_TEARDOWN_TIMEOUT_MS,
@@ -1218,7 +1218,7 @@ export function createVoiceSession(
     const sdp = attempt.peer!.localDescription?.sdp;
     if (!sdp?.trim()) throw new VoiceError("The browser could not create a voice connection offer.");
     const readiness = parseLivePlaybackOwnerReadiness(await connecting(attempt,
-      env.rpc("mobkit/live/playback_owner/register", {
+      env.rpc("meta/live/playback_owner/register", {
         identity: pending.targetIdentity,
         channel_id: pending.channelId,
         pending_receipt: pending.pendingReceipt,
@@ -1244,7 +1244,7 @@ export function createVoiceSession(
       type: "answer", sdp: (answer as { answer_sdp: string }).answer_sdp,
     }));
     assertOwns(attempt);
-    const received = await connecting(attempt, env.rpc("mobkit/console/voice/answer_received", {
+    const received = await connecting(attempt, env.rpc("meta/console/voice/answer_received", {
       ...closeParams(attempt),
       channel_id: pending.channelId,
     }, VOICE_CONNECT_TIMEOUT_MS));
@@ -1271,7 +1271,7 @@ export function createVoiceSession(
   ): Promise<ActiveLiveChannelHandle> {
     while (owns(attempt)) {
       const status = parseExperimentalLiveChannelStatus(await connecting(attempt,
-        env.rpc("mobkit/live/status", {
+        env.rpc("meta/live/status", {
           identity: pending.targetIdentity,
           channel_id: pending.channelId,
           pending_receipt: pending.pendingReceipt,
@@ -1338,7 +1338,7 @@ export function createVoiceSession(
         fail(attempt, RECOVERY_TIMEOUT_MESSAGE);
         return;
       }
-      const raw = await controlPlaneCall(attempt, "mobkit/console/voice/replacement", closeParams(attempt));
+      const raw = await controlPlaneCall(attempt, "meta/console/voice/replacement", closeParams(attempt));
       assertOwns(attempt);
       if (attempt.recoveryDeadline !== undefined && env.now() >= attempt.recoveryDeadline) {
         fail(attempt, RECOVERY_TIMEOUT_MESSAGE);
@@ -1464,7 +1464,7 @@ export function createVoiceSession(
       publish({ phase: "connecting", connectionStage: "opening" });
       assertOwns(attempt);
       attempt.openSent = true;
-      const raw = await connecting(attempt, env.rpc("mobkit/console/voice/open", {
+      const raw = await connecting(attempt, env.rpc("meta/console/voice/open", {
         identity: attempt.target.identity, request_id: attempt.requestId,
       }, VOICE_CONNECT_TIMEOUT_MS));
       assertOwns(attempt);

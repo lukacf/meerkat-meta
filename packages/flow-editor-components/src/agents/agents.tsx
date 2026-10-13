@@ -30,14 +30,14 @@ export function AgentsView({ studio, agentSel, setAgentSel, contract, deploySett
 
 function AgentsList({ studio, agentSel, setAgentSel, contract, deploySettings, agentDefinitions, applyAgentIntent = null, toolCatalog = [], modelCatalog = [], agentView = null }) {
   const [schemaAddResult, setSchemaAddResult] = React.useState(null);
-  const listState = window.MobKitFlowController.agentListState({
+  const listState = window.MetaFlowController.agentListState({
     members: studio.members,
     instances: studio.instances,
     schemas: studio.schemas,
     selection: agentSel,
     agentView,
   });
-  const schemaAddErrorState = window.MobKitFlowController.schemaDefinitionAddErrorState(schemaAddResult, listState.schemaAddFallbackError);
+  const schemaAddErrorState = window.MetaFlowController.schemaDefinitionAddErrorState(schemaAddResult, listState.schemaAddFallbackError);
   return (
     <aside className="agents-list">
       <div className="agents-list__head">
@@ -50,7 +50,7 @@ function AgentsList({ studio, agentSel, setAgentSel, contract, deploySettings, a
             <button
               key={row.id}
               className={row.itemClass}
-              onClick={() => setAgentSel(window.MobKitFlowController.agentListSelectionProjection("agent", row.id))}
+              onClick={() => setAgentSel(window.MetaFlowController.agentListSelectionProjection("agent", row.id))}
             >
               <span className="agents-list__bullet" data-role={row.bulletRole} style={row.bulletStyle}>●</span>
               <div className="agents-list__col">
@@ -76,7 +76,7 @@ function AgentsList({ studio, agentSel, setAgentSel, contract, deploySettings, a
             <button
               key={row.id}
               className={row.itemClass}
-              onClick={() => setAgentSel(window.MobKitFlowController.agentListSelectionProjection("schema", row.id))}
+              onClick={() => setAgentSel(window.MetaFlowController.agentListSelectionProjection("schema", row.id))}
             >
               <span className="agents-list__bullet" data-role={row.bulletRole} style={row.bulletStyle}>▢</span>
               <div className="agents-list__col">
@@ -118,8 +118,8 @@ function AgentsList({ studio, agentSel, setAgentSel, contract, deploySettings, a
 
 function AddAgentControl({ studio, setAgentSel, agentDefinitions = [], applyAgentIntent = null, contract = null, deploySettings = null, toolCatalog = [], modelCatalog = [], agentView = null }) {
   const [lastAddResult, setLastAddResult] = React.useState(null);
-  const definitionState = window.MobKitFlowController.agentDefinitionAddControlState(agentDefinitions, agentView);
-  const definitionErrorState = window.MobKitFlowController.agentDefinitionAddErrorState(lastAddResult, agentView);
+  const definitionState = window.MetaFlowController.agentDefinitionAddControlState(agentDefinitions, agentView);
+  const definitionErrorState = window.MetaFlowController.agentDefinitionAddErrorState(lastAddResult, agentView);
   const createFromDefinition = async (definitionId) => {
     if (!applyAgentIntent) {
       setLastAddResult({ ok: false, error: definitionState.authoringOperationUnavailableError });
@@ -171,7 +171,7 @@ function AddAgentControl({ studio, setAgentSel, agentDefinitions = [], applyAgen
 }
 
 function AgentsMain({ studio, agentSel, setAgentSel, contract, deploySettings, flow, setFlow, mobSettings, setMobSettings, toolCatalog, modelCatalog, applyAgentIntent = null, agentView = null, agentDetailView = null, agentAccessView = null, schemaView = null }) {
-  const selectionState = window.MobKitFlowController.agentSelectionState({
+  const selectionState = window.MetaFlowController.agentSelectionState({
     selection: agentSel,
     members: studio.members,
     schemas: studio.schemas,
@@ -202,10 +202,10 @@ function AgentEditor({ studio, member, setAgentSel, contract, deploySettings, fl
   React.useEffect(() => {
     setDeleteConfirmOpen(false);
   }, [member.id]);
-  const mobKitOperationError = (result, fallback) => {
-    return window.MobKitFlowController.operationErrorText(result, fallback);
+  const metaOperationError = (result, fallback) => {
+    return window.MetaFlowController.operationErrorText(result, fallback);
   };
-  const editorState = window.MobKitFlowController.agentEditorControlState({
+  const editorState = window.MetaFlowController.agentEditorControlState({
     member,
     instances: studio.instances,
     schemas: studio.schemas,
@@ -225,7 +225,7 @@ function AgentEditor({ studio, member, setAgentSel, contract, deploySettings, fl
     try {
       const result = await applyAgentIntent({ intent: "agent.updateMember", memberId: member.id, patch });
       if (!result?.ok) {
-        setMemberEditError(mobKitOperationError(result, editorState.memberUpdateFallbackError));
+        setMemberEditError(metaOperationError(result, editorState.memberUpdateFallbackError));
         return;
       }
       setMemberEditError("");
@@ -236,8 +236,8 @@ function AgentEditor({ studio, member, setAgentSel, contract, deploySettings, fl
   const [toolDraft, setToolDraft] = React.useState("");
   const [toolDraftError, setToolDraftError] = React.useState("");
   const [schemaChangeResult, setSchemaChangeResult] = React.useState(null);
-  const toolAccessState = window.MobKitFlowController.memberToolAccessState(member, toolCatalog, agentAccessView);
-  const schemaErrorState = window.MobKitFlowController.memberSchemaChangeErrorState(schemaChangeResult);
+  const toolAccessState = window.MetaFlowController.memberToolAccessState(member, toolCatalog, agentAccessView);
+  const schemaErrorState = window.MetaFlowController.memberSchemaChangeErrorState(schemaChangeResult);
   const addToolAccess = async (raw) => {
     const toolId = String(raw || "").trim();
     if (!toolId) {
@@ -251,7 +251,7 @@ function AgentEditor({ studio, member, setAgentSel, contract, deploySettings, fl
     try {
       const result = await applyAgentIntent({ intent: "agent.addTool", memberId: member.id, toolId });
       if (!result?.ok) {
-        setToolDraftError(mobKitOperationError(result, editorState.toolUpdateFallbackError));
+        setToolDraftError(metaOperationError(result, editorState.toolUpdateFallbackError));
         return;
       }
       setToolDraft("");
@@ -268,7 +268,7 @@ function AgentEditor({ studio, member, setAgentSel, contract, deploySettings, fl
     try {
       const result = await applyAgentIntent({ intent: "agent.removeTool", memberId: member.id, toolId });
       if (!result?.ok) {
-        setToolDraftError(mobKitOperationError(result, editorState.toolUpdateFallbackError));
+        setToolDraftError(metaOperationError(result, editorState.toolUpdateFallbackError));
         return;
       }
       setToolDraftError("");
@@ -292,7 +292,7 @@ function AgentEditor({ studio, member, setAgentSel, contract, deploySettings, fl
       setSchemaChangeResult({ ok: false, error: error?.message || editorState.schemaAssignmentFallbackError });
     });
   };
-  const deleteConfirmState = window.MobKitFlowController.agentDeleteConfirmationState(editorState, deleteConfirmOpen);
+  const deleteConfirmState = window.MetaFlowController.agentDeleteConfirmationState(editorState, deleteConfirmOpen);
   const deleteMember = () => {
     if (!applyAgentIntent) return;
     const selection = null;
@@ -319,7 +319,7 @@ function AgentEditor({ studio, member, setAgentSel, contract, deploySettings, fl
               key={member.id}
               className="agent-editor__title-input"
               value={member.name}
-              onChangeText={name => change(window.MobKitFlowController.memberNamePatch(name))}
+              onChangeText={name => change(window.MetaFlowController.memberNamePatch(name))}
             />
             <div className="inspector__id">{editorState.idLine}</div>
             {memberEditError && <div className="hint__line" style={{ color: "var(--danger)" }}>{memberEditError}</div>}
@@ -355,7 +355,7 @@ function AgentEditor({ studio, member, setAgentSel, contract, deploySettings, fl
                     className="field__input field__input--mono"
                     value={member.realmProfile || ""}
                     placeholder={editorState.realmProfilePlaceholder}
-                    onChange={e => change(window.MobKitFlowController.memberRealmProfilePatch(e.target.value))}
+                    onChange={e => change(window.MetaFlowController.memberRealmProfilePatch(e.target.value))}
                   />
                   <div className="hint__line">{editorState.realmProfileImportHint}</div>
                 </div>
@@ -363,7 +363,7 @@ function AgentEditor({ studio, member, setAgentSel, contract, deploySettings, fl
                 <>
               <div className="field">
                 <label className="field__label">{editorState.modelLabel}</label>
-                <select className="field__select" value={member.model} onChange={e => change(window.MobKitFlowController.memberModelPatch(e.target.value, modelCatalog))}>
+                <select className="field__select" value={member.model} onChange={e => change(window.MetaFlowController.memberModelPatch(e.target.value, modelCatalog))}>
                   {editorState.modelOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
                 </select>
               </div>
@@ -375,14 +375,14 @@ function AgentEditor({ studio, member, setAgentSel, contract, deploySettings, fl
               <div className="section">
                 <div className="section__title section__title--row">
                   <span>{editorState.systemPromptTitle}</span>
-                  <button className="ghost-btn" onClick={() => change(window.MobKitFlowController.memberSystemPromptPatch(window.MobKitFlowController.memberPromptSkeleton(member)))} title={editorState.applySkeletonTitle}>{editorState.applySkeletonLabel}</button>
+                  <button className="ghost-btn" onClick={() => change(window.MetaFlowController.memberSystemPromptPatch(window.MetaFlowController.memberPromptSkeleton(member)))} title={editorState.applySkeletonTitle}>{editorState.applySkeletonLabel}</button>
                 </div>
                 <EchoTextArea
                   key={member.id}
                   className="field__textarea"
                   rows={8}
                   value={member.systemPrompt || ""}
-                  onChangeText={text => change(window.MobKitFlowController.memberSystemPromptPatch(text))}
+                  onChangeText={text => change(window.MetaFlowController.memberSystemPromptPatch(text))}
                   placeholder={editorState.systemPromptPlaceholder}
                 />
               </div>
@@ -398,7 +398,7 @@ function AgentEditor({ studio, member, setAgentSel, contract, deploySettings, fl
                   <select
                     className="field__select"
                     value={editorState.profileBinding}
-                    onChange={e => change(window.MobKitFlowController.memberProfileBindingPatch(member, e.target.value, contract))}
+                    onChange={e => change(window.MetaFlowController.memberProfileBindingPatch(member, e.target.value, contract))}
                   >
                     {editorState.bindingOptions.map(option => (
                       <option key={option.value} value={option.value} disabled={option.disabled}>{option.label}</option>
@@ -410,7 +410,7 @@ function AgentEditor({ studio, member, setAgentSel, contract, deploySettings, fl
                   <>
                     <div className="field">
                       <label className="field__label">{editorState.runtimeModeLabel}</label>
-                      <select className="field__select" value={editorState.runtimeMode} onChange={e => change(window.MobKitFlowController.memberRuntimeModePatch(e.target.value, contract, deploySettings))}>
+                      <select className="field__select" value={editorState.runtimeMode} onChange={e => change(window.MetaFlowController.memberRuntimeModePatch(e.target.value, contract, deploySettings))}>
                         {editorState.runtimeOptions.map(option => (
                           <option key={option.value} value={option.value} disabled={option.disabled}>
                             {option.label}
@@ -421,7 +421,7 @@ function AgentEditor({ studio, member, setAgentSel, contract, deploySettings, fl
                     </div>
                     <div className="field">
                       <label className="field__label">{editorState.backendLabel}</label>
-                      <select className="field__select" value={editorState.backendValue} onChange={e => change(window.MobKitFlowController.memberBackendPatch(e.target.value, contract))}>
+                      <select className="field__select" value={editorState.backendValue} onChange={e => change(window.MetaFlowController.memberBackendPatch(e.target.value, contract))}>
                         {editorState.backendOptions.map(option => (
                           <option key={option.value || "default"} value={option.value} disabled={option.disabled}>{option.label}</option>
                         ))}
@@ -437,7 +437,7 @@ function AgentEditor({ studio, member, setAgentSel, contract, deploySettings, fl
                         step="1"
                         value={member.maxInlinePeerNotifications ?? ""}
                         placeholder={editorState.inlinePeerNotificationsPlaceholder}
-                        onChange={e => change(window.MobKitFlowController.memberMaxInlinePeerNotificationsPatch(e.target.value))}
+                        onChange={e => change(window.MetaFlowController.memberMaxInlinePeerNotificationsPatch(e.target.value))}
                       />
                     </div>
                     <ProviderParamsEditor member={member} change={change} agentDetailView={agentDetailView} />
@@ -586,30 +586,30 @@ function SchemaEditor({ studio, schema, setAgentSel, contract, flow, setFlow, sc
   const [schemaOperationError, setSchemaOperationError] = React.useState("");
   React.useEffect(() => setFieldAddResult(null), [schema?.id]);
   React.useEffect(() => setSchemaOperationError(""), [schema?.id]);
-  const schemaState = window.MobKitFlowController.schemaEditorControlState({
+  const schemaState = window.MetaFlowController.schemaEditorControlState({
     schema,
     members: studio.members,
     schemaView,
   });
-  const fieldAddErrorState = window.MobKitFlowController.schemaFieldAddErrorState(fieldAddResult, schemaState.fieldAddFallbackError);
+  const fieldAddErrorState = window.MetaFlowController.schemaFieldAddErrorState(fieldAddResult, schemaState.fieldAddFallbackError);
   const applySchemaIntent = async (intentRequest, selection = { kind: "schema", id: schema.id }) => {
     const fallback = schemaState.schemaOperationFallbackError;
     if (!applyAgentIntent) {
       const result = { ok: false, error: schemaState.authoringOperationUnavailableError };
-      setSchemaOperationError(window.MobKitFlowController.operationErrorText(result, fallback));
+      setSchemaOperationError(window.MetaFlowController.operationErrorText(result, fallback));
       return result;
     }
     try {
       const result = await applyAgentIntent({ ...intentRequest, selection });
       if (result?.ok === false) {
-        setSchemaOperationError(window.MobKitFlowController.operationErrorText(result, fallback));
+        setSchemaOperationError(window.MetaFlowController.operationErrorText(result, fallback));
       } else {
         setSchemaOperationError("");
       }
       return result;
     } catch (error) {
       const result = { ok: false, error: error?.message || String(error || fallback) };
-      setSchemaOperationError(window.MobKitFlowController.operationErrorText(result, fallback));
+      setSchemaOperationError(window.MetaFlowController.operationErrorText(result, fallback));
       return result;
     }
   };
@@ -662,7 +662,7 @@ function SchemaEditor({ studio, schema, setAgentSel, contract, flow, setFlow, sc
   };
 
   const renameSchema = async (newId) => {
-    const result = window.MobKitFlowController.renameSchemaDefinition({
+    const result = window.MetaFlowController.renameSchemaDefinition({
       schemas: studio.schemas,
       members: studio.members,
       flow,
@@ -705,7 +705,7 @@ function SchemaEditor({ studio, schema, setAgentSel, contract, flow, setFlow, sc
             rows={2}
             value={schema.description || ""}
             placeholder={schemaState.descriptionPlaceholder}
-            onChange={e => change(window.MobKitFlowController.schemaDescriptionPatch(e.target.value))}
+            onChange={e => change(window.MetaFlowController.schemaDescriptionPatch(e.target.value))}
           />
         </div>
 
@@ -728,7 +728,7 @@ function SchemaEditor({ studio, schema, setAgentSel, contract, flow, setFlow, sc
               <SchemaField
                 key={f.id}
                 field={f}
-                normalizeName={(raw) => window.MobKitFlowController.uniqueSchemaFieldName(schema.fields, raw, f.id)}
+                normalizeName={(raw) => window.MetaFlowController.uniqueSchemaFieldName(schema.fields, raw, f.id)}
                 onChange={(patch) => updateField(f.id, patch)}
                 onRename={(oldName, newName) => renameField(f.id, oldName, newName)}
                 onDelete={() => deleteField(f.id)}
@@ -774,14 +774,14 @@ function SchemaEnumValueChip({ field, value, index, onChange }: any) {
         value={draftValue}
         onChange={e => setDraftValue(e.target.value)}
         onBlur={e => {
-          const patch = window.MobKitFlowController.enumValueCommitPatch(field, index, e.target.value);
+          const patch = window.MetaFlowController.enumValueCommitPatch(field, index, e.target.value);
           setDraftValue(patch.enumValues?.[index] || "");
           onChange(patch);
         }}
       />
       <button
         className="chip__x"
-        onClick={() => onChange(window.MobKitFlowController.enumValueDeletePatch(field, index))}
+        onClick={() => onChange(window.MetaFlowController.enumValueDeletePatch(field, index))}
       >×</button>
     </span>
   );
@@ -793,7 +793,7 @@ function SchemaField({ field, normalizeName, onChange, onRename, onDelete, contr
   React.useEffect(() => {
     setDraftName(field.name || "");
   }, [field.id, field.name]);
-  const fieldState = window.MobKitFlowController.schemaFieldRowControlState(field, contract, schemaView);
+  const fieldState = window.MetaFlowController.schemaFieldRowControlState(field, contract, schemaView);
   const typeState = fieldState.typeState;
   const values = fieldState.enumValues;
 
@@ -820,7 +820,7 @@ function SchemaField({ field, normalizeName, onChange, onRename, onDelete, contr
         className="sb-select sb-col--type"
         value={typeState.type}
         onChange={e => {
-          onChange(window.MobKitFlowController.schemaLikeFieldTypePatch(field, e.target.value, contract));
+          onChange(window.MetaFlowController.schemaLikeFieldTypePatch(field, e.target.value, contract));
         }}
       >
         {typeState.typeOptions.map(option => (
@@ -832,13 +832,13 @@ function SchemaField({ field, normalizeName, onChange, onRename, onDelete, contr
         <input
           type="checkbox"
           checked={!!field.required}
-          onChange={e => onChange(window.MobKitFlowController.schemaLikeFieldRequiredPatch(e.target.checked))}
+          onChange={e => onChange(window.MetaFlowController.schemaLikeFieldRequiredPatch(e.target.checked))}
         />
       </label>
       <input
         className="sb-input sb-col--desc"
         value={field.description || ""}
-        onChange={e => onChange(window.MobKitFlowController.schemaLikeFieldDescriptionPatch(e.target.value))}
+        onChange={e => onChange(window.MetaFlowController.schemaLikeFieldDescriptionPatch(e.target.value))}
         placeholder={fieldState.descriptionPlaceholder}
       />
       <button className="sb-del" onClick={onDelete} title={fieldState.removeTitle}>×</button>
@@ -851,7 +851,7 @@ function SchemaField({ field, normalizeName, onChange, onRename, onDelete, contr
             ))}
             <button
               className="chip chip--add"
-              onClick={() => onChange(window.MobKitFlowController.enumValueAddPatch(field, fieldState.enumAddValue))}
+              onClick={() => onChange(window.MetaFlowController.enumValueAddPatch(field, fieldState.enumAddValue))}
             >{fieldState.enumAddLabel}</button>
           </div>
         </div>
@@ -861,7 +861,7 @@ function SchemaField({ field, normalizeName, onChange, onRename, onDelete, contr
 }
 
 function ProviderParamsEditor({ member, change, agentDetailView = null }) {
-  const paramsState = window.MobKitFlowController.memberProviderParamsEditorState(member, agentDetailView);
+  const paramsState = window.MetaFlowController.memberProviderParamsEditorState(member, agentDetailView);
   const [draft, setDraft] = React.useState(paramsState.text);
   const [error, setError] = React.useState("");
   React.useEffect(() => {
@@ -870,7 +870,7 @@ function ProviderParamsEditor({ member, change, agentDetailView = null }) {
   }, [member.id, paramsState.text]);
   const commit = (next) => {
     setDraft(next);
-    const result = window.MobKitFlowController.memberProviderParamsPatch(next, agentDetailView);
+    const result = window.MetaFlowController.memberProviderParamsPatch(next, agentDetailView);
     if (!result.ok) {
       setError(result.error || paramsState.invalidJsonLabel);
       return;
@@ -896,13 +896,13 @@ function ProviderParamsEditor({ member, change, agentDetailView = null }) {
 // ── Skill access (realm picker + per-skill toggles, baked into the pack) ──
 function SkillAccess({ studio, member, agentAccessView = null, applyAgentIntent = null }) {
   const realms = studio.skillRealms || [];
-  const initialSkillState = window.MobKitFlowController.memberSkillAccessState({ member, skillRealms: realms, accessView: agentAccessView });
+  const initialSkillState = window.MetaFlowController.memberSkillAccessState({ member, skillRealms: realms, accessView: agentAccessView });
   const [realmId, setRealmId] = React.useState(initialSkillState.realmId);
   const [inlineOpen, setInlineOpen] = React.useState(false);
   const [inlineLabel, setInlineLabel] = React.useState("");
   const [inlineContent, setInlineContent] = React.useState("");
   const [inlineError, setInlineError] = React.useState("");
-  const skillState = window.MobKitFlowController.memberSkillAccessState({ member, skillRealms: realms, realmId, inlineOpen, accessView: agentAccessView });
+  const skillState = window.MetaFlowController.memberSkillAccessState({ member, skillRealms: realms, realmId, inlineOpen, accessView: agentAccessView });
   React.useEffect(() => {
     if (skillState.realmId !== realmId) setRealmId(skillState.realmId);
   }, [skillState.realmId, realmId]);
@@ -914,7 +914,7 @@ function SkillAccess({ studio, member, agentAccessView = null, applyAgentIntent 
     try {
       const result = await applyAgentIntent({ memberId: member.id, ...intentRequest });
       if (!result?.ok) {
-        setInlineError(window.MobKitFlowController.operationErrorText(result, fallback));
+        setInlineError(window.MetaFlowController.operationErrorText(result, fallback));
         return null;
       }
       setInlineError("");
@@ -937,7 +937,7 @@ function SkillAccess({ studio, member, agentAccessView = null, applyAgentIntent 
       content: inlineContent,
     }, skillState.inlineErrorFallback);
     if (result) {
-      const nextRealmId = window.MobKitFlowController.inlineSkillRealmIdFromOperationResult(result);
+      const nextRealmId = window.MetaFlowController.inlineSkillRealmIdFromOperationResult(result);
       if (nextRealmId) setRealmId(nextRealmId);
       setInlineLabel("");
       setInlineContent("");

@@ -21,7 +21,7 @@ import { InlineSourceEditor } from "../overlays/overlays";
 import { EchoInput, EchoTextArea } from "../shared/echo-text";
 
 function CondValue({ field, value, onChange, conditionView = null }) {
-  const control = window.MobKitFlowController.conditionValueControl(field, value, conditionView);
+  const control = window.MetaFlowController.conditionValueControl(field, value, conditionView);
   if (control.kind === "enum") {
     return (
       <select className="field__select bld-cond__val" value={control.value} onChange={e => onChange(e.target.value)}>
@@ -51,18 +51,18 @@ function InputEnumValueChip({ field, value, index, onChange }: any) {
         value={draftValue}
         onChange={e => setDraftValue(e.target.value)}
         onBlur={e => {
-          const patch = window.MobKitFlowController.enumValueCommitPatch(field, index, e.target.value);
+          const patch = window.MetaFlowController.enumValueCommitPatch(field, index, e.target.value);
           setDraftValue(patch.enumValues?.[index] || "");
           onChange(patch);
         }}
       />
-      <button className="chip__x" onClick={() => onChange(window.MobKitFlowController.enumValueDeletePatch(field, index))}>×</button>
+      <button className="chip__x" onClick={() => onChange(window.MetaFlowController.enumValueDeletePatch(field, index))}>×</button>
     </span>
   );
 }
 
 function InputParamField({ param, normalizeName, onRename, onChange, onDelete, contract, basicView = null }: any) {
-  const fieldState = window.MobKitFlowController.inputParamFieldControlState(param, contract, basicView);
+  const fieldState = window.MetaFlowController.inputParamFieldControlState(param, contract, basicView);
   const values = fieldState.enumValues;
   const previousNameRef = React.useRef(null);
   const [draftName, setDraftName] = React.useState(param.name || "");
@@ -90,7 +90,7 @@ function InputParamField({ param, normalizeName, onRename, onChange, onDelete, c
         className="sb-select sb-col--type"
         value={typeState.type}
         onChange={e => {
-          onChange(window.MobKitFlowController.schemaLikeFieldTypePatch(param, e.target.value, contract));
+          onChange(window.MetaFlowController.schemaLikeFieldTypePatch(param, e.target.value, contract));
         }}
       >
         {typeState.typeOptions.map(option => (
@@ -99,12 +99,12 @@ function InputParamField({ param, normalizeName, onRename, onChange, onDelete, c
       </select>
       {typeState.selectedType?.reason && <div className="hint__line" style={{ color: "var(--warn)" }}>{typeState.selectedType.reason}</div>}
       <label className="sb-col--req sb-checkbox">
-        <input type="checkbox" checked={param.required !== false} onChange={e => onChange(window.MobKitFlowController.schemaLikeFieldRequiredPatch(e.target.checked))} />
+        <input type="checkbox" checked={param.required !== false} onChange={e => onChange(window.MetaFlowController.schemaLikeFieldRequiredPatch(e.target.checked))} />
       </label>
       <input
         className="sb-input sb-col--desc"
         value={param.description || ""}
-        onChange={e => onChange(window.MobKitFlowController.schemaLikeFieldDescriptionPatch(e.target.value))}
+        onChange={e => onChange(window.MetaFlowController.schemaLikeFieldDescriptionPatch(e.target.value))}
         placeholder={fieldState.descriptionPlaceholder}
       />
       <button className="sb-del" onClick={onDelete} title={fieldState.removeTitle}>×</button>
@@ -115,7 +115,7 @@ function InputParamField({ param, normalizeName, onRename, onChange, onDelete, c
             {values.map((value, index) => (
               <InputEnumValueChip key={index} field={param} value={value} index={index} onChange={onChange} />
             ))}
-            <button className="chip chip--add" onClick={() => onChange(window.MobKitFlowController.enumValueAddPatch(param, fieldState.enumAddValue))}>{fieldState.enumAddLabel}</button>
+            <button className="chip chip--add" onClick={() => onChange(window.MetaFlowController.enumValueAddPatch(param, fieldState.enumAddValue))}>{fieldState.enumAddLabel}</button>
           </div>
         </div>
       )}
@@ -124,7 +124,7 @@ function InputParamField({ param, normalizeName, onRename, onChange, onDelete, c
 }
 
 function BranchConditionEditor({ index, branch, options, schemas, onChange, contract, basicView = null, conditionView = null }: any) {
-  const conditionState = window.MobKitFlowController.basicBranchConditionControlState({
+  const conditionState = window.MetaFlowController.basicBranchConditionControlState({
     branch: { ...branch, index },
     options,
     schemas,
@@ -139,20 +139,20 @@ function BranchConditionEditor({ index, branch, options, schemas, onChange, cont
       ) : (
         <>
           <div className="bld-cond">
-            <select className="field__select" value={conditionState.cond.stepId || ""} onChange={e => onChange(window.MobKitFlowController.basicConditionSourcePatch(options, e.target.value, { includeNamespace: true }))}>
+            <select className="field__select" value={conditionState.cond.stepId || ""} onChange={e => onChange(window.MetaFlowController.basicConditionSourcePatch(options, e.target.value, { includeNamespace: true }))}>
               <option value="">{conditionState.sourcePlaceholder}</option>
               {conditionState.sourceOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
             </select>
-            <select className="field__select" value={conditionState.cond.field || ""} onChange={e => onChange(window.MobKitFlowController.basicConditionFieldPatch(e.target.value, conditionState.fieldOptions))} disabled={!conditionState.fields.length}>
+            <select className="field__select" value={conditionState.cond.field || ""} onChange={e => onChange(window.MetaFlowController.basicConditionFieldPatch(e.target.value, conditionState.fieldOptions))} disabled={!conditionState.fields.length}>
               <option value="">{conditionState.fieldPlaceholder}</option>
               {conditionState.fieldOptions.map(option => <option key={option.field.id || option.value} value={option.value}>{option.label}</option>)}
             </select>
-            <select className="field__select bld-cond__op" value={conditionState.operatorValue} onChange={e => onChange(window.MobKitFlowController.basicConditionOperatorPatch(e.target.value, contract))}>
+            <select className="field__select bld-cond__op" value={conditionState.operatorValue} onChange={e => onChange(window.MetaFlowController.basicConditionOperatorPatch(e.target.value, contract))}>
               {conditionState.operatorOptions.map(option => (
                 <option key={option.value} value={option.value} disabled={option.disabled}>{option.label}</option>
               ))}
             </select>
-            <CondValue field={conditionState.field} value={conditionState.cond.val} conditionView={conditionView} onChange={v => onChange(window.MobKitFlowController.basicConditionValuePatch(v))} />
+            <CondValue field={conditionState.field} value={conditionState.cond.val} conditionView={conditionView} onChange={v => onChange(window.MetaFlowController.basicConditionValuePatch(v))} />
           </div>
           <div className="bld-cond__preview">{conditionState.previewPrefix} <code>{conditionState.previewLabel}</code></div>
         </>
@@ -163,7 +163,7 @@ function BranchConditionEditor({ index, branch, options, schemas, onChange, cont
 
 export function BuilderView({ studio, mode = "build", flow: flowProp, setFlow: setFlowProp, sel: selProp, setSel: setSelProp, onShowSource, sourceOpen = false, sourceDocument = null, sourceBusy = false, sourceToggleLabel = "", onCloseSource, contract, toolCatalog = [], sourceView = null, basicView = null, launchView = null, conditionView = null, applyAuthoringIntent = null }) {
   const members = studio?.members || [];
-  const [flowLocal, setFlowLocal] = React.useState(() => window.MobKitFlowController.emptyAuthoringFlowState());
+  const [flowLocal, setFlowLocal] = React.useState(() => window.MetaFlowController.emptyAuthoringFlowState());
   const [selLocal, setSelLocal] = React.useState(null);
   const flow = flowProp || flowLocal;
   const setFlow = setFlowProp || setFlowLocal;
@@ -175,7 +175,7 @@ export function BuilderView({ studio, mode = "build", flow: flowProp, setFlow: s
   const hostRef = React.useRef(null);
   const panRef = React.useRef(null);
   const isFlow = mode === "flow";
-  const viewState = window.MobKitFlowController.basicEditorViewState(basicView);
+  const viewState = window.MetaFlowController.basicEditorViewState(basicView);
   const canvasView = Math.abs(view.ty) > 1200
     ? { ...view, ty: 0 }
     : view;
@@ -184,13 +184,13 @@ export function BuilderView({ studio, mode = "build", flow: flowProp, setFlow: s
     const fallback = viewState.authoringOperationFallbackError;
     if (!applyAuthoringIntent) {
       const result = { ok: false, error: viewState.authoringOperationUnavailableError };
-      setOperationError(window.MobKitFlowController.operationErrorText(result, fallback));
+      setOperationError(window.MetaFlowController.operationErrorText(result, fallback));
       return result;
     }
     try {
       const result = await applyAuthoringIntent(intentRequest);
       if (result?.ok === false) {
-        setOperationError(window.MobKitFlowController.operationErrorText(result, fallback));
+        setOperationError(window.MetaFlowController.operationErrorText(result, fallback));
       } else {
         setOperationError("");
       }
@@ -200,7 +200,7 @@ export function BuilderView({ studio, mode = "build", flow: flowProp, setFlow: s
         ok: false,
         error: error?.message || String(error || fallback),
       };
-      setOperationError(window.MobKitFlowController.operationErrorText(result, fallback));
+      setOperationError(window.MetaFlowController.operationErrorText(result, fallback));
       return result;
     }
   };
@@ -219,7 +219,7 @@ export function BuilderView({ studio, mode = "build", flow: flowProp, setFlow: s
   };
 
   const insertAt = (laneRef, pick) => {
-    applyBasicInteraction(window.MobKitFlowController.basicStepPickerCloseTransition());
+    applyBasicInteraction(window.MetaFlowController.basicStepPickerCloseTransition());
     commitFlow({ intent: "basic.insertStep", pick, laneRef }).then((result) => {
       if (result?.ok === false) return;
       const id = result?.selection?.id;
@@ -227,14 +227,14 @@ export function BuilderView({ studio, mode = "build", flow: flowProp, setFlow: s
     });
   };
   const removeStep = (id) => {
-    const result = window.MobKitFlowController.flowStepDeleteTransition(flow, id);
+    const result = window.MetaFlowController.flowStepDeleteTransition(flow, id);
     commitFlow({ intent: "basic.deleteStep", stepId: id }).then((operationResult) => {
       if (operationResult?.ok === false) return;
       setSel(result.selection);
       setPicker(result.picker);
     });
   };
-  const openPicker = (laneRef) => applyBasicInteraction(window.MobKitFlowController.basicStepPickerOpenTransition(laneRef));
+  const openPicker = (laneRef) => applyBasicInteraction(window.MetaFlowController.basicStepPickerOpenTransition(laneRef));
 
   // pan / zoom
   const onWheel = (e) => {
@@ -268,7 +268,7 @@ export function BuilderView({ studio, mode = "build", flow: flowProp, setFlow: s
       const move = (ev) => setView(v => ({ ...v, tx: panRef.current.tx + (ev.clientX - panRef.current.sx), ty: panRef.current.ty + (ev.clientY - panRef.current.sy) }));
       const up = () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
       window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
-      applyBasicInteraction(window.MobKitFlowController.basicCanvasClearTransition());
+      applyBasicInteraction(window.MetaFlowController.basicCanvasClearTransition());
     }
   };
 
@@ -280,7 +280,7 @@ export function BuilderView({ studio, mode = "build", flow: flowProp, setFlow: s
           <Lane studio={studio} mode={mode} steps={flow.steps} laneRef={{ lane: "main" }} sel={sel}
             contract={contract}
             basicView={basicView}
-            setSel={(id) => applyBasicInteraction(window.MobKitFlowController.basicStepSelectionTransition(id))}
+            setSel={(id) => applyBasicInteraction(window.MetaFlowController.basicStepSelectionTransition(id))}
             openPicker={openPicker} />
         </div>
 
@@ -310,7 +310,7 @@ export function BuilderView({ studio, mode = "build", flow: flowProp, setFlow: s
             contract={contract}
             basicView={basicView}
             onPick={(pick) => insertAt(picker.at, pick)}
-            onClose={() => applyBasicInteraction(window.MobKitFlowController.basicStepPickerCloseTransition())}
+            onClose={() => applyBasicInteraction(window.MetaFlowController.basicStepPickerCloseTransition())}
           />
         ) : selStep ? (
           <>
@@ -326,7 +326,7 @@ export function BuilderView({ studio, mode = "build", flow: flowProp, setFlow: s
 }
 
 function Lane({ studio, mode, steps, laneRef, sel, setSel, openPicker, contract, basicView = null }) {
-  const viewState = window.MobKitFlowController.basicEditorViewState(basicView);
+  const viewState = window.MetaFlowController.basicEditorViewState(basicView);
   return (
     <div className="bld-lane">
       {steps.map((step, i) => (
@@ -362,7 +362,7 @@ function Lane({ studio, mode, steps, laneRef, sel, setSel, openPicker, contract,
 // copy) is projected by the controller plane from the server view contract;
 // the block composes no copy locally.
 function AdaptiveBody({ studio, step, selected, onSelect, contract, basicView = null }) {
-  const adaptiveState = window.MobKitFlowController.adaptiveStepState(studio, step, contract, basicView);
+  const adaptiveState = window.MetaFlowController.adaptiveStepState(studio, step, contract, basicView);
   const block = adaptiveState.block || {};
   const chips = Array.isArray(block.chips) ? block.chips : [];
   return (
@@ -394,8 +394,8 @@ function AdaptiveBody({ studio, step, selected, onSelect, contract, basicView = 
 }
 
 function Fork({ studio, mode, step, sel, setSel, openPicker, contract, basicView = null }) {
-  const forkState = window.MobKitFlowController.basicForkCanvasState({ step, contract, basicView });
-  const viewState = window.MobKitFlowController.basicEditorViewState(basicView);
+  const forkState = window.MetaFlowController.basicForkCanvasState({ step, contract, basicView });
+  const viewState = window.MetaFlowController.basicEditorViewState(basicView);
   return (
     <div className={forkState.className}>
       <div className="bld-fork__bar" />
@@ -429,8 +429,8 @@ function Fork({ studio, mode, step, sel, setSel, openPicker, contract, basicView
 }
 
 function RepeatBody({ studio, mode, step, sel, setSel, openPicker, contract, basicView = null }) {
-  const repeatState = window.MobKitFlowController.basicRepeatCanvasState({ step, members: studio?.members || [], contract, basicView });
-  const viewState = window.MobKitFlowController.basicEditorViewState(basicView);
+  const repeatState = window.MetaFlowController.basicRepeatCanvasState({ step, members: studio?.members || [], contract, basicView });
+  const viewState = window.MetaFlowController.basicEditorViewState(basicView);
   return (
     <div className="bld-repeat">
       <div className="bld-fork__bar" />
@@ -456,7 +456,7 @@ function RepeatBody({ studio, mode, step, sel, setSel, openPicker, contract, bas
 
 function StepCard({ studio, step, index, selected, onSelect, contract, basicView = null }) {
   if (step.type === "adaptive") return null; // rendered as an expanded block by AdaptiveBody
-  const cardState = window.MobKitFlowController.basicStepCardState({ step, members: studio?.members || [], contract, basicView });
+  const cardState = window.MetaFlowController.basicStepCardState({ step, members: studio?.members || [], contract, basicView });
 
   return (
     <div
@@ -499,7 +499,7 @@ function InsertBtn({ onClick, mid, mode, title = "" }: any) {
 // ── Picker ──
 function StepPicker({ members, isKickoff, contract, onPick, onClose, basicView = null }) {
   const [q, setQ] = React.useState("");
-  const pickerState = window.MobKitFlowController.basicStepPickerState({ members, contract, query: q, isKickoff, basicView });
+  const pickerState = window.MetaFlowController.basicStepPickerState({ members, contract, query: q, isKickoff, basicView });
   if (pickerState.mode === "kickoff") {
     return (
       <div className="bld-panel__inner">
@@ -556,11 +556,11 @@ function StepPicker({ members, isKickoff, contract, onPick, onClose, basicView =
 function StepInspector({ studio, members, flow, setFlow, step, update, editStep, onDelete, contract, toolCatalog, basicView = null, launchView = null, conditionView = null }) {
   const [paramAddResult, setParamAddResult] = React.useState(null);
   React.useEffect(() => setParamAddResult(null), [step?.id]);
-  const viewState = window.MobKitFlowController.basicEditorViewState(basicView);
+  const viewState = window.MetaFlowController.basicEditorViewState(basicView);
   if (step.type === "input") {
-    const inputState = window.MobKitFlowController.basicInputControlState(step, contract, basicView);
+    const inputState = window.MetaFlowController.basicInputControlState(step, contract, basicView);
     const params = inputState.params;
-    const paramAddErrorState = window.MobKitFlowController.inputParamAddErrorState(paramAddResult, viewState.authoringOperationFallbackError);
+    const paramAddErrorState = window.MetaFlowController.inputParamAddErrorState(paramAddResult, viewState.authoringOperationFallbackError);
     const applyInputIntent = (intentRequest) => {
       if (!update) return Promise.resolve({ ok: false, error: viewState.authoringOperationUnavailableError });
       return update(intentRequest);
@@ -607,7 +607,7 @@ function StepInspector({ studio, members, flow, setFlow, step, update, editStep,
               <InputParamField
                 key={param.id}
                 param={param}
-                normalizeName={(raw) => window.MobKitFlowController.uniqueInputParamName(params, raw, param.id)}
+                normalizeName={(raw) => window.MetaFlowController.uniqueInputParamName(params, raw, param.id)}
                 onRename={(raw, previousName) => renameParam(param.id, raw, previousName)}
                 onChange={(patch) => updateParam(param.id, patch)}
                 onDelete={() => deleteParam(param.id)}
@@ -632,7 +632,7 @@ function StepInspector({ studio, members, flow, setFlow, step, update, editStep,
   }
 
   if (step.type === "branch" || step.type === "parallel") {
-    const branchState = window.MobKitFlowController.basicBranchParallelControlState({
+    const branchState = window.MetaFlowController.basicBranchParallelControlState({
       step,
       flow,
       members: studio?.members || [],
@@ -701,14 +701,14 @@ function StepInspector({ studio, members, flow, setFlow, step, update, editStep,
   }
 
   if (step.type === "repeat") {
-    const repeatState = window.MobKitFlowController.basicRepeatControlState({
+    const repeatState = window.MetaFlowController.basicRepeatControlState({
       step,
       members: studio?.members || [],
       schemas: studio?.schemas || [],
       contract,
       basicView,
     });
-    const setCond = (patch) => editStep(step.id, "set_repeat_condition", window.MobKitFlowController.flowStepRepeatConditionPatch(step, patch));
+    const setCond = (patch) => editStep(step.id, "set_repeat_condition", window.MetaFlowController.flowStepRepeatConditionPatch(step, patch));
     return (
       <div className="bld-panel__inner">
         <PanelHead icon={repeatState.panelIcon} iconTint="member" title={repeatState.panelTitle} sub={repeatState.panelSub} onClose={onDelete} deleteMode />
@@ -720,20 +720,20 @@ function StepInspector({ studio, members, flow, setFlow, step, update, editStep,
           <div className="bld-hint" style={{ marginTop: 10, color: "var(--warn)" }}>{repeatState.emptyBodyHint}</div>
         ) : (
           <div className="bld-cond">
-            <select className="field__select" value={repeatState.cond.stepId || ""} onChange={e => setCond(window.MobKitFlowController.basicConditionSourcePatch(repeatState.bodyMembers, e.target.value))}>
+            <select className="field__select" value={repeatState.cond.stepId || ""} onChange={e => setCond(window.MetaFlowController.basicConditionSourcePatch(repeatState.bodyMembers, e.target.value))}>
               <option value="">{repeatState.memberPlaceholderLabel}</option>
               {repeatState.bodyMemberOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
             </select>
-            <select className="field__select" value={repeatState.cond.field || ""} onChange={e => setCond(window.MobKitFlowController.basicConditionFieldPatch(e.target.value, repeatState.fieldOptions))} disabled={!repeatState.condSchema}>
+            <select className="field__select" value={repeatState.cond.field || ""} onChange={e => setCond(window.MetaFlowController.basicConditionFieldPatch(e.target.value, repeatState.fieldOptions))} disabled={!repeatState.condSchema}>
               <option value="">{repeatState.fieldPlaceholder}</option>
               {repeatState.fieldOptions.map(option => <option key={option.field.id || option.value} value={option.value}>{option.label}</option>)}
             </select>
-            <select className="field__select bld-cond__op" value={repeatState.operatorValue} onChange={e => setCond(window.MobKitFlowController.basicConditionOperatorPatch(e.target.value, contract))}>
+            <select className="field__select bld-cond__op" value={repeatState.operatorValue} onChange={e => setCond(window.MetaFlowController.basicConditionOperatorPatch(e.target.value, contract))}>
               {repeatState.operatorOptions.map(option => (
                 <option key={option.value} value={option.value} disabled={option.disabled}>{option.label}</option>
               ))}
             </select>
-            <CondValue field={repeatState.condField} value={repeatState.cond.val} conditionView={conditionView} onChange={v => setCond(window.MobKitFlowController.basicConditionValuePatch(v))} />
+            <CondValue field={repeatState.condField} value={repeatState.cond.val} conditionView={conditionView} onChange={v => setCond(window.MetaFlowController.basicConditionValuePatch(v))} />
           </div>
         )}
         <div className="bld-cond__preview">{repeatState.previewLabel} <code>{repeatState.repeatUntilExpression || repeatState.previewFallback}</code></div>
@@ -758,7 +758,7 @@ function StepInspector({ studio, members, flow, setFlow, step, update, editStep,
   }
 
   // member step
-  const memberStepState = window.MobKitFlowController.basicMemberStepControlState({
+  const memberStepState = window.MetaFlowController.basicMemberStepControlState({
     step,
     flow,
     members,
@@ -881,13 +881,13 @@ function StepInspector({ studio, members, flow, setFlow, step, update, editStep,
 
 function ToolScopeEditor({ label, emptyLabel, member, selected, onChange, mode = "member", toolCatalog = [], basicView = null }) {
   const field = mode === "catalog" ? "blockedTools" : "allowedTools";
-  const scope = window.MobKitFlowController.stepToolScopeState({ member, selected, mode, toolCatalog, basicView });
+  const scope = window.MetaFlowController.stepToolScopeState({ member, selected, mode, toolCatalog, basicView });
   const remove = (id) => {
-    const result = window.MobKitFlowController.stepToolScopeRemovePatch(selected, id, { field });
+    const result = window.MetaFlowController.stepToolScopeRemovePatch(selected, id, { field });
     if (result.patch) onChange(result.patch[field] || []);
   };
   const add = (id) => {
-    const result = window.MobKitFlowController.stepToolScopeAddPatch(selected, id, { member, mode, toolCatalog, field, basicView });
+    const result = window.MetaFlowController.stepToolScopeAddPatch(selected, id, { member, mode, toolCatalog, field, basicView });
     if (result.patch) onChange(result.patch[field] || []);
   };
   return (
@@ -927,8 +927,8 @@ function ToolScopeEditor({ label, emptyLabel, member, selected, onChange, mode =
 // EXISTING members — member CRUD lives in the AGENTS tab (the hint below the
 // toggle list points there).
 function AdaptivePanel({ studio, step, update, onDelete, contract, basicView = null }) {
-  const viewState = window.MobKitFlowController.basicEditorViewState(basicView);
-  const adaptiveState = window.MobKitFlowController.adaptiveStepState(studio, step, contract, basicView);
+  const viewState = window.MetaFlowController.basicEditorViewState(basicView);
+  const adaptiveState = window.MetaFlowController.adaptiveStepState(studio, step, contract, basicView);
   const [advancedLimitsOpen, setAdvancedLimitsOpen] = React.useState(false);
   React.useEffect(() => setAdvancedLimitsOpen(false), [step.id]);
   const flowmasterOptions = Array.isArray(adaptiveState.flowmasterOptions) ? adaptiveState.flowmasterOptions : [];

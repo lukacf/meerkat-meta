@@ -7,7 +7,7 @@ const { build } = require("esbuild");
 const { EMBEDDED_SHARED_FILES } = require("./generated-assets.cjs");
 
 const outDir = path.join(__dirname, "dist");
-const embeddedOutDir = path.join(__dirname, "../crates/meerkat-mobkit/console-dist");
+const embeddedOutDir = path.join(__dirname, "../crates/meerkat-meta/console-dist");
 const indexSourcePath = path.join(__dirname, "src/index.tsx");
 const browserSourcePath = path.join(__dirname, "src/browser.tsx");
 const libraryBundlePath = path.join(outDir, "index.cjs");
@@ -41,8 +41,8 @@ function renderHtml({ jsVersion, cssVersion }) {
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="mobkit-base-url" content="" />
-    <title>MobKit Console</title>
+    <meta name="meta-base-url" content="" />
+    <title>Meta Console</title>
     <link rel="stylesheet" href="/console/assets/console-app.css?v=${cssVersion}" />
   </head>
   <body>

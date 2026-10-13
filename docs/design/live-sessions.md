@@ -73,13 +73,13 @@ composition and are not claims that these owner seams are still missing:
    It obtains generated worker-start/consequential-effect authority, starts a
    durable executor fork, and owns result reconciliation/cleanup. There is no
    existing-background-member selection in the registered client-context
-   coordinator. Copying this coordinator into MobKit or sending a second
+   coordinator. Copying this coordinator into Meta or sending a second
    untracked text turn would create competing execution authority.
 4. `rpc_gateway` installs `LiveRpcHandler` only in its stdin dispatcher and
    publishes sanitized assistant-output addresses through the stdin callback
    bridge. `http_console` currently advertises an empty
    `feature_capabilities` array and has no strict live handler, response-delivery
-   custody, or public-observation delivery acknowledgements. `mobkit_gateway`
+   custody, or public-observation delivery acknowledgements. `meta_gateway`
    does not register the public live host.
 
 At that baseline, the browser had to treat voice as unavailable until those
@@ -94,10 +94,10 @@ transcript to manufacture a seed, or report a fork as the existing agent.
 Untargeted `/console/experience` never probes credentials or scans the roster
 for voice readiness. Its `voice.available` stays false; a configured,
 authenticated host additionally publishes
-`voice.readiness_method: "mobkit/console/voice/readiness"` as discovery, not an
+`voice.readiness_method: "meta/console/voice/readiness"` as discovery, not an
 authorization grant.
 
-Call `mobkit/console/voice/readiness {identity}` for the selected target. The
+Call `meta/console/voice/readiness {identity}` for the selected target. The
 result is exactly `{identity, available}`, echoing the requested identity, and uses the shared
 `probe_execution_readiness` authority: current durable source, configured
 binding, AuthMachine and credential resolution, with no summary, channel
@@ -117,7 +117,7 @@ The one-voice/open exclusivity fence is enforced separately by open.
 
 Compile with `openai-live` (the release binary feature). In `rpc_gateway`, supply
 `runtime_options.console_voice` and `runtime_options.auth_config` with persistent
-state. In standalone `mobkit_gateway`, supply top-level `console_voice`,
+state. In standalone `meta_gateway`, supply top-level `console_voice`,
 `auth_config`, and `persistent_sessions: true`.
 
 The console voice registration uses the shared public profile shape:
@@ -155,30 +155,30 @@ A gateway that registers both `runtime_options.console_voice` and
 `runtime_options.live` composes ONE live context (one adapter host, one WS
 state, one provider registration) and mounts two doors onto it: the
 authenticated console voice controller and the external door (the live
-WebSocket router at `{base}/live/ws` plus the stdio `mobkit/live/*` RPCs).
+WebSocket router at `{base}/live/ws` plus the stdio `meta/live/*` RPCs).
 Meerkat keeps channels per session and couples nothing across members, so the
-policy that only one voice path is active per gateway is MobKit's:
+policy that only one voice path is active per gateway is Meta's:
 `live_wiring::LiveOwnerArbiter`, held by the shared `GatewayLiveContext`.
 
 Arbitration is "latest engaged wins". Each door engages the arbiter before it
 opens, carrying the close sequence it would use on itself:
 
-- A console `mobkit/console/voice/open` closes an active external channel
+- A console `meta/console/voice/open` closes an active external channel
   through the external host's generated close. The external client sees its
-  socket end; `mobkit/live/status` and `mobkit/live/close` for that channel
+  socket end; `meta/live/status` and `meta/live/close` for that channel
   answer `"close_reason": "superseded_by_console_voice"` (a closed channel the
   arbiter ended reports `status: closed` with the reason instead of demanding
   a phase receipt), and the stdio gateway emits
-  `mobkit/live/superseded {owner, identity, channel_id, reason, superseded_by}`
+  `meta/live/superseded {owner, identity, channel_id, reason, superseded_by}`
   immediately.
-- An external `mobkit/live/open` closes an active console call through the
+- An external `meta/live/open` closes an active console call through the
   console slot's ordinary teardown. Every later console request for that call
   (`replacement`, `context_status`, `activity`) fails with kind
   `voice_superseded` and `data.reason = "superseded_by_external_live"`; the
   browser ends the call with "Voice moved to the external live channel". The
   open result carries `"superseded": {"owner": "console_voice", "identity",
   "channel_id"}`.
-- `mobkit/console/voice/readiness` answers
+- `meta/console/voice/readiness` answers
   `{identity, available: false, reason: "external_live_active", holder:
   {identity, channel_id}}` while the external door holds the path. Plain
   unavailability keeps the old two-field shape.
@@ -223,10 +223,10 @@ bridge eligibility, snapshot, and operation hooks to the owning service.
 Both gateway HTTP apps install a console request controller; without the above
 configuration it cannot enable voice or open a provider:
 
-- `mobkit/console/voice/open {identity, request_id}` returns the raw strict
+- `meta/console/voice/open {identity, request_id}` returns the raw strict
   pending handle from the composed shared host; an
   unconfigured host returns `-32050`, `data.kind: "voice_unavailable"`.
-- `mobkit/console/voice/close {identity, request_id}` fences that
+- `meta/console/voice/close {identity, request_id}` fences that
   request ID for its authenticated principal, including when close arrives
   before open, while its closed slot is retained as described below. It returns
   `{phase: "closed"}` only after any late successful open has been closed
@@ -257,13 +257,13 @@ configuration it cannot enable voice or open a provider:
 These are product request/retry mechanics, not replacement live authority.
 The host retains the upstream channel and publication custody behind each
 request. The complete request-owned HTTP channel subset is
-`mobkit/live/playback_owner/register`, `mobkit/live/playback_owner/revoke`,
-`mobkit/live/status`, `mobkit/live/close`, `mobkit/live/refresh`,
-`mobkit/live/interrupt`, and `live/webrtc/answer`. Each requires the exact
+`meta/live/playback_owner/register`, `meta/live/playback_owner/revoke`,
+`meta/live/status`, `meta/live/close`, `meta/live/refresh`,
+`meta/live/interrupt`, and `live/webrtc/answer`. Each requires the exact
 identity and channel of the authenticated owner's current request, in addition
-to the applicable strict receipts. Raw `mobkit/live/open`,
-`mobkit/live/send_input`, `mobkit/live/commit_input`, `mobkit/live/truncate`,
-and `mobkit/live/playback_complete` are not HTTP console fallbacks. Guessed
+to the applicable strict receipts. Raw `meta/live/open`,
+`meta/live/send_input`, `meta/live/commit_input`, `meta/live/truncate`,
+and `meta/live/playback_complete` are not HTTP console fallbacks. Guessed
 playback completion and provider-native identifiers are not alternative paths.
 
 Browser close gates microphone transmission and speaker gain immediately but
@@ -293,14 +293,14 @@ loss-intolerant when the owner emits them, but are not guaranteed once per
 spoken utterance.
 
 After `live/webrtc/answer`, apply the remote SDP and then call
-`mobkit/console/voice/answer_received {identity, request_id, channel_id}`.
+`meta/console/voice/answer_received {identity, request_id, channel_id}`.
 Its `{accepted: true}` response settles the retained upstream HTTP answer
 publication custody. Only then poll strict status for activation and release
 media gates. Open publication is acknowledged by the subsequent exact
 pending-receipt owner registration. Failed/disconnected setup retains cleanup
 ownership until request-scoped close.
 
-`mobkit/console/voice/activity {identity, request_id}` returns `{accepted: true}`. Report fresh,
+`meta/console/voice/activity {identity, request_id}` returns `{accepted: true}`. Report fresh,
 measured non-silent audio, debounced to at most once per five seconds; never send
 ordinary text or a keepalive as activity. The backend independently enforces
 the 900-second silence window and retries shared-host cleanup. An observation
@@ -351,7 +351,7 @@ entry in a bounded per-channel buffer (coalesced per item, oldest evicted
 first) and wakes readers. Captions for sessions without a console call are
 dropped.
 
-`mobkit/console/voice/captions {identity, request_id, channel_id, after,
+`meta/console/voice/captions {identity, request_id, channel_id, after,
 wait_ms}` reads that buffer with the same exact `{identity, request_id,
 channel_id}` scope as `context_status`. It answers `{identity, request_id,
 channel_id, cursor, captions}` with entries newer than `after`, waiting up to
@@ -380,11 +380,11 @@ until its answer binds. The browser must negotiate a new peer/owner/answer and
 wait for activation, without changing the background identity.
 
 The #1117-based candidate adds an opaque `pending_receipt` to each replacement
-variant. MobKit's current SDK replacement parser still expects the older
+variant. Meta's current SDK replacement parser still expects the older
 `LiveChannelHandle` shape without that receipt. Its strict RPC preflight also
 requires the old channel's active receipt, which is not sufficient once
 recovery has closed that old channel. The console adapter therefore uses
-`mobkit/console/voice/replacement {identity, request_id}`. It returns
+`meta/console/voice/replacement {identity, request_id}`. It returns
 `{required: false}` or
 `{required: true, reason, replacement, canonical_seed_cursor}`, where
 `replacement` is the full strict pending handle. Install a new peer and owner,
@@ -404,15 +404,15 @@ fallbacks:
 
 | Method | Request fields beyond JSON-RPC envelope | Result |
 | --- | --- | --- |
-| `mobkit/capabilities` | none | Require both `live.execution_identity.v1` and `live.execution.client_context.v1` in `feature_capabilities`. |
-| `mobkit/live/open` | `identity`, `transport: "webrtc"`, `execution_identity: {version: "v1", profile_id: "openai.gpt-live-1.client-context.v1"}` | Pending handle: `channel_id`, `target_identity`, `execution_mode`, `pending_receipt`, `transport`, `capabilities`, `continuity`. |
-| `mobkit/live/playback_owner/register` | `identity`, `channel_id`, `pending_receipt` | `channel_id`, `readiness_receipt`. |
+| `meta/capabilities` | none | Require both `live.execution_identity.v1` and `live.execution.client_context.v1` in `feature_capabilities`. |
+| `meta/live/open` | `identity`, `transport: "webrtc"`, `execution_identity: {version: "v1", profile_id: "openai.gpt-live-1.client-context.v1"}` | Pending handle: `channel_id`, `target_identity`, `execution_mode`, `pending_receipt`, `transport`, `capabilities`, `continuity`. |
+| `meta/live/playback_owner/register` | `identity`, `channel_id`, `pending_receipt` | `channel_id`, `readiness_receipt`. |
 | `live/webrtc/answer` | `identity`, `channel_id`, `pending_receipt`, `readiness_receipt`, `token`, `offer_sdp` | `answer_sdp`; publication custody must succeed before activation. |
-| `mobkit/live/status` | `identity`, `channel_id`, exactly one of `pending_receipt` or `activation_receipt` | `phase: "pending"`, `"active"` with `handle`, `"revoked"`, or `"closed"`. Active handle carries `channel_id`, `target_identity`, `execution_mode`, `activation_receipt`. |
-| `mobkit/live/close` | `identity`, `channel_id`, exactly one phase receipt | `status` from the shared close owner. |
-| `mobkit/live/playback_owner/revoke` | `identity`, `channel_id`, `pending_receipt`, `readiness_receipt`, plus `activation_receipt` if active | `phase: "revoked"`. |
-| `mobkit/live/playback_complete` | `identity`, `channel_id`, `activation_receipt`, `output_id` | `status: "completed"`. |
-| `mobkit/live/truncate` | `identity`, `channel_id`, `activation_receipt`, `output_id`, `audio_played_ms`, optional `reported_playback_prefix` | Shared typed truncation result. |
+| `meta/live/status` | `identity`, `channel_id`, exactly one of `pending_receipt` or `activation_receipt` | `phase: "pending"`, `"active"` with `handle`, `"revoked"`, or `"closed"`. Active handle carries `channel_id`, `target_identity`, `execution_mode`, `activation_receipt`. |
+| `meta/live/close` | `identity`, `channel_id`, exactly one phase receipt | `status` from the shared close owner. |
+| `meta/live/playback_owner/revoke` | `identity`, `channel_id`, `pending_receipt`, `readiness_receipt`, plus `activation_receipt` if active | `phase: "revoked"`. |
+| `meta/live/playback_complete` | `identity`, `channel_id`, `activation_receipt`, `output_id` | `status: "completed"`. |
+| `meta/live/truncate` | `identity`, `channel_id`, `activation_receipt`, `output_id`, `audio_played_ms`, optional `reported_playback_prefix` | Shared typed truncation result. |
 
 Prepare and gate microphone/output before registering the playback owner.
 Apply the answer while media remains gated. Release media only after status
@@ -469,10 +469,10 @@ and account secrets never cross that projection.
 top of this page.** The development lineage and qualification evidence below
 are retained; they are not instructions to restore a patch or downgrade.
 
-The requested Meerkat **0.8.39** / MobKit **0.8.36** baseline was incorporated.
+The requested Meerkat **0.8.39** / Meta **0.8.36** baseline was incorporated.
 On 2026-09-16, crates.io published Meerkat 0.8.39 from
 `ad39733a00743723c2227a43a7557cc3f2c6344f`, but that crate does not contain
-`LiveContextSummaryPolicy` or `ProviderManagedUnmeasured`. MobKit main then
+`LiveContextSummaryPolicy` or `ProviderManagedUnmeasured`. Meta main then
 contained the 0.8.36 release commit. Registry publication and GitHub release
 listings can lag each other; version labels alone are not API evidence.
 Meerkat [lukacf/meerkat#1117](https://github.com/lukacf/meerkat/pull/1117), inspected at
@@ -520,7 +520,7 @@ for future dependency changes:
    idempotent input delivery, final-transcript correlation, result publication,
    and cancellation/recovery. It must not spawn a durable fork, duplicate the
    user transcript, block independent text submission, or change the member's
-   normal model/tool policy. No MobKit-owned replacement coordinator.
+   normal model/tool policy. No Meta-owned replacement coordinator.
 3. **Authenticated readiness without provider opening.** A secret-free,
    current per-target projection uses the same fixed public profile, selected
    configured OpenAI binding, credential resolver, and AuthMachine authority
@@ -538,11 +538,11 @@ for future dependency changes:
 Upstream tests must cover an active text turn racing voice open/delegation,
 context changes during summarization, summary failure, cold resume, restart or
 generation replacement, duplicate/ambiguous delivery, and cancellation before
-the open response is delivered. MobKit separately owns authenticated HTTP
+the open response is delivered. Meta separately owns authenticated HTTP
 request-id fencing, answer delivery acknowledgements, the console
 silence policy, and agent-selection UI policy.
 
-MobKit's prepared summary producer uses the existing typed `LlmClient` request
+Meta's prepared summary producer uses the existing typed `LlmClient` request
 path with no tools. It renders the authoritative snapshot as data, requests a
 factual context summary, enforces the UTF-8 output budget, excludes reasoning
 blocks, and rejects incomplete, truncated, empty, non-text, or oversized output.
@@ -562,11 +562,11 @@ The console opts into `LiveContextBootstrapMode::Concurrent`. Audio admission
 and receipt activation do not await summary generation. Meerkat owns the
 captured canonical prefix separately from provider-delivered knowledge, orders
 its quiet context delivery with newer conversation updates, and fences or
-cancels jobs when their channel closes or is replaced. MobKit does not mint a
+cancels jobs when their channel closes or is replaced. Meta does not mint a
 delivered cursor, insert a synthetic user turn, or substitute instructions
 for summary authority. Non-console callers retain the `BeforeOpen` default.
 
-`mobkit/console/voice/context_status` reads the retained shared-owner custody
+`meta/console/voice/context_status` reads the retained shared-owner custody
 with an exact `{identity, request_id, channel_id}` scope. Its response echoes
 that scope and projects `context_preparation` as `not_requested`,
 `preparing` with a `capturing`, `generating`, or `delivering` stage,
@@ -602,10 +602,10 @@ The current console composition is described above.
 - Experimental GPT Live canonical projection is shared by Meerkat's generic
   `ServiceLiveProjection<B>`, which implements `LiveProjectionSink`,
   `LiveChannelCloseFeedback`, `LiveChannelStatusFeedback`, and
-  `LiveWsTokenAuthority`. MobKit composes this facade directly and does not
+  `LiveWsTokenAuthority`. Meta composes this facade directly and does not
   port experimental transcript, playback, or machine-authority sequences.
   Published Meerkat 0.8.26 still exposes only its Factory-bound projection,
-  so non-experimental builds retain MobKit's preexisting ordinary websocket
+  so non-experimental builds retain Meta's preexisting ordinary websocket
   projection behind an exclusive compatibility cfg. The two paths cannot be
   compiled into the same build.
 - Lifecycle authority is machine-owned: every open/close/status/token step
@@ -613,7 +613,7 @@ The current console composition is described above.
   methods (`resolve_live_open_admission`, `resolve_live_close_result`,
   `record_live_websocket_token_issued`,
   `resolve_live_websocket_token_admission`, ...). All present in published
-  meerkat-runtime 0.7.25 under the `live` feature (mobkit already enables
+  meerkat-runtime 0.7.25 under the `live` feature (meta already enables
   it).
 - Session-scoped seams the sink needs are inherent methods on
   `PersistentSessionService<B>`: `append_external_user_content`,
@@ -640,10 +640,10 @@ The current console composition is described above.
   Config`. Facade features required: `live` + `openai-realtime`. Only
   `gpt-realtime-2` (OpenAI) is realtime-capable in the shipped catalog.
 
-## mobkit design
+## meta design
 
 Original design and versioned compatibility history for
-`crates/meerkat-mobkit/src/live_wiring.rs`; the ordinary-stdin versus console-HTTP
+`crates/meerkat-meta/src/live_wiring.rs`; the ordinary-stdin versus console-HTTP
 boundary in item 5 is clarified for the current implementation. Older
 published-version limitations below do not require a development pin today.
 
@@ -672,10 +672,10 @@ published-version limitations below do not require a development pin today.
    provider default (env `OPENAI_API_KEY`), matching text-model behavior.
    Embedders with real config stores can swap the source later.
 5. **Ordinary RPC surface** (unified stdin, not the full console HTTP surface):
-   `mobkit/live/open`,
-   `mobkit/live/status`, `mobkit/live/close`, `mobkit/live/refresh`,
-   `mobkit/live/send_input`, `mobkit/live/commit_input`,
-   `mobkit/live/interrupt`, `mobkit/live/truncate`. Params accept an
+   `meta/live/open`,
+   `meta/live/status`, `meta/live/close`, `meta/live/refresh`,
+   `meta/live/send_input`, `meta/live/commit_input`,
+   `meta/live/interrupt`, `meta/live/truncate`. Params accept an
    IDENTITY TARGET —
    `{identity: "device"}` or `{member_id}` or raw `{session_id}` —
    resolved via `resolve_bridge_session_id` + the roster `agent_identity`
@@ -685,19 +685,19 @@ published-version limitations below do not require a development pin today.
    answer `-32050 live_unavailable` when the gateway has no live context
    (ephemeral mode, or feature disabled).
    The original full-console proposal is superseded: HTTP opens through
-   `mobkit/console/voice/open` and supports only the explicitly enumerated
+   `meta/console/voice/open` and supports only the explicitly enumerated
    request-owned channel subset in [HTTP request fencing](#http-request-fencing).
    The ordinary `identity`/`member_id`/`session_id` alternatives are not
    interchangeable HTTP authorization targets.
 6. **Realtime model selection (v1)**: the member session's model decides
    (profile `model = "gpt-realtime-2"` for a voice-first member). For
-   members whose text model differs, `mobkit/live/open` accepts an
+   members whose text model differs, `meta/live/open` accepts an
    optional `model` override forwarded into `RealtimeSessionOpenConfig`;
    a per-profile `realtime_model` map can ride `runtime_options.live` in a
    follow-up once field usage settles. (Deliberately NOT a mob.toml
    profile field — profiles are upstream schema.) For members whose text
    PROVIDER differs too (the downstream app: Anthropic text profiles opening the
-   OpenAI realtime lane), `mobkit/live/open` also accepts a strict
+   OpenAI realtime lane), `meta/live/open` also accepts a strict
    optional `provider` paired with `model`: an unrecognized provider name
    is a typed invalid-params error (never a silent fallthrough), the
    (provider, model) pair is applied to the channel identity before the
@@ -712,7 +712,7 @@ published-version limitations below do not require a development pin today.
    close reverts by construction and `live/refresh` re-projects from the
    durable session.
 7. **Gating**: `runtime_options.live = true | {ws: true}` opt-in on
-   `mobkit/init` (default OFF). ABAC: live methods map to `agent.send` on
+   `meta/init` (default OFF). ABAC: live methods map to `agent.send` on
    the target member (console surface); stdin surface is host-trusted as
    usual.
 
@@ -758,8 +758,8 @@ advertising those generic atoms.
 ## Public GPT Live registration (`runtime_options.openai_live`)
 
 Meerkat 0.8.38 ships a public OpenAI Live path for the released `gpt-live-1`
-catalog row behind the `openai-live` feature (mobkit forwards it as
-`crates/meerkat-mobkit/openai-live`). It reuses the strict channel machinery above
+catalog row behind the `openai-live` feature (meta forwards it as
+`crates/meerkat-meta/openai-live`). It reuses the strict channel machinery above
 (pending/active receipts, WebRTC answer, playback custody, client-context
 delegation) but has no operator, Gate0 qualification, or factory identity:
 the released catalog row, the host's configured OpenAI API-key binding, and
@@ -807,7 +807,7 @@ rejected at parse time.
 
 Still-image input rides the SAME transport and RPC surface: the wire chunk
 `{kind: "image", idempotency_key, mime, data}` flows through
-`mobkit/live/send_input` unchanged (the handler deserializes
+`meta/live/send_input` unchanged (the handler deserializes
 `LiveInputChunkWire`, which gained the exhaustive `Image` variant), and the
 SDKs add `live_send_input_image` / `liveSendInputImage` conveniences
 mirroring meerkat's SDK signatures. `idempotency_key` is caller-stable
@@ -824,7 +824,7 @@ explicit GPT-5.5 pins stay honored) — realtime capability is unchanged.
 
 ## Field-reported additions (mobkit 0.7.32)
 
-- **Host-trusted voice profiles (strict opens)**: `mobkit/live/open` selecting
+- **Host-trusted voice profiles (strict opens)**: `meta/live/open` selecting
   `execution_identity` and a host-registered public/experimental profile rejects
   caller-supplied instructions, execution-mode overrides, model, provider,
   tools, and Responses configuration. Unknown fields inside the nested
@@ -839,7 +839,7 @@ explicit GPT-5.5 pins stay honored) — realtime capability is unchanged.
   channel-scoped `instructions`, `model`, a validated `provider` paired with an
   explicit `model`, and `turning_mode`. These ordinary controls are not console
   voice overrides.
-- **Seed clamp (upstream ask 30, historical stopgap — replaced)**: MobKit
+- **Seed clamp (upstream ask 30, historical stopgap — replaced)**: Meta
   originally dropped whole canonical conversation messages oldest-first to
   bound long seeds. Current `runtime_options.live.seed_max_chars` (object form)
   supplies the gateway-wide serialized-character budget; per-open
@@ -853,7 +853,7 @@ explicit GPT-5.5 pins stay honored) — realtime capability is unchanged.
   token-limit guarantee. Console
   summary production is separate; see
   [Nonblocking console context bootstrap](#nonblocking-console-context-bootstrap).
-- **`mobkit/live/truncate`** (was deliberately unported in v1): barge-in
+- **`meta/live/truncate`** (was deliberately unported in v1): barge-in
   cleanup — truncate an assistant item at the client-tracked playback
   cursor. Same machine-authority choreography as the sibling command
   handlers; SDK conveniences `live_truncate` / `liveTruncate`.

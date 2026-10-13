@@ -213,7 +213,7 @@ export class CallbackDispatcher {
     params: Record<string, unknown>,
     callbackContext?: ProviderCallbackContext,
   ): Promise<unknown> {
-    if (method === "mobkit/live/assistant_output_available") {
+    if (method === "meta/live/assistant_output_available") {
       const output = parseLiveAssistantOutputAddress(params);
       const consumer = this._liveOutputConsumers.get(output.channelId);
       if (consumer === undefined) {
@@ -225,7 +225,7 @@ export class CallbackDispatcher {
       return { accepted: true };
     }
 
-    if (method === "mobkit/on_error") {
+    if (method === "meta/on_error") {
       if (this._errorCallback !== null) {
         const event = parseErrorEvent(params);
         try {

@@ -16,7 +16,7 @@ import re
 import sys
 import pathlib
 
-GATEWAY = pathlib.Path(__file__).resolve().parent.parent / "crates/meerkat-mobkit/src/bin/rpc_gateway.rs"
+GATEWAY = pathlib.Path(__file__).resolve().parent.parent / "crates/meerkat-meta/src/rpc_gateway.rs"
 
 
 def main() -> int:

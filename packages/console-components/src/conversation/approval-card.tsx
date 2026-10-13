@@ -25,15 +25,22 @@ export function ApprovalCard({ request, resourceStatus, decision, readOnly = fal
       </header>
       {request.rationale ? <p>{request.rationale}</p> : null}
       <dl className="cc-approval__scope">
+        {request.actorId ? <><dt>Actor</dt><dd>{request.actorId}</dd></> : null}
+        <dt>Requested approver</dt><dd>{request.requestedApprover || "Not specified"}</dd>
         {request.origin ? <><dt>Origin</dt><dd>{request.origin.identity}</dd></> : null}
         {request.riskTier ? <><dt>Risk</dt><dd>{request.riskTier}</dd></> : null}
+        {request.approvalRecipient ? <><dt>Notification recipient</dt><dd>{request.approvalRecipient}</dd></> : null}
+        {request.approvalChannel ? <><dt>Notification channel</dt><dd>{request.approvalChannel}</dd></> : null}
         {request.deadlineAtMs !== undefined ? <><dt>Deadline</dt><dd><time dateTime={new Date(request.deadlineAtMs).toISOString()}>{new Date(request.deadlineAtMs).toLocaleString()}</time></dd></> : null}
       </dl>
       <RowDetails part={`approval-details:${request.pendingId}`} className="cc-approval__details"><summary>Complete request details</summary>
         <dl className="cc-approval__scope">
           <dt>Request</dt><dd><code>{request.pendingId}</code></dd>
           <dt>Action scope</dt><dd><code>{request.actionId}</code></dd>
+          {request.approvalRouteId ? <><dt>Route reference</dt><dd><code>{request.approvalRouteId}</code></dd></> : null}
+          {request.approvalDeliveryId ? <><dt>Delivery reference</dt><dd><code>{request.approvalDeliveryId}</code></dd></> : null}
         </dl>
+        {request.approvalRouteId || request.approvalDeliveryId ? <p>Notification references do not confirm receipt or a human decision.</p> : null}
         <pre>{JSON.stringify(request.raw, null, 2)}</pre>
       </RowDetails>
       {decision?.error ? <p role="alert">{decision.error}</p> : null}

@@ -71,14 +71,14 @@ desktop/renderer/src/app/App.tsx +4 -3
   });
 
   test("restores inline code after emphasis parsing", () => {
-    expect(renderConversationInlineMarkdown("Use `config/mob.toml` and `mobkit/send_message`.")).toBe(
-      'Use <code class="cc-rich-inline-code">config/mob.toml</code> and <code class="cc-rich-inline-code">mobkit/send_message</code>.',
+    expect(renderConversationInlineMarkdown("Use `config/mob.toml` and `meta/send_message`.")).toBe(
+      'Use <code class="cc-rich-inline-code">config/mob.toml</code> and <code class="cc-rich-inline-code">meta/send_message</code>.',
     );
   });
 
   test("does not let inline-code placeholders collide with user text", () => {
-    expect(renderConversationInlineMarkdown("Literal @@CODETOKEN0@@ and `mobkit/send_message`.")).toBe(
-      'Literal @@CODETOKEN0@@ and <code class="cc-rich-inline-code">mobkit/send_message</code>.',
+    expect(renderConversationInlineMarkdown("Literal @@CODETOKEN0@@ and `meta/send_message`.")).toBe(
+      'Literal @@CODETOKEN0@@ and <code class="cc-rich-inline-code">meta/send_message</code>.',
     );
   });
 
@@ -94,7 +94,7 @@ desktop/renderer/src/app/App.tsx +4 -3
     );
   });
 
-  test("preserves public MobKit peer message kinds in inline code", () => {
+  test("preserves public Meta peer message kinds in inline code", () => {
     const text = "All are connected over **inproc** and support `peer_message`, `peer_request`, and `peer_response`.";
     const blocks = parseConversationRichBlocks(text);
 
@@ -109,14 +109,14 @@ desktop/renderer/src/app/App.tsx +4 -3
 
   test("normalizes legacy leaked code placeholders before rich block parsing", () => {
     const blocks = parseConversationRichBlocks([
-      "@@CODE0@@ — builds MobKit runtime, starts channels/connectors, exposes @@CODE1@@, @@CODE2@@, @@CODE3@@, and proxies stock console/runtime routes.",
+      "@@CODE0@@ — builds Meta runtime, starts channels/connectors, exposes @@CODE1@@, @@CODE2@@, @@CODE3@@, and proxies stock console/runtime routes.",
       "@@CODE4@@ — turns @@CODE5@@ + config/mob.toml into durable identities and peer topology.",
     ].join("\n"));
 
     expect(blocks).toEqual([{
       type: "paragraph",
       text: [
-        "builds MobKit runtime, starts channels/connectors, exposes and proxies stock console/runtime routes.",
+        "builds Meta runtime, starts channels/connectors, exposes and proxies stock console/runtime routes.",
         "turns config/mob.toml into durable identities and peer topology.",
       ].join("\n"),
     }]);
@@ -149,21 +149,21 @@ desktop/renderer/src/app/App.tsx +4 -3
   test("does not expose raw UUID peer targets as display labels", () => {
     expect(conversationRichPeerTargetForDisplay("e3ec9e90-460e-51b3-80b9-dea0f0c31752")).toBe("Peer");
     expect(conversationRichPeerTargetForDisplay("Lib thread")).toBe("Lib thread");
-    expect(conversationRichPeerTargetForDisplay("HSNS peer source peer-root-1781853922227")).toBe("HSNS peer thread");
+    expect(conversationRichPeerTargetForDisplay("Ops peer source peer-root-1781853922227")).toBe("Ops peer thread");
   });
 
   test("normalizes legacy machine-token labels before shared console rendering", () => {
     expect(normalizeConversationDisplayLabel("Example peer target peer-root-1781853922227")).toBe("Example peer thread");
-    expect(normalizeConversationDisplayLabel("HSNS request source peer-req-1781854233913")).toBe("HSNS request thread");
+    expect(normalizeConversationDisplayLabel("Ops request source peer-req-1781854233913")).toBe("Ops request thread");
     expect(normalizeConversationDisplayLabel("Example merged response peer-merge-1781854428883")).toBe("Example peer response");
-    expect(normalizeConversationDisplayLabel("Peer live hsns peer-live-1781853108762")).toBe("HSNS peer thread");
+    expect(normalizeConversationDisplayLabel("Peer live ops peer-live-1781853108762")).toBe("Ops peer thread");
     expect(normalizeConversationDisplayLabel("e3ec9e90-460e-51b3-80b9-dea0f0c31752")).toBe("");
     expect(normalizeConversationDisplayLabel("Design review")).toBe("Design review");
   });
 
   test("formats project labels without changing ordinary conversation labels", () => {
-    expect(normalizeProjectDisplayLabel("hsns_clean")).toBe("HSNS");
-    expect(normalizeProjectDisplayLabel("homecore")).toBe("HomeCore");
+    expect(normalizeProjectDisplayLabel("ops_clean")).toBe("Ops Clean");
+    expect(normalizeProjectDisplayLabel("example")).toBe("Example");
     expect(normalizeProjectDisplayLabel("meerkat-app")).toBe("Meerkat App");
     expect(normalizeConversationDisplayLabel("Design review")).toBe("Design review");
   });
@@ -214,9 +214,9 @@ desktop/renderer/src/app/App.tsx +4 -3
 
   test("summarizes generated peer steering prompts for display", () => {
     expect(parseConversationRichBlocks([
-      "Connected to Example peer thread. Each thread keeps its own transcript and can message the other through MobKit.",
+      "Connected to Example peer thread. Each thread keeps its own transcript and can message the other through Meta.",
       "",
-      "Use your MobKit peer tools only. Do not run shell commands and do not edit files.",
+      "Use your Meta peer tools only. Do not run shell commands and do not edit files.",
       "Send this exact message body to the peered Example thread: \"Please reply with acknowledgement and do not edit files.\"",
       "After the peer message is sent, stop.",
     ].join("\n"))).toEqual([{
@@ -231,9 +231,9 @@ desktop/renderer/src/app/App.tsx +4 -3
       text: "Requested a peer response.",
     }]);
     expect(parseConversationRichBlocks([
-      "Connected to Example peer response. Each thread keeps its own transcript and can message the other through MobKit.",
+      "Connected to Example peer response. Each thread keeps its own transcript and can message the other through Meta.",
       "",
-      "Use your MobKit peer tools only. Do not run shell commands and do not edit files.",
+      "Use your Meta peer tools only. Do not run shell commands and do not edit files.",
       "Call peers, then send a send_request to the peered Example thread using intent checksum_token and params {\"subject\":\"response token\"}.",
       "In the request blocks, ask it to send_response with result.token exactly \"response token\".",
       "After the request is sent, stop.",
@@ -242,7 +242,7 @@ desktop/renderer/src/app/App.tsx +4 -3
       text: "Connected to Example peer response.\nRequested a peer response from Example peer response.",
     }]);
     expect(parseConversationRichBlocks([
-      "Use your MobKit peer tools only. Do not run shell commands and do not edit files.",
+      "Use your Meta peer tools only. Do not run shell commands and do not edit files.",
       "Send this exact message body to the peered Example thread: \"Please reply with acknowledgement and do not edit files.\"",
       "After the peer message is sent, stop.",
     ].join("\n"))).toEqual([{
@@ -250,7 +250,7 @@ desktop/renderer/src/app/App.tsx +4 -3
       text: "Requested an acknowledgement from Example thread.",
     }]);
     expect(parseConversationRichBlocks([
-      "Use your MobKit peer tools only. Do not run shell commands and do not edit files.",
+      "Use your Meta peer tools only. Do not run shell commands and do not edit files.",
       "Call peers, then send a send_request to the peered Example thread using intent checksum_token and params {\"subject\":\"response token\"}.",
       "In the request blocks, ask it to send_response with result.token exactly \"response token\".",
       "After the request is sent, stop.",
@@ -258,7 +258,7 @@ desktop/renderer/src/app/App.tsx +4 -3
       type: "paragraph",
       text: "Requested a peer response from Example thread.",
     }]);
-    expect(parseConversationRichBlocks("Use your MobKit peer tools only. Do not run shell commands and do not edit files.")).toEqual([]);
+    expect(parseConversationRichBlocks("Use your Meta peer tools only. Do not run shell commands and do not edit files.")).toEqual([]);
     expect(parseConversationRichBlocks("Send this exact message body to the peered Example thread: \"Please reply with acknowledgement and do not edit files.\"")).toEqual([{
       type: "paragraph",
       text: "Requested an acknowledgement from Example thread.",
@@ -270,7 +270,7 @@ desktop/renderer/src/app/App.tsx +4 -3
     expect(parseConversationRichBlocks([
       "Connected to Example peer thread. Each thread keeps its own transcript. They can now message each other.",
       "",
-      "Find your trusted peer and use send_message with handling_mode steer to send this exact body: \"MobKit live peer smoke. Please reply in your own thread in one sentence. If you can, send a one sentence peer message back. Do not edit files.\".",
+      "Find your trusted peer and use send_message with handling_mode steer to send this exact body: \"Meta live peer smoke. Please reply in your own thread in one sentence. If you can, send a one sentence peer message back. Do not edit files.\".",
       "Then stop after reporting delivery.",
     ].join("\n"))).toEqual([{
       type: "paragraph",

@@ -17,11 +17,11 @@ SPEC.loader.exec_module(registries)
 
 
 ARTIFACTS = {
-    "https://crates.example/meerkat-mobkit-0.8.0.crate": b"crate archive",
-    "https://crates.example/mobkit-extension-state-0.8.0.crate": b"extension crate archive",
-    "https://files.example/meerkat_mobkit-0.8.0-py3-none-any.whl": b"wheel",
-    "https://files.example/meerkat_mobkit-0.8.0.tar.gz": b"sdist",
-    "https://npm.example/rkat-mobkit-sdk-0.8.0.tgz": b"npm tarball",
+    "https://crates.example/meerkat-meta-0.8.0.crate": b"crate archive",
+    "https://crates.example/meta-extension-state-0.8.0.crate": b"extension crate archive",
+    "https://files.example/meerkat_meta-0.8.0-py3-none-any.whl": b"wheel",
+    "https://files.example/meerkat_meta-0.8.0.tar.gz": b"sdist",
+    "https://npm.example/rkat-meta-sdk-0.8.0.tgz": b"npm tarball",
 }
 
 
@@ -31,7 +31,7 @@ def artifact_digest(url: str, algorithm: str) -> str:
 
 def exact_payload(url: str) -> dict:
     if "crates.io" in url:
-        crate = "mobkit-extension-state" if "mobkit-extension-state" in url else "meerkat-mobkit"
+        crate = "meta-extension-state" if "meta-extension-state" in url else "meerkat-meta"
         artifact = f"https://crates.example/{crate}-0.8.0.crate"
         return {
             "version": {
@@ -43,20 +43,20 @@ def exact_payload(url: str) -> dict:
             }
         }
     if "pypi.org" in url:
-        wheel = "https://files.example/meerkat_mobkit-0.8.0-py3-none-any.whl"
-        sdist = "https://files.example/meerkat_mobkit-0.8.0.tar.gz"
+        wheel = "https://files.example/meerkat_meta-0.8.0-py3-none-any.whl"
+        sdist = "https://files.example/meerkat_meta-0.8.0.tar.gz"
         return {
             "info": {"version": "0.8.0"},
             "urls": [
                 {
-                    "filename": "meerkat_mobkit-0.8.0-py3-none-any.whl",
+                    "filename": "meerkat_meta-0.8.0-py3-none-any.whl",
                     "packagetype": "bdist_wheel",
                     "url": wheel,
                     "yanked": False,
                     "digests": {"sha256": artifact_digest(wheel, "sha256")},
                 },
                 {
-                    "filename": "meerkat_mobkit-0.8.0.tar.gz",
+                    "filename": "meerkat_meta-0.8.0.tar.gz",
                     "packagetype": "sdist",
                     "url": sdist,
                     "yanked": False,
@@ -65,9 +65,9 @@ def exact_payload(url: str) -> dict:
             ],
         }
     if "npmjs.org" in url:
-        artifact = "https://npm.example/rkat-mobkit-sdk-0.8.0.tgz"
+        artifact = "https://npm.example/rkat-meta-sdk-0.8.0.tgz"
         return {
-            "name": "@rkat/mobkit-sdk",
+            "name": "@rkat/meta-sdk",
             "version": "0.8.0",
             "dist": {
                 "tarball": artifact,

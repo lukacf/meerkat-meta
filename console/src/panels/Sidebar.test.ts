@@ -973,7 +973,7 @@ test("stock sidebar renderer flattens its ConsoleNavigationModel", () => {
   assert.deepEqual(
     model.nodes.map((node) => [node.type, node.id, node.label]),
     [
-      ["group", "section:__mobkit_pinned", "Pinned"],
+      ["group", "section:__meta_pinned", "Pinned"],
       ["group", "section:initiatives", "initiatives"],
       ["group", "section:workers", "workers"],
     ],
@@ -1051,7 +1051,7 @@ test("stock sidebar navigation model does not collide with a configured Pinned g
     model.nodes
       .filter((node) => node.label === "Pinned")
       .map((node) => node.id),
-    ["section:__mobkit_pinned", "section:Pinned"],
+    ["section:__meta_pinned", "section:Pinned"],
   );
   assert.deepEqual(
     __sidebarTest.sidebarNavigationRows(model)

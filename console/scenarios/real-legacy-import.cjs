@@ -7,7 +7,7 @@ const { startFixture, eventually } = require("../acceptance-runtime.cjs");
 const { browserFailureMonitor, navigation } = require("./browser-failure-monitor.cjs");
 
 async function explicitLegacyImport({ embeddedHttp = false } = {}) {
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "Use the coordinator's prebuilt fixture");
+  assert(process.env.META_EXAMPLE_BIN_DIR, "Use the coordinator's prebuilt fixture");
   const fixture = await startFixture();
   const browser = await chromium.launch({ headless: true, ...(embeddedHttp ? { args: ["--no-proxy-server", "--host-resolver-rules=MAP console-storage.test 127.0.0.1"] } : {}) });
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
@@ -20,7 +20,7 @@ async function explicitLegacyImport({ embeddedHttp = false } = {}) {
   const screenshotPrefix = embeddedHttp ? "embedded-http-legacy-import" : "legacy-import";
   let namespace = `${fixture.baseUrl}/acceptance-realm/operator-a`;
   let queueKey;
-  const dir = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+  const dir = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
   const monitor = browserFailureMonitor(page.context(), { origin });
   const { errors, expected: expectedFailures, failures: requestFailures } = monitor;
   const live = () => page.locator('[data-testid="console-transport-status"][data-phase="live"]').waitFor();
@@ -30,7 +30,7 @@ async function explicitLegacyImport({ embeddedHttp = false } = {}) {
     return response;
   });
   const sends = () => fixture.observations.filter(item => item.method === "POST" &&
-    (item.path.endsWith("/send") || item.request.includes('"method":"mobkit/console/send"')));
+    (item.path.endsWith("/send") || item.request.includes('"method":"meta/console/send"')));
   const requests = async () => (await (await fetch(fixture.backendUrl + "/__fixture/requests")).json());
   try {
     if (embeddedHttp) {
@@ -41,7 +41,7 @@ async function explicitLegacyImport({ embeddedHttp = false } = {}) {
       assert(experience.storage_scope.trim());
       namespace = JSON.stringify([origin, experience.storage_scope]);
     }
-    queueKey = `mobkit-send-attempts:v1:${encodeURIComponent(namespace)}:${encodeURIComponent(identity)}`;
+    queueKey = `meta-send-attempts:v1:${encodeURIComponent(namespace)}:${encodeURIComponent(identity)}`;
     await navigation(page, "open legacy-import host", async () => {
       const response = await page.goto(origin + (embeddedHttp ? "/console" : "/scoped"));
       await live();
@@ -64,7 +64,7 @@ async function explicitLegacyImport({ embeddedHttp = false } = {}) {
     if (embeddedHttp) {
       await page.getByTestId(`chat-composer:${identity}`).first().fill(unsentDraft);
       await eventually(() => page.evaluate(({ namespace, unsentDraft }) => Object.keys(sessionStorage)
-        .filter(key => key.startsWith("mobkit-composer-draft:v2:"))
+        .filter(key => key.startsWith("meta-composer-draft:v2:"))
         .some(key => { const draft = JSON.parse(sessionStorage.getItem(key)); return draft.namespace === namespace && draft.text === unsentDraft; }),
       { namespace, unsentDraft }), "default embedded composer draft saved in server scope");
       await reload();

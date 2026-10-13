@@ -24,7 +24,7 @@
     "storedPins": ["identity:thread-alpha-plan"],
     "expectedPins": ["identity:thread-alpha-plan"]
   },
-  "directRouteProtectionWhenMobKitAuthDisabled": {
+  "directRouteProtectionWhenMetaAuthDisabled": {
     "/console": "host-proxy",
     "/console/": "host-proxy",
     "/console/assets/console-app.js": "host-proxy",

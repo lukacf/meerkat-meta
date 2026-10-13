@@ -29,7 +29,7 @@ import type {
   ConsoleSidebarButtonConfig,
 } from "../types";
 import { Icon } from "../icon";
-import { isAgentPinned, sidebarAgentPinId } from "../lib/adapters";
+import { isAgentPinned, operatorPanelPath, sidebarAgentPinId } from "../lib/adapters";
 import { countRender } from "../lib/render-counts";
 
 export { sidebarAgentPinId } from "../lib/adapters";
@@ -66,6 +66,8 @@ interface SidebarProps {
   onSelect: (agent: ConsoleAgent) => void;
   onTogglePinnedAgent?: (agent: ConsoleAgent, familyPinIds?: Set<string>) => void;
   onOpenControl: (kind: NavKind) => void;
+  /** Opens a configured operator panel button in the dock. */
+  onOpenOperatorPanel?: (buttonId: string) => void;
 }
 
 /// Nav-item visibility configuration via URL query params:
@@ -155,7 +157,7 @@ const SIDEBAR_ROW_HEIGHT = {
 
 const SIDEBAR_OVERSCAN_PX = 360;
 const PINNED_SECTION_NAME = "Pinned";
-const PINNED_SECTION_KEY = "section:__mobkit_pinned";
+const PINNED_SECTION_KEY = "section:__meta_pinned";
 
 function localSidebarStorage(): ConsoleSidebarStorageLike | null {
   if (typeof window === "undefined") return null;
@@ -1262,6 +1264,7 @@ export const Sidebar = React.memo(function Sidebar({
   onSelect,
   onTogglePinnedAgent,
   onOpenControl,
+  onOpenOperatorPanel,
   approvals,
   onOpenApproval,
 }: SidebarProps): React.JSX.Element {
@@ -1358,7 +1361,7 @@ export const Sidebar = React.memo(function Sidebar({
     setSubgroupOrder(readSidebarStringList(localSidebarStorage(), subgroupOrderStorageKey) || []);
   }, [subgroupOrderStorageKey]);
   const customSidebarButtons = React.useMemo(
-    () => (customButtons || []).filter((button) => button.id && button.label && (button.control || button.href)),
+    () => (customButtons || []).filter((button) => button.id && button.label && (button.control || button.href || button.panel)),
     [customButtons],
   );
   const completeSectionDrop = React.useCallback((
@@ -1669,6 +1672,20 @@ export const Sidebar = React.memo(function Sidebar({
             {panel.title}
           </button>)}
           {customSidebarButtons.map((button) => {
+            if (button.panel) {
+              if (!operatorPanelPath(button.panel) || !onOpenOperatorPanel) return null;
+              return (
+                <button
+                  key={button.id}
+                  className="sidebar__navitem"
+                  onClick={() => onOpenOperatorPanel(button.id)}
+                  data-testid={`nav-panel:${button.id}`}
+                  title={button.label}
+                >
+                  {button.label}
+                </button>
+              );
+            }
             const control = normalizeNavKind(button.control);
             if (control) {
               return (

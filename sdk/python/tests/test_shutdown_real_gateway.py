@@ -5,12 +5,12 @@ import os
 
 import pytest
 
-from meerkat_mobkit.builder import MobKit
-from meerkat_mobkit.identity_first_models import (
+from meerkat_meta.builder import Meta
+from meerkat_meta.identity_first_models import (
     DurableAgentSpec,
     IdentityBootstrapMode,
 )
-from meerkat_mobkit.identity_first_providers import (
+from meerkat_meta.identity_first_providers import (
     ContinuityRecord,
     ContinuityResolveState,
     LeaseAcquireResult,
@@ -20,7 +20,7 @@ from meerkat_mobkit.identity_first_providers import (
 
 
 def _resolve_gateway_bin() -> str:
-    override = os.environ.get("MOBKIT_GATEWAY_BIN", "").strip()
+    override = os.environ.get("META_GATEWAY_BIN", "").strip()
     if override:
         return override
     return os.path.join(
@@ -168,7 +168,7 @@ async def test_runtime_shutdown_releases_exact_external_grant_before_process_exi
     scratch_dir.mkdir()
     lease_provider = _ExactLeaseProvider()
     runtime = await (
-        MobKit.builder()
+        Meta.builder()
         .gateway(_GATEWAY_BIN)
         .mob_inline(_MOB_TOML)
         .roster(_Roster())

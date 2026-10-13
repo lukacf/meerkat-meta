@@ -1,5 +1,5 @@
 /**
- * Typed data models for MobKit SDK — input/config objects sent to the runtime.
+ * Typed data models for Meta SDK — input/config objects sent to the runtime.
  */
 
 import { DetachedJobExecution } from "./jobs.js";
@@ -90,7 +90,7 @@ export function sessionQueryToDict(
 /**
  * A mob member as meerkat names it: its mob, role and roster member id.
  *
- * In a MobKit mob `member` is MobKit's comms-safe roster encoding of the
+ * In a Meta mob `member` is Meta's comms-safe roster encoding of the
  * member's durable identity (`mk--...`), not the identity itself.
  */
 export interface MobMemberBinding {
@@ -152,6 +152,57 @@ export function parseForkBuildSource(raw: unknown): ForkBuildSource | null {
 // -- SessionBuildOptions --------------------------------------------------
 
 /** Callback tool handler: receives arguments dict, returns JSON-serializable result. */
+/**
+ * An installed artifact a callback tool's handler came from: an opaque
+ * artifact id and the digest the host installed. The gateway verifies it
+ * against the host's {@link MetaBuilder.installedArtifacts} before the build
+ * publishes any tool, and carries a verified reference on the tool's
+ * provenance. Attribution only: it never grants or refuses a call, and a
+ * tool's name never implies one. It is not proof of the executable bytes or
+ * the semantics of the handler that runs. The host's installed set is
+ * trusted configuration from its own bootstrap.
+ */
+export interface ToolArtifactRef {
+  readonly artifactId: string;
+  readonly digest: string;
+}
+
+const TOOL_ARTIFACT_PART_MAX_BYTES = 256;
+
+/** Validate a {@link ToolArtifactRef}; throws on a malformed part. */
+export function validateToolArtifactRef(artifact: ToolArtifactRef): ToolArtifactRef {
+  if (artifact === null || typeof artifact !== "object") {
+    throw new TypeError("artifact must be a ToolArtifactRef object");
+  }
+  for (const [label, part] of [
+    ["artifactId", artifact.artifactId],
+    ["digest", artifact.digest],
+  ] as const) {
+    if (typeof part !== "string" || part.length === 0) {
+      throw new Error(`tool artifact ${label} must be a non-empty string`);
+    }
+    if (new TextEncoder().encode(part).length > TOOL_ARTIFACT_PART_MAX_BYTES) {
+      throw new Error(`tool artifact ${label} exceeds ${TOOL_ARTIFACT_PART_MAX_BYTES} bytes`);
+    }
+    if (/[\s\p{Cc}]/u.test(part)) {
+      throw new Error(`tool artifact ${label} must not contain whitespace or control characters`);
+    }
+  }
+  return { artifactId: artifact.artifactId, digest: artifact.digest };
+}
+
+export function toolArtifactRefToWire(artifact: ToolArtifactRef): Record<string, string> {
+  return { artifact_id: artifact.artifactId, digest: artifact.digest };
+}
+
+export function parseToolArtifactRef(raw: unknown): ToolArtifactRef {
+  const d = (raw ?? {}) as Record<string, unknown>;
+  return validateToolArtifactRef({
+    artifactId: d.artifact_id as string,
+    digest: d.digest as string,
+  });
+}
+
 export type ToolHandler = (
   args: Record<string, unknown>,
 ) => unknown | Promise<unknown>;
@@ -188,7 +239,7 @@ export class SessionBuildOptions {
    * Receive-only fork lineage: which member this member was forked from, so
    * the builder can build the child as its source. Never sent back, and the
    * gateway ignores it in a build response: fork lineage is set by the mob
-   * runtime alone. `forkSource.sourceMember.member` is MobKit's encoded
+   * runtime alone. `forkSource.sourceMember.member` is Meta's encoded
    * roster id; {@link forkSourceIdentity} is the source's durable identity
    * (for example `domain:calendar`), the key to resolve grants by. The
    * child's own `labels` and `sessionId` still name the child.
@@ -237,6 +288,8 @@ export class SessionBuildOptions {
       description?: string;
       inputSchema?: Record<string, unknown>;
       execution?: DetachedJobExecution;
+      /** Installed artifact this handler came from; verified by the gateway. */
+      artifact?: ToolArtifactRef;
     },
   ): void {
     if (typeof name !== "string") {
@@ -249,26 +302,37 @@ export class SessionBuildOptions {
         `handler must be callable, got ${typeof handler}: ${String(handler)}`,
       );
     }
-    this._tools.push(name);
-    this._toolHandlers.set(name, handler);
+    // Validate everything before any mutation: a refused registration
+    // leaves the previous handler and metadata untouched.
+    const artifact =
+      options?.artifact !== undefined ? validateToolArtifactRef(options.artifact) : undefined;
     if (
       options?.execution !== undefined &&
       !(options.execution instanceof DetachedJobExecution)
     ) {
       throw new TypeError("execution must be a DetachedJobExecution");
     }
+    // Registering a name again replaces its handler AND all of its metadata:
+    // a registration without an artifact never inherits the previous
+    // handler's artifact (or description, schema, execution).
+    if (!this._tools.includes(name)) this._tools.push(name);
+    this._toolDefs.delete(name);
+    this._jobExecutions.delete(name);
+    this._toolHandlers.set(name, handler);
     if (
       options?.description !== undefined ||
       options?.inputSchema !== undefined ||
-      options?.execution !== undefined
+      options?.execution !== undefined ||
+      artifact !== undefined
     ) {
       const def: Record<string, unknown> = { name };
-      if (options.description !== undefined) def.description = options.description;
-      if (options.inputSchema !== undefined) def.input_schema = options.inputSchema;
-      if (options.execution !== undefined) {
+      if (options?.description !== undefined) def.description = options.description;
+      if (options?.inputSchema !== undefined) def.input_schema = options.inputSchema;
+      if (options?.execution !== undefined) {
         def.execution = options.execution.toWire();
         this._jobExecutions.set(name, options.execution);
       }
+      if (artifact !== undefined) def.artifact = toolArtifactRefToWire(artifact);
       this._toolDefs.set(name, def);
     }
   }

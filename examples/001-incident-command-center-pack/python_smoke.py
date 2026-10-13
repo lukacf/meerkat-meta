@@ -27,13 +27,13 @@ def rpc(base_url: str, method: str, params: dict):
 
 def main() -> int:
     base_url = sys.argv[1]
-    status = rpc(base_url, "mobkit/status_identity", {"identity": "incident-commander"})
+    status = rpc(base_url, "meta/status_identity", {"identity": "incident-commander"})
     assert status["identity"] == "incident-commander"
 
-    console_identities = rpc(base_url, "mobkit/console/list_identities", {})["identities"]
+    console_identities = rpc(base_url, "meta/console/list_identities", {})["identities"]
     assert any(entry["identity"] == "incident-commander" for entry in console_identities)
 
-    console_inspect = rpc(base_url, "mobkit/console/inspect_identity", {"identity": "incident-commander"})
+    console_inspect = rpc(base_url, "meta/console/inspect_identity", {"identity": "incident-commander"})
     assert console_inspect["identity"]["identity"] == "incident-commander"
     assert console_inspect["identity"]["visibility"] == "addressable"
 
@@ -42,7 +42,7 @@ def main() -> int:
     # poll instead of asserting the very first read.
     deadline = time.time() + 90
     while True:
-        timeline = rpc(base_url, "mobkit/console/query_timeline", {
+        timeline = rpc(base_url, "meta/console/query_timeline", {
             "identity": "incident-commander",
             "limit": 20,
         })
@@ -52,18 +52,18 @@ def main() -> int:
     assert timeline["frames"], "expected canonical console timeline frames"
     assert all(frame["identity"] == "incident-commander" for frame in timeline["frames"])
 
-    inspect = rpc(base_url, "mobkit/inspect_identity", {"identity": "payments-sre"})
+    inspect = rpc(base_url, "meta/inspect_identity", {"identity": "payments-sre"})
     assert inspect["identity"] == "payments-sre"
 
-    rpc(base_url, "mobkit/reset", {"identity": "merchant-success"})
-    inspect_after_reset = rpc(base_url, "mobkit/inspect_identity", {"identity": "merchant-success"})
+    rpc(base_url, "meta/reset", {"identity": "merchant-success"})
+    inspect_after_reset = rpc(base_url, "meta/inspect_identity", {"identity": "merchant-success"})
     assert inspect_after_reset["identity"] == "merchant-success"
 
-    pending = rpc(base_url, "mobkit/gating/pending", {})["pending"]
+    pending = rpc(base_url, "meta/gating/pending", {})["pending"]
     assert pending, "expected seeded pending gating entry"
     first_pending = pending[0]
 
-    escalated = rpc(base_url, "mobkit/gating/decide", {
+    escalated = rpc(base_url, "meta/gating/decide", {
         "pending_id": first_pending["pending_id"],
         "approver_id": "console-ops-lead",
         "decision": "escalate",
@@ -72,10 +72,10 @@ def main() -> int:
     next_pending_id = escalated["next_pending_id"]
     assert next_pending_id, "expected successor pending id"
 
-    pending_after = rpc(base_url, "mobkit/gating/pending", {})["pending"]
+    pending_after = rpc(base_url, "meta/gating/pending", {})["pending"]
     successor = next(item for item in pending_after if item["pending_id"] == next_pending_id)
 
-    approved = rpc(base_url, "mobkit/gating/decide", {
+    approved = rpc(base_url, "meta/gating/decide", {
         "pending_id": successor["pending_id"],
         "approver_id": "console-ops-lead",
         "decision": "approve",
@@ -83,10 +83,10 @@ def main() -> int:
     })
     assert approved["decision"] == "approve"
 
-    routes = rpc(base_url, "mobkit/routing/routes/list", {})["routes"]
+    routes = rpc(base_url, "meta/routing/routes/list", {})["routes"]
     assert any(route["recipient"] == "statuspage@example.test" for route in routes)
 
-    history = rpc(base_url, "mobkit/delivery/history", {"limit": 20})["deliveries"]
+    history = rpc(base_url, "meta/delivery/history", {"limit": 20})["deliveries"]
     assert history, "expected seeded delivery history"
 
     print("incident python smoke passed")

@@ -2,7 +2,7 @@ const { createConsoleApp } = require("./index.cjs");
 
 function resolveBaseUrl() {
   const configured = document
-    .querySelector('meta[name="mobkit-base-url"]')
+    .querySelector('meta[name="meta-base-url"]')
     ?.getAttribute("content")
     ?.trim();
   if (configured) {

@@ -36,7 +36,7 @@ test("claim owner id prefers the authenticated operator subject and falls back t
   assert.equal(workGraphClaimOwnerId(undefined, "console-ops-lead"), "console-ops-lead");
 });
 
-test("item revision resolution reads mobkit/workgraph/get and returns the live CAS token", async () => {
+test("item revision resolution reads meta/workgraph/get and returns the live CAS token", async () => {
   const { run, callCount } = stubRunner([
     {
       command: CONSOLE_COMMAND_NAMES.workgraphGet,
@@ -143,11 +143,11 @@ test("conflict refresh planning declines when the failed params name no entity",
 });
 
 test("operator-result frames stamp the real RPC method behind each console command", () => {
-  assert.equal(consoleCommandMethod(CONSOLE_COMMAND_NAMES.workgraphClaim), "mobkit/workgraph/claim");
-  assert.equal(consoleCommandMethod(CONSOLE_COMMAND_NAMES.workgraphGet), "mobkit/workgraph/get");
-  assert.equal(consoleCommandMethod(CONSOLE_COMMAND_NAMES.workgraphGoalStatus), "mobkit/workgraph/goal/status");
+  assert.equal(consoleCommandMethod(CONSOLE_COMMAND_NAMES.workgraphClaim), "meta/workgraph/claim");
+  assert.equal(consoleCommandMethod(CONSOLE_COMMAND_NAMES.workgraphGet), "meta/workgraph/get");
+  assert.equal(consoleCommandMethod(CONSOLE_COMMAND_NAMES.workgraphGoalStatus), "meta/workgraph/goal/status");
   assert.equal(
     consoleCommandMethod(CONSOLE_COMMAND_NAMES.workgraphGoalRequestClose),
-    "mobkit/workgraph/goal/request_close",
+    "meta/workgraph/goal/request_close",
   );
 });

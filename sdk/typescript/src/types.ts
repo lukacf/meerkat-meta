@@ -1,12 +1,19 @@
 /**
- * Typed return models for MobKit SDK RPC methods.
+ * Typed return models for Meta SDK RPC methods.
  *
  * All interfaces use `readonly` fields with camelCase naming. Parse functions
  * convert from the wire protocol's snake_case representation.
  */
 
 // Type-only import (erased at runtime — no module cycle).
-import type { ToolHandler } from "./models.js";
+import type { ToolArtifactRef, ToolHandler } from "./models.js";
+import {
+  parseToolArtifactRef,
+  toolArtifactRefToWire,
+  validateToolArtifactRef,
+} from "./models.js";
+// errors.ts imports nothing, so this runtime import adds no cycle.
+import { ContractMismatchError } from "./errors.js";
 
 // -- Helpers (internal) ---------------------------------------------------
 
@@ -124,8 +131,8 @@ export interface StorageSlotSummary {
 
 /**
  * The runtime's composition-time storage census — the `storage` object
- * shared by `mobkit/status`, `mobkit/capabilities`, and
- * `mobkit/storage/doctor`: `blobDurability` / `blobStorePersistent` record
+ * shared by `meta/status`, `meta/capabilities`, and
+ * `meta/storage/doctor`: `blobDurability` / `blobStorePersistent` record
  * the blob slot's resolution (H1), `sessionStoreIncremental` the
  * incremental persistence probe (H2, `null` when no sessions are
  * persisted), and `slots` the per-slot durability census (M4).
@@ -196,7 +203,7 @@ export interface StorageDoctorFinding {
   readonly realm?: string;
 }
 
-/** `mobkit/storage/doctor` result: the shape-stable StorageDiagnosis plus
+/** `meta/storage/doctor` result: the shape-stable StorageDiagnosis plus
  *  the live H1/H2 storage summary when the gateway resolved one. `storage`
  *  stays the raw wire record for compatibility; apply
  *  {@link parseStorageSummary} to get the typed census. */
@@ -593,7 +600,7 @@ export function parseAgentMemoryForgetResult(raw: unknown): AgentMemoryForgetRes
   };
 }
 
-/** Result of mobkit/agent_memory/update: the superseding record's id. */
+/** Result of meta/agent_memory/update: the superseding record's id. */
 export interface AgentMemoryUpdateResult {
   readonly memoryId: string;
   readonly supersedes: string;
@@ -731,7 +738,7 @@ export function parseMemberSnapshot(raw: unknown): MemberSnapshot {
 // -- MemberReloadResult / MemberHealth --------------------------------------
 
 /**
- * Result of `mobkit/reload_member` (non-destructive cold reload).
+ * Result of `meta/reload_member` (non-destructive cold reload).
  *
  * `disposition` is `"discarded"` (the live registration was replaced by a
  * re-materialization of the SAME durable session), `"not_degraded"` (a
@@ -762,7 +769,7 @@ export function parseMemberReloadResult(raw: unknown): MemberReloadResult {
 }
 
 /**
- * Result of `mobkit/member_health`: lifecycle and delivery health read
+ * Result of `meta/member_health`: lifecycle and delivery health read
  * in-process, so it answers while the mob actor loop is stalled.
  *
  * `actorLoop.state` is `"live" | "stalled" | "terminated" | "unobserved"`;
@@ -869,6 +876,11 @@ export interface GatingDecisionResult {
   readonly pendingId: string;
   readonly actionId: string;
   readonly decision: string;
+  readonly approverId?: string | null;
+  readonly outcome?: string | null;
+  readonly decidedAtMs?: number | null;
+  readonly reason?: string | null;
+  readonly nextPendingId?: string | null;
 }
 
 export function parseGatingDecisionResult(
@@ -879,6 +891,13 @@ export function parseGatingDecisionResult(
     pendingId: String(d.pending_id ?? ""),
     actionId: String(d.action_id ?? ""),
     decision: String(d.decision ?? ""),
+    approverId: typeof d.approver_id === "string" ? d.approver_id : null,
+    outcome: typeof d.outcome === "string" ? d.outcome : null,
+    decidedAtMs: typeof d.decided_at_ms === "number"
+      && Number.isSafeInteger(d.decided_at_ms) && d.decided_at_ms >= 0
+      ? d.decided_at_ms : null,
+    reason: typeof d.reason === "string" ? d.reason : null,
+    nextPendingId: typeof d.next_pending_id === "string" ? d.next_pending_id : null,
   };
 }
 
@@ -892,10 +911,15 @@ export interface GatingAuditEntry {
   readonly actorId: string;
   readonly riskTier: string | null;
   readonly outcome: string;
+  /** The pending entry this record belongs to, when the owner recorded one. */
+  readonly pendingId?: string | null;
+  /** The owner's event detail as returned; empty when absent or malformed. */
+  readonly detail?: Readonly<Record<string, unknown>>;
 }
 
 export function parseGatingAuditEntry(raw: unknown): GatingAuditEntry {
   const d = asRecord(raw);
+  const detail = d.detail;
   return {
     auditId: String(d.audit_id ?? ""),
     timestampMs: Number(d.timestamp_ms ?? 0),
@@ -904,6 +928,37 @@ export function parseGatingAuditEntry(raw: unknown): GatingAuditEntry {
     actorId: String(d.actor_id ?? ""),
     riskTier: typeof d.risk_tier === "string" ? d.risk_tier : null,
     outcome: String(d.outcome ?? ""),
+    pendingId: typeof d.pending_id === "string" && d.pending_id.trim() ? d.pending_id : null,
+    detail: typeof detail === "object" && detail !== null && !Array.isArray(detail)
+      ? { ...(detail as Record<string, unknown>) } : {},
+  };
+}
+
+// -- GatingOrigin ---------------------------------------------------------
+
+/** Where a gated action was requested from, as recorded by the owner. */
+export interface GatingOrigin {
+  readonly identity: string;
+  readonly conversationId: string | null;
+  readonly interactionId: string | null;
+}
+
+/** Returns the origin, or null when it is absent or has no identity. */
+export function parseGatingOrigin(raw: unknown): GatingOrigin | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return null;
+  }
+  const d = raw as Record<string, unknown>;
+  const text = (value: unknown): string | null =>
+    typeof value === "string" && value.trim() ? value : null;
+  const identity = text(d.identity);
+  if (identity === null) {
+    return null;
+  }
+  return {
+    identity,
+    conversationId: text(d.conversation_id),
+    interactionId: text(d.interaction_id),
   };
 }
 
@@ -916,10 +971,20 @@ export interface GatingPendingEntry {
   readonly actorId: string;
   readonly riskTier: string | null;
   readonly createdAtMs: number;
+  readonly requestedApprover?: string | null;
+  readonly approvalRecipient?: string | null;
+  readonly approvalChannel?: string | null;
+  readonly approvalRouteId?: string | null;
+  readonly approvalDeliveryId?: string | null;
+  readonly deadlineAtMs?: number | null;
+  readonly rationale?: string | null;
+  readonly origin?: GatingOrigin | null;
 }
 
 export function parseGatingPendingEntry(raw: unknown): GatingPendingEntry {
   const d = asRecord(raw);
+  const text = (value: unknown): string | null =>
+    typeof value === "string" && value.trim() ? value : null;
   return {
     pendingId: String(d.pending_id ?? ""),
     actionId: String(d.action_id ?? ""),
@@ -927,6 +992,16 @@ export function parseGatingPendingEntry(raw: unknown): GatingPendingEntry {
     actorId: String(d.actor_id ?? ""),
     riskTier: typeof d.risk_tier === "string" ? d.risk_tier : null,
     createdAtMs: Number(d.created_at_ms ?? 0),
+    requestedApprover: text(d.requested_approver),
+    approvalRecipient: text(d.approval_recipient),
+    approvalChannel: text(d.approval_channel),
+    approvalRouteId: text(d.approval_route_id),
+    approvalDeliveryId: text(d.approval_delivery_id),
+    deadlineAtMs: typeof d.deadline_at_ms === "number"
+      && Number.isSafeInteger(d.deadline_at_ms) && d.deadline_at_ms >= 0
+      ? d.deadline_at_ms : null,
+    rationale: text(d.rationale),
+    origin: parseGatingOrigin(d.origin),
   };
 }
 
@@ -1078,7 +1153,7 @@ export function parsePersistedEvent(raw: unknown): PersistedEvent {
  * Query parameters for historical event retrieval. `afterSeq` is the
  * pagination cursor — pass the highest seen `seq`/`cursor` to receive
  * only strictly-newer events. `mobId`, `runId`, `stepId`, `identity`
- * filter the structural mob-events surface (`mobkit/mob_events/query`).
+ * filter the structural mob-events surface (`meta/mob_events/query`).
  */
 export interface EventQuery {
   readonly sinceMs?: number;
@@ -1458,7 +1533,7 @@ export function parseIdentityResolvedToolsResult(raw: unknown): IdentityResolved
 }
 
 /**
- * Model routing status from `mobkit/identity/routing_status`.
+ * Model routing status from `meta/identity/routing_status`.
  *
  * Relays meerkat's `SessionModelRoutingStatus` unchanged. The override
  * summaries stay as opaque records on purpose: re-declaring meerkat's
@@ -2012,7 +2087,7 @@ export function parseMobpackDraftGetResult(
   };
 }
 
-/** Result shape shared by mobkit/mobpacks/create and mobkit/mobpacks/save. */
+/** Result shape shared by meta/mobpacks/create and meta/mobpacks/save. */
 export interface MobpackDraftSaveResult {
   readonly source: string;
   readonly storePath: string | null;
@@ -2033,7 +2108,7 @@ export function parseMobpackDraftSaveResult(
 }
 
 /**
- * Result shape shared by mobkit/mobpacks/undo and mobkit/mobpacks/redo.
+ * Result shape shared by meta/mobpacks/undo and meta/mobpacks/redo.
  * `stepped` is false (with a `reason`) when there is no history or future
  * entry to step to; the draft is left untouched in that case.
  */
@@ -2166,7 +2241,7 @@ export function parseMobpackDeployResult(raw: unknown): MobpackDeployResult {
 
 // Every Rust `ErrorEvent` variant must appear here with its serde
 // `snake_case` wire tag. The Rust test
-// `crates/meerkat-mobkit/tests/sdk_error_category_parity.rs` fails the build if this
+// `crates/meerkat-meta/tests/sdk_error_category_parity.rs` fails the build if this
 // set drifts from the Rust enum.
 export const ErrorCategory = {
   SPAWN_FAILURE: "spawn_failure",
@@ -2598,25 +2673,32 @@ export interface ExternalToolDef {
   readonly name: string;
   readonly description: string;
   readonly inputSchema: Record<string, unknown>;
+  /** Installed artifact this handler came from; verified by the gateway. */
+  readonly artifact?: ToolArtifactRef;
 }
 
 export function parseExternalToolDef(raw: unknown): ExternalToolDef {
   const d = asRecord(raw);
-  return {
+  const tool: ExternalToolDef = {
     name: String(d.name ?? ""),
     description: String(d.description ?? ""),
     inputSchema: asRecord(d.input_schema),
   };
+  return d.artifact !== undefined && d.artifact !== null
+    ? { ...tool, artifact: parseToolArtifactRef(d.artifact) }
+    : tool;
 }
 
 export function externalToolDefToDict(
   tool: ExternalToolDef,
 ): Record<string, unknown> {
-  return {
+  const out: Record<string, unknown> = {
     name: tool.name,
     description: tool.description,
     input_schema: tool.inputSchema,
   };
+  if (tool.artifact !== undefined) out.artifact = toolArtifactRefToWire(tool.artifact);
+  return out;
 }
 
 // -- AgentBuildContext (REQ-49a) -------------------------------------------
@@ -2679,6 +2761,14 @@ export function parseRosterContext(raw: unknown): RosterContext {
 
 // -- AgentBuildDraft (REQ-49a) --------------------------------------------
 
+/** Options for {@link AgentBuildDraft.registerTool}. */
+export interface AgentBuildDraftToolOptions {
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+  /** Installed artifact this handler came from; verified by the gateway. */
+  artifact?: ToolArtifactRef;
+}
+
 export interface AgentBuildDraft {
   model: string | null;
   systemPrompt: string | null;
@@ -2689,7 +2779,7 @@ export interface AgentBuildDraft {
   /**
    * Per-identity provider parameter overrides, carried verbatim to the
    * gateway. Mirrors meerkat's `ProviderParamsOverride` (the type behind
-   * `AgentBuildConfig.provider_params`): provider knobs with no MobKit
+   * `AgentBuildConfig.provider_params`): provider knobs with no Meta
    * vocabulary of their own, such as OpenAI `prompt_cache_key` /
    * `prompt_cache_options` / `prompt_cache_retention` and Anthropic
    * `cache_control`. Kept opaque here because the Rust boundary parses it
@@ -2716,6 +2806,13 @@ export interface AgentBuildDraft {
     handler: ToolHandler,
     description?: string,
     inputSchema?: Record<string, unknown>,
+    artifact?: ToolArtifactRef,
+  ): void;
+  /** Options form; same semantics as the positional form. */
+  registerTool(
+    name: string,
+    handler: ToolHandler,
+    options: AgentBuildDraftToolOptions,
   ): void;
   /** Handlers registered via {@link registerTool} (in-process only). */
   readonly toolHandlers: ReadonlyMap<string, ToolHandler>;
@@ -2740,9 +2837,21 @@ export function parseAgentBuildDraft(raw: unknown): AgentBuildDraft {
     registerTool(
       name: string,
       handler: ToolHandler,
-      description = "",
-      inputSchema: Record<string, unknown> = { type: "object" },
+      descriptionOrOptions?: string | AgentBuildDraftToolOptions,
+      positionalSchema?: Record<string, unknown>,
+      positionalArtifact?: ToolArtifactRef,
     ): void {
+      const options: AgentBuildDraftToolOptions =
+        typeof descriptionOrOptions === "object" && descriptionOrOptions !== null
+          ? descriptionOrOptions
+          : {
+              description: descriptionOrOptions,
+              inputSchema: positionalSchema,
+              artifact: positionalArtifact,
+            };
+      const description = options.description ?? "";
+      const inputSchema = options.inputSchema ?? { type: "object" };
+      const artifact = options.artifact;
       if (typeof name !== "string") {
         throw new TypeError(
           `tool name must be a string, got ${typeof name}: ${String(name)}`,
@@ -2753,7 +2862,17 @@ export function parseAgentBuildDraft(raw: unknown): AgentBuildDraft {
           `handler must be callable, got ${typeof handler}: ${String(handler)}`,
         );
       }
-      externalTools.push({ name, description, inputSchema });
+      // Build and validate the replacement first: a refused registration
+      // leaves the previous definition, artifact and handler untouched.
+      const replacement: ExternalToolDef =
+        artifact !== undefined
+          ? { name, description, inputSchema, artifact: validateToolArtifactRef(artifact) }
+          : { name, description, inputSchema };
+      // Registering a name again replaces its definition wholesale: a
+      // registration without an artifact never inherits the previous one's.
+      const existing = externalTools.findIndex((tool) => tool.name === name);
+      if (existing >= 0) externalTools.splice(existing, 1);
+      externalTools.push(replacement);
       toolHandlers.set(name, handler);
     },
     get toolHandlers(): ReadonlyMap<string, ToolHandler> {
@@ -2971,6 +3090,15 @@ function turnTrackingToDict(
 }
 
 /** Typed result from identity-first `send()`. */
+/** An identity's registered roster row (`meta/registered_spec`). */
+export interface RegisteredSpec {
+  readonly identity: string;
+  /** The full registered row, wire-shaped, including `additional_instructions`. */
+  readonly spec: Record<string, unknown>;
+  /** Canonical digest of `spec`; pass it to `send` as `expectedSpecDigest`. */
+  readonly specDigest: string;
+}
+
 export interface SendResult {
   readonly fencingToken: number;
   /**
@@ -3031,6 +3159,207 @@ export function parseDispatchResult(raw: unknown): DispatchResult {
   };
 }
 
+/** Serialized format version of {@link DeliveryScope} this SDK reads. */
+export const DELIVERY_SCOPE_VERSION = 1 as const;
+
+/**
+ * One identity's exact delivery scope, from `status()`.
+ *
+ * Persist it ({@link deliveryScopeToDict}) before a scoped dispatch, and pass
+ * the same scope to `dispatch(..., { expectedScope })` and
+ * `recoverDelivery`. It pins the Meta continuity (runtime id, generation,
+ * lease fencing token) and meerkat's native member scope (`member`, opaque
+ * and versioned on its own). A selector and stale-binding guard: the gateway
+ * re-validates every atom and refuses a moved scope with `StaleScopeError`.
+ */
+export interface DeliveryScope {
+  readonly version: number;
+  readonly identity: string;
+  readonly agentRuntimeId: string;
+  readonly generation: number;
+  readonly leaseFencingToken: number;
+  readonly member: Readonly<Record<string, unknown>>;
+  /** The member session the scope pins. */
+  readonly sessionId: string | null;
+}
+
+function nonNegativeInteger(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new TypeError(`delivery scope ${name} must be a non-negative integer`);
+  }
+  return value;
+}
+
+/**
+ * Decode a persisted scope. Throws `ContractMismatchError` for a scope
+ * version this SDK does not read and `TypeError` for a malformed scope;
+ * neither is ever read as a guess.
+ */
+export function parseDeliveryScope(raw: unknown): DeliveryScope {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new TypeError("delivery scope must be an object");
+  }
+  const d = raw as Record<string, unknown>;
+  if (typeof d.version !== "number" || !Number.isInteger(d.version)) {
+    throw new TypeError("delivery scope has no integer version");
+  }
+  if (d.version !== DELIVERY_SCOPE_VERSION) {
+    throw new ContractMismatchError(
+      `unsupported delivery scope version ${d.version} (this SDK reads version ${DELIVERY_SCOPE_VERSION})`,
+    );
+  }
+  if (typeof d.identity !== "string" || d.identity === "") {
+    throw new TypeError("delivery scope identity must be a non-empty string");
+  }
+  if (typeof d.agent_runtime_id !== "string" || d.agent_runtime_id === "") {
+    throw new TypeError("delivery scope agent_runtime_id must be a non-empty string");
+  }
+  const member = d.member;
+  if (member === null || typeof member !== "object" || Array.isArray(member)) {
+    throw new TypeError("delivery scope member must be an object");
+  }
+  const memberCopy = JSON.parse(JSON.stringify(member)) as Record<string, unknown>;
+  return {
+    version: d.version,
+    identity: d.identity,
+    agentRuntimeId: d.agent_runtime_id,
+    generation: nonNegativeInteger(d.generation, "generation"),
+    leaseFencingToken: nonNegativeInteger(d.lease_fencing_token, "lease_fencing_token"),
+    member: memberCopy,
+    sessionId: typeof memberCopy.session_id === "string" ? memberCopy.session_id : null,
+  };
+}
+
+/** The exact persisted form the gateway expects back. */
+export function deliveryScopeToDict(scope: DeliveryScope): Record<string, unknown> {
+  return {
+    version: scope.version,
+    identity: scope.identity,
+    agent_runtime_id: scope.agentRuntimeId,
+    generation: scope.generation,
+    lease_fencing_token: scope.leaseFencingToken,
+    member: JSON.parse(JSON.stringify(scope.member)) as Record<string, unknown>,
+  };
+}
+
+/**
+ * What a scoped dispatch's admission proved. `stage` is the admission stage
+ * the receipt proves (`ingress_accepted` for this path: the member's work
+ * lane accepted the delivery; not a durable runtime-input claim).
+ * `sessionId` is the scope's session, validated inside meerkat's admission.
+ */
+export interface DeliveryReceipt {
+  readonly workRef: string;
+  readonly stage: string;
+  readonly sessionId: string;
+}
+
+/** Result of `dispatch(..., { expectedScope })`. */
+export interface ScopedDispatchResult {
+  readonly receipt: DeliveryReceipt;
+  readonly deliveryScope: DeliveryScope;
+  readonly fencingToken: number;
+}
+
+export function parseScopedDispatchResult(raw: unknown): ScopedDispatchResult {
+  const d = asRecord(raw);
+  const receipt = asRecord(d.receipt);
+  return {
+    receipt: {
+      workRef: String(receipt.work_ref ?? ""),
+      stage: String(receipt.stage ?? ""),
+      sessionId: String(receipt.session_id ?? ""),
+    },
+    deliveryScope: parseDeliveryScope(d.delivery_scope),
+    fencingToken: Number(d.fencing_token ?? 0),
+  };
+}
+
+/**
+ * What `recoverDelivery` established, from the ORIGINAL session only.
+ * `absent` is an authoritative point-in-time miss and `unresolved` an
+ * unreachable original owner: neither is permission to retry.
+ */
+export type ScopedRecoveryState =
+  | "absent"
+  | "in_flight"
+  | "completed"
+  | "failed"
+  | "terminal_without_run"
+  | "broken"
+  | "unresolved";
+
+const SCOPED_RECOVERY_STATES: ReadonlySet<string> = new Set([
+  "absent",
+  "in_flight",
+  "completed",
+  "failed",
+  "terminal_without_run",
+  "broken",
+  "unresolved",
+]);
+
+/** Result of `recoverDelivery`. Only `state` is always set. */
+export interface ScopedRecovery {
+  readonly state: ScopedRecoveryState;
+  readonly deliveryScope: DeliveryScope | null;
+  readonly inputId: string | null;
+  /** `in_flight`: the runtime input phase. */
+  readonly phase: unknown;
+  /** `in_flight`: whether a committed store row backs it. */
+  readonly durableWitness: boolean | null;
+  /** `completed`: as for {@link TurnResult}. */
+  readonly outputStatus: string | null;
+  readonly output: string | null;
+  readonly outputTruncated: boolean;
+  /** `failed`. */
+  readonly error: string | null;
+  /** `terminal_without_run`. */
+  readonly terminal: unknown;
+  readonly lastRunId: string | null;
+  /** `broken`. */
+  readonly reason: string | null;
+  /**
+   * `unresolved`: `runtime_adapter_unavailable`, `original_session_unknown`,
+   * `original_owner_unavailable`, `evidence_read_timed_out` or
+   * `scope_binding_unproven`.
+   */
+  readonly cause: string | null;
+  readonly detail: string | null;
+}
+
+function optionalString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+export function parseScopedRecovery(raw: unknown): ScopedRecovery {
+  const d = asRecord(raw);
+  const r = asRecord(d.recovery ?? d);
+  const rawState = String(r.state ?? "unresolved");
+  // A state this SDK does not know is unknown, never absence.
+  const known = SCOPED_RECOVERY_STATES.has(rawState);
+  const state = (known ? rawState : "unresolved") as ScopedRecoveryState;
+  return {
+    state,
+    deliveryScope:
+      d.delivery_scope !== null && typeof d.delivery_scope === "object"
+        ? parseDeliveryScope(d.delivery_scope)
+        : null,
+    inputId: optionalString(r.input_id),
+    phase: r.phase ?? null,
+    durableWitness: typeof r.durable_witness === "boolean" ? r.durable_witness : null,
+    outputStatus: optionalString(r.output_status),
+    output: optionalString(r.output),
+    outputTruncated: Boolean(r.output_truncated ?? false),
+    error: optionalString(r.error),
+    terminal: r.terminal ?? null,
+    lastRunId: optionalString(r.last_run_id),
+    reason: optionalString(r.reason),
+    cause: known ? optionalString(r.cause) : `unknown_state:${rawState}`,
+    detail: optionalString(r.detail),
+  };
+}
+
 export function dispatchResultToDict(
   result: DispatchResult,
 ): Record<string, unknown> {
@@ -3045,7 +3374,7 @@ export function dispatchResultToDict(
   return out;
 }
 
-/** Where a ticketed turn stands (`mobkit/turn_result`). */
+/** Where a ticketed turn stands (`meta/turn_result`). */
 export type TurnState = "pending" | "completed" | "failed" | "unknown";
 
 /**
@@ -3068,7 +3397,7 @@ const TURN_OUTPUT_STATUSES: readonly TurnOutputStatus[] = [
 ];
 
 /**
- * `mobkit/turn_result`: one ticketed turn's state and its OWN output, from
+ * `meta/turn_result`: one ticketed turn's state and its OWN output, from
  * that turn's committed run result (never the session's latest text).
  */
 /**
@@ -3140,7 +3469,7 @@ export function parseTurnResult(raw: unknown): TurnResult {
   };
 }
 
-/** Execution-level inspection of an identity (`mobkit/inspect_identity`). */
+/** Execution-level inspection of an identity (`meta/inspect_identity`). */
 export interface IdentityInspection {
   readonly identity: string;
   readonly outputPreview: string | null;
@@ -3211,11 +3540,48 @@ export interface IdentityStatus {
   readonly checkpointVersion: number;
   readonly lease: LeaseInfo | null;
   readonly continuityHealth: ContinuityHealth | null;
+  /**
+   * The exact delivery scope to persist before a scoped dispatch
+   * (`dispatch(..., { expectedScope })`); `null` when none can be captured,
+   * with the reason in `deliveryScopeUnavailable`.
+   */
+  readonly deliveryScope?: DeliveryScope | null;
+  /** `{ kind, reason }` when `deliveryScope` is `null`. */
+  readonly deliveryScopeUnavailable?: DeliveryScopeUnavailable | null;
+}
+
+export interface DeliveryScopeUnavailable {
+  readonly kind: string;
+  readonly reason: string;
 }
 
 export function parseIdentityStatus(raw: unknown): IdentityStatus {
   const d = asRecord(raw);
+  let deliveryScope: DeliveryScope | null = null;
+  const unavailableRaw = d.delivery_scope_unavailable;
+  let deliveryScopeUnavailable: DeliveryScopeUnavailable | null =
+    unavailableRaw !== null && typeof unavailableRaw === "object"
+      ? {
+          kind: String(asRecord(unavailableRaw).kind ?? ""),
+          reason: String(asRecord(unavailableRaw).reason ?? ""),
+        }
+      : null;
+  if (d.delivery_scope !== null && typeof d.delivery_scope === "object") {
+    try {
+      deliveryScope = parseDeliveryScope(d.delivery_scope);
+    } catch (error) {
+      if (!(error instanceof ContractMismatchError)) throw error;
+      // A scope this SDK cannot read is never guessed at; the rest of the
+      // status stays usable.
+      deliveryScopeUnavailable = {
+        kind: "unsupported_delivery_scope_version",
+        reason: error.message,
+      };
+    }
+  }
   return {
+    deliveryScope,
+    deliveryScopeUnavailable,
     identity: String(d.identity ?? ""),
     lifecycleState: String(d.state ?? ""),
     agentRuntimeId: String(d.agent_runtime_id ?? ""),
@@ -4241,7 +4607,7 @@ export interface IdentityBootstrapEntry {
   readonly restore: IdentityRestoreProgress | null;
 }
 
-/** Identity bootstrap snapshot (`mobkit/status_identity_bootstrap`). */
+/** Identity bootstrap snapshot (`meta/status_identity_bootstrap`). */
 export interface IdentityBootstrapStatus {
   readonly mode: Readonly<Record<string, unknown>>;
   readonly complete: boolean;
@@ -4249,7 +4615,7 @@ export interface IdentityBootstrapStatus {
   readonly error: string | null;
   readonly counts: Readonly<Record<string, number>>;
   readonly identities: Readonly<Record<string, IdentityBootstrapEntry>>;
-  /** Set by `mobkit/wait_identity_bootstrap` only. */
+  /** Set by `meta/wait_identity_bootstrap` only. */
   readonly timedOut: boolean | null;
   readonly target: string | null;
   readonly startupReady: boolean | null;

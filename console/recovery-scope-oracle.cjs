@@ -50,7 +50,7 @@ function assertScopeCancellation(value) {
       let request;
       try { request = JSON.parse(item.request); } catch { return false; }
       const params = request.params;
-      return request.method === "mobkit/console/query_timeline" && params?.mode === "recent" && params.limit === 200
+      return request.method === "meta/console/query_timeline" && params?.mode === "recent" && params.limit === 200
         && params.before === undefined && params.after === undefined
         && (value.host === "shared" ? params.identity === "router:main" : params.identity === undefined);
     }).sort((left, right) => right.endedAt - left.endedAt);
@@ -69,7 +69,7 @@ function assertScopeCancellation(value) {
   for (const item of value.observations) {
     let body;
     try { body = JSON.parse(item.request || "{}"); } catch { continue; }
-    assert(body.method !== "mobkit/console/send" && !item.path.endsWith("/send"), "scope switch cannot automatically send");
+    assert(body.method !== "meta/console/send" && !item.path.endsWith("/send"), "scope switch cannot automatically send");
   }
 }
 

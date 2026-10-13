@@ -93,7 +93,7 @@ export interface MemoryPanelProps {
   /// Issue a filtered/paged panel/records query. Resolves null on access
   /// denial (-32030), mirroring the per-section tolerance of the base load.
   onQueryRecords?: (params: Record<string, unknown>) => Promise<MemoryPanelRecordsResult | null>;
-  /// Resolve an evidence ref against mobkit/console/query_timeline. Resolves
+  /// Resolve an evidence ref against meta/console/query_timeline. Resolves
   /// null when the session is no longer in the timeline (the degrade rule:
   /// fall back to the evidenceLabel text).
   onLoadEvidence?: (
@@ -103,7 +103,7 @@ export interface MemoryPanelProps {
   /// Deep-link into the gating inbox — memory promotion verdicts ride the
   /// normal gating flow, never a parallel decision surface here.
   onOpenGating?: () => void;
-  /// The operator half of quarantine review (mobkit/memory/quarantine/decide)
+  /// The operator half of quarantine review (meta/memory/quarantine/decide)
   /// for quarantined records that no gated promotion is waiting on. Passed
   /// only when the caller is advertised the method on a mutable console;
   /// absent, quarantined records stay read-only here. Rejects with the
@@ -405,15 +405,15 @@ export function filtersEquivalent(a: MemoryRecordsFilter, b: MemoryRecordsFilter
 }
 
 /// Message prefix of the error the headless layer throws when
-/// mobkit/capabilities omits a method (`requireCapability`, headless.ts) —
+/// meta/capabilities omits a method (`requireCapability`, headless.ts) —
 /// raised client-side before any RPC is issued, so no rpcError code exists.
-const CAPABILITY_MISS_PREFIX = "MobKit capability missing for ";
+const CAPABILITY_MISS_PREFIX = "Meta capability missing for ";
 
 /// Classify a memory-section RPC failure: -32030 is an ABAC denial (render
 /// "no grant", never an empty store), -32601 means the panel is not wired on
 /// this runtime, anything else is a real error. A per-method capability miss
 /// also classifies as DENIED: under an enforced view the server intersects
-/// mobkit/capabilities per principal (a scoped read grant drops panel/dreams
+/// meta/capabilities per principal (a scoped read grant drops panel/dreams
 /// and panel/quarantine from the method list), so the miss IS denial by
 /// intersection — it must degrade that section, never abort the whole panel.
 /// Only the server's -32601 (store not configured) renders memory-unavailable.
@@ -823,7 +823,7 @@ export function computeVerdictTiles(inputs: VerdictInputs): VerdictTile[] {
     id: "echo-safety",
     label: "ECHO-SAFETY",
     status: "unverifiable",
-    lines: ["needs mobkit/memory/panel/injections (surface 6)"],
+    lines: ["needs meta/memory/panel/injections (surface 6)"],
     targetTab: "knowledge",
   });
   tiles.push({
@@ -949,7 +949,7 @@ export function computeVerdictTiles(inputs: VerdictInputs): VerdictTile[] {
       id: "store-floor",
       label: "STORE FLOOR",
       status: "unverifiable",
-      lines: ["needs mobkit/memory/panel/overview (surface 1)"],
+      lines: ["needs meta/memory/panel/overview (surface 1)"],
       targetTab: "holdings",
     });
   } else {
@@ -1401,7 +1401,7 @@ function quarantineDecisionSummary(result: MemoryQuarantineDecideResult): string
 }
 
 /// Human text for a failed quarantine decision: the typed refusal reasons
-/// of mobkit/memory/quarantine/decide, the access denial, or the raw error.
+/// of meta/memory/quarantine/decide, the access denial, or the raw error.
 function quarantineDecisionErrorText(error: unknown): string {
   const rpcError = (error as { rpcError?: { code?: unknown; data?: unknown } } | null)?.rpcError;
   if (rpcError?.code === -32030) {
@@ -2442,7 +2442,7 @@ export function MemoryPanel({
                     }`}
               </div>
               <div className="memory-detail__line">
-                Health (taint · budgets · cursors): needs mobkit/memory/panel/health (surface 8)
+                Health (taint · budgets · cursors): needs meta/memory/panel/health (surface 8)
               </div>
             </div>
             <div className="memory-group" data-testid="memory-harvests">
@@ -2726,7 +2726,7 @@ export function MemoryPanel({
             )}
             <SectionNote testid="memory-knowledge-as-injected">
               AS-INJECTED is unverifiable in phase 1 — the composed injection block requires
-              mobkit/memory/panel/context (surface 10).
+              meta/memory/panel/context (surface 10).
             </SectionNote>
             <div className="memory-group" data-testid="memory-knowledge-history">
               <div className="memory-group__label">

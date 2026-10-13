@@ -1,6 +1,6 @@
 import { test, vi } from "vitest";
 import assert from "node:assert/strict";
-import voiceContract from "../../../crates/meerkat-mobkit/tests/fixtures/console_voice_v1.json";
+import voiceContract from "../../../crates/meerkat-meta/tests/fixtures/console_voice_v1.json";
 import { parseVoiceContextStatus, voiceContextFailureMessage } from "./voice-context";
 import { parseVoiceCaptions, VOICE_CAPTIONS_METHOD } from "./voice-captions";
 import {
@@ -277,22 +277,22 @@ function harness() {
       calls.push({ method, params });
       const overridden = onRpc?.(method, params);
       if (overridden) return overridden;
-      if (method === "mobkit/console/voice/readiness") return { identity: params.identity, available: true };
-      if (method === "mobkit/console/voice/replacement") return { required: false };
-      if (method === "mobkit/console/voice/answer_received") return { accepted: true };
-      if (method === "mobkit/console/voice/activity") return { accepted: true };
-      if (method === "mobkit/console/voice/context_status") return contextStatus(params);
+      if (method === "meta/console/voice/readiness") return { identity: params.identity, available: true };
+      if (method === "meta/console/voice/replacement") return { required: false };
+      if (method === "meta/console/voice/answer_received") return { accepted: true };
+      if (method === "meta/console/voice/activity") return { accepted: true };
+      if (method === "meta/console/voice/context_status") return contextStatus(params);
       // The caption long poll waits; tests that need captions script it.
-      if (method === "mobkit/console/voice/captions") return new Promise(() => {});
-      if (method === "mobkit/console/voice/open") {
+      if (method === "meta/console/voice/captions") return new Promise(() => {});
+      if (method === "meta/console/voice/open") {
         return pending(params.identity as string, `channel-${params.identity}`);
       }
-      if (method === "mobkit/console/voice/close") return { phase: "closed" };
-      if (method === "mobkit/live/playback_owner/register") {
+      if (method === "meta/console/voice/close") return { phase: "closed" };
+      if (method === "meta/live/playback_owner/register") {
         return { channel_id: params.channel_id, readiness_receipt: "readiness-receipt" };
       }
       if (method === "live/webrtc/answer") return { answer_sdp: "answer-sdp" };
-      if (method === "mobkit/live/status") {
+      if (method === "meta/live/status") {
         return {
           phase: "active",
           handle: {
@@ -331,7 +331,7 @@ test("the context observer sends the exact shared Rust method and request shape"
   const request = voiceContract.context_status_request;
   h.env.randomId = () => request.request_id;
   h.setRpc((method) => {
-    if (method === "mobkit/console/voice/open") return Promise.resolve(pending(request.identity, request.channel_id));
+    if (method === "meta/console/voice/open") return Promise.resolve(pending(request.identity, request.channel_id));
     if (method === voiceContract.context_status_method) return Promise.resolve(voiceContract.context_status_responses.generating);
     return undefined;
   });
@@ -349,8 +349,8 @@ test("the context observer sends the exact shared Rust method and request shape"
 test("voice activates before a 20-second context job and context acknowledgement stops polling", async () => {
   const h = harness();
   h.setRpc((method, params) => {
-    if (method === "mobkit/console/send") return Promise.resolve({ accepted: true });
-    if (method !== "mobkit/console/voice/context_status") return undefined;
+    if (method === "meta/console/send") return Promise.resolve({ accepted: true });
+    if (method !== "meta/console/voice/context_status") return undefined;
     return Promise.resolve(contextStatus(params, h.clock.now < 20_000
       ? { phase: "preparing", stage: "generating" }
       : { phase: "provider_acknowledged" }));
@@ -361,7 +361,7 @@ test("voice activates before a 20-second context job and context acknowledgement
   assert.equal(h.streams[0].tracks[0].enabled, true);
   assert.equal(h.contexts[0].gains[0].gain.value, 1);
   assert.deepEqual(h.controller.getSnapshot().contextPreparation, { phase: "preparing", stage: "generating" });
-  assert.deepEqual(await h.env.rpc("mobkit/console/send", { identity: target.identity, message: "Newer facts" }, 5000), { accepted: true });
+  assert.deepEqual(await h.env.rpc("meta/console/send", { identity: target.identity, message: "Newer facts" }, 5000), { accepted: true });
   h.controller.toggleMicrophone();
   h.controller.toggleSpeaker();
   await h.clock.advance(19_999);
@@ -546,14 +546,14 @@ test.each([null, "provider_acknowledged"])("observer close during context public
 test("strict handshake installs output before offer, gates media until typed authority, and hides credentials", async () => {
   const h = harness();
   const status = deferred<unknown>();
-  h.setRpc((method) => method === "mobkit/live/status" ? status.promise : undefined);
+  h.setRpc((method) => method === "meta/live/status" ? status.promise : undefined);
   const start = h.controller.start(target);
   assert.equal(h.contexts[0].resumed, true, "AudioContext resumed synchronously in click gesture");
   await flush();
   assert.equal(h.controller.getSnapshot().phase, "connecting");
   assert.equal(h.streams[0].tracks[0].enabled, false);
   assert.equal(h.contexts[0].gains[0].gain.value, 0);
-  const statusCall = h.calls.find((call) => call.method === "mobkit/live/status")!;
+  const statusCall = h.calls.find((call) => call.method === "meta/live/status")!;
   status.resolve({
     phase: "active", handle: {
       channel_id: statusCall.params.channel_id, target_identity: target.identity,
@@ -565,9 +565,9 @@ test("strict handshake installs output before offer, gates media until typed aut
   assert.equal(h.streams[0].tracks[0].enabled, true);
   assert.equal(h.contexts[0].gains[0].gain.value, 1);
   assert.deepEqual(h.calls.map((call) => call.method), [
-    "mobkit/console/voice/open", "mobkit/live/playback_owner/register",
-    "live/webrtc/answer", "mobkit/console/voice/answer_received", "mobkit/live/status",
-    "mobkit/console/voice/context_status", "mobkit/console/voice/captions",
+    "meta/console/voice/open", "meta/live/playback_owner/register",
+    "live/webrtc/answer", "meta/console/voice/answer_received", "meta/live/status",
+    "meta/console/voice/context_status", "meta/console/voice/captions",
   ]);
   assert.doesNotMatch(JSON.stringify(h.controller.getSnapshot()), /secret|receipt|opaque-bootstrap|sdp/);
   await h.controller.close();
@@ -577,7 +577,7 @@ test("strict handshake installs output before offer, gates media until typed aut
 test("pending-handle activation preserves target and mute choices without opening another channel", async () => {
   const h = harness();
   const status = deferred<unknown>();
-  h.setRpc((method) => method === "mobkit/live/status" ? status.promise : undefined);
+  h.setRpc((method) => method === "meta/live/status" ? status.promise : undefined);
   const start = h.controller.start(target);
   await flush();
   h.controller.toggleMicrophone();
@@ -602,13 +602,13 @@ test("pending-handle activation preserves target and mute choices without openin
 
 test("stable snapshot and voice target survive independent background text", async () => {
   const h = harness();
-  h.setRpc((method) => method === "mobkit/console/send" ? Promise.resolve({ accepted: true }) : undefined);
+  h.setRpc((method) => method === "meta/console/send" ? Promise.resolve({ accepted: true }) : undefined);
   let changes = 0;
   const unsubscribe = h.controller.subscribe(() => { changes++; });
   await h.controller.start(target);
   const snapshot = h.controller.getSnapshot();
   const before = changes;
-  await h.env.rpc("mobkit/console/send", { identity: other.identity, message: "Independent text" }, 5000);
+  await h.env.rpc("meta/console/send", { identity: other.identity, message: "Independent text" }, 5000);
   assert.equal(h.controller.getSnapshot(), snapshot);
   assert.equal(changes, before);
   assert.deepEqual(snapshot.target, target);
@@ -776,7 +776,7 @@ test("a replacement channel drops old captions and reads the new channel from th
       feed.reads.push({ params, answer });
       return answer.promise;
     }
-    if (method !== "mobkit/console/voice/replacement") return undefined;
+    if (method !== "meta/console/voice/replacement") return undefined;
     const result = required ? replacement() : { required: false };
     required = false;
     return Promise.resolve(result);
@@ -857,7 +857,7 @@ test("the caption observer and parser match the shared Rust captions contract", 
   const reads: Record<string, unknown>[] = [];
   let answered = false;
   h.setRpc((method, params) => {
-    if (method === "mobkit/console/voice/open") return Promise.resolve(pending(request.identity, request.channel_id));
+    if (method === "meta/console/voice/open") return Promise.resolve(pending(request.identity, request.channel_id));
     if (method !== VOICE_CAPTIONS_METHOD) return undefined;
     reads.push(params);
     if (answered) return new Promise(() => {});
@@ -906,7 +906,7 @@ test("provisional live speech is dropped when the call is superseded or the prov
   h.peers[0].channel.emit({ type: "session.input_transcript.delta", item_id: "u1", delta: "hello" });
   assert.equal(h.controller.getSnapshot().liveSpeech.length, 1);
   const error = Object.assign(new Error("internal detail"), { rpcError: voiceContract.superseded_error });
-  h.setRpc((method) => method === "mobkit/console/voice/replacement" ? Promise.reject(error) : undefined);
+  h.setRpc((method) => method === "meta/console/voice/replacement" ? Promise.reject(error) : undefined);
   await h.clock.advance(VOICE_REPLACEMENT_POLL_INTERVAL_MS);
   assert.equal(h.controller.getSnapshot().phase, "error");
   assert.deepEqual(h.controller.getSnapshot().liveSpeech, [], "supersession drops every provisional row");
@@ -967,11 +967,11 @@ test("closes at exactly 900000ms of silence despite silent PCM and keepalives", 
 
 test("independent text to either agent and model text or transcripts never refresh audio silence", async () => {
   const h = harness();
-  h.setRpc((method) => method === "mobkit/console/send" ? Promise.resolve({ accepted: true }) : undefined);
+  h.setRpc((method) => method === "meta/console/send" ? Promise.resolve({ accepted: true }) : undefined);
   await h.controller.start(target);
   await h.clock.advance(800_000);
   for (const identity of [target.identity, other.identity]) {
-    const result = await h.env.rpc("mobkit/console/send", { identity, message: "Still independently texting" }, 5000);
+    const result = await h.env.rpc("meta/console/send", { identity, message: "Still independently texting" }, 5000);
     assert.deepEqual(result, { accepted: true });
   }
   for (const type of [
@@ -1021,7 +1021,7 @@ test("replacement mutes immediately and drains the old transport before opening 
   const h = harness();
   await h.controller.start(target);
   const closing = deferred<unknown>();
-  h.setRpc((method) => method === "mobkit/console/voice/close" ? closing.promise : undefined);
+  h.setRpc((method) => method === "meta/console/voice/close" ? closing.promise : undefined);
   const replacement = h.controller.start(other);
   assert.equal(h.streams[0].tracks[0].enabled, false);
   assert.equal(h.contexts[0].gains[0].gain.value, 0);
@@ -1068,7 +1068,7 @@ test("close fences an in-flight open, and a late response cannot activate or ove
     method.endsWith("/open") && params.identity === target.identity ? opened.promise : undefined);
   const first = h.controller.start(target);
   await flush();
-  assert.equal(h.calls[0].method, "mobkit/console/voice/open");
+  assert.equal(h.calls[0].method, "meta/console/voice/open");
   const second = h.controller.start(other);
   await Promise.all([first, second]);
   assert.equal(h.controller.getSnapshot().target?.identity, other.identity);
@@ -1084,7 +1084,7 @@ test("close fences an in-flight open, and a late response cannot activate or ove
 
 test("pending activation does not enable media and has a bounded deadline", async () => {
   const h = harness();
-  h.setRpc((method) => method === "mobkit/live/status" ? Promise.resolve({ phase: "pending" }) : undefined);
+  h.setRpc((method) => method === "meta/live/status" ? Promise.resolve({ phase: "pending" }) : undefined);
   const start = h.controller.start(target);
   await flush();
   h.controller.toggleMicrophone();
@@ -1101,7 +1101,7 @@ test("pending activation does not enable media and has a bounded deadline", asyn
 
 test("open admission is distinct from media connection and its timeout does not blame microphone permission", async () => {
   const h = harness();
-  h.setRpc(method => method === "mobkit/console/voice/open" ? new Promise(() => {}) : undefined);
+  h.setRpc(method => method === "meta/console/voice/open" ? new Promise(() => {}) : undefined);
   const start = h.controller.start(target);
   await flush();
   assert.equal(h.controller.getSnapshot().connectionStage, "opening");
@@ -1115,7 +1115,7 @@ test("open admission is distinct from media connection and its timeout does not 
 
 test("open failures identify gateway admission without exposing its upstream response", async () => {
   const h = harness();
-  h.setRpc(method => method === "mobkit/console/voice/open"
+  h.setRpc(method => method === "meta/console/voice/open"
     ? Promise.reject(new Error("admission rejected: private-source-data"))
     : undefined);
   await h.controller.start(target);
@@ -1282,7 +1282,7 @@ test("RTC, data channel, input track, and remote track loss close local and remo
     assert.equal(h.controller.getSnapshot().phase, "error");
     assert.equal(h.streams[0].tracks[0].stopped, true);
     assert.equal(h.contexts[0].state, "closed");
-    assert.equal(h.calls.at(-1)?.method, "mobkit/console/voice/close");
+    assert.equal(h.calls.at(-1)?.method, "meta/console/voice/close");
     assert.equal(h.clock.timers.size, 0);
   }
 });
@@ -1324,7 +1324,7 @@ test("ICE disconnected that never heals becomes transport loss only when the gra
   await h.controller.start(target);
   const peer = h.peers[0];
   // The owner only issues replacement authority once the browser has actually lost transport.
-  h.setRpc((method) => method !== "mobkit/console/voice/replacement" ? undefined
+  h.setRpc((method) => method !== "meta/console/voice/replacement" ? undefined
     : Promise.resolve(h.clock.now >= VOICE_TRANSPORT_RECONNECT_GRACE_MS ? replacement() : { required: false }));
   peer.disconnect();
   await h.clock.advance(VOICE_TRANSPORT_RECONNECT_GRACE_MS - 1);
@@ -1365,7 +1365,7 @@ test("ICE failed and closed are terminal immediately, without a reconnect grace"
 
 test("mismatched active authority fails closed without ungating media", async () => {
   const h = harness();
-  h.setRpc((method) => method === "mobkit/live/status" ? Promise.resolve({
+  h.setRpc((method) => method === "meta/live/status" ? Promise.resolve({
     phase: "active", handle: {
       channel_id: "wrong-channel", target_identity: other.identity,
       execution_mode: "client_context", activation_receipt: "wrong-receipt",
@@ -1376,7 +1376,7 @@ test("mismatched active authority fails closed without ungating media", async ()
   assert.match(h.controller.getSnapshot().error!, /authority did not match/);
   assert.equal(h.streams[0].tracks[0].enabled, false);
   assert.equal(h.contexts[0].gains[0].gain.value, 0);
-  assert.equal(h.calls.at(-1)?.method, "mobkit/console/voice/close");
+  assert.equal(h.calls.at(-1)?.method, "meta/console/voice/close");
 });
 
 test("pagehide uses keepalive teardown, dispose is idempotent, and no start is admitted while hidden", async () => {
@@ -1430,8 +1430,8 @@ test("server errors never surface raw credentials or transport data", async () =
 
 test("every post-open handshake failure fences the remote request and stops media", async () => {
   for (const stage of [
-    "mobkit/live/playback_owner/register", "live/webrtc/answer",
-    "mobkit/console/voice/answer_received", "mobkit/live/status",
+    "meta/live/playback_owner/register", "live/webrtc/answer",
+    "meta/console/voice/answer_received", "meta/live/status",
   ]) {
     const h = harness();
     h.setRpc((method) => method === stage ? Promise.reject(new Error("handshake failure")) : undefined);
@@ -1440,7 +1440,7 @@ test("every post-open handshake failure fences the remote request and stops medi
     assert.equal(h.streams[0].tracks[0].stopped, true, stage);
     assert.equal(h.peers[0].connectionState, "closed", stage);
     assert.equal(h.contexts[0].state, "closed", stage);
-    assert.equal(h.calls.at(-1)?.method, "mobkit/console/voice/close", stage);
+    assert.equal(h.calls.at(-1)?.method, "meta/console/voice/close", stage);
   }
 });
 
@@ -1462,7 +1462,7 @@ test("an unconnected peer cannot activate merely because the server returns acti
 test("remote output arriving before typed activation remains muted and does not count activity", async () => {
   const h = harness();
   const status = deferred<unknown>();
-  h.setRpc((method) => method === "mobkit/live/status" ? status.promise : undefined);
+  h.setRpc((method) => method === "meta/live/status" ? status.promise : undefined);
   const start = h.controller.start(target);
   await flush();
   assert.equal(h.contexts[0].gains[0].gain.value, 0);
@@ -1548,7 +1548,7 @@ test("browser audio that stays suspended past the bounded wait closes media-owne
     assert.equal(h.controller.getSnapshot().phase, "error", state);
     assert.match(h.controller.getSnapshot().error!, /audio was interrupted/);
     assert.equal(h.streams[0].tracks[0].stopped, true);
-    assert.equal(h.calls.at(-1)?.method, "mobkit/console/voice/close");
+    assert.equal(h.calls.at(-1)?.method, "meta/console/voice/close");
     assert.equal(h.clock.timers.size, 0);
   }
 });
@@ -1671,7 +1671,7 @@ test("activation waits for the transport by event, with one status poll and no 1
   const start = h.controller.start(target);
   await flush();
   assert.equal(h.controller.getSnapshot().phase, "connecting");
-  const statusPolls = () => h.calls.filter((call) => call.method === "mobkit/live/status").length;
+  const statusPolls = () => h.calls.filter((call) => call.method === "meta/live/status").length;
   assert.equal(statusPolls(), 1, "the activation receipt was polled once");
   // Time passes without transport events: no further status polls are issued.
   await h.clock.advance(1_000);
@@ -1711,7 +1711,7 @@ test("a transport that never connects fails activation at the connect deadline w
   await flush();
   assert.equal(h.controller.getSnapshot().phase, "error");
   assert.match(h.controller.getSnapshot().error!, /media connection timed out/);
-  assert.equal(h.calls.filter((call) => call.method === "mobkit/live/status").length, 1);
+  assert.equal(h.calls.filter((call) => call.method === "meta/live/status").length, 1);
   assert.ok(h.streams[0].tracks.every((track) => track.stopped));
 });
 
@@ -1748,7 +1748,7 @@ test("availability helper queries exact target readiness, accepts only explicit 
       globalThis.fetch = (async (input, init) => {
         assert.equal(input, "https://gateway.example/console/rpc");
         const request = JSON.parse(String(init?.body));
-        assert.equal(request.method, "mobkit/console/voice/readiness");
+        assert.equal(request.method, "meta/console/voice/readiness");
         assert.deepEqual(request.params, { identity: target.identity });
         return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: body }), { status: 200 });
       }) as typeof fetch;
@@ -1806,7 +1806,7 @@ test("readiness helper accepts the shared Rust HTTP golden contract for both ava
         calls++;
         assert.equal(input, "https://gateway.example/console/rpc");
         const request = JSON.parse(String(init?.body));
-        assert.equal(request.method, "mobkit/console/voice/readiness");
+        assert.equal(request.method, "meta/console/voice/readiness");
         assert.deepEqual(request.params, voiceContract.readiness_request);
         return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }));
       }) as typeof fetch;
@@ -1929,7 +1929,7 @@ test("owner-issued replacement reuses request and mic, preserves target/mutes an
     const oldNodes = [...h.contexts[0].sources, ...h.contexts[0].analysers, ...h.contexts[0].gains];
     let required = true;
     h.setRpc((method) => {
-      if (method !== "mobkit/console/voice/replacement") return undefined;
+      if (method !== "meta/console/voice/replacement") return undefined;
       const result = required ? replacement(reason) : { required: false };
       required = false;
       return Promise.resolve(result);
@@ -1949,9 +1949,9 @@ test("owner-issued replacement reuses request and mic, preserves target/mutes an
     assert.equal(h.peers.length, 2);
     assert.equal(masterGain(h.contexts[0], 1).gain.value, 0);
     assert.equal(h.calls.filter((call) => call.method.endsWith("/open")).length, 1);
-    const register = h.calls.filter((call) => call.method === "mobkit/live/playback_owner/register").at(-1)!;
+    const register = h.calls.filter((call) => call.method === "meta/live/playback_owner/register").at(-1)!;
     assert.equal(register.params.channel_id, "recovery-channel");
-    const poll = h.calls.find((call) => call.method === "mobkit/console/voice/replacement")!;
+    const poll = h.calls.find((call) => call.method === "meta/console/voice/replacement")!;
     assert.deepEqual(poll.params, { identity: target.identity, request_id: "request-1" });
     await h.clock.advance(VOICE_SILENCE_TIMEOUT_MS - VOICE_REPLACEMENT_POLL_INTERVAL_MS - 1);
     assert.equal(h.controller.getSnapshot().phase, "active");
@@ -1968,8 +1968,8 @@ test("recovery keeps media gated until new typed activation and can be cancelled
   await h.controller.start(target);
   const status = deferred<unknown>();
   h.setRpc((method, params) => {
-    if (method === "mobkit/console/voice/replacement") return Promise.resolve(replacement());
-    if (method === "mobkit/live/status" && params.channel_id === "recovery-channel") return status.promise;
+    if (method === "meta/console/voice/replacement") return Promise.resolve(replacement());
+    if (method === "meta/live/status" && params.channel_id === "recovery-channel") return status.promise;
     return undefined;
   });
   await h.clock.advance(VOICE_REPLACEMENT_POLL_INTERVAL_MS);
@@ -2018,7 +2018,7 @@ test("late old-peer events and playback promises cannot kill or ungate the repla
   const lateClose = old.channel.onclose!;
   const lateError = old.channel.onerror!;
   const lateRemoteEnd = old.remoteTrack.onended!;
-  h.setRpc((method) => method === "mobkit/console/voice/replacement" ? Promise.resolve(replacement()) : undefined);
+  h.setRpc((method) => method === "meta/console/voice/replacement" ? Promise.resolve(replacement()) : undefined);
   await h.clock.advance(VOICE_REPLACEMENT_POLL_INTERVAL_MS);
   const snapshot = h.controller.getSnapshot();
   const late = new Track();
@@ -2040,7 +2040,7 @@ test("late old-peer events and playback promises cannot kill or ungate the repla
 test("retained replacement response already bound does not create repeated peers", async () => {
   const h = harness();
   await h.controller.start(target);
-  h.setRpc((method) => method === "mobkit/console/voice/replacement" ? Promise.resolve(replacement()) : undefined);
+  h.setRpc((method) => method === "meta/console/voice/replacement" ? Promise.resolve(replacement()) : undefined);
   await h.clock.advance(VOICE_REPLACEMENT_POLL_INTERVAL_MS * 3);
   assert.equal(h.peers.length, 2);
   assert.equal(h.calls.filter((call) => call.method.endsWith("/open")).length, 1);
@@ -2061,11 +2061,11 @@ test("malformed, legacy, conflicting or cross-target replacement authority fails
   ]) {
     const h = harness();
     await h.controller.start(target);
-    h.setRpc((method) => method === "mobkit/console/voice/replacement" ? Promise.resolve(raw) : undefined);
+    h.setRpc((method) => method === "meta/console/voice/replacement" ? Promise.resolve(raw) : undefined);
     await h.clock.advance(VOICE_REPLACEMENT_POLL_INTERVAL_MS);
     assert.equal(h.controller.getSnapshot().phase, "error");
     assert.equal(h.streams[0].tracks[0].stopped, true);
-    assert.equal(h.calls.at(-1)?.method, "mobkit/console/voice/close");
+    assert.equal(h.calls.at(-1)?.method, "meta/console/voice/close");
     assert.equal(h.clock.timers.size, 0);
   }
 });
@@ -2077,7 +2077,7 @@ test("closed, superseded, denied or lost replacement polling fails closed and ne
     const error = Object.assign(new Error("internal detail"), {
       rpcError: kind === "voice_superseded" ? voiceContract.superseded_error : { data: { kind } },
     });
-    h.setRpc((method) => method === "mobkit/console/voice/replacement" ? Promise.reject(error) : undefined);
+    h.setRpc((method) => method === "meta/console/voice/replacement" ? Promise.reject(error) : undefined);
     await h.clock.advance(VOICE_REPLACEMENT_POLL_INTERVAL_MS);
     assert.equal(h.controller.getSnapshot().phase, "error");
     if (kind === "voice_closed") assert.match(h.controller.getSnapshot().error!, /gateway closed/);
@@ -2090,19 +2090,19 @@ test("closed, superseded, denied or lost replacement polling fails closed and ne
     const error = Object.assign(new Error("internal detail"), {
       rpcError: { data: { kind: "voice_superseded", reason: "superseded_by_console_voice" } },
     });
-    h.setRpc((method) => method === "mobkit/console/voice/replacement" ? Promise.reject(error) : undefined);
+    h.setRpc((method) => method === "meta/console/voice/replacement" ? Promise.reject(error) : undefined);
     await h.clock.advance(VOICE_REPLACEMENT_POLL_INTERVAL_MS);
     assert.equal(h.controller.getSnapshot().phase, "error");
     assert.match(h.controller.getSnapshot().error!, /moved to another console call/);
     assert.equal(h.streams[0].tracks[0].stopped, true);
-    assert.equal(h.calls.at(-1)?.method, "mobkit/console/voice/close");
+    assert.equal(h.calls.at(-1)?.method, "meta/console/voice/close");
   }
 });
 
 test("a stalled replacement poll keeps connected audio and only sustained failure closes voice at the tolerance", async () => {
   const h = harness();
   await h.controller.start(target);
-  h.setRpc((method) => method === "mobkit/console/voice/replacement" ? new Promise(() => {}) : undefined);
+  h.setRpc((method) => method === "meta/console/voice/replacement" ? new Promise(() => {}) : undefined);
   await h.clock.advance(VOICE_REPLACEMENT_POLL_INTERVAL_MS + VOICE_TEARDOWN_TIMEOUT_MS);
   assert.equal(h.controller.getSnapshot().phase, "active", "one stalled poll does not end connected audio");
   assert.equal(h.streams[0].tracks[0].enabled, true);
@@ -2114,7 +2114,7 @@ test("a stalled replacement poll keeps connected audio and only sustained failur
   assert.equal(h.controller.getSnapshot().phase, "error");
   assert.match(h.controller.getSnapshot().error!, /could not be verified/);
   assert.equal(h.streams[0].tracks[0].stopped, true);
-  assert.equal(h.calls.at(-1)?.method, "mobkit/console/voice/close");
+  assert.equal(h.calls.at(-1)?.method, "meta/console/voice/close");
   assert.equal(h.clock.timers.size, 0);
 });
 
@@ -2123,7 +2123,7 @@ test("one failed replacement poll is retried with backoff and a later success di
   await h.controller.start(target);
   let polls = 0;
   h.setRpc((method) => {
-    if (method !== "mobkit/console/voice/replacement") return undefined;
+    if (method !== "meta/console/voice/replacement") return undefined;
     polls++;
     return polls <= 2 ? Promise.reject(new Error("network failed")) : Promise.resolve({ required: false });
   });
@@ -2147,7 +2147,7 @@ test("pending replacement polling is cancelled on close and its late response ca
   const h = harness();
   await h.controller.start(target);
   const result = deferred<unknown>();
-  h.setRpc((method) => method === "mobkit/console/voice/replacement" ? result.promise : undefined);
+  h.setRpc((method) => method === "meta/console/voice/replacement" ? result.promise : undefined);
   await h.clock.advance(VOICE_REPLACEMENT_POLL_INTERVAL_MS);
   await h.controller.close();
   result.resolve(replacement());
@@ -2162,8 +2162,8 @@ test("silence deadline can expire during recovery without waiting for connect ti
   await h.controller.start(target);
   await h.clock.advance(VOICE_SILENCE_TIMEOUT_MS - 2000);
   h.setRpc((method, params) => {
-    if (method === "mobkit/console/voice/replacement") return Promise.resolve(replacement());
-    if (method === "mobkit/live/status" && params.channel_id === "recovery-channel") return new Promise(() => {});
+    if (method === "meta/console/voice/replacement") return Promise.resolve(replacement());
+    if (method === "meta/live/status" && params.channel_id === "recovery-channel") return new Promise(() => {});
     return undefined;
   });
   await h.clock.advance(1000);
@@ -2181,7 +2181,7 @@ test("new target start during recovery tears down the entire old request before 
   await h.controller.start(target);
   const answer = deferred<unknown>();
   h.setRpc((method, params) => {
-    if (method === "mobkit/console/voice/replacement") return Promise.resolve(replacement());
+    if (method === "meta/console/voice/replacement") return Promise.resolve(replacement());
     if (method === "live/webrtc/answer" && params.channel_id === "recovery-channel") return answer.promise;
     return undefined;
   });
@@ -2210,7 +2210,7 @@ test("old peer closing before the next poll discovers owner recovery instead of 
     await h.controller.start(target);
     const oldPeer = h.peers[0];
     const lateState = oldPeer.onconnectionstatechange!;
-    h.setRpc((method) => method === "mobkit/console/voice/replacement" ? Promise.resolve(replacement()) : undefined);
+    h.setRpc((method) => method === "meta/console/voice/replacement" ? Promise.resolve(replacement()) : undefined);
     lose(oldPeer);
     assert.equal(h.controller.getSnapshot().phase, "connecting");
     assert.equal(h.streams[0].tracks[0].enabled, false);
@@ -2233,7 +2233,7 @@ test("transport loss joins an in-flight request-owned replacement check instead 
   const h = harness();
   await h.controller.start(target);
   const result = deferred<unknown>();
-  h.setRpc((method) => method === "mobkit/console/voice/replacement" ? result.promise : undefined);
+  h.setRpc((method) => method === "meta/console/voice/replacement" ? result.promise : undefined);
   await h.clock.advance(VOICE_REPLACEMENT_POLL_INTERVAL_MS);
   const lateConnection = h.peers[0].onconnectionstatechange!;
   h.peers[0].fail();
@@ -2243,7 +2243,7 @@ test("transport loss joins an in-flight request-owned replacement check instead 
   result.resolve({ required: false });
   await flush();
   assert.equal(h.controller.getSnapshot().phase, "connecting");
-  h.setRpc((method) => method === "mobkit/console/voice/replacement" ? Promise.resolve(replacement()) : undefined);
+  h.setRpc((method) => method === "meta/console/voice/replacement" ? Promise.resolve(replacement()) : undefined);
   await h.clock.advance(VOICE_REPLACEMENT_POLL_INTERVAL_MS);
   assert.equal(h.controller.getSnapshot().phase, "active");
   assert.equal(h.peers.length, 2);
@@ -2253,7 +2253,7 @@ test("transport loss joins an in-flight request-owned replacement check instead 
 test("lost transport fails closed on consumed authority without opening fresh", async () => {
   const h = harness();
   await h.controller.start(target);
-  h.setRpc((method) => method === "mobkit/console/voice/replacement"
+  h.setRpc((method) => method === "meta/console/voice/replacement"
     ? Promise.resolve(replacement("canonical_context", pending(target.identity, `channel-${target.identity}`)))
     : undefined);
   h.peers[0].fail();
@@ -2263,14 +2263,14 @@ test("lost transport fails closed on consumed authority without opening fresh", 
   assert.equal(h.streams[0].tracks[0].stopped, true);
   assert.equal(h.calls.filter((call) => call.method.endsWith("/replacement")).length, 1);
   assert.equal(h.calls.filter((call) => call.method.endsWith("/open")).length, 1);
-  assert.equal(h.calls.at(-1)?.method, "mobkit/console/voice/close");
+  assert.equal(h.calls.at(-1)?.method, "meta/console/voice/close");
   assert.equal(h.clock.timers.size, 0);
 });
 
 test("lost transport with a stalled replacement poll keeps retrying until the fixed recovery deadline", async () => {
   const h = harness();
   await h.controller.start(target);
-  h.setRpc((method) => method === "mobkit/console/voice/replacement" ? new Promise<unknown>(() => {}) : undefined);
+  h.setRpc((method) => method === "meta/console/voice/replacement" ? new Promise<unknown>(() => {}) : undefined);
   h.peers[0].fail();
   assert.equal(h.streams[0].tracks[0].enabled, false);
   await h.clock.advance(VOICE_TEARDOWN_TIMEOUT_MS);
@@ -2283,7 +2283,7 @@ test("lost transport with a stalled replacement poll keeps retrying until the fi
   assert.ok(h.calls.filter((call) => call.method.endsWith("/replacement")).length > 1, "polling retried with backoff");
   assert.equal(h.calls.filter((call) => call.method.endsWith("/open")).length, 1);
   assert.equal(h.streams[0].tracks[0].stopped, true);
-  assert.equal(h.calls.at(-1)?.method, "mobkit/console/voice/close");
+  assert.equal(h.calls.at(-1)?.method, "meta/console/voice/close");
   assert.equal(h.clock.timers.size, 0);
 });
 
@@ -2295,7 +2295,7 @@ test("transport loss waits for delayed owner replacement while preserving target
   await h.clock.advance(10_000);
   let polls = 0;
   h.setRpc((method) => {
-    if (method !== "mobkit/console/voice/replacement") return undefined;
+    if (method !== "meta/console/voice/replacement") return undefined;
     polls++;
     return Promise.resolve(polls <= 3 ? { required: false } : replacement());
   });
@@ -2334,7 +2334,7 @@ test("false replacement replies and repeated old-peer loss cannot extend the fix
   const lateClose = old.channel.onclose!;
   let polls = 0;
   h.setRpc((method) => {
-    if (method !== "mobkit/console/voice/replacement") return undefined;
+    if (method !== "meta/console/voice/replacement") return undefined;
     polls++;
     lateState();
     lateClose();
@@ -2360,10 +2360,10 @@ test("late pending discovery cannot extend the recovery deadline with a new acti
   const h = harness();
   await h.controller.start(target);
   h.setRpc((method, params) => {
-    if (method === "mobkit/console/voice/replacement") {
+    if (method === "meta/console/voice/replacement") {
       return Promise.resolve(h.clock.now < VOICE_RECOVERY_TIMEOUT_MS - 1000 ? { required: false } : replacement());
     }
-    if (method === "mobkit/live/status" && params.channel_id === "recovery-channel") return new Promise(() => {});
+    if (method === "meta/live/status" && params.channel_id === "recovery-channel") return new Promise(() => {});
     return undefined;
   });
   h.peers[0].fail();
@@ -2383,7 +2383,7 @@ test("explicit cancel during delayed replacement discovery fences late pending w
   const late = deferred<unknown>();
   let polls = 0;
   h.setRpc((method) => {
-    if (method !== "mobkit/console/voice/replacement") return undefined;
+    if (method !== "meta/console/voice/replacement") return undefined;
     polls++;
     return polls <= 2 ? Promise.resolve({ required: false }) : late.promise;
   });
@@ -2422,7 +2422,7 @@ test("terminal authorization errors stop recovery waiting immediately", async ()
   await h.controller.start(target);
   let polls = 0;
   h.setRpc((method) => {
-    if (method !== "mobkit/console/voice/replacement") return undefined;
+    if (method !== "meta/console/voice/replacement") return undefined;
     polls++;
     return polls < 3
       ? Promise.resolve({ required: false })
@@ -2442,7 +2442,7 @@ test("explicit close wins over a transport-loss recovery check and fences its la
   const h = harness();
   await h.controller.start(target);
   const result = deferred<unknown>();
-  h.setRpc((method) => method === "mobkit/console/voice/replacement" ? result.promise : undefined);
+  h.setRpc((method) => method === "meta/console/voice/replacement" ? result.promise : undefined);
   h.peers[0].fail();
   assert.equal(h.controller.getSnapshot().phase, "connecting");
   await h.controller.close();
@@ -2458,7 +2458,7 @@ test("answer delivery ACK follows remote description and precedes status or medi
   const h = harness();
   const receipt = deferred<unknown>();
   h.setRpc((method, params) => {
-    if (method !== "mobkit/console/voice/answer_received") return undefined;
+    if (method !== "meta/console/voice/answer_received") return undefined;
     assert.equal(h.peers[0].connectionState, "connected", "answer must have been applied locally");
     assert.equal(h.streams[0].tracks[0].enabled, false);
     assert.equal(h.contexts[0].gains[0].gain.value, 0);
@@ -2470,7 +2470,7 @@ test("answer delivery ACK follows remote description and precedes status or medi
   const start = h.controller.start(target);
   await flush();
   assert.equal(h.controller.getSnapshot().phase, "connecting");
-  assert.equal(h.calls.some((call) => call.method === "mobkit/live/status"), false);
+  assert.equal(h.calls.some((call) => call.method === "meta/live/status"), false);
   receipt.resolve({ accepted: true });
   await start;
   assert.equal(h.controller.getSnapshot().phase, "active");
@@ -2480,13 +2480,13 @@ test("answer delivery ACK follows remote description and precedes status or medi
 test("missing or denied answer delivery ACK fails closed without querying activation", async () => {
   for (const result of [null, {}, [], { accepted: false }, { accepted: "true" }]) {
     const h = harness();
-    h.setRpc((method) => method === "mobkit/console/voice/answer_received" ? Promise.resolve(result) : undefined);
+    h.setRpc((method) => method === "meta/console/voice/answer_received" ? Promise.resolve(result) : undefined);
     await h.controller.start(target);
     assert.equal(h.controller.getSnapshot().phase, "error");
     assert.match(h.controller.getSnapshot().error!, /acknowledge voice answer delivery/);
-    assert.equal(h.calls.some((call) => call.method === "mobkit/live/status"), false);
+    assert.equal(h.calls.some((call) => call.method === "meta/live/status"), false);
     assert.equal(h.streams[0].tracks[0].stopped, true);
-    assert.equal(h.calls.at(-1)?.method, "mobkit/console/voice/close");
+    assert.equal(h.calls.at(-1)?.method, "meta/console/voice/close");
   }
 });
 
@@ -2495,8 +2495,8 @@ test("each recovery answer has its own channel-scoped delivery ACK, cancelled la
   await h.controller.start(target);
   const receipt = deferred<unknown>();
   h.setRpc((method, params) => {
-    if (method === "mobkit/console/voice/replacement") return Promise.resolve(replacement());
-    if (method === "mobkit/console/voice/answer_received" && params.channel_id === "recovery-channel") {
+    if (method === "meta/console/voice/replacement") return Promise.resolve(replacement());
+    if (method === "meta/console/voice/answer_received" && params.channel_id === "recovery-channel") {
       assert.deepEqual(params, {
         identity: target.identity, request_id: "request-1", channel_id: "recovery-channel",
       });
@@ -2506,8 +2506,8 @@ test("each recovery answer has its own channel-scoped delivery ACK, cancelled la
   });
   await h.clock.advance(VOICE_REPLACEMENT_POLL_INTERVAL_MS);
   assert.equal(h.controller.getSnapshot().phase, "connecting");
-  assert.equal(h.calls.filter((call) => call.method === "mobkit/console/voice/answer_received").length, 2);
-  assert.equal(h.calls.some((call) => call.method === "mobkit/live/status" && call.params.channel_id === "recovery-channel"), false);
+  assert.equal(h.calls.filter((call) => call.method === "meta/console/voice/answer_received").length, 2);
+  assert.equal(h.calls.some((call) => call.method === "meta/live/status" && call.params.channel_id === "recovery-channel"), false);
   await h.controller.close();
   receipt.resolve({ accepted: true });
   await flush();
@@ -2520,7 +2520,7 @@ test("actual audio reports activity immediately, throttles to five seconds, and 
   const h = harness();
   const times: number[] = [];
   h.setRpc((method, params) => {
-    if (method !== "mobkit/console/voice/activity") return undefined;
+    if (method !== "meta/console/voice/activity") return undefined;
     times.push(h.clock.now);
     assert.deepEqual(params, { identity: target.identity, request_id: "request-1" });
     return Promise.resolve({ accepted: true });
@@ -2562,7 +2562,7 @@ test("muted mic, text and quiet frames never report activity; incoming model aud
 test("activity reports never overlap; a stalled confirmation retries and only sustained failure closes voice", async () => {
   const h = harness();
   const reports = () => h.calls.filter((call) => call.method.endsWith("/activity")).length;
-  h.setRpc((method) => method === "mobkit/console/voice/activity" ? new Promise(() => {}) : undefined);
+  h.setRpc((method) => method === "meta/console/voice/activity" ? new Promise(() => {}) : undefined);
   await h.controller.start(target);
   h.contexts[0].analysers[0].signal = 0.5;
   await h.clock.advance(100);
@@ -2580,7 +2580,7 @@ test("activity reports never overlap; a stalled confirmation retries and only su
   assert.equal(h.controller.getSnapshot().phase, "error");
   assert.match(h.controller.getSnapshot().error!, /activity could not be confirmed/);
   assert.equal(h.streams[0].tracks[0].stopped, true);
-  assert.equal(h.calls.at(-1)?.method, "mobkit/console/voice/close");
+  assert.equal(h.calls.at(-1)?.method, "meta/console/voice/close");
   assert.equal(h.clock.timers.size, 0);
 });
 
@@ -2589,7 +2589,7 @@ test("one failed activity heartbeat keeps audio flowing and a later success disa
   let failing = true;
   let reports = 0;
   h.setRpc((method) => {
-    if (method !== "mobkit/console/voice/activity") return undefined;
+    if (method !== "meta/console/voice/activity") return undefined;
     reports++;
     return failing ? Promise.reject(new Error("network failed")) : Promise.resolve({ accepted: true });
   });
@@ -2613,7 +2613,7 @@ test("sustained activity heartbeat failure closes voice at the tolerance deadlin
   const h = harness();
   let reports = 0;
   h.setRpc((method) => {
-    if (method !== "mobkit/console/voice/activity") return undefined;
+    if (method !== "meta/console/voice/activity") return undefined;
     reports++;
     return Promise.reject(new Error("network failed"));
   });
@@ -2628,7 +2628,7 @@ test("sustained activity heartbeat failure closes voice at the tolerance deadlin
   assert.equal(h.controller.getSnapshot().phase, "error");
   assert.match(h.controller.getSnapshot().error!, /activity could not be confirmed/);
   assert.equal(h.streams[0].tracks[0].stopped, true);
-  assert.equal(h.calls.at(-1)?.method, "mobkit/console/voice/close");
+  assert.equal(h.calls.at(-1)?.method, "meta/console/voice/close");
   assert.equal(h.clock.timers.size, 0);
 });
 
@@ -2640,7 +2640,7 @@ test("HTTP 5xx and 429 heartbeat rejections are transient; other HTTP statuses a
     [{ rpcError: { code: -32030, data: { kind: "access_denied" } } }, false],
   ] as const) {
     const h = harness();
-    h.setRpc((method) => method === "mobkit/console/voice/activity"
+    h.setRpc((method) => method === "meta/console/voice/activity"
       ? Promise.reject(Object.assign(new Error("gateway"), annotation))
       : undefined);
     await h.controller.start(target);
@@ -2658,13 +2658,13 @@ test("invalid activity acceptance is a definite gateway answer: it closes voice 
     () => Promise.resolve({ accepted: "true" }),
   ]) {
     const h = harness();
-    h.setRpc((method) => method === "mobkit/console/voice/activity" ? response() : undefined);
+    h.setRpc((method) => method === "meta/console/voice/activity" ? response() : undefined);
     await h.controller.start(target);
     h.contexts[0].analysers[1].signal = 0.5;
     await h.clock.advance(100);
     assert.equal(h.controller.getSnapshot().phase, "error");
     assert.equal(h.streams[0].tracks[0].stopped, true);
-    assert.equal(h.calls.at(-1)?.method, "mobkit/console/voice/close");
+    assert.equal(h.calls.at(-1)?.method, "meta/console/voice/close");
     assert.equal(h.clock.timers.size, 0);
   }
 });
@@ -2672,7 +2672,7 @@ test("invalid activity acceptance is a definite gateway answer: it closes voice 
 test("late activity acknowledgement after close is inert", async () => {
   const h = harness();
   const accepted = deferred<unknown>();
-  h.setRpc((method) => method === "mobkit/console/voice/activity" ? accepted.promise : undefined);
+  h.setRpc((method) => method === "meta/console/voice/activity" ? accepted.promise : undefined);
   await h.controller.start(target);
   h.contexts[0].analysers[0].signal = 0.5;
   await h.clock.advance(100);
@@ -2690,12 +2690,12 @@ test("activity uses the same request scope across owner-issued recovery, never o
   await h.controller.start(target);
   h.peers[0].channel.emit({ type: "input_audio_buffer.speech_started" });
   await flush();
-  h.setRpc((method) => method === "mobkit/console/voice/replacement" ? Promise.resolve(replacement()) : undefined);
+  h.setRpc((method) => method === "meta/console/voice/replacement" ? Promise.resolve(replacement()) : undefined);
   await h.clock.advance(VOICE_ACTIVITY_REPORT_INTERVAL_MS);
   assert.equal(h.peers.length, 2);
   h.peers[1].channel.emit({ type: "input_audio_buffer.speech_started" });
   await flush();
-  const reports = h.calls.filter((call) => call.method === "mobkit/console/voice/activity");
+  const reports = h.calls.filter((call) => call.method === "meta/console/voice/activity");
   assert.equal(reports.length, 2);
   assert.ok(reports.every((call) => Object.keys(call.params).length === 2));
   assert.deepEqual(reports.map((call) => call.params), [
@@ -2709,7 +2709,7 @@ test("unreported real audio during cooldown flushes once after quiet without cha
   const h = harness();
   const reports: number[] = [];
   h.setRpc((method) => {
-    if (method !== "mobkit/console/voice/activity") return undefined;
+    if (method !== "meta/console/voice/activity") return undefined;
     reports.push(h.clock.now);
     return Promise.resolve({ accepted: true });
   });
@@ -2734,7 +2734,7 @@ test("audio received during an in-flight report remains dirty for one trailing f
   const accepted = deferred<unknown>();
   let reports = 0;
   h.setRpc((method) => {
-    if (method !== "mobkit/console/voice/activity") return undefined;
+    if (method !== "meta/console/voice/activity") return undefined;
     reports++;
     return reports === 1 ? accepted.promise : Promise.resolve({ accepted: true });
   });

@@ -39,7 +39,7 @@ function createPreviewServer() {
       let body = "";
       for await (const chunk of req) body += chunk;
       const request = JSON.parse(body);
-      const result = request.method === "mobkit/console/query_timeline"
+      const result = request.method === "meta/console/query_timeline"
         ? { frames: request.params?.after ? [] : frames, exhausted: true, available: true, latest_cursor: "console:3" }
         : request.method.endsWith("capabilities") ? { version: "0.5.0", methods: [] } : {};
       return json({ jsonrpc: "2.0", id: request.id, result });

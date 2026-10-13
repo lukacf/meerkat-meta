@@ -40,7 +40,7 @@ async function clickNav(page, testId, expectedPanelTestId) {
 async function main() {
   const baseUrl = process.argv[2];
   assert.ok(baseUrl, "Usage: browser_smoke.cjs <base-url>");
-  const artifactDir = process.env.MOBKIT_BROWSER_SMOKE_ARTIFACT_DIR || "";
+  const artifactDir = process.env.META_BROWSER_SMOKE_ARTIFACT_DIR || "";
   let shot = 0;
 
   const experience = await fetchJson(baseUrl, "/console/experience");
@@ -88,9 +88,9 @@ async function main() {
     await expectVisible(page.getByTestId("meerkat-console"), "console root");
     await expectHidden(page.getByTestId("console-loading"), "loading indicator");
 
-    await expectVisible(page.getByTestId("mobkit-topbar").getByText("Borealis Foresight"), "brand label");
-    await expectVisible(page.getByTestId("mobkit-topbar").getByText("Foresight Studio"), "console title");
-    await expectVisible(page.getByTestId("mobkit-topbar").getByText("demo / board-readiness"), "environment label");
+    await expectVisible(page.getByTestId("meta-topbar").getByText("Borealis Foresight"), "brand label");
+    await expectVisible(page.getByTestId("meta-topbar").getByText("Foresight Studio"), "console title");
+    await expectVisible(page.getByTestId("meta-topbar").getByText("demo / board-readiness"), "environment label");
     shot = await screenshot(page, artifactDir, shot, "initial-console");
 
     for (const nav of ["roster", "topology", "timeline", "routing", "logs", "health"]) {

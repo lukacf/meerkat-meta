@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 import {
-  MobKit,
+  Meta,
   type AgentBuildContext,
   type AgentBuildDraft,
   type AgentCustomizer,
@@ -86,19 +86,19 @@ function repoCargoEnv(): Record<string, string> {
 }
 
 function ensureGatewayBin(skipBuild: boolean): string {
-  if (process.env.MOBKIT_RPC_GATEWAY_BIN) {
-    return process.env.MOBKIT_RPC_GATEWAY_BIN;
+  if (process.env.META_RPC_GATEWAY_BIN) {
+    return process.env.META_RPC_GATEWAY_BIN;
   }
   const env = repoCargoEnv();
   const gateway = join(env.CARGO_TARGET_DIR, "debug", "rpc_gateway");
   if (!skipBuild || !existsSync(gateway)) {
     const result = spawnSync(
       join(repoRoot, "scripts/repo-cargo"),
-      ["build", "-p", "meerkat-mobkit", "--bin", "rpc_gateway"],
+      ["build", "-p", "meerkat-meta", "--bin", "rpc_gateway"],
       { cwd: repoRoot, stdio: "inherit" },
     );
     if (result.status !== 0) {
-      throw new Error("failed to build meerkat-mobkit rpc_gateway");
+      throw new Error("failed to build meerkat-meta rpc_gateway");
     }
   }
   return gateway;
@@ -176,7 +176,7 @@ class SwarmCustomizer implements AgentCustomizer {
     draft.appContext = contextFor(agent, peers);
     draft.additionalInstructions = [
       ...draft.additionalInstructions,
-      "This is Example 3, a high-cardinality MobKit and Meerkat stress run.",
+      "This is Example 3, a high-cardinality Meta and Meerkat stress run.",
       "Keep outputs compact so the test stresses session/timeline mechanics, not token volume.",
       `Visible peer count for this build: ${peers.length}.`,
     ];
@@ -377,7 +377,7 @@ async function main() {
   // Env opt-out of real provider calls (same effect as --demo-llm) so keyed
   // shells can run shape-only without editing the command line. An explicit
   // --real-llm flag overrides it.
-  const envDemoLlm = process.env.MOBKIT_EXAMPLE_DEMO_LLM === "1";
+  const envDemoLlm = process.env.META_EXAMPLE_DEMO_LLM === "1";
   const useDemoLlm = forceDemoLlm || (!forceRealLlm && envDemoLlm);
   if (
     !useDemoLlm &&
@@ -389,17 +389,17 @@ async function main() {
     );
   }
   const stateDir = join(here, ".state");
-  const keepState = Boolean(process.env.MOBKIT_KEEP_EXAMPLE_STATE);
+  const keepState = Boolean(process.env.META_KEEP_EXAMPLE_STATE);
   const hadPersistentState =
     existsSync(join(stateDir, "continuity.db")) ||
-    existsSync(join(stateDir, "mobkit_console.sqlite"));
-  if (!process.env.MOBKIT_KEEP_EXAMPLE_STATE) {
+    existsSync(join(stateDir, "meta_console.sqlite"));
+  if (!process.env.META_KEEP_EXAMPLE_STATE) {
     rmSync(stateDir, { recursive: true, force: true });
   }
   mkdirSync(stateDir, { recursive: true });
   const restoreBurst =
-    process.env.MOBKIT_SWARM_RESTORE_BURST === "1" ||
-    (process.env.MOBKIT_SWARM_RESTORE_BURST !== "0" &&
+    process.env.META_SWARM_RESTORE_BURST === "1" ||
+    (process.env.META_SWARM_RESTORE_BURST !== "0" &&
       keepState &&
       hadPersistentState);
 
@@ -414,13 +414,13 @@ async function main() {
     console.warn(
       `[swarm-stress] WARNING: real ${SWARM_STRESS_MODEL} provider calls will be made via ${keySource}` +
         ` (hundreds of agents; this burns real tokens${forceRealLlm ? "" : "; implicit because the key is set"}).` +
-        " Pass --demo-llm or set MOBKIT_EXAMPLE_DEMO_LLM=1 for a deterministic shape-only run.",
+        " Pass --demo-llm or set META_EXAMPLE_DEMO_LLM=1 for a deterministic shape-only run.",
     );
   }
 
   const topologyProvider = new SwarmTopologyProvider();
-  const skipDense = process.env.MOBKIT_SWARM_SKIP_DENSE === "1";
-  let builder = MobKit.builder()
+  const skipDense = process.env.META_SWARM_SKIP_DENSE === "1";
+  let builder = Meta.builder()
     .mob(join(configDir, "mob.toml"))
     .gateway(ensureGatewayBin(skipBuild))
     .consoleConfig(join(configDir, "console.toml"))
@@ -475,7 +475,7 @@ async function main() {
       }
     } else {
       const reason = skipDense
-        ? "requested by MOBKIT_SWARM_SKIP_DENSE"
+        ? "requested by META_SWARM_SKIP_DENSE"
         : `restored ${restoredEdgeCount} existing topology edges`;
       console.log(`[swarm-stress] skipping dense topology reapply (${reason})`);
     }

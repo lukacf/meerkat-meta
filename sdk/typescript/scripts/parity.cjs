@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const {
-  MobkitTypedClient,
+  MetaTypedClient,
   buildConsoleModulesRoute,
   defineModuleSpec,
   leaseAcquireResultToDict,
@@ -10,9 +10,9 @@ const {
   parsePersistedEvent,
 } = require("../dist/index.cjs");
 
-const gatewayBin = process.env.MOBKIT_RPC_GATEWAY_BIN;
+const gatewayBin = process.env.META_RPC_GATEWAY_BIN;
 if (!gatewayBin) {
-  console.error("MOBKIT_RPC_GATEWAY_BIN must be set");
+  console.error("META_RPC_GATEWAY_BIN must be set");
   process.exit(2);
 }
 
@@ -35,10 +35,10 @@ function assertDeepEqual(actual, expected, label) {
   }
 }
 
-const client = new MobkitTypedClient(gatewayBin);
+const client = new MetaTypedClient(gatewayBin);
 
 check("typed client status success", () => {
-  const response = client.rpc("ts-status", "mobkit/status", {});
+  const response = client.rpc("ts-status", "meta/status", {});
   assertDeepEqual(response, {
     jsonrpc: "2.0",
     id: "ts-status",
@@ -51,15 +51,15 @@ check("typed client status success", () => {
 });
 
 check("typed client capabilities success", () => {
-  const response = client.rpc("ts-caps", "mobkit/capabilities", {});
+  const response = client.rpc("ts-caps", "meta/capabilities", {});
   const methods = response.result && response.result.methods;
-  if (!Array.isArray(methods) || !methods.includes("mobkit/events/subscribe")) {
+  if (!Array.isArray(methods) || !methods.includes("meta/events/subscribe")) {
     throw new Error(`unexpected capabilities methods: ${JSON.stringify(response)}`);
   }
 });
 
 check("typed client invalid params exact json-rpc error", () => {
-  const response = client.rpc("ts-invalid", "mobkit/spawn_member", {});
+  const response = client.rpc("ts-invalid", "meta/spawn_member", {});
   assertDeepEqual(response, {
     jsonrpc: "2.0",
     id: "ts-invalid",

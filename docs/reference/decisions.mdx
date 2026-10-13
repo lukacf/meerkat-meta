@@ -4,7 +4,7 @@ description: "Policy enforcement: auth rules, console access, runtime ops constr
 icon: "scale-balanced"
 ---
 
-MobKit's decision layer enforces operational policies through typed validation functions. Each function takes a policy or configuration input and returns a typed error on violation.
+Meta's decision layer enforces operational policies through typed validation functions. Each function takes a policy or configuration input and returns a typed error on violation.
 
 ## Console access
 
@@ -58,7 +58,7 @@ validate_runtime_ops_policy(&RuntimeOpsPolicy {
 
 ```rust
 validate_bigquery_naming(&BigQueryNaming {
-    dataset: "mobkit_sessions".into(),
+    dataset: "meta_sessions".into(),
     table: "session_rows".into(),
 })?;
 ```
@@ -74,10 +74,10 @@ validate_bigquery_naming(&BigQueryNaming {
 
 ## Trusted module loading
 
-`load_trusted_mobkit_modules_from_toml` parses and validates a trust manifest.
+`load_trusted_meta_modules_from_toml` parses and validates a trust manifest.
 
 ```rust
-let modules = load_trusted_mobkit_modules_from_toml(r#"
+let modules = load_trusted_meta_modules_from_toml(r#"
 [[modules]]
 id = "router"
 command = "meerkat-router"
@@ -138,8 +138,8 @@ that crashes at startup is unwrapping the result.
 
 ```rust
 let decisions = build_runtime_decision_state(RuntimeDecisionInputs {
-    bigquery: BigQueryNaming { dataset: "mobkit".into(), table: "sessions".into() },
-    trusted_mobkit_toml: String::new(),          // empty manifest: no trusted modules
+    bigquery: BigQueryNaming { dataset: "meta".into(), table: "sessions".into() },
+    trusted_meta_toml: String::new(),          // empty manifest: no trusted modules
     auth: AuthPolicy::default(),
     trusted_oidc: TrustedOidcRuntimeConfig {
         discovery_json: discovery_json,          // must carry issuer and jwks_uri
@@ -156,7 +156,7 @@ let decisions = build_runtime_decision_state(RuntimeDecisionInputs {
 | # | Check | Input | Runs when | Error |
 |---|-------|-------|-----------|-------|
 | 1 | `validate_bigquery_naming` | `bigquery` | Always | `EmptyBigQueryDataset`, `EmptyBigQueryTable`, `InvalidBigQueryName` |
-| 2 | `load_trusted_mobkit_modules_from_toml` | `trusted_mobkit_toml` | Always; an empty string is accepted and declares no modules | `TomlParse`, `MissingModuleId`, `MissingModuleCommand` |
+| 2 | `load_trusted_meta_modules_from_toml` | `trusted_meta_toml` | Always; an empty string is accepted and declares no modules | `TomlParse`, `MissingModuleId`, `MissingModuleCommand` |
 | 3 | `validate_runtime_ops_policy` | `ops` | Always | `ReplicaCountMustBeOne`, `SloTargetsNotSupportedV01` |
 | 4 | `parse_release_metadata_json` + `validate_release_metadata` | `release_metadata_json` | Always. Nothing reads the result at serve time; this is release governance carried in the build path | `TomlParse` (message names the release metadata JSON), `MissingReleaseTarget`, `DuplicateReleaseTarget`, `InvalidSupportMatrix` |
 | 5 | `validate_trusted_oidc_runtime_config` | `trusted_oidc` | Only when `console.require_app_auth` is `true` | `InvalidTrustedAuthConfig` |

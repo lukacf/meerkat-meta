@@ -20,8 +20,8 @@ class ReleaseVersionScriptsTests(unittest.TestCase):
         (self.root / "scripts").mkdir()
         (self.root / "sdk/python").mkdir(parents=True)
         (self.root / "sdk/typescript").mkdir(parents=True)
-        (self.root / "crates/meerkat-mobkit").mkdir(parents=True)
-        (self.root / "crates/mobkit-store-conformance").mkdir(parents=True)
+        (self.root / "crates/meerkat-meta").mkdir(parents=True)
+        (self.root / "crates/meta-store-conformance").mkdir(parents=True)
         (self.root / "docs/sdks").mkdir(parents=True)
         (self.root / "src").mkdir()
 
@@ -39,20 +39,20 @@ class ReleaseVersionScriptsTests(unittest.TestCase):
         repo_cargo.chmod(0o755)
 
         (self.root / "Cargo.toml").write_text(
-            '[package]\nname = "meerkat-mobkit"\nversion = "0.8.1"\nedition = "2024"\n'
+            '[package]\nname = "meerkat-meta"\nversion = "0.8.1"\nedition = "2024"\n'
         )
         (self.root / "src/lib.rs").write_text("")
         (self.root / "sdk/python/pyproject.toml").write_text(
-            '[project]\nname = "meerkat-mobkit"\nversion = "0.8.0"\n'
+            '[project]\nname = "meerkat-meta"\nversion = "0.8.0"\n'
         )
         (self.root / "sdk/typescript/package.json").write_text(
-            json.dumps({"name": "@rkat/mobkit-sdk", "version": "0.8.0"}, indent=2)
+            json.dumps({"name": "@rkat/meta-sdk", "version": "0.8.0"}, indent=2)
             + "\n"
         )
         (self.root / "sdk/typescript/package-lock.json").write_text(
             json.dumps(
                 {
-                    "name": "@rkat/mobkit-sdk",
+                    "name": "@rkat/meta-sdk",
                     "version": "0.8.0",
                     "packages": {"": {"version": "0.8.0"}},
                 },
@@ -60,27 +60,27 @@ class ReleaseVersionScriptsTests(unittest.TestCase):
             )
             + "\n"
         )
-        (self.root / "crates/meerkat-mobkit/BUILD.bazel").write_text(
+        (self.root / "crates/meerkat-meta/BUILD.bazel").write_text(
             'rustc_env = {"CARGO_PKG_VERSION": "0.8.0"}\n'
         )
         # A SECOND generated BUILD.bazel, because one is not a test of the
-        # defect. bump-sdk-versions.sh used to sed meerkat-mobkit's file by
+        # defect. bump-sdk-versions.sh used to sed meerkat-meta's file by
         # name and release-hook.sh used to stage it by name, so
-        # crates/mobkit-store-conformance/BUILD.bazel drifted a release behind from
+        # crates/meta-store-conformance/BUILD.bazel drifted a release behind from
         # the moment that crate existed. With a single-crate fixture both the
         # broken and the fixed script pass.
-        (self.root / "crates/mobkit-store-conformance").mkdir(parents=True, exist_ok=True)
-        (self.root / "crates/mobkit-store-conformance/BUILD.bazel").write_text(
+        (self.root / "crates/meta-store-conformance").mkdir(parents=True, exist_ok=True)
+        (self.root / "crates/meta-store-conformance/BUILD.bazel").write_text(
             'rustc_env = {"CARGO_PKG_VERSION": "0.8.0"}\n'
         )
         (self.root / "MODULE.bazel").write_text(
-            'module(\n    name = "meerkat_mobkit",\n    version = "0.8.0",\n)\n'
+            'module(\n    name = "meerkat_meta",\n    version = "0.8.0",\n)\n'
         )
         (self.root / "docs/quickstart.mdx").write_text(
-            'meerkat-mobkit = "0.8.0"\n'
+            'meerkat-meta = "0.8.0"\n'
         )
         (self.root / "docs/sdks/rust.mdx").write_text(
-            'meerkat-mobkit = "0.8.0"\n'
+            'meerkat-meta = "0.8.0"\n'
         )
 
         self.run_command("git", "init", "-q")
@@ -125,7 +125,7 @@ class ReleaseVersionScriptsTests(unittest.TestCase):
         # EVERY generated BUILD.bazel, bumped and staged. The conformance crate
         # is the one the old hardcoded paths missed, so asserting it is what
         # makes this a test of the defect rather than of the happy path.
-        for crate in ("meerkat-mobkit", "mobkit-store-conformance"):
+        for crate in ("meerkat-meta", "meta-store-conformance"):
             build_file = f"crates/{crate}/BUILD.bazel"
             self.assertIn(
                 '"CARGO_PKG_VERSION": "0.8.1"',
@@ -139,10 +139,10 @@ class ReleaseVersionScriptsTests(unittest.TestCase):
         dirty = self.run_command(
             "git", "diff", "--name-only"
         ).stdout.splitlines()
-        self.assertNotIn("crates/mobkit-store-conformance/BUILD.bazel", dirty)
-        self.assertNotIn("crates/meerkat-mobkit/BUILD.bazel", dirty)
+        self.assertNotIn("crates/meta-store-conformance/BUILD.bazel", dirty)
+        self.assertNotIn("crates/meerkat-meta/BUILD.bazel", dirty)
         self.assertIn(
-            'meerkat-mobkit = "0.8.1"',
+            'meerkat-meta = "0.8.1"',
             (self.root / "docs/quickstart.mdx").read_text(),
         )
 
@@ -151,7 +151,7 @@ class ReleaseVersionScriptsTests(unittest.TestCase):
     def test_version_parity_rejects_unparsable_bazel_module_version(self):
         self.run_command("scripts/bump-sdk-versions.sh", "0.8.1")
         (self.root / "MODULE.bazel").write_text(
-            'module(\n    name = "meerkat_mobkit",\n)\n'
+            'module(\n    name = "meerkat_meta",\n)\n'
         )
 
         result = self.run_command(
@@ -186,7 +186,7 @@ class ReleaseVersionScriptsTests(unittest.TestCase):
     def test_version_parity_rejects_stale_rust_install_docs(self):
         self.run_command("scripts/bump-sdk-versions.sh", "0.8.1")
         (self.root / "docs/sdks/rust.mdx").write_text(
-            'meerkat-mobkit = "0.7.39"\n'
+            'meerkat-meta = "0.7.39"\n'
         )
 
         result = self.run_command(

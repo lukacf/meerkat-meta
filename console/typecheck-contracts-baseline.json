@@ -43,13 +43,13 @@
     {
       "file": "console/src/lib/headless.ts",
       "code": 2339,
-      "message": "Property 'identity' does not exist on type 'MobKitIdentityChatTarget | HostWorkbenchTarget<unknown>'.\n  Property 'identity' does not exist on type 'HostWorkbenchTarget<unknown>'.",
+      "message": "Property 'identity' does not exist on type 'MetaIdentityChatTarget | HostWorkbenchTarget<unknown>'.\n  Property 'identity' does not exist on type 'HostWorkbenchTarget<unknown>'.",
       "count": 1
     },
     {
       "file": "console/src/lib/headless.ts",
       "code": 2339,
-      "message": "Property 'identity' does not exist on type 'MobKitIdentityChatTarget | MobKitIdentityInspectTarget | HostWorkbenchTarget<unknown>'.\n  Property 'identity' does not exist on type 'HostWorkbenchTarget<unknown>'.",
+      "message": "Property 'identity' does not exist on type 'MetaIdentityChatTarget | MetaIdentityInspectTarget | HostWorkbenchTarget<unknown>'.\n  Property 'identity' does not exist on type 'HostWorkbenchTarget<unknown>'.",
       "count": 1
     },
     {
@@ -95,7 +95,7 @@
       "count": 10
     },
     {
-      "file": "console/src/panels/MobKitDock.tsx",
+      "file": "console/src/panels/MetaDock.tsx",
       "code": 2339,
       "message": "Property 'id' does not exist on type 'ConsoleDockNode'.\n  Property 'id' does not exist on type 'ConsoleDockPanelNode'.",
       "count": 1

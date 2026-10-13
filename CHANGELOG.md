@@ -7,7 +7,261 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking (mob lifetime)
+
+- A mob is now publicly owned while any public owner remains: the
+  `UnifiedRuntime`, and every handle, runtime and identity view exported
+  from it. Dropping the last one without `shutdown()` hands the runtime to
+  a retained teardown; the mob's native lifecycle owner closes its admission
+  only when it is idle, and the existing shutdown then runs to its end. A
+  mob with entered work is left running. Internal holders no longer keep it
+  owned.
+- `UnifiedRuntime::identity_runtime()` returns `Option<PublicIdentityRuntime>`
+  (was `Option<&Arc<IdentityRuntime>>`), `identity_first_context()` returns
+  `Option<PublicIdentityFirstContext>` and `session_bridge()` returns
+  `Option<PublicSessionBridge>`. These owned views carry the mob's public
+  owner, dereference to the runtime, context or bridge, and expose the
+  tracked operations; they never hand out the inner `Arc`.
+- `IdentityFirstRuntimeContext::runtime` is no longer a public field; use
+  `PublicIdentityFirstContext::runtime()`.
+- `MobHandleControlHandler::with_identity_runtime` takes a
+  `PublicIdentityRuntime`, and `rpc::IdentityFirstContext::runtime` is a
+  `PublicIdentityRuntime`.
+- `UnifiedRuntime` dereferences to its runtime state, `UnifiedRuntimeCore`.
+
+### Breaking (rename)
+
+- The product is renamed to Meta, as a clean break with no aliases. Every
+  name changes at once:
+  - Crate, Python distribution and repository `meerkat-meta`; the Rust
+    library and the Python import are `meerkat_meta`.
+  - npm package `@rkat/meta-sdk`.
+  - Public Rust and SDK types use the `Meta` prefix, for example
+    `MetaConfig`, `MetaBuilder`, `MetaRuntime`, `MetaStorageLayout`,
+    `handle_meta_rpc_json`, `start_meta_runtime` and `MetaTypedClient`.
+  - JSON-RPC methods and notifications use the `meta/` prefix, and the
+    HTTP routes `/meta/...`. Detached-job callbacks use Meerkat's renamed
+    `meta/jobs/*` methods, so this release pairs with the Meerkat release
+    that renames them.
+  - Environment variables use the `META_` prefix. The gateways and the
+    flow editor refuse to start while any variable the predecessor read is
+    set, because the renamed binaries would otherwise ignore it silently.
+    The match is by exact variable name: host variables that merely contain
+    the predecessor name are not affected.
+  - Binaries `meta_gateway`, `meta_repair` and `meta_flow_editor`, release
+    archives `meta-gateway`, `meta-rpc-gateway` and `meta-repair`, and
+    tracing targets `meta_gateway` and `meta::workgraph_realm_migration`.
+  - Console exports, CSS classes and the `meta-base-url` embedding meta tag;
+    browser preference keys reset once.
+  - Signing and digest contexts for cross-mob control and remote host facts
+    and health use the new name, so this release cannot exchange signed
+    control requests or host facts with predecessor gateways.
+  - The steward dream host runnable is `meta.memory.steward.dream`, and the
+    WorkGraph event module is `meta.workgraph`.
+  - Mobpack exports keep their editor files under `meta/`.
+- Durable names change too, and existing state carries over only through
+  one explicit offline step. Startup refuses typed instead of starting
+  renamed stores empty beside predecessor state:
+  - A state directory holding the predecessor metadata or console database
+    files, the predecessor memory ledger file, or the stage an interrupted
+    write of that file left behind refuses with
+    `StorageLayoutError::PredecessorState`, whether or not the start enables
+    memory. The refusal names the exact command for the directory it
+    resolved, `meta_gateway storage-adopt-predecessor --state-dir <that dir>
+    --apply`: the `persistent_state` of `rpc_gateway` and the SDK builders,
+    or the store directory of `meta_gateway`. The adoption verb never
+    infers it.
+  - A missing gateway home whose predecessor sibling exists refuses with
+    `StorageLayoutError::PredecessorGatewayHome`, instead of minting a new
+    peer key.
+  - A metadata database that still carries the predecessor table refuses
+    at open.
+  - `meta_gateway storage-adopt-predecessor --state-dir <dir>
+    [--gateway-home <dir>] [--predecessor-home <dir>] [--apply]` performs
+    the step for one stopped installation. It is dry-run by default, and
+    the dry run is read-only. It:
+    - renames the database files to `meta_metadata.sqlite3` and
+      `meta_console.sqlite3`;
+    - renames the gateway's memory ledger file to
+      `memory-ledger-state.json`: a same-directory rename of the committed
+      bytes, with no decode, rewrite or health check. Only that one fixed
+      path in the state directory is adopted; a ledger an embedder
+      configured at its own `state_path` is the embedder's to rename. A
+      leftover stage of an interrupted write is preserved and refused for
+      manual resolution, never deleted or promoted, and a renamed ledger (or
+      its stage) beside the predecessor file refuses as twins;
+    - rewrites the schema ledger domains to `meta-continuity`,
+      `meta-metadata`, `meta-console` and `meta-memory`, and moves the
+      metadata table to `meta_metadata`;
+    - retargets the steward dream schedule;
+    - moves the gateway home to `meerkat-meta`. The established peer key,
+      host pins and control audiences are validated before the move and
+      after it.
+  - Apply fences every database it touches, including the renamed
+    destinations. It refuses while a runtime registry lists a live
+    process, and it refuses each step whose renamed target already exists,
+    before changing anything. The fence covers SQLite databases only.
+    Nothing fences the memory ledger's JSON writer: the stopped
+    installation is what keeps it away, and the ledger's digest, rechecked
+    before the rename, detects a change without excluding one.
+  - Apply writes an adoption journal, `meta-adoption.json`, before its
+    first change and stops at the first failure. Startup refuses with
+    `StorageLayoutError::AdoptionIncomplete` until the journal records
+    every step finished; a rerun resumes the adoption with the homes the
+    journal recorded, and refuses named homes that differ. The journal is
+    written to a staged file, fsynced, renamed over and its directory
+    fsynced, and on Unix every file and directory rename is followed by an
+    fsync of the affected directories; elsewhere a rename's durability
+    rests on the filesystem's own ordering. A journal that cannot be
+    decoded refuses with `AdoptionJournalUnreadable`, which names the
+    manual recovery. A journal write creates its staged file exclusively.
+    A staged file left by an earlier run is never overwritten or removed:
+    adoption refuses before any change and names it. A write that fails
+    before replacing the journal removes only its own staged file and
+    reports that nothing changed.
+  - Runtime registry evidence is fail-closed: a registry without an
+    entries array, or a row without its pid or runtime id, refuses, and a
+    pid whose liveness cannot be probed, including a failed `/proc`
+    lookup, counts as live.
+  - An explicit session database path no longer bypasses the installation
+    refusals: an unadopted, mid-adoption or unresolvable installation
+    refuses before its session store opens.
+  - `StorageLayoutError` gains `PredecessorState`,
+    `PredecessorGatewayHome`, `AdoptionIncomplete`,
+    `AdoptionJournalUnreadable`, `RealmTwin` and `AdoptedRealmInvalid`, and
+    `DatabaseResolution` gains `PredecessorState` and `AdoptionIncomplete`.
+    Exhaustive matches must handle them. `PredecessorState` carries the
+    `state_dir` it refused.
+  - The adoption journal gains the `memory_ledger_file` step
+    (`AdoptionStep::MemoryLedgerFile`, reported as
+    `PredecessorItem::MemoryLedger`). An unfinished journal written before
+    the step existed lists it as pending, so a rerun runs it. A journal that
+    records it is unreadable to an earlier build, which refuses it as
+    `AdoptionJournalUnreadable`. A completed adoption does not hide a
+    predecessor ledger found later: startup refuses, the dry run plans the
+    rename and reports the adoption incomplete, and apply performs it.
+  - `GatewayPeerKeyError` gains `EnrolledWithoutKey`.
+    `GatewayPeerKeys::load_or_create` refuses with it when the state
+    directory recorded host pairings but its key is missing, instead of
+    minting a replacement identity. `GatewayPeerKeys::load_existing` loads
+    an established key without ever minting one.
+  - The meerkat-level realm id is per installation, resolved once when the
+    storage layout is constructed. A fresh installation uses `meta`
+    (`DEFAULT_MEERKAT_LEVEL_REALM_ID`, which replaces
+    `MEERKAT_LEVEL_REALM_ID`). An adopted installation keeps `mobkit`, which
+    the adoption records in its journal. No job, outbox or manifest row is
+    rewritten.
+    - The recorded value is validated, and a missing or invalid one refuses
+      with `StorageLayoutError::AdoptedRealmInvalid`.
+    - A predecessor realm directory without an adoption refuses as
+      `PredecessorState`.
+    - Both realm directories present refuses as `RealmTwin`.
+    - `MetaStorageLayout::meerkat_level_realm` exposes the resolved realm,
+      and `MetaStorageLayout::jobs_db` now returns a `Result`.
+    - `StorageResolutionError` gains `Layout`, and `DatabaseResolution`
+      gains `RealmRefused`.
+  - A non-disk storage provider keys its runtime, workgraph and job data
+    by the meerkat-level realm outside the state directory. When the state
+    directory records no realm (no adoption journal, no realm manifest from
+    an earlier start), as with an ephemeral `scratch_dir()`, the
+    composition refuses with `MetaStorageProviderError::RealmUndeclared`
+    instead of defaulting. The embedder declares the realm with
+    `UnifiedRuntimeBuilder::meerkat_level_realm`:
+    `MeerkatLevelRealmDeclaration::Fresh` for a new backend, or
+    `AdoptedPredecessor` for a backend the predecessor wrote. A declaration
+    that contradicts the recorded realm refuses with
+    `RealmDeclarationConflict`. An `AdoptedPredecessor` declaration over
+    unrecorded state records the predecessor realm with the installation
+    once it is pinned, so later starts recognize it and refuse a
+    contradicting declaration. Scratch layouts resolve the installation
+    like any other. `MetaRealmOpenContext` gains the
+    `meerkat_realm_declaration` field, and `MetaStorageProviderError`
+    gains both variants.
+  - Three frozen durable identifiers keep their values in every
+    installation: the console storage-scope context, the
+    delivery-correlation namespace and the agent-memory tool source id.
+    Each keys existing data, and none of them is a signing context.
+  - A predecessor mobpack export (editor files under the predecessor
+    directory) refuses to import, and names the entries to move.
+  - The console offers queued messages saved by the predecessor console
+    through its existing "Older queued messages" import.
+  - `meta_repair` treats tool-result rows bounded by the predecessor repair
+    tool as already bounded.
+  - Metadata and console no longer probe legacy `.sqlite` spellings.
+- The predecessor's memory backend shape is removed with no alias.
+  `MemoryBackendConfig` keeps only `LocalJson` (`kind = "local_json"`). The
+  predecessor's config struct, its conversion, the error-type alias and the
+  Python and TypeScript helpers are gone. Any other `kind`, or any other
+  gateway `memory_config.backend`, is refused with an error naming
+  `local_json` (the gateway answers -32602), never reinterpreted;
+  `health_check_endpoint` stays optional. `RuntimeOptions` and
+  `MemoryBackendConfig` are serializable public configuration, so
+  configuration an application persisted with the retired value no longer
+  decodes and must be rewritten as `kind = "local_json"`, with the old
+  endpoint as `health_check_endpoint`. The built-in ledger file holds only
+  assertions and conflict signals, with no backend field, so its bytes
+  carry over unchanged. `rpc_gateway` reads only
+  `<persistent_state>/memory-ledger-state.json` and no longer falls back to
+  the predecessor file name.
+
 ### Breaking (Rust source)
+
+- `AccessController::load_or_default` is replaced by `AccessController::load`,
+  which reads and validates an explicitly configured access file directly: a
+  missing path, a directory, or an unreadable or invalid file is a typed
+  `AccessConfigError`, never a disabled default.
+  `UnifiedRuntimeBuilder::access_control_file` loads the same way. Bootstrap
+  a new deployment with `AccessController::new`, naming its admin, and
+  `with_persist_path`. `ConventionalPaths::discover` now leaves
+  `access_toml` `None` only when the lookup of `config/access.toml` reports
+  `NotFound` (nothing there, including a missing or dangling parent
+  directory). Any other entry there (a directory, a dangling `access.toml`
+  link) and any other lookup error (such as `ENOTDIR`) is reported, so the
+  strict loader handles it instead of access control silently staying off.
+- `ConventionalPaths::discover` treats `config/gating.toml` the same way:
+  `gating_toml` is `None` only when the lookup reports `NotFound`
+  (including a missing or dangling parent directory), and any other entry or
+  lookup error is reported for the strict gating load.
+- Held identity bootstrap (whole-setup deadline):
+  `GatewayHostComposition::complete_held_identity_members`, the
+  `HeldIdentityCompletion` callback and
+  `IdentityFirstRuntimeContext::bootstrap_roster_held`'s `complete` now also
+  receive the pass's `HeldCompletion` (`deadline()`, and `aborted()`, which
+  resolves once the pass's one terminal decision is `Abort` and only wakes
+  observers). `bootstrap_roster_held` returns `HeldBootstrapStart`
+  (`Activated` or `Unsettled(HeldBootstrapSettlement)`), and
+  `IdentityRuntimeError` gains `HeldBootstrapAborted { refusal, completion }`
+  for a pass that aborted after its host was asked (`HeldCompletionOutcome`:
+  `NotAsked`, `Completed` or `Refused`) and `HeldCompletionOwed { identity }`
+  for an embodiment refused because a held pass did not publish that member.
+  Exhaustive matches need the new arms. See Added.
+
+- `GovernedBindContext` has a new `spec` field (the registered row) and
+  `IdentityRuntimeError` a new `RegisteredSpecChanged` variant.
+  `IdentityRuntime::update_spec`, `register` and `adopt_roster_spec` now take
+  the identity's lifecycle lock; a caller must not invoke them while it holds
+  that lock (for example from inside a governed binder).
+
+- `RosterError` gains `Refused`: an authoritative refusal (a prepared
+  application's roster projection failed). A reset refuses on it instead of
+  rebuilding on the stored spec; other provider errors keep that fallback.
+- `GatingDecideError` gains `NoEscalationRoute` (see Changed).
+- `AccessControlConfig` gains `approvers`, `AccessConfigError` gains
+  `EmptyApproverId`, `ApproverWithoutHolders` and `UnknownApproverGroup`,
+  and `GatingDecideError` gains `EmptyPrincipal`.
+- `MobRuntimeError` gains `ChildMobStorage`, and
+  `UnifiedRuntimeShutdownReport` gains `child_mob_stand_down`.
+  `cleanup_completed()` is true for a runtime with durable child mobs only
+  when their stand-down released the child root.
+  Exhaustive matches and struct literals need the new arm and field.
+  Behaviour: a runtime over a persistent root now keeps agent-created child
+  mobs durable by default and claims `<state>/mobs` until a proven
+  stand-down releases it (otherwise until process exit), so a second such runtime
+  over the same state dir in one process is refused with
+  `ChildMobStorageError::AlreadyClaimed` until then. Select
+  `ChildMobStorage::ProcessBound` to keep the old behaviour. A custom spec
+  that declares a persistent root, installs agent mob tools and records no
+  Meta layout now fails with `ChildMobStorageError::LayoutNotRecorded`.
 
 - Custom specs that install agent mob tools must explicitly provide
   `MobRuntimeDelivery` with `with_runtime_delivery` before `with_agent_mob_tools`.
@@ -22,7 +276,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sessions, runtimes and failures, but does not expose row identities. The
   separate `runtime_inbox_backlog` remains an exact store census.
 
-- Meerkat's fallible runtime acquisition (Meerkat 0.8.52) reaches MobKit's
+- Meerkat's fallible runtime acquisition (Meerkat 0.8.52) reaches Meta's
   composition. Building a runtime machine can now refuse, and so can the
   agent mob tools' runtime adapter:
   - `MobBootstrapSpec::ephemeral` and `ephemeral_with_hook` return
@@ -35,7 +289,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     Exhaustive matches must add the arm.
   - Session-service wrappers replace `runtime_adapter()` with
     `acquire_runtime_adapter(explicit)` and preserve the inner service's
-    `Some`, `None` or error result. MobKit's wrapper supplies the explicit
+    `Some`, `None` or error result. Meta's wrapper supplies the explicit
     owner when provided, otherwise its configured override; supplying an
     owner does not turn the inner service's `None` into an acquired
     adapter.
@@ -72,7 +326,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   MobTerminalShutdownOutcome` (see Changed). Code constructing the report
   must set it; `MobTerminalShutdownOutcome` is `#[non_exhaustive]`.
 - `ContinuityStore::as_incremental_sessions` no longer has a default. Every
-  continuity store now states whether it serves MobKit's session-delta
+  continuity store now states whether it serves Meta's session-delta
   channel: a decorator forwards its inner store's channel, and a
   whole-snapshot store returns `None` and says why.
   - The default `None` let wrappers around incremental-capable stores, and
@@ -93,7 +347,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `StorageSlotSummary.declaration: DurabilityDeclaration` is replaced by
   `durability: StorageSlotDurability`. Match `Declared(declaration)` or
   `Unverified { domain, class }`; use the enum's accessors to inspect the
-  common domain/class or an optional declaration. This MobKit census type
+  common domain/class or an optional declaration. This Meta census type
   leaves Meerkat's `DurabilityResolution` unchanged.
 
 - `ProcessBoundaryError` adds `CleanupUnconfirmed { pid, source }` for an OS
@@ -139,7 +393,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `ConsoleFrameSource` adds `member_provenance`; `GatingPendingEntry` adds
   `rationale` and `origin`. Update Rust struct literals for these fields.
-- `MobKitConsoleAggregator::query_timeline_windowed` returns
+- `MetaConsoleAggregator::query_timeline_windowed` returns
   `ConsoleTimelineQueryResult<ConsoleTimelineWindowPage>`. Custom
   `ConsoleLogStore` implementations must preserve member provenance when
   storing and reading frames so retired-member visibility remains enforceable.
@@ -161,29 +415,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Storage and wire compatibility
 
-- Memory panel reads (`mobkit/memory/panel/*`) treat a tombstoned record
+- Gating audit: an R3 gate with a notification recipient and channel now
+  records a separate `approval_notification` event (`disposition` plus
+  route and delivery ids, and the error for routing, module or delivery
+  failures), and `pending_created.detail.approval_delivery_id` is always
+  null. Readers that took the delivery id or the send error from
+  `pending_created` must read `approval_notification` instead.
+- Memory panel reads (`meta/memory/panel/*`) treat a tombstoned record
   that was ever quarantined as quarantine evidence: a caller without
   `memory.quarantine.review` no longer receives it, as it never received a
   quarantined one. `memory.quarantine.verdict` frames may carry
   `successor_id`, and the steward's open-loop nudges
   (`verdict: "open_loop_escalated"`) no longer carry the dream's rationale
   (`rationale` is null).
-- `mobkit/access/*` failures are typed and no longer echo server detail (see
+- `meta/access/*` failures are typed and no longer echo server detail (see
   Added). A failed save of the access file answers `-32000` with
   `data.kind = "access_persistence_failed"` instead of `-32602`; an exhausted
   revision answers `-32004` with `access_mutation_unavailable`. Invalid
   configurations keep `-32602` and `invalid_access_config` with the fixed
   message "Invalid access configuration.", and unparseable payloads answer
   "Invalid access config.", "Invalid access rule." or "Invalid access
-  group." instead of the parser text. `mobkit/access/get`, `preview` and
+  group." instead of the parser text. `meta/access/get`, `preview` and
   every write recheck the caller's current administrator access at the owner
   instead of the request's captured view. Unchecked top-level writes
   otherwise keep their shape.
-- `mobkit/init` composition provenance refusals now answer `-32019` with
+- `meta/init` composition provenance refusals now answer `-32019` with
   refusal `data` instead of `-32603` (see Added). A client that matched these
   refusals on `-32603` must match `-32019`; an SDK older than this release
   raises them as a plain `RpcError` with the new code.
-- `mobkit/console/voice/captions` batches may carry a `playback_hint` entry
+- `meta/console/voice/captions` batches may carry a `playback_hint` entry
   (`{"kind": "playback_hint", "hint": "duck" | "restore"}`) next to
   `caption` and `retracted`. The embedded console ships with the gateway that
   emits it; a client that parses captions strictly must accept the new kind.
@@ -225,6 +485,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- The generic identity-bridge submit with a stable delivery identity now
+  goes through meerkat's scope-bound bounded submit: it captures the
+  member's current scope immediately before submitting, which is the binding
+  it always targeted. A session rotation landing between that capture and
+  admission is refused typed (`StaleDeliveryScope`) instead of admitting to
+  the replacement session. A member with no session binding (a remotely
+  hosted peer) keeps meerkat's unscoped delivery-identity submit, bounded by
+  the same admission deadline.
+
+- The published crate no longer includes in-repo forensic test captures.
+- Gating commits an R3 pending entry and its `pending_created` audit
+  before sending the approval notification, and records the send outcome
+  as a separate `approval_notification` audit event (`acknowledged`,
+  `not_delivered`, `not_sent` or `unknown`) instead of in
+  `pending_created`, whose `approval_delivery_id` is now always null; the
+  pending entry still carries the delivery id once acknowledged. A
+  notification outcome never retries, restores or renews the gate. A
+  refused decision no longer moves the entry to the end of the pending
+  order, and a decision uses one timestamp for its expiry check and the
+  escalation successor it creates. These are in-memory commits; exporting
+  a gating snapshot is not a durable commit.
+- Gating escalation now routes to a configured successor approver instead
+  of clearing the requested approver. Routes map a requested approver to
+  its successor, with an optional default, set through
+  `set_gating_escalation_routes` or the `escalation` object in
+  `gating_config_path`. The successor keeps the action, candidate and
+  deadline. Without a route, escalation is refused with
+  `NoEscalationRoute` (invalid params, -32602, over JSON-RPC) and the entry
+  stays pending; hosts that escalate must configure routes. `meta_gateway`
+  reads them from an `[escalation]` table in `config/gating.toml`, and an
+  unknown key in the escalation configuration fails startup. Successors
+  restored from snapshots taken before this change have no requested
+  approver and stay open to any `gating.decide` holder until decided or
+  expired.
 - Process-local launches now run a native delivery owner over persistent
   composition. Both gateways' default process-local launches and the library
   `MobBootstrapSpec::ephemeral_runtime_backed*` path use a
@@ -239,7 +533,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Ephemeral launches now install the agent mob tools with an in-memory
   detached-job store, so their members can create child mobs, delegate and run
   detached jobs.
-- The persistent `mobkit_gateway` opens the canonical `jobs.sqlite3` detached-job
+- The persistent `meta_gateway` opens the canonical `jobs.sqlite3` detached-job
   store.
 - A restored classic mob resumes through a deferred activation that runs only
   after its address resolver has its handle and the delivery owner is armed.
@@ -296,14 +590,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     re-read every 500 ms. The caller's timeout is the only timer.
   - **Python:** a bare `IdentityAgentHandle.wait_for_output()`, the
     deprecated `baseline=` form and `wait_for_output_containing()` read the
-    member, then wait server-side (`mobkit/wait_for_completion`) for the next
+    member, then wait server-side (`meta/wait_for_completion`) for the next
     completion past the cursor that read saw. Before, they called
-    `mobkit/inspect_identity` every 1.5 s. `poll_interval` now applies only
+    `meta/inspect_identity` every 1.5 s. `poll_interval` now applies only
     to gateways that predate the server-side wait.
   - **Behavior change:** a bare `wait_for_output()` or
     `wait_for_output_containing()` on a live alias with no completion cursor
     now raises the typed `CompletionCursorUnavailableError` (exported from
-    `meerkat_mobkit`, carrying `identity`) at once. Before, it polled
+    `meerkat_meta`, carrying `identity`) at once. Before, it polled
     `inspect_identity` until its timeout. **Migration:** a live alias has no
     completion to wait for, so wait on its turn instead: send or dispatch
     with `track_turn=True` and pass the ticket as `wait_for_output(turn=...)`
@@ -320,10 +614,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   before a restart; to keep such an edge, declare it in your provider.
   Runtimes without a topology provider are unchanged: they unwire only the
   edges they wired.
-- Behaviour change: dropping a `MobkitRuntimeHandle` without `shutdown()`
+- Behaviour change: dropping a `MetaRuntimeHandle` without `shutdown()`
   now terminates its live module processes; previously they kept running.
   Call `shutdown()` for an orderly stop (see Fixed, module subprocess reaping).
-- MobKit runs on meerkat 0.8.51:
+- Meta runs on meerkat 0.8.51:
   - `UnifiedRuntime::shutdown` drives the mob actor's terminal teardown with
     one `MobHandle::shutdown_with_report` call bounded by
     `MOB_TERMINAL_SHUTDOWN_BUDGET` (5 s), instead of retrying `shutdown` for
@@ -392,7 +686,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   shared host previously showed that text verbatim.
 - **Upgrade action for hosts that serve application tool policies:** a
   member's `delegate` and agent `mob_create` are refused until the host
-  chooses a child application tool policy (see Added). MobKit now hands its
+  chooses a child application tool policy (see Added). Meta now hands its
   tool-policy registry to the agent mob tools, which it never did before, so
   meerkat 0.8.51's child policy applies: without a child policy, a governed
   member's delegate helpers and the members of the mobs it created ran
@@ -431,14 +725,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     `asyncio.CancelledError` (the same instance, re-raised). A turn still
     pending at the deadline raises `TurnWaitTimeoutError` (a Python
     `TimeoutError`); the Python identity-wide deadline raises it too.
-  - The server-side `mobkit/wait_for_turn` stays the primary wait; only the
-    exact-ticket `mobkit/turn_result` poll remains as the fallback for
+  - The server-side `meta/wait_for_turn` stays the primary wait; only the
+    exact-ticket `meta/turn_result` poll remains as the fallback for
     gateways without it.
 - Console: the chat turn-navigation rail no longer draws a gray capsule track
   behind its ticks; the ticks stand on their own.
 
 - The console forwarder and the identity health monitor no longer need
-  MobKit's create-time live event tap (meerkat #1236). Meerkat 0.8.49
+  Meta's create-time live event tap (meerkat #1236). Meerkat 0.8.49
   retains each session actor's recent events and replays them on
   `MobHandle::subscribe_agent_events_from(identity,
   SessionEventCursor::Earliest)`, so both attach whenever they reconcile and
@@ -512,7 +806,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   runs one pass when it starts and then retries on a typed trigger: another
   identity's embodiment settled (a resume or a fresh durable mint committed,
   releasing the store writer it held), a host restore or reconcile pass
-  settled (boot, a roster refresh, `mobkit/reconcile_identity`), a delivery or
+  settled (boot, a roster refresh, `meta/reconcile_identity`), a delivery or
   materialization refused because the identity is Broken (a caller's
   demand), or an explicit request. It defers a pass while other embodiments
   are in flight, so a warm-up burst runs one pass and cannot trip the
@@ -539,7 +833,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **BEHAVIOR CHANGE: `idle_retire_secs: null` on the `delegate`, `fork_off`
   and `mob_spawn_member` agent tools now means the same as omitting it.** It
-  used to disable idle retirement for the spawned member. MobKit's argument
+  used to disable idle retirement for the spawned member. Meta's argument
   was the lone exception to the rule every other optional tool argument
   follows (meerkat's own tool args, such as `fork_off`'s `message_count` and
   `max_run_secs`, are `Option` fields where null and absent both mean "not
@@ -559,9 +853,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Bind the Meerkat family to published 0.8.47. Voice readiness no longer
   loads the session body (lukacf/meerkat#1244): meerkat adds the required
-  `MobSessionService::observe_live_durable_source` (forwarded by both MobKit
+  `MobSessionService::observe_live_durable_source` (forwarded by both Meta
   session decorators) and `MobHandle::observe_live_durable_source_readiness`,
-  and MobKit's live binding authorities override
+  and Meta's live binding authorities override
   `observe_live_durable_source_readiness` with it. The probe checks the
   member's live binding against the published machine snapshot, observes the
   durable source body-free, authorizes the binding and checks credential
@@ -574,19 +868,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   message when its segment seals (turn end, a typed between-speech boundary,
   or channel close). Also included: a reopen whose context summary missed the
   pre-open bound is no longer silent when a typed turn is queued
-  (#474), and playback snapshot rows always name their channel. MobKit builds
+  (#474), and playback snapshot rows always name their channel. Meta builds
   against 0.8.46 without source changes. See Added for the console captions
   that cover the time until the row lands.
 - Bind the Meerkat family to published 0.8.45: bounded per-member status
   observations with a typed `preview_unavailable` reason, fork lineage on the
   builds of fork-derived members (`SessionBuildOptions::fork_source`), the
   runtime's uncommitted-run-input read, and assistant message ids on streamed
-  and committed events. See Added and Fixed for what MobKit surfaces.
+  and committed events. See Added and Fixed for what Meta surfaces.
 - Bind the Meerkat family to published 0.8.44, including durable runtime-notice
   origin and transcript lineage. The 0.8.43 lifecycle changes remain included:
   `fork_off` and council
   completions arrive in the owner's transcript as a persisted `BackgroundJob`
-  notice delivered in-turn (MobKit's callers are all mob members, so no
+  notice delivered in-turn (Meta's callers are all mob members, so no
   `DetachedOwnerHost` is needed), with the typed `no_owner_revival_host`
   in-turn fallback; retiring a member retires everything it spawned
   (`spawned_by`); member status never waits for a running turn; legacy
@@ -598,7 +892,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Anthropic model, GPT-6 Sol and Luna in the model catalog, upstream crates/
   repository layout).
 - Repository layout: the workspace crates live under `crates/`
-  (`crates/meerkat-mobkit`, `crates/mobkit-store-conformance`), the memory
+  (`crates/meerkat-meta`, `crates/meta-store-conformance`), the memory
   calibration harness under `tests/memory-evals`, the documentation review
   archives under `docs/internal/audit`, and the Bazel execution platforms under
   `tools/bazel/platforms`. The dangling `vendor` symlink is gone. Crate names,
@@ -609,12 +903,595 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Console extensions and MCP Apps (from MobKit main #634; requires a meerkat
+  release with native MCP Apps support). The Console loads host panel
+  modules (`panel_modules`) and renders in-chat MCP App views for tools
+  that declare a `ui://` resource, inside an isolated sandbox on an origin
+  separate from the Console. MCP Apps stay off unless the host opts in:
+  the stock gateways enable the native capability only when the effective
+  Console config (or a realm override) sets `mcp_apps_sandbox_url`;
+  embedders call `UnifiedRuntimeBuilder::mcp_apps(true)`
+  (`CapabilityFlags::default()` keeps it off). Without a sandbox URL
+  every MCP Apps request (`resolve`, `read_resource`, `call_tool`) is
+  refused with 403 and the Console shows the ordinary transcript.
+  Continuity store providers answer the new `session_owner` callback from
+  durable session ownership; the default falls back to the current binding
+  for the exact session only.
+- Scope-bound internal dispatch (requires the meerkat release carrying
+  `MemberDeliveryScope`). `meta/status_identity` gains `delivery_scope`, a
+  versioned scope (`version: 1`) a host persists before it dispatches: the
+  identity's runtime id, generation and lease fencing token plus meerkat's
+  own versioned member scope (runtime incarnation, fence and session), or
+  `null` with `delivery_scope_unavailable: {kind, reason}`. `meta/dispatch`
+  accepts `expected_scope`: exact content to the session the scope pins,
+  with a required full `idempotency_key` + `correlation_id` pair used
+  verbatim. The scoped path never materializes, repairs, retargets or
+  prepares the delivery (no defang, ambient memory or injected context) and
+  does not combine with `track_turn`. It returns the native receipt
+  (`receipt: {work_ref, stage, session_id}`, `stage` = `ingress_accepted`,
+  never a durable-input claim) or a typed refusal: a moved scope is the new
+  `-32007` stale-delivery-scope error with `data.mismatch` (`runtime_id`,
+  `generation`, `lease_fencing_token`, `member` or `member_binding`); a
+  bridge without the scoped seam is `-32004`; every refusal carries
+  `data.kind` and `data.admission_possible` (true only for
+  `scoped_delivery_uncertain`). New `meta/recover_delivery` reads one
+  delivery's state from the scope's ORIGINAL session ledger only:
+  `absent` (an authoritative point-in-time miss, never permission to retry),
+  `in_flight` (with `durable_witness`), `completed`, `failed`,
+  `terminal_without_run`, `broken` or `unresolved` (`cause`); it never
+  resubmits. Rust: `IdentityRuntime::{capture_delivery_scope,
+  dispatch_at_scope, recover_at_scope}`, `DeliveryScope` (decoding an unknown
+  version is the typed `DeliveryScopeError::UnsupportedVersion`),
+  `ScopedDeliveryError`, `ScopedDispatchReceipt` and `ScopedRecovery`.
+  `SessionBridge` gains `capture_member_delivery_scope`, `submit_at_scope`
+  and `recover_at_scope`, defaulting to the typed `Unsupported` refusal, so
+  custom and remote bridges are unsupported until they opt in;
+  `MobSessionBridge` implements them on meerkat's scoped APIs. A member
+  with no native session binding (remotely hosted or peer-only) is refused
+  `Unsupported` on capture, dispatch and recovery; the scoped path never
+  falls back to the unscoped submit. Python:
+  `DeliveryScope` (from `status()`; an unknown version raises
+  `ContractMismatchError` and leaves the rest of the status usable),
+  `dispatch(..., expected_scope=)` / `dispatch_text(..., expected_scope=)`
+  returning `ScopedDispatchResult` with its `DeliveryReceipt`,
+  `recover_delivery(...)` returning `ScopedRecovery` / `ScopedRecoveryState`,
+  and `StaleScopeError` (`mismatch`). TypeScript: the same surface
+  (`parseDeliveryScope`, `deliveryScopeToDict`, `dispatch(..., {
+  expectedScope })`, `recoverDelivery`, `StaleScopeError`).
+
+- `PublicIdentityRuntime::dispatch_governed_with_turn_ticket` (and
+  `IdentityRuntime::dispatch_governed_with_turn_ticket`) deliver the trusted
+  host's own retained, already-bound governed input to a member it composed
+  through the internal mob door (`SessionBridge::begin_internal_governed_delivery`,
+  which uses meerkat-mob's `start_internal_governed_input_with_custody`), so a
+  member whose profile is not externally addressable can receive it. The
+  lease, pinned controller, host binder, bound-input check, entry fence,
+  exact-session check, definitive admission wait and custody settlement are
+  the same as `send_governed_with_turn_ticket`, which is unchanged: it stays
+  the external door, and still refuses an `InternalOnly` identity and a member
+  that is not externally addressable. No wire route reaches the internal door.
+
+- Gateway member factories now get the meerkat facade's canonical MCP
+  credential source for the installation's meerkat-level realm
+  (`meerkat::surface::install_default_mcp_auth_resolver_for_realm`), bound to
+  the gateway runtime and the factory's own provider-auth persistence. A
+  member launch of a stdio server that the realm's own config document
+  defines reads its declared `secret_env` values from that store. Before, no
+  member builder had a credential source, so every such launch was refused.
+  Servers without `secret_env` are unaffected.
+- `GatewayFactoryConstruction::realm_mcp_installation()` gives the host a
+  `GatewayRealmMcpInstallation` over the same realm and store, for its
+  authenticated configuration administrator: `servers()` returns the realm's
+  own MCP servers and the document generation for review,
+  `install(reviewed, expected_generation, entry)` adds the reviewed
+  definition at that generation, and `set_secret` / `remove_secret` store or
+  remove a service-secret value (`meerkat::set_mcp_service_secret_entered`,
+  `meerkat::remove_mcp_service_secret_entered`) for exactly the definition
+  the realm's own document lists. Each mutation runs the host's
+  `AdministrationEntry` at its entry, after the custody it waits for and
+  immediately before it writes, and holds the admission until it settles; a
+  refusal there writes nothing (`GatewayRealmMcpError::NotAdmitted`,
+  `McpServiceSecretUpdateError::NotAdmitted`), and a write that began and
+  failed is an unknown outcome, never a success. The value travels as
+  `McpServiceSecretValue`; the handle returns none and shows none in
+  `Debug`. Meta now enables `meerkat`'s `local-authorization` feature
+  (private 0.9 pair).
+- `MobRuntime::continuation_source_announcer()` returns a
+  `ContinuationSourceAnnouncer` when the runtime was composed with a
+  delivery. Its one method, `announce_source_custody_changed()`, tells that
+  delivery that the custody its bound continuation sources read may have
+  changed: Meta's delivery owner now subscribes to these source changes when
+  it arms, and retries the rows it holds blocked. Call it after the restored
+  facts are readable through the bound source. The announcement is a hint:
+  it grants and asserts nothing, and the retry re-reads current custody and
+  permissions. `Some` means the runtime has a delivery composition, not that
+  its owner is running; the delivery survives an explicit stop. `true` means
+  only that the bindings still existed and the hint was published, `false`
+  that they are gone; neither is a delivery outcome to replay, replace or
+  fail a turn on. The announcer holds the bindings weakly and exposes no
+  binding, rebinding or other authority.
+- Governed input carries an optional host entry fence. A binder may return
+  `BoundGovernedInput::entry_fence`, a `GovernedEntryFence` such as the
+  exact retained login the input was bound for. The identity runtime enters
+  it synchronously at the final protected entry: after the binder and the
+  bridge's member lookup, immediately before native admission, under the
+  identity's existing custody. A refusal (`Retired`, `Expired` or
+  `Unavailable`, kept distinct) submits nothing, withdraws the host custody
+  and answers `GovernedInputError::EntryRefused`. An entered use's
+  `GovernedEntryPermit` is finished `Unentered`, `Entered` or `Uncertain`
+  from the native settlement; a dropped permit means `Uncertain`. A host
+  closing its fence waits only for the admission decisions of attempts
+  already reserved, and may report them fenced but unsettled; it never
+  claims completed cleanup. The fence guards native admission only: effects
+  a binder takes before it returns, and presenter entries, are the host's
+  to order against the same owner. A governed Console send re-checks the
+  human's authentication and live access at the same final entry
+  (`GovernedEntryRefusal::NotAuthorized`). Without a fence, delivery is
+  unchanged. `BoundGovernedInput` gains the public field
+  (breaking for struct literals; 0.9 line only).
+
+- Python SDK: gateway child lifetime observation.
+  `PersistentTransport.child_ended` and `wait_child_ended(timeout)`, and
+  `MetaRuntime.gateway_ended` and `await wait_gateway_ended(timeout)`,
+  return the child's `GatewayChildEndedError` record: the first recorded
+  cause (`reason`), `exit_code` (`None` unless the process exit was
+  observed; a failed channel does not prove exit), and `stop_requested`. A
+  waiter keeps its own child's record across a replacement, and the runtime
+  keeps the record after `shutdown()` detaches the transport. A runtime
+  without a gateway (session-builder only) reports `None`.
+
+- Console sends to governed members carry the authenticated Console human.
+  The Console keeps the verified OIDC issuer and `sub` of each request's
+  token as an `AuthenticatedConsoleHuman` (none for a service identity or a
+  token without a `sub`). `principal()` is its one qualified identity: a
+  `Human` with the `sub` as id, in the trust domain `oidc-issuer:<issuer>`.
+  A trusted host installs a `ConsoleGovernedIngress` with
+  `UnifiedRuntime::set_console_governed_ingress`. A Console send to an
+  identity the host governs then reaches the member only through the host's
+  `GovernedInputBinder` for that human. A caller who is not a verified human
+  is refused before anything is reserved (`unqualified_console_principal`).
+  A host refusal is `governed_send_refused`. Compatibility restriction:
+  an installed host closes the Console's member-only send path (targets
+  outside identity-first admission) for every target, whatever `governs`
+  says. A runtime whose machine
+  has a host's native work authorization owner installed governs every
+  Console send whatever the host's `governs` says, and refuses one when no
+  host is installed. The host's binder is reached only after the human is
+  re-verified (`AuthenticatedConsoleHuman::current`: the retained token
+  still verifies under the decisions it was accepted with and names the
+  same issuer and `sub`; a replaced login or replaced verifier decisions
+  are not observed) and the Console's live access policy still allows the
+  send. Without a governed runtime or an
+  installed host, Console sends are unchanged.
+  `AuthenticatedConsoleHuman::login_scope` is the token's signed `sid`
+  exactly as signed: an issuer's opaque login association, not identity,
+  permission or currentness. An absent, non-string or blank `sid` gives
+  none, and a token without one can still be a valid human. `current()`
+  requires the same association. `ValidatedJwt` gains the public field
+  `session_id` (breaking for struct literals; 0.9 line only).
+  `ConsoleViewerContext::human` carries the
+  same verified human to host routes, so an approval a Console human gives
+  qualifies exactly as the original it sent.
+
+- Native gateway hosts can serve read-only routes beside the Console:
+  `GatewayHostComposition::host_app_routes` (default none) returns an axum
+  router that `run_persistent_with_host` nests under `/host`, same-origin with
+  the Console, so a configured operator panel can frame it. The host receives a
+  `ConsoleViewerResolver` that authenticates a request's Console viewer exactly
+  as the Console does (same decisions, OIDC issuer, provider policy, allowlist
+  and access controller; bearer header before `auth_token`). Library embedders
+  get the same resolver from `UnifiedRuntime::console_viewer_resolver`. A
+  resolved viewer is not task or source authorization: callers require an
+  authenticated principal for human-only data and resolve again after awaits.
+
+- `GatewayHostComposition::bind_identity_runtime` (defaulted to `Ok(())`):
+  on the identity-first path the gateway now installs the identity context,
+  then lets its host bind the installed public identity view
+  (`runtime.identity_runtime()`), and only then registers persisted owners,
+  prewarms, consumes any pending mob activation, restores the roster and
+  starts the identity supervisors. The runtime, its base modules and the mob
+  itself may already exist when the host binds. `bind_runtime` still runs first on every path, where the
+  identity view does not exist yet. A refusal fails init before any of
+  those steps; the existing init cleanup shuts the installed context down.
+  `UnifiedRuntime::install_identity_first_context` and
+  `bootstrap_installed_identity_first_context` are the two phases of
+  `install_and_bootstrap_identity_first_context`, which is unchanged.
+
+- `GatewayHostComposition::compose_member_factory` (defaulted to `Ok(None)`):
+  a host-composed gateway offers each member factory it constructs
+  (`GatewayFactoryKind::Persistent`, `ProcessLocal`, `ContinuityBacked`) to
+  its host before the factory is cloned for live or consumed by its builder,
+  and before any session service, bootstrap spec or member exists. A returned
+  `GatewayMcpComposition` installs the host's MCP adapter composer (and,
+  optionally, a per-call MCP context provider) on that factory, so every
+  first, restored and rebuilt member construction runs it; `Err` refuses
+  init. `GatewayFactoryConstruction::host_auth_service` is the account facade
+  over the factory's own provider-auth persistence and the gateway machine's
+  runtime authority. The gateway sets no MCP composer, provider or connector
+  authority on these factories itself.
+
+- `AccessController::join_authorization_publication`: a governed
+  composition joins the Console access facts, once, at quiescent startup
+  (before any configuration or attribute writer and any eligibility reader
+  is exposed), to the authorization publication its native grant owner
+  publishes through. Every change of
+  those facts (rule, group, admin and enablement edits, and both agent
+  attribute owners) then publishes inside the controller's own lock order,
+  right before the write that exposes the change and until it is visible,
+  so a native consent eligibility observed from the facts before the change
+  no longer checks current. A refused edit and unchanged attribute priming
+  publish nothing. A second join is
+  refused with `AccessPublicationAlreadyJoined`. Without a join nothing is
+  published, as before.
+
+- Held identity bootstrap bounded by its setup deadline as a whole:
+  `UnifiedRuntime::bootstrap_installed_identity_first_context_held_until`
+  returns `HeldBootstrapStart::Activated` once the roster pass completed
+  after the pass chose `Activate` before the deadline (with each member's
+  actual outcome, never a blanket success), or
+  `HeldBootstrapStart::Unsettled(settlement)` otherwise: at the setup's
+  terminal `Abort` at the latest (deadline first, then the caller's loss, a
+  host refusal, a member not held or the pass ending), without waiting for
+  the identity runtime's tracked operation, which keeps owning whatever
+  setup it entered (a prepared mob's activation, the members' aborts, the
+  join of a still running host callback and the identities' cleanup), or
+  with a settlement already resolved when the setup was refused or failed
+  first. The deadline bounds the whole entry: the start's admission into the
+  tracked operation (which also ends at once when the runtime's foreground
+  operations close, instead of queueing behind a shutdown's join) and a
+  prepared mob's activation, which now runs first in that tracked operation
+  in its unchanged order (register the persisted owners, publish the
+  customizer tools, prewarm, lift); an entered step runs to its end and no
+  later step starts after the deadline or the caller's loss, which is the
+  setup's terminal `Abort` too. `finish_held_identity_bootstrap(settlement)`
+  awaits the settlement (not bounded) and then runs the runtime's failure
+  shutdown; the existing `bootstrap_installed_identity_first_context_held`
+  does both. The pass, its
+  members, the host's `HeldCompletion` and the start share one terminal
+  decision: the first recorded wins, an `Activate` at or after the deadline
+  is an `Abort`, waiting for every member to be held checks the deadline
+  first even when all are held, and a member still waiting for a
+  construction slot at an `Abort` is never constructed. The pass's `Activate`
+  linearizes its choice only, not each member's native activation: Core
+  accepts or expires each member's activation at that member's first
+  `activate()` poll against the same deadline, an expired member is reported
+  `Broken` with Core's expiry and cleanup outcome while the pass's choice
+  stays `Activate`, and a member Core accepted before the deadline keeps its
+  actual publication outcome even when publication finishes after the
+  deadline. A member the pass did not publish (it ended Broken in the pass)
+  owes its host a fresh held completion: the continuity repair skips it and
+  any embodiment outside a held pass covering it is refused with
+  `HeldCompletionOwed`, so no fresh unheld session is published around the
+  configured hold; a held pass that publishes it discharges it. Each member
+  spawns through Core's bounded `spawn_held_until`, and a member not held by
+  the deadline waits for Core's settlement before its identity custody is
+  cleaned up. The host callback's settlement is recorded apart from native
+  activation, the host's own close and any publication outside the runtime:
+  a late `Ok` proves callback settlement only, and a native abort does not
+  undo an external publication. On the gateway, a terminal `Abort` (also
+  after the callback returned `Ok`) calls `GatewayHostComposition::begin_close`
+  synchronously before the gateway waits for the callback, the members or
+  the runtime's shutdown, and keeps its outcome in the run's close record,
+  where an earlier failure is never replaced by a later success.
+
+- Held identity bootstrap:
+  `UnifiedRuntime::bootstrap_installed_identity_first_context_held(roster,
+  deadline, complete)` bootstraps the installed identity context with every
+  roster member held before its publication. Each member is still created
+  by its own identity embodiment, under its materialize lease and tentative
+  continuity record, through the native held spawn; the restore pass keeps
+  its ordinary construction concurrency, and a member gives its slot back
+  when it reports held. Once every roster identity is held or settled,
+  `complete` receives the `HeldIdentityMember`s (identity and finished
+  tool-surface selection): `Ok` publishes each held member and its
+  embodiment commits as an ordinary create; `Err` (or the setup `deadline`
+  passing first) aborts each one, its embodiment releases its identity
+  custody, and the bootstrap fails. Publication is per member, not atomic.
+  Only a fresh roster in the eager bootstrap mode can be held: a roster
+  member with existing continuity (it would resume), a placed or externally
+  bound member, or one with an initial message is refused before anything
+  is constructed, with `IdentityRuntimeError::HeldBootstrapRefused`
+  carrying a typed `HeldBootstrapRefusal`. The freshness decision is made
+  under the bootstrap controller, and a member that settles without being
+  held (embodied outside the pass) refuses the pass (`NotHeld`): the host is
+  never asked to complete an incomplete inventory, and a validly created
+  member is left intact. On the gateway, `GatewayHostComposition::identity_bootstrap_hold`
+  (default `None`) and `complete_held_identity_members` select it.
+  `SessionBridge::create_session_held` (defaulted to a refusal) is the
+  bridge's held create.
+- `HeldIdentityMember::controller_route` carries the
+  `meerkat_mob::ControllerRouteObservation` each held member's actor
+  reported under its hold, from the controller client it actually pinned:
+  the bounded route report, or the typed `Unavailable` or `Unsupported`. It
+  is an observation, not authority; a host that requires the route refuses
+  those itself. Meta's mob session-service decorators now forward
+  `controller_route_under_runtime_turn_boundary` to the inner service
+  instead of answering the trait's `Unsupported` default.
+- `meta/registered_spec` returns an identity's full registered roster row
+  (including `additional_instructions`) and its canonical digest, and
+  `meta/send` accepts `expected_spec_digest`: a send whose input was
+  authored from another row is refused with `-32006`
+  (`registered_spec_changed`) and nothing is submitted. A row stale at the
+  embodiment decision does not wake a non-Active identity or take its lease;
+  a change committing after that decision is refused at the final
+  pre-delivery check. Python `MetaRuntime.registered_spec()` /
+  `send(..., expected_spec_digest=)` and TypeScript `registeredSpec()` /
+  `send(..., { expectedSpecDigest })` with `RegisteredSpecChangedError`;
+  Rust `IdentityRuntime::registered_spec` and
+  `send_expecting_registered_spec`.
+- `GovernedBindContext::spec` hands a governed send's binder the full
+  registered row, read with the Active/session check under the lifecycle
+  lock the delivery holds through native submission.
+- `UnifiedRuntimeBuilder::tool_consequence_policy_registry` carries the
+  host's application consequence-policy registry into the mob spec, so a
+  member a registration hook governs is finished bound to the policy its
+  host selects from that registry for the member's prepared surface. A
+  supplied `MobBootstrapSpec` that already sets one is refused at build.
+
+- The SDK gateway (`rpc_gateway`) accepts an authenticated prepared
+  application: init param `prepared_application`
+  (`{"bundle_base64", "digest"}`, transport only). The native host
+  composition authenticates it through the new
+  `GatewayHostComposition::prepared_application(Option<&request>)` hook,
+  which a present host is always asked (with `None` when the init carries
+  no carrier; the default answers `Ok(None)`, ordinary startup, and a host
+  may refuse a missing required carrier), before any definition is parsed
+  and before storage, identity or the roster are touched. It returns a
+  `PreparedGatewayApplication`: the
+  selected definition (replacing `mob_config`) and an optional
+  `RosterProjection`. The gateway's roster provider applies that projection
+  to every current SDK roster result (`ProjectedRosterProvider`), on every
+  existing path. The request is refused, never replaced, when it is null,
+  malformed, or combined with `mob_config` or `application_tool_policies`,
+  when no host authenticates it (the stock binaries compose none: use
+  `rpc_gateway::run_persistent_with_host` from a host-composed application),
+  when a host selects one the init did not carry, or when it projects a
+  roster without a registered roster provider. `meta_gateway` refuses `prepared_application` explicitly until
+  its roster owner and resume comparison carry the authenticated selection.
+  The Python (`MetaBuilder.prepared_application(bundle, digest)`) and
+  TypeScript (`preparedApplication(bundle, digest)`) builders send the
+  carrier instead of `mob_config`; they are mutually exclusive with `mob()`
+  and never parse or rebuild the bundle.
+- The SDK stdin-RPC gateway is a library module, `meerkat_meta::rpc_gateway`;
+  the stock `rpc_gateway` binary delegates to it unchanged. A native
+  application host can run the same persistent gateway in-process with
+  `run_persistent_with_host(control_listen, host)`, supplying a
+  `GatewayHostComposition` that prepares the bootstrap spec, binds the
+  runtime, publishes the exact `meta/init` Ready line, and owns admission
+  close (`begin_close`) and its join (`join_close`). The driver retains cleanup
+  when its awaiting caller is dropped and reports `GatewayRunError` instead of
+  exiting the process; init failures and shutdown during init are returned to
+  the driver rather than ending the process.
+
+- Callback tools can name the installed artifact their handler came from.
+  A host names the artifacts it installed with
+  `MetaBuilder.installed_artifacts([...])` (TS `installedArtifacts`), sent
+  as `runtime_options.installed_artifacts` at the trusted bootstrap.
+  `register_tool(..., artifact=ToolArtifactRef(id, digest))` (TS
+  `registerTool(name, handler, { artifact })`, and the customizer draft's
+  `register_tool`) carries the reference on the build wire. The gateway
+  verifies every callback tool of a build before publishing any: an unknown
+  id, a digest mismatch, a tool without a reference when the host selected
+  artifacts, or a reference when it selected none refuses the build
+  (`tool_artifact_refused`). A verified reference rides the tool's
+  provenance (`ToolProvenance.artifact`) beside the unchanged per-build
+  `source_id`. Attribution only: it never grants or refuses a call, and it
+  is not proof of the executable bytes or the semantics of the handler that
+  runs. The installed set is trusted host configuration; the field itself
+  authenticates nothing. Only callback tools are checked; native and MCP
+  tools carry no artifact requirement. Registering a tool name again
+  replaces its handler and all of its metadata (a registration without an
+  artifact never inherits the previous one's); where artifacts are in play,
+  two callback tools with one name refuse the build. The refusal is typed
+  end to end (`ToolArtifactRefusal`: `CustomizerError::ToolArtifactRefused`,
+  `IdentityRuntimeError::ToolArtifactRefused` with error data kind
+  `tool_artifact_refused`, `AgentError::ToolArtifactRefused` from
+  `callback/build_agent`), and it is a build refusal, never a tool result.
+  Without installed artifacts and without references, nothing changes.
+- Breaking (Rust): `ExternalToolDef` gains `artifact`, and
+  `CustomizerToolsPending` gains `artifact_refusal`, so struct literals need
+  `artifact: None` / `artifact_refusal: None`; `CustomizerError` and
+  `IdentityRuntimeError` gain the `ToolArtifactRefused` variant.
+
+- TypeScript SDK: hosts can compose the local gateway process too.
+  `PersistentTransport` accepts `extraArgs` (appended after `--persistent`)
+  and `extraStdio` slots (child descriptors 3 and up: `"pipe"`, `"ignore"` or
+  an inherited POSIX descriptor); both are validated before any spawn and
+  never serialized into RPC. `extraStdioEndpoint(index)` returns the parent
+  end of a `"pipe"` slot. `MetaBuilder.gatewayTransport(factory)` builds the
+  transport on every `connect()` (the runtime's overridable
+  `_makeGatewayTransport` also honors a transport given to its constructor),
+  and `connect()` awaits the transport's `startAsync()` host startup before
+  `meta/init`. `shutdown()` and a failed connect stop that transport. Such a
+  host-composed transport (built by the factory, or with its own
+  `startAsync()`) never respawns its gateway on a request: once the process
+  is gone, requests fail with `GatewayRestartRefusedError` until the runtime
+  reconnects. A default transport keeps its respawn. A gateway killed by a
+  signal now counts as exited too (`isRunning()` was true for it, so the
+  default transport never respawned it and requests failed on the closed
+  reader).
+
+- TypeScript SDK: `MetaBuilder.declareSpecUpdate(expectedRevision)` applies
+  this boot's mob definition (from `mob()` or `preparedApplication()`) as a
+  one-shot revision-pinned update of the canonical definition in
+  `persistentState()`, as the Python builder's `declare_spec_update()` does.
+  It sends the existing `runtime_options.declare_spec_update`
+  (`{expected_revision}`) with `runtime_options.mob_composition =
+  {authority: "authoritative"}`; there is no new RPC. `expectedRevision` must
+  be a non-negative safe integer, and `build()` refuses the declaration
+  without a replacement definition or without persistent state.
+
+- TypeScript SDK: `PersistentTransport.lastTermination()` reports what the
+  last `stop()` observed for the exact child it stopped, read before the
+  child is released: `state` (`exited`, `not_started` or `unknown` when the
+  bounded cleanup ended without an exit and the child stays owned),
+  `exitCode`, `signal`, the highest `escalation` attempted against that
+  child (`none`, `sigterm`, `sigkill`; an attempt is not proof it caused the
+  exit) and, separately, `nativeShutdown` (`acknowledged`,
+  `retained_until_exit`, `refused`, `unanswered`, `not_negotiated`). A child
+  gets one shutdown request: a later stop of the same child finishes reaping
+  it without asking again, and the stop that reaps it reports a refused or
+  unanswered request. A new child starts without a record. An exit 0 without
+  escalation is the process outcome only, not proof of the gateway's cleanup
+  or of drained stdio.
+
+- TypeScript SDK: a `MetaRuntime` keeps its gateway transport until that
+  transport's stop fulfils. A `shutdown()` whose bounded cleanup did not
+  settle (the live child stays owned) leaves the transport for the next
+  `shutdown()` to rejoin on the same child, and `connect()` settles such a
+  transport before building another, so no second gateway starts beside a
+  live one. A startup failure whose transport stop rejects throws
+  `GatewayStartupCleanupError` (`startupError`, also the `cause`;
+  `cleanupError`, the exact rejection; `cleanup`, whose `shutdown()` retries
+  that stop and whose `lastTermination()` reads its record, reaching the same
+  runtime even when `MetaBuilder.build()` returned none). The rejection is
+  not proof that the process still runs: a host-composed transport can fail
+  its own cleanup after the child exited. A startup failure whose stop
+  fulfilled still throws its original error.
+  `MetaRuntime.lastGatewayTermination()` reads the last stop's record.
+
+- Python SDK: hosts can compose the local gateway process. `PersistentTransport`
+  accepts `inherited_fds` (POSIX descriptors passed to the child with
+  `pass_fds`, everything else closed) and `extra_args` (appended after
+  `--persistent`); both are validated before any spawn and never serialized
+  into RPC. `MetaRuntime._make_gateway_transport()` is the overridable factory
+  that `connect()` uses to build the transport; `shutdown()` stops whatever it
+  returned.
+
+- Python SDK: `PersistentTransport.last_termination` reports what the last
+  `stop()` observed for the exact child it stopped, read before the child is
+  released or kept: `state` (`exited`, `not_started`, or `unknown` when the
+  bounded cleanup ended without an exit and the child stays owned),
+  `exit_code`, `signal`, the highest `escalation` attempted against that
+  child (`none`, `sigterm`, `sigkill`; an attempt is not proof it caused the
+  exit) and, separately, `native_shutdown` (`acknowledged`,
+  `retained_until_exit`, `refused`, `unanswered`, `not_negotiated`). A child
+  gets one shutdown request: a later stop of the same child finishes reaping
+  it without asking again, and the stop that reaps it reports a refused or
+  unanswered request. A new child starts without a record, and a failed
+  spawn records `not_started`. An exit 0 without escalation is the process
+  outcome only, not proof of the gateway's cleanup.
+
+- Python SDK: a `MetaRuntime` keeps its gateway transport until that
+  transport's stop succeeds, with RPC admission closed meanwhile. A
+  `shutdown()` whose stop failed leaves the transport for the next
+  `shutdown()` to stop again, on the same child, and `connect()` settles
+  such a transport before making another, so no second gateway starts
+  beside a live one. A startup failure whose transport stop fails raises
+  `GatewayStartupCleanupError` (`startup_error`, also the `__cause__`;
+  `cleanup_error`, the stop's failure exactly as raised, an exception group
+  included; `cleanup`, whose `shutdown()` retries that stop and whose
+  `last_termination` reads its record, reaching the same runtime even when
+  `MetaBuilder.build()` returned none). The failure is not proof that the
+  process still runs: a host-composed transport can fail its own cleanup
+  after the child exited. A startup failure whose stop succeeded still
+  raises its own exception. A cancelled or interrupted startup, or a caller
+  cancelled while the stop runs, is never wrapped: while the stop has not
+  succeeded, the exception that propagates (the same object, type and
+  chain) carries `gateway_cleanup`, the same runtime's cleanup, and the stop
+  goes on, owned by the runtime. Under `asyncio.timeout()` or
+  `asyncio.wait_for()` it is the `TimeoutError`'s `__cause__` on Python 3.11
+  and later. `MetaRuntime.last_gateway_termination` reads the last stop's
+  record; `gateway_ended` is unchanged.
+
+- Gating audit reads are resumable: `meta/gating/audit` accepts
+  `after_audit_id` and returns `next_cursor` and `gap`, which is true when
+  the cursor is not in the retained audit: evicted, from an earlier runtime
+  whose audit was not restored, or unknown
+  (`MetaRuntimeHandle::gating_audit_after`). The console filters
+  cursor reads by the same origin audience as pending entries, and serves
+  `GET /console/gating/stream`, a live stream of data-free
+  `gating.changed` and `gating.resync_required` wakes that re-checks
+  `gating.view` and the origin audience on every change and ends with
+  `gating.access_revoked` when the view is revoked.
+- Access control can bind gating approver ids to principals:
+  `[approvers."<id>"]` lists the subjects and groups that hold an id,
+  read from the live configuration at decision time so edits revoke
+  immediately. The console decides as its authenticated principal through
+  the new `MetaRuntimeHandle::decide_gating_action_for` and `GatingDecider`:
+  a requested approver must be the principal or an id it holds, request
+  fields are ignored, shared roles settle on the first eligible decision,
+  and the self-approval refusal covers every held id. The decision audit
+  records `deciding_principal` and `approver_binding`. The console
+  re-checks `gating.decide`, the origin and the held ids under the access
+  configuration's read lock through the gate mutation
+  (`decide_gating_action_authorized`), so a revocation published while a
+  decision waits is honored, and gating resolution and timeout notices are
+  delivered after an operation finishes, outside that lock. Bindings apply
+  only to authenticated decisions; an open console stays trusted-local.
+- Console sidebar buttons can dock an operator `panel`: a same-origin path
+  from static `console.toml` configuration, shown in a docked frame. The
+  panel is trusted operator code, not an isolated frame; it runs with the
+  viewing operator's console session. Invalid paths, or a `panel` combined
+  with `control` or `href`, drop the button; an empty `panel` counts as
+  none. Panel paths are used exactly
+  as written: at most 2048 UTF-8 bytes, no surrounding or inner whitespace
+  (a byte order mark included),
+  no control characters or backslashes, and no `.` or `..` segment in any
+  spelling. The console and flow editor documents are now served with
+  `Content-Security-Policy: frame-ancestors 'self'`: a deployment that
+  frames the console from another origin must change before 0.9, while
+  same-origin framing and top-level use are unaffected.
 - `MobRuntimeDelivery` (`new`, `inbox`, `last_pass`, `is_running`) composes a
   host's native job and continuation delivery owner, and
   `MobRuntime::runtime_delivery_pass` and `MobRuntime::stop_runtime_delivery`
   observe and stop it.
+- Agent-created child mobs (agent `mob_create`, delegate's implicit mob)
+  survive a restart by default. `MobBootstrapSpec::with_child_mob_storage`
+  takes a `ChildMobStorage`: `ProcessBound` or `Durable(layout)`.
+  - Without a selection, a runtime whose final root mob storage is declared
+    persistent keeps child mobs `Durable` under its recorded Meta layout;
+    without a recorded layout its bootstrap fails with
+    `ChildMobStorageError::LayoutNotRecorded` rather than falling back to
+    memory. Every other runtime keeps them `ProcessBound`. The stock
+    persistent constructors and both gateways record their layout; a host
+    composing its own spec records it with
+    `MobBootstrapSpec::with_meta_storage_layout`. An explicit selection
+    always wins.
+  - The selection is applied at bootstrap, before the agent mob-tool state is
+    shared, so it may be set before or after `with_agent_mob_tools`. A late
+    `ProcessBound` never opens the child root.
+  - `Durable` claims the layout's child root (`<state>/mobs`) exclusively and
+    holds it until the process exits, so a second runtime over the same
+    layout in one process is refused with `AlreadyClaimed`. It requires
+    Meta's canonical council store, and durable participant custody: the
+    root mob storage must be declared persistent. Realm profiles authored by
+    agents become durable under the definition's inline-profile overlay.
+  - Bootstrap restores every persisted child before the runtime reports ready
+    and before delivery arms. Composition and restore failures are typed
+    `MobRuntimeError::ChildMobStorage` errors, never a fallback to memory.
+  - `UnifiedRuntime::shutdown` stands child mobs down after the root mob;
+    library hosts call `MobRuntime::stand_down_child_mobs`. An unsettled
+    child stays reported across repeated calls.
+  - The stand-down closes the agent mob-tool state's admission before it
+    takes the child snapshot, shuts every child down, and then stands the
+    state down (Meerkat `MobMcpState::stand_down`), joining the work it owns.
+    Only when admission, that work and every child settled, which includes a
+    root with no child at all, is the child root released:
+    `ChildMobStandDownOutcome::Released { child_mobs }` (additive; the enum
+    is non-exhaustive), `cleanup_completed()` is true, and a successor over
+    the same layout in this process can claim it. A child that already shut
+    down cleanly keeps that receipt for its incarnation, so a retry does not
+    read its closed channel as unknown debt. Stand-downs through runtime
+    clones run one at a time, and `Released` is reported only after the
+    claim's last holder was dropped, so the root is free whenever any clone
+    reads it. A stand-down that is still waiting for another clone's
+    running stand-down at its own deadline returns the additive
+    `ChildMobStandDownOutcome::InProgress` (cleanup not complete) without
+    cancelling the running one.
+  - Otherwise the child root stays held (a later stand-down retries;
+    process exit releases it), and the runtime does not report
+    `cleanup_completed()`.
+    `UnifiedRuntimeShutdownReport::cleanup_retained_until_process_exit()` is
+    true when that retention is the only blocked phase; the gateway's
+    `meta/shutdown` result then adds `runtime_cleanup_retained_until_exit`
+    (with `runtime_cleanup_completed` still false), and the Python and
+    TypeScript SDKs reap the gateway without raising for it.
+  - Storage doctor, the maintenance fence and `storage-migrate` enumerate the
+    child databases and run Meerkat's own constructors for them.
+
 - Operators can decide quarantined agent memory from the console:
-  `mobkit/memory/quarantine/decide` releases or tombstones one quarantined
+  `meta/memory/quarantine/decide` releases or tombstones one quarantined
   identity-scope record, without the memory steward or the gating flow.
   - Until now only the steward's dream could decide a quarantined record.
     With the steward disabled, a write quarantined by session taint could
@@ -626,7 +1503,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     secret gate refuses secret-shaped content, and a quarantined update is
     released as a supersede of its still-active prior instead of forking.
   - The decision binds the record's `content_hash` (now returned by
-    `mobkit/memory/panel/record`), refuses typed with `-32043`
+    `meta/memory/panel/record`), refuses typed with `-32043`
     (`MEMORY_QUARANTINE_REVIEW_REFUSED_CODE`; `not_found`,
     `content_mismatch`, `not_quarantined`, `gate_pending`,
     `successor_conflict`, `secret_detected`, `stale_update`) and records
@@ -661,8 +1538,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - The store operation is `StewardStore::review_quarantined`; the Memory
     panel offers Release and Tombstone on a quarantined record.
 
-- Checked access saves (`checked_v1`). `mobkit/access/get`, and
-  `mobkit/access/status` for a caller who can administer, advertise
+- Checked access saves (`checked_v1`). `meta/access/get`, and
+  `meta/access/status` for a caller who can administer, advertise
   `conditional_mutations: "checked_v1"` with an opaque `owner_instance` for
   the controller lifetime. The six access writes accept a nested
   `params.checked_v1` carrying `owner_instance`, `expected_revision` and the
@@ -685,7 +1562,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   revision or configuration changes. The real-browser scenario
   `real-checked-save-recovery` drives this flow against the acceptance
   fixture's real access owner.
-- A typed `mobkit/init` code for mob composition provenance refusals: `-32019`
+- A typed `meta/init` code for mob composition provenance refusals: `-32019`
   (`COMPOSITION_PROVENANCE_CODE`), with Python and TypeScript
   `CompositionProvenanceError` (#613).
   - Every refusal the gateway raises because a persistent mob storage's
@@ -707,11 +1584,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     `CompositionProvenanceRefusal`, and
     `UnifiedRuntimeBootstrapError::composition_provenance()` finds the
     refusal behind a bootstrap failure.
-  - `mobkit_gateway` (the console/HTTP binary) still reports these refusals
+  - `meta_gateway` (the console/HTTP binary) still reports these refusals
     as `-32603`.
 
-- Host-only `mobkit/member_activate_instruction` and
-  `mobkit/member_instruction_activations` (Python
+- Host-only `meta/member_activate_instruction` and
+  `meta/member_instruction_activations` (Python
   `activate_member_instruction` / `member_instruction_activations`,
   TypeScript `activateMemberInstruction` / `memberInstructionActivations`).
   A host can change a member's standing instructions after its session was
@@ -756,8 +1633,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   The console routes the assistant's audio through a playback gate after the
   speaker analyser and ramps it to silence on `duck` and back on `restore`.
   Mute and speaker state stay on the master gain.
-- Python SDK: `MobKitBuilder.gateway_init_timeout(seconds)` sets how long
-  `connect()` waits for the gateway to answer `mobkit/init` (its `accepted`
+- Python SDK: `MetaBuilder.gateway_init_timeout(seconds)` sets how long
+  `connect()` waits for the gateway to answer `meta/init` (its `accepted`
   acknowledgement, or an older gateway's single response). The default stays
   60 s. It takes a positive finite number of seconds; booleans, NaN,
   infinities, zero and negatives raise `ValueError`. It bounds a slow host
@@ -771,11 +1648,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   in) are built with, as an `ApplicationToolPolicyBinding`:
   `{"kind":"provider","provider_id":...,"policy_id":...}` or the explicit
   opt-out `{"kind":"unmanaged"}`.
-  - `mobkit/init` top-level parameter, next to `application_tool_policies`.
+  - `meta/init` top-level parameter, next to `application_tool_policies`.
     The gateway refuses the boot (`-32602`) for a malformed value,
     `{"kind":"inherit"}`, or a provider binding whose provider or policy no
     served policy carries.
-  - Python `MobKitBuilder.child_application_tool_policy(binding)`.
+  - Python `MetaBuilder.child_application_tool_policy(binding)`.
   - Rust `MobBootstrapSpec::with_child_application_tool_policy` (and
     `with_optional_child_application_tool_policy`) and
     `UnifiedRuntimeBuilder::child_application_tool_policy`; two different
@@ -785,7 +1662,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Child-available host tool bundles:
   `MobBootstrapSpec::register_tool_bundle_with_availability` and
   `UnifiedRuntimeBuilder::register_tool_bundle_with_availability` take a
-  `ChildToolBundleAvailability` (re-exported from MobKit).
+  `ChildToolBundleAvailability` (re-exported from Meta).
   `register_tool_bundle` keeps registering `HostOnly` bundles, which child
   mobs never receive; a `ChildAvailable` bundle is supplied to every child
   member, still narrowed by the child profile's `deny` list and governed by
@@ -807,16 +1684,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   step through matching rows (newest first), each brought into view (and
   revealed when it is behind Show earlier messages) and highlighted with
   the CSS Custom Highlight API, with a live "n of m" count; Escape closes it.
-- `mobkit/init` can run as accepted-then-settled (#550), so startup is no
+- `meta/init` can run as accepted-then-settled (#550), so startup is no
   longer cut off by the SDK's 60 s request timeout. Both SDKs opt in by
   default.
   - The SDK sends `init_protocol: "accepted_then_settled"` and an `init_id` it
     is already listening for. After the cheap pre-durable gates pass, the
     gateway answers `accepted` at once. It then emits
-    `mobkit/init_progress {init_id, phase}` at each startup phase: `storage`,
+    `meta/init_progress {init_id, phase}` at each startup phase: `storage`,
     `owner_publication`, `prepare`, `roster`, `register_owners`, `prewarm`,
     `activate`, `restore`, `schedules`, `serve`, and `cleanup` on failure.
-    Finally it emits exactly one `mobkit/init_settled`, either
+    Finally it emits exactly one `meta/init_settled`, either
     `{outcome: "ready", ...init result}` or
     `{outcome: "failed", code, message, data, durable_effects}`.
   - `durable_effects` is `"none"` only when init failed before the `storage`
@@ -831,7 +1708,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - The SDKs have no built-in total deadline for an accepted init, because
     persisted-authority prewarm on a large roster is deliberately unbounded.
     The wait ends on the settlement, the gateway exiting, a reader failure,
-    or the caller's deadline (Python `MobKitBuilder.init_deadline(seconds)`,
+    or the caller's deadline (Python `MetaBuilder.init_deadline(seconds)`,
     TypeScript `initDeadline(ms)`).
   - A `failed` settlement raises the same typed error as before, with
     `data.durable_effects`.
@@ -844,7 +1721,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     cleanup.
   - Startup provider callbacks must not issue ordinary RPCs on the same
     gateway, because ordinary dispatch starts only after init settles.
-- `mobkit_store_conformance::chapters::continuity_wrapper_preserves_incremental_channel`
+- `meta_store_conformance::chapters::continuity_wrapper_preserves_incremental_channel`
   takes an incremental-capable substrate and the embedder's own wrapping
   function. It fails when the wrapped store, or the
   `ContinuitySessionStoreAdapter` over it, loses the session-delta channel.
@@ -861,7 +1738,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   returns `ProcessLifetime` unless a store vouches for durability.
   `SqliteConsoleLogStore::open` reports `Durable`;
   `SqliteConsoleLogStore::in_memory` and `InMemoryConsoleLogStore` report
-  `ProcessLifetime`. `MobKitConsoleAggregator::send_dedupe_durability()`
+  `ProcessLifetime`. `MetaConsoleAggregator::send_dedupe_durability()`
   reads it from the store in use, and `GET /console/experience` exposes it
   as `send_dedupe: { durable: bool }` (absent without a console
   aggregator). Custom stores that persist dedupe records across restarts
@@ -879,7 +1756,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Error types `TurnTrackingUnavailableError`, `PostAdmissionObservationError`
   and `TurnWaitTimeoutError` in both SDKs.
 
-- `mobkit/stop_member_run` relays meerkat's run-fenced Stop
+- `meta/stop_member_run` relays meerkat's run-fenced Stop
   (`MobHandle::stop_member_run`, lukacf/meerkat#1279) on the unified RPC and
   the console gateway. Params are `{ member_id, run_id, reason }`, and the
   result is `{ member_id, receipt }`, with meerkat's typed receipt verbatim
@@ -889,7 +1766,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     already bound to it, including durable steers that joined it.
   - A stale run id is `not_current` and never interrupts newer work.
   - Malformed params are `-32602`. The console authorizes the method like
-    `mobkit/force_cancel_member`.
+    `meta/force_cancel_member`.
   - SDKs: Python `MobHandle.stop_member_run(member_id, run_id, reason=)`
     returns the typed `MemberRunStopReceipt`. TypeScript
     `MobHandle.stopMemberRun(memberId, runId, reason)` returns
@@ -902,7 +1779,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     Retire, and force-cancel is unchanged. The receipt is summarized in the
     header: the cancelled inputs, "that run already ended", or the runtime
     state that refused the stop.
-- ConsoleSend (`POST /console/send`, `mobkit/console/send`, and the
+- ConsoleSend (`POST /console/send`, `meta/console/send`, and the
   multipart form) accepts typed `skill_refs` for the exact addressed member
   (#486). The selection rides meerkat's fenced host-human admission
   (`MobHandle::submit_host_human_input_with_options_bounded`), so the member
@@ -920,25 +1797,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   as soon as its own restore does, before the whole pass ends.
   `IdentityRuntime::watch_identity_bootstrap_status` streams the snapshot in
   process; the Python SDK parses it as `IdentityRestoreProgress`.
-- `mobkit/request_continuity_repair` (and `request_continuity_repair()` /
+- `meta/request_continuity_repair` (and `request_continuity_repair()` /
   `requestContinuityRepair()` in the SDKs,
   `IdentityFirstRuntimeContext::request_continuity_repair` in Rust) asks the
   continuity repair supervisor for a pass and answers, typed, what it reached:
-  `scheduled`, `nothing_to_repair` or `no_supervisor`. `mobkit/reconcile_identity`
+  `scheduled`, `nothing_to_repair` or `no_supervisor`. `meta/reconcile_identity`
   reports the same for the supervisor pass its settled pass triggered
   (`continuity_repair`), and a `broken` outcome now carries its typed `kind`.
 - The TypeScript SDK gains `identityBootstrapStatus()` and
   `waitIdentityBootstrap()`, parsing each identity's typed `restore` progress.
 
-- Server-side, event-driven completion waits (#468). `mobkit/wait_for_completion`
+- Server-side, event-driven completion waits (#468). `meta/wait_for_completion`
   resolves when an identity's completion cursor moves past `after` (or, with no
   `after`, counts its first completed turn), returning the typed `outcome`
   (`completed`, `incarnation_changed`, `timed_out`, `untracked`) and the
-  cursor. `mobkit/wait_for_turn` is `mobkit/turn_result` taken once the ticket
+  cursor. `meta/wait_for_turn` is `meta/turn_result` taken once the ticket
   settles. The gateway parks the request on the runtime's typed change signals
   (the identity table and completion cursor, and the ticket registry), so
   neither side polls; `timeout_ms` is only the caller's deadline.
-  `mobkit/completion_cursor` is a one-shot cursor read. None of them touch the
+  `meta/completion_cursor` is a one-shot cursor read. None of them touch the
   member session. A completion wait also ends typed on `run_failed`,
   `broken`, `retiring`, `identity_gone` and `shutting_down` instead of running
   to its deadline, and a turn wait reports `wait: shutting_down`. Waits default
@@ -954,7 +1831,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `waitForTurn` (and so `send_and_wait` / `sendAndWait`), `wait_for_output(after=...)`
   and `wait_until_ready` / `waitUntilReady` are now one server-side wait each
   and read the member's output once, at completion, instead of polling
-  `mobkit/inspect_identity` or `mobkit/turn_result`. They fall back to the
+  `meta/inspect_identity` or `meta/turn_result`. They fall back to the
   previous polling only against a gateway that predates the server-side waits.
   New `completion_cursor()` / `completionCursor()` reads, and TypeScript gains
   `waitUntilReady`. The docs name `track_turn` plus `wait_for_turn` as the
@@ -966,7 +1843,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   caption carries the open segment's whole text so far and its item id, the
   id the committed assistant row later lists in
   `realtime_origin.provider_item_ids`. The browser reads them through the new
-  `mobkit/console/voice/captions {identity, request_id, channel_id, after,
+  `meta/console/voice/captions {identity, request_id, channel_id, after,
   wait_ms}` long poll, scoped to the owned call exactly like
   `context_status` (agent view access; permitted on a read-only console). It
   answers `{identity, request_id, channel_id, cursor, captions}`, where each
@@ -985,9 +1862,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   durable identity (for example `domain:calendar`). meerkat sets the lineage
   on the build that seats a durable fork (fork_off children, fork_member
   children, local council participants) and on every later rebuild of that
-  member, so a host can build a fork child as its source. In a MobKit mob
-  `source_member.member` is MobKit's encoded roster id (`mk--...`), which is
-  why the identity rides beside it, resolved through MobKit's own roster
+  member, so a host can build a fork child as its source. In a Meta mob
+  `source_member.member` is Meta's encoded roster id (`mk--...`), which is
+  why the identity rides beside it, resolved through Meta's own roster
   mapping (also public as `member_comms_id::durable_identity_for_roster_member`).
   Both are null for every other build. The child's own labels and session
   still name the child and never carry the source's `agent_identity`.
@@ -1011,7 +1888,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - TypeScript `SessionBuildOptions.resumeSessionId`, matching Python's
   `resume_session_id`: the build callback's resume session is decoded, and a
   builder can set it to ask the gateway to resume a session (persistent mode).
-- `mobkit/inspect_identity` (and its raw-alias projection) and the console's
+- `meta/inspect_identity` (and its raw-alias projection) and the console's
   per-member progress (also when it falls back to the runtime machine's run
   state, as for a retiring member) carry `preview_unavailable` when meerkat
   could not observe the member's session for its status
@@ -1024,7 +1901,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   pass through.
 
 - Turn tickets: per-admission completion for identity deliveries.
-  `mobkit/send`, `mobkit/interact` and `mobkit/dispatch` accept
+  `meta/send`, `meta/interact` and `meta/dispatch` accept
   `"track_turn": true` and then return `"turn": {"ticket": ...}`, a ticket
   the runtime mints for that one admission and keeps the admitted turn's own
   completion handle under (the caller's interaction id and a dispatch's
@@ -1043,8 +1920,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ran as its own turn). `not_delivered` (`delivered: false`) means nothing
   was delivered.
   Trackability is decided from the live roster entry right before admission,
-  never from MobKit's desired spec, so a same-profile `runtime_mode_override`
-  hot reload, a repair respawn that drops the override, or a profile MobKit
+  never from Meta's desired spec, so a same-profile `runtime_mode_override`
+  hot reload, a repair respawn that drops the override, or a profile Meta
   cannot read never turns into a failed send: an `autonomous_host` member is
   refused typed before anything is submitted and delivered once untracked.
   meerkat's own refusal (`MobError::UnsupportedForMode`, now carried typed as
@@ -1053,7 +1930,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   re-dispatch of a key whose tracked admission to the identity's current
   session is still pending or completed names the original's ticket (meerkat
   deduplicates per session ledger, so after a session rotation it is a turn of
-  its own). The new `mobkit/turn_result {identity, ticket}` reports that turn
+  its own). The new `meta/turn_result {identity, ticket}` reports that turn
   as `pending`, `completed`, `failed` (with `error`) or a typed `unknown`; a
   completed turn carries `output_status`: `text` (its own `output`, from the
   turn's committed run result via meerkat's exact-turn `wait_bounded`,
@@ -1082,24 +1959,195 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- The rpc_gateway's SDK callback builder hands a member's external tools to
-  the agent by ownership (`SessionAgentBuilder::build_agent_taking_tools`,
-  Meerkat 0.8.52). Before, an ops-capable external tool source (one that
-  binds to the session's ops registry, such as a detached-job tool bundle)
-  stayed shared with the build request. Meerkat 0.8.52 refuses to bind a
-  shared one, so that member's build failed with `SharedOwnership`.
-  - Both builder branches take the request's tool slot before any copy,
-    whether or not an SDK SessionBuilder is configured. The callback path
-    composes the SDK's tools over the drained source.
-  - `ComposedExternalTools` now forwards `capabilities()` and
-    `bind_ops_lifecycle`. An ops-capable dispatcher composed under other
-    tools is reported and bound instead of silently skipped. A composition
-    or an ops-capable half still held elsewhere refuses with
-    `SharedOwnership`, never running unbound.
+- Gateway shutdown no longer reports complete cleanup while a member's MCP
+  server is still running. A stdio MCP server's close takes up to its EOF and
+  TERM graces plus a kill backstop (18 s by default), longer than the 5 s
+  member teardown, and the gateway could answer `meta/shutdown` with
+  `runtime_cleanup_completed: true` and exit while such a server was still
+  alive. Every member factory now adopts its MCP routers into one
+  `MemberMcpCustody` before any server starts; custody keeps each router
+  adapter until the adapter's own shutdown reported, so a release cut off by
+  the member teardown loses nothing. `UnifiedRuntime::shutdown` freezes it,
+  starts every close at once (in-flight tool calls no longer delay it),
+  and waits for each close's native outcome until the deadline Meerkat
+  derives from the closes it started (at most
+  `MEMBER_MCP_SETTLEMENT_BUDGET`, 20 s); the new `member_mcp_settlement`
+  report field gates `cleanup_completed()`. The gateway repeats that
+  settlement at its executor-exit boundary, after the runtime shutdown's
+  observation ends for any reason, including an init stopped by
+  `meta/shutdown` after its runtime existed. There a deadline ends no wait:
+  the gateway answers, and its executor is destroyed, only once every
+  close's native outcome reported, so neither a horizon cut-off nor a close
+  that outlives the deadline Meerkat derived from it is discarded mid-attempt.
+  Such a late close counts in its outcome's class, and its router under
+  `deadline`, as the bound Meerkat broke. A server that is not reaped, whose
+  stdout is still held open by a process outside its group, or whose close
+  failed, is reported by class under
+  `runtime_cleanup_diagnostics.member_mcp_settlement` (or
+  `member_mcp_settlement_at_exit` when the horizon cut the runtime report
+  off) and is never counted as complete. The runtime shutdown budget
+  rises from 317 s to 337 s, and the advertised `stdio_shutdown_horizon_ms`
+  from 352000 to 392000. Waiting past a deadline at the exit boundary changes
+  neither the budget nor the horizon: it lasts longer than
+  `MEMBER_MCP_SETTLEMENT_BUDGET` only when Meerkat breaks its own close
+  bound, and the answer then reports `deadline`. Embedders composing their
+  own factories install the custody with `MemberMcpCustody::install` and
+  `MobBootstrapSpec::with_member_mcp_custody`.
+- Module MCP boundary calls (routing, delivery, gating, memory) no longer
+  cancel their server's close at the call timeout. The call connects with
+  Meerkat's bounded connect and waits, in its own runtime, for Meerkat's
+  bounded close (up to 18 s for a server that ignores EOF and SIGTERM). A
+  close that does not settle is a typed `McpBoundaryError::CloseUnsettled`
+  cleanup failure next to the operation's own result (`CloseFailed` stays
+  for an actual close error), and nothing is called again.
+- A conversation pane following the live edge no longer stops following
+  when a tool opened at the end grows the transcript before the browser's
+  own one-pixel scroll event arrives. The pane only leaves the live edge on
+  an upward move; this fixes an intermittent console acceptance failure
+  ("opening the actual tool at live edge remains following").
+- Identity members: tools published by `customize_build` now resolve their
+  execution plan through the dispatcher that serves them. The identity
+  dispatcher used Meerkat's default resolution from its own catalog, so a
+  published tool set composed through a dynamic composite never added the
+  composite's owner witness, and the composite then refused the forwarded
+  plan: the call failed as `tool_unavailable` ("tool execution owner changed
+  after plan resolution"). The serving dispatcher's plan is now kept whole
+  (its owner witnesses, an argument-chosen mode and the deadline chain),
+  validation goes to the same dispatcher, and the identity dispatcher adds
+  its own witness: a plan resolved before a later publication, even one
+  with identical tool metadata, is refused as `ExecutionOwnerChanged`, and a
+  plan for a tool the current publication no longer advertises is refused
+  as not found.
+
+- Meta's mob session-service decorators forward
+  `MobSessionService::await_removed_actor_exit` and
+  `SessionService::update_session_mcp_attachment_intent`, and the
+  write-epoch runtime-store facade (`epoch_tracking_runtime_store`) forwards
+  `hosting_capability`, the continuation key-binding and admission verbs and
+  `load_delivery_generation`. Without the forwards they answered their trait
+  defaults through Meta: an immediate return, a typed `Unsupported`, no
+  hosting claim or a zero generation. The facade also names its
+  execution-custody pair, which already reached the inner store through its
+  session-authority carrier.
+- Detached callback tools store their arguments as base64, as the blob
+  contract requires. The gateway handed the literal JSON text to its base64
+  blob adapter, which refused it with `invalid blob base64`, so a detached
+  callback whose arguments were an object, an array or a string failed
+  before its job was admitted. Records written before stay readable, and an
+  exact retry of a call admitted before the change returns that same job;
+  the same call with other arguments is still refused as a different
+  submission.
+- An access configuration that names no admin, including a disabled one,
+  grants administration to nobody: authentication alone no longer lets a
+  Console caller read the configuration or write it (checked or legacy
+  writes), including appointing itself. A configured
+  `runtime_options.access_config_path` must name a readable, valid file: a
+  missing path, a directory or an invalid file refuses initialization instead
+  of starting with access disabled and creating the file on the first Console
+  write. An omitted path still leaves access control off. Conventional
+  discovery of `config/access.toml` (meta_gateway and the Python and
+  TypeScript builders) skips it only when the lookup reports nothing there,
+  which includes a missing or dangling parent directory. A directory, a
+  dangling `access.toml` link, `ENOTDIR` or another lookup error goes to the
+  same strict load, which refuses startup when it cannot open, read, parse or
+  validate the file instead of leaving access control off. The loader does
+  not check the file type, so a FIFO at that path blocks startup instead of
+  refusing it.
+- Gating configuration follows the same omission-versus-failure rule, since
+  it sets gating tiers and escalation. Conventional discovery of
+  `config/gating.toml` (meta_gateway and the Python and TypeScript builders)
+  skips it only when the lookup reports nothing there, including a missing
+  or dangling parent directory. A directory, a dangling `gating.toml` link,
+  `ENOTDIR` or another lookup error goes to the strict gating load, which
+  refuses startup when it cannot open or read the file or rejects its
+  contents, instead of leaving gating off. A present non-string
+  `runtime_options.gating_config_path` refuses initialization instead of
+  being ignored; an absent or null one is still an omission. The Python and
+  TypeScript builders reject an explicit empty gating path and forward any
+  explicit one instead of dropping it by truthiness. The loaders do not check
+  the file type, so a FIFO at the path blocks startup instead of refusing it.
+- Meta's raw LLM client wrappers (the mob-wide default client's
+  provider-agnostic claim and the replay sanitizer) carry the wrapped
+  client's controller selection, request-free route, credential maintenance
+  and replay projection. A member built on a raw client override now pins
+  that client's controller instead of none. Prepared (governed) requests run
+  the same replay sanitization before they reach the wrapped client and keep
+  their admitted work, authorization target and route witness.
+  `meerkat-llm-core` is now a normal dependency of `meerkat-meta`.
+- Meta's mob session-service decorators forward
+  `MobSessionService::pin_controller_client_under_runtime_turn_boundary`
+  to the inner service with the exact actor. They already forward the
+  runtime turn-finalization boundary that this pin pairs with, so
+  `MeerkatMachine::with_admitted_original` through a Meta-decorated member
+  service now pins the member actor's own controller client. Before, it got
+  the trait's `Unsupported` refusal and refused the admitted original as
+  unavailable.
+
+- Python SDK: a request no longer starts a replacement gateway child after
+  the transport's child ended (its process exited, its stdout closed, or its
+  reader failed). The replacement used to receive the request before any
+  `meta/init` or provider registration, and `MetaRuntime.is_running` kept
+  reporting `True`. Such a request now raises `GatewayChildEndedError`, a
+  `TransportReaderFailedError`, and starts nothing; `is_running` reports
+  `False` for a runtime whose gateway child ended. Behavior change for
+  direct `PersistentTransport` users who relied on the implicit restart:
+  call `start()` to replace the child, or on a runtime `shutdown()` then
+  `connect()`, which bootstraps a new child with the configured providers
+  and init. The first send of a never-started transport still starts it,
+  and concurrent first sends start one child. `stop()` now closes ordinary
+  admission, also before the first send, while its shutdown handshake and
+  callback replies continue. Explicit `start()` refuses to start a second
+  child beside one that still runs after its channel ended.
+
+- A durable child-mob root that holds the predecessor's empty, unversioned
+  `mobs/realm_profiles.db` (exactly the `realm_profiles` table and its key
+  index, no rows, no schema ledger, as MobKit 0.8.47 left it) no longer fails
+  boot with "schema domain mob has no ledger row but already owns objects".
+  Under the child-root claim and Meerkat's maintenance fence for the file,
+  the composition drops that empty table in one transaction and Meerkat
+  initializes the store as new. Any other content is left untouched and
+  refused as before.
+- `storage-adopt-predecessor` adopts a carried schedule store that holds
+  `schedule_json` as TEXT (it now reads TEXT or BLOB, as the schedule store
+  does) and no longer plans to retarget a deleted steward schedule (the
+  schedule service never sees deleted rows, so the apply failed with
+  "schedule ... is gone" and left the adoption half-applied). Planning, run
+  before any change and again under the fence, is the steward step's
+  preflight: every schedule row must decode as a schedule and carry its own
+  row id, so a row the apply could not use refuses the adoption before the
+  first change. An interrupted adoption still resumes as before.
 
 - Identity repair no longer destroys a member's queued inputs when the runtime
   owner refuses to serve: a refused acquisition defers the repair disposal
   instead of being read as an empty queue.
+- The Console shows the images a tool returns. Image blocks in a tool
+  result's content (inline images as data URLs, stored images through
+  `/blobs/{id}`) render on the tool card, in live and history views alike;
+  the rest of the result (text, resources, structured blocks, and any image
+  that cannot be shown) is presented exactly as before. Previously only
+  `generate_image` showed images: other tools dropped them behind a
+  text-only `result`, or printed their base64 as JSON text.
+  The live event stream carries such images by reference: an inline image
+  in a live `tool_result_received` or `tool_execution_completed` payload
+  is put into the session blob store and the event carries the `blob_id`,
+  as history already did. Ids are content-addressed, so both events and the
+  persisted transcript name the same blob; each event still performs its
+  own put (object and metadata write on a persistent store). Without a blob
+  store, or if storing fails, the image stays inline.
+  A stored tool image is read through the Console transport's new
+  `readBlob`, with the transport's own request authority and lifetime, and
+  shown and opened full size from one local object URL, so it loads where
+  the gateway requires app auth. The default HTTP transport reads
+  `/blobs/{id}` same-origin with the browser's credentials (a session
+  cookie or an authenticating front) and puts no token in the URL; its
+  timeout covers the body as well as the headers. Only PNG, JPEG, GIF and
+  WebP bytes are shown; a refused or other read shows "Image unavailable".
+  A host transport without `readBlob` keeps the direct URL. An image already
+  shown stays visible until its view or the Console instance goes away, so
+  a token expiry or logout the host does not signal by retiring the Console
+  does not hide it, and revoking the object URL cannot erase an image
+  already open in another tab or saved.
+
 - A conversation pane following the live edge no longer stops following
   when a tool opened at the end grows the transcript before the browser's
   own one-pixel scroll event arrives. The pane only leaves the live edge on
@@ -1280,7 +2328,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   split. Waking on commits, rather than on the gateway's timer, depends on
   this.
 
-- The published `meerkat-mobkit` crate package now includes the license texts
+- The published `meerkat-meta` crate package now includes the license texts
   its manifest declares (`LICENSE-MIT`, `LICENSE-APACHE`). Cargo packages only
   files under the crate directory, so earlier releases published the crate
   without them. The crate directory now carries symlinks to the root files,
@@ -1297,9 +2345,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   console did not write (wheel, scrollbar, touch, or a gesture chained out
   of a code block) now leaves the live edge at once; following resumes on
   the way down, within the live-edge band or at the end.
-- MobKit's session-service decorators forward
+- Meta's session-service decorators forward
   `SessionServiceHistoryExt::read_instruction_activation_records`. Without the
-  forward, the defaulted method answered `Unsupported` through MobKit.
+  forward, the defaulted method answered `Unsupported` through Meta.
   `verify-session-service-decorators` now also checks the base
   `SessionService` and `SessionServiceHistoryExt` traits, so a decorator
   missing a defaulted base method fails the gate.
@@ -1307,13 +2355,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   across reconnect. Late results, errors and deadline/cancellation responses
   cannot answer reused callback IDs on a replacement process, and retired
   readers cannot fail its pending requests.
-- A voice channel reopened through MobKit while delegated work from an
+- A voice channel reopened through Meta while delegated work from an
   earlier channel was still running now opens with Meerkat's "work started
   before this call is still finishing" startup line (meerkat #1652), so the
-  model does not claim that work is done before its result arrives. MobKit's
+  model does not claim that work is done before its result arrives. Meta's
   live composition now binds its delegation coordinator as the open
   authority's post-close work source, as Meerkat's RPC router does; before,
-  no MobKit door bound one.
+  no Meta door bound one.
 - A declared role migration is applied on the boot path, or refused typed;
   it is never silently dropped (children that declared `role_migrations`
   to a restricted profile kept their old role and its tools, such as
@@ -1325,7 +2373,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     restored member, and the collision handling adopted the occupant as
     it was.
   - When a declared migration meets an occupant on another role and
-    MobKit has repair custody, the bridge applies it: it retires the
+    Meta has repair custody, the bridge applies it: it retires the
     restored member to absence (after proving the resume source exists,
     carrying queued input) and resumes the same session under the
     declared role with `resume_from_role`, which Meerkat re-verifies
@@ -1333,7 +2381,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - Where a Present identity intent owns the member's materialization,
     retiring it would fight MobMachine, so the resume is refused with
     `ResumeRejectionKind::RoleMigrationNotApplied` and the identity is
-    degraded with a detail naming the migration. The `mobkit/init` result
+    degraded with a detail naming the migration. The `meta/init` result
     shows it: `identity_bootstrap` reports the identity `broken` with
     restore kind `role_migration_not_applied` and `ready: false`, so a
     host never deploys believing the migration landed. Meerkat's own typed
@@ -1393,7 +2441,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - A completed pass whose session write epoch moved during its read
     re-reads once at once, instead of waiting for a tick and watermark
     expiry. It runs only because the epoch moved, so it cannot loop.
-  - `MobKitConsoleAggregator::history_backfill_converged` resolves once no
+  - `MetaConsoleAggregator::history_backfill_converged` resolves once no
     session-history backfill is running, queued or armed to re-run.
     `idle_cpu_gate` waits on it instead of a 2 s CPU probe that could not see
     a pass scheduled after it. The large session is now read once (one full
@@ -1421,7 +2469,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   paths such as `../../<other-worktree>/console/node_modules/...` into
   `console/dist/index.cjs`, which passed the freshness check there and
   reached main once (regenerated in 4e337578).
-- The stdio gateway no longer queues ordinary requests behind `mobkit/init`
+- The stdio gateway no longer queues ordinary requests behind `meta/init`
   (#550). Before, a request that arrived during startup waited in a 64-slot
   queue that nothing drained until init finished. A startup provider callback
   that awaited such a request waited on itself until its 130 s deadline, and
@@ -1429,7 +2477,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   routed. An ordinary request sent before init settles now gets an immediate
   typed refusal: `-32018`, `data.kind: "init_in_progress"`, exported as
   `INIT_IN_PROGRESS_CODE` and raised as `InitInProgressError` in both SDKs.
-  `mobkit/shutdown` and callback responses are still admitted. Startup
+  `meta/shutdown` and callback responses are still admitted. Startup
   callbacks must not issue ordinary RPCs on the runtime that is starting.
 - Python SDK: a callback response is no longer written behind host requests
   queued for the gateway's stdin. Writes stay whole lines, and a callback
@@ -1447,7 +2495,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     requests to the same gateway process fail at once. Before, a gateway that
     closed its stdout answered waiters with an untyped `-32099 "subprocess
     died"` RPC error. A response that arrived before the exit (such as a
-    fail-closed `mobkit/init` refusal) still reaches its waiter.
+    fail-closed `meta/init` refusal) still reaches its waiter.
   - A callback result containing NaN or Infinity is answered with a typed
     error (`data.kind: "non_finite_result"`). Before, Python wrote a `NaN`
     token the gateway could not parse, so the callback waited out its deadline,
@@ -1468,7 +2516,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     malformed memory state) now kills and reaps those modules instead of
     leaking them.
   - A cleanup failure after a failed start, an aborted respawn's replacement
-    and dropping a `MobkitRuntimeHandle` without `shutdown()` all kill and
+    and dropping a `MetaRuntimeHandle` without `shutdown()` all kill and
     reap the process when its owner is released.
   - `RuntimeShutdownReport::orphan_processes` still counts children whose
     synchronous termination failed; those children are now also reaped as
@@ -1490,20 +2538,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - delivery-time repair respawned with role and labels only.
 
   The host's handlers stayed registered, but the live agent stopped
-  advertising the tools (`mobkit/identity/resolved_tools`). Now each identity
+  advertising the tools (`meta/identity/resolved_tools`). Now each identity
   member carries one stable, dynamic dispatcher for its whole life:
   - Every successful `customize_build` publishes into it, swapping the tool
     list and its handler scope together. A tool from an earlier build is
     refused typed, never routed to a stale scope.
   - A new `CustomizerToolsSpawnCustomizer` attaches it to every meerkat-side
-    build of a registered identity. MobKit installs it whenever an agent
+    build of a registered identity. Meta installs it whenever an agent
     customizer exists, and composes it with the memory customizer in meerkat's
     single slot.
   - An adopted occupant picks up the current tools without a respawn.
   - On a restart, `customize_build` runs for every roster identity before the
     mob is restored (before activation, or before the mob build when meerkat
     restores members inside it). Restored members therefore start with their
-    tools, `mobkit/identity/resolved_tools` lists them before the first turn,
+    tools, `meta/identity/resolved_tools` lists them before the first turn,
     and runs that start at activation see them. The materialization still runs
     `customize_build` and republishes. An early failure is logged per identity
     and reported as the new optional
@@ -1520,9 +2568,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - An identity member that had not run a turn before a shutdown is
   materialized again at the next boot. The local continuity store creates its
   head-canonical tables only at the first delta write, but its per-session
-  record lookup always read them. On such a file the lookup failed, MobKit
+  record lookup always read them. On such a file the lookup failed, Meta
   skipped the member's owner pre-registration, and the member stayed
-  unmaterialized with no live session (`mobkit/identity/resolved_tools`
+  unmaterialized with no live session (`meta/identity/resolved_tools`
   answered "session not found").
 
 - Console: queued rows that did not go through now say what happened in
@@ -1707,7 +2755,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   to the fixture, which bound it later; anything on the host could take it in
   between (CI saw `AddrInUse`, OS error 98, at console fixture startup).
   Fixtures and the flow editor now bind the port-0 address the harness passes
-  and print `MOBKIT_FIXTURE_READY {"addr":"..."}` with the address they
+  and print `META_FIXTURE_READY {"addr":"..."}` with the address they
   actually bound, which the harnesses (`console/fixture-ready.cjs` and the
   example scripts) wait for. The flow editor smokes no longer use fixed
   ports, and the Python reference flow hands uvicorn an already-listening
@@ -1750,7 +2798,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tool or lifecycle event from any agent refreshed the roster and every
   docked panel kind, including panels in hidden tabs, with no limit on
   requests in flight. With a topology panel docked and a 60 s
-  `mobkit/topology/query`, the browser queued 28 topology queries a minute
+  `meta/topology/query`, the browser queued 28 topology queries a minute
   and every other console request waited behind them at the per-origin
   connection limit (p95 53 s). Each panel kind and the event-driven roster
   refresh now keep at most one request in flight and coalesce later events
@@ -1774,7 +2822,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   behaviour is unchanged and nothing is replayed. TypeScript: a tracked
   `WaitEndedError` now carries the top-level `ticket` as well as `admission`.
   The docs name the one exception: a thrown value that cannot carry fields.
-- `mobkit/topology/query` no longer serializes behind the topology mutation
+- `meta/topology/query` no longer serializes behind the topology mutation
   lock. In a production deployment (MobKit 0.8.43) queries arriving about once a second
   with a roughly 0.8 s edge discovery queued behind each other, with p50 67 s
   and p95 119 s, almost all of it waiting before the provider ran: every read
@@ -1810,7 +2858,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the reader and kills/reaps the direct child; OS cleanup can outlast the
   deadline. Windows and other targets retain their narrower legacy behavior.
 
-- MobKit's two `MobSessionService` wrappers (`delegate_mob_session_service!`
+- Meta's two `MobSessionService` wrappers (`delegate_mob_session_service!`
   and `AfterCreateMobSessionService`) forward meerkat 0.8.49's
   `append_system_notice_under_runtime_turn_boundary`. The trait default
   refuses, so interrupted-run notices stayed owed behind the wrappers
@@ -1842,11 +2890,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   monitor's previous ordinary subscription off instead of counting its
   completions a second time.
 
-- `mobkit/force_cancel_member` on the unified RPC keyed an identity-resolved
+- `meta/force_cancel_member` on the unified RPC keyed an identity-resolved
   member by the undecoded `rt:` runtime alias, so an alias call missed the
   durable identity's roster row. It now resolves the row like the console
   path (`roster_member_id_for_supplied_id`), and so does
-  `mobkit/stop_member_run`.
+  `meta/stop_member_run`.
 - Each turn's WholeBlob projection into the continuity store now costs
   O(delta) instead of O(document), in two ways.
   - The committed document is no longer read back. `SessionStoreBackedRuntimeStore`
@@ -1983,7 +3031,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   A committed placed edge whose host has not yet acknowledged the trust row
   is reported as `PlacedRouteInstallPending` and kept, instead of being
   rolled back on every coordinator retry; readiness requires the committed
-  edge's external descriptor to name the exact peer id. `local_member_peer_info`, `mobkit/cross_mob/peer_info` (RPC,
+  edge's external descriptor to name the exact peer id. `local_member_peer_info`, `meta/cross_mob/peer_info` (RPC,
   used by the Python SDK) and the console peer-info read report a placed
   member's durable host address instead of `inproc://`.
 - Cold boot no longer re-verifies unchanged transcripts in the durable
@@ -1998,7 +3046,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   appended, the head shape check takes the full content digest, which seeds
   the digest the successor head mint then reuses. Measured through the
   shipped `rpc_gateway --persistent` identity-first composition on meerkat
-  0.8.47, `mobkit/init` hashed 11.79x the durable transcript bytes before
+  0.8.47, `meta/init` hashed 11.79x the durable transcript bytes before
   and 7.86x after (11.95x to 8.03x at about 4 MB). The two
   `unchanged_boundaries_over_*_hash_the_transcript_once` tests bound a
   projection of an unchanged transcript at one digest.
@@ -2061,13 +3109,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A mob activation whose explicit resume stalls no longer fails bootstrap.
   On a memory-starved host one member's resume can go past meerkat's 30 s
   patience window, which returns the retryable
-  `MobError::LifecycleOperationProgressStalled`. MobKit treated it as fatal,
+  `MobError::LifecycleOperationProgressStalled`. Meta treated it as fatal,
   shut down, and exited, so a supervisor restarted the whole boot from scratch
   in a loop (seen in a downstream app's production). Activation now re-joins the same
   meerkat operation in-process (`MobHandle::resume` on the prepared handle
   joins the still-current Resume) for as long as it makes progress: a changed
   member or stage resets the count. It gives up after
-  `MOBKIT_ACTIVATION_STALL_RETRIES` consecutive stalls at one member and stage
+  `META_ACTIVATION_STALL_RETRIES` consecutive stalls at one member and stage
   (default 10, clamped to 1-1000; about five minutes without progress) or
   twenty times that many stalls overall. Each stall logs a WARN with member,
   stage, attempt, and elapsed time, and completion after stalls logs an INFO.
@@ -2080,14 +3128,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   stream that closes within a second of its subscribe counts as a failure, so
   it cannot spin. During a cold boot this was a flood of actor commands
   (meerkat #1250).
-- `mobkit/send_message` to a raw roster member with an interaction id retries
+- `meta/send_message` to a raw roster member with an interaction id retries
   once on `StaleFenceToken` against the re-read binding (a respawn between the
   binding read and the submit no longer fails the send), and no longer makes a
   redundant `member()` round trip: SubmitWork admission already refuses a
   restore-failed member with the typed `MemberRestoreFailed` (#479).
 - The console store's unobserved-start phase clear also clears a stale
   callback pause (#479).
-- `mobkit/interact` refuses a caller-supplied `interaction_id` that is still in
+- `meta/interact` refuses a caller-supplied `interaction_id` that is still in
   flight on the identity with `-32602` and `error.data.code:
   "interaction_id_in_flight"`, before delivering anything (#479). A settled id
   may be sent again.
@@ -2101,14 +3149,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `run_failed` with no final `turn_completed`), so the console drain gate stops
   parking the queue. Such a terminal never closes another current run or
   interaction and settles no reservation.
-- `mobkit/send_message` console reservations now close when their run settles
-  (#469). The reservation id is a UUID (was `mobkit-send-...`) threaded as the
+- `meta/send_message` console reservations now close when their run settles
+  (#469). The reservation id is a UUID (was `meta-send-...`) threaded as the
   run's typed interaction lineage on both delivery targets: the identity
   bridge carries it into the WorkSpec, and raw roster members receive it on
   an external-origin WorkSpec. Previously the ids could not be threaded, so
   reservations accumulated to the 256 cap and each new send evicted a settled
   one with a false `interaction_failed { reason: "queue_overflow" }`. The
-  untracked `mobkit/send` lane now threads its reserved id as well. The id is
+  untracked `meta/send` lane now threads its reserved id as well. The id is
   not part of the `send_message` response; it appears only as the console
   event `interaction_id`.
 
@@ -2136,7 +3184,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `output_preview`, so a concurrent delivery to the same identity (a peer
   message, a scheduled turn, a fork completion wake) could satisfy the wait
   and hand the caller someone else's output. They now send with
-  `track_turn` and wait on the turn ticket through `mobkit/turn_result`;
+  `track_turn` and wait on the turn ticket through `meta/turn_result`;
   signatures and return types are unchanged. A failed turn raises
   `TurnFailedError`, and an unknown ticket (for example after a gateway
   restart) raises `TurnUnknownError`. Text cut at the 256 KiB bound, and a
@@ -2193,7 +3241,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sent through `delegate` with a null had the same problem. See the behavior
   change under Changed.
 
-- Concurrent `mobkit/inspect_identity` calls no longer each cost a
+- Concurrent `meta/inspect_identity` calls no longer each cost a
   member-status read. Meerkat admits one member-status read per mob at a time
   (refusing the rest as `observation_lane_saturated` before meerkat 0.8.45),
   so a once-a-second `inspect_identity` poller made `mob_check_member` fail.
@@ -2208,7 +3256,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   times out, or carries no progress shows its run state from the runtime
   machine it runs on (`run_open`, `idle` or `unknown`) with the typed
   `unknown` health class, instead of being dropped.
-- A busy member's status returns its last committed preview. MobKit's session
+- A busy member's status returns its last committed preview. Meta's session
   service wrappers forward meerkat 0.8.45's member-status observation exactly,
   so a status read joins meerkat's one bounded observation for that member
   instead of reading the whole session behind a running turn.
@@ -2217,7 +3265,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   block (a persisted `BackgroundJob` block and a non-persisted one, in either
   order) now counts as a completion entry. `is_detached_completion_entry`
   required every `BackgroundJob` block of the notice to be persisted, so the
-  hygienist could collapse such a row and `mobkit/bound_member_transcript` did
+  hygienist could collapse such a row and `meta/bound_member_transcript` did
   not count it in `dropped_completion_entries`. It now uses meerkat 0.8.43's
   typed `SystemNoticeMessage::persisted_background_job_id`: a `BackgroundJob`
   notice with at least one persisted background-job block. Refresh-only
@@ -2246,12 +3294,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   does not answer in time, counts as busy and is left for a later pass.
 
 - Councils a restart interrupted are recovered after the restart (requires
-  the meerkat release carrying #1190's durable-store council sweep). MobKit
+  the meerkat release carrying #1190's durable-store council sweep). Meta
   built its agent-tool `MobMcpState` with `Arc::new`, so the state could not
   own a restore task and meerkat's council sweep never ran: councils the
   previous process left mid-run stayed unfinished, and a detached council's
   convener never heard back. The state is now shared with `into_shared`;
-  restoring the mob through `mob_insert_handle` with MobKit's durable council
+  restoring the mob through `mob_insert_handle` with Meta's durable council
   store schedules the sweep (recovery, the retry once the dead coordinator's
   claim lease lapses, and the detached-council re-link).
 
@@ -2273,14 +3321,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   gets) lived only in an in-memory map, so after a restart the restored fork
   children were never idle-retired and held their sessions until retired by
   hand. Opt-ins are now written through to the persistent metadata store
-  (new `member_idle_retire/<member_id>` rows in the existing `mobkit_metadata`
+  (new `member_idle_retire/<member_id>` rows in the existing `meta_metadata`
   table; no schema change) and restored when the idle sweep starts, so the
   sweep re-arms for restored members. Each opt-in is bound to the member
   instance it was set for, by the member's bridge session: the sweep honours
   it only while the member seated under that id still runs that session and
   drops it otherwise, so a member id reused after its member was retired
   outside the sweep never inherits the old opt-in. A respawn keeps the
-  opt-in: MobKit's operator, RPC and console respawns carry it to the
+  opt-in: Meta's operator, RPC and console respawns carry it to the
   respawned session, and an identity member's continuity rebind (respawn or
   delivery repair) does the same. Every retirement of a member session,
   whatever surface caused it (the sweep, `mob_retire_member`, operator or
@@ -2293,7 +3341,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `mob_respawn` tool carries the opt-in like the other respawn surfaces;
   member reset, mob reset and mob destroy release only opt-ins recorded
   before the event; opt-ins of implicit delegation mobs are released when
-  the sweep no longer finds their member or mob (a member with a MobKit
+  the sweep no longer finds their member or mob (a member with a Meta
   respawn in flight is skipped); a member retired and then resumed onto its
   exact session gets its opt-in back (in the same process); and a release
   deletes a row by key and bound session, so rows written by other versions
@@ -2312,18 +3360,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   implementations; `MemberIdleRetireOverrideRecord` and
   `DelegateIdleRetireOverride` are now public.
 
-- Detached `fork_off`/council completion entries are protected from MobKit's
+- Detached `fork_off`/council completion entries are protected from Meta's
   transcript curation (requires the meerkat release carrying #1190). Meerkat
   records a detached job's outcome in the owner's transcript as a durable
   `BackgroundJob` system notice whose `SystemNoticeBlock::BackgroundJob`
-  blocks are `persisted`; `meerkat_mobkit::detached_completion::
+  blocks are `persisted`; `meerkat_meta::detached_completion::
   is_detached_completion_entry` recognizes exactly that typed shape
   (non-persisted `BackgroundJob` notices, such as shell job progress, stay
   ordinary refresh projections). The hygienist's `collapse` op could fold
   such a notice into a one-line summary like any other system notice; the
   entry now classifies as the new `HygieneRole::BackgroundJobResult`, which
   the validator treats as untouchable like the system prompt (a new variant
-  on the public `HygieneRole` enum). `mobkit/bound_member_transcript` keeps
+  on the public `HygieneRole` enum). `meta/bound_member_transcript` keeps
   its keep-last-N contract and still drops everything before the cut, but
   its response now reports `dropped_completion_entries` so losing completion
   entries is never silent.
@@ -2344,16 +3392,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   terminal check.
 
 - Forks of transcripts holding an image written before MobKit 0.8.41 no longer
-  fail with "blob identity mismatch". Those references carry MobKit's raw-bytes
+  fail with "blob identity mismatch". Those references carry Meta's raw-bytes
   address, `sha256(media_type || 0x00 || decoded_bytes)`, while Meerkat
   recomputes `content_blob_id(canonical_media_type, base64)` on read-back.
   `Base64BlobStoreAdapter` implements Meerkat's `BlobStore::attest_address`: it
-  recomputes MobKit's raw-bytes recipe over the payload it returned and attests
+  recomputes Meta's raw-bytes recipe over the payload it returned and attests
   only an exact match, so Meerkat's durable-fork preflight re-homes the child's
   reference to the Meerkat content address and realtime history hydration
   accepts it. Meerkat asks only when the stored media type matches the image
   block's and the bytes are a valid image of that type, so a non-image
-  MobKit object cannot pass as an image. The source transcript and its stored
+  Meta object cannot pass as an image. The source transcript and its stored
   object are unchanged; any other reference stays unattested and is refused as
   before. Requires the Meerkat release that adds `BlobStore::attest_address`.
 
@@ -2386,7 +3434,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   meerkat 0.8.41 types the refusal (`SessionError::WholeBlobAuditedEndpointDivergence`,
   resume hold `audited_endpoint_divergence`): the committed document keeps
   every message, but every read refuses until the operator runs the sanctioned
-  `rkat session repair-wholeblob` repair. MobKit now reads that hold typed
+  `rkat session repair-wholeblob` repair. Meta now reads that hold typed
   (never from error text) on all three doors it can arrive through, the
   resume (`ResumeRejectionKind::AuditedEndpointDivergence`), the registration
   reload (`BridgeError::SessionRepairRequired`), and the heal authority
@@ -2397,7 +3445,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   token), and parks the identity Broken
   with a `SessionRepairRequired` hold (`ContinuityFailureKind::RepairRequired`)
   carrying the session id and the exact diagnose and apply commands. The hold
-  rides `mobkit/member_health.session_repair_required`, the identity status,
+  rides `meta/member_health.session_repair_required`, the identity status,
   the console status and inspect payloads (`session_repair`, console health
   `needs_repair`, rendered as **needs repair** with both commands), and the
   typed error's `error.data` (`kind: mob_member_session_repair_required`,
@@ -2408,7 +3456,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rendered as `rkat session repair-wholeblob <id> --runtime-store <path>`;
   `RuntimeStoreLocator::MeerkatRealm` for a composite storage provider's
   meerkat-level realm, rendered as `rkat --state-root <state_dir> --realm
-  mobkit ...`). Both gateway binaries and `UnifiedRuntimeBuilder` derive the
+  meta ...`). Both gateway binaries and `UnifiedRuntimeBuilder` derive the
   scope from that record; `UnifiedRuntimeBuilder::session_repair_scope`
   overrides it, and a runtime with no persistent runtime store declares no
   scope, so the commands carry explicit placeholders instead of a guessed path.
@@ -2423,7 +3471,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   no operator path anywhere. Now the FIRST typed refusal parks the identity;
   the supervisor makes no heal call and no reconcile retry against it, and
   reconcile keeps the Broken projection typed `RepairRequired`.
-  `mobkit/reload_member` is the way back: after the operator's repair the same
+  `meta/reload_member` is the way back: after the operator's repair the same
   verb, with no extra flag, resumes the SAME session and generation and clears
   the hold; a document still refused re-parks the identity typed and records
   the attempt as `last_reload.outcome: repair_required`.
@@ -2433,10 +3481,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   resolves attention bindings there and nowhere else; a goal, binding or
   reassignment that names a member (`mob/<mob_id>/agent/<identity>`) from any
   other realm is refused by Meerkat with the typed
-  `AttentionTargetRealmMismatch`. MobKit's runtime service was already scoped
+  `AttentionTargetRealmMismatch`. Meta's runtime service was already scoped
   to the mob realm, so console, RPC and agent-tool work bound to this mob's
   members lands where the member reads it. Two things changed:
-  - `mobkit/workgraph/goal/create`, `attention/reassign` and
+  - `meta/workgraph/goal/create`, `attention/reassign` and
     `attention/break_glass_reassign` classify the lowered target by its typed
     owner key and refuse a member of another mob before the write with
     `-32602` and `data.kind = "attention_target_realm_mismatch"` (`owner_key`,
@@ -2455,12 +3503,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     original item are not carried. `MobBootstrapSpec::with_workgraph_realm_migration`
     selects `apply` (default), `dry_run` or `off`; the report
     (`MobRuntime::workgraph_realm_migration`, `UnifiedRuntime::workgraph_realm_migration`)
-    is serialized on `mobkit/capabilities` as `workgraph_realm_migration`, and a
+    is serialized on `meta/capabilities` as `workgraph_realm_migration`, and a
     failed scan or write is recorded there rather than aborting bootstrap.
   - Every `MobSessionService` wrapper forwards the two methods Meerkat 0.8.41
     made required (`fork_persisted_session_at_turn_boundary`,
     `commit_live_delegation_final_transcript_at_turn_boundary`).
-- Meerkat image blobs stored through MobKit's blob store now carry meerkat's
+- Meerkat image blobs stored through Meta's blob store now carry meerkat's
   required content address. `Base64BlobStoreAdapter::put_image` (the meerkat
   `BlobStore` face of every `ObjectStoreBlobStore` the gateway, the storage
   provider and the console voice host inject) decoded the base64 payload and
@@ -2472,10 +3520,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   delegation policy) for any session carrying an image, realtime user content
   with an image, and realtime history image hydration. The adapter now mints
   meerkat's id, stores under the canonical media type, and writes through the
-  new `BinaryBlobStore::put_bytes_addressed`. MobKit-native blobs written with
-  `put_bytes` (console image uploads, `mobkit/blob/*`) keep their raw-bytes
+  new `BinaryBlobStore::put_bytes_addressed`. Meta-native blobs written with
+  `put_bytes` (console image uploads, `meta/blob/*`) keep their raw-bytes
   address and stay readable through both faces, so existing stores need no
-  migration. Console image uploads (`mobkit/blob/upload` and multipart
+  migration. Console image uploads (`meta/blob/upload` and multipart
   `image_upload` placeholders) now store through
   `blob_store::put_meerkat_image_bytes`, so a console-attached image survives
   `verify_stored_image_blob` in a later durable fork; references to images
@@ -2496,9 +3544,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - The console requests the microphone during the click, concurrently with
     the readiness RPC (released again if readiness is negative), and waits
     for the WebRTC peer and data channel by event instead of issuing a
-    `mobkit/live/status` poll every 100 ms until the transport connects.
+    `meta/live/status` poll every 100 ms until the transport connects.
     The connect timeout still bounds both.
-  - One validation on the open path. `mobkit/console/voice/open` no longer
+  - One validation on the open path. `meta/console/voice/open` no longer
     repeats the readiness probe the console already ran on the click; the
     host's own target resolution and Meerkat's open admission still refuse a
     foreign principal (`access_denied`), an unknown member, a grant held by
@@ -2522,7 +3570,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     maxOutputBytes }`). Measured on a
     40-turn seeded session the previous bounds took 4.0 to 5.9 s of summary
     generation for a 1.3 to 1.5 KB result (3 fragments).
-- Console voice readiness leaves a server-side trace. `mobkit/console/voice/
+- Console voice readiness leaves a server-side trace. `meta/console/voice/
   readiness` used to answer `available: false` silently when the host refused,
   when the target could not be resolved, when the credential probe failed, or
   when the server's own 5 s budget expired; the console then showed "Voice
@@ -2537,7 +3585,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Console voice activation is traced. Every console voice control-plane RPC,
   the open stages, the durable-source validation, the WebRTC answer, the
   playback-owner registration, and the activation status polls log their wall
-  time under `meerkat_mobkit::console_voice::timing` (polls at debug, the rest
+  time under `meerkat_meta::console_voice::timing` (polls at debug, the rest
   at info). `console/voice-e2e-live.cjs --time-to-talk` is an opt-in paid
   harness mode that seeds a long session and reports click-to-talk stage
   timings, including the new `'you can talk' visible` stage and the gateway's
@@ -2571,7 +3619,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   member is missing tools), then recorded per member at DEBUG. A failed live
   catalog read stays at WARN as a read error, not as a mismatch. Decision
   and policy semantics are unchanged.
-- MobKit's own tool dispatcher wrappers declare exact catalogs. The
+- Meta's own tool dispatcher wrappers declare exact catalogs. The
   agent-memory `RecorderToolDispatcher`, the SDK `GatewayCallbackToolDispatcher`,
   `ComposedExternalTools`, both schedule wrappers, and the mob-tools auto-wire
   wrapper left `tool_catalog_capabilities()` / `tool_catalog()` on the
@@ -2580,22 +3628,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   invariant could never verify it. Each wrapper now derives exactness from
   what it wraps (composition is exact only when both halves are; a fixed
   callback tool list is exact on its own) and publishes the catalog it
-  actually advertises, so members with MobKit-composed tools reach a real
+  actually advertises, so members with Meta-composed tools reach a real
   `Match` or `Gap` decision.
-- Stuck voice close. `mobkit/console/voice/context_status` no longer
+- Stuck voice close. `meta/console/voice/context_status` no longer
   validates durable-source availability on every poll; that validation loaded
   the full persisted session body on the mob actor once a second per preparing
   voice call, exceeded the actor's inline step budget, and queued every later
   mob command behind it. Availability is validated once at open admission,
   and the channel custody read remains the authority for the poll.
-- `mobkit/live/close` on a channel that already completed its close reports
+- `meta/live/close` on a channel that already completed its close reports
   `Closed` when the live host no longer holds an active binding but the
   machine records the channel's close status, instead of "the experimental
   live channel is not active for the session". Close failures are coded by
   origin: a binding or custody mismatch is `-32602`; a physical transport,
   terminal projection, or semantic failure is `-32000`, which callers may
   retry. Retiring a remote that already hung up needs meerkat 0.8.41 (the
-  transport retirement bound fix); MobKit on 0.8.40 still surfaces
+  transport retirement bound fix); Meta on 0.8.40 still surfaces
   `-32000` until the owner converges.
 - Console voice close is bounded. A retryable close failure (network,
   timeout, or a `-32000` gateway fault) is retried on a fixed backoff
@@ -2607,9 +3655,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - Documentation publication follows main, not releases. A new `Publish docs`
-  workflow dispatches `mobkit-docs-updated` to docs.rkat.ai on every push to
+  workflow dispatches `meta-docs-updated` to docs.rkat.ai on every push to
   main that touches `docs/`, and the release workflow no longer publishes
-  documentation. Published MobKit docs now match whatever is on main.
+  documentation. Published Meta docs now match whatever is on main.
 
 ### Added
 
@@ -2619,7 +3667,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   The builder retains the typed persistent session service, machine, and
   agent factory it already creates, and `UnifiedRuntime::compose_live`
   composes one shared live context with the console voice controller and the
-  `mobkit/live/*` handler over it (the same shared-owner arbitration as the
+  `meta/live/*` handler over it (the same shared-owner arbitration as the
   gateway binaries). `build_reference_app_router_with_live(decisions)` mounts
   both beside the console and refuses an open console when voice is composed
   (`LiveComposeError::ConsoleVoiceRequiresAppAuth`); a live door on an
@@ -2641,18 +3689,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   owner. `rpc_gateway` accepts `runtime_options.console_voice` together with
   `runtime_options.live` (still exclusive with `openai_live` and
   `experimental_live`), composes one live context, and mounts the live
-  WebSocket router and the stdio `mobkit/live/*` RPCs beside the console voice
+  WebSocket router and the stdio `meta/live/*` RPCs beside the console voice
   controller. `live_wiring::LiveOwnerArbiter` arbitrates the two doors "latest
   engaged wins": a console `voice/open` closes an active external channel and
-  an external `mobkit/live/open` closes an active console call, each through
+  an external `meta/live/open` closes an active console call, each through
   the loser's own close sequence, failing the newcomer closed if that close
   fails. Losers learn why: console requests answer kind `voice_superseded`
-  with `reason: superseded_by_external_live`; external `mobkit/live/status`
-  and `mobkit/live/close` answer `close_reason: superseded_by_console_voice`
+  with `reason: superseded_by_external_live`; external `meta/live/status`
+  and `meta/live/close` answer `close_reason: superseded_by_console_voice`
   (without demanding a phase receipt for a channel the arbiter closed); the
-  stdio gateway emits `mobkit/live/superseded {owner, identity, channel_id,
-  reason, superseded_by}` at once; `mobkit/live/open` reports what it
-  `superseded`. `mobkit/console/voice/readiness` answers `available: false,
+  stdio gateway emits `meta/live/superseded {owner, identity, channel_id,
+  reason, superseded_by}` at once; `meta/live/open` reports what it
+  `superseded`. `meta/console/voice/readiness` answers `available: false,
   reason: external_live_active, holder: {identity, channel_id}` while the
   external door holds the path. The browser ends a superseded call with
   "Voice moved to the external live channel" (or "another console call" when
@@ -2695,7 +3743,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `load_head_canonical_metadata` (exact HeadCanonical boundary metadata without
   materializing transcript rows) instead of answering the trait default.
 - `MobSessionService::commit_live_delegation_final_transcript` implementations no
-  longer gate the method on MobKit's `openai-live` feature. Meerkat 0.8.40 declares
+  longer gate the method on Meta's `openai-live` feature. Meerkat 0.8.40 declares
   the trait method unconditionally, so a default-feature build against it failed
   with "not all trait items implemented".
 - `fork_off` children are retired on the idle default. Idle retirement was
@@ -2842,11 +3890,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   workspace `.rkat/config.toml` a gateway adopts as its Meerkat host config.
 
 - **The dead `.discovery()` / `.pre_spawn()` builder knobs are gone from both
-  gateway SDKs.** Python `MobKitBuilder.discovery(callback)` /
+  gateway SDKs.** Python `MetaBuilder.discovery(callback)` /
   `.pre_spawn(callback)` and TypeScript `.discovery()` / `.preSpawn()` stored
   the callback on the builder config and nothing ever read it: `_bootstrap`
   registered continuity, lease, roster, topology and customizer callbacks only,
-  `mobkit/init` carried no field for it, and neither gateway binary has a
+  `meta/init` carried no field for it, and neither gateway binary has a
   discovery callback protocol (the Rust `Discovery` trait is a classic-plane
   bootstrap hook that only an in-process Rust builder can install). The knobs
   were born dead in v0.2 and `docs/sdks/python.mdx` listed them as a working
@@ -2862,7 +3910,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **`mobkit/reload_member`: a non-destructive cold reload verb.** A member
+- **`meta/reload_member`: a non-destructive cold reload verb.** A member
   whose runtime registration is durability-degraded (meerkat's
   `RecoveryRepairBlocked`, "registration-authorized cold reload is required")
   had no repair short of `retire_member` then a send, and the tempting
@@ -2880,7 +3928,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `docs/api/rpc.mdx`. Broken/suspended identities and worker-plane members are
   refused typed. Retired identities return `not_current` without revival;
   only an operation addressed to them can use the existing revival door.
-- **`mobkit/member_health`: an in-process health read for one identity.**
+- **`meta/member_health`: an in-process health read for one identity.**
   Returns lifecycle state, whether a materialization is in flight, the last
   delivery error class (`reload_required`, `actor_loop_stalled`,
   `actor_terminated`, `admission_timeout`, `admission_failed`, `completion`),
@@ -2891,13 +3939,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (0.8.34). Python `MobHandle.member_health`, TypeScript
   `MobHandle.memberHealth`.
 - **meerkat 0.8.34 wiring for the reload verb and member health.**
-  `mobkit/reload_member` now calls `MobHandle::reload_member_registration`
+  `meta/reload_member` now calls `MobHandle::reload_member_registration`
   when the session bridge exposes it (`SessionBridge::reload_member_registration`,
   default `Ok(None)`): meerkat quiesces, discards and re-registers the
   executor for the same session off the actor loop and reports
   `discarded` / `not_degraded` / `not_current`; `not_degraded` is a success
   no-op and `not_current` is a no-op with no destructive fallback.
-  `mobkit/member_health` carries `durability` from
+  `meta/member_health` carries `durability` from
   `MeerkatMachine::durability_reload_required` through the new
   `SessionBridge::member_durability` seam. The delivery classifier matches
   the typed `MobError::MemberReloadRequired` ahead of the 0.8.33 text
@@ -2929,11 +3977,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   itself lived in a test name. Each binary now logs one INFO line when its
   `select!` resolves, before the shutdown sequence, with `reason=` naming the
   branch (`rpc_gateway`: `stdin_closed`, `signal`, `sdk_shutdown_handshake`;
-  `mobkit_gateway`: `signal`, `http_server_ended`, `stdin_guard_ended`) and
+  `meta_gateway`: `signal`, `http_server_ended`, `stdin_guard_ended`) and
   `signal=SIGINT|SIGTERM` when a signal did it, then a "shutdown complete;
   exiting" bookend, so a wedge between the two is visible as a missing
   bookend. The `rpc_gateway` stdin reader names EOF versus a read error;
-  `mobkit_gateway` logs the stdin close it survives by design and, when the
+  `meta_gateway` logs the stdin close it survives by design and, when the
   HTTP server task ends abnormally, logs the error at ERROR on stderr as well
   as failing init on stdout. `init_gateway_tracing` installs a panic hook
   (`install_gateway_panic_hook`, exported) that reports every panic through
@@ -2947,7 +3995,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   binaries through each exit with `RUST_LOG` unset and by a hook unit test;
   `docs/guides/deployment.mdx` gains a "Reading a gateway exit" section that
   also states the two designed exit contracts (`rpc_gateway` exits on stdin
-  EOF, `mobkit_gateway` does not).
+  EOF, `meta_gateway` does not).
 
 - **`DurableAgentSpec` exposes `runtime_mode_override` and `initial_message`
   in both gateway SDKs.** The Rust spec has deserialized both since the
@@ -2971,9 +4019,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`GatewayHttpBinding::bind_loopback` was the only constructor), so a reverse
   proxy in another container could not reach them at all. `rpc_gateway` now
   takes `runtime_options.http_listen` (`HOST:PORT`, default `127.0.0.1:0`),
-  `http_public_base_url` and `allow_remote`; `mobkit_gateway` takes the same
+  `http_public_base_url` and `allow_remote`; `meta_gateway` takes the same
   three as top-level init params, plus `--http-listen` / `--allow-remote` and
-  `MOBKIT_HTTP_LISTEN_ADDR` / `MOBKIT_HTTP_ALLOW_REMOTE` below them, and folds
+  `META_HTTP_LISTEN_ADDR` / `META_HTTP_ALLOW_REMOTE` below them, and folds
   the listen address AND the advertised base into its resume fingerprint like
   `--control-listen`, so a relaunch that changes `http_public_base_url` is not
   answered with the previous launch's value. The same four keys sent top-level
@@ -2983,7 +4031,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`meerkat_rpc::secure_rpc::TcpBindPolicy`, `--allow-remote`): a
   non-loopback bind is refused at init, before any bootstrap, unless the
   console enforces app auth (`auth_config` with a trusted key) or the launch
-  acknowledges the exposure with `allow_remote`; `mobkit_gateway` serves an
+  acknowledges the exposure with `allow_remote`; `meta_gateway` serves an
   open console, so on that binary only the acknowledgement opens it. Every
   non-loopback bind logs one WARN line. The init result's `http_base_url`
   keeps the same-host form (`127.0.0.1` for `0.0.0.0` and `::` binds) so the
@@ -3001,7 +4049,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   hosts get `GatewayHttpBinding::bind(addr)`, `HttpBindPolicy`,
   `validate_http_bind_policy(surface, ..)` and
   `warn_on_non_loopback_bind(surface, ..)` in `gateway_composition`, where
-  `surface` is the new `GatewaySurface` enum (`RpcGateway` | `MobkitGateway`)
+  `surface` is the new `GatewaySurface` enum (`RpcGateway` | `MetaGateway`)
   rather than a string, the console's auth state is the new
   `ConsoleAuthPosture` (`Open` | `ClosedToEveryCaller` | `Enforced`, one
   classifier consumed by the gate, the non-loopback warning and
@@ -3012,7 +4060,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   possible) is a `-32603` init error on the request id with no runtime built
   and no schedule executor lease taken; previously the bind ran last and a
   collision exited past the graceful tail with the lease held. On
-  `mobkit_gateway` every init-param refusal (`http_listen`, the gate,
+  `meta_gateway` every init-param refusal (`http_listen`, the gate,
   `http_public_base_url`, `meerkat_config_path`, `compaction`, host-config
   tables in `mob.toml`) is now `-32602` ON THE REQUEST ID, where it used to
   surface as `-32603` with a null id; the bind failure is `-32603` on the
@@ -3027,10 +4075,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   from `Config::default()` and had no ingress for the host config where
   Meerkat keeps `[self_hosted]`, `[realm]` and `[models]`, so a self-hosted
   profile was refused at init on `rpc_gateway` and died at the first member
-  build on `mobkit_gateway` ("self-hosted model '..' is not registered in
+  build on `meta_gateway` ("self-hosted model '..' is not registered in
   config"); the only route was a patched binary. `rpc_gateway` now takes
   `runtime_options.meerkat_config_path` (Python `.meerkat_config(path)`,
-  TypeScript `.meerkatConfig(path)`); `mobkit_gateway` takes the same file as
+  TypeScript `.meerkatConfig(path)`); `meta_gateway` takes the same file as
   a top-level `meerkat_config_path` init param and adopts
   `<workspace>/.rkat/config.toml` when it exists, folding the file's content
   into its resume fingerprint and logging one INFO line naming the adopted
@@ -3057,7 +4105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   so a host-config `[models]` row reaches the factory but does not satisfy
   the check. Defaults are unchanged: an exact-pinned host that names no
   file, has no `<workspace>/.rkat/config.toml` beside its `config/` directory
-  (`mobkit_gateway` now adopts that file when present), and writes no such
+  (`meta_gateway` now adopts that file when present), and writes no such
   table builds from the default config exactly as before.
 
 - **Console auth opt-out reaches every surface.** The Python builder gains
@@ -3065,14 +4113,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `runtime_options.console_require_app_auth`) and `console_config(path)` (emits
   `runtime_options.console_config_path`), the two knobs Python hosts, including
   the in-repo memory live driver and the downstream app, had to inject by overriding
-  `MobKitRuntime._build_init_params`. The Rust library gains
+  `MetaRuntime._build_init_params`. The Rust library gains
   `RuntimeDecisionState::local_console(console, bigquery)`, the one exported
   constructor for a console that trusts no identity provider, plus
   `with_modules(..)` for a Rust host that opted out of console auth but still
   runs trusted modules (the state serves `console`, the session-store naming
   and `modules`); both gateway
   binaries now build their keyless decision state through it instead of two
-  private struct literals (mobkit_gateway keeps its `tux_local` /
+  private struct literals (meta_gateway keeps its `tux_local` /
   `runtime_events` session-store naming through the parameter). The default is
   unchanged and fail-closed: `ConsolePolicy::default()` requires app auth, and
   an SDK launch with neither `auth_config` nor `console_require_app_auth =
@@ -3083,11 +4131,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **`AgentBuildDraft`, `AgentBuildContext`, `DurableAgentSpec`,
   `ExternalToolDef`, and `AgentCustomizerProtocol` are importable from the
-  top-level `meerkat_mobkit` package.** The identity-first customizer
+  top-level `meerkat_meta` package.** The identity-first customizer
   (`customize_build(context, spec, draft)` with `draft.register_tool`) is the
   per-identity equivalent of `SessionAgentBuilder.build_agent`, but its
   argument types were public only through
-  `meerkat_mobkit.identity_first_models` / `identity_first_providers`, so the
+  `meerkat_meta.identity_first_models` / `identity_first_providers`, so the
   documented per-profile tool path needed a submodule import while every other
   public surface did not. Additive: the submodule paths keep working.
 
@@ -3112,7 +4160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   new `Incomplete { report }` variant.
 
 - **A retired identity is no longer stuck in `Retiring`
-  ([#404](https://github.com/lukacf/meerkat-mobkit/issues/404)).** `retire_member`
+  ([#404](https://github.com/lukacf/meerkat-meta/issues/404)).** `retire_member`
   leaves the durable identity registered in `Retiring` (member gone, session
   archived, lease released), but the roster reconciler refused that state:
   every later topology refresh failed with `cannot reconcile_roster_remove
@@ -3141,7 +4189,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the registry row the UI last saw. When the autosave triggered by an
   authoring projection had already bumped the store revision but its
   response was not yet applied to that row, the server refused the render
-  with `mobkit/mobpacks/source draft revision conflict ... expected N, found
+  with `meta/mobpacks/source draft revision conflict ... expected N, found
   N+1` even though the submitted document was the freshest authoring state;
   the app then left the panel open and empty behind a "Source render failed"
   sheet. Most visible when opening the Graph-mode source file right after
@@ -3157,7 +4205,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   stalled mob actor loop.** A 2026-09-04 production incident: one repair-blocked member's inline
   work wedged meerkat-mob's single serialized command loop; the probe paged
   `actor_loop_stalled`, and every console send still queued behind the wedged
-  command and was abandoned after exactly `MOBKIT_BRIDGE_ACTOR_ADMISSION_SECS`
+  command and was abandoned after exactly `META_BRIDGE_ACTOR_ADMISSION_SECS`
   (600 s), five times over fifty minutes. The probe now publishes its verdict
   into a shared `ActorLoopHealth` slot that the session bridge's admission
   path reads: while a stall is open every actor round trip fails fast with the
@@ -3204,7 +4252,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   bridge now nests the context under `context`, matching the envelope the SDKs
   already read, so the callback receives the booted mob definition (as JSON)
   and the identities the runtime has registered (empty on the bootstrap
-  resolves, populated on later re-derivations such as `mobkit/topology/query`
+  resolves, populated on later re-derivations such as `meta/topology/query`
   or an edge reconcile). Both SDKs gain a typed `RosterContext`
   (`mob_definition` / `mobDefinition`, `previous_identities` /
   `previousIdentities`) and parse the envelope into it before invoking the
@@ -3212,7 +4260,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   The regression drives the real `rpc_gateway --persistent` binary over the
   stdin-JSONL host protocol and asserts on the wire that every bootstrap roster
   call carries `context.mob_definition.id` and an empty
-  `context.previous_identities`, and that a later `mobkit/topology/query`
+  `context.previous_identities`, and that a later `meta/topology/query`
   re-asks the roster with the registered identity in `previous_identities`.
   Behaviour change for SDK implementors: the Python callback argument is now
   the frozen `RosterContext` dataclass instead of a `dict` (read
@@ -3225,34 +4273,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `comms` must be `true` because Meerkat keys a member's identity, wiring and
   peer messaging on its comms name and refuses `comms = false` (or an omitted
   key) with `profile '<name>' has tools.comms=false; mob meerkats require
-  comms=true`, which `mobkit/ensure_member` reports as `-32602` on the worker
+  comms=true`, which `meta/ensure_member` reports as `-32602` on the worker
   plane and as outcome `broken` on the identity plane. The assertion ledger's
   `state_path` row now says what the file is: a runtime-owned snapshot loaded
-  once at bootstrap and rewritten wholesale on every `mobkit/memory/index`
+  once at bootstrap and rewritten wholesale on every `meta/memory/index`
   (host calls and enabled Steward conflict signals alike), not a shared
   append log, with the 4,096-assertion cap and the load-time refusal and drop
   rules. A WorkGraph section documents the `runtime_options.workgraph`
   default, the store placement per launch mode including the memory-backed
   fallback without `persistent_state`, and that the `WorkGraphNamespaceGrant`
   (realm `mob.<id>`, namespace `default`) is issued by the gateway, never by
-  the host. The `mobkit_gateway` `identity_roster` init param, shipped
+  the host. The `meta_gateway` `identity_roster` init param, shipped
   undocumented, gets its shape and boot-scoped semantics.
   `docs/sdks/typescript.mdx` documents `.onError(...)` beside the gateway
   logging section. Documentation only; no behaviour changed.
 
-- **`mobkit_gateway` exits after SIGINT/SIGTERM even when stdin is still
+- **`meta_gateway` exits after SIGINT/SIGTERM even when stdin is still
   open.** With stdin held open (a terminal, or a parent process holding the
-  pipe), a signalled `mobkit_gateway` completed its graceful shutdown and then
+  pipe), a signalled `meta_gateway` completed its graceful shutdown and then
   never exited: the tokio runtime destructor waits forever for the blocking
   stdin read, which dropping its future cannot cancel. `rpc_gateway` has
   worked around exactly this with an explicit exit on its signal path since
-  the stdin adapter landed; `mobkit_gateway` now does the same once cleanup
+  the stdin adapter landed; `meta_gateway` now does the same once cleanup
   is complete. With stdin already at EOF (the container case) nothing
   changes. Found by the new exit-reason subprocess suite, which asserts the
   process is gone after the "shutdown complete; exiting" line.
 
 - **A `session_service()` builder that cannot answer `build_agent` is refused
-  at `connect()` instead of being skipped in silence.** `MobKitRuntime._bootstrap`
+  at `connect()` instead of being skipped in silence.** `MetaRuntime._bootstrap`
   registered the builder only when `isinstance(builder, SessionAgentBuilder)`
   held (a `runtime_checkable` Protocol, so this is an attribute check: a bare
   function, a `partial`, or a class with the method misnamed fails it), yet
@@ -3271,13 +4319,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `role_wiring`, and not after `ensure_member`, which already reconciles.
 
 - **`rpc_gateway` no longer refuses `[models.<id>]` custom models and
-  provider-annotated self-hosted profiles at init.** The `mobkit/init`
+  provider-annotated self-hosted profiles at init.** The `meta/init`
   pre-check compared every inline profile's `model` against the static
   `meerkat_models` catalog alone, so anything Meerkat's registry legitimately
   owns but the catalog does not (a `[models.<id>]` row, a
   `provider = "self_hosted"` alias) was refused with `Profile '<p>' uses
   unknown model '<m>'` and the process exited, while `MobBuilder::create`
-  would have accepted the same definition; `mobkit_gateway` had no such check,
+  would have accepted the same definition; `meta_gateway` had no such check,
   so the two binaries disagreed. The check now delegates to meerkat-mob's
   exported `validate_definition`, narrowed to its `UnknownModel` diagnostic
   (catalogued, or defined under the definition's own `[models.<id>]`, or
@@ -3303,7 +4351,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   discovery with `issuer` and `jwks_uri`, JWKS with at least one key) now run
   only when `console.require_app_auth` is true; the request-time fail-closed
   check is unchanged, and the release-metadata validation still runs on every
-  build. An empty trust manifest is accepted (`TrustedMobkitToml.modules` is
+  build. An empty trust manifest is accepted (`TrustedMetaToml.modules` is
   `#[serde(default)]`); hosts no longer have to write `modules = []`. A
   malformed release-metadata document is still `DecisionPolicyError::TomlParse`
   (the enum is not `#[non_exhaustive]`, so no variant was added) but its
@@ -3315,7 +4363,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **A provider failure names itself.** Meerkat has carried `RunFailed` as the
   typed `error_report { class, reason, message }` with no flat `error` string
-  since 0.7.0, and nothing in MobKit read it: the Python and TypeScript SDKs
+  since 0.7.0, and nothing in Meta read it: the Python and TypeScript SDKs
   parsed only `error` (always empty), the console timeline rendered every LLM
   failure as `Failed: error`, the signals rail said "Needs attention", and
   the `HostLoopCrash` ERROR line carried only an event id, so a bad key, an
@@ -3362,7 +4410,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   embedders that match `BridgeError` or
   `BridgeAdmissionError` exhaustively (one new variant each).
 
-- **`mobkit/reset_all` now resets every registered identity instead of
+- **`meta/reset_all` now resets every registered identity instead of
   retiring the whole roster.** The console handler chose reset-versus-retire
   by membership in the baseline member-spec slot, which only the
   non-identity-first `UnifiedRuntime::reconcile` populates. On every shipped
@@ -3388,7 +4436,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   warning asserted a cleanup gap that does not exist, once per identity per
   call. `reset_details[]` now carries the successor `agent_runtime_id` and
   `generation` instead. The reset set is also classified by lifecycle state
-  before anything is touched: a `Retiring` identity (the entry `mobkit/retire`
+  before anything is touched: a `Retiring` identity (the entry `meta/retire`
   leaves until delete or roster reconcile) is leaving the fleet and is neither
   resurrected nor reported, and a registered identity with no live roster row
   (Dormant under lazy bootstrap, Broken after a failed materialize such as the
@@ -3440,7 +4488,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   signal (the member-addressed `send` path returned early on
   `AppendDisposition::Existing` all along). Reproduced 2026-09-03: four
   `run_started` for three sends.
-  `MobKitConsoleAggregator::reserve_identity_first_interaction` now returns
+  `MetaConsoleAggregator::reserve_identity_first_interaction` now returns
   the typed `IdentityFirstReservation` (`Fresh` / `Existing`) and the door
   dispatches only `Fresh`; a same-key different-content resend is still the
   `-32009` idempotency conflict. The per-send live projection the door started
@@ -3467,7 +4515,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Prebuilt Linux gateway binaries load on glibc 2.31 and newer.** The
   `*-unknown-linux-gnu` release legs built directly on `ubuntu-latest`
   (Ubuntu 24.04, glibc 2.39) and nothing read the produced binary, so the
-  v0.8.30 `mobkit-rpc-gateway` and `mobkit-gateway` archives carried a hard
+  v0.8.30 `meta-rpc-gateway` and `meta-gateway` archives carried a hard
   `GLIBC_2.39` version requirement (`pidfd_spawnp`/`pidfd_getpid`) and the
   loader refused them on Debian bookworm (2.36), Ubuntu 22.04 (2.35) and
   bullseye (2.31); only trixie and Ubuntu 24.04 could run them. The Linux legs
@@ -3499,7 +4547,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   release. The editor document key `systemPrompt` (and its
   `system_prompt` import alias) is unchanged, so saved editor documents and
   the bundled client keep round-tripping; the mapping is documented at the
-  projection and export sites. MobKit's own test fixtures modelled the same
+  projection and export sites. Meta's own test fixtures modelled the same
   mistake with an inert profile-level `system_prompt` key that meerkat
   silently drops; they now carry their prompts as inline skills, or omit them
   where no turn reads a prompt.

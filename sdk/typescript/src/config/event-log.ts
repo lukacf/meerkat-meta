@@ -1,5 +1,5 @@
 /**
- * Event-log durability declaration for MobKit runtime.
+ * Event-log durability declaration for Meta runtime.
  *
  * The gateway ingests operational events only when
  * `runtime_options.event_log` is configured; the absence of the key means
@@ -7,7 +7,7 @@
  * storage kinds are both *declared ephemeral* choices:
  *
  * - {@link memory} — a bounded, queryable in-process store
- *   (`{"storage": "memory"}`); serves `mobkit/query_events`.
+ *   (`{"storage": "memory"}`); serves `meta/query_events`.
  * - {@link nullStore} — events are explicitly dropped
  *   (`{"storage": "null"}`); queries return empty.
  *
@@ -15,10 +15,10 @@
  * `UnifiedRuntimeBuilder` accepts any `EventLogStore` implementation, but
  * the gateway wire supports only the declarations above and rejects
  * anything else at startup. The resolved choice is visible in the storage
- * census (`mobkit/status` → `storage.slots`).
+ * census (`meta/status` → `storage.slots`).
  */
 
-/** A typed event-log declaration for `MobKitBuilder.eventLog()`. */
+/** A typed event-log declaration for `MetaBuilder.eventLog()`. */
 export interface EventLogDeclaration {
   toDict(): Record<string, unknown>;
 }

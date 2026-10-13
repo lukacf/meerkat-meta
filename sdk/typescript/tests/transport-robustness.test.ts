@@ -49,7 +49,7 @@ describe("persistent transport robustness", () => {
     withWrites(transport);
     (transport as any)._ensureRunning = () => {};
     const waiting = (transport as any)._sendAsyncWithTimeout(
-      { jsonrpc: "2.0", id: "w1", method: "mobkit/status" },
+      { jsonrpc: "2.0", id: "w1", method: "meta/status" },
       30_000,
     );
 
@@ -63,7 +63,7 @@ describe("persistent transport robustness", () => {
     });
     await assert.rejects(
       (transport as any)._sendAsyncWithTimeout(
-        { jsonrpc: "2.0", id: "w2", method: "mobkit/status" },
+        { jsonrpc: "2.0", id: "w2", method: "meta/status" },
         30_000,
       ),
       TransportReaderFailedError,
@@ -124,7 +124,7 @@ describe("persistent transport robustness", () => {
 
 describe("persistent callback connection lifetime", () => {
   it("retires exited-child waiters before restart while its stdout is still open", { timeout: 10_000 }, async () => {
-    const root = mkdtempSync(path.join(os.tmpdir(), "mobkit-ts-exited-reader-"));
+    const root = mkdtempSync(path.join(os.tmpdir(), "meta-ts-exited-reader-"));
     const bin = path.join(root, "gateway.cjs");
     const holderPid = path.join(root, "holder.pid");
     writeFileSync(bin, `#!/usr/bin/env node
@@ -146,7 +146,7 @@ if (process.argv.includes("--hold-stdout")) {
       held = msg.id;
     } else if (msg.method === "test/release") {
       send({ jsonrpc: "2.0", id: held, result: "replacement response" });
-      send({ jsonrpc: "2.0", method: "mobkit/init_settled", params: { init_id: "new-init", status: "ready" } });
+      send({ jsonrpc: "2.0", method: "meta/init_settled", params: { init_id: "new-init", status: "ready" } });
       send({ jsonrpc: "2.0", id: msg.id, result: true });
     }
   });
@@ -230,7 +230,7 @@ if (process.argv.includes("--hold-stdout")) {
 
   for (const oldOutcome of ["success", "error", "deadline"]) {
     it(`drops an old callback ${oldOutcome} after restart with a reused callback id`, { timeout: 10_000 }, async () => {
-      const root = mkdtempSync(path.join(os.tmpdir(), "mobkit-ts-callback-"));
+      const root = mkdtempSync(path.join(os.tmpdir(), "meta-ts-callback-"));
       const bin = path.join(root, "gateway.cjs");
       writeFileSync(bin, `#!/usr/bin/env node
 const rl = require("node:readline").createInterface({ input: process.stdin });

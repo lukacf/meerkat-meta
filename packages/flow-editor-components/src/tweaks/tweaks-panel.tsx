@@ -265,11 +265,11 @@ export function TweaksPanel({ title = 'Tweaks', closeLabel = 'Close', noDeckCont
     // postMessage protocol stays for embedding hosts with their own toggle.
     const onToggle = () => setOpen((current) => !current);
     window.addEventListener('message', onMsg);
-    window.addEventListener('mobkit-flow-editor:settings-toggle', onToggle);
+    window.addEventListener('meta-flow-editor:settings-toggle', onToggle);
     window.parent.postMessage({ type: '__edit_mode_available' }, '*');
     return () => {
       window.removeEventListener('message', onMsg);
-      window.removeEventListener('mobkit-flow-editor:settings-toggle', onToggle);
+      window.removeEventListener('meta-flow-editor:settings-toggle', onToggle);
     };
   }, []);
 

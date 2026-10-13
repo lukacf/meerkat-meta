@@ -6,7 +6,7 @@ export async function withConsoleSendStorageLock<T>(key: string, update: () => T
   // The callback stays synchronous, entirely within an active transaction.
   const database = await new Promise<IDBDatabase>((resolve, reject) => {
     let abandoned = false;
-    const request = indexedDB.open("mobkit-console-queue-locks", 1);
+    const request = indexedDB.open("meta-console-queue-locks", 1);
     request.onupgradeneeded = () => { request.result.createObjectStore("locks"); };
     request.onsuccess = () => {
       if (abandoned) request.result.close();

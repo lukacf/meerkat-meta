@@ -4,8 +4,8 @@ import sys
 
 import pytest
 
-from meerkat_mobkit.builder import MobKit
-from meerkat_mobkit.runtime import MobKitRuntime
+from meerkat_meta.builder import Meta
+from meerkat_meta.runtime import MetaRuntime
 
 
 def _write_echo_gateway(tmp_path, result: dict):
@@ -33,7 +33,7 @@ class TestHttpExposureInitResult:
                 "http_public_base_url": "https://mob.example.com",
             },
         )
-        runtime = MobKitRuntime(MobKit.builder().gateway(str(gateway))._config)
+        runtime = MetaRuntime(Meta.builder().gateway(str(gateway))._config)
         try:
             await runtime.connect()
             assert runtime.rust_http_base_url == "http://127.0.0.1:1"
@@ -49,7 +49,7 @@ class TestHttpExposureInitResult:
             tmp_path,
             {"http_base_url": "http://127.0.0.1:1", "http_public_base_url": None},
         )
-        runtime = MobKitRuntime(MobKit.builder().gateway(str(gateway))._config)
+        runtime = MetaRuntime(Meta.builder().gateway(str(gateway))._config)
         try:
             await runtime.connect()
             assert runtime.rust_http_base_url == "http://127.0.0.1:1"

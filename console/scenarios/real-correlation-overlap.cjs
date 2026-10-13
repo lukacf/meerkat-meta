@@ -25,7 +25,7 @@ async function frames(fixture, identity) {
   return result.frames;
 }
 async function send(fixture, identity, content, key) {
-  const result = await owner(fixture, "mobkit/console/send", {
+  const result = await owner(fixture, "meta/console/send", {
     identity, content, origin: "console:correlation-overlap", origin_kind: "operator",
     handling_mode: "queue", idempotency_key: key,
   });
@@ -59,7 +59,7 @@ function assertOperatorCorrelation(operatorFrames, accepted) {
 }
 
 async function overlap() {
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "Use coordinator prebuilt fixtures; this scenario must not trigger Cargo.");
+  assert(process.env.META_EXAMPLE_BIN_DIR, "Use coordinator prebuilt fixtures; this scenario must not trigger Cargo.");
   const fixture = await startFixture();
   const evidence = { ordering: [] };
   try {
@@ -153,7 +153,7 @@ async function overlap() {
       : null;
     throw error;
   } finally {
-    const folder = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+    const folder = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
     await fs.mkdir(folder, { recursive: true });
     await fs.writeFile(path.join(folder, "real-correlation-overlap.json"), JSON.stringify({ ...evidence, logs: fixture.logs() }, null, 2));
     await fixture.close();

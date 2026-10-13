@@ -162,7 +162,7 @@ export function workGraphGoalRevisionOf(
   return typeof item?.revision === "number" ? item.revision : undefined;
 }
 
-/// `mobkit/workgraph/events` params for the panel's recent-events tail.
+/// `meta/workgraph/events` params for the panel's recent-events tail.
 /// Upstream returns events ASCENDING truncated to `limit`, so a bare
 /// `{limit}` query pins the OLDEST window forever once the ledger outgrows
 /// it. Page from the snapshot's `event_high_water_mark` instead; a null/

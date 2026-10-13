@@ -2,17 +2,17 @@
   "name": "reference-wrapper",
   "models": "stock console behind a host wrapper",
   "consoleRoutes": {
-    "/console": "mobkit-reference-console",
-    "/console/assets/console-app.js": "mobkit-reference-console",
-    "/console/rpc": "mobkit-reference-console",
-    "/console/timeline": "mobkit-reference-console",
-    "/console/timeline/stream": "mobkit-reference-console",
-    "/blobs/{blob_id}": "mobkit-reference-console"
+    "/console": "meta-reference-console",
+    "/console/assets/console-app.js": "meta-reference-console",
+    "/console/rpc": "meta-reference-console",
+    "/console/timeline": "meta-reference-console",
+    "/console/timeline/stream": "meta-reference-console",
+    "/blobs/{blob_id}": "meta-reference-console"
   },
   "hostRoutes": {
     "/host/status": {
       "provenance": "host-adapter",
-      "consumedByMobKitHeadless": false
+      "consumedByMetaHeadless": false
     }
   },
   "wrapperPolicy": {

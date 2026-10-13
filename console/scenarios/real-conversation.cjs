@@ -6,7 +6,7 @@ const { chromium } = require("playwright");
 const { randomUUID } = require("node:crypto");
 const { startFixture, eventually, rpc } = require("../acceptance-runtime.cjs");
 
-const evidence = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+const evidence = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
 const prose = index => `## Investigation ${index}\n\nThe reviewer checks the **candidate workgraph** and records the exact evidence. Repeated phrase, repeated phrase. Unicode: A\u030A, \u00e5 and \ud83d\ude80.\n\n- [x] Source inspected\n- [ ] Peer review pending\n\n| Check | Result |\n| --- | --- |\n| Runtime | Healthy |\n| Delivery | Confirmed |\n\n\`\`\`ts\nconst check = ${index};\n\`\`\`\n\n[Reference](https://example.com) and ![remote tracking image](https://example.com/tracker.png).\n\n`;
 
 function browserErrors(page) {
@@ -62,7 +62,7 @@ async function anchorAt(viewport, row, offset = 100) {
 const isOlderHistoryPage = (response) => {
   if (!response.url().endsWith("/console/rpc")) return false;
   const request = response.request().postDataJSON();
-  return request?.method === "mobkit/console/query_timeline" && Boolean(request.params?.before);
+  return request?.method === "meta/console/query_timeline" && Boolean(request.params?.before);
 };
 
 /// Scroll the transcript to its start once, as a reader does. That scroll is
@@ -191,7 +191,7 @@ function initializationCancellation(request) {
   if (new URL(request.url()).pathname.endsWith("/timeline/stream")) return true;
   try {
     const body = JSON.parse(request.postData() || "{}");
-    return body.method === "mobkit/console/query_timeline" && body.params?.mode === "recent" && body.params?.limit === 200 && !body.params?.identity;
+    return body.method === "meta/console/query_timeline" && body.params?.mode === "recent" && body.params?.limit === 200 && !body.params?.identity;
   } catch { return false; }
 }
 
@@ -379,7 +379,7 @@ async function capture(page, name) {
 }
 
 async function sendApi(fixture, text, key = text) {
-  const accepted = await rpc(fixture.baseUrl, "mobkit/console/send", {
+  const accepted = await rpc(fixture.baseUrl, "meta/console/send", {
     identity: "router:main", content: text, origin: "console:visual-acceptance",
     origin_kind: "operator", idempotency_key: key,
   });
@@ -684,7 +684,7 @@ function identitySwitchCancellation(request) {
   if (url.pathname.endsWith("/timeline/stream")) return true;
   try {
     const body = JSON.parse(request.postData() || "{}");
-    return body.method === "mobkit/console/query_timeline" && body.params?.mode === "recent"
+    return body.method === "meta/console/query_timeline" && body.params?.mode === "recent"
       && ["router:main", "domain:delivery"].includes(body.params?.identity);
   } catch { return false; }
 }
@@ -722,7 +722,7 @@ async function readingIntent(host) {
     result.toolSeed = toolSeed;
     const awaySource = "Delivery reviewer is checking the independent image branch.";
     await fixture.control("model", { source: awaySource, delay_ms: 0, chunk_chars: 4096 });
-    const away = await rpc(fixture.baseUrl, "mobkit/console/send", { identity: "domain:delivery", content: "Review the image branch independently.",
+    const away = await rpc(fixture.baseUrl, "meta/console/send", { identity: "domain:delivery", content: "Review the image branch independently.",
       origin: "console:reading-intent", origin_kind: "operator", idempotency_key: "reading-away" });
     assert(away.body.result?.interaction_id, JSON.stringify(away));
     await eventually(async () => {
@@ -926,7 +926,7 @@ async function uploadDiagram(fixture, bytes, instruction) {
   const uploadId = `presentation-${randomUUID()}`;
   const form = new FormData();
   form.append(`file:${uploadId}`, new Blob([bytes], { type: "image/png" }), "presentation-diagram.png");
-  form.append("payload", JSON.stringify({ jsonrpc: "2.0", id: uploadId, method: "mobkit/console/send", params: {
+  form.append("payload", JSON.stringify({ jsonrpc: "2.0", id: uploadId, method: "meta/console/send", params: {
     identity: "router:main", origin: "console:presentation-geometry", origin_kind: "operator", idempotency_key: uploadId,
     content: [{ type: "text", text: instruction }, { type: "image_upload", upload_id: uploadId, media_type: "image/png", alt: "Presentation dependency diagram" }],
   } }));
@@ -949,7 +949,7 @@ async function layoutMutations(host) {
   let releaseImage;
   try {
     // Emit real WorkGraph tool calls so the disclosure contains owner records.
-    const peer = (await rpc(fixture.baseUrl, "mobkit/cross_mob/peer_info", { member_id: "router:main" })).body.result;
+    const peer = (await rpc(fixture.baseUrl, "meta/cross_mob/peer_info", { member_id: "router:main" })).body.result;
     const parts = peer?.comms_name?.split("/");
     assert(parts?.length === 3 && parts[0] === peer.mob_id, JSON.stringify(peer));
     const runId = `layout-${randomUUID().slice(0, 8)}`;
@@ -1080,7 +1080,7 @@ async function olderHistory(host) {
       if (!item.request || !item.response) return [];
       try {
         const request = JSON.parse(item.request);
-        if (request.method !== "mobkit/console/query_timeline" || request.params?.identity !== "router:main"
+        if (request.method !== "meta/console/query_timeline" || request.params?.identity !== "router:main"
           || request.params?.mode !== "recent" || request.params?.limit !== 200) return [];
         return [{ observation: item, request, response: JSON.parse(item.response) }];
       } catch { return []; }
@@ -1264,6 +1264,6 @@ const scenarios = [
 module.exports = { scenarios, geometry: { browserErrors, initializationCancellation, settle, timeline, completed, anchorAt, measureAnchor, mountEarlyRow, readThrough, open, transcript, conversationPane, seedReadingHistory } };
 
 if (require.main === module) {
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "Use the coordinator prebuilt fixture; this lane must not run Cargo.");
+  assert(process.env.META_EXAMPLE_BIN_DIR, "Use the coordinator prebuilt fixture; this lane must not run Cargo.");
   require("../scenario-registry.cjs").runScenarios(scenarios).catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1; });
 }

@@ -1,11 +1,11 @@
 """TDD tests for provider protocols and result models (REQ-42, REQ-43c)."""
 import pytest
 
-from meerkat_mobkit.identity_first_models import (
+from meerkat_meta.identity_first_models import (
     DurableAgentSpec,
     ManagedPeerEdge,
 )
-from meerkat_mobkit.identity_first_providers import (
+from meerkat_meta.identity_first_providers import (
     AgentCustomizerProtocol,
     ContinuityFailure,
     ContinuityRecord,

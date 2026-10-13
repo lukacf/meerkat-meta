@@ -18,6 +18,7 @@ import type { ConversationViewState } from "@console-core";
 import { useConversationScrollController, type ConversationScrollControllerOptions, type ConversationViewportKey } from "./scroll-controller";
 import { ConversationEmptyState } from "./conversation-empty-state";
 import { ConversationTranscript } from "./conversation-transcript";
+import { ConversationBlobReaderProvider, type ConversationBlobReader } from "./blob-image";
 import type { MarkdownUrlPolicy } from "./conversation-markdown";
 import type { FlowRunRestoreHandler } from "./flow-run-card";
 import type { WorkGraphCardActions } from "./work-graph-card";
@@ -33,6 +34,10 @@ export type ConversationPaneProps = ConversationApprovalProps & {
   submittedRowId?: string | null;
   onRevealAnchor?: ConversationScrollControllerOptions["revealAnchor"];
   markdownUrlPolicy?: MarkdownUrlPolicy;
+  // Reads stored images with the host transport's authority (its `readBlob`).
+  // Without it, stored images keep their direct URL. Pass a stable function:
+  // a new reader restarts every stored image's read.
+  blobReader?: ConversationBlobReader;
   displayLabels?: ConversationDisplayLabels;
   header?: ConversationHeaderProps;
   Icon?: IconRenderer | null;
@@ -53,7 +58,7 @@ export type ConversationPaneProps = ConversationApprovalProps & {
   onFlowRunMessageMember?: ((memberKey: string) => void) | null;
   onFlowRunRestore?: FlowRunRestoreHandler | null;
   workGraphActions?: WorkGraphCardActions | null;
-  // The jump-to-turn rail on the pane's edge. Default true (the MobKit
+  // The jump-to-turn rail on the pane's edge. Default true (the Meta
   // console ships it); meerkat-studio opts out until it adopts the rail
   // deliberately.
   showTurnRail?: boolean;
@@ -77,6 +82,7 @@ export function ConversationPane({
   submittedRowId,
   onRevealAnchor,
   markdownUrlPolicy,
+  blobReader,
   displayLabels,
   header,
   Icon,
@@ -251,6 +257,7 @@ export function ConversationPane({
 
   return (
     <ConversationPresentationProvider labels={displayLabels} viewportKey={viewportKey} autoFold={scroll.mode === "following-end"}>
+    <ConversationBlobReaderProvider reader={blobReader}>
     <div className={clsx("cc-theme-scope", "cc-conversation-pane", header && "cc-conversation-pane--header", className)} style={{ "--cc-conversation-header-height": `${railInsets.top}px`, "--cc-conversation-footer-height": `${railInsets.bottom}px` } as CSSProperties}>
       {header ? <div ref={headerRef}><ConversationHeader {...header} /></div> : null}
       {showTurnRail ? (
@@ -367,6 +374,7 @@ export function ConversationPane({
         </div>
       ) : null}
     </div>
+    </ConversationBlobReaderProvider>
     </ConversationPresentationProvider>
   );
 }

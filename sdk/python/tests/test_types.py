@@ -1,6 +1,6 @@
 """Tests for typed return models (from_dict)."""
 import pytest
-from meerkat_mobkit.types import (
+from meerkat_meta.types import (
     AgentMemoryForgetResult,
     AgentMemoryRecallResult,
     AgentMemoryRecord,
@@ -15,6 +15,7 @@ from meerkat_mobkit.types import (
     GatingAuditEntry,
     GatingDecisionResult,
     GatingEvaluateResult,
+    GatingOrigin,
     GatingPendingEntry,
     KeepAliveConfig,
     MEMBER_STATE_ACTIVE,
@@ -163,7 +164,7 @@ class TestMobpackEditorCatalogResults:
         tools = MobpackToolsCatalogResult.from_dict({
             "schema_version": "mobpack.editor.v1",
             "runtime_backed": False,
-            "source": "mobkit/tool-config",
+            "source": "meta/tool-config",
             "authoring_provider": {"id": "standalone_authoring", "runtime_binding": "unbound"},
             "runtime_unavailable_reason": "standalone",
             "tool_catalog": [{"id": "shell"}],
@@ -177,17 +178,17 @@ class TestMobpackEditorCatalogResults:
         skills = MobpackSkillsCatalogResult.from_dict({
             "schema_version": "mobpack.editor.v1",
             "runtime_backed": False,
-            "source": "mobkit/authoring-skill-realms",
+            "source": "meta/authoring-skill-realms",
             "authoring_provider": {"id": "standalone_authoring"},
-            "skill_realms": [{"id": "mobkit/authoring"}],
+            "skill_realms": [{"id": "meta/authoring"}],
         })
         assert skills.authoring_provider["id"] == "standalone_authoring"
-        assert skills.skill_realms == [{"id": "mobkit/authoring"}]
+        assert skills.skill_realms == [{"id": "meta/authoring"}]
 
         agents = MobpackAgentDefinitionsResult.from_dict({
             "schema_version": "mobpack.editor.v1",
             "runtime_backed": False,
-            "source": "mobkit/authoring-agent-definitions",
+            "source": "meta/authoring-agent-definitions",
             "authoring_provider": {"id": "standalone_authoring"},
             "agent_definitions": [{"id": "authoring:reviewer"}],
         })
@@ -196,7 +197,7 @@ class TestMobpackEditorCatalogResults:
 
         templates = MobpackTemplatesResult.from_dict({
             "schema_version": "mobpack.editor.v1",
-            "source": "mobkit/mobpack-templates",
+            "source": "meta/mobpack-templates",
             "authoring_provider": {"id": "standalone_authoring"},
             "runtime_unavailable_reason": "standalone",
             "blank_mobpack": {"document": {}},
@@ -216,10 +217,10 @@ class TestMobpackEditorCatalogResults:
             "runtime_backed": False,
             "authoring_provider": {"id": "standalone_authoring", "runtime_binding": "unbound"},
             "runtime_unavailable_reason": "standalone",
-            "sources": {"tools": "mobkit/tools/catalog"},
+            "sources": {"tools": "meta/tools/catalog"},
             "templates": {},
             "tool_catalog": [{"id": "shell"}],
-            "skill_realms": [{"id": "mobkit/authoring"}],
+            "skill_realms": [{"id": "meta/authoring"}],
             "blank_mobpack": {"document": {}},
             "sample_mobpacks": [{"id": "sample"}],
             "agent_definitions": [{"id": "authoring:reviewer"}],
@@ -239,7 +240,7 @@ class TestMobpackEditorCatalogResults:
         })
         assert catalogs.authoring_provider["runtime_binding"] == "unbound"
         assert catalogs.runtime_unavailable_reason == "standalone"
-        assert catalogs.sources == {"tools": "mobkit/tools/catalog"}
+        assert catalogs.sources == {"tools": "meta/tools/catalog"}
         assert catalogs.tool_catalog == [{"id": "shell"}]
         assert catalogs.models[0].display_name == "GPT-5"
         assert catalogs.provider_defaults[0].default_model_id == "gpt-5"
@@ -264,7 +265,7 @@ class TestMobpackAuthoringResults:
             }],
             "mob_id": "demo",
             "flow_ids": ["flow_a"],
-            "validation_source": "mobkit/mobpacks/validate",
+            "validation_source": "meta/mobpacks/validate",
             "deploy_command": "rkat mob deploy",
         })
         assert validation.ok is False
@@ -299,7 +300,7 @@ class TestMobpackAuthoringResults:
                 "text": "[mob]\n",
             }],
             "validation": {"ok": True},
-            "source": "mobkit/mobpacks/source",
+            "source": "meta/mobpacks/source",
         })
         assert source.filename == "demo.mobpack"
         assert source.source_files[0].path == "mob.toml"
@@ -322,12 +323,12 @@ class TestMobpackAuthoringResults:
         imported = MobpackImportResult.from_dict({
             "document": {"mob_id": "demo"},
             "validation": {"ok": True},
-            "source": "mobkit/mobpacks/import:archive",
+            "source": "meta/mobpacks/import:archive",
             "source_label": "demo.mobpack",
             "source_media_type": "application/vnd.meerkat.mobpack",
         })
         assert imported.document == {"mob_id": "demo"}
-        assert imported.source == "mobkit/mobpacks/import:archive"
+        assert imported.source == "meta/mobpacks/import:archive"
         assert imported.source_label == "demo.mobpack"
 
     def test_draft_row_and_registry_results_from_dict(self):
@@ -336,8 +337,8 @@ class TestMobpackAuthoringResults:
             "name": "Demo",
             "version": "mobpack.editor.v1",
             "stage": "draft",
-            "trigger": "MobKit authoring draft",
-            "source": "mobkit/mobpacks/create",
+            "trigger": "Meta authoring draft",
+            "source": "meta/mobpacks/create",
             "revision": 3,
             "etag": "f_demo:3",
             "updated_at_unix_ms": 1700000000000,
@@ -361,7 +362,7 @@ class TestMobpackAuthoringResults:
         assert bare_row.can_redo is None
 
         listed = MobpackDraftListResult.from_dict({
-            "source": "mobkit/mobpacks/list",
+            "source": "meta/mobpacks/list",
             "store_path": "/tmp/drafts.json",
             "runtime_backed": True,
             "rows": [row_payload],
@@ -371,7 +372,7 @@ class TestMobpackAuthoringResults:
         assert listed.rows[0].id == "f_demo"
 
         got = MobpackDraftGetResult.from_dict({
-            "source": "mobkit/mobpacks/get",
+            "source": "meta/mobpacks/get",
             "runtime_backed": True,
             "row": row_payload,
         })
@@ -379,7 +380,7 @@ class TestMobpackAuthoringResults:
         assert got.row.revision == 3
 
         saved = MobpackDraftSaveResult.from_dict({
-            "source": "mobkit/mobpacks/save",
+            "source": "meta/mobpacks/save",
             "store_path": "/tmp/drafts.json",
             "row": row_payload,
             "rows": [row_payload],
@@ -388,7 +389,7 @@ class TestMobpackAuthoringResults:
         assert len(saved.rows) == 1
 
         deleted = MobpackDraftDeleteResult.from_dict({
-            "source": "mobkit/mobpacks/delete",
+            "source": "meta/mobpacks/delete",
             "store_path": "/tmp/drafts.json",
             "id": "f_demo",
             "deleted": True,
@@ -411,13 +412,13 @@ class TestMobpackAuthoringResults:
             "can_redo": True,
         }
         stepped = MobpackDraftHistoryResult.from_dict({
-            "source": "mobkit/mobpacks/undo",
+            "source": "meta/mobpacks/undo",
             "store_path": "/tmp/drafts.json",
             "stepped": True,
             "row": row_payload,
             "rows": [row_payload],
         })
-        assert stepped.source == "mobkit/mobpacks/undo"
+        assert stepped.source == "meta/mobpacks/undo"
         assert stepped.store_path == "/tmp/drafts.json"
         assert stepped.stepped is True
         assert stepped.reason is None
@@ -427,7 +428,7 @@ class TestMobpackAuthoringResults:
         assert stepped.rows[0].id == "f_demo"
 
         blocked = MobpackDraftHistoryResult.from_dict({
-            "source": "mobkit/mobpacks/redo",
+            "source": "meta/mobpacks/redo",
             "store_path": "/tmp/drafts.json",
             "stepped": False,
             "reason": "nothing to redo",
@@ -440,7 +441,7 @@ class TestMobpackAuthoringResults:
 
     def test_apply_operation_result_from_dict(self):
         applied = MobpackApplyOperationResult.from_dict({
-            "source": "mobkit/mobpacks/apply_operation",
+            "source": "meta/mobpacks/apply_operation",
             "operation": "add_member",
             "ok": True,
             "document": {"mob_id": "demo", "members": [{"id": "reviewer"}]},
@@ -454,7 +455,7 @@ class TestMobpackAuthoringResults:
 
     def test_apply_operation_result_null_selection(self):
         applied = MobpackApplyOperationResult.from_dict({
-            "source": "mobkit/mobpacks/apply_operation",
+            "source": "meta/mobpacks/apply_operation",
             "operation": "delete_member",
             "ok": True,
             "document": {"mob_id": "demo"},
@@ -470,7 +471,7 @@ class TestMobpackAuthoringResults:
             "deploy_command": "rkat mob deploy",
             "filename": "demo.mobpack",
             "validation": {"ok": True},
-            "source": "meerkat_mobkit::mobpack::deploy_argv",
+            "source": "meerkat_meta::mobpack::deploy_argv",
         })
         assert preview.command == "rkat mob deploy demo.mobpack"
         assert preview.argv == ["rkat", "mob", "deploy", "demo.mobpack"]
@@ -652,7 +653,7 @@ class TestToolCaller:
     async def test_call_unwraps_result(self):
         """ToolCaller.__call__ should unwrap CallToolResult.result."""
         from unittest.mock import AsyncMock
-        from meerkat_mobkit.runtime import ToolCaller
+        from meerkat_meta.runtime import ToolCaller
 
         mock_handle = AsyncMock()
         mock_handle.call_tool.return_value = CallToolResult.from_dict({
@@ -671,7 +672,7 @@ class TestToolCaller:
 
     def test_tool_caller_stores_module_id(self):
         from unittest.mock import AsyncMock
-        from meerkat_mobkit.runtime import ToolCaller, MobHandle
+        from meerkat_meta.runtime import ToolCaller, MobHandle
         mock_handle = AsyncMock(spec=MobHandle)
         caller = ToolCaller(mock_handle, "my-module")
         assert caller._module_id == "my-module"
@@ -680,7 +681,7 @@ class TestToolCaller:
     @pytest.mark.asyncio
     async def test_call_propagates_errors(self):
         from unittest.mock import AsyncMock
-        from meerkat_mobkit.runtime import ToolCaller
+        from meerkat_meta.runtime import ToolCaller
 
         mock_handle = AsyncMock()
         mock_handle.call_tool.side_effect = RuntimeError("module not loaded")
@@ -761,6 +762,64 @@ class TestGatingDecisionResult:
         assert r.pending_id == "p1"
         assert r.action_id == "a1"
         assert r.decision == "approve"
+        assert r.approver_id is None
+        assert r.outcome is None
+        assert r.decided_at_ms is None
+        assert r.reason is None
+        assert r.next_pending_id is None
+
+    def test_original_positional_construction_remains_valid(self):
+        result = GatingDecisionResult("p1", "a1", "approve")
+        assert result == GatingDecisionResult.from_dict(
+            {"pending_id": "p1", "action_id": "a1", "decision": "approve"}
+        )
+        assert result.outcome is None
+
+    @pytest.mark.parametrize(
+        ("decision", "outcome", "next_pending_id"),
+        [
+            ("approve", "allowed", None),
+            ("reject", "safe_draft", None),
+            ("escalate", "pending_approval", "gate-pending-000002"),
+        ],
+    )
+    def test_preserves_runtime_decision_wire_shape(
+        self, decision, outcome, next_pending_id
+    ):
+        result = GatingDecisionResult.from_dict(
+            {
+                "pending_id": "gate-pending-000001",
+                "action_id": "gate-action-000001",
+                "approver_id": "human-reviewer",
+                "decision": decision,
+                "outcome": outcome,
+                "decided_at_ms": 1720000000123,
+                "reason": "Recorded human decision",
+                "next_pending_id": next_pending_id,
+            }
+        )
+        assert result.pending_id == "gate-pending-000001"
+        assert result.action_id == "gate-action-000001"
+        assert result.approver_id == "human-reviewer"
+        assert result.decision == decision
+        assert result.outcome == outcome
+        assert result.decided_at_ms == 1720000000123
+        assert result.reason == "Recorded human decision"
+        assert result.next_pending_id == next_pending_id
+
+    @pytest.mark.parametrize("outcome", [None, "future_outcome"])
+    def test_unknown_outcome_is_not_inferred_from_approval(self, outcome):
+        result = GatingDecisionResult.from_dict(
+            {
+                "pending_id": "p1",
+                "action_id": "a1",
+                "decision": "approve",
+                "outcome": outcome,
+                "reason": None,
+            }
+        )
+        assert result.outcome == outcome
+        assert result.reason is None
 
 
 class TestGatingAuditEntry:
@@ -783,9 +842,114 @@ class TestGatingAuditEntry:
         assert r.actor_id == "bot-1"
         assert r.risk_tier == "r0"
         assert r.outcome == "allowed"
+        assert r.pending_id is None
+        assert r.detail == {}
+
+    def test_preserves_pending_id_and_owner_detail(self):
+        detail = {
+            "approver_id": "human:reviewer",
+            "decision": "approve",
+            "next_pending_id": None,
+            "origin": {"identity": "agent:writer"},
+        }
+        r = GatingAuditEntry.from_dict(
+            {
+                "audit_id": "au2",
+                "timestamp_ms": 2000,
+                "event_type": "approval_decided",
+                "action_id": "a1",
+                "pending_id": "p1",
+                "actor_id": "agent:writer",
+                "risk_tier": "r3",
+                "outcome": "allowed",
+                "detail": detail,
+            }
+        )
+        assert r.pending_id == "p1"
+        assert r.detail == detail
+        assert r.detail is not detail
+
+    @pytest.mark.parametrize("pending_id", [None, "", " ", 7, {}])
+    @pytest.mark.parametrize("detail", [None, "text", [1], 3])
+    def test_malformed_pending_id_and_detail_stay_unknown(self, pending_id, detail):
+        r = GatingAuditEntry.from_dict({"pending_id": pending_id, "detail": detail})
+        assert r.pending_id is None
+        assert r.detail == {}
+
+    def test_original_positional_construction_remains_valid(self):
+        r = GatingAuditEntry("au1", 1000, "evaluate", "a1", "bot-1", "r0", "allowed")
+        assert r.pending_id is None
+        assert r.detail == {}
 
 
 class TestGatingPendingEntry:
+    def test_preserves_origin(self):
+        r = GatingPendingEntry.from_dict({
+            "pending_id": "p1", "action_id": "a1", "action": "publish",
+            "actor_id": "agent:writer", "risk_tier": "r3", "created_at_ms": 5000,
+            "origin": {
+                "identity": "person:alice",
+                "conversation_id": "conv-1",
+                "interaction_id": "int-1",
+            },
+        })
+        assert r.origin == GatingOrigin("person:alice", "conv-1", "int-1")
+        partial = GatingPendingEntry.from_dict({
+            "pending_id": "p1", "action_id": "a1", "action": "publish",
+            "actor_id": "agent:writer", "origin": {"identity": "person:alice"},
+        })
+        assert partial.origin == GatingOrigin("person:alice")
+
+    @pytest.mark.parametrize(
+        "origin",
+        [None, "person:alice", [], {}, {"identity": ""}, {"identity": 3},
+         {"conversation_id": "conv-1"}],
+    )
+    def test_absent_or_malformed_origin_stays_unknown(self, origin):
+        r = GatingPendingEntry.from_dict({
+            "pending_id": "p1", "action_id": "a1", "action": "publish",
+            "actor_id": "agent:writer", "origin": origin,
+        })
+        assert r.origin is None
+
+    def test_preserves_owner_routing_and_deadline(self):
+        r = GatingPendingEntry.from_dict({
+            "pending_id": "p1", "action_id": "a1", "action": "publish",
+            "actor_id": "agent:writer", "risk_tier": "r3", "created_at_ms": 5000,
+            "requested_approver": "human:reviewer", "approval_recipient": "review-queue",
+            "approval_channel": "notification", "approval_route_id": "route:1",
+            "approval_delivery_id": "delivery:1", "deadline_at_ms": 65000,
+            "rationale": "Requested publication",
+        })
+        assert r.actor_id == "agent:writer"
+        assert r.requested_approver == "human:reviewer"
+        assert r.approval_recipient == "review-queue"
+        assert r.approval_channel == "notification"
+        assert r.approval_route_id == "route:1"
+        assert r.approval_delivery_id == "delivery:1"
+        assert r.deadline_at_ms == 65000
+        assert r.rationale == "Requested publication"
+
+    def test_absent_or_malformed_optional_routing_stays_unknown(self):
+        base = {"pending_id": "p1", "action_id": "a1", "action": "publish", "actor_id": "actor"}
+        for extra in ({}, {
+            "requested_approver": 7, "approval_recipient": {}, "approval_channel": " ",
+            "approval_route_id": False, "approval_delivery_id": [],
+            "deadline_at_ms": "60000", "rationale": False,
+        }):
+            r = GatingPendingEntry.from_dict({**base, **extra})
+            assert r.requested_approver is None
+            assert r.approval_recipient is None
+            assert r.approval_channel is None
+            assert r.approval_route_id is None
+            assert r.approval_delivery_id is None
+            assert r.deadline_at_ms is None
+            assert r.rationale is None
+        for value in (-1, float("nan"), float("inf"), True, 1.5):
+            assert GatingPendingEntry.from_dict({**base, "deadline_at_ms": value}).deadline_at_ms is None
+        # Existing callers can still construct the six-field model positionally.
+        assert GatingPendingEntry("p1", "a1", "publish", "actor", None, 0).deadline_at_ms is None
+
     def test_from_dict(self):
         r = GatingPendingEntry.from_dict(
             {
@@ -1220,7 +1384,7 @@ class TestErrorEvent:
             assert event.is_resolution is expected, category
 
     # The full set is gated against the Rust `ErrorEvent` enum by
-    # crates/meerkat-mobkit/tests/sdk_error_category_parity.rs; this asserts the exact
+    # crates/meerkat-meta/tests/sdk_error_category_parity.rs; this asserts the exact
     # tags so a rename here cannot pass by editing both sides of that gate.
     def test_error_category_members_match_expected_values(self):
         assert {member.name: member.value for member in ErrorCategory} == {

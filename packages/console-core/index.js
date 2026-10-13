@@ -190,13 +190,6 @@ function normalizeProjectDisplayLabel(value) {
   if (!text) {
     return "";
   }
-  const lower = text.toLowerCase();
-  if (lower === "hsns" || lower === "hsns_clean") {
-    return "HSNS";
-  }
-  if (lower === "homecore") {
-    return "HomeCore";
-  }
   return text
     .split(/[\s_-]+/u)
     .filter(Boolean)
@@ -277,7 +270,7 @@ function normalizePeerSteeringPrompt(text) {
       ? `Requested an acknowledgement from ${projectLabel} thread.`
       : `Sent a peer message to ${projectLabel} thread.`;
   }
-  const standalonePeerInstruction = source.match(/^Use your MobKit peer tools only\b[\s\S]*?\bto the peered\s+(.+?)\s+thread\b/i);
+  const standalonePeerInstruction = source.match(/^Use your Meta peer tools only\b[\s\S]*?\bto the peered\s+(.+?)\s+thread\b/i);
   if (standalonePeerInstruction) {
     const projectLabel = normalizeProjectDisplayLabel(standalonePeerInstruction[1]) || standalonePeerInstruction[1].trim();
     const peerLabel = `${projectLabel} thread`;
@@ -289,14 +282,14 @@ function normalizePeerSteeringPrompt(text) {
     }
     return `Sent a peer message to ${peerLabel}.`;
   }
-  if (/^Use your MobKit peer tools only\b/i.test(source)) {
+  if (/^Use your Meta peer tools only\b/i.test(source)) {
     return "";
   }
   const legacyTrustedPeerInstruction = /\bFind your trusted peer\b[\s\S]*?\bsend_message\b[\s\S]*?\bhandling_mode\b/i.test(source);
   const connectedMatch = source.match(
-    /^Connected to\s+(.+?)\.\s+(?:Each thread keeps its own transcript and can message the other through MobKit|Each thread keeps its own transcript\. They can now message each other)\./is,
+    /^Connected to\s+(.+?)\.\s+(?:Each thread keeps its own transcript and can message the other through Meta|Each thread keeps its own transcript\. They can now message each other)\./is,
   );
-  if (connectedMatch && (/\bUse your MobKit peer tools only\b/i.test(source) || legacyTrustedPeerInstruction)) {
+  if (connectedMatch && (/\bUse your Meta peer tools only\b/i.test(source) || legacyTrustedPeerInstruction)) {
     const peerLabel = normalizeConversationDisplayLabel(connectedMatch[1]) || connectedMatch[1].trim();
     if (legacyTrustedPeerInstruction) {
       const action = /\bplease reply\b/i.test(source)

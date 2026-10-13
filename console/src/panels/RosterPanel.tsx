@@ -7,7 +7,7 @@ interface RosterPanelProps {
   onSelect: (agent: ConsoleAgent) => void;
   onChat: (agent: ConsoleAgent) => void;
   onDetails: (agent: ConsoleAgent) => void;
-  onLifecycle: (identity: string, method: "mobkit/retire" | "mobkit/respawn" | "mobkit/reset") => void;
+  onLifecycle: (identity: string, method: "meta/retire" | "meta/respawn" | "meta/reset") => void;
   canResetLifecycle?: boolean;
   actionLabels?: {
     chat?: string;
@@ -195,13 +195,13 @@ export function RosterPanel({
                 {actionVisibility?.inspect !== false ? <button onClick={() => onDetails(active)}>{actionLabels?.inspect || "Details"}</button> : null}
                 {actionVisibility?.chat !== false ? <button onClick={() => onChat(active)}>{actionLabels?.chat || "Open chat"}</button> : null}
                 {actionVisibility?.respawn !== false && active.affordances?.can_respawn ? (
-                  <button onClick={() => onLifecycle(activeIdentity, "mobkit/respawn")}>{actionLabels?.respawn || "Respawn"}</button>
+                  <button onClick={() => onLifecycle(activeIdentity, "meta/respawn")}>{actionLabels?.respawn || "Respawn"}</button>
                 ) : null}
                 {actionVisibility?.reset !== false && canResetLifecycle ? (
-                  <button onClick={() => onLifecycle(activeIdentity, "mobkit/reset")}>{actionLabels?.reset || "Reset"}</button>
+                  <button onClick={() => onLifecycle(activeIdentity, "meta/reset")}>{actionLabels?.reset || "Reset"}</button>
                 ) : null}
                 {actionVisibility?.retire !== false && active.affordances?.can_retire ? (
-                  <button className="danger" onClick={() => onLifecycle(activeIdentity, "mobkit/retire")}>{actionLabels?.retire || "Retire"}</button>
+                  <button className="danger" onClick={() => onLifecycle(activeIdentity, "meta/retire")}>{actionLabels?.retire || "Retire"}</button>
                 ) : null}
               </div>
             </>

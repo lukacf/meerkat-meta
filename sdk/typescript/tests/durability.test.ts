@@ -2,7 +2,7 @@
  * Tests for the M5 storage durability vocabulary: the typed config blocks
  * (`runtimeStore` / `eventLog`), their exact `runtime_options` wire forms,
  * the typed storage census model (`StorageSummary` / `StorageSlotSummary`)
- * parsed from `mobkit/status` / `mobkit/capabilities`, and the
+ * parsed from `meta/status` / `meta/capabilities`, and the
  * `StorageResolutionError` (-32014) reification for the gateway's
  * fail-closed init refusals.
  */
@@ -11,12 +11,12 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  MobKit,
-  MobKitRuntime,
+  Meta,
+  MetaRuntime,
   STORAGE_RESOLUTION_CODE,
   StorageResolutionError,
   RpcError,
-  MobKitError,
+  MetaError,
   eventLog,
   runtimeStore,
   isRpcError,
@@ -58,9 +58,22 @@ const CENSUS_WIRE = {
 
 function initParams(builder: unknown): Record<string, any> {
   const config = (builder as { _config: unknown })._config;
-  const rt = new MobKitRuntime(config as ConstructorParameters<typeof MobKitRuntime>[0]);
+  const rt = new MetaRuntime(config as ConstructorParameters<typeof MetaRuntime>[0]);
   return (rt as any)._buildInitParams();
 }
+
+describe("prepared application carrier", () => {
+  it("is sent as prepared_application, never as mob_config", () => {
+    const params = initParams(
+      Meta.builder().preparedApplication(new Uint8Array([0, 112, 255]), "sha256:abc"),
+    );
+    assert.deepEqual(params.prepared_application, {
+      bundle_base64: "AHD/",
+      digest: "sha256:abc",
+    });
+    assert.equal(params.mob_config, undefined);
+  });
+});
 
 describe("runtimeStore config", () => {
   it("memory() produces the exact wire form", () => {
@@ -68,7 +81,7 @@ describe("runtimeStore config", () => {
   });
 
   it("builder emits runtime_options.runtime_store", () => {
-    const b = MobKit.builder().runtimeStore(runtimeStore.memory());
+    const b = Meta.builder().runtimeStore(runtimeStore.memory());
     const params = initParams(b);
     assert.deepEqual(params.runtime_options.runtime_store, {
       storage: "memory",
@@ -76,7 +89,7 @@ describe("runtimeStore config", () => {
   });
 
   it("builder accepts the raw wire dict", () => {
-    const b = MobKit.builder().runtimeStore({ storage: "memory" });
+    const b = Meta.builder().runtimeStore({ storage: "memory" });
     const params = initParams(b);
     assert.deepEqual(params.runtime_options.runtime_store, {
       storage: "memory",
@@ -84,7 +97,7 @@ describe("runtimeStore config", () => {
   });
 
   it("is omitted by default", () => {
-    const params = initParams(MobKit.builder());
+    const params = initParams(Meta.builder());
     assert.equal("runtime_store" in params.runtime_options, false);
   });
 });
@@ -121,13 +134,13 @@ describe("eventLog config", () => {
   });
 
   it("builder accepts the typed declaration", () => {
-    const b = MobKit.builder().eventLog(eventLog.nullStore());
+    const b = Meta.builder().eventLog(eventLog.nullStore());
     const params = initParams(b);
     assert.deepEqual(params.runtime_options.event_log, { storage: "null" });
   });
 
   it("builder keeps the legacy raw form working", () => {
-    const b = MobKit.builder().eventLog({ storage: "memory", batch_size: 2 });
+    const b = Meta.builder().eventLog({ storage: "memory", batch_size: 2 });
     const params = initParams(b);
     assert.deepEqual(params.runtime_options.event_log, {
       storage: "memory",
@@ -211,7 +224,7 @@ describe("storage census model", () => {
   it("rides CapabilitiesResult when present", () => {
     const capabilities = parseCapabilitiesResult({
       contract_version: "0.5.0",
-      methods: ["mobkit/status"],
+      methods: ["meta/status"],
       loaded_modules: [],
       storage: CENSUS_WIRE,
     });
@@ -223,13 +236,13 @@ describe("storage census model", () => {
 describe("StorageResolutionError", () => {
   it("is a typed RpcError with the pinned code", () => {
     const err = new StorageResolutionError(
-      "file-name twins for the sessions store: run the storage doctor (mobkit/storage/doctor)",
+      "file-name twins for the sessions store: run the storage doctor (meta/storage/doctor)",
       "init:1",
-      "mobkit/init",
+      "meta/init",
     );
     assert.ok(err instanceof StorageResolutionError);
     assert.ok(err instanceof RpcError);
-    assert.ok(err instanceof MobKitError);
+    assert.ok(err instanceof MetaError);
     assert.equal(err.code, STORAGE_RESOLUTION_CODE);
     assert.equal(STORAGE_RESOLUTION_CODE, -32014);
     assert.equal(err.name, "StorageResolutionError");

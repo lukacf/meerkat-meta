@@ -1,36 +1,51 @@
 /**
- * Tests for MobKitBuilder configuration chain.
+ * Tests for MetaBuilder configuration chain.
  */
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { MobKit, MobKitBuilder } from "../dist/index.js";
+import { Meta, MetaBuilder } from "../dist/index.js";
 
-describe("MobKit.builder()", () => {
-  it("returns a MobKitBuilder instance", () => {
-    const builder = MobKit.builder();
-    assert.ok(builder instanceof MobKitBuilder);
+describe("Meta.builder()", () => {
+  it("returns a MetaBuilder instance", () => {
+    const builder = Meta.builder();
+    assert.ok(builder instanceof MetaBuilder);
   });
 });
 
-describe("MobKitBuilder chainable methods", () => {
+describe("MetaBuilder chainable methods", () => {
   it("mob() sets mobConfigPath and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.mob("config/mob.toml");
     assert.equal(result, builder);
     assert.equal(builder._config.mobConfigPath, "config/mob.toml");
   });
 
+  it("preparedApplication() carries the bytes opaquely", () => {
+    const builder = Meta.builder();
+    const bundle = new Uint8Array([0, 1, 2, 255]);
+    const result = builder.preparedApplication(bundle, "sha256:abc");
+    assert.equal(result, builder);
+    assert.deepEqual(builder._config.preparedApplication, {
+      bundle: new Uint8Array([0, 1, 2, 255]),
+      digest: "sha256:abc",
+    });
+    assert.throws(() => Meta.builder().preparedApplication(bundle, ""));
+  });
+
   it("gateway() sets gatewayBin and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.gateway("/usr/bin/gateway");
     assert.equal(result, builder);
     assert.equal(builder._config.gatewayBin, "/usr/bin/gateway");
   });
 
   it("sessionService() sets sessionBuilder and sessionStore", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const mockBuilder = { buildAgent: async () => {} };
     const mockStore = { type: "json" };
     const result = builder.sessionService(mockBuilder, mockStore);
@@ -40,7 +55,7 @@ describe("MobKitBuilder chainable methods", () => {
   });
 
   it("sessionService() defaults store to null", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const mockBuilder = { buildAgent: async () => {} };
     builder.sessionService(mockBuilder);
     assert.equal(builder._config.sessionBuilder, mockBuilder);
@@ -48,7 +63,7 @@ describe("MobKitBuilder chainable methods", () => {
   });
 
   it("onError() sets errorCallback and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const cb = () => {};
     const result = builder.onError(cb);
     assert.equal(result, builder);
@@ -56,7 +71,7 @@ describe("MobKitBuilder chainable methods", () => {
   });
 
   it("eventLog() sets eventLog config and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const opts = { storage: "file", path: "/tmp/events.log" };
     const result = builder.eventLog(opts);
     assert.equal(result, builder);
@@ -67,28 +82,36 @@ describe("MobKitBuilder chainable methods", () => {
   });
 
   it("gating() sets gatingConfigPath and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.gating("config/gating.toml");
     assert.equal(result, builder);
     assert.equal(builder._config.gatingConfigPath, "config/gating.toml");
   });
 
+  it("gating() rejects an explicit empty path", () => {
+    assert.throws(() => Meta.builder().gating(""), /non-empty/);
+  });
+
   it("consoleConfig() sets consoleConfigPath and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.consoleConfig("config/console.toml");
     assert.equal(result, builder);
     assert.equal(builder._config.consoleConfigPath, "config/console.toml");
   });
 
   it("accessControl() sets accessConfigPath and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.accessControl("config/access.toml");
     assert.equal(result, builder);
     assert.equal(builder._config.accessConfigPath, "config/access.toml");
   });
 
+  it("accessControl() rejects an explicit empty path", () => {
+    assert.throws(() => Meta.builder().accessControl(""), /non-empty/);
+  });
+
   it("meerkatConfig() sets meerkatConfigPath and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.meerkatConfig(".rkat/config.toml");
     assert.equal(result, builder);
     assert.equal(builder._config.meerkatConfigPath, ".rkat/config.toml");
@@ -96,13 +119,13 @@ describe("MobKitBuilder chainable methods", () => {
 
   it("meerkatConfig() rejects an empty path", () => {
     assert.throws(
-      () => MobKit.builder().meerkatConfig("  "),
+      () => Meta.builder().meerkatConfig("  "),
       /meerkatConfig path must not be empty/,
     );
   });
 
   it("httpListen() trims, sets httpListen and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.httpListen(" 0.0.0.0:8080 ");
     assert.equal(result, builder);
     assert.equal(builder._config.httpListen, "0.0.0.0:8080");
@@ -110,39 +133,39 @@ describe("MobKitBuilder chainable methods", () => {
 
   it("httpListen() rejects an empty address", () => {
     assert.throws(
-      () => MobKit.builder().httpListen("  "),
+      () => Meta.builder().httpListen("  "),
       /httpListen address must not be empty/,
     );
   });
 
   it("httpPublicBaseUrl() sets httpPublicBaseUrl and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.httpPublicBaseUrl("https://mob.example.com");
     assert.equal(result, builder);
     assert.equal(builder._config.httpPublicBaseUrl, "https://mob.example.com");
   });
 
   it("allowRemote() defaults to true and accepts an explicit false", () => {
-    assert.equal(MobKit.builder().allowRemote()._config.allowRemote, true);
-    assert.equal(MobKit.builder().allowRemote(false)._config.allowRemote, false);
+    assert.equal(Meta.builder().allowRemote()._config.allowRemote, true);
+    assert.equal(Meta.builder().allowRemote(false)._config.allowRemote, false);
   });
 
   it("consoleAuthRequired() sets consoleRequireAppAuth and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.consoleAuthRequired(false);
     assert.equal(result, builder);
     assert.equal(builder._config.consoleRequireAppAuth, false);
   });
 
   it("consoleReadOnly() sets consoleReadOnly and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.consoleReadOnly();
     assert.equal(result, builder);
     assert.equal(builder._config.consoleReadOnly, true);
   });
 
   it("consoleFetchTimeoutMs() sets consoleFetchTimeoutMs and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.consoleFetchTimeoutMs(120_000);
     assert.equal(result, builder);
     assert.equal(builder._config.consoleFetchTimeoutMs, 120_000);
@@ -150,26 +173,26 @@ describe("MobKitBuilder chainable methods", () => {
 
   it("consoleFetchTimeoutMs() rejects invalid timeouts", () => {
     assert.throws(
-      () => MobKit.builder().consoleFetchTimeoutMs(0),
+      () => Meta.builder().consoleFetchTimeoutMs(0),
       /consoleFetchTimeoutMs must be a positive integer/,
     );
   });
 
   it("demoLlm() enables deterministic gateway LLM mode and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.demoLlm();
     assert.equal(result, builder);
     assert.equal(builder._config.demoLlm, true);
   });
 
   it("demoLlm(false) disables deterministic gateway LLM mode", () => {
-    const builder = MobKit.builder().demoLlm();
+    const builder = Meta.builder().demoLlm();
     builder.demoLlm(false);
     assert.equal(builder._config.demoLlm, false);
   });
 
   it("memberCommsTcp() configures cross-process peer replies", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.memberCommsTcp();
     assert.equal(result, builder);
     assert.equal(builder._config.memberCommsAddress, "127.0.0.1:0");
@@ -179,19 +202,19 @@ describe("MobKitBuilder chainable methods", () => {
   });
 
   it("maxSessions() sets maxSessions and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.maxSessions(320);
     assert.equal(result, builder);
     assert.equal(builder._config.maxSessions, 320);
   });
 
   it("maxSessions() rejects invalid capacities", () => {
-    assert.throws(() => MobKit.builder().maxSessions(0), /positive integer/);
-    assert.throws(() => MobKit.builder().maxSessions(1.5), /positive integer/);
+    assert.throws(() => Meta.builder().maxSessions(0), /positive integer/);
+    assert.throws(() => Meta.builder().maxSessions(1.5), /positive integer/);
   });
 
   it("gatewayTimeoutMs() sets gatewayTimeoutMs and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.gatewayTimeoutMs(300_000);
     assert.equal(result, builder);
     assert.equal(builder._config.gatewayTimeoutMs, 300_000);
@@ -199,45 +222,45 @@ describe("MobKitBuilder chainable methods", () => {
 
   it("gatewayTimeoutMs() rejects invalid timeouts", () => {
     assert.throws(
-      () => MobKit.builder().gatewayTimeoutMs(0),
+      () => Meta.builder().gatewayTimeoutMs(0),
       /positive integer/,
     );
     assert.throws(
-      () => MobKit.builder().gatewayTimeoutMs(1.5),
+      () => Meta.builder().gatewayTimeoutMs(1.5),
       /positive integer/,
     );
   });
 
   it("routing() sets routingConfigPath and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.routing("deployment/routing.toml");
     assert.equal(result, builder);
     assert.equal(builder._config.routingConfigPath, "deployment/routing.toml");
   });
 
   it("workgraph() defaults to enabled=true and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.workgraph();
     assert.equal(result, builder);
     assert.equal(builder._config.workgraphEnabled, true);
   });
 
   it("workgraph(false) disables WorkGraph construction", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     builder.workgraph(false);
     assert.equal(builder._config.workgraphEnabled, false);
   });
 
   it("memory() sets memoryConfig with config object and returns this", () => {
-    const builder = MobKit.builder();
-    const cfg = { engine: "elephant" };
+    const builder = Meta.builder();
+    const cfg = { backend: "local_json" };
     const result = builder.memory(cfg);
     assert.equal(result, builder);
-    assert.deepEqual(builder._config.memoryConfig, { engine: "elephant" });
+    assert.deepEqual(builder._config.memoryConfig, { backend: "local_json" });
   });
 
   it("memory() rejects options.stores without a Rust gateway config", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     assert.throws(
       () => builder.memory(undefined, { stores: ["main", "archive"] }),
       /not supported by the Rust gateway/,
@@ -245,13 +268,13 @@ describe("MobKitBuilder chainable methods", () => {
   });
 
   it("memory() defaults to null when called with no args", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     builder.memory();
     assert.equal(builder._config.memoryConfig, null);
   });
 
   it("auth() sets authConfig and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const cfg = { provider: "google" };
     const result = builder.auth(cfg);
     assert.equal(result, builder);
@@ -259,25 +282,25 @@ describe("MobKitBuilder chainable methods", () => {
   });
 
   it("implicitDelegateIdleRetirement() sets seconds and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.implicitDelegateIdleRetirement(30);
     assert.equal(result, builder);
     assert.equal(builder._config.implicitDelegateIdleRetireSecs, 30);
   });
 
   it("implicitDelegateIdleRetirement() accepts null to disable", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     builder.implicitDelegateIdleRetirement(null);
     assert.equal(builder._config.implicitDelegateIdleRetireSecs, null);
   });
 
   it("implicitDelegateIdleRetirement() rejects negative seconds", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     assert.throws(() => builder.implicitDelegateIdleRetirement(-1));
   });
 
   it("modules() sets modules array and returns this", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const specs = [{ id: "mod-a", command: "cmd" }];
     const result = builder.modules(specs);
     assert.equal(result, builder);
@@ -285,9 +308,9 @@ describe("MobKitBuilder chainable methods", () => {
   });
 });
 
-describe("MobKitBuilder default config", () => {
+describe("MetaBuilder default config", () => {
   it("has null/empty defaults for all fields", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const cfg = builder._config;
     assert.equal(cfg.mobConfigPath, null);
     assert.equal(cfg.sessionBuilder, null);
@@ -317,18 +340,18 @@ describe("MobKitBuilder default config", () => {
   });
 });
 
-describe("MobKitBuilder convention defaults", () => {
+describe("MetaBuilder convention defaults", () => {
   it("does not set gating if file does not exist", () => {
     // Convention defaults look for config/gating.toml — which won't
     // exist in the test environment, so gatingConfigPath stays null.
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     // Manually call the private method via build path check
     // We can test by checking the config before build would set it:
     assert.equal(builder._config.gatingConfigPath, null);
   });
 
   it("does not set routing if file does not exist", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     assert.equal(builder._config.routingConfigPath, null);
   });
 
@@ -336,17 +359,106 @@ describe("MobKitBuilder convention defaults", () => {
     // Convention defaults look for config/access.toml; an explicit
     // accessControl() value must survive _applyConventionDefaults()
     // regardless of whether the conventional file exists.
-    const builder = MobKit.builder()
+    const builder = Meta.builder()
       .mob("config/mob.toml")
       .accessControl("custom/access.toml");
     (builder as any)._applyConventionDefaults();
     assert.equal(builder._config.accessConfigPath, "custom/access.toml");
   });
+
+  it("forwards anything at config/access.toml so the gateway refuses it", () => {
+    // Only a genuinely absent entry leaves access control off. A directory,
+    // a dangling link or a lookup that fails other than by absence is
+    // forwarded so the gateway's strict loader refuses it.
+    const previous = process.cwd();
+    const root = mkdtempSync(join(tmpdir(), "meta-access-convention-"));
+    const discovered = (): string | null => {
+      const builder = Meta.builder().mob("config/mob.toml");
+      (builder as any)._applyConventionDefaults();
+      return builder._config.accessConfigPath;
+    };
+    try {
+      process.chdir(root);
+      assert.equal(discovered(), null);
+
+      mkdirSync("config/access.toml", { recursive: true });
+      assert.equal(discovered(), "config/access.toml");
+
+      if (process.platform !== "win32") {
+        rmSync("config", { recursive: true });
+        mkdirSync("config");
+        symlinkSync(join(root, "missing.toml"), "config/access.toml");
+        assert.equal(discovered(), "config/access.toml");
+
+        // With config a file, the lookup reports "not a directory".
+        rmSync("config", { recursive: true });
+        writeFileSync("config", "");
+        assert.equal(discovered(), "config/access.toml");
+      }
+    } finally {
+      process.chdir(previous);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("forwards anything at config/gating.toml so the gateway refuses it", () => {
+    // Like access.toml, only ENOENT leaves gating off. A directory, a
+    // dangling link or another lookup error is forwarded so the gateway's
+    // strict loader refuses it.
+    const previous = process.cwd();
+    const root = mkdtempSync(join(tmpdir(), "meta-gating-convention-"));
+    const discovered = (): string | null => {
+      const builder = Meta.builder().mob("config/mob.toml");
+      (builder as any)._applyConventionDefaults();
+      return builder._config.gatingConfigPath;
+    };
+    try {
+      process.chdir(root);
+      assert.equal(discovered(), null);
+
+      mkdirSync("config/gating.toml", { recursive: true });
+      assert.equal(discovered(), "config/gating.toml");
+
+      if (process.platform !== "win32") {
+        rmSync("config", { recursive: true });
+        mkdirSync("config");
+        symlinkSync(join(root, "missing.toml"), "config/gating.toml");
+        assert.equal(discovered(), "config/gating.toml");
+
+        // With config a file, the lookup reports "not a directory".
+        rmSync("config", { recursive: true });
+        writeFileSync("config", "");
+        assert.equal(discovered(), "config/gating.toml");
+      }
+    } finally {
+      process.chdir(previous);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("omits the opt-in files under a dangling config directory link", () => {
+    // ENOENT also covers a dangling parent link, so access.toml and
+    // gating.toml are omitted there exactly like a missing file.
+    if (process.platform === "win32") return;
+    const previous = process.cwd();
+    const root = mkdtempSync(join(tmpdir(), "meta-dangling-parent-"));
+    try {
+      process.chdir(root);
+      symlinkSync(join(root, "missing-dir"), "config");
+      const builder = Meta.builder().mob("config/mob.toml");
+      (builder as any)._applyConventionDefaults();
+      assert.equal(builder._config.accessConfigPath, null);
+      assert.equal(builder._config.gatingConfigPath, null);
+    } finally {
+      process.chdir(previous);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
-describe("MobKitBuilder method chaining", () => {
+describe("MetaBuilder method chaining", () => {
   it("supports full chain", () => {
-    const builder = MobKit.builder()
+    const builder = Meta.builder()
       .mob("mob.toml")
       .gateway("/bin/gw")
       .consoleConfig("console.toml")
@@ -389,18 +501,18 @@ describe("MobKitBuilder method chaining", () => {
   });
 });
 
-describe("MobKitBuilder removed boot knobs", () => {
+describe("MetaBuilder removed boot knobs", () => {
   // discovery() / preSpawn() were stored and never transmitted (dead since
   // v0.2). The method must be gone so a caller fails loudly at the call site
   // instead of being accepted and dropped, and the config has no slot for it.
   it("discovery() and preSpawn() are not builder methods", () => {
-    const builder = MobKit.builder() as unknown as Record<string, unknown>;
+    const builder = Meta.builder() as unknown as Record<string, unknown>;
     assert.equal(typeof builder.discovery, "undefined");
     assert.equal(typeof builder.preSpawn, "undefined");
   });
 
   it("the config carries no dead callback slots", () => {
-    const cfg = MobKit.builder()._config as unknown as Record<string, unknown>;
+    const cfg = Meta.builder()._config as unknown as Record<string, unknown>;
     assert.equal("discoveryCallback" in cfg, false);
     assert.equal("preSpawnCallback" in cfg, false);
     // The live boot-membership knob is still there.

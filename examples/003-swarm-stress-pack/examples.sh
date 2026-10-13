@@ -71,7 +71,7 @@ if [[ " $* " == *" --browser-smoke "* ]]; then
 
   ARTIFACT_DIR="$ROOT/output/playwright/example-003"
   echo "[swarm-stress-pack] running browser smoke at $BASE_URL"
-  (cd "$ROOT/examples" && MOBKIT_BROWSER_SMOKE_ARTIFACT_DIR="$ARTIFACT_DIR" node "$PACK_DIR/browser_smoke.cjs" "$BASE_URL")
+  (cd "$ROOT/examples" && META_BROWSER_SMOKE_ARTIFACT_DIR="$ARTIFACT_DIR" node "$PACK_DIR/browser_smoke.cjs" "$BASE_URL")
   exit $?
 fi
 

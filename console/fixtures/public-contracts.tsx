@@ -3,7 +3,7 @@ import type { ComponentProps } from "react";
 import {
   beginConsoleSendAttempt, buildConversationViewState, conversationRichBlockCopyText,
   createConsoleContextRecord, createConsoleSendAttempt, createHttpConsoleTransport,
-  createMobKitConsoleController, createPendingApprovalResource, finishConsoleSendAttempt,
+  createMetaConsoleController, createPendingApprovalResource, finishConsoleSendAttempt,
   mapFramesToTimelineEntries, serializeConsoleContextMessage,
   type ConsoleFrame, type ConsoleTransportState, type ConversationRichMarkdownBlock,
 } from "@console-core";
@@ -27,7 +27,7 @@ const resource = createPendingApprovalResource({ scopeKey: viewportKey.authority
 const frames: ConsoleFrame[] = [];
 const entries = mapFramesToTimelineEntries(null, frames, { textMode: "markdown", renderTextDeltas: true });
 const viewState = buildConversationViewState({ memberId: viewportKey.identity, agentLabel: "One", entries });
-const controller = createMobKitConsoleController({ transport: createHttpConsoleTransport({ baseUrl: "/console" }) });
+const controller = createMetaConsoleController({ transport: createHttpConsoleTransport({ baseUrl: "/console" }) });
 const transportState: ConsoleTransportState = { phase: "retrying", stale: true, freshness: "replaying", retryInMs: 1000 };
 const legacyReveal: ConversationScrollControllerOptions["revealAnchor"] = _id => true;
 const asyncReveal: ConversationScrollControllerOptions["revealAnchor"] = async (_id, signal) => !signal.aborted;

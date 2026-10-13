@@ -5,8 +5,8 @@
       "id": "mem-001",
       "kind": "Gotcha",
       "title": "Release must publish PyPI and npm together",
-      "description": "Matters when preparing a mobkit release.",
-      "body": "The Rust release must publish meerkat-mobkit to PyPI and @rkat/mobkit-sdk to npm at the same version, in the same pass.",
+      "description": "Matters when preparing a meta release.",
+      "body": "The Rust release must publish meerkat-meta to PyPI and @rkat/meta-sdk to npm at the same version, in the same pass.",
       "scope_kind": "identity",
       "scope_key": "identity:release-bot",
       "trust": "agent_observed",
@@ -36,7 +36,7 @@
     }
   ],
   "proposals": [],
-  "mob_context": { "mob": "mob:release", "purpose": "cut and publish mobkit releases" },
+  "mob_context": { "mob": "mob:release", "purpose": "cut and publish meta releases" },
   "scripted_reply": {
     "ops": [
       {
@@ -45,8 +45,8 @@
         "scope": { "kind": "identity", "key": "identity:release-bot" },
         "kind": "gotcha",
         "title": "SDK releases ship PyPI and npm in lockstep",
-        "description": "Matters whenever a mobkit release or version bump is prepared.",
-        "body": "A mobkit Rust release must publish meerkat-mobkit to PyPI and @rkat/mobkit-sdk to npm at the same version in the same pass — never one without the other.",
+        "description": "Matters whenever a meta release or version bump is prepared.",
+        "body": "A meta Rust release must publish meerkat-meta to PyPI and @rkat/meta-sdk to npm at the same version in the same pass — never one without the other.",
         "tags": [],
         "trust": "agent_observed",
         "derived_from": ["mem-001", "mem-002"],

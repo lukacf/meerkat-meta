@@ -11,17 +11,17 @@ from pathlib import Path
 
 import pytest
 
-from meerkat_mobkit import RoleMigrationDeclaration
-from meerkat_mobkit.builder import MobKit
-from meerkat_mobkit.runtime import MobKitRuntime
+from meerkat_meta import RoleMigrationDeclaration
+from meerkat_meta.builder import Meta
+from meerkat_meta.runtime import MetaRuntime
 
 
 def _init_params(builder):
-    return MobKitRuntime(builder._config)._build_init_params()
+    return MetaRuntime(builder._config)._build_init_params()
 
 
 def test_declaration_reaches_the_init_params():
-    builder = MobKit.builder().role_migrations(
+    builder = Meta.builder().role_migrations(
         [
             RoleMigrationDeclaration(
                 identity="domain:automation", from_role="domain"
@@ -35,7 +35,7 @@ def test_declaration_reaches_the_init_params():
 
 
 def test_a_plain_dict_is_accepted_and_still_validated():
-    builder = MobKit.builder().role_migrations(
+    builder = Meta.builder().role_migrations(
         [{"identity": "domain:automation", "from_role": "domain"}]
     )
     assert _init_params(builder)["role_migrations"] == [
@@ -43,7 +43,7 @@ def test_a_plain_dict_is_accepted_and_still_validated():
     ]
 
     with pytest.raises(ValueError):
-        MobKit.builder().role_migrations([{"identity": "has a space", "from_role": "d"}])
+        Meta.builder().role_migrations([{"identity": "has a space", "from_role": "d"}])
 
 
 def test_no_declaration_means_no_key_at_all():
@@ -52,8 +52,8 @@ def test_no_declaration_means_no_key_at_all():
     The key must be absent rather than an empty list, so a gateway can never
     read an armed-but-empty declaration as "migrations were considered".
     """
-    assert "role_migrations" not in _init_params(MobKit.builder())
-    assert "role_migrations" not in _init_params(MobKit.builder().role_migrations([]))
+    assert "role_migrations" not in _init_params(Meta.builder())
+    assert "role_migrations" not in _init_params(Meta.builder().role_migrations([]))
 
 
 # The one committed wire contract, shared with the Rust parser's
@@ -63,7 +63,7 @@ def test_no_declaration_means_no_key_at_all():
 FIXTURE = (
     Path(__file__).resolve().parents[3]
     / "crates"
-    / "meerkat-mobkit"
+    / "meerkat-meta"
     / "tests"
     / "fixtures"
     / "role_migrations_init_params.json"
@@ -72,7 +72,7 @@ FIXTURE = (
 
 def test_builder_output_matches_the_committed_wire_fixture():
     expected = json.loads(FIXTURE.read_text())["role_migrations"]
-    builder = MobKit.builder().role_migrations(
+    builder = Meta.builder().role_migrations(
         [
             RoleMigrationDeclaration(
                 identity=expected[0]["identity"], from_role=expected[0]["from_role"]
@@ -89,14 +89,14 @@ def test_conflicting_declarations_are_refused_and_repeats_are_not():
     irregularity as fatal.
     """
     with pytest.raises(ValueError, match="cannot be resolved by order"):
-        MobKit.builder().role_migrations(
+        Meta.builder().role_migrations(
             [
                 {"identity": "domain:automation", "from_role": "domain"},
                 {"identity": "domain:automation", "from_role": "other"},
             ]
         )
 
-    repeated = MobKit.builder().role_migrations(
+    repeated = Meta.builder().role_migrations(
         [
             {"identity": "domain:automation", "from_role": "domain"},
             {"identity": "domain:automation", "from_role": "domain"},

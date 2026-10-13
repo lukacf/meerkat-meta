@@ -1,19 +1,19 @@
 ---
 title: "SSE API"
-description: "Server-Sent Events for real-time MobKit interaction and event subscription flows."
+description: "Server-Sent Events for real-time Meta interaction and event subscription flows."
 icon: "bolt"
 ---
 
-MobKit uses Server-Sent Events (SSE) for several live HTTP streams:
+Meta uses Server-Sent Events (SSE) for several live HTTP streams:
 
 - agent-scoped streaming through `GET /agents/{agent_id}/events`
 - mob-merged streaming through `GET /mob/events`
-- structural mob events through `GET /mobkit/mob_events/stream`
-- lossy WorkGraph wake events through `GET /mobkit/workgraph/facts/stream`
+- structural mob events through `GET /meta/mob_events/stream`
+- lossy WorkGraph wake events through `GET /meta/workgraph/facts/stream`
 - console timeline replay and live continuation through `GET /console/timeline/stream`
 - identity-filtered console timeline streaming through `GET /console/identity/{identity}/stream`
 
-The related `mobkit/events/subscribe` JSON-RPC method returns bounded replay
+The related `meta/events/subscribe` JSON-RPC method returns bounded replay
 snapshots in SSE frame format, but does not open a stream.
 
 ## Authentication
@@ -95,7 +95,7 @@ suffix (`worker-1:0` here). The `mob:<sequence>` ID is connection-local and
 starts again on a new connection; it is not a durable cursor. This route
 does not replay from `Last-Event-ID`. Use
 [structural mob SSE](#structural-mob-events-stream) for ledger-cursor replay,
-or `mobkit/events/subscribe` for a bounded merged-event RPC snapshot with its
+or `meta/events/subscribe` for a bounded merged-event RPC snapshot with its
 own envelope and checkpoint contract.
 
 ## Console timeline stream
@@ -167,7 +167,7 @@ Convenience route for an identity-filtered console timeline stream. It sets the 
 
 ## Event subscription
 
-Use the `mobkit/events/subscribe` JSON-RPC method to request a bounded
+Use the `meta/events/subscribe` JSON-RPC method to request a bounded
 point-in-time snapshot. It returns each selected event both as a typed envelope
 and as an SSE-ready frame. It does not open a live connection or return a
 stream URL; use the HTTP routes on this page for live observation.
@@ -178,7 +178,7 @@ Example request:
 {
   "jsonrpc": "2.0",
   "id": "sub-1",
-  "method": "mobkit/events/subscribe",
+  "method": "meta/events/subscribe",
   "params": {
     "scope": "agent",
     "agent_id": "worker-1",
@@ -212,7 +212,7 @@ whose only difference is a trailing numeric generation suffix. The server
 applies the scope first and retains at most its three newest matching events.
 
 `last_event_id` is an `event_id` from an earlier
-`mobkit/events/subscribe` result, not an HTTP SSE frame ID. It must be present
+`meta/events/subscribe` result, not an HTTP SSE frame ID. It must be present
 in that bounded, scope-filtered window. Replay is inclusive: the checkpoint
 event is returned again, followed by later retained events. An unknown,
 out-of-scope, or expired checkpoint returns JSON-RPC `-32602`, so reconnecting
@@ -221,25 +221,25 @@ consumers should deduplicate the first event by `event_id`.
 ## WorkGraph wake stream
 
 ```
-GET /mobkit/workgraph/facts/stream
+GET /meta/workgraph/facts/stream
 ```
 
 This route is present when the runtime has a WorkGraph service. It is a
 dedicated, lossy wake channel, not another view of the merged event log. Its
 `data` field is a bare `UnifiedEvent::Module` value with module
-`mobkit.workgraph`; the event is not wrapped in `EventEnvelope` and is not
-duplicated into `GET /mob/events` or `mobkit/events/subscribe`.
+`meta.workgraph`; the event is not wrapped in `EventEnvelope` and is not
+duplicated into `GET /mob/events` or `meta/events/subscribe`.
 
 Every connection starts with this mandatory resynchronization signal:
 
 ```
 event: workgraph.resync_required
-data: {"kind":"module","module":"mobkit.workgraph","event_type":"workgraph.resync_required","payload":{"reason":"initial_sync","skipped":null,"authority":"durable_workgraph_pull"}}
+data: {"kind":"module","module":"meta.workgraph","event_type":"workgraph.resync_required","payload":{"reason":"initial_sync","skipped":null,"authority":"durable_workgraph_pull"}}
 ```
 
-On receipt, read authoritative state through `mobkit/workgraph/get`,
-`mobkit/workgraph/list`, `mobkit/workgraph/ready`, or
-`mobkit/workgraph/snapshot`. Subsequent `workgraph.fact` events carry
+On receipt, read authoritative state through `meta/workgraph/get`,
+`meta/workgraph/list`, `meta/workgraph/ready`, or
+`meta/workgraph/snapshot`. Subsequent `workgraph.fact` events carry
 identifiers that can accelerate another read, but they are never state
 authority.
 
@@ -253,7 +253,7 @@ grant.
 ## Structural mob events stream
 
 ```
-GET /mobkit/mob_events/stream?after_seq=<cursor>&mob_id=<id>&run_id=<id>&event_types=<list>
+GET /meta/mob_events/stream?after_seq=<cursor>&mob_id=<id>&run_id=<id>&event_types=<list>
 ```
 
 Per-client SSE stream of structural `MobEvent`s (typed envelopes
@@ -290,7 +290,7 @@ If `after_seq > latest_cursor`, the route returns HTTP **410 Gone**
 with `{"error":"event_query_stale","after_cursor":N,"latest_cursor":M}`.
 SDK clients should rewind to `latest_cursor` and reconnect.
 
-### Continuation from `mobkit/mob_events/subscribe`
+### Continuation from `meta/mob_events/subscribe`
 
 The JSON-RPC handshake returns a snapshot frame plus a
 `subscribe_url` field that already encodes the resume cursor and
@@ -301,7 +301,7 @@ filters:
   "stream": "mob_events",
   "events": [...],
   "next_after_seq": 1234,
-  "subscribe_url": "/mobkit/mob_events/stream?after_seq=1234&mob_id=home",
+  "subscribe_url": "/meta/mob_events/stream?after_seq=1234&mob_id=home",
   "keep_alive": {"interval_ms": 15000, "event": "keep_alive"}
 }
 ```
@@ -317,7 +317,7 @@ can checkpoint it and reconnect with `after_seq=<checkpointed cursor>` only
 while the configured mob-event store retains that cursor and its later events.
 
 `.persistent_state(path)` alone does not make the mob-event ledger durable. It
-persists MobKit projection metadata, while the stock unified-runtime builder
+persists Meta projection metadata, while the stock unified-runtime builder
 still uses in-memory Mob storage. Restart-safe replay requires a separately
 configured upstream Meerkat mob-event store that retains the ledger across the
 restart. If a checkpoint is ahead of the available ledger, the route returns
@@ -337,7 +337,7 @@ When the console timeline broadcast lags (slow consumer, channel saturated), the
 
 ## Sending messages
 
-To send a message to an agent, use the `mobkit/send_message` RPC method and capture the returned `session_id` for correlation:
+To send a message to an agent, use the `meta/send_message` RPC method and capture the returned `session_id` for correlation:
 
 ```json
 {
@@ -348,7 +348,7 @@ To send a message to an agent, use the `mobkit/send_message` RPC method and capt
 ```
 
 Then observe live responses via `GET /console/timeline/stream` or
-`GET /console/identity/{identity}/stream`. Use `mobkit/events/subscribe` only
+`GET /console/identity/{identity}/stream`. Use `meta/events/subscribe` only
 when a bounded merged-event replay snapshot is sufficient.
 
 ## Error handling

@@ -12,12 +12,12 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 try:
-    from meerkat_mobkit import MobKit, MobKitRuntime, RpcError
+    from meerkat_meta import Meta, MetaRuntime, RpcError
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from meerkat_mobkit import (  # type: ignore[no-redef]
-        MobKit,
-        MobKitRuntime,
+    from meerkat_meta import (  # type: ignore[no-redef]
+        Meta,
+        MetaRuntime,
         RpcError,
     )
 
@@ -43,7 +43,7 @@ class EventsSubscribePayload(BaseModel):
     agent_id: str | None = None
 
 
-app = FastAPI(title="MobKit H2 Python RPC-Mode Reference App")
+app = FastAPI(title="Meta H2 Python RPC-Mode Reference App")
 
 H2_REFERENCE_MOB_TOML = """
 [mob]
@@ -69,16 +69,16 @@ H2_REFERENCE_ROUTING_MODULE = {
 
 
 def _required_gateway_bin() -> str:
-    gateway_bin = os.environ.get("MOBKIT_RPC_GATEWAY_BIN")
+    gateway_bin = os.environ.get("META_RPC_GATEWAY_BIN")
     if not gateway_bin:
-        raise RuntimeError("MOBKIT_RPC_GATEWAY_BIN must be set for h2_reference_app")
+        raise RuntimeError("META_RPC_GATEWAY_BIN must be set for h2_reference_app")
     return gateway_bin
 
 
-def _runtime() -> MobKitRuntime:
-    rt = getattr(app.state, "mobkit_runtime", None)
-    if not isinstance(rt, MobKitRuntime):
-        raise RuntimeError("MobKit runtime is not initialized")
+def _runtime() -> MetaRuntime:
+    rt = getattr(app.state, "meta_runtime", None)
+    if not isinstance(rt, MetaRuntime):
+        raise RuntimeError("Meta runtime is not initialized")
     return rt
 
 
@@ -132,14 +132,14 @@ async def startup_event() -> None:
     gateway_bin = _required_gateway_bin()
     app.state.gateway_bin = gateway_bin
     rt = await (
-        MobKit.builder()
+        Meta.builder()
         .mob_inline(H2_REFERENCE_MOB_TOML)
         .gateway(gateway_bin)
         .modules([H2_REFERENCE_ROUTING_MODULE])
         .build()
     )
     await rt.connect()
-    app.state.mobkit_runtime = rt
+    app.state.meta_runtime = rt
 
 
 @app.get("/healthz")
@@ -155,7 +155,7 @@ async def rpc_status(payload: RpcRequestIdPayload) -> dict[str, Any]:
     handle = _runtime().mob_handle()
     typed_result, typed_error = await _typed_call_result(handle.status())
     return {
-        "route": "mobkit/status",
+        "route": "meta/status",
         "jsonrpc_envelope": _jsonrpc_envelope(
             payload.request_id, typed_result, typed_error
         ),
@@ -169,7 +169,7 @@ async def rpc_capabilities(payload: RpcRequestIdPayload) -> dict[str, Any]:
     handle = _runtime().mob_handle()
     typed_result, typed_error = await _typed_call_result(handle.capabilities())
     return {
-        "route": "mobkit/capabilities",
+        "route": "meta/capabilities",
         "jsonrpc_envelope": _jsonrpc_envelope(
             payload.request_id, typed_result, typed_error
         ),
@@ -185,7 +185,7 @@ async def rpc_reconcile(payload: ReconcilePayload) -> dict[str, Any]:
         handle.reconcile(payload.modules)
     )
     return {
-        "route": "mobkit/reconcile",
+        "route": "meta/reconcile",
         "jsonrpc_envelope": _jsonrpc_envelope(
             payload.request_id, typed_result, typed_error
         ),
@@ -201,7 +201,7 @@ async def rpc_spawn_member(payload: SpawnMemberPayload) -> dict[str, Any]:
         handle.spawn_member(payload.module_id or "")
     )
     return {
-        "route": "mobkit/spawn_member",
+        "route": "meta/spawn_member",
         "jsonrpc_envelope": _jsonrpc_envelope(
             payload.request_id, typed_result, typed_error
         ),
@@ -221,7 +221,7 @@ async def rpc_events_subscribe(payload: EventsSubscribePayload) -> dict[str, Any
         )
     )
     return {
-        "route": "mobkit/events/subscribe",
+        "route": "meta/events/subscribe",
         "jsonrpc_envelope": _jsonrpc_envelope(
             payload.request_id, typed_result, typed_error
         ),

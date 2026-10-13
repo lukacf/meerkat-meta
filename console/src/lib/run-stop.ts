@@ -10,7 +10,7 @@ export interface RunStopContributor {
 
 /**
  * meerkat's typed run-stop receipt, relayed verbatim by
- * `mobkit/stop_member_run`.
+ * `meta/stop_member_run`.
  */
 export type RunStopReceipt =
   | { outcome: "stopped"; run_id: string; contributors: RunStopContributor[] }
@@ -83,18 +83,18 @@ export function activeRunIdFromFrames(frames: readonly ConsoleFrame[]): string |
   return null;
 }
 
-/** Validate the `mobkit/stop_member_run` result; fail closed on anything else. */
+/** Validate the `meta/stop_member_run` result; fail closed on anything else. */
 export function parseRunStopResult(result: unknown): RunStopReceipt {
   const receipt =
     result && typeof result === "object"
       ? (result as Record<string, unknown>).receipt
       : undefined;
   if (!receipt || typeof receipt !== "object") {
-    throw new Error("invalid mobkit/stop_member_run result: missing receipt");
+    throw new Error("invalid meta/stop_member_run result: missing receipt");
   }
   const record = receipt as Record<string, unknown>;
   if (typeof record.run_id !== "string") {
-    throw new Error("invalid mobkit/stop_member_run receipt: missing run_id");
+    throw new Error("invalid meta/stop_member_run receipt: missing run_id");
   }
   switch (record.outcome) {
     case "stopped":
@@ -108,18 +108,18 @@ export function parseRunStopResult(result: unknown): RunStopReceipt {
             typeof (row as Record<string, unknown>).completion === "string",
         )
       ) {
-        throw new Error("invalid mobkit/stop_member_run receipt: malformed contributors");
+        throw new Error("invalid meta/stop_member_run receipt: malformed contributors");
       }
       break;
     case "not_current":
       break;
     case "not_stoppable":
       if (typeof record.state !== "string") {
-        throw new Error("invalid mobkit/stop_member_run receipt: missing state");
+        throw new Error("invalid meta/stop_member_run receipt: missing state");
       }
       break;
     default:
-      throw new Error(`invalid mobkit/stop_member_run receipt outcome: ${String(record.outcome)}`);
+      throw new Error(`invalid meta/stop_member_run receipt outcome: ${String(record.outcome)}`);
   }
   return receipt as RunStopReceipt;
 }

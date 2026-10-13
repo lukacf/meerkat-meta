@@ -47,10 +47,10 @@ async function startFixture({ mode = "member", stateDir, liveImages = false, liv
   const spec = exampleBackendSpec(repoRoot, "console_acceptance_fixture");
   const child = spawn(spec.command, spec.args, {
     cwd: repoRoot,
-    env: { ...process.env, MOBKIT_FIXTURE_ADDR: LOOPBACK_ANY_PORT, MOBKIT_FIXTURE_MODE: mode,
-      MOBKIT_FIXTURE_LIVE_IMAGES: liveImages ? "1" : "0", MOBKIT_FIXTURE_LIVE_MODEL: liveModel ? "1" : "0",
-      MOBKIT_FIXTURE_ROUTINE_TOOLS: routineTools ? "1" : "0",
-      ...(stateDir ? { MOBKIT_FIXTURE_STATE: stateDir } : {}) },
+    env: { ...process.env, META_FIXTURE_ADDR: LOOPBACK_ANY_PORT, META_FIXTURE_MODE: mode,
+      META_FIXTURE_LIVE_IMAGES: liveImages ? "1" : "0", META_FIXTURE_LIVE_MODEL: liveModel ? "1" : "0",
+      META_FIXTURE_ROUTINE_TOOLS: routineTools ? "1" : "0",
+      ...(stateDir ? { META_FIXTURE_STATE: stateDir } : {}) },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let logs = "";
@@ -66,7 +66,7 @@ async function startFixture({ mode = "member", stateDir, liveImages = false, liv
     }, `fixture readiness (${mode})`, spec.prebuilt ? 30_000 : 300_000);
     if (child.exitCode !== null) throw new Error(`fixture exited ${child.exitCode}: ${logs}`);
     const ready = await eventually(async () => {
-      const { status, body } = await rpc(backendUrl, "mobkit/wait_ready", { timeout_ms: 1000 });
+      const { status, body } = await rpc(backendUrl, "meta/wait_ready", { timeout_ms: 1000 });
       assert.equal(status, 200);
       if (body.error) throw new Error(JSON.stringify(body.error));
       return body.result?.timeout === false && body.result.ready?.length === 2 ? body.result : null;
@@ -108,7 +108,7 @@ async function startFixture({ mode = "member", stateDir, liveImages = false, liv
     }
     const upstream = http.request(url, { method: req.method, headers: { ...req.headers, host: url.host } }, incoming => {
       observation.status = incoming.statusCode;
-      const drop = dropSend && req.method === "POST" && (url.pathname.endsWith("/send") || observation.request.includes('"method":"mobkit/console/send"'));
+      const drop = dropSend && req.method === "POST" && (url.pathname.endsWith("/send") || observation.request.includes('"method":"meta/console/send"'));
       if (drop) dropSend = false;
       res.writeHead(incoming.statusCode, incoming.headers);
       // Commit actual response headers before simulating body loss. Otherwise

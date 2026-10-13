@@ -24,6 +24,7 @@ import type {
   ConversationEmptySuggestion,
   ConversationIdentity,
   ConversationRichBlock,
+  ConversationRichImageBlock,
   ConversationTextMode,
   ConversationRichToolCallBlock,
   ConversationTimelineEntry,
@@ -61,7 +62,7 @@ function messageTextBlocks(source: string, textMode: ConversationTextMode = "mar
     : parseConversationRichBlocks(source, { displayNormalization: false });
 }
 
-export type MobKitDockTarget =
+export type MetaDockTarget =
   | AgentChatTarget
   | IdentityInspectTarget
   | RoutingPanelTarget
@@ -75,7 +76,39 @@ export type MobKitDockTarget =
   | AccessPanelTarget
   | MemoryPanelTarget
   | WorkGraphPanelTarget
+  | OperatorPanelTarget
   | import("@console-core").ConsoleCustomPanelTarget;
+
+/** A docked operator panel. Only the button id is kept: the panel path is read
+ * from the current static console configuration whenever the panel renders. */
+export interface OperatorPanelTarget extends ConsoleDockTarget {
+  kind: "operator-panel";
+  buttonId: string;
+}
+
+/** Same-origin path check for an operator panel, matching the server: one
+ * leading slash, at most 2048 UTF-8 bytes, no whitespace (a byte order mark
+ * included), C0/C1 control characters or backslashes, and no `.` or `..` segment in any spelling
+ * (`%2e` included). The path is used as written, never normalized. */
+export function operatorPanelPath(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.startsWith("/") || value.startsWith("//")) return undefined;
+  if (new TextEncoder().encode(value).length > 2048) return undefined;
+  if (/[\s\\]/.test(value)) return undefined;
+  if ([...value].some((character) => {
+    const code = character.codePointAt(0) ?? 0;
+    return code < 0x20 || (code >= 0x7f && code <= 0x9f);
+  })) return undefined;
+  const pathPart = value.split(/[?#]/, 1)[0];
+  if (pathPart.split("/").some((segment) => {
+    const decoded = segment.toLowerCase().replace(/%2e/g, ".");
+    return decoded === "." || decoded === "..";
+  })) return undefined;
+  return value;
+}
+
+export function buildOperatorPanelTarget(button: { id: string; label: string }): OperatorPanelTarget {
+  return { id: `operator-panel:${button.id}`, kind: "operator-panel", buttonId: button.id, title: button.label, subtitle: "Operator panel", iconName: "i-gear" };
+}
 
 export interface AgentChatTarget extends ConsoleDockTarget {
   kind: "agent-chat";
@@ -204,7 +237,7 @@ export type ControlTargetKind =
   | "routing" | "gating" | "topology" | "health"
   | "timeline" | "roster" | "gates" | "logs" | "access" | "memory" | "workgraph";
 
-export function buildControlTarget(kind: ControlTargetKind): MobKitDockTarget {
+export function buildControlTarget(kind: ControlTargetKind): MetaDockTarget {
   switch (kind) {
     case "routing":
       return { id: "routing", kind, title: "Routing", subtitle: "Routes and delivery history", iconName: "i-swap" };
@@ -1170,22 +1203,35 @@ function peerTargetFromArgs(
           : undefined;
 }
 
-function parseToolResult(frame: ConsoleFrame): { result?: string; status: "pending" | "success" | "error"; completionEvidence: ToolCompletionEvidence } {
+type ParsedToolResult = {
+  result?: string;
+  images?: ConversationRichImageBlock[];
+  status: "pending" | "success" | "error";
+  completionEvidence: ToolCompletionEvidence;
+};
+
+function parseToolResult(frame: ConsoleFrame, blobBaseUrl?: string): ParsedToolResult {
   const record = frame.data && typeof frame.data === "object" ? frame.data as Record<string, unknown> : null;
   const completionEvidence = toolCompletionFromFrame(frame, parseToolCallId(frame) || "");
   const status = completionEvidence.outcome === "success" ? "success" : completionEvidence.outcome === "error" ? "error" : "pending";
-  const raw = record?.result ?? record?.content;
   const feedback = operationFeedbackFromFrame(frame);
-  const result = feedback ? feedback.detail : toolResultTextFromContent(raw);
-  return { ...(result !== undefined ? { result } : {}), status, completionEvidence };
+  const { text, images } = toolResultTextAndImages(record, blobBaseUrl);
+  const result = feedback ? feedback.detail : text;
+  return {
+    ...(result !== undefined ? { result } : {}),
+    ...(images.length > 0 ? { images } : {}),
+    status,
+    completionEvidence,
+  };
 }
 
 function buildToolBlocks(
   frames: ConsoleFrame[],
   cardToolCallIds: Set<string>,
+  blobBaseUrl?: string,
 ): Map<string, ConversationRichToolCallBlock> {
   const toolCalls = new Map<string, ConversationRichToolCallBlock>();
-  const pendingResults = new Map<string, { result?: string; status: "pending" | "success" | "error"; completionEvidence: ToolCompletionEvidence }>();
+  const pendingResults = new Map<string, ParsedToolResult>();
   // Peer registry built from `peers` tool results: peer_id (uuid) -> name.
   // The LLM-supplied `display_name` field on send_* args is unreliable
   // (agents have been observed filling it with their own name on every
@@ -1247,12 +1293,13 @@ function buildToolBlocks(
         capturePeersResult(peerRegistry, data.result);
       }
       if (!toolCallId) continue;
-      const parsed = parseToolResult(frame);
+      const parsed = parseToolResult(frame, blobBaseUrl);
       if (toolCalls.has(toolCallId)) {
         const current = toolCalls.get(toolCallId)!;
         toolCalls.set(toolCallId, {
           ...current,
           ...(parsed.result !== undefined ? { result: parsed.result } : {}),
+          ...(parsed.images ? { images: parsed.images } : {}),
           status: parsed.status,
           completionEvidence: parsed.completionEvidence,
         });
@@ -1291,6 +1338,7 @@ function buildToolBlocks(
         name,
         arguments: parseToolArguments(frame),
         ...(pending?.result !== undefined ? { result: pending.result } : {}),
+        ...(pending?.images ? { images: pending.images } : {}),
         status: pending?.status || "pending",
         completionEvidence: pending?.completionEvidence ?? { outcome: "running", source: "runtime-start", toolCallId },
         ...(peerTarget ? { peerTarget } : {}),
@@ -1398,11 +1446,11 @@ export function buildWorkGraphOperatorResultFrame(input: {
 }
 
 /// Failure-line label for an operator mutation, in the same underscored
-/// vocabulary as tool names: "mobkit/workgraph/goal/confirm" →
+/// vocabulary as tool names: "meta/workgraph/goal/confirm" →
 /// "workgraph_goal_confirm".
 function workGraphOperatorDisplayName(method: unknown): string {
   const raw = typeof method === "string" && method.trim() ? method.trim() : "workgraph";
-  return raw.replace(/^mobkit\//, "").replace(/\//g, "_");
+  return raw.replace(/^meta\//, "").replace(/\//g, "_");
 }
 
 /// Backfilled result frames (tool_execution_completed / tool_result_received
@@ -3346,9 +3394,59 @@ function serverToolContentSummary(frame: ConsoleFrame): { result?: string; statu
 
 type HistoryToolResult = {
   result?: string;
+  images?: ConversationRichImageBlock[];
   status: "pending" | "success" | "error";
   completionEvidence: ToolCompletionEvidence;
 };
+
+function isToolResultImageBlock(block: unknown): boolean {
+  if (!block || typeof block !== "object") return false;
+  const type = (block as Record<string, unknown>).type;
+  return type === "image" || type === "image_ref";
+}
+
+/** Split a content-block list into the image blocks presented as images
+ * (inline as data URLs, stored through `/blobs/{id}`) and the residual
+ * content, in order. An image block that cannot be presented stays in the
+ * residual. Anything but a list is all residual. */
+function splitToolResultImages(
+  content: unknown,
+  blobBaseUrl?: string,
+): { images: ConversationRichImageBlock[]; residual: unknown } {
+  if (!Array.isArray(content) || !content.some(isToolResultImageBlock)) {
+    return { images: [], residual: content };
+  }
+  const images: ConversationRichImageBlock[] = [];
+  const residual: unknown[] = [];
+  for (const block of content) {
+    const presented = isToolResultImageBlock(block)
+      ? contentToUserBlocks([block], blobBaseUrl, "legacy")
+        .filter((item): item is ConversationRichImageBlock => item.type === "image")
+      : [];
+    if (presented.length > 0) images.push(...presented);
+    else residual.push(block);
+  }
+  return { images, residual };
+}
+
+/** A tool result's text and images. The text carrier is `result`, else
+ * `content`; its presented images are removed and the residual keeps the
+ * canonical text-only/JSON formatting. Images come from that carrier, else
+ * from the content beside a text `result`. */
+function toolResultTextAndImages(
+  record: Record<string, unknown> | null | undefined,
+  blobBaseUrl?: string,
+): { text?: string; images: ConversationRichImageBlock[] } {
+  const carrier = record?.result ?? record?.content;
+  const split = splitToolResultImages(carrier, blobBaseUrl);
+  const images = split.images.length > 0 || carrier === record?.content
+    ? split.images
+    : splitToolResultImages(record?.content, blobBaseUrl).images;
+  const residualEmpty = split.images.length > 0
+    && Array.isArray(split.residual) && split.residual.length === 0;
+  const text = residualEmpty ? undefined : toolResultTextFromContent(split.residual);
+  return { ...(text !== undefined ? { text } : {}), images };
+}
 
 function toolResultTextFromContent(content: unknown): string | undefined {
   if (typeof content === "string") return content;
@@ -3370,6 +3468,7 @@ function historyToolResults(
   frames: ConsoleFrame[],
   cardToolCallIds: Set<string>,
   includeLive = false,
+  blobBaseUrl?: string,
 ): Map<string, HistoryToolResult> {
   const results = new Map<string, HistoryToolResult>();
   for (const frame of frames) {
@@ -3390,14 +3489,15 @@ function historyToolResults(
         ? data.id.trim()
         : "";
     if (!toolCallId) continue;
-    const rawResult = data?.result ?? data?.content;
     const feedback = operationFeedbackFromFrame(frame);
-    const result = feedback ? feedback.detail : toolResultTextFromContent(rawResult);
+    const { text, images } = toolResultTextAndImages(data, blobBaseUrl);
+    const result = feedback ? feedback.detail : text;
     const completionEvidence = toolCompletionFromFrame(frame, toolCallId);
     const status = completionEvidence.outcome === "success" ? "success" : completionEvidence.outcome === "error" ? "error" : "pending";
     results.set(toolCallId, {
       status, completionEvidence,
       ...(result !== undefined ? { result } : {}),
+      ...(images.length > 0 ? { images } : {}),
     });
   }
   return results;
@@ -3466,6 +3566,7 @@ function blockAssistantToolBlock(
       name,
       arguments: argumentsText,
       ...(displayResult !== undefined ? { result: displayResult } : {}),
+      ...(result?.images ? { images: result.images } : {}),
       status: result?.status || "pending",
       completionEvidence: result?.completionEvidence ?? unknownToolCompletion(id),
       ...(peerTarget ? { peerTarget } : {}),
@@ -3491,7 +3592,7 @@ function blockAssistantRichBlocks(
     if ((block.block_type ?? block.type) !== "server_tool_content") continue;
     serverFrames.set(value, { id: "", event: "server_tool_content", data: block.data } as ConsoleFrame);
   }
-  const serverBlocks = buildToolBlocks([...serverFrames.values()], new Set());
+  const serverBlocks = buildToolBlocks([...serverFrames.values()], new Set(), blobBaseUrl);
   const emittedServerTools = new Set<string>();
   const actionAndTextBlocks: ConversationRichBlock[] = [];
   let hasNonTextBlock = false;
@@ -5076,9 +5177,9 @@ function createTimelineFold(
   const emittedMcpApps = new Set<string>();
   const { entriesByAnchor: workGraphEntriesByAnchor, representedToolCallIds: cardToolCallIds } =
     buildWorkGraphEntries(agent, orderedFrames, workGraphNamesByCallId);
-  const toolBlocks = buildToolBlocks(orderedFrames, cardToolCallIds);
+  const toolBlocks = buildToolBlocks(orderedFrames, cardToolCallIds, options.blobBaseUrl);
   const peerRegistry = buildPeerRegistry(orderedFrames);
-  const sessionToolResults = historyToolResults(orderedFrames, cardToolCallIds);
+  const sessionToolResults = historyToolResults(orderedFrames, cardToolCallIds, false, options.blobBaseUrl);
   const occurrenceToolResults = new Map<string, Map<string, HistoryToolResult>>();
   function toolResultsForHistory(frame: ConsoleFrame): Map<string, HistoryToolResult> {
     if (!assistantMessageKey(frame)) return sessionToolResults;
@@ -5088,7 +5189,7 @@ function createTimelineFold(
       const matching = orderedFrames.filter(other => !ownerContextsConflict(frame, other));
       // Current history is authoritative when both views carry a result.
       matching.sort((left, right) => Number(left.sourceKind === "session_history") - Number(right.sourceKind === "session_history"));
-      result = historyToolResults(matching, cardToolCallIds, true);
+      result = historyToolResults(matching, cardToolCallIds, true, options.blobBaseUrl);
       occurrenceToolResults.set(scope, result);
     }
     return result;

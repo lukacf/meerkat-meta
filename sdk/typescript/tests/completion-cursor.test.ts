@@ -19,7 +19,7 @@ type ScriptedInspection = {
 };
 
 /**
- * Model the gateway's server-side `mobkit/wait_for_completion`: walk the
+ * Model the gateway's server-side `meta/wait_for_completion`: walk the
  * scripted cursor states (each a later moment) until one satisfies the wait.
  * A script that ends unsatisfied is the typed `timed_out`.
  */
@@ -64,10 +64,10 @@ async function makeRuntime(script: {
   /** Answer every `wait_for_completion` with this typed outcome. */
   waitOutcome?: string;
 }) {
-  const { MobKitRuntime } = await import("../src/runtime.js");
+  const { MetaRuntime } = await import("../src/runtime.js");
   const { RpcError } = await import("../src/errors.js");
   const calls: { method: string; params: Record<string, unknown> }[] = [];
-  const rt = new MobKitRuntime({
+  const rt = new MetaRuntime({
     mobConfigPath: null,
     sessionBuilder: null,
     sessionStore: null,
@@ -106,16 +106,16 @@ async function makeRuntime(script: {
     params?: Record<string, unknown>,
   ) => {
     calls.push({ method, params: params ?? {} });
-    if (method === "mobkit/send") return script.send ?? {};
-    if (method === "mobkit/dispatch") return script.dispatch ?? {};
+    if (method === "meta/send") return script.send ?? {};
+    if (method === "meta/dispatch") return script.dispatch ?? {};
     if (
       script.legacyGateway &&
-      (method === "mobkit/completion_cursor" ||
-        method === "mobkit/wait_for_completion")
+      (method === "meta/completion_cursor" ||
+        method === "meta/wait_for_completion")
     ) {
       throw new RpcError(-32601, "method not found", "1", method);
     }
-    if (method === "mobkit/wait_for_completion") {
+    if (method === "meta/wait_for_completion") {
       if (script.waitOutcome !== undefined) {
         return {
           identity: params?.identity ?? "x:1",
@@ -140,10 +140,10 @@ async function makeRuntime(script: {
       }
       return result;
     }
-    if (method === "mobkit/request_continuity_repair") {
+    if (method === "meta/request_continuity_repair") {
       return { continuity_repair: "scheduled" };
     }
-    if (method === "mobkit/completion_cursor") {
+    if (method === "meta/completion_cursor") {
       const entry = walk();
       return {
         identity: params?.identity ?? "x:1",
@@ -151,7 +151,7 @@ async function makeRuntime(script: {
         completion_cursor: entry.completion_cursor,
       };
     }
-    if (method === "mobkit/inspect_identity") {
+    if (method === "meta/inspect_identity") {
       const entry = pinned
         ? inspections[Math.min(index - 1, inspections.length - 1)]
         : walk();
@@ -162,9 +162,9 @@ async function makeRuntime(script: {
   (rt as unknown as Record<string, unknown>)._running = true;
   const count = (method: string) =>
     calls.filter((c) => c.method === method).length;
-  const inspectCalls = () => count("mobkit/inspect_identity");
-  const cursorCalls = () => count("mobkit/completion_cursor");
-  const waitCalls = () => count("mobkit/wait_for_completion");
+  const inspectCalls = () => count("meta/inspect_identity");
+  const cursorCalls = () => count("meta/completion_cursor");
+  const waitCalls = () => count("meta/wait_for_completion");
   return { rt, calls, inspectCalls, cursorCalls, waitCalls };
 }
 
@@ -321,7 +321,7 @@ describe("server-side completion waits", () => {
     assert.equal(output, "new");
     assert.deepEqual(
       calls.map((c) => c.method),
-      ["mobkit/wait_for_completion", "mobkit/inspect_identity"],
+      ["meta/wait_for_completion", "meta/inspect_identity"],
     );
     assert.deepEqual(calls[0]?.params, {
       identity: "triage:main",

@@ -146,11 +146,11 @@ async function streamInteraction(identity: string, content: string, origin: stri
       (frame.event === "interaction_complete" || frame.event === "interaction_failed"),
   });
 
-  // mobkit/interact left the stock console surface in the May 2026 console
-  // projection-path migration; mobkit/console/send is the canonical
+  // meta/interact left the stock console surface in the May 2026 console
+  // projection-path migration; meta/console/send is the canonical
   // identity-first send (server-owned acknowledgement + canonical frames).
   const sendResult = await callConsoleRpc<{ interaction_id: string; identity: string }>(
-    "mobkit/console/send",
+    "meta/console/send",
     {
       identity,
       content,
@@ -182,7 +182,7 @@ async function streamConsoleSend(identity: string, content: string, origin: stri
     input_frame_id: string;
     cursor: string;
     status: string;
-  }>("mobkit/console/send", {
+  }>("meta/console/send", {
     identity,
     content,
     origin,
@@ -257,7 +257,7 @@ async function main() {
     let after: string | undefined = canonicalTurn.accepted.cursor;
     for (let pages = 0; pages < 40 && after; pages += 1) {
       const timelinePage: { frames: ConsoleFrame[]; next_cursor?: string } = await callConsoleRpc(
-        "mobkit/console/query_timeline",
+        "meta/console/query_timeline",
         { identity: "incident-commander", after, limit: 50 },
       );
       if (
@@ -342,7 +342,7 @@ async function main() {
     body: JSON.stringify({
       jsonrpc: "2.0",
       id: "ts-smoke-reject",
-      method: "mobkit/console/send",
+      method: "meta/console/send",
       params: {
         identity: "approval-gate",
         content: "should reject",
@@ -355,7 +355,7 @@ async function main() {
   assert.equal(internalReject.error?.code, -32002);
 
   const statusIdentity = await callConsoleRpc<{ identity: string; addressability: string }>(
-    "mobkit/status_identity",
+    "meta/status_identity",
     { identity: "incident-commander" },
   );
   assert.equal(statusIdentity.identity, "incident-commander");

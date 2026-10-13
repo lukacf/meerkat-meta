@@ -1,6 +1,6 @@
 """session_service() registration refuses a non-conforming builder typed.
 
-``mobkit/init`` carries ``has_session_builder``, which makes the gateway call
+``meta/init`` carries ``has_session_builder``, which makes the gateway call
 back into this process for every build. An object without ``build_agent`` (a
 bare function, a partial, a misnamed method) used to be skipped in silence
 while that flag was still sent, so the first spawn failed later with "no
@@ -12,8 +12,8 @@ import sys
 
 import pytest
 
-from meerkat_mobkit.builder import MobKit
-from meerkat_mobkit.runtime import MobKitRuntime
+from meerkat_meta.builder import Meta
+from meerkat_meta.runtime import MetaRuntime
 
 
 class _ConformingBuilder:
@@ -51,7 +51,7 @@ class TestSessionBuilderRegistration:
     @pytest.mark.asyncio
     async def test_conforming_builder_is_registered_without_a_gateway(self):
         builder = _ConformingBuilder()
-        runtime = MobKitRuntime(MobKit.builder().session_service(builder)._config)
+        runtime = MetaRuntime(Meta.builder().session_service(builder)._config)
         await runtime.connect()
         assert runtime.is_running
         assert runtime._dispatcher._builder is builder
@@ -60,8 +60,8 @@ class TestSessionBuilderRegistration:
     async def test_conforming_builder_is_registered_before_init(self, tmp_path):
         gateway, marker = _write_marking_gateway(tmp_path)
         builder = _ConformingBuilder()
-        runtime = MobKitRuntime(
-            MobKit.builder().gateway(str(gateway)).session_service(builder)._config
+        runtime = MetaRuntime(
+            Meta.builder().gateway(str(gateway)).session_service(builder)._config
         )
         try:
             await runtime.connect()
@@ -73,8 +73,8 @@ class TestSessionBuilderRegistration:
 
     @pytest.mark.asyncio
     async def test_bare_function_is_refused_typed_without_a_gateway(self):
-        runtime = MobKitRuntime(
-            MobKit.builder().session_service(_bare_function_builder)._config
+        runtime = MetaRuntime(
+            Meta.builder().session_service(_bare_function_builder)._config
         )
         with pytest.raises(TypeError, match="SessionAgentBuilder") as refused:
             await runtime.connect()
@@ -85,8 +85,8 @@ class TestSessionBuilderRegistration:
     @pytest.mark.asyncio
     async def test_misnamed_method_is_refused_before_the_gateway_starts(self, tmp_path):
         gateway, marker = _write_marking_gateway(tmp_path)
-        runtime = MobKitRuntime(
-            MobKit.builder()
+        runtime = MetaRuntime(
+            Meta.builder()
             .gateway(str(gateway))
             .session_service(_MisnamedMethodBuilder())
             ._config

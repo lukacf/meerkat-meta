@@ -1,14 +1,14 @@
 ---
 title: "Console"
-description: "Embedded MobKit console with configurable branding, grouped roster, chat workspace, timeline replay, signals, logs, and operator controls."
+description: "Embedded Meta console with configurable branding, grouped roster, chat workspace, timeline replay, signals, logs, and operator controls."
 icon: "desktop"
 ---
 
-MobKit ships a web-based operator console through its HTTP composition. The
-console/admin `mobkit_gateway` serves it directly. A persistent, SDK-driven
+Meta ships a web-based operator console through its HTTP composition. The
+console/admin `meta_gateway` serves it directly. A persistent, SDK-driven
 `rpc_gateway` also mounts the console routes, but the two binaries are not
 interchangeable: SDK hosts drive `rpc_gateway` over stdio, while
-`mobkit_gateway` accepts its init handshake and then serves console/admin HTTP.
+`meta_gateway` accepts its init handshake and then serves console/admin HTTP.
 The console provides real-time visibility into agents, conversations, events,
 logs, approvals, and recovery actions. The stock shell is built from shared
 `@console-core` and `@console-components` packages, while app-specific policy
@@ -25,7 +25,7 @@ Once the runtime is serving HTTP, open the console at:
 Both gateway binaries bind an available loopback port and report the exact
 `http_base_url` in their init result. A Rust library host chooses its own bind
 address. `http://localhost:8080/console` is correct only when your host or
-reverse proxy explicitly publishes MobKit there.
+reverse proxy explicitly publishes Meta there.
 
 The HTML, JavaScript, and CSS are compiled into the binary via `include_str!`, so no build step is required at deployment time. The stock CSS requests optional Google Fonts; when those requests are unavailable or blocked, it uses the configured local/system fallback fonts.
 
@@ -206,13 +206,13 @@ The bundled console uses a small set of stable protocol surfaces:
 
 `/console/modules` returns IDs from `RuntimeDecisionState.modules`. It is a configuration inventory, not confirmation of successful startup, current liveness, or health.
 
-The console contract version is `0.5.0` in `console/src/lib/contract.ts` and `docs/rct/console-rest-sse-contract-v0.5.0.json`. The runtime JSON-RPC contract is separately versioned by `MOBKIT_CONTRACT_VERSION`.
+The console contract version is `0.5.0` in `console/src/lib/contract.ts` and `docs/rct/console-rest-sse-contract-v0.5.0.json`. The runtime JSON-RPC contract is separately versioned by `META_CONTRACT_VERSION`.
 
 Gateway custody also differs. `rpc_gateway` installs a SQLite console timeline
 store only when its init request configures `persistent_state`; long-lived
 `--persistent` process mode alone does not make the timeline durable. Without
 persistent state, its timeline stays in memory. The console-only
-`mobkit_gateway` also keeps its timeline in memory. Do not infer timeline
+`meta_gateway` also keeps its timeline in memory. Do not infer timeline
 durability from the presence of the same browser shell and route names.
 
 ## Layout
@@ -257,6 +257,20 @@ default_pinned_agent_ids = ["identity:ops-lead"]
 collapse_single_subgroup = true
 ```
 
+A sidebar button can open a stock `control`, link to an `href`, or dock an operator `panel`. A `panel` is a same-origin path (one leading `/`, at most 2048 UTF-8 bytes, no whitespace, control characters or backslashes, and no `.` or `..` segment in any spelling, `%2e` included) that the console shows in a docked frame. The path is used exactly as written; surrounding whitespace is refused, not trimmed. It cannot be combined with `control` or `href`; an invalid button is dropped.
+
+<Warning>
+An operator panel is trusted code, not an isolated frame. A same-origin page runs with the viewing operator's console session and can do anything that operator can do in the console. Configure only pages you would trust with that session. The path comes only from static operator configuration, and the console reads it from the current configuration whenever the panel opens.
+</Warning>
+
+The console and flow editor documents are served with `Content-Security-Policy: frame-ancestors 'self'`, so only their own origin can frame them. A deployment that frames the console from another origin must change before Meta 0.9; same-origin framing (for example behind a reverse proxy on the console's origin) and top-level use are unaffected. A panel page that a reverse proxy serves outside the gateway must send its own framing policy; the gateway's header does not cover responses it does not serve.
+
+Operator panels depend on a few host constraints:
+
+- The console sets no `frame-src` restriction, so same-origin panel paths stay framable. A host's own same-origin review page can be configured as a panel.
+- The panel frame is not sandboxed, so a host page's form posts keep their real `Origin`. A sandbox without `allow-same-origin` would send `Origin: null` and break same-origin form admission.
+- A page served with `frame-ancestors 'none'`, such as a secret-entry page, cannot be framed and must not be configured as a panel.
+
 Each agent row shows:
 - Agent display name and member ID
 - Status badge (active, running, idle)
@@ -279,7 +293,7 @@ reload it. Read-only consoles cannot submit decisions.
 | Policies | A placeholder; policy details and editing are not available in this console. |
 
 Audit tiers display the recorded `r0`, `r1`, `r2`, or `r3`; missing or unrecognized
-tiers display as unknown. The current MobKit R2 path normally allows with audit.
+tiers display as unknown. The current Meta R2 path normally allows with audit.
 It does not run the proposed native model reviewer. An approval record does not
 confirm execution: the caller remains responsible for enforcing the returned
 outcome and carrying out any permitted action. See [Gating](/concepts/gating) for
@@ -352,7 +366,7 @@ requires a compatible OpenAI API-key binding; a ChatGPT OAuth login alone
 does not enable this feature.
 
 Voice is an explicit gateway registration, not a setting in `console.toml`.
-For `mobkit_gateway`, supply `console_voice` in the init parameters alongside
+For `meta_gateway`, supply `console_voice` in the init parameters alongside
 your `auth_config` and enable `persistent_sessions`:
 
 ```json
@@ -461,7 +475,7 @@ previous voice conversation before opening the new one. Text composers remain
 usable throughout, including for the agent currently in voice mode.
 
 A gateway may also register `live: true` beside `console_voice` so an external
-client (for example an embodiment daemon opening `mobkit/live/open` over
+client (for example an embodiment daemon opening `meta/live/open` over
 `{base}/live/ws`) shares the same live host. The two take turns: the newest
 engagement wins. When the external client opens a channel, the console call
 ends with "Voice moved to the external live channel", and readiness for the
@@ -508,7 +522,7 @@ npm --prefix console run e2e:voice:live
 ```
 
 The live runner builds the voice-enabled gateway through `scripts/repo-cargo`.
-Set `MOBKIT_VOICE_GATEWAY_BIN` to an already-built current gateway to reuse it.
+Set `META_VOICE_GATEWAY_BIN` to an already-built current gateway to reuse it.
 Missing credentials fail the selected live lane; they do not produce a skip
 that looks like a passing acceptance run. The runner does not use an existing
 console or record microphone input.
@@ -530,7 +544,7 @@ The optional summary-latency benchmark makes three billed `gpt-5.5` calls and
 checks a five-second summary budget while retaining exact context values:
 
 ```bash
-./scripts/repo-cargo test -p meerkat-mobkit --features openai-live --lib \
+./scripts/repo-cargo test -p meerkat-meta --features openai-live --lib \
   console_voice_summary_live_latency_and_context_retention -- --ignored --nocapture
 ```
 
@@ -540,7 +554,7 @@ The right column shows user-meaningful signals: requests, assistant replies, pee
 
 ### WorkGraph panel - Tree and Graph views
 
-The WorkGraph panel (sidebar nav entry, visible when the runtime wires a WorkGraph service) reads `mobkit/workgraph/snapshot` and offers two views of the same data via the Tree | Graph toggle in the panel head. Tree is the default: an indented item list with claim/close actions plus the attention-binding and recent-event sections. Graph draws a read-only layered DAG - roots leftmost, one column per parent-edge depth, solid arrows into parents, dashed amber `blocks` edges, node borders/dots in the item-status palette (pulsing blue in progress, green completed, red failed, amber blocked, struck-through cancelled). Drag to pan, wheel to zoom, Fit resets, clicking a node shows its id/status/owner detail underneath. The view caps at 200 nodes and reports the overflow; all mutations stay in the tree and attention sections.
+The WorkGraph panel (sidebar nav entry, visible when the runtime wires a WorkGraph service) reads `meta/workgraph/snapshot` and offers two views of the same data via the Tree | Graph toggle in the panel head. Tree is the default: an indented item list with claim/close actions plus the attention-binding and recent-event sections. Graph draws a read-only layered DAG - roots leftmost, one column per parent-edge depth, solid arrows into parents, dashed amber `blocks` edges, node borders/dots in the item-status palette (pulsing blue in progress, green completed, red failed, amber blocked, struck-through cancelled). Drag to pan, wheel to zoom, Fit resets, clicking a node shows its id/status/owner detail underneath. The view caps at 200 nodes and reports the overflow; all mutations stay in the tree and attention sections.
 
 ## Agent grouping
 
@@ -582,7 +596,7 @@ SpawnMemberSpec::new(
 
 ## Console configuration
 
-The stock console can be shaped by `config/console.toml` in the conventional workspace layout. `mobkit_gateway` loads that file automatically; `rpc_gateway` accepts `runtime_options.console_config_path`, and the TypeScript builder exposes `.consoleConfig("config/console.toml")`.
+The stock console can be shaped by `config/console.toml` in the conventional workspace layout. `meta_gateway` loads that file automatically; `rpc_gateway` accepts `runtime_options.console_config_path`, and the TypeScript builder exposes `.consoleConfig("config/console.toml")`.
 
 The parsed config is projected through `GET /console/experience` as `console_config`.
 
@@ -628,6 +642,11 @@ label = "Ops Board"
 href = "https://example.test/ops"
 target = "_blank"
 icon_name = "external-link"
+
+[[sidebar.buttons]]
+id = "reviews"
+label = "Reviews"
+panel = "/host/reviews"
 
 [agent_list]
 group_by = ["labels.console_group", "labels.group", "role"]
@@ -734,7 +753,7 @@ Identity-first status and inspect payloads use lowercase wire enums for addressa
     Panels load recent visible frames with `GET /console/timeline?identity=identity:alice&mode=recent&limit=...`. Older history is paged with `before`; live continuation uses `latest_cursor`.
   </Step>
   <Step title="Send message">
-    Identity-addressed panels call `mobkit/console/send` through `POST /console/rpc`:
+    Identity-addressed panels call `meta/console/send` through `POST /console/rpc`:
     ```json
     {
       "identity": "identity:alice",
@@ -793,7 +812,7 @@ Identity-first status and inspect payloads use lowercase wire enums for addressa
     turns as frames with `source.kind = "session_history"`; they carry the
     persisted interaction id of the turn they replay and are never fresh
     completions, so clients MUST exclude them from live turn handling (the
-    rule is stated with the frame shape under `mobkit/console/query_timeline`
+    rule is stated with the frame shape under `meta/console/query_timeline`
     in the [JSON-RPC reference](/api/rpc)).
 
     If a requested cursor is no longer replayable, the stream returns `409 replay_unavailable`; refetch a recent page and resume from its `latest_cursor`.
@@ -820,17 +839,17 @@ Identity-first status and inspect payloads use lowercase wire enums for addressa
 
 Primary RPC methods on `/console/rpc`:
 
-- `mobkit/console/send` - identity-addressed console send
-- `mobkit/console/query_timeline` - timeline replay query
-- `mobkit/console/list_identities` and `mobkit/console/inspect_identity` - identity-first inspection
-- `mobkit/blob/upload` - multipart blob upload
-- `mobkit/reload_member` - non-destructive cold reload of one identity's live
+- `meta/console/send` - identity-addressed console send
+- `meta/console/query_timeline` - timeline replay query
+- `meta/console/list_identities` and `meta/console/inspect_identity` - identity-first inspection
+- `meta/blob/upload` - multipart blob upload
+- `meta/reload_member` - non-destructive cold reload of one identity's live
   member (same session, same generation); the repair for a member whose sends
   fail with the reload-required class. Gated by the `agent.respawn` action.
-  `mobkit/member_health` is the matching read (`agent.view`): lifecycle
+  `meta/member_health` is the matching read (`agent.view`): lifecycle
   state, last delivery error class, and the actor-loop probe verdict with the
   open `stall_id`, from in-process reads that answer during a stall.
-- `mobkit/retire`, `mobkit/respawn`, `mobkit/reset`, and `mobkit/reset_all` -
+- `meta/retire`, `meta/respawn`, `meta/reset`, and `meta/reset_all` -
   operator lifecycle actions. `reset_all` resets every identity the identity
   runtime knows (generation advance, one `identity_reset` lifecycle frame
   each, listed under `reset`) and retires only members with no registered
@@ -845,9 +864,9 @@ Primary RPC methods on `/console/rpc`:
   is the bridge's successor transition and needs a live member to replace;
   the identities beside it are still reset, and the call answers `-32000`
   with the full body in `error.data`
-- `mobkit/send_message` - legacy member-addressed send path
-- `mobkit/topology/query`, `mobkit/topology/plan`, `mobkit/topology/apply`,
-  `mobkit/topology/operation/get`, and `mobkit/topology/audit/query` - optional,
+- `meta/send_message` - legacy member-addressed send path
+- `meta/topology/query`, `meta/topology/plan`, `meta/topology/apply`,
+  `meta/topology/operation/get`, and `meta/topology/audit/query` - optional,
   revisioned connection management and separately permissioned durable audit
 
 Topology management is opt-in at the runtime. With the default disabled
@@ -868,16 +887,16 @@ JSON-RPC adapter. They may use `topologyAuthorityRevisionToken` as the
 component's scalar view token when the coordinator snapshot has no scalar
 revision, but never as the coordinator CAS value.
 
-Editable mode requires a durable runtime state path; MobKit fails closed
+Editable mode requires a durable runtime state path; Meta fails closed
 rather than accepting reconnect/suppression intent that would disappear on
 restart:
 
 ```rust
-use meerkat_mobkit::{TopologyControlMode, TopologyControlPolicy, UnifiedRuntime};
+use meerkat_meta::{TopologyControlMode, TopologyControlPolicy, UnifiedRuntime};
 
 let runtime = UnifiedRuntime::builder()
     .definition_path("config/mob.toml")
-    .persistent_state(".mobkit/state")
+    .persistent_state(".meta/state")
     .topology_control(TopologyControlPolicy {
         mode: TopologyControlMode::Editable,
         allow_bulk: false,
@@ -914,7 +933,7 @@ When `read_only` is `true`, the console can inspect identities, timelines,
 logs, and topology, but chat sends, uploads, lifecycle controls, and other write
 RPCs are denied server-side.
 
-For per-principal and per-agent authorization, install MobKit's optional
+For per-principal and per-agent authorization, install Meta's optional
 `AccessController` from `config/access.toml` or the runtime builder. When
 enabled, its ABAC policy is deny-by-default with deny-overrides across console
 REST, JSON-RPC, and SSE. JSON-RPC denials use code `-32030` with
@@ -931,10 +950,10 @@ available to authorized administrators on a read-only connection. A preview is
 an observation, not permission for a later action or a native tool grant.
 
 Upstream hosts that already know a user's ACL can also force the stock console UI
-into view-only mode without changing MobKit auth: set
-`window.__MOBKIT_CONSOLE_READ_ONLY__ = true` before loading the console bundle,
+into view-only mode without changing Meta auth: set
+`window.__META_CONSOLE_READ_ONLY__ = true` before loading the console bundle,
 or append `?console_read_only=true` (also accepted:
-`mobkit_console_read_only=true` or `view_only=true`) to the console URL. This is
+`meta_console_read_only=true` or `view_only=true`) to the console URL. This is
 a frontend-only affordance for per-user UX; direct RPC calls are still governed
 by the server-side `ConsolePolicy.read_only` setting.
 
@@ -960,8 +979,8 @@ The production build resolves `@console-core` and `@console-components` as local
 
 ```bash
 # Terminal 1: start the gateway
-MOBKIT_REF_ADDR=127.0.0.1:63220 MOBKIT_REF_HTTP_MODE=serve \
-  ./scripts/repo-cargo run -p meerkat-mobkit --example library_mode_reference
+META_REF_ADDR=127.0.0.1:63220 META_REF_HTTP_MODE=serve \
+  ./scripts/repo-cargo run -p meerkat-meta --example library_mode_reference
 
 # Terminal 2: start the Vite dev server (proxies API calls to gateway)
 cd console && npm run dev
@@ -1002,18 +1021,18 @@ packages/
 console/
 ├── src/
 │   ├── ConsoleApp.tsx        # Main app: wires shared components + data
-│   ├── lib/adapters.ts       # MobKit data → console-core view states
+│   ├── lib/adapters.ts       # Meta data → console-core view states
 │   ├── lib/network.ts        # RPC, SSE, fetch helpers
 │   ├── lib/agents.ts         # Agent normalization
 │   ├── icon.tsx              # SVG sprite sheet + Icon renderer
-│   ├── console-host.css      # MobKit-specific overrides + global styles
+│   ├── console-host.css      # Meta-specific overrides + global styles
 │   └── types.ts              # ConsoleAgent, ConsoleFrame, etc.
 ├── build.cjs                 # esbuild production build
 ├── vite.config.ts            # Vite dev server config
 └── smoke.cjs                 # JSDOM smoke test
 ```
 
-The shared packages (`console-core` and `console-components`) avoid app-store and Electron/Desktop-bridge coupling. `console-components` owns presentation; `console-core` includes a MobKit HTTP/SSE transport using web APIs and a controller that accepts injected host transports. These are private workspace packages, not independently published npm API promises.
+The shared packages (`console-core` and `console-components`) avoid app-store and Electron/Desktop-bridge coupling. `console-components` owns presentation; `console-core` includes a Meta HTTP/SSE transport using web APIs and a controller that accepts injected host transports. These are private workspace packages, not independently published npm API promises.
 
 ## See also
 

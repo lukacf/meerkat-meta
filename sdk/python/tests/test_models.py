@@ -1,7 +1,7 @@
 """Tests for data models (SessionBuildOptions, DiscoverySpec, etc.)."""
 import pytest
 
-from meerkat_mobkit.models import (
+from meerkat_meta.models import (
     DiscoverySpec,
     PreSpawnData,
     SessionBuildOptions,

@@ -30,7 +30,7 @@ function setup(options = {}) {
   const commit = (response = beginNavigation()) => { page.emit("framenavigated", frame); return response; };
   return { context, page, frame, monitor, request, start, fail, beginNavigation, commit };
 }
-const seed = { method: "mobkit/console/query_timeline", params: { mode: "recent", limit: 200 } };
+const seed = { method: "meta/console/query_timeline", params: { mode: "recent", limit: 200 } };
 
 test("unexpected aborted requests and uncaught page errors both fail and retain evidence", () => {
   const s = setup();
@@ -272,7 +272,7 @@ test("initialization cannot forgive duplicate seeds, scoped reads, writes, forei
     s.fail(s.start(s.request(options)));
     s.fail(s.start(s.request(options)));
     s.fail(s.start(s.request({ ...options, body: { ...seed, params: { ...seed.params, identity: "router:main" } } })));
-    s.fail(s.start(s.request({ ...options, body: { method: "mobkit/console/send", params: { content: "do not hide" } } })));
+    s.fail(s.start(s.request({ ...options, body: { method: "meta/console/send", params: { content: "do not hide" } } })));
     s.fail(s.start(s.request({ ...options, url: "http://foreign.test/console/rpc" })));
     s.fail(s.start(s.request({ url: `${origin}/console/timeline/stream`, error: "net::ERR_FAILED" })));
   });
@@ -291,7 +291,7 @@ test("initialization allowance ends with its action even for the same request", 
 
 test("a deliberately dropped response permits only the exact request and error once", () => {
   const s = setup();
-  const options = { method: "POST", url: `${origin}/console/rpc`, body: { method: "mobkit/console/send" }, error: "net::ERR_FAILED" };
+  const options = { method: "POST", url: `${origin}/console/rpc`, body: { method: "meta/console/send" }, error: "net::ERR_FAILED" };
   const chosen = s.start(s.request(options));
   s.monitor.expectFailure(chosen, "drop completed owner response", "net::ERR_FAILED");
   s.fail(chosen);

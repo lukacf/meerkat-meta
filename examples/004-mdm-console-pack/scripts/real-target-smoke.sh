@@ -47,7 +47,7 @@ trap cleanup EXIT
 targets_file="${tmp_dir}/targets.json"
 
 cd "$repo_root"
-./scripts/repo-cargo build -p meerkat-mobkit --example mdm_mob_target
+./scripts/repo-cargo build -p meerkat-meta --example mdm_mob_target
 target_bin="$(./scripts/repo-cargo --print-env | awk -F= '$1 == "CARGO_TARGET_DIR" { print $2 }')/debug/examples/mdm_mob_target"
 
 for target_index in $(seq 1 "$target_count"); do

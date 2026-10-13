@@ -113,7 +113,7 @@ async function installConsoleFixture(page, { available = true, publishTimeline =
   await page.route("**/console/experience", (route) => route.fulfill({ json: {
     contract_version: "0.5.0",
     runtime_id: "voice-browser-fixture",
-    voice: { available: false, readiness_method: "mobkit/console/voice/readiness" },
+    voice: { available: false, readiness_method: "meta/console/voice/readiness" },
     runtime_capabilities: { can_send_messages: true },
     console_config: {
       title: "Voice fixture",
@@ -133,27 +133,27 @@ async function installConsoleFixture(page, { available = true, publishTimeline =
     const { id, method, params = {} } = route.request().postDataJSON();
     requests.push({ method, params });
     const respond = (result) => route.fulfill({ json: { jsonrpc: "2.0", id, result } });
-    if (method === "mobkit/capabilities") {
-      return respond({ methods: ["mobkit/console/send"], feature_capabilities: available ? ["live.execution_identity.v1", "live.execution.client_context.v1"] : [] });
+    if (method === "meta/capabilities") {
+      return respond({ methods: ["meta/console/send"], feature_capabilities: available ? ["live.execution_identity.v1", "live.execution.client_context.v1"] : [] });
     }
-    if (method === "mobkit/console/voice/readiness") {
+    if (method === "meta/console/voice/readiness") {
       return respond({ identity: params.identity, available: available && agents.some((agent) => agent.identity === params.identity) });
     }
-    if (method === "mobkit/console/voice/replacement") {
+    if (method === "meta/console/voice/replacement") {
       const channel = [...channels.values()].find((channel) => channel.requestId === params.request_id && channel.identity === params.identity && !channel.closed);
       if (cancelled.has(params.request_id) || (!channel && !preparing.has(params.request_id))) {
         return route.fulfill({ json: { jsonrpc: "2.0", id, error: { code: -32000, message: "Voice closed", data: { kind: "voice_closed" } } } });
       }
       return respond(replacements.get(params.request_id) ?? { required: false });
     }
-    if (method === "mobkit/console/voice/context_status") {
+    if (method === "meta/console/voice/context_status") {
       const channel = channels.get(params.channel_id);
       assert.ok(channel && !channel.closed && channel.identity === params.identity &&
         channel.requestId === params.request_id && !cancelled.has(params.request_id),
       "context status must address the current owned channel");
       return respond({ ...params, context_preparation: channel.contextPreparation });
     }
-    if (method === "mobkit/console/voice/captions") {
+    if (method === "meta/console/voice/captions") {
       const channel = channels.get(params.channel_id);
       assert.ok(channel && channel.identity === params.identity && channel.requestId === params.request_id,
         "captions must address an owned channel");
@@ -174,7 +174,7 @@ async function installConsoleFixture(page, { available = true, publishTimeline =
       return respond({ identity: params.identity, request_id: params.request_id, channel_id: params.channel_id, ...batch })
         .catch(() => {});
     }
-    if (method === "mobkit/console/voice/answer_received" || method === "mobkit/console/voice/activity") {
+    if (method === "meta/console/voice/answer_received" || method === "meta/console/voice/activity") {
       const channel = [...channels.entries()].find(([channelId, candidate]) =>
         candidate.identity === params.identity && candidate.requestId === params.request_id &&
         !cancelled.has(params.request_id) &&
@@ -184,7 +184,7 @@ async function installConsoleFixture(page, { available = true, publishTimeline =
       else assert.equal(channel[1].answerAccepted, true, "activity must follow activation");
       return respond({ accepted: true });
     }
-    if (method === "mobkit/console/voice/open") {
+    if (method === "meta/console/voice/open") {
       assert.equal(available, true, "voice must not open without OpenAI auth");
       assert.equal(typeof params.request_id, "string");
       const channelId = `voice-${++sequence}`;
@@ -194,7 +194,7 @@ async function installConsoleFixture(page, { available = true, publishTimeline =
       });
       return respond(pendingHandle(channelId, params.identity));
     }
-    if (method === "mobkit/live/playback_owner/register") {
+    if (method === "meta/live/playback_owner/register") {
       return respond({ channel_id: params.channel_id, readiness_receipt: `ready-${params.channel_id}` });
     }
     if (method === "live/webrtc/answer") {
@@ -234,7 +234,7 @@ async function installConsoleFixture(page, { available = true, publishTimeline =
       }
       return respond({ answer_sdp: answerSdp });
     }
-    if (method === "mobkit/live/status") {
+    if (method === "meta/live/status") {
       const channel = channels.get(params.channel_id);
       assert.ok(channel, "status must address an opened channel");
       if (!channel.closed && !channel.answerAccepted) return respond({ phase: "pending" });
@@ -246,7 +246,7 @@ async function installConsoleFixture(page, { available = true, publishTimeline =
         },
       });
     }
-    if (method === "mobkit/console/voice/close") {
+    if (method === "meta/console/voice/close") {
       const owned = [...channels.values()].filter((channel) => channel.requestId === params.request_id && channel.identity === params.identity);
       assert.ok(owned.length, "close must address an opened request");
       owned.forEach((channel) => { channel.closed = true; });
@@ -255,12 +255,12 @@ async function installConsoleFixture(page, { available = true, publishTimeline =
       cancelled.add(params.request_id);
       return respond({ phase: "closed" });
     }
-    if (method === "mobkit/live/replacement_required") return respond({ required: false });
-    if (method === "mobkit/live/playback_complete") return respond({ status: "completed" });
-    if (method === "mobkit/console/send") {
+    if (method === "meta/live/replacement_required") return respond({ required: false });
+    if (method === "meta/live/playback_complete") return respond({ status: "completed" });
+    if (method === "meta/console/send") {
       return respond({ interaction_id: `text-${++sequence}`, identity: params.identity, accepted: true });
     }
-    if (method === "mobkit/console/query_timeline") return respond(timelinePage(params.identity));
+    if (method === "meta/console/query_timeline") return respond(timelinePage(params.identity));
     return route.fulfill({ json: { jsonrpc: "2.0", id, error: { code: -32601, message: `Fixture does not implement ${method}` } } });
   });
   await page.addInitScript(() => {
@@ -325,7 +325,7 @@ async function openAgent(page, label) {
 async function sendText(page, identity, text) {
   await page.getByTestId(`chat-composer:${identity}`).fill(text);
   const sent = page.waitForResponse((response) => response.url().endsWith("/console/rpc") &&
-    response.request().postDataJSON()?.method === "mobkit/console/send");
+    response.request().postDataJSON()?.method === "meta/console/send");
   await page.getByTestId(`chat-send:${identity}`).click();
   await sent;
 }
@@ -513,7 +513,7 @@ async function main() {
     assert.equal(await page.locator(".voice-waveform").count(), 2);
     await sendText(page, "identity:alpha", "Keep working while we talk");
     await page.locator('[data-testid="voice-bar"][data-phase="active"]').waitFor();
-    assert.ok(fixture.requests.some((request) => request.method === "mobkit/console/send" && request.params.identity === "identity:alpha"));
+    assert.ok(fixture.requests.some((request) => request.method === "meta/console/send" && request.params.identity === "identity:alpha"));
     await verifyVoiceTranscriptHandoff(page, fixture);
     await page.getByRole("button", { name: "Mute microphone" }).click();
     assert.equal(await page.evaluate(() => window.voiceFixture.microphoneTracks.at(-1).enabled), false);
@@ -547,7 +547,7 @@ async function main() {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const preparingResponse = await page.waitForResponse((response) =>
         response.url().endsWith("/console/rpc") &&
-        response.request().postDataJSON()?.method === "mobkit/console/voice/replacement");
+        response.request().postDataJSON()?.method === "meta/console/voice/replacement");
       assert.deepEqual((await preparingResponse.json()).result, { required: false });
     }
     replacement.publish();
@@ -557,20 +557,20 @@ async function main() {
     await page.getByRole("button", { name: "Unmute microphone" }).waitFor();
     await page.getByRole("button", { name: "Unmute speakers" }).waitFor();
     assert.equal(await page.evaluate(() => window.voiceFixture.microphoneTracks.length), capturesBeforeRecovery);
-    assert.equal(fixture.requests.filter((request) => request.method === "mobkit/console/voice/open").length, 1);
+    assert.equal(fixture.requests.filter((request) => request.method === "meta/console/voice/open").length, 1);
     assert.equal(await page.getByRole("heading", { name: "Spoken review", exact: true }).count(), 1,
       "saved speech remains visible after the channel replacement clears provisional items");
 
     await openAgent(page, "Beta");
     await page.getByRole("region", { name: "Voice with Alpha" }).waitFor();
-    assert.equal(fixture.requests.filter((request) => request.method === "mobkit/console/voice/open").length, 1);
+    assert.equal(fixture.requests.filter((request) => request.method === "meta/console/voice/open").length, 1);
     await page.getByTestId("nav:roster").click();
     await page.locator('.main > [data-testid="voice-bar"]').waitFor();
     await page.getByRole("region", { name: "Voice with Alpha" }).waitFor();
     await openAgent(page, "Beta");
     await sendText(page, "identity:beta", "A separate text task");
     await page.waitForFunction(() => document.querySelector('[data-testid="chat-composer:identity:beta"]').value === "");
-    assert.ok(fixture.requests.some((request) => request.method === "mobkit/console/send" && request.params.identity === "identity:beta"));
+    assert.ok(fixture.requests.some((request) => request.method === "meta/console/send" && request.params.identity === "identity:beta"));
     assert.equal(await page.getByRole("heading", { name: "Spoken review", exact: true }).count(), 0,
       "the separate agent has no canonical speech from Alpha's history");
 
@@ -605,8 +605,8 @@ async function main() {
     await page.getByRole("button", { name: "Start voice with Beta" }).click();
     await page.getByRole("region", { name: "Voice with Beta" }).waitFor();
     await waitForVoice(page, fixture.requests);
-    const firstClose = fixture.requests.findIndex((request) => request.method === "mobkit/console/voice/close");
-    const secondOpen = fixture.requests.findIndex((request) => request.method === "mobkit/console/voice/open" && request.params.identity === "identity:beta");
+    const firstClose = fixture.requests.findIndex((request) => request.method === "meta/console/voice/close");
+    const secondOpen = fixture.requests.findIndex((request) => request.method === "meta/console/voice/open" && request.params.identity === "identity:beta");
     assert.ok(firstClose >= 0 && firstClose < secondOpen, "old voice closes before the new voice opens");
     await page.getByRole("button", { name: "End voice conversation" }).click();
     await page.waitForFunction(() => window.voiceFixture.microphoneTracks.every((track) => track.readyState === "ended"));
@@ -625,7 +625,7 @@ async function main() {
     assert.equal(await page.evaluate(() => window.voiceFixture.microphoneTracks.length), capturesBeforeAuthLoss + 1);
     await page.waitForFunction(() => window.voiceFixture.microphoneTracks.every((track) => track.readyState === "ended"));
     assert.equal(fixture.channels.size, openedBeforeAuthLoss);
-    assert.ok(!fixture.requests.slice(secondOpen + 1).some((request) => request.method === "mobkit/console/voice/open"),
+    assert.ok(!fixture.requests.slice(secondOpen + 1).some((request) => request.method === "meta/console/voice/open"),
       "no open follows a negative readiness");
 
     const unauthenticated = await context.newPage();
@@ -634,7 +634,7 @@ async function main() {
     // negative answer for the opened agent then removes it.
     const alphaReadinessAnswered = unauthenticated.waitForResponse((response) => {
       const body = response.request().postDataJSON?.();
-      return body?.method === "mobkit/console/voice/readiness" && body?.params?.identity === "identity:alpha";
+      return body?.method === "meta/console/voice/readiness" && body?.params?.identity === "identity:alpha";
     });
     await unauthenticated.goto(`${url}/console`);
     await openAgent(unauthenticated, "Alpha");
@@ -642,7 +642,7 @@ async function main() {
     await unauthenticated.getByTestId("voice-start").waitFor({ state: "detached" });
     assert.equal(await unauthenticated.getByTestId("voice-start").count(), 0);
     assert.equal(await unauthenticated.evaluate(() => window.voiceFixture.microphoneTracks.length), 0);
-    assert.ok(!noAuth.requests.some((request) => request.method === "mobkit/console/voice/open"));
+    assert.ok(!noAuth.requests.some((request) => request.method === "meta/console/voice/open"));
     const assets = await Promise.all(assetResponses);
     assert.equal(assets.length, 2, "the browser fetched both production console assets");
     assert(assets.every(asset => asset.status === 200));

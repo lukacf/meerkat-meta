@@ -14,6 +14,48 @@ function Icon({ name }: { name: string; className?: string }) {
 }
 
 describe("ConversationMessageView", () => {
+  test("stock and shared native review cards show local facts without inventing approval controls", () => {
+    for (const [error, kind, category, expected, approvalId] of [
+      ["review_unsatisfied", "denied", "review-unsatisfied", "reviewer declined"],
+      ["review_unsatisfied", "escalated", "review-unsatisfied", "requires further review"],
+      ["review_unsatisfied", "human_consent_required", "review-unsatisfied", "requires human consent"],
+      ["review_unsatisfied", "human_consent_required", "review-unsatisfied", "requires human consent", "B6503200-06B6-4157-AFC0-2A3C8D124178"],
+      ["review_unsatisfied", "already_consumed", "review-unsatisfied", "does not establish the action's execution result"],
+      ["review_unavailable", "reviewer_missing", "review-unavailable", "No reviewer is configured"],
+      ["review_unavailable", "dispatch_ended", "review-unavailable", "does not establish the action's execution result"],
+    ]) {
+      const frames = [{ id: "start", event: "run_started", runId: "run", data: {} }, {
+        id: "review", event: "tool_result_received", runId: "run", data: {
+          id: "reviewed-call", name: "write_file", is_error: true,
+          content: [{ type: "text", text: JSON.stringify({ error, message: "private-review-canary", data: { kind, ...(approvalId ? { approval_id: approvalId } : {}) } }) }],
+        },
+      }];
+      for (const map of [mapShared, mapStock]) {
+        const entry = map(null, frames).find(item => item.kind === "message" && item.operationFeedback)!;
+        expect(entry).toBeDefined();
+        const shared = render(<ConversationMessageView entry={entry} />);
+        const stock = render(<ChatPane agent={null} agentLabel="Agent" identity="agent" entries={[entry]} phase="waiting" draft="" sending={false} staged={[]} onDraftChange={() => {}} onStagedChange={() => {}} onSend={() => false} />);
+        for (const view of [shared, stock]) {
+          const feedback = view.container.querySelector(`[data-feedback-kind="${category}"]`);
+          expect(feedback?.getAttribute("role")).toBe("status");
+          expect(feedback?.textContent).toContain(expected);
+          expect(feedback?.textContent).toContain("Call reviewed-call");
+          const approvalReferences = Array.from(
+            feedback?.querySelectorAll(".cc-operation-feedback__reference") ?? [],
+            (reference) => reference.textContent,
+          ).filter((text) => text?.startsWith("Approval reference"));
+          expect(approvalReferences).toEqual(approvalId ? [`Approval reference ${approvalId}`] : []);
+          expect(feedback?.textContent).not.toMatch(/private-review-canary|Permission denied|Run failed|Awaiting approval|Approved/);
+          expect(feedback?.querySelector("button, a, [role='button']")).toBeNull();
+          if (kind === "already_consumed" || kind === "dispatch_ended") {
+            expect(feedback?.textContent).not.toMatch(/did not run|never entered|no effect/);
+          }
+        }
+        shared.unmount(); stock.unmount();
+      }
+    }
+  });
+
   test("stock and shared local hook feedback names the blocked call without presenting a run failure", () => {
     const frames = [{ id: "start", event: "run_started", runId: "run", data: {} }, {
       id: "refused", event: "hook_launch_refused", runId: "run", data: {
@@ -300,7 +342,7 @@ describe("ConversationMessageView", () => {
     render(<ConversationMessageView entry={entry} Icon={Icon} />);
 
     // The transcript keeps peer sends humanized: the header carries the peer
-    // target, never the raw tool name (mobkit's pre-union `send_message →
+    // target, never the raw tool name (meta's pre-union `send_message →
     // worker-a` label was superseded by the studio's title-neutral rendering).
     expect(screen.getByText("worker-a")).toBeInTheDocument();
     expect(screen.queryByText(/send_message/)).not.toBeInTheDocument();
@@ -503,7 +545,7 @@ describe("ConversationMessageView", () => {
       arguments: JSON.stringify({ body }),
       status: "success" as const,
       peerIncoming: true,
-      peerTarget: "HSNS thread",
+      peerTarget: "Ops thread",
       peerBody: body,
       peerBodyFormat: "verbatim" as const,
     };
@@ -524,7 +566,7 @@ describe("ConversationMessageView", () => {
     expect(screen.queryByText("Response requested.")).not.toBeInTheDocument();
   });
 
-  test("summarizes legacy MobKit peer protocol prompts in peer cards", () => {
+  test("summarizes legacy Meta peer protocol prompts in peer cards", () => {
     const entry: ConversationTimelineEntry = {
       id: "assistant-peer-protocol-body",
       kind: "message",
@@ -538,7 +580,7 @@ describe("ConversationMessageView", () => {
         arguments: JSON.stringify({ body: 'Please send_response with result.token exactly "peer-merge-123".' }),
         status: "success",
         peerIncoming: true,
-        peerTarget: "HSNS thread",
+        peerTarget: "Ops thread",
         peerBody: 'Please send_response with result.token exactly "peer-merge-123".',
       }],
     };

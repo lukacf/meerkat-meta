@@ -190,7 +190,7 @@ export function renameSchemaDefinition({ schemas, members, flow } = {}, oldId, n
   };
 }
 
-// Mirrors MobKit's rewrite_adaptive_result_schema_references: a schema id
+// Mirrors Meta's rewrite_adaptive_result_schema_references: a schema id
 // rename remaps an adaptive layer's matching resultSchema alongside the
 // member schema refs (the server also remaps the graph instance's embedded
 // adaptive payload, which the authoritative apply_operation result carries).
@@ -261,7 +261,7 @@ export function pruneMissingMemberSteps(steps, memberIds) {
 }
 
 export function pruneMissingMemberStep(step, memberIds) {
-  // Mirrors MobKit's prune_step_array_for_members: member steps without a
+  // Mirrors Meta's prune_step_array_for_members: member steps without a
   // live member are dropped, but containers (repeat/branch/parallel) stay
   // even when emptied — an empty lane is a legitimate draft state, and the
   // server keeps it. Adaptive steps also stay: only their stale member refs
@@ -295,7 +295,7 @@ export function pruneMissingMemberStep(step, memberIds) {
   return step;
 }
 
-// Mirrors MobKit's prune_adaptive_step_member_refs: a stale flowmasterId
+// Mirrors Meta's prune_adaptive_step_member_refs: a stale flowmasterId
 // clears to "", stale profileTemplateIds entries drop, and the step itself
 // never drops. Applied to the flow step and to a graph instance's embedded
 // adaptive payload alike so graph_derives_flow equivalence keeps holding.

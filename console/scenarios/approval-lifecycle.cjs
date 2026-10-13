@@ -6,23 +6,23 @@ const path = require("node:path");
 const { chromium } = require("playwright");
 const { startFixture, eventually, rpc } = require("../acceptance-runtime.cjs");
 const { browserFailureMonitor, navigation } = require("./browser-failure-monitor.cjs");
-const evidence = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+const evidence = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
 
 function requirePrebuilt() {
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "Set MOBKIT_EXAMPLE_BIN_DIR to the coordinator's prebuilt fixture directory.");
+  assert(process.env.META_EXAMPLE_BIN_DIR, "Set META_EXAMPLE_BIN_DIR to the coordinator's prebuilt fixture directory.");
 }
 async function pending(fixture) {
-  const response = await rpc(fixture.baseUrl, "mobkit/gating/pending");
+  const response = await rpc(fixture.baseUrl, "meta/gating/pending");
   assert.equal(response.status, 200, JSON.stringify(response));
   assert(Array.isArray(response.body.result?.pending), JSON.stringify(response));
   return response.body.result.pending;
 }
 async function audit(fixture) {
-  const response = await rpc(fixture.baseUrl, "mobkit/gating/audit", { limit: 100 });
+  const response = await rpc(fixture.baseUrl, "meta/gating/audit", { limit: 100 });
   assert(Array.isArray(response.body.result?.entries), JSON.stringify(response));
   return response.body.result.entries;
 }
-const decide = (fixture, id, decision = "approve", approver = "fixture-operator") => rpc(fixture.baseUrl, "mobkit/gating/decide", {
+const decide = (fixture, id, decision = "approve", approver = "fixture-operator") => rpc(fixture.baseUrl, "meta/gating/decide", {
   pending_id: id, approver_id: approver, decision, reason: "Reviewed the complete owner request",
 });
 function accessDenied(response) {
@@ -38,7 +38,7 @@ function decisionResult(response, id, decision) {
 function decisions(fixture, id) {
   return fixture.observations.filter(item => {
     if (item.method !== "POST" || !item.request) return false;
-    try { const value = JSON.parse(item.request); return value.method === "mobkit/gating/decide" && value.params?.pending_id === id; }
+    try { const value = JSON.parse(item.request); return value.method === "meta/gating/decide" && value.params?.pending_id === id; }
     catch { return false; }
   });
 }
@@ -82,32 +82,32 @@ async function withBrowser(name, run) {
 
 async function ownerRestart() {
   requirePrebuilt();
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "mobkit-approval-owner-"));
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "meta-approval-owner-"));
   let fixture = await startFixture({ stateDir });
   try {
     const origin = { identity: "router:main", interaction_id: "review-interaction", conversation_id: "release-review" };
     const created = await fixture.control("approval", { ...origin, action: "Publish the reviewed workgraph report" });
     assert(created.pending_id, JSON.stringify(created));
-    const first = await rpc(fixture.baseUrl, "mobkit/gating/pending");
+    const first = await rpc(fixture.baseUrl, "meta/gating/pending");
     assert.deepEqual(first.body.result.pending[0].origin, origin);
     await fixture.close(); fixture = await startFixture({ stateDir });
-    const restored = await rpc(fixture.baseUrl, "mobkit/gating/pending");
+    const restored = await rpc(fixture.baseUrl, "meta/gating/pending");
     assert.deepEqual(restored.body.result.pending[0], first.body.result.pending[0]);
-    const escalated = await rpc(fixture.baseUrl, "mobkit/gating/decide", {
+    const escalated = await rpc(fixture.baseUrl, "meta/gating/decide", {
       pending_id: created.pending_id, approver_id: "fixture-operator", decision: "escalate", reason: "Second reviewer required",
     });
     assert(escalated.body.result.next_pending_id, JSON.stringify(escalated.body));
     await fixture.close(); fixture = await startFixture({ stateDir });
-    const successor = (await rpc(fixture.baseUrl, "mobkit/gating/pending")).body.result.pending[0];
+    const successor = (await rpc(fixture.baseUrl, "meta/gating/pending")).body.result.pending[0];
     assert.equal(successor.pending_id, escalated.body.result.next_pending_id);
     assert.deepEqual(successor.origin, origin);
-    const decided = await rpc(fixture.baseUrl, "mobkit/gating/decide", {
+    const decided = await rpc(fixture.baseUrl, "meta/gating/decide", {
       pending_id: successor.pending_id, approver_id: "fixture-operator", decision: "approve", reason: "Reviewed complete request",
     });
     assert.equal(decided.body.result.outcome, "allowed", JSON.stringify(decided.body));
     await fixture.close(); fixture = await startFixture({ stateDir });
-    assert.deepEqual((await rpc(fixture.baseUrl, "mobkit/gating/pending")).body.result.pending, []);
-    const audit = (await rpc(fixture.baseUrl, "mobkit/gating/audit", { limit: 100 })).body.result.entries;
+    assert.deepEqual((await rpc(fixture.baseUrl, "meta/gating/pending")).body.result.pending, []);
+    const audit = (await rpc(fixture.baseUrl, "meta/gating/audit", { limit: 100 })).body.result.entries;
     assert(audit.some(item => item.detail?.origin?.interaction_id === origin.interaction_id));
     const next = await fixture.control("approval", { ...origin, action: "Review next report" });
     assert.notEqual(next.pending_id, successor.pending_id);
@@ -201,14 +201,14 @@ async function composedApproval(host) {
     await capture(page, `${host}-approval-review-1440`);
     const before = decisions(fixture, created.pending_id).length;
     await page.getByTestId(`gating-action:${created.pending_id}:approve`).first().click();
-    await eventually(async () => (await rpc(fixture.baseUrl, "mobkit/gating/pending")).body.result.pending.length === 0, "owner approval resolution");
+    await eventually(async () => (await rpc(fixture.baseUrl, "meta/gating/pending")).body.result.pending.length === 0, "owner approval resolution");
     await eventually(async () => await page.getByTestId(`gating-action:${created.pending_id}:approve`).count() === 0, "all approval copies settle");
     await navigation(page, "explicit approval host reload", async () => {
       const response = await page.reload();
       await page.locator('[data-testid="console-transport-status"][data-phase="live"]').waitFor();
       return response;
     });
-    assert.equal((await rpc(fixture.baseUrl, "mobkit/gating/pending")).body.result.pending.length, 0);
+    assert.equal((await rpc(fixture.baseUrl, "meta/gating/pending")).body.result.pending.length, 0);
     assert.equal(decisions(fixture, created.pending_id).length, before + 1, "one UI decision dispatch settles all copies");
     await capture(page, `${host}-approval-settled`);
   });
@@ -216,7 +216,7 @@ async function composedApproval(host) {
 
 async function openConversation(page, fixture, host) {
   await fixture.control("model", { source: "## Release review\n\nThe graph has two independent review branches. Both must complete before publishing the final report.\n\n- [x] Dependencies checked\n- [ ] Operator approval\n", delay_ms: 0, chunk_chars: 64 });
-  const accepted = (await rpc(fixture.baseUrl, "mobkit/console/send", {
+  const accepted = (await rpc(fixture.baseUrl, "meta/console/send", {
     identity: "router:main", content: "Prepare the workgraph release review", origin: "console:approval-scenario",
     origin_kind: "operator", idempotency_key: "approval-turn", handling_mode: "queue",
   })).body.result;
@@ -260,8 +260,8 @@ async function accessMatrix() {
     assert.equal((await pending(fixture)).length, 3, "denied decisions do not consume pending owner entries");
 
     await fixture.control("access", { mode: "denied" });
-    accessDenied(await rpc(fixture.baseUrl, "mobkit/gating/pending"));
-    accessDenied(await rpc(fixture.baseUrl, "mobkit/gating/audit", { limit: 100 }));
+    accessDenied(await rpc(fixture.baseUrl, "meta/gating/pending"));
+    accessDenied(await rpc(fixture.baseUrl, "meta/gating/audit", { limit: 100 }));
     accessDenied(await decide(fixture, publicRequest.pending_id));
 
     await fixture.control("access", { mode: "hide-origin" });
@@ -335,12 +335,12 @@ async function accessRevocation(host) {
       await page.getByTestId("nav:gating").click();
       await page.getByText("Approvals are not available for this connection", { exact: true }).waitFor();
       const capabilityReads = fixture.observations.filter(item => {
-        try { return JSON.parse(item.request || "{}").method === "mobkit/capabilities"; }
+        try { return JSON.parse(item.request || "{}").method === "meta/capabilities"; }
         catch { return false; }
       });
       const advertised = JSON.parse(capabilityReads.at(-1)?.response || "{}").result?.methods;
       assert(Array.isArray(advertised), "revocation captured the advertised capabilities");
-      assert(!advertised.includes("mobkit/gating/pending"), "revocation removes the read capability before dispatch");
+      assert(!advertised.includes("meta/gating/pending"), "revocation removes the read capability before dispatch");
       assert.equal(await page.getByText("No pending approvals.", { exact: true }).count(), 0, "unsupported is not an empty success");
     }
     await capture(page, `${host}-approval-access-revoked`);
@@ -445,7 +445,7 @@ async function staleCopies() {
     const gate = new Promise(resolve => { release = resolve; });
     await page.route("**/console/rpc", async route => {
       const body = route.request().postDataJSON();
-      if (!armed || body?.method !== "mobkit/gating/pending") return route.continue();
+      if (!armed || body?.method !== "meta/gating/pending") return route.continue();
       armed = false;
       const response = await route.fetch();
       const snapshot = await response.json();

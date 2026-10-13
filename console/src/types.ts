@@ -114,6 +114,8 @@ export interface ConsoleSidebarButtonConfig {
   label: string;
   control?: string;
   href?: string;
+  /** Same-origin path of a docked operator panel (trusted operator code). */
+  panel?: string;
   target?: string;
   icon_name?: string;
   iconName?: string;
@@ -405,7 +407,7 @@ export interface ConsoleAccessSaveFailure {
 export type ConsoleAccessSaveResult = void | boolean | ConsoleAccessSaveFailure;
 
 // ── Memory panel (read-only) ──────────────────────────────────────────────
-// Shapes mirror the server contract for the `mobkit/memory/panel/*`
+// Shapes mirror the server contract for the `meta/memory/panel/*`
 // JSON-RPC methods. All fields are best-effort/optional on the client so the
 // panel degrades gracefully across runtime versions.
 
@@ -544,7 +546,7 @@ export interface MemoryPanelRecordResult {
 export type MemoryQuarantineVerdict = "release" | "tombstone";
 
 /// One record as it stands after a quarantine decision, read back from the
-/// store (mobkit/memory/quarantine/decide).
+/// store (meta/memory/quarantine/decide).
 export interface MemoryReviewedRecordReceipt {
   memory_id: string;
   scope: MemoryRecordScope;
@@ -718,7 +720,7 @@ export interface MemoryPanelAuditVerdictsResult {
 
 // ── WorkGraph panel (read + gated operator actions) ───────────────────────
 // Tolerant mirrors of meerkat-workgraph's typed results, serialized verbatim
-// by the `mobkit/workgraph/*` JSON-RPC methods. All fields optional on the
+// by the `meta/workgraph/*` JSON-RPC methods. All fields optional on the
 // client so the panel degrades gracefully across runtime versions.
 
 export interface WorkGraphWireOwnerKey {
@@ -775,7 +777,7 @@ export interface WorkGraphWireEvent {
   payload?: unknown;
 }
 
-/// `mobkit/workgraph/snapshot` result (WorkGraphSnapshot verbatim).
+/// `meta/workgraph/snapshot` result (WorkGraphSnapshot verbatim).
 export interface WorkGraphSnapshotResult {
   realm_id?: string;
   namespace?: string;

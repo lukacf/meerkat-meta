@@ -1,8 +1,8 @@
-export const SIDEBAR_PINS_STORAGE_PREFIX = "mobkit-console-sidebar-pins";
-export const SIDEBAR_SECTION_ORDER_STORAGE_PREFIX = "mobkit-console-sidebar-section-order";
-export const SIDEBAR_SUBGROUP_ORDER_STORAGE_PREFIX = "mobkit-console-sidebar-subgroup-order";
-export const SECTION_COLLAPSE_STORAGE_PREFIX = "mobkit-console-sidebar-sections";
-export const SUBGROUP_COLLAPSE_STORAGE_PREFIX = "mobkit-console-sidebar-subgroups";
+export const SIDEBAR_PINS_STORAGE_PREFIX = "meta-console-sidebar-pins";
+export const SIDEBAR_SECTION_ORDER_STORAGE_PREFIX = "meta-console-sidebar-section-order";
+export const SIDEBAR_SUBGROUP_ORDER_STORAGE_PREFIX = "meta-console-sidebar-subgroup-order";
+export const SECTION_COLLAPSE_STORAGE_PREFIX = "meta-console-sidebar-sections";
+export const SUBGROUP_COLLAPSE_STORAGE_PREFIX = "meta-console-sidebar-subgroups";
 
 export const SIDEBAR_STORAGE_PREFIXES = [
   SIDEBAR_PINS_STORAGE_PREFIX,

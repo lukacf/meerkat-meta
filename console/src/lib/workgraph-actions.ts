@@ -35,8 +35,8 @@ export interface WorkGraphConflictRefresh {
 /// and the fold only heals from observed frames, so without a fresh sighting
 /// every subsequent click would resend the same wedged revision. Plan the
 /// read that re-observes the entity the failed mutation addressed: item
-/// mutations (`id`) via `mobkit/workgraph/get`; binding-addressed mutations
-/// (`binding_id`) via `mobkit/workgraph/goal/status`, whose result carries
+/// mutations (`id`) via `meta/workgraph/get`; binding-addressed mutations
+/// (`binding_id`) via `meta/workgraph/goal/status`, whose result carries
 /// the goal item AND the binding machine state, healing both CAS classes at
 /// once. Null when the failed params name no entity to refetch.
 export function workGraphConflictRefreshRequest(
@@ -66,7 +66,7 @@ function revisionOfItem(result: unknown): number | undefined {
   return typeof item?.revision === "number" ? item.revision : undefined;
 }
 
-/// Live revision of one work item via `mobkit/workgraph/get`.
+/// Live revision of one work item via `meta/workgraph/get`.
 export async function resolveWorkGraphItemRevision(
   run: WorkGraphCommandRunner,
   itemId: string,
@@ -80,7 +80,7 @@ export async function resolveWorkGraphItemRevision(
 }
 
 /// Live revision of the goal WORK ITEM behind an attention binding via
-/// `mobkit/workgraph/goal/status` — the CAS token goal confirm/request-close
+/// `meta/workgraph/goal/status` — the CAS token goal confirm/request-close
 /// must echo.
 export async function resolveWorkGraphGoalItemRevision(
   run: WorkGraphCommandRunner,
@@ -95,7 +95,7 @@ export async function resolveWorkGraphGoalItemRevision(
 }
 
 /// Live machine revision of an attention binding via
-/// `mobkit/workgraph/goal/status` — the CAS token attention
+/// `meta/workgraph/goal/status` — the CAS token attention
 /// pause/resume/reassign must echo.
 export async function resolveWorkGraphBindingRevision(
   run: WorkGraphCommandRunner,

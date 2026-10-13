@@ -10,7 +10,7 @@ version       = "1"
 # larger tier earns its cost. Deployments override per-config via
 # `agent_memory.distiller.model`. Must stay in sync with
 # `DistillerProfile::embedded_default()`
-# (crates/meerkat-mobkit/src/memory/distiller.rs) — a unit test enforces the prompt
+# (crates/meerkat-meta/src/memory/distiller.rs) — a unit test enforces the prompt
 # half of that sync.
 model         = "claude-haiku-4-5"
 prompt_bundle = "prompts/distiller-v0.md"

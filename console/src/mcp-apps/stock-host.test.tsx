@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { expect, it, vi } from "vitest";
 import type { ConsoleFrame } from "@console-core";
 import { ConsoleApp } from "../ConsoleApp";
-import type { MobKitConsoleTransport } from "../lib/headless";
+import type { MetaConsoleTransport } from "../lib/headless";
 import { CONSOLE_RPC_METHODS } from "../lib/contract";
 
 it("routes a live native app locator through the mounted stock Console before history or turn completion", async () => {
@@ -11,7 +11,7 @@ it("routes a live native app locator through the mounted stock Console before hi
   const identity = "member:app";
   let live: ((frame: ConsoleFrame) => void) | undefined;
   const queryTimeline = vi.fn(async () => ({ frames: [], exhausted: true, available: true }));
-  const transport: MobKitConsoleTransport = {
+  const transport: MetaConsoleTransport = {
     loadExperience: async () => ({
       contract_version: "test", runtime_id: "app-routing-test", storage_scope: "app-routing-subject",
       console_config: {}, console_policy: {},

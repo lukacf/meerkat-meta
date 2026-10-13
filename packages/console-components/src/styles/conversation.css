@@ -1615,6 +1615,13 @@ span.cc-conversation-turn-preview__file-icon::after {
   height: auto;
   object-fit: contain;
 }
+.cc-tool-call__image-unavailable {
+  border: 1px dashed var(--_cc-border-soft, rgba(255,255,255,0.08));
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  opacity: 0.75;
+}
 .cc-tool-call__section-label {
   font-size: 12px;
   font-weight: 500;

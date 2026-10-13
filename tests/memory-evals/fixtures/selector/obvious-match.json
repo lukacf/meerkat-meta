@@ -4,8 +4,8 @@
     {
       "id": "mem-001",
       "kind": "Procedure",
-      "title": "MobKit release publishes PyPI and npm in lockstep",
-      "description": "Matters whenever a mobkit release or version bump is being prepared: the Rust release must publish meerkat-mobkit to PyPI and @rkat/mobkit-sdk to npm at the same version in the same pass.",
+      "title": "Meta release publishes PyPI and npm in lockstep",
+      "description": "Matters whenever a meta release or version bump is being prepared: the Rust release must publish meerkat-meta to PyPI and @rkat/meta-sdk to npm at the same version in the same pass.",
       "age_days": 40,
       "rank": 2
     },

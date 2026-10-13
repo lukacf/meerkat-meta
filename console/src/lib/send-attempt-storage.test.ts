@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createConsoleSendAttempt, beginConsoleSendAttempt, finishConsoleSendAttempt } from "../../../packages/console-core/src/send-attempt";
-import { consoleSendStorageKey, loadConsoleSendAttempts, saveConsoleSendAttempts, readLegacyConsoleQueue } from "./send-attempt-storage";
+import { consoleSendStorageKey, loadConsoleSendAttempts, saveConsoleSendAttempts, readLegacyConsoleQueue, predecessorConsoleSendStorageKey, readPredecessorConsoleQueue } from "./send-attempt-storage";
 const storage = () => { const data = new Map<string, string>(); return { data, getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => { data.set(key, value); } }; };
 const draft = () => createConsoleSendAttempt({ id: "a", scope: "runtime/realm/principal", destination: "d", origin: "console:p1", idempotencyKey: "same-key", text: "hello", now: 1 });
 describe("scoped queue storage", () => {
@@ -26,6 +26,17 @@ describe("scoped queue storage", () => {
     expect(loadConsoleSendAttempts(s, "runtime/realm/principal", "d").attempts).toEqual([]);
     expect(readLegacyConsoleQueue(s, "d")).toHaveLength(1);
     expect(s.getItem("mobkit-pending-stack:d")).toBe(bytes);
+  });
+  it("reads a predecessor queue only when asked, and preserves its bytes", () => {
+    const s = storage(); const a = beginConsoleSendAttempt(draft(), { owner: "tab1", now: 1, handlingMode: "steer" });
+    const bytes = JSON.stringify({ version: 1, namespace: a.scope, destination: "d", attempts: [a] });
+    s.setItem(predecessorConsoleSendStorageKey(a.scope, "d"), bytes);
+    expect(loadConsoleSendAttempts(s, a.scope, "d").attempts).toEqual([]);
+    const predecessor = readPredecessorConsoleQueue(s, a.scope, "d", 20_000);
+    expect(predecessor.kind).toBe("ready");
+    expect(predecessor.attempts[0].envelopeJson).toBe(a.envelopeJson);
+    expect(readPredecessorConsoleQueue(s, "another principal", "d").attempts).toEqual([]);
+    expect(s.getItem(predecessorConsoleSendStorageKey(a.scope, "d"))).toBe(bytes);
   });
   it("exposes quota failure without deleting previous persisted content", () => {
     const s = storage(); const a = draft(); saveConsoleSendAttempts(s, a.scope, "d", [a]);

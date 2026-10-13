@@ -3,8 +3,8 @@ import json
 
 import pytest
 
-from meerkat_mobkit._sse import SseEvent
-from meerkat_mobkit.events import (
+from meerkat_meta._sse import SseEvent
+from meerkat_meta.events import (
     AgentEvent,
     Event,
     EventStream,

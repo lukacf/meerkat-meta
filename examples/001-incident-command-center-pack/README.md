@@ -1,13 +1,13 @@
 # Incident Command Center Pack
 
-Synthetic incident-response scenario for the stock MobKit console.
+Synthetic incident-response scenario for the stock Meta console.
 
 This pack uses:
 
 - the stock Rust runtime and stock `/console/*` surfaces
-- stock `mobkit/console/query_timeline`, `mobkit/console/send`, and `/console/timeline/stream`
+- stock `meta/console/query_timeline`, `meta/console/send`, and `/console/timeline/stream`
 - stock routing, delivery, inspect, lifecycle, topology, and gating methods
-- a live provider-backed MobKit runtime with synthetic incident data and deterministic tool fixtures
+- a live provider-backed Meta runtime with synthetic incident data and deterministic tool fixtures
 - explicitly opt-in, single-edge topology management (`allow_bulk: false`)
 
 ## Source layout
@@ -20,8 +20,8 @@ This pack uses:
 
 ## What it proves
 
-- identity-addressed chat with server-owned acceptance over `mobkit/console/send` + `/console/identity/{identity}/stream`
-- canonical console timeline replay over `mobkit/console/query_timeline`
+- identity-addressed chat with server-owned acceptance over `meta/console/send` + `/console/identity/{identity}/stream`
+- canonical console timeline replay over `meta/console/query_timeline`
 - aggregate timeline catch-up/live streaming over `/console/timeline/stream`
 - watch/alert/degraded projection from seeded labels
 - inspect, routing, gating, topology, and health panels in the stock console
@@ -45,7 +45,7 @@ export OPENAI_API_KEY=...
 
 Topology control has a separate deterministic browser path. It builds and
 drives the same embedded stock console against the real Rust runtime, but uses
-MobKit's test client and never performs a model call:
+Meta's test client and never performs a model call:
 
 ```bash
 ./examples/001-incident-command-center-pack/topology_examples.sh
@@ -59,7 +59,7 @@ Its offline module-readiness window is deliberately longer so a clean CI
 checkout can compile generated module binaries on first boot; override it with
 `INCIDENT_COMMAND_CENTER_MODULE_RECONCILE_TIMEOUT_SECS` when needed.
 
-The scenario opts into editable topology explicitly. MobKit's default remains
+The scenario opts into editable topology explicitly. Meta's default remains
 disabled, so existing consumers retain the passive Graph and Roles views and
 do not receive mutation controls. Editable mode always uses durable runtime
 state: set `INCIDENT_COMMAND_CENTER_STATE_DIR` to choose its location, or the

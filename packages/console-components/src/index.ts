@@ -8,6 +8,8 @@ export type { CopyGlyphState } from "./copy-glyph";
 export { ConversationEmptyState } from "./conversation/conversation-empty-state";
 export { ConsoleConversationPanel } from "./conversation/console-conversation-panel";
 export { ConversationPane } from "./conversation/conversation-pane";
+export { ConversationBlobReaderProvider } from "./conversation/blob-image";
+export type { ConversationBlobReader } from "./conversation/blob-image";
 export { ConversationRichContent } from "./conversation/conversation-rich-content";
 export { ConversationTranscript } from "./conversation/conversation-transcript";
 export type { FlowRunRestoreHandler } from "./conversation/flow-run-card";

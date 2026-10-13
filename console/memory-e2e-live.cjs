@@ -97,7 +97,7 @@ async function pollUntil(label, timeoutMs, intervalMs, probe) {
 }
 
 async function timelineFrames(baseUrl, params = {}) {
-  const page = await rpc(baseUrl, "mobkit/console/query_timeline", {
+  const page = await rpc(baseUrl, "meta/console/query_timeline", {
     mode: "recent",
     limit: 400,
     ...params,
@@ -110,11 +110,11 @@ const AUTH_ERROR_RE = /auth|credential|api[_ ]?key|unauthorized|401|permission/i
 // ── Boot the live fixture through the Python SDK ────────────────────────
 
 function buildGatewayBinary() {
-  if (process.env.MOBKIT_GATEWAY_BIN) return;
+  if (process.env.META_GATEWAY_BIN) return;
   process.stdout.write("live e2e: building rpc_gateway (repo-cargo)…\n");
   const build = spawnSync(
     path.join(repoRoot, "scripts", "repo-cargo"),
-    ["build", "-p", "meerkat-mobkit", "--bin", "rpc_gateway"],
+    ["build", "-p", "meerkat-meta", "--bin", "rpc_gateway"],
     {
       cwd: repoRoot,
       env: { ...process.env, CARGO_INCREMENTAL: "0" },
@@ -204,7 +204,7 @@ const TURNS = [
 async function driveRealTurns(baseUrl) {
   let completed = 0;
   for (const [index, content] of TURNS.entries()) {
-    const send = await rpc(baseUrl, "mobkit/console/send", {
+    const send = await rpc(baseUrl, "meta/console/send", {
       identity: IDENTITY,
       content,
       origin: "memory-e2e-live",
@@ -256,7 +256,7 @@ async function main() {
       120_000,
       2_000,
       async () => {
-        const result = await rpc(baseUrl, "mobkit/memory/panel/records", { limit: 200 });
+        const result = await rpc(baseUrl, "meta/memory/panel/records", { limit: 200 });
         const rows = result.records || [];
         const agentRows = rows.filter(
           (row) => row.provenance?.author?.author === "agent",
@@ -297,7 +297,7 @@ async function main() {
         180_000,
         3_000,
         async () => {
-          const result = await rpc(baseUrl, "mobkit/memory/panel/records", { limit: 200 });
+          const result = await rpc(baseUrl, "meta/memory/panel/records", { limit: 200 });
           const rows = (result.records || []).filter(
             (row) => row.provenance?.author?.author === "distiller",
           );
@@ -322,7 +322,7 @@ async function main() {
       300_000,
       5_000,
       async () => {
-        const result = await rpc(baseUrl, "mobkit/memory/panel/dreams", {});
+        const result = await rpc(baseUrl, "meta/memory/panel/dreams", {});
         const runs = result.runs || [];
         return runs.length > 0 ? runs : null;
       },
@@ -400,7 +400,7 @@ async function main() {
     } else {
       loudGap("biography has no multi-node lineage (contradiction handled without supersede)");
     }
-    const detail = await rpc(baseUrl, "mobkit/memory/panel/record", { memory_id: bioId });
+    const detail = await rpc(baseUrl, "meta/memory/panel/record", { memory_id: bioId });
     if ((detail.injections || []).length > 0) {
       const life = await page.getByTestId(T.DETAIL_LIFE).innerText();
       assert(

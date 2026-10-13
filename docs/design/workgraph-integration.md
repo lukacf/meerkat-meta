@@ -1,8 +1,8 @@
 # WorkGraph Integration (mobkit 0.7.30)
 
 Full integration of meerkat 0.7.23's WorkGraph (goals, work items, attention
-bindings, apply-time attention overlays) into MobKit: runtime wiring, agent
-tool surface, `mobkit/workgraph/*` JSON-RPC, Python + TypeScript SDK parity,
+bindings, apply-time attention overlays) into Meta: runtime wiring, agent
+tool surface, `meta/workgraph/*` JSON-RPC, Python + TypeScript SDK parity,
 and a conversation-native console widget.
 
 This is the historical 0.7.30 implementation plan and upstream survey, not a
@@ -40,19 +40,19 @@ agent's turn calls workgraph tools. A light workbench panel is secondary.
   `req.runtime.turn_tool_overlay` + `turn_metadata.turn_tool_overlay`. VERIFIED:
   identity-first bridge submits (`bridge.rs:230` submit_work lane) and schedule
   internal deliveries (`schedule_wiring.rs:591`) both ride this executor;
-  mobkit's `normalize_runtime_turn_request` does NOT strip the overlay
+  meta's `normalize_runtime_turn_request` does NOT strip the overlay
   (only handling_mode + render_metadata). Failure mode (HISTORICAL, ≤0.7.24):
   `MultipleActiveBindings` was a HARD per-turn error — meerkat 0.7.25 (ask 25)
   removed it (newest-binding-wins arbitration with a loud diagnostic) and
-  moved binding uniqueness into the store; mobkit's admission demotes to
+  moved binding uniqueness into the store; meta's admission demotes to
   defense-in-depth + alias unification (see workgraph-wire-contract.md).
 - Nested mobs: `MobMcpState::with_workgraph_service` (`meerkat-mob-mcp/src/lib.rs:245`)
-  — thread in mobkit's `install_agent_mob_tools` so delegate/spawned child mobs inherit.
+  — thread in meta's `install_agent_mob_tools` so delegate/spawned child mobs inherit.
 - Schedule host: `spawn_runtime_backed_schedule_host_with_mobs(..., workgraph_service, owner_id)`
   arg 8 (currently `None` at `schedule_wiring.rs:758`).
 - Authority witness: `AttentionContextProjection` (`types.rs:1521`) with
   `ProjectedAttentionAuthority` capability bits — SERVER-INJECTED; wire callers
-  cannot forge it. `reassign_attention`/`escalate_policy` require it: mobkit RPC
+  cannot forge it. `reassign_attention`/`escalate_policy` require it: meta RPC
   fetches `attention_projection(binding_id)` server-side then calls the mutation.
   `GoalConfirmRequest.principal` is `#[serde(skip)]` — host promotes via
   `with_trusted_principal` (console: authenticated principal).
@@ -69,13 +69,13 @@ agent's turn calls workgraph tools. A light workbench panel is secondary.
 
 ## Rust core (Stage A)
 
-1. New `crates/meerkat-mobkit/src/workgraph_wiring.rs`:
+1. New `crates/meerkat-meta/src/workgraph_wiring.rs`:
    `pub const WORKGRAPH_STORE_FILE: &str = "workgraph.sqlite3";`
    `attach_workgraph_tools(&FactoryAgentBuilder, state_dir, realm_id) -> Option<WorkGraphService>`
    = open sqlite store (warn + None on failure — boot-without, matches schedule),
    `with_scope(store, realm_id, default ns)`, `set_default_workgraph_tools`.
    Ephemeral constructor: `attach_workgraph_tools_ephemeral` with `MemoryWorkGraphStore`
-   (mobkit_gateway default launch is ephemeral; feature should exist there too,
+   (meta_gateway default launch is ephemeral; feature should exist there too,
    tools stay profile-gated so nothing changes for existing consumers).
 2. `MobBootstrapSpec.workgraph_service: Option<WorkGraphService>` +
    `with_workgraph_service`; `MobRuntime::bootstrap` forwards to
@@ -88,14 +88,14 @@ agent's turn calls workgraph tools. A light workbench panel is secondary.
    sidecar, tool-plane slots) freezes at `MobRuntime::bootstrap`, so
    spec-at-bootstrap is the only blessed wiring.
 4. `spawn_schedule_host` gains `workgraph_service: Option<WorkGraphService>`
-   param → upstream arg 8. Call sites: rpc_gateway.rs:4588, mobkit_gateway.rs:867,
+   param → upstream arg 8. Call sites: rpc_gateway.rs:4588, meta_gateway.rs:867,
    in-crate e2e harness.
 5. rpc_gateway: construct in persistent branch (`state_path.join(WORKGRAPH_STORE_FILE)`,
    realm = `definition.id`) beside `attach_schedule_tools_with_identity_targets`
    (:3684); runtime_options allowlist gains `workgraph` (bool, default true;
    `false` disables construction entirely); thread to spec/schedule-host/runtime slot.
    Ephemeral branch: memory store (unless `workgraph:false`).
-6. mobkit_gateway: hoist `load_definition` above `build_persistent_session_service`
+6. meta_gateway: hoist `load_definition` above `build_persistent_session_service`
    (needed for realm scoping); construct in `build_persistent_session_service`
    (extend `PersistentSessionServiceParts`); ephemeral launch gets memory-store
    service; thread same as rpc_gateway. No new InitParams field.
@@ -105,9 +105,9 @@ agent's turn calls workgraph tools. A light workbench panel is secondary.
 New `src/rpc/workgraph_methods.rs` (gating_methods.rs template). Methods
 (params → service call → serde of upstream typed results, snake_case):
 
-Read: `mobkit/workgraph/snapshot`, `list`, `get`, `ready`, `events`,
+Read: `meta/workgraph/snapshot`, `list`, `get`, `ready`, `events`,
 `attention/list`, `goal/status`.
-Mutate: `mobkit/workgraph/create`, `update`, `claim`, `release`, `close`,
+Mutate: `meta/workgraph/create`, `update`, `claim`, `release`, `close`,
 `block`, `link`, `evidence/add`, `policy/escalate`, `goal/create`,
 `goal/confirm`, `goal/request_close`, `attention/pause`, `attention/resume`,
 `attention/reassign`.
@@ -123,7 +123,7 @@ Mutate: `mobkit/workgraph/create`, `update`, `claim`, `release`, `close`,
 - Registered in ALL dispatch tables: unified rpc.rs (match + capabilities table)
   and console http_console.rs (match + grant-intersected table). Module-mode
   (rpc.rs:481) does NOT get workgraph (no runtime).
-- Capabilities: `workgraph: true` in `mobkit/capabilities`.
+- Capabilities: `workgraph: true` in `meta/capabilities`.
 - ABAC: new actions `workgraph.view` (reads) + `workgraph.manage` (mutations)
   in `access/model.rs` vocabulary; console_rpc_access_requirement maps the
   method groups; experience payload gains
@@ -145,7 +145,7 @@ Mutate: `mobkit/workgraph/create`, `update`, `claim`, `release`, `close`,
 ## Console (Stage C)
 
 Primary — inline WorkGraphCard (FlowRunCard is the component/type template but
-has NO producer in mobkit; the reducer is new work; ChatPane is the real path):
+has NO producer in meta; the reducer is new work; ChatPane is the real path):
 
 1. console-core `conversation.ts`: `ConversationWorkGraphEntry`
    (kind:"workgraph"; rootId; title; status aggregate; item tree rows with
@@ -171,7 +171,7 @@ has NO producer in mobkit; the reducer is new work; ChatPane is the real path):
 4. ChatPane.tsx: `MsgKind` += "workgraph"; `flattenEntry` branch; render
    branch → `<WorkGraphCard>`; new optional callback props
    (onWorkGraphAction) threaded from ConsoleApp (onGatingDecision template)
-   via new headless commands → `mobkit/workgraph/*`; affordance-gated
+   via new headless commands → `meta/workgraph/*`; affordance-gated
    (`experience.workgraph.can_manage`, consoleReadOnly).
 5. Secondary panel: NavKind "workgraph" server-gated on
    `experience.workgraph.available/can_view` (memory-panel pattern);
@@ -211,7 +211,7 @@ bindings stuck on wedged/retired agents, not an operating feature.
 
 ## Non-goals (this pass)
 
-- No mobkit-side workgraph identity-target rewriting dispatcher (upstream tools
+- No meta-side workgraph identity-target rewriting dispatcher (upstream tools
   already speak session/owner targets; revisit if field pain appears).
 - No WorkGraph REST routes beyond console RPC (SDKs ride the RPC gateway).
 - No workgraph-driven scheduling semantics beyond upstream's overlay injection.

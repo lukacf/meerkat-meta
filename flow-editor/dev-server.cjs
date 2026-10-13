@@ -6,7 +6,7 @@ const path = require("node:path");
 
 const root = path.join(__dirname, "dist");
 const port = Number(process.env.PORT || 4190);
-const rpcProxyUrl = (process.env.MOBKIT_FLOW_EDITOR_RPC_URL || "").trim();
+const rpcProxyUrl = (process.env.META_FLOW_EDITOR_RPC_URL || "").trim();
 
 const types = {
   ".css": "text/css; charset=utf-8",
@@ -43,7 +43,7 @@ async function proxyRpc(payload) {
   });
   const text = await response.text();
   if (!response.ok) {
-    throw new Error(`MobKit RPC proxy ${response.status}: ${text.slice(0, 240)}`);
+    throw new Error(`Meta RPC proxy ${response.status}: ${text.slice(0, 240)}`);
   }
   JSON.parse(text);
   return text;
@@ -60,7 +60,7 @@ const server = http.createServer(async (req, res) => {
       }
       send(res, 200, "application/json; charset=utf-8", jsonRpcError(
         payload.id ?? null,
-        "flow editor dev server requires MOBKIT_FLOW_EDITOR_RPC_URL=<real /flow-editor/rpc endpoint>; fixture RPC is not available",
+        "flow editor dev server requires META_FLOW_EDITOR_RPC_URL=<real /flow-editor/rpc endpoint>; fixture RPC is not available",
         -32000,
       ));
       return;
@@ -91,7 +91,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(port, "127.0.0.1", () => {
   const rpcMode = rpcProxyUrl
     ? `proxying RPC to ${rpcProxyUrl}`
-    : "RPC disabled until MOBKIT_FLOW_EDITOR_RPC_URL is set";
+    : "RPC disabled until META_FLOW_EDITOR_RPC_URL is set";
   process.stdout.write(`flow editor listening on http://127.0.0.1:${port}/flow-editor (${rpcMode})\n`);
 });
 

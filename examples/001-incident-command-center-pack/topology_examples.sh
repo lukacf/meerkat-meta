@@ -8,7 +8,7 @@ RUST_LANE_ID="${RUST_LANE_ID:-incident-console}"
 CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/incident-topology-smoke.XXXXXX")"
 # The server binds port 0 and announces its bound address on stdout
-# ("MOBKIT_FIXTURE_READY {...}"); start_server reads it back. Reserving a free
+# ("META_FIXTURE_READY {...}"); start_server reads it back. Reserving a free
 # port here and binding it later raced every other process for that port.
 LISTEN_ADDR=""
 
@@ -31,7 +31,7 @@ offset = int(sys.argv[2])
 server_pid = int(sys.argv[3])
 ready_timeout_seconds = float(sys.argv[4])
 deadline = time.time() + ready_timeout_seconds
-prefix = "MOBKIT_FIXTURE_READY "
+prefix = "META_FIXTURE_READY "
 addr = None
 while time.time() < deadline:
     try:
@@ -107,31 +107,31 @@ echo "[incident-topology] building the stock embedded console"
 echo "[incident-topology] ensuring Playwright dependencies"
 (cd "$ROOT/examples" && npm ci --silent --no-fund --no-audit)
 
-# MOBKIT_EXAMPLE_BIN_DIR lets CI build the meerkat-mobkit dependency graph once
+# META_EXAMPLE_BIN_DIR lets CI build the meerkat-meta dependency graph once
 # in a dedicated job and hand the binaries here, instead of every consumer
 # compiling the same graph. Unset - the local default - is unchanged.
 #
 # Not a cargo warm-up: `cargo run --example` recomputes freshness from
 # target/.fingerprint, so a bare prebuilt binary would be rebuilt and ignored.
 # The script has to exec the binary directly.
-if [[ -n "${MOBKIT_EXAMPLE_BIN_DIR:-}" ]]; then
-  INCIDENT_COMMAND_CENTER_CMD=("${MOBKIT_EXAMPLE_BIN_DIR}/incident_command_center")
+if [[ -n "${META_EXAMPLE_BIN_DIR:-}" ]]; then
+  INCIDENT_COMMAND_CENTER_CMD=("${META_EXAMPLE_BIN_DIR}/incident_command_center")
   # Fail rather than silently rebuild. A fallback would still pass, just slowly,
   # so a mis-wired artifact download would look like a successful compile-once
   # run and the measurement would be quietly wrong.
   for required in incident_command_center mcp_fixture; do
-    if [[ ! -x "${MOBKIT_EXAMPLE_BIN_DIR}/${required}" ]]; then
-      echo "[incident-topology] MOBKIT_EXAMPLE_BIN_DIR=${MOBKIT_EXAMPLE_BIN_DIR} is set but ${required} is missing or not executable" >&2
+    if [[ ! -x "${META_EXAMPLE_BIN_DIR}/${required}" ]]; then
+      echo "[incident-topology] META_EXAMPLE_BIN_DIR=${META_EXAMPLE_BIN_DIR} is set but ${required} is missing or not executable" >&2
       exit 1
     fi
   done
-  export PATH="${MOBKIT_EXAMPLE_BIN_DIR}:${PATH}"
-  echo "[incident-topology] using prebuilt binaries from ${MOBKIT_EXAMPLE_BIN_DIR}"
+  export PATH="${META_EXAMPLE_BIN_DIR}:${PATH}"
+  echo "[incident-topology] using prebuilt binaries from ${META_EXAMPLE_BIN_DIR}"
 else
-  INCIDENT_COMMAND_CENTER_CMD=(./scripts/repo-cargo run -p meerkat-mobkit --example incident_command_center)
+  INCIDENT_COMMAND_CENTER_CMD=(./scripts/repo-cargo run -p meerkat-meta --example incident_command_center)
   echo "[incident-topology] building the deterministic Rust example"
   (cd "$ROOT" && RUST_LANE_ID="$RUST_LANE_ID" CARGO_INCREMENTAL="$CARGO_INCREMENTAL" \
-    ./scripts/repo-cargo build -p meerkat-mobkit \
+    ./scripts/repo-cargo build -p meerkat-meta \
       --example incident_command_center --bin mcp_fixture)
 fi
 

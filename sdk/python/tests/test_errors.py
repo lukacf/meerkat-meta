@@ -1,20 +1,20 @@
-"""Tests for the MobKit error hierarchy."""
+"""Tests for the Meta error hierarchy."""
 import pytest
 
-from meerkat_mobkit.errors import (
+from meerkat_meta.errors import (
     CapabilityUnavailableError,
     ConsoleTimelineReplayUnavailableError,
     ContractMismatchError,
-    MobKitError,
+    MetaError,
     NotConnectedError,
     RpcError,
     TransportError,
 )
 
 
-class TestMobKitErrorHierarchy:
+class TestMetaErrorHierarchy:
     def test_base_is_exception(self):
-        assert issubclass(MobKitError, Exception)
+        assert issubclass(MetaError, Exception)
 
     @pytest.mark.parametrize(
         "cls",
@@ -28,7 +28,7 @@ class TestMobKitErrorHierarchy:
         ],
     )
     def test_subclasses(self, cls):
-        assert issubclass(cls, MobKitError)
+        assert issubclass(cls, MetaError)
 
 
 class TestRpcError:

@@ -6,14 +6,14 @@
 silently reports its own authority instead of the wrapped client's. meerkat
 0.8.31 rejects `materialize resume` for a client reporting LegacySplit over a
 Unified adapter: that cost 72 stranded identities at boot, measured downstream,
-with nothing in MobKit's own suite going red.
+with nothing in Meta's own suite going red.
 
 The per-wrapper unit tests cover the wrappers that EXIST. This covers the ones
 that do not exist yet - a new decorator added later inherits the same default and
 is silently wrong again, and no per-wrapper test can fail for a wrapper nobody
 has written.
 
-TWO TRAPS THIS AVOIDS, both found the hard way:
+THREE TRAPS THIS AVOIDS, all found the hard way:
 
   FILE-LEVEL MATCHING IS NOT IMPL-LEVEL. Asking whether the FILE containing an
   impl mentions the symbol passes a tree where a production decorator omits it
@@ -24,6 +24,12 @@ TWO TRAPS THIS AVOIDS, both found the hard way:
   `#[allow(...)]` between them. A pattern requiring `cfg(test)` then whitespace
   then `mod` matches nothing and silently classifies every test double as
   production - or, inverted, every production impl as a test.
+
+  A TEST MODULE MAY CARRY A VISIBILITY. Shared test support is declared
+  `pub(crate) mod ... {` (or `pub`, `pub(super)`, `pub(in path)`). A module
+  pattern that requires the line to start with `mod` misses it, so the test
+  doubles inside count as production: dispatch_taint.rs's
+  `controller_test_support::PinnedInner` failed this gate that way.
 """
 
 from __future__ import annotations
@@ -33,11 +39,11 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "crates" / "meerkat-mobkit" / "src"
+SRC = ROOT / "crates" / "meerkat-meta" / "src"
 
 IMPL = re.compile(r"^(\s*)impl\s+(?:[\w:]+::)?AgentLlmClient\s+for\s+(\w+)")
 CFG_TEST = re.compile(r"^\s*#\[cfg\(test\)\]")
-MOD_LINE = re.compile(r"^(\s*)mod\s+\w+\s*\{")
+MOD_LINE = re.compile(r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{")
 
 # Production decorators that legitimately do NOT forward. Empty by design: add a
 # name here only with a reason, never to silence a failure.
@@ -62,7 +68,9 @@ def test_regions(lines: list[str]) -> list[tuple[int, int]]:
         depth = 0
         for k in range(j, len(lines)):
             depth += lines[k].count("{") - lines[k].count("}")
-            if depth <= 0 and k > j:
+            # MOD_LINE requires the `{`, so a balanced declaration line is a
+            # module that closes where it opens (`pub(crate) mod empty {}`).
+            if depth <= 0:
                 regions.append((i, k + 1))
                 break
         else:

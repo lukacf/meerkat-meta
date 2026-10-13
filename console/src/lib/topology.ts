@@ -299,7 +299,7 @@ function modeReason(mode: TopologyManagementMode): string | null {
 }
 
 /**
- * Adapt the authoritative MobKit query response into the transport-neutral
+ * Adapt the authoritative Meta query response into the transport-neutral
  * shared component contract. Endpoint grants are intersected for every pair;
  * missing affordances fail closed instead of inferring authority from labels.
  */
@@ -693,7 +693,7 @@ export function createConsoleTopologyMutationRequest(
 function topologyMutationErrorMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message;
   if (typeof error === "string" && error.trim()) return error.trim();
-  return "MobKit topology operation failed";
+  return "Meta topology operation failed";
 }
 
 function topologyRpcError(error: unknown): Record<string, unknown> | null {
@@ -821,7 +821,7 @@ export async function executeConsoleTopologyMutation(
   if (!receipt) {
     return ambiguousTopologyFailure(
       pending,
-      new Error("MobKit returned an invalid topology operation receipt"),
+      new Error("Meta returned an invalid topology operation receipt"),
     );
   }
   return {
@@ -868,7 +868,7 @@ export async function resolveAmbiguousConsoleTopologyMutation(
   if (!receipt) {
     return ambiguousTopologyFailure(
       pending,
-      new Error("MobKit returned an invalid topology operation receipt"),
+      new Error("Meta returned an invalid topology operation receipt"),
     );
   }
   return {

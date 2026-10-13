@@ -1,5 +1,5 @@
 /**
- * Transport-neutral topology control models shared by MobKit console hosts.
+ * Transport-neutral topology control models shared by Meta console hosts.
  *
  * These types intentionally describe observed state and server-issued
  * capabilities. They do not grant authority: a console may only offer a

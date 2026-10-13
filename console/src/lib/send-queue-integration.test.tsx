@@ -2,7 +2,7 @@ import React from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConsoleApp } from "../ConsoleApp";
-import { createHttpConsoleTransport, type MobKitConsoleTransport } from "./headless";
+import { createHttpConsoleTransport, type MetaConsoleTransport } from "./headless";
 import type { ConsoleAccessConfig, ConsoleFrame } from "../types";
 import { createConsoleSendAttempt, beginConsoleSendAttempt } from "../../../packages/console-core/src/send-attempt";
 import { consoleSendStorageKey, saveConsoleSendAttempts } from "./send-attempt-storage";
@@ -12,17 +12,17 @@ import { ACCEPTANCE_NOTICE_GRACE_MS, PendingStack, type PendingItem } from "../p
 const identity = "identity:queue-agent";
 function seed(twoPanes = false) {
   const target = { id: `chat:${identity}`, kind: "agent-chat", title: "Queue agent", identity, memberId: identity };
-  window.localStorage.setItem("mobkit-console-dock-state:runtime/realm/principal", JSON.stringify({
+  window.localStorage.setItem("meta-console-dock-state:runtime/realm/principal", JSON.stringify({
     tabs: [{ id: "tab-1", presetId: "single", layout: twoPanes ? { kind: "split", id: "split-1", direction: "horizontal", ratio: 0.5, first: { kind: "panel", panelId: "panel-1" }, second: { kind: "panel", panelId: "panel-2" } } : { kind: "panel", panelId: "panel-1" } }],
     panels: [{ id: "panel-1", mode: "console", target }, ...(twoPanes ? [{ id: "panel-2", mode: "console", target }] : [])],
     activeTabId: "tab-1", focusedPanelId: "panel-1",
   }));
 }
-function transport(send: MobKitConsoleTransport["send"]): MobKitConsoleTransport {
+function transport(send: MetaConsoleTransport["send"]): MetaConsoleTransport {
   return {
     loadExperience: async () => ({ runtime_id: "queue-test", console_config: { layout: { initial_agent: identity } }, agent_sidebar: { live_snapshot: { agents: [{ identity, member_id: identity, agent_id: identity, label: "Queue agent", kind: "member", state: "running", addressable: true, affordances: { can_send_message: true }, model_capabilities: { image_input: false } }] } }, activity_feed: { filter_presets: [], active_preset_id: "all" } }) as never,
     loadModules: async () => ({ modules: [] }) as never,
-    capabilities: async () => ({ version: "test", methods: ["mobkit/console/send", "mobkit/console/timeline"] }) as never,
+    capabilities: async () => ({ version: "test", methods: ["meta/console/send", "meta/console/timeline"] }) as never,
     queryTimeline: async () => ({ frames: [], available: true }),
     subscribeTimeline: () => () => {}, send,
     executeCommand: async () => ({ result: {} }) as never,
@@ -245,7 +245,7 @@ describe("stock durable queue integration", () => {
     saveConsoleSendAttempts(window.localStorage, scope, identity, [unknown]);
     const send = vi.fn();
     const fake = transport(send);
-    fake.capabilities = async () => ({ version: "test", methods: ["mobkit/console/send", "mobkit/console/timeline", "mobkit/console/inspect_identity"] }) as never;
+    fake.capabilities = async () => ({ version: "test", methods: ["meta/console/send", "meta/console/timeline", "meta/console/inspect_identity"] }) as never;
     const calls: string[] = [];
     const receipt = { id: "canonical-receipt", event: "user_input", identity: canonical, interactionId: "canonical-turn", timestampMs: 2, data: { ...JSON.parse(attempted.envelopeJson!), identity: canonical } };
     fake.executeCommand = vi.fn(async input => {
@@ -276,7 +276,7 @@ describe("stock durable queue integration", () => {
     { owner: "old-tab", now: 2, handlingMode: "steer" });
     saveConsoleSendAttempts(window.localStorage, scope, identity, [{ ...attempted, state: "outcome-unknown", lease: undefined }]);
     const fake = transport(vi.fn());
-    fake.capabilities = async () => ({ methods: ["mobkit/console/send", "mobkit/console/timeline", "mobkit/console/inspect_identity"] });
+    fake.capabilities = async () => ({ methods: ["meta/console/send", "meta/console/timeline", "meta/console/inspect_identity"] });
     let checkingAcceptance = false;
     fake.executeCommand = vi.fn(async input => {
       checkingAcceptance = true;
@@ -328,9 +328,9 @@ describe("stock durable queue integration", () => {
     { owner: "old-tab", now: 2, handlingMode: "steer" });
     saveConsoleSendAttempts(window.localStorage, scope, identity, [{ ...attempted, state: "outcome-unknown", lease: undefined }]);
     const fake = transport(vi.fn());
-    fake.capabilities = async () => ({ methods: ["mobkit/console/send", "mobkit/console/timeline", "mobkit/console/inspect_identity"] });
+    fake.capabilities = async () => ({ methods: ["meta/console/send", "meta/console/timeline", "meta/console/inspect_identity"] });
     let checkingAcceptance = false;
-    let finishCheck!: (page: Awaited<ReturnType<MobKitConsoleTransport["queryTimeline"]>>) => void;
+    let finishCheck!: (page: Awaited<ReturnType<MetaConsoleTransport["queryTimeline"]>>) => void;
     fake.executeCommand = vi.fn(async input => {
       checkingAcceptance = true;
       return { command: input.command, accepted: true, result: { identity: { identity } } };
@@ -375,7 +375,7 @@ describe("stock durable queue integration", () => {
     const unknown = { ...attempted, state: "outcome-unknown" as const, lease: undefined };
     saveConsoleSendAttempts(window.localStorage, scope, identity, [unknown]);
     const fake = transport(vi.fn());
-    fake.capabilities = async () => ({ version: "test", methods: ["mobkit/console/send", "mobkit/console/timeline", "mobkit/console/inspect_identity"] }) as never;
+    fake.capabilities = async () => ({ version: "test", methods: ["meta/console/send", "meta/console/timeline", "meta/console/inspect_identity"] }) as never;
     fake.executeCommand = vi.fn(async input => {
       if (failure === "denied") throw new Error("Owner resolution denied");
       return { command: input.command, accepted: true, result: { identity: { display_name: "Not canonical identity" } } };
@@ -402,7 +402,7 @@ describe("stock durable queue integration", () => {
       const unknown = { ...attempted, state: "outcome-unknown" as const, lease: undefined };
       saveConsoleSendAttempts(window.localStorage, scope, identity, [unknown]);
       const fake = transport(vi.fn());
-      fake.capabilities = async () => ({ version: "test", methods: ["mobkit/console/send", "mobkit/console/timeline", "mobkit/console/inspect_identity"] }) as never;
+      fake.capabilities = async () => ({ version: "test", methods: ["meta/console/send", "meta/console/timeline", "meta/console/inspect_identity"] }) as never;
       const calls: string[] = [];
       fake.executeCommand = vi.fn(async input => {
         if (input.command !== "inspectIdentity" || !("identity" in input.target)) throw new Error("Unexpected command");
@@ -502,7 +502,7 @@ describe("stock durable queue integration", () => {
 
   it("clears pending approval data before loading a new principal", async () => {
     const fake = transport(vi.fn());
-    fake.capabilities = async () => ({ methods: ["mobkit/gating/pending", "mobkit/gating/decide", "mobkit/console/send"] });
+    fake.capabilities = async () => ({ methods: ["meta/gating/pending", "meta/gating/decide", "meta/console/send"] });
     fake.executeCommand = async () => ({ result: { pending: [{ pending_id: "private-gate", action_id: "private-action", action: "Private principal approval", origin: { identity }, risk_tier: "r3" }] } }) as never;
     const view = render(<ConsoleApp baseUrl="" transport={fake} storageNamespace="old-principal" />);
     fireEvent.click(await screen.findByRole("button", { name: "Needs you, 1 pending approval" }));
@@ -535,7 +535,7 @@ describe("stock durable queue integration", () => {
     await compose("waiting for capability");
     await waitFor(() => expect(fake.capabilities).toHaveBeenCalled());
     view.unmount();
-    await act(async () => { finish({ version: "test", methods: ["mobkit/console/send"] } as never); });
+    await act(async () => { finish({ version: "test", methods: ["meta/console/send"] } as never); });
     expect(send).not.toHaveBeenCalled();
   });
 
@@ -588,7 +588,7 @@ describe("stock durable queue integration", () => {
   });
   // What the fetch layer raises for the gateway's typed 401 (see network.ts
   // and tests/console_route_auth.rs): no reservation exists server-side.
-  const unauthenticated = () => Object.assign(new Error("mobkit/console/send request failed 401: code=-32600 unauthorized"), {
+  const unauthenticated = () => Object.assign(new Error("meta/console/send request failed 401: code=-32600 unauthorized"), {
     httpStatus: 401,
     responseRpcError: { code: -32600, message: "unauthorized: console rpc requires a valid auth token", data: { kind: "unauthenticated", http_status: 401 } },
   });
@@ -781,7 +781,7 @@ describe("stock durable queue integration", () => {
   it("reports a failed acceptance check as a typed state on the row", async () => {
     const send = vi.fn(async () => { throw Object.assign(new TypeError("Failed to fetch"), { transportFailure: "connection_failed" }); });
     const fake = transport(send);
-    fake.capabilities = async () => ({ version: "test", methods: ["mobkit/console/send", "mobkit/console/timeline", "mobkit/console/inspect_identity"] }) as never;
+    fake.capabilities = async () => ({ version: "test", methods: ["meta/console/send", "meta/console/timeline", "meta/console/inspect_identity"] }) as never;
     fake.executeCommand = vi.fn(async () => { throw unauthenticated(); });
     render(<ConsoleApp baseUrl="" storageNamespace="runtime/realm/principal" transport={fake} />);
     await compose("check me");
@@ -799,7 +799,7 @@ describe("stock durable queue integration", () => {
       static createObjectURL = vi.fn(() => `blob:preview-${Math.random()}`);
       static revokeObjectURL = vi.fn();
     });
-    const send = vi.fn(async (_input: Parameters<MobKitConsoleTransport["send"]>[0]) => { throw unauthenticated(); });
+    const send = vi.fn(async (_input: Parameters<MetaConsoleTransport["send"]>[0]) => { throw unauthenticated(); });
     const fake = transport(send); const experience = await fake.loadExperience();
     fake.loadExperience = async () => ({ ...experience, agent_sidebar: { live_snapshot: { agents: [{ identity, member_id: identity, agent_id: identity, label: "Queue agent", kind: "member", state: "running", addressable: true, affordances: { can_send_message: true }, model_capabilities: { image_input: true } }] } } }) as never;
     render(<ConsoleApp baseUrl="" storageNamespace="runtime/realm/principal" transport={fake} />);
@@ -916,7 +916,7 @@ describe("stock durable queue integration", () => {
     await screen.findByTestId(`chat-composer:${identity}`);
     const original = Storage.prototype.setItem;
     vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (key, value) {
-      if (key.startsWith("mobkit-send-attempts:")) throw new Error("quota exhausted");
+      if (key.startsWith("meta-send-attempts:")) throw new Error("quota exhausted");
       original.call(this, key, value);
     });
     const textarea = await compose("preserve in composer");
@@ -1003,7 +1003,7 @@ describe("stock durable queue integration", () => {
     let quota = true;
     const original = Storage.prototype.setItem;
     vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (key, value) {
-      if (quota && key.startsWith("mobkit-send-attempts:")) throw new Error("frozen-write quota");
+      if (quota && key.startsWith("meta-send-attempts:")) throw new Error("frozen-write quota");
       original.call(this, key, value);
     });
     const send = vi.fn(async (input) => ({ interaction_id: "recovered", identity: input.identity }));
@@ -1062,23 +1062,23 @@ describe("stock durable queue integration", () => {
   it("isolates independently opened tab drafts while preserving each reload identity", async () => {
     const send = vi.fn(async (input) => ({ interaction_id: "tab-a-send", identity: input.identity }));
     const props = { baseUrl: "", storageNamespace: "runtime/realm/principal", transport: transport(send) };
-    window.sessionStorage.setItem("mobkit-composer-tab:v1", "browser-a");
+    window.sessionStorage.setItem("meta-composer-tab:v1", "browser-a");
     let view = render(<ConsoleApp {...props} />);
     fireEvent.change(await screen.findByTestId(`chat-composer:${identity}`), { target: { value: "Draft browser A" } });
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 160)); }); view.unmount();
-    window.sessionStorage.setItem("mobkit-composer-tab:v1", "browser-b");
+    window.sessionStorage.setItem("meta-composer-tab:v1", "browser-b");
     view = render(<ConsoleApp {...props} />);
     expect((await screen.findByTestId(`chat-composer:${identity}`) as HTMLTextAreaElement).value).toBe("");
     fireEvent.change(screen.getByTestId(`chat-composer:${identity}`), { target: { value: "Draft browser B" } });
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 160)); }); view.unmount();
-    window.sessionStorage.setItem("mobkit-composer-tab:v1", "browser-a");
+    window.sessionStorage.setItem("meta-composer-tab:v1", "browser-a");
     view = render(<ConsoleApp {...props} />);
     await waitFor(() => expect((screen.getByTestId(`chat-composer:${identity}`) as HTMLTextAreaElement).value).toBe("Draft browser A"));
     fireEvent.keyDown(screen.getByTestId(`chat-composer:${identity}`), { key: "Enter" });
     await waitFor(() => expect(send).toHaveBeenCalledTimes(1)); view.unmount();
-    window.sessionStorage.setItem("mobkit-composer-tab:v1", "browser-b"); render(<ConsoleApp {...props} />);
+    window.sessionStorage.setItem("meta-composer-tab:v1", "browser-b"); render(<ConsoleApp {...props} />);
     await waitFor(() => expect((screen.getByTestId(`chat-composer:${identity}`) as HTMLTextAreaElement).value).toBe("Draft browser B"));
-    expect([...Array(window.sessionStorage.length)].map((_, index) => window.sessionStorage.key(index)).filter(key => key?.startsWith("mobkit-composer-draft:v2:"))).toHaveLength(2);
+    expect([...Array(window.sessionStorage.length)].map((_, index) => window.sessionStorage.key(index)).filter(key => key?.startsWith("meta-composer-draft:v2:"))).toHaveLength(2);
   });
 
   it("isolates transient intent when a replacement transport uses the same URL", async () => {
@@ -1125,7 +1125,7 @@ describe("stock durable queue integration", () => {
   it("proves capability refusal before dispatch and retries the same frozen envelope explicitly", async () => {
     const send = vi.fn(async (input) => ({ interaction_id: "restored-capability", identity: input.identity }));
     const fake = transport(send); let canSend = false;
-    fake.capabilities = async () => ({ version: "test", methods: ["mobkit/console/timeline", ...(canSend ? ["mobkit/console/send"] : [])] }) as never;
+    fake.capabilities = async () => ({ version: "test", methods: ["meta/console/timeline", ...(canSend ? ["meta/console/send"] : [])] }) as never;
     render(<ConsoleApp baseUrl="" storageNamespace="runtime/realm/principal" transport={fake} />);
     await compose("retry after capability restoration");
     await screen.findByRole("button", { name: "Send again" });
@@ -1178,7 +1178,7 @@ describe("stock durable queue integration", () => {
     if (delay) await act(async () => { await new Promise(resolve => setTimeout(resolve, delay)); });
     await act(async () => { callbacks.shift()!(); await Promise.resolve(); });
     await waitFor(() => expect(textarea.value).toBe(nextText));
-    const documents = [...Array(window.sessionStorage.length)].map((_, index) => window.sessionStorage.key(index)!).filter(key => key.startsWith("mobkit-composer-draft:v2:")).map(key => JSON.parse(window.sessionStorage.getItem(key)!));
+    const documents = [...Array(window.sessionStorage.length)].map((_, index) => window.sessionStorage.key(index)!).filter(key => key.startsWith("meta-composer-draft:v2:")).map(key => JSON.parse(window.sessionStorage.getItem(key)!));
     expect(documents.some(draft => draft.text === nextText)).toBe(true);
   });
 
@@ -1203,7 +1203,7 @@ describe("stock durable queue integration", () => {
     await act(async () => { callbacks.shift()!(); await Promise.resolve(); });
     await waitFor(() => expect([...document.querySelectorAll(".cc-context-chip blockquote")].map(node => node.textContent)).toEqual(["Newer quote."]));
     expect(textarea.value).toBe("Newer instruction");
-    const documents = [...Array(window.sessionStorage.length)].map((_, index) => window.sessionStorage.key(index)!).filter(key => key.startsWith("mobkit-composer-draft:v2:")).map(key => JSON.parse(window.sessionStorage.getItem(key)!));
+    const documents = [...Array(window.sessionStorage.length)].map((_, index) => window.sessionStorage.key(index)!).filter(key => key.startsWith("meta-composer-draft:v2:")).map(key => JSON.parse(window.sessionStorage.getItem(key)!));
     expect(documents).toHaveLength(1);
     expect(documents[0].text).toBe("Newer instruction");
     expect(documents[0].contexts.map((context: { quote: string }) => context.quote)).toEqual(["Newer quote."]);
@@ -1217,7 +1217,7 @@ describe("stock durable queue integration", () => {
       static revokeObjectURL = vi.fn();
     });
     let finish!: (value: never) => void;
-    const send = vi.fn((_input: Parameters<MobKitConsoleTransport["send"]>[0]) => new Promise<never>(resolve => { finish = resolve; }));
+    const send = vi.fn((_input: Parameters<MetaConsoleTransport["send"]>[0]) => new Promise<never>(resolve => { finish = resolve; }));
     const fake = transport(send); const experience = await fake.loadExperience();
     fake.loadExperience = async () => ({ ...experience, agent_sidebar: { live_snapshot: { agents: [{ identity, member_id: identity, agent_id: identity, label: "Queue agent", kind: "member", state: "running", addressable: true, affordances: { can_send_message: true }, model_capabilities: { image_input: true } }] } } }) as never;
     render(<ConsoleApp baseUrl="" storageNamespace="runtime/realm/principal" transport={fake} />);
@@ -1236,7 +1236,7 @@ describe("stock durable queue integration", () => {
     await waitFor(() => expect(screen.getAllByRole("button", { name: "Remove attachment" })).toHaveLength(1));
     expect(textarea.value).toBe(nextText);
     expect(send).toHaveBeenCalledTimes(1);
-    const documents = [...Array(window.sessionStorage.length)].map((_, index) => window.sessionStorage.key(index)!).filter(key => key.startsWith("mobkit-composer-draft:v2:")).map(key => JSON.parse(window.sessionStorage.getItem(key)!));
+    const documents = [...Array(window.sessionStorage.length)].map((_, index) => window.sessionStorage.key(index)!).filter(key => key.startsWith("meta-composer-draft:v2:")).map(key => JSON.parse(window.sessionStorage.getItem(key)!));
     expect(documents.some(draft => draft.text === nextText)).toBe(true);
   });
 
@@ -1367,11 +1367,11 @@ describe("dock layout hydration", () => {
   // runs before any later task) and require the click to win.
   it("keeps a nav click made as soon as the experience renders", async () => {
     // The restore race needs a saved layout; the file's beforeEach seeds it.
-    expect(window.localStorage.getItem("mobkit-console-dock-state:runtime/realm/principal")).not.toBeNull();
+    expect(window.localStorage.getItem("meta-console-dock-state:runtime/realm/principal")).not.toBeNull();
     const fake = transport(vi.fn());
     const initial = await fake.loadExperience();
     fake.loadExperience = async () => ({ ...initial, access: { available: true, enabled: true, can_administer: true, subject: "first-admin" } }) as never;
-    fake.capabilities = async () => ({ version: "test", methods: ["mobkit/console/timeline", "mobkit/access/status", "mobkit/access/get"] }) as never;
+    fake.capabilities = async () => ({ version: "test", methods: ["meta/console/timeline", "meta/access/status", "meta/access/get"] }) as never;
     fake.executeCommand = vi.fn(async input => {
       if (input.command === "accessStatus") return { command: input.command, accepted: true, result: { available: true, enabled: true, can_administer: true, subject: "first-admin", revision: 1, actions: [] } } as never;
       if (input.command === "getAccessConfig") return { command: input.command, accepted: true, result: { config: { enabled: true, admins: ["first-admin"], rules: [], groups: {} }, revision: 1 } } as never;
@@ -1401,7 +1401,7 @@ describe("dock layout hydration", () => {
     const fake = transport(vi.fn());
     const initial = await fake.loadExperience();
     fake.loadExperience = async () => ({ ...initial, console_config: { layout: { initial_control: "logs" } }, access: { available: true, enabled: true, can_administer: true, subject: "first-admin" } }) as never;
-    fake.capabilities = async () => ({ version: "test", methods: ["mobkit/console/timeline", "mobkit/access/status", "mobkit/access/get"] }) as never;
+    fake.capabilities = async () => ({ version: "test", methods: ["meta/console/timeline", "meta/access/status", "meta/access/get"] }) as never;
     fake.executeCommand = vi.fn(async input => {
       if (input.command === "accessStatus") return { command: input.command, accepted: true, result: { available: true, enabled: true, can_administer: true, subject: "first-admin", revision: 1, actions: [] } } as never;
       if (input.command === "getAccessConfig") return { command: input.command, accepted: true, result: { config: { enabled: true, admins: ["first-admin"], rules: [], groups: {} }, revision: 1 } } as never;
@@ -1438,7 +1438,7 @@ describe("access async scope isolation", () => {
     const started = vi.fn();
     fake.loadExperience = async () => ({ ...initial, access: { available: true, enabled: true, can_administer: true, subject } }) as never;
     fake.subscribeTimeline = (_input, next) => { receive = next; return () => {}; };
-    fake.capabilities = async () => ({ version: "test", methods: ["mobkit/console/timeline", "mobkit/access/status", "mobkit/access/get", "mobkit/access/preview", "mobkit/access/enable"] }) as never;
+    fake.capabilities = async () => ({ version: "test", methods: ["meta/console/timeline", "meta/access/status", "meta/access/get", "meta/access/preview", "meta/access/enable"] }) as never;
     fake.executeCommand = vi.fn(async input => {
       let result: unknown;
       if (input.command === "accessStatus") result = { available: true, enabled: true, can_administer: true, subject, revision: 1, owner_instance: "scope-owner", conditional_mutations: "checked_v1", actions: ["agent.view"] };
@@ -1479,8 +1479,8 @@ describe("checked access saves", () => {
   const draftText = editedAdmins.join(", ");
   const newerRule = { id: "b-newer-rule", effect: "allow" as const, subjects: ["reader@example.test"], actions: ["agent.view"], agents: ["worker"] };
   const mutationMethods = new Set([
-    "mobkit/access/set", "mobkit/access/enable", "mobkit/access/rules/upsert",
-    "mobkit/access/rules/delete", "mobkit/access/groups/set", "mobkit/access/groups/delete",
+    "meta/access/set", "meta/access/enable", "meta/access/rules/upsert",
+    "meta/access/rules/delete", "meta/access/groups/set", "meta/access/groups/delete",
   ]);
 
   async function fixture(capability: string | undefined) {
@@ -1493,7 +1493,7 @@ describe("checked access saves", () => {
     const writes: Array<{ url: string; method: string; params: Record<string, unknown> }> = [];
     const reads: string[] = [];
     fake.loadExperience = async () => ({ ...experience, access: { available: true, enabled: true, can_administer: true, subject: "root@example.test" } }) as never;
-    fake.capabilities = async () => ({ version: "test", methods: ["mobkit/console/timeline", "mobkit/access/status", "mobkit/access/get", ...mutationMethods] }) as never;
+    fake.capabilities = async () => ({ version: "test", methods: ["meta/console/timeline", "meta/access/status", "meta/access/get", ...mutationMethods] }) as never;
     fake.executeCommand = createHttpConsoleTransport({ baseUrl: "http://console.test" }).executeCommand;
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body || "{}")) as { id: string; method: string; params: Record<string, unknown> };
@@ -1502,11 +1502,11 @@ describe("checked access saves", () => {
         revision: state.revision,
         ...(!state.legacy ? { owner_instance: state.ownerInstance, conditional_mutations: state.capability } : {}),
       };
-      if (body.method === "mobkit/access/status") {
+      if (body.method === "meta/access/status") {
         reads.push(body.method);
         return reply({ result: { available: true, enabled: state.config.enabled, can_administer: true, subject: "root@example.test", actions: ["agent.view"], ...metadata } });
       }
-      if (body.method === "mobkit/access/get") {
+      if (body.method === "meta/access/get") {
         reads.push(body.method);
         return reply({ result: { config: state.config, ...metadata } });
       }
@@ -1514,13 +1514,13 @@ describe("checked access saves", () => {
         writes.push({ url: String(url), method: body.method, params: body.params });
         // A legacy handler accepts its required top-level payload. This makes
         // an unsafe fallback observable rather than making every write fail.
-        if (state.legacy && body.method === "mobkit/access/set" && body.params.config) {
+        if (state.legacy && body.method === "meta/access/set" && body.params.config) {
           state.config = body.params.config as ConsoleAccessConfig;
           state.applied += 1; state.revision += 1;
           return reply({ result: { config: state.config, revision: state.revision } });
         }
         const checked = body.params.checked_v1 as { owner_instance?: string; expected_revision?: number; config?: ConsoleAccessConfig } | undefined;
-        if (state.legacy || body.method !== "mobkit/access/set" || !checked?.config || Object.keys(body.params).length !== 1) {
+        if (state.legacy || body.method !== "meta/access/set" || !checked?.config || Object.keys(body.params).length !== 1) {
           return reply({ error: { code: -32602, message: "PRIVATE_CHECKED_PAYLOAD_ERROR" } });
         }
         if (checked.owner_instance !== state.ownerInstance) {
@@ -1540,8 +1540,8 @@ describe("checked access saves", () => {
 
   // Restore a saved layout with Access already open, so no nav click can race
   // the dock layout hydration.
-  async function openAccess(fake: MobKitConsoleTransport) {
-    window.localStorage.setItem("mobkit-console-dock-state:runtime/realm/principal", JSON.stringify({
+  async function openAccess(fake: MetaConsoleTransport) {
+    window.localStorage.setItem("meta-console-dock-state:runtime/realm/principal", JSON.stringify({
       tabs: [{ id: "tab-1", presetId: "single", layout: { kind: "panel", panelId: "panel-1" } }],
       panels: [{ id: "panel-1", mode: "console", target: { id: "access", kind: "access", title: "Access" } }],
       activeTabId: "tab-1", focusedPanelId: "panel-1",
@@ -1579,7 +1579,7 @@ describe("checked access saves", () => {
     await act(async () => { fireEvent.click(screen.getByTestId("access-save-admins")); });
     await waitFor(() => expect(writes).toHaveLength(1));
     expect(writes[0]).toEqual({
-      url: "http://console.test/console/rpc", method: "mobkit/access/set",
+      url: "http://console.test/console/rpc", method: "meta/access/set",
       params: { checked_v1: { owner_instance: state.ownerInstance, expected_revision: 10, config: { ...originalConfig, admins: editedAdmins } } },
     });
     expect(await screen.findByTestId("access-error")).toHaveTextContent("Access configuration changed. Review the latest settings before saving again.");
@@ -1605,7 +1605,7 @@ describe("checked access saves", () => {
     await waitFor(() => expect(screen.queryByTestId("access-admins-input")).toBeNull());
     expect(writes).toHaveLength(2);
     expect(writes[1]).toEqual({
-      url: "http://console.test/console/rpc", method: "mobkit/access/set",
+      url: "http://console.test/console/rpc", method: "meta/access/set",
       params: { checked_v1: { owner_instance: state.ownerInstance, expected_revision: 11, config: { ...originalConfig, rules: [newerRule], admins: editedAdmins } } },
     });
     expect(state.config).toEqual({ ...originalConfig, rules: [newerRule], admins: editedAdmins });
@@ -1620,8 +1620,8 @@ describe("checked access saves", () => {
     for (const capability of [undefined, "checked_v2"]) {
       const { fake, state, writes, reads } = await fixture(capability);
       const view = await openAccess(fake);
-      expect(reads).toContain("mobkit/access/status");
-      expect(reads).toContain("mobkit/access/get");
+      expect(reads).toContain("meta/access/status");
+      expect(reads).toContain("meta/access/get");
       expect(screen.getByText("alice@example.test", { exact: true })).toBeVisible();
       unavailableWrite("access-toggle-enabled");
       unavailableWrite("access-edit-admins");
@@ -1646,7 +1646,7 @@ describe("checked access saves", () => {
     await act(async () => { fireEvent.click(screen.getByTestId("access-save-admins")); });
     await waitFor(() => expect(writes).toHaveLength(1));
     expect(writes[0]).toEqual({
-      url: "http://console.test/console/rpc", method: "mobkit/access/set",
+      url: "http://console.test/console/rpc", method: "meta/access/set",
       params: { checked_v1: { owner_instance: state.ownerInstance, expected_revision: 10, config: { ...originalConfig, admins: editedAdmins } } },
     });
     expect(await screen.findByTestId("access-error")).toHaveTextContent("Changes were not saved. Checked access saves are unavailable; your draft is retained.");
@@ -1670,7 +1670,7 @@ describe("checked access saves", () => {
     // control. The mock checks only wire shape/sequence, not owner atomicity.
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body || "{}")) as { id: string; method: string; params: Record<string, unknown> };
-      if (!mutationMethods.has(body.method) || body.method === "mobkit/access/set") return originalFetch(url, init);
+      if (!mutationMethods.has(body.method) || body.method === "meta/access/set") return originalFetch(url, init);
       writes.push({ url: String(url), method: body.method, params: body.params });
       const reply = (payload: Record<string, unknown>) => new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, ...payload }), { status: 200 });
       const checked = body.params.checked_v1 as Record<string, unknown> | undefined;
@@ -1679,11 +1679,11 @@ describe("checked access saves", () => {
         return reply({ error: { code: -32602, message: "PRIVATE_ROUTING_PAYLOAD_ERROR" } });
       }
       switch (body.method) {
-        case "mobkit/access/enable": state.config = { ...state.config, enabled: checked.enabled as boolean }; break;
-        case "mobkit/access/rules/upsert": state.config = { ...state.config, rules: [...(state.config.rules ?? []), checked.rule as NonNullable<ConsoleAccessConfig["rules"]>[number]] }; break;
-        case "mobkit/access/rules/delete": state.config = { ...state.config, rules: state.config.rules?.filter(rule => rule.id !== checked.id) }; break;
-        case "mobkit/access/groups/set": state.config = { ...state.config, groups: { ...state.config.groups, [checked.name as string]: checked.group as { members: string[] } } }; break;
-        case "mobkit/access/groups/delete": {
+        case "meta/access/enable": state.config = { ...state.config, enabled: checked.enabled as boolean }; break;
+        case "meta/access/rules/upsert": state.config = { ...state.config, rules: [...(state.config.rules ?? []), checked.rule as NonNullable<ConsoleAccessConfig["rules"]>[number]] }; break;
+        case "meta/access/rules/delete": state.config = { ...state.config, rules: state.config.rules?.filter(rule => rule.id !== checked.id) }; break;
+        case "meta/access/groups/set": state.config = { ...state.config, groups: { ...state.config.groups, [checked.name as string]: checked.group as { members: string[] } } }; break;
+        case "meta/access/groups/delete": {
           const groups = { ...state.config.groups };
           delete groups[checked.name as string];
           state.config = { ...state.config, groups };
@@ -1723,12 +1723,12 @@ describe("checked access saves", () => {
     expect(screen.queryByTestId("access-error")).toBeNull();
 
     const payloads = [
-      ["mobkit/access/set", { config: { ...originalConfig, admins: editedAdmins } }],
-      ["mobkit/access/enable", { enabled: false }],
-      ["mobkit/access/rules/upsert", { rule: { id: "checked-rule", effect: "allow", actions: ["agent.view"] } }],
-      ["mobkit/access/rules/delete", { id: "checked-rule" }],
-      ["mobkit/access/groups/set", { name: "checked-group", group: { members: ["alice@example.test"] } }],
-      ["mobkit/access/groups/delete", { name: "checked-group" }],
+      ["meta/access/set", { config: { ...originalConfig, admins: editedAdmins } }],
+      ["meta/access/enable", { enabled: false }],
+      ["meta/access/rules/upsert", { rule: { id: "checked-rule", effect: "allow", actions: ["agent.view"] } }],
+      ["meta/access/rules/delete", { id: "checked-rule" }],
+      ["meta/access/groups/set", { name: "checked-group", group: { members: ["alice@example.test"] } }],
+      ["meta/access/groups/delete", { name: "checked-group" }],
     ] as const;
     expect(writes).toEqual(payloads.map(([method, payload], index) => ({
       url: "http://console.test/console/rpc", method,
@@ -1749,7 +1749,7 @@ describe("checked access saves", () => {
     const originalFetch = globalThis.fetch;
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body || "{}")) as { id: string; method: string; params: Record<string, unknown> };
-      if (body.method !== "mobkit/access/groups/set") return originalFetch(url, init);
+      if (body.method !== "meta/access/groups/set") return originalFetch(url, init);
       writes.push({ url: String(url), method: body.method, params: body.params });
       const reply = (payload: Record<string, unknown>) => new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, ...payload }), { status: 200 });
       const checked = body.params.checked_v1 as { owner_instance?: string; expected_revision?: number; name?: string; group?: { description?: string; members: string[] } } | undefined;
@@ -1775,7 +1775,7 @@ describe("checked access saves", () => {
     await act(async () => { fireEvent.click(screen.getByTestId("access-group-save")); });
     await waitFor(() => expect(writes).toHaveLength(1));
     expect(writes[0]).toEqual({
-      url: "http://console.test/console/rpc", method: "mobkit/access/groups/set",
+      url: "http://console.test/console/rpc", method: "meta/access/groups/set",
       params: { checked_v1: { owner_instance: state.ownerInstance, expected_revision: 10, name: "ops", group: { ...initialGroup, members: editedMembers } } },
     });
     expect(await screen.findByTestId("access-error")).toHaveTextContent("Access configuration changed. Review the latest settings before saving again.");
@@ -1791,7 +1791,7 @@ describe("checked access saves", () => {
     await screen.findByTestId("access-group:ops");
     expect(writes).toEqual([
       writes[0],
-      { url: "http://console.test/console/rpc", method: "mobkit/access/groups/set",
+      { url: "http://console.test/console/rpc", method: "meta/access/groups/set",
         params: { checked_v1: { owner_instance: state.ownerInstance, expected_revision: 11, name: "ops", group: { ...newerGroup, members: editedMembers } } } },
     ]);
     expect(screen.getByText(newerGroup.description, { exact: true })).toBeVisible();
@@ -1805,7 +1805,7 @@ describe("checked access saves", () => {
     const originalFetch = globalThis.fetch;
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body || "{}")) as { id: string; method: string; params: Record<string, unknown> };
-      if (body.method !== "mobkit/access/set") return originalFetch(url, init);
+      if (body.method !== "meta/access/set") return originalFetch(url, init);
       writes.push({ url: String(url), method: body.method, params: body.params });
       return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error: {
         code: -32004, message: "PRIVATE_UNAVAILABLE_MESSAGE", data: { kind: "access_mutation_unavailable" },
@@ -1824,7 +1824,7 @@ describe("checked access saves", () => {
     await waitFor(() => expect(reads.length).toBeGreaterThan(beforeRefresh));
     expect(screen.getByTestId("access-admins-input")).toHaveValue(draftText);
     unavailableWrite("access-save-admins");
-    expect(writes).toEqual([{ url: "http://console.test/console/rpc", method: "mobkit/access/set", params: {
+    expect(writes).toEqual([{ url: "http://console.test/console/rpc", method: "meta/access/set", params: {
       checked_v1: { owner_instance: state.ownerInstance, expected_revision: 10, config: { ...originalConfig, admins: editedAdmins } },
     } }]);
     expect(state.capability).toBe("checked_v1");
@@ -1838,7 +1838,7 @@ describe("checked access saves", () => {
     const originalFetch = globalThis.fetch;
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body || "{}")) as { id: string; method: string; params: Record<string, unknown> };
-      if (body.method !== "mobkit/access/rules/upsert") return originalFetch(url, init);
+      if (body.method !== "meta/access/rules/upsert") return originalFetch(url, init);
       writes.push({ url: String(url), method: body.method, params: body.params });
       const reply = (payload: Record<string, unknown>) => new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, ...payload }), { status: 200 });
       const checked = body.params.checked_v1 as { owner_instance?: string; expected_revision?: number; rule?: { groups?: string[] } } | undefined;
@@ -1868,9 +1868,9 @@ describe("checked access saves", () => {
     await act(async () => { fireEvent.click(screen.getByTestId("access-rule-save")); });
     await screen.findByTestId("access-rule:ops-rule");
     expect(writes).toEqual([
-      { url: "http://console.test/console/rpc", method: "mobkit/access/rules/upsert",
+      { url: "http://console.test/console/rpc", method: "meta/access/rules/upsert",
         params: { checked_v1: { owner_instance: state.ownerInstance, expected_revision: 10, rule: { id: "ops-rule", effect: "allow", actions: ["agent.view"], groups: ["missing-group"] } } } },
-      { url: "http://console.test/console/rpc", method: "mobkit/access/rules/upsert",
+      { url: "http://console.test/console/rpc", method: "meta/access/rules/upsert",
         params: { checked_v1: { owner_instance: state.ownerInstance, expected_revision: 10, rule: { id: "ops-rule", effect: "allow", actions: ["agent.view"] } } } },
     ]);
     expect(state.applied).toBe(1);

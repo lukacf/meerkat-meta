@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // WorkGraph graph-view browser e2e: boots the real console bundle in
-// chromium against crates/meerkat-mobkit/examples/workgraph_console_reference
+// chromium against crates/meerkat-meta/examples/workgraph_console_reference
 // (library-mode runtime, builder-wired ephemeral WorkGraph service,
 // unenforced console), seeds a deterministic six-item fixture through the
 // real `POST /console/rpc` wire contract (goal/create root + 5 children,
@@ -110,7 +110,7 @@ async function rpc(baseUrl, method, params) {
 
 async function seedWorkGraph(baseUrl) {
   // Root via goal/create so the graph carries an attention binding too.
-  const goal = await rpc(baseUrl, "mobkit/workgraph/goal/create", {
+  const goal = await rpc(baseUrl, "meta/workgraph/goal/create", {
     title: "Ship 0.8.13",
     target: { kind: "identity", identity: "planner" },
   });
@@ -127,7 +127,7 @@ async function seedWorkGraph(baseUrl) {
   ];
   const children = [];
   for (const title of childTitles) {
-    const created = await rpc(baseUrl, "mobkit/workgraph/create", { title });
+    const created = await rpc(baseUrl, "meta/workgraph/create", { title });
     assert.ok(created.item.id, `create '${title}' returned an item id`);
     children.push(created.item);
   }
@@ -135,13 +135,13 @@ async function seedWorkGraph(baseUrl) {
   // Edges first (links never bump item revisions, so the create-time CAS
   // tokens below stay valid). Parent edges run child→parent.
   for (const child of children) {
-    await rpc(baseUrl, "mobkit/workgraph/link", {
+    await rpc(baseUrl, "meta/workgraph/link", {
       kind: "parent",
       from_id: child.id,
       to_id: rootId,
     });
   }
-  await rpc(baseUrl, "mobkit/workgraph/link", {
+  await rpc(baseUrl, "meta/workgraph/link", {
     kind: "blocks",
     from_id: children[0].id,
     to_id: children[3].id,
@@ -149,18 +149,18 @@ async function seedWorkGraph(baseUrl) {
 
   // One child each: in_progress / completed / blocked. Every mutation
   // threads the item's latest returned revision.
-  const claimed = await rpc(baseUrl, "mobkit/workgraph/claim", {
+  const claimed = await rpc(baseUrl, "meta/workgraph/claim", {
     id: children[0].id,
     expected_revision: children[0].revision,
     owner: { key: { kind: "agent", id: "builder" } },
   });
   assert.equal(claimed.item.status, "in_progress");
-  const closed = await rpc(baseUrl, "mobkit/workgraph/close", {
+  const closed = await rpc(baseUrl, "meta/workgraph/close", {
     id: children[1].id,
     expected_revision: children[1].revision,
   });
   assert.equal(closed.item.status, "completed");
-  const blocked = await rpc(baseUrl, "mobkit/workgraph/block", {
+  const blocked = await rpc(baseUrl, "meta/workgraph/block", {
     id: children[2].id,
     expected_revision: children[2].revision,
   });
@@ -168,7 +168,7 @@ async function seedWorkGraph(baseUrl) {
 
   // Wire-level sanity before touching the browser: 6 items, 6 edges. The
   // default snapshot drops terminal rows, so opt in like the panel does.
-  const snapshot = await rpc(baseUrl, "mobkit/workgraph/snapshot", {
+  const snapshot = await rpc(baseUrl, "meta/workgraph/snapshot", {
     include_terminal: true,
   });
   assert.equal(snapshot.items.length, 6, "seeded item count");
@@ -314,7 +314,7 @@ async function main() {
         // Guards the known rustc incremental-build ICE (same as the CI
         // flow-editor job).
         CARGO_INCREMENTAL: "0",
-        MOBKIT_WORKGRAPH_E2E_ADDR: LOOPBACK_ANY_PORT,
+        META_WORKGRAPH_E2E_ADDR: LOOPBACK_ANY_PORT,
       },
       stdio: ["ignore", "pipe", "pipe"],
     },

@@ -45,5 +45,5 @@
     ]
   },
   "expected": { "verdict": "reject", "error": "transitive_taint_ceiling", "op_index": 1 },
-  "notes": "Transitive-laundering invariant (arch doc §10.2, §11): merging quarantined content into a 'fresh' consolidated record carries the provenance ceiling with it — mem-fresh's derived_from reaches quarantined mem-q, so the follow-up retier above agent_observed is a validator reject even with a steward author and a verification claim. Executable check: laundering tests in crates/meerkat-mobkit/src/memory/staged.rs; schema-validated only here."
+  "notes": "Transitive-laundering invariant (arch doc §10.2, §11): merging quarantined content into a 'fresh' consolidated record carries the provenance ceiling with it — mem-fresh's derived_from reaches quarantined mem-q, so the follow-up retier above agent_observed is a validator reject even with a steward author and a verification claim. Executable check: laundering tests in crates/meerkat-meta/src/memory/staged.rs; schema-validated only here."
 }

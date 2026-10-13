@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for the MobKit release-asset manifest contract."""
+"""Regression tests for the Meta release-asset manifest contract."""
 
 import importlib.util
 import tempfile
@@ -32,7 +32,7 @@ class ReleaseAssetContractTests(unittest.TestCase):
             (artifact_dir / name).write_bytes(f"artifact-{index}".encode())
 
     def test_expected_inventory_includes_the_repair_binary_on_all_targets(self):
-        # Release-blocker regression (v0.8.14 attempt 1): mobkit-repair
+        # Release-blocker regression (v0.8.14 attempt 1): meta-repair
         # archives were built but rejected as unexpected because the
         # inventory constant was never taught about the new binary. The
         # repair tool ships as a release asset by explicit consumer
@@ -40,7 +40,7 @@ class ReleaseAssetContractTests(unittest.TestCase):
         # repair window is how deployment defects are born.
         names = release_assets.expected_archive_names("0.8.0")
         for target, ext in release_assets.TARGET_ARCHIVES:
-            self.assertIn(f"mobkit-repair-0.8.0-{target}.{ext}", names)
+            self.assertIn(f"meta-repair-0.8.0-{target}.{ext}", names)
 
     def test_prepare_emits_exact_flat_manifest_and_verified_checksums(self):
         self.write_complete_source()

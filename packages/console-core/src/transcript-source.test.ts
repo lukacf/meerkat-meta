@@ -218,7 +218,7 @@ describe("member comms names", () => {
     expect(parseMemberCommsName("a/b/c d")).toBe(null);
   });
 
-  test("decodes the MobKit member id codec", () => {
+  test("decodes the Meta member id codec", () => {
     expect(decodeMemberAlias("mk--identity_cparent-1")).toBe("identity:parent-1");
     expect(decodeMemberAlias("mk--rt_creview_csingleton_c0")).toBe("rt:review:singleton:0");
     expect(decodeMemberAlias("mk--rt_cperson_cjane_x2e_doe_x40_example_x2e_com_c2"))

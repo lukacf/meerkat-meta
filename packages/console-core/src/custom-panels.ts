@@ -94,7 +94,7 @@ function assertConsoleJson(value: unknown, ancestors = new Set<unknown>()): asse
 
 const namespaced = (value: unknown): value is string => typeof value === "string"
   && /^[a-zA-Z0-9][a-zA-Z0-9._-]*\/[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(value)
-  && !value.startsWith("mobkit/") && !value.startsWith("meta/");
+  && !value.startsWith("meta/") && !value.startsWith("meta/");
 /** Validate a complete set before publishing it; duplicate registrations are errors. */
 export function validateConsolePanels(panels: readonly ConsolePanelDefinition[]): void {
   const ids = new Set<string>();

@@ -16,10 +16,10 @@ const TOTAL = BASE_TOTAL + BURST_TOTAL;
 const BASE_PEERS_PER_AGENT = 150;
 const PEER_FANOUT_PER_PARENT = BASE_PEERS_PER_AGENT;
 const SPAWN_CONCURRENCY = Number(
-  process.env.MOBKIT_SWARM_SPAWN_CONCURRENCY || 240,
+  process.env.META_SWARM_SPAWN_CONCURRENCY || 240,
 );
 const RECOVERY_CONCURRENCY = Number(
-  process.env.MOBKIT_SWARM_RECOVERY_CONCURRENCY || 32,
+  process.env.META_SWARM_RECOVERY_CONCURRENCY || 32,
 );
 const SEND_CONCURRENCY = 32;
 
@@ -326,7 +326,7 @@ async function screenshot(page, artifactDir, index, label) {
 async function main() {
   const baseUrl = process.argv[2];
   assert.ok(baseUrl, "Usage: browser_smoke.cjs <base-url>");
-  const artifactDir = process.env.MOBKIT_BROWSER_SMOKE_ARTIFACT_DIR || "";
+  const artifactDir = process.env.META_BROWSER_SMOKE_ARTIFACT_DIR || "";
   let shot = 0;
 
   const experience = await fetchJson(baseUrl, "/console/experience");
@@ -348,9 +348,9 @@ async function main() {
       const parentRow = rowByIdentity.get(parent.identity);
       assert.ok(parentRow, `missing parent row for ${parent.identity}`);
       await sleep(parentIndex * 300);
-      // Console RPC plane has no mobkit/send_message (gateway-only method);
-      // use mobkit/console/send, the console-plane equivalent.
-      await rpcWithRetry(baseUrl, "mobkit/console/send", {
+      // Console RPC plane has no meta/send_message (gateway-only method);
+      // use meta/console/send, the console-plane equivalent.
+      await rpcWithRetry(baseUrl, "meta/console/send", {
         identity: rowRuntimeIdentity(parentRow, parent.identity),
         content: `stress action ${parentIndex + 1}: spawn ${(groups.get(parent.identity) || []).length} sub-agents over a burst window, collect their returns, then fan out to ${PEER_FANOUT_PER_PARENT} wired peers.`,
         origin: "example-003-playwright",
@@ -362,7 +362,7 @@ async function main() {
         SUBAGENTS_PER_PARENT,
         async (agent) => {
           try {
-            await rpc(baseUrl, "mobkit/ensure_member", ensureParams(agent));
+            await rpc(baseUrl, "meta/ensure_member", ensureParams(agent));
           } catch (error) {
             failed.push({ agent, error });
           }
@@ -375,7 +375,7 @@ async function main() {
     await runBounded(failed, RECOVERY_CONCURRENCY, async ({ agent }) => {
       await rpcWithRetry(
         baseUrl,
-        "mobkit/ensure_member",
+        "meta/ensure_member",
         ensureParams(agent),
         8,
       );
@@ -396,7 +396,7 @@ async function main() {
   await runBounded(burst, SEND_CONCURRENCY, async (agent, index) => {
     const row = rowByIdentity.get(agent.identity);
     assert.ok(row, `missing sub-agent row for ${agent.identity}`);
-    await rpcWithRetry(baseUrl, "mobkit/console/send", {
+    await rpcWithRetry(baseUrl, "meta/console/send", {
       identity: rowRuntimeIdentity(row, agent.identity),
       content: `sub-agent return ${index + 1}/${BURST_TOTAL}: return a compact status for parent=${agent.parentIdentity}; include identity=${agent.identity}, shard=${agent.shard}, and wave=burst.`,
       origin: "example-003-playwright",
@@ -408,7 +408,7 @@ async function main() {
     const children = groups.get(parent.identity) || [];
     const parentRow = rowByIdentity.get(parent.identity);
     assert.ok(parentRow, `missing parent row for ${parent.identity}`);
-    await rpcWithRetry(baseUrl, "mobkit/console/send", {
+    await rpcWithRetry(baseUrl, "meta/console/send", {
       identity: rowRuntimeIdentity(parentRow, parent.identity),
       content: `sub-agent returns received for stress action ${parentIndex + 1}: ${children
         .map((child) => `${child.identity}/${child.shard}`)
@@ -427,7 +427,7 @@ async function main() {
         async (peerIdentity, peerIndex) => {
           const peerRow = rowByIdentity.get(peerIdentity);
           assert.ok(peerRow, `missing peer row for ${peerIdentity}`);
-          await rpcWithRetry(baseUrl, "mobkit/console/send", {
+          await rpcWithRetry(baseUrl, "meta/console/send", {
             identity: rowRuntimeIdentity(peerRow, peerIdentity),
             content: `peer fanout from ${parent.identity} action ${parentIndex + 1}: acknowledge parent=${parent.identity}, peer_index=${peerIndex + 1}/${peers.length}, burst_children=${(groups.get(parent.identity) || []).length}.`,
             origin: "example-003-playwright",
@@ -446,7 +446,7 @@ async function main() {
     async (agent, index) => {
       const row = rowByIdentity.get(agent.identity);
       assert.ok(row, `missing identity row for ${agent.identity}`);
-      await rpcWithRetry(baseUrl, "mobkit/console/send", {
+      await rpcWithRetry(baseUrl, "meta/console/send", {
         identity: rowRuntimeIdentity(row, agent.identity),
         content: `direct SDK-style probe ${index + 1}: answer with mob=${agent.mob}, shard=${agent.shard}, wave=burst, and one readiness observation.`,
         origin: "example-003-playwright",
@@ -458,7 +458,7 @@ async function main() {
   await runBounded(sample.slice(12), SEND_CONCURRENCY, async (agent, index) => {
     const row = rowByIdentity.get(agent.identity);
     assert.ok(row, `missing identity row for ${agent.identity}`);
-    await rpcWithRetry(baseUrl, "mobkit/console/send", {
+    await rpcWithRetry(baseUrl, "meta/console/send", {
       identity: rowRuntimeIdentity(row, agent.identity),
       content: `playwright console-send probe ${index + 1}: answer with mob=${agent.mob}, shard=${agent.shard}, wave=burst, and one console observation.`,
       origin: "example-003-playwright",
@@ -510,7 +510,7 @@ async function main() {
     });
     await expectVisible(page.getByTestId("meerkat-console"), "console root");
     await expectVisible(
-      page.getByTestId("mobkit-topbar").getByText("MobKit Load Lab"),
+      page.getByTestId("meta-topbar").getByText("Meta Load Lab"),
       "brand",
     );
     shot = await screenshot(

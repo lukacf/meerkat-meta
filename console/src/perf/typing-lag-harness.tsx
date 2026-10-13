@@ -13,7 +13,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 
 import { ConsoleApp } from "../ConsoleApp";
-import type { MobKitConsoleTransport } from "../lib/headless";
+import type { MetaConsoleTransport } from "../lib/headless";
 import * as adapters from "../lib/adapters";
 import { CONSOLE_RPC_METHODS } from "../lib/contract";
 import { parseSseFrames } from "../lib/network";
@@ -78,7 +78,7 @@ function agentRow(index: number) {
   };
 }
 
-const transport: MobKitConsoleTransport = {
+const transport: MetaConsoleTransport = {
   loadExperience: async () => experience() as never,
   loadModules: async () => ({ modules: [] }) as never,
   // Advertise the console methods like the gateway; without send the console
@@ -123,7 +123,7 @@ function seedDockedChat(): void {
     target: { id: `chat:${CHAT_IDENTITY}`, kind: "agent-chat", title: "Router", identity: CHAT_IDENTITY, memberId: CHAT_IDENTITY },
   };
   window.localStorage.setItem(
-    `mobkit-console-dock-state:${RUNTIME_ID}`,
+    `meta-console-dock-state:${RUNTIME_ID}`,
     JSON.stringify({
       tabs: [{ id: "tab-1", presetId: "single", layout: { kind: "panel", panelId: panel.id } }],
       panels: [panel],

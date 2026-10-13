@@ -6,26 +6,26 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawnSync } = require("node:child_process");
 
-global.window = { __MOBKIT_FLOW_CONTROLLER_TEST__: true };
+global.window = { __META_FLOW_CONTROLLER_TEST__: true };
 global.document = { querySelector: () => null };
 global.Blob = class Blob {};
-global.URL.createObjectURL = global.URL.createObjectURL || (() => "blob:mobkit-live-test");
+global.URL.createObjectURL = global.URL.createObjectURL || (() => "blob:meta-live-test");
 global.URL.revokeObjectURL = global.URL.revokeObjectURL || (() => {});
 // The controller links exactly like the projection suite: the core package
-// IIFE plus the window.MobKitFlowController bootstrap shim, emitted by
+// IIFE plus the window.MetaFlowController bootstrap shim, emitted by
 // `node build.cjs --test-bundle` (the test:rkat-e2e scripts run it first).
 require("../.tmp/controller-under-test.cjs");
 
-const rpcUrl = process.env.MOBKIT_FLOW_EDITOR_RPC_URL || "http://127.0.0.1:4191/flow-editor/rpc";
-const sampleId = process.env.MOBKIT_FLOW_EDITOR_SAMPLE_ID || "sample_docs_only";
-const runDeploy = process.argv.includes("--deploy") || process.env.MOBKIT_FLOW_EDITOR_RUN_DEPLOY === "1";
-const hostDeployExpectation = process.env.MOBKIT_FLOW_EDITOR_EXPECT_HOST_DEPLOY;
+const rpcUrl = process.env.META_FLOW_EDITOR_RPC_URL || "http://127.0.0.1:4191/flow-editor/rpc";
+const sampleId = process.env.META_FLOW_EDITOR_SAMPLE_ID || "sample_docs_only";
+const runDeploy = process.argv.includes("--deploy") || process.env.META_FLOW_EDITOR_RUN_DEPLOY === "1";
+const hostDeployExpectation = process.env.META_FLOW_EDITOR_EXPECT_HOST_DEPLOY;
 if (hostDeployExpectation && !["0", "1"].includes(hostDeployExpectation)) {
-  throw new Error("MOBKIT_FLOW_EDITOR_EXPECT_HOST_DEPLOY must be 0 or 1 when set");
+  throw new Error("META_FLOW_EDITOR_EXPECT_HOST_DEPLOY must be 0 or 1 when set");
 }
 const hasExplicitHostDeployExpectation = hostDeployExpectation === "0" || hostDeployExpectation === "1";
 const expectHostDeploy = hostDeployExpectation === "1";
-const controller = global.window.MobKitFlowController;
+const controller = global.window.MetaFlowController;
 let contractSchema = null;
 const testDeploySettings = () => controller.deployDefaultsFromSchema(contractSchema);
 const testMobSettings = () => controller.mobDefaultsFromSchema(contractSchema);
@@ -35,7 +35,7 @@ function sha256(bytes) {
 }
 
 async function rpc(method, params) {
-  const requestParams = method === "mobkit/mobpacks/validate"
+  const requestParams = method === "meta/mobpacks/validate"
     ? { ...(params || {}), rkat_validate: true }
     : (params || {});
   const response = await fetch(rpcUrl, {
@@ -72,31 +72,31 @@ async function rpcExpectError(method, params) {
 }
 
 async function assertAuthoringCapabilities() {
-  const capabilities = await rpc("mobkit/capabilities", {});
+  const capabilities = await rpc("meta/capabilities", {});
   const authoring = capabilities.authoring_capabilities || {};
   const expectedMethods = [
-    "mobkit/mobpacks/schema",
-    "mobkit/mobpacks/catalogs",
-    "mobkit/tools/catalog",
-    "mobkit/skills/catalog",
-    "mobkit/agent_definitions/list",
-    "mobkit/mobpacks/templates",
-    "mobkit/mobpacks/validate",
-    "mobkit/mobpacks/source",
-    "mobkit/mobpacks/export",
-    "mobkit/mobpacks/import",
-    "mobkit/mobpacks/list",
-    "mobkit/mobpacks/get",
-    "mobkit/mobpacks/create",
-    "mobkit/mobpacks/save",
-    "mobkit/mobpacks/delete",
-    "mobkit/mobpacks/apply_operation",
-    "mobkit/mobpacks/undo",
-    "mobkit/mobpacks/redo",
-    "mobkit/mobpacks/graph_projection",
-    "mobkit/mobpacks/graph_to_flow",
-    "mobkit/mobpacks/deploy_command",
-    "mobkit/mobpacks/deploy",
+    "meta/mobpacks/schema",
+    "meta/mobpacks/catalogs",
+    "meta/tools/catalog",
+    "meta/skills/catalog",
+    "meta/agent_definitions/list",
+    "meta/mobpacks/templates",
+    "meta/mobpacks/validate",
+    "meta/mobpacks/source",
+    "meta/mobpacks/export",
+    "meta/mobpacks/import",
+    "meta/mobpacks/list",
+    "meta/mobpacks/get",
+    "meta/mobpacks/create",
+    "meta/mobpacks/save",
+    "meta/mobpacks/delete",
+    "meta/mobpacks/apply_operation",
+    "meta/mobpacks/undo",
+    "meta/mobpacks/redo",
+    "meta/mobpacks/graph_projection",
+    "meta/mobpacks/graph_to_flow",
+    "meta/mobpacks/deploy_command",
+    "meta/mobpacks/deploy",
   ];
   if (authoring.domain !== "mobpack_authoring") {
     throw new Error(`flow editor capabilities expose wrong authoring domain: ${JSON.stringify(authoring)}`);
@@ -104,7 +104,7 @@ async function assertAuthoringCapabilities() {
   if (authoring.runtime_mutation !== false) {
     throw new Error(`flow editor authoring capabilities must not mutate runtime: ${JSON.stringify(authoring)}`);
   }
-  if (authoring.host_mutation_methods?.["mobkit/mobpacks/deploy"] !== "when execute=true, writes a mobpack archive and runs rkat mob run on the host") {
+  if (authoring.host_mutation_methods?.["meta/mobpacks/deploy"] !== "when execute=true, writes a mobpack archive and runs rkat mob run on the host") {
     throw new Error(`flow editor capabilities must disclose deploy host mutation: ${JSON.stringify(authoring)}`);
   }
   if (authoring.host_mutation_allowed !== authoring.deploy_execute_allowed) {
@@ -151,8 +151,8 @@ async function assertAuthoringCapabilities() {
     if (!operation) {
       throw new Error(`flow editor authoring capabilities missing operation ${operationType}: ${JSON.stringify(operations)}`);
     }
-    if (operation.authority !== "mobkit") {
-      throw new Error(`flow editor operation ${operationType} must be MobKit-authoritative: ${JSON.stringify(operation)}`);
+    if (operation.authority !== "meta") {
+      throw new Error(`flow editor operation ${operationType} must be Meta-authoritative: ${JSON.stringify(operation)}`);
     }
   }
   for (const method of expectedMethods) {
@@ -163,7 +163,7 @@ async function assertAuthoringCapabilities() {
       throw new Error(`flow editor methods missing ${method}: ${JSON.stringify(capabilities.methods)}`);
     }
   }
-  const allowedStandaloneMethods = new Set(["mobkit/capabilities", ...expectedMethods]);
+  const allowedStandaloneMethods = new Set(["meta/capabilities", ...expectedMethods]);
   for (const method of array(capabilities.methods, "capabilities.methods")) {
     if (!allowedStandaloneMethods.has(method)) {
       throw new Error(`standalone flow editor exposed non-authoring RPC method ${method}`);
@@ -242,11 +242,11 @@ function assertDeployPlanTrace(result, label) {
     }
   }
   const firstBody = String(trace[0]?.body || "");
-  if (!firstBody.includes("source: mobkit/mob.toml") || !/command: .*rkat mob run/.test(firstBody)) {
-    throw new Error(`${label} deploy plan_trace did not describe the MobKit deploy source/command: ${JSON.stringify(trace[0])}`);
+  if (!firstBody.includes("source: meta/mob.toml") || !/command: .*rkat mob run/.test(firstBody)) {
+    throw new Error(`${label} deploy plan_trace did not describe the Meta deploy source/command: ${JSON.stringify(trace[0])}`);
   }
   if (!trace.some((row) => String(row?.body || "").includes("skills:") && String(row?.body || "").includes("tools:"))) {
-    throw new Error(`${label} deploy plan_trace did not include profile tools/skills from the parsed MobKit definition: ${JSON.stringify(trace)}`);
+    throw new Error(`${label} deploy plan_trace did not include profile tools/skills from the parsed Meta definition: ${JSON.stringify(trace)}`);
   }
   return {
     rows: trace.length,
@@ -349,11 +349,11 @@ function buildGraphBranchShapeDocument() {
 
 async function validateGraphBranchShape(dir) {
   const document = buildGraphBranchShapeDocument();
-  const validation = await rpc("mobkit/mobpacks/validate", { document });
+  const validation = await rpc("meta/mobpacks/validate", { document });
   if (!validation.ok) {
-    throw new Error(`graph branch shape failed MobKit validation: ${JSON.stringify(validation.diagnostics)}`);
+    throw new Error(`graph branch shape failed Meta validation: ${JSON.stringify(validation.diagnostics)}`);
   }
-  const exported = await rpc("mobkit/mobpacks/export", {
+  const exported = await rpc("meta/mobpacks/export", {
     document,
     filename: "graph-branch-shape.mobpack",
   });
@@ -366,7 +366,7 @@ async function validateGraphBranchShape(dir) {
   const packPath = path.join(dir, exported.filename || "graph-branch-shape.mobpack");
   fs.writeFileSync(packPath, Buffer.from(exported.content_base64, "base64"));
   const validate = run("rkat", ["mob", "validate", "--trust-policy", "permissive", packPath]);
-  const imported = await rpc("mobkit/mobpacks/import", { content_base64: exported.content_base64 });
+  const imported = await rpc("meta/mobpacks/import", { content_base64: exported.content_base64 });
   const branch = imported.document?.flow?.steps?.find((step) => step.type === "branch");
   if (!branch) throw new Error("imported graph branch shape dropped branch step");
   if (branch.controllerRole !== "m_reviewer") throw new Error(`imported graph branch shape dropped join member: ${JSON.stringify(branch)}`);
@@ -474,11 +474,11 @@ function buildGraphParallelShapeDocument() {
 
 async function validateGraphParallelShape(dir) {
   const document = buildGraphParallelShapeDocument();
-  const validation = await rpc("mobkit/mobpacks/validate", { document });
+  const validation = await rpc("meta/mobpacks/validate", { document });
   if (!validation.ok) {
-    throw new Error(`graph parallel shape failed MobKit validation: ${JSON.stringify(validation.diagnostics)}`);
+    throw new Error(`graph parallel shape failed Meta validation: ${JSON.stringify(validation.diagnostics)}`);
   }
-  const exported = await rpc("mobkit/mobpacks/export", {
+  const exported = await rpc("meta/mobpacks/export", {
     document,
     filename: "graph-parallel-shape.mobpack",
   });
@@ -488,7 +488,7 @@ async function validateGraphParallelShape(dir) {
   const packPath = path.join(dir, exported.filename || "graph-parallel-shape.mobpack");
   fs.writeFileSync(packPath, Buffer.from(exported.content_base64, "base64"));
   const validate = run("rkat", ["mob", "validate", "--trust-policy", "permissive", packPath]);
-  const imported = await rpc("mobkit/mobpacks/import", { content_base64: exported.content_base64 });
+  const imported = await rpc("meta/mobpacks/import", { content_base64: exported.content_base64 });
   const parallel = imported.document?.flow?.steps?.find((step) => step.type === "parallel");
   if (!parallel) throw new Error("imported graph parallel shape dropped parallel step");
   if (parallel.branches?.length !== 2) {
@@ -616,11 +616,11 @@ function buildGraphLoopShapeDocument() {
 
 async function validateGraphLoopShape(dir) {
   const document = buildGraphLoopShapeDocument();
-  const validation = await rpc("mobkit/mobpacks/validate", { document });
+  const validation = await rpc("meta/mobpacks/validate", { document });
   if (!validation.ok) {
-    throw new Error(`graph loop shape failed MobKit validation: ${JSON.stringify(validation.diagnostics)}`);
+    throw new Error(`graph loop shape failed Meta validation: ${JSON.stringify(validation.diagnostics)}`);
   }
-  const exported = await rpc("mobkit/mobpacks/export", {
+  const exported = await rpc("meta/mobpacks/export", {
     document,
     filename: "graph-loop-shape.mobpack",
   });
@@ -630,7 +630,7 @@ async function validateGraphLoopShape(dir) {
   const packPath = path.join(dir, exported.filename || "graph-loop-shape.mobpack");
   fs.writeFileSync(packPath, Buffer.from(exported.content_base64, "base64"));
   const validate = run("rkat", ["mob", "validate", "--trust-policy", "permissive", packPath]);
-  const imported = await rpc("mobkit/mobpacks/import", { content_base64: exported.content_base64 });
+  const imported = await rpc("meta/mobpacks/import", { content_base64: exported.content_base64 });
   const repeat = imported.document?.flow?.steps?.find((step) => step.type === "repeat");
   if (!repeat) throw new Error("imported graph loop shape dropped repeat step");
   if (repeat.cond?.field !== "verdict" || repeat.cond?.val !== "green") {
@@ -688,7 +688,7 @@ function buildEditedAgentDefinitionDocument() {
     ],
   }];
   const skillRealms = [{
-    id: "mobkit/editor-inline",
+    id: "meta/editor-inline",
     label: "This mobpack",
     source: "editor",
     default: true,
@@ -741,11 +741,11 @@ function buildEditedAgentDefinitionDocument() {
 
 async function validateEditedAgentDefinition(dir) {
   const document = buildEditedAgentDefinitionDocument();
-  const validation = await rpc("mobkit/mobpacks/validate", { document });
+  const validation = await rpc("meta/mobpacks/validate", { document });
   if (!validation.ok) {
-    throw new Error(`edited agent definition failed MobKit validation: ${JSON.stringify(validation.diagnostics)}`);
+    throw new Error(`edited agent definition failed Meta validation: ${JSON.stringify(validation.diagnostics)}`);
   }
-  const exported = await rpc("mobkit/mobpacks/export", {
+  const exported = await rpc("meta/mobpacks/export", {
     document,
     filename: "edited-agent-definition.mobpack",
   });
@@ -771,7 +771,7 @@ async function validateEditedAgentDefinition(dir) {
   const packPath = path.join(dir, exported.filename || "edited-agent-definition.mobpack");
   fs.writeFileSync(packPath, Buffer.from(exported.content_base64, "base64"));
   const validate = run("rkat", ["mob", "validate", "--trust-policy", "permissive", packPath]);
-  const imported = await rpc("mobkit/mobpacks/import", { content_base64: exported.content_base64 });
+  const imported = await rpc("meta/mobpacks/import", { content_base64: exported.content_base64 });
   const member = imported.document?.members?.find((candidate) => candidate.id === "m_quality_agent");
   if (!member) throw new Error("imported edited agent definition dropped quality agent member");
   if (!["builtins", "shell", "comms"].every((tool) => member.tools?.includes(tool))) {
@@ -816,7 +816,7 @@ function buildFilesystemSkillDocument(skillPath) {
     name: "platform_agent",
     role: "platform_agent",
     model: "gpt-5.5",
-    systemPrompt: "Use the selected MobKit platform skill to answer from the real contract.",
+    systemPrompt: "Use the selected Meta platform skill to answer from the real contract.",
     tools: ["builtins", "comms"],
     skills: ["mob.platform"],
     profileBinding: "inline",
@@ -828,7 +828,7 @@ function buildFilesystemSkillDocument(skillPath) {
     source: "filesystem",
     skills: [{
       id: "mob.platform",
-      label: "MobKit Platform",
+      label: "Meta Platform",
       source: "path",
       origin: "filesystem",
       path: skillPath,
@@ -849,7 +849,7 @@ function buildFilesystemSkillDocument(skillPath) {
         id: "platform_turn",
         type: "member",
         role: "m_platform_agent",
-        instruction: "Use the MobKit platform skill and cite the packed contract.",
+        instruction: "Use the Meta platform skill and cite the packed contract.",
         launchMode: { kind: "Fresh" },
       },
     ],
@@ -873,15 +873,15 @@ function buildFilesystemSkillDocument(skillPath) {
 
 async function validateFilesystemSkillPacking(dir) {
   const skillPath = path.join(dir, "SKILL.md");
-  const skillContent = "Use the real MobKit platform contract from this packed filesystem skill.";
+  const skillContent = "Use the real Meta platform contract from this packed filesystem skill.";
   fs.writeFileSync(skillPath, skillContent);
 
   const document = buildFilesystemSkillDocument(skillPath);
-  const validation = await rpc("mobkit/mobpacks/validate", { document });
+  const validation = await rpc("meta/mobpacks/validate", { document });
   if (!validation.ok) {
-    throw new Error(`filesystem skill definition failed MobKit validation: ${JSON.stringify(validation.diagnostics)}`);
+    throw new Error(`filesystem skill definition failed Meta validation: ${JSON.stringify(validation.diagnostics)}`);
   }
-  const exported = await rpc("mobkit/mobpacks/export", {
+  const exported = await rpc("meta/mobpacks/export", {
     document,
     filename: "filesystem-skill-definition.mobpack",
   });
@@ -915,8 +915,8 @@ async function validateFilesystemSkillPacking(dir) {
 
   const validate = run("rkat", ["mob", "validate", "--trust-policy", "permissive", packPath]);
   fs.unlinkSync(skillPath);
-  const imported = await rpc("mobkit/mobpacks/import", { content_base64: exported.content_base64 });
-  const importedValidation = await rpc("mobkit/mobpacks/validate", { document: imported.document });
+  const imported = await rpc("meta/mobpacks/import", { content_base64: exported.content_base64 });
+  const importedValidation = await rpc("meta/mobpacks/validate", { document: imported.document });
   if (!importedValidation.ok) {
     throw new Error(`imported packed filesystem skill failed validation after original file removal: ${JSON.stringify(importedValidation.diagnostics)}`);
   }
@@ -942,18 +942,18 @@ async function validateFilesystemSkillPacking(dir) {
 async function buildUnifiedProjectionDocument(catalogs) {
   const definitions = controller.agentDefinitionsFromCatalogs(catalogs);
   const coderDefinition = definitions.find((definition) => definition.role === "coder") || definitions[0];
-  const reviewerDefinition = definitions.find((definition) => definition.role === "reviewer" && definition.sourceOrigin === "mobkit/sample-mobpack")
+  const reviewerDefinition = definitions.find((definition) => definition.role === "reviewer" && definition.sourceOrigin === "meta/sample-mobpack")
     || definitions.find((definition) => definition.role === "reviewer")
     || definitions[1]
     || definitions[0];
   if (!coderDefinition || !reviewerDefinition) {
-    throw new Error("unified projection proof needs MobKit agent definitions from mobkit/mobpacks/catalogs");
+    throw new Error("unified projection proof needs Meta agent definitions from meta/mobpacks/catalogs");
   }
   const modelCatalog = controller.modelCatalogFromCatalogs(catalogs);
   const model = modelCatalog[0]?.id || coderDefinition.model || reviewerDefinition.model || "gpt-5.5";
   const toolCatalog = controller.toolCatalogFromCatalogs(catalogs);
   if (!toolCatalog.length) {
-    throw new Error("unified projection proof needs real MobKit tools from mobkit/mobpacks/catalogs");
+    throw new Error("unified projection proof needs real Meta tools from meta/mobpacks/catalogs");
   }
   const toolIds = toolCatalog.map((tool) => tool.id).filter(Boolean);
   for (const required of ["builtins", "shell", "comms", "mob"]) {
@@ -961,7 +961,7 @@ async function buildUnifiedProjectionDocument(catalogs) {
   }
   const catalogSkillRealms = controller.skillRealmsFromCatalogs(catalogs);
   const leakedSampleRealm = catalogSkillRealms
-    .find((realm) => realm.id === "mobkit/sample-mobpacks" || realm.source === "mobkit/sample-mobpack");
+    .find((realm) => realm.id === "meta/sample-mobpacks" || realm.source === "meta/sample-mobpack");
   if (leakedSampleRealm) {
     throw new Error(`global skill catalog leaked sample mobpack skills: ${JSON.stringify(leakedSampleRealm)}`);
   }
@@ -970,19 +970,19 @@ async function buildUnifiedProjectionDocument(catalogs) {
     .flatMap((realm) => realm.skills || [])
     .filter((skill) => ["mob.workpad", "mob.review"].includes(skill.id));
   if (sampleSkills.length < 2) {
-    throw new Error("unified projection proof needs real MobKit sample mobpack skills from sample_mobpacks");
+    throw new Error("unified projection proof needs real Meta sample mobpack skills from sample_mobpacks");
   }
   if (!sampleSkills.every((skill) => skill.source)) {
-    throw new Error(`unified projection proof needs MobKit sample skill source metadata: ${JSON.stringify(sampleSkills)}`);
+    throw new Error(`unified projection proof needs Meta sample skill source metadata: ${JSON.stringify(sampleSkills)}`);
   }
   const sampleSkillRealm = {
-    id: "mobkit/sample-mobpacks",
-    label: "MobKit sample skills",
-    source: "mobkit/sample-mobpack",
+    id: "meta/sample-mobpacks",
+    label: "Meta sample skills",
+    source: "meta/sample-mobpack",
     skills: sampleSkills,
   };
   const inlineSkillRealm = {
-    id: "mobkit/editor-inline",
+    id: "meta/editor-inline",
     label: "This mobpack",
     source: "editor",
     skills: [{
@@ -996,27 +996,27 @@ async function buildUnifiedProjectionDocument(catalogs) {
 
   const baseDocument = catalogs.blank_mobpack?.document;
   if (!baseDocument || typeof baseDocument !== "object") {
-    throw new Error("unified projection proof needs MobKit blank mobpack document");
+    throw new Error("unified projection proof needs Meta blank mobpack document");
   }
-  const coderAdd = await rpc("mobkit/mobpacks/apply_operation", {
+  const coderAdd = await rpc("meta/mobpacks/apply_operation", {
     document: baseDocument,
     operation: { type: "add_agent_definition", definition_id: coderDefinition.id },
   });
   if (coderAdd.ok === false || !coderAdd.document || !coderAdd.selection?.id) {
-    throw new Error(`unified projection proof could not add coder definition through MobKit apply_operation: ${JSON.stringify(coderAdd)}`);
+    throw new Error(`unified projection proof could not add coder definition through Meta apply_operation: ${JSON.stringify(coderAdd)}`);
   }
-  const reviewerAdd = await rpc("mobkit/mobpacks/apply_operation", {
+  const reviewerAdd = await rpc("meta/mobpacks/apply_operation", {
     document: coderAdd.document,
     operation: { type: "add_agent_definition", definition_id: reviewerDefinition.id },
   });
   if (reviewerAdd.ok === false || !reviewerAdd.document || !reviewerAdd.selection?.id) {
-    throw new Error(`unified projection proof could not add reviewer definition through MobKit apply_operation: ${JSON.stringify(reviewerAdd)}`);
+    throw new Error(`unified projection proof could not add reviewer definition through Meta apply_operation: ${JSON.stringify(reviewerAdd)}`);
   }
   const addedMembers = array(reviewerAdd.document.members, "apply_operation document.members");
   const coderSource = addedMembers.find((member) => member.sourceDefinition?.definitionId === coderDefinition.id);
   const reviewerSource = addedMembers.find((member) => member.sourceDefinition?.definitionId === reviewerDefinition.id);
   if (!coderSource?.sourceDefinition || !reviewerSource?.sourceDefinition) {
-    throw new Error(`MobKit apply_operation did not preserve sourceDefinition provenance: ${JSON.stringify(addedMembers)}`);
+    throw new Error(`Meta apply_operation did not preserve sourceDefinition provenance: ${JSON.stringify(addedMembers)}`);
   }
 
   const coder = {
@@ -1025,7 +1025,7 @@ async function buildUnifiedProjectionDocument(catalogs) {
     name: "Unified Coder",
     role: "unified_coder",
     model,
-    systemPrompt: "Implement the graph-selected path using only the agent-edited MobKit profile definition.",
+    systemPrompt: "Implement the graph-selected path using only the agent-edited Meta profile definition.",
     tools: ["builtins", "shell", "mob"],
     skills: ["mob.workpad", "mob.editor.unified"],
     profileBinding: "inline",
@@ -1166,11 +1166,11 @@ async function buildUnifiedProjectionDocument(catalogs) {
 
 async function validateUnifiedEditorProjection(dir, catalogs) {
   const document = await buildUnifiedProjectionDocument(catalogs);
-  const validation = await rpc("mobkit/mobpacks/validate", { document });
+  const validation = await rpc("meta/mobpacks/validate", { document });
   if (!validation.ok) {
-    throw new Error(`unified editor projection failed MobKit validation: ${JSON.stringify(validation.diagnostics)}`);
+    throw new Error(`unified editor projection failed Meta validation: ${JSON.stringify(validation.diagnostics)}`);
   }
-  const exported = await rpc("mobkit/mobpacks/export", {
+  const exported = await rpc("meta/mobpacks/export", {
     document,
     filename: "unified-editor-projection.mobpack",
   });
@@ -1200,8 +1200,8 @@ async function validateUnifiedEditorProjection(dir, catalogs) {
   const packPath = path.join(dir, exported.filename || "unified-editor-projection.mobpack");
   fs.writeFileSync(packPath, Buffer.from(exported.content_base64, "base64"));
   const validate = run("rkat", ["mob", "validate", "--trust-policy", "permissive", packPath]);
-  const imported = await rpc("mobkit/mobpacks/import", { content_base64: exported.content_base64 });
-  const importedValidation = await rpc("mobkit/mobpacks/validate", { document: imported.document });
+  const imported = await rpc("meta/mobpacks/import", { content_base64: exported.content_base64 });
+  const importedValidation = await rpc("meta/mobpacks/validate", { document: imported.document });
   if (!importedValidation.ok) {
     throw new Error(`imported unified editor projection failed validation: ${JSON.stringify(importedValidation.diagnostics)}`);
   }
@@ -1224,9 +1224,9 @@ async function validateUnifiedEditorProjection(dir, catalogs) {
     const sourceOrigin = String(source.sourceOrigin || "").trim();
     const realCatalogSource = sourceKind === "authoring"
       || sourceKind === "sample"
-      || sourceOrigin === "mobkit/authoring-agent-definitions"
-      || sourceOrigin === "mobkit/sample-mobpack";
-    if (source.definitionType !== "mobkit/profile-member" || !source.definitionId || !source.sourceMobpack || !realCatalogSource) {
+      || sourceOrigin === "meta/authoring-agent-definitions"
+      || sourceOrigin === "meta/sample-mobpack";
+    if (source.definitionType !== "meta/profile-member" || !source.definitionId || !source.sourceMobpack || !realCatalogSource) {
       throw new Error(`imported unified ${label} lost source-definition provenance from the real profile-member catalog: ${JSON.stringify(source)}`);
     }
     if (!String(source.sourceDocumentPath || "").startsWith("document.members[")) {
@@ -1303,7 +1303,7 @@ function buildRealmProfileDefinitionDocument() {
 
 async function rejectRealmProfileDefinition() {
   const document = buildRealmProfileDefinitionDocument();
-  const validation = await rpc("mobkit/mobpacks/validate", { document });
+  const validation = await rpc("meta/mobpacks/validate", { document });
   const diagnostic = validation.diagnostics?.find((candidate) => candidate.code === "unsupported_realm_profile_pack_binding");
   if (validation.ok || !diagnostic) {
     throw new Error(`realm profile definition should fail before export: ${JSON.stringify(validation)}`);
@@ -1318,12 +1318,12 @@ async function rejectRealmProfileDefinition() {
 async function validateBlankMobpackTemplate(dir, catalogs) {
   const blankTemplate = controller.blankMobpackFromCatalogs(catalogs);
   if (!blankTemplate?.document) {
-    throw new Error(`mobkit/mobpacks/catalogs did not provide a blank mobpack template: ${JSON.stringify(catalogs.blank_mobpack)}`);
+    throw new Error(`meta/mobpacks/catalogs did not provide a blank mobpack template: ${JSON.stringify(catalogs.blank_mobpack)}`);
   }
   if (blankTemplate.validation?.ok !== true) {
     throw new Error(`blank mobpack template is not API-valid: ${JSON.stringify(blankTemplate.validation)}`);
   }
-  const created = await rpc("mobkit/mobpacks/create", {
+  const created = await rpc("meta/mobpacks/create", {
     id: "f_blank_live",
     name: "Blank Live Proof",
     trigger: "label · blank-live-proof",
@@ -1333,14 +1333,14 @@ async function validateBlankMobpackTemplate(dir, catalogs) {
     document: created?.row?.document,
     row: created?.row,
   };
-  if (!draft?.document || draft.row?.source !== "mobkit/blank-mobpack") {
-    throw new Error(`mobkit/mobpacks/create did not return a blank MobKit draft: ${JSON.stringify(created)}`);
+  if (!draft?.document || draft.row?.source !== "meta/blank-mobpack") {
+    throw new Error(`meta/mobpacks/create did not return a blank Meta draft: ${JSON.stringify(created)}`);
   }
-  const validation = await rpc("mobkit/mobpacks/validate", { document: draft.document });
+  const validation = await rpc("meta/mobpacks/validate", { document: draft.document });
   if (!validation.ok) {
     throw new Error(`created blank draft failed validation: ${JSON.stringify(validation.diagnostics)}`);
   }
-  const exported = await rpc("mobkit/mobpacks/export", {
+  const exported = await rpc("meta/mobpacks/export", {
     document: draft.document,
     filename: "blank-live-proof.mobpack",
   });
@@ -1350,7 +1350,7 @@ async function validateBlankMobpackTemplate(dir, catalogs) {
   const packPath = path.join(dir, exported.filename || "blank-live-proof.mobpack");
   fs.writeFileSync(packPath, Buffer.from(exported.content_base64, "base64"));
   const rkatValidate = run("rkat", ["mob", "validate", "--trust-policy", "permissive", packPath]);
-  const imported = await rpc("mobkit/mobpacks/import", { content_base64: exported.content_base64 });
+  const imported = await rpc("meta/mobpacks/import", { content_base64: exported.content_base64 });
   const member = imported.document?.members?.find((candidate) => candidate.id === "m_worker");
   if (!member || member.profileBinding !== "inline" || member.runtimeMode !== "turn_driven") {
     throw new Error(`imported blank draft lost real worker profile definition: ${JSON.stringify(imported.document?.members)}`);
@@ -1388,12 +1388,12 @@ async function validateCustomDeploySettings(dir) {
     prompt: "Custom deploy proof prompt.",
   });
   const packPath = path.join(dir, "custom-deploy-settings.mobpack");
-  const preview = await rpc("mobkit/mobpacks/deploy_command", {
+  const preview = await rpc("meta/mobpacks/deploy_command", {
     document,
     pack_path: packPath,
     prompt: "Custom deploy proof prompt.",
   });
-  const result = await rpc("mobkit/mobpacks/deploy", {
+  const result = await rpc("meta/mobpacks/deploy", {
     document,
     execute: false,
     pack_path: packPath,
@@ -1410,8 +1410,8 @@ async function validateCustomDeploySettings(dir) {
   if (preview.command !== result.command || JSON.stringify(preview.argv || []) !== JSON.stringify(argv)) {
     throw new Error(`deploy command preview drifted from deploy plan\npreview=${JSON.stringify(preview)}\nresult=${JSON.stringify({ command: result.command, argv })}`);
   }
-  if (preview.source !== "meerkat_mobkit::mobpack::deploy_argv") {
-    throw new Error(`deploy command preview did not report MobKit deploy_argv source: ${JSON.stringify(preview)}`);
+  if (preview.source !== "meerkat_meta::mobpack::deploy_argv") {
+    throw new Error(`deploy command preview did not report Meta deploy_argv source: ${JSON.stringify(preview)}`);
   }
   if (!preview.validation?.ok || preview.filename !== "custom-deploy-settings.mobpack") {
     throw new Error(`deploy command preview was not document-backed: ${JSON.stringify(preview)}`);
@@ -1451,13 +1451,13 @@ async function validateCustomDeploySettings(dir) {
     }
   }
   if (!array(result.display_rows, "deploy.display_rows").some((row) => row.kind === "warn" && row.head === "Deploy plan ready" && row.sub.includes("rkat mob run"))) {
-    throw new Error(`MobKit deploy response did not provide API-backed display rows: ${JSON.stringify(result.display_rows)}`);
+    throw new Error(`Meta deploy response did not provide API-backed display rows: ${JSON.stringify(result.display_rows)}`);
   }
   const planTrace = assertDeployPlanTrace(result, "customDeploySettings");
-  const exported = await rpc("mobkit/mobpacks/export", { document });
+  const exported = await rpc("meta/mobpacks/export", { document });
   const packBytes = Buffer.from(exported.content_base64, "base64");
   if (result.pack_sha256 !== sha256(packBytes)) {
-    throw new Error(`MobKit deploy response did not report the planned pack sha256: ${JSON.stringify({ pack_sha256: result.pack_sha256, pack_path: result.pack_path })}`);
+    throw new Error(`Meta deploy response did not report the planned pack sha256: ${JSON.stringify({ pack_sha256: result.pack_sha256, pack_path: result.pack_path })}`);
   }
   fs.writeFileSync(result.pack_path, packBytes);
   // editor-authored packs are unsigned; rkat 0.7 `mob validate` defaults to
@@ -1477,7 +1477,7 @@ async function validateCustomDeploySettings(dir) {
 }
 
 async function validateDocumentBackedDeployPreview(document) {
-  const preview = await rpc("mobkit/mobpacks/deploy_command", { document });
+  const preview = await rpc("meta/mobpacks/deploy_command", { document });
   const argv = array(preview.argv, "documentBackedDeployPreview.argv");
   const expectedPackName = `${String(document?.name || document?.mob_id || "mobpack")
     .trim()
@@ -1521,7 +1521,7 @@ async function validateHostDeployRpc(document, dir) {
     userConfigRoot: path.join(dir, "host-config"),
     prompt: "Reply with exactly OK.",
   });
-  const result = await rpc("mobkit/mobpacks/deploy", {
+  const result = await rpc("meta/mobpacks/deploy", {
     document: deployDocument,
     execute: true,
     pack_path: path.join(dir, "host-deploy-rpc.mobpack"),
@@ -1550,15 +1550,15 @@ async function validateNamedTypedOperations(catalogs) {
   let document = catalogs.blank_mobpack.document;
   const catalogSnapshotId = catalogs.catalog_snapshot?.id;
   if (!catalogSnapshotId) {
-    throw new Error(`named operation proof needs a MobKit catalog snapshot id: ${JSON.stringify(catalogs.catalog_snapshot)}`);
+    throw new Error(`named operation proof needs a Meta catalog snapshot id: ${JSON.stringify(catalogs.catalog_snapshot)}`);
   }
   const implementerDefinition = array(catalogs.agent_definitions, "catalogs.agent_definitions")
-    .find((definition) => definition.role === "implementer" && definition.sourceOrigin === "mobkit/authoring-agent-definitions");
+    .find((definition) => definition.role === "implementer" && definition.sourceOrigin === "meta/authoring-agent-definitions");
   if (!implementerDefinition?.id) {
-    throw new Error(`MobKit catalogs did not expose an implementer authoring profile definition: ${JSON.stringify(catalogs.agent_definitions)}`);
+    throw new Error(`Meta catalogs did not expose an implementer authoring profile definition: ${JSON.stringify(catalogs.agent_definitions)}`);
   }
   try {
-    await rpc("mobkit/mobpacks/apply_operation", {
+    await rpc("meta/mobpacks/apply_operation", {
       document,
       expected_catalog_snapshot_id: "stale-catalog-snapshot",
       operation: {
@@ -1572,7 +1572,7 @@ async function validateNamedTypedOperations(catalogs) {
       throw error;
     }
   }
-  const added = await rpc("mobkit/mobpacks/apply_operation", {
+  const added = await rpc("meta/mobpacks/apply_operation", {
     document,
     expected_catalog_snapshot_id: catalogSnapshotId,
     operation: {
@@ -1585,7 +1585,7 @@ async function validateNamedTypedOperations(catalogs) {
   }
   document = added.document;
   const memberId = added.selection.id;
-  const updated = await rpc("mobkit/mobpacks/apply_operation", {
+  const updated = await rpc("meta/mobpacks/apply_operation", {
     document,
     operation: {
       type: "update_member",
@@ -1599,11 +1599,11 @@ async function validateNamedTypedOperations(catalogs) {
     throw new Error(`named typed operation did not apply member patch: ${JSON.stringify(updated)}`);
   }
   const blankDefinition = array(catalogs.agent_definitions, "catalogs.agent_definitions")
-    .find((definition) => definition.role === "agent" && definition.sourceOrigin === "mobkit/authoring-agent-definitions");
+    .find((definition) => definition.role === "agent" && definition.sourceOrigin === "meta/authoring-agent-definitions");
   if (!blankDefinition?.id) {
-    throw new Error(`MobKit catalogs did not expose a blank authoring profile definition: ${JSON.stringify(catalogs.agent_definitions)}`);
+    throw new Error(`Meta catalogs did not expose a blank authoring profile definition: ${JSON.stringify(catalogs.agent_definitions)}`);
   }
-  const blankAdded = await rpc("mobkit/mobpacks/apply_operation", {
+  const blankAdded = await rpc("meta/mobpacks/apply_operation", {
     document: updated.document,
     expected_catalog_snapshot_id: catalogSnapshotId,
     operation: {
@@ -1616,7 +1616,7 @@ async function validateNamedTypedOperations(catalogs) {
   if (!blankAdded.ok || blankMember?.role !== "agent" || blankMember?.sourceDefinition?.definitionId !== blankDefinition.id) {
     throw new Error(`blank authoring profile definition did not materialize as an editable member: ${JSON.stringify(blankAdded)}`);
   }
-  const settings = await rpc("mobkit/mobpacks/apply_operation", {
+  const settings = await rpc("meta/mobpacks/apply_operation", {
     document: blankAdded.document,
     operation: {
       type: "update_deploy_settings",
@@ -1627,7 +1627,7 @@ async function validateNamedTypedOperations(catalogs) {
   if (!settings.ok || settings.document.deploy.prompt !== "Named section payload prompt.") {
     throw new Error(`named deploy settings operation did not apply field payload: ${JSON.stringify(settings)}`);
   }
-  const invalidSettings = await rpcExpectError("mobkit/mobpacks/apply_operation", {
+  const invalidSettings = await rpcExpectError("meta/mobpacks/apply_operation", {
     document: settings.document,
     operation: {
       type: "update_deploy_settings",
@@ -1638,7 +1638,7 @@ async function validateNamedTypedOperations(catalogs) {
   if (!String(invalidSettings.message || "").includes("update_deploy_settings surface must be one of cli, rpc")) {
     throw new Error(`invalid deploy settings were not rejected at the mutation boundary: ${JSON.stringify(invalidSettings)}`);
   }
-  const mobSettings = await rpc("mobkit/mobpacks/apply_operation", {
+  const mobSettings = await rpc("meta/mobpacks/apply_operation", {
     document: settings.document,
     operation: {
       type: "update_mob_settings",
@@ -1649,7 +1649,7 @@ async function validateNamedTypedOperations(catalogs) {
   if (!mobSettings.ok || mobSettings.document.mob_settings?.backendDefault !== "session") {
     throw new Error(`named mob settings operation did not apply field payload: ${JSON.stringify(mobSettings)}`);
   }
-  const roleWiring = await rpc("mobkit/mobpacks/apply_operation", {
+  const roleWiring = await rpc("meta/mobpacks/apply_operation", {
     document: mobSettings.document,
     operation: {
       type: "update_role_wiring",
@@ -1663,7 +1663,7 @@ async function validateNamedTypedOperations(catalogs) {
   if (roleWiring.validation?.validation_source !== "rkat mob validate") {
     throw new Error(`named role wiring operation did not run rkat validation: ${JSON.stringify(roleWiring.validation)}`);
   }
-  const validation = await rpc("mobkit/mobpacks/validate", { document: roleWiring.document });
+  const validation = await rpc("meta/mobpacks/validate", { document: roleWiring.document });
   if (!validation.ok) {
     throw new Error(`named projected operation document failed validation: ${JSON.stringify(validation.diagnostics)}`);
   }
@@ -1727,7 +1727,7 @@ async function validateInputParamOperations(catalogs) {
     label: "params.route == code",
   }];
 
-  const added = await rpc("mobkit/mobpacks/apply_operation", {
+  const added = await rpc("meta/mobpacks/apply_operation", {
     document,
     operation: {
       type: "add_input_param",
@@ -1735,9 +1735,9 @@ async function validateInputParamOperations(catalogs) {
     },
   });
   if (added.selection?.param_id !== "p2" || added.document.flow.steps[0].inputParams[1]?.name !== "param") {
-    throw new Error(`input param add operation did not use MobKit draft defaults: ${JSON.stringify(added.document.flow.steps[0])}`);
+    throw new Error(`input param add operation did not use Meta draft defaults: ${JSON.stringify(added.document.flow.steps[0])}`);
   }
-  const renamed = await rpc("mobkit/mobpacks/apply_operation", {
+  const renamed = await rpc("meta/mobpacks/apply_operation", {
     document: added.document,
     operation: {
       type: "rename_input_param",
@@ -1749,7 +1749,7 @@ async function validateInputParamOperations(catalogs) {
   if (renamed.document.flow.steps[1].branches[0].cond.field !== "kind" || renamed.document.edges[0].cond.var !== "params.kind") {
     throw new Error(`input param rename operation did not rewrite references: ${JSON.stringify(renamed.document)}`);
   }
-  const deleted = await rpc("mobkit/mobpacks/apply_operation", {
+  const deleted = await rpc("meta/mobpacks/apply_operation", {
     document: renamed.document,
     operation: {
       type: "delete_input_param",
@@ -1776,17 +1776,17 @@ async function validateSchemaOperations(catalogs) {
     fields: [{ id: "f1", name: "verdict", type: "string", required: true, description: "", enumValues: [] }],
   }];
 
-  const addedSchema = await rpc("mobkit/mobpacks/apply_operation", {
+  const addedSchema = await rpc("meta/mobpacks/apply_operation", {
     document,
     operation: {
       type: "add_schema",
     },
   });
   if (addedSchema.selection?.id !== "Artifact1" || addedSchema.document.schemas[1]?.fields?.[0]?.name !== "field_one") {
-    throw new Error(`schema add operation did not use MobKit draft defaults: ${JSON.stringify(addedSchema.document.schemas)}`);
+    throw new Error(`schema add operation did not use Meta draft defaults: ${JSON.stringify(addedSchema.document.schemas)}`);
   }
 
-  const addedField = await rpc("mobkit/mobpacks/apply_operation", {
+  const addedField = await rpc("meta/mobpacks/apply_operation", {
     document: addedSchema.document,
     operation: {
       type: "add_schema_field",
@@ -1795,7 +1795,7 @@ async function validateSchemaOperations(catalogs) {
   });
   const field = addedField.document.schemas[0]?.fields?.[1];
   if (addedField.selection?.field_id !== "f2" || field?.name !== "new_field") {
-    throw new Error(`schema field add operation did not use MobKit draft defaults: ${JSON.stringify(addedField.document.schemas[0])}`);
+    throw new Error(`schema field add operation did not use Meta draft defaults: ${JSON.stringify(addedField.document.schemas[0])}`);
   }
 
   return {
@@ -1835,7 +1835,7 @@ async function validateGraphOperations(catalogs) {
     { id: "n_review", kind: "member", memberId: "reviewer", col: 1, row: 0 },
   ];
   document.edges = [];
-  const semanticMember = await rpc("mobkit/mobpacks/apply_operation", {
+  const semanticMember = await rpc("meta/mobpacks/apply_operation", {
     document,
     operation: {
       type: "insert_graph_node",
@@ -1844,9 +1844,9 @@ async function validateGraphOperations(catalogs) {
     },
   });
   if (semanticMember.selection?.id !== "i_planner" || semanticMember.document.instances[2]?.launchMode?.kind !== "Fresh") {
-    throw new Error(`semantic graph member insert did not use MobKit defaults: ${JSON.stringify(semanticMember.document.instances)}`);
+    throw new Error(`semantic graph member insert did not use Meta defaults: ${JSON.stringify(semanticMember.document.instances)}`);
   }
-  const semanticBranch = await rpc("mobkit/mobpacks/apply_operation", {
+  const semanticBranch = await rpc("meta/mobpacks/apply_operation", {
     document,
     operation: {
       type: "insert_graph_node",
@@ -1855,10 +1855,10 @@ async function validateGraphOperations(catalogs) {
     },
   });
   if (semanticBranch.selection?.id !== "g_branch_1" || semanticBranch.document.edges[1]?.label !== "fallback") {
-    throw new Error(`semantic graph branch insert did not use MobKit graph draft: ${JSON.stringify(semanticBranch.document)}`);
+    throw new Error(`semantic graph branch insert did not use Meta graph draft: ${JSON.stringify(semanticBranch.document)}`);
   }
   try {
-    await rpc("mobkit/mobpacks/apply_operation", {
+    await rpc("meta/mobpacks/apply_operation", {
       document,
       operation: {
         type: "insert_graph_node",
@@ -1871,7 +1871,7 @@ async function validateGraphOperations(catalogs) {
       throw error;
     }
   }
-  const inserted = await rpc("mobkit/mobpacks/apply_operation", {
+  const inserted = await rpc("meta/mobpacks/apply_operation", {
     document,
     operation: {
       type: "insert_graph_node",
@@ -1883,7 +1883,7 @@ async function validateGraphOperations(catalogs) {
   if (!insertedId) {
     throw new Error(`semantic graph insert did not return a selected instance: ${JSON.stringify(inserted)}`);
   }
-  const moved = await rpc("mobkit/mobpacks/apply_operation", {
+  const moved = await rpc("meta/mobpacks/apply_operation", {
     document: inserted.document,
     operation: {
       type: "move_graph_node",
@@ -1897,7 +1897,7 @@ async function validateGraphOperations(catalogs) {
   if (doneAfterMove?.col !== 1 || reviewerAfterMove?.col !== 2) {
     throw new Error(`graph move operation did not swap cells: ${JSON.stringify(moved.document.instances)}`);
   }
-  const updated = await rpc("mobkit/mobpacks/apply_operation", {
+  const updated = await rpc("meta/mobpacks/apply_operation", {
     document: moved.document,
     operation: {
       type: "apply_graph_node_edit",
@@ -1907,7 +1907,7 @@ async function validateGraphOperations(catalogs) {
     },
   });
   try {
-    await rpc("mobkit/mobpacks/apply_operation", {
+    await rpc("meta/mobpacks/apply_operation", {
       document: updated.document,
       operation: {
         type: "insert_graph_node",
@@ -1930,7 +1930,7 @@ async function validateGraphOperations(catalogs) {
     edges: [],
   };
   try {
-    await rpc("mobkit/mobpacks/apply_operation", {
+    await rpc("meta/mobpacks/apply_operation", {
       document: legacyTerminalDocument,
       operation: {
         type: "connect_graph_nodes",
@@ -1944,7 +1944,7 @@ async function validateGraphOperations(catalogs) {
       throw error;
     }
   }
-  const connected = await rpc("mobkit/mobpacks/apply_operation", {
+  const connected = await rpc("meta/mobpacks/apply_operation", {
     document: updated.document,
     operation: {
       type: "connect_graph_nodes",
@@ -1956,7 +1956,7 @@ async function validateGraphOperations(catalogs) {
   if (connected.selection?.id !== expectedEdgeId || connected.document.edges[0]?.kind !== "next") {
     throw new Error(`semantic graph connect operation did not draft expected edge: ${JSON.stringify(connected.document.edges)}`);
   }
-  const edgeUpdated = await rpc("mobkit/mobpacks/apply_operation", {
+  const edgeUpdated = await rpc("meta/mobpacks/apply_operation", {
     document: connected.document,
     operation: {
       type: "apply_graph_edge_edit",
@@ -1968,7 +1968,7 @@ async function validateGraphOperations(catalogs) {
   if (edgeUpdated.document.edges[0]?.label !== "done") {
     throw new Error(`semantic graph edge edit did not apply label: ${JSON.stringify(edgeUpdated.document.edges)}`);
   }
-  const edgeDeleted = await rpc("mobkit/mobpacks/apply_operation", {
+  const edgeDeleted = await rpc("meta/mobpacks/apply_operation", {
     document: edgeUpdated.document,
     operation: {
       type: "delete_graph_edge",
@@ -1978,7 +1978,7 @@ async function validateGraphOperations(catalogs) {
   if (edgeDeleted.document.edges.length !== 0) {
     throw new Error(`graph edge delete operation did not remove edge: ${JSON.stringify(edgeDeleted.document.edges)}`);
   }
-  const reconnected = await rpc("mobkit/mobpacks/apply_operation", {
+  const reconnected = await rpc("meta/mobpacks/apply_operation", {
     document: edgeDeleted.document,
     operation: {
       type: "connect_graph_nodes",
@@ -1986,7 +1986,7 @@ async function validateGraphOperations(catalogs) {
       to_id: "n_plan",
     },
   });
-  const deleted = await rpc("mobkit/mobpacks/apply_operation", {
+  const deleted = await rpc("meta/mobpacks/apply_operation", {
     document: reconnected.document,
     operation: {
       type: "delete_graph_node",
@@ -2059,7 +2059,7 @@ async function validateFlowStepOperations(catalogs) {
       },
     ],
   };
-  const inserted = await rpc("mobkit/mobpacks/apply_operation", {
+  const inserted = await rpc("meta/mobpacks/apply_operation", {
     document,
     operation: {
       type: "insert_flow_step",
@@ -2071,7 +2071,7 @@ async function validateFlowStepOperations(catalogs) {
   if (!semanticStepId || inserted.document.flow.steps[1]?.role !== "reviewer") {
     throw new Error(`semantic flow step insert did not return a real reviewer step: ${JSON.stringify(inserted.document.flow.steps)}`);
   }
-  const authoredReview = await rpc("mobkit/mobpacks/apply_operation", {
+  const authoredReview = await rpc("meta/mobpacks/apply_operation", {
     document: inserted.document,
     operation: {
       type: "apply_flow_step_edit",
@@ -2080,7 +2080,7 @@ async function validateFlowStepOperations(catalogs) {
       value: "Review.",
     },
   });
-  const nested = await rpc("mobkit/mobpacks/apply_operation", {
+  const nested = await rpc("meta/mobpacks/apply_operation", {
     document: authoredReview.document,
     operation: {
       type: "insert_flow_step",
@@ -2091,7 +2091,7 @@ async function validateFlowStepOperations(catalogs) {
   if (nested.document.flow.steps[2]?.branches?.[0]?.steps?.[0]?.id !== "approve") {
     throw new Error(`nested flow step insert did not mutate branch lane: ${JSON.stringify(nested.document.flow)}`);
   }
-  const updated = await rpc("mobkit/mobpacks/apply_operation", {
+  const updated = await rpc("meta/mobpacks/apply_operation", {
     document: nested.document,
     operation: {
       type: "apply_flow_step_edit",
@@ -2103,7 +2103,7 @@ async function validateFlowStepOperations(catalogs) {
   if (updated.document.flow.steps[1]?.instruction !== "Review carefully.") {
     throw new Error(`semantic flow step edit did not apply instruction: ${JSON.stringify(updated.document.flow.steps)}`);
   }
-  const branchCondition = await rpc("mobkit/mobpacks/apply_operation", {
+  const branchCondition = await rpc("meta/mobpacks/apply_operation", {
     document: updated.document,
     operation: {
       type: "apply_flow_step_edit",
@@ -2117,7 +2117,7 @@ async function validateFlowStepOperations(catalogs) {
   if (routeStep?.branches?.[0]?.cond?.stepId !== semanticStepId || routeStep.branches[0].condition !== `steps.${semanticStepId}.verdict == "blue"`) {
     throw new Error(`semantic branch condition edit did not mutate branch condition: ${JSON.stringify(routeStep)}`);
   }
-  const branchAdded = await rpc("mobkit/mobpacks/apply_operation", {
+  const branchAdded = await rpc("meta/mobpacks/apply_operation", {
     document: branchCondition.document,
     operation: {
       type: "apply_flow_step_edit",
@@ -2127,9 +2127,9 @@ async function validateFlowStepOperations(catalogs) {
   });
   const branchAddedRoute = branchAdded.document.flow.steps.find((step) => step.id === "route");
   if (branchAddedRoute?.branches?.length !== 2 || branchAddedRoute.branches[1]?.id !== "br_1" || branchAddedRoute.branches[1]?.label !== "Branch 2") {
-    throw new Error(`semantic branch add did not append a real MobKit lane: ${JSON.stringify(branchAddedRoute)}`);
+    throw new Error(`semantic branch add did not append a real Meta lane: ${JSON.stringify(branchAddedRoute)}`);
   }
-  const deleted = await rpc("mobkit/mobpacks/apply_operation", {
+  const deleted = await rpc("meta/mobpacks/apply_operation", {
     document: branchAdded.document,
     operation: {
       type: "delete_flow_step",
@@ -2157,85 +2157,85 @@ async function validateFlowStepOperations(catalogs) {
   run("rkat", ["mob", "--help"]);
 
   const authoringCapabilities = await assertAuthoringCapabilities();
-  const schema = await rpc("mobkit/mobpacks/schema", {});
-  const catalogs = await rpc("mobkit/mobpacks/catalogs", {});
-  const toolsCatalog = await rpc("mobkit/tools/catalog", {});
-  const skillsCatalog = await rpc("mobkit/skills/catalog", {});
-  const agentDefinitions = await rpc("mobkit/agent_definitions/list", {});
-  const templatesCatalog = await rpc("mobkit/mobpacks/templates", {});
-  if (!catalogs.sources || catalogs.sources.tools !== "mobkit/tools/catalog" || catalogs.sources.templates !== "mobkit/mobpacks/templates") {
-    throw new Error(`mobkit/mobpacks/catalogs did not expose split catalog source metadata: ${JSON.stringify(catalogs.sources)}`);
+  const schema = await rpc("meta/mobpacks/schema", {});
+  const catalogs = await rpc("meta/mobpacks/catalogs", {});
+  const toolsCatalog = await rpc("meta/tools/catalog", {});
+  const skillsCatalog = await rpc("meta/skills/catalog", {});
+  const agentDefinitions = await rpc("meta/agent_definitions/list", {});
+  const templatesCatalog = await rpc("meta/mobpacks/templates", {});
+  if (!catalogs.sources || catalogs.sources.tools !== "meta/tools/catalog" || catalogs.sources.templates !== "meta/mobpacks/templates") {
+    throw new Error(`meta/mobpacks/catalogs did not expose split catalog source metadata: ${JSON.stringify(catalogs.sources)}`);
   }
   if (!Array.isArray(toolsCatalog.tool_catalog) || toolsCatalog.tool_catalog.length !== catalogs.tool_catalog.length) {
-    throw new Error(`mobkit/tools/catalog did not expose the tool catalog slice: ${JSON.stringify(toolsCatalog)}`);
+    throw new Error(`meta/tools/catalog did not expose the tool catalog slice: ${JSON.stringify(toolsCatalog)}`);
   }
   if (!Array.isArray(skillsCatalog.skill_realms) || skillsCatalog.skill_realms.length !== catalogs.skill_realms.length) {
-    throw new Error(`mobkit/skills/catalog did not expose the skill realm slice: ${JSON.stringify(skillsCatalog)}`);
+    throw new Error(`meta/skills/catalog did not expose the skill realm slice: ${JSON.stringify(skillsCatalog)}`);
   }
   if (!Array.isArray(agentDefinitions.agent_definitions) || agentDefinitions.agent_definitions.length !== catalogs.agent_definitions.length) {
-    throw new Error(`mobkit/agent_definitions/list did not expose the agent definition slice: ${JSON.stringify(agentDefinitions)}`);
+    throw new Error(`meta/agent_definitions/list did not expose the agent definition slice: ${JSON.stringify(agentDefinitions)}`);
   }
   if (!templatesCatalog.blank_mobpack || !Array.isArray(templatesCatalog.sample_mobpacks) || !Array.isArray(templatesCatalog.sample_agent_definitions)) {
-    throw new Error(`mobkit/mobpacks/templates did not expose separated templates and samples: ${JSON.stringify(templatesCatalog)}`);
+    throw new Error(`meta/mobpacks/templates did not expose separated templates and samples: ${JSON.stringify(templatesCatalog)}`);
   }
   if (!Array.isArray(catalogs.tool_catalog) || catalogs.tool_catalog.length === 0) {
-    throw new Error("mobkit/mobpacks/catalogs did not expose a real tool_catalog");
+    throw new Error("meta/mobpacks/catalogs did not expose a real tool_catalog");
   }
   const shellTool = catalogs.tool_catalog.find((tool) => tool.id === "shell");
   if (!shellTool || shellTool.tag_class !== "is-shell") {
-    throw new Error(`mobkit/mobpacks/catalogs did not expose graph tag metadata for shell: ${JSON.stringify(shellTool)}`);
+    throw new Error(`meta/mobpacks/catalogs did not expose graph tag metadata for shell: ${JSON.stringify(shellTool)}`);
   }
   if (!catalogs.tool_catalog.every((tool) => Object.prototype.hasOwnProperty.call(tool, "tag_class"))) {
-    throw new Error(`mobkit/mobpacks/catalogs omitted tool tag_class metadata: ${JSON.stringify(catalogs.tool_catalog)}`);
+    throw new Error(`meta/mobpacks/catalogs omitted tool tag_class metadata: ${JSON.stringify(catalogs.tool_catalog)}`);
   }
   if (!Array.isArray(catalogs.skill_realms) || catalogs.skill_realms.length === 0) {
-    throw new Error("mobkit/mobpacks/catalogs did not expose real skill_realms");
+    throw new Error("meta/mobpacks/catalogs did not expose real skill_realms");
   }
   if (!Array.isArray(catalogs.agent_definitions) || catalogs.agent_definitions.length === 0) {
-    throw new Error("mobkit/mobpacks/catalogs did not expose real agent_definitions");
+    throw new Error("meta/mobpacks/catalogs did not expose real agent_definitions");
   }
   if (!Array.isArray(catalogs.sample_agent_definitions) || catalogs.sample_agent_definitions.length === 0) {
-    throw new Error("mobkit/mobpacks/catalogs did not expose sample_agent_definitions separately from authoring agent_definitions");
+    throw new Error("meta/mobpacks/catalogs did not expose sample_agent_definitions separately from authoring agent_definitions");
   }
   const authoringDefinition = catalogs.agent_definitions.find((definition) => (
     definition.role === "reviewer"
-    && definition.sourceMobpack === "mobkit_authoring_profiles"
-    && definition.sourceOrigin === "mobkit/authoring-agent-definitions"
+    && definition.sourceMobpack === "meta_authoring_profiles"
+    && definition.sourceOrigin === "meta/authoring-agent-definitions"
   ));
   if (!authoringDefinition) {
-    throw new Error(`mobkit/mobpacks/catalogs did not expose MobKit-owned authoring agent definitions: ${JSON.stringify(catalogs.agent_definitions)}`);
+    throw new Error(`meta/mobpacks/catalogs did not expose Meta-owned authoring agent definitions: ${JSON.stringify(catalogs.agent_definitions)}`);
   }
   if (!Array.isArray(authoringDefinition.tools) || !authoringDefinition.tools.includes("shell")) {
-    throw new Error(`MobKit authoring reviewer definition did not carry real tool refs: ${JSON.stringify(authoringDefinition)}`);
+    throw new Error(`Meta authoring reviewer definition did not carry real tool refs: ${JSON.stringify(authoringDefinition)}`);
   }
   if (!Array.isArray(authoringDefinition.skills) || !authoringDefinition.skills.includes("mob.authoring.review")) {
-    throw new Error(`MobKit authoring reviewer definition did not carry real skill refs: ${JSON.stringify(authoringDefinition)}`);
+    throw new Error(`Meta authoring reviewer definition did not carry real skill refs: ${JSON.stringify(authoringDefinition)}`);
   }
   if (authoringDefinition.schemaDefinition?.id !== "ReviewerOutput") {
-    throw new Error(`MobKit authoring reviewer definition did not carry its real schema definition: ${JSON.stringify(authoringDefinition)}`);
+    throw new Error(`Meta authoring reviewer definition did not carry its real schema definition: ${JSON.stringify(authoringDefinition)}`);
   }
-  if (catalogs.agent_definitions.some((definition) => definition.sourceOrigin === "mobkit/sample-mobpack" || definition.sourceKind === "sample")) {
-    throw new Error(`MobKit Agent Editor definitions must not include sample-derived profiles: ${JSON.stringify(catalogs.agent_definitions)}`);
+  if (catalogs.agent_definitions.some((definition) => definition.sourceOrigin === "meta/sample-mobpack" || definition.sourceKind === "sample")) {
+    throw new Error(`Meta Agent Editor definitions must not include sample-derived profiles: ${JSON.stringify(catalogs.agent_definitions)}`);
   }
-  const authoringRealm = catalogs.skill_realms.find((realm) => realm.id === "mobkit/authoring-agent-definitions");
+  const authoringRealm = catalogs.skill_realms.find((realm) => realm.id === "meta/authoring-agent-definitions");
   if (!authoringRealm || !String(authoringRealm.source || "").includes("authoring-agent-definition")) {
-    throw new Error(`mobkit/mobpacks/catalogs did not expose authoring skill realm metadata: ${JSON.stringify(catalogs.skill_realms)}`);
+    throw new Error(`meta/mobpacks/catalogs did not expose authoring skill realm metadata: ${JSON.stringify(catalogs.skill_realms)}`);
   }
   const reviewerDefinitions = catalogs.sample_agent_definitions.filter((definition) => definition.role === "reviewer");
   const reviewerSources = new Set(reviewerDefinitions.map((definition) => definition.sourceMobpack).filter(Boolean));
   const reviewerIds = new Set(reviewerDefinitions.map((definition) => definition.id).filter(Boolean));
   if (reviewerDefinitions.length < 2 || reviewerSources.size < 2 || reviewerIds.size !== reviewerDefinitions.length) {
-    throw new Error(`mobkit/mobpacks/catalogs collapsed sample reviewer agent definitions: ${JSON.stringify(reviewerDefinitions)}`);
+    throw new Error(`meta/mobpacks/catalogs collapsed sample reviewer agent definitions: ${JSON.stringify(reviewerDefinitions)}`);
   }
   for (const dynamicKey of ["tool_catalog", "skill_realms", "agent_definitions", "sample_agent_definitions", "sample_mobpacks", "blank_mobpack", "models", "provider_defaults"]) {
     if (Object.prototype.hasOwnProperty.call(schema, dynamicKey)) {
-      throw new Error(`mobkit/mobpacks/schema leaked dynamic catalog key ${dynamicKey}`);
+      throw new Error(`meta/mobpacks/schema leaked dynamic catalog key ${dynamicKey}`);
     }
   }
   contractSchema = schema;
   const mobDefaults = schema.mob_definition?.mob_settings?.defaults;
   if (mobDefaults?.backendDefault !== "session" || mobDefaults?.advanced?.topology !== null) {
-    throw new Error(`flow editor schema did not expose MobKit mob setting defaults: ${JSON.stringify(mobDefaults)}`);
+    throw new Error(`flow editor schema did not expose Meta mob setting defaults: ${JSON.stringify(mobDefaults)}`);
   }
   const realmProfileRestriction = schema.mob_definition?.profile_binding_restrictions?.realm_profile;
   if (realmProfileRestriction?.deployable !== false || !String(realmProfileRestriction?.reason || "").includes("rkat mob validate")) {
@@ -2256,7 +2256,7 @@ async function validateFlowStepOperations(catalogs) {
   }
   const agentAccessView = schema.mob_definition?.editor_agent_access_view || {};
   for (const [key, expected] of Object.entries({
-    inline_skill_realm_source: "mobkit/editor",
+    inline_skill_realm_source: "meta/editor",
     inline_skill_source: "inline",
   })) {
     if (agentAccessView[key] !== expected) {
@@ -2275,7 +2275,7 @@ async function validateFlowStepOperations(catalogs) {
     }
   }
   const sourceView = schema.mob_definition?.editor_source_view || {};
-  if (sourceView.primary_source_path !== "mobkit/mob.toml") {
+  if (sourceView.primary_source_path !== "meta/mob.toml") {
     throw new Error(`flow editor schema did not expose primary source path: ${JSON.stringify(sourceView)}`);
   }
   const graphView = schema.mob_definition?.editor_graph_view || {};
@@ -2284,7 +2284,7 @@ async function validateFlowStepOperations(catalogs) {
     source_file_node_kind: "source",
     source_file_node_col_offset: 0,
     source_file_node_row_offset: -1,
-    source_file_activation_hash: "#mobkit-graph-source",
+    source_file_activation_hash: "#meta-graph-source",
     source_file_activation_selector: ".node--source-file",
   })) {
     if (graphView[key] !== expected) {
@@ -2295,31 +2295,31 @@ async function validateFlowStepOperations(catalogs) {
   const sample = samples.find((candidate) => candidate.id === sampleId) || samples[0];
   if (!sample?.document) throw new Error("flow editor schema did not return any sample mobpack documents");
 
-  const validation = await rpc("mobkit/mobpacks/validate", { document: sample.document });
+  const validation = await rpc("meta/mobpacks/validate", { document: sample.document });
   if (!validation.ok) {
-    throw new Error(`MobKit validation rejected ${sample.id}: ${JSON.stringify(validation.diagnostics)}`);
+    throw new Error(`Meta validation rejected ${sample.id}: ${JSON.stringify(validation.diagnostics)}`);
   }
   if (validation.validation_source !== "rkat mob validate") {
-    throw new Error(`MobKit validation response did not run rkat mob validate: ${JSON.stringify(validation)}`);
+    throw new Error(`Meta validation response did not run rkat mob validate: ${JSON.stringify(validation)}`);
   }
   if (!array(validation.display_rows, "validation.display_rows").some((row) => row.kind === "ok" && row.head === "rkat mob validate executed")) {
-    throw new Error(`MobKit validation response did not provide executed rkat display rows: ${JSON.stringify(validation.display_rows)}`);
+    throw new Error(`Meta validation response did not provide executed rkat display rows: ${JSON.stringify(validation.display_rows)}`);
   }
 
-  const sourcePreview = await rpc("mobkit/mobpacks/source", { document: sample.document });
-  if (!sourcePreview.validation?.ok || sourcePreview.source !== "mobkit/mobpacks/source") {
+  const sourcePreview = await rpc("meta/mobpacks/source", { document: sample.document });
+  if (!sourcePreview.validation?.ok || sourcePreview.source !== "meta/mobpacks/source") {
     throw new Error(`source preview did not return API-backed validated source metadata: ${JSON.stringify(sourcePreview)}`);
   }
   if (Object.prototype.hasOwnProperty.call(sourcePreview, "content_base64")) {
-    throw new Error("mobkit/mobpacks/source must not return the full archive content_base64 payload");
+    throw new Error("meta/mobpacks/source must not return the full archive content_base64 payload");
   }
   const previewSourceFiles = array(sourcePreview.source_files, "sourcePreview.source_files");
-  const previewMobToml = previewSourceFiles.find((file) => file.path === "mobkit/mob.toml");
+  const previewMobToml = previewSourceFiles.find((file) => file.path === "meta/mob.toml");
   if (previewMobToml?.text !== sourcePreview.mob_toml || previewMobToml?.media_type !== "text/toml") {
-    throw new Error(`source preview mob.toml file does not match MobKit-rendered TOML: ${JSON.stringify(previewMobToml)}`);
+    throw new Error(`source preview mob.toml file does not match Meta-rendered TOML: ${JSON.stringify(previewMobToml)}`);
   }
 
-  const exported = await rpc("mobkit/mobpacks/export", {
+  const exported = await rpc("meta/mobpacks/export", {
     document: sample.document,
     filename: `${sample.id || "flow-editor-e2e"}.mobpack`,
   });
@@ -2327,29 +2327,29 @@ async function validateFlowStepOperations(catalogs) {
     throw new Error(`export validation rejected ${sample.id}: ${JSON.stringify(exported.validation?.diagnostics)}`);
   }
   const sourceFiles = array(exported.source_files, "exported.source_files");
-  for (const requiredPath of ["manifest.toml", "definition.json", "mobkit/editor.json", "mobkit/mob.toml"]) {
+  for (const requiredPath of ["manifest.toml", "definition.json", "meta/editor.json", "meta/mob.toml"]) {
     if (!sourceFiles.some((file) => file.path === requiredPath)) {
       throw new Error(`export did not expose archive source file ${requiredPath}: ${JSON.stringify(sourceFiles)}`);
     }
   }
-  const sourceMobToml = sourceFiles.find((file) => file.path === "mobkit/mob.toml");
+  const sourceMobToml = sourceFiles.find((file) => file.path === "meta/mob.toml");
   if (sourceMobToml?.text !== exported.mob_toml || sourceMobToml?.media_type !== "text/toml") {
-    throw new Error(`exported mob.toml source file does not match MobKit-rendered TOML: ${JSON.stringify(sourceMobToml)}`);
+    throw new Error(`exported mob.toml source file does not match Meta-rendered TOML: ${JSON.stringify(sourceMobToml)}`);
   }
   if (sourceMobToml.sha256 !== sha256(Buffer.from(exported.mob_toml || "", "utf8"))) {
     throw new Error(`exported mob.toml source file did not report a matching sha256: ${JSON.stringify(sourceMobToml)}`);
   }
 
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mobkit-flow-editor-e2e."));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "meta-flow-editor-e2e."));
   const packPath = path.join(dir, exported.filename || `${sample.id || "flow-editor-e2e"}.mobpack`);
   fs.writeFileSync(packPath, Buffer.from(exported.content_base64, "base64"));
   fs.writeFileSync(path.join(dir, "mob.toml"), exported.mob_toml || "");
 
   const inspect = run("rkat", ["mob", "inspect", packPath]);
   const validate = run("rkat", ["mob", "validate", "--trust-policy", "permissive", packPath]);
-  const imported = await rpc("mobkit/mobpacks/import", { content_base64: exported.content_base64 });
+  const imported = await rpc("meta/mobpacks/import", { content_base64: exported.content_base64 });
   const roundTrip = assertRoundTrip(imported, sample.document);
-  const importedValidation = await rpc("mobkit/mobpacks/validate", { document: imported.document });
+  const importedValidation = await rpc("meta/mobpacks/validate", { document: imported.document });
   if (!importedValidation.ok) {
     throw new Error(`round-tripped document failed validation: ${JSON.stringify(importedValidation.diagnostics)}`);
   }

@@ -9,8 +9,8 @@ const { chromium } = require("playwright");
 const identity = "history-keeper";
 const session = "keeper-session";
 const runtime = "default";
-const evidence = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
-const assetDirectory = path.join(__dirname, "../../crates/meerkat-mobkit/console-dist");
+const evidence = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+const assetDirectory = path.join(__dirname, "../../crates/meerkat-meta/console-dist");
 const now = Date.parse("2026-09-28T00:59:40Z");
 
 function frame(cursor, kind, payload, extra = {}) {
@@ -87,11 +87,11 @@ async function startServer(initialFrames) {
       request.on("end", () => {
         const call = JSON.parse(Buffer.concat(chunks)); requests.push(call);
         const reply = result => json({ jsonrpc: "2.0", id: call.id, result });
-        if (call.method === "mobkit/capabilities") return reply({ methods: ["mobkit/console/send"], feature_capabilities: [] });
-        if (call.method === "mobkit/console/query_timeline") return reply(timeline(call.params?.identity));
-        if (call.method === "mobkit/console/send") return reply({ accepted: true, identity, session_id: session, interaction_id: "queued-send" });
-        if (call.method === "mobkit/console/inspect_identity") return reply({ identity: agent });
-        if (call.method === "mobkit/console/voice/readiness") return reply({ available: false });
+        if (call.method === "meta/capabilities") return reply({ methods: ["meta/console/send"], feature_capabilities: [] });
+        if (call.method === "meta/console/query_timeline") return reply(timeline(call.params?.identity));
+        if (call.method === "meta/console/send") return reply({ accepted: true, identity, session_id: session, interaction_id: "queued-send" });
+        if (call.method === "meta/console/inspect_identity") return reply({ identity: agent });
+        if (call.method === "meta/console/voice/readiness") return reply({ available: false });
         return reply({});
       }); return;
     }
@@ -138,10 +138,10 @@ async function runHistoryQueue(mode) {
   const result = { mode, scope: "Real Chromium, embedded bundle, captured-shape fixture HTTP/SSE, zero provider calls", assets: fixture.assets,
     errors: [], sent: [], frames: initial, emitted: [] };
   page.on("pageerror", error => result.errors.push(error.message));
-  const sends = () => fixture.requests.filter(call => call.method === "mobkit/console/send");
+  const sends = () => fixture.requests.filter(call => call.method === "meta/console/send");
   const emit = item => { result.emitted.push(item); fixture.emit(item); };
   const waitForSend = () => page.waitForResponse(response => response.url().endsWith("/console/rpc")
-    && response.request().postDataJSON()?.method === "mobkit/console/send");
+    && response.request().postDataJSON()?.method === "meta/console/send");
   const waitsForCurrentWork = ["active-run", "newer-live", "update-to-history", "update-to-live"].includes(mode);
   const text = `Continue the review after history recovery (${mode}).`;
   try {

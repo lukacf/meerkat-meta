@@ -82,22 +82,39 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertIn("--locked --features openai-live", block)
         self.assertIn("--test console_route_auth --test console_experience --test never_executed_persistence --test swarm_integration console_voice", block)
         self.assertIn("gateway_openai_live_registration", block)
-        self.assertIn("clippy -p meerkat-mobkit", block)
+        self.assertIn("clippy -p meerkat-meta", block)
         self.assertIn("-- -D warnings", block)
         self.assertIn('CARGO_INCREMENTAL: "0"', block)
+
+    def test_voice_lane_runs_the_live_registration_test_from_the_library(self):
+        # src/bin/rpc_gateway.rs is a one-line wrapper around
+        # meerkat_meta::rpc_gateway::main(), and the registration test lives in
+        # the library module. A `--bin rpc_gateway` selector compiles the
+        # wrapper and runs zero tests, so the step passed without testing.
+        command = (
+            "scripts/repo-cargo test -p meerkat-meta --locked "
+            "--features openai-live --lib gateway_openai_live_registration"
+        )
+        block = job_block("test-voice")
+        self.assertEqual(block.count(f"- run: {command}\n"), 1)
+        self.assertNotIn("--bin rpc_gateway gateway_openai_live_registration", block)
+        wrapper = (ROOT / "crates/meerkat-meta/src/bin/rpc_gateway.rs").read_text()
+        self.assertNotIn("gateway_openai_live_registration", wrapper)
+        library = (ROOT / "crates/meerkat-meta/src/rpc_gateway.rs").read_text()
+        self.assertIn("fn gateway_openai_live_registration_is_explicit_and_strict()", library)
 
     def test_voice_lane_selects_every_persistent_http_restart_case(self):
         # Default workspace tests cannot see the feature-gated voice cases.
         # Select their integration binary and shared filter in the existing
         # voice lane, which already compiles the gateway with openai-live.
         command = (
-            "scripts/repo-cargo test -p meerkat-mobkit --locked "
-            "--features openai-live --test mobkit_gateway_bootstrap "
+            "scripts/repo-cargo test -p meerkat-meta --locked "
+            "--features openai-live --test meta_gateway_bootstrap "
             "persistent_http_restarts"
         )
         block = job_block("test-voice")
         self.assertEqual(block.count(f"- run: {command}\n"), 1)
-        source = (ROOT / "crates/meerkat-mobkit/tests/mobkit_gateway_bootstrap.rs").read_text()
+        source = (ROOT / "crates/meerkat-meta/tests/meta_gateway_bootstrap.rs").read_text()
         self.assertEqual(
             set(re.findall(r"fn (persistent_http_restarts_\w+)\(", source)),
             {
@@ -116,7 +133,7 @@ class CiWorkflowTests(unittest.TestCase):
 
     def test_console_fixture_unit_regressions_run_with_the_shared_backend_build(self):
         block = job_block("console")
-        command = "scripts/repo-cargo test -p meerkat-mobkit --example console_acceptance_fixture"
+        command = "scripts/repo-cargo test -p meerkat-meta --example console_acceptance_fixture"
         self.assertEqual(block.count(command), 1)
         self.assertLess(block.index("Build console acceptance backends"), block.index(command))
         self.assertLess(block.index(command), block.index("node console/api-e2e.cjs"))

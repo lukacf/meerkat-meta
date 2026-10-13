@@ -7,7 +7,7 @@ const { randomUUID } = require("node:crypto");
 const { chromium } = require("playwright");
 const { startFixture, eventually, rpc, snapshot } = require("../acceptance-runtime.cjs");
 const { browserFailureMonitor, navigation } = require("./browser-failure-monitor.cjs");
-const evidence = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+const evidence = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
 const actions = ["cancel_after_boundary", "interrupt"];
 function stoppedTools(scenarioId) { return require("./real-routine-tools.cjs").expectedTools(scenarioId).slice(0, 4); }
 function textContent(value) { return typeof value === "string" ? value : (value || []).filter(block => block.type === "text").map(block => block.text).join(""); }
@@ -146,8 +146,8 @@ async function assertStoppedToolDisclosure(section, state, { fullReload = false 
 }
 
 async function stoppedScenario(host, action) {
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "Use the coordinator's prebuilt fixture; this scenario must not invoke Cargo.");
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), `mobkit-routine-${action}-`));
+  assert(process.env.META_EXAMPLE_BIN_DIR, "Use the coordinator's prebuilt fixture; this scenario must not invoke Cargo.");
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), `meta-routine-${action}-`));
   const result = { host: host || "api", action, scenarioId: `routine-${action}-${randomUUID().slice(0, 8)}`, errors: [] };
   let fixture, browser, page, live, monitor;
   const viewport = () => page.locator(host === "stock" ? ".conv__body" : '[data-testid="shared-pane-0"] .cc-conversation-pane__scroll').first();
@@ -208,7 +208,7 @@ async function stoppedScenario(host, action) {
       page.on("response", response => { if (response.status() >= 400) result.errors.push({ url: response.url(), status: response.status() }); });
       await open();
     }
-    const owner = await rpc(fixture.baseUrl, "mobkit/status_identity", { identity: "router:main" });
+    const owner = await rpc(fixture.baseUrl, "meta/status_identity", { identity: "router:main" });
     assert.equal(owner.status, 200); assert.equal(owner.body.result?.identity, "router:main");
     result.baselineOwner = owner.body.result; assert(result.baselineOwner.session_id, "actual pre-run session owner");
     const sessionId = result.baselineOwner.session_id;
@@ -216,7 +216,7 @@ async function stoppedScenario(host, action) {
     await eventually(async () => (await idle()).current_run_id === null, "owner is idle before warmup");
     result.warmup = { sessionId, source: `Prior completed routine check ${result.scenarioId}.`, content: `Record the baseline for ${result.scenarioId}; no tools are needed.` };
     await fixture.control("model", { source: result.warmup.source, delay_ms: 0, chunk_chars: 256 });
-    const warmed = await rpc(fixture.baseUrl, "mobkit/console/send", { identity: "router:main", content: result.warmup.content,
+    const warmed = await rpc(fixture.baseUrl, "meta/console/send", { identity: "router:main", content: result.warmup.content,
       origin: "console:routine-negative-warmup", origin_kind: "operator", handling_mode: "queue", idempotency_key: randomUUID() });
     assert.equal(warmed.status, 200); assert(warmed.body.result?.interaction_id, JSON.stringify(warmed.body)); result.warmup.accepted = warmed.body.result;
     result.baselineHistory = await eventually(async () => {
@@ -229,7 +229,7 @@ async function stoppedScenario(host, action) {
     live = await require("./real-routine-tools.cjs").capture(`${fixture.backendUrl}/console/timeline/stream?identity=router%3Amain&after=${encodeURIComponent(baseline.latest_cursor)}`);
     await eventually(() => { live.check(); return live.events.some(event => event.type === "snapshot_complete"); }, "subscriber connected before real tool dispatch");
     await fixture.control("model", { source: "Acknowledged.", delay_ms: 0, chunk_chars: 256, scenario: { kind: "routine", run_id: result.scenarioId } });
-    const sent = await rpc(fixture.baseUrl, "mobkit/console/send", { identity: "router:main", content: `[fixture:${result.scenarioId}] Inspect the release files, then hold the delayed review for cancellation.`,
+    const sent = await rpc(fixture.baseUrl, "meta/console/send", { identity: "router:main", content: `[fixture:${result.scenarioId}] Inspect the release files, then hold the delayed review for cancellation.`,
       origin: "console:routine-negative", origin_kind: "operator", handling_mode: "queue", idempotency_key: randomUUID() });
     assert.equal(sent.status, 200); assert(sent.body.result?.interaction_id, JSON.stringify(sent.body)); result.accepted = sent.body.result;
     assert.equal(result.accepted.session_id, sessionId, "tested cancellation uses the captured pre-run owner session");
@@ -292,7 +292,7 @@ async function stoppedScenario(host, action) {
 }
 const hardInterruptDiagnostic = {
   reason: "Hard cancellation can finalize the runtime input without a terminal event, leaving the console Working. Durable receipt projection is deferred; this known failing repro is excluded from release acceptance.",
-  issues: ["https://github.com/lukacf/meerkat-mobkit/issues/460", "https://github.com/lukacf/meerkat/issues/1233"],
+  issues: ["https://github.com/lukacf/meerkat-meta/issues/460", "https://github.com/lukacf/meerkat/issues/1233"],
 };
 const diagnosticMetadata = action => action === "interrupt" ? { diagnostic: hardInterruptDiagnostic } : {};
 const apiScenarios = actions.map(action => ({ id: `api-routine-${action.replaceAll("_", "-")}`, family: "routine-tools", backend: "real", ...diagnosticMetadata(action), run: () => stoppedScenario(null, action) }));

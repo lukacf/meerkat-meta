@@ -1,7 +1,7 @@
 {
-  "name": "@rkat/mobkit-sdk",
-  "version": "0.8.49",
-  "description": "MobKit TypeScript SDK — companion orchestration for the Meerkat agent runtime",
+  "name": "@rkat/meta-sdk",
+  "version": "0.9.0",
+  "description": "Meta TypeScript SDK — companion orchestration for the Meerkat agent runtime",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -19,7 +19,7 @@
     "build": "tsc && node scripts/build-cjs.js",
     "typecheck": "tsc --noEmit",
     "test": "npx tsx --test tests/*.test.ts",
-    "test:agent-memory-real": "MOBKIT_AGENT_MEMORY_REAL_API_SMOKE=1 npx tsx --test tests/agent-memory-real-smoke.test.ts",
+    "test:agent-memory-real": "META_AGENT_MEMORY_REAL_API_SMOKE=1 npx tsx --test tests/agent-memory-real-smoke.test.ts",
     "validate": "npm run typecheck && npm run build && npm test",
     "parity": "node scripts/parity.cjs",
     "productization": "node scripts/productization.cjs"

@@ -368,13 +368,13 @@
 }
 
 /* ================================================================
-   ConsolePendingStack (mobkit console pending queue) — sibling fork
+   ConsolePendingStack (meta console pending queue) — sibling fork
    of the sheet above; scoped to .stack / .stk-* class names.
    ================================================================ */
 
 /* Pending-message stack — Codex-style queue visible between the
    conversation and composer. Lifted from the supplied Banana Sorbet
-   design with token names rewritten to mobkit's existing palette
+   design with token names rewritten to meta's existing palette
    (--bg-elev-*, --line, --ink-*, --accent, --ok, --warn, --mono,
    --disp, --r-sm).
 

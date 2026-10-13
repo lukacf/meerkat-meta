@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 
-import { MobKit } from "../../sdk/typescript/src/index.ts";
+import { Meta } from "../../sdk/typescript/src/index.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const configDir = join(here, "config");
@@ -30,7 +30,7 @@ assert.match(consoleToml, /group_by = \["labels\.console_group"/);
 assert.match(consoleToml, /subgroup_by = \["labels\.org"/);
 assert.match(consoleToml, /\[\[sidebar\.buttons\]\]/);
 
-const builder = MobKit.builder()
+const builder = Meta.builder()
   .mob(resolve(configDir, "mob.toml"))
   .consoleConfig(resolve(configDir, "console.toml"))
   .consoleAuthRequired(false)

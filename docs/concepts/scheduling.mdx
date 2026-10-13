@@ -4,14 +4,14 @@ description: "Durable schedule ownership, occurrence claims, firing, and target 
 icon: "clock"
 ---
 
-MobKit uses Meerkat's durable `ScheduleService` as its only scheduling
+Meta uses Meerkat's durable `ScheduleService` as its only scheduling
 authority. Schedule definitions live in the schedule store, every firing is
 claimed as an occurrence, and the firing host records the outcome before it
 advances.
 
 <Warning>
-The stateless `mobkit/scheduling/evaluate` and
-`mobkit/scheduling/dispatch` methods were removed in contract 0.5.0.
+The stateless `meta/scheduling/evaluate` and
+`meta/scheduling/dispatch` methods were removed in contract 0.5.0.
 `runtime_options.scheduling_files` is also rejected. Static TOML evaluation
 never owned durable firing authority.
 </Warning>
@@ -52,14 +52,14 @@ Schedules can target:
 - a named host runnable
 
 Python applications register deterministic host runnables with
-`MobKitBuilder.host_runnables(...)` and handle
-`callback/schedule_fire` through `MobKitRuntime.on_schedule_fire(...)`.
+`MetaBuilder.host_runnables(...)` and handle
+`callback/schedule_fire` through `MetaRuntime.on_schedule_fire(...)`.
 The callback is delivery for a durable occurrence, not a substitute scheduler.
 
 ## Rust embedding
 
 Rust embedders can supply a schedule store and attach both schedule tools and
-the firing host through `meerkat_mobkit::schedule_wiring`. Keep those two
+the firing host through `meerkat_meta::schedule_wiring`. Keep those two
 surfaces on one `ScheduleService`; using separate stores would split
 authoring from firing authority.
 
@@ -72,8 +72,8 @@ authoring from firing authority.
 4. Bind deterministic application work as a host runnable when needed.
 5. Inspect occurrences through `meerkat_schedule_occurrences`.
 
-Unknown `runtime_options.scheduling_files` fails `mobkit/init` with
-`-32602`. Calls to either removed `mobkit/scheduling/*` method return the
+Unknown `runtime_options.scheduling_files` fails `meta/init` with
+`-32602`. Calls to either removed `meta/scheduling/*` method return the
 standard `-32601` method-not-found error.
 
 ## See also

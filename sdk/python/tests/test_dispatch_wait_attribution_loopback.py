@@ -8,8 +8,8 @@ observation error after a successful admission lost the ``DispatchResult``
 
 These tests drive the real SDK runtime and its persistent stdio JSON-RPC
 transport against a scripted stand-in gateway process over loopback pipes.
-The stand-in serves the actual wire methods (``mobkit/dispatch``,
-``mobkit/wait_for_turn``, ...) and logs every request it receives, so each
+The stand-in serves the actual wire methods (``meta/dispatch``,
+``meta/wait_for_turn``, ...) and logs every request it receives, so each
 test can count dispatches and prove which observation methods ran. The
 gateway's own ticket semantics are covered by the Rust
 ``identity_first_turn_tickets`` tests; the shipped gateway cannot run a turn
@@ -25,17 +25,17 @@ from pathlib import Path
 
 import pytest
 
-from meerkat_mobkit.builder import MobKit
-from meerkat_mobkit.errors import (
+from meerkat_meta.builder import Meta
+from meerkat_meta.errors import (
     PostAdmissionObservationError,
     RpcError,
+    TransportReaderFailedError,
     TurnTrackingUnavailableError,
     TurnTrackingUnavailableWarning,
-    TurnUnknownError,
     TurnWaitTimeoutError,
 )
-from meerkat_mobkit.identity_first_models import AwaitedTurn, DispatchResult
-from meerkat_mobkit.runtime import MobKitRuntime
+from meerkat_meta.identity_first_models import AwaitedTurn, DispatchResult
+from meerkat_meta.runtime import MetaRuntime
 
 _IDENTITY = "keeper"
 _TICKET = "6f1c2a8e-0d4b-4b7e-9a51-3c2f8d7e1a90"
@@ -45,9 +45,9 @@ _SATURATED = {
 }
 # Identity-wide observation methods. A per-admission wait must never call them.
 _IDENTITY_WIDE = (
-    "mobkit/wait_for_completion",
-    "mobkit/completion_cursor",
-    "mobkit/inspect_identity",
+    "meta/wait_for_completion",
+    "meta/completion_cursor",
+    "meta/inspect_identity",
 )
 
 # The stand-in gateway. Each request is handled on its own thread so a held
@@ -81,7 +81,7 @@ def respond(request):
         steps = script.get(method)
         if steps is None:
             step = {"result": {"http_base_url": "http://127.0.0.1:1"}
-                    if method == "mobkit/init" else {}}
+                    if method == "meta/init" else {}}
         else:
             index = min(positions.get(method, 0), len(steps) - 1)
             positions[method] = index + 1
@@ -95,7 +95,7 @@ def respond(request):
         reply["error"] = step["error"]
     else:
         result = dict(step["result"])
-        if method in ("mobkit/wait_for_turn", "mobkit/turn_result"):
+        if method in ("meta/wait_for_turn", "meta/turn_result"):
             result = {"identity": params.get("identity"),
                       "ticket": params.get("ticket"), **result}
         reply["result"] = result
@@ -134,14 +134,14 @@ _PENDING_AT_DEADLINE = {"result": {"state": "pending", "wait": "timed_out"}}
 # What the identity-wide observations would report: a peer's turn completed
 # past the dispatch's baseline. Serving it makes any fallback visible.
 _PEER_COMPLETED = {
-    "mobkit/wait_for_completion": [{"result": {
+    "meta/wait_for_completion": [{"result": {
         "outcome": "completed", "completion_cursor": {"epoch": 3, "turns": 5},
     }}],
-    "mobkit/completion_cursor": [{"result": {
+    "meta/completion_cursor": [{"result": {
         "identity": _IDENTITY, "state": "active",
         "completion_cursor": {"epoch": 3, "turns": 5},
     }}],
-    "mobkit/inspect_identity": [{"result": {
+    "meta/inspect_identity": [{"result": {
         "identity": _IDENTITY, "output_preview": "peer reply", "is_final": False,
         "peer_reachable_count": 0, "completion_cursor": {"epoch": 3, "turns": 5},
     }}],
@@ -169,8 +169,8 @@ class _StandIn:
         return [r for r in self.requests() if r["method"] == method]
 
 
-async def _runtime(stand_in: _StandIn) -> MobKitRuntime:
-    runtime = MobKitRuntime(MobKit.builder().gateway(str(stand_in.path))._config)
+async def _runtime(stand_in: _StandIn) -> MetaRuntime:
+    runtime = MetaRuntime(Meta.builder().gateway(str(stand_in.path))._config)
     await runtime.connect()
     return runtime
 
@@ -182,8 +182,8 @@ async def test_admission_then_read_failure_retains_the_receipt_and_never_redispa
     fails. The exact-ticket wait is retried and still answers with this
     turn's own output; the work was dispatched exactly once."""
     stand_in = _StandIn(tmp_path, {
-        "mobkit/dispatch": [{"result": _admitted(_TICKET)}],
-        "mobkit/wait_for_turn": [
+        "meta/dispatch": [{"result": _admitted(_TICKET)}],
+        "meta/wait_for_turn": [
             {"error": _SATURATED}, {"error": _SATURATED}, _own("own reply"),
         ],
         **_PEER_COMPLETED,
@@ -197,8 +197,8 @@ async def test_admission_then_read_failure_retains_the_receipt_and_never_redispa
         await runtime.shutdown()
 
     assert output == "own reply"
-    assert len(stand_in.calls("mobkit/dispatch")) == 1
-    waits = stand_in.calls("mobkit/wait_for_turn")
+    assert len(stand_in.calls("meta/dispatch")) == 1
+    waits = stand_in.calls("meta/wait_for_turn")
     assert len(waits) == 3
     assert {w["params"]["ticket"] for w in waits} == {_TICKET}
     assert not [r for r in stand_in.requests() if r["method"] in _IDENTITY_WIDE]
@@ -208,8 +208,8 @@ async def test_admission_then_read_failure_retains_the_receipt_and_never_redispa
 @pytest.mark.timeout(60)
 async def test_persistent_read_failure_raises_typed_with_admission_and_ticket(tmp_path):
     stand_in = _StandIn(tmp_path, {
-        "mobkit/dispatch": [{"result": _admitted(_TICKET)}],
-        "mobkit/wait_for_turn": [{"error": _SATURATED}],
+        "meta/dispatch": [{"result": _admitted(_TICKET)}],
+        "meta/wait_for_turn": [{"error": _SATURATED}],
         **_PEER_COMPLETED,
     })
     runtime = await _runtime(stand_in)
@@ -228,7 +228,7 @@ async def test_persistent_read_failure_raises_typed_with_admission_and_ticket(tm
     assert error.attempts >= 2
     assert isinstance(error.__cause__, RpcError)
     assert "observation_lane_saturated" in str(error.__cause__)
-    assert len(stand_in.calls("mobkit/dispatch")) == 1
+    assert len(stand_in.calls("meta/dispatch")) == 1
     assert not [r for r in stand_in.requests() if r["method"] in _IDENTITY_WIDE]
 
 
@@ -238,8 +238,8 @@ async def test_an_unrelated_peer_completion_does_not_satisfy_the_wait(tmp_path):
     """A peer's turn completes on the identity while this dispatch's turn is
     still pending. Only this turn's own settlement answers the wait."""
     stand_in = _StandIn(tmp_path, {
-        "mobkit/dispatch": [{"result": _admitted(_TICKET)}],
-        "mobkit/wait_for_turn": [
+        "meta/dispatch": [{"result": _admitted(_TICKET)}],
+        "meta/wait_for_turn": [
             {"sleep": 0.2, **_PENDING_AT_DEADLINE},
             {"sleep": 0.2, **_PENDING_AT_DEADLINE},
             _own("own reply"),
@@ -255,7 +255,7 @@ async def test_an_unrelated_peer_completion_does_not_satisfy_the_wait(tmp_path):
         await runtime.shutdown()
 
     assert (outcome.text, outcome.attributed, outcome.ticket) == ("own reply", True, _TICKET)
-    assert len(stand_in.calls("mobkit/wait_for_turn")) == 3
+    assert len(stand_in.calls("meta/wait_for_turn")) == 3
     assert not [r for r in stand_in.requests() if r["method"] in _IDENTITY_WIDE]
 
 
@@ -267,7 +267,7 @@ async def test_the_default_mode_waits_identity_wide_typed_as_not_attributed(tmp_
     typed outcome says the text is not attributed (here it is the peer's) and
     the warning says so too."""
     stand_in = _StandIn(tmp_path, {
-        "mobkit/dispatch": [{"result": _admitted(None, unavailable="autonomous_host")}],
+        "meta/dispatch": [{"result": _admitted(None, unavailable="autonomous_host")}],
         **_PEER_COMPLETED,
     })
     runtime = await _runtime(stand_in)
@@ -283,9 +283,9 @@ async def test_the_default_mode_waits_identity_wide_typed_as_not_attributed(tmp_
     assert (outcome.text, outcome.attributed, outcome.ticket) == ("peer reply", False, None)
     assert outcome.untracked_code == "autonomous_host"
     assert isinstance(outcome.admission, DispatchResult)
-    assert len(stand_in.calls("mobkit/dispatch")) == 1
-    assert stand_in.calls("mobkit/wait_for_completion")
-    assert stand_in.calls("mobkit/wait_for_turn") == []
+    assert len(stand_in.calls("meta/dispatch")) == 1
+    assert stand_in.calls("meta/wait_for_completion")
+    assert stand_in.calls("meta/wait_for_turn") == []
 
 
 @pytest.mark.asyncio
@@ -294,7 +294,7 @@ async def test_runtime_refused_also_waits_non_attributed_by_default(tmp_path):
     """No untracked case raises by default, so callers that worked before
     keep working; the code rides on the outcome and in the warning."""
     stand_in = _StandIn(tmp_path, {
-        "mobkit/dispatch": [{"result": _admitted(None, unavailable="runtime_refused")}],
+        "meta/dispatch": [{"result": _admitted(None, unavailable="runtime_refused")}],
         **_PEER_COMPLETED,
     })
     runtime = await _runtime(stand_in)
@@ -308,14 +308,14 @@ async def test_runtime_refused_also_waits_non_attributed_by_default(tmp_path):
 
     assert (outcome.text, outcome.attributed) == ("peer reply", False)
     assert outcome.untracked_code == "runtime_refused"
-    assert len(stand_in.calls("mobkit/dispatch")) == 1
+    assert len(stand_in.calls("meta/dispatch")) == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(60)
 async def test_require_attribution_raises_on_the_default_mode(tmp_path):
     stand_in = _StandIn(tmp_path, {
-        "mobkit/dispatch": [{"result": _admitted(None, unavailable="autonomous_host")}],
+        "meta/dispatch": [{"result": _admitted(None, unavailable="autonomous_host")}],
         **_PEER_COMPLETED,
     })
     runtime = await _runtime(stand_in)
@@ -329,7 +329,7 @@ async def test_require_attribution_raises_on_the_default_mode(tmp_path):
 
     assert raised.value.code == "autonomous_host"
     assert isinstance(raised.value.admission, DispatchResult)
-    assert len(stand_in.calls("mobkit/dispatch")) == 1
+    assert len(stand_in.calls("meta/dispatch")) == 1
     assert not [r for r in stand_in.requests() if r["method"] in _IDENTITY_WIDE]
 
 
@@ -337,8 +337,8 @@ async def test_require_attribution_raises_on_the_default_mode(tmp_path):
 @pytest.mark.timeout(60)
 async def test_cancelling_the_wait_never_redispatches(tmp_path):
     stand_in = _StandIn(tmp_path, {
-        "mobkit/dispatch": [{"result": _admitted(_TICKET)}],
-        "mobkit/wait_for_turn": [{"sleep": 30, **_own("too late")}],
+        "meta/dispatch": [{"result": _admitted(_TICKET)}],
+        "meta/wait_for_turn": [{"sleep": 30, **_own("too late")}],
     })
     runtime = await _runtime(stand_in)
     captured: dict[str, BaseException] = {}
@@ -366,15 +366,15 @@ async def test_cancelling_the_wait_never_redispatches(tmp_path):
     try:
         task = asyncio.create_task(dispatch_and_wait())
         for _ in range(200):
-            if stand_in.calls("mobkit/wait_for_turn"):
+            if stand_in.calls("meta/wait_for_turn"):
                 break
             await asyncio.sleep(0.01)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
         await asyncio.sleep(0.3)
-        assert len(stand_in.calls("mobkit/dispatch")) == 1
-        assert len(stand_in.calls("mobkit/wait_for_turn")) == 1
+        assert len(stand_in.calls("meta/dispatch")) == 1
+        assert len(stand_in.calls("meta/wait_for_turn")) == 1
     finally:
         await runtime.shutdown()
 
@@ -395,9 +395,9 @@ async def test_a_real_transport_timeout_on_the_default_path_keeps_the_admission(
     never arrives. On the default (untracked) path that error keeps its type
     and carries the exact admission, with no ticket and one dispatch."""
     stand_in = _StandIn(tmp_path, {
-        "mobkit/dispatch": [{"result": _admitted(None, unavailable="autonomous_host")}],
+        "meta/dispatch": [{"result": _admitted(None, unavailable="autonomous_host")}],
         # Never answered within the transport's response deadline.
-        "mobkit/wait_for_completion": [{"sleep": 60, "result": {"outcome": "completed"}}],
+        "meta/wait_for_completion": [{"sleep": 60, "result": {"outcome": "completed"}}],
     })
     runtime = await _runtime(stand_in)
     try:
@@ -414,38 +414,43 @@ async def test_a_real_transport_timeout_on_the_default_path_keeps_the_admission(
     assert isinstance(error.admission, DispatchResult)
     assert error.admission.turn_ticket is None
     assert error.ticket is None
-    assert len(stand_in.calls("mobkit/dispatch")) == 1
+    assert len(stand_in.calls("meta/dispatch")) == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(60)
-async def test_an_unknown_ticket_after_a_gateway_restart_raises_typed_with_admission(tmp_path):
-    """The gateway dies after admitting the dispatch; the transport restarts
-    it, and the replacement knows no such ticket. The SDK reports that,
-    typed, with the admission, and does not dispatch again."""
+async def test_a_gateway_death_after_admission_raises_typed_without_a_replacement(tmp_path):
+    """The gateway dies after admitting the dispatch. The transport does not
+    start an uninitialized replacement to ask about the ticket: the SDK
+    reports the admitted, unobservable turn, typed, with the admission, and
+    does not dispatch again."""
     stand_in = _StandIn(
         tmp_path,
         first={
-            "mobkit/dispatch": [{"result": _admitted(_TICKET)}],
-            "mobkit/wait_for_turn": [{"crash": True}],
+            "meta/dispatch": [{"result": _admitted(_TICKET)}],
+            "meta/wait_for_turn": [{"crash": True}],
         },
         after_restart={
-            "mobkit/wait_for_turn": [{"result": {"state": "unknown", "wait": "settled"}}],
+            "meta/wait_for_turn": [{"result": {"state": "unknown", "wait": "settled"}}],
         },
     )
     runtime = await _runtime(stand_in)
     try:
-        with pytest.raises(TurnUnknownError) as raised:
-            await runtime.agent(_IDENTITY).dispatch_text_and_wait("process", timeout=20)
+        with pytest.raises(PostAdmissionObservationError) as raised:
+            await runtime.agent(_IDENTITY).dispatch_text_and_wait("process", timeout=3)
+        assert not runtime.is_running
+        assert runtime.gateway_ended is not None
     finally:
         await runtime.shutdown()
 
-    assert isinstance(raised.value.admission, DispatchResult)
-    assert raised.value.admission.turn_ticket == _TICKET
-    assert raised.value.ticket == _TICKET
-    assert len(stand_in.calls("mobkit/dispatch")) == 1
-    generations = [r["generation"] for r in stand_in.calls("mobkit/wait_for_turn")]
-    assert generations[0] == 1 and generations[-1] == 2
+    error = raised.value
+    assert isinstance(error.admission, DispatchResult)
+    assert error.admission.turn_ticket == _TICKET
+    assert error.ticket == _TICKET
+    assert isinstance(error.__cause__, TransportReaderFailedError)
+    assert len(stand_in.calls("meta/dispatch")) == 1
+    generations = {r["generation"] for r in stand_in.requests()}
+    assert generations == {1}, "a replacement gateway received a request"
     assert not [r for r in stand_in.requests() if r["method"] in _IDENTITY_WIDE]
 
 
@@ -453,8 +458,8 @@ async def test_an_unknown_ticket_after_a_gateway_restart_raises_typed_with_admis
 @pytest.mark.timeout(60)
 async def test_a_turn_pending_at_the_deadline_is_a_timeout_carrying_the_admission(tmp_path):
     stand_in = _StandIn(tmp_path, {
-        "mobkit/dispatch": [{"result": _admitted(_TICKET)}],
-        "mobkit/wait_for_turn": [_PENDING_AT_DEADLINE],
+        "meta/dispatch": [{"result": _admitted(_TICKET)}],
+        "meta/wait_for_turn": [_PENDING_AT_DEADLINE],
     })
     runtime = await _runtime(stand_in)
     try:
@@ -465,4 +470,4 @@ async def test_a_turn_pending_at_the_deadline_is_a_timeout_carrying_the_admissio
 
     assert isinstance(raised.value, TurnWaitTimeoutError)
     assert raised.value.admission.turn_ticket == _TICKET
-    assert len(stand_in.calls("mobkit/dispatch")) == 1
+    assert len(stand_in.calls("meta/dispatch")) == 1

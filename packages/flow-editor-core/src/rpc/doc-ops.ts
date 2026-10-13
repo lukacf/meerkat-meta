@@ -12,7 +12,7 @@
 // Document-operation RPC wrappers for the Flow Editor controller plane.
 // Moved verbatim from the controller.js rpc-doc-ops range: schema/
 // capability/catalog loads, document validate/source/export/deploy/import/
-// list/get/create/save/delete, MobKit-owned undo/redo history steps, the
+// list/get/create/save/delete, Meta-owned undo/redo history steps, the
 // authoring operation apply path with draft and catalog snapshot guards,
 // createAuthoringOperationRunner (a stateful per-runner promise queue —
 // moved intact as a closure factory), graph projection RPCs, and decoded
@@ -32,7 +32,7 @@ export async function loadSchema(options = {}) {
 }
 
 export async function loadCapabilities(options = {}) {
-  return callRpc("mobkit/capabilities", {}, options);
+  return callRpc("meta/capabilities", {}, options);
 }
 
 export async function loadCatalogs(options = {}) {
@@ -138,7 +138,7 @@ export async function createDocument(spec = {}, options = {}) {
   return callRpc(rpcMethod("create"), spec || {}, options);
 }
 
-// MobKit-owned history steps over the draft store: the server restores a
+// Meta-owned history steps over the draft store: the server restores a
 // snapshot it recorded itself, so the browser never authors restore state.
 export async function undoDocument(params = {}, options = {}) {
   return historyStepDocument("undo", params, options);
@@ -166,7 +166,7 @@ export async function saveDocument(row = {}, options = {}) {
       ok: false,
       error: "runtime_projection_read_only",
       row: null,
-      reason: "Runtime flow projections must be forked into a MobKit draft before saving.",
+      reason: "Runtime flow projections must be forked into a Meta draft before saving.",
     };
   }
   const document = row.document;
@@ -231,7 +231,7 @@ export function createAuthoringOperationRunner(options = {}) {
     if (hooks.isRevisionCurrent && !hooks.isRevisionCurrent(enqueuedRevision)) {
       return {
         ok: false,
-        error: hooks.getStaleError?.() || "MobKit authoring operation result is stale",
+        error: hooks.getStaleError?.() || "Meta authoring operation result is stale",
       };
     }
     const translatedOperation = authoringOperationFromIntent(operation);
@@ -266,14 +266,14 @@ export function createAuthoringOperationRunner(options = {}) {
     if (hooks.isRevisionCurrent && !hooks.isRevisionCurrent(requestToken)) {
       return {
         ok: false,
-        error: hooks.getStaleError?.() || "MobKit authoring operation result is stale",
+        error: hooks.getStaleError?.() || "Meta authoring operation result is stale",
       };
     }
     const projection = authoringProjectionFromOperationResult(result, hooks.getProjectionDefaults?.() || {});
     if (!projection) {
       return {
         ok: false,
-        error: hooks.getMissingDocumentError?.() || "MobKit authoring operation did not return a document",
+        error: hooks.getMissingDocumentError?.() || "Meta authoring operation did not return a document",
       };
     }
     hooks.beginProjectionSync?.();

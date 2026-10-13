@@ -6,7 +6,7 @@ const { randomUUID, createHash } = require("node:crypto");
 const { chromium } = require("playwright");
 const { startFixture, eventually, rpc } = require("../acceptance-runtime.cjs");
 
-const evidence = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+const evidence = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
 const identity = "router:main";
 
 async function uploadReviewImage(fixture, browser) {
@@ -19,7 +19,7 @@ async function uploadReviewImage(fixture, browser) {
   const uploadId = randomUUID();
   const form = new FormData();
   form.append(`file:${uploadId}`, new Blob([bytes], { type: "image/png" }), "release-evidence.png");
-  form.append("payload", JSON.stringify({ jsonrpc: "2.0", id: uploadId, method: "mobkit/blob/upload", params: {
+  form.append("payload", JSON.stringify({ jsonrpc: "2.0", id: uploadId, method: "meta/blob/upload", params: {
     upload: { type: "image_upload", upload_id: uploadId, media_type: "image/png", alt: "Release evidence" },
   } }));
   const response = await fetch(`${fixture.baseUrl}/console/rpc/multipart`, { method: "POST", body: form });
@@ -31,7 +31,7 @@ async function uploadReviewImage(fixture, browser) {
 
 async function seedReply(fixture, source) {
   await fixture.control("model", { source, delay_ms: 0, chunk_chars: 128 });
-  const reply = await rpc(fixture.baseUrl, "mobkit/console/send", {
+  const reply = await rpc(fixture.baseUrl, "meta/console/send", {
     identity, content: "Present the release evidence with links approved by this console host.",
     origin: "console:markdown-policy", origin_kind: "operator", idempotency_key: randomUUID(),
   });
@@ -51,7 +51,7 @@ function initializationCancellation(request) {
   if (new URL(request.url()).pathname.endsWith("/timeline/stream")) return true;
   try {
     const body = JSON.parse(request.postData() || "{}");
-    return body.method === "mobkit/console/query_timeline" && body.params?.mode === "recent" && body.params?.limit === 200 && !body.params?.identity;
+    return body.method === "meta/console/query_timeline" && body.params?.mode === "recent" && body.params?.limit === 200 && !body.params?.identity;
   } catch { return false; }
 }
 
@@ -65,7 +65,7 @@ async function urlPolicy(host) {
     const approvedUrl = `${fixture.baseUrl}/blobs/${encodeURIComponent(image.blobId)}`;
     // This same-origin URL is deliberately absent from the host image allowlist.
     const deniedUrl = `${fixture.baseUrl}/blobs/not-approved-by-host`;
-    const source = `## Release review\n\nThis report includes the evidence approved for this console.\n\n[Relative review](/release/review) - [App review](mobkit:review) - [Reference](https://example.com/reference) - [Denied link](https://denied.invalid/link)\n\n![Approved release evidence](${approvedUrl})\n\n![Denied local image](${deniedUrl}) ![Denied external image](https://denied.invalid/tracker.png)\n\n[Unsafe script](javascript:alert%281%29)\n\nPolicy review complete.`;
+    const source = `## Release review\n\nThis report includes the evidence approved for this console.\n\n[Relative review](/release/review) - [App review](meta:review) - [Reference](https://example.com/reference) - [Denied link](https://denied.invalid/link)\n\n![Approved release evidence](${approvedUrl})\n\n![Denied local image](${deniedUrl}) ![Denied external image](https://denied.invalid/tracker.png)\n\n[Unsafe script](javascript:alert%281%29)\n\nPolicy review complete.`;
     result.owner = await seedReply(fixture, source);
     result.blobId = image.blobId;
     for (const mode of ["default", "custom"]) {
@@ -150,6 +150,6 @@ async function urlPolicy(host) {
 const scenarios = ["stock", "shared"].map(host => ({ id: `real-${host}-markdown-url-policy`, family: "real-presentation", backend: "real", run: () => urlPolicy(host) }));
 module.exports = { scenarios };
 if (require.main === module) {
-  assert(process.argv.includes("--list") || process.env.MOBKIT_EXAMPLE_BIN_DIR, "Use the coordinator's prebuilt fixture; this scenario must not compile Rust.");
+  assert(process.argv.includes("--list") || process.env.META_EXAMPLE_BIN_DIR, "Use the coordinator's prebuilt fixture; this scenario must not compile Rust.");
   require("../scenario-registry.cjs").runScenarios(scenarios).catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1; });
 }

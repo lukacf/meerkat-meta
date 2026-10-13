@@ -1,5 +1,5 @@
 name: Release
-# MobKit release protocol v1: tags validate only. Publication requires an
+# Meta release protocol v1: tags validate only. Publication requires an
 # explicit accepted-artifact selection through `make release-promote`.
 
 on:
@@ -50,7 +50,7 @@ permissions:
 concurrency:
   # Candidate runs are independent. Every dispatch that may write the same
   # release is serialized; tag events never write and need no release lock.
-  group: mobkit-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && inputs.release_tag || github.run_id }}
+  group: meta-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && inputs.release_tag || github.run_id }}
   cancel-in-progress: false
 
 env:
@@ -58,7 +58,9 @@ env:
 
 # Required GitHub Actions secrets for full release:
 #   CARGO_REGISTRY_TOKEN  - crates.io API token
-#   PYPI_API_TOKEN        - PyPI API token (scoped to meerkat-mobkit package)
+#   PYPI_API_TOKEN        - PyPI API token able to upload meerkat-meta (the first
+#                           upload of a new project needs an account-scoped
+#                           token; narrow it to a project token afterwards)
 #   NPM_TOKEN             - npm access token (scoped to @rkat org)
 #   DOCS_PUBLISH_TOKEN    - fine-grained token with Contents: write on lukacf/meerkat;
 #                           used only to dispatch the docs-owner workflow
@@ -94,7 +96,7 @@ jobs:
           REGISTRY_DRY_RUN: ${{ inputs.registry_dry_run }}
         run: python3 scripts/release-candidate.py resolve
 
-  # MobKit's release path had no CI gate at all: release_validate had no `needs`,
+  # Meta's release path had no CI gate at all: release_validate had no `needs`,
   # so a tag on any commit published without anyone checking that commit was ever
   # green. Tonight (v0.8.26) the check was done by hand. This refuses instead.
   #
@@ -361,7 +363,7 @@ jobs:
         env:
           CARGO_TARGET_DIR: target
           # Bound rustc parallelism: the meerkat mega-crates (meerkat-mob,
-          # meerkat-runtime, meerkat-mobkit lib) each drive LLVM into multiple
+          # meerkat-runtime, meerkat-meta lib) each drive LLVM into multiple
           # GB; at default -j on 16 GB hosted runners the Windows leg dies
           # with "rustc-LLVM ERROR: out of memory" and the Linux legs get
           # OOM-killed (surfacing as "runner received a shutdown signal",
@@ -379,7 +381,7 @@ jobs:
           # Build BOTH gateways for this target with plain cargo. (The repo-cargo
           # wrapper redirects CARGO_TARGET_DIR for dev-worktree isolation; a clean
           # release runner wants the predictable ./target path.) rpc_gateway is the
-          # SDK stdin-RPC gateway; mobkit_gateway is the console/HTTP one — SDK
+          # SDK stdin-RPC gateway; meta_gateway is the console/HTTP one — SDK
           # users need rpc_gateway, so both ship.
           # --locked: the binaries we ship must be built from the SAME
           # dependency set the audit lane checked. Without it cargo is
@@ -388,7 +390,7 @@ jobs:
           # published artifact carried something else. RUSTSEC-2026-0258 made
           # that distinction concrete: adopters running a prebuilt gateway are
           # exposed by what is IN THE BINARY, not by what the lock says.
-          cargo build -p meerkat-mobkit --bin mobkit_gateway --bin rpc_gateway --bin mobkit_repair \
+          cargo build -p meerkat-meta --bin meta_gateway --bin rpc_gateway --bin meta_repair \
             --features openai-live --locked --release --target "${{ matrix.target }}"
 
       # The gate reads the produced binary, not the build environment: a
@@ -407,16 +409,16 @@ jobs:
         run: |
           set -euo pipefail
           ./scripts/check-linux-release-binary-portability.sh \
-            "target/${TARGET}/release/mobkit_gateway" \
+            "target/${TARGET}/release/meta_gateway" \
             "target/${TARGET}/release/rpc_gateway" \
-            "target/${TARGET}/release/mobkit_repair"
+            "target/${TARGET}/release/meta_repair"
 
       - name: Ad-hoc codesign macOS binaries
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
-          for bin in mobkit_gateway rpc_gateway mobkit_repair; do
+          for bin in meta_gateway rpc_gateway meta_repair; do
             codesign --force --sign - "target/${{ matrix.target }}/release/${bin}"
           done
 
@@ -430,7 +432,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           # cargo bin name -> published archive prefix
-          BINS=("mobkit_gateway:mobkit-gateway" "rpc_gateway:mobkit-rpc-gateway" "mobkit_repair:mobkit-repair")
+          BINS=("meta_gateway:meta-gateway" "rpc_gateway:meta-rpc-gateway" "meta_repair:meta-repair")
           for entry in "${BINS[@]}"; do
             bin="${entry%%:*}"; prefix="${entry##*:}"
             if [[ "${RUNNER_OS}" == "Windows" ]]; then
@@ -476,7 +478,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: mobkit-gateway-binaries-${{ matrix.target }}-${{ github.run_attempt }}
+          name: meta-gateway-binaries-${{ matrix.target }}-${{ github.run_attempt }}
           path: dist/*
           if-no-files-found: error
           overwrite: false
@@ -530,7 +532,7 @@ jobs:
         id: manifest
         uses: actions/upload-artifact@v4
         with:
-          name: mobkit-candidate-manifest-${{ github.run_attempt }}
+          name: meta-candidate-manifest-${{ github.run_attempt }}
           path: candidate/*
           if-no-files-found: error
           overwrite: false
@@ -757,15 +759,15 @@ jobs:
           DRY_RUN="${{ needs.resolve_release.outputs.dry_run }}"
           if [[ "$DRY_RUN" == "true" ]]; then
             echo "Running cargo publish in dry-run mode"
-            scripts/repo-cargo publish -p mobkit-extension-state --locked --dry-run
+            scripts/repo-cargo publish -p meta-extension-state --locked --dry-run
           else
-            echo "Publishing mobkit-extension-state to crates.io"
-            output=$(scripts/repo-cargo publish -p mobkit-extension-state --locked 2>&1) && true
+            echo "Publishing meta-extension-state to crates.io"
+            output=$(scripts/repo-cargo publish -p meta-extension-state --locked 2>&1) && true
             rc=$?
             if [[ $rc -eq 0 ]]; then
-              echo "  mobkit-extension-state: published"
+              echo "  meta-extension-state: published"
             elif echo "$output" | grep -q "already exists\|already uploaded"; then
-              echo "  mobkit-extension-state: already published, skipping"
+              echo "  meta-extension-state: already published, skipping"
             else
               echo "$output" >&2
               exit $rc
@@ -780,15 +782,15 @@ jobs:
           DRY_RUN="${{ needs.resolve_release.outputs.dry_run }}"
           if [[ "$DRY_RUN" == "true" ]]; then
             echo "Running cargo publish in dry-run mode"
-            scripts/repo-cargo publish -p meerkat-mobkit --locked --dry-run
+            scripts/repo-cargo publish -p meerkat-meta --locked --dry-run
           else
-            echo "Publishing meerkat-mobkit to crates.io"
-            output=$(scripts/repo-cargo publish -p meerkat-mobkit --locked 2>&1) && true
+            echo "Publishing meerkat-meta to crates.io"
+            output=$(scripts/repo-cargo publish -p meerkat-meta --locked 2>&1) && true
             rc=$?
             if [[ $rc -eq 0 ]]; then
-              echo "  meerkat-mobkit: published"
+              echo "  meerkat-meta: published"
             elif echo "$output" | grep -q "already exists\|already uploaded"; then
-              echo "  meerkat-mobkit: already published, skipping"
+              echo "  meerkat-meta: already published, skipping"
             else
               echo "$output" >&2
               exit $rc

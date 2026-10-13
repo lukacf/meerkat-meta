@@ -43,7 +43,7 @@ function PanelGlyph({ side, open }: { side: "left" | "right"; open: boolean }): 
 export function Topbar({
   mobName,
   connectionStatus,
-  brandLabel = "MobKit",
+  brandLabel = "Meta",
   brandLogoUrl,
   brandLogoAlt,
   mobStatus = "idle",
@@ -57,10 +57,10 @@ export function Topbar({
   onToggleRail,
 }: TopbarProps): React.JSX.Element {
   return (
-    <div className="mobkit-topbar" data-testid="mobkit-topbar">
+    <div className="meta-topbar" data-testid="meta-topbar">
       <button
         type="button"
-        className="mobkit-topbar__toggle mobkit-topbar__toggle--left"
+        className="meta-topbar__toggle meta-topbar__toggle--left"
         onClick={onToggleSidebar}
         aria-pressed={!sidebarCollapsed}
         aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
@@ -69,24 +69,24 @@ export function Topbar({
       >
         <PanelGlyph side="left" open={!sidebarCollapsed} />
       </button>
-      <div className="mobkit-topbar__brand">
+      <div className="meta-topbar__brand">
         {brandLogoUrl
-          ? <img className="mobkit-topbar__brand-logo" src={brandLogoUrl} alt={brandLogoAlt || brandLabel} />
-          : <span className="mobkit-topbar__brand-mark" />}
+          ? <img className="meta-topbar__brand-logo" src={brandLogoUrl} alt={brandLogoAlt || brandLabel} />
+          : <span className="meta-topbar__brand-mark" />}
         <span>{brandLabel}</span>
       </div>
-      <div className="mobkit-topbar__mob">
-        <span className="mobkit-topbar__mob-status" title={mobStatus} />
+      <div className="meta-topbar__mob">
+        <span className="meta-topbar__mob-status" title={mobStatus} />
         <span>{mobName}</span>
         <span className="dim">· {mobStatus}</span>
       </div>
-      <div className="mobkit-topbar__mob">
+      <div className="meta-topbar__mob">
         <span>env:</span>
         <span>{environment}</span>
       </div>
-      <div className="mobkit-topbar__spacer" />
+      <div className="meta-topbar__spacer" />
       {connectionStatus}
-      <div className="mobkit-topbar__util">
+      <div className="meta-topbar__util">
         <button
           type="button"
           onClick={onToggleTheme}
@@ -99,7 +99,7 @@ export function Topbar({
       {railVisible ? (
         <button
           type="button"
-          className="mobkit-topbar__toggle mobkit-topbar__toggle--right"
+          className="meta-topbar__toggle meta-topbar__toggle--right"
           onClick={onToggleRail}
           aria-pressed={!railCollapsed}
           aria-label={railCollapsed ? "Expand signals rail" : "Collapse signals rail"}

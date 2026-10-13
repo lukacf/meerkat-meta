@@ -1,5 +1,5 @@
 /**
- * Persistent subprocess transport for MobKit JSON-RPC.
+ * Persistent subprocess transport for Meta JSON-RPC.
  *
  * Keeps a long-lived gateway binary alive, communicating over stdin/stdout
  * newline-delimited JSON. Supports bidirectional callbacks from Rust.
@@ -11,8 +11,9 @@ import { closeSync, openSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline";
 import type { ChildProcess } from "node:child_process";
+import type { Readable, Writable } from "node:stream";
 import type { ProviderCallbackContext } from "./types.js";
-import { TransportReaderFailedError } from "./errors.js";
+import { GatewayRestartRefusedError, TransportReaderFailedError } from "./errors.js";
 
 // -- Types ----------------------------------------------------------------
 
@@ -89,7 +90,7 @@ export const PROVIDER_CALLBACK_COMPLETION_MS = 125_000;
 const PERSISTENT_TRANSPORT_SIGTERM_GRACE_MS = 5_000;
 const PERSISTENT_TRANSPORT_SIGKILL_GRACE_MS = 5_000;
 const MAX_GATEWAY_SHUTDOWN_HORIZON_MS = 2_147_483_647;
-const GATEWAY_SHUTDOWN_METHOD = "mobkit/shutdown";
+const GATEWAY_SHUTDOWN_METHOD = "meta/shutdown";
 
 type ChildExitWaiter = (
   child: ChildProcess,
@@ -120,18 +121,18 @@ function sanitizeForJson(obj: unknown): unknown {
   return String(obj);
 }
 
-/** mobkit/init: accepted, then settled (#550). */
+/** meta/init: accepted, then settled (#550). */
 export const INIT_PROTOCOL_ACCEPTED_THEN_SETTLED = "accepted_then_settled";
-const INIT_PROGRESS_METHOD = "mobkit/init_progress";
-const INIT_SETTLED_METHOD = "mobkit/init_settled";
+const INIT_PROGRESS_METHOD = "meta/init_progress";
+const INIT_SETTLED_METHOD = "meta/init_settled";
 
 /**
- * Correlates one accepted-then-settled `mobkit/init`. Registered before the
+ * Correlates one accepted-then-settled `meta/init`. Registered before the
  * init request is written, so no progress or settlement line arrives
  * unclaimed.
  */
 export class InitWatch {
-  /** The last `mobkit/init_progress` phase seen, for diagnostics. */
+  /** The last `meta/init_progress` phase seen, for diagnostics. */
   lastPhase: string | null = null;
   private _settle!: (params: Record<string, unknown>) => void;
   private _fail!: (error: Error) => void;
@@ -165,7 +166,7 @@ export class InitWatch {
   }
 
   /**
-   * Wait for `mobkit/init_settled`. `deadlineMs` is the caller's own cap
+   * Wait for `meta/init_settled`. `deadlineMs` is the caller's own cap
    * (`null`: wait until the gateway settles, exits, or the reader fails);
    * exceeding it rejects with `InitDeadlineExceeded`.
    */
@@ -208,7 +209,9 @@ function childHasExited(child: ChildProcess): boolean {
   return child.exitCode !== null || child.signalCode !== null;
 }
 
-function validateGatewayShutdownResponse(response: unknown): void {
+function validateGatewayShutdownResponse(
+  response: unknown,
+): "acknowledged" | "retained_until_exit" {
   if (typeof response !== "object" || response === null) {
     throw new Error("gateway shutdown returned a malformed response");
   }
@@ -220,14 +223,23 @@ function validateGatewayShutdownResponse(response: unknown): void {
     throw new Error(`gateway shutdown failed: ${message}`);
   }
   const result = envelope.result;
-  if (
-    typeof result !== "object" ||
-    result === null ||
-    (result as Record<string, unknown>).shutdown !== true ||
-    (result as Record<string, unknown>).runtime_cleanup_completed !== true
-  ) {
+  if (typeof result !== "object" || result === null) {
     throw new Error("gateway shutdown did not complete runtime-owned cleanup");
   }
+  const fields = result as Record<string, unknown>;
+  if (fields.shutdown === true && fields.runtime_cleanup_completed === true) {
+    return "acknowledged";
+  }
+  // Cleanup is still incomplete, but the only cause is durable child mobs
+  // held until the gateway process exits; reaping it (next, with its own
+  // failure path) releases them. Not a failed phase.
+  if (
+    fields.runtime_cleanup_completed === false &&
+    fields.runtime_cleanup_retained_until_exit === true
+  ) {
+    return "retained_until_exit";
+  }
+  throw new Error("gateway shutdown did not complete runtime-owned cleanup");
 }
 
 async function waitForChildExit(
@@ -266,12 +278,25 @@ async function waitForChildExit(
   });
 }
 
-/** @internal Exported for deterministic lifecycle policy tests. */
+/**
+ * The highest signal {@link stopChildProcess} attempted: none (it only closed
+ * stdin), SIGTERM, or SIGKILL. An attempt is not proof that it caused the
+ * exit.
+ */
+export type ChildStopEscalation = "none" | "sigterm" | "sigkill";
+
+/**
+ * @internal Exported for deterministic lifecycle policy tests. `progress`
+ * records each escalation before it is attempted, so a caller still knows it
+ * when this rejects. It only rises: an earlier stop's attempt against the
+ * same child is kept.
+ */
 export async function stopChildProcess(
   child: ChildProcess,
   waitForExit: ChildExitWaiter = waitForChildExit,
   shutdownGraceMs = PERSISTENT_TRANSPORT_SHUTDOWN_GRACE_MS,
-): Promise<void> {
+  progress: { escalation: ChildStopEscalation } = { escalation: "none" },
+): Promise<ChildStopEscalation> {
   try {
     child.stdin?.end();
   } catch {
@@ -281,9 +306,10 @@ export async function stopChildProcess(
   if (
     await waitForExit(child, shutdownGraceMs)
   ) {
-    return;
+    return progress.escalation;
   }
 
+  progress.escalation = progress.escalation === "sigkill" ? "sigkill" : "sigterm";
   try {
     child.kill("SIGTERM");
   } catch {
@@ -291,9 +317,10 @@ export async function stopChildProcess(
   }
 
   if (await waitForExit(child, PERSISTENT_TRANSPORT_SIGTERM_GRACE_MS)) {
-    return;
+    return progress.escalation;
   }
 
+  progress.escalation = "sigkill";
   try {
     child.kill("SIGKILL");
   } catch {
@@ -305,9 +332,140 @@ export async function stopChildProcess(
       "persistent transport: gateway process did not terminate after bounded cleanup",
     );
   }
+  return progress.escalation;
+}
+
+/**
+ * What one `stop()` observed for the gateway process it stopped. Read it with
+ * {@link PersistentTransport.lastTermination}.
+ *
+ * `"exited"` with `exitCode` 0 and escalation `"none"` is the process outcome
+ * only. It does not prove the gateway's own cleanup (see `nativeShutdown`), a
+ * host's private settlement, or drained stdio: the stop's wait can finish on
+ * the process exit before its streams close.
+ */
+export interface TransportTermination {
+  /**
+   * `"exited"`: the stop observed the process end (`exitCode` or `signal`).
+   * `"not_started"`: there was no started process to stop (never started,
+   * or its spawn failed). `"unknown"`: the bounded cleanup ended without an
+   * observed exit; the transport keeps the process and a later `stop()`
+   * tries again.
+   */
+  readonly state: "exited" | "not_started" | "unknown";
+  /** The process's own exit code; `null` when a signal ended it or no exit was observed. */
+  readonly exitCode: number | null;
+  /** The signal that ended the process (for example `"SIGKILL"`); `null` for a normal exit. */
+  readonly signal: string | null;
+  /**
+   * The highest signal any stop attempted against this process. An attempted
+   * signal is not proof that it caused the exit, nor that the process ended
+   * at all.
+   */
+  readonly escalation: ChildStopEscalation;
+  /**
+   * The gateway's own answer to the shutdown request, apart from the process
+   * outcome: `"acknowledged"` (runtime cleanup completed),
+   * `"retained_until_exit"` (cleanup completes only with the process exit),
+   * `"refused"` (an error or non-attesting answer), `"unanswered"` (no answer:
+   * a timeout, a failed reader or a gone process), or `"not_negotiated"`
+   * (the gateway offered no shutdown handshake, so the stop only closed its
+   * stdin).
+   */
+  readonly nativeShutdown:
+    | "acknowledged"
+    | "retained_until_exit"
+    | "refused"
+    | "unanswered"
+    | "not_negotiated";
+}
+
+const NOT_STARTED: TransportTermination = Object.freeze({
+  state: "not_started",
+  exitCode: null,
+  signal: null,
+  escalation: "none",
+  nativeShutdown: "not_negotiated",
+});
+
+/** What a stop observed for `child`, read from the child itself. */
+function terminationOf(
+  child: ChildProcess,
+  escalation: ChildStopEscalation,
+  nativeShutdown: TransportTermination["nativeShutdown"],
+): TransportTermination {
+  // A failed spawn has no pid; Node then reports a negative errno as its
+  // exit code, which is not an exit of a started gateway.
+  if (child.pid === undefined) return NOT_STARTED;
+  const exited = childHasExited(child);
+  return Object.freeze({
+    state: exited ? "exited" : "unknown",
+    exitCode: exited ? child.exitCode : null,
+    signal: exited ? child.signalCode : null,
+    escalation,
+    nativeShutdown,
+  });
 }
 
 // -- PersistentTransport --------------------------------------------------
+
+/**
+ * One extra stdio slot of the gateway process, at child descriptor
+ * `3 + index`: `"pipe"` gives the parent an endpoint
+ * ({@link PersistentTransport.extraStdioEndpoint}), `"ignore"` leaves it
+ * closed, and a number passes that open parent descriptor (3 or above).
+ */
+export type PersistentTransportStdioSlot = "pipe" | "ignore" | number;
+
+export interface PersistentTransportOptions {
+  env?: Record<string, string>;
+  timeout?: number;
+  /** Arguments appended after `--persistent`. */
+  extraArgs?: readonly string[];
+  /**
+   * Extra stdio slots of the gateway process. Every other parent descriptor
+   * stays closed in the child.
+   */
+  extraStdio?: readonly PersistentTransportStdioSlot[];
+}
+
+/**
+ * Builds the transport one `connect()` starts. It runs on every connect,
+ * before any `meta/init`.
+ */
+export type GatewayTransportFactory = (gateway: {
+  gatewayBin: string;
+  timeoutMs: number | undefined;
+}) => PersistentTransport;
+
+function validateExtraArgs(extraArgs: readonly string[]): readonly string[] {
+  if (extraArgs.some((arg) => typeof arg !== "string" || arg.includes("\0"))) {
+    throw new Error("extraArgs must be strings without NUL");
+  }
+  return [...extraArgs];
+}
+
+function validateExtraStdio(
+  extraStdio: readonly PersistentTransportStdioSlot[],
+): readonly PersistentTransportStdioSlot[] {
+  const descriptors: number[] = [];
+  for (const slot of extraStdio) {
+    if (slot === "pipe" || slot === "ignore") continue;
+    if (typeof slot !== "number" || !Number.isSafeInteger(slot) || slot < 3) {
+      throw new Error(
+        'extraStdio slots must be "pipe", "ignore" or an open non-stdio descriptor',
+      );
+    }
+    descriptors.push(slot);
+  }
+  if (new Set(descriptors).size !== descriptors.length) {
+    throw new Error("extraStdio must not contain duplicate descriptors");
+  }
+  if (descriptors.length > 0 && process.platform === "win32") {
+    throw new Error("inherited descriptors require a POSIX host");
+  }
+  return [...extraStdio];
+}
 
 /**
  * Long-lived gateway subprocess communicating over stdin/stdout JSON-RPC.
@@ -322,9 +480,29 @@ export class PersistentTransport {
   private _stderrFd: number | null = null;
   private readonly _env: Record<string, string>;
   private readonly _timeout: number;
+  // Process-local startup capabilities, never serialized in RPC. Their
+  // creator keeps ownership of the parent descriptors.
+  private readonly _extraArgs: readonly string[];
+  private readonly _extraStdio: readonly PersistentTransportStdioSlot[];
+  // Set by the runtime for a factory-built transport. A host-composed
+  // transport (this, or one with its own startAsync) never respawns its
+  // process on a request: the respawn would skip the host's trusted startup.
+  private _hostComposed = false;
   private _callbackHandler: CallbackHandler | null = null;
   // Mutable only so deterministic tests can scale the 125-second contract.
   private _providerCallbackCompletionMs = PROVIDER_CALLBACK_COMPLETION_MS;
+  // Mutable only so deterministic tests can scale the bounded stop waits.
+  private _waitForExit: ChildExitWaiter = waitForChildExit;
+  // What the last completed stop() observed for the current or last child;
+  // null while that child is live or its stop has not completed.
+  private _lastTermination: TransportTermination | null = null;
+  // The highest signal any stop attempted against the current child.
+  private _attemptedEscalation: ChildStopEscalation = "none";
+  // The current child's answer to its one shutdown request (and the error
+  // that request ended with), or null while it was not asked: a later stop
+  // of the same child keeps them and never asks it again.
+  private _nativeShutdown: TransportTermination["nativeShutdown"] | null = null;
+  private _nativeShutdownError: Error | null = null;
   private _supportsShutdownHandshake = false;
   private _shutdownHorizonMs = PERSISTENT_TRANSPORT_SHUTDOWN_GRACE_MS;
   private readonly _pending = new Map<
@@ -339,8 +517,10 @@ export class PersistentTransport {
 
   constructor(
     readonly gatewayBin: string,
-    options?: { env?: Record<string, string>; timeout?: number },
+    options?: PersistentTransportOptions,
   ) {
+    this._extraArgs = validateExtraArgs(options?.extraArgs ?? []);
+    this._extraStdio = validateExtraStdio(options?.extraStdio ?? []);
     this._env = { ...process.env, ...(options?.env ?? {}) } as Record<string, string>;
     this._timeout = options?.timeout ?? 60_000;
   }
@@ -349,7 +529,7 @@ export class PersistentTransport {
     this._callbackHandler = handler;
   }
 
-  /** Register the watch for `initId` before writing `mobkit/init`. */
+  /** Register the watch for `initId` before writing `meta/init`. */
   openInitWatch(initId: string): InitWatch {
     const watch = new InitWatch(initId);
     this._initWatch = watch;
@@ -361,11 +541,48 @@ export class PersistentTransport {
     if (this._initWatch === watch) this._initWatch = null;
   }
 
+  /**
+   * Start the gateway process and finish any host-owned startup before the
+   * runtime sends `meta/init`. The default only spawns. A subclass that
+   * passes private startup channels overrides it to complete its own trusted
+   * bootstrap over them; a rejection fails `connect()`, which then stops this
+   * transport.
+   */
+  async startAsync(): Promise<void> {
+    this.start();
+  }
+
+  /**
+   * Mark this transport host-composed: once its gateway process is gone, a
+   * request fails with `GatewayRestartRefusedError` instead of respawning
+   * it. A transport with its own `startAsync()` is host-composed already.
+   */
+  requireHostStartup(): void {
+    this._hostComposed = true;
+  }
+
+  /**
+   * The parent end of extra stdio slot `index` (child descriptor
+   * `3 + index`) of the running gateway process, for a `"pipe"` slot; `null`
+   * for another slot or when no process runs. The transport never reads or
+   * writes it; it closes with the process.
+   */
+  extraStdioEndpoint(index: number): Readable | Writable | null {
+    if (!Number.isSafeInteger(index) || index < 0 || index >= this._extraStdio.length) {
+      throw new RangeError(`no extra stdio slot ${index}`);
+    }
+    const child = this._process;
+    if (this._extraStdio[index] !== "pipe" || child === null || childHasExited(child)) {
+      return null;
+    }
+    return (child.stdio[3 + index] as Readable | Writable | null | undefined) ?? null;
+  }
+
   start(): void {
     if (this._stopping !== null) {
       throw new Error("persistent transport is stopping");
     }
-    if (this._process !== null && this._process.exitCode === null) {
+    if (this.isRunning()) {
       return;
     }
 
@@ -382,9 +599,15 @@ export class PersistentTransport {
     this._shutdownHorizonMs = PERSISTENT_TRANSPORT_SHUTDOWN_GRACE_MS;
     // A new process gets a new reader.
     this._readerFailure = null;
-    this._process = spawn(this.gatewayBin, ["--persistent"], {
+    // A new process has no termination yet; a previous child's never stands
+    // in for it.
+    this._lastTermination = null;
+    this._attemptedEscalation = "none";
+    this._nativeShutdown = null;
+    this._nativeShutdownError = null;
+    this._process = spawn(this.gatewayBin, ["--persistent", ...this._extraArgs], {
       env: this._env,
-      stdio: ["pipe", "pipe", this._stderrDisposition()],
+      stdio: ["pipe", "pipe", this._stderrDisposition(), ...this._extraStdio],
     });
 
     const child = this._process;
@@ -572,7 +795,7 @@ export class PersistentTransport {
       request,
       options.timeoutMs ?? this._timeout,
     );
-    if (request.method === "mobkit/init") {
+    if (request.method === "meta/init") {
       const result =
         typeof response === "object" && response !== null
           ? (response as Record<string, unknown>).result
@@ -641,40 +864,62 @@ export class PersistentTransport {
     if (this._stopping !== null) return this._stopping;
 
     const child = this._process;
-    if (child === null) return;
+    if (child === null) {
+      // Nothing was started to stop. A real record of an earlier child stays.
+      if (this._lastTermination === null) this._lastTermination = NOT_STARTED;
+      return;
+    }
 
     const shutdownStarted = performance.now();
     let childTerminated = false;
+    const progress: { escalation: ChildStopEscalation } = {
+      escalation: this._attemptedEscalation,
+    };
+    // An earlier stop of this child already gave it the whole horizon and
+    // escalated; a later stop goes straight to the signals.
+    const graceSpent = this._attemptedEscalation !== "none";
+    // A child gets one shutdown request. A later stop of the same child, after
+    // bounded cleanup failed, only finishes reaping it: the stdin that request
+    // used is already ended, and asking again could only report a false
+    // failure. That stop reports the answer as the stop that reaps would have.
+    const asked = this._nativeShutdown;
+    let nativeShutdown: TransportTermination["nativeShutdown"] = asked ?? "not_negotiated";
     let stopping: Promise<void>;
     stopping = (async () => {
-      let shutdownError: Error | null = null;
-      try {
-        // Keep stdin open while the gateway shuts its runtime down: external
-        // lease/continuity providers may still need callback round-trips.
-        // Capability negotiation keeps older/custom gateways on their EOF
-        // protocol instead of assuming method-not-found behavior.
-        if (this._supportsShutdownHandshake) {
+      let shutdownError: Error | null = asked === null ? null : this._nativeShutdownError;
+      // Keep stdin open while the gateway shuts its runtime down: external
+      // lease/continuity providers may still need callback round-trips.
+      // Capability negotiation keeps older/custom gateways on their EOF
+      // protocol instead of assuming method-not-found behavior.
+      if (asked === null && this._supportsShutdownHandshake) {
+        nativeShutdown = "unanswered";
+        try {
           const response = await this._sendAsyncWithTimeout(
             {
               jsonrpc: "2.0",
-              id: `mobkit-shutdown-${randomUUID()}`,
+              id: `meta-shutdown-${randomUUID()}`,
               method: GATEWAY_SHUTDOWN_METHOD,
               params: {},
             },
             this._shutdownHorizonMs,
             child,
           );
-          validateGatewayShutdownResponse(response);
+          // An answer that does not attest the gateway's cleanup is a refusal.
+          nativeShutdown = "refused";
+          nativeShutdown = validateGatewayShutdownResponse(response);
+        } catch (error) {
+          shutdownError = error instanceof Error ? error : new Error(String(error));
         }
-      } catch (error) {
-        shutdownError = error instanceof Error ? error : new Error(String(error));
+        if (this._process === child) {
+          this._nativeShutdown = nativeShutdown;
+          this._nativeShutdownError = shutdownError;
+        }
       }
       const elapsedMs = performance.now() - shutdownStarted;
-      const remainingGraceMs = Math.max(
-        0,
-        this._shutdownHorizonMs - elapsedMs,
-      );
-      await stopChildProcess(child, waitForChildExit, remainingGraceMs);
+      const remainingGraceMs = graceSpent
+        ? 0
+        : Math.max(0, this._shutdownHorizonMs - elapsedMs);
+      await stopChildProcess(child, this._waitForExit, remainingGraceMs, progress);
       childTerminated = true;
       if (shutdownError !== null) {
         throw new Error(
@@ -682,6 +927,12 @@ export class PersistentTransport {
         );
       }
     })().finally(() => {
+      if (this._process === child) {
+        // Read from this exact child before it is released or kept: an exit
+        // after the last bounded wait is recorded as the exit it was.
+        this._attemptedEscalation = progress.escalation;
+        this._lastTermination = terminationOf(child, progress.escalation, nativeShutdown);
+      }
       if (
         this._process === child &&
         (childTerminated || childHasExited(child))
@@ -698,8 +949,20 @@ export class PersistentTransport {
     return stopping;
   }
 
+  /**
+   * What the most recent completed `stop()` observed for this transport's
+   * current or last gateway process: its exit, the escalation it attempted
+   * and the gateway's own shutdown answer (see {@link TransportTermination}).
+   * `null` while the current process runs or its stop has not finished; a
+   * new process never inherits an earlier one's record.
+   */
+  lastTermination(): TransportTermination | null {
+    return this._lastTermination;
+  }
+
   isRunning(): boolean {
-    return this._process !== null && this._process.exitCode === null;
+    // A process killed by a signal has a null exit code but has exited.
+    return this._process !== null && !childHasExited(this._process);
   }
 
   /**
@@ -709,20 +972,20 @@ export class PersistentTransport {
    * of panic-hook lines in one production fleet. Opt-outs, mirroring the
    * Python SDK:
    *
-   * - `MOBKIT_GATEWAY_STDERR_FILE=<path>`: append gateway stderr to a file.
-   * - `MOBKIT_GATEWAY_STDERR=devnull`: discard (the pre-0.8.9 default).
+   * - `META_GATEWAY_STDERR_FILE=<path>`: append gateway stderr to a file.
+   * - `META_GATEWAY_STDERR=devnull`: discard (the pre-0.8.9 default).
    */
   private _stderrDisposition(): "inherit" | "ignore" | number {
     if (this._stderrFd !== null) {
       closeSync(this._stderrFd);
       this._stderrFd = null;
     }
-    const stderrPath = (this._env.MOBKIT_GATEWAY_STDERR_FILE ?? "").trim();
+    const stderrPath = (this._env.META_GATEWAY_STDERR_FILE ?? "").trim();
     if (stderrPath) {
       this._stderrFd = openSync(stderrPath, "a");
       return this._stderrFd;
     }
-    const optOut = (this._env.MOBKIT_GATEWAY_STDERR ?? "").trim().toLowerCase();
+    const optOut = (this._env.META_GATEWAY_STDERR ?? "").trim().toLowerCase();
     if (optOut === "devnull") {
       return "ignore";
     }
@@ -734,6 +997,15 @@ export class PersistentTransport {
       throw new Error("persistent transport is stopping");
     }
     if (!this.isRunning()) {
+      // Decided on the initialized instance: a subclass's startAsync class
+      // field is assigned only after this base constructor has run.
+      if (this._hostComposed || this.startAsync !== PersistentTransport.prototype.startAsync) {
+        throw new GatewayRestartRefusedError(
+          this._process === null
+            ? "its gateway process is not started"
+            : "its gateway process exited",
+        );
+      }
       this.start();
     }
   }
@@ -750,7 +1022,7 @@ export function createGatewaySyncTransport(
   return (request: JsonRpcRequest): unknown => {
     const requestJson = JSON.stringify(request);
     const out = spawnSync(gatewayBin, [], {
-      env: { ...process.env, MOBKIT_RPC_REQUEST: requestJson },
+      env: { ...process.env, META_RPC_REQUEST: requestJson },
       encoding: "utf8",
     });
 
@@ -778,7 +1050,7 @@ export function createGatewayAsyncTransport(
     new Promise<unknown>((resolve, reject) => {
       const requestJson = JSON.stringify(request);
       const child = spawn(gatewayBin, [], {
-        env: { ...process.env, MOBKIT_RPC_REQUEST: requestJson },
+        env: { ...process.env, META_RPC_REQUEST: requestJson },
         stdio: ["ignore", "pipe", "pipe"],
       });
 

@@ -14,7 +14,7 @@ const repoRoot = path.join(__dirname, "..", "..");
 const binary = resolveFlowEditorBinary();
 // A spawned editor binds port 0 and announces the bound address; a fixed
 // port collides with anything else on the host using it.
-let baseUrl = process.env.MOBKIT_FLOW_EDITOR_INTERACTIONS_URL;
+let baseUrl = process.env.META_FLOW_EDITOR_INTERACTIONS_URL;
 const shouldSpawn = !baseUrl;
 
 function waitForReady(url, child) {
@@ -22,7 +22,7 @@ function waitForReady(url, child) {
   return new Promise((resolve, reject) => {
     const poll = () => {
       if (child && child.exitCode !== null) {
-        reject(new Error(`mobkit_flow_editor exited before ready with status ${child.exitCode}`));
+        reject(new Error(`meta_flow_editor exited before ready with status ${child.exitCode}`));
         return;
       }
       const req = http.request(url, { method: "GET" }, (res) => {
@@ -53,7 +53,7 @@ async function chooseFirstRealAgentDefinition(page) {
     const option = options.find((candidate) => candidate.value && !candidate.disabled);
     return option?.value || "";
   });
-  if (!value) throw new Error("Agent Editor did not expose any real MobKit agent definitions");
+  if (!value) throw new Error("Agent Editor did not expose any real Meta agent definitions");
   await addDefinition.selectOption(value);
 }
 
@@ -93,18 +93,18 @@ async function main() {
   let serverReady = null;
   let draftDir = null;
   if (shouldSpawn) {
-    draftDir = fs.mkdtempSync(path.join(os.tmpdir(), "mobkit-flow-editor-interactions."));
+    draftDir = fs.mkdtempSync(path.join(os.tmpdir(), "meta-flow-editor-interactions."));
     server = spawn(binary, ["--listen", LOOPBACK_ANY_PORT], {
       cwd: repoRoot,
       env: {
         ...process.env,
-        MOBKIT_FLOW_EDITOR_DRAFT_STORE: path.join(draftDir, "drafts.json"),
+        META_FLOW_EDITOR_DRAFT_STORE: path.join(draftDir, "drafts.json"),
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
     // Listen for the ready line from the spawn on: output is not replayed
     // for a listener attached after the browser launch below.
-    serverReady = awaitFixtureReady(server, { label: "mobkit_flow_editor", timeoutMs: 60_000 });
+    serverReady = awaitFixtureReady(server, { label: "meta_flow_editor", timeoutMs: 60_000 });
     serverReady.catch(() => {}); // Awaited (and reported) inside the try below.
     server.stdout.on("data", (chunk) => process.stdout.write(chunk));
     server.stderr.on("data", (chunk) => process.stderr.write(chunk));
@@ -144,7 +144,7 @@ async function main() {
     );
     const graphNodeCountAfter = await page.locator(memberNodes).count();
     if (graphNodeCountAfter <= graphNodeCountBefore) {
-      throw new Error(`Graph add menu did not create a MobKit graph node: before=${graphNodeCountBefore} after=${graphNodeCountAfter}`);
+      throw new Error(`Graph add menu did not create a Meta graph node: before=${graphNodeCountBefore} after=${graphNodeCountAfter}`);
     }
 
     const movedNode = page.locator(memberNodes).last();
@@ -158,7 +158,7 @@ async function main() {
     await page.waitForTimeout(1_000);
     const afterMove = await movedNode.boundingBox();
     if (!afterMove || Math.abs(afterMove.x - beforeMove.x) < 100 || Math.abs(afterMove.y - beforeMove.y) < 40) {
-      throw new Error(`Graph drag did not move through MobKit graph projection: before=${JSON.stringify(beforeMove)} after=${JSON.stringify(afterMove)}`);
+      throw new Error(`Graph drag did not move through Meta graph projection: before=${JSON.stringify(beforeMove)} after=${JSON.stringify(afterMove)}`);
     }
 
     const sourceNode = page.locator(memberNodes).first();
@@ -213,7 +213,7 @@ async function main() {
     await page.waitForTimeout(1_000);
     const titleValue = await titleInput.inputValue();
     if (titleValue !== "Browser Interaction Agent") {
-      throw new Error(`Agent Editor title did not reflect MobKit operation result: ${titleValue}`);
+      throw new Error(`Agent Editor title did not reflect Meta operation result: ${titleValue}`);
     }
 
     const toolSelect = page.locator("select").filter({ has: page.locator('option[value="image_generation"]') }).first();
@@ -260,7 +260,7 @@ async function main() {
     }
     await adaptiveBlock.locator(".bld-afan__empty").waitFor({ state: "visible", timeout: 10_000 });
 
-    // Selecting a FlowMaster round-trips MobKit and retitles the block node.
+    // Selecting a FlowMaster round-trips Meta and retitles the block node.
     const adaptivePanel = page.locator(".bld-panel");
     const flowmasterSelect = adaptivePanel.locator("select.field__select").first();
     const flowmasterPick = await flowmasterSelect.locator("option").evaluateAll((options) => {
@@ -317,7 +317,7 @@ async function main() {
     await page.waitForTimeout(500); // unfocused draft resyncs from the document
     const promptAfterBlur = await promptArea.inputValue();
     if (promptAfterBlur !== "plan and deep wide layers  ") {
-      throw new Error(`Adaptive prompt did not round-trip verbatim through MobKit: ${JSON.stringify(promptAfterBlur)}`);
+      throw new Error(`Adaptive prompt did not round-trip verbatim through Meta: ${JSON.stringify(promptAfterBlur)}`);
     }
 
     // A limits edit round-trips and re-renders the block head (max depth).

@@ -1,6 +1,6 @@
 # flow-editor-components
 
-`@flow-editor-components` is the MobKit Flow Editor's React view layer,
+`@flow-editor-components` is the Meta Flow Editor's React view layer,
 moved verbatim from the legacy `flow-editor/src/*.jsx` files. Components
 render props and call the controller facade; they own no networking and no
 document state.
@@ -30,9 +30,9 @@ the window global that `react-globals.js` provides (ambient declaration in
 
 ## The facade contract
 
-Components call `window.MobKitFlowController.*` at render/handler time — not
+Components call `window.MetaFlowController.*` at render/handler time — not
 import time. That global is the runtime contract between the views and
-`@flow-editor-core`'s `createMobKitFlowController` (the exact ordinary and
+`@flow-editor-core`'s `createMetaFlowController` (the exact ordinary and
 test-only export sets in `flow-editor/test/controller-export-manifest.json`
 are pinned by `controller-export-keys.test.cjs`); the shell assigns it once
 at module scope. Views must not import the RPC client or call `fetch` themselves —
@@ -55,9 +55,9 @@ rewriting moved render bodies.
 
 ## Workspace-private
 
-This package is private to the MobKit repository. `@flow-editor-components`
+This package is private to the Meta repository. `@flow-editor-components`
 is a build-time alias, not an npm-published package name; external consumers
-must not depend on it until MobKit makes an explicit public-package decision.
+must not depend on it until Meta makes an explicit public-package decision.
 
 ## Window-global surface change (extraction note)
 
@@ -65,6 +65,6 @@ The legacy concat build leaked every view component onto `window`
 (`window.GraphEditor`, `window.Inspector`, the `Tweak*` family, …) as its
 linking mechanism. The bundled shell no longer exposes those globals — the
 only intentional window surface of the shipped artifact is
-`window.MobKitFlowController` (and `window.MOBKIT_BOOT`). Page scripts or
+`window.MetaFlowController` (and `window.META_BOOT`). Page scripts or
 embedders that touched the old component globals must import this package
 instead.

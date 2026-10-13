@@ -1,6 +1,6 @@
 # Independent extension-state and native adapter review
 
-Date: 2026-10-05. Reviewed the current uncommitted MobKit worktree, the
+Date: 2026-10-05. Reviewed the current uncommitted Meta worktree, the
 upstream Meerkat creation/activation changes, and a downstream adapter
 (`src/native.rs` and `tests/native.rs` in its separate repository). This reviewer authored the design; different agents wrote
 the implementation. This pass changed documentation only and ran no builds.
@@ -9,7 +9,7 @@ the implementation. This pass changed documentation only and ran no builds.
 
 ### P1: Initial identity kickoff can acquire the temporary Worker principal
 
-Primary location: `crates/meerkat-mobkit/src/extension_state.rs`,
+Primary location: `crates/meerkat-meta/src/extension_state.rs`,
 `NativeAuthorityRegistry::principal` (lines 252-280 before formatting).
 
 An absent retained identity binding plus covered member birth is classified
@@ -38,7 +38,7 @@ on the subsequent turn and after restart.
 
 ### P2: Cold-resume registry retains a lifecycle watch that never updates
 
-Primary location: `crates/meerkat-mobkit/src/extension_state.rs:212-219`,
+Primary location: `crates/meerkat-meta/src/extension_state.rs:212-219`,
 the existing-handle replacement check in `before_activation`.
 
 Upstream `crates/meerkat-mob/src/runtime/builder.rs:7780` creates an isolated
@@ -79,7 +79,7 @@ propagates a failed read immediately. A valid ordering is: duplicate edit
 finds no receipt; the original identical edit commits; the owner deletes the
 document; the duplicate reads the tombstone and gets NotFound. The backend
 still retains and authorizes the original edit receipt against the tombstone
-ACL (`crates/mobkit-extension-state/src/sqlite.rs:126-135`), but the adapter
+ACL (`crates/meta-extension-state/src/sqlite.rs:126-135`), but the adapter
 returns unavailable instead of that receipt. The same request succeeds if
 retried once more, making the result depend on this narrow race.
 
@@ -261,7 +261,7 @@ different pending logical identity (`identity_publication.rs:132-153`).
 The subtree-denial evaluator remains correct in the inspected source. It
 distinguishes no audience route from a matching route with no data ceiling,
 then applies denies before owner or explicit child grants
-(`crates/mobkit-extension-state/src/policy.rs:26-46,72-90`). A zero source
+(`crates/meta-extension-state/src/policy.rs:26-46,72-90`). A zero source
 ceiling therefore cannot hide an ancestor from a deny. A direct child grant
 can independently authorize data when permitted, but cannot override a
 matching subtree deny. The current caller's native policy and ABAC still
@@ -271,7 +271,7 @@ directly lock down the nested-option distinction.
 
 ### P1: Retained metadata seam omitted by service wrappers - repaired in source
 
-When `source_ceiling` moved to `load_retained_session_metadata`, MobKit's
+When `source_ceiling` moved to `load_retained_session_metadata`, Meta's
 `delegate_mob_session_service!` and `AfterCreateMobSessionService` still
 forwarded only ordinary metadata reads. They therefore inherited the new
 upstream method's `Unsupported` default. The normal persistent constructor
@@ -310,7 +310,7 @@ this exercises the relevant failure-state predicates. Compilation and runtime
 results remain pending. This re-review made no production changes and ran no
 builds or tests.
 
-## Final focused source pass at MobKit c4e60f1e936a934608de02e167226bbfa706b947
+## Final focused source pass at Meta c4e60f1e936a934608de02e167226bbfa706b947
 
 No new production defect was found in this bounded pass. The prior retained
 metadata forwarding repair is present in both wrapper implementations
@@ -342,7 +342,7 @@ actual agent's `delegate` call delivers the registered bundle into its child
 mob, captures the parent from the executing session, and registers the child
 handle before its first native extension-probe dispatch.
 
-Source wiring exists: MobKit supplies the shared dispatcher and pre-activation
+Source wiring exists: Meta supplies the shared dispatcher and pre-activation
 callback to `MobMcpState` (`unified_runtime/builder.rs:1953-1973`). Upstream
 `configure_builder` applies them for child create and restore
 (`meerkat-mob-mcp/src/lib.rs:1463-1478,1671-1675`); child definitions receive
@@ -380,7 +380,7 @@ or tests and does not treat queued tests as passed.
 ## Implementation response to delegation acceptance scope
 
 The actual native delegate lifetime narrows the requested restart case:
-MobKit currently composes implicit child mobs with in-memory journals, and
+Meta currently composes implicit child mobs with in-memory journals, and
 delegate completion retires the helper together with its fork descendants.
 The new probe fixture exercises actual cross-mob delegation, native fork_off,
 private denial, explicit Reader sharing and revocation while those members

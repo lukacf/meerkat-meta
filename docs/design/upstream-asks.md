@@ -8,7 +8,7 @@ authoritative only through the explicit status line under each ask.
 
 **Open actionable asks: none.** All 40 tracked asks now have an explicit
 closed or shipped disposition. Ask 34 shipped in Meerkat 0.7.30 via PR #879
-(`9300fcf0df351125c6196d25a1cf97b8b26f3faa`) and was adopted in MobKit
+(`9300fcf0df351125c6196d25a1cf97b8b26f3faa`) and was adopted in Meta
 0.7.37 via PR #277 (`5f22e445`). Ask 35 shipped in Meerkat 0.7.30 via PR #878
 (`d084689a84c27c0a6daefcd926952110a967abfd`).
 
@@ -19,34 +19,34 @@ only unfinished property was split out and is tracked exclusively as ask 34.
 Ask 31's rollback half and asks 33/10/29 shipped changelog-silent and were
 source-verified 2026-07-12.
 
-**Mobkit adoption:**
+**Meta adoption:**
 - **0.7.35**: ask 32 (retire-disposition fence — 0.7.34 drain-poll workaround
   removed), ask 14 (`MemberProgressSnapshot` on member_status wire + SDK types
   + identity-inspect projection), ask 28 (objective events projected), ask 27
-  (verified no mobkit surface consumes the receipt — outcomes reach agents
+  (verified no meta surface consumes the receipt — outcomes reach agents
   upstream).
 - **0.7.36**: ask 29 (`SpawnMemberSpec.model_override` field-scoped seam for
   model-only reprofiles — whole-profile snapshot retained only for
   provider-pinned profiles, since upstream does not re-infer the provider
   under `model_override`), ask 31's rollback half acknowledged (resume
-  rollback restores to durable idle; MobKit forwards the retired-session
+  rollback restores to durable idle; Meta forwards the retired-session
   revival seam and carries ask 34's ignored end-to-end acceptance test, but
   ordinary resume does not auto-revive yet; the 0.7.34 GONE-probe stays as a
   regression tripwire), ask 33 acknowledged (busy_timeout 5s→60s +
-  `SqliteConnectionOptions`; `MOBKIT_IDENTITY_RESTORE_CONCURRENCY` can return
+  `SqliteConnectionOptions`; `META_IDENTITY_RESTORE_CONCURRENCY` can return
   to its default of 4, knob retained). Ask 10 (call-level fork authorization)
-  has no mobkit surface to adopt.
+  has no meta surface to adopt.
 - **0.7.37**: all Meerkat pins moved to 0.7.30 and ask 34's end-to-end
   retired-session revival acceptance test was un-ignored. Ordinary cold
   restart now revives the same archived + retired session identity with its
   transcript intact; the Bug I manual row-copy repair is no longer needed on
   Meerkat 0.7.30+.
 
-At the 2026-07-12 checkpoint, the non-ask follow-ups were a MobKit
-console-health affordance from ask 14's progress data, an optional MobKit
+At the 2026-07-12 checkpoint, the non-ask follow-ups were a Meta
+console-health affordance from ask 14's progress data, an optional Meta
 gateway projection for M4's already-shipped terminal-status query, and refresh
 of Meerkat's downstream compatibility table after M3. **Follow-up update
-(2026-09-22):** the console-health affordance subsequently landed in MobKit
+(2026-09-22):** the console-health affordance subsequently landed in Meta
 PR #279 (`f3db01834548ede68faf56bfd2d8cba8a8fea3c3`, 2026-07-13) and is no
 longer outstanding. The M4 projection and compatibility-table refresh are
 separate local projection/documentation follow-ups, not open upstream runtime
@@ -54,22 +54,22 @@ asks.
 
 Everything else in this document is **closed, shipped, superseded, or retired
 as a separate upstream ask**. In particular, ask 12 was fixed before it was
-filed, ask 13's operational incidents were closed by a MobKit-local forwarder
+filed, ask 13's operational incidents were closed by a Meta-local forwarder
 fix plus later Meerkat member-scoped failure containment, and the previously
 status-less Studio M1–M4 reports now carry explicit closure lines below.
 
 > **Handed to the meerkat coding agent by Luka (2026-07-02).** Eight asks for
-> the meerkat repo, derived from the MobKit memory initiative
+> the meerkat repo, derived from the Meta memory initiative
 > ([`agent-memory-architecture.md`](agent-memory-architecture.md) §13) and
 > refined by what its implementation actually found. **None of these block
-> MobKit** — every ask has a shipped MobKit interim behavior, so land them in
+> Meta** — every ask has a shipped Meta interim behavior, so land them in
 > whatever order fits meerkat's own constraints. Each ask states the problem,
 > code-verified evidence, a proposed shape (a starting point, not a contract —
 > deviate where meerkat's internals argue otherwise, but preserve the stated
-> *property*), and what MobKit does today / will do when it lands.
+> *property*), and what Meta does today / will do when it lands.
 >
 > **Suggested sequencing by impact:**
-> 1. **Ask 1 + Ask 3** (same seam, one change set) — unlocks MobKit flipping
+> 1. **Ask 1 + Ask 3** (same seam, one change set) — unlocks Meta flipping
 >    ambient per-turn memory injection on by default, echo-safe by
 >    construction, and closes the injection-channel-authenticity gap.
 > 2. **Ask 2 (+ Ask 8, natural pair)** — stops the per-build re-embed tax that
@@ -83,7 +83,7 @@ status-less Studio M1–M4 reports now carry explicit closure lines below.
 >    quality-of-life; no urgency.
 
 Evidence citations were code-verified against meerkat 0.7.9 (the version
-MobKit pins) and the mobkit `feat/agent-memory-system` branch; line numbers
+Meta pins) and the meta `feat/agent-memory-system` branch; line numbers
 may have drifted. The memory-survey archive
 ([`../archive/design/evidence/memory-survey-2026-07/followups.md`](../archive/design/evidence/memory-survey-2026-07/followups.md))
 holds the original deep-dive evidence.
@@ -99,15 +99,15 @@ separate transcript class and is excluded from semantic-memory indexing.
 **Title:** Add a typed injected-context message class that
 `indexable_content()` excludes from compaction indexing
 
-**Problem statement.** Hosts that inject ambient context into a turn (MobKit
+**Problem statement.** Hosts that inject ambient context into a turn (Meta
 injects agent-memory recall blocks) have no message class to deliver it in.
 `ContentInput` has no role field, so the injection is fused into the user's
 own message text and persists verbatim in the transcript. At compaction,
 `indexable_content()` classifies `Message::User` as
 `Indexable(u.text_content())` unconditionally, so every discarded injected
-turn deposits a full copy of the injection block (~18.5 KB at MobKit
+turn deposits a full copy of the injection block (~18.5 KB at Meta
 defaults) into session-scoped semantic memory. The result is linear,
-unbounded-within-a-session pollution of `memory_search` (MobKit defect D1):
+unbounded-within-a-session pollution of `memory_search` (Meta defect D1):
 duplicate near-identical entries progressively dominate results for any query
 overlapping the injected records' vocabulary.
 
@@ -123,13 +123,13 @@ overlapping the injected records' vocabulary.
 - Indexing of every discarded message on every successful compaction:
   `meerkat-core/src/agent/state.rs:1265` (call site), `state.rs:1362-1431`
   (session-scoped `MemoryIndexScope`).
-- MobKit side of the fusion: `crates/meerkat-mobkit/src/identity_first/runtime.rs:2425-2448`
+- Meta side of the fusion: `crates/meerkat-meta/src/identity_first/runtime.rs:2425-2448`
   (every non-Steer send passes through `inject_for_turn`),
   `identity_first/agent_memory.rs:854-871` (`prepend_memory_injection`
   physically concatenates: `format!("{injection}\n\nCurrent user
   message:\n{text}")`).
 - No filter exists for the injection marker: `grep
-  mobkit_memory_observation` over meerkat-core and meerkat-memory returns
+  meta_memory_observation` over meerkat-core and meerkat-memory returns
   zero hits (survey, `followups.md` §1).
 
 **Proposed shape.** A first-class injected-context delivery class — either a
@@ -140,28 +140,28 @@ host attach injected-context messages alongside (not inside) the user's
 content on the submit-work path.
 
 **Coupling note (important).** This ask alone is not sufficient, and it is
-explicitly coupled to a MobKit-side restructuring
-(`agent-memory-architecture.md` §9.1): because MobKit today *fuses* the
+explicitly coupled to a Meta-side restructuring
+(`agent-memory-architecture.md` §9.1): because Meta today *fuses* the
 injection into the user's message text, a role class applied to the fused
 message would either exclude nothing or exclude the operator's real words
-along with the injection. MobKit must stop fusing and deliver injected bodies
+along with the injection. Meta must stop fusing and deliver injected bodies
 as a **separate typed message** — the ask and the restructuring land
 together.
 
 **Second rationale: channel authenticity.** The injection envelope is plain
 text an attacker can reproduce — a peer message or echoed web content can
 forge "remembered operator preferences" verbatim, inheriting whatever
-authority the model grants real memory. MobKit's interim mitigations (inbound
+authority the model grants real memory. Meta's interim mitigations (inbound
 defanging of reserved envelope markers, a per-session nonce) are bar-raising,
 not authoritative. A typed message class gives injected memory an
 authenticated channel instead of a text pattern (§9.1 anti-spoofing).
 
-**MobKit interim behavior.** Per-turn ambient push defaults **off**
+**Meta interim behavior.** Per-turn ambient push defaults **off**
 (`agent_memory.per_turn_injection = "off" | "budgeted"`); the opt-in
 `budgeted` mode carries the full budget ladder and dedup. All *default*
 injection surfaces are already-excluded message classes (system prompt, tool
 results). The per-turn default flips to on only when both halves — this ask
-and MobKit's separate-typed-message delivery — have landed.
+and Meta's separate-typed-message delivery — have landed.
 
 ---
 
@@ -180,7 +180,7 @@ operations, permanently orphaning rows. And the cost of orphans is not just
 disk: the store re-embeds *every* row in the shared DB on *every* agent
 build in the realm, so orphan growth taxes all future builds with CPU, RAM,
 and startup latency — monotonically, with no cleanup facility of any kind
-(MobKit defect D3, storage half).
+(Meta defect D3, storage half).
 
 **Evidence.**
 - The `MemoryStore` trait has exactly three methods — `index_scoped`,
@@ -198,9 +198,9 @@ and startup latency — monotonically, with no cleanup facility of any kind
   text (`hnsw.rs:344`), and constructs an in-memory HNSW graph per session id
   found — including orphaned sessions nothing will ever search
   (`hnsw.rs:348-354`).
-- Host lifecycle rotates session ids: MobKit's `mobkit/respawn` RPC is always
+- Host lifecycle rotates session ids: Meta's `meta/respawn` RPC is always
   a mob-level retire+spawn that mints a fresh `SessionId` and rebinds
-  continuity (`crates/meerkat-mobkit/src/rpc.rs:2937-2972`; meerkat-mob
+  continuity (`crates/meerkat-meta/src/rpc.rs:2937-2972`; meerkat-mob
   `actor.rs:14553` builds the replacement with no `resume_session`); `reset`
   mints a new id by design; resume has a fresh-spawn fallback; retire/delete
   leave all rows behind forever (survival matrix in `followups.md` §2).
@@ -213,10 +213,10 @@ and startup latency — monotonically, with no cleanup facility of any kind
    embeds only the requested scope's rows instead of rebuilding every
    session's graph in the realm on every agent build.
 
-**MobKit interim behavior.** Orphan growth is documented as a known cost.
-The *knowledge* half of D3 is handled MobKit-side regardless:
+**Meta interim behavior.** Orphan growth is documented as a known cost.
+The *knowledge* half of D3 is handled Meta-side regardless:
 distill-before-rotation (initiative P2) runs the Distiller over the session
-before respawn/reset rotates it, so what mattered survives in MobKit's own
+before respawn/reset rotates it, so what mattered survives in Meta's own
 identity-keyed store even though the meerkat rows are stranded.
 
 ---
@@ -253,8 +253,8 @@ of ask 1.
 `Excluded(MemoryIndexExclusion::CompactionSummary)` for summaries. The seam
 is one line today; the role already exists and is already stamped.
 
-**MobKit interim behavior.** None required — the edge is meerkat-internal.
-MobKit's echo-safe injection posture (ask 1 interim) shrinks what leaks into
+**Meta interim behavior.** None required — the edge is meerkat-internal.
+Meta's echo-safe injection posture (ask 1 interim) shrinks what leaks into
 summaries in the first place, and the residual pollution is documented as a
 known defect rather than worked around.
 
@@ -269,7 +269,7 @@ also exposes the current head requested by the implementation refinement.
 **Title:** Let a host-supplied curator produce the compaction summary
 
 **Problem statement.** Summary generation is fixed inside the compactor; a
-host cannot supply or amend the summary content. MobKit's Hygienist
+host cannot supply or amend the summary content. Meta's Hygienist
 (`agent-memory-architecture.md` §8.6) targets the incremental-session-notes
 pattern proven out by Claude Code's SessionMemory/SM-compact: a
 continuously-maintained notes artifact that gets spliced in at the compaction
@@ -288,7 +288,7 @@ twice.
   (`claude-code/src/services/compact/compact.ts:614-624`,
   `sessionMemoryCompact.ts:479-480`; survey `followups.md` §1) — flag-gated
   in CC but the right shape (`agent-memory-architecture.md` §5, adopt list).
-- The MobKit consumer: Hygienist incremental-notes target, §8.6 — "a
+- The Meta consumer: Hygienist incremental-notes target, §8.6 — "a
   continuously-maintained notes artifact spliced in at the compaction
   boundary via upstream ask 4's curator seam would make compaction itself
   zero-LLM-cost."
@@ -301,7 +301,7 @@ gates the compaction commit — "never lose the only copy") and compose with
 ask 3's exclusion so a curated summary is not itself re-indexed later.
 Marked **later** in §13 — valuable, not urgent.
 
-**MobKit internal parked engine.** Meerkat's standard compaction stays as-is.
+**Meta internal parked engine.** Meerkat's standard compaction stays as-is.
 The retained Hygienist engine can use meerkat's existing audited same-session
 transcript revisions
 (`session/rewrite_transcript` / `session/transcript_revision` /
@@ -312,7 +312,7 @@ memory mutation.
 meerkat 0.7.9).** The revision *apply* surface is reachable and used:
 `PersistentSessionService` implements `SessionServiceTranscriptEditExt`
 (`rewrite_session_transcript` / `restore_session_transcript_revision`) and
-MobKit's internal seam can accept the concrete typed service (the erased
+Meta's internal seam can accept the concrete typed service (the erased
 `MobSessionService` does not carry the edit extension), but the public SDK and
 gateway do not activate it in this release. One adjacent read gap remains:
 **no `SessionService`-level API
@@ -384,13 +384,13 @@ defense:
    path can classify synchronously instead of racing the observe stream.
    Marked **later** in §13.
 
-**MobKit interim behavior.** P1 ships the coarse deterministic posture: a
+**Meta interim behavior.** P1 ships the coarse deterministic posture: a
 content-trust configuration (web/fetch always untrusted; MCP servers
 untrusted by default with an explicit allowlist) plus an observe-stream
 tracker that marks the session tainted — session-sticky, cleared only at
 fresh-context boundaries — with the first-ingestion race documented. P2
 ships the comms taint join over what the observe surface actually carries
-(implemented in `crates/meerkat-mobkit/src/memory/taint.rs`,
+(implemented in `crates/meerkat-meta/src/memory/taint.rs`,
 `observe_inbound_peer_content`), and building it sharpened this ask:
 meerkat 0.7.9 has **no typed inbound peer-message event** — a delivery
 surfaces only as injected prompt text on the receiver's `RunStarted`
@@ -417,19 +417,19 @@ in Meerkat 0.7.29.
 a fork-launched member can be capability-contained without changing its tool
 list
 
-**Problem statement.** MobKit's memory Distiller wants to run as a fork of
+**Problem statement.** Meta's memory Distiller wants to run as a fork of
 the live session — `Session::fork`/`fork_at` are O(1) copy-on-write, and a
 fork shares the parent's prompt-cache prefix, making extraction nearly free
 in input tokens (the pattern Claude Code uses for exactly this workload). But
 prompt-cache identity requires a byte-identical prefix *including the tool
-list*, and the only fork path MobKit can reach —
+list*, and the only fork path Meta can reach —
 `MemberLaunchMode::Fork` / `fork_helper` — spawns a **live member carrying
 the parent's full tool surface**. An LLM stage whose entire job is reading
 possibly-poisoned transcript evidence cannot be handed live tools: that is an
 uncontained extractor. Containment must therefore live at the *authorization*
 layer (every call gated to an allowlist, e.g. read-only + a memory-write
 seam), not at tool-list subsetting (which breaks the cache) — and no such
-layer exists on the fork/spawn path today. The same gap forced MobKit's
+layer exists on the fork/spawn path today. The same gap forced Meta's
 memory Steward to be a shell-driven pipeline of structured calls instead of
 an agentic dream member.
 
@@ -444,7 +444,7 @@ an agentic dream member.
   list and gates via a `canUseTool` closure —
   `../archive/design/evidence/memory-survey-2026-07/followups.md` and
   `agent-memory-architecture.md` §8.4.
-- MobKit's decision record: `crates/meerkat-mobkit/src/memory/distiller.rs` module
+- Meta's decision record: `crates/meerkat-meta/src/memory/distiller.rs` module
   docs ("full tool surface … §8.4's fork containment") — the fork seam is
   named and parked there.
 
@@ -458,11 +458,11 @@ ordinary tool error. Composes with meerkat's fail-closed capability
 philosophy; dogma-wise it is an authorization seam, not a new semantic
 authority.
 
-**MobKit interim behavior.** The Distiller runs as a detached bounded
+**Meta interim behavior.** The Distiller runs as a detached bounded
 one-shot over a transcript slice read from the session store (correct but
-full-input-price; spend bounded by MobKit's background resource guards), and
+full-input-price; spend bounded by Meta's background resource guards), and
 the Steward is a deterministic multi-phase pipeline of structured LLM calls
-(the model holds no tools at all). When this ask lands, MobKit switches the
+(the model holds no tools at all). When this ask lands, Meta switches the
 interaction-triggered and pre-rotation distillation paths to session forks
 and can consider an agentic steward gather phase; the seam is documented in
 `distiller.rs` module docs.
@@ -479,7 +479,7 @@ occurrence lifecycle.
 mob members/sessions
 
 **Problem statement.** Schedule target bindings only address sessions and mob
-members. Host-internal periodic work — MobKit's memory steward is the
+members. Host-internal periodic work — Meta's memory steward is the
 concrete case: a scheduled consolidation "dream" that must NOT be a mob
 member (see Ask 6's containment problem) — cannot be expressed as a
 schedule, so it runs as a guarded `tokio` interval loop outside the schedule
@@ -488,9 +488,9 @@ cadence semantics, separate operational story.
 
 **Evidence.**
 - Target vocabulary: `meerkat-schedule` `TargetBinding::{Session, Mob}` —
-  verified during MobKit P3 implementation; no host-runnable variant.
+  verified during Meta P3 implementation; no host-runnable variant.
 - The workaround and its deliberate forward-compatibility:
-  `crates/meerkat-mobkit/src/memory/steward.rs` (`spawn_dream_loop`) uses the
+  `crates/meerkat-meta/src/memory/steward.rs` (`spawn_dream_loop`) uses the
   schedule subsystem's own interval-marker grammar
   (`parse_interval_marker_ms`) for its cadence config, so the config
   migrates unchanged the day a real target type exists; module docs carry
@@ -504,8 +504,8 @@ unchanged). No new machine semantics — the schedule/occurrence machines
 already own the lifecycle; this adds a target kind whose "delivery" is a
 host callback.
 
-**MobKit interim behavior.** The steward's interval loop stays; cadence
-config is already schedule-grammar-compatible. On landing, MobKit registers
+**Meta interim behavior.** The steward's interval loop stays; cadence
+config is already schedule-grammar-compatible. On landing, Meta registers
 the dream as a host runnable and deletes the loop.
 
 ---
@@ -521,7 +521,7 @@ paged deterministic reads with source-range and indexed-time filters.
 **Problem statement.** The `MemoryStore` trait exposes exactly
 `index_scoped`, `index_scoped_batch`, and `search` — similarity search is
 the *only* read surface. Hosts that need to read back what a scope contains
-must approximate enumeration with a generous-limit search query. MobKit hits
+must approximate enumeration with a generous-limit search query. Meta hits
 this in the post-compaction harvest: after `CompactionCompleted`, the
 Distiller reads the discarded message range host-side from meerkat's own
 session-memory store, and "read the discard range" becomes "one
@@ -533,7 +533,7 @@ cannot list), as does any re-derivation/re-indexing tooling.
 - Trait surface: `meerkat-core/src/memory.rs:404-434` — three methods, no
   list/enumerate/count.
 - The approximation and its honesty caveat:
-  `crates/meerkat-mobkit/src/memory/distiller.rs` (`HnswDiscardSource`) — one
+  `crates/meerkat-meta/src/memory/distiller.rs` (`HnswDiscardSource`) — one
   scoped `MemoryStore::search` with a generous limit per harvest, caveat
   documented in code ("search is the only read surface … approximates
   enumeration").
@@ -545,7 +545,7 @@ caller can fetch exactly the entries covering a transcript range). Read-only
 and additive — no change to indexing or search semantics; implementations
 that cannot page can return one page.
 
-**MobKit interim behavior.** The generous-limit search approximation, with
+**Meta interim behavior.** The generous-limit search approximation, with
 the limit sized to compaction discard batches. On landing, the harvest reads
 the exact range and the approximation caveat comes out of `distiller.rs`.
 
@@ -556,13 +556,19 @@ the exact range and the approximation caveat comes out of `distiller.rs`.
 > Seven further asks, derived from (a) the two §10.1 security gaps the shipped
 > taint firewall documents as upstream-gated, (b) the fork-Distiller seam that
 > ask 6's landing did not fully unlock, and (c) production evidence from
-> **operator_validator** — the most general MobKit deployment (one mob; hundreds of
+> **operator_validator** — the most general Meta deployment (one mob; hundreds of
 > years-lived durable identities in the personal-agents + domain-agents +
 > task-agents pattern; multi-GB sessions; BigQuery-backed custom stores; heavy
 > agent-spawned worker churn). The operator deployment's own filed docs (in
 > `operator_validator/docs/`, commit `c36c105`) are the authoritative specs for
-> asks 11–13 — work from them directly. None of these block MobKit; every ask
+> asks 11–13 — work from them directly. None of these block Meta; every ask
 > states the interim behavior.
+>
+> *Locator note:* `operator_validator` is a pseudonymous, redacted stand-in for
+> the operator deployment's private repository. Every `operator_validator/...`
+> path, line number and commit cited in this document refers to that
+> repository (the filed specs at commit `c36c105`, the evidence citations at
+> its HEAD of 2026-07-04) and cannot be resolved from this tree.
 >
 > **Suggested sequencing by impact:**
 > 1. **Ask 11** (incremental session persistence) — the standing scale wall;
@@ -575,8 +581,9 @@ the exact range and the approximation caveat comes out of `distiller.rs`.
 >    over multi-GB transcripts).
 > 5. **Ask 14 + Ask 15** — quality-of-life; no urgency.
 >
-> Evidence citations verified against meerkat 0.7.15 and mobkit `main`
-> (post-#218/#219); the operator deployment citations against `operator_validator` HEAD 2026-07-04.
+> Evidence citations verified against meerkat 0.7.15 and meta `main`
+> (post-#218/#219); the operator deployment citations against `operator_validator` HEAD 2026-07-04
+> (a pseudonymous locator; see the locator note above).
 
 ## Ask 9 — Dispatch-time content-taint visibility + `ToolDef` provenance
 
@@ -587,7 +594,7 @@ than relying on name parsing and a lagging observe-only signal.
 **Title:** Give hosts a synchronous taint signal at tool dispatch, and typed
 tool provenance (completes Ask 5)
 
-**Problem statement.** MobKit's content-taint tracker derives taint from the
+**Problem statement.** Meta's content-taint tracker derives taint from the
 asynchronous observe stream, which leaves two documented, deliberate gaps:
 (1) the **first-ingestion race** — a memory write in the same turn as the
 session's *first* untrusted ingestion can reach the store before the taint
@@ -596,14 +603,14 @@ tool events carry only the tool NAME, so MCP tools can only be attributed to
 a server when their names are server-qualified (`mcp__<server>__<tool>`);
 anything else needs manual `untrusted_tools` config.
 
-**Historical evidence and correction.** The filing-time MobKit
-`crates/meerkat-mobkit/src/memory/taint.rs` module docs recorded the first-ingestion
+**Historical evidence and correction.** The filing-time Meta
+`crates/meerkat-meta/src/memory/taint.rs` module docs recorded the first-ingestion
 race and that its asynchronous tool events carried names without
 `ToolDef.provenance`. The original report incorrectly generalized this to
 missing upstream APIs in Meerkat 0.7.15: `ToolDef.provenance` and
 provenance-bearing `HookToolCall`/`HookToolResult` payloads were already present
 in that release (`84ecb083e982929d06217185acdcfc2f0182fffb`). This corrects
-the reported upstream diagnosis, not the historical MobKit observer-only
+the reported upstream diagnosis, not the historical Meta observer-only
 integration limitation; upstream capability availability and a host
 composition's use of those capabilities are separate adoption questions.
 
@@ -614,7 +621,7 @@ such that the host can classify "untrusted content is entering this session"
 builtin / MCP server id / bundle / host) surfaced on dispatch events, so
 classification stops guessing from name shapes.
 
-**MobKit interim behavior.** Session-sticky async taint (conservative), plus
+**Meta interim behavior.** Session-sticky async taint (conservative), plus
 the `agent_memory.llm_writes = "quarantined"` posture knob for deployments
 that cannot accept the race. On landing: dispatch-time classification closes
 the race; name-shape probing and the `untrusted_tools` escape hatch shrink to
@@ -623,7 +630,7 @@ compat.
 ## Ask 10 — Fork tool authorization + fork-from-persisted (completes Ask 6)
 
 **SHIPPED in meerkat 0.7.29** (PR #874, changelog-silent — call-level fork
-authorization landed at its ownership boundary; no mobkit surface to adopt).
+authorization landed at its ownership boundary; no meta surface to adopt).
 Historical status before PR #874: OPEN, NARROWED (2026-07-10) to call-level
 fork authorization only. `PersistentSessionService` already resolved
 transcript-edit sources from the authoritative persisted session when no live
@@ -639,14 +646,14 @@ persisted (non-live) session
 members, but the fork-Distiller was blocked on two specifics:
 `SessionForkAtRequest` carried no `tool_access_policy` (fork authorization was
 build-time only), and
-`fork_session_at` requires a LIVE parent session — while MobKit's
+`fork_session_at` requires a LIVE parent session — while Meta's
 reset/resume-fallback/compaction distillations run AFTER teardown, reading
 from the session store.
 
 **Evidence.** meerkat-core 0.7.15 `service/mod.rs:1632-1636`
 (`SessionForkAtRequest { message_index, running_behavior }` — no policy
 field); the fork-harness seam documented in
-`crates/meerkat-mobkit/src/memory/distiller.rs` module docs ("TODO(§8.4 fork
+`crates/meerkat-meta/src/memory/distiller.rs` module docs ("TODO(§8.4 fork
 harness)").
 
 **Proposed shape.** Add `tool_access_policy: Option<ToolAccessPolicy>` to
@@ -654,7 +661,7 @@ the fork request family (fork-at / fork-replace), and a
 fork-from-persisted path (parent loaded from the session store when not in
 the live map) preserving the prompt-cache prefix.
 
-**Historical MobKit interim behavior.** The Distiller ran detached bounded
+**Historical Meta interim behavior.** The Distiller ran detached bounded
 extraction over a bare LLM client (zero tools — so no containment gap, only foregone
 prompt-cache economics). On landing, extraction moves to a fork sharing the
 parent's cached prefix — material at production-scale multi-GB transcripts.
@@ -680,16 +687,18 @@ mechanism meant to bound context growth unbounds storage growth.
 (authoritative; includes the trait sketch:
 `append_messages` / `commit_rewrite` / `save_head` / `load_head` /
 `load_messages`). The operator deployment's chunked-persistence mitigation:
-`operator_validator/src/meerkat/session.rs:39-73`.
+`operator_validator/src/meerkat/session.rs:39-73`. (Pseudonymous locators:
+both paths refer to the operator deployment's private repository at the
+versions in the locator note in the introduction.)
 
 **Proposed shape.** As the operator deployment's spec: an additive `IncrementalSessionStore`
 trait with append/rewrite-commit semantics; whole-blob `SessionStore` remains
 the compat surface. Compaction commits a *rewrite* (shrinking the head), not
 a superset blob.
 
-**MobKit interim behavior.** None needed in mobkit itself; the operator deployment carries
+**Meta interim behavior.** None needed in meta itself; the operator deployment carries
 chunked plain-text persistence as a workaround. This ask also sets the
-persistence contract MobKit's memory providers will follow (memory writes
+persistence contract Meta's memory providers will follow (memory writes
 must stay O(delta) — architecture §12 discipline).
 
 ## Ask 12 — Compaction-archive must not strand singletons
@@ -726,7 +735,7 @@ ArchiveSession shrink-save can hit `MonotonicityViolation`; there is no
 bridge fallback, and the roster keeps a ghost entry. Respawn/reset cannot
 recover the identity — only a full process restart. For fleets of years-lived
 singletons this is a standing incident class, and compaction boundaries are
-exactly where MobKit's Distiller harvest hooks live.
+exactly where Meta's Distiller harvest hooks live.
 
 **Evidence + spec.** `operator_validator/docs/MEERKAT_BUG_compaction_archive_singleton.md`
 (authoritative repro + trace).
@@ -735,13 +744,13 @@ exactly where MobKit's Distiller harvest hooks live.
 sequence around) the shrink, and give the failure path a typed, recoverable
 outcome instead of a ghost entry.
 
-**MobKit interim behavior.** None possible mobkit-side (the seam is inside
+**Meta interim behavior.** None possible meta-side (the seam is inside
 meerkat's session archive path); hosts carry watchdogs + process restarts.
 
 ## Ask 13 — Event-forwarder backoff + per-member commit-failure quarantine
 
 **CLOSED AS AN OPERATIONAL INCIDENT (2026-07-10).** The forwarder hot-loop was
-fixed in MobKit (`9b55a063`): only active members are subscribed, failures use
+fixed in Meta (`9b55a063`): only active members are subscribed, failures use
 per-member exponential backoff capped at 30 seconds, and repeated failures do
 not flood WARN logs. Meerkat later made failed-batch resolution machine-total
 (#859) and session-scoped composition-dispatch failures degrade only the
@@ -757,14 +766,14 @@ fleet; (b) a runtime-loop commit failure cascades fleet-wide instead of
 quarantining the single failing member. At hundreds of members these are
 outages, not nuisances.
 
-**Evidence + spec.** `operator_validator/docs/MOBKIT_EVIDENCE_forwarder_hotloop_and_commit_cascade.md`
+**Evidence + spec.** `operator_validator/docs/META_EVIDENCE_forwarder_hotloop_and_commit_cascade.md`
 (authoritative; includes measurements and call sites).
 
 **Proposed shape.** Exponential backoff with a ceiling (and eventual typed
 terminal state) on dead event streams; per-member isolation on commit
 failure — one member degrades, the fleet continues.
 
-**MobKit interim behavior.** None mobkit-side; the operator deployment wraps every mob call in
+**Meta interim behavior.** None meta-side; the operator deployment wraps every mob call in
 app-level timeouts and runs its own wedge sentinel.
 
 ## Ask 14 — Typed member health/progress surface
@@ -772,11 +781,11 @@ app-level timeouts and runs its own wedge sentinel.
 **SHIPPED in meerkat 0.7.29** (`MemberProgressSnapshot` on the member
 snapshot: `run_state` Idle/RunOpen, `in_flight_work`, `last_progress_at_ms`,
 typed last-progress event, machine-owned `health`
-Healthy/Degraded/Wedged/Unknown). Mobkit 0.7.35 exposure: flows natively on
-`mobkit/member_status` (whole-snapshot serde), typed as
+Healthy/Degraded/Wedged/Unknown). MobKit 0.7.35 exposure: flows natively on
+`meta/member_status` (whole-snapshot serde), typed as
 `MemberProgressSnapshot` on `RichMemberSnapshot` in both SDKs, and projected
 on the identity-inspect RPC. The console-health affordance remained a follow-up
-at that checkpoint; it subsequently landed in MobKit PR #279 (`f3db0183`,
+at that checkpoint; it subsequently landed in Meta PR #279 (`f3db0183`,
 2026-07-13). When progress is available, sidebar chips expose non-healthy
 machine health and roster details show Health, Run state, In flight, and Last
 progress.
@@ -797,14 +806,14 @@ cooldown + breaker). The console "working" indicator bug is the same gap
 surfacing in UI (indicator driven by event recency, not run-open state).
 
 **Evidence.** `operator_validator/src/wedge.rs`, `operator_validator/src/watchdog.rs`;
-`operator_validator/docs/MOBKIT_BUG_console_working_indicator_clears_mid_run.md`.
+`operator_validator/docs/META_BUG_console_working_indicator_clears_mid_run.md`.
 
 **Proposed shape.** A typed per-member health projection (last-event-at,
 run-open/idle state, in-flight work count, wedge classification) queryable
 from `MobHandle` and/or emitted as a low-rate status event. This is the
 historical design target; the shipped projection above closes it.
 
-**MobKit interim behavior.** Hosts keep their watchdogs; MobKit's console
+**Meta interim behavior.** Hosts keep their watchdogs; Meta's console
 approximates from event recency.
 
 ## Ask 15 — Persist `interaction_id` in the transcript
@@ -816,7 +825,7 @@ them onto committed messages. Identity-first console sends mint UUIDv5 ids,
 history backfill stamps `interaction_id`/`run_id`, and console dedup treats
 UUID-form ids as authoritative twin identity. The CLASSIC compatibility path
 cannot thread an id through `external_turn_for_member`; that limitation does
-not reopen the identity-first MobKit ask and should only become a new ask if a
+not reopen the identity-first Meta ask and should only become a new ask if a
 supported classic consumer requires it.
 
 
@@ -825,27 +834,27 @@ shared identity
 
 **Problem statement.** The console must deduplicate a live-streamed reply
 against its own persisted twin, but the two share no id — forcing lossy
-content-heuristic dedup (the mobkit console over-cull class). The
+content-heuristic dedup (the meta console over-cull class). The
 `TranscriptMessageIdentity` machinery (meerkat #808) is the natural home;
 it currently carries identity for other purposes but the interaction id is
 not persisted through the transcript.
 
-**Evidence.** MobKit console dedup investigation (2026-07-01): an
-interaction-id-based mobkit fix was a no-op and was reverted because the
+**Evidence.** Meta console dedup investigation (2026-07-01): an
+interaction-id-based meta fix was a no-op and was reverted because the
 persisted transcript lacks the id; heuristic collapse remains.
 
 **Proposed shape.** Persist `interaction_id` (and `run_id`, already modeled)
 in `TranscriptMessageIdentity` for assistant messages, serde-defaulted so old
 sessions deserialize unchanged.
 
-**MobKit interim behavior.** Content-heuristic dedup with its documented
+**Meta interim behavior.** Content-heuristic dedup with its documented
 over-cull edge cases; removed when the id lands.
 
 ---
 
 **Explicitly not asked (batch 2):** multi-embodiment / multi-bind primitives.
 The two production deployments (the operator deployment, the downstream app) both run strictly one live
-session per identity; MobKit ships a fail-closed single-embodiment guard and
+session per identity; Meta ships a fail-closed single-embodiment guard and
 will file the ask when a real use case materializes.
 
 ---
@@ -857,18 +866,18 @@ carried across upgrades since ~0.7.13-era binaries. Authoring and planning
 work; NOTHING fires. Every occurrence in the store sat at `phase=pending`
 with `lease_expires_at_ms=NULL` — including a fresh one-shot authored on a
 just-cleaned store — with zero log output at any level. Root-caused in the
-published 0.7.18 sources (all four asks are visible there); mobkit ships a
+published 0.7.18 sources (all four asks are visible there); meta ships a
 read-only watchdog (`spawn_schedule_claim_watchdog`) that names the stall
 and the poisoned row, but only meerkat can make the driver survive one.
 
-### Ask 15 addendum (2026-07-08, mobkit issue #254 item 3)
+### Ask 15 addendum (2026-07-08, meta issue #254 item 3)
 
 A second consumer class hit this: the console aggregator's session-history
 backfill re-emits past turns as `interaction_complete` frames with
 `session_id` set and `interaction_id: None` (nothing to stamp — the
 transcript doesn't persist it), and identity queries force-trigger
 backfill. A consumer correlating by session id alone treats old history as
-fresh completions (field: false job completion). mobkit interim: frames
+fresh completions (field: false job completion). meta interim: frames
 carry `source.kind == "session_history"` and the API docs now declare its
 exclusion mandatory. Real fix remains this ask: persist interaction ids in
 the transcript so backfill can stamp them.
@@ -924,7 +933,7 @@ durable parse boundary and new invalid states remain fail-closed.
 recovered `ScheduleLifecycleMachine` state is then REJECTED on read:
 `RecoveredStateInvariantRejected { phase: Deleted, invariant:
 "deleted_has_no_planning_cursor" }`. Every subsequent `list schedules` (and
-therefore every driver tick and every mobkit boot repair) fails until the
+therefore every driver tick and every meta boot repair) fails until the
 operator hand-deletes rows in sqlite. The writer and the recovery invariant
 disagree about what a legal Deleted state looks like — one of them is wrong.
 
@@ -954,7 +963,7 @@ AND due_at_ms <= :now + horizon` (due_at_ms is already a column and already
 indexed by the ORDER BY) — and let per-row tolerance (ask 17) handle the
 stragglers. Terminal rows never enter the scan.
 
-**MobKit interim behavior (ships in 0.7.25).** Read-only
+**Meta interim behavior (ships in 0.7.25).** Read-only
 `spawn_schedule_claim_watchdog` in both gateways: probes `list()`, the
 occurrence scan, and overdue-pending-unclaimed state every 60 s, and logs a
 row-level diagnosis (poisoned row ids via direct sqlite triage) when the
@@ -965,14 +974,14 @@ make the driver claim past a poisoned row.
 
 # Batch 4 — meerkat-studio field report (2026-07-06)
 
-Reporter context: desktop app pinning meerkat =0.7.17 / mobkit =0.7.23; thread
+Reporter context: desktop app pinning meerkat =0.7.17 / meta =0.7.23; thread
 mobs through an embedded gateway (FactoryAgentBuilder →
 PersistentSessionService → MobBootstrapSpec → UnifiedRuntime), helper crews
-through per-thread mobkit_gateway HTTP children. Asks M1–M4 below are the
-reporter's, relayed verbatim-in-substance; ask 20 is mobkit's root-cause of
+through per-thread meta_gateway HTTP children. Asks M1–M4 below are the
+reporter's, relayed verbatim-in-substance; ask 20 is meta's root-cause of
 the reporter's K1, which turned out to be upstream.
 
-## Ask 20 — retire/respawn of a never-ran member fails ArchiveSession and strands it in `retiring` (reported as mobkit K1) — P0
+## Ask 20 — retire/respawn of a never-ran member fails ArchiveSession and strands it in `retiring` (reported as meta K1) — P0
 
 **CLOSED — converged across Meerkat 0.7.19–0.7.23 (#842, #843, #845, #847,
 #849).** The original K1 disposal path and the subsequently exposed
@@ -993,13 +1002,13 @@ aborts, leaving a cancelled-kickoff zombie. Net: the only per-member control
 primitives on a non-crashing path (see M1) fail for exactly the members an
 operator most wants to manage.
 
-**Evidence.** Deterministic mobkit repro
-(`crates/meerkat-mobkit/tests/studio_k_asks.rs`, the `#[ignore]`d persistent test):
+**Evidence.** Deterministic meta repro
+(`crates/meerkat-meta/tests/studio_k_asks.rs`, the `#[ignore]`d persistent test):
 3-member crew via `ensure_member` on
 FactoryAgentBuilder→PersistentSessionService; both RPCs fail with the exact
 field string; members verified stranded in `retiring`. The identity-first
 bridge already classifies this exact string as recoverable for SESSION-OWNED
-retire (mobkit `is_recoverable_session_owned_retire_cleanup_error`) — the mob-
+retire (meta `is_recoverable_session_owned_retire_cleanup_error`) — the mob-
 member path needs the equivalent judgment at the source.
 
 **Proposed shape.** In meerkat-mob (the escalation site is the archive
@@ -1013,7 +1022,7 @@ judgment belongs upstream.) Do NOT fix this with downstream tolerance:
 retrying fails identically and `list_members` is unchanged afterwards — the
 member is neither respawned nor removed — so a console-layer
 "tolerate and report accepted" patch misreports reality (verified
-empirically by both mobkit and the reporter, independently). mobkit's
+empirically by both meta and the reporter, independently). meta's
 identity-first bridge already carries the exact tolerance string
 (`is_recoverable_session_owned_retire_cleanup_error`) but it never applies
 on the console `handle.retire()`/`respawn()` path, and lifting it there
@@ -1062,7 +1071,7 @@ adapter. And `materialize_revived_member_session` composes
 `external_tools_for_profile(&profile, None)` — revived members silently lose
 per-spawn tools. Acceptance: a supported way to attach an MCP stdio server to
 factory-built agents that composes with builtins, survives revival, and needs
-no test-code incantation. (Mobkit shipped its half: a mob-wide
+no test-code incantation. (Meta shipped its half: a mob-wide
 revival-surviving provider seam, `MobBootstrapSpec::with_default_external_tools_provider`.)
 
 ## M3 — semver discipline within 0.7.x — P1
@@ -1078,8 +1087,8 @@ refresh, which is documentation maintenance rather than an open runtime ask.
 0.7.16 changed `PersistentSessionService::new` (Option → required Arc);
 0.7.12 added a required `content_taint` field to `CommsCommand::PeerMessage`.
 Both broke 0.7-pinned downstreams. Ask: treat public-signature changes as
-breaking (minor bump) or publish a meerkat↔mobkit compatibility matrix.
-(Mobkit now exact-pins its meerkat family and records the pin per release.)
+breaking (minor bump) or publish a meerkat↔meta compatibility matrix.
+(Meta now exact-pins its meerkat family and records the pin per release.)
 
 ## M4 — durable run/interaction lifecycle query — P2
 
@@ -1087,7 +1096,7 @@ breaking (minor bump) or publish a meerkat↔mobkit compatibility matrix.
 restart-first-class interaction and run terminal-status queries completed in
 0.7.25 (#856).** Rust exposes live-or-durable terminal reports, and
 `session/input_status` projects interaction status over JSON-RPC and the SDKs.
-A MobKit-gateway wrapper and a direct run-id wire projection remain optional
+A Meta-gateway wrapper and a direct run-id wire projection remain optional
 surface follow-ups, not missing upstream runtime authority.
 
 **Historical problem statement (pre-0.7.19/0.7.25).**
@@ -1116,12 +1125,12 @@ runtime session" → member stranded `state=retiring`. The authority-read
 (`load_authoritative_session`, store-projection-eligible) and the
 control-read disagree about the same session.
 
-**Evidence.** Deterministic mobkit repro on meerkat =0.7.19
-(`crates/meerkat-mobkit/tests/studio_k_asks.rs`, `#[ignore]`d persistent test):
+**Evidence.** Deterministic meta repro on meerkat =0.7.19
+(`crates/meerkat-meta/tests/studio_k_asks.rs`, `#[ignore]`d persistent test):
 3-member `ensure_member` crew on FactoryAgentBuilder→PersistentSessionService;
 probe confirms `session_known_to_archive_authority = Ok(true)` for all three
 idle members; retire still fails with the exact field string. The wrapper-
-forwarding gap on mobkit's side is FIXED (mobkit forwards the seam through
+forwarding gap on meta's side is FIXED (meta forwards the seam through
 `PreBuildMobSessionService`/`AfterCreateMobSessionService`); the remaining
 failure is upstream.
 
@@ -1133,7 +1142,7 @@ same store-projection eligibility the authority-read already accepts).
 Regression: retire + respawn of a freshly created, never-prompted member on a
 persistent service with a runtime store must succeed.
 
-**MobKit interim behavior.** Identity-first gateways (default-on since
+**Meta interim behavior.** Identity-first gateways (default-on since
 0.7.25) route crew members through the identity authority, which disposes
 tolerantly — the strand is only reachable for mob-plane (worker) members
 that never ran, a narrow window in practice since workers receive kickoff
@@ -1165,8 +1174,8 @@ re-plans. Aggravations: the same loop shape fires for COMPLETED one-shots
 (re-plan → re-dispatch = double-fire, not just misfire spam), and interval
 triggers are plausibly exposed on their last-planned slot.
 
-Mobkit cross-confirmation: the loop reproduces with pure meerkat service
-APIs (`refill_horizon` + `claim_due_occurrences`) — no mobkit code in the
+Meta cross-confirmation: the loop reproduces with pure meerkat service
+APIs (`refill_horizon` + `claim_due_occurrences`) — no meta code in the
 cycle; the #237 claim watchdog is read-only and ticks at 60s (cannot drive
 a 1/s loop). The ms/ns mismatch also explains regeneration WITH a pending
 occurrence present: the stored occurrence due is ms-truncated while the
@@ -1195,7 +1204,7 @@ no-refire, interval terminal-tail stability over N ticks.
 
 ### Ask 21 addendum (21b) — 0.7.20 verification: read fixed, archive still NotFounds afterwards
 
-Verified against meerkat =0.7.20 with the mobkit repro: the archive-scoped
+Verified against meerkat =0.7.20 with the meta repro: the archive-scoped
 read (`load_persisted_session_for_archive`) works — traces show the durable
 document COMMITTING (`discarding stale live session … reason=StoredArchived`)
 — yet `archive_with_mob_lifecycle_authority` still returns
@@ -1208,13 +1217,13 @@ runtime-retire realization for a registered-but-snapshotless machine session
 retire), or the post-commit archived-typed-NotFound contract folding into
 the error path mid-protocol.
 
-Empirically ruled out on the mobkit side: the two-adapter split (a separate
+Empirically ruled out on the meta side: the two-adapter split (a separate
 `with_session_runtime_adapter` machine vs the service's cached adapter) —
 the repro fails identically when the mob shares the concrete service's own
 cached machine as the sole authority. Wrapper forwarding of
 `session_known_to_archive_authority` verified live (probe: `Ok(true)`).
 
-Repro unchanged: `crates/meerkat-mobkit/tests/studio_k_asks.rs`, `#[ignore]`d
+Repro unchanged: `crates/meerkat-meta/tests/studio_k_asks.rs`, `#[ignore]`d
 persistent test; the trace capture recipe is a `tracing_subscriber` init
 with `meerkat_mob=debug,meerkat_session=debug` in the test body.
 
@@ -1224,14 +1233,14 @@ with `meerkat_mob=debug,meerkat_session=debug` in the test body.
 residue closed in 0.7.23 (#849).** Runtime-loop stop realization no longer
 runs executor cleanup while holding the session mutation gate.
 
-Verified against meerkat =0.7.21 with the mobkit K1 persistent repro
-(`crates/meerkat-mobkit/tests/studio_k_asks.rs`,
+Verified against meerkat =0.7.21 with the meta K1 persistent repro
+(`crates/meerkat-meta/tests/studio_k_asks.rs`,
 `studio_k1_retire_respawn_succeed_on_persistent_ensure_member_crew`):
 respawn of a never-run member now HANGS FOREVER at 0% CPU (deterministic,
 4/4 runs) instead of 0.7.20's fast-fail NotFound. The wedged task is the
 single-threaded MobActor, so the ENTIRE MOB is dead — every subsequent mob
 command queues forever. Severity inverted: 0.7.20 stranded one member in
-`retiring`; 0.7.21 bricks the mob. mobkit is HOLDING its pins at =0.7.20
+`retiring`; 0.7.21 bricks the mob. meta is HOLDING its pins at =0.7.20
 and will not ship 0.7.21 to consumers until this is fixed.
 
 **Root cause — a single-task self-deadlock in the runtime loop's
@@ -1269,7 +1278,7 @@ terminal-failure exit, PRE-EXISTING on 0.7.20 and newly load-bearing:**
    `runtime_session_registered` is true precisely BECAUSE the unregister is
    the deadlocked continuation — the arm's own trigger condition is the
    deadlock's output.
-5. Second victim (diagnostic red herring): mobkit's detached console
+5. Second victim (diagnostic red herring): meta's detached console
    event forwarder's 250ms reconcile sends
    `MobCommand::ApplyMachineInputEffects` (`handle.rs:6058`) to the wedged
    actor and parks on the reply. Not load-bearing.
@@ -1300,7 +1309,7 @@ producer of that state still deadlocks upstream of it.
    actor indefinitely on the gate (bounded acquisition + typed busy error),
    so a future regression of this class fast-fails instead of wedging mobs.
 
-**Acceptance (both mobkit repros, both must pass):**
+**Acceptance (both meta repros, both must pass):**
 - `studio_k1_retire_respawn_succeed_on_persistent_ensure_member_crew`
   (classic persistent chain) — currently DEADLOCKS on 0.7.21. Run it with
   a nextest per-test timeout; a hang is a fail, not a slow test.
@@ -1324,7 +1333,7 @@ no "locked mutation gate" → "retire_runtime_control_plane start" → silence).
 
 ### Ask 21 addendum (21d) — 0.7.22 verification: classic chain converged, identity-first-construction workers still archive-NotFound — P1
 
-meerkat 0.7.22 (#847) verification with both mobkit acceptance repros:
+meerkat 0.7.22 (#847) verification with both meta acceptance repros:
 
 - `studio_k1_retire_respawn_succeed_on_persistent_ensure_member_crew`
   (classic persistent chain): **PASSES** — retire AND respawn of never-run
@@ -1347,12 +1356,12 @@ by the pre-archive retire, yet the archive protocol still resolves
 NotFound and the machine still reports the session registered — the #845
 Ready+Archived+registered retire-only arm apparently does not fire (or
 fires and NotFounds) on this wiring. Construction difference to focus on:
-the identity-first gateway runtime (mobkit `gateway_wiring::
+the identity-first gateway runtime (meta `gateway_wiring::
 open_identity_substrate` + identity_first bridge on MobHandle) with the
 worker member on the mob plane; session service wiring differs from the
 classic FactoryAgentBuilder → PersistentSessionService chain.
 
-Repro: `crates/meerkat-mobkit/tests/studio_k_asks.rs`,
+Repro: `crates/meerkat-meta/tests/studio_k_asks.rs`,
 `doctrine_member_rpcs_route_identity_owned_members_through_identity_authority`
 — currently TOLERANT of the ArchiveSession failure class (assert-routing
 only); tighten the branch at the end of the test when 21d lands. Trace
@@ -1412,7 +1421,7 @@ through RPC and the SDKs.
 JSON-decodes EVERY row — all realms, all statuses — before Rust-side
 filtering; and every `reassign_attention` keeps the superseded row forever,
 so the table grows monotonically with binding churn. Any host that must
-read binding state on a hot path (mobkit's one-binding-per-target
+read binding state on a hot path (meta's one-binding-per-target
 admission guard runs under a runtime-wide gate and, on shared stores, a
 cross-process lock) pays an unbounded scan while serializing all binding
 mutations behind it; at production-style eternal-fleet churn this walks into
@@ -1421,7 +1430,7 @@ lock-timeout territory.
 Ask: (1) push `realm_id`/`namespace`/`status`/`target` filters into the
 SQL (indexed columns or generated columns over the JSON); (2) a GC/prune
 facility for terminal (Superseded/Stopped) bindings, mirroring the ask-2
-memory-store lifecycle shape. mobkit interim: realm+status-filtered list
+memory-store lifecycle shape. meta interim: realm+status-filtered list
 calls (upstream still decodes every row) and an actionable lock-timeout
 error; the guard's session→member resolution memoizes per session id, but
 each FIRST resolution still pays `load_persisted_session`'s full-session
@@ -1432,7 +1441,7 @@ own ask candidate).
 
 **CLOSED — shipped in Meerkat 0.7.25 (#854).** Both halves landed:
 transactional store-level uniqueness with a typed occupant conflict, and
-newest-binding-wins arbitration for legacy duplicates. MobKit's admission
+newest-binding-wins arbitration for legacy duplicates. Meta's admission
 layer is defense in depth; its sidecar-lock cleanup is downstream maintenance,
 not an open upstream ask.
 
@@ -1458,37 +1467,37 @@ Ask, either (both is best):
    deterministically (e.g. newest-binding-wins) with a loud diagnostic,
    instead of hard-failing every turn.
 
-When either lands, mobkit's admission layer demotes to defense-in-depth.
+When either lands, meta's admission layer demotes to defense-in-depth.
 
 
 ## Ask 26 — structural reply affordance on comms deliveries — P2
 
 **CLOSED — shipped in Meerkat 0.7.25 (#856).** `PeerReplyCapability` in the
 dispatch context and the pre-addressed `reply_to_peer` tool provide the
-structural affordance. No MobKit change is required.
+structural affordance. No Meta change is required.
 
 
 Peer messages arrive framed as prose ("Peer message from <endpoint>...")
 with no structural reply affordance. Models reliably answer in their own
 transcript instead of calling the comms tool back — charter/prompt
-strengthening does not hold (mobkit consumer field report, 2026-07-08),
+strengthening does not hold (meta consumer field report, 2026-07-08),
 so every consumer ends up building an app-side relay.
 
 Ask: deliver peer messages with a typed reply seam — e.g. a delivery
 envelope carrying a `reply_to` capability/token the runtime turns into a
 pre-addressed comms call (or a first-class `reply` tool scoped to the
 delivery), so "answer the peer" is an affordance rather than a prompt
-convention. mobkit interim: none (app-side relays).
+convention. meta interim: none (app-side relays).
 
 ## Ask 27 — peer sends to unreachable targets must not read as success — P2
 
 **SHIPPED in meerkat 0.7.29** (`PeerDeliveryOutcome { Acked, HandedOff,
 Queued }` typed peer-send outcomes; Python/TS SDKs validate the canonical
 `comms/send` result variants and reject legacy/malformed shapes). Verified
-2026-07-12: no mobkit surface consumes `PeerMessageReceipt`/`acked` — peer
+2026-07-12: no meta surface consumes `PeerMessageReceipt`/`acked` — peer
 sends happen agent-side inside the actor, so the typed outcome reaches the
 complaining agents (the downstream app's false-success sends) directly upstream;
-nothing to expose in mobkit. Originally filed 2026-07-10. Ordinary comms still collapse successful no-ACK
+nothing to expose in meta. Originally filed 2026-07-10. Ordinary comms still collapse successful no-ACK
 handoff and some unreachable paths into `acked: false`. Supervisor rotation's
 durable operation receipts are intentionally scoped to that lifecycle
 operation and do not make general peer delivery truthful.
@@ -1510,14 +1519,14 @@ Ask: deliver-or-error at the comms tool seam (a send whose transport
 connect/write fails must surface a typed error to the agent), or a typed
 receipt state the agent can act on — e.g. `delivery: "acked" | "handed_off"
 | "queued" | "unreachable"` — so "the peer never got this" is representable.
-mobkit interim: none (host-side relay).
+meta interim: none (host-side relay).
 
 ## Ask 28 — kickoff-scoped objective→outcome correlation (reply-to-kickoff) — P2
 
 **SHIPPED in meerkat 0.7.29** (`ObjectiveOwnerBound` durable owner-authority
 binding + `ObjectiveConcluded { member, objective_id, outcome }` explicit
 conclusion mob events; batched runtime inputs merge transcript causality with
-conflict-stable objective consensus). Mobkit 0.7.35 projects both events
+conflict-stable objective consensus). MobKit 0.7.35 projects both events
 through the structural mob-event surface. Originally filed 2026-07-10. Interaction ids and peer-reply capabilities are
 available building blocks, but no durable objective id propagates across the
 delegated work, and the lead has no explicit conclude-objective affordance.
@@ -1541,7 +1550,7 @@ message and delegated turn transitively caused by it, and (b) gives the
 LEAD a pre-addressed "conclude the objective" affordance (mirroring
 `reply_to_peer`) whose payload is the objective's final answer. Hosts then
 await "objective concluded" instead of inferring it from interaction
-completion + quiescence heuristics. mobkit would surface the conclusion as
+completion + quiescence heuristics. meta would surface the conclusion as
 a typed console/RPC event.
 
 ## Ask 29 — profile overrides freeze the whole tool surface across definition drift — P2
@@ -1550,11 +1559,11 @@ a typed console/RPC event.
 `SpawnMemberSpec.model_override: Option<String>` — a field-scoped model pin
 reapplied over the CURRENT role profile on every materialization, including
 cold restore, revival, and respawn, so tools/skills/peer posture keep
-following the definition). Mobkit 0.7.36 adopts it in `build_spawn_spec`
+following the definition). MobKit 0.7.36 adopts it in `build_spawn_spec`
 (whole-profile snapshot retained only for provider-pinned profiles — upstream
 does not re-infer the provider under `model_override`); reset-reprofiled
 members frozen under the old whole-profile override (the downstream app's security-domain agent)
-heal on their next reset. The planned mobkit heal-on-divergence mitigation is
+heal on their next reset. The planned meta heal-on-divergence mitigation is
 superseded. Originally filed 2026-07-10 (Bug G′).
 
 Field (the downstream app's Bug G′, 2026-07-10): the only reset-reprofiled member
@@ -1563,7 +1572,7 @@ Field (the downstream app's Bug G′, 2026-07-10): the only reset-reprofiled mem
 unrestricted shell, hand-writing schedule rows into `schedule.sqlite` that
 the driver fired into the wrong member.
 
-Mechanism (confirmed): a model-only reprofile forces mobkit to snapshot the
+Mechanism (confirmed): a model-only reprofile forces meta to snapshot the
 WHOLE profile into `SpawnMemberSpec.override_profile` (there is no
 narrower override — handle.rs:1894). meerkat 0.7.25 M2 durably persists
 `effective_profile_override` and the revival path takes it VERBATIM over
@@ -1582,7 +1591,7 @@ Ask (either resolves it):
   recorded override as a patch (requires knowing which fields were
   overridden — same shape as the first option).
 
-Historical MobKit interim (superseded): heal-on-divergence at identity-first
+Historical Meta interim (superseded): heal-on-divergence at identity-first
 restore (compare the replayed effective profile against the freshly-composed
 spec; retire + resume-respawn when they diverge). The field-scoped upstream
 fix and MobKit 0.7.36 adoption made this mitigation unnecessary.
@@ -1592,7 +1601,7 @@ fix and MobKit 0.7.36 adoption made this mitigation unnecessary.
 **SHIPPED in meerkat 0.7.28** (`live/open.seed_max_chars` — windowed
 projection preserving enabled root context, an affordable compaction
 summary, the identity/tombstone/rewrite-generation/canonical-image
-sidecars, with explicit degraded-continuity reporting). Mobkit adoption
+sidecars, with explicit degraded-continuity reporting). Meta adoption
 (0.7.33): `live_open_config_for_session` delegates to
 `realtime_projection_messages_with_window`; the 0.7.32 oldest-first clamp
 stopgap is DELETED — the `seed_max_chars` wire params are unchanged.
@@ -1607,7 +1616,7 @@ Ask: a seed-window knob on the realtime open path — project a bounded
 suffix (and/or a compaction-style summary head) of the session instead of
 the full transcript, in the session-projection layer where
 `realtime_projection_messages` lives, so the bound composes with the
-user-content identity lane and exact-retry guards. mobkit stopgap (shipped
+user-content identity lane and exact-retry guards. meta stopgap (shipped
 0.7.32): the gateway clamps the projected seed at open time — correct but
 lossy; the principled summarize-then-seed belongs in core.
 
@@ -1630,7 +1639,7 @@ revival-flow acceptance was moved to ask 34 rather than counted twice.
   adopted it and un-ignored
   `identity_first_resume_revives_terminally_retired_runtime`. Existing victims
   no longer need the manual row-copy repair on those versions.
-Mobkit keeps the destruction-detection probe as a regression tripwire.
+Meta keeps the destruction-detection probe as a regression tripwire.
 Originally filed 2026-07-11 (Bug I). The single most destructive defect of the
 downstream app's saga: on 0.7.33 boots, 1-2 slow-restoring eternal identities per boot
 were terminally retired by their own failed resume, and repair boots re-rolled
@@ -1654,7 +1663,7 @@ Mechanism (code-verified in meerkat-mob 0.7.28):
    transcript is unreachable forever.
 
 Forensic confirmation (the downstream app's server, store
-`data/mobkit_state/5f68197796d9.damaged-bug-i/runtime.sqlite`): victims'
+`data/meta_state/5f68197796d9.damaged-bug-i/runtime.sqlite`): victims'
 `runtime_states` rows read `{"record_version":2,"runtime_state":"retired",
 "binding":{"agent_runtime_id":null,...}}` while their multi-hundred-MB
 snapshots sit intact alongside. Gateway stderr shows the full chain, including
@@ -1664,7 +1673,7 @@ locked store.
 The rollback semantics are correct for a FRESH spawn (the provisioned session
 is garbage without its member). They are catastrophic for a RESUME: the
 provisioned session is the only copy of an eternal identity's history, and the
-mobkit bridge's rejection contract ("durable session preserved, identity
+meta bridge's rejection contract ("durable session preserved, identity
 degraded pending reconcile retry") is silently violated — the bridge REFUSES
 fresh-spawn fallback precisely because it assumes the session survived.
 
@@ -1679,10 +1688,10 @@ Ask (both halves):
   made legitimate). Without it, every past and future victim needs hand
   surgery on `runtime.sqlite`.
 
-mobkit interim (0.7.34): post-rejection verification probes the session store
+meta interim (0.7.34): post-rejection verification probes the session store
 and logs continuity destruction explicitly instead of the false "durable
 session preserved"; restore concurrency knob + collision-retry drain reduce
-the two known triggers. mobkit CANNOT prevent the destruction — the rollback
+the two known triggers. meta CANNOT prevent the destruction — the rollback
 runs inside the spawn path.
 
 ## Ask 32 — RetireAbsent leaves a queued retire that cancels the next spawn of the same id — P0
@@ -1691,7 +1700,7 @@ runs inside the spawn path.
 public mob retire asks MobMachine for an incarnation-scoped pending-spawn
 disposition; only the exact machine-authorized pending session can be
 canceled, and an absent committed identity preserves a pending later
-incarnation). Mobkit 0.7.35 removed the 0.7.34 drain-poll + retry-once
+incarnation). MobKit 0.7.35 removed the 0.7.34 drain-poll + retry-once
 workaround. Originally filed 2026-07-11 (Bug I secondary racer). Field trace (2ms apart,
 two independent incidents captured):
 
@@ -1716,7 +1725,7 @@ same identity (it retired nothing; there is nothing to cancel), or the machine
 exposes an awaitable retire-drain so a caller can sequence
 retire-then-respawn without racing the command queue.
 
-mobkit interim (0.7.34): after a collision retire the bridge drain-polls the
+meta interim (0.7.34): after a collision retire the bridge drain-polls the
 roster (bounded 2s) before retrying, and treats `spawn canceled ... retire
 command received` as retryable-once-after-drain. This narrows the window; it
 cannot close it (the queue is unobservable from the handle surface).
@@ -1726,12 +1735,12 @@ cannot close it (the queue is unobservable from the handle surface).
 **SHIPPED in meerkat 0.7.29** (PR #874, changelog-silent; source-verified:
 `SQLITE_BUSY_TIMEOUT_MS` 5s→60s default sized for long WAL writer holds from
 large snapshot commits, plus per-store `SqliteConnectionOptions.busy_timeout`).
-`MOBKIT_IDENTITY_RESTORE_CONCURRENCY` can return to its default (knob
+`META_IDENTITY_RESTORE_CONCURRENCY` can return to its default (knob
 retained). The snapshot-size defect initially observed here is now diagnosed
 and tracked separately as ask 35; it does not reopen ask 33. Originally filed
 2026-07-11 (Bug I trigger). At filing, meerkat-store set
 `busy_timeout=5s` + WAL (sqlite_store.rs:24,113-114). A downstream app boot restores
-16 identities with sessions up to 366MB; mobkit restores up to 4 concurrently
+16 identities with sessions up to 366MB; meta restores up to 4 concurrently
 (#265). Multi-hundred-MB snapshot writes hold the WAL writer lock past 5s, and
 every lifecycle persist that loses the wait surfaces raw `Store write failed:
 SQLite error: database is locked` — in the field this hit supervisor-trust
@@ -1751,8 +1760,8 @@ persistence failed: Store write failed: string or blob too big`. The apparent
 per-value ceiling was the symptom; retained full transcript bodies in the
 revision chain are the diagnosed root cause.
 
-mobkit interim (0.7.34): `MOBKIT_IDENTITY_RESTORE_CONCURRENCY` env knob
-(clamped 1-16, default 4); `=1` serializes restores and removes mobkit's own
+meta interim (0.7.34): `META_IDENTITY_RESTORE_CONCURRENCY` env knob
+(clamped 1-16, default 4); `=1` serializes restores and removes meta's own
 contribution to writer contention.
 
 ## Ask 34 — retired-session revival flow refuses executor registration — P1
@@ -1765,7 +1774,7 @@ runtime, and only then attaches the executor. Failure after promotion restores
 the exact `Archived` + `Retired` pair without leaking a live agent, executor,
 runtime registration, or provisioner sidecar.
 
-Reproduction (mobkit `identity_first_cold_restart_continuity.rs::
+Reproduction (meta `identity_first_cold_restart_continuity.rs::
 identity_first_resume_revives_terminally_retired_runtime`, landed `#[ignore]`d
 as the acceptance criterion): boot 1 creates a durable member and delivers a
 turn; a MOB-PLANE retire archives the session and durably writes
@@ -1777,7 +1786,7 @@ resume spawn: internal error: Input validation failed: generated
 MeerkatMachine did not grant active executor registration
 ```
 
-Progression evidence: before mobkit forwarded the revival seam through its
+Progression evidence: before meta forwarded the revival seam through its
 session-service wrappers, the same boot failed earlier with `missing durable
 session snapshot` — so `load_revivable_retired_session` now finds the session
 and the flow reaches session materialization, where executor registration is
@@ -1795,7 +1804,7 @@ bindings/creation, or the registration claim must admit the archived-resume
 authority.
 
 Resolution: upstream now covers both explicit `Archived` + `Retired` revival
-and the `Active` + `Retired` crash-recovery compatibility shape. MobKit's
+and the `Active` + `Retired` crash-recovery compatibility shape. Meta's
 `identity_first_resume_revives_terminally_retired_runtime` acceptance test is
 un-ignored and shipped in 0.7.37 against Meerkat 0.7.30. Bug I victims no
 longer require the manual `runtime_states` row-copy repair on these versions.
@@ -1806,7 +1815,7 @@ longer require the manual `runtime_states` row-copy repair on these versions.
 `d084689a84c27c0a6daefcd926952110a967abfd`). The released fix keeps genuine
 audited rewrite endpoints plus the live head, compacts legacy mechanical
 append-head chains on read/save, and routes typed synthetic-notice refreshes
-outside the audited undo path. No MobKit API adoption is required.
+outside the audited undo path. No Meta API adoption is required.
 
 Field-reported reproduction (the downstream app's forensic measurement, 2026-07-12): the
 895-message `domain:security` member has a roughly 2MB live transcript but 764

@@ -13,7 +13,7 @@
 //   comments document the shell's window contract; the modules themselves
 //   never touch the global.
 // - @flow-editor-components is the React view layer. Views render props
-//   and call the window.MobKitFlowController facade at render time; they
+//   and call the window.MetaFlowController facade at render time; they
 //   must never open their own network path (fetch/callRpc) or import Node
 //   built-ins, so the package stays a pure browser-bundle input.
 const assert = require("node:assert/strict");
@@ -51,7 +51,7 @@ function scan(files, rules) {
 }
 
 // The facade and the barrel are the bridge files: their header comments
-// document the window.MobKitFlowCore / window.MobKitFlowController shell
+// document the window.MetaFlowCore / window.MetaFlowController shell
 // contract. Code-level window access stays forbidden everywhere — these two
 // files are themselves window-free at runtime (the ~3-line shell bootstrap
 // in app.tsx owns the window assignment).
@@ -98,7 +98,7 @@ const componentsRules = [
   {
     // Every browser network path, not just fetch.
     pattern: /\bfetch\s*\(|new\s+XMLHttpRequest\b|new\s+WebSocket\b|new\s+EventSource\b|\bsendBeacon\b/,
-    why: "views go through props or the window.MobKitFlowController facade; networking lives in @flow-editor-core rpc/client",
+    why: "views go through props or the window.MetaFlowController facade; networking lives in @flow-editor-core rpc/client",
   },
   {
     pattern: /\bcallRpc\b/,
@@ -109,7 +109,7 @@ const componentsRules = [
     // path around the facade AND create a second module instance of the
     // rpc singletons inside the app bundle.
     pattern: /from\s+["']@flow-editor-core/,
-    why: "views consume controller state through props or window.MobKitFlowController, never by importing @flow-editor-core",
+    why: "views consume controller state through props or window.MetaFlowController, never by importing @flow-editor-core",
   },
   {
     // Value imports of react would silently bundle a second React into

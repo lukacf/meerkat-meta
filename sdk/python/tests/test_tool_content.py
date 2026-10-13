@@ -1,14 +1,14 @@
 """Tests for rich tool-result content blocks (callback tools returning images)."""
 import pytest
-from meerkat_mobkit import (
+from meerkat_meta import (
     ToolResultContent,
     image_block,
     image_blob_block,
     text_block,
     tool_content,
 )
-from meerkat_mobkit.agent_builder import CallbackDispatcher
-from meerkat_mobkit.models import SessionBuildOptions
+from meerkat_meta.agent_builder import CallbackDispatcher
+from meerkat_meta.models import SessionBuildOptions
 
 
 class TestContentBlockHelpers:

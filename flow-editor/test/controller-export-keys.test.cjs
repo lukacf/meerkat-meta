@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Migration anchor: window.MobKitFlowController must expose EXACTLY the key
+// Migration anchor: window.MetaFlowController must expose EXACTLY the key
 // set recorded in controller-export-manifest.json, no matter how much of the
 // controller has moved into @flow-editor-core. The JSX views consume the
 // facade stringly, so a missing key is a silent runtime failure.
@@ -29,9 +29,9 @@ function diff(label, actual, expected) {
 
 // With the projection-test flag set, the facade carries the manifest plus the
 // test-gated assembler exports.
-global.window = { __MOBKIT_FLOW_CONTROLLER_TEST__: true };
+global.window = { __META_FLOW_CONTROLLER_TEST__: true };
 require(bundlePath);
-const testKeys = Object.keys(global.window.MobKitFlowController).sort();
+const testKeys = Object.keys(global.window.MetaFlowController).sort();
 diff(
   "test-flagged facade",
   testKeys,
@@ -45,7 +45,7 @@ const baseKeys = JSON.parse(
     [
       "-e",
       `global.window = {}; require(${JSON.stringify(bundlePath)});` +
-        "process.stdout.write(JSON.stringify(Object.keys(global.window.MobKitFlowController).sort()));",
+        "process.stdout.write(JSON.stringify(Object.keys(global.window.MetaFlowController).sort()));",
     ],
     { encoding: "utf8" },
   ),

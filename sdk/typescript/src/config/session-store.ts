@@ -1,5 +1,5 @@
 /**
- * Session store configuration for MobKit runtime.
+ * Session store configuration for Meta runtime.
  */
 
 // -- JSON file store ------------------------------------------------------

@@ -9,7 +9,7 @@ const { chromium } = require("playwright");
 async function runIndexedDbStorageLock() {
   const bundle = await build({ entryPoints: [path.join(__dirname, "../src/lib/send-storage-lock.ts")], bundle: true,
     platform: "browser", format: "iife", globalName: "QueueLock", write: false });
-  const evidence = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+  const evidence = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
   const server = http.createServer((req, res) => {
     res.writeHead(200, { "content-type": req.url === "/lock.js" ? "text/javascript" : "text/html" });
     res.end(req.url === "/lock.js" ? bundle.outputFiles[0].text : '<!doctype html><html><head><meta charset="utf-8"><title>Queue storage coordination proof</title></head><body><h1>Queue storage coordination</h1><p>Real Chromium IndexedDB, two same-origin tabs, plain HTTP.</p><pre id="proof">Running</pre><script src="/lock.js"></script></body></html>');
@@ -29,7 +29,7 @@ async function runIndexedDbStorageLock() {
   async function holdTransaction(page) {
     await page.evaluate(async () => {
       const db = await new Promise((resolve, reject) => {
-        const open = indexedDB.open("mobkit-console-queue-locks", 1);
+        const open = indexedDB.open("meta-console-queue-locks", 1);
         open.onupgradeneeded = () => open.result.createObjectStore("locks");
         open.onsuccess = () => resolve(open.result); open.onerror = () => reject(open.error);
       });

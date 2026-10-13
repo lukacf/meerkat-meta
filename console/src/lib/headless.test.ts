@@ -8,22 +8,24 @@ import {
 import {
   CONSOLE_COMMAND_NAMES as SHARED_CONSOLE_COMMAND_NAMES,
   consoleCommandMethod as sharedConsoleCommandMethod,
-  createMobKitConsoleController as createSharedMobKitConsoleController,
+  createHttpConsoleTransport as createSharedHttpConsoleTransport,
+  createMetaConsoleController as createSharedMetaConsoleController,
 } from "../../../packages/console-core/src/headless";
 import { CONSOLE_REST_PATHS, CONSOLE_RPC_METHODS, CONSOLE_RPC_PATHS } from "./contract";
 import {
   CONSOLE_COMMAND_NAMES,
   createHttpConsoleTransport,
-  createMobKitConsoleController,
+  createMetaConsoleController,
   type ConsoleCapabilities,
-  type MobKitConsoleTransport,
+  type MetaConsoleTransport,
 } from "./headless";
 import type { ConsoleFrame, ConsoleTimelineAccepted, ConsoleTimelinePage } from "../types";
+import type { ConsoleTransportFailure } from "./network";
 
 function identityTarget(): ConsoleWorkbenchTarget {
   const target = migrateConsoleWorkbenchTarget({
     id: "chat:identity:lead",
-    kind: "mobkit/identity-chat",
+    kind: "meta/identity-chat",
     title: "Lead",
     identity: "identity:lead",
   });
@@ -57,7 +59,7 @@ function createFakeTransport(options: {
   capabilities?: ConsoleCapabilities | ConsoleCapabilities[];
   queryPages?: ConsoleTimelinePage[];
   accepted?: ConsoleTimelineAccepted;
-} = {}): MobKitConsoleTransport & {
+} = {}): MetaConsoleTransport & {
   capabilityCalls: number;
   live?: (frame: ConsoleFrame) => void;
   sends: unknown[];
@@ -109,7 +111,7 @@ function createFakeTransport(options: {
     },
     upload: async () => ({ blob_id: "blob-1" }),
     blobUrl: (blobId) => `/blobs/${blobId}`,
-  } satisfies MobKitConsoleTransport & {
+  } satisfies MetaConsoleTransport & {
     capabilityCalls: number;
     live?: (frame: ConsoleFrame) => void;
     sends: unknown[];
@@ -129,7 +131,7 @@ test("headless timeline controller seeds, subscribes after cursor, backfills rep
       { frames: [seed, backfill], available: true, latestCursor: "console:2" },
     ],
   });
-  const controller = createMobKitConsoleController({ transport });
+  const controller = createMetaConsoleController({ transport });
   const delivered: ConsoleFrame[] = [];
 
   const unsubscribe = await controller.timeline.subscribeWithBackfill(
@@ -160,7 +162,7 @@ test("headless timeline dedup keeps a bounded recent identity window", async () 
   const transport = createFakeTransport({
     queryPages: [{ frames: seedFrames, available: true, latestCursor: "console:1001" }],
   });
-  const controller = createMobKitConsoleController({ transport });
+  const controller = createMetaConsoleController({ transport });
   const delivered: ConsoleFrame[] = [];
 
   const unsubscribe = await controller.timeline.subscribeWithBackfill(
@@ -181,7 +183,7 @@ test("headless timeline dedup does not collapse anonymous identical frames", asy
   const transport = createFakeTransport({
     queryPages: [{ frames: [], available: true, latestCursor: "console:1" }],
   });
-  const controller = createMobKitConsoleController({ transport });
+  const controller = createMetaConsoleController({ transport });
   const delivered: ConsoleFrame[] = [];
 
   const unsubscribe = await controller.timeline.subscribeWithBackfill(
@@ -196,9 +198,9 @@ test("headless timeline dedup does not collapse anonymous identical frames", asy
   unsubscribe();
 });
 
-test("headless command surface sends only capability-gated MobKit identity targets and returns optimistic plus accepted facts", async () => {
+test("headless command surface sends only capability-gated Meta identity targets and returns optimistic plus accepted facts", async () => {
   const transport = createFakeTransport();
-  const controller = createMobKitConsoleController({ transport });
+  const controller = createMetaConsoleController({ transport });
 
   const result = await controller.commands.sendMessage(identityTarget(), {
     content: "hello",
@@ -210,7 +212,7 @@ test("headless command surface sends only capability-gated MobKit identity targe
 
   assert.equal(result.optimistic.provenance.source, "optimistic");
   assert.equal(result.optimistic.provenance.correlationId, "idem-1");
-  assert.equal(result.accepted.provenance.source, "mobkit-protocol");
+  assert.equal(result.accepted.provenance.source, "meta-protocol");
   assert.equal(result.accepted.provenance.routeOrMethod, CONSOLE_RPC_METHODS.send);
   assert.equal(result.accepted.provenance.capabilityVersion, "fake-capabilities");
   assert.equal(transport.sends.length, 1);
@@ -224,7 +226,7 @@ test("headless command surface refreshes stale missing capabilities before faili
       { version: "fresh", methods: [CONSOLE_RPC_METHODS.send] },
     ],
   });
-  const controller = createMobKitConsoleController({ transport });
+  const controller = createMetaConsoleController({ transport });
 
   const result = await controller.commands.sendMessage(identityTarget(), {
     content: "hello",
@@ -238,7 +240,7 @@ test("headless command surface refreshes stale missing capabilities before faili
 
 test("headless command surface coalesces concurrent capability loads", async () => {
   const transport = createFakeTransport();
-  const controller = createMobKitConsoleController({ transport });
+  const controller = createMetaConsoleController({ transport });
 
   await Promise.all([
     controller.commands.sendMessage(identityTarget(), {
@@ -265,7 +267,7 @@ test("headless command surface refreshes previously-present capabilities before 
       { version: "still-revoked", methods: [] },
     ],
   });
-  const controller = createMobKitConsoleController({ transport });
+  const controller = createMetaConsoleController({ transport });
 
   await controller.commands.sendMessage(identityTarget(), {
     content: "first",
@@ -278,7 +280,7 @@ test("headless command surface refreshes previously-present capabilities before 
       origin: "test",
       idempotencyKey: "idem-revoke-2",
     }),
-    /MobKit capability missing for mobkit\/console\/send/,
+    /Meta capability missing for meta\/console\/send/,
   );
 
   assert.equal(transport.capabilityCalls, 3);
@@ -286,7 +288,7 @@ test("headless command surface refreshes previously-present capabilities before 
 });
 
 test("headless command surface exposes capability-gated blob upload", async () => {
-  const controller = createMobKitConsoleController({
+  const controller = createMetaConsoleController({
     transport: createFakeTransport({
       capabilities: {
         version: "blob-capabilities",
@@ -301,13 +303,13 @@ test("headless command surface exposes capability-gated blob upload", async () =
   });
 
   assert.deepEqual(result.value, { blob_id: "blob-1" });
-  assert.equal(result.provenance.source, "mobkit-protocol");
+  assert.equal(result.provenance.source, "meta-protocol");
   assert.equal(result.provenance.routeOrMethod, CONSOLE_RPC_METHODS.blobUpload);
   assert.equal(result.provenance.capabilityVersion, "blob-capabilities");
 });
 
 test("headless command surface fails closed on missing capabilities and inert host targets", async () => {
-  const noSend = createMobKitConsoleController({
+  const noSend = createMetaConsoleController({
     transport: createFakeTransport({ capabilities: { methods: [] } }),
   });
 
@@ -320,7 +322,7 @@ test("headless command surface fails closed on missing capabilities and inert ho
     /capability missing/i,
   );
 
-  const controller = createMobKitConsoleController({ transport: createFakeTransport() });
+  const controller = createMetaConsoleController({ transport: createFakeTransport() });
   await assert.rejects(
     () => controller.commands.sendMessage(hostTarget(), {
       content: "hello",
@@ -331,12 +333,12 @@ test("headless command surface fails closed on missing capabilities and inert ho
   );
   for (const command of [
     CONSOLE_RPC_METHODS.send,
-    "mobkit/member/retire",
-    "mobkit/member/respawn",
-    "mobkit/member/reset",
-    "mobkit/routing/routes/list",
-    "mobkit/gating/decide",
-    "mobkit/raw/rpc",
+    "meta/member/retire",
+    "meta/member/respawn",
+    "meta/member/reset",
+    "meta/routing/routes/list",
+    "meta/gating/decide",
+    "meta/raw/rpc",
   ]) {
     await assert.rejects(
       () => controller.commands.execute({
@@ -349,7 +351,7 @@ test("headless command surface fails closed on missing capabilities and inert ho
 });
 
 test("headless command execution only accepts modeled commands for allowed target kinds", async () => {
-  const controller = createMobKitConsoleController({ transport: createFakeTransport() });
+  const controller = createMetaConsoleController({ transport: createFakeTransport() });
 
   assert.deepEqual(await controller.commands.execute({
     command: CONSOLE_COMMAND_NAMES.inspectIdentity,
@@ -361,21 +363,21 @@ test("headless command execution only accepts modeled commands for allowed targe
   });
 
   for (const command of [
-    "mobkit/raw/rpc",
-    "mobkit/member/reset",
-    "mobkit/console/list_identities",
-    "mobkit/inspect_identity",
+    "meta/raw/rpc",
+    "meta/member/reset",
+    "meta/console/list_identities",
+    "meta/inspect_identity",
   ]) {
     await assert.rejects(
       () => controller.commands.execute({
         command: command as typeof CONSOLE_COMMAND_NAMES.inspectIdentity,
         target: identityTarget(),
       }),
-      /unknown MobKit console command/i,
+      /unknown Meta console command/i,
     );
   }
 
-  const noInspect = createMobKitConsoleController({
+  const noInspect = createMetaConsoleController({
     transport: createFakeTransport({ capabilities: { methods: [CONSOLE_RPC_METHODS.send] } }),
   });
   await assert.rejects(
@@ -383,10 +385,10 @@ test("headless command execution only accepts modeled commands for allowed targe
       command: CONSOLE_COMMAND_NAMES.inspectIdentity,
       target: identityTarget(),
     }),
-    /capability missing.*mobkit\/console\/inspect_identity/i,
+    /capability missing.*meta\/console\/inspect_identity/i,
   );
 
-  const hostController = createMobKitConsoleController({ transport: createFakeTransport() });
+  const hostController = createMetaConsoleController({ transport: createFakeTransport() });
   await assert.rejects(
     () => hostController.commands.execute({
       command: CONSOLE_COMMAND_NAMES.inspectIdentity,
@@ -411,7 +413,7 @@ test("headless command execution models lifecycle, routing, and gating commands 
     CONSOLE_RPC_METHODS.gatingDecide,
   ];
   const transport = createFakeTransport({ capabilities: { methods, version: "cap-all" } });
-  const controller = createMobKitConsoleController({ transport });
+  const controller = createMetaConsoleController({ transport });
 
   for (const command of [
     CONSOLE_COMMAND_NAMES.retireIdentity,
@@ -467,7 +469,7 @@ test("headless command execution models the optional topology control surface", 
     CONSOLE_RPC_METHODS.topologyAuditQuery,
   ];
   const transport = createFakeTransport({ capabilities: { methods, version: "topology-v1" } });
-  const controller = createMobKitConsoleController({ transport });
+  const controller = createMetaConsoleController({ transport });
   const target = controlTarget("topology");
 
   for (const command of [
@@ -498,7 +500,7 @@ test("headless command execution models the optional topology control surface", 
     /cannot execute command topologyApply/,
   );
 
-  const disabled = createMobKitConsoleController({
+  const disabled = createMetaConsoleController({
     transport: createFakeTransport({
       capabilities: {
         methods: [CONSOLE_RPC_METHODS.topologyQuery, CONSOLE_RPC_METHODS.topologyOperationGet],
@@ -513,7 +515,7 @@ test("headless command execution models the optional topology control surface", 
   });
   await assert.rejects(
     () => disabled.commands.execute({ command: CONSOLE_COMMAND_NAMES.topologyApply, target }),
-    /capability missing.*mobkit\/topology\/apply/i,
+    /capability missing.*meta\/topology\/apply/i,
   );
 });
 
@@ -549,7 +551,7 @@ test("stock and shared-core headless topology contracts cannot drift", async () 
       },
     },
   });
-  const controller = createSharedMobKitConsoleController({ transport });
+  const controller = createSharedMetaConsoleController({ transport });
   const target = controlTarget("topology");
   for (const command of commands) {
     assert.equal((await controller.commands.execute({ command, target })).accepted, true);
@@ -571,9 +573,9 @@ test("headless transport keeps uploads and blob URLs typed optional hooks", asyn
 });
 
 test("headless facts carry all required provenance classes", () => {
-  const controller = createMobKitConsoleController({ transport: createFakeTransport() });
+  const controller = createMetaConsoleController({ transport: createFakeTransport() });
 
-  assert.equal(controller.facts.mobkit({}).provenance.source, "mobkit-protocol");
+  assert.equal(controller.facts.meta({}).provenance.source, "meta-protocol");
   assert.equal(controller.facts.derived({}).provenance.source, "controller-derived");
   assert.equal(controller.facts.optimistic({}, "idem").provenance.source, "optimistic");
   assert.equal(controller.facts.host({}).provenance.source, "host-adapter");
@@ -701,7 +703,7 @@ test("createHttpConsoleTransport falls back to legacy inspect RPC when the conso
           error: { code: -32601, message: "method not found" },
         }), { status: 200 });
       }
-      if (body.method === "mobkit/inspect_identity") {
+      if (body.method === "meta/inspect_identity") {
         return new Response(JSON.stringify({
           jsonrpc: "2.0",
           id: body.id,
@@ -724,7 +726,7 @@ test("createHttpConsoleTransport falls back to legacy inspect RPC when the conso
     });
     assert.deepEqual(methods, [
       CONSOLE_RPC_METHODS.inspectIdentity,
-      "mobkit/inspect_identity",
+      "meta/inspect_identity",
     ]);
   } finally {
     globalThis.fetch = previousFetch;
@@ -746,7 +748,7 @@ test("createHttpConsoleTransport does not fall back on non-method-missing inspec
           error: { code: -32000, message: "backend unavailable" },
         }), { status: 200 });
       }
-      if (body.method === "mobkit/inspect_identity") {
+      if (body.method === "meta/inspect_identity") {
         return new Response(JSON.stringify({
           jsonrpc: "2.0",
           id: body.id,
@@ -771,3 +773,79 @@ test("createHttpConsoleTransport does not fall back on non-method-missing inspec
     globalThis.fetch = previousFetch;
   }
 });
+
+for (const [label, create] of [["stock", createHttpConsoleTransport], ["shared", createSharedHttpConsoleTransport]] as const) {
+  test(`${label} HTTP transport reads a stored image same-origin, with no token in the URL, and refuses anything else`, async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: Array<{ url: string; credentials?: RequestCredentials; authorization: string | null }> = [];
+    let reply = () => new Response(new Uint8Array([137, 80, 78, 71]), { status: 200, headers: { "content-type": "image/png" } });
+    let hang = false;
+    globalThis.fetch = ((url: string | URL | Request, init?: RequestInit) => {
+      requests.push({ url: String(url), credentials: init?.credentials, authorization: new Headers(init?.headers).get("authorization") });
+      if (hang) {
+        return new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+        });
+      }
+      return Promise.resolve(reply());
+    }) as typeof fetch;
+    try {
+      const transport = create({ baseUrl: "http://gateway.test" });
+      const bytes = await transport.readBlob!({ blobId: "sha256:abc" });
+      assert.equal(bytes.type, "image/png");
+      assert.equal(bytes.size, 4);
+      // The browser's same-origin credentials (a session cookie, an
+      // authenticating front); the Console adds no header and no URL token.
+      assert.deepEqual(requests, [{ url: "http://gateway.test/blobs/sha256%3Aabc", credentials: "same-origin", authorization: null }]);
+
+      // A media failure and an HTTP failure keep their own errors: neither is a
+      // timeout or a connection failure.
+      const untyped = (pattern: RegExp) => (error: ConsoleTransportFailure) => pattern.test(error.message) && error.transportFailure === undefined;
+      for (const contentType of ["text/html", "image/svg+xml", "application/octet-stream"]) {
+        reply = () => new Response("<svg onload=alert(1)>", { status: 200, headers: { "content-type": contentType } });
+        await assert.rejects(transport.readBlob!({ blobId: "sha256:abc" }), untyped(/not a displayable image/), contentType);
+      }
+      reply = () => new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+      await assert.rejects(transport.readBlob!({ blobId: "sha256:abc" }), untyped(/Blob read failed 401/));
+
+      hang = true;
+      const controller = new AbortController();
+      const pending = transport.readBlob!({ blobId: "sha256:abc", signal: controller.signal });
+      controller.abort();
+      await assert.rejects(pending, (error: unknown) => (error as Error).name === "AbortError");
+      assert.ok(requests.every(request => !request.url.includes("auth_token")));
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+}
+
+for (const [label, create] of [["stock", createHttpConsoleTransport], ["shared", createSharedHttpConsoleTransport]] as const) {
+  test(`${label} HTTP transport times out a stored image whose body stalls after its headers`, { timeout: 5000 }, async () => {
+    const previousFetch = globalThis.fetch;
+    // 200 raster headers at once, then a body that never arrives. Aborting the
+    // request errors the body, as a real fetch does.
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => new Response(new ReadableStream<Uint8Array>({
+      start(body) {
+        init?.signal?.addEventListener("abort", () => body.error(init.signal?.reason), { once: true });
+      },
+    }), { status: 200, headers: { "content-type": "image/png" } })) as typeof fetch;
+    try {
+      await assert.rejects(
+        create({ baseUrl: "http://gateway.test", fetchTimeoutMs: 50 }).readBlob!({ blobId: "sha256:abc" }),
+        (error: ConsoleTransportFailure) => error.transportFailure === "timeout" && error.timeoutMs === 50
+          && error.message === "console blob read timeout after 50 ms",
+      );
+      // The caller cancelling while the body stalls keeps the caller's abort
+      // error; it is not reported as a timeout.
+      const controller = new AbortController();
+      const pending = create({ baseUrl: "http://gateway.test", fetchTimeoutMs: 60_000 })
+        .readBlob!({ blobId: "sha256:abc", signal: controller.signal });
+      await new Promise(resolve => setTimeout(resolve, 10));
+      controller.abort();
+      await assert.rejects(pending, (error: ConsoleTransportFailure) => error.name === "AbortError" && error.transportFailure === undefined);
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+}

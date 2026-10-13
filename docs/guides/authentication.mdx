@@ -4,7 +4,7 @@ description: "JWT validation, OIDC discovery, provider configuration, and email 
 icon: "lock"
 ---
 
-MobKit authenticates protected console, REST, JSON-RPC, Flow Editor, and SSE
+Meta authenticates protected console, REST, JSON-RPC, Flow Editor, and SSE
 requests with JWTs. Signature and claim validation establishes a principal;
 `AuthPolicy` then applies provider matching and an exact principal allowlist.
 The reference HTTP router deliberately leaves only its shells, static assets,
@@ -20,7 +20,7 @@ and health endpoint public.
 | `ServiceIdentity` | Machine-to-machine principals (prefix: `svc:`) |
 | `TestProvider` | Testing classification -- rejected by protected policy |
 
-These values classify an already validated token; MobKit does not run the
+These values classify an already validated token; Meta does not run the
 provider's browser OAuth login flow. An absent or unrecognized `provider`
 claim maps to `GenericOidc`. A token with `actor_type = "service"`, or a
 principal beginning with `svc:`, maps to `ServiceIdentity`.
@@ -47,7 +47,7 @@ AuthPolicy {
 
 ## JWT validation
 
-MobKit's low-level JWT implementation supports `HS256`, `RS256`, and `ES256`
+Meta's low-level JWT implementation supports `HS256`, `RS256`, and `ES256`
 with P-256 keys. For a token backed by a parsed JWKS document, use the helpers
 in this order:
 
@@ -79,12 +79,12 @@ in this order:
 
     ```rust
     let verification_key =
-        meerkat_mobkit::auth::build_jwt_verification_key(jwk, &header.alg)?;
+        meerkat_meta::auth::build_jwt_verification_key(jwk, &header.alg)?;
     let validated: ValidatedJwt =
-        meerkat_mobkit::auth::validate_jwt_with_verification_key(
+        meerkat_meta::auth::validate_jwt_with_verification_key(
             &token,
             &verification_key,
-            &meerkat_mobkit::auth::JwtClaimsValidationConfig {
+            &meerkat_meta::auth::JwtClaimsValidationConfig {
                 issuer: Some(expected_issuer),
                 audience: Some(expected_audience),
                 now_epoch_seconds,
@@ -246,7 +246,7 @@ In the reference app router, these surfaces remain public even when
 - `/console`, `/console/`, and `/console/assets/*`
 - `/flow-editor`, `/flow-editor/`, and `/flow-editor/assets/*`
 
-Console JSON, JSON-RPC, timeline, blob, Flow Editor RPC, and all MobKit SSE
+Console JSON, JSON-RPC, timeline, blob, Flow Editor RPC, and all Meta SSE
 surfaces honor `require_app_auth`. When enabled, they accept either
 `Authorization: Bearer <token>` or an exact `auth_token` query parameter.
 Query values are percent-decoded, so callers must URL-encode reserved

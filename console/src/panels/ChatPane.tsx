@@ -9,6 +9,7 @@ import { approvalInteractionIdsByTurn, ConversationApprovals, pendingApprovalTur
 import type { ConsoleQuoteSelection } from "../../../packages/console-components/src/conversation/context-selection";
 import type { MarkdownUrlPolicy } from "../../../packages/console-components/src/conversation/conversation-markdown";
 import { CompletedToolDisclosure, groupRoutineToolRows, ConversationPresentationProvider, ConversationRowStateScope, RowDetails, type ConversationDisplayLabels } from "../../../packages/console-components/src/conversation/presentation-policy";
+import { ConversationBlobReaderProvider, type ConversationBlobReader } from "../../../packages/console-components/src/conversation/blob-image";
 import React from "react";
 import type {
   ConversationTimelineEntry,
@@ -73,6 +74,8 @@ interface ChatPaneProps extends ConversationApprovalProps {
   headerVariant?: "full" | "compact";
   displayLabels?: ConversationDisplayLabels;
   markdownUrlPolicy?: MarkdownUrlPolicy;
+  /** Reads stored images with the host transport's authority (its `readBlob`). */
+  blobReader?: ConversationBlobReader;
   conversationId?: string;
   contextSlot?: React.ReactNode;
   onQuoteSelection?: (quote: ConsoleQuoteSelection) => void;
@@ -1782,6 +1785,7 @@ export function ChatPane({
   headerVariant = "full",
   displayLabels,
   markdownUrlPolicy,
+  blobReader,
   conversationId,
   approvalSnapshot,
   onApprovalDecision,
@@ -2480,6 +2484,7 @@ export function ChatPane({
 
   return (
     <ConversationPresentationProvider labels={presentationLabels} viewportKey={viewportKey} autoFold={scroll.mode === "following-end"}>
+    <ConversationBlobReaderProvider reader={blobReader}>
     <div
       className="conv"
       data-testid={`chat-pane:${identity}`}
@@ -2656,6 +2661,7 @@ export function ChatPane({
         </div>
       </div>
     </div>
+    </ConversationBlobReaderProvider>
     </ConversationPresentationProvider>
   );
 }

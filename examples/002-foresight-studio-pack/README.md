@@ -1,6 +1,6 @@
 # Foresight Studio Pack
 
-Synthetic strategy/research scenario for a heavily customized MobKit console.
+Synthetic strategy/research scenario for a heavily customized Meta console.
 
 This pack uses the TypeScript SDK to provide:
 
@@ -44,4 +44,4 @@ Live console:
 ./examples/002-foresight-studio-pack/examples.sh --kickoff
 ```
 
-The script prints the local `/console` URL. Without `OPENAI_API_KEY`, the pack uses MobKit's deterministic demo LLM so autonomous agents stay live and console sends work. To exercise provider-backed turns, set `OPENAI_API_KEY` and pass `--real-llm`. Omit `--kickoff` if you only want to open the customized console and start the studio manually.
+The script prints the local `/console` URL. Without `OPENAI_API_KEY`, the pack uses Meta's deterministic demo LLM so autonomous agents stay live and console sends work. To exercise provider-backed turns, set `OPENAI_API_KEY` and pass `--real-llm`. Omit `--kickoff` if you only want to open the customized console and start the studio manually.

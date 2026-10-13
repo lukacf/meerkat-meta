@@ -6,7 +6,7 @@ import {
   type ConsoleWorkbenchTarget,
 } from "./targets";
 
-// Dual-runner: mobkit's console gates bundle this file with esbuild and run it
+// Dual-runner: meta's console gates bundle this file with esbuild and run it
 // under `node --test`; the meerkat-studio desktop app picks it up with vitest
 // (globals enabled). Resolve the registrar for whichever runner is active.
 type TestFn = (name: string, fn: () => void | Promise<void>) => void;
@@ -17,39 +17,39 @@ const test: TestFn = process.env.VITEST
 
 test("migrateConsoleWorkbenchTarget maps legacy agent-chat targets to namespaced identity chat", () => {
   const target = migrateConsoleWorkbenchTarget({
-    id: "member-luka",
+    id: "member-alex",
     kind: "agent-chat",
-    title: "Luka",
-    identity: "identity:luka",
-    memberId: "member-luka",
+    title: "Alex",
+    identity: "identity:alex",
+    memberId: "member-alex",
   });
 
-  assert.equal(target?.kind, "mobkit/identity-chat");
-  assert.equal(target?.kind === "mobkit/identity-chat" && "identity" in target ? target.identity : null, "identity:luka");
-  assert.equal(target?.kind === "mobkit/identity-chat" && "addressingMode" in target ? target.addressingMode : null, "identity");
+  assert.equal(target?.kind, "meta/identity-chat");
+  assert.equal(target?.kind === "meta/identity-chat" && "identity" in target ? target.identity : null, "identity:alex");
+  assert.equal(target?.kind === "meta/identity-chat" && "addressingMode" in target ? target.addressingMode : null, "identity");
 });
 
 test("migrateConsoleWorkbenchTarget maps legacy identity-inspect, routing, and gating targets", () => {
   assert.deepEqual(migrateConsoleWorkbenchTarget({
-    id: "inspect:identity:luka",
+    id: "inspect:identity:alex",
     kind: "identity-inspect",
-    title: "Luka Details",
-    identity: "identity:luka",
+    title: "Alex Details",
+    identity: "identity:alex",
   }), {
-    id: "inspect:identity:luka",
-    kind: "mobkit/identity-inspect",
-    title: "Luka Details",
+    id: "inspect:identity:alex",
+    kind: "meta/identity-inspect",
+    title: "Alex Details",
     subtitle: undefined,
     iconName: undefined,
     badgeLabel: undefined,
-    identity: "identity:luka",
+    identity: "identity:alex",
     memberId: undefined,
   });
 
-  assert.equal(migrateConsoleWorkbenchTarget({ id: "routing", kind: "routing", title: "Routing" })?.kind, "mobkit/routing");
-  assert.equal(migrateConsoleWorkbenchTarget({ id: "gating", kind: "gating", title: "Approvals" })?.kind, "mobkit/gating");
-  assert.equal(migrateConsoleWorkbenchTarget({ id: "workgraph", kind: "workgraph", title: "WorkGraph" })?.kind, "mobkit/workgraph");
-  assert.equal(migrateConsoleWorkbenchTarget({ id: "workgraph", kind: "mobkit/workgraph", title: "WorkGraph" })?.kind, "mobkit/workgraph");
+  assert.equal(migrateConsoleWorkbenchTarget({ id: "routing", kind: "routing", title: "Routing" })?.kind, "meta/routing");
+  assert.equal(migrateConsoleWorkbenchTarget({ id: "gating", kind: "gating", title: "Approvals" })?.kind, "meta/gating");
+  assert.equal(migrateConsoleWorkbenchTarget({ id: "workgraph", kind: "workgraph", title: "WorkGraph" })?.kind, "meta/workgraph");
+  assert.equal(migrateConsoleWorkbenchTarget({ id: "workgraph", kind: "meta/workgraph", title: "WorkGraph" })?.kind, "meta/workgraph");
 });
 
 test("migrated legacy targets hydrate through dock normalization", () => {
@@ -61,21 +61,21 @@ test("migrated legacy targets hydrate through dock normalization", () => {
         id: "p-chat",
         mode: "console",
         target: migrateConsoleWorkbenchTarget({
-          id: "member-luka",
+          id: "member-alex",
           kind: "agent-chat",
-          title: "Luka",
-          identity: "identity:luka",
-          memberId: "member-luka",
+          title: "Alex",
+          identity: "identity:alex",
+          memberId: "member-alex",
         }),
       },
       {
         id: "p-inspect",
         mode: "console",
         target: migrateConsoleWorkbenchTarget({
-          id: "inspect:identity:luka",
+          id: "inspect:identity:alex",
           kind: "identity-inspect",
-          title: "Luka Details",
-          identity: "identity:luka",
+          title: "Alex Details",
+          identity: "identity:alex",
         }),
       },
       {
@@ -117,10 +117,10 @@ test("migrated legacy targets hydrate through dock normalization", () => {
   });
 
   assert.deepEqual(state.panels.map((panel) => panel.target?.kind), [
-    "mobkit/identity-chat",
-    "mobkit/identity-inspect",
-    "mobkit/routing",
-    "mobkit/gating",
+    "meta/identity-chat",
+    "meta/identity-inspect",
+    "meta/routing",
+    "meta/gating",
   ]);
   assert.equal(state.focusedPanelId, "p-chat");
 });

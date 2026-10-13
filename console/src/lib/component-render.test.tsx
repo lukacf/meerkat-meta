@@ -46,7 +46,7 @@ function HorizontalNavigation() {
   );
 }
 
-test("alternate shell renders non-sidebar navigation with MobKit transcript and composer components", () => {
+test("alternate shell renders non-sidebar navigation with Meta transcript and composer components", () => {
   const entries: ConversationTimelineEntry[] = [
     {
       id: "user-1",
@@ -60,7 +60,7 @@ test("alternate shell renders non-sidebar navigation with MobKit transcript and 
       kind: "message",
       variant: "plain",
       identity: { id: "assistant", label: "Assistant", role: "assistant" },
-      text: "MobKit transcript and composer still render.",
+      text: "Meta transcript and composer still render.",
     },
   ];
   const html = renderToStaticMarkup(
@@ -81,7 +81,7 @@ test("alternate shell renders non-sidebar navigation with MobKit transcript and 
         <ConsoleComposer
           viewState={{
             value: "next prompt",
-            placeholder: "Send to the selected MobKit target",
+            placeholder: "Send to the selected Meta target",
             mainRowItems: [],
             footerLeftItems: [],
             footerRightItems: [],
@@ -96,8 +96,8 @@ test("alternate shell renders non-sidebar navigation with MobKit transcript and 
   assert.match(html, /data-orientation="horizontal"/);
   assert.match(html, /Project Alpha/);
   assert.match(html, /Planning Thread/);
-  assert.match(html, /MobKit transcript and composer still render/);
-  assert.match(html, /Send to the selected MobKit target/);
+  assert.match(html, /Meta transcript and composer still render/);
+  assert.match(html, /Send to the selected Meta target/);
 });
 
 test("council entries render as cards through the SHARED transcript, not only in ChatPane", () => {

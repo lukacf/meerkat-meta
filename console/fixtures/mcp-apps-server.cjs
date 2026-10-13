@@ -4,7 +4,7 @@ const readline = require('node:readline');
 const uri = 'ui://fixture/results.html';
 let count = 7;
 const viewCounts = new Map();
-const log = value => fs.appendFileSync(process.env.MOBKIT_FIXTURE_APP_LOG, JSON.stringify({ pid: process.pid, atMs: Date.now(), ...value }) + '\n');
+const log = value => fs.appendFileSync(process.env.META_FIXTURE_APP_LOG, JSON.stringify({ pid: process.pid, atMs: Date.now(), ...value }) + '\n');
 const result = (viewId, operation, requestId) => {
   const value = { count: viewId ? (viewCounts.get(viewId) ?? 7) : count };
   if (viewId) value.viewId = viewId;
@@ -33,7 +33,7 @@ lines.on('line', line => {
       ] }; break;
     case 'resources/list': value = { resources: [] }; break;
     case 'resources/read':
-      if (request.params.uri === uri) value = { contents: [{ uri, mimeType: 'text/html;profile=mcp-app', text: fs.readFileSync(process.env.MOBKIT_FIXTURE_APP_HTML, 'utf8') }] };
+      if (request.params.uri === uri) value = { contents: [{ uri, mimeType: 'text/html;profile=mcp-app', text: fs.readFileSync(process.env.META_FIXTURE_APP_HTML, 'utf8') }] };
       else error = { code: -32602, message: 'Unknown resource' };
       break;
     case 'tools/call':

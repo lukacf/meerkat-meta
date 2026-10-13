@@ -7,7 +7,7 @@ contract mirrors the Rust `ConsoleIdentityRecord` serde shape:
 and `labels` default to empty.
 """
 
-from meerkat_mobkit import ConsoleIdentityRecord
+from meerkat_meta import ConsoleIdentityRecord
 
 
 def test_full_record_round_trips_the_wire_shape() -> None:

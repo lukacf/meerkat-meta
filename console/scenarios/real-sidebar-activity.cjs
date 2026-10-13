@@ -7,7 +7,7 @@ const { chromium } = require("playwright");
 const { startFixture, eventually } = require("../acceptance-runtime.cjs");
 const { assertSidebarCompletion, waitForExplicitIdleRoster, waitForSidebarCompletion } = require("../sidebar-activity-oracle.cjs");
 
-const evidence = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+const evidence = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
 const router = "router:main";
 const delivery = "domain:delivery";
 const activePhases = new Set(["waiting", "tool-executing", "generating"]);
@@ -31,13 +31,13 @@ function initializationCancellation(request) {
   if (new URL(request.url()).pathname.endsWith("/timeline/stream")) return true;
   try {
     const body = JSON.parse(request.postData() || "{}");
-    return body.method === "mobkit/console/query_timeline" && body.params?.mode === "recent"
+    return body.method === "meta/console/query_timeline" && body.params?.mode === "recent"
       && body.params?.limit === 200 && !body.params?.identity;
   } catch { return false; }
 }
 
 async function sidebarActivity() {
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "Use the coordinator's prebuilt fixture; this scenario must not compile Rust.");
+  assert(process.env.META_EXAMPLE_BIN_DIR, "Use the coordinator's prebuilt fixture; this scenario must not compile Rust.");
   const fixture = await startFixture();
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });

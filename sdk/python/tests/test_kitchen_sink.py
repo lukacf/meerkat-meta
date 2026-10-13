@@ -28,13 +28,13 @@ from uuid import UUID
 
 import pytest
 
-from meerkat_mobkit.builder import MobKit
-from meerkat_mobkit.identity_first_models import (
+from meerkat_meta.builder import Meta
+from meerkat_meta.identity_first_models import (
     DispatchInput,
     DurableAgentSpec,
     ManagedPeerEdge,
 )
-from meerkat_mobkit.errors import RpcError, TurnTrackingUnavailableWarning
+from meerkat_meta.errors import RpcError, TurnTrackingUnavailableWarning
 
 # ---------------------------------------------------------------------------
 # Environment / skip helpers
@@ -45,9 +45,9 @@ from meerkat_mobkit.errors import RpcError, TurnTrackingUnavailableWarning
 # path below is the repository's plain cargo target directory; running from a
 # feature worktree would silently test the wrong artifact (and hide the wire
 # drift the branch introduces). Prefer an explicit override:
-#   MOBKIT_GATEWAY_BIN=$(./scripts/repo-cargo --print-env CARGO_TARGET_DIR)/debug/rpc_gateway
+#   META_GATEWAY_BIN=$(./scripts/repo-cargo --print-env CARGO_TARGET_DIR)/debug/rpc_gateway
 def _resolve_gateway_bin() -> str:
-    override = os.environ.get("MOBKIT_GATEWAY_BIN", "").strip()
+    override = os.environ.get("META_GATEWAY_BIN", "").strip()
     if override:
         return override
     return os.path.join(
@@ -283,7 +283,7 @@ _EDGES = [
 
 async def _boot(state_dir, roster, topology, customizer):
     return await (
-        MobKit.builder()
+        Meta.builder()
         .gateway(_GATEWAY_BIN)
         .mob_inline(_TEAM_MOB_TOML)
         .persistent_state(state_dir)
@@ -1103,7 +1103,7 @@ def _sdk_run_only_fixture():
 @pytest.mark.parametrize("intermediate", [False, True])
 async def test_kitchen_sdk_run_only_lineage_requires_own_committed_output(monkeypatch, sdk_output, intermediate):
     from functools import partial
-    from meerkat_mobkit.runtime import IdentityAgentHandle
+    from meerkat_meta.runtime import IdentityAgentHandle
     from .test_identity_first_turn_tickets import TicketTransport, _completed, _make_runtime, _sent
 
     ticket = "ac8832d0-ce0e-43cb-810a-fbd30f65be4f"
@@ -1142,8 +1142,8 @@ async def test_kitchen_sdk_run_only_lineage_requires_own_committed_output(monkey
         assert result["run_id"] == "requested-run"
         assert result["input_history"]["id"] == "sdk-user"
         assert result["history"]["payload"]["assistant_message_id"] == "requested-assistant"
-    assert transport.params_of("mobkit/send")[0]["track_turn"] is True
-    assert transport.params_of("mobkit/inspect_identity") == []
+    assert transport.params_of("meta/send")[0]["track_turn"] is True
+    assert transport.params_of("meta/inspect_identity") == []
 
 
 @pytest.mark.asyncio
@@ -1291,7 +1291,7 @@ async def test_kitchen_dispatch_requires_its_ticket_and_one_deadline(monkeypatch
 @pytest.mark.asyncio
 @pytest.mark.parametrize("sdk_output", ["incident processed", "unrelated peer reply"])
 async def test_kitchen_research_sdk_peer_output_requires_cursor_and_exact_history(monkeypatch, sdk_output):
-    from meerkat_mobkit.runtime import IdentityAgentHandle
+    from meerkat_meta.runtime import IdentityAgentHandle
     from .test_identity_first_turn_tickets import TicketTransport, _inspection, _make_runtime
 
     clock = [0.0]
@@ -1316,8 +1316,8 @@ async def test_kitchen_research_sdk_peer_output_requires_cursor_and_exact_histor
         assert remaining == 55
         # The baseline read, then the member read once at completion; the
         # wait itself is one server-side wait.
-        assert len(transport.params_of("mobkit/inspect_identity")) == 2
-        assert len(transport.params_of("mobkit/wait_for_completion")) == 1
+        assert len(transport.params_of("meta/inspect_identity")) == 2
+        assert len(transport.params_of("meta/wait_for_completion")) == 1
         frames = _interaction_fixture("domain:research", "research-session", "research-envelope")
         frames.append({"id": "research-notice", **_research_history_fixture()})
         return {"frames": frames, "exhausted": True}
@@ -1335,9 +1335,9 @@ async def test_kitchen_research_sdk_peer_output_requires_cursor_and_exact_histor
     else:
         assert (await operation)["run_id"] == "incident-run"
     assert calls == [(baseline, 60)]
-    assert transport.params_of("mobkit/turn_result") == []
-    assert transport.params_of("mobkit/dispatch") == []
-    assert transport.params_of("mobkit/send") == []
+    assert transport.params_of("meta/turn_result") == []
+    assert transport.params_of("meta/dispatch") == []
+    assert transport.params_of("meta/send") == []
 
 
 @pytest.mark.asyncio
@@ -1359,7 +1359,7 @@ async def test_kitchen_research_sdk_peer_wait_rejects_missing_baseline():
 @pytest.mark.parametrize("duplicate_input", [False, True])
 async def test_kitchen_sdk_ticket_ignores_identical_foreign_output(monkeypatch, duplicate_input):
     from functools import partial
-    from meerkat_mobkit.runtime import IdentityAgentHandle
+    from meerkat_meta.runtime import IdentityAgentHandle
     from .test_identity_first_turn_tickets import (
         TicketTransport, _completed, _inspection, _make_runtime, _sent,
     )
@@ -1396,15 +1396,15 @@ async def test_kitchen_sdk_ticket_ignores_identical_foreign_output(monkeypatch, 
             await operation
     else:
         assert (await operation)["run_id"] == "requested-run"
-    assert transport.params_of("mobkit/send")[0]["track_turn"] is True
-    assert transport.params_of("mobkit/inspect_identity") == []
-    assert transport.params_of("mobkit/turn_result") == []
+    assert transport.params_of("meta/send")[0]["track_turn"] is True
+    assert transport.params_of("meta/inspect_identity") == []
+    assert transport.params_of("meta/turn_result") == []
     assert transport.waited_turns() == [{"identity": "identity:luka", "ticket": ticket}]
 
 
 @pytest.mark.asyncio
 async def test_kitchen_sdk_rejects_cursor_fallback_even_with_matching_output(monkeypatch):
-    from meerkat_mobkit.runtime import IdentityAgentHandle
+    from meerkat_meta.runtime import IdentityAgentHandle
     from .test_identity_first_turn_tickets import TicketTransport, _inspection, _make_runtime, _sent
     transport = TicketTransport(
         sends=[_sent(None)],
@@ -1420,9 +1420,9 @@ async def test_kitchen_sdk_rejects_cursor_fallback_even_with_matching_output(mon
         await _send_sdk_and_verify(
             object(), handle, "identity:luka", "luka-session", "Unique SDK input", timeout=60,
         )
-    assert transport.params_of("mobkit/send")[0]["track_turn"] is True
-    assert transport.params_of("mobkit/inspect_identity") == []
-    assert transport.params_of("mobkit/turn_result") == []
+    assert transport.params_of("meta/send")[0]["track_turn"] is True
+    assert transport.params_of("meta/inspect_identity") == []
+    assert transport.params_of("meta/turn_result") == []
 
 
 # ===========================================================================

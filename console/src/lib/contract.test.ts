@@ -190,16 +190,16 @@ test("console contract route and method names stay synchronized with Rust http c
   const schema = JSON.parse(
     readFileSync(resolve(process.cwd(), "../docs/rct/console-rest-sse-contract-v0.5.0.json"), "utf8"),
   ) as ContractSchema;
-  const rustSource = readFileSync(resolve(process.cwd(), "../crates/meerkat-mobkit/src/http_console.rs"), "utf8");
+  const rustSource = readFileSync(resolve(process.cwd(), "../crates/meerkat-meta/src/http_console.rs"), "utf8");
   const registeredRoutes = parseAxumRoutes(rustSource);
   const dispatchedRpcMethods = parseJsonRpcDispatchMethods(rustSource);
-  // The mobkit/workgraph/* group dispatches through one guard arm
+  // The meta/workgraph/* group dispatches through one guard arm
   // (`method if workgraph_methods::is_workgraph_method(method)`) whose
   // authoritative method list lives in rpc/workgraph_methods.rs — union it in
   // only while http_console.rs actually routes through that guard.
   if (/workgraph_methods::is_workgraph_method\(method\)/.test(rustSource)) {
     const workGraphSource = readFileSync(
-      resolve(process.cwd(), "../crates/meerkat-mobkit/src/rpc/workgraph_methods.rs"),
+      resolve(process.cwd(), "../crates/meerkat-meta/src/rpc/workgraph_methods.rs"),
       "utf8",
     );
     for (const method of parseWorkGraphMethodLists(workGraphSource)) {
@@ -212,7 +212,7 @@ test("console contract route and method names stay synchronized with Rust http c
   // with duplicated string literals.
   if (/topology_methods::TOPOLOGY_[A-Z_]+_METHOD/.test(rustSource)) {
     const topologySource = readFileSync(
-      resolve(process.cwd(), "../crates/meerkat-mobkit/src/rpc/topology_methods.rs"),
+      resolve(process.cwd(), "../crates/meerkat-meta/src/rpc/topology_methods.rs"),
       "utf8",
     );
     for (const method of parseTopologyMethods(topologySource)) {

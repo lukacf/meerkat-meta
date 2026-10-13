@@ -5,7 +5,7 @@
  * messages, metadata) into the `session_history` console frames the gateway
  * serves after a reload, following
  * `frames_from_session_history_message_with_namespace` in
- * crates/meerkat-mobkit/src/console_aggregator: conversational user messages
+ * crates/meerkat-meta/src/console_aggregator: conversational user messages
  * become `user_input`, each tool result a `tool_execution_completed` carrying
  * its full text, assistant messages `text_complete` (with text) or
  * `assistant_message`, and tool-only steps their `tool_call_requested`

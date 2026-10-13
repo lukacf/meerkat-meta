@@ -1,4 +1,4 @@
-from meerkat_mobkit.helpers import build_module_spec, define_module, define_module_spec
+from meerkat_meta.helpers import build_module_spec, define_module, define_module_spec
 
 
 def test_module_spec_boundary_serializes_for_gateway_init():

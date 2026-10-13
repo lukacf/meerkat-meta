@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { approvalMatchesConversation, createPendingApprovalResource, normalizePendingApproval, type ApprovalResourceEnvironment } from "./pending-approvals";
-import { CONSOLE_COMMAND_NAMES, createMobKitConsoleController as sharedController, type MobKitConsoleTransport } from "./headless";
-import { createMobKitConsoleController as stockController } from "../../../console/src/lib/headless";
+import { CONSOLE_COMMAND_NAMES, createMetaConsoleController as sharedController, type MetaConsoleTransport } from "./headless";
+import { createMetaConsoleController as stockController } from "../../../console/src/lib/headless";
 import { migrateConsoleWorkbenchTarget } from "./targets";
 import { CONSOLE_RPC_METHODS } from "./contract";
 
@@ -22,6 +22,52 @@ function clock() {
 }
 const row = (id = "p1") => ({ pending_id: id, action_id: `action:${id}`, action: "Deploy service", actor_id: "actor", risk_tier: "r3", deadline_at_ms: 1000 });
 const accepted = (id = "p1", decision = "approve") => ({ pending_id: id, action_id: `action:${id}`, approver_id: "operator", decision, outcome: decision === "escalate" ? "pending_approval" : "allowed", decided_at_ms: 10, ...(decision === "escalate" ? { next_pending_id: "p2" } : {}) });
+
+test("pending approval projection keeps actor, requested approver and notification references distinct", () => {
+  const request = normalizePendingApproval({ ...row(), requested_approver: "human:reviewer",
+    approval_recipient: "review-queue", approval_channel: "notification",
+    approval_route_id: "route:1", approval_delivery_id: "delivery:1" })!;
+  assert.equal(request.actorId, "actor");
+  assert.equal(request.requestedApprover, "human:reviewer");
+  assert.equal(request.approvalRecipient, "review-queue");
+  assert.equal(request.approvalChannel, "notification");
+  assert.equal(request.approvalRouteId, "route:1");
+  assert.equal(request.approvalDeliveryId, "delivery:1");
+  const absent = normalizePendingApproval({ ...row(), requested_approver: 42,
+    approval_recipient: {}, approval_channel: " ", approval_route_id: false, approval_delivery_id: [] })!;
+  assert.equal(absent.requestedApprover, undefined);
+  assert.equal(absent.approvalRecipient, undefined);
+  assert.equal(absent.approvalChannel, undefined);
+  assert.equal(absent.approvalRouteId, undefined);
+  assert.equal(absent.approvalDeliveryId, undefined);
+});
+
+test("an escalated successor uses its own routing facts without reviving the previous approver or delivery", async () => {
+  const c = clock();
+  const first = { ...row(), requested_approver: "human:reviewer", approval_recipient: "review-queue",
+    approval_channel: "notification", approval_route_id: "route:1", approval_delivery_id: "delivery:1" };
+  const successor = { ...first, pending_id: "p2", requested_approver: null,
+    approval_route_id: null, approval_delivery_id: null };
+  let reads = 0;
+  const resource = createPendingApprovalResource({ scopeKey: "a", environment: c.environment,
+    load: async () => ({ pending: [++reads === 1 ? first : successor] }),
+    decide: async () => accepted("p1", "escalate"),
+  });
+  try {
+    await tick();
+    assert.equal(resource.getSnapshot().requests[0].requestedApprover, "human:reviewer");
+    await resource.decide("p1", "escalate");
+    const request = resource.getSnapshot().requests[0];
+    assert.equal(request.pendingId, "p2");
+    assert.equal(request.actionId, first.action_id);
+    assert.equal(request.requestedApprover, undefined);
+    assert.equal(request.approvalRouteId, undefined);
+    assert.equal(request.approvalDeliveryId, undefined);
+    assert.equal(request.approvalRecipient, "review-queue");
+    assert.equal(request.approvalChannel, "notification");
+    assert.equal(request.deadlineAtMs, first.deadline_at_ms);
+  } finally { resource.dispose(); }
+});
 
 test("one resource discovers approvals without an inbox, pauses while hidden and refreshes on return", async () => {
   const c = clock(); let calls = 0;
@@ -175,7 +221,7 @@ for (const [name, create] of [["shared", sharedController], ["stock", stockContr
       loadExperience: async () => ({}), capabilities: async () => ({ methods }),
       executeCommand: async (input: { command: string }) => ({ command: input.command, accepted: true,
         result: input.command === CONSOLE_COMMAND_NAMES.listGatingPending ? { pending: [row()] } : (writes++, accepted()) }),
-    } as unknown as MobKitConsoleTransport;
+    } as unknown as MetaConsoleTransport;
     const controller = create({ transport });
     const resource = createPendingApprovalResource({ scopeKey: "a", environment: c.environment,
       load: async signal => (await controller.commands.execute({ command: CONSOLE_COMMAND_NAMES.listGatingPending, target, signal })).result,
@@ -209,7 +255,7 @@ for (const [name, create] of [["shared", sharedController], ["stock", stockContr
         // Error prose cannot establish whether this dispatched command was accepted.
         throw new Error(message);
       },
-    } as unknown as MobKitConsoleTransport });
+    } as unknown as MetaConsoleTransport });
     const resource = createPendingApprovalResource({ scopeKey: "a", environment: c.environment,
       load: async signal => (await controller.commands.execute({ command: CONSOLE_COMMAND_NAMES.listGatingPending, target, signal })).result,
       decide: async (_id, _action, signal) => (await controller.commands.execute({ command: CONSOLE_COMMAND_NAMES.decideGating, target, signal })).result,
@@ -235,7 +281,7 @@ for (const [name, create] of [["shared", sharedController], ["stock", stockContr
       loadExperience: async () => ({}),
       capabilities: async () => { if (failing) throw new Error("offline"); return { methods: [CONSOLE_RPC_METHODS.gatingPending] }; },
       executeCommand: async () => ({ command: CONSOLE_COMMAND_NAMES.listGatingPending, accepted: true, result: { pending: [row()] } }),
-    } as unknown as MobKitConsoleTransport });
+    } as unknown as MetaConsoleTransport });
     const resource = createPendingApprovalResource({ scopeKey: "a", environment: c.environment,
       load: async signal => (await controller.commands.execute({ command: CONSOLE_COMMAND_NAMES.listGatingPending, target, signal })).result,
       decide: async () => accepted(),

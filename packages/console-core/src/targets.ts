@@ -1,36 +1,36 @@
 import type { ConsoleDockTarget } from "./dock";
 
-export type MobKitWorkbenchTarget =
-  | MobKitIdentityChatTarget
-  | MobKitIdentityInspectTarget
-  | MobKitControlWorkbenchTarget;
+export type MetaWorkbenchTarget =
+  | MetaIdentityChatTarget
+  | MetaIdentityInspectTarget
+  | MetaControlWorkbenchTarget;
 
-export interface MobKitIdentityChatTarget extends ConsoleDockTarget {
-  kind: "mobkit/identity-chat";
+export interface MetaIdentityChatTarget extends ConsoleDockTarget {
+  kind: "meta/identity-chat";
   identity: string;
   memberId?: string;
   addressingMode: "identity";
 }
 
-export interface MobKitIdentityInspectTarget extends ConsoleDockTarget {
-  kind: "mobkit/identity-inspect";
+export interface MetaIdentityInspectTarget extends ConsoleDockTarget {
+  kind: "meta/identity-inspect";
   identity: string;
   memberId?: string;
 }
 
-export type MobKitControlTargetKind =
-  | "mobkit/topology"
-  | "mobkit/activity"
-  | "mobkit/roster"
-  | "mobkit/routing"
-  | "mobkit/gating"
-  | "mobkit/access"
-  | "mobkit/memory"
-  | "mobkit/workgraph"
-  | "mobkit/logs";
+export type MetaControlTargetKind =
+  | "meta/topology"
+  | "meta/activity"
+  | "meta/roster"
+  | "meta/routing"
+  | "meta/gating"
+  | "meta/access"
+  | "meta/memory"
+  | "meta/workgraph"
+  | "meta/logs";
 
-export interface MobKitControlWorkbenchTarget extends ConsoleDockTarget {
-  kind: MobKitControlTargetKind;
+export interface MetaControlWorkbenchTarget extends ConsoleDockTarget {
+  kind: MetaControlTargetKind;
 }
 
 export interface HostWorkbenchTarget<TPayload = unknown> extends ConsoleDockTarget {
@@ -42,23 +42,23 @@ export interface HostWorkbenchTarget<TPayload = unknown> extends ConsoleDockTarg
 }
 
 export type ConsoleWorkbenchTarget<THost = unknown> =
-  | MobKitWorkbenchTarget
+  | MetaWorkbenchTarget
   | HostWorkbenchTarget<THost>;
 
 type UnknownRecord = Record<string, unknown>;
 
-const LEGACY_CONTROL_TARGETS: Record<string, MobKitControlTargetKind> = {
-  topology: "mobkit/topology",
-  health: "mobkit/activity",
-  timeline: "mobkit/activity",
-  roster: "mobkit/roster",
-  routing: "mobkit/routing",
-  gating: "mobkit/gating",
-  gates: "mobkit/gating",
-  access: "mobkit/access",
-  memory: "mobkit/memory",
-  workgraph: "mobkit/workgraph",
-  logs: "mobkit/logs",
+const LEGACY_CONTROL_TARGETS: Record<string, MetaControlTargetKind> = {
+  topology: "meta/topology",
+  health: "meta/activity",
+  timeline: "meta/activity",
+  roster: "meta/roster",
+  routing: "meta/routing",
+  gating: "meta/gating",
+  gates: "meta/gating",
+  access: "meta/access",
+  memory: "meta/memory",
+  workgraph: "meta/workgraph",
+  logs: "meta/logs",
 };
 
 export function migrateConsoleWorkbenchTarget(
@@ -78,7 +78,7 @@ export function migrateConsoleWorkbenchTarget(
   if (kind === "agent-chat") {
     const identity = stringValue(input.identity) || stringValue(input.memberId) || id;
     return {
-      ...baseTarget(input, id, "mobkit/identity-chat", title),
+      ...baseTarget(input, id, "meta/identity-chat", title),
       identity,
       memberId: stringValue(input.memberId),
       addressingMode: "identity",
@@ -88,7 +88,7 @@ export function migrateConsoleWorkbenchTarget(
   if (kind === "identity-inspect") {
     const identity = stringValue(input.identity) || stringValue(input.memberId) || id.replace(/^inspect:/, "");
     return {
-      ...baseTarget(input, id, "mobkit/identity-inspect", title),
+      ...baseTarget(input, id, "meta/identity-inspect", title),
       identity,
       memberId: stringValue(input.memberId),
     };
@@ -99,11 +99,11 @@ export function migrateConsoleWorkbenchTarget(
     return baseTarget(input, id, controlKind, title);
   }
 
-  if (kind.startsWith("mobkit/")) {
-    return normalizeMobKitWorkbenchTarget(input, id, kind, title);
+  if (kind.startsWith("meta/")) {
+    return normalizeMetaWorkbenchTarget(input, id, kind, title);
   }
 
-  if (isNamespacedKind(kind) && kind !== "mobkit/unknown") {
+  if (isNamespacedKind(kind) && kind !== "meta/unknown") {
     const payloadVersion = typeof input.payloadVersion === "number" && Number.isSafeInteger(input.payloadVersion)
       ? input.payloadVersion
       : 1;
@@ -118,13 +118,13 @@ export function migrateConsoleWorkbenchTarget(
   return null;
 }
 
-function normalizeMobKitWorkbenchTarget(
+function normalizeMetaWorkbenchTarget(
   input: UnknownRecord,
   id: string,
   kind: string,
   title: string,
 ): ConsoleWorkbenchTarget | null {
-  if (kind === "mobkit/identity-chat") {
+  if (kind === "meta/identity-chat") {
     const identity = stringValue(input.identity) || stringValue(input.memberId);
     if (!identity) return null;
     return {
@@ -135,7 +135,7 @@ function normalizeMobKitWorkbenchTarget(
     };
   }
 
-  if (kind === "mobkit/identity-inspect") {
+  if (kind === "meta/identity-inspect") {
     const identity = stringValue(input.identity) || stringValue(input.memberId);
     if (!identity) return null;
     return {
@@ -145,8 +145,8 @@ function normalizeMobKitWorkbenchTarget(
     };
   }
 
-  if (Object.values(LEGACY_CONTROL_TARGETS).includes(kind as MobKitControlTargetKind)) {
-    return baseTarget(input, id, kind as MobKitControlTargetKind, title);
+  if (Object.values(LEGACY_CONTROL_TARGETS).includes(kind as MetaControlTargetKind)) {
+    return baseTarget(input, id, kind as MetaControlTargetKind, title);
   }
 
   return null;

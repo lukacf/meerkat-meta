@@ -1,14 +1,14 @@
 """Mock-RPC tests for the non-destructive reload verb and the member health read.
 
 `reload_member` is the repair for a durability-degraded member (meerkat's
-`RecoveryRepairBlocked`); it must hit `mobkit/reload_member`, never the
-destructive `mobkit/respawn_member`. `member_health` is the in-process read
+`RecoveryRepairBlocked`); it must hit `meta/reload_member`, never the
+destructive `meta/respawn_member`. `member_health` is the in-process read
 that answers while the mob actor loop is stalled.
 """
 
 import pytest
 
-from meerkat_mobkit import MemberHealth, MemberReloadResult
+from meerkat_meta import MemberHealth, MemberReloadResult
 
 from .test_rpc_method_names import make_mock_mob_handle
 
@@ -16,7 +16,7 @@ from .test_rpc_method_names import make_mock_mob_handle
 @pytest.mark.asyncio
 async def test_reload_member_rpc_name_and_typed_result():
     handle, calls = make_mock_mob_handle({
-        "mobkit/reload_member": {
+        "meta/reload_member": {
             "reloaded": True,
             "disposition": "discarded",
             "session_id": "sess-1",
@@ -26,7 +26,7 @@ async def test_reload_member_rpc_name_and_typed_result():
         }
     })
     result = await handle.reload_member("review:singleton")
-    assert calls[0] == ("mobkit/reload_member", {"member_id": "review:singleton"})
+    assert calls[0] == ("meta/reload_member", {"member_id": "review:singleton"})
     assert isinstance(result, MemberReloadResult)
     assert result.reloaded is True
     assert result.disposition == "discarded"
@@ -38,10 +38,10 @@ async def test_reload_member_rpc_name_and_typed_result():
 @pytest.mark.asyncio
 async def test_reload_member_never_calls_respawn():
     handle, calls = make_mock_mob_handle({
-        "mobkit/reload_member": {"reloaded": False, "disposition": "not_current"}
+        "meta/reload_member": {"reloaded": False, "disposition": "not_current"}
     })
     result = await handle.reload_member("review:singleton")
-    assert [method for method, _ in calls] == ["mobkit/reload_member"]
+    assert [method for method, _ in calls] == ["meta/reload_member"]
     assert result.reloaded is False
     assert result.disposition == "not_current"
     assert result.session_id is None
@@ -51,7 +51,7 @@ async def test_reload_member_never_calls_respawn():
 @pytest.mark.asyncio
 async def test_reload_member_tolerates_unknown_disposition():
     handle, _ = make_mock_mob_handle({
-        "mobkit/reload_member": {"reloaded": False, "disposition": "some_future_value"}
+        "meta/reload_member": {"reloaded": False, "disposition": "some_future_value"}
     })
     result = await handle.reload_member("x")
     assert result.disposition == "some_future_value"
@@ -60,7 +60,7 @@ async def test_reload_member_tolerates_unknown_disposition():
 @pytest.mark.asyncio
 async def test_member_health_rpc_name_and_typed_result():
     handle, calls = make_mock_mob_handle({
-        "mobkit/member_health": {
+        "meta/member_health": {
             "identity": "review:singleton",
             "member_id": "rt:review:singleton:4",
             "state": "active",
@@ -78,7 +78,7 @@ async def test_member_health_rpc_name_and_typed_result():
         }
     })
     health = await handle.member_health("review:singleton")
-    assert calls[0] == ("mobkit/member_health", {"member_id": "review:singleton"})
+    assert calls[0] == ("meta/member_health", {"member_id": "review:singleton"})
     assert isinstance(health, MemberHealth)
     assert health.identity == "review:singleton"
     assert health.member_id == "rt:review:singleton:4"
@@ -98,7 +98,7 @@ async def test_member_health_rpc_name_and_typed_result():
 @pytest.mark.asyncio
 async def test_member_health_carries_last_reload():
     handle, _ = make_mock_mob_handle({
-        "mobkit/member_health": {
+        "meta/member_health": {
             "identity": "review:singleton",
             "state": "active",
             "materialization_in_flight": False,
@@ -118,7 +118,7 @@ async def test_member_health_carries_last_reload():
 @pytest.mark.asyncio
 async def test_member_health_carries_durability_when_present():
     handle, _ = make_mock_mob_handle({
-        "mobkit/member_health": {
+        "meta/member_health": {
             "identity": "review:singleton",
             "state": "active",
             "materialization_in_flight": False,
@@ -139,7 +139,7 @@ async def test_member_health_carries_durability_when_present():
 
 @pytest.mark.asyncio
 async def test_member_health_degrades_on_missing_actor_loop():
-    handle, _ = make_mock_mob_handle({"mobkit/member_health": {"identity": "x", "state": "dormant"}})
+    handle, _ = make_mock_mob_handle({"meta/member_health": {"identity": "x", "state": "dormant"}})
     health = await handle.member_health("x")
     assert health.actor_loop == {"state": "unobserved"}
     assert health.materialization_in_flight is False
@@ -148,7 +148,7 @@ async def test_member_health_degrades_on_missing_actor_loop():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["actor_command_admission", "actor_command_reply"])
 async def test_timeout_observations_survive_health_and_rpc_errors(stage):
-    from meerkat_mobkit.errors import RpcError
+    from meerkat_meta.errors import RpcError
 
     data = {
         "kind": "mob_actor_command_timed_out",
@@ -157,7 +157,7 @@ async def test_timeout_observations_survive_health_and_rpc_errors(stage):
         "deadline_reached": True,
     }
     handle, _ = make_mock_mob_handle({
-        "mobkit/member_health": {
+        "meta/member_health": {
             "identity": "x",
             "state": "active",
             "last_delivery_error": {
@@ -181,6 +181,6 @@ async def test_timeout_observations_survive_health_and_rpc_errors(stage):
     with pytest.raises(RpcError) as caught:
         await handle.send("x", "turn")
     assert caught.value.data == data
-    assert calls == ["mobkit/send_message"]
+    assert calls == ["meta/send_message"]
     assert "executed" not in error.data
     assert "retryable" not in error.data

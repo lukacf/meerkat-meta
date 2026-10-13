@@ -28,14 +28,14 @@ trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 
 # The server binds port 0 and announces its bound address in its log
-# ("MOBKIT_FIXTURE_READY {...}"). Print that address once the console answers
+# ("META_FIXTURE_READY {...}"). Print that address once the console answers
 # there. Reserving a free port first and binding it later raced every other
 # process on the host for that port.
 wait_for_server() {
   python3 - <<'PY' "$SERVER_LOG" "$SERVER_PID"
 import json, os, sys, time, urllib.request
 log_path, server_pid = sys.argv[1], int(sys.argv[2])
-prefix = "MOBKIT_FIXTURE_READY "
+prefix = "META_FIXTURE_READY "
 addr = None
 deadline = time.time() + 120
 while time.time() < deadline:
@@ -70,7 +70,7 @@ start_server() {
   # set -m puts the background job in its own process group so cleanup can
   # kill the entire cargo/server tree via kill -- -PID.
   set -m
-  (cd "$ROOT" && INCIDENT_COMMAND_CENTER_LISTEN_ADDR="127.0.0.1:0" cargo run -p meerkat-mobkit --example incident_command_center > "$SERVER_LOG" 2>&1) &
+  (cd "$ROOT" && INCIDENT_COMMAND_CENTER_LISTEN_ADDR="127.0.0.1:0" cargo run -p meerkat-meta --example incident_command_center > "$SERVER_LOG" 2>&1) &
   SERVER_PID=$!
   set +m
   SERVER_ADDR="$(wait_for_server)"

@@ -1,9 +1,9 @@
 /**
- * Configuration modules for MobKit runtime.
+ * Configuration modules for Meta runtime.
  *
  * @example
  * ```ts
- * import { auth, memory, sessionStore } from "@rkat/mobkit-sdk";
+ * import { auth, memory, sessionStore } from "@rkat/meta-sdk";
  *
  * const authConfig = auth.google("my-client-id");
  * const memConfig = memory.localJson();

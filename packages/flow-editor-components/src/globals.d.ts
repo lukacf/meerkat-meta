@@ -8,7 +8,7 @@ declare global {
   // The controller facade global stays the runtime contract for view
   // components until S23; components call it at render time, not import time.
   interface Window {
-    MobKitFlowController: any;
+    MetaFlowController: any;
   }
 }
 

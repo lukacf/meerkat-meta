@@ -137,7 +137,7 @@ elif args[:2] == ["release", "upload"]:
         "local_file": str(destination)})
     state_path.write_text(json.dumps(state))
 elif args[:2] == ["release", "edit"]:
-    if args[3:] != ["--repo", "lukacf/meerkat-mobkit", "--draft=false"]:
+    if args[3:] != ["--repo", "lukacf/meerkat-meta", "--draft=false"]:
         fail("metadata mutation forbidden")
     state["release"]["draft"] = False
     state_path.write_text(json.dumps(state))
@@ -251,7 +251,7 @@ class CandidateProtocolTests(unittest.TestCase):
             (folder / helper.PROVENANCE).write_text('{"original":"signed bundle fixture"}\n')
             packed = self.root / f"artifact-{aid}.zip"
             self.pack(packed, folder, [*names, helper.PROVENANCE])
-            metadata = self.add_artifact(aid, f"mobkit-gateway-binaries-{target}-{ATTEMPT}", packed)
+            metadata = self.add_artifact(aid, f"meta-gateway-binaries-{target}-{ATTEMPT}", packed)
             listing.append(metadata)
             self.artifact_ids.append(aid)
         self.state["api"][helper.repo_endpoint(f"actions/runs/{RUN}/artifacts?per_page=100")] = [
@@ -323,7 +323,7 @@ class CandidateProtocolTests(unittest.TestCase):
         (directory / helper.PROVENANCE).write_text('{"original":"manifest attestation fixture"}\n')
         packed = self.root / "candidate.zip"
         self.pack(packed, directory, [helper.MANIFEST, helper.PROVENANCE, "index.json", "checksums.sha256"])
-        metadata = self.add_artifact(300, f"mobkit-candidate-manifest-{ATTEMPT}", packed)
+        metadata = self.add_artifact(300, f"meta-candidate-manifest-{ATTEMPT}", packed)
         self.state["api"][helper.repo_endpoint(f"actions/runs/{RUN}")].update(status="completed", conclusion="success")
         self.save()
         stdout, _ = self.command("selection", "--manifest-file", str(directory / helper.MANIFEST),
@@ -561,7 +561,7 @@ class CandidateProtocolTests(unittest.TestCase):
         endpoint = helper.repo_endpoint("actions/artifacts/300")
         original = copy.deepcopy(self.state["api"][endpoint])
         changes = [
-            ("id", 301), ("name", "mobkit-candidate-manifest-1"), ("expired", True),
+            ("id", 301), ("name", "meta-candidate-manifest-1"), ("expired", True),
             ("digest", "sha256:" + "0" * 64),
             ("workflow_run", {**original["workflow_run"], "id": RUN + 1}),
             ("workflow_run", {**original["workflow_run"], "head_sha": OTHER_SHA}),
@@ -668,7 +668,7 @@ class CandidateProtocolTests(unittest.TestCase):
 
     def test_archive_members_reject_traversal_links_duplicates_wrong_binary_and_directories(self):
         target = "x86_64-unknown-linux-gnu"
-        path = self.target_files[f"mobkit-rpc-gateway-{VERSION}-{target}.tar.gz"]
+        path = self.target_files[f"meta-rpc-gateway-{VERSION}-{target}.tar.gz"]
         for name, kind, duplicate in [
             ("../rpc_gateway", tarfile.REGTYPE, False),
             ("/rpc_gateway", tarfile.REGTYPE, False),
@@ -690,7 +690,7 @@ class CandidateProtocolTests(unittest.TestCase):
                 with self.assertRaises(helper.ProtocolError):
                     helper.describe_archive(path, VERSION, target)
         windows = "x86_64-pc-windows-msvc"
-        path = self.target_files[f"mobkit-rpc-gateway-{VERSION}-{windows}.zip"]
+        path = self.target_files[f"meta-rpc-gateway-{VERSION}-{windows}.zip"]
         for name, mode in [
             ("../rpc_gateway.exe", stat.S_IFREG), ("rpc_gateway", stat.S_IFREG),
             ("rpc_gateway.exe/", stat.S_IFDIR), ("rpc_gateway.exe", stat.S_IFLNK),
@@ -721,13 +721,13 @@ class CandidateProtocolTests(unittest.TestCase):
     def test_windows_zip_refuses_every_nonproducer_path_and_nonregular_member(self):
         target = "x86_64-pc-windows-msvc"
         expected = f"target/{target}/release/rpc_gateway.exe"
-        path = self.target_files[f"mobkit-rpc-gateway-{VERSION}-{target}.zip"]
+        path = self.target_files[f"meta-rpc-gateway-{VERSION}-{target}.zip"]
         cases = [
             ("rpc_gateway.exe", stat.S_IFREG << 16, False, None),
             ("elsewhere/rpc_gateway.exe", stat.S_IFREG << 16, False, None),
             (f"target/{target}/debug/rpc_gateway.exe", stat.S_IFREG << 16, False, None),
             ("target/aarch64-apple-darwin/release/rpc_gateway.exe", stat.S_IFREG << 16, False, None),
-            (f"target/{target}/release/mobkit_gateway.exe", stat.S_IFREG << 16, False, None),
+            (f"target/{target}/release/meta_gateway.exe", stat.S_IFREG << 16, False, None),
             (f"target/{target}/release/../release/rpc_gateway.exe", stat.S_IFREG << 16, False, None),
             ("/" + expected, stat.S_IFREG << 16, False, None),
             ("C:/" + expected, stat.S_IFREG << 16, False, None),
@@ -1072,7 +1072,7 @@ class CandidateProtocolTests(unittest.TestCase):
         _, manifest = self.staged()
         self.protocol = False
         item = next(a for a in manifest["artifacts"] if a["target"] == "x86_64-unknown-linux-gnu")
-        item["name"] = f"mobkit-gateway-binaries-{item['target']}"
+        item["name"] = f"meta-gateway-binaries-{item['target']}"
         record = item["archives"][0]
         packed = self.root / f"artifact-{item['id']}.zip"
         self.pack(packed, self.target_files[record["name"]].parent,
@@ -1375,13 +1375,13 @@ class CandidateProtocolTests(unittest.TestCase):
 
     def test_make_assets_facade_accepts_explicit_original_selection_and_help_warns(self):
         target = "x86_64-unknown-linux-gnu"
-        path = self.target_files[f"mobkit-gateway-{VERSION}-{target}.tar.gz"]
+        path = self.target_files[f"meta-gateway-{VERSION}-{target}.tar.gz"]
         original = {
             "schema_version": 1, "kind": "original-assets", "repository": REPO,
             "source_sha": SHA, "version": VERSION, "tag": TAG, "run_id": RUN, "run_attempt": ATTEMPT,
             "metadata": {"index.json": "a" * 64, "checksums.sha256": "b" * 64},
             "artifacts": [{
-                "id": 201, "name": f"mobkit-gateway-binaries-{target}", "digest": "c" * 64,
+                "id": 201, "name": f"meta-gateway-binaries-{target}", "digest": "c" * 64,
                 "target": target, "archives": [helper.describe_archive(path, VERSION, target)],
             }],
         }

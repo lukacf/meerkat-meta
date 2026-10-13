@@ -33,7 +33,7 @@ async function startScopeProxy(owners) {
       let rpc;
       try { rpc = JSON.parse(observation.request); } catch { /* Non-RPC request. */ }
       const shouldHold = hold && scope === hold.scope && incoming.statusCode === 200 &&
-        rpc?.method === "mobkit/console/query_timeline" && rpc.params?.mode === "recent" &&
+        rpc?.method === "meta/console/query_timeline" && rpc.params?.mode === "recent" &&
         rpc.params?.limit === 200 && !rpc.params?.before && !rpc.params?.after &&
         (hold.host === "shared" ? rpc.params?.identity === "router:main" : !rpc.params?.identity);
       const isStream = pathname.startsWith("/console/timeline/stream");

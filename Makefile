@@ -1,5 +1,5 @@
 # ──────────────────────────────────────────────────────────────
-# MobKit — single source of truth for build / test / lint
+# Meta — single source of truth for build / test / lint
 # ──────────────────────────────────────────────────────────────
 
 CARGO  ?= ./scripts/repo-cargo
@@ -40,26 +40,26 @@ test: ## Run Rust tests via cargo-nextest
 
 test-python: ## Run Python SDK tests
 	@echo "$(YELLOW)Running Python SDK tests…$(NC)"
-	CARGO_INCREMENTAL=0 $(CARGO) build -p meerkat-mobkit --bin rpc_gateway --locked
+	CARGO_INCREMENTAL=0 $(CARGO) build -p meerkat-meta --bin rpc_gateway --locked
 	@gateway_target_dir="$$($(CARGO) --print-env | awk -F= '$$1 == "CARGO_TARGET_DIR" { print substr($$0, index($$0, "=") + 1) }')"; \
 		gateway_bin="$$gateway_target_dir/debug/rpc_gateway"; \
 		test -x "$$gateway_bin" || { echo "missing freshly built rpc_gateway at $$gateway_bin" >&2; exit 1; }; \
-		MOBKIT_GATEWAY_BIN="$$gateway_bin" PYTHONPATH=sdk/python python3 -m pytest sdk/python/tests/ -q
+		META_GATEWAY_BIN="$$gateway_bin" PYTHONPATH=sdk/python python3 -m pytest sdk/python/tests/ -q
 	@echo "$(GREEN)Python SDK tests passed.$(NC)"
 
 e2e-live: ## Real-API end-to-end lane: real rpc_gateway + Python SDK + real Anthropic turns (needs ANTHROPIC_API_KEY)
 	@echo "$(YELLOW)Running real-API e2e lane…$(NC)"
 	@test -n "$${ANTHROPIC_API_KEY:-$${RKAT_ANTHROPIC_API_KEY:-}}" || { echo "e2e-live: ANTHROPIC_API_KEY (or RKAT_ANTHROPIC_API_KEY) is not set; refusing to run a lane that would skip" >&2; exit 1; }
-	CARGO_INCREMENTAL=0 $(CARGO) build -p meerkat-mobkit --bin rpc_gateway --locked
+	CARGO_INCREMENTAL=0 $(CARGO) build -p meerkat-meta --bin rpc_gateway --locked
 	@gateway_target_dir="$$($(CARGO) --print-env | awk -F= '$$1 == "CARGO_TARGET_DIR" { print substr($$0, index($$0, "=") + 1) }')"; \
 		gateway_bin="$$gateway_target_dir/debug/rpc_gateway"; \
 		test -x "$$gateway_bin" || { echo "missing freshly built rpc_gateway at $$gateway_bin" >&2; exit 1; }; \
-		MOBKIT_E2E_LIVE=1 MOBKIT_GATEWAY_BIN="$$gateway_bin" PYTHONPATH=sdk/python python3 -m pytest sdk/python/tests/e2e_live -q -rA
+		META_E2E_LIVE=1 META_GATEWAY_BIN="$$gateway_bin" PYTHONPATH=sdk/python python3 -m pytest sdk/python/tests/e2e_live -q -rA
 	@echo "$(GREEN)Real-API e2e lane passed.$(NC)"
 
 test-flow-editor: ## Run Flow Editor source, projection, visual, browser, and embedded freshness contracts
 	@echo "$(YELLOW)Running Flow Editor tests…$(NC)"
-	CARGO_INCREMENTAL=0 $(CARGO) build -p meerkat-mobkit --bin mobkit_flow_editor
+	CARGO_INCREMENTAL=0 $(CARGO) build -p meerkat-meta --bin meta_flow_editor
 	npm --prefix flow-editor run test:controller --silent
 	npm --prefix flow-editor run test:visual-contract --silent
 	npm --prefix flow-editor run test:browser-source --silent
@@ -111,7 +111,7 @@ memory-evals: ## Validate memory calibration profiles/fixtures + gate mock-lane 
 	@echo "$(YELLOW)Checking memory calibration harness…$(NC)"
 # Build the calibration binaries BEFORE the harness runs them. Each stage
 # shells out to `repo-cargo run --bin <stage>-eval` under a fixed 600s
-# subprocess budget, and those bins live in the mobkit crate, so a cold link
+# subprocess budget, and those bins live in the meta crate, so a cold link
 # pulls the whole meerkat graph. Without this the budget covers COMPILATION and
 # the first run after any dependency bump reports a calibration timeout for a
 # build that had not finished, a gate failing for a reason other than the one
@@ -193,7 +193,7 @@ bump-sdk-versions: ## Bump SDK version strings
 	@scripts/bump-sdk-versions.sh
 
 verify-version: ## Verify Cargo.toml version matches git tag
-	@VERSION=$$($(CARGO) metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "meerkat-mobkit") | .version'); \
+	@VERSION=$$($(CARGO) metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "meerkat-meta") | .version'); \
 	TAG=$$(git describe --tags --exact-match 2>/dev/null | sed 's/^v//'); \
 	if [ -z "$$TAG" ]; then \
 		echo "$(YELLOW)No tag found on current commit$(NC)"; \
@@ -206,7 +206,7 @@ verify-version: ## Verify Cargo.toml version matches git tag
 
 publish-dry-run: ## Dry-run cargo publish
 	@echo "$(YELLOW)Dry-run cargo publish…$(NC)"
-	$(CARGO) publish -p meerkat-mobkit --dry-run
+	$(CARGO) publish -p meerkat-meta --dry-run
 	@echo "$(GREEN)Cargo dry-run succeeded.$(NC)"
 
 publish-dry-run-python: ## Dry-run Python package build + twine check
@@ -275,7 +275,7 @@ release-assets-recover: ## Add missing original assets only (RELEASE_TAG, ARTIFA
 # ── help ──────────────────────────────────────────────────────
 
 help: ## Show this help
-	@echo "$(GREEN)MobKit Makefile targets:$(NC)"
+	@echo "$(GREEN)Meta Makefile targets:$(NC)"
 	@echo "Release protocol v1: tag pushes validate only; release-promote publishes accepted bytes."
 	@echo ""
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \

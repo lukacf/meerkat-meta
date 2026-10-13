@@ -1,6 +1,0 @@
-{
-  "application_tool_policies": [
-    "{\"schema_version\":1,\"provider_id\":\"example-provider\",\"policy_id\":\"team-tools\",\"revision\":1,\"policy_digest\":\"sha256:9244c6a43589d57872d9c0f2f32b9cd9425dc105761cf38fd8502f894739f82e\",\"source\":{\"source_id\":\"mobkit-test-source\",\"source_digest\":\"sha256:2dcfe8ad3209481fa41efd07a3aef8a16da374e7768d20542ed0faa3fccd2bb7\"},\"default_deny\":true,\"members\":[{\"member_identity\":\"member-a\",\"grants\":[{\"tool_name\":\"shell\",\"action\":\"invoke\",\"consequence\":\"r2\"}]}]}\n"
-  ],
-  "has_roster_provider": true
-}

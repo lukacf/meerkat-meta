@@ -16,12 +16,12 @@ from pathlib import Path
 
 import pytest
 
-from meerkat_mobkit.builder import MobKit
-from meerkat_mobkit.runtime import MobKitRuntime
+from meerkat_meta.builder import Meta
+from meerkat_meta.runtime import MetaRuntime
 
 
 def _init_params(builder):
-    return MobKitRuntime(builder._config)._build_init_params()
+    return MetaRuntime(builder._config)._build_init_params()
 
 
 # ONE wire fixture, shared with the Rust side. member_tool_policy's
@@ -35,7 +35,7 @@ def _init_params(builder):
 FIXTURE = (
     Path(__file__).resolve().parents[3]
     / "crates"
-    / "meerkat-mobkit"
+    / "meerkat-meta"
     / "tests"
     / "fixtures"
     / "application_tool_policies_init_params.json"
@@ -47,7 +47,7 @@ POLICY_GUEST = POLICY_PRIMARY.replace("team-tools", "guest-tools")
 
 
 def test_a_declared_policy_reaches_the_init_params():
-    builder = MobKit.builder().application_tool_policies([POLICY_PRIMARY])
+    builder = Meta.builder().application_tool_policies([POLICY_PRIMARY])
     assert _init_params(builder)["application_tool_policies"] == [POLICY_PRIMARY]
 
 
@@ -55,19 +55,19 @@ def test_the_compilers_bytes_travel_verbatim():
     # Parsing verifies the digest against the bytes it is handed, so anything
     # that reformats here would make that check meaningless. Trailing newline
     # and key order must survive exactly.
-    builder = MobKit.builder().application_tool_policies([POLICY_PRIMARY])
+    builder = Meta.builder().application_tool_policies([POLICY_PRIMARY])
     sent = _init_params(builder)["application_tool_policies"][0]
     assert sent == POLICY_PRIMARY
     assert sent.endswith("\n")
 
 
 def test_bytes_are_accepted_and_decoded_as_utf8():
-    builder = MobKit.builder().application_tool_policies([POLICY_PRIMARY.encode()])
+    builder = Meta.builder().application_tool_policies([POLICY_PRIMARY.encode()])
     assert _init_params(builder)["application_tool_policies"] == [POLICY_PRIMARY]
 
 
 def test_several_policies_keep_their_order():
-    builder = MobKit.builder().application_tool_policies(
+    builder = Meta.builder().application_tool_policies(
         [POLICY_PRIMARY, POLICY_GUEST]
     )
     assert _init_params(builder)["application_tool_policies"] == [
@@ -77,27 +77,27 @@ def test_several_policies_keep_their_order():
 
 
 def test_the_parameter_is_absent_unless_the_host_asked():
-    assert "application_tool_policies" not in _init_params(MobKit.builder())
+    assert "application_tool_policies" not in _init_params(Meta.builder())
 
 
 def test_an_empty_entry_is_refused_rather_than_forwarded():
     # Forwarding a blank entry surfaces at boot as a parse error with nothing
     # pointing at which entry was blank.
     with pytest.raises(ValueError, match=r"application_tool_policies\[1\] is empty"):
-        MobKit.builder().application_tool_policies([POLICY_PRIMARY, "   "])
+        Meta.builder().application_tool_policies([POLICY_PRIMARY, "   "])
 
 
 def test_a_non_string_entry_is_refused_with_its_index():
     with pytest.raises(TypeError, match=r"application_tool_policies\[0\] must be str"):
-        MobKit.builder().application_tool_policies([{"provider_id": "example-provider"}])
+        Meta.builder().application_tool_policies([{"provider_id": "example-provider"}])
 
 
 def test_invalid_utf8_bytes_are_refused_with_their_index():
     with pytest.raises(ValueError, match=r"application_tool_policies\[0\] is not valid UTF-8"):
-        MobKit.builder().application_tool_policies([b"\xff\xfe not json"])
+        Meta.builder().application_tool_policies([b"\xff\xfe not json"])
 
 
 def test_the_builder_emits_exactly_the_committed_wire_payload():
     expected = json.loads(FIXTURE.read_text())["application_tool_policies"]
-    builder = MobKit.builder().application_tool_policies(expected)
+    builder = Meta.builder().application_tool_policies(expected)
     assert _init_params(builder)["application_tool_policies"] == expected

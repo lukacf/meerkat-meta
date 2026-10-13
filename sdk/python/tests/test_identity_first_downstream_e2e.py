@@ -14,20 +14,20 @@ import asyncio
 
 import pytest
 
-from meerkat_mobkit.builder import MobKit
-from meerkat_mobkit.identity_first_models import (
+from meerkat_meta.builder import Meta
+from meerkat_meta.identity_first_models import (
     DispatchInput,
     DurableAgentSpec,
     IdentityBootstrapMode,
     IdentityBootstrapState,
     ManagedPeerEdge,
 )
-from meerkat_mobkit.identity_first_providers import (
+from meerkat_meta.identity_first_providers import (
     AgentCustomizerProtocol,
     RosterProviderProtocol,
     TopologyProviderProtocol,
 )
-from meerkat_mobkit.errors import RpcError
+from meerkat_meta.errors import RpcError
 
 # ---------------------------------------------------------------------------
 # Environment / skip helpers
@@ -38,9 +38,9 @@ from meerkat_mobkit.errors import RpcError
 # path below is the repository's plain cargo target directory; running from a
 # feature worktree would silently test the wrong artifact (and hide the wire
 # drift the branch introduces). Prefer an explicit override:
-#   MOBKIT_GATEWAY_BIN=$(./scripts/repo-cargo --print-env CARGO_TARGET_DIR)/debug/rpc_gateway
+#   META_GATEWAY_BIN=$(./scripts/repo-cargo --print-env CARGO_TARGET_DIR)/debug/rpc_gateway
 def _resolve_gateway_bin() -> str:
-    override = os.environ.get("MOBKIT_GATEWAY_BIN", "").strip()
+    override = os.environ.get("META_GATEWAY_BIN", "").strip()
     if override:
         return override
     return os.path.join(
@@ -229,7 +229,7 @@ async def _boot_identity_runtime(
 ):
     """Boot a real rpc_gateway with identity-first providers."""
     builder = (
-        MobKit.builder()
+        Meta.builder()
         .gateway(_GATEWAY_BIN)
         .mob(mob_toml_path)
         .persistent_state(state_dir)
@@ -293,7 +293,7 @@ async def test_lazy_gateway_init_exposes_typed_dormant_bootstrap_status(
     """Lazy init is metadata-only and needs no model-provider credential."""
     roster = DownstreamRoster(_DEFAULT_ROSTER)
     runtime = await (
-        MobKit.builder()
+        Meta.builder()
         .gateway(_GATEWAY_BIN)
         .mob(mob_toml)
         .persistent_state(state_dir)
@@ -651,7 +651,7 @@ class TestDS07ResetVsDelete:
             # before reset returns. Retire cleanup targets the superseded old
             # session and cannot advance the replacement's checkpoint.
             # Rust pins first boot, reset return, status and the durable record:
-            #   crates/meerkat-mobkit/tests/identity_first_builder.rs
+            #   crates/meerkat-meta/tests/identity_first_builder.rs
             #     reset_checkpoint_version_is_the_initial_document_flush_not_cleanup
             # Keep this exact: None/0 would lose the durable creation flush;
             # 2 would be the older nonempty append-plus-head write shape.

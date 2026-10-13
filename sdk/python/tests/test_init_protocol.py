@@ -1,4 +1,4 @@
-"""mobkit/init: accepted, then settled (#550, part 2), against stand-in gateways.
+"""meta/init: accepted, then settled (#550, part 2), against stand-in gateways.
 
 Each stand-in is a tiny script speaking the stdio protocol, so these tests
 pin the SDK side of every outcome without a real gateway:
@@ -22,18 +22,20 @@ from pathlib import Path
 
 import pytest
 
-import meerkat_mobkit.runtime as runtime_module
-import meerkat_mobkit
-from meerkat_mobkit import (
+import meerkat_meta.runtime as runtime_module
+import meerkat_meta
+from meerkat_meta import (
     COMPOSITION_PROVENANCE_CODE,
     CompositionProvenanceError,
+    GatewayStartupCleanupError,
     InitOutcomeUnknownError,
     RpcError,
     StorageResolutionError,
+    TransportTermination,
 )
-from meerkat_mobkit._transport import PersistentTransport
-from meerkat_mobkit.builder import MobKit
-from meerkat_mobkit.runtime import MobKitRuntime, _rpc_error_from_payload
+from meerkat_meta._transport import PersistentTransport
+from meerkat_meta.builder import Meta
+from meerkat_meta.runtime import MetaRuntime, _rpc_error_from_payload
 
 # Every stand-in shares this prelude: it reads the init request, records it,
 # and gives the scenario helpers to answer.
@@ -55,16 +57,16 @@ def accepted(**extra):
         "provider_callback_timeout_ms": 130000,
         "stdio_shutdown_handshake": True, "stdio_shutdown_horizon_ms": 30000, **extra}})
 def progress(phase, for_init=None):
-    emit({"jsonrpc": "2.0", "method": "mobkit/init_progress",
+    emit({"jsonrpc": "2.0", "method": "meta/init_progress",
           "params": {"init_id": for_init or init_id, "phase": phase}})
 def settled(for_init=None, **params):
-    emit({"jsonrpc": "2.0", "method": "mobkit/init_settled",
+    emit({"jsonrpc": "2.0", "method": "meta/init_settled",
           "params": {"init_id": for_init or init_id, **params}})
 def serve_shutdown():
     for raw in sys.stdin:
         message = json.loads(raw)
         log({"after_init": message})
-        if message.get("method") == "mobkit/shutdown":
+        if message.get("method") == "meta/shutdown":
             emit({"jsonrpc": "2.0", "id": message["id"],
                   "result": {"shutdown": True, "runtime_cleanup_completed": True}})
             return
@@ -95,11 +97,32 @@ def short_request_timeout(monkeypatch):
     )
 
 
-def _runtime(script: Path, *, init_deadline: float | None = None) -> MobKitRuntime:
-    builder = MobKit.builder().gateway(str(script))
+async def _startup_error_behind_failed_stop(
+    runtime: MetaRuntime, exit_code: int
+) -> BaseException:
+    """A gateway that negotiated the shutdown handshake and then exited
+    leaves the runtime's stop nobody to ask, so that stop fails: the startup
+    error arrives exactly, as ``startup_error`` and ``__cause__`` of the
+    cleanup error, the stop's own record stays apart, and a retry has nothing
+    left to clean up. Returns the original startup error."""
+    with pytest.raises(GatewayStartupCleanupError) as raised:
+        await runtime.connect()
+    failure = raised.value
+    assert failure.__cause__ is failure.startup_error
+    assert "gateway shutdown failed after bounded cleanup" in str(failure.cleanup_error)
+    record = TransportTermination("exited", exit_code, None, "none", "unanswered")
+    assert failure.cleanup.last_termination == record
+    await failure.cleanup.shutdown()
+    assert runtime.last_gateway_termination == record
+    assert not runtime.is_running
+    return failure.startup_error
+
+
+def _runtime(script: Path, *, init_deadline: float | None = None) -> MetaRuntime:
+    builder = Meta.builder().gateway(str(script))
     if init_deadline is not None:
         builder.init_deadline(init_deadline)
-    return MobKitRuntime(builder._config)
+    return MetaRuntime(builder._config)
 
 
 @pytest.mark.asyncio
@@ -151,12 +174,11 @@ async def test_failed_settlement_raises_typed_error_with_durable_effects(
                 durable_effects="{durable_effects}")
     """)
     runtime = _runtime(script)
-    with pytest.raises(error_type) as raised:
-        await runtime.connect()
-    assert not isinstance(raised.value, InitOutcomeUnknownError)
-    assert raised.value.code == code
-    assert raised.value.data["durable_effects"] == durable_effects
-    assert not runtime.is_running
+    error = await _startup_error_behind_failed_stop(runtime, 0)
+    assert isinstance(error, error_type)
+    assert not isinstance(error, InitOutcomeUnknownError)
+    assert error.code == code
+    assert error.data["durable_effects"] == durable_effects
 
 
 @pytest.mark.asyncio
@@ -171,21 +193,19 @@ async def test_failed_settlement_for_a_composition_refusal_carries_its_kind_and_
                       "fields": ["profiles.lead.tools.deny"]})
     """)
     runtime = _runtime(script)
-    with pytest.raises(CompositionProvenanceError) as raised:
-        await runtime.connect()
-    error = raised.value
+    error = await _startup_error_behind_failed_stop(runtime, 0)
+    assert isinstance(error, CompositionProvenanceError)
     assert error.code == COMPOSITION_PROVENANCE_CODE == -32019
     assert error.kind == "candidate_divergent"
     assert error.fields == ["profiles.lead.tools.deny"]
     assert error.data["durable_effects"] == "none"
-    assert not runtime.is_running
 
 
 class TestCompositionProvenanceError:
     def test_is_a_typed_rpc_error_exported_at_top_level(self):
         assert issubclass(CompositionProvenanceError, RpcError)
-        assert meerkat_mobkit.CompositionProvenanceError is CompositionProvenanceError
-        assert meerkat_mobkit.COMPOSITION_PROVENANCE_CODE == -32019
+        assert meerkat_meta.CompositionProvenanceError is CompositionProvenanceError
+        assert meerkat_meta.COMPOSITION_PROVENANCE_CODE == -32019
 
     def test_an_error_response_reifies_with_the_refusal(self):
         error = _rpc_error_from_payload(
@@ -199,19 +219,19 @@ class TestCompositionProvenanceError:
                 },
             },
             request_id="init:1",
-            method="mobkit/init",
+            method="meta/init",
         )
         assert isinstance(error, CompositionProvenanceError)
         assert error.kind == "divergent"
         assert error.fields == ["profiles.default.model", "profiles.worker"]
         assert error.data["manifest"] == "/state/mob.sqlite3.composition.json"
-        assert error.method == "mobkit/init"
+        assert error.method == "meta/init"
 
     def test_a_refusal_without_data_still_reifies(self):
         error = _rpc_error_from_payload(
             {"code": -32019, "message": "Runtime bootstrap failed"},
             request_id="init:1",
-            method="mobkit/init",
+            method="meta/init",
         )
         assert isinstance(error, CompositionProvenanceError)
         assert error.kind is None
@@ -222,7 +242,7 @@ class TestCompositionProvenanceError:
             error = _rpc_error_from_payload(
                 {"code": code, "message": "refused", "data": {"kind": "divergent"}},
                 request_id="init:1",
-                method="mobkit/init",
+                method="meta/init",
             )
             assert not isinstance(error, CompositionProvenanceError)
 
@@ -250,11 +270,11 @@ async def test_gateway_exit_after_acceptance_is_outcome_unknown_not_a_refusal(tm
         sys.exit(3)
     """)
     runtime = _runtime(script)
-    with pytest.raises(InitOutcomeUnknownError) as raised:
-        await runtime.connect()
-    assert not isinstance(raised.value, RpcError)
-    assert raised.value.last_phase == "prewarm"
-    assert "closed its stdout" in raised.value.reason
+    error = await _startup_error_behind_failed_stop(runtime, 3)
+    assert isinstance(error, InitOutcomeUnknownError)
+    assert not isinstance(error, RpcError)
+    assert error.last_phase == "prewarm"
+    assert "closed its stdout" in error.reason
 
 
 @pytest.mark.asyncio
@@ -272,7 +292,7 @@ async def test_init_deadline_after_acceptance_is_outcome_unknown_and_shuts_down(
     # The accepted response negotiated the handshake, so cleanup asked the
     # gateway to shut down instead of closing stdin under it.
     methods = [entry["after_init"].get("method") for entry in _records(script) if "after_init" in entry]
-    assert methods == ["mobkit/shutdown"]
+    assert methods == ["meta/shutdown"]
 
 
 @pytest.mark.asyncio
@@ -323,7 +343,7 @@ async def test_older_gateway_single_response_still_connects(tmp_path):
 
 
 def test_init_deadline_must_be_positive_and_finite():
-    builder = MobKit.builder()
+    builder = Meta.builder()
     for bad in (0, -1, float("inf"), float("nan"), True, "5"):
         with pytest.raises(ValueError):
             builder.init_deadline(bad)
@@ -373,14 +393,14 @@ async def test_long_prewarm_past_the_callback_bound_settles_ready(tmp_path, monk
 
 @pytest.mark.asyncio
 async def test_init_in_progress_refusal_is_typed(tmp_path):
-    from meerkat_mobkit import INIT_IN_PROGRESS_CODE, InitInProgressError
+    from meerkat_meta import INIT_IN_PROGRESS_CODE, InitInProgressError
 
     script = _gateway(tmp_path, "refuses_during_init", """
         emit({"jsonrpc": "2.0", "id": init["id"], "result": {"http_base_url": "http://127.0.0.1:5"}})
         request = json.loads(sys.stdin.readline())
         emit({"jsonrpc": "2.0", "id": request["id"], "error": {
-            "code": -32018, "message": "mobkit/status refused: mobkit/init has not settled yet",
-            "data": {"kind": "init_in_progress", "method": "mobkit/status"}}})
+            "code": -32018, "message": "meta/status refused: meta/init has not settled yet",
+            "data": {"kind": "init_in_progress", "method": "meta/status"}}})
         for raw in sys.stdin:
             pass
     """)
@@ -388,7 +408,7 @@ async def test_init_in_progress_refusal_is_typed(tmp_path):
     try:
         await runtime.connect()
         with pytest.raises(InitInProgressError) as raised:
-            await runtime._rpc("mobkit/status")
+            await runtime._rpc("meta/status")
         assert raised.value.code == INIT_IN_PROGRESS_CODE
         assert raised.value.data["kind"] == "init_in_progress"
     finally:
@@ -418,7 +438,7 @@ def recording_transport(monkeypatch):
 
 
 def test_gateway_init_timeout_must_be_positive_and_finite():
-    builder = MobKit.builder()
+    builder = Meta.builder()
     assert builder._config.gateway_init_timeout == 60.0, "the default keeps the 60 s request timeout"
     for bad in (0, -1, -0.5, float("inf"), float("-inf"), float("nan"), True, False, None, "5"):
         with pytest.raises(ValueError):
@@ -444,7 +464,7 @@ async def test_init_uses_the_default_gateway_init_timeout(tmp_path, recording_tr
     try:
         await runtime.connect()
         (transport,) = recording_transport
-        assert ("mobkit/init", 60.0) in transport.timeouts
+        assert ("meta/init", 60.0) in transport.timeouts
     finally:
         await runtime.shutdown()
 
@@ -452,14 +472,14 @@ async def test_init_uses_the_default_gateway_init_timeout(tmp_path, recording_tr
 @pytest.mark.asyncio
 async def test_gateway_init_timeout_reaches_only_the_init_request(tmp_path, recording_transport):
     script = _gateway(tmp_path, "legacy_configured", _LEGACY_SERVING)
-    runtime = MobKitRuntime(MobKit.builder().gateway(str(script)).gateway_init_timeout(7.5)._config)
+    runtime = MetaRuntime(Meta.builder().gateway(str(script)).gateway_init_timeout(7.5)._config)
     try:
         await runtime.connect()
-        await runtime._rpc("mobkit/status")
+        await runtime._rpc("meta/status")
         (transport,) = recording_transport
-        assert ("mobkit/init", 7.5) in transport.timeouts
+        assert ("meta/init", 7.5) in transport.timeouts
         # An ordinary call keeps the transport's own request timeout.
-        assert ("mobkit/status", None) in transport.timeouts
+        assert ("meta/status", None) in transport.timeouts
     finally:
         await runtime.shutdown()
 
@@ -470,7 +490,7 @@ async def test_a_short_gateway_init_timeout_ends_init_and_still_cleans_up(tmp_pa
         for raw in sys.stdin:  # hold the pipe open until the SDK closes it
             pass
     """)
-    runtime = MobKitRuntime(MobKit.builder().gateway(str(script)).gateway_init_timeout(0.5)._config)
+    runtime = MetaRuntime(Meta.builder().gateway(str(script)).gateway_init_timeout(0.5)._config)
     started = time.monotonic()
     with pytest.raises(InitOutcomeUnknownError) as raised:
         await runtime.connect()
@@ -478,6 +498,6 @@ async def test_a_short_gateway_init_timeout_ends_init_and_still_cleans_up(tmp_pa
     assert "no answer" in raised.value.reason
     assert not runtime.is_running
     (transport,) = recording_transport
-    assert ("mobkit/init", 0.5) in transport.timeouts
+    assert ("meta/init", 0.5) in transport.timeouts
     # The existing failed-bootstrap cleanup still stopped the gateway.
     assert not transport.is_running()

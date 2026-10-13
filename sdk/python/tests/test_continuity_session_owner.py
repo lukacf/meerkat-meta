@@ -2,8 +2,8 @@
 
 import pytest
 
-from meerkat_mobkit.agent_builder import CallbackDispatcher
-from meerkat_mobkit.identity_first_providers import ContinuityRecord, SessionOwnershipProvider
+from meerkat_meta.agent_builder import CallbackDispatcher
+from meerkat_meta.identity_first_providers import ContinuityRecord, SessionOwnershipProvider
 
 
 @pytest.mark.asyncio

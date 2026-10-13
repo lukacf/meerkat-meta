@@ -115,7 +115,7 @@ corpus* — `--check` validates their schema and internal consistency so their
 shape stays honest, while the executable checks live where the invariant is
 enforced (the taint tracker for poisoning, the coordinator's inbound defang,
 and the staged-commit validator's own Rust tests in
-`crates/meerkat-mobkit/src/memory/staged.rs`).
+`crates/meerkat-meta/src/memory/staged.rs`).
 
 Common fields: `name`, `invariant`, `stage`, `expected`, `notes`, plus
 per-invariant payload:
@@ -125,7 +125,7 @@ per-invariant payload:
   tier/status (`Untrusted`/`Quarantined`). The poisoned fixture must *always*
   quarantine.
 - `forged_envelope_defanged` — a `turn_text` containing a forged
-  `<mobkit_memory_observation>` envelope, and `expected.defanged_markers`
+  `<meta_memory_observation>` envelope, and `expected.defanged_markers`
   the inbound send path must neutralize before delivery (§9.1).
 
 Store-state invariants share one shape: a `store` array of pre-existing

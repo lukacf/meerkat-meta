@@ -1,9 +1,9 @@
 /**
- * Typed error hierarchy for the MobKit SDK.
+ * Typed error hierarchy for the Meta SDK.
  *
  * @example
  * ```ts
- * import { RpcError, MobKitError } from "@rkat/mobkit-sdk";
+ * import { RpcError, MetaError } from "@rkat/meta-sdk";
  *
  * try {
  *   await handle.status();
@@ -15,28 +15,30 @@
  * ```
  */
 
+import type { TransportTermination } from "./transport.js";
+
 // -- Base error -----------------------------------------------------------
 
-/** Base exception for all MobKit SDK errors. */
-export class MobKitError extends Error {
+/** Base exception for all Meta SDK errors. */
+export class MetaError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
-    this.name = "MobKitError";
+    this.name = "MetaError";
   }
 }
 
 // -- Transport errors -----------------------------------------------------
 
 /** Raised when the transport layer fails (subprocess died, connection refused, etc.). */
-export class TransportError extends MobKitError {
-  constructor(message: string) {
-    super(message);
+export class TransportError extends MetaError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "TransportError";
   }
 }
 
 /**
- * The SDK stopped waiting for `mobkit/init` before it settled.
+ * The SDK stopped waiting for `meta/init` before it settled.
  *
  * Thrown when the init request was written but no settlement arrived: the
  * acceptance was lost, the reader failed, the gateway exited, or the
@@ -44,17 +46,17 @@ export class TransportError extends MobKitError {
  * (owner publication, identities, leases, continuity, schedules) before it
  * stopped, so this is never reported as a refusal and never retried
  * automatically. `initId` correlates with the gateway's progress
- * notifications; `lastPhase` is the last `mobkit/init_progress` phase seen
+ * notifications; `lastPhase` is the last `meta/init_progress` phase seen
  * (`null` when none arrived); `reason` names what ended the wait.
  */
-export class InitOutcomeUnknownError extends MobKitError {
+export class InitOutcomeUnknownError extends MetaError {
   constructor(
     readonly initId: string,
     readonly lastPhase: string | null,
     readonly reason: string,
   ) {
     super(
-      `mobkit/init outcome unknown (init_id=${initId}, last phase: ${lastPhase ?? "none"}): ` +
+      `meta/init outcome unknown (init_id=${initId}, last phase: ${lastPhase ?? "none"}): ` +
         `${reason}; native state may have changed`,
     );
     this.name = "InitOutcomeUnknownError";
@@ -76,10 +78,66 @@ export class TransportReaderFailedError extends TransportError {
   }
 }
 
+/**
+ * A host-composed gateway transport refused to respawn its gateway process.
+ *
+ * A transport built by a gateway transport factory, or one with its own
+ * `startAsync()`, finishes a trusted host startup that a plain respawn would
+ * skip. Once its process is gone, requests fail with this error until the
+ * runtime reconnects, which builds and starts the transport again.
+ */
+export class GatewayRestartRefusedError extends TransportError {
+  constructor(readonly reason: string) {
+    super(`host-composed gateway transport will not respawn: ${reason}; reconnect the runtime`);
+    this.name = "GatewayRestartRefusedError";
+  }
+}
+
+/**
+ * The cleanup of a runtime's gateway transport, reached through that same
+ * runtime: `shutdown()` retries its retained stop (bounded per call) and
+ * `lastTermination()` reads what the last stop observed.
+ */
+export interface GatewayCleanup {
+  shutdown(): Promise<void>;
+  lastTermination(): TransportTermination | null;
+}
+
+/**
+ * A runtime's startup failed and the stop of the gateway transport it made
+ * then rejected, so the runtime keeps that transport until a stop fulfils.
+ * The rejection is not proof that the gateway process still runs: a process
+ * can exit while its transport's own cleanup fails, and
+ * `cleanup.lastTermination()` tells what the stop observed.
+ *
+ * `startupError` (also the `cause`) is the startup failure exactly as it is
+ * thrown when the stop fulfils; `cleanupError` is the stop's rejection,
+ * exactly as thrown. `cleanup` reaches the same runtime even when
+ * `MetaBuilder.build()` returned none; its `shutdown()` retries that stop.
+ * A startup failure whose stop fulfilled throws its original error unchanged.
+ */
+export class GatewayStartupCleanupError extends TransportError {
+  constructor(
+    readonly startupError: unknown,
+    readonly cleanupError: unknown,
+    readonly cleanup: GatewayCleanup,
+  ) {
+    // A fixed message: formatting either failure can itself throw (an object
+    // without a prototype, a throwing `message` getter) and would lose the
+    // cleanup this error carries.
+    super(
+      "gateway startup failed and the stop of its gateway transport was rejected " +
+        "(see startupError and cleanupError)",
+      { cause: startupError },
+    );
+    this.name = "GatewayStartupCleanupError";
+  }
+}
+
 // -- RPC errors -----------------------------------------------------------
 
 /** Raised when a JSON-RPC call returns an error response. */
-export class RpcError extends MobKitError {
+export class RpcError extends MetaError {
   constructor(
     readonly code: number,
     message: string,
@@ -95,8 +153,8 @@ export class RpcError extends MobKitError {
 
 /**
  * JSON-RPC error code returned when the caller's `after_seq` is past the
- * current ledger frontier. Returned by `mobkit/mob_events/{query,subscribe}`
- * and the `/mobkit/mob_events/stream` SSE route (HTTP 410 Gone).
+ * current ledger frontier. Returned by `meta/mob_events/{query,subscribe}`
+ * and the `/meta/mob_events/stream` SSE route (HTTP 410 Gone).
  */
 export const MOB_EVENTS_STALE_CURSOR_CODE = -32010 as const;
 export const CAPABILITY_UNAVAILABLE_CODE = -32004 as const;
@@ -106,10 +164,16 @@ export const CAPABILITY_UNAVAILABLE_CODE = -32004 as const;
  * re-acquisition is not mis-typed as a permanent capability gap.
  */
 export const LEASE_LOST_CODE = -32005 as const;
+/**
+ * A send named the registered row its input was authored from
+ * (`expectedSpecDigest`) and the identity's registered row is no longer that
+ * row. Checked before delivery: nothing was submitted.
+ */
+export const REGISTERED_SPEC_CHANGED_CODE = -32006 as const;
 export const MEMORY_BACKEND_UNAVAILABLE_CODE = -32012 as const;
 export const CONSOLE_TIMELINE_REPLAY_UNAVAILABLE_CODE = -32013 as const;
 /**
- * Fail-closed storage refusal at gateway startup (`mobkit/init`): file-name
+ * Fail-closed storage refusal at gateway startup (`meta/init`): file-name
  * twins the storage layout refuses to pick between, a store that failed to
  * open where the silent fallback used to be, or a state-root creation
  * failure. The message carries the remediation (the storage doctor, or the
@@ -117,13 +181,13 @@ export const CONSOLE_TIMELINE_REPLAY_UNAVAILABLE_CODE = -32013 as const;
  */
 export const STORAGE_RESOLUTION_CODE = -32014 as const;
 /**
- * An ordinary request sent before `mobkit/init` settled: the stdio gateway
+ * An ordinary request sent before `meta/init` settled: the stdio gateway
  * refuses it at once instead of queueing it behind startup (a provider
  * callback awaiting it during init would wait on itself).
  */
 export const INIT_IN_PROGRESS_CODE = -32018 as const;
 /**
- * Mob composition provenance refusal at gateway startup (`mobkit/init`): the
+ * Mob composition provenance refusal at gateway startup (`meta/init`): the
  * persistent mob storage's recorded composition cannot be proven to match
  * the launch. The error data carries the refusal's `kind` and, where it has
  * them, the diverged `fields`.
@@ -131,6 +195,12 @@ export const INIT_IN_PROGRESS_CODE = -32018 as const;
 export const COMPOSITION_PROVENANCE_CODE = -32019 as const;
 /** WorkGraph service not configured on this runtime (memory-backend-unavailable pattern). */
 export const WORKGRAPH_UNAVAILABLE_CODE = -32041 as const;
+/**
+ * A saved delivery scope no longer matches the identity's binding
+ * (`meta/dispatch` with `expected_scope`): nothing was submitted and
+ * nothing was retargeted.
+ */
+export const STALE_DELIVERY_SCOPE_CODE = -32007 as const;
 /** WorkGraph CAS/revision conflict — refetch the item/binding's current revision and retry. */
 export const WORKGRAPH_CONFLICT_CODE = -32042 as const;
 
@@ -208,6 +278,51 @@ export class LeaseLostError extends RpcError {
   }
 }
 
+/**
+ * A send's `expectedSpecDigest` no longer names the identity's registered
+ * row. The gateway checks it under the identity's lifecycle lock before
+ * delivery, so nothing was submitted.
+ */
+export class RegisteredSpecChangedError extends RpcError {
+  constructor(
+    message: string,
+    requestId = "",
+    method = "",
+    data?: unknown,
+  ) {
+    super(REGISTERED_SPEC_CHANGED_CODE, message, requestId, method, data);
+    this.name = "RegisteredSpecChangedError";
+  }
+}
+
+/**
+ * Raised when a scoped dispatch's saved delivery scope no longer matches.
+ * Nothing was submitted and the delivery was not retargeted to the
+ * identity's current binding. `mismatch` names the atom that moved:
+ * `runtime_id`, `generation`, `lease_fencing_token`, `member` or
+ * `member_binding` (the member's session, incarnation or fence). Recover an
+ * earlier attempt under the same scope with `recoverDelivery`, never by
+ * redispatching to a fresh scope.
+ */
+export class StaleScopeError extends RpcError {
+  readonly mismatch: string | null;
+
+  constructor(
+    message: string,
+    requestId = "",
+    method = "",
+    data?: unknown,
+  ) {
+    super(STALE_DELIVERY_SCOPE_CODE, message, requestId, method, data);
+    this.name = "StaleScopeError";
+    const mismatch =
+      data !== null && typeof data === "object"
+        ? (data as Record<string, unknown>).mismatch
+        : undefined;
+    this.mismatch = typeof mismatch === "string" ? mismatch : null;
+  }
+}
+
 export class MemoryBackendUnavailableError extends RpcError {
   constructor(
     message: string,
@@ -240,7 +355,7 @@ export class ConsoleTimelineReplayUnavailableError extends RpcError {
  * will not pick between, a session/runtime/blob/metadata/console store that
  * failed to open where older gateways silently fell back to in-memory, or
  * an uncreatable state root. The message names the remediation — run the
- * storage doctor (`mobkit/storage/doctor`) for twins, fix the database
+ * storage doctor (`meta/storage/doctor`) for twins, fix the database
  * file, or declare the ephemeral choice explicitly (e.g.
  * `runtimeStore.memory()`).
  */
@@ -257,7 +372,7 @@ export class StorageResolutionError extends RpcError {
 }
 
 /**
- * An ordinary request reached the gateway before `mobkit/init` settled. The
+ * An ordinary request reached the gateway before `meta/init` settled. The
  * gateway serves ordinary requests only after init settles and refuses
  * earlier ones at once; startup provider callbacks must not issue ordinary
  * runtime RPCs on the runtime that is starting.
@@ -299,8 +414,8 @@ export type CompositionProvenanceRefusalKind =
  * mob actuates. The message names the remedy. `kind` names the refusal:
  *
  * - `"divergent"`: the supplied definition differs from the one recorded for
- *   the storage (revert the change, or move the stored definition with the
- *   `runtime_options.declare_spec_update` gateway option);
+ *   the storage (revert the change, or move the stored definition with
+ *   `MetaBuilder.declareSpecUpdate(expectedRevision)`);
  * - `"candidate_divergent"`: a candidate launch supplied a definition that
  *   differs from the stored one it would boot. Only a gateway launched with
  *   `runtime_options.mob_composition.authority = "candidate"` raises it,
@@ -345,7 +460,7 @@ export class CompositionProvenanceError extends RpcError {
   }
 }
 
-/** Raised when a `mobkit/workgraph/*` call is made but no WorkGraph service is configured. */
+/** Raised when a `meta/workgraph/*` call is made but no WorkGraph service is configured. */
 export class WorkGraphUnavailableError extends RpcError {
   constructor(
     message: string,
@@ -378,7 +493,7 @@ export class WorkGraphConflictError extends RpcError {
 // -- Contract errors ------------------------------------------------------
 
 /** Raised when the SDK and runtime contract versions are incompatible. */
-export class ContractMismatchError extends MobKitError {
+export class ContractMismatchError extends MetaError {
   constructor(message: string) {
     super(message);
     this.name = "ContractMismatchError";
@@ -388,7 +503,7 @@ export class ContractMismatchError extends MobKitError {
 // -- Connection errors ----------------------------------------------------
 
 /** Raised when an operation requires a connected runtime but none is available. */
-export class NotConnectedError extends MobKitError {
+export class NotConnectedError extends MetaError {
   constructor(message: string) {
     super(message);
     this.name = "NotConnectedError";
@@ -398,10 +513,10 @@ export class NotConnectedError extends MobKitError {
 // -- Ticketed turns -------------------------------------------------------
 
 /**
- * The turn a ticket names ran and failed (`mobkit/turn_result` state
+ * The turn a ticket names ran and failed (`meta/turn_result` state
  * `failed`). `reason` carries the runtime's typed detail.
  */
-export class TurnFailedError extends MobKitError {
+export class TurnFailedError extends MetaError {
   readonly identity: string;
   readonly ticket: string;
   readonly reason: string;
@@ -428,7 +543,7 @@ export class TurnFailedError extends MobKitError {
  * cancelled during the wait), `broken`, `retiring` (retiring, retired or
  * being deleted), `identity_gone` or `shutting_down`. Tolerate future values.
  */
-export class WaitEndedError extends MobKitError {
+export class WaitEndedError extends MetaError {
   readonly identity: string;
   readonly outcome: string;
   /** The send/dispatch result when an `*AndWait` call threw this, else `null`. */
@@ -448,7 +563,7 @@ export class WaitEndedError extends MobKitError {
   }
 }
 
-export class TurnUnknownError extends MobKitError {
+export class TurnUnknownError extends MetaError {
   readonly identity: string;
   readonly ticket: string;
   /**
@@ -475,7 +590,7 @@ export class TurnUnknownError extends MobKitError {
  * bound runtime). Nothing ran and there is no turn to wait for, so retrying
  * is safe, unlike a failed or unknown turn.
  */
-export class TurnNotDeliveredError extends MobKitError {
+export class TurnNotDeliveredError extends MetaError {
   readonly identity: string;
   readonly operation: string;
   readonly code: string;
@@ -507,7 +622,7 @@ export class TurnNotDeliveredError extends MobKitError {
  * gateway predates turn tickets. Without `requireAttribution` the call waits
  * identity-wide instead and resolves a non-attributed result.
  */
-export class TurnTrackingUnavailableError extends MobKitError {
+export class TurnTrackingUnavailableError extends MetaError {
   readonly identity: string;
   readonly operation: string;
   readonly admission: unknown;
@@ -548,7 +663,7 @@ export class TurnTrackingUnavailableError extends MobKitError {
  * error. `cause` is the last observation failure and `attempts` counts
  * observation tries.
  */
-export class PostAdmissionObservationError extends MobKitError {
+export class PostAdmissionObservationError extends MetaError {
   readonly identity: string;
   readonly operation: string;
   readonly admission: unknown;
@@ -584,7 +699,7 @@ export class PostAdmissionObservationError extends MobKitError {
  * `*AndWait` call it carries `admission` (the send/dispatch result) so the
  * turn can be read later instead of redispatched.
  */
-export class TurnWaitTimeoutError extends MobKitError {
+export class TurnWaitTimeoutError extends MetaError {
   readonly identity: string;
   readonly ticket: string;
   readonly timeoutMs: number;
@@ -649,6 +764,6 @@ export function isMobEventsStaleError(err: unknown): err is MobEventsStaleError 
 // -- Backward compatibility -----------------------------------------------
 
 /** @deprecated Use {@link RpcError} instead. */
-export const MobkitRpcError = RpcError;
+export const MetaRpcError = RpcError;
 /** @deprecated Use {@link RpcError} instead. */
-export type MobkitRpcError = RpcError;
+export type MetaRpcError = RpcError;

@@ -10,12 +10,12 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from meerkat_mobkit.errors import NotConnectedError, RpcError
+from meerkat_meta.errors import NotConnectedError, RpcError
 
 
 def make_mock_mob_handle(rpc_responses=None):
     """Create a MobHandle with a mocked RPC transport."""
-    from meerkat_mobkit.runtime import MobHandle
+    from meerkat_meta.runtime import MobHandle
 
     runtime = MagicMock()
     calls = []
@@ -33,7 +33,7 @@ def make_mock_mob_handle(rpc_responses=None):
 
 
 def make_http_mob_handle():
-    from meerkat_mobkit.runtime import MobHandle
+    from meerkat_meta.runtime import MobHandle
 
     runtime = MagicMock()
     runtime.rust_http_base_url = "http://127.0.0.1:8765"
@@ -58,23 +58,77 @@ class FakeHttpResponse:
 
 @pytest.mark.asyncio
 async def test_attach_session_rpc_name():
-    """P1 regression: attach_session must call mobkit/attach_existing_session."""
+    """P1 regression: attach_session must call meta/attach_existing_session."""
     handle, calls = make_mock_mob_handle({
-        "mobkit/attach_existing_session": {
+        "meta/attach_existing_session": {
             "status": "active",
             "tokens_used": 0,
             "is_final": False,
         }
     })
     await handle.attach_session("worker", "w1", "sid_abc123")
-    assert calls[0][0] == "mobkit/attach_existing_session"
+    assert calls[0][0] == "meta/attach_existing_session"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decision", "outcome", "next_pending_id"),
+    [
+        ("approve", "allowed", None),
+        ("reject", "safe_draft", None),
+        ("escalate", "pending_approval", "gate-pending-000002"),
+    ],
+)
+async def test_gating_decide_preserves_owner_result_without_followup(
+    decision, outcome, next_pending_id
+):
+    handle, calls = make_mock_mob_handle({
+        "meta/gating/decide": {
+            "pending_id": "gate-pending-000001",
+            "action_id": "gate-action-000001",
+            "approver_id": "human-reviewer",
+            "decision": decision,
+            "outcome": outcome,
+            "decided_at_ms": 1720000000123,
+            "reason": "Recorded human decision",
+            "next_pending_id": next_pending_id,
+        }
+    })
+
+    result = await handle.gating_decide(
+        "gate-pending-000001",
+        decision,
+        "human-reviewer",
+        reason="Recorded human decision",
+    )
+
+    # Even an escalation successor is an observation, not an automatic request.
+    assert calls == [
+        (
+            "meta/gating/decide",
+            {
+                "pending_id": "gate-pending-000001",
+                "decision": decision,
+                "approver_id": "human-reviewer",
+                "reason": "Recorded human decision",
+            },
+        )
+    ]
+    assert result.pending_id == "gate-pending-000001"
+    assert result.action_id == "gate-action-000001"
+    assert result.approver_id == "human-reviewer"
+    assert result.decision == decision
+    assert result.outcome == outcome
+    assert result.decided_at_ms == 1720000000123
+    assert result.reason == "Recorded human decision"
+    assert result.next_pending_id == next_pending_id
 
 
 @pytest.mark.asyncio
 async def test_agent_memory_rpc_names_and_params():
     """Agent memory helpers must hit the first-class durable memory RPCs."""
     handle, calls = make_mock_mob_handle({
-        "mobkit/agent_memory/remember": {
+        "meta/agent_memory/remember": {
             "memory_id": "mem-1",
             "title": "Release checklist",
             "body": "Checklist runs before release planning.",
@@ -82,7 +136,7 @@ async def test_agent_memory_rpc_names_and_params():
             "created_at_ms": 10,
             "updated_at_ms": 20,
         },
-        "mobkit/agent_memory/recall": {
+        "meta/agent_memory/recall": {
             "records": [{
                 "memory_id": "mem-1",
                 "title": "Release checklist",
@@ -92,7 +146,7 @@ async def test_agent_memory_rpc_names_and_params():
                 "updated_at_ms": 20,
             }],
         },
-        "mobkit/agent_memory/forget": {
+        "meta/agent_memory/forget": {
             "memory_id": "mem-1",
             "deleted": True,
         },
@@ -119,7 +173,7 @@ async def test_agent_memory_rpc_names_and_params():
 
     assert calls == [
         (
-            "mobkit/agent_memory/remember",
+            "meta/agent_memory/remember",
             {
                 "identity": "identity:luka",
                 "realm": "example",
@@ -129,7 +183,7 @@ async def test_agent_memory_rpc_names_and_params():
             },
         ),
         (
-            "mobkit/agent_memory/recall",
+            "meta/agent_memory/recall",
             {
                 "identity": "identity:luka",
                 "realm": "example",
@@ -140,7 +194,7 @@ async def test_agent_memory_rpc_names_and_params():
             },
         ),
         (
-            "mobkit/agent_memory/forget",
+            "meta/agent_memory/forget",
             {
                 "identity": "identity:luka",
                 "memory_id": "mem-1",
@@ -157,11 +211,11 @@ async def test_agent_memory_rpc_names_and_params():
 async def test_agent_memory_update_and_manifest_rpc_names_and_params():
     """update/manifest must hit the v2 durable-memory RPCs with exact params."""
     handle, calls = make_mock_mob_handle({
-        "mobkit/agent_memory/update": {
+        "meta/agent_memory/update": {
             "memory_id": "mem-2",
             "supersedes": "mem-1",
         },
-        "mobkit/agent_memory/manifest": {
+        "meta/agent_memory/manifest": {
             "records": [{
                 "id": "mem-2",
                 "kind": "fact",
@@ -190,7 +244,7 @@ async def test_agent_memory_update_and_manifest_rpc_names_and_params():
 
     assert calls == [
         (
-            "mobkit/agent_memory/update",
+            "meta/agent_memory/update",
             {
                 "identity": "identity:luka",
                 "memory_id": "mem-1",
@@ -201,7 +255,7 @@ async def test_agent_memory_update_and_manifest_rpc_names_and_params():
             },
         ),
         (
-            "mobkit/agent_memory/manifest",
+            "meta/agent_memory/manifest",
             {
                 "identity": "identity:luka",
                 "realm": "example",
@@ -223,7 +277,7 @@ async def test_agent_memory_manifest_optional_params_omitted():
     """Optional tier/k/realm must not leak into params when not provided,
     and a rank-less manifest row parses with rank=None."""
     handle, calls = make_mock_mob_handle({
-        "mobkit/agent_memory/manifest": {
+        "meta/agent_memory/manifest": {
             "records": [{
                 "id": "mem-3",
                 "kind": "gotcha",
@@ -235,7 +289,7 @@ async def test_agent_memory_manifest_optional_params_omitted():
 
     manifest = await handle.manifest_agent_memory("identity:luka")
 
-    assert calls[0][0] == "mobkit/agent_memory/manifest"
+    assert calls[0][0] == "meta/agent_memory/manifest"
     assert calls[0][1] == {"identity": "identity:luka"}
     assert manifest[0].rank is None
     assert manifest[0].description == ""
@@ -244,44 +298,44 @@ async def test_agent_memory_manifest_optional_params_omitted():
 @pytest.mark.asyncio
 async def test_mobpack_editor_catalog_rpc_names():
     handle, calls = make_mock_mob_handle({
-        "mobkit/tools/catalog": {
+        "meta/tools/catalog": {
             "schema_version": "mobpack.editor.v1",
             "runtime_backed": False,
-            "source": "mobkit/tool-config",
+            "source": "meta/tool-config",
             "authoring_provider": {"id": "standalone_authoring"},
             "tool_catalog": [{"id": "shell"}],
         },
-        "mobkit/skills/catalog": {
+        "meta/skills/catalog": {
             "schema_version": "mobpack.editor.v1",
             "runtime_backed": False,
-            "source": "mobkit/authoring-skill-realms",
+            "source": "meta/authoring-skill-realms",
             "authoring_provider": {"id": "standalone_authoring"},
-            "skill_realms": [{"id": "mobkit/authoring"}],
+            "skill_realms": [{"id": "meta/authoring"}],
         },
-        "mobkit/agent_definitions/list": {
+        "meta/agent_definitions/list": {
             "schema_version": "mobpack.editor.v1",
             "runtime_backed": False,
-            "source": "mobkit/authoring-agent-definitions",
+            "source": "meta/authoring-agent-definitions",
             "authoring_provider": {"id": "standalone_authoring"},
             "agent_definitions": [{"id": "authoring:reviewer"}],
         },
-        "mobkit/mobpacks/templates": {
+        "meta/mobpacks/templates": {
             "schema_version": "mobpack.editor.v1",
-            "source": "mobkit/mobpack-templates",
+            "source": "meta/mobpack-templates",
             "authoring_provider": {"id": "standalone_authoring"},
             "blank_mobpack": {"document": {}},
             "sample_mobpacks": [{"id": "sample"}],
             "sample_agent_definitions": [{"id": "sample:reviewer"}],
             "templates": {"blank_mobpack": {"document": {}}},
         },
-        "mobkit/mobpacks/catalogs": {
+        "meta/mobpacks/catalogs": {
             "schema_version": "mobpack.editor.v1",
             "runtime_backed": False,
             "authoring_provider": {"id": "standalone_authoring"},
-            "sources": {"tools": "mobkit/tools/catalog"},
+            "sources": {"tools": "meta/tools/catalog"},
             "templates": {},
             "tool_catalog": [{"id": "shell"}],
-            "skill_realms": [{"id": "mobkit/authoring"}],
+            "skill_realms": [{"id": "meta/authoring"}],
             "blank_mobpack": {"document": {}},
             "sample_mobpacks": [{"id": "sample"}],
             "agent_definitions": [{"id": "authoring:reviewer"}],
@@ -292,16 +346,16 @@ async def test_mobpack_editor_catalog_rpc_names():
     })
 
     assert (await handle.tools_catalog()).tool_catalog == [{"id": "shell"}]
-    assert (await handle.skills_catalog()).skill_realms == [{"id": "mobkit/authoring"}]
+    assert (await handle.skills_catalog()).skill_realms == [{"id": "meta/authoring"}]
     assert (await handle.agent_definitions()).agent_definitions == [{"id": "authoring:reviewer"}]
     assert (await handle.mobpack_templates()).sample_mobpacks == [{"id": "sample"}]
-    assert (await handle.mobpack_catalogs()).sources == {"tools": "mobkit/tools/catalog"}
+    assert (await handle.mobpack_catalogs()).sources == {"tools": "meta/tools/catalog"}
     assert [call[0] for call in calls] == [
-        "mobkit/tools/catalog",
-        "mobkit/skills/catalog",
-        "mobkit/agent_definitions/list",
-        "mobkit/mobpacks/templates",
-        "mobkit/mobpacks/catalogs",
+        "meta/tools/catalog",
+        "meta/skills/catalog",
+        "meta/agent_definitions/list",
+        "meta/mobpacks/templates",
+        "meta/mobpacks/catalogs",
     ]
 
 
@@ -312,7 +366,7 @@ def _mobpack_validation_payload(ok=True):
         "display_rows": [{"kind": "ok", "glyph": "✓", "head": "valid", "sub": "", "meta": ""}],
         "mob_id": "demo",
         "flow_ids": ["flow_a"],
-        "validation_source": "mobkit/mobpacks/validate",
+        "validation_source": "meta/mobpacks/validate",
         "deploy_command": "rkat mob deploy",
     }
 
@@ -325,8 +379,8 @@ def _mobpack_draft_row_payload(
         "name": "Demo",
         "version": "mobpack.editor.v1",
         "stage": "draft",
-        "trigger": "MobKit authoring draft",
-        "source": "mobkit/mobpacks/create",
+        "trigger": "Meta authoring draft",
+        "source": "meta/mobpacks/create",
         "revision": revision,
         "etag": f"{draft_id}:{revision}",
         "updated_at_unix_ms": 1700000000000,
@@ -343,8 +397,8 @@ async def test_mobpack_authoring_rpc_names_and_params():
     snake_case params and parse the typed result."""
     document = {"mob_id": "demo", "members": []}
     handle, calls = make_mock_mob_handle({
-        "mobkit/mobpacks/validate": _mobpack_validation_payload(),
-        "mobkit/mobpacks/source": {
+        "meta/mobpacks/validate": _mobpack_validation_payload(),
+        "meta/mobpacks/source": {
             "filename": "demo.mobpack",
             "media_type": "application/vnd.meerkat.mobpack",
             "mob_toml": "[mob]\nid = \"demo\"\n",
@@ -356,9 +410,9 @@ async def test_mobpack_authoring_rpc_names_and_params():
                 "sha256": "abc",
             }],
             "validation": _mobpack_validation_payload(),
-            "source": "mobkit/mobpacks/source",
+            "source": "meta/mobpacks/source",
         },
-        "mobkit/mobpacks/export": {
+        "meta/mobpacks/export": {
             "filename": "demo.mobpack",
             "media_type": "application/vnd.meerkat.mobpack",
             "content_base64": "UEsDBA==",
@@ -366,75 +420,75 @@ async def test_mobpack_authoring_rpc_names_and_params():
             "source_files": [],
             "validation": _mobpack_validation_payload(),
         },
-        "mobkit/mobpacks/import": {
+        "meta/mobpacks/import": {
             "document": {"mob_id": "demo"},
             "validation": _mobpack_validation_payload(),
-            "source": "mobkit/mobpacks/import:mob.toml",
+            "source": "meta/mobpacks/import:mob.toml",
             "source_label": "demo.toml",
             "source_media_type": "text/x-toml",
         },
-        "mobkit/mobpacks/list": {
-            "source": "mobkit/mobpacks/list",
+        "meta/mobpacks/list": {
+            "source": "meta/mobpacks/list",
             "store_path": "/tmp/drafts.json",
             "runtime_backed": False,
             "rows": [_mobpack_draft_row_payload()],
         },
-        "mobkit/mobpacks/get": {
-            "source": "mobkit/mobpacks/get",
+        "meta/mobpacks/get": {
+            "source": "meta/mobpacks/get",
             "store_path": "/tmp/drafts.json",
             "runtime_backed": False,
             "row": _mobpack_draft_row_payload(),
         },
-        "mobkit/mobpacks/create": {
-            "source": "mobkit/mobpacks/create",
+        "meta/mobpacks/create": {
+            "source": "meta/mobpacks/create",
             "store_path": "/tmp/drafts.json",
             "row": _mobpack_draft_row_payload(),
             "rows": [_mobpack_draft_row_payload()],
         },
-        "mobkit/mobpacks/save": {
-            "source": "mobkit/mobpacks/save",
+        "meta/mobpacks/save": {
+            "source": "meta/mobpacks/save",
             "store_path": "/tmp/drafts.json",
             "row": _mobpack_draft_row_payload(revision=2),
             "rows": [_mobpack_draft_row_payload(revision=2)],
         },
-        "mobkit/mobpacks/undo": {
-            "source": "mobkit/mobpacks/undo",
+        "meta/mobpacks/undo": {
+            "source": "meta/mobpacks/undo",
             "store_path": "/tmp/drafts.json",
             "stepped": True,
             "row": _mobpack_draft_row_payload(revision=3, can_undo=False, can_redo=True),
             "rows": [_mobpack_draft_row_payload(revision=3, can_undo=False, can_redo=True)],
         },
-        "mobkit/mobpacks/redo": {
-            "source": "mobkit/mobpacks/redo",
+        "meta/mobpacks/redo": {
+            "source": "meta/mobpacks/redo",
             "store_path": "/tmp/drafts.json",
             "stepped": True,
             "row": _mobpack_draft_row_payload(revision=4, can_undo=True, can_redo=False),
             "rows": [_mobpack_draft_row_payload(revision=4, can_undo=True, can_redo=False)],
         },
-        "mobkit/mobpacks/delete": {
-            "source": "mobkit/mobpacks/delete",
+        "meta/mobpacks/delete": {
+            "source": "meta/mobpacks/delete",
             "store_path": "/tmp/drafts.json",
             "id": "f_demo",
             "deleted": True,
             "rows": [],
         },
-        "mobkit/mobpacks/apply_operation": {
-            "source": "mobkit/mobpacks/apply_operation",
+        "meta/mobpacks/apply_operation": {
+            "source": "meta/mobpacks/apply_operation",
             "operation": "add_member",
             "ok": True,
             "document": {"mob_id": "demo", "members": [{"id": "reviewer"}]},
             "selection": {"kind": "agent", "id": "reviewer"},
             "validation": _mobpack_validation_payload(),
         },
-        "mobkit/mobpacks/deploy_command": {
+        "meta/mobpacks/deploy_command": {
             "command": "rkat mob deploy demo.mobpack",
             "argv": ["rkat", "mob", "deploy", "demo.mobpack"],
             "deploy_command": "rkat mob deploy",
             "filename": "demo.mobpack",
             "validation": _mobpack_validation_payload(),
-            "source": "meerkat_mobkit::mobpack::deploy_argv",
+            "source": "meerkat_meta::mobpack::deploy_argv",
         },
-        "mobkit/mobpacks/deploy": {
+        "meta/mobpacks/deploy": {
             "filename": "demo.mobpack",
             "pack_path": "/tmp/demo.mobpack",
             "pack_sha256": "deadbeef",
@@ -467,7 +521,7 @@ async def test_mobpack_authoring_rpc_names_and_params():
         mob_toml="[mob]\nid = \"demo\"\n", source_name="demo.toml"
     )
     assert imported.document == {"mob_id": "demo"}
-    assert imported.source == "mobkit/mobpacks/import:mob.toml"
+    assert imported.source == "meta/mobpacks/import:mob.toml"
 
     listed = await handle.mobpack_list()
     assert listed.rows[0].id == "f_demo"
@@ -526,20 +580,20 @@ async def test_mobpack_authoring_rpc_names_and_params():
     assert deployed.pack_sha256 == "deadbeef"
 
     assert [call[0] for call in calls] == [
-        "mobkit/mobpacks/validate",
-        "mobkit/mobpacks/source",
-        "mobkit/mobpacks/export",
-        "mobkit/mobpacks/import",
-        "mobkit/mobpacks/list",
-        "mobkit/mobpacks/get",
-        "mobkit/mobpacks/create",
-        "mobkit/mobpacks/save",
-        "mobkit/mobpacks/undo",
-        "mobkit/mobpacks/redo",
-        "mobkit/mobpacks/delete",
-        "mobkit/mobpacks/apply_operation",
-        "mobkit/mobpacks/deploy_command",
-        "mobkit/mobpacks/deploy",
+        "meta/mobpacks/validate",
+        "meta/mobpacks/source",
+        "meta/mobpacks/export",
+        "meta/mobpacks/import",
+        "meta/mobpacks/list",
+        "meta/mobpacks/get",
+        "meta/mobpacks/create",
+        "meta/mobpacks/save",
+        "meta/mobpacks/undo",
+        "meta/mobpacks/redo",
+        "meta/mobpacks/delete",
+        "meta/mobpacks/apply_operation",
+        "meta/mobpacks/deploy_command",
+        "meta/mobpacks/deploy",
     ]
     assert calls[0][1] == {"document": document, "rkat_validate": True}
     assert calls[1][1] == {"document": document}
@@ -578,9 +632,9 @@ async def test_mobpack_authoring_rpc_names_and_params():
 async def test_mobpack_authoring_optional_params_omitted():
     """Optional guards must not leak into params when not provided."""
     handle, calls = make_mock_mob_handle({
-        "mobkit/mobpacks/validate": _mobpack_validation_payload(),
-        "mobkit/mobpacks/delete": {
-            "source": "mobkit/mobpacks/delete",
+        "meta/mobpacks/validate": _mobpack_validation_payload(),
+        "meta/mobpacks/delete": {
+            "source": "meta/mobpacks/delete",
             "store_path": "/tmp/drafts.json",
             "id": "f_demo",
             "deleted": False,
@@ -600,8 +654,8 @@ async def test_mobpack_undo_not_stepped_carries_reason():
     """When the history is empty, undo reports stepped=False with a reason
     and leaves the draft row untouched."""
     handle, calls = make_mock_mob_handle({
-        "mobkit/mobpacks/undo": {
-            "source": "mobkit/mobpacks/undo",
+        "meta/mobpacks/undo": {
+            "source": "meta/mobpacks/undo",
             "store_path": "/tmp/drafts.json",
             "stepped": False,
             "reason": "nothing to undo",
@@ -611,7 +665,7 @@ async def test_mobpack_undo_not_stepped_carries_reason():
     })
 
     result = await handle.mobpack_undo("f_demo")
-    assert calls[0][0] == "mobkit/mobpacks/undo"
+    assert calls[0][0] == "meta/mobpacks/undo"
     assert calls[0][1] == {"id": "f_demo"}
     assert result.stepped is False
     assert result.reason == "nothing to undo"
@@ -621,7 +675,7 @@ async def test_mobpack_undo_not_stepped_carries_reason():
 
 @pytest.mark.asyncio
 async def test_send_with_attachments_uses_multipart(monkeypatch):
-    from meerkat_mobkit import runtime as runtime_module
+    from meerkat_meta import runtime as runtime_module
 
     captured = {}
 
@@ -631,7 +685,7 @@ async def test_send_with_attachments_uses_multipart(monkeypatch):
         captured["body"] = body
         assert 'name="payload"' in body
         assert 'name="file:upload-1"' in body
-        assert '"method": "mobkit/send_message"' in body
+        assert '"method": "meta/send_message"' in body
         assert '"type": "image_upload"' in body
         return FakeHttpResponse({
             "jsonrpc": "2.0",
@@ -650,7 +704,7 @@ async def test_send_with_attachments_uses_multipart(monkeypatch):
 @pytest.mark.asyncio
 async def test_memory_query_uses_assertion_filter_params():
     handle, calls = make_mock_mob_handle({
-        "mobkit/memory/query": {
+        "meta/memory/query": {
             "assertions": [],
             "conflicts": [],
         }
@@ -662,7 +716,7 @@ async def test_memory_query_uses_assertion_filter_params():
         "store": "knowledge_graph",
     })
 
-    assert calls[0][0] == "mobkit/memory/query"
+    assert calls[0][0] == "meta/memory/query"
     assert calls[0][1] == {
         "entity": "identity:ops",
         "topic": "deployment",
@@ -673,7 +727,7 @@ async def test_memory_query_uses_assertion_filter_params():
 @pytest.mark.asyncio
 async def test_memory_query_keeps_legacy_string_wire_shape():
     handle, calls = make_mock_mob_handle({
-        "mobkit/memory/query": {
+        "meta/memory/query": {
             "assertions": [],
             "conflicts": [],
         }
@@ -681,7 +735,7 @@ async def test_memory_query_keeps_legacy_string_wire_shape():
 
     await handle.memory_query("legacy search text", store="knowledge_graph")
 
-    assert calls[0][0] == "mobkit/memory/query"
+    assert calls[0][0] == "meta/memory/query"
     assert calls[0][1] == {
         "query": "legacy search text",
         "store": "knowledge_graph",
@@ -690,7 +744,7 @@ async def test_memory_query_keeps_legacy_string_wire_shape():
 
 @pytest.mark.asyncio
 async def test_send_with_structured_content_and_attachment_forwards_mode(monkeypatch):
-    from meerkat_mobkit import runtime as runtime_module
+    from meerkat_meta import runtime as runtime_module
 
     def fake_urlopen(req, timeout=60):
         body = req.data.decode("utf-8", errors="replace")
@@ -717,7 +771,7 @@ async def test_send_with_structured_content_and_attachment_forwards_mode(monkeyp
 
 @pytest.mark.asyncio
 async def test_send_attachment_requires_http_base():
-    from meerkat_mobkit.runtime import MobHandle
+    from meerkat_meta.runtime import MobHandle
 
     runtime = MagicMock()
     runtime.rust_http_base_url = None
@@ -729,11 +783,11 @@ async def test_send_attachment_requires_http_base():
 
 @pytest.mark.asyncio
 async def test_upload_blob_uses_multipart(monkeypatch):
-    from meerkat_mobkit import runtime as runtime_module
+    from meerkat_meta import runtime as runtime_module
 
     def fake_urlopen(req, timeout=60):
         body = req.data.decode("utf-8", errors="replace")
-        assert '"method": "mobkit/blob/upload"' in body
+        assert '"method": "meta/blob/upload"' in body
         assert '"media_type": "image/png"' in body
         return FakeHttpResponse({
             "jsonrpc": "2.0",
@@ -750,7 +804,7 @@ async def test_upload_blob_uses_multipart(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_upload_blob_raises_rpc_error(monkeypatch):
-    from meerkat_mobkit import runtime as runtime_module
+    from meerkat_meta import runtime as runtime_module
 
     def fake_urlopen(req, timeout=60):
         return FakeHttpResponse({
@@ -764,12 +818,12 @@ async def test_upload_blob_raises_rpc_error(monkeypatch):
     with pytest.raises(RpcError) as exc:
         await handle.upload_blob(b"png", media_type="image/png")
     assert exc.value.code == -32602
-    assert exc.value.method == "mobkit/blob/upload"
+    assert exc.value.method == "meta/blob/upload"
 
 
 @pytest.mark.asyncio
 async def test_upload_blob_requires_http_base():
-    from meerkat_mobkit.runtime import MobHandle
+    from meerkat_meta.runtime import MobHandle
 
     runtime = MagicMock()
     runtime.rust_http_base_url = None
@@ -783,7 +837,7 @@ async def test_upload_blob_requires_http_base():
 async def test_collect_completed_parses_wrapped_response():
     """P2 regression: collect_completed response is {"completed": [...]}, not bare list."""
     handle, calls = make_mock_mob_handle({
-        "mobkit/collect_completed": {
+        "meta/collect_completed": {
             "completed": [
                 {
                     "member_id": "w1",
@@ -797,7 +851,7 @@ async def test_collect_completed_parses_wrapped_response():
         }
     })
     result = await handle.collect_completed()
-    assert calls[0][0] == "mobkit/collect_completed"
+    assert calls[0][0] == "meta/collect_completed"
     assert len(result) == 1
     assert result[0][0] == "w1"
     assert result[0][1].status == "completed"
@@ -808,7 +862,7 @@ async def test_collect_completed_parses_wrapped_response():
 async def test_collect_completed_empty():
     """collect_completed returns empty list when no members are terminal."""
     handle, calls = make_mock_mob_handle({
-        "mobkit/collect_completed": {"completed": []}
+        "meta/collect_completed": {"completed": []}
     })
     result = await handle.collect_completed()
     assert result == []
@@ -817,36 +871,36 @@ async def test_collect_completed_empty():
 @pytest.mark.asyncio
 async def test_member_status_rpc_name():
     handle, calls = make_mock_mob_handle({
-        "mobkit/member_status": {
+        "meta/member_status": {
             "status": "active",
             "tokens_used": 42,
             "is_final": False,
         }
     })
     result = await handle.member_status("w1")
-    assert calls[0][0] == "mobkit/member_status"
+    assert calls[0][0] == "meta/member_status"
     assert result.tokens_used == 42
 
 
 @pytest.mark.asyncio
 async def test_storage_doctor_rpc_name_and_params():
     handle, calls = make_mock_mob_handle({
-        "mobkit/storage/doctor": {
-            "state_dir": "/var/lib/mobkit/state",
+        "meta/storage/doctor": {
+            "state_dir": "/var/lib/meta/state",
             "diagnosis": {"findings": [], "inventory": []},
             "storage": None,
         }
     })
-    result = await handle.storage_doctor(state_dir="/var/lib/mobkit/state")
-    assert calls[0][0] == "mobkit/storage/doctor"
-    assert calls[0][1] == {"state_dir": "/var/lib/mobkit/state"}
+    result = await handle.storage_doctor(state_dir="/var/lib/meta/state")
+    assert calls[0][0] == "meta/storage/doctor"
+    assert calls[0][1] == {"state_dir": "/var/lib/meta/state"}
     assert result["diagnosis"] == {"findings": [], "inventory": []}
 
     await handle.storage_doctor(
-        state_dir="/var/lib/mobkit/state", identity="domain:security"
+        state_dir="/var/lib/meta/state", identity="domain:security"
     )
     assert calls[1][1] == {
-        "state_dir": "/var/lib/mobkit/state",
+        "state_dir": "/var/lib/meta/state",
         "identity": "domain:security",
     }
 
@@ -859,14 +913,14 @@ async def test_storage_doctor_rpc_name_and_params():
 @pytest.mark.asyncio
 async def test_identity_resolved_tools_rpc_name():
     handle, calls = make_mock_mob_handle({
-        "mobkit/identity/resolved_tools": {
+        "meta/identity/resolved_tools": {
             "identity": "domain:security",
             "session_id": "sid-1",
             "tools": ["shell", "send_message"],
         }
     })
     result = await handle.identity_resolved_tools("domain:security")
-    assert calls[0][0] == "mobkit/identity/resolved_tools"
+    assert calls[0][0] == "meta/identity/resolved_tools"
     assert calls[0][1] == {"identity": "domain:security"}
     assert result == ["shell", "send_message"]
 
@@ -874,14 +928,14 @@ async def test_identity_resolved_tools_rpc_name():
 @pytest.mark.asyncio
 async def test_identity_resolved_tools_detail_rpc_name():
     handle, calls = make_mock_mob_handle({
-        "mobkit/identity/resolved_tools": {
+        "meta/identity/resolved_tools": {
             "identity": "domain:security",
             "session_id": "sid-1",
             "tools": ["shell"],
         }
     })
     result = await handle.identity_resolved_tools_detail("domain:security")
-    assert calls[0][0] == "mobkit/identity/resolved_tools"
+    assert calls[0][0] == "meta/identity/resolved_tools"
     assert result.identity == "domain:security"
     assert result.session_id == "sid-1"
     assert result.tools == ["shell"]
@@ -890,7 +944,7 @@ async def test_identity_resolved_tools_detail_rpc_name():
 @pytest.mark.asyncio
 async def test_identity_routing_status_rpc_name():
     handle, calls = make_mock_mob_handle({
-        "mobkit/identity/routing_status": {
+        "meta/identity/routing_status": {
             "identity": "domain:security",
             "session_id": "sid-1",
             "baseline_model": "gpt-5.6-sol",
@@ -899,7 +953,7 @@ async def test_identity_routing_status_rpc_name():
         }
     })
     result = await handle.identity_routing_status("domain:security")
-    assert calls[0][0] == "mobkit/identity/routing_status"
+    assert calls[0][0] == "meta/identity/routing_status"
     assert calls[0][1] == {"identity": "domain:security"}
     assert result.identity == "domain:security"
     assert result.session_id == "sid-1"
@@ -921,7 +975,7 @@ async def test_identity_routing_status_absent_provider_stays_none():
     that was never read.
     """
     handle, _calls = make_mock_mob_handle({
-        "mobkit/identity/routing_status": {
+        "meta/identity/routing_status": {
             "identity": "domain:security",
             "session_id": "sid-1",
             "baseline_model": "claude-fable-5",
@@ -937,17 +991,17 @@ async def test_identity_routing_status_absent_provider_stays_none():
 async def test_force_cancel_member_rpc_name():
     handle, calls = make_mock_mob_handle()
     await handle.force_cancel_member("w1")
-    assert calls[0][0] == "mobkit/force_cancel_member"
+    assert calls[0][0] == "meta/force_cancel_member"
 
 
 @pytest.mark.asyncio
 async def test_stop_member_run_rpc_name_and_receipt():
     receipt = {"outcome": "not_current", "run_id": "r-1", "current_run_id": "r-2"}
     handle, calls = make_mock_mob_handle(
-        {"mobkit/stop_member_run": {"member_id": "w1", "receipt": receipt}}
+        {"meta/stop_member_run": {"member_id": "w1", "receipt": receipt}}
     )
     result = await handle.stop_member_run("w1", "r-1", reason="stop")
-    assert calls[0][0] == "mobkit/stop_member_run"
+    assert calls[0][0] == "meta/stop_member_run"
     assert calls[0][1] == {"member_id": "w1", "run_id": "r-1", "reason": "stop"}
     assert result.outcome == "not_current"
     assert result.run_id == "r-1"
@@ -965,7 +1019,7 @@ async def test_stop_member_run_parses_stopped_contributors():
         ],
     }
     handle, _calls = make_mock_mob_handle(
-        {"mobkit/stop_member_run": {"member_id": "w1", "receipt": receipt}}
+        {"meta/stop_member_run": {"member_id": "w1", "receipt": receipt}}
     )
     result = await handle.stop_member_run("w1", "r-1", reason="stop")
     assert result.outcome == "stopped"
@@ -976,7 +1030,7 @@ async def test_stop_member_run_parses_stopped_contributors():
 @pytest.mark.asyncio
 async def test_stop_member_run_rejects_a_malformed_receipt():
     handle, _calls = make_mock_mob_handle(
-        {"mobkit/stop_member_run": {"member_id": "w1", "receipt": {"outcome": "?"}}}
+        {"meta/stop_member_run": {"member_id": "w1", "receipt": {"outcome": "?"}}}
     )
     with pytest.raises(ValueError):
         await handle.stop_member_run("w1", "r-1", reason="stop")
@@ -985,7 +1039,7 @@ async def test_stop_member_run_rejects_a_malformed_receipt():
 @pytest.mark.asyncio
 async def test_spawn_helper_rpc_name():
     handle, calls = make_mock_mob_handle({
-        "mobkit/spawn_helper": {
+        "meta/spawn_helper": {
             "output": "done",
             "tokens_used": 10,
             "session_id": "sess-1",
@@ -998,7 +1052,7 @@ async def test_spawn_helper_rpc_name():
         max_text_bytes=65536,
         role="worker",
     )
-    assert calls[0][0] == "mobkit/spawn_helper"
+    assert calls[0][0] == "meta/spawn_helper"
     assert calls[0][1]["agent_identity"] == "h1"
     assert calls[0][1]["task"] == "do stuff"
     assert calls[0][1]["result_label"] == "helper-result"
@@ -1011,7 +1065,7 @@ async def test_spawn_helper_rpc_name():
 @pytest.mark.asyncio
 async def test_fork_helper_rpc_name_and_params():
     handle, calls = make_mock_mob_handle({
-        "mobkit/fork_helper": {"output": "forked result", "tokens_used": 5}
+        "meta/fork_helper": {"output": "forked result", "tokens_used": 5}
     })
     result = await handle.fork_helper(
         "lead",
@@ -1022,7 +1076,7 @@ async def test_fork_helper_rpc_name_and_params():
         fork_context={"type": "last_messages", "count": 10},
         runtime_mode="turn_driven",
     )
-    assert calls[0][0] == "mobkit/fork_helper"
+    assert calls[0][0] == "meta/fork_helper"
     assert calls[0][1]["source_member_id"] == "lead"
     assert calls[0][1]["result_label"] == "fork-result"
     assert calls[0][1]["max_text_bytes"] == 32768
@@ -1034,13 +1088,13 @@ async def test_fork_helper_rpc_name_and_params():
 async def test_cancel_flow_rpc_name():
     handle, calls = make_mock_mob_handle()
     await handle.cancel_flow("run_123")
-    assert calls[0][0] == "mobkit/cancel_flow"
+    assert calls[0][0] == "meta/cancel_flow"
 
 
 @pytest.mark.asyncio
 async def test_flow_status_rpc_name():
     handle, calls = make_mock_mob_handle({
-        "mobkit/flow_status": {
+        "meta/flow_status": {
             "run_id": "r1",
             "mob_id": "m1",
             "flow_id": "f1",
@@ -1050,39 +1104,39 @@ async def test_flow_status_rpc_name():
         }
     })
     result = await handle.flow_status("r1")
-    assert calls[0][0] == "mobkit/flow_status"
+    assert calls[0][0] == "meta/flow_status"
     assert result.status == "running"
 
 
 @pytest.mark.asyncio
 async def test_list_flows_rpc_name():
-    """list_flows must call mobkit/list_flows and parse the {flows: [...]} envelope."""
+    """list_flows must call meta/list_flows and parse the {flows: [...]} envelope."""
     handle, calls = make_mock_mob_handle({
-        "mobkit/list_flows": {"flows": ["demo", "pipeline"]}
+        "meta/list_flows": {"flows": ["demo", "pipeline"]}
     })
     result = await handle.list_flows()
-    assert calls[0][0] == "mobkit/list_flows"
+    assert calls[0][0] == "meta/list_flows"
     assert calls[0][1] is None
     assert result == ["demo", "pipeline"]
 
 
 @pytest.mark.asyncio
 async def test_run_flow_rpc_name_and_params():
-    """run_flow must call mobkit/run_flow with flow_id+params and return run_id."""
+    """run_flow must call meta/run_flow with flow_id+params and return run_id."""
     handle, calls = make_mock_mob_handle({
-        "mobkit/run_flow": {"run_id": "run_abc123"}
+        "meta/run_flow": {"run_id": "run_abc123"}
     })
     run_id = await handle.run_flow("demo", {"choice": "a"})
-    assert calls[0][0] == "mobkit/run_flow"
+    assert calls[0][0] == "meta/run_flow"
     assert calls[0][1] == {"flow_id": "demo", "params": {"choice": "a"}}
     assert run_id == "run_abc123"
 
 
 @pytest.mark.asyncio
 async def test_list_runs_rpc_name_no_filter():
-    """list_runs must call mobkit/list_runs with no flow_id and parse the full ledger."""
+    """list_runs must call meta/list_runs with no flow_id and parse the full ledger."""
     handle, calls = make_mock_mob_handle({
-        "mobkit/list_runs": {
+        "meta/list_runs": {
             "runs": [
                 {
                     "run_id": "r-1",
@@ -1124,7 +1178,7 @@ async def test_list_runs_rpc_name_no_filter():
         }
     })
     runs = await handle.list_runs()
-    assert calls[0][0] == "mobkit/list_runs"
+    assert calls[0][0] == "meta/list_runs"
     assert calls[0][1] == {}
     assert len(runs) == 1
     run = runs[0]
@@ -1145,9 +1199,9 @@ async def test_list_runs_rpc_name_no_filter():
 @pytest.mark.asyncio
 async def test_list_runs_rpc_name_with_flow_id_filter():
     """list_runs(flow_id=...) must forward flow_id."""
-    handle, calls = make_mock_mob_handle({"mobkit/list_runs": {"runs": []}})
+    handle, calls = make_mock_mob_handle({"meta/list_runs": {"runs": []}})
     runs = await handle.list_runs(flow_id="alpha")
-    assert calls[0][0] == "mobkit/list_runs"
+    assert calls[0][0] == "meta/list_runs"
     assert calls[0][1] == {"flow_id": "alpha"}
     assert runs == []
 
@@ -1155,7 +1209,7 @@ async def test_list_runs_rpc_name_with_flow_id_filter():
 @pytest.mark.asyncio
 async def test_query_mob_events_stale_raises_typed_error():
     """A -32010 RpcError must be reified into MobEventsStaleError carrying both cursors."""
-    from meerkat_mobkit.errors import MobEventsStaleError, RpcError
+    from meerkat_meta.errors import MobEventsStaleError, RpcError
 
     async def stale_rpc(method, params=None):
         raise RpcError(
@@ -1166,7 +1220,7 @@ async def test_query_mob_events_stale_raises_typed_error():
             data={"after_cursor": 999, "latest_cursor": 42},
         )
 
-    from meerkat_mobkit.runtime import MobHandle
+    from meerkat_meta.runtime import MobHandle
 
     runtime = MagicMock()
     runtime._rpc = stale_rpc
@@ -1183,8 +1237,8 @@ async def test_query_mob_events_stale_raises_typed_error():
 
 def test_console_timeline_replay_unavailable_uses_distinct_typed_error():
     """Console timeline replay gaps must not be reified as MobEventsStaleError."""
-    from meerkat_mobkit.errors import ConsoleTimelineReplayUnavailableError
-    from meerkat_mobkit.runtime import _rpc_error_from_payload
+    from meerkat_meta.errors import ConsoleTimelineReplayUnavailableError
+    from meerkat_meta.runtime import _rpc_error_from_payload
 
     err = _rpc_error_from_payload(
         {
@@ -1198,12 +1252,12 @@ def test_console_timeline_replay_unavailable_uses_distinct_typed_error():
             },
         },
         request_id="rid",
-        method="mobkit/console/query_timeline",
+        method="meta/console/query_timeline",
     )
 
     assert isinstance(err, ConsoleTimelineReplayUnavailableError)
     assert err.code == -32013
-    assert err.method == "mobkit/console/query_timeline"
+    assert err.method == "meta/console/query_timeline"
     assert err.data["requested_cursor"] == "console:500"
     assert err.data["latest_cursor"] == "console:42"
 
@@ -1216,32 +1270,32 @@ def test_lease_lost_reifies_as_lease_lost_error_not_capability_unavailable():
     must surface as the distinct LeaseLostError so callers do not give up on
     an identity that merely needs a lease re-acquire.
     """
-    from meerkat_mobkit.errors import (
+    from meerkat_meta.errors import (
         CapabilityUnavailableError,
         LeaseLostError,
     )
-    from meerkat_mobkit.runtime import _rpc_error_from_payload
+    from meerkat_meta.runtime import _rpc_error_from_payload
 
     err = _rpc_error_from_payload(
         {"code": -32005, "message": "lease lost: review:singleton"},
         request_id="rid",
-        method="mobkit/send",
+        method="meta/send",
     )
 
     assert isinstance(err, LeaseLostError)
     assert not isinstance(err, CapabilityUnavailableError)
     assert err.code == -32005
-    assert err.method == "mobkit/send"
+    assert err.method == "meta/send"
 
 
 @pytest.mark.asyncio
 async def test_wait_ready_rpc_name():
-    """wait_ready must call mobkit/wait_ready and forward timeout in ms."""
+    """wait_ready must call meta/wait_ready and forward timeout in ms."""
     handle, calls = make_mock_mob_handle({
-        "mobkit/wait_ready": {"ready": [], "timeout": False}
+        "meta/wait_ready": {"ready": [], "timeout": False}
     })
     result = await handle.wait_ready(timeout=2.5)
-    assert calls[0][0] == "mobkit/wait_ready"
+    assert calls[0][0] == "meta/wait_ready"
     assert calls[0][1] == {"timeout_ms": 2500}
     assert result == {"ready": [], "timeout": False}
 
@@ -1249,24 +1303,24 @@ async def test_wait_ready_rpc_name():
 
 @pytest.mark.asyncio
 async def test_peer_pubkey_rpc_name():
-    """peer_pubkey must call mobkit/peer_pubkey and unwrap pubkey_b64."""
+    """peer_pubkey must call meta/peer_pubkey and unwrap pubkey_b64."""
     handle, calls = make_mock_mob_handle({
-        "mobkit/peer_pubkey": {"pubkey_b64": "AAAA"}
+        "meta/peer_pubkey": {"pubkey_b64": "AAAA"}
     })
     result = await handle.peer_pubkey()
-    assert calls[0][0] == "mobkit/peer_pubkey"
+    assert calls[0][0] == "meta/peer_pubkey"
     assert result == "AAAA"
 
 
 @pytest.mark.asyncio
 async def test_session_store_bigquery_rpc_name():
     handle, calls = make_mock_mob_handle({
-        "mobkit/session_store/bigquery": {"rows": 1}
+        "meta/session_store/bigquery": {"rows": 1}
     })
 
     result = await handle.session_store_bigquery(operation="probe")
 
-    assert calls[0][0] == "mobkit/session_store/bigquery"
+    assert calls[0][0] == "meta/session_store/bigquery"
     assert calls[0][1] == {"operation": "probe"}
     assert result == {"rows": 1}
 
@@ -1282,7 +1336,7 @@ async def test_wire_local_forwards_optional_pubkey():
         "tcp://10.0.0.2:9001",
         remote_pubkey_b64="KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=",
     )
-    assert calls[0][0] == "mobkit/cross_mob/wire_local"
+    assert calls[0][0] == "meta/cross_mob/wire_local"
     params = calls[0][1]
     assert params["remote_pubkey_b64"] == "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="
     assert params["remote_address"] == "tcp://10.0.0.2:9001"
@@ -1331,7 +1385,7 @@ async def test_workgraph_rpc_names_and_params():
     """Every WorkGraph wrapper must hit its exact RPC name with snake_case
     params and parse the typed result (docs/design/workgraph-wire-contract.md)."""
     handle, calls = make_mock_mob_handle({
-        "mobkit/workgraph/snapshot": {
+        "meta/workgraph/snapshot": {
             "realm_id": "realm-1",
             "namespace": "default",
             "all_namespaces": False,
@@ -1342,10 +1396,10 @@ async def test_workgraph_rpc_names_and_params():
             "attention": [_wg_binding()],
             "ready_item_ids": ["item-1"],
         },
-        "mobkit/workgraph/list": {"items": [_wg_item()]},
-        "mobkit/workgraph/get": {"item": _wg_item()},
-        "mobkit/workgraph/ready": {"items": [_wg_item()]},
-        "mobkit/workgraph/events": {
+        "meta/workgraph/list": {"items": [_wg_item()]},
+        "meta/workgraph/get": {"item": _wg_item()},
+        "meta/workgraph/ready": {"items": [_wg_item()]},
+        "meta/workgraph/events": {
             "events": [{
                 "seq": 1,
                 "realm_id": "realm-1",
@@ -1356,15 +1410,15 @@ async def test_workgraph_rpc_names_and_params():
                 "payload": {},
             }]
         },
-        "mobkit/workgraph/attention/list": {"attention": [_wg_binding()]},
-        "mobkit/workgraph/goal/status": {"item": _wg_item(), "attention": _wg_binding()},
-        "mobkit/workgraph/create": {"item": _wg_item()},
-        "mobkit/workgraph/update": {"item": _wg_item(revision=2)},
-        "mobkit/workgraph/claim": {"item": _wg_item(revision=2)},
-        "mobkit/workgraph/release": {"item": _wg_item(revision=3)},
-        "mobkit/workgraph/close": {"item": _wg_item(status="completed", revision=4)},
-        "mobkit/workgraph/block": {"item": _wg_item(status="blocked", revision=2)},
-        "mobkit/workgraph/link": {
+        "meta/workgraph/attention/list": {"attention": [_wg_binding()]},
+        "meta/workgraph/goal/status": {"item": _wg_item(), "attention": _wg_binding()},
+        "meta/workgraph/create": {"item": _wg_item()},
+        "meta/workgraph/update": {"item": _wg_item(revision=2)},
+        "meta/workgraph/claim": {"item": _wg_item(revision=2)},
+        "meta/workgraph/release": {"item": _wg_item(revision=3)},
+        "meta/workgraph/close": {"item": _wg_item(status="completed", revision=4)},
+        "meta/workgraph/block": {"item": _wg_item(status="blocked", revision=2)},
+        "meta/workgraph/link": {
             "edge": {
                 "realm_id": "realm-1",
                 "namespace": "default",
@@ -1374,26 +1428,26 @@ async def test_workgraph_rpc_names_and_params():
                 "created_at": "2026-07-01T00:00:00Z",
             }
         },
-        "mobkit/workgraph/evidence/add": {"item": _wg_item(revision=2)},
-        "mobkit/workgraph/policy/escalate": {"item": _wg_item(revision=2)},
-        "mobkit/workgraph/goal/create": {"item": _wg_item(), "attention": _wg_binding()},
-        "mobkit/workgraph/goal/confirm": {
+        "meta/workgraph/evidence/add": {"item": _wg_item(revision=2)},
+        "meta/workgraph/policy/escalate": {"item": _wg_item(revision=2)},
+        "meta/workgraph/goal/create": {"item": _wg_item(), "attention": _wg_binding()},
+        "meta/workgraph/goal/confirm": {
             "item": _wg_item(status="completed"),
             "attention": _wg_binding(),
         },
-        "mobkit/workgraph/goal/request_close": {
+        "meta/workgraph/goal/request_close": {
             "item": _wg_item(status="completed"),
             "attention": _wg_binding(),
         },
-        "mobkit/workgraph/attention/pause": {
+        "meta/workgraph/attention/pause": {
             "attention": _wg_binding(status={"state": "paused", "until": None})
         },
-        "mobkit/workgraph/attention/resume": {"attention": _wg_binding()},
-        "mobkit/workgraph/attention/reassign": {
+        "meta/workgraph/attention/resume": {"attention": _wg_binding()},
+        "meta/workgraph/attention/reassign": {
             "previous": _wg_binding(binding_id="binding-1"),
             "attention": _wg_binding(binding_id="binding-2"),
         },
-        "mobkit/workgraph/attention/prune": {"pruned": 3},
+        "meta/workgraph/attention/prune": {"pruned": 3},
     })
 
     snapshot = await handle.workgraph_snapshot(namespace="default")
@@ -1486,29 +1540,29 @@ async def test_workgraph_rpc_names_and_params():
     assert pruned == 3
 
     assert [c[0] for c in calls] == [
-        "mobkit/workgraph/snapshot",
-        "mobkit/workgraph/list",
-        "mobkit/workgraph/get",
-        "mobkit/workgraph/ready",
-        "mobkit/workgraph/events",
-        "mobkit/workgraph/attention/list",
-        "mobkit/workgraph/goal/status",
-        "mobkit/workgraph/create",
-        "mobkit/workgraph/update",
-        "mobkit/workgraph/claim",
-        "mobkit/workgraph/release",
-        "mobkit/workgraph/close",
-        "mobkit/workgraph/block",
-        "mobkit/workgraph/link",
-        "mobkit/workgraph/evidence/add",
-        "mobkit/workgraph/policy/escalate",
-        "mobkit/workgraph/goal/create",
-        "mobkit/workgraph/goal/confirm",
-        "mobkit/workgraph/goal/request_close",
-        "mobkit/workgraph/attention/pause",
-        "mobkit/workgraph/attention/resume",
-        "mobkit/workgraph/attention/reassign",
-        "mobkit/workgraph/attention/prune",
+        "meta/workgraph/snapshot",
+        "meta/workgraph/list",
+        "meta/workgraph/get",
+        "meta/workgraph/ready",
+        "meta/workgraph/events",
+        "meta/workgraph/attention/list",
+        "meta/workgraph/goal/status",
+        "meta/workgraph/create",
+        "meta/workgraph/update",
+        "meta/workgraph/claim",
+        "meta/workgraph/release",
+        "meta/workgraph/close",
+        "meta/workgraph/block",
+        "meta/workgraph/link",
+        "meta/workgraph/evidence/add",
+        "meta/workgraph/policy/escalate",
+        "meta/workgraph/goal/create",
+        "meta/workgraph/goal/confirm",
+        "meta/workgraph/goal/request_close",
+        "meta/workgraph/attention/pause",
+        "meta/workgraph/attention/resume",
+        "meta/workgraph/attention/reassign",
+        "meta/workgraph/attention/prune",
     ]
     assert calls[0][1] == {"namespace": "default"}
     assert calls[1][1] == {"statuses": ["open"]}
@@ -1564,7 +1618,7 @@ async def test_workgraph_read_methods_omit_filter_when_no_kwargs():
     """Filter-style reads must send `{}` (server default filter), matching
     the mobpack_list/list_runs precedent, not None."""
     handle, calls = make_mock_mob_handle({
-        "mobkit/workgraph/snapshot": {
+        "meta/workgraph/snapshot": {
             "realm_id": "realm-1",
             "captured_at": "2026-07-08T00:00:00Z",
             "all_namespaces": False,
@@ -1573,10 +1627,10 @@ async def test_workgraph_read_methods_omit_filter_when_no_kwargs():
             "attention": [],
             "ready_item_ids": [],
         },
-        "mobkit/workgraph/list": {"items": []},
-        "mobkit/workgraph/ready": {"items": []},
-        "mobkit/workgraph/events": {"events": []},
-        "mobkit/workgraph/attention/list": {"attention": []},
+        "meta/workgraph/list": {"items": []},
+        "meta/workgraph/ready": {"items": []},
+        "meta/workgraph/events": {"events": []},
+        "meta/workgraph/attention/list": {"attention": []},
     })
 
     await handle.workgraph_snapshot()
@@ -1591,8 +1645,8 @@ async def test_workgraph_read_methods_omit_filter_when_no_kwargs():
 @pytest.mark.asyncio
 async def test_workgraph_unavailable_error_reifies_from_payload():
     """A -32041 RpcError must reify into WorkGraphUnavailableError."""
-    from meerkat_mobkit.errors import WorkGraphUnavailableError
-    from meerkat_mobkit.runtime import _rpc_error_from_payload
+    from meerkat_meta.errors import WorkGraphUnavailableError
+    from meerkat_meta.runtime import _rpc_error_from_payload
 
     err = _rpc_error_from_payload(
         {
@@ -1601,20 +1655,20 @@ async def test_workgraph_unavailable_error_reifies_from_payload():
             "data": {"kind": "workgraph_unavailable"},
         },
         request_id="rid",
-        method="mobkit/workgraph/snapshot",
+        method="meta/workgraph/snapshot",
     )
 
     assert isinstance(err, WorkGraphUnavailableError)
     assert err.code == -32041
-    assert err.method == "mobkit/workgraph/snapshot"
+    assert err.method == "meta/workgraph/snapshot"
     assert err.data == {"kind": "workgraph_unavailable"}
 
 
 @pytest.mark.asyncio
 async def test_workgraph_conflict_error_reifies_from_payload_and_carries_detail():
     """A -32042 RpcError must reify into WorkGraphConflictError carrying detail."""
-    from meerkat_mobkit.errors import WorkGraphConflictError
-    from meerkat_mobkit.runtime import _rpc_error_from_payload
+    from meerkat_meta.errors import WorkGraphConflictError
+    from meerkat_meta.runtime import _rpc_error_from_payload
 
     err = _rpc_error_from_payload(
         {
@@ -1623,31 +1677,31 @@ async def test_workgraph_conflict_error_reifies_from_payload_and_carries_detail(
             "data": {"kind": "workgraph_conflict", "detail": "expected 3, found 4"},
         },
         request_id="rid",
-        method="mobkit/workgraph/update",
+        method="meta/workgraph/update",
     )
 
     assert isinstance(err, WorkGraphConflictError)
     assert err.code == -32042
-    assert err.method == "mobkit/workgraph/update"
+    assert err.method == "meta/workgraph/update"
     assert err.detail == "expected 3, found 4"
 
 
 @pytest.mark.asyncio
 async def test_workgraph_conflict_error_reifies_via_from_rpc_error():
     """WorkGraphConflictError.from_rpc_error must lift detail off a generic RpcError."""
-    from meerkat_mobkit.errors import RpcError, WorkGraphConflictError
+    from meerkat_meta.errors import RpcError, WorkGraphConflictError
 
     generic = RpcError(
         code=-32042,
         message="revision conflict",
         request_id="rid",
-        method="mobkit/workgraph/claim",
+        method="meta/workgraph/claim",
         data={"detail": "expected 1, found 2"},
     )
     typed = WorkGraphConflictError.from_rpc_error(generic)
     assert typed.detail == "expected 1, found 2"
     assert typed.code == -32042
-    assert typed.method == "mobkit/workgraph/claim"
+    assert typed.method == "meta/workgraph/claim"
 
 
 @pytest.mark.asyncio
@@ -1661,20 +1715,20 @@ async def test_wire_local_omits_pubkey_when_absent():
         "00000000-0000-4000-8000-000000000001",
         "inproc://remote-name",
     )
-    assert calls[0][0] == "mobkit/cross_mob/wire_local"
+    assert calls[0][0] == "meta/cross_mob/wire_local"
     assert "remote_pubkey_b64" not in calls[0][1]
 
 
 @pytest.mark.asyncio
 async def test_live_method_names_and_identity_param():
     handle, calls = make_mock_mob_handle({
-        "mobkit/live/open": {
+        "meta/live/open": {
             "channel_id": "ch-1",
             "transport": {"type": "websocket", "url": "ws://x/live/ws", "token": "t"},
         },
-        "mobkit/live/status": {"open": True, "channel_id": "ch-1"},
-        "mobkit/live/close": {"closed": True},
-        "mobkit/live/refresh": {"refreshed": True},
+        "meta/live/status": {"open": True, "channel_id": "ch-1"},
+        "meta/live/close": {"closed": True},
+        "meta/live/refresh": {"refreshed": True},
     })
 
     opened = await handle.live_open(
@@ -1693,16 +1747,16 @@ async def test_live_method_names_and_identity_param():
 
     closed = await handle.live_close("live-channel-1")
     assert closed["closed"] is True
-    assert calls[-1] == ("mobkit/live/close", {"channel_id": "live-channel-1"})
+    assert calls[-1] == ("meta/live/close", {"channel_id": "live-channel-1"})
 
     refreshed = await handle.live_refresh("robot")
     assert refreshed["refreshed"] is True
 
     assert [c[0] for c in calls] == [
-        "mobkit/live/open",
-        "mobkit/live/status",
-        "mobkit/live/close",
-        "mobkit/live/refresh",
+        "meta/live/open",
+        "meta/live/status",
+        "meta/live/close",
+        "meta/live/refresh",
     ]
     assert calls[0][1] == {
         "identity": "robot",
@@ -1717,19 +1771,19 @@ async def test_live_method_names_and_identity_param():
 
 @pytest.mark.asyncio
 async def test_live_open_typed_serializes_v1_and_returns_handle():
-    from meerkat_mobkit.live import LiveExecutionIdentityV1
+    from meerkat_meta.live import LiveExecutionIdentityV1
 
     handle, calls = make_mock_mob_handle({
-        "mobkit/capabilities": {
+        "meta/capabilities": {
             "contract_version": "0.5.0",
-            "methods": ["mobkit/live/open"],
+            "methods": ["meta/live/open"],
             "loaded_modules": [],
             "feature_capabilities": [
                 "live.execution_identity.v1",
                 "live.execution.function_bridge.v1",
             ],
         },
-        "mobkit/live/open": {
+        "meta/live/open": {
             "channel_id": "ch-typed",
             "target_identity": "identity:robot",
             "execution_mode": "function_bridge",
@@ -1760,9 +1814,9 @@ async def test_live_open_typed_serializes_v1_and_returns_handle():
     assert opened.channel_id == "ch-typed"
     assert opened.target_identity == "identity:robot"
     assert opened.execution_mode == "function_bridge"
-    assert calls[0][0] == "mobkit/capabilities"
+    assert calls[0][0] == "meta/capabilities"
     assert calls[1] == (
-        "mobkit/live/open",
+        "meta/live/open",
         {
             "identity": "identity:robot",
             "execution_identity": {
@@ -1775,13 +1829,13 @@ async def test_live_open_typed_serializes_v1_and_returns_handle():
 
 @pytest.mark.asyncio
 async def test_live_open_typed_refuses_execution_identity_before_old_gateway_open():
-    from meerkat_mobkit.errors import CapabilityUnavailableError
-    from meerkat_mobkit.live import LiveExecutionIdentityV1
+    from meerkat_meta.errors import CapabilityUnavailableError
+    from meerkat_meta.live import LiveExecutionIdentityV1
 
     handle, calls = make_mock_mob_handle({
-        "mobkit/capabilities": {
+        "meta/capabilities": {
             "contract_version": "0.5.0",
-            "methods": ["mobkit/live/open"],
+            "methods": ["meta/live/open"],
             "loaded_modules": [],
         }
     })
@@ -1794,7 +1848,7 @@ async def test_live_open_typed_refuses_execution_identity_before_old_gateway_ope
             ),
         )
 
-    assert calls == [("mobkit/capabilities", None)]
+    assert calls == [("meta/capabilities", None)]
 
 
 @pytest.mark.asyncio
@@ -1816,7 +1870,7 @@ async def test_live_open_typed_refuses_execution_identity_before_old_gateway_ope
 async def test_strict_live_open_rejects_catalog_and_responses_bridge_overrides(
     field, value
 ):
-    from meerkat_mobkit.live import LiveExecutionIdentityV1
+    from meerkat_meta.live import LiveExecutionIdentityV1
 
     handle, calls = make_mock_mob_handle({})
     with pytest.raises(ValueError, match="experimental live/open does not accept"):
@@ -1832,16 +1886,16 @@ async def test_strict_live_open_rejects_catalog_and_responses_bridge_overrides(
 
 @pytest.mark.asyncio
 async def test_strict_live_open_refuses_missing_server_target_identity():
-    from meerkat_mobkit.live import LiveExecutionIdentityV1
+    from meerkat_meta.live import LiveExecutionIdentityV1
 
     handle, _calls = make_mock_mob_handle({
-        "mobkit/capabilities": {
+        "meta/capabilities": {
             "contract_version": "0.5.0",
-            "methods": ["mobkit/live/open"],
+            "methods": ["meta/live/open"],
             "loaded_modules": [],
             "feature_capabilities": ["live.execution_identity.v1"],
         },
-        "mobkit/live/open": {
+        "meta/live/open": {
             "channel_id": "ch-typed",
             "transport": {"transport": "webrtc", "token": "t", "answer_method": "live/webrtc/answer"},
             "capabilities": {
@@ -1876,7 +1930,7 @@ async def test_live_webrtc_answer_uses_bootstrap_method_shape():
 
 @pytest.mark.asyncio
 async def test_live_connect_orders_owner_readiness_answer_and_activation():
-    from meerkat_mobkit.live import LiveExecutionIdentityV1
+    from meerkat_meta.live import LiveExecutionIdentityV1
 
     events: list[str] = []
 
@@ -1895,7 +1949,7 @@ async def test_live_connect_orders_owner_readiness_answer_and_activation():
             events.append("abort")
 
     handle, calls = make_mock_mob_handle({
-        "mobkit/capabilities": {
+        "meta/capabilities": {
             "contract_version": "0.5.0",
             "methods": [],
             "loaded_modules": [],
@@ -1904,7 +1958,7 @@ async def test_live_connect_orders_owner_readiness_answer_and_activation():
                 "live.execution.function_bridge.v1",
             ],
         },
-        "mobkit/live/open": {
+        "meta/live/open": {
             "channel_id": "chan-1",
             "target_identity": "identity:robot",
             "execution_mode": "function_bridge",
@@ -1927,12 +1981,12 @@ async def test_live_connect_orders_owner_readiness_answer_and_activation():
             },
             "continuity": {"mode": "transcript_only"},
         },
-        "mobkit/live/playback_owner/register": {
+        "meta/live/playback_owner/register": {
             "channel_id": "chan-1",
             "readiness_receipt": "ready-receipt",
         },
         "live/webrtc/answer": {"answer_sdp": "v=0\r\nanswer"},
-        "mobkit/live/status": {
+        "meta/live/status": {
             "phase": "active",
             "handle": {
                 "channel_id": "chan-1",
@@ -1941,7 +1995,7 @@ async def test_live_connect_orders_owner_readiness_answer_and_activation():
                 "activation_receipt": "active-receipt",
             },
         },
-        "mobkit/live/playback_owner/revoke": {"phase": "revoked"},
+        "meta/live/playback_owner/revoke": {"phase": "revoked"},
     })
 
     active = await handle.live_connect(
@@ -1961,11 +2015,11 @@ async def test_live_connect_orders_owner_readiness_answer_and_activation():
         "activate:active-receipt",
     ]
     assert [method for method, _ in calls] == [
-        "mobkit/capabilities",
-        "mobkit/live/open",
-        "mobkit/live/playback_owner/register",
+        "meta/capabilities",
+        "meta/live/open",
+        "meta/live/playback_owner/register",
         "live/webrtc/answer",
-        "mobkit/live/status",
+        "meta/live/status",
     ]
     assert calls[2][1] == {
         "identity": "identity:robot",
@@ -1982,7 +2036,7 @@ async def test_live_connect_orders_owner_readiness_answer_and_activation():
     assert revoked.phase == "revoked"
     assert events[-1] == "abort"
     assert calls[-1] == (
-        "mobkit/live/playback_owner/revoke",
+        "meta/live/playback_owner/revoke",
         {
             "identity": "identity:robot",
             "channel_id": "chan-1",
@@ -1995,7 +2049,7 @@ async def test_live_connect_orders_owner_readiness_answer_and_activation():
 
 @pytest.mark.asyncio
 async def test_live_connect_aborts_and_closes_pending_channel_when_owner_is_revoked():
-    from meerkat_mobkit.live import LiveExecutionIdentityV1
+    from meerkat_meta.live import LiveExecutionIdentityV1
 
     events: list[str] = []
 
@@ -2014,7 +2068,7 @@ async def test_live_connect_aborts_and_closes_pending_channel_when_owner_is_revo
             events.append("abort")
 
     handle, calls = make_mock_mob_handle({
-        "mobkit/capabilities": {
+        "meta/capabilities": {
             "contract_version": "0.5.0",
             "methods": [],
             "loaded_modules": [],
@@ -2023,7 +2077,7 @@ async def test_live_connect_aborts_and_closes_pending_channel_when_owner_is_revo
                 "live.execution.function_bridge.v1",
             ],
         },
-        "mobkit/live/open": {
+        "meta/live/open": {
             "channel_id": "chan-1",
             "target_identity": "identity:robot",
             "execution_mode": "function_bridge",
@@ -2046,13 +2100,13 @@ async def test_live_connect_aborts_and_closes_pending_channel_when_owner_is_revo
             },
             "continuity": {"mode": "transcript_only"},
         },
-        "mobkit/live/playback_owner/register": {
+        "meta/live/playback_owner/register": {
             "channel_id": "chan-1",
             "readiness_receipt": "ready-receipt",
         },
         "live/webrtc/answer": {"answer_sdp": "v=0\r\nanswer"},
-        "mobkit/live/status": {"phase": "revoked"},
-        "mobkit/live/close": {"closed": True},
+        "meta/live/status": {"phase": "revoked"},
+        "meta/live/close": {"closed": True},
     })
 
     with pytest.raises(RuntimeError, match="revoked before activation"):
@@ -2067,12 +2121,12 @@ async def test_live_connect_aborts_and_closes_pending_channel_when_owner_is_revo
 
     assert events == ["prepare", "answer", "abort"]
     assert [method for method, _ in calls] == [
-        "mobkit/capabilities",
-        "mobkit/live/open",
-        "mobkit/live/playback_owner/register",
+        "meta/capabilities",
+        "meta/live/open",
+        "meta/live/playback_owner/register",
         "live/webrtc/answer",
-        "mobkit/live/status",
-        "mobkit/live/close",
+        "meta/live/status",
+        "meta/live/close",
     ]
     assert calls[-1][1] == {
         "identity": "identity:robot",
@@ -2083,7 +2137,7 @@ async def test_live_connect_aborts_and_closes_pending_channel_when_owner_is_revo
 
 @pytest.mark.asyncio
 async def test_pending_handle_cannot_invoke_active_provider_operations():
-    from meerkat_mobkit import PendingLiveChannelHandle
+    from meerkat_meta import PendingLiveChannelHandle
 
     pending = PendingLiveChannelHandle.from_dict({
         "channel_id": "chan-1",
@@ -2116,10 +2170,10 @@ async def test_pending_handle_cannot_invoke_active_provider_operations():
 
 @pytest.mark.asyncio
 async def test_live_replacement_required_uses_active_channel_authority():
-    from meerkat_mobkit import ActiveLiveChannelHandle
+    from meerkat_meta import ActiveLiveChannelHandle
 
     handle, calls = make_mock_mob_handle({
-        "mobkit/live/replacement_required": {"required": False},
+        "meta/live/replacement_required": {"required": False},
     })
     active = ActiveLiveChannelHandle(
         "chan-1", "identity:robot", "function_bridge", "active-receipt"
@@ -2127,7 +2181,7 @@ async def test_live_replacement_required_uses_active_channel_authority():
     result = await handle.live_replacement_required(active)
     assert result.required is False
     assert calls == [(
-        "mobkit/live/replacement_required",
+        "meta/live/replacement_required",
         {
             "identity": "identity:robot",
             "channel_id": "chan-1",
@@ -2138,10 +2192,10 @@ async def test_live_replacement_required_uses_active_channel_authority():
 
 @pytest.mark.asyncio
 async def test_live_playback_complete_has_no_caller_interaction_identity():
-    from meerkat_mobkit import ActiveLiveChannelHandle, LiveAssistantOutputAddress
+    from meerkat_meta import ActiveLiveChannelHandle, LiveAssistantOutputAddress
 
     handle, calls = make_mock_mob_handle({
-        "mobkit/live/playback_complete": {"status": "completed"},
+        "meta/live/playback_complete": {"status": "completed"},
     })
     active = ActiveLiveChannelHandle(
         "chan-1", "identity:robot", "function_bridge", "active-receipt"
@@ -2150,7 +2204,7 @@ async def test_live_playback_complete_has_no_caller_interaction_identity():
     result = await handle.live_playback_complete(active, output)
     assert result.status == "completed"
     assert calls == [(
-        "mobkit/live/playback_complete",
+        "meta/live/playback_complete",
         {
             "identity": "identity:robot",
             "channel_id": "chan-1",
@@ -2162,10 +2216,10 @@ async def test_live_playback_complete_has_no_caller_interaction_identity():
 
 @pytest.mark.asyncio
 async def test_live_truncate_wire_shape():
-    from meerkat_mobkit import ActiveLiveChannelHandle, LiveAssistantOutputAddress
+    from meerkat_meta import ActiveLiveChannelHandle, LiveAssistantOutputAddress
 
     handle, calls = make_mock_mob_handle({
-        "mobkit/live/truncate": {"status": "truncated"},
+        "meta/live/truncate": {"status": "truncated"},
     })
     active = ActiveLiveChannelHandle(
         "chan-1", "identity:robot", "function_bridge", "active-receipt"
@@ -2173,7 +2227,7 @@ async def test_live_truncate_wire_shape():
     output = LiveAssistantOutputAddress("chan-1", "opaque-output-1", 0)
     result = await handle.live_truncate(active, output, 1200)
     assert result["status"] == "truncated"
-    assert calls[0][0] == "mobkit/live/truncate"
+    assert calls[0][0] == "meta/live/truncate"
     assert calls[0][1] == {
         "identity": "identity:robot",
         "channel_id": "chan-1",
@@ -2185,12 +2239,12 @@ async def test_live_truncate_wire_shape():
 
 @pytest.mark.asyncio
 async def test_live_output_callback_streams_to_terminal_and_closes_on_teardown():
-    from meerkat_mobkit import ActiveLiveChannelHandle
-    from meerkat_mobkit.agent_builder import CallbackDispatcher
+    from meerkat_meta import ActiveLiveChannelHandle
+    from meerkat_meta.agent_builder import CallbackDispatcher
 
     handle, calls = make_mock_mob_handle({
-        "mobkit/live/playback_complete": {"status": "completed"},
-        "mobkit/live/close": {"status": "closed"},
+        "meta/live/playback_complete": {"status": "completed"},
+        "meta/live/close": {"status": "closed"},
     })
     dispatcher = CallbackDispatcher()
     handle._runtime._dispatcher = dispatcher
@@ -2201,7 +2255,7 @@ async def test_live_output_callback_streams_to_terminal_and_closes_on_teardown()
     next_output = asyncio.create_task(anext(stream))
     await asyncio.sleep(0)
     assert await dispatcher.handle_callback(
-        "mobkit/live/assistant_output_available",
+        "meta/live/assistant_output_available",
         {"channel_id": "chan-1", "output_id": "opaque-output-1", "content_index": 0},
     ) == {"accepted": True}
     output = await next_output
@@ -2210,7 +2264,7 @@ async def test_live_output_callback_streams_to_terminal_and_closes_on_teardown()
     await stream.aclose()
     assert calls == [
         (
-            "mobkit/live/playback_complete",
+            "meta/live/playback_complete",
             {
                 "identity": "identity:robot",
                 "channel_id": "chan-1",
@@ -2219,7 +2273,7 @@ async def test_live_output_callback_streams_to_terminal_and_closes_on_teardown()
             },
         ),
         (
-            "mobkit/live/close",
+            "meta/live/close",
             {
                 "identity": "identity:robot",
                 "channel_id": "chan-1",
@@ -2231,23 +2285,23 @@ async def test_live_output_callback_streams_to_terminal_and_closes_on_teardown()
 
 @pytest.mark.asyncio
 async def test_live_output_queue_overflow_and_missing_consumer_fail_loudly():
-    from meerkat_mobkit.agent_builder import CallbackDispatcher
+    from meerkat_meta.agent_builder import CallbackDispatcher
 
     dispatcher = CallbackDispatcher()
     queue = dispatcher.register_live_output_queue("chan-1", 1)
     await dispatcher.handle_callback(
-        "mobkit/live/assistant_output_available",
+        "meta/live/assistant_output_available",
         {"channel_id": "chan-1", "output_id": "opaque-output-1", "content_index": 0},
     )
     with pytest.raises(RuntimeError, match="queue is full"):
         await dispatcher.handle_callback(
-            "mobkit/live/assistant_output_available",
+            "meta/live/assistant_output_available",
             {"channel_id": "chan-1", "output_id": "opaque-output-2", "content_index": 0},
         )
     dispatcher.unregister_live_output_queue("chan-1", queue)
     with pytest.raises(RuntimeError, match="no live output consumer"):
         await dispatcher.handle_callback(
-            "mobkit/live/assistant_output_available",
+            "meta/live/assistant_output_available",
             {"channel_id": "chan-1", "output_id": "opaque-output-3", "content_index": 0},
         )
 
@@ -2255,13 +2309,13 @@ async def test_live_output_queue_overflow_and_missing_consumer_fail_loudly():
 @pytest.mark.asyncio
 async def test_live_send_input_image_wire_shape():
     handle, calls = make_mock_mob_handle({
-        "mobkit/live/send_input": {"accepted": True},
+        "meta/live/send_input": {"accepted": True},
     })
     result = await handle.live_send_input_image(
         "robot", "frame-0001", "image/jpeg", "aGVsbG8="
     )
     assert result["accepted"] is True
-    assert calls[0][0] == "mobkit/live/send_input"
+    assert calls[0][0] == "meta/live/send_input"
     assert calls[0][1] == {
         "identity": "robot",
         "chunk": {

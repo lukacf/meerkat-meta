@@ -10,7 +10,7 @@
 //
 // View-config projections for the Flow Editor controller plane. Moved
 // verbatim from the controller.js ui-view-config range: role accent styling
-// plus the *ViewFromSchema / *ViewForState pairs that project MobKit
+// plus the *ViewFromSchema / *ViewForState pairs that project Meta
 // editor view schemas into agent, flow-registry, schema, deploy, settings,
 // basic, launch, and graph view state. The three control-state functions
 // from this range (agentListState, basicEditorViewState,

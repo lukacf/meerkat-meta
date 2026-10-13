@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare and verify the complete, flat MobKit gateway release asset set."""
+"""Prepare and verify the complete, flat Meta gateway release asset set."""
 
 import argparse
 import hashlib
@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 
-ARCHIVE_PREFIXES = ("mobkit-gateway", "mobkit-rpc-gateway", "mobkit-repair")
+ARCHIVE_PREFIXES = ("meta-gateway", "meta-rpc-gateway", "meta-repair")
 TARGET_ARCHIVES = (
     ("x86_64-unknown-linux-gnu", "tar.gz"),
     ("aarch64-unknown-linux-gnu", "tar.gz"),

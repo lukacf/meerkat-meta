@@ -228,7 +228,7 @@ async function waitForTimelineQuiet(baseUrl, identity, quietMs = 12000, timeout 
 async function main() {
   const baseUrl = process.argv[2];
   assert.ok(baseUrl, "baseUrl is required");
-  const artifactDir = process.env.MOBKIT_BROWSER_SMOKE_ARTIFACT_DIR || "";
+  const artifactDir = process.env.META_BROWSER_SMOKE_ARTIFACT_DIR || "";
   if (artifactDir) fs.mkdirSync(artifactDir, { recursive: true });
   let screenshotIndex = 0;
   async function screenshot(page, label) {

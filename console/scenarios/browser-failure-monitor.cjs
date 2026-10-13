@@ -28,7 +28,7 @@ function browserFailureMonitor(context, { origin, initializationPrefixes = [""] 
     if (request.method() !== "POST" || url.pathname !== `${prefix}/console/rpc`) return null;
     try {
       const body = JSON.parse(request.postData() || "{}");
-      return body.method === "mobkit/console/query_timeline" && body.params?.mode === "recent"
+      return body.method === "meta/console/query_timeline" && body.params?.mode === "recent"
         && body.params?.limit === 200 && !Object.hasOwn(body.params, "identity")
         && !Object.hasOwn(body.params, "before") && !Object.hasOwn(body.params, "after") ? `${prefix}:seed` : null;
     } catch { return null; }

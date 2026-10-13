@@ -78,10 +78,204 @@ import {
 const confinementCauses = ["invalid_requirement", "invalid_launch", "unsupported_requirement",
   "backend_unavailable", "preparation_failed"] as const;
 
+const reviewOutcomes = [
+  ["review_unsatisfied", "review-unsatisfied", "reviewUnsatisfied", [
+    "denied", "escalated", "context_changed", "human_consent_required", "already_consumed",
+  ]],
+  ["review_unavailable", "review-unavailable", "reviewUnavailable", [
+    "deadline_expired", "reviewer_failed", "reviewer_missing", "unsupported_entry", "owner_unavailable", "dispatch_ended",
+  ]],
+] as const;
+
 for (const [name, map, phase] of [
   ["stock", mapFramesToTimelineEntries, inferResponsePhaseFromFrames],
   ["shared", mapFramesToTimelineEntriesShared, inferResponsePhaseFromFramesShared],
 ] as const) {
+  test(`${name} native review feedback preserves the exact call, permitted sibling and active phase`, () => {
+    for (const [error, category, reasonField, reasons] of reviewOutcomes) {
+      for (const kind of reasons) {
+        for (const event of ["tool_result_received", "tool_execution_completed"]) {
+          const callId = "  exact-reviewed-call  ";
+          const result = { id: "review-result", event, runId: "run", data: {
+            id: callId, name: "write_file", is_error: true,
+            content: [{ type: "text", text: JSON.stringify({ error, message: "private-review-canary", data: { kind } }) }],
+            ...(event === "tool_execution_completed" ? { duration_ms: 0 } : {}),
+          } };
+          const pairedEvent = event === "tool_result_received" ? "tool_execution_completed" : "tool_result_received";
+          const paired = { ...result, id: "review-replay", event: pairedEvent, data: {
+            id: callId, name: "write_file", is_error: true, content: result.data.content,
+            ...(pairedEvent === "tool_execution_completed" ? { duration_ms: 0 } : {}),
+          } };
+          const frames = [{ id: "start", event: "run_started", runId: "run", data: {} },
+            { id: "review-start", event: "tool_call_requested", runId: "run", data: { id: callId, name: "write_file", args: {} } },
+            result,
+            paired,
+            { id: "sibling-start", event: "tool_execution_started", runId: "run", data: { id: "permitted", name: "read_file" } },
+            { id: "sibling", event: "tool_execution_completed", runId: "run", data: {
+              id: "permitted", name: "read_file", is_error: false, duration_ms: 1,
+              content: [{ type: "text", text: "Permitted sibling result" }],
+            } }];
+          const before = JSON.stringify(frames);
+          const entries = map(null, frames);
+          const feedback = entries.flatMap(entry => entry.kind === "message" && entry.operationFeedback ? [entry.operationFeedback] : []);
+          assert.equal(feedback.length, 1, `${error}/${kind}/${event}`);
+          assert.equal(feedback[0].kind, category);
+          assert.equal(feedback[0][reasonField], kind);
+          assert.equal(feedback[0].toolCallId, callId);
+          assert.equal(feedback[0].operationId, undefined);
+          assert.doesNotMatch(JSON.stringify(entries), /private-review-canary/);
+          if (kind === "already_consumed" || kind === "dispatch_ended") {
+            assert.match(feedback[0].detail, /does not establish.*execution result/);
+            assert.doesNotMatch(feedback[0].detail, /did not run|never entered|no effect/);
+          }
+          assert.equal(phase(frames, null), "waiting");
+          const continued = [...frames, { id: "answer", event: "text_delta", runId: "run", data: { delta: "Continuing with permitted work." } }];
+          assert.equal(phase(continued, null), "generating");
+          assert.match(JSON.stringify(map(null, continued)), /Permitted sibling result/);
+          assert.match(JSON.stringify(map(null, continued)), /Continuing with permitted work/);
+          assert.equal(phase([...continued, { id: "done", event: "run_completed", runId: "run", data: {} }], null), null);
+          assert.equal(JSON.stringify(frames), before);
+        }
+      }
+    }
+  });
+
+  test(`${name} native consent references remain optional display data without changing local settlement`, () => {
+    const approvalId = "b6503200-06b6-4157-afc0-2a3c8d124178";
+    for (const reference of [approvalId, approvalId.toUpperCase(), undefined, null, "", "not-an-approval",
+      ` ${approvalId}`, `${approvalId}\n`, approvalId.replaceAll("-", ""), [approvalId], { approval_id: approvalId }]) {
+      const data = { kind: "human_consent_required", ...(reference === undefined ? {} : { approval_id: reference }) };
+      const result = { id: "consent-result", event: "tool_result_received", runId: "run", data: {
+        id: "reviewed-call", name: "write_file", is_error: true,
+        content: [{ type: "text", text: JSON.stringify({ error: "review_unsatisfied", message: "private-consent-canary", data }) }],
+      } };
+      const frames = [{ id: "start", event: "run_started", runId: "run", data: {} }, result,
+        { ...result, id: "consent-completed", event: "tool_execution_completed", data: { ...result.data, duration_ms: 0 } },
+        { id: "sibling-start", event: "tool_execution_started", runId: "run", data: { id: "permitted", name: "read_file" } },
+        { id: "sibling", event: "tool_execution_completed", runId: "run", data: {
+          id: "permitted", name: "read_file", is_error: false, duration_ms: 1,
+          content: [{ type: "text", text: "Permitted sibling result" }],
+        } }];
+      const before = JSON.stringify(frames);
+      const feedback = map(null, frames).flatMap(entry => entry.kind === "message" && entry.operationFeedback ? [entry.operationFeedback] : []);
+      assert.equal(feedback.length, 1);
+      assert.equal(feedback[0].kind, "review-unsatisfied");
+      assert.equal(feedback[0].reviewUnsatisfied, "human_consent_required");
+      assert.equal(feedback[0].approvalId, reference === approvalId || reference === approvalId.toUpperCase() ? reference : undefined);
+      assert.equal(feedback[0].toolCallId, "reviewed-call");
+      assert.equal(feedback[0].operationId, undefined);
+      assert.doesNotMatch(JSON.stringify(feedback), /private-consent-canary|Approved|Awaiting approval/);
+      assert.equal(phase(frames, null), "waiting");
+      const continued = [...frames, { id: "answer", event: "text_delta", runId: "run", data: { delta: "Continuing with permitted work." } }];
+      assert.equal(phase(continued, null), "generating");
+      assert.match(JSON.stringify(map(null, continued)), /Permitted sibling result/);
+      assert.match(JSON.stringify(map(null, continued)), /Continuing with permitted work/);
+      assert.equal(phase([...continued, { id: "done", event: "run_completed", runId: "run", data: {} }], null), null);
+      assert.equal(JSON.stringify(frames), before);
+    }
+    for (const [error, kind, data] of [
+      ["review_unsatisfied", "denied", { kind: "denied" }],
+      ["review_unavailable", "reviewer_missing", { kind: "reviewer_missing", approval_id: approvalId }],
+    ] as const) {
+      const frames = [{ id: "unreferenced", event: "tool_result_received", data: { id: approvalId, name: "write_file", is_error: true,
+        content: [{ type: "text", text: JSON.stringify({ error, message: approvalId, approval_id: approvalId, data }) }],
+      } }];
+      const feedback = map(null, frames).flatMap(entry => entry.kind === "message" && entry.operationFeedback ? [entry.operationFeedback] : []);
+      assert.equal(feedback.length, 1, kind);
+      assert.equal(feedback[0].approvalId, undefined, "never infer a reference from a call ID, prose, another error family or another field");
+    }
+    const modelNotice = { id: "model", event: "system_notice", data: { message: {
+      role: "system_notice", kind: "generic", body: approvalId, blocks: [{ type: "runtime_notice", category: "operation_review_required",
+        payload: { code: "REVIEW_UNSATISFIED", approval_id: approvalId,
+          review: { review: "unsatisfied", kind: "human_consent_required", approval_id: approvalId } },
+      }],
+    } } };
+    const noticeFeedback = map(null, [modelNotice]).flatMap(entry => entry.kind === "message" && entry.operationFeedback ? [entry.operationFeedback] : []);
+    assert.equal(noticeFeedback.length, 1);
+    assert.equal(noticeFeedback[0].approvalId, undefined, "the model-notice contract has not acquired a consent reference");
+    const consumed = map(null, [{ id: "consumed", event: "tool_result_received", data: { id: "consumed-call", name: "write_file", is_error: true,
+      content: [{ type: "text", text: JSON.stringify({ error: "review_unsatisfied", message: "review already used",
+        data: { kind: "already_consumed", approval_id: approvalId } }) }],
+    } }]).flatMap(entry => entry.kind === "message" && entry.operationFeedback ? [entry.operationFeedback] : []);
+    assert.equal(consumed.length, 1);
+    assert.equal(consumed[0].approvalId, approvalId);
+    assert.match(consumed[0].detail, /does not establish.*execution result/);
+    assert.doesNotMatch(consumed[0].detail, /did not run|never entered|no effect/);
+  });
+
+  test(`${name} native model review notices require matching typed codes and add no action reference`, () => {
+    for (const [error, category, reasonField, reasons] of reviewOutcomes) {
+      for (const kind of reasons) {
+        for (const wrapped of [false, true]) {
+          const message = { role: "system_notice", kind: "generic", body: "private-model-review-canary", blocks: [{
+            type: "runtime_notice", category: "operation_review_required", detail: null,
+            payload: { code: error.toUpperCase(), review: { review: error.slice("review_".length), kind } },
+          }] };
+          const notice = { id: "model-review", event: "system_notice", runId: "run", data: wrapped ? { message } : message };
+          const frames = [{ id: "start", event: "run_started", runId: "run", data: {} }, notice];
+          const entries = map(null, frames);
+          const feedback = entries.flatMap(entry => entry.kind === "message" && entry.operationFeedback ? [entry.operationFeedback] : []);
+          assert.equal(feedback.length, 1);
+          assert.equal(feedback[0].kind, category);
+          assert.equal(feedback[0][reasonField], kind);
+          assert.equal(feedback[0].toolCallId, undefined);
+          assert.equal(feedback[0].operationId, undefined);
+          assert.doesNotMatch(JSON.stringify(entries), /private-model-review-canary/);
+          assert.equal(phase(frames, null), "waiting");
+          assert.equal(systemNoticeClearsBusyState(notice), false);
+        }
+      }
+    }
+  });
+
+  test(`${name} malformed native review data stays generic and audit failure stays infrastructure`, () => {
+    const valid = { error: "review_unsatisfied", message: "review detail", data: { kind: "denied" } };
+    const invalid = [
+      { ...valid, data: { kind: "future_reason" } }, { ...valid, data: { kind: "reviewer_failed" } },
+      { ...valid, data: { kind: null } }, { ...valid, data: { kind: ["denied"] } },
+      { ...valid, data: {} }, { ...valid, data: null }, { ...valid, message: null },
+      { error: "review_unsatisfied", data: { kind: "denied" } },
+      { ...valid, error: "review_unavailable" },
+      { error: "operation_observation_unavailable", message: "review_unsatisfied", data: { kind: "denied" } },
+    ];
+    const result = { id: "review", event: "tool_result_received", data: { id: "call", name: "write_file", is_error: true,
+      content: [{ type: "text", text: JSON.stringify(valid) }],
+    } };
+    for (const frame of [
+      ...invalid.map(payload => ({ ...result, data: { ...result.data, content: [{ type: "text", text: JSON.stringify(payload) }] } })),
+      { ...result, data: { ...result.data, is_error: false } },
+      { ...result, data: { ...result.data, id: "" } },
+      { ...result, data: { ...result.data, content: [{ type: "text", text: "review_unsatisfied denied" }] } },
+      { ...result, data: { ...result.data, content: [...result.data.content, { type: "text", text: "extra" }] } },
+    ]) {
+      assert.equal(map(null, [frame]).some(entry => entry.kind === "message" && entry.operationFeedback), false);
+    }
+    for (const payload of [
+      { code: "REVIEW_UNAVAILABLE", review: { review: "unsatisfied", kind: "denied" } },
+      { code: "REVIEW_UNSATISFIED", review: { review: "unsatisfied", kind: "owner_unavailable" } },
+      { code: "REVIEW_UNSATISFIED", review: { review: "unsatisfied", kind: "future_reason" } },
+      { code: "review_unsatisfied", review: { review: "unsatisfied", kind: "denied" } },
+      { code: "REVIEW_UNSATISFIED", review: [{ review: "unsatisfied", kind: "denied" }] },
+      { code: "REVIEW_UNSATISFIED" },
+    ]) {
+      const notice = { id: "bad-notice", event: "system_notice", data: { message: {
+        role: "system_notice", kind: "generic", body: "ordinary notice",
+        blocks: [{ type: "runtime_notice", category: "operation_review_required", payload }],
+      } } };
+      assert.equal(map(null, [notice]).some(entry => entry.kind === "message" && entry.operationFeedback), false);
+    }
+    const frames = [{ id: "start", event: "run_started", data: {} }, {
+      id: "audit", event: "operation_observation_failed", data: { operation_id: "actual-operation", phase: "outcome" },
+    }];
+    const feedback = map(null, frames).flatMap(entry => entry.kind === "message" && entry.operationFeedback ? [entry.operationFeedback] : []);
+    assert.equal(feedback.length, 1);
+    assert.equal(feedback[0].kind, "audit-unavailable");
+    assert.equal(feedback[0].operationId, "actual-operation");
+    assert.equal(feedback[0].reviewUnsatisfied, undefined);
+    assert.equal(feedback[0].reviewUnavailable, undefined);
+    assert.equal(phase(frames, null), "waiting");
+  });
+
   test(`${name} local confinement feedback preserves every cause and exact call without ending the run`, () => {
     for (const refusal of confinementCauses) {
       for (const reverse of [false, true]) {
@@ -7766,7 +7960,7 @@ test("workgraph operator-result frames fold like tool results so consecutive car
     result: { item: workGraphItem({ id: "item-op", title: "Operator target", status: "open", revision: 1 }) },
   });
   const claimEcho = buildWorkGraphOperatorResultFrame({
-    method: "mobkit/workgraph/claim",
+    method: "meta/workgraph/claim",
     params: { id: "item-op", expected_revision: 1, owner: { kind: "principal", id: "ops@example.com" } },
     result: {
       item: workGraphItem({
@@ -7794,7 +7988,7 @@ test("workgraph operator-result frames fold like tool results so consecutive car
   // Consecutive action: the close the card would now send uses revision 2,
   // and its echoed result advances the card again without any refresh.
   const closeEcho = buildWorkGraphOperatorResultFrame({
-    method: "mobkit/workgraph/close",
+    method: "meta/workgraph/close",
     params: { id: "item-op", expected_revision: 2 },
     result: {
       item: workGraphItem({ id: "item-op", title: "Operator target", status: "completed", revision: 3 }),
@@ -7814,7 +8008,7 @@ test("workgraph operator-result frames fold like tool results so consecutive car
 
   // A stale echo (out-of-order delivery) never rolls the revision back.
   const staleEcho = buildWorkGraphOperatorResultFrame({
-    method: "mobkit/workgraph/claim",
+    method: "meta/workgraph/claim",
     params: { id: "item-op", expected_revision: 1 },
     result: {
       item: workGraphItem({ id: "item-op", title: "Operator target", status: "open", revision: 1 }),
@@ -7845,7 +8039,7 @@ test("workgraph operator failures fold a failure note and flag through the same 
     result: { item: workGraphItem({ id: "item-op", title: "Operator target", status: "open", revision: 1 }) },
   });
   const failedEcho = buildWorkGraphOperatorResultFrame({
-    method: "mobkit/workgraph/claim",
+    method: "meta/workgraph/claim",
     params: { id: "item-op", expected_revision: 9 },
     errorMessage: "workgraph conflict: stale revision 9, item is at 1",
     identity: "planner",
@@ -7939,7 +8133,7 @@ test("workgraph unroutable failures join an existing catch-all card for the same
 
 test("workgraph unroutable operator failures fold to the unscoped catch-all card", () => {
   const failedEcho = buildWorkGraphOperatorResultFrame({
-    method: "mobkit/workgraph/attention/pause",
+    method: "meta/workgraph/attention/pause",
     params: { binding_id: "b-ghost", expected_revision: 3 },
     errorMessage: "attention binding b-ghost not found",
     timestampMs: 1_779_405_464_000,
@@ -8118,7 +8312,7 @@ test("workgraph item-less catch-all cards anchor UI state on the unrooted placeh
   // Operator-echo-only activity (no interaction) keys per target id instead
   // of one shared "unscoped" anchor.
   const echo = buildWorkGraphOperatorResultFrame({
-    method: "mobkit/workgraph/claim",
+    method: "meta/workgraph/claim",
     params: { id: "item-echo", expected_revision: 1 },
     result: { item: workGraphItem({ id: "item-echo", title: "Echo target", status: "in_progress", revision: 2 }) },
     timestampMs: 1_779_405_465_000,
@@ -8143,7 +8337,7 @@ test("workgraph post-conflict refresh echoes heal the folded revision without cl
   // The inline card sent its folded revision 1, but the item moved to 5
   // underneath: the mutation conflicts and echoes only the error…
   const conflictEcho = buildWorkGraphOperatorResultFrame({
-    method: "mobkit/workgraph/claim",
+    method: "meta/workgraph/claim",
     params: { id: "item-heal", expected_revision: 1, owner: { kind: "principal", id: "ops@example.com" } },
     errorMessage: "workgraph conflict: stale revision 1, item is at 5",
     identity: "planner",
@@ -8153,7 +8347,7 @@ test("workgraph post-conflict refresh echoes heal the folded revision without cl
   // …then the console re-reads the entity and folds the live state through
   // the same echo path, marked `refresh`.
   const refreshEcho = buildWorkGraphOperatorResultFrame({
-    method: "mobkit/workgraph/get",
+    method: "meta/workgraph/get",
     params: { id: "item-heal" },
     result: { item: workGraphItem({ id: "item-heal", title: "Wedged target", status: "in_progress", revision: 5 }) },
     identity: "planner",
@@ -8196,7 +8390,7 @@ test("workgraph post-conflict refresh echoes heal the folded revision without cl
     },
   });
   const bindingConflict = buildWorkGraphOperatorResultFrame({
-    method: "mobkit/workgraph/attention/pause",
+    method: "meta/workgraph/attention/pause",
     params: { binding_id: "b-heal", expected_revision: 3 },
     errorMessage: "workgraph conflict: stale machine revision 3, binding is at 8",
     identity: "planner",
@@ -8204,7 +8398,7 @@ test("workgraph post-conflict refresh echoes heal the folded revision without cl
     frameId: "local-wg-heal-bfail",
   });
   const bindingRefresh = buildWorkGraphOperatorResultFrame({
-    method: "mobkit/workgraph/goal/status",
+    method: "meta/workgraph/goal/status",
     params: { binding_id: "b-heal" },
     result: {
       item: workGraphItem({ id: "goal-heal", title: "Bound goal", status: "in_progress", revision: 6 }),
@@ -8624,7 +8818,7 @@ test("workgraph post-reload snapshot refresh echoes re-hydrate operator-driven s
   });
   // The pane-mount hook fetches ONE snapshot and folds it as a refresh echo.
   const refreshEcho = buildWorkGraphOperatorResultFrame({
-    method: "mobkit/workgraph/snapshot",
+    method: "meta/workgraph/snapshot",
     params: {},
     result: {
       snapshot: {
@@ -8938,6 +9132,15 @@ for (const [surface, mapper] of [
         ]);
         const block = entries.flatMap((entry) => entry.kind === "message" ? entry.blocks || [] : [])
           .find((candidate) => candidate.type === "tool-call");
+        if (payload === payloads[0]) {
+          // The image is presented as an image beside its text, never as text.
+          assert.equal(block?.type === "tool-call" ? block.result : undefined, "A picture follows.");
+          assert.deepEqual(
+            block?.type === "tool-call" ? block.images?.map((image) => image.src) : undefined,
+            ["data:image/png;base64,image-bytes"],
+          );
+          continue;
+        }
         assert.equal(block?.type === "tool-call" ? block.result : undefined, JSON.stringify(payload, null, 2));
       }
     });
@@ -9367,7 +9570,7 @@ test("two sequential interactions stay contiguous when they do not overlap", () 
 });
 
 test("failure summary reads meerkat's typed error_report before the flat keys", () => {
-  // A meerkat >= 0.7 `run_failed` payload as MobKit projects it into an
+  // A meerkat >= 0.7 `run_failed` payload as Meta projects it into an
   // `interaction_failed` frame: the typed report is the failure truth.
   const typed = {
     type: "run_failed",
@@ -9384,7 +9587,7 @@ test("failure summary reads meerkat's typed error_report before the flat keys", 
   });
   assert.equal(describeFailure(typed), "LLM error: authentication failed (401) (llm_auth_error)");
 
-  // Frames MobKit mints itself carry only the flat keys.
+  // Frames Meta mints itself carry only the flat keys.
   assert.equal(describeFailure({ reason: "superseded_by_later_run" }), "superseded_by_later_run");
   assert.equal(describeFailure({ error: "member not found: mk--x" }), "member not found: mk--x");
 
@@ -9754,4 +9957,139 @@ for (const [name, project] of [["console", mapFramesToTimelineEntries], ["shared
     assert(tools.some(block => block.toolCallId === "denied" && block.status === "error"));
     assert(tools.some(block => block.toolCallId === "allowed" && block.status === "success"));
   });
+}
+
+function toolCallBlocksIn(value: unknown): Array<Record<string, unknown>> {
+  if (!value || typeof value !== "object") return [];
+  if (Array.isArray(value)) return value.flatMap(toolCallBlocksIn);
+  const record = value as Record<string, unknown>;
+  const own = record.type === "tool-call" ? [record] : [];
+  return [...own, ...Object.values(record).flatMap(toolCallBlocksIn)];
+}
+
+const SCREENSHOT_CONTENT = [
+  { type: "text", text: "Captured the screen." },
+  { type: "image", media_type: "image/png", source: "inline", data: "iVBORw0KGgo=" },
+  { type: "text", text: "receipt: 1" },
+];
+
+for (const [surface, mapTimeline] of [["stock", mapFramesToTimelineEntries], ["shared", mapFramesToTimelineEntriesShared]] as const) {
+test(`${surface}: live tool results render their images and keep only text as the result`, () => {
+  const agent = { agent_id: "pilot", member_id: "pilot", label: "pilot", kind: "mob_agent" as const };
+  for (const completed of [
+    // tool_execution_completed carries a text-only `result` beside the content.
+    { id: "done", event: "tool_execution_completed", data: { id: "shot", name: "computer_screenshot", is_error: false, result: "Captured the screen.", content: SCREENSHOT_CONTENT } },
+    // tool_result_received carries the content only.
+    { id: "done", event: "tool_result_received", data: { id: "shot", name: "computer_screenshot", is_error: false, content: SCREENSHOT_CONTENT } },
+  ]) {
+    const entries = mapTimeline(agent, [
+      { id: "start", event: "tool_execution_started", data: { id: "shot", name: "computer_screenshot", args: {} } },
+      completed,
+    ]);
+    const [block] = toolCallBlocksIn(entries).filter((item) => item.toolCallId === "shot");
+    assert.ok(block, completed.event);
+    const images = block.images as Array<Record<string, unknown>>;
+    assert.equal(images.length, 1, completed.event);
+    assert.equal(images[0]?.src, "data:image/png;base64,iVBORw0KGgo=");
+    assert.equal(typeof block.result, "string");
+    assert.doesNotMatch(block.result as string, /iVBORw0KGgo/, "no base64 is shown as text");
+    assert.match(block.result as string, /Captured the screen\./);
+  }
+});
+
+test(`${surface}: session-history tool results render blob images through the blob route`, () => {
+  const agent = { agent_id: "pilot", member_id: "pilot", label: "pilot", kind: "mob_agent" as const };
+  const entries = mapTimeline(agent, [
+    {
+      id: "history-assistant",
+      event: "interaction_complete",
+      identity: "pilot",
+      sourceKind: "session_history",
+      data: {
+        message: {
+          role: "block_assistant",
+          blocks: [{ block_type: "tool_use", data: { name: "computer_screenshot", args: {}, id: "shot" } }],
+        },
+      },
+    },
+    {
+      id: "history-result",
+      event: "tool_execution_completed",
+      identity: "pilot",
+      sourceKind: "session_history",
+      data: {
+        id: "shot",
+        name: "computer_screenshot",
+        is_error: false,
+        result: "Captured the screen.",
+        content: [
+          { type: "text", text: "Captured the screen." },
+          { type: "image", media_type: "image/png", source: "blob", blob_id: "sha256:abc" },
+        ],
+      },
+    },
+  ], { blobBaseUrl: "http://gateway.test/" });
+  const [block] = toolCallBlocksIn(entries).filter((item) => item.toolCallId === "shot");
+  assert.ok(block);
+  const images = block.images as Array<Record<string, unknown>>;
+  assert.equal(images.length, 1);
+  assert.equal(images[0]?.src, "http://gateway.test/blobs/sha256%3Aabc");
+  assert.equal(block.result, "Captured the screen.");
+});
+
+test(`${surface}: residual non-image content keeps its canonical formatting beside presented images`, () => {
+  const agent = { agent_id: "pilot", member_id: "pilot", label: "pilot", kind: "mob_agent" as const };
+  const resource = { type: "resource", uri: "file:///shot.txt", text: "Saved alongside" };
+  const structured = { type: "data", value: { width: 1280, height: 720 } };
+  const unpresentable = { type: "image", media_type: "image/png" };
+  // Live: the presented image leaves the content; text, resource and
+  // structured blocks keep the canonical JSON payload.
+  const live = mapTimeline(agent, [
+    { id: "start", event: "tool_execution_started", data: { id: "shot", name: "computer_screenshot", args: {} } },
+    { id: "done", event: "tool_result_received", data: { id: "shot", name: "computer_screenshot", is_error: false,
+      content: [{ type: "text", text: "Captured." }, SCREENSHOT_CONTENT[1], resource, structured, unpresentable] } },
+  ]);
+  const [liveBlock] = toolCallBlocksIn(live).filter((item) => item.toolCallId === "shot");
+  assert.ok(liveBlock);
+  assert.deepEqual((liveBlock.images as Array<Record<string, unknown>>).map((image) => image.src), ["data:image/png;base64,iVBORw0KGgo="]);
+  assert.equal(
+    liveBlock.result,
+    JSON.stringify([{ type: "text", text: "Captured." }, resource, structured, unpresentable], null, 2),
+    "an image that cannot be presented stays in the residual",
+  );
+  // History: a `result` that is a block list with a stored image.
+  const history = mapTimeline(agent, [
+    {
+      id: "history-assistant",
+      event: "interaction_complete",
+      identity: "pilot",
+      sourceKind: "session_history",
+      data: { message: { role: "block_assistant", blocks: [{ block_type: "tool_use", data: { name: "computer_screenshot", args: {}, id: "shot" } }] } },
+    },
+    {
+      id: "history-result",
+      event: "tool_execution_completed",
+      identity: "pilot",
+      sourceKind: "session_history",
+      data: { id: "shot", name: "computer_screenshot", is_error: false,
+        result: [{ type: "text", text: "Captured." }, { type: "image", media_type: "image/png", source: "blob", blob_id: "sha256:abc" }, resource] },
+    },
+  ], { blobBaseUrl: "http://gateway.test" });
+  const [historyBlock] = toolCallBlocksIn(history).filter((item) => item.toolCallId === "shot");
+  assert.ok(historyBlock);
+  assert.deepEqual((historyBlock.images as Array<Record<string, unknown>>).map((image) => image.src), ["http://gateway.test/blobs/sha256%3Aabc"]);
+  assert.equal(historyBlock.result, JSON.stringify([{ type: "text", text: "Captured." }, resource], null, 2));
+});
+
+test(`${surface}: tool results without images keep their existing result text`, () => {
+  const agent = { agent_id: "pilot", member_id: "pilot", label: "pilot", kind: "mob_agent" as const };
+  const entries = mapTimeline(agent, [
+    { id: "start", event: "tool_execution_started", data: { id: "read", name: "read_file", args: {} } },
+    { id: "done", event: "tool_result_received", data: { id: "read", name: "read_file", is_error: false, content: [{ type: "text", text: "a" }, { type: "resource", uri: "file:///x" }] } },
+  ]);
+  const [block] = toolCallBlocksIn(entries).filter((item) => item.toolCallId === "read");
+  assert.ok(block);
+  assert.equal(block.images, undefined);
+  assert.match(block.result as string, /"resource"/, "mixed non-image content keeps its complete payload");
+});
 }

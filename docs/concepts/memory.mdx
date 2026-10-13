@@ -4,13 +4,13 @@ description: "Operational memory assertions plus optional identity-first agent m
 icon: "brain"
 ---
 
-MobKit has two memory-adjacent surfaces, and they serve different latency
+Meta has two memory-adjacent surfaces, and they serve different latency
 classes:
 
 - `agent_memory` is hot identity memory plus prompt injection. It is keyed by
   stable `AgentIdentity`, stored by realm, and injected during
   create/resume/materialize and ordinary identity-first turns.
-- `mobkit/memory/*` is the operational **assertion ledger**: assertions and
+- `meta/memory/*` is the operational **assertion ledger**: assertions and
   conflict signals used by routing/gating flows. The runtime owns it and
   holds it in memory; it is persisted as a local JSON file under
   `persistent_state`, optionally gated by an HTTP health check. Query
@@ -37,9 +37,9 @@ Nothing in the current runtime sends data to an external memory hub.
 
 Meerkat's session semantic memory is a separate layer again: it indexes
 compacted session content and exposes semantic recall through Meerkat's
-`memory_search` tool. MobKit's `agent_memory` injector can be backed by a
-provider that consults session memory or other stores, but the MobKit runtime
-does not assume semantic/vector search from `mobkit/memory/*`.
+`memory_search` tool. Meta's `agent_memory` injector can be backed by a
+provider that consults session memory or other stores, but the Meta runtime
+does not assume semantic/vector search from `meta/memory/*`.
 
 The assertion ledger backend persists assertions and conflict signals as a
 local JSON file, optionally gated by an HTTP health check at the startup load
@@ -48,7 +48,7 @@ and before every persist. Configuration is provided through
 
 ```rust
 LocalJsonMemoryBackendConfig {
-    state_path: "/var/mobkit/state/memory-ledger-state.json".into(),
+    state_path: "/var/meta/state/memory-ledger-state.json".into(),
     health_check_endpoint: Some("http://localhost:3000".into()),
 }
 ```
@@ -58,18 +58,18 @@ LocalJsonMemoryBackendConfig {
 | `state_path` | `String` | Local JSON file the assertion ledger is persisted to. Runtime-owned: loaded once at bootstrap, rewritten wholesale on every index; not a shared append log (see below) |
 | `health_check_endpoint` | `Option<String>` | Optional HTTP base URL; when set, `GET <endpoint>/v1/health` must return 2xx at the startup load and before every persist |
 
-The legacy `ElephantMemoryBackendConfig` shape (`kind = "elephant"` with an
-`endpoint`) is still accepted for config compatibility and logs a deprecation
-warning: despite its name it never sent data to an external memory hub - the `endpoint` was
-only ever health-checked and the ledger persisted locally. It maps to the
-local-JSON backend with `endpoint` as the health-check endpoint.
+`local_json` is the only backend `kind`. Meta 0.9 removed the predecessor's
+backend shape and its `kind` value with no alias: configuration that still
+names that value is refused at decode (and at gateway init) with an error that
+names `local_json`, never reinterpreted. Rewrite it as `kind = "local_json"`,
+with the old `endpoint` as `health_check_endpoint`.
 
 ### The runtime owns the assertion ledger
 
 The assertion ledger is a runtime-owned snapshot, not a shared append log.
-`MobkitRuntimeHandle` reads `state_path` exactly once, at runtime bootstrap,
+`MetaRuntimeHandle` reads `state_path` exactly once, at runtime bootstrap,
 and from then on the in-memory assertions and conflict signals are the
-authority. Every `mobkit/memory/index` serializes that entire in-memory state
+authority. Every `meta/memory/index` serializes that entire in-memory state
 and atomically replaces the file (write to `state_path.with_extension("tmp")`,
 then rename over `state_path`). The scratch path replaces the extension:
 `memory-ledger-state.json` uses `memory-ledger-state.tmp`. Nothing re-reads
@@ -93,23 +93,23 @@ What this means for anything else that touches the file:
   remain non-empty. Rows that fail these checks are dropped at load without
   a diagnostic; mixed case or surrounding whitespace alone is not a failure.
 - A structurally malformed file (an assertion missing a required field, or
-  invalid JSON) refuses the next boot with `MobkitRuntimeError::MemoryBackend`.
+  invalid JSON) refuses the next boot with `MetaRuntimeError::MemoryBackend`.
 - Retention is capped: the runtime keeps at most 4,096 assertions
   (`MEMORY_ASSERTIONS_MAX_RETAINED`), evicting the oldest at index time and at
   load. Conflict signals are keyed by `entity`/`topic`/`store`, one per key.
   Do not treat the file as a durable audit log.
-- Single writer is by convention: no MobKit lock guards `state_path`. Run one
+- Single writer is by convention: no Meta lock guards `state_path`. Run one
   runtime per state file.
 
-Append through the runtime, never the file: `mobkit/memory/index` over
+Append through the runtime, never the file: `meta/memory/index` over
 JSON-RPC, `MobHandle.memory_index(...)` in Python, `handle.memoryIndex(...)`
 in TypeScript, or `UnifiedRuntime::memory_index` /
-`MobkitRuntimeHandle::memory_index` from Rust (the Rust `MobHandle` has no
+`MetaRuntimeHandle::memory_index` from Rust (the Rust `MobHandle` has no
 ledger method). There is no agent-facing tool that wraps the ledger; a host
 that wants members to write assertions exposes its own tool over one of those
 handles.
 
-When using the Python or TypeScript SDK through the stock `rpc_gateway`, configure the ledger with `memory.local_json()` (Python) / `memory.localJson()` (TypeScript), optionally passing a health-check endpoint, and enable `.persistent_state(path)`. The gateway derives the state file as `<persistent_state>/memory-ledger-state.json` (an existing legacy `<persistent_state>/elephant-memory-state.json` is adopted automatically so restarts keep their data). The deprecated `memory.elephant(endpoint)` helpers still work and emit the legacy `backend: "elephant"` wire shape; fields such as `stores`, `space_id`, and `collection` are rejected at init so unsupported configuration does not become a silent no-op.
+When using the Python or TypeScript SDK through the stock `rpc_gateway`, configure the ledger with `memory.local_json()` (Python) / `memory.localJson()` (TypeScript), optionally passing a health-check endpoint, and enable `.persistent_state(path)`. The gateway derives the state file as `<persistent_state>/memory-ledger-state.json` and never reads another name. A ledger file the predecessor (pre-0.9) gateway left under `persistent_state` refuses startup, whether or not memory is configured, until the stopped installation is adopted once with `meta_gateway storage-adopt-predecessor --state-dir <persistent_state> --apply`; the refusal names the exact directory. Adoption renames the committed file in place, byte for byte, and refuses to touch a leftover stage of an interrupted write or a renamed ledger already beside it. Unsupported fields such as `stores`, `space_id`, and `collection` are rejected at init so unsupported configuration does not become a silent no-op.
 
 ## Indexing
 
@@ -127,7 +127,7 @@ MemoryIndexRequest {
 }
 ```
 
-The current MobKit runtime stores a canonical assertion in memory and, when the memory backend is configured, rewrites the whole ledger file from that in-memory state (see [the ownership model](#the-runtime-owns-the-assertion-ledger)). Set `conflict: Some(true)`, optionally with `conflict_reason`, to record or update a conflict signal. For a conflict-only write, set `fact: None`; a non-empty `fact` together with `conflict: Some(true)` records both an assertion and a conflict signal.
+The current Meta runtime stores a canonical assertion in memory and, when the memory backend is configured, rewrites the whole ledger file from that in-memory state (see [the ownership model](#the-runtime-owns-the-assertion-ledger)). Set `conflict: Some(true)`, optionally with `conflict_reason`, to record or update a conflict signal. For a conflict-only write, set `fact: None`; a non-empty `fact` together with `conflict: Some(true)` records both an assertion and a conflict signal.
 
 ## Querying
 
@@ -142,15 +142,15 @@ MemoryQueryRequest {
 }
 ```
 
-The current MobKit runtime filters stored assertions and conflict signals by `entity`, `topic`, and `store` (exact matches on trimmed, ASCII-lowercased tokens). Empty normalized filters and unsupported `store` filters are treated as absent, not as validation errors. The optional `query` parameter is applied afterwards as a case-insensitive substring filter across entity, topic, and fact (reason for conflict signals). Semantic/vector search should be supplied by a provider or upstream Meerkat memory surface rather than assumed from this RPC.
+The current Meta runtime filters stored assertions and conflict signals by `entity`, `topic`, and `store` (exact matches on trimmed, ASCII-lowercased tokens). Empty normalized filters and unsupported `store` filters are treated as absent, not as validation errors. The optional `query` parameter is applied afterwards as a case-insensitive substring filter across entity, topic, and fact (reason for conflict signals). Semantic/vector search should be supplied by a provider or upstream Meerkat memory surface rather than assumed from this RPC.
 
 ## Agent memory injection
 
 Gateway users can enable identity-first injection with:
 
 ```typescript
-MobKit.builder()
-  .persistentState(".mobkit/state")
+Meta.builder()
+  .persistentState(".meta/state")
   .rosterProvider(appRosterProvider)
   .agentMemory({
     realm: "default",
@@ -161,19 +161,19 @@ MobKit.builder()
   })
 ```
 
-By default, the bundled provider stores one SQLite database per realm under `<persistent_state>/agent-memory`. Records are injected as a quoted observation block for the matching durable identity. Contextual recall receives the raw turn or RPC `query_text`, ignores common stopwords, scores matching records, and size-caps injected records. Existing markdown files under a realm's legacy subdirectory are parsed only when that realm is first accessed, imported through the SQLite validator, and renamed rather than deleted; malformed records are skipped instead of being promoted into runtime context. Automatic build/turn injection is time-bounded by `recall_timeout_ms` (default `500`) and defaults to `recall_failure_policy: "skip"`, so provider slowness or outage does not block normal delivery. Set `recall_failure_policy: "fail"` for fail-closed deployments. Explicit `mobkit/agent_memory/recall` calls still return provider errors to the caller.
+By default, the bundled provider stores one SQLite database per realm under `<persistent_state>/agent-memory`. Records are injected as a quoted observation block for the matching durable identity. Contextual recall receives the raw turn or RPC `query_text`, ignores common stopwords, scores matching records, and size-caps injected records. Existing markdown files under a realm's legacy subdirectory are parsed only when that realm is first accessed, imported through the SQLite validator, and renamed rather than deleted; malformed records are skipped instead of being promoted into runtime context. Automatic build/turn injection is time-bounded by `recall_timeout_ms` (default `500`) and defaults to `recall_failure_policy: "skip"`, so provider slowness or outage does not block normal delivery. Set `recall_failure_policy: "fail"` for fail-closed deployments. Explicit `meta/agent_memory/recall` calls still return provider errors to the caller.
 
-Apps write identity-scoped agent memory explicitly through `mobkit/agent_memory/remember`, TypeScript `handle.rememberAgentMemory(...)`, or Python `handle.remember_agent_memory(...)`; read it through `mobkit/agent_memory/recall`, `handle.recallAgentMemory(...)`, or `handle.recall_agent_memory(...)`; and delete individual records through `mobkit/agent_memory/forget`, `handle.forgetAgentMemory(...)`, or `handle.forget_agent_memory(...)`. A successful `remember` means the configured hot identity-memory provider durably accepted the record and it is available to the next identity-first send for that identity, plus build context on materialization/resume/respawn/reset. It does not imply external memory hub entity extraction, truth maintenance, or document/vector indexing has completed. Custom providers receive both raw `query_text` and normalized `query_terms` so they can implement stronger retrieval without changing MobKit runtime authority.
+Apps write identity-scoped agent memory explicitly through `meta/agent_memory/remember`, TypeScript `handle.rememberAgentMemory(...)`, or Python `handle.remember_agent_memory(...)`; read it through `meta/agent_memory/recall`, `handle.recallAgentMemory(...)`, or `handle.recall_agent_memory(...)`; and delete individual records through `meta/agent_memory/forget`, `handle.forgetAgentMemory(...)`, or `handle.forget_agent_memory(...)`. A successful `remember` means the configured hot identity-memory provider durably accepted the record and it is available to the next identity-first send for that identity, plus build context on materialization/resume/respawn/reset. It does not imply external memory hub entity extraction, truth maintenance, or document/vector indexing has completed. Custom providers receive both raw `query_text` and normalized `query_terms` so they can implement stronger retrieval without changing Meta runtime authority.
 
-Agent memory is identity-scoped rather than session-scoped. A session respawn or identity reset does not delete stored memory; apps that need privacy reset semantics can call `mobkit/agent_memory/forget` for specific records or use a provider that clears memory as part of the app's identity lifecycle. `forget` removes records from future recall and injection, but it cannot remove text already delivered into an active model context; reset or respawn the identity after deletion when immediate context revocation matters.
+Agent memory is identity-scoped rather than session-scoped. A session respawn or identity reset does not delete stored memory; apps that need privacy reset semantics can call `meta/agent_memory/forget` for specific records or use a provider that clears memory as part of the app's identity lifecycle. `forget` removes records from future recall and injection, but it cannot remove text already delivered into an active model context; reset or respawn the identity after deletion when immediate context revocation matters.
 
 On disk, the agent-memory root under the state directory is
-`agent-memory/` — the canonical name owned by `MobKitStorageLayout`; the
+`agent-memory/` — the canonical name owned by `MetaStorageLayout`; the
 legacy `agent-memory-sqlite/` spelling remains readable through
 canonical-name-first probing, and both existing at once refuses startup as
-file-name twins (run `mobkit/storage/doctor`). Per-realm files beneath the
+file-name twins (run `meta/storage/doctor`). Per-realm files beneath the
 root stay feature-owned. Like every durable slot, the agent-memory store
-appears in the storage census (`mobkit/status` → `storage.slots`) with its
+appears in the storage census (`meta/status` → `storage.slots`) with its
 durability class and resolution; see
 [Configuration → Storage layout and durability](/reference/configuration#storage-layout-and-durability).
 
@@ -204,10 +204,10 @@ pass-through; custom or classic-provider compositions need equivalent tracker,
 decorator, and write-gate wiring. The stricter `"quarantined"` posture is not a
 workaround for an unshipped stock dispatch-order fix.
 
-Application/operator writes (the `mobkit/agent_memory/*` RPCs) are non-LLM principals and are never quarantined by this machinery. Quarantined records leave quarantine only through review: the memory steward's dream, the gating flow for steward-staged promotions, or an operator decision (see [Reviewing quarantined records](#reviewing-quarantined-records)). `llm_writes` and `content_trust` require `store: "sqlite"`. Selecting `store: "markdown"` is refused before a runtime can start; combining it with these SQLite-only knobs is rejected earlier during config validation.
+Application/operator writes (the `meta/agent_memory/*` RPCs) are non-LLM principals and are never quarantined by this machinery. Quarantined records leave quarantine only through review: the memory steward's dream, the gating flow for steward-staged promotions, or an operator decision (see [Reviewing quarantined records](#reviewing-quarantined-records)). `llm_writes` and `content_trust` require `store: "sqlite"`. Selecting `store: "markdown"` is refused before a runtime can start; combining it with these SQLite-only knobs is rejected earlier during config validation.
 
 ```typescript
-MobKit.builder().agentMemory({
+Meta.builder().agentMemory({
   llmWrites: "observed",
   recorderTool: true,
   contentTrust: {
@@ -219,9 +219,9 @@ MobKit.builder().agentMemory({
 
 ## Conflict detection
 
-Conflict signals are recorded through `mobkit/memory/index` with
+Conflict signals are recorded through `meta/memory/index` with
 `conflict: true` and an optional `conflict_reason`. When competing claims exist
-about the same entity/topic, MobKit's gating subsystem checks for an active
+about the same entity/topic, Meta's gating subsystem checks for an active
 conflict before approving an action.
 
 A `MemoryConflictSignal` carries:
@@ -233,7 +233,7 @@ This integrates with [gating](/concepts/gating) to prevent agents from acting on
 
 ## Health checks
 
-When `health_check_endpoint` is configured, the ledger adapter performs a TCP-level health check against it once at the startup load and before every persist (the whole-file rewrite that follows each `mobkit/memory/index`). There are no per-query file reads to gate. The health check:
+When `health_check_endpoint` is configured, the ledger adapter performs a TCP-level health check against it once at the startup load and before every persist (the whole-file rewrite that follows each `meta/memory/index`). There are no per-query file reads to gate. The health check:
 
 1. Resolves the endpoint hostname
 2. Opens a TCP connection with `MEMORY_LEDGER_HEALTHCHECK_TIMEOUT` (2s)
@@ -244,7 +244,7 @@ Failed health checks produce `LocalJsonMemoryStoreError::ExternalCallFailed` wit
 
 ## Memory store info
 
-`mobkit/memory/stores` returns a `MemoryStoreInfo` entry per supported store:
+`meta/memory/stores` returns a `MemoryStoreInfo` entry per supported store:
 
 ```rust
 MemoryStoreInfo {
@@ -257,7 +257,7 @@ MemoryStoreInfo {
 
 ## Reviewing quarantined records
 
-A quarantined record waits for review. Without a memory steward (or alongside one), an operator decides it from the console with `mobkit/memory/quarantine/decide`:
+A quarantined record waits for review. Without a memory steward (or alongside one), an operator decides it from the console with `meta/memory/quarantine/decide`:
 
 ```json
 {
@@ -265,7 +265,7 @@ A quarantined record waits for review. Without a memory steward (or alongside on
   "identity": "lead:main",
   "memory_id": "mem-...",
   "verdict": "release",
-  "expected_content_hash": "<record.content_hash from mobkit/memory/panel/record>",
+  "expected_content_hash": "<record.content_hash from meta/memory/panel/record>",
   "rationale": "confirmed with the reader"
 }
 ```
@@ -293,20 +293,20 @@ The store operation behind it is `StewardStore::review_quarantined`, which the b
 
 ## Console Memory panel
 
-When the bundled SQLite agent-memory store is wired, the console gains a **Memory** panel: trust through inspectability. Its reads are served by ten `mobkit/memory/panel/*` RPC methods, subject to provider capability and the caller's access grants. Its one mutation is the quarantine decision above, offered as Release and Tombstone on a quarantined record's detail view:
+When the bundled SQLite agent-memory store is wired, the console gains a **Memory** panel: trust through inspectability. Its reads are served by ten `meta/memory/panel/*` RPC methods, subject to provider capability and the caller's access grants. Its one mutation is the quarantine decision above, offered as Release and Tombstone on a quarantined record's detail view:
 
 | Method | Returns |
 |--------|---------|
-| `mobkit/memory/panel/records` | Records filtered by realm/scope/status, newest-updated first, keyset cursor (`{realm?, scope?, identity?, scope_key?, status?, limit?, cursor?}`). List rows are body-free (`body_bytes` stands in) |
-| `mobkit/memory/panel/record` | One record with body and `content_hash`, its supersede chain (ancestors, committed successors, trailing uncommitted claimants), and its injection-ledger usage |
-| `mobkit/memory/panel/quarantine` | The quarantine queue plus pending gated promotions. Gated promotions are decided through the gating flow; quarantined records through `mobkit/memory/quarantine/decide` or the steward's dream |
-| `mobkit/memory/panel/dreams` | Steward dream-run summaries reconstructed from the audit rows (op counts and kinds, quarantined ops, sampled record ids and rationales) |
-| `mobkit/memory/panel/dream_runs` | Durable dream-run detail, including partition, timestamps, committed-op count, and saved detail |
-| `mobkit/memory/panel/audit_verdicts` | Open usage-audit verdicts awaiting operator action, with record/run ids and rationales |
-| `mobkit/memory/panel/overview` | Per-scope status counts and body bytes, with store floors and pressure indicators |
-| `mobkit/memory/panel/proposals` | Pending mob/operator proposal metadata and a propose-time taint flag; bodies are withheld |
-| `mobkit/memory/panel/injections` | Recent injection-ledger rows, newest first, with record, identity, session key, surface, and timestamp |
-| `mobkit/memory/panel/harvests` | Pending exit-interview harvests, with identity, session key, cause, and retirement timestamp |
+| `meta/memory/panel/records` | Records filtered by realm/scope/status, newest-updated first, keyset cursor (`{realm?, scope?, identity?, scope_key?, status?, limit?, cursor?}`). List rows are body-free (`body_bytes` stands in) |
+| `meta/memory/panel/record` | One record with body and `content_hash`, its supersede chain (ancestors, committed successors, trailing uncommitted claimants), and its injection-ledger usage |
+| `meta/memory/panel/quarantine` | The quarantine queue plus pending gated promotions. Gated promotions are decided through the gating flow; quarantined records through `meta/memory/quarantine/decide` or the steward's dream |
+| `meta/memory/panel/dreams` | Steward dream-run summaries reconstructed from the audit rows (op counts and kinds, quarantined ops, sampled record ids and rationales) |
+| `meta/memory/panel/dream_runs` | Durable dream-run detail, including partition, timestamps, committed-op count, and saved detail |
+| `meta/memory/panel/audit_verdicts` | Open usage-audit verdicts awaiting operator action, with record/run ids and rationales |
+| `meta/memory/panel/overview` | Per-scope status counts and body bytes, with store floors and pressure indicators |
+| `meta/memory/panel/proposals` | Pending mob/operator proposal metadata and a propose-time taint flag; bodies are withheld |
+| `meta/memory/panel/injections` | Recent injection-ledger rows, newest first, with record, identity, session key, surface, and timestamp |
+| `meta/memory/panel/harvests` | Pending exit-interview harvests, with identity, session key, cause, and retirement timestamp |
 
 These six additional methods accept optional `realm` selection; all except
 `overview` also accept `limit`. The current `injections` handler does not parse

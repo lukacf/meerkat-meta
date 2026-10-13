@@ -30,9 +30,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "sdk" / "python"))
 
-from meerkat_mobkit.builder import MobKit  # noqa: E402
-from meerkat_mobkit.identity_first_models import DurableAgentSpec  # noqa: E402
-from meerkat_mobkit.runtime import MobKitRuntime  # noqa: E402
+from meerkat_meta.builder import Meta  # noqa: E402
+from meerkat_meta.identity_first_models import DurableAgentSpec  # noqa: E402
+from meerkat_meta.runtime import MetaRuntime  # noqa: E402
 
 IDENTITY = "identity:curator"
 
@@ -69,7 +69,7 @@ class LiveRoster:
 
 
 def resolve_gateway_bin() -> str:
-    override = os.environ.get("MOBKIT_GATEWAY_BIN", "").strip()
+    override = os.environ.get("META_GATEWAY_BIN", "").strip()
     if override:
         return override
     import subprocess
@@ -112,13 +112,13 @@ async def main() -> int:
     if not gateway_bin or not os.path.isfile(gateway_bin):
         print(
             f"ERROR gateway binary not found at '{gateway_bin}' — run "
-            "./scripts/repo-cargo build -p meerkat-mobkit --bin rpc_gateway",
+            "./scripts/repo-cargo build -p meerkat-meta --bin rpc_gateway",
             flush=True,
         )
         return 2
 
-    state_dir = os.environ.get("MOBKIT_MEMORY_LIVE_STATE") or tempfile.mkdtemp(
-        prefix="mobkit-memory-live-"
+    state_dir = os.environ.get("META_MEMORY_LIVE_STATE") or tempfile.mkdtemp(
+        prefix="meta-memory-live-"
     )
     Path(state_dir).mkdir(parents=True, exist_ok=True)
     mob_toml = Path(state_dir) / "mob.toml"
@@ -128,17 +128,17 @@ async def main() -> int:
     # accepts it in runtime_options. Patch the init-params assembly — the
     # console UI must be reachable without an auth token, exactly like the
     # seeded lane runs.
-    original_build_init_params = MobKitRuntime._build_init_params
+    original_build_init_params = MetaRuntime._build_init_params
 
     def patched_build_init_params(self):  # type: ignore[no-untyped-def]
         params = original_build_init_params(self)
         params.setdefault("runtime_options", {})["console_require_app_auth"] = False
         return params
 
-    MobKitRuntime._build_init_params = patched_build_init_params
+    MetaRuntime._build_init_params = patched_build_init_params
 
     runtime = await (
-        MobKit.builder()
+        Meta.builder()
         .gateway(gateway_bin)
         .mob(str(mob_toml))
         .persistent_state(state_dir)

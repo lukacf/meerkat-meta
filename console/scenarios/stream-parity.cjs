@@ -57,7 +57,7 @@ function assertCapturedSource(frames, source, label) {
 }
 
 async function sharedOwnerStreamParity() {
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "This acceptance must use the coordinator's prebuilt runtime.");
+  assert(process.env.META_EXAMPLE_BIN_DIR, "This acceptance must use the coordinator's prebuilt runtime.");
   const fixture = await startFixture();
   const captures = [];
   const evidence = {};
@@ -71,7 +71,7 @@ async function sharedOwnerStreamParity() {
       capture.check();
       return capture.events.some(event => event.type === "snapshot_complete");
     }), "all actual router snapshots complete before send");
-    const sent = await rpc(fixture.baseUrl, "mobkit/console/send", {
+    const sent = await rpc(fixture.baseUrl, "meta/console/send", {
       identity: "router:main", origin: "fixture:stream-parity", origin_kind: "operator",
       idempotency_key: randomUUID(), content: "Prove each actual router emits the complete source.",
     });
@@ -107,7 +107,7 @@ async function sharedOwnerStreamParity() {
   } finally {
     evidence.captures = captures.map(capture => capture.events);
     evidence.logs = fixture.logs();
-    const dir = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+    const dir = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, "dual-router-stream-parity.json"), JSON.stringify(evidence, null, 2));
     await Promise.all(captures.map(capture => capture.close()));

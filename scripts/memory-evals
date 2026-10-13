@@ -218,7 +218,7 @@ KNOWN_INVARIANTS = (
 RECORD_META_KEYS = ("id", "kind", "title", "description", "age_days", "rank")
 
 # Staged-validator invariants mirror the Rust wire shapes exactly
-# (crates/meerkat-mobkit/src/memory/records.rs + staged.rs serde): snake_case kinds
+# (crates/meerkat-meta/src/memory/records.rs + staged.rs serde): snake_case kinds
 # and tiers, internally-tagged scope/status/author/op enums. Each invariant
 # pins the StagedBatchError variant the validator must produce.
 STAGED_INVARIANT_ERRORS = {

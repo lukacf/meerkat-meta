@@ -325,7 +325,7 @@ export function AccessPanel({
     <div className="gating access-panel" data-testid="access-panel">
       <div className="gating__head" style={{ flexDirection: "column", alignItems: "flex-start", gap: 6 }}>
         <h2>Console access</h2>
-        <p>Manage access to MobKit console and runtime surfaces. These rules do not grant native tool, source or connected-account permissions.</p>
+        <p>Manage access to Meta console and runtime surfaces. These rules do not grant native tool, source or connected-account permissions.</p>
         <p>
           · {enabled ? "enforcing" : "not enforced"} · {rules.length} rules ·{" "}
           {groups.length} groups

@@ -1,27 +1,27 @@
 ---
 title: "Python SDK"
-description: "MobKit Python SDK — typed builder API, async runtime, and streaming events."
+description: "Meta Python SDK — typed builder API, async runtime, and streaming events."
 icon: "python"
 ---
 
-The MobKit Python SDK provides a typed host API for launching and operating
+The Meta Python SDK provides a typed host API for launching and operating
 Meerkat mobs through the SDK-facing gateway. Apps own policy. Meerkat and
 `meerkat-mob` remain authoritative for agent execution, identity, membership,
-lifecycle, and wiring; MobKit packages gateway startup, provider adapters,
+lifecycle, and wiring; Meta packages gateway startup, provider adapters,
 operational modules, persistence projections, and operator surfaces.
 
 ## Installation
 
 ```bash
-pip install meerkat-mobkit
+pip install meerkat-meta
 ```
 
 <Note>
   The wheel is client-only and does not contain `rpc_gateway`. Download
-  `mobkit-rpc-gateway-<version>-<target>.tar.gz` for Unix or macOS, or
-  `mobkit-rpc-gateway-<version>-<target>.zip` for Windows, and extract its
+  `meta-rpc-gateway-<version>-<target>.tar.gz` for Unix or macOS, or
+  `meta-rpc-gateway-<version>-<target>.zip` for Windows, and extract its
   `rpc_gateway` binary (`rpc_gateway.exe` on Windows). Alternatively, follow the
-  [source-build instructions](/quickstart#install). Pass that binary's path to
+  [source-build instructions](/quickstart#prepare-a-matching-sdk-and-gateway). Pass that binary's path to
   `.gateway(...)`.
 </Note>
 
@@ -58,11 +58,11 @@ so the example explicitly creates an ephemeral worker before sending.
 
 ```python
 import asyncio
-from meerkat_mobkit import MobKit
+from meerkat_meta import Meta
 
 async def main():
     async with await (
-        MobKit.builder()
+        Meta.builder()
         .mob("config/mob.toml")
         .gateway("/path/to/rpc_gateway")
         .console_auth_required(False)
@@ -87,7 +87,7 @@ Declare long-running host work explicitly instead of holding
 `callback/call_tool` open:
 
 ```python
-from meerkat_mobkit import DetachedJobExecution, DetachedJobResult
+from meerkat_meta import DetachedJobExecution, DetachedJobResult
 
 async def run_scan(ctx):
     await ctx.progress(1, "scan started")
@@ -114,8 +114,8 @@ class AppAgentBuilder:
         )
 
 runtime = await (
-    MobKit.builder()
-    .persistent_state("state/mobkit")
+    Meta.builder()
+    .persistent_state("state/meta")
     .job_credentials(resolve_profile_credentials)
     .session_service(AppAgentBuilder())
     .gateway("/path/to/rpc_gateway")
@@ -129,7 +129,7 @@ await runtime.jobs.cancel(job_id)
 The gateway durably accepts the job and returns a receipt; host work then runs
 outside the agent turn. Start, reconcile, and cancel are short control-plane
 callbacks subject to the 120-second public contract (the Python host and wire
-margins are 125 and 130 seconds). On reconnect, MobKit offers the exact
+margins are 125 and 130 seconds). On reconnect, Meta offers the exact
 committed attempt, fence, lease, checkpoint, and runner handle. Reopening does
 not mint a new fence; only a machine-authorized claim or retry can do that.
 Resolved credentials are attempt-local and never enter durable job state.
@@ -140,12 +140,12 @@ For apps with durable agent identities, the identity-first API provides durable 
 Agents are addressed by stable identities (`identity:alice`, `triage:main`), not member IDs.
 
 ```python
-from meerkat_mobkit import MobKit, TurnOutputStatus
-from meerkat_mobkit.identity_first_models import DispatchInput, DurableAgentSpec, ManagedPeerEdge
+from meerkat_meta import Meta, TurnOutputStatus
+from meerkat_meta.identity_first_models import DispatchInput, DurableAgentSpec, ManagedPeerEdge
 
 # Boot with roster provider
 rt = await (
-    MobKit.builder()
+    Meta.builder()
     .mob_inline(MOB_TOML)                 # or .mob("mob.toml")
     .persistent_state(state_dir)
     .agent_memory()                       # optional: durable per-agent memory
@@ -204,7 +204,7 @@ await rt.reconcile()                  # In-process roster reconciliation
 `send_and_wait`, `dispatch_and_wait` and `dispatch_text_and_wait` are
 per-admission: the runtime mints a turn ticket for the delivery and keeps the
 admitted turn's own completion handle under it, and the wait reads
-`mobkit/turn_result` for that ticket, which reports that turn's own output
+`meta/turn_result` for that ticket, which reports that turn's own output
 from its committed run result. A failed turn raises `TurnFailedError`, and a
 ticket the gateway does not know (for example after a gateway restart) raises
 `TurnUnknownError`. Text cut at the 256 KiB bound emits
@@ -283,9 +283,9 @@ or `wait_for_output(turn=ticket)` to wait for one specific turn.
 The recommended completion barrier is `track_turn=True` plus
 `wait_for_turn(ticket)` (or `send_and_wait`): it reads only the ticket ledger.
 Every wait is server-side and event-driven: `wait_for_turn` is one
-`mobkit/wait_for_turn` request, and the identity-wide waits
+`meta/wait_for_turn` request, and the identity-wide waits
 (`wait_for_completion`, `wait_for_output(after=...)`, `rt.wait_until_ready`)
-are one `mobkit/wait_for_completion` request each. The gateway answers when
+are one `meta/wait_for_completion` request each. The gateway answers when
 the ticket settles or a completion is recorded, so nothing polls, and the
 member's output is read once, at completion. `timeout` is only the deadline;
 `poll_interval` applies only against a gateway that predates the server-side
@@ -330,7 +330,7 @@ DurableAgentSpec(
 ### Roster provider context
 
 The gateway calls `roster(context)` with a typed `RosterContext`
-(`meerkat_mobkit.identity_first_models.RosterContext`), a one-to-one mirror of
+(`meerkat_meta.identity_first_models.RosterContext`), a one-to-one mirror of
 the Rust struct:
 
 | Field | Type | Meaning |
@@ -353,6 +353,48 @@ DispatchInput.system("text")
 DispatchInput.connector("event from slack", correlation_id="msg-1")
 DispatchInput.scheduler("nightly sync")
 ```
+
+### Scope-bound dispatch
+
+A host that must never admit a delivery to a session other than the one it
+recorded captures the identity's scope from `status()`, persists it, and
+dispatches against it. A moved scope raises `StaleScopeError` with nothing
+submitted; a lost reply is recovered from the scope's original session.
+
+```python
+from meerkat_meta import DeliveryScope, ScopedRecoveryState, StaleScopeError
+
+status = await runtime.status("domain:calendar")
+scope = status.delivery_scope            # None: see status.delivery_scope_unavailable
+saved = scope.to_dict()                  # persist byte-exact before dispatching
+
+try:
+    result = await runtime.dispatch_text(
+        "domain:calendar", "occurrence 42",
+        idempotency_key="occ-42", correlation_id=correlation,
+        expected_scope=DeliveryScope.from_dict(saved),
+    )
+    result.receipt.stage                 # "ingress_accepted": not a durable-input claim
+except StaleScopeError as error:
+    error.mismatch                       # which atom moved; nothing was submitted
+
+recovery = await runtime.recover_delivery(
+    "domain:calendar", DeliveryScope.from_dict(saved),
+    idempotency_key="occ-42", correlation_id=correlation,
+)
+if recovery.state is ScopedRecoveryState.ABSENT:
+    ...                                  # a point-in-time miss, never permission to retry
+```
+
+`expected_scope` needs both `idempotency_key` and `correlation_id`, does not
+combine with `track_turn`, and applies no delivery preparation. A scope with
+an unknown `version` raises `ContractMismatchError` from
+`DeliveryScope.from_dict`; in `status()` it leaves `delivery_scope` `None` and
+the rest of the status usable. `recover_delivery` returns `ScopedRecovery`
+with `state` `ABSENT`, `IN_FLIGHT` (`durable_witness`), `COMPLETED`
+(`output_status`, `output`), `FAILED`, `TERMINAL_WITHOUT_RUN`, `BROKEN` or
+`UNRESOLVED` (`cause`); a state this SDK does not know reads as `UNRESOLVED`,
+never `ABSENT`. See [Scope-bound dispatch](/api/rpc#scope-bound-dispatch).
 
 ## Mob-Level API
 
@@ -392,7 +434,7 @@ preserving `mob_id`, `run_id`, `step_id`, `agent_identity`, and the
 full payload.
 
 ```python
-from meerkat_mobkit import EventQuery, MobEventsStaleError
+from meerkat_meta import EventQuery, MobEventsStaleError
 
 # Latest 256 matching events
 events = await handle.query_mob_events(EventQuery(
@@ -415,7 +457,7 @@ except MobEventsStaleError as exc:
 ```
 
 `MobStructuralEvent.cursor` is the **meerkat ledger cursor** —
-durable across mobkit gateway restarts when the runtime is built
+durable across meta gateway restarts when the runtime is built
 with `.persistent_state(path)`. Checkpoint a cursor and resume by
 passing it as `after_seq` on the next call.
 
@@ -528,15 +570,15 @@ async for event in runtime.mob_handle().subscribe_agent(f"personal:{user_id}"):
 
 Reserve `ensure_member` for **ephemeral workers** (helpers a parent spawns
 and an idle-retire label reaps) — the worker plane. See the
-[identity-first doctrine](https://github.com/lukacf/meerkat-mobkit/blob/main/docs/design/identity-first-doctrine.md).
+[identity-first doctrine](https://github.com/lukacf/meerkat-meta/blob/main/docs/design/identity-first-doctrine.md).
 
 ## Builder pattern
 
 ```python
-from meerkat_mobkit import MobKit
+from meerkat_meta import Meta
 
 rt = await (
-    MobKit.builder()
+    Meta.builder()
     .mob("config/mob.toml")
     .session_service(my_builder, my_store)
     .roster(my_roster)
@@ -559,7 +601,7 @@ rt = await (
 | `.roster(provider)` | Identity-first roster provider |
 | `.topology_provider(provider)` | Identity-first topology provider |
 | `.agent_customizer(customizer)` | Identity-first agent customizer (`customize_build(context, spec, draft)`; see [Per-profile tools](#session-agent-builder-and-per-profile-tools)) |
-| `.on_error(callback)` | Error hook. Receives every runtime `ErrorEvent` (`category`, `message`, `context`) the gateway forwards as the `mobkit/on_error` notification; sync or async, fire-and-forget. Without it the events reach only the gateway's normal log sink: ERROR for failures, INFO for `actor_loop_recovered`, subject to configured tracing filters and stderr handling (see [Error hook and logging](/guides/unified-runtime#error-hook-and-logging)) |
+| `.on_error(callback)` | Error hook. Receives every runtime `ErrorEvent` (`category`, `message`, `context`) the gateway forwards as the `meta/on_error` notification; sync or async, fire-and-forget. Without it the events reach only the gateway's normal log sink: ERROR for failures, INFO for `actor_loop_recovered`, subject to configured tracing filters and stderr handling (see [Error hook and logging](/guides/unified-runtime#error-hook-and-logging)) |
 | `.identity_bootstrap_mode(mode)` | Eager, lazy, or bounded background-warm identity materialization; requires `.roster(...)` |
 | `.role_migrations(declarations)` | Authorize durable member role migrations for THIS boot. Takes an iterable of `RoleMigrationDeclaration` dataclasses or equivalent `identity` / `from_role` dicts, validating either form; a conflicting pair for one identity raises `ValueError`, an identical repeat is accepted, and leaving the setter unused emits no `role_migrations` init-params key at all |
 | `.session_service(builder, store)` | Session agent builder and optional store |
@@ -616,10 +658,11 @@ setter keeps a gateway without a roster on the classic path; a configured
 roster with no explicit mode retains eager materialization.
 
 Gateway memory config accepts `{backend: "local_json"}` with an optional
-`health_check_endpoint` (`memory.local_json(...)`); the legacy `elephant`
-`{backend, endpoint}` shape still works but emits a `DeprecationWarning`.
+`health_check_endpoint` (`memory.local_json(...)`), the only backend. The
+predecessor's backend helper was removed in 0.9 with no alias, and the gateway
+refuses its backend value at init.
 `memory(stores=...)` is intentionally rejected because the Rust gateway does not
-accept store lists in `mobkit/init`. JWT auth is the gateway-supported auth mode;
+accept store lists in `meta/init`. JWT auth is the gateway-supported auth mode;
 Google/OIDC helpers are not accepted by gateway init today.
 
 Agent memory is configured with `.agent_memory()` and requires
@@ -635,13 +678,13 @@ silent in-memory fallback. The `config.runtime_store` and
 `config.event_log` modules produce the explicit declarations:
 
 ```python
-from meerkat_mobkit import MobKit
-from meerkat_mobkit.config import event_log, runtime_store
+from meerkat_meta import Meta
+from meerkat_meta.config import event_log, runtime_store
 
 runtime = await (
-    MobKit.builder()
+    Meta.builder()
     .mob("config/mob.toml")
-    .persistent_state("state/mobkit")
+    .persistent_state("state/meta")
     # Declare an in-memory runtime store (sessions do not survive restart).
     .runtime_store(runtime_store.memory())
     # Declare a bounded queryable in-process event log — or event_log.null().
@@ -659,7 +702,7 @@ per-slot `StorageSlotSummary` census with `domain`, `durability_class`,
 refusal — file-name twins, a store that failed to open — surfaces as the
 typed `StorageResolutionError` (code `-32014`,
 `STORAGE_RESOLUTION_CODE`), not a `TransportError`; its message names the
-remediation (`mobkit/storage/doctor`, or the explicit ephemeral
+remediation (`meta/storage/doctor`, or the explicit ephemeral
 declaration). Blob-store durability has no wire declaration today — it is
 declared by Rust embedders via `ephemeral_blobs(true)` /
 `binary_blob_store(...)` and reported read-only in the census.
@@ -676,7 +719,7 @@ changed without parsing the message. Revert the edit, or move the stored
 definition with `declare_spec_update(expected_revision=...)`:
 
 ```python
-from meerkat_mobkit import CompositionProvenanceError
+from meerkat_meta import CompositionProvenanceError
 
 try:
     runtime = await builder.build()
@@ -695,7 +738,7 @@ startup warning naming this. Opening the console is an explicit builder call:
 
 ```python
 runtime = await (
-    MobKit.builder()
+    Meta.builder()
     .mob("config/mob.toml")
     .gateway("./rpc_gateway")
     .console_auth_required(False)  # explicit opt-out: local console, no identity provider
@@ -707,7 +750,7 @@ runtime = await (
 Use `.console_auth_required(False)` only behind a loopback bind or a reverse
 proxy that authenticates; for anything shared, configure `.auth(...)` instead.
 Earlier SDKs had no setter and hosts overrode
-`MobKitRuntime._build_init_params` to inject `console_require_app_auth` or
+`MetaRuntime._build_init_params` to inject `console_require_app_auth` or
 `console_config_path`; both now have builder methods and the override is no
 longer needed.
 
@@ -723,12 +766,12 @@ refused at init. See [Deployment](/guides/deployment).
 
 ```python
 # Context manager (recommended)
-async with await MobKit.builder().mob("mob.toml").gateway("./rpc_gateway").build() as rt:
+async with await Meta.builder().mob("mob.toml").gateway("./rpc_gateway").build() as rt:
     handle = rt.mob_handle()
     # ...
 
 # Explicit lifecycle
-rt = await MobKit.builder().mob("mob.toml").gateway("./rpc_gateway").build()
+rt = await Meta.builder().mob("mob.toml").gateway("./rpc_gateway").build()
 try:
     handle = rt.mob_handle()
     # ...
@@ -738,7 +781,7 @@ finally:
 
 ### Startup: no built-in total deadline
 
-`connect()` (and `build()`) runs `mobkit/init` as accepted-then-settled. The
+`connect()` (and `build()`) runs `meta/init` as accepted-then-settled. The
 gateway accepts the init at once, reports each startup phase, and then
 settles it `ready` or `failed`. The SDK has **no built-in total deadline** for
 that wait. Startup legitimately includes provider callbacks (each bounded at
@@ -747,9 +790,9 @@ deliberately unbounded and can run for minutes on a large roster. Any fixed
 SDK timer would sooner or later abort a healthy restore. A 60 s timeout still
 bounds the wait for the `accepted` answer, and for an older gateway's single
 init response. A host whose gateway answers init late can raise it with
-`MobKit.builder().gateway_init_timeout(seconds)` (a positive finite number of
+`Meta.builder().gateway_init_timeout(seconds)` (a positive finite number of
 seconds). That bounds a slow host startup; it does not fix one. It applies only
-to the `mobkit/init` request: ordinary RPCs and provider callback deadlines
+to the `meta/init` request: ordinary RPCs and provider callback deadlines
 keep their own timeouts.
 
 The wait ends only when one of these happens:
@@ -761,12 +804,12 @@ The wait ends only when one of these happens:
 - the gateway exits, or the transport reader fails. You get
   `InitOutcomeUnknownError`;
 - your own deadline runs out. Set it with
-  `MobKit.builder().init_deadline(seconds)`, and running out also raises
+  `Meta.builder().init_deadline(seconds)`, and running out also raises
   `InitOutcomeUnknownError`;
 - your task is cancelled.
 
 `InitOutcomeUnknownError` carries `init_id`, `last_phase` (the last
-`mobkit/init_progress` phase seen, such as `"prewarm"` or `"restore"`) and
+`meta/init_progress` phase seen, such as `"prewarm"` or `"restore"`) and
 `reason`. That makes a stuck or interrupted init diagnosable. The gateway may
 already have changed native state, so the SDK never retries it automatically
 and asks the gateway to shut down.
@@ -786,8 +829,8 @@ Two environment variables adjust this:
 
 | Variable | Effect |
 |----------|--------|
-| `MOBKIT_GATEWAY_STDERR_FILE=<path>` | Append gateway stderr to a file |
-| `MOBKIT_GATEWAY_STDERR=devnull` | Discard gateway stderr entirely |
+| `META_GATEWAY_STDERR_FILE=<path>` | Append gateway stderr to a file |
+| `META_GATEWAY_STDERR=devnull` | Discard gateway stderr entirely |
 
 Discarding is the legacy pre-0.8.9 default and is not recommended: it hides
 panic output and makes a slow-but-working storage migration indistinguishable
@@ -805,7 +848,7 @@ resume). The gateway pre-fills `SessionBuildOptions` before it calls you:
 | `app_context` | The host context attached to the spawn, if any |
 | `session_id` | The spawn's `session_id` label when it carries one, else the resumed session's id |
 | `resume_session_id` | The resumed session's id on a resume; `None` on a mint |
-| `fork_source` | On a fork child's builds (meerkat 0.8.45+), a `ForkBuildSource`: the source member (`source_member.mob_id`, `.role`, and `.member`, MobKit's encoded roster id) and the source session it was forked from (`source_session_id`); `None` otherwise |
+| `fork_source` | On a fork child's builds (meerkat 0.8.45+), a `ForkBuildSource`: the source member (`source_member.mob_id`, `.role`, and `.member`, Meta's encoded roster id) and the source session it was forked from (`source_session_id`); `None` otherwise |
 | `fork_source_identity` | On a fork child's builds, the source's durable identity (for example `domain:calendar`), the key to resolve the source's grants by; `None` otherwise |
 
 meerkat sets the fork lineage on the build that seats a durable fork
@@ -824,7 +867,7 @@ registered `tools` from what you return, and ignores a host-set
 one builder that branches on the pre-filled value:
 
 ```python
-from meerkat_mobkit import SessionAgentBuilder, SessionBuildOptions
+from meerkat_meta import SessionAgentBuilder, SessionBuildOptions
 
 class MyBuilder(SessionAgentBuilder):
     async def build_agent(self, options: SessionBuildOptions) -> None:
@@ -839,7 +882,7 @@ class MyBuilder(SessionAgentBuilder):
             )
 
 runtime = await (
-    MobKit.builder()
+    Meta.builder()
     .mob("config/mob.toml")
     .session_service(MyBuilder())
     .gateway("./rpc_gateway")
@@ -848,9 +891,9 @@ runtime = await (
 ```
 
 `.session_service(builder)` is the public setter; `build()` connects and
-registers the builder on the callback dispatcher for you. `MobKitBuilder._config`
-and `MobKitRuntime._dispatcher` are internal and change without notice. The
-builder must be set before `build()`: `mobkit/init` tells the gateway whether a
+registers the builder on the callback dispatcher for you. `MetaBuilder._config`
+and `MetaRuntime._dispatcher` are internal and change without notice. The
+builder must be set before `build()`: `meta/init` tells the gateway whether a
 session builder exists, so there is no post-connect registration.
 
 ### Identity-first equivalent: `customize_build`
@@ -865,7 +908,7 @@ handlers. The hook receives the durable spec (so `spec.profile` is the profile
 name), and registers tools on the draft:
 
 ```python
-from meerkat_mobkit import (
+from meerkat_meta import (
     AgentBuildContext,
     AgentBuildDraft,
     AgentCustomizerProtocol,
@@ -894,9 +937,9 @@ every `customize_build` publishes its tools into it. The tool list and the
 handler scope that serves it always change together. The tools therefore
 follow the member through every rebuild: a gateway restart, a member that is
 adopted instead of respawned, a respawn, and delivery-time repair. On a
-restart MobKit runs `customize_build` for each roster identity before the mob
+restart Meta runs `customize_build` for each roster identity before the mob
 is restored, so every restored member starts with its tools. They are listed by
-`mobkit/identity/resolved_tools` before any turn, and a run that starts at
+`meta/identity/resolved_tools` before any turn, and a run that starts at
 activation (a queued input, a kickoff) sees them. The materialization that
 follows runs `customize_build` again and republishes. If that early call fails,
 the failure is logged for the identity and reported as
@@ -948,11 +991,11 @@ to declare it.
 
 ## Error hierarchy
 
-All SDK errors inherit from `MobKitError`:
+All SDK errors inherit from `MetaError`:
 
 ```python
-from meerkat_mobkit.errors import (
-    MobKitError,           # Base exception
+from meerkat_meta.errors import (
+    MetaError,           # Base exception
     TransportError,        # Transport layer failures
     RpcError,              # JSON-RPC error responses
     NotConnectedError,     # No active runtime connection
@@ -993,9 +1036,19 @@ Most apps should use `send`, `subscribe_agent`/`subscribe_mob`, and `status`/`re
 | `memory_stores()` | `list[MemoryStoreInfo]` | List available memory stores |
 | `memory_index(...)` | `MemoryIndexResult` | Index an operational memory assertion |
 
+`gating_decide()` preserves the owner's recorded `approver_id`, `outcome`,
+`decided_at_ms`, `reason`, and `next_pending_id`. Older responses that omit these
+fields leave them as `None`; an absent or unrecognized outcome must not be treated
+as permission. Escalation returns `pending_approval` with a successor
+`next_pending_id`. The SDK makes no automatic follow-up request.
+
+Approval records a decision and does not execute the action. These methods expose
+[Meta gating](/concepts/gating); native retained-action consent and model-review
+configuration are separate contracts.
+
 ## Mobpack authoring
 
-`MobHandle` wraps the full Flow Editor authoring surface (`mobkit/mobpacks/*`) with snake_case typed methods — `mobpack_templates`, `mobpack_catalogs`, `mobpack_validate`, `mobpack_source`, `mobpack_export`, `mobpack_import`, `mobpack_list`, `mobpack_get`, `mobpack_create`, `mobpack_save`, `mobpack_delete`, `mobpack_undo`, `mobpack_redo`, `mobpack_apply_operation`, `mobpack_deploy_command`, and `mobpack_deploy`. The same wrappers exist on the SDK's typed JSON-RPC clients.
+`MobHandle` wraps the full Flow Editor authoring surface (`meta/mobpacks/*`) with snake_case typed methods — `mobpack_templates`, `mobpack_catalogs`, `mobpack_validate`, `mobpack_source`, `mobpack_export`, `mobpack_import`, `mobpack_list`, `mobpack_get`, `mobpack_create`, `mobpack_save`, `mobpack_delete`, `mobpack_undo`, `mobpack_redo`, `mobpack_apply_operation`, `mobpack_deploy_command`, and `mobpack_deploy`. The same wrappers exist on the SDK's typed JSON-RPC clients.
 
 ```python
 import base64
@@ -1015,18 +1068,18 @@ archive = base64.b64decode(pack.content_base64)  # pack.filename, pack.media_typ
 
 ## Public surface exports
 
-Everything below is importable directly from `meerkat_mobkit`:
+Everything below is importable directly from `meerkat_meta`:
 
 ```python
-from meerkat_mobkit import (
+from meerkat_meta import (
     # Builder + Runtime
-    MobKit, MobKitBuilder, MobKitRuntime,
+    Meta, MetaBuilder, MetaRuntime,
     # Data models
     DiscoverySpec, PreSpawnData, SessionBuildOptions, SessionQuery,
     # Agent builder
     SessionAgentBuilder,
     # Errors
-    MobKitError, TransportError, RpcError,
+    MetaError, TransportError, RpcError,
     MobEventsStaleError, MOB_EVENTS_STALE_CURSOR_CODE,
     StorageResolutionError, STORAGE_RESOLUTION_CODE,
     CompositionProvenanceError, COMPOSITION_PROVENANCE_CODE,
@@ -1046,7 +1099,7 @@ from meerkat_mobkit import (
     RuntimeRouteResult, DeliveryHistoryResult,
     # Gating
     GatingEvaluateResult, GatingDecisionResult,
-    GatingAuditEntry, GatingPendingEntry,
+    GatingAuditEntry, GatingPendingEntry, GatingOrigin,
     # Memory
     MemoryQueryResult, MemoryStoreInfo, MemoryIndexResult,
     AgentMemoryRecord, AgentMemoryRecallResult, AgentMemoryForgetResult,
@@ -1060,7 +1113,7 @@ from meerkat_mobkit import (
 )
 ```
 
-Module authoring helpers (`ModuleSpec`, `define_module`, etc.) live in `meerkat_mobkit.helpers` — not top-level.
+Module authoring helpers (`ModuleSpec`, `define_module`, etc.) live in `meerkat_meta.helpers` — not top-level.
 
 ## See also
 

@@ -1,7 +1,7 @@
 """TDD tests for identity-first models: DurableAgentSpec, DispatchInput, ContentBlock (REQ-40, REQ-43)."""
 import pytest
 
-from meerkat_mobkit.identity_first_models import (
+from meerkat_meta.identity_first_models import (
     ContentBlock,
     ContinuityHealth,
     DispatchInput,
@@ -90,7 +90,7 @@ class TestIdentityBootstrapModels:
         assert status.to_dict()["error"] == "one or more identities failed to warm"
 
     def test_status_parser_reads_typed_restore_progress(self):
-        from meerkat_mobkit import IdentityRestoreProgress
+        from meerkat_meta import IdentityRestoreProgress
 
         payload = self._status_payload(
             identities={

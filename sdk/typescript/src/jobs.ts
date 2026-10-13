@@ -203,7 +203,7 @@ export class DetachedJobReporter {
     leaseExpiresAtMs: number;
     heartbeatAtMs?: number;
   }): Promise<unknown> {
-    return this.send("mobkit/jobs/heartbeat", {
+    return this.send("meta/jobs/heartbeat", {
       heartbeat_at_ms: options.heartbeatAtMs ?? Date.now(),
       lease_expires_at_ms: options.leaseExpiresAtMs,
     });
@@ -214,7 +214,7 @@ export class DetachedJobReporter {
     detail: string,
     options?: { observedAtMs?: number },
   ): Promise<unknown> {
-    return this.send("mobkit/jobs/progress", {
+    return this.send("meta/jobs/progress", {
       cursor,
       detail,
       observed_at_ms: options?.observedAtMs ?? Date.now(),
@@ -225,7 +225,7 @@ export class DetachedJobReporter {
     checkpointRef: string,
     options?: { observedAtMs?: number },
   ): Promise<unknown> {
-    return this.send("mobkit/jobs/checkpoint", {
+    return this.send("meta/jobs/checkpoint", {
       checkpoint_ref: checkpointRef,
       observed_at_ms: options?.observedAtMs ?? Date.now(),
     });
@@ -235,7 +235,7 @@ export class DetachedJobReporter {
     if (this.terminal) return null;
     const params: Record<string, unknown> = { completed_at_ms: Date.now() };
     if (resultRef !== null) params.result_ref = resultRef;
-    const result = await this.send("mobkit/jobs/complete", params);
+    const result = await this.send("meta/jobs/complete", params);
     this.terminal = true;
     return result;
   }
@@ -247,14 +247,14 @@ export class DetachedJobReporter {
       code,
     };
     if (detailRef !== undefined) params.detail_ref = detailRef;
-    const result = await this.send("mobkit/jobs/fail", params);
+    const result = await this.send("meta/jobs/fail", params);
     this.terminal = true;
     return result;
   }
 
   async cancelAck(): Promise<unknown> {
     if (this.terminal) return null;
-    const result = await this.send("mobkit/jobs/cancel_ack", {
+    const result = await this.send("meta/jobs/cancel_ack", {
       acknowledged_at_ms: Date.now(),
     });
     this.terminal = true;

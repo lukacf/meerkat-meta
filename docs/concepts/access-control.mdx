@@ -4,7 +4,7 @@ description: "Optional ABAC for the console: control which users can see which a
 icon: "lock"
 ---
 
-MobKit ships an optional attribute-based access control (ABAC) layer for everything that flows through the console and observation surfaces. When it is off — the default — nothing changes. When it is on, every console caller only sees and operates exactly what their attributes grant: the agent sidebar, roster, topology, timeline, event streams, sends, and lifecycle actions are all filtered or gated per principal, invisibly. A restricted user doesn't see denied agents or disabled buttons explained; they just get a console shaped to what they're allowed.
+Meta ships an optional attribute-based access control (ABAC) layer for everything that flows through the console and observation surfaces. When it is off — the default — nothing changes. When it is on, every console caller only sees and operates exactly what their attributes grant: the agent sidebar, roster, topology, timeline, event streams, sends, and lifecycle actions are all filtered or gated per principal, invisibly. A restricted user doesn't see denied agents or disabled buttons explained; they just get a console shaped to what they're allowed.
 
 There are no roles. Every check evaluates the caller's attributes (subject, group memberships) against the resource's attributes (agent identity, role, labels) for one action — the closest thing to a role is a rule that bundles a group with a set of actions.
 
@@ -123,9 +123,9 @@ let runtime = UnifiedRuntime::builder()
 ```
 
 ```typescript
-import { MobKit } from "@rkat/mobkit-sdk";
+import { Meta } from "@rkat/meta-sdk";
 
-const mobkit = await MobKit.builder()
+const meta = await Meta.builder()
   .mob("config/mob.toml")
   .accessControl("config/access.toml") // auto-discovered if the file exists
   .gateway("/path/to/rpc_gateway")
@@ -133,16 +133,30 @@ const mobkit = await MobKit.builder()
 ```
 
 Use the `rpc_gateway` executable installed by the
-[quickstart](/quickstart#install) for the explicit gateway path.
+[quickstart](/quickstart#prepare-a-matching-sdk-and-gateway) for the explicit gateway path.
 
 ```python
-mobkit = await (
-    MobKit.builder()
+meta = await (
+    Meta.builder()
     .mob("config/mob.toml")
     .access_control("config/access.toml")  # auto-discovered if the file exists
     .build()
 )
 ```
+
+### Approver identities
+
+`approvers` binds the approver ids that gating requests name in `requested_approver` to the principals who may decide as them. A binding lists subjects, groups, or both; several principals may hold one id, such as a shared role.
+
+```toml
+[approvers."person:alice"]
+subjects = ["alice@example.com"]
+
+[approvers."role:release-manager"]
+groups = ["release-managers"]
+```
+
+Holders are read from the live configuration when a decision is made, so removing a subject from a binding or from a holding group revokes the identity for the next request. An approver id must not be empty or carry surrounding whitespace, must have at least one holder, and may only reference defined groups. A binding grants no permission by itself: deciding still requires `gating.decide`. Bindings apply only to authenticated console decisions; an open console (no app authentication) takes the approver id from the request and is for trusted local use only. The console re-checks `gating.decide`, the request's origin and the held approver ids against the live configuration while it records the decision, so a revocation published while a decision waits is honored.
 
 ## Live administration from the console
 
@@ -155,8 +169,19 @@ one admin when enabling enforcement. A file-backed controller saves successful
 changes to its configured TOML path before publishing the new live state; an
 in-memory controller has no file persistence guarantee.
 
-A disabled controller with no admins lets authenticated callers bootstrap access
-settings. Naming admins closes that bootstrap path.
+Authentication alone never grants administration. A controller whose
+configuration names no admin, enabled or not, can be administered by nobody from
+the console. Name the first admin in the file before starting the runtime, or in
+trusted local setup with `AccessController::new` and `with_persist_path`. A
+configured access file must exist and be valid: a missing path, a directory or
+an invalid file stops startup. Conventional discovery follows the same rule.
+Access control stays off only when nothing is at `config/access.toml`, which
+includes a missing or dangling parent directory. Any other entry there, even a
+directory or a dangling `access.toml` link, and any other lookup error (such as
+a parent that is a file) goes to the same strict load, which stops startup when
+it cannot open, read, parse or validate the file. The loader does not check the
+file type before reading, so a FIFO at that path blocks startup instead of
+stopping it with an error.
 
 Configure trusted [console authentication](/guides/authentication) separately.
 The authenticated token supplies the caller's subject; a `subject` in a preview
@@ -194,7 +219,7 @@ reads and previews remain available.
 ### Implement a checked-save client
 
 Use `POST /console/rpc` with the existing console authentication transport.
-Read `mobkit/access/status`, then the protected `mobkit/access/get`. Require
+Read `meta/access/status`, then the protected `meta/access/get`. Require
 `conditional_mutations: "checked_v1"`, a nonempty `owner_instance` and a usable
 `revision`; retain the `get` configuration and its complete token with the draft.
 The owner instance identifies this controller lifetime. It is not a permission
@@ -208,7 +233,7 @@ upsert a rule using the owner instance and revision returned by the read
 {
   "jsonrpc": "2.0",
   "id": "access-save-1",
-  "method": "mobkit/access/rules/upsert",
+  "method": "meta/access/rules/upsert",
   "params": {
     "checked_v1": {
       "owner_instance": "<owner_instance from get>",
@@ -225,12 +250,12 @@ upsert a rule using the owner instance and revision returned by the read
 
 | Existing method | Payload inside `checked_v1`, in addition to the edit token |
 |-----------------|----------------------------------------------------------|
-| `mobkit/access/set` | `config` |
-| `mobkit/access/enable` | `enabled` |
-| `mobkit/access/rules/upsert` | `rule` |
-| `mobkit/access/rules/delete` | `id` |
-| `mobkit/access/groups/set` | `name`, `group` |
-| `mobkit/access/groups/delete` | `name` |
+| `meta/access/set` | `config` |
+| `meta/access/enable` | `enabled` |
+| `meta/access/rules/upsert` | `rule` |
+| `meta/access/rules/delete` | `id` |
+| `meta/access/groups/set` | `name`, `group` |
+| `meta/access/groups/delete` | `name` |
 
 Successful writes return the new `revision`; refresh before starting a new edit.
 Malformed, mixed or unknown checked envelopes fail without falling back to a
@@ -275,8 +300,8 @@ from mutation permissions. Checked saves add no comprehensive
 configuration-history or native-operation audit viewer.
 
 For implementation work, the existing entrypoints are
-`crates/meerkat-mobkit/src/access/controller.rs` (owner),
-`crates/meerkat-mobkit/src/http_console.rs` (RPC contract),
+`crates/meerkat-meta/src/access/controller.rs` (owner),
+`crates/meerkat-meta/src/http_console.rs` (RPC contract),
 `console/src/panels/AccessPanel.tsx` and `console/src/ConsoleApp.tsx` (draft and
 save flow), and `packages/console-core/src/headless.ts` (transport).
 The real-owner browser scenario runs through `console/browser-e2e.cjs` against
@@ -286,17 +311,17 @@ the existing `console_acceptance_fixture` example. Discover it with:
 node console/browser-e2e.cjs --list --scenario=real-checked-save-recovery
 ```
 
-Running it requires the prebuilt fixture binary (`MOBKIT_EXAMPLE_BIN_DIR`) and
+Running it requires the prebuilt fixture binary (`META_EXAMPLE_BIN_DIR`) and
 the composed Console bundle; discovery alone is not an E2E result.
 
 ## What gets enforced
 
 - `/console/experience` — agents the caller can't view vanish from the sidebar, roster, topology, identity status; per-agent affordances (`can_send_message`, `can_retire`, `can_respawn`) and runtime capabilities are intersected with the caller's grants, so the stock console UI degrades invisibly. Affordances are resolved per agent: a caller who can view and retire an agent but not message it gets a disabled composer on that agent while keeping the retire action — having no send grant anywhere does not flip the whole console to deployment read-only.
-- `/console/timeline`, timeline streams, and `mobkit/console/query_timeline` — frames for hidden identities are filtered out.
-- `mobkit/console/send` and `/console/send` — require `agent.send` on the target.
-- `mobkit/agent_memory/remember` and `mobkit/agent_memory/forget` — require `agent.memory.write` and `agent.memory.delete` respectively on the target identity. `mobkit/agent_memory/recall` and `mobkit/agent_memory/manifest` require **both** `agent.memory.read` and `agent.view` on the identity.
-- `mobkit/memory/panel/*` (the console Memory panel's reads) filters every returned record by its scope: identity-scoped records need `agent.memory.read` + `agent.view` on that identity, mob-scoped records need `mob.memory.read`, operator-scoped records need `operator.memory.read`, realm-scoped records and `mobkit/memory/panel/dreams` need an unscoped `agent.memory.read` grant, and quarantined records (still quarantined, or tombstoned after ever being quarantined) plus `mobkit/memory/panel/quarantine` need `memory.quarantine.review`. The review grant only opens the quarantine surface; each queue record and pending promotion is still filtered by the per-scope read grants above on its (target) scope. Memory content is more sensitive than roster visibility, so plain `agent.view` alone no longer reads any of it.
-- `mobkit/memory/quarantine/decide` (the operator quarantine decision) requires `memory.quarantine.review`, `agent.view` and `agent.memory.read` on the identity, and `agent.memory.write` to release or `agent.memory.delete` to tombstone (any other verdict needs both, then fails validation). Every effect is one the same caller could already cause through `remember`, `update` or `forget` (a released update supersedes its prior, as `update` does); the decision adds the lineage, the trust ceiling, the content binding and the audit trail. An anonymous caller is held to the same grants whenever access control is on. The capabilities list advertises it only to callers holding `memory.quarantine.review`.
+- `/console/timeline`, timeline streams, and `meta/console/query_timeline` — frames for hidden identities are filtered out.
+- `meta/console/send` and `/console/send` — require `agent.send` on the target.
+- `meta/agent_memory/remember` and `meta/agent_memory/forget` — require `agent.memory.write` and `agent.memory.delete` respectively on the target identity. `meta/agent_memory/recall` and `meta/agent_memory/manifest` require **both** `agent.memory.read` and `agent.view` on the identity.
+- `meta/memory/panel/*` (the console Memory panel's reads) filters every returned record by its scope: identity-scoped records need `agent.memory.read` + `agent.view` on that identity, mob-scoped records need `mob.memory.read`, operator-scoped records need `operator.memory.read`, realm-scoped records and `meta/memory/panel/dreams` need an unscoped `agent.memory.read` grant, and quarantined records (still quarantined, or tombstoned after ever being quarantined) plus `meta/memory/panel/quarantine` need `memory.quarantine.review`. The review grant only opens the quarantine surface; each queue record and pending promotion is still filtered by the per-scope read grants above on its (target) scope. Memory content is more sensitive than roster visibility, so plain `agent.view` alone no longer reads any of it.
+- `meta/memory/quarantine/decide` (the operator quarantine decision) requires `memory.quarantine.review`, `agent.view` and `agent.memory.read` on the identity, and `agent.memory.write` to release or `agent.memory.delete` to tombstone (any other verdict needs both, then fails validation). Every effect is one the same caller could already cause through `remember`, `update` or `forget` (a released update supersedes its prior, as `update` does); the decision adds the lineage, the trust ceiling, the content binding and the audit trail. An anonymous caller is held to the same grants whenever access control is on. The capabilities list advertises it only to callers holding `memory.quarantine.review`.
 - Lifecycle and runtime RPCs — mapped to `agent.retire` / `agent.respawn` / `agent.reset` / `agent.spawn` / `runtime.admin` per method.
 - Topology control — query visibility requires `agent.view` and
   `topology.view` per endpoint. Connect, disconnect, and reconnect require the
@@ -307,7 +332,7 @@ the composed Console bundle; discovery alone is not an E2E result.
   every endpoint in a returned record. Cross-authority mutation is separately
   gated and is available only to a same-process host coordinating both
   runtimes; the authority-local JSON-RPC surface fails it closed.
-- `/agents/{id}/events` — requires `agent.view` on that agent. `/mob/events` and `/mobkit/mob_events/stream` require `mob.observe` to open and additionally filter each event by `agent.view` on its source (see below).
+- `/agents/{id}/events` — requires `agent.view` on that agent. `/mob/events` and `/meta/mob_events/stream` require `mob.observe` to open and additionally filter each event by `agent.view` on its source (see below).
 
 Label- and role-based rules resolve against an attribute cache the runtime refreshes from every roster projection, so selectors keep working on surfaces that only carry an identity string.
 
@@ -317,7 +342,7 @@ Label- and role-based rules resolve against an attribute cache the runtime refre
 
 ### `mob.observe` and per-agent filtering
 
-`mob.observe` gates *access to the whole-mob event surfaces* — `/mob/events`, `/mobkit/mob_events/stream`, and `mobkit/mob_events/query` / `subscribe`. It does **not** override per-agent `agent.view`: events flowing through those surfaces are still filtered per agent, so a caller with `mob.observe` but not `agent.view` on agent X sees neither X's live events nor X's lifecycle entries. (Mob-level structural events with no agent attribution flow on the `mob.observe` grant alone.) To observe the entire mob, grant `mob.observe` together with `agent.view` on `*`.
+`mob.observe` gates *access to the whole-mob event surfaces* — `/mob/events`, `/meta/mob_events/stream`, and `meta/mob_events/query` / `subscribe`. It does **not** override per-agent `agent.view`: events flowing through those surfaces are still filtered per agent, so a caller with `mob.observe` but not `agent.view` on agent X sees neither X's live events nor X's lifecycle entries. (Mob-level structural events with no agent attribution flow on the `mob.observe` grant alone.) To observe the entire mob, grant `mob.observe` together with `agent.view` on `*`.
 
 ### `/blobs/{id}` is a capability surface
 
@@ -349,7 +374,7 @@ Two separately granted host-plane verbs address the runtime host, not a member:
 Host verbs must be explicitly named in the grant and require an installed
 host-facts provider to return data; member selectors do not scope them.
 
-A **control grant** binds one calling gateway - identified by its Ed25519 pubkey, the same one `mobkit/peer_pubkey` reports - to the verbs it may use and, for member-plane operations, the members it may reach. Anything outside the grant is refused before the request reaches your mob, so an ungranted caller never learns whether the member it named exists.
+A **control grant** binds one calling gateway - identified by its Ed25519 pubkey, the same one `meta/peer_pubkey` reports - to the verbs it may use and, for member-plane operations, the members it may reach. Anything outside the grant is refused before the request reaches your mob, so an ungranted caller never learns whether the member it named exists.
 
 ### How a caller is identified
 
@@ -361,7 +386,7 @@ This is independent of the response signing you may already be using: `pubkey` o
 
 ```toml
 [control_grants.ops-mob]
-# The calling gateway's pubkey, from its `mobkit/peer_pubkey`.
+# The calling gateway's pubkey, from its `meta/peer_pubkey`.
 pubkey = "ed25519:KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="
 verbs = ["lookup_member", "wire", "unwire"]
 members = ["bob"]
@@ -409,7 +434,7 @@ let advertised = runtime
 Use `ControlAuthorizer::with_grants_for_audience(table, "my-mob-id")` when one caller holds grants on several of your gateways and a captured request must not be replayable across them; the mob id is the one peers use for this gateway in their contact directories.
 
 <Note>
-The SDK-driven `rpc_gateway` accepts the same TOML under `runtime_options.control_grants_toml`; the conventional `mobkit_gateway` reads `[control_grants]` beside `[mobs]` in `config/contacts.toml`. The Rust builder accepts a `ControlGrantTable` through `control_grants`. Every configured-listener path binds the table to the runtime's mob id as the signed audience. `ControlAuthorizer::from_toml` still distinguishes an absent section from an empty section for embedders that explicitly choose compatibility behavior.
+The SDK-driven `rpc_gateway` accepts the same TOML under `runtime_options.control_grants_toml`; the conventional `meta_gateway` reads `[control_grants]` beside `[mobs]` in `config/contacts.toml`. The Rust builder accepts a `ControlGrantTable` through `control_grants`. Every configured-listener path binds the table to the runtime's mob id as the signed audience. `ControlAuthorizer::from_toml` still distinguishes an absent section from an empty section for embedders that explicitly choose compatibility behavior.
 </Note>
 
 Three limits worth stating plainly:

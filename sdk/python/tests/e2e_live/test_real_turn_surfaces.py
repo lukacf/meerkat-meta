@@ -14,8 +14,8 @@ Rules for tests in this file:
   - bounded polling; the bound is generous because the LLM is real and the
     test is about correctness, not latency
 
-Run:  make e2e-live            (builds rpc_gateway, exports MOBKIT_GATEWAY_BIN)
-Cost: three short turns on the model named by MOBKIT_E2E_LIVE_MODEL
+Run:  make e2e-live            (builds rpc_gateway, exports META_GATEWAY_BIN)
+Cost: three short turns on the model named by META_E2E_LIVE_MODEL
       (default claude-sonnet-4-6).
 """
 from __future__ import annotations
@@ -28,13 +28,13 @@ from pathlib import Path
 
 import pytest
 
-from meerkat_mobkit.builder import MobKit
-from meerkat_mobkit.identity_first_models import DurableAgentSpec
+from meerkat_meta.builder import Meta
+from meerkat_meta.identity_first_models import DurableAgentSpec
 
-MODEL = os.environ.get("MOBKIT_E2E_LIVE_MODEL", "claude-sonnet-4-6")
+MODEL = os.environ.get("META_E2E_LIVE_MODEL", "claude-sonnet-4-6")
 IDENTITY = "identity:archivist"
 PROFILE = "archivist"
-TURN_BUDGET_S = float(os.environ.get("MOBKIT_E2E_LIVE_TURN_BUDGET_S", "120"))
+TURN_BUDGET_S = float(os.environ.get("META_E2E_LIVE_TURN_BUDGET_S", "120"))
 
 MOB_TOML = f"""\
 [mob]
@@ -69,7 +69,7 @@ AUTONOMOUS_PROFILE = "sentinel"
 
 MOB_TOML += f"""
 # No runtime_mode: meerkat's default is autonomous_host. On that mode meerkat
-# refuses injected context, so MobKit must skip recall typed and let the turn
+# refuses injected context, so Meta must skip recall typed and let the turn
 # proceed without memory (0.8.31), instead of the bridge refusing the turn.
 [profiles.sentinel]
 model = "{MODEL}"
@@ -108,7 +108,7 @@ class _Roster:
 
 async def _boot(state_dir: Path, mob_toml: Path, gateway_bin: str, **agent_memory_kwargs):
     builder = (
-        MobKit.builder()
+        Meta.builder()
         .gateway(gateway_bin)
         .mob(str(mob_toml))
         .persistent_state(str(state_dir))
@@ -219,12 +219,12 @@ async def _seed_and_send(rt, token: str):
     # Two SDK doors reach a member. `send_message` is what handle.send() uses
     # and is the default here; `send` is the identity-first door. The knob lets
     # the same end-to-end assertion exercise either public SDK surface.
-    door = os.environ.get("MOBKIT_E2E_LIVE_SEND_DOOR", "send_message")
+    door = os.environ.get("META_E2E_LIVE_SEND_DOOR", "send_message")
     if door == "send":
-        # identity-first door: mobkit/send
+        # identity-first door: meta/send
         result = await rt.send(IDENTITY, "What is the archive vault door code?")
     else:
-        # mob-handle door: mobkit/send_message (what handle.send uses)
+        # mob-handle door: meta/send_message (what handle.send uses)
         result = await handle.send(IDENTITY, message="What is the archive vault door code?")
     assert getattr(result, "accepted", True), result
     return handle

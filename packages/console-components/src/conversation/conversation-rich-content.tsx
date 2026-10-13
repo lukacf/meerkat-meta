@@ -22,6 +22,7 @@ import { cloneElement, useEffect, useRef, useState, type KeyboardEvent, type Rea
 import { copyTextToClipboard } from "../shared";
 
 import { ConversationMarkdown, type MarkdownUrlPolicy } from "./conversation-markdown";
+import { useConversationImageSource } from "./blob-image";
 
 import { ChangeStatPair } from "./change-stat-pair";
 import { CopyButton } from "../copy-button";
@@ -33,7 +34,7 @@ type ConversationRichContentProps = {
   markdownUrlPolicy?: MarkdownUrlPolicy;
   richStyle?: "default" | "streaming";
   Icon?: IconRenderer | null;
-  // Default true preserves meerkat-studio's display normalization; the MobKit
+  // Default true preserves meerkat-studio's display normalization; the Meta
   // console passes false for faithful rendering of raw agent text (pairs with
   // the parse-side `displayNormalization` option).
   displayNormalization?: boolean;
@@ -527,27 +528,7 @@ function ToolCallBlock({
           <span className="cc-tool-call__status">{statusIcon}</span>
           <CopyBtn text={toolBlockCopyText(block)} />
         </div>
-        {block.peerImages && block.peerImages.length > 0 && (
-          <div className="cc-tool-call__attachments">
-            {block.peerImages.map((image, index) => (
-              <button
-                className="cc-tool-call__image-button"
-                key={`${image.blobId || image.imageId || image.src}-${index}`}
-                onClick={() => window.open(image.src, "_blank", "noopener,noreferrer")}
-                type="button"
-              >
-                <img
-                  alt={image.alt || ""}
-                  className="cc-tool-call__image"
-                  height={image.height}
-                  loading="lazy"
-                  src={image.src}
-                  width={image.width}
-                />
-              </button>
-            ))}
-          </div>
-        )}
+        <ToolCallImages images={block.peerImages} />
         {expanded && detailRows.length > 0 && (
           <div className="cc-tool-call__body">
             {detailRows.map((row) => (
@@ -590,6 +571,7 @@ function ToolCallBlock({
         <span className="cc-tool-call__status">{statusIcon} {toolCompletionLabel(block)}</span>
         <CopyBtn text={toolBlockCopyText(block)} />
       </div>
+      <ToolCallImages images={block.images} />
       {expanded && (
         <div className="cc-tool-call__body">
           {argsPreview && (
@@ -607,6 +589,44 @@ function ToolCallBlock({
         </div>
       )}
     </section>
+  );
+}
+
+/// Images attached to a tool call: a peer message's images or the images a
+/// tool returned in its result. Each opens full size in a new tab.
+function ToolCallImages({ images }: { images?: ConversationRichImageBlock[] }) {
+  if (!images || images.length === 0) return null;
+  return (
+    <div className="cc-tool-call__attachments">
+      {images.map((image, index) => (
+        <ToolCallImage image={image} key={`${image.blobId || image.imageId || image.src}-${index}`} />
+      ))}
+    </div>
+  );
+}
+
+function ToolCallImage({ image }: { image: ConversationRichImageBlock }) {
+  const shown = useConversationImageSource(image);
+  if (shown.unavailable) {
+    return <span className="cc-tool-call__image-unavailable">Image unavailable</span>;
+  }
+  const src = shown.src;
+  if (!src) return null;
+  return (
+    <button
+      className="cc-tool-call__image-button"
+      onClick={() => window.open(src, "_blank", "noopener,noreferrer")}
+      type="button"
+    >
+      <img
+        alt={image.alt || ""}
+        className="cc-tool-call__image"
+        height={image.height}
+        loading="lazy"
+        src={src}
+        width={image.width}
+      />
+    </button>
   );
 }
 
@@ -678,6 +698,7 @@ function ToolCallGroup({ blocks }: { blocks: ConversationRichToolCallBlock[] }) 
                     <pre className="cc-tool-call__pre">{result}</pre>
                   </div>
                 )}
+                <ToolCallImages images={block.images} />
               </div>
             );
           })}

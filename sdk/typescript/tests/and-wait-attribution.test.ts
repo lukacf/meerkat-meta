@@ -15,7 +15,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  MobKitError,
+  MetaError,
   PostAdmissionObservationError,
   RpcError,
   TurnTrackingUnavailableError,
@@ -59,19 +59,19 @@ function own(output: string): Record<string, unknown> {
 
 /**
  * Runtime whose `_rpc` answers from a script. `waitForTurn` steps are walked
- * one per `mobkit/wait_for_turn` (holding the last); a step with `error`
+ * one per `meta/wait_for_turn` (holding the last); a step with `error`
  * rejects like a gateway JSON-RPC error. The identity-wide methods report a
  * peer's completed turn, so any fallback is visible.
  */
 async function makeRuntime(script: {
   sends: Record<string, unknown>[];
   waitForTurn?: Step[];
-  /** Answer for `mobkit/wait_for_completion`; `raw` throws a plain Error. */
+  /** Answer for `meta/wait_for_completion`; `raw` throws a plain Error. */
   completion?: Record<string, unknown> | { raw: string };
 }) {
-  const { MobKitRuntime } = await import("../src/runtime.js");
+  const { MetaRuntime } = await import("../src/runtime.js");
   const calls: { method: string; params: Record<string, unknown> }[] = [];
-  const rt = new MobKitRuntime({
+  const rt = new MetaRuntime({
     mobConfigPath: null,
     sessionBuilder: null,
     sessionStore: null,
@@ -107,10 +107,10 @@ async function makeRuntime(script: {
     await Promise.resolve();
     const p = params ?? {};
     calls.push({ method, params: p });
-    if (method === "mobkit/send" || method === "mobkit/dispatch") {
+    if (method === "meta/send" || method === "meta/dispatch") {
       return sends.shift() ?? {};
     }
-    if (method === "mobkit/wait_for_turn") {
+    if (method === "meta/wait_for_turn") {
       const step = steps[Math.min(waitIndex, steps.length - 1)] ?? { state: "unknown" };
       waitIndex += 1;
       if ("error" in step && typeof step.error === "object" && step.error !== null) {
@@ -122,7 +122,7 @@ async function makeRuntime(script: {
       }
       return { identity: p.identity, ticket: p.ticket, ...step };
     }
-    if (method === "mobkit/wait_for_completion") {
+    if (method === "meta/wait_for_completion") {
       const completion = script.completion;
       if (completion !== undefined && "raw" in completion) {
         throw new Error(String(completion.raw));
@@ -134,7 +134,7 @@ async function makeRuntime(script: {
         ...(completion ?? {}),
       };
     }
-    if (method === "mobkit/inspect_identity") {
+    if (method === "meta/inspect_identity") {
       return {
         identity: p.identity,
         output_preview: "peer reply",
@@ -148,7 +148,7 @@ async function makeRuntime(script: {
   const count = (method: string) => calls.filter((c) => c.method === method).length;
   const identityWide = () =>
     calls.filter((c) =>
-      ["mobkit/wait_for_completion", "mobkit/completion_cursor", "mobkit/inspect_identity"].includes(
+      ["meta/wait_for_completion", "meta/completion_cursor", "meta/inspect_identity"].includes(
         c.method,
       ),
     ).length;
@@ -205,7 +205,7 @@ describe("attribution", () => {
       assert.equal(outcome.untrackedCode, code);
       assert.equal(outcome.ticket, null);
       assert.match(warnings[0] ?? "", new RegExp(`TurnTrackingUnavailableWarning: .*${code}.*not attributed`));
-      assert.equal(count("mobkit/dispatch"), 1);
+      assert.equal(count("meta/dispatch"), 1);
     });
   }
 
@@ -230,7 +230,7 @@ describe("attribution", () => {
           return true;
         },
       );
-      assert.equal(count("mobkit/send"), 1);
+      assert.equal(count("meta/send"), 1);
       assert.equal(identityWide(), 0);
     });
   }
@@ -250,7 +250,7 @@ describe("post-admission observation", () => {
       assert.equal(error.ticket, TICKET);
       return true;
     });
-    assert.equal(count("mobkit/send"), 1);
+    assert.equal(count("meta/send"), 1);
   });
 
   it("retries only the exact ticket after a read failure and never redispatches", async () => {
@@ -267,8 +267,8 @@ describe("post-admission observation", () => {
 
     assert.equal(outcome.text, "own reply");
     assert.equal(outcome.attributed, true);
-    assert.equal(count("mobkit/dispatch"), 1);
-    assert.equal(count("mobkit/wait_for_turn"), 3);
+    assert.equal(count("meta/dispatch"), 1);
+    assert.equal(count("meta/wait_for_turn"), 3);
     assert.equal(identityWide(), 0);
   });
 
@@ -293,7 +293,7 @@ describe("post-admission observation", () => {
         return true;
       },
     );
-    assert.equal(count("mobkit/dispatch"), 1);
+    assert.equal(count("meta/dispatch"), 1);
   });
 
   it("an unknown ticket throws TurnUnknownError carrying the admission", async () => {
@@ -307,7 +307,7 @@ describe("post-admission observation", () => {
       assert.equal((error.admission as { turnTicket: unknown }).turnTicket, TICKET);
       return true;
     });
-    assert.equal(count("mobkit/send"), 1);
+    assert.equal(count("meta/send"), 1);
   });
 
   it("a turn pending at the deadline throws TurnWaitTimeoutError with the admission", async () => {
@@ -325,7 +325,7 @@ describe("post-admission observation", () => {
         return true;
       },
     );
-    assert.equal(count("mobkit/send"), 1);
+    assert.equal(count("meta/send"), 1);
   });
 });
 
@@ -346,7 +346,7 @@ describe("default-path custody", () => {
         error = caught;
       }
     });
-    return { error, dispatches: count("mobkit/dispatch") };
+    return { error, dispatches: count("meta/dispatch") };
   }
 
   function custody(error: unknown): { admission: unknown; ticket: unknown } {

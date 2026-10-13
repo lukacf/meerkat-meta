@@ -8,12 +8,12 @@ key must be reachable from the builder and absent unless the host chose one.
 
 import pytest
 
-from meerkat_mobkit.builder import MobKit
-from meerkat_mobkit.runtime import MobKitRuntime
+from meerkat_meta.builder import Meta
+from meerkat_meta.runtime import MetaRuntime
 
 
 def _init_params(builder):
-    return MobKitRuntime(builder._config)._build_init_params()
+    return MetaRuntime(builder._config)._build_init_params()
 
 
 PROVIDER_BINDING = {
@@ -24,24 +24,24 @@ PROVIDER_BINDING = {
 
 
 def test_a_provider_binding_reaches_the_init_params():
-    builder = MobKit.builder().child_application_tool_policy(PROVIDER_BINDING)
+    builder = Meta.builder().child_application_tool_policy(PROVIDER_BINDING)
     assert _init_params(builder)["child_application_tool_policy"] == PROVIDER_BINDING
 
 
 def test_the_explicit_unmanaged_opt_out_reaches_the_init_params():
-    builder = MobKit.builder().child_application_tool_policy({"kind": "unmanaged"})
+    builder = Meta.builder().child_application_tool_policy({"kind": "unmanaged"})
     assert _init_params(builder)["child_application_tool_policy"] == {
         "kind": "unmanaged"
     }
 
 
 def test_the_parameter_is_absent_unless_the_host_chose_one():
-    assert "child_application_tool_policy" not in _init_params(MobKit.builder())
+    assert "child_application_tool_policy" not in _init_params(Meta.builder())
 
 
 def test_the_builder_keeps_its_own_copy():
     binding = dict(PROVIDER_BINDING)
-    builder = MobKit.builder().child_application_tool_policy(binding)
+    builder = Meta.builder().child_application_tool_policy(binding)
     binding["policy_id"] = "guest-tools"
     assert (
         _init_params(builder)["child_application_tool_policy"]["policy_id"]
@@ -68,9 +68,9 @@ def test_the_builder_keeps_its_own_copy():
 )
 def test_a_binding_meerkat_cannot_use_is_refused(binding, message):
     with pytest.raises(ValueError, match=message):
-        MobKit.builder().child_application_tool_policy(binding)
+        Meta.builder().child_application_tool_policy(binding)
 
 
 def test_a_non_mapping_is_refused():
     with pytest.raises(TypeError, match="must be a mapping"):
-        MobKit.builder().child_application_tool_policy("unmanaged")
+        Meta.builder().child_application_tool_policy("unmanaged")

@@ -1,3 +1,4 @@
+export { CONSOLE_DISPLAYABLE_IMAGE_TYPES, displayableImageMediaType } from "./blob-image";
 export * from "./custom-panels";
 export { realtimeMessageOrigin, hasRealtimeMessageOriginCarrier, isRealtimeHistoryMessage } from "./realtime-message-identity";
 export { conversationPresentationRows } from "./assistant-presentation";
@@ -351,7 +352,7 @@ export type {
   IdentityInspectTarget,
   LogsPanelTarget,
   MemoryPanelTarget,
-  MobKitDockTarget,
+  MetaDockTarget,
   OptimisticUserMessage,
   RosterPanelTarget,
   RoutingPanelTarget,
@@ -405,17 +406,18 @@ export type {
   ConsoleTimelineController,
   ConsoleTimelineQueryInput,
   ConsoleTimelineSubscribeInput,
+  ConsoleBlobReadInput,
   ConsoleUploadInput,
   ConsoleUploadResult,
-  MobKitConsoleController,
-  MobKitConsoleTransport,
+  MetaConsoleController,
+  MetaConsoleTransport,
 } from "./headless";
 export {
   CONSOLE_COMMAND_NAMES,
   ConsoleCapabilityUnavailableError,
   consoleCommandMethod,
   createHttpConsoleTransport,
-  createMobKitConsoleController,
+  createMetaConsoleController,
 } from "./headless";
 
 export type {
@@ -443,11 +445,11 @@ export {
 export type {
   ConsoleWorkbenchTarget,
   HostWorkbenchTarget,
-  MobKitControlTargetKind,
-  MobKitControlWorkbenchTarget,
-  MobKitIdentityChatTarget,
-  MobKitIdentityInspectTarget,
-  MobKitWorkbenchTarget,
+  MetaControlTargetKind,
+  MetaControlWorkbenchTarget,
+  MetaIdentityChatTarget,
+  MetaIdentityInspectTarget,
+  MetaWorkbenchTarget,
 } from "./targets";
 export {
   migrateConsoleWorkbenchTarget,

@@ -7,6 +7,30 @@ afterEach(cleanup);
 const request = normalizePendingApproval({ pending_id: "request:1", action_id: "action:1", action: "Publish release artifacts", rationale: "Make the tested release available", actor_id: "actor", deadline_at_ms: 1, payload: { destination: "production", full: "complete request contents" } })!;
 const snapshot = (status: PendingApprovalSnapshot["status"] = "ready"): PendingApprovalSnapshot => ({ scopeKey: "authority", status, requests: [request], decisions: {}, readOnly: false });
 describe("ApprovalCard", () => {
+  it("shows the requested approver separately from actor and describes notification IDs as references", () => {
+    const routed = normalizePendingApproval({ ...request.raw, requested_approver: "human:reviewer",
+      approval_recipient: "review-queue", approval_channel: "notification",
+      approval_route_id: "route:1", approval_delivery_id: "delivery:1" })!;
+    const view = render(<ApprovalCard request={routed} resourceStatus="ready" onDecide={() => {}} />);
+    expect(view.getByText("Actor").nextElementSibling?.textContent).toBe("actor");
+    expect(view.getByText("Requested approver").nextElementSibling?.textContent).toBe("human:reviewer");
+    expect(view.getByText("Notification recipient").nextElementSibling?.textContent).toBe("review-queue");
+    expect(view.getByText("Notification channel").nextElementSibling?.textContent).toBe("notification");
+    expect(view.getByText("Route reference").nextElementSibling?.textContent).toBe("route:1");
+    expect(view.getByText("Delivery reference").nextElementSibling?.textContent).toBe("delivery:1");
+    expect(view.getByText("Notification references do not confirm receipt or a human decision.")).toBeTruthy();
+    expect(view.queryByText("Delivered")).toBeNull();
+    expect(view.queryByText("Approved")).toBeNull();
+  });
+
+  it("does not infer an approver or delivery when the owner omits them", () => {
+    const view = render(<ApprovalCard request={request} resourceStatus="ready" onDecide={() => {}} />);
+    expect(view.getByText("Requested approver").nextElementSibling?.textContent).toBe("Not specified");
+    expect(view.queryByText("Route reference")).toBeNull();
+    expect(view.queryByText("Delivery reference")).toBeNull();
+    expect(view.queryByText("Notification references do not confirm receipt or a human decision.")).toBeNull();
+  });
+
   it("shows readable scope, full request details and supported decisions", () => {
     const decide = vi.fn();
     const view = render(<ApprovalCard request={request} resourceStatus="ready" onDecide={decide} />);

@@ -5,7 +5,7 @@ const path = require("node:path");
 const { chromium } = require("playwright");
 const { startFixture, eventually } = require("../acceptance-runtime.cjs");
 const { browserFailureMonitor, navigation } = require("./browser-failure-monitor.cjs");
-const evidence = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+const evidence = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
 
 async function clonedTabDrafts() {
   const fixture = await startFixture();
@@ -18,7 +18,7 @@ async function clonedTabDrafts() {
   const editor = page => page.getByTestId("chat-composer:router:main").first();
   async function waitSaved(page, text) {
     await eventually(() => page.evaluate(value => [localStorage, sessionStorage].some(storage =>
-      Object.keys(storage).some(key => key.startsWith("mobkit-composer-draft:v2:") && JSON.parse(storage.getItem(key)).text === value)), text), "draft persisted");
+      Object.keys(storage).some(key => key.startsWith("meta-composer-draft:v2:") && JSON.parse(storage.getItem(key)).text === value)), text), "draft persisted");
   }
   try {
     await navigation(first, "open original draft tab", async () => {
@@ -38,8 +38,8 @@ async function clonedTabDrafts() {
       return copy;
     });
     // A real same-origin opener copies sessionStorage, including the tab ID.
-    assert.equal(await first.evaluate(() => sessionStorage.getItem("mobkit-composer-tab:v1")),
-      await clone.evaluate(() => sessionStorage.getItem("mobkit-composer-tab:v1")));
+    assert.equal(await first.evaluate(() => sessionStorage.getItem("meta-composer-tab:v1")),
+      await clone.evaluate(() => sessionStorage.getItem("meta-composer-tab:v1")));
     assert.equal(await editor(clone).inputValue(), "Original tab draft");
     await editor(clone).fill("Independent copied tab draft");
     await waitSaved(clone, "Independent copied tab draft");

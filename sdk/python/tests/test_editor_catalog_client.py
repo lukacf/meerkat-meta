@@ -1,9 +1,9 @@
-"""Tests for low-level MobKit editor catalog typed-client wrappers."""
+"""Tests for low-level Meta editor catalog typed-client wrappers."""
 from __future__ import annotations
 
 import pytest
 
-from meerkat_mobkit._client import MobkitAsyncTypedClient, MobkitTypedClient
+from meerkat_meta._client import MetaAsyncTypedClient, MetaTypedClient
 
 
 def _response(request, result):
@@ -13,44 +13,44 @@ def _response(request, result):
 def test_sync_typed_client_editor_catalog_methods_call_exact_rpc_names():
     calls = []
     responses = {
-        "mobkit/tools/catalog": {
+        "meta/tools/catalog": {
             "schema_version": "mobpack.editor.v1",
             "runtime_backed": False,
-            "source": "mobkit/tool-config",
+            "source": "meta/tool-config",
             "authoring_provider": {"id": "standalone_authoring"},
             "tool_catalog": [{"id": "shell"}],
         },
-        "mobkit/skills/catalog": {
+        "meta/skills/catalog": {
             "schema_version": "mobpack.editor.v1",
             "runtime_backed": False,
-            "source": "mobkit/authoring-skill-realms",
+            "source": "meta/authoring-skill-realms",
             "authoring_provider": {"id": "standalone_authoring"},
-            "skill_realms": [{"id": "mobkit/authoring"}],
+            "skill_realms": [{"id": "meta/authoring"}],
         },
-        "mobkit/agent_definitions/list": {
+        "meta/agent_definitions/list": {
             "schema_version": "mobpack.editor.v1",
             "runtime_backed": False,
-            "source": "mobkit/authoring-agent-definitions",
+            "source": "meta/authoring-agent-definitions",
             "authoring_provider": {"id": "standalone_authoring"},
             "agent_definitions": [{"id": "authoring:reviewer"}],
         },
-        "mobkit/mobpacks/templates": {
+        "meta/mobpacks/templates": {
             "schema_version": "mobpack.editor.v1",
-            "source": "mobkit/mobpack-templates",
+            "source": "meta/mobpack-templates",
             "authoring_provider": {"id": "standalone_authoring"},
             "blank_mobpack": {"document": {}},
             "sample_mobpacks": [{"id": "sample"}],
             "sample_agent_definitions": [{"id": "sample:reviewer"}],
             "templates": {"blank_mobpack": {"document": {}}},
         },
-        "mobkit/mobpacks/catalogs": {
+        "meta/mobpacks/catalogs": {
             "schema_version": "mobpack.editor.v1",
             "runtime_backed": False,
             "authoring_provider": {"id": "standalone_authoring"},
-            "sources": {"tools": "mobkit/tools/catalog"},
+            "sources": {"tools": "meta/tools/catalog"},
             "templates": {},
             "tool_catalog": [{"id": "shell"}],
-            "skill_realms": [{"id": "mobkit/authoring"}],
+            "skill_realms": [{"id": "meta/authoring"}],
             "blank_mobpack": {"document": {}},
             "sample_mobpacks": [{"id": "sample"}],
             "agent_definitions": [{"id": "authoring:reviewer"}],
@@ -64,18 +64,18 @@ def test_sync_typed_client_editor_catalog_methods_call_exact_rpc_names():
         calls.append(request["method"])
         return _response(request, responses[request["method"]])
 
-    client = MobkitTypedClient.from_persistent(transport)
+    client = MetaTypedClient.from_persistent(transport)
     assert client.tools_catalog()["tool_catalog"] == [{"id": "shell"}]
-    assert client.skills_catalog()["skill_realms"] == [{"id": "mobkit/authoring"}]
+    assert client.skills_catalog()["skill_realms"] == [{"id": "meta/authoring"}]
     assert client.agent_definitions()["agent_definitions"] == [{"id": "authoring:reviewer"}]
     assert client.mobpack_templates()["sample_mobpacks"] == [{"id": "sample"}]
-    assert client.mobpack_catalogs()["sources"] == {"tools": "mobkit/tools/catalog"}
+    assert client.mobpack_catalogs()["sources"] == {"tools": "meta/tools/catalog"}
     assert calls == [
-        "mobkit/tools/catalog",
-        "mobkit/skills/catalog",
-        "mobkit/agent_definitions/list",
-        "mobkit/mobpacks/templates",
-        "mobkit/mobpacks/catalogs",
+        "meta/tools/catalog",
+        "meta/skills/catalog",
+        "meta/agent_definitions/list",
+        "meta/mobpacks/templates",
+        "meta/mobpacks/catalogs",
     ]
 
 
@@ -90,7 +90,7 @@ async def test_async_typed_client_editor_catalog_methods_call_exact_rpc_names():
             {
                 "schema_version": "mobpack.editor.v1",
                 "runtime_backed": False,
-                "source": "mobkit/tool-config",
+                "source": "meta/tool-config",
                 "authoring_provider": {"id": "standalone_authoring"},
                 "tool_catalog": [],
                 "skill_realms": [],
@@ -105,18 +105,18 @@ async def test_async_typed_client_editor_catalog_methods_call_exact_rpc_names():
             },
         )
 
-    client = MobkitAsyncTypedClient(transport)
+    client = MetaAsyncTypedClient(transport)
     await client.tools_catalog()
     await client.skills_catalog()
     await client.agent_definitions()
     await client.mobpack_templates()
     await client.mobpack_catalogs()
     assert calls == [
-        "mobkit/tools/catalog",
-        "mobkit/skills/catalog",
-        "mobkit/agent_definitions/list",
-        "mobkit/mobpacks/templates",
-        "mobkit/mobpacks/catalogs",
+        "meta/tools/catalog",
+        "meta/skills/catalog",
+        "meta/agent_definitions/list",
+        "meta/mobpacks/templates",
+        "meta/mobpacks/catalogs",
     ]
 
 
@@ -126,7 +126,7 @@ def _validation_payload():
         "diagnostics": [],
         "display_rows": [],
         "flow_ids": ["flow_a"],
-        "validation_source": "mobkit/mobpacks/validate",
+        "validation_source": "meta/mobpacks/validate",
         "deploy_command": "rkat mob deploy",
     }
 
@@ -146,16 +146,16 @@ def _draft_row_payload(revision=1, can_undo=False, can_redo=False):
 
 
 _MOBPACK_AUTHORING_RESPONSES = {
-    "mobkit/mobpacks/validate": _validation_payload(),
-    "mobkit/mobpacks/source": {
+    "meta/mobpacks/validate": _validation_payload(),
+    "meta/mobpacks/source": {
         "filename": "demo.mobpack",
         "media_type": "application/vnd.meerkat.mobpack",
         "mob_toml": "[mob]\n",
         "source_files": [],
         "validation": _validation_payload(),
-        "source": "mobkit/mobpacks/source",
+        "source": "meta/mobpacks/source",
     },
-    "mobkit/mobpacks/export": {
+    "meta/mobpacks/export": {
         "filename": "demo.mobpack",
         "media_type": "application/vnd.meerkat.mobpack",
         "content_base64": "UEsDBA==",
@@ -163,76 +163,76 @@ _MOBPACK_AUTHORING_RESPONSES = {
         "source_files": [],
         "validation": _validation_payload(),
     },
-    "mobkit/mobpacks/import": {
+    "meta/mobpacks/import": {
         "document": {"mob_id": "demo"},
         "validation": _validation_payload(),
-        "source": "mobkit/mobpacks/import:mob.toml",
+        "source": "meta/mobpacks/import:mob.toml",
         "source_label": "mob.toml",
         "source_media_type": "text/x-toml",
     },
-    "mobkit/mobpacks/list": {
-        "source": "mobkit/mobpacks/list",
+    "meta/mobpacks/list": {
+        "source": "meta/mobpacks/list",
         "store_path": "/tmp/drafts.json",
         "runtime_backed": False,
         "rows": [_draft_row_payload()],
     },
-    "mobkit/mobpacks/get": {
-        "source": "mobkit/mobpacks/get",
+    "meta/mobpacks/get": {
+        "source": "meta/mobpacks/get",
         "store_path": "/tmp/drafts.json",
         "runtime_backed": False,
         "row": _draft_row_payload(),
     },
-    "mobkit/mobpacks/create": {
-        "source": "mobkit/mobpacks/create",
+    "meta/mobpacks/create": {
+        "source": "meta/mobpacks/create",
         "store_path": "/tmp/drafts.json",
         "row": _draft_row_payload(),
         "rows": [_draft_row_payload()],
     },
-    "mobkit/mobpacks/save": {
-        "source": "mobkit/mobpacks/save",
+    "meta/mobpacks/save": {
+        "source": "meta/mobpacks/save",
         "store_path": "/tmp/drafts.json",
         "row": _draft_row_payload(revision=2),
         "rows": [_draft_row_payload(revision=2)],
     },
-    "mobkit/mobpacks/undo": {
-        "source": "mobkit/mobpacks/undo",
+    "meta/mobpacks/undo": {
+        "source": "meta/mobpacks/undo",
         "store_path": "/tmp/drafts.json",
         "stepped": True,
         "row": _draft_row_payload(revision=3, can_redo=True),
         "rows": [_draft_row_payload(revision=3, can_redo=True)],
     },
-    "mobkit/mobpacks/redo": {
-        "source": "mobkit/mobpacks/redo",
+    "meta/mobpacks/redo": {
+        "source": "meta/mobpacks/redo",
         "store_path": "/tmp/drafts.json",
         "stepped": False,
         "reason": "nothing to redo",
         "row": _draft_row_payload(revision=3, can_redo=True),
         "rows": [_draft_row_payload(revision=3, can_redo=True)],
     },
-    "mobkit/mobpacks/delete": {
-        "source": "mobkit/mobpacks/delete",
+    "meta/mobpacks/delete": {
+        "source": "meta/mobpacks/delete",
         "store_path": "/tmp/drafts.json",
         "id": "f_demo",
         "deleted": True,
         "rows": [],
     },
-    "mobkit/mobpacks/apply_operation": {
-        "source": "mobkit/mobpacks/apply_operation",
+    "meta/mobpacks/apply_operation": {
+        "source": "meta/mobpacks/apply_operation",
         "operation": "add_member",
         "ok": True,
         "document": {"mob_id": "demo"},
         "selection": {"kind": "agent", "id": "reviewer"},
         "validation": _validation_payload(),
     },
-    "mobkit/mobpacks/deploy_command": {
+    "meta/mobpacks/deploy_command": {
         "command": "rkat mob deploy demo.mobpack",
         "argv": ["rkat", "mob", "deploy", "demo.mobpack"],
         "deploy_command": "rkat mob deploy",
         "filename": "demo.mobpack",
         "validation": _validation_payload(),
-        "source": "meerkat_mobkit::mobpack::deploy_argv",
+        "source": "meerkat_meta::mobpack::deploy_argv",
     },
-    "mobkit/mobpacks/deploy": {
+    "meta/mobpacks/deploy": {
         "filename": "demo.mobpack",
         "pack_path": "/tmp/demo.mobpack",
         "pack_sha256": "deadbeef",
@@ -247,15 +247,15 @@ _MOBPACK_AUTHORING_RESPONSES = {
 }
 
 _EXPECTED_MOBPACK_AUTHORING_CALLS = [
-    ("mobkit/mobpacks/validate", {"document": {"mob_id": "demo"}, "rkat_validate": True}),
-    ("mobkit/mobpacks/source", {"document": {"mob_id": "demo"}}),
-    ("mobkit/mobpacks/export", {"document": {"mob_id": "demo"}}),
-    ("mobkit/mobpacks/import", {"mob_toml": "[mob]\n", "source_name": "mob.toml"}),
-    ("mobkit/mobpacks/list", {}),
-    ("mobkit/mobpacks/get", {"id": "f_demo"}),
-    ("mobkit/mobpacks/create", {"template": "blank", "name": "Demo"}),
+    ("meta/mobpacks/validate", {"document": {"mob_id": "demo"}, "rkat_validate": True}),
+    ("meta/mobpacks/source", {"document": {"mob_id": "demo"}}),
+    ("meta/mobpacks/export", {"document": {"mob_id": "demo"}}),
+    ("meta/mobpacks/import", {"mob_toml": "[mob]\n", "source_name": "mob.toml"}),
+    ("meta/mobpacks/list", {}),
+    ("meta/mobpacks/get", {"id": "f_demo"}),
+    ("meta/mobpacks/create", {"template": "blank", "name": "Demo"}),
     (
-        "mobkit/mobpacks/save",
+        "meta/mobpacks/save",
         {
             "id": "f_demo",
             "document": {"mob_id": "demo"},
@@ -265,21 +265,21 @@ _EXPECTED_MOBPACK_AUTHORING_CALLS = [
         },
     ),
     (
-        "mobkit/mobpacks/undo",
+        "meta/mobpacks/undo",
         {"id": "f_demo", "expected_revision": 2, "expected_etag": "f_demo:2"},
     ),
-    ("mobkit/mobpacks/redo", {"id": "f_demo"}),
-    ("mobkit/mobpacks/delete", {"id": "f_demo", "expected_revision": 2}),
+    ("meta/mobpacks/redo", {"id": "f_demo"}),
+    ("meta/mobpacks/delete", {"id": "f_demo", "expected_revision": 2}),
     (
-        "mobkit/mobpacks/apply_operation",
+        "meta/mobpacks/apply_operation",
         {
             "document": {"mob_id": "demo"},
             "operation": {"type": "add_member"},
             "expected_catalog_snapshot_id": "snap-1",
         },
     ),
-    ("mobkit/mobpacks/deploy_command", {"document": {"mob_id": "demo"}}),
-    ("mobkit/mobpacks/deploy", {"document": {"mob_id": "demo"}, "execute": False}),
+    ("meta/mobpacks/deploy_command", {"document": {"mob_id": "demo"}}),
+    ("meta/mobpacks/deploy", {"document": {"mob_id": "demo"}, "execute": False}),
 ]
 
 
@@ -291,7 +291,7 @@ def test_sync_typed_client_mobpack_authoring_methods_call_exact_rpc_names():
         return _response(request, _MOBPACK_AUTHORING_RESPONSES[request["method"]])
 
     document = {"mob_id": "demo"}
-    client = MobkitTypedClient.from_persistent(transport)
+    client = MetaTypedClient.from_persistent(transport)
     assert client.mobpack_validate(document, rkat_validate=True)["ok"] is True
     assert client.mobpack_source(document)["mob_toml"] == "[mob]\n"
     assert client.mobpack_export(document)["content_base64"] == "UEsDBA=="
@@ -343,7 +343,7 @@ async def test_async_typed_client_mobpack_authoring_methods_call_exact_rpc_names
         return _response(request, _MOBPACK_AUTHORING_RESPONSES[request["method"]])
 
     document = {"mob_id": "demo"}
-    client = MobkitAsyncTypedClient(transport)
+    client = MetaAsyncTypedClient(transport)
     await client.mobpack_validate(document, rkat_validate=True)
     await client.mobpack_source(document)
     await client.mobpack_export(document)
@@ -377,6 +377,6 @@ def test_sync_typed_client_mobpack_validate_rejects_invalid_payload():
     def transport(request):
         return _response(request, {"ok": "yes"})
 
-    client = MobkitTypedClient.from_persistent(transport)
+    client = MetaTypedClient.from_persistent(transport)
     with pytest.raises(ValueError, match="invalid result payload"):
         client.mobpack_validate({"mob_id": "demo"})

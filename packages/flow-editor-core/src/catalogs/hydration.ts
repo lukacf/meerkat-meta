@@ -1,19 +1,19 @@
 // @ts-nocheck — migration window only (removed by the S23 strictness
 // ratchet): the catalogs-hydration functions move byte-verbatim as plain
 // JS, and their `options = {}` / `boot = {}` / `result = {}` parameter
-// defaults (emptyMobKitCatalogs, mobKitCatalogsFromSchema,
-// hydrateMobpackDocumentState, authoringProjectionFromMobKitDocument, and
+// defaults (emptyMetaCatalogs, metaCatalogsFromSchema,
+// hydrateMobpackDocumentState, authoringProjectionFromMetaDocument, and
 // friends) raise TS2339 under .ts semantics. Source-contract pins this
 // exact text, so suppression must live at file level, not in the moved
 // bodies. Resolution/linkage stays guarded behaviorally: the projection
 // suite and export-keys test load the bundle and exercise these functions,
 // so a missed import or re-export still fails the gate as a ReferenceError.
 //
-// Catalog hydration plane for the Flow Editor controller: MobKit catalog
+// Catalog hydration plane for the Flow Editor controller: Meta catalog
 // projections (models, tool catalog, skill realms, deploy defaults, the
-// per-surface *ViewFromSchema aggregation in mobKitCatalogsFromSchema),
+// per-surface *ViewFromSchema aggregation in metaCatalogsFromSchema),
 // mobpack document hydration into editor state, authoring projections from
-// MobKit documents/operation results, and imported-flow id allocation.
+// Meta documents/operation results, and imported-flow id allocation.
 // Moved verbatim from the controller.js catalogs-hydration range. This
 // slice re-homes deploySettingsForUi from the residue, retiring the last
 // _residue-bridge wrapper (flow/reconcile.ts now imports it relatively).
@@ -105,7 +105,7 @@ export function toolCatalogFromCatalogs(schema) {
     }));
 }
 
-export function emptyMobKitCatalogs(boot = {}) {
+export function emptyMetaCatalogs(boot = {}) {
   return {
     models: [],
     toolCatalog: [],
@@ -147,7 +147,7 @@ export function emptyMobKitCatalogs(boot = {}) {
   };
 }
 
-export function mobKitCatalogsFromSchema(schema, boot = {}, catalogPayload = null) {
+export function metaCatalogsFromSchema(schema, boot = {}, catalogPayload = null) {
   const catalogSource = catalogPayload && typeof catalogPayload === "object" ? catalogPayload : {};
   const agentDefinitions = agentDefinitionsFromCatalogs(catalogSource);
   const sampleAgentDefinitions = sampleAgentDefinitionsFromCatalogs(catalogSource);
@@ -251,7 +251,7 @@ export function graphProjectionForDocument(document, members, contract) {
   };
 }
 
-export function graphProjectionFromMobKitResult(result) {
+export function graphProjectionFromMetaResult(result) {
   const source = result?.graph_projection || result?.graphProjection || result;
   if (!source || typeof source !== "object") return null;
   if (!Array.isArray(source.instances) || !Array.isArray(source.edges) || !Array.isArray(source.frames)) return null;
@@ -299,7 +299,7 @@ export function hydrateMobpackDocumentState(result, options = {}) {
     };
   }
   const skillRealms = mergeSkillRealms(document.skill_realms, options.contractSkillRealms || []);
-  const graphProjection = graphProjectionFromMobKitResult(result)
+  const graphProjection = graphProjectionFromMetaResult(result)
     || graphProjectionForDocument({ ...document, flow }, members, options.contract);
   const hasDeploySettings = document.deploy && typeof document.deploy === "object" && !Array.isArray(document.deploy);
   const hasMobSettings = document.mob_settings && typeof document.mob_settings === "object" && !Array.isArray(document.mob_settings);
@@ -334,7 +334,7 @@ export function hydrateMobpackDocumentState(result, options = {}) {
   };
 }
 
-export function authoringProjectionFromMobKitDocument(document, options = {}) {
+export function authoringProjectionFromMetaDocument(document, options = {}) {
   const source = document && typeof document === "object" ? document : {};
   const flow = flowFromHydratedDocument(source) || emptyAuthoringFlowState();
   return {
@@ -354,8 +354,8 @@ export function authoringProjectionFromMobKitDocument(document, options = {}) {
 export function authoringProjectionFromOperationResult(result, options = {}) {
   const document = result?.document && typeof result.document === "object" ? result.document : null;
   if (!document) return null;
-  const projection = authoringProjectionFromMobKitDocument(document, options);
-  const graphProjection = graphProjectionFromMobKitResult(result);
+  const projection = authoringProjectionFromMetaDocument(document, options);
+  const graphProjection = graphProjectionFromMetaResult(result);
   if (graphProjection) {
     projection.instances = graphProjection.instances;
     projection.edges = graphProjection.edges;

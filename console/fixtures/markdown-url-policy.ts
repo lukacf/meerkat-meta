@@ -10,7 +10,7 @@ export function acceptanceMarkdownUrlPolicy(
   const approvedImage = approvedBlob ? `${host.origin}/blobs/${encodeURIComponent(approvedBlob)}` : null;
   return {
     resolveLink: url => {
-      if (url === "/release/review" || url === "mobkit:review") return `${host.origin}/console#release-review`;
+      if (url === "/release/review" || url === "meta:review") return `${host.origin}/console#release-review`;
       return url === "https://example.com/reference" ? url : null;
     },
     resolveImage: url => approvedImage !== null && url === approvedImage ? url : null,

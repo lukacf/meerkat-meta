@@ -1,8 +1,8 @@
 # 004 - MDM Console Pack
 
-This pack re-imagines the old TUX MDM flow as a MobKit console over one real
+This pack re-imagines the old TUX MDM flow as a Meta console over one real
 mob roster. There is no kennel service and no target HTTP registry in this
-design. MobKit owns the roster, the hive is a local member, and every target is
+design. Meta owns the roster, the hive is a local member, and every target is
 declared as a remote `backend: external` mob member with a real Meerkat comms
 address and Ed25519 public key.
 
@@ -28,7 +28,7 @@ console:
 ]
 ```
 
-The same value can be supplied as `binding` in the canonical MobKit/Meerkat
+The same value can be supplied as `binding` in the canonical Meta/Meerkat
 wire shape:
 
 ```json
@@ -122,7 +122,7 @@ not a provider-backed Hive-to-target query proof.
 
 The success signal is not "target is listed." The success signal is a target
 turn that runs on the target host, uses target-side tools or shell where
-appropriate, and returns over the MobKit/Meerkat peer path.
+appropriate, and returns over the Meta/Meerkat peer path.
 
 ## Smoke
 
@@ -152,7 +152,7 @@ ingress acknowledgement as proof of target execution.
 processes and requires Hive's verified terminal summary to name both targets.
 
 The pack uses the repository's pinned Meerkat dependency family in
-`crates/meerkat-mobkit/Cargo.toml` (currently `=0.8.40`), not an independent pack pin.
+`crates/meerkat-meta/Cargo.toml` (currently `=0.8.40`), not an independent pack pin.
 Validate the checked-in dependencies without changing them:
 
 ```bash

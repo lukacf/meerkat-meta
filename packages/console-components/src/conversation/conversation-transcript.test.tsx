@@ -101,7 +101,7 @@ describe("ConversationTranscript", () => {
           meta: "implementation",
           avatarLabel: "BLD",
         },
-        text: "I normalized the view model for MobKit.",
+        text: "I normalized the view model for Meta.",
       },
     ];
 
@@ -110,7 +110,7 @@ describe("ConversationTranscript", () => {
         Icon={Icon}
         onToggleDiffFile={() => undefined}
         viewState={{
-          conversationId: "mobkit-thread",
+          conversationId: "meta-thread",
           entries,
           groups: groupConversationTimelineEntries(entries),
           turnDiff: null,
@@ -121,7 +121,7 @@ describe("ConversationTranscript", () => {
 
     expect(screen.getByText("Builder")).toBeInTheDocument();
     expect(screen.getByText("implementation")).toBeInTheDocument();
-    expect(screen.getByText("I normalized the view model for MobKit.")).toBeInTheDocument();
+    expect(screen.getByText("I normalized the view model for Meta.")).toBeInTheDocument();
   });
 
   test("groups timeline entries into scrollable user turns", () => {

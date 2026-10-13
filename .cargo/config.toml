@@ -2,7 +2,7 @@
 # and friends) allocates very large stack frames, especially in debug builds.
 # Upstream meerkat carries the same workspace-wide workaround (see meerkat's
 # .cargo/config.toml) and sizes its rpc binary's tokio workers explicitly.
-# Without this, mobkit debug test runs overflow the default 2 MiB tokio
+# Without this, meta debug test runs overflow the default 2 MiB tokio
 # worker stacks inside meerkat-runtime's DSL apply path.
 [env]
 RUST_MIN_STACK = "16777216"

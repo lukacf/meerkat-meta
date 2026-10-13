@@ -1,23 +1,23 @@
 """TDD tests for the new builder API: persistent_state, after_create, SessionCreatedContext."""
 import pytest
-from meerkat_mobkit.builder import MobKit, MobKitBuilder
-from meerkat_mobkit.agent_builder import CallbackDispatcher, SessionAgentBuilder
-from meerkat_mobkit.models import SessionBuildOptions, SessionCreatedContext
+from meerkat_meta.builder import Meta, MetaBuilder
+from meerkat_meta.agent_builder import CallbackDispatcher, SessionAgentBuilder
+from meerkat_meta.models import SessionBuildOptions, SessionCreatedContext
 
 
 class TestPersistentState:
-    """Tests for .persistent_state() on MobKitBuilder."""
+    """Tests for .persistent_state() on MetaBuilder."""
 
     def test_persistent_state_returns_builder(self):
-        b = MobKit.builder().persistent_state("/tmp/test-state")
-        assert isinstance(b, MobKitBuilder)
+        b = Meta.builder().persistent_state("/tmp/test-state")
+        assert isinstance(b, MetaBuilder)
 
     def test_persistent_state_sets_config(self):
-        b = MobKit.builder().persistent_state("/tmp/test-state")
+        b = Meta.builder().persistent_state("/tmp/test-state")
         assert b._config.persistent_state == "/tmp/test-state"
 
     def test_persistent_state_default_is_none(self):
-        b = MobKit.builder()
+        b = Meta.builder()
         assert b._config.persistent_state is None
 
 
@@ -100,7 +100,7 @@ class TestSessionCreatedContext:
     """Tests for SessionCreatedContext dataclass."""
 
     def test_import(self):
-        from meerkat_mobkit import SessionCreatedContext
+        from meerkat_meta import SessionCreatedContext
         ctx = SessionCreatedContext(
             model="claude-sonnet-4-5",
             labels={"agent_type": "lead"},
@@ -111,7 +111,7 @@ class TestSessionCreatedContext:
         assert ctx.system_prompt == "You are a lead agent."
 
     def test_from_dict(self):
-        from meerkat_mobkit import SessionCreatedContext
+        from meerkat_meta import SessionCreatedContext
         ctx = SessionCreatedContext.from_dict({
             "model": "test-model",
             "labels": {"k": "v"},
@@ -209,7 +209,7 @@ class TestForkSource:
 
     @pytest.mark.asyncio
     async def test_fork_build_receives_typed_source_and_identity(self):
-        from meerkat_mobkit import ForkBuildSource, MobMemberBinding
+        from meerkat_meta import ForkBuildSource, MobMemberBinding
 
         seen: dict = {}
 
@@ -248,7 +248,7 @@ class TestForkSource:
 
     @pytest.mark.asyncio
     async def test_fork_source_is_never_sent_back(self):
-        from meerkat_mobkit import ForkBuildSource, MobMemberBinding
+        from meerkat_meta import ForkBuildSource, MobMemberBinding
 
         class MintingBuilder:
             async def build_agent(self, opts: SessionBuildOptions) -> None:

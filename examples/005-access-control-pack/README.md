@@ -1,7 +1,7 @@
 # Access Control Pack
 
 Demonstrates the optional ABAC (attribute-based access control) layer against
-the **stock** MobKit console — no custom UI. With access control enabled, every
+the **stock** Meta console — no custom UI. With access control enabled, every
 console caller's experience is filtered by their authenticated identity and
 group membership: agents they can't view vanish from the sidebar/roster/
 topology, per-agent affordances are gated, event streams are filtered, and

@@ -2,7 +2,7 @@ import { subscribeTimelineWithRecovery } from "./timeline-recovery";
 import type { ConsoleTimelineSubscriptionOptions, ConsoleTransportState } from "./timeline-subscription";
 import {
   type ConsoleWorkbenchTarget,
-  type MobKitWorkbenchTarget,
+  type MetaWorkbenchTarget,
 } from "./targets";
 import {
   CONSOLE_BLOB_PATH_PREFIX,
@@ -16,6 +16,7 @@ import {
   sendConsole,
   sendConsoleMultipart,
   subscribeTimelineEvents,
+  readConsoleBlob,
   uploadConsoleBlobMultipart,
 } from "./network";
 import type {
@@ -28,7 +29,7 @@ import type {
 import type { ConsoleTopologyControlCapabilities } from "./topology";
 
 export type ConsoleFactSource =
-  | "mobkit-protocol"
+  | "meta-protocol"
   | "controller-derived"
   | "optimistic"
   | "host-adapter";
@@ -87,6 +88,11 @@ export interface ConsoleUploadInput {
   blobId?: string;
   file?: File;
   mediaType?: string;
+}
+
+export interface ConsoleBlobReadInput {
+  blobId: string;
+  signal?: AbortSignal;
 }
 
 export interface ConsoleUploadResult {
@@ -148,216 +154,216 @@ export type ConsoleCommandName = typeof CONSOLE_COMMAND_NAMES[keyof typeof CONSO
 
 type ConsoleCommandSpec = {
   method: typeof CONSOLE_RPC_METHODS[keyof typeof CONSOLE_RPC_METHODS];
-  targetKinds: ReadonlySet<MobKitWorkbenchTarget["kind"]>;
+  targetKinds: ReadonlySet<MetaWorkbenchTarget["kind"]>;
 };
 
-const LEGACY_INSPECT_IDENTITY_METHOD = "mobkit/inspect_identity";
+const LEGACY_INSPECT_IDENTITY_METHOD = "meta/inspect_identity";
 
 const CONSOLE_COMMAND_SPECS: Record<ConsoleCommandName, ConsoleCommandSpec> = {
   [CONSOLE_COMMAND_NAMES.inspectIdentity]: {
     method: CONSOLE_RPC_METHODS.inspectIdentity,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>([
-      "mobkit/identity-chat",
-      "mobkit/identity-inspect",
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>([
+      "meta/identity-chat",
+      "meta/identity-inspect",
     ]),
   },
   [CONSOLE_COMMAND_NAMES.retireIdentity]: {
     method: CONSOLE_RPC_METHODS.retireIdentity,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>([
-      "mobkit/identity-chat",
-      "mobkit/identity-inspect",
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>([
+      "meta/identity-chat",
+      "meta/identity-inspect",
     ]),
   },
   [CONSOLE_COMMAND_NAMES.respawnIdentity]: {
     method: CONSOLE_RPC_METHODS.respawnIdentity,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>([
-      "mobkit/identity-chat",
-      "mobkit/identity-inspect",
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>([
+      "meta/identity-chat",
+      "meta/identity-inspect",
     ]),
   },
   [CONSOLE_COMMAND_NAMES.resetIdentity]: {
     method: CONSOLE_RPC_METHODS.resetIdentity,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>([
-      "mobkit/identity-chat",
-      "mobkit/identity-inspect",
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>([
+      "meta/identity-chat",
+      "meta/identity-inspect",
     ]),
   },
   // Run-fenced Stop: params carry `member_id`, `run_id` and `reason`
   // explicitly (the run id comes from the member's `run_started`).
   [CONSOLE_COMMAND_NAMES.stopMemberRun]: {
     method: CONSOLE_RPC_METHODS.stopMemberRun,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>([
-      "mobkit/identity-chat",
-      "mobkit/identity-inspect",
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>([
+      "meta/identity-chat",
+      "meta/identity-inspect",
     ]),
   },
   [CONSOLE_COMMAND_NAMES.listRoutingRoutes]: {
     method: CONSOLE_RPC_METHODS.routingRoutesList,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/routing"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/routing"]),
   },
   [CONSOLE_COMMAND_NAMES.listDeliveryHistory]: {
     method: CONSOLE_RPC_METHODS.deliveryHistory,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/routing"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/routing"]),
   },
   [CONSOLE_COMMAND_NAMES.listGatingPending]: {
     method: CONSOLE_RPC_METHODS.gatingPending,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/gating"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/gating"]),
   },
   [CONSOLE_COMMAND_NAMES.listGatingAudit]: {
     method: CONSOLE_RPC_METHODS.gatingAudit,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/gating"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/gating"]),
   },
   [CONSOLE_COMMAND_NAMES.decideGating]: {
     method: CONSOLE_RPC_METHODS.gatingDecide,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/gating"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/gating"]),
   },
   [CONSOLE_COMMAND_NAMES.accessStatus]: {
     method: CONSOLE_RPC_METHODS.accessStatus,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/access"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/access"]),
   },
   [CONSOLE_COMMAND_NAMES.getAccessConfig]: {
     method: CONSOLE_RPC_METHODS.accessGet,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/access"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/access"]),
   },
   [CONSOLE_COMMAND_NAMES.setAccessConfig]: {
     method: CONSOLE_RPC_METHODS.accessSet,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/access"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/access"]),
   },
   [CONSOLE_COMMAND_NAMES.enableAccess]: {
     method: CONSOLE_RPC_METHODS.accessEnable,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/access"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/access"]),
   },
   [CONSOLE_COMMAND_NAMES.upsertAccessRule]: {
     method: CONSOLE_RPC_METHODS.accessRuleUpsert,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/access"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/access"]),
   },
   [CONSOLE_COMMAND_NAMES.deleteAccessRule]: {
     method: CONSOLE_RPC_METHODS.accessRuleDelete,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/access"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/access"]),
   },
   [CONSOLE_COMMAND_NAMES.setAccessGroup]: {
     method: CONSOLE_RPC_METHODS.accessGroupSet,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/access"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/access"]),
   },
   [CONSOLE_COMMAND_NAMES.deleteAccessGroup]: {
     method: CONSOLE_RPC_METHODS.accessGroupDelete,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/access"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/access"]),
   },
   [CONSOLE_COMMAND_NAMES.previewAccess]: {
     method: CONSOLE_RPC_METHODS.accessPreview,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/access"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/access"]),
   },
   [CONSOLE_COMMAND_NAMES.listMemoryRecords]: {
     method: CONSOLE_RPC_METHODS.memoryPanelRecords,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/memory"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/memory"]),
   },
   [CONSOLE_COMMAND_NAMES.getMemoryRecord]: {
     method: CONSOLE_RPC_METHODS.memoryPanelRecord,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/memory"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/memory"]),
   },
   [CONSOLE_COMMAND_NAMES.listMemoryQuarantine]: {
     method: CONSOLE_RPC_METHODS.memoryPanelQuarantine,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/memory"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/memory"]),
   },
   [CONSOLE_COMMAND_NAMES.listMemoryDreams]: {
     method: CONSOLE_RPC_METHODS.memoryPanelDreams,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/memory"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/memory"]),
   },
   [CONSOLE_COMMAND_NAMES.getMemoryOverview]: {
     method: CONSOLE_RPC_METHODS.memoryPanelOverview,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/memory"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/memory"]),
   },
   [CONSOLE_COMMAND_NAMES.listMemoryProposals]: {
     method: CONSOLE_RPC_METHODS.memoryPanelProposals,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/memory"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/memory"]),
   },
   [CONSOLE_COMMAND_NAMES.listMemoryInjections]: {
     method: CONSOLE_RPC_METHODS.memoryPanelInjections,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/memory"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/memory"]),
   },
   [CONSOLE_COMMAND_NAMES.listMemoryHarvests]: {
     method: CONSOLE_RPC_METHODS.memoryPanelHarvests,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/memory"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/memory"]),
   },
   [CONSOLE_COMMAND_NAMES.listMemoryDreamRuns]: {
     method: CONSOLE_RPC_METHODS.memoryPanelDreamRuns,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/memory"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/memory"]),
   },
   [CONSOLE_COMMAND_NAMES.listMemoryAuditVerdicts]: {
     method: CONSOLE_RPC_METHODS.memoryPanelAuditVerdicts,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/memory"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/memory"]),
   },
   [CONSOLE_COMMAND_NAMES.decideMemoryQuarantine]: {
     method: CONSOLE_RPC_METHODS.memoryQuarantineDecide,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/memory"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/memory"]),
   },
   [CONSOLE_COMMAND_NAMES.workgraphSnapshot]: {
     method: CONSOLE_RPC_METHODS.workgraphSnapshot,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/workgraph"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/workgraph"]),
   },
   [CONSOLE_COMMAND_NAMES.workgraphGet]: {
     method: CONSOLE_RPC_METHODS.workgraphGet,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/workgraph"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/workgraph"]),
   },
   [CONSOLE_COMMAND_NAMES.workgraphEvents]: {
     method: CONSOLE_RPC_METHODS.workgraphEvents,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/workgraph"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/workgraph"]),
   },
   [CONSOLE_COMMAND_NAMES.workgraphGoalStatus]: {
     method: CONSOLE_RPC_METHODS.workgraphGoalStatus,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/workgraph"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/workgraph"]),
   },
   [CONSOLE_COMMAND_NAMES.workgraphClaim]: {
     method: CONSOLE_RPC_METHODS.workgraphClaim,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/workgraph"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/workgraph"]),
   },
   [CONSOLE_COMMAND_NAMES.workgraphRelease]: {
     method: CONSOLE_RPC_METHODS.workgraphRelease,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/workgraph"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/workgraph"]),
   },
   [CONSOLE_COMMAND_NAMES.workgraphClose]: {
     method: CONSOLE_RPC_METHODS.workgraphClose,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/workgraph"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/workgraph"]),
   },
   [CONSOLE_COMMAND_NAMES.workgraphGoalConfirm]: {
     method: CONSOLE_RPC_METHODS.workgraphGoalConfirm,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/workgraph"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/workgraph"]),
   },
   [CONSOLE_COMMAND_NAMES.workgraphGoalRequestClose]: {
     method: CONSOLE_RPC_METHODS.workgraphGoalRequestClose,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/workgraph"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/workgraph"]),
   },
   [CONSOLE_COMMAND_NAMES.workgraphAttentionPause]: {
     method: CONSOLE_RPC_METHODS.workgraphAttentionPause,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/workgraph"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/workgraph"]),
   },
   [CONSOLE_COMMAND_NAMES.workgraphAttentionResume]: {
     method: CONSOLE_RPC_METHODS.workgraphAttentionResume,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/workgraph"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/workgraph"]),
   },
   [CONSOLE_COMMAND_NAMES.workgraphAttentionReassign]: {
     method: CONSOLE_RPC_METHODS.workgraphAttentionReassign,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/workgraph"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/workgraph"]),
   },
   [CONSOLE_COMMAND_NAMES.topologyQuery]: {
     method: CONSOLE_RPC_METHODS.topologyQuery,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/topology"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/topology"]),
   },
   [CONSOLE_COMMAND_NAMES.topologyPlan]: {
     method: CONSOLE_RPC_METHODS.topologyPlan,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/topology"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/topology"]),
   },
   [CONSOLE_COMMAND_NAMES.topologyApply]: {
     method: CONSOLE_RPC_METHODS.topologyApply,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/topology"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/topology"]),
   },
   [CONSOLE_COMMAND_NAMES.topologyOperationGet]: {
     method: CONSOLE_RPC_METHODS.topologyOperationGet,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/topology"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/topology"]),
   },
   [CONSOLE_COMMAND_NAMES.topologyAuditQuery]: {
     method: CONSOLE_RPC_METHODS.topologyAuditQuery,
-    targetKinds: new Set<MobKitWorkbenchTarget["kind"]>(["mobkit/topology"]),
+    targetKinds: new Set<MetaWorkbenchTarget["kind"]>(["meta/topology"]),
   },
 };
 
@@ -379,7 +385,7 @@ export interface ConsoleCommandResult {
   result?: unknown;
 }
 
-export interface MobKitConsoleTransport {
+export interface MetaConsoleTransport {
   loadExperience(): Promise<ConsoleExperience>;
   loadModules?(): Promise<ConsoleModulesResponse>;
   capabilities(): Promise<ConsoleCapabilities>;
@@ -392,15 +398,21 @@ export interface MobKitConsoleTransport {
   send(input: ConsoleSendInput): Promise<ConsoleTimelineAccepted>;
   executeCommand?(input: ConsoleCommandRequest): Promise<ConsoleCommandResult>;
   upload?(input: ConsoleUploadInput): Promise<ConsoleUploadResult>;
+  /// Reads a stored blob's bytes with this transport's own request
+  /// authority, the credentials the host gives every Console request.
+  /// The Console shows stored images from these bytes; a bare
+  /// `/blobs/{id}` load carries no Authorization. Resolves to a Blob typed
+  /// with its image media type. `blobUrl` stays a projection-only resolver.
+  readBlob?(input: ConsoleBlobReadInput): Promise<Blob>;
   blobUrl?(blobId: string): string;
 }
 
-export interface MobKitConsoleController {
-  transport: MobKitConsoleTransport;
+export interface MetaConsoleController {
+  transport: MetaConsoleTransport;
   commands: ConsoleCommandSurface;
   timeline: ConsoleTimelineController;
   facts: {
-    mobkit<T>(value: T, meta?: Partial<ConsoleFact<T>["provenance"]>): ConsoleFact<T>;
+    meta<T>(value: T, meta?: Partial<ConsoleFact<T>["provenance"]>): ConsoleFact<T>;
     derived<T>(value: T, meta?: Partial<ConsoleFact<T>["provenance"]>): ConsoleFact<T>;
     optimistic<T>(value: T, correlationId: string): ConsoleFact<T>;
     host<T>(value: T): ConsoleFact<T>;
@@ -434,7 +446,7 @@ export function createHttpConsoleTransport({
 }: {
   baseUrl: string;
   fetchTimeoutMs?: number | (() => number);
-}): MobKitConsoleTransport {
+}): MetaConsoleTransport {
   const timeout = () => typeof fetchTimeoutMs === "function" ? fetchTimeoutMs() : fetchTimeoutMs;
   return {
     loadExperience: () => fetchJson<ConsoleExperience>(baseUrl, CONSOLE_REST_PATHS.experience, timeout()),
@@ -499,15 +511,16 @@ export function createHttpConsoleTransport({
       };
     },
     upload: (input) => uploadConsoleBlobMultipart(baseUrl, input, timeout()),
+    readBlob: (input) => readConsoleBlob(baseUrl, input.blobId, timeout(), input.signal),
     blobUrl: (blobId) => `${baseUrl}${CONSOLE_BLOB_PATH_PREFIX}${encodeURIComponent(blobId)}`,
   };
 }
 
-export function createMobKitConsoleController({
+export function createMetaConsoleController({
   transport,
 }: {
-  transport: MobKitConsoleTransport;
-}): MobKitConsoleController {
+  transport: MetaConsoleTransport;
+}): MetaConsoleController {
   const facts = createFactFactory();
   return {
     transport,
@@ -523,8 +536,8 @@ function isJsonRpcMethodNotFoundError(error: unknown): boolean {
 }
 
 function createConsoleCommandSurface(
-  transport: MobKitConsoleTransport,
-  facts: MobKitConsoleController["facts"],
+  transport: MetaConsoleTransport,
+  facts: MetaConsoleController["facts"],
 ): ConsoleCommandSurface {
   let cachedCapabilities: ConsoleCapabilities | null = null;
   let capabilitiesRequest: Promise<ConsoleCapabilities> | null = null;
@@ -551,7 +564,7 @@ function createConsoleCommandSurface(
     async sendMessage(target, input) {
       const identity = identityForSendTarget(target);
       if (!identity) {
-        throw new Error(`target ${target.kind} cannot send MobKit console messages`);
+        throw new Error(`target ${target.kind} cannot send Meta console messages`);
       }
       const currentCapabilities = await requireFreshCapability(CONSOLE_RPC_METHODS.send);
       const optimistic = facts.optimistic({
@@ -564,7 +577,7 @@ function createConsoleCommandSurface(
       });
       return {
         optimistic,
-        accepted: facts.mobkit(accepted, {
+        accepted: facts.meta(accepted, {
           routeOrMethod: CONSOLE_RPC_METHODS.send,
           capabilityVersion: currentCapabilities.version,
           correlationId: input.idempotencyKey,
@@ -578,15 +591,15 @@ function createConsoleCommandSurface(
         throw new Error(`transport does not implement ${CONSOLE_RPC_METHODS.blobUpload}`);
       }
       const uploaded = await transport.upload(input);
-      return facts.mobkit(uploaded, {
+      return facts.meta(uploaded, {
         routeOrMethod: CONSOLE_RPC_METHODS.blobUpload,
         capabilityVersion: currentCapabilities.version,
       });
     },
     async execute(input) {
       input.signal?.throwIfAborted();
-      if (!isMobKitTarget(input.target)) {
-        throw new Error(`host target ${input.target.kind} cannot execute MobKit commands`);
+      if (!isMetaTarget(input.target)) {
+        throw new Error(`host target ${input.target.kind} cannot execute Meta commands`);
       }
       const spec = commandSpec(input.command);
       if (!spec.targetKinds.has(input.target.kind)) {
@@ -603,20 +616,20 @@ function createConsoleCommandSurface(
 }
 
 function createTimelineController(
-  transport: MobKitConsoleTransport,
-  facts: MobKitConsoleController["facts"],
+  transport: MetaConsoleTransport,
+  facts: MetaConsoleController["facts"],
 ): ConsoleTimelineController {
   return {
     async query(input) {
       const page = await transport.queryTimeline(input);
-      return facts.mobkit(page, {
+      return facts.meta(page, {
         routeOrMethod: CONSOLE_RPC_METHODS.queryTimeline,
         cursor: page.latestCursor || page.nextCursor,
       });
     },
     subscribeWithBackfill(input, onFrame, onReplayGap) {
       return subscribeTimelineWithRecovery(transport, input, (frame) => {
-        return onFrame(facts.mobkit(frame, {
+        return onFrame(facts.meta(frame, {
           routeOrMethod: CONSOLE_REST_PATHS.timelineStream,
           cursor: frame.cursor,
         }));
@@ -625,7 +638,7 @@ function createTimelineController(
   };
 }
 
-function createFactFactory(): MobKitConsoleController["facts"] {
+function createFactFactory(): MetaConsoleController["facts"] {
   const wrap = <T>(
     source: ConsoleFactSource,
     value: T,
@@ -639,7 +652,7 @@ function createFactFactory(): MobKitConsoleController["facts"] {
     },
   });
   return {
-    mobkit: (value, meta) => wrap("mobkit-protocol", value, meta),
+    meta: (value, meta) => wrap("meta-protocol", value, meta),
     derived: (value, meta) => wrap("controller-derived", value, meta),
     optimistic: (value, correlationId) => wrap("optimistic", value, { correlationId }),
     host: (value) => wrap("host-adapter", value),
@@ -668,7 +681,7 @@ export class ConsoleCapabilityUnavailableError extends Error {
   readonly kind = "console-capability-unavailable";
   readonly availableMethods: readonly string[];
   constructor(readonly method: string, capabilities: ConsoleCapabilities) {
-    super(`MobKit capability missing for ${method}`);
+    super(`Meta capability missing for ${method}`);
     this.name = "ConsoleCapabilityUnavailableError";
     this.availableMethods = [...capabilities.methods];
   }
@@ -686,7 +699,7 @@ function hasCapability(capabilities: ConsoleCapabilities, method: string): boole
 
 function commandSpec(command: ConsoleCommandName): ConsoleCommandSpec {
   if (!isConsoleCommandName(command)) {
-    throw new Error(`unknown MobKit console command ${String(command)}`);
+    throw new Error(`unknown Meta console command ${String(command)}`);
   }
   return CONSOLE_COMMAND_SPECS[command];
 }
@@ -696,7 +709,7 @@ function isConsoleCommandName(command: unknown): command is ConsoleCommandName {
 }
 
 function identityForSendTarget(target: ConsoleWorkbenchTarget): string | null {
-  return target.kind === "mobkit/identity-chat" && "identity" in target ? target.identity : null;
+  return target.kind === "meta/identity-chat" && "identity" in target ? target.identity : null;
 }
 
 const identityCommandMethods = new Set<string>([
@@ -708,7 +721,7 @@ const identityCommandMethods = new Set<string>([
 
 function identityForCommandTarget(target: ConsoleWorkbenchTarget): string | null {
   if (
-    (target.kind === "mobkit/identity-chat" || target.kind === "mobkit/identity-inspect")
+    (target.kind === "meta/identity-chat" || target.kind === "meta/identity-inspect")
     && "identity" in target
   ) {
     return target.identity;
@@ -720,6 +733,6 @@ function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-function isMobKitTarget(target: ConsoleWorkbenchTarget): target is MobKitWorkbenchTarget {
-  return target.kind.startsWith("mobkit/");
+function isMetaTarget(target: ConsoleWorkbenchTarget): target is MetaWorkbenchTarget {
+  return target.kind.startsWith("meta/");
 }

@@ -81,7 +81,7 @@ export function runtimeModeDeploySurfaceReason(contract, surface, mode) {
   const value = String(mode || "").trim();
   const blocked = deployRuntimeCompatibility(contract, surface)?.blocked;
   const reason = blocked && typeof blocked === "object" ? blocked[value] : "";
-  return String(reason || "Unsupported by this MobKit deploy surface.");
+  return String(reason || "Unsupported by this Meta deploy surface.");
 }
 
 export function firstDeploySurfaceRuntimeMode(contract, surface) {

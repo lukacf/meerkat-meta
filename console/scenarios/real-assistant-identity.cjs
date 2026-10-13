@@ -94,18 +94,18 @@ function allowedNavigationAbort(request) {
   if (new URL(request.url()).pathname.endsWith("/timeline/stream")) return true;
   try {
     const body = JSON.parse(request.postData() || "{}");
-    return body.method === "mobkit/console/query_timeline" && body.params?.mode === "recent" && !body.params?.identity;
+    return body.method === "meta/console/query_timeline" && body.params?.mode === "recent" && !body.params?.identity;
   } catch { return false; }
 }
 
 async function assistantIdentity(host) {
   const hostRoute = { stock: "/scoped", shared: "/shared", embedded: "/console" }[host];
   assert(hostRoute, `Unknown assistant identity host: ${host}`);
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "The identity scenario requires the coordinator's matching prebuilt fixture.");
+  assert(process.env.META_EXAMPLE_BIN_DIR, "The identity scenario requires the coordinator's matching prebuilt fixture.");
   const fixture = await startFixture();
-  const browser = await chromium.launch({ headless: process.env.MOBKIT_HEADED !== "1" });
+  const browser = await chromium.launch({ headless: process.env.META_HEADED !== "1" });
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
-  const folder = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+  const folder = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
   const result = { host, hostRoute, source, errors: [], expectedCancellations: [], navigations: [], rendered: {} };
   const assetResponses = [];
   const draft = "Next, compare these three observations. Preserve A\u030a and 🚀.";
@@ -185,7 +185,7 @@ async function assistantIdentity(host) {
     await eventually(() => { live.check(); return live.events.some(event => event.type === "snapshot_complete"); }, "live capture is ready before the operator send");
     await fixture.control("model", { source: "Unexpected fallback response.", delay_ms: 80, chunk_chars: 8,
       scenario: { kind: "assistant_identity", run_id: marker } });
-    const sent = await rpc(fixture.baseUrl, "mobkit/console/send", { identity, origin: "console:identity-acceptance", origin_kind: "operator",
+    const sent = await rpc(fixture.baseUrl, "meta/console/send", { identity, origin: "console:identity-acceptance", origin_kind: "operator",
       idempotency_key: randomUUID(), content: `[fixture:${marker}] Review the release twice through the WorkGraph, then repeat your conclusion.` });
     assert.equal(sent.status, 200); assert(!sent.body.error, JSON.stringify(sent.body));
     result.accepted = sent.body.result; assert(result.accepted?.interaction_id && result.accepted?.input_frame_id);

@@ -12,7 +12,7 @@
 // Moved verbatim from the controller.js tool-skill-access range: slug/profile
 // naming, tool catalog ref normalization and availability, member tool/skill
 // access state projections and patches, step tool-scope state and patches,
-// and inline skill authoring against MobKit skill realms.
+// and inline skill authoring against Meta skill realms.
 //
 // stepToolScopeState reaches basicEditorViewState, which went through the
 // lazy _residue-bridge until editors/basic-editor.ts landed in S11; it is

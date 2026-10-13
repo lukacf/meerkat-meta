@@ -24,7 +24,7 @@
 # memory-module file (coordinator.rs, selector.rs, …) still fails the gate.
 
 meerkat-memory  # §8.4 bounded host-side harvest and lifecycle scope reclamation of meerkat's OWN session semantic store; the bundled agent-memory store stays plain B-tree SQLite
-src:crates/meerkat-mobkit/src/memory/distiller.rs:hnsw  # §8.4 HnswDiscardSource: bounded read-only enumerate_scoped harvest plus explicit drop_scope lifecycle reclamation
-src:crates/meerkat-mobkit/src/memory/distiller.rs:meerkat-memory  # §8.4 source import site (meerkat_memory::HnswMemoryStore::open, paged harvest and lifecycle scope reclamation)
-src:crates/meerkat-mobkit/src/memory/mod.rs:hnsw  # re-export of the §8.4 HnswDiscardSource only
-src:crates/meerkat-mobkit/src/memory_wiring.rs:hnsw  # §8.4 wiring only: constructs HnswDiscardSource for bounded harvest and lifecycle scope reclamation (same pinned exception as distiller.rs)
+src:crates/meerkat-meta/src/memory/distiller.rs:hnsw  # §8.4 HnswDiscardSource: bounded read-only enumerate_scoped harvest plus explicit drop_scope lifecycle reclamation
+src:crates/meerkat-meta/src/memory/distiller.rs:meerkat-memory  # §8.4 source import site (meerkat_memory::HnswMemoryStore::open, paged harvest and lifecycle scope reclamation)
+src:crates/meerkat-meta/src/memory/mod.rs:hnsw  # re-export of the §8.4 HnswDiscardSource only
+src:crates/meerkat-meta/src/memory_wiring.rs:hnsw  # §8.4 wiring only: constructs HnswDiscardSource for bounded harvest and lifecycle scope reclamation (same pinned exception as distiller.rs)

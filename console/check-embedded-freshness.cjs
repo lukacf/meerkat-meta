@@ -11,8 +11,8 @@ const {
 
 const rootDir = path.resolve(__dirname, "..");
 const distDir = path.join(__dirname, "dist");
-const embeddedDir = path.join(rootDir, "crates", "meerkat-mobkit", "console-dist");
-const rustConsolePath = path.join(rootDir, "crates", "meerkat-mobkit", "src", "http_console.rs");
+const embeddedDir = path.join(rootDir, "crates", "meerkat-meta", "console-dist");
+const rustConsolePath = path.join(rootDir, "crates", "meerkat-meta", "src", "http_console.rs");
 
 function read(filePath) {
   try {
@@ -100,16 +100,16 @@ function assertNoLocalPaths(directory, files, label) {
 
 assertDirectoryFiles(distDir, DIST_GENERATED_FILES, "console/dist");
 assertNoLocalPaths(distDir, DIST_GENERATED_FILES, "console/dist");
-assertNoLocalPaths(embeddedDir, EMBEDDED_GENERATED_FILES, "crates/meerkat-mobkit/console-dist");
-assertDirectoryFiles(embeddedDir, EMBEDDED_GENERATED_FILES, "crates/meerkat-mobkit/console-dist");
+assertNoLocalPaths(embeddedDir, EMBEDDED_GENERATED_FILES, "crates/meerkat-meta/console-dist");
+assertDirectoryFiles(embeddedDir, EMBEDDED_GENERATED_FILES, "crates/meerkat-meta/console-dist");
 assertRustEmbeddedAssets();
 assertGitTracksFiles(
   DIST_GENERATED_FILES.map((file) => path.join("console", "dist", file)),
   "console/dist",
 );
 assertGitTracksFiles(
-  EMBEDDED_GENERATED_FILES.map((file) => path.join("crates", "meerkat-mobkit", "console-dist", file)),
-  "crates/meerkat-mobkit/console-dist",
+  EMBEDDED_GENERATED_FILES.map((file) => path.join("crates", "meerkat-meta", "console-dist", file)),
+  "crates/meerkat-meta/console-dist",
 );
 
 for (const file of EMBEDDED_SHARED_FILES) {
@@ -125,12 +125,12 @@ for (const file of EMBEDDED_SHARED_FILES) {
 
 const diff = spawnSync(
   "git",
-  ["diff", "--quiet", "HEAD", "--", "console/dist", "crates/meerkat-mobkit/console-dist"],
+  ["diff", "--quiet", "HEAD", "--", "console/dist", "crates/meerkat-meta/console-dist"],
   { cwd: rootDir, stdio: "inherit" },
 );
 if (diff.status !== 0) {
   process.stderr.write(
-    "console build left generated asset diffs; commit the refreshed console/dist and crates/meerkat-mobkit/console-dist assets before building release binaries\n",
+    "console build left generated asset diffs; commit the refreshed console/dist and crates/meerkat-meta/console-dist assets before building release binaries\n",
   );
   process.exit(diff.status || 1);
 }

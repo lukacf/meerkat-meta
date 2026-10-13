@@ -224,7 +224,7 @@ const core = {
   setFailed(message) { calls.push({ kind: "setFailed", message }); },
   setOutput(name, value) { calls.push({ kind: "setOutput", name, value }); },
 };
-const context = { repo: { owner: "lukacf", repo: "meerkat-mobkit" } };
+const context = { repo: { owner: "lukacf", repo: "meerkat-meta" } };
 const github = {
   rest: { actions: { listWorkflowRuns: async (args) => {
     calls.push({ kind: "listWorkflowRuns", args });
@@ -395,9 +395,9 @@ esac
         env["PATH"] = f"{bin_dir}:{env['PATH']}"
         env["FAKE_READELF_DYNSYMS"] = dynsyms
         env["FAKE_READELF_DYNAMIC"] = dynamic
-        env.pop("MOBKIT_GLIBC_FLOOR", None)
+        env.pop("META_GLIBC_FLOOR", None)
         if floor is not None:
-            env["MOBKIT_GLIBC_FLOOR"] = floor
+            env["META_GLIBC_FLOOR"] = floor
         names = ["rpc_gateway"] if binaries is None else binaries
         return subprocess.run(
             [str(PORTABILITY_SCRIPT), *(str(root / name) for name in names)],
@@ -447,7 +447,7 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
         self.bin.mkdir()
         self.sdk.mkdir(parents=True)
         (self.sdk / "package.json").write_text(
-            json.dumps({"name": "@rkat/mobkit-sdk", "version": "0.8.0"}) + "\n"
+            json.dumps({"name": "@rkat/meta-sdk", "version": "0.8.0"}) + "\n"
         )
         self.log = self.root / "npm.log"
         npm = self.bin / "npm"
@@ -531,7 +531,7 @@ esac
         result = self.run_publish("exact")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("@rkat/mobkit-sdk@0.8.0: already published, skipping", result.stdout)
+        self.assertIn("@rkat/meta-sdk@0.8.0: already published, skipping", result.stdout)
         self.assertTrue(any(command.startswith("view ") for command in self.npm_commands()))
         self.assertFalse(any(command.startswith("publish ") for command in self.npm_commands()))
 
@@ -650,7 +650,7 @@ class RegistryPublicationShellTests(unittest.TestCase):
     def test_crate_rehearsal_passes_dry_run_and_locked_to_the_real_step(self):
         result, commands = self.run_script("Publish Rust crate", "publish_registries", dry=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(commands, [["publish", "-p", "meerkat-mobkit", "--locked", "--dry-run"]])
+        self.assertEqual(commands, [["publish", "-p", "meerkat-meta", "--locked", "--dry-run"]])
 
     def test_crate_package_exists_is_success_but_other_errors_keep_their_status(self):
         for output, status, expected in (
@@ -662,7 +662,7 @@ class RegistryPublicationShellTests(unittest.TestCase):
                     "Publish Rust crate", "publish_registries", status=status, output=output
                 )
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
-                self.assertEqual(commands, [["publish", "-p", "meerkat-mobkit", "--locked"]])
+                self.assertEqual(commands, [["publish", "-p", "meerkat-meta", "--locked"]])
 
     def test_registry_readback_uses_workspace_version_and_preserves_refusals(self):
         for status in (0, 23):
@@ -685,7 +685,7 @@ class DocsPublicationWorkflowTests(unittest.TestCase):
     def test_release_workflow_no_longer_dispatches_documentation(self):
         workflow = RELEASE_WORKFLOW.read_text()
         self.assertNotIn("publish_docs:", workflow)
-        self.assertNotIn("mobkit-release-published", workflow)
+        self.assertNotIn("meta-release-published", workflow)
         self.assertNotIn("repos/lukacf/meerkat/dispatches", workflow)
 
     def test_docs_dispatch_fires_on_every_docs_push_to_main(self):
@@ -694,7 +694,7 @@ class DocsPublicationWorkflowTests(unittest.TestCase):
         self.assertIn('- "docs/**"', workflow)
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("secrets.DOCS_PUBLISH_TOKEN", workflow)
-        self.assertIn('event_type: "mobkit-docs-updated"', workflow)
+        self.assertIn('event_type: "meta-docs-updated"', workflow)
         self.assertIn("sha: $sha", workflow)
         self.assertIn('ref: "main"', workflow)
         self.assertIn("SOURCE_SHA: ${{ github.sha }}", workflow)
@@ -988,7 +988,7 @@ class ImmutableReleaseWorkflowTests(unittest.TestCase):
         })
         script = step_script("Build gateway binaries")
         self.assertEqual(set(re.findall(r"--bin (\w+)", script)),
-                         {"mobkit_gateway", "rpc_gateway", "mobkit_repair"})
+                         {"meta_gateway", "rpc_gateway", "meta_repair"})
         self.assertIn("--locked --release --target", script)
         self.assertRegex(script.replace("\\\n", " "),
                          r"cargo build [^\n]*--features openai-live --locked")
@@ -998,7 +998,7 @@ class ImmutableReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('artifact="${prefix}-${VERSION}-${TARGET}.${ARCHIVE_EXT}"', packaging)
         signing = step_block("Ad-hoc codesign macOS binaries")
         self.assertEqual(scalar(signing, "if", "        "), "runner.os == 'macOS'")
-        self.assertIn("for bin in mobkit_gateway rpc_gateway mobkit_repair", signing)
+        self.assertIn("for bin in meta_gateway rpc_gateway meta_repair", signing)
         self.assertIn('codesign --force --sign - "target/${{ matrix.target }}/release/${bin}"', signing)
         block = job_block("build_binaries")
         order = ("Apply release build profile overrides", "Build gateway binaries",
@@ -1010,9 +1010,9 @@ class ImmutableReleaseWorkflowTests(unittest.TestCase):
     def test_original_bundles_are_retained_before_immutable_attempt_qualified_uploads(self):
         for job, attest, retain, upload, expected_name, directory in (
             ("build_binaries", "Attest build provenance", "Retain original provenance bundle",
-             "Upload artifacts", "mobkit-gateway-binaries-${{ matrix.target }}-${{ github.run_attempt }}", "dist"),
+             "Upload artifacts", "meta-gateway-binaries-${{ matrix.target }}-${{ github.run_attempt }}", "dist"),
             ("collect_candidate", "Attest candidate manifest", "Retain manifest provenance bundle",
-             "Upload immutable candidate manifest", "mobkit-candidate-manifest-${{ github.run_attempt }}", "candidate"),
+             "Upload immutable candidate manifest", "meta-candidate-manifest-${{ github.run_attempt }}", "candidate"),
         ):
             with self.subTest(job=job):
                 block = job_block(job)
@@ -1175,7 +1175,7 @@ class ExactMainCiGateTests(unittest.TestCase):
         self.assertEqual([c["kind"] for c in calls].count("setFailed"), 0)
         self.assertEqual(calls[0], {
             "kind": "listWorkflowRuns",
-            "args": {"owner": "lukacf", "repo": "meerkat-mobkit", "workflow_id": "ci.yml",
+            "args": {"owner": "lukacf", "repo": "meerkat-meta", "workflow_id": "ci.yml",
                      "branch": "main", "event": "push", "head_sha": "deadbeef", "per_page": 100},
         })
         self.assertIn({"kind": "setOutput", "name": "run_id", "value": "42"}, calls)
@@ -1278,12 +1278,12 @@ class LinuxBinaryPortabilityGateTests(unittest.TestCase):
 
     def test_one_missing_binary_fails_the_whole_set(self):
         result = run_portability_check(
-            DYNSYMS_WITHIN_FLOOR, DYNAMIC_RUSTLS, binaries=["rpc_gateway", "mobkit_gateway"]
+            DYNSYMS_WITHIN_FLOOR, DYNAMIC_RUSTLS, binaries=["rpc_gateway", "meta_gateway"]
         )
 
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("PASS", result.stdout)
-        self.assertIn("mobkit_gateway: file not found", result.stderr)
+        self.assertIn("meta_gateway: file not found", result.stderr)
 
     def test_the_gate_is_executable_from_a_checkout(self):
         # The workflow invokes it as ./scripts/...; a 644 file fails the step
@@ -1329,7 +1329,7 @@ class LinuxReleaseContainerTests(unittest.TestCase):
             f"unknown Debian codename {codename!r}: extend CONTAINER_GLIBC and decide the floor",
         )
         declared = re.search(
-            r'^MOBKIT_GLIBC_FLOOR="\$\{MOBKIT_GLIBC_FLOOR:-([0-9.]+)\}"$',
+            r'^META_GLIBC_FLOOR="\$\{META_GLIBC_FLOOR:-([0-9.]+)\}"$',
             PORTABILITY_SCRIPT.read_text(),
             re.M,
         )

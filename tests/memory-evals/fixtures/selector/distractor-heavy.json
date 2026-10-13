@@ -53,7 +53,7 @@
       "id": "mem-056",
       "kind": "Fact",
       "title": "Cross-mob peer messages drop prompt body in meerkat 0.7.3",
-      "description": "Matters when cross-mob sends arrive empty: confirmed meerkat-side defect in actor.rs, not a mobkit bug.",
+      "description": "Matters when cross-mob sends arrive empty: confirmed meerkat-side defect in actor.rs, not a meta bug.",
       "age_days": 22,
       "rank": 4
     },
@@ -61,7 +61,7 @@
       "id": "mem-057",
       "kind": "Reference",
       "title": "Meerkat upstream asks doc",
-      "description": "Matters when deciding whether a defect should be fixed mobkit-side or filed upstream: docs/design/upstream-asks.md tracks the filed asks.",
+      "description": "Matters when deciding whether a defect should be fixed meta-side or filed upstream: docs/design/upstream-asks.md tracks the filed asks.",
       "age_days": 18,
       "rank": 8
     },
@@ -92,7 +92,7 @@
     {
       "id": "mem-061",
       "kind": "Fact",
-      "title": "Bazel builds are remote-only for mobkit",
+      "title": "Bazel builds are remote-only for meta",
       "description": "Matters when someone tries a local bazel build: only hosted BuildBuddy RBE is supported.",
       "age_days": 44,
       "rank": 16

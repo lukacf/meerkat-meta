@@ -7,7 +7,7 @@ a fork completion wake) completing first satisfied the wait, and the caller
 got someone else's output.
 
 ``send_and_wait`` / ``dispatch*_and_wait`` now send with ``track_turn`` and
-wait on the returned ticket through ``mobkit/turn_result``, which reports THAT
+wait on the returned ticket through ``meta/turn_result``, which reports THAT
 turn and its own output.
 """
 import asyncio
@@ -15,9 +15,9 @@ import warnings
 
 import pytest
 
-from meerkat_mobkit.errors import (
+from meerkat_meta.errors import (
     CompletionCursorUnavailableError,
-    MobKitError,
+    MetaError,
     TurnFailedError,
     TurnNotDeliveredError,
     TurnOutputTruncatedWarning,
@@ -29,7 +29,7 @@ from meerkat_mobkit.errors import (
     TurnWaitTimeoutError,
     WaitEndedError,
 )
-from meerkat_mobkit.identity_first_models import (
+from meerkat_meta.identity_first_models import (
     AwaitedTurn,
     CompletionCursor,
     DispatchInput,
@@ -40,17 +40,17 @@ from meerkat_mobkit.identity_first_models import (
     TurnState,
     TurnUnavailable,
 )
-from meerkat_mobkit.runtime import IdentityAgentHandle, MobKitRuntime
+from meerkat_meta.runtime import IdentityAgentHandle, MetaRuntime
 
 
 class TicketTransport:
     """Answers each RPC from a script.
 
-    ``sends`` is consumed one entry per ``mobkit/send`` (or dispatch) call;
-    ``turn_results`` maps a ticket to the states ``mobkit/turn_result`` walks
+    ``sends`` is consumed one entry per ``meta/send`` (or dispatch) call;
+    ``turn_results`` maps a ticket to the states ``meta/turn_result`` walks
     through, one per poll, holding the last. ``inspections`` does the same for
-    the identity-wide cursor polls (``mobkit/completion_cursor``): it models
-    the cursor moving for someone else's turn. ``mobkit/inspect_identity``
+    the identity-wide cursor polls (``meta/completion_cursor``): it models
+    the cursor moving for someone else's turn. ``meta/inspect_identity``
     answers the entry the latest cursor poll saw (the output a waiter reads
     once, at completion), or walks the script itself before any cursor poll.
     """
@@ -74,15 +74,15 @@ class TicketTransport:
         self.calls.append(request)
         method = request.get("method")
         params = request.get("params") or {}
-        if method in ("mobkit/send", "mobkit/dispatch"):
+        if method in ("meta/send", "meta/dispatch"):
             result = self._sends.pop(0)
-        elif method == "mobkit/turn_result":
+        elif method == "meta/turn_result":
             ticket = params["ticket"]
             script = self._turn_results.get(ticket, [{"state": "unknown"}])
             index = min(self._turn_polls.get(ticket, 0), len(script) - 1)
             self._turn_polls[ticket] = self._turn_polls.get(ticket, 0) + 1
             result = {"identity": params["identity"], "ticket": ticket, **script[index]}
-        elif method == "mobkit/wait_for_turn":
+        elif method == "meta/wait_for_turn":
             # The gateway's server-side wait: answer once the ticket leaves
             # pending, or at the deadline (the script ends still pending).
             ticket = params["ticket"]
@@ -93,7 +93,7 @@ class TicketTransport:
             self._turn_polls[ticket] = index + 1
             result = {"identity": params["identity"], "ticket": ticket, **script[index]}
             result["wait"] = "timed_out" if result.get("state") == "pending" else "settled"
-        elif method == "mobkit/wait_for_completion":
+        elif method == "meta/wait_for_completion":
             from .test_identity_first_completion_cursor import _serve_completion_wait
             result = _serve_completion_wait(
                 self._walk_inspections,
@@ -101,7 +101,7 @@ class TicketTransport:
                 params,
             )
             self._cursor_reads += 1
-        elif method == "mobkit/completion_cursor":
+        elif method == "meta/completion_cursor":
             self._cursor_reads += 1
             entry = self._walk_inspections()
             result = {
@@ -109,7 +109,7 @@ class TicketTransport:
                 "state": "active",
                 "completion_cursor": entry.get("completion_cursor"),
             }
-        elif method == "mobkit/inspect_identity":
+        elif method == "meta/inspect_identity":
             if self._cursor_reads:
                 index = min(self._inspect_index - 1, len(self._inspections) - 1)
                 result = self._inspections[index]
@@ -146,22 +146,22 @@ class TicketTransport:
         return [call.get("params") or {} for call in self.calls if call["method"] == method]
 
     def waited_turns(self) -> list[dict]:
-        """The ``mobkit/wait_for_turn`` calls, minus their deadline."""
+        """The ``meta/wait_for_turn`` calls, minus their deadline."""
         return [
             {"identity": params["identity"], "ticket": params["ticket"]}
-            for params in self.params_of("mobkit/wait_for_turn")
+            for params in self.params_of("meta/wait_for_turn")
         ]
 
 
-def _make_runtime(transport) -> MobKitRuntime:
-    rt = MobKitRuntime.__new__(MobKitRuntime)
+def _make_runtime(transport) -> MetaRuntime:
+    rt = MetaRuntime.__new__(MetaRuntime)
     rt._config = None
     rt._transport = transport
     rt._running = True
     rt._rust_http_base = None
     rt._lifecycle_lock = asyncio.Lock()
     rt._shutdown_task = None
-    from meerkat_mobkit.agent_builder import CallbackDispatcher
+    from meerkat_meta.agent_builder import CallbackDispatcher
 
     rt._dispatcher = CallbackDispatcher()
     return rt
@@ -216,13 +216,13 @@ class TestSendAndWaitWaitsForItsOwnTurn:
         output = await handle.send_and_wait("alpha", timeout=5, poll_interval=0.001)
 
         assert output == "A's reply"
-        assert transport.params_of("mobkit/send")[0]["track_turn"] is True
-        assert transport.params_of("mobkit/inspect_identity") == [], (
+        assert transport.params_of("meta/send")[0]["track_turn"] is True
+        assert transport.params_of("meta/inspect_identity") == [], (
             "a ticketed wait must not read the identity-wide cursor at all"
         )
-        assert transport.params_of("mobkit/turn_result") == [], "no client polling"
+        assert transport.params_of("meta/turn_result") == [], "no client polling"
         assert transport.waited_turns() == [{"identity": "keeper", "ticket": "ticket-a"}]
-        assert transport.params_of("mobkit/wait_for_completion") == []
+        assert transport.params_of("meta/wait_for_completion") == []
 
     @pytest.mark.asyncio
     async def test_concurrent_sends_each_get_their_own_output(self):
@@ -279,7 +279,7 @@ class TestSendAndWaitWaitsForItsOwnTurn:
         )
 
         assert (dispatched, texted) == ("dispatched reply", "text reply")
-        params = transport.params_of("mobkit/dispatch")
+        params = transport.params_of("meta/dispatch")
         assert all(p["track_turn"] is True for p in params)
         # The text helper carries the caller's dedup pair AND tracks the turn.
         assert params[1]["dispatch_input"]["idempotency_key"] == "evt-1"
@@ -308,7 +308,7 @@ class TestSendAndWaitWaitsForItsOwnTurn:
             result = await runtime.dispatch_text("keeper", content, **pair, **tracking)
 
         assert len(transport.calls) == 1
-        assert transport.params_of("mobkit/dispatch") == [{
+        assert transport.params_of("meta/dispatch") == [{
             "identity": "keeper",
             "dispatch_input": {"content": content, "origin": "system", **pair},
             **tracking,
@@ -334,13 +334,13 @@ class TestSendAndWaitWaitsForItsOwnTurn:
         )
 
         assert output == "Lab notice accepted"
-        assert transport.params_of("mobkit/dispatch") == [{
+        assert transport.params_of("meta/dispatch") == [{
             "identity": "keeper",
             "dispatch_input": {"content": "Lab notice", "origin": "connector", **pair},
             "track_turn": True,
         }]
         assert transport.waited_turns() == [{"identity": "keeper", "ticket": ticket}]
-        assert transport.params_of("mobkit/inspect_identity") == []
+        assert transport.params_of("meta/inspect_identity") == []
 
 
 class TestWaitForTurn:
@@ -482,7 +482,7 @@ class TestAttribution:
         assert (outcome.text, outcome.attributed, outcome.ticket) == ("latest reply", False, None)
         assert outcome.untracked_code is None
         assert isinstance(outcome.admission, SendResult)
-        assert transport.params_of("mobkit/turn_result") == []
+        assert transport.params_of("meta/turn_result") == []
 
     @pytest.mark.asyncio
     async def test_the_default_mode_keeps_the_plain_text_api_working(self):
@@ -499,7 +499,7 @@ class TestAttribution:
             output = await handle.dispatch_text_and_wait("alpha", timeout=5, poll_interval=0.001)
 
         assert output == "latest reply"
-        assert len(transport.params_of("mobkit/dispatch")) == 1, "delivered exactly once"
+        assert len(transport.params_of("meta/dispatch")) == 1, "delivered exactly once"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -539,8 +539,8 @@ class TestAttribution:
                 )
         assert raised.value.code == unavailable
         assert isinstance(raised.value.admission, SendResult)
-        assert len(transport.params_of("mobkit/send")) == 1
-        assert transport.params_of("mobkit/inspect_identity") == []
+        assert len(transport.params_of("meta/send")) == 1
+        assert transport.params_of("meta/inspect_identity") == []
 
     @pytest.mark.asyncio
     async def test_an_undelivered_send_raises_instead_of_waiting(self):
@@ -554,10 +554,10 @@ class TestAttribution:
 
         with pytest.raises(TurnNotDeliveredError) as raised:
             await handle.send_and_wait("alpha", timeout=5, poll_interval=0.001)
-        assert isinstance(raised.value, MobKitError)
+        assert isinstance(raised.value, MetaError)
         assert isinstance(raised.value.admission, SendResult)
         assert (raised.value.code, raised.value.reason) == ("not_delivered", "no session bridge")
-        assert transport.params_of("mobkit/inspect_identity") == []
+        assert transport.params_of("meta/inspect_identity") == []
 
     @pytest.mark.asyncio
     async def test_plain_send_does_not_request_tracking(self):
@@ -566,12 +566,12 @@ class TestAttribution:
 
         result = await handle.send("alpha")
 
-        assert "track_turn" not in transport.params_of("mobkit/send")[0]
+        assert "track_turn" not in transport.params_of("meta/send")[0]
         assert result.turn_ticket is None
 
 
 class _CursorOutcomeTransport(TicketTransport):
-    """Answers the identity-wide ``mobkit/wait_for_completion`` with a fixed
+    """Answers the identity-wide ``meta/wait_for_completion`` with a fixed
     typed outcome, to drive the default (untracked) wait's failure paths."""
 
     def __init__(self, *, sends, outcome: str, cursor: dict | None):
@@ -580,7 +580,7 @@ class _CursorOutcomeTransport(TicketTransport):
         self._cursor = cursor
 
     def send_sync(self, request):
-        if request.get("method") == "mobkit/wait_for_completion":
+        if request.get("method") == "meta/wait_for_completion":
             self.calls.append(request)
             params = request.get("params") or {}
             result = {
@@ -602,7 +602,7 @@ class TestDefaultPathCustody:
             warnings.simplefilter("ignore", TurnTrackingUnavailableWarning)
             with pytest.raises(BaseException) as raised:
                 await handle.dispatch_text_and_wait("alpha", timeout=0.2, poll_interval=0.001)
-        assert len(transport.params_of("mobkit/dispatch")) == 1, "dispatched exactly once"
+        assert len(transport.params_of("meta/dispatch")) == 1, "dispatched exactly once"
         return raised.value
 
     @pytest.mark.asyncio
@@ -680,7 +680,7 @@ class TestWarningsAsErrorsCustody:
                 await handle.dispatch_text_and_wait("alpha", timeout=5, poll_interval=0.001)
         assert isinstance(raised.value.admission, DispatchResult)
         assert raised.value.ticket is None
-        assert len(transport.params_of("mobkit/dispatch")) == 1
+        assert len(transport.params_of("meta/dispatch")) == 1
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -703,7 +703,7 @@ class TestWarningsAsErrorsCustody:
                 await handle.send_and_wait("alpha", timeout=5, poll_interval=0.001)
         assert isinstance(raised.value.admission, SendResult)
         assert raised.value.ticket == "t-own"
-        assert len(transport.params_of("mobkit/send")) == 1
+        assert len(transport.params_of("meta/send")) == 1
 
     @pytest.mark.asyncio
     async def test_warnings_still_name_the_callers_line(self):

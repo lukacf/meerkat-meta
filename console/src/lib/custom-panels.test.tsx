@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { type ConsolePanelDefinition, type ConsoleFrame } from "@console-core";
 import { ConsoleApp } from "../ConsoleApp";
-import type { MobKitConsoleTransport } from "./headless";
+import type { MetaConsoleTransport } from "./headless";
 import { CONSOLE_RPC_METHODS } from "./contract";
 const identity = { id: "identity:demo", label: "Demo", role: "assistant" as const };
 
@@ -14,7 +14,7 @@ describe("stock custom panels", () => {
     let visible = true;
     const agent = { identity: identity.id, member_id: identity.id, agent_id: identity.id,
       label: "Demo", kind: "member", role: "worker", state: "idle", addressable: true, affordances: {} };
-    const transport: MobKitConsoleTransport = {
+    const transport: MetaConsoleTransport = {
       loadExperience: async () => ({ contract_version: "test", runtime_id: "panel-selection-test", storage_scope: "panel-selection-subject",
         console_config: {}, console_policy: {}, agent_sidebar: { live_snapshot: { agents: visible ? [agent] : [] } },
         activity_feed: { filter_presets: [], active_preset_id: "all" } }) as never,
@@ -49,7 +49,7 @@ describe("stock custom panels", () => {
       agent_sidebar: { live_snapshot: { agents: [{ identity: identity.id, member_id: identity.id, agent_id: identity.id,
         label: "Demo", kind: "member", role: "worker", state: "idle", addressable: true, affordances: {} }] } },
       activity_feed: { filter_presets: [], active_preset_id: "all" } };
-    const transport: MobKitConsoleTransport = {
+    const transport: MetaConsoleTransport = {
       loadExperience: async () => experience as never, loadModules: async () => ({ modules: [] }) as never,
       capabilities: async () => ({ version: "test", methods: Object.values(CONSOLE_RPC_METHODS) }) as never,
       queryTimeline: async () => ({ frames: [], exhausted: true, available: true }),

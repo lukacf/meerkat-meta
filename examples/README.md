@@ -1,6 +1,6 @@
 # Examples
 
-This repo now has a repo-root `examples/` surface for multi-language packs that prove the shipped MobKit surfaces end to end.
+This repo now has a repo-root `examples/` surface for multi-language packs that prove the shipped Meta surfaces end to end.
 
 Numbered packs are intentionally browser-first and can include:
 

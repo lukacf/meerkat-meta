@@ -1,11 +1,11 @@
 """Real gateway profile capability tests.
 
-These tests cover the shipping Python SDK -> rpc_gateway -> MobKit/Meerkat
+These tests cover the shipping Python SDK -> rpc_gateway -> Meta/Meerkat
 factory path. They intentionally assert the per-identity resolved tool surface,
-not the global mobkit/tools/catalog.
+not the global meta/tools/catalog.
 
 Run:
-    scripts/repo-cargo build -p meerkat-mobkit --bin rpc_gateway
+    scripts/repo-cargo build -p meerkat-meta --bin rpc_gateway
     PYTHONPATH=sdk/python python3 -m pytest sdk/python/tests/test_profile_capabilities_real_gateway.py -q
 """
 from __future__ import annotations
@@ -16,13 +16,13 @@ import subprocess
 
 import pytest
 
-from meerkat_mobkit.builder import MobKit
-from meerkat_mobkit.errors import RpcError
-from meerkat_mobkit.identity_first_models import DurableAgentSpec
+from meerkat_meta.builder import Meta
+from meerkat_meta.errors import RpcError
+from meerkat_meta.identity_first_models import DurableAgentSpec
 
 
 def _resolve_gateway_bin() -> str:
-    override = os.environ.get("MOBKIT_GATEWAY_BIN", "").strip()
+    override = os.environ.get("META_GATEWAY_BIN", "").strip()
     if override:
         return override
     repo_root = Path(__file__).resolve().parents[3]
@@ -56,7 +56,7 @@ _skip_no_binary = pytest.mark.skipif(
     not _GATEWAY_BIN or not os.path.isfile(_GATEWAY_BIN),
     reason=(
         f"Gateway binary not found at {_GATEWAY_BIN} - run: "
-        "./scripts/repo-cargo build -p meerkat-mobkit --bin rpc_gateway"
+        "./scripts/repo-cargo build -p meerkat-meta --bin rpc_gateway"
     ),
 )
 
@@ -104,7 +104,7 @@ class MutableRoster:
 
 async def _build_runtime(mob_toml: Path, state_dir: Path, roster: MutableRoster):
     return await (
-        MobKit.builder()
+        Meta.builder()
         .gateway(_GATEWAY_BIN)
         .mob(str(mob_toml))
         .persistent_state(str(state_dir))
@@ -130,7 +130,7 @@ _ROUTING_STATUS_REASONS = {
 
 
 async def _assert_routing_status_is_reachable_through_a_real_gateway(handle) -> None:
-    """End-to-end reachability for mobkit/identity/routing_status.
+    """End-to-end reachability for meta/identity/routing_status.
 
     Deliberately NOT asserting a particular provider: this fixture does not
     control whether the member has been addressed, and routing status is

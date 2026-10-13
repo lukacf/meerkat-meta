@@ -3,7 +3,7 @@
 // PAID, opt-in acceptance: npm run build && npm run e2e:voice:live
 // Offline evidence/fixture checks: node voice-e2e-live.cjs --self-test
 // Native local WebRTC clock check: node voice-e2e-live.cjs --self-test-audio
-// Optional MOBKIT_VOICE_GATEWAY_BIN uses an already-built openai-live gateway.
+// Optional META_VOICE_GATEWAY_BIN uses an already-built openai-live gateway.
 // No provider/RPC mocks, human microphone, external demo, native text injection,
 // output ACK fabrication, or default-CI calls. Only getUserMedia is substituted.
 // Typed input goes to the existing background agent; it is NOT Live user text:
@@ -29,7 +29,7 @@ const COVERAGE = {
   ownerAckBoundary: "Separate upstream deterministic owner tests gate append after generated authorization and before provider ACK",
   appendObservability: "No public provider-append count; this lane checks peer sends, canonical finals and native spoken-result duplicates",
 };
-const HELP = `PAID MobKit console voice acceptance (gpt-live-1 + original gpt-5.5 agent)
+const HELP = `PAID Meta console voice acceptance (gpt-live-1 + original gpt-5.5 agent)
 
   npm --prefix console run e2e:voice:live
   node console/voice-e2e-live.cjs --self-test
@@ -38,11 +38,11 @@ const HELP = `PAID MobKit console voice acceptance (gpt-live-1 + original gpt-5.
   node console/voice-e2e-live.cjs --help
 
 Prepare the embedded console with npm --prefix console run build first.
-The runner does not modify generated bundles. It builds mobkit_gateway using
+The runner does not modify generated bundles. It builds meta_gateway using
 scripts/repo-cargo --locked, --features openai-live and CARGO_INCREMENTAL=0.
-MOBKIT_VOICE_GATEWAY_BIN=/absolute/path selects an already-built current gateway.
+META_VOICE_GATEWAY_BIN=/absolute/path selects an already-built current gateway.
 OPENAI_API_KEY or OPENAI_API_KEY_OLD is required for the paid lane; absence fails.
-MOBKIT_VOICE_KEEP_ARTIFACTS=1 retains private temporary diagnostics after success.
+META_VOICE_KEEP_ARTIFACTS=1 retains private temporary diagnostics after success.
 
 Only microphone capture is substituted, using portable original WAV fixtures.
 Provider, RPC, runtime authority and peer model calls are real. No human mic,
@@ -57,9 +57,9 @@ the requested number of open/close runs and prints per-run and median/max
 tables. --seed-words sets the requested reply length per seeded turn and
 --hold-ms keeps each call open until context preparation settles (bounded), so
 the concurrent summary's duration is observed too.
-MOBKIT_VOICE_ALLOW_STALE_BUNDLE=1 accepts an override gateway whose embedded
+META_VOICE_ALLOW_STALE_BUNDLE=1 accepts an override gateway whose embedded
 console differs from the current build (older commits under test), and
-MOBKIT_VOICE_TTT_RUST_LOG overrides the gateway's RUST_LOG for that run.
+META_VOICE_TTT_RUST_LOG overrides the gateway's RUST_LOG for that run.
 
 Coverage: speech-triggered real keeper verification and keeper-only knowledge;
 typed exact-value recall; delayed peer results;
@@ -234,7 +234,7 @@ function memberObservationPending(method, response) {
   // (upstream LifecycleOperationAdmissionPending, authority_retained=false).
   // It is not a queued mutation, so a later observation may safely retry.
   const message = "member_status failed: mob lifecycle operation admission is still pending at observation_lane_saturated: member_status_observation";
-  return method === "mobkit/member_status" && !response.result && response.error?.code === -32000 &&
+  return method === "meta/member_status" && !response.result && response.error?.code === -32000 &&
     response.error.message === message && response.error.data?.error === "internal_error" &&
     response.error.data.detail === message;
 }
@@ -685,11 +685,11 @@ function selfTest() {
   const pendingMessage = "member_status failed: mob lifecycle operation admission is still pending at observation_lane_saturated: member_status_observation";
   const pendingObservation = { error: { code: -32000, message: pendingMessage,
     data: { error: "internal_error", detail: pendingMessage } } };
-  assert.ok(memberObservationPending("mobkit/member_status", pendingObservation));
-  assert.equal(memberObservationPending("mobkit/console/send", pendingObservation), false);
-  assert.equal(memberObservationPending("mobkit/member_status", { error: { ...pendingObservation.error, code: -32600 } }), false);
-  assert.equal(memberObservationPending("mobkit/member_status", { error: { ...pendingObservation.error, message: "Unauthorized" } }), false);
-  assert.equal(memberObservationPending("mobkit/member_status", { error: { ...pendingObservation.error, data: undefined } }), false);
+  assert.ok(memberObservationPending("meta/member_status", pendingObservation));
+  assert.equal(memberObservationPending("meta/console/send", pendingObservation), false);
+  assert.equal(memberObservationPending("meta/member_status", { error: { ...pendingObservation.error, code: -32600 } }), false);
+  assert.equal(memberObservationPending("meta/member_status", { error: { ...pendingObservation.error, message: "Unauthorized" } }), false);
+  assert.equal(memberObservationPending("meta/member_status", { error: { ...pendingObservation.error, data: undefined } }), false);
   const call = { kind: "tool_call_requested", payload: { name: "send_message", id: "a", args: { content: "launch" } } };
   const result = { kind: "tool_execution_completed", payload: { id: "a", is_error: false,
     result: JSON.stringify({ status: "sent", receipt: { envelope_id: "native-envelope", delivery: "queued" } }) } };
@@ -831,7 +831,7 @@ async function selfTestPeerGate() {
 }
 
 function buildGateway() {
-  const override = process.env.MOBKIT_VOICE_GATEWAY_BIN;
+  const override = process.env.META_VOICE_GATEWAY_BIN;
   if (override) {
     const binary = path.resolve(override);
     fs.accessSync(binary, fs.constants.X_OK);
@@ -839,16 +839,16 @@ function buildGateway() {
   }
   for (const name of ["console-app.js", "console-app.css", "index.html"]) {
     assert.ok(fs.readFileSync(path.join(__dirname, "dist", name))
-      .equals(fs.readFileSync(path.join(ROOT, "crates", "meerkat-mobkit", "console-dist", name))),
+      .equals(fs.readFileSync(path.join(ROOT, "crates", "meerkat-meta", "console-dist", name))),
     "Prepare the current embedded console first: cd console && npm run build");
   }
-  log("build", { binary: "mobkit_gateway", features: "openai-live", incremental: false });
+  log("build", { binary: "meta_gateway", features: "openai-live", incremental: false });
   const run = spawnSync(path.join(ROOT, "scripts", "repo-cargo"),
-    ["build", "--locked", "-p", "meerkat-mobkit", "--bin", "mobkit_gateway", "--features", "openai-live", "--message-format=json"],
+    ["build", "--locked", "-p", "meerkat-meta", "--bin", "meta_gateway", "--features", "openai-live", "--message-format=json"],
     { cwd: ROOT, env: { ...childEnv(), CARGO_INCREMENTAL: "0" }, encoding: "utf8", timeout: 1_200_000, maxBuffer: 32 * 1024 * 1024 });
   assert.equal(run.status, 0, `Gateway build failed: ${redact(run.stderr)}`);
   const artifact = run.stdout.split("\n").filter(Boolean).map(line => JSON.parse(line))
-    .find(row => row.reason === "compiler-artifact" && row.target?.name === "mobkit_gateway" && row.executable);
+    .find(row => row.reason === "compiler-artifact" && row.target?.name === "meta_gateway" && row.executable);
   assert.ok(artifact, "Cargo did not report the built gateway");
   return artifact.executable;
 }
@@ -862,7 +862,7 @@ async function launchGateway(binary, apiKey, facts, directory, options = {}) {
   secrets.push(signingKey);
   const encode = value => Buffer.from(JSON.stringify(value)).toString("base64url");
   const unsigned = `${encode({ alg: "HS256", typ: "JWT" })}.${encode({
-    iss: "http://127.0.0.1/mobkit-gateway", aud: "persistent-gateway",
+    iss: "http://127.0.0.1/meta-gateway", aud: "persistent-gateway",
     sub: principal, email: principal, exp: Math.floor(Date.now() / 1000) + 3600,
   })}`;
   const jwt = `${unsigned}.${crypto.createHmac("sha256", signingKey).update(unsigned).digest("base64url")}`;
@@ -945,7 +945,7 @@ provider_default = true
   const url = `http://127.0.0.1:${proxy.address().port}`;
   const gateway = spawn(binary, [], { cwd: workspace,
     env: { ...childEnv(), OPENAI_API_KEY: apiKey, XDG_STATE_HOME: path.join(directory, "xdg"),
-      RUST_LOG: options.rustLog ?? "warn,meerkat_mobkit=info,meerkat::experimental_gpt_live=info,meerkat::session_runtime::live_orchestration=info,meerkat_openai::public_live=info" },
+      RUST_LOG: options.rustLog ?? "warn,meerkat_meta=info,meerkat::experimental_gpt_live=info,meerkat::session_runtime::live_orchestration=info,meerkat_openai::public_live=info" },
     stdio: ["pipe", "pipe", "pipe"] });
   const stderr = readline.createInterface({ input: gateway.stderr });
   const logPath = path.join(directory, "gateway.log");
@@ -975,7 +975,7 @@ provider_default = true
     stdout.close();
   };
   try {
-    gateway.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: "voice-e2e-init", method: "mobkit/init", params: {
+    gateway.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: "voice-e2e-init", method: "meta/init", params: {
       workspace_root: workspace, runtime_root: path.join(directory, "runtime"), store_path: path.join(directory, "state"),
       persistent_sessions: true, identity_first: true, realm, meerkat_config_path: configPath,
       http_listen: "127.0.0.1:0", http_public_base_url: url,
@@ -1041,7 +1041,7 @@ provider_default = true
     const servedBundle = await preflight("embedded console bundle", `${url}/console/assets/console-app.js`);
     assert.equal(servedBundle.status, 200);
     const currentBundle = servedBundle.bytes.equals(
-      fs.readFileSync(path.join(ROOT, "crates", "meerkat-mobkit", "console-dist", "console-app.js")));
+      fs.readFileSync(path.join(ROOT, "crates", "meerkat-meta", "console-dist", "console-app.js")));
     if (options.allowStaleBundle) log("embedded-console-bundle", { matchesCurrentBuild: currentBundle });
     else assert.ok(currentBundle, "Gateway embeds a stale console: prepare npm run build, then rebuild the openai-live binary");
     log("gateway-ready", { pid: gateway.pid, model: "gpt-5.5", voiceModel: "gpt-live-1" });
@@ -1372,7 +1372,7 @@ async function runBrowser(url, facts, directory, gate) {
       signal: AbortSignal.timeout(15_000) });
     assert.equal(response.status, 200, `${method} HTTP ${response.status}`);
     const data = await response.json();
-    if (method.startsWith("mobkit/live/") || method.startsWith("mobkit/console/voice/")) {
+    if (method.startsWith("meta/live/") || method.startsWith("meta/console/voice/")) {
       observations.directControls.push({ method, at: Date.now(), identity: params.identity,
         channelId: params.channel_id, requestId: params.request_id, phase: data.result?.phase,
         errorCode: data.error?.code, errorKind: data.error?.data?.kind,
@@ -1387,11 +1387,11 @@ async function runBrowser(url, facts, directory, gate) {
   };
   const controlParams = active => ({ identity: PRIMARY, channel_id: active.channelId,
     activation_receipt: active.activationReceipt });
-  const status = active => rpc("mobkit/live/status", controlParams(active));
+  const status = active => rpc("meta/live/status", controlParams(active));
   const history = new Map();
   const sessionIds = new Map();
   const frames = async identity => {
-    const result = await rpc("mobkit/console/query_timeline", { identity, mode: "recent", limit: 1000 });
+    const result = await rpc("meta/console/query_timeline", { identity, mode: "recent", limit: 1000 });
     for (const frame of result.frames ?? []) history.set(frame.id, frame);
     return [...history.values()].filter(frame => frame.identity === identity);
   };
@@ -1407,12 +1407,12 @@ async function runBrowser(url, facts, directory, gate) {
     const start = requests.length;
     await page.getByTestId(`chat-send:${identity}`).click();
     return poll("console accepted typed input", () => {
-      const sent = requests.slice(start).find(row => row.method === "mobkit/console/send" && row.params.identity === identity);
+      const sent = requests.slice(start).find(row => row.method === "meta/console/send" && row.params.identity === identity);
       if (sent?.error) throw new Error(`Typed send failed: ${redact(JSON.stringify(sent.error))}`);
       return sent?.result && sent;
     });
   };
-  const peerSend = content => rpc("mobkit/console/send", { identity: KEEPER, content,
+  const peerSend = content => rpc("meta/console/send", { identity: KEEPER, content,
     origin: "voice-live-acceptance", idempotency_key: crypto.randomUUID() });
   const hear = async (start, expected, label = expected) => {
     const evidence = await poll(`native spoken output: ${label}`, async () => {
@@ -1434,7 +1434,7 @@ async function runBrowser(url, facts, directory, gate) {
   };
   let original;
   const sameOriginal = async () => {
-    const current = (await rpc("mobkit/console/inspect_identity", { identity: PRIMARY })).identity;
+    const current = (await rpc("meta/console/inspect_identity", { identity: PRIMARY })).identity;
     assert.equal(current.runtime_member_id, original.runtime_member_id, "Delegation must keep ORIGINAL member");
     assert.equal(current.session_id, original.session_id, "Delegation must keep ORIGINAL background session");
   };
@@ -1442,12 +1442,12 @@ async function runBrowser(url, facts, directory, gate) {
     const begin = requests.length;
     await page.getByRole("button", { name: `Start voice with ${LABEL}`, exact: true }).click({ timeout: 30_000 });
     await page.getByTestId("voice-bar").and(page.locator('[data-phase="active"]')).waitFor({ timeout: 45_000 });
-    const row = requests.slice(begin).find(request => request.method === "mobkit/console/voice/open" && request.result);
+    const row = requests.slice(begin).find(request => request.method === "meta/console/voice/open" && request.result);
     assert.ok(row, "Real open RPC must succeed");
     assert.equal(row.params.identity, PRIMARY);
     assert.equal(row.result.execution_mode, "client_context");
     assert.equal(row.result.target_identity, PRIMARY);
-    const activated = requests.slice(begin).find(request => request.method === "mobkit/live/status" &&
+    const activated = requests.slice(begin).find(request => request.method === "meta/live/status" &&
       request.result?.phase === "active");
     assert.ok(activated, "Server must report real active provider session");
     assert.equal(activated.result.handle.channel_id, row.result.channel_id);
@@ -1470,7 +1470,7 @@ async function runBrowser(url, facts, directory, gate) {
         state.gains.every(gain => gain === 0);
     }, 1000, 25);
     const closed = await poll("exact server cleanup under 5 seconds", () => requests.find(row =>
-      row.method === "mobkit/console/voice/close" && row.params.request_id === active.requestId &&
+      row.method === "meta/console/voice/close" && row.params.request_id === active.requestId &&
       row.params.identity === PRIMARY && row.result?.phase === "closed"), Math.max(1, 4900 - (Date.now() - start)), 25);
     assert.ok(closed.ended - start < 5000, `Server close took ${closed.ended - start}ms`);
     await poll("all local media and peers stopped", async () => {
@@ -1485,7 +1485,7 @@ async function runBrowser(url, facts, directory, gate) {
     log("closed", receipt);
     // Positive cleanup is proven above. The console releases channel custody
     // after close, so the retired channel must now fail its exact owner guard.
-    assertRetiredChannelGuard(await rpcRaw("mobkit/live/status", controlParams(active)));
+    assertRetiredChannelGuard(await rpcRaw("meta/live/status", controlParams(active)));
   };
   page.on("request", request => {
     if (!request.url().endsWith("/console/rpc")) return;
@@ -1516,7 +1516,7 @@ async function runBrowser(url, facts, directory, gate) {
     ]);
     const records = [];
     for (const identity of [PRIMARY, KEEPER]) {
-      const record = (await rpc("mobkit/console/inspect_identity", { identity })).identity;
+      const record = (await rpc("meta/console/inspect_identity", { identity })).identity;
       assert.equal(barriers.find(frame => frame.identity === identity)?.session_id, record.session_id,
         "Startup barrier must belong to the inspected canonical session");
       sessionIds.set(identity, record.session_id);
@@ -1532,11 +1532,11 @@ async function runBrowser(url, facts, directory, gate) {
       // These probes share one actor observation lane; parallel deep reads
       // can saturate that lane even when the two members themselves are idle.
       for (const record of records) {
-        observations.bootstrapProbe = { identity: record.identity, method: "mobkit/status_identity" };
-        const identityStatus = await rpc("mobkit/status_identity", { identity: record.identity });
-        observations.bootstrapProbe.method = "mobkit/member_status";
-        const memberResponse = await rpcRaw("mobkit/member_status", { member_id: record.runtime_member_id });
-        if (memberObservationPending("mobkit/member_status", memberResponse)) {
+        observations.bootstrapProbe = { identity: record.identity, method: "meta/status_identity" };
+        const identityStatus = await rpc("meta/status_identity", { identity: record.identity });
+        observations.bootstrapProbe.method = "meta/member_status";
+        const memberResponse = await rpcRaw("meta/member_status", { member_id: record.runtime_member_id });
+        if (memberObservationPending("meta/member_status", memberResponse)) {
           stableReads = 0;
           lastWitness = undefined;
           observations.bootstrapAdmissionRetries++;
@@ -1546,7 +1546,7 @@ async function runBrowser(url, facts, directory, gate) {
             cause: memberResponse.error.message });
           return null;
         }
-        assert.ok(!memberResponse.error, `mobkit/member_status: ${redact(JSON.stringify(memberResponse.error))}`);
+        assert.ok(!memberResponse.error, `meta/member_status: ${redact(JSON.stringify(memberResponse.error))}`);
         const member = memberResponse.result;
         assert.ok(!["broken", "retiring", "retired"].includes(identityStatus.state),
           `Bootstrap member unhealthy: ${record.identity} ${identityStatus.state}`);
@@ -1574,7 +1574,7 @@ async function runBrowser(url, facts, directory, gate) {
     observations.bootstrap = { barriers: barriers.map(frame => frame.id), stableReads, members: bootstrap };
     log("bootstrap-ready", { canonicalBarriers: barriers.length, stableReads,
       members: bootstrap.map(row => ({ identity: row.identity, progress: row.member.progress })) });
-    original = (await rpc("mobkit/console/inspect_identity", { identity: PRIMARY })).identity;
+    original = (await rpc("meta/console/inspect_identity", { identity: PRIMARY })).identity;
     assert.ok(original.session_id && original.runtime_member_id, "Warmup must establish a real original session");
     const active = await open();
 
@@ -1623,7 +1623,7 @@ async function runBrowser(url, facts, directory, gate) {
     const recall = await speak(page, ["recall"]);
     await inputHeard(recall, "current console value");
     await hear(recall, facts.typed, "subsequent spoken recall");
-    assert.equal(requests.filter(row => row.method === "mobkit/console/send" && row.params.content === content).length, 1);
+    assert.equal(requests.filter(row => row.method === "meta/console/send" && row.params.content === content).length, 1);
     assertTypedSendAdmission(await frames(PRIMARY), { runtime_key: original.runtime_key, identity: PRIMARY,
       session_id: original.session_id, interaction_id: typed.result.interaction_id }, content);
     assertCanonicalTypedUser(readCommittedTypedSource(directory, original.session_id),
@@ -1751,7 +1751,7 @@ async function runBrowser(url, facts, directory, gate) {
       releasedOnPeer: lateRelease.peer, ...lateSpoken };
     await final(PRIMARY, overlapBefore, facts.oldTyped);
     await final(PRIMARY, overlapBefore, facts.overlapValue);
-    assert.equal(requests.filter(row => row.method === "mobkit/console/send" &&
+    assert.equal(requests.filter(row => row.method === "meta/console/send" &&
       row.params.content === concurrentContent).length, 1, "Concurrent typed update must be admitted only once");
     assertTypedSendAdmission(await frames(PRIMARY), { runtime_key: original.runtime_key, identity: PRIMARY,
       session_id: original.session_id, interaction_id: concurrent.result.interaction_id }, concurrentContent);
@@ -1761,14 +1761,14 @@ async function runBrowser(url, facts, directory, gate) {
     assert.equal((await status(reopened)).phase, "active");
     // This is an intentional adversarial control against this test's isolated
     // gateway, not UI traffic exempted from the browser receipt-isolation check.
-    const mismatchedClose = await rpcRaw("mobkit/live/close", {
+    const mismatchedClose = await rpcRaw("meta/live/close", {
       ...controlParams(reopened), activation_receipt: active.activationReceipt,
     });
     assert.equal(mismatchedClose.error?.code, -32602,
       "The old real activation receipt must be rejected when targeting the new channel");
     assert.ok(!mismatchedClose.result, "Rejected stale-receipt close must not report success");
     assert.equal((await status(reopened)).phase, "active", "Stale receipt must not close the new provider channel");
-    const oldClose = await rpc("mobkit/console/voice/close", { identity: PRIMARY, request_id: active.requestId });
+    const oldClose = await rpc("meta/console/voice/close", { identity: PRIMARY, request_id: active.requestId });
     assert.equal(oldClose.phase, "closed", "The old request's idempotent close must stay scoped to that request");
     assert.equal((await status(reopened)).phase, "active", "Stale request close must leave the new channel active");
     observations.staleControls = { rejectedOldActivationReceipt: true, oldRequestRemainedClosed: true,
@@ -1850,7 +1850,7 @@ function makeFacts(nonce) {
   return facts;
 }
 
-const TTT_RUST_LOG = "warn,meerkat_mobkit=info,meerkat_mobkit::console_voice::timing=debug," +
+const TTT_RUST_LOG = "warn,meerkat_meta=info,meerkat_meta::console_voice::timing=debug," +
   "meerkat::experimental_gpt_live=info,meerkat::session_runtime::live_orchestration=info,meerkat_openai::public_live=info";
 const median = values => {
   const sorted = [...values].filter(value => Number.isFinite(value)).sort((a, b) => a - b);
@@ -1878,7 +1878,7 @@ function summarizeActivation({ clickWall, activeWall, rows, timeline }) {
     const row = rpcRow(method);
     return row ? { at: row.started - clickWall, ms: row.ended - row.started, ok: !row.error } : null;
   };
-  const statusRows = rows.filter(row => row.method === "mobkit/live/status" && row.params.pending_receipt &&
+  const statusRows = rows.filter(row => row.method === "meta/live/status" && row.params.pending_receipt &&
     row.started >= clickWall && row.ended);
   const activeRow = statusRows.find(row => row.result?.phase === "active");
   const status = statusRows.length ? {
@@ -1889,16 +1889,16 @@ function summarizeActivation({ clickWall, activeWall, rows, timeline }) {
     maxPollMs: Math.max(...statusRows.map(row => row.ended - row.started)),
     medianPollMs: median(statusRows.map(row => row.ended - row.started)),
   } : null;
-  const answerReceived = rpc("mobkit/console/voice/answer_received");
+  const answerReceived = rpc("meta/console/voice/answer_received");
   return {
     totalUiActiveMs: activeWall - clickWall,
     micEnabledAt: markAt("mic-enabled"),
-    readiness: rpc("mobkit/console/voice/readiness"),
+    readiness: rpc("meta/console/voice/readiness"),
     getUserMedia: { at: markAt("getUserMedia:start"), ms: markAt("getUserMedia:end") - markAt("getUserMedia:start") },
-    open: rpc("mobkit/console/voice/open"),
+    open: rpc("meta/console/voice/open"),
     offerLocal: { at: markAt("peer-created"), ms: markAt("set-local:end") - markAt("peer-created") },
     iceGatheringComplete: markAt("ice-gathering", entry => entry.state === "complete"),
-    register: rpc("mobkit/live/playback_owner/register"),
+    register: rpc("meta/live/playback_owner/register"),
     answer: rpc("live/webrtc/answer"),
     setRemoteMs: markAt("set-remote:end") - markAt("set-remote:start"),
     answerReceived,
@@ -1943,12 +1943,12 @@ async function timeToTalk({ runs, seedTurns, seedWords, holdMs }) {
   secrets = [apiKey];
   const binary = buildGateway();
   const nonce = crypto.randomUUID();
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "mobkit-voice-ttt-"));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "meta-voice-ttt-"));
   fs.chmodSync(directory, 0o700);
   const facts = makeFacts(nonce);
   const gateway = await launchGateway(binary, apiKey, facts, directory, {
-    allowStaleBundle: process.env.MOBKIT_VOICE_ALLOW_STALE_BUNDLE === "1",
-    rustLog: process.env.MOBKIT_VOICE_TTT_RUST_LOG || TTT_RUST_LOG,
+    allowStaleBundle: process.env.META_VOICE_ALLOW_STALE_BUNDLE === "1",
+    rustLog: process.env.META_VOICE_TTT_RUST_LOG || TTT_RUST_LOG,
   });
   const logPath = path.join(directory, "gateway.log");
   const serverLine = /console_voice::timing|context summary finished/;
@@ -1985,7 +1985,7 @@ async function timeToTalk({ runs, seedTurns, seedWords, holdMs }) {
     await page.addInitScript(instrumentBrowser);
     await page.goto(`${gateway.url}/console`);
     await page.getByTestId(`chat-composer:${PRIMARY}`).waitFor({ timeout: 30_000 });
-    const finals = async (scope = {}) => new Set(((await rpc("mobkit/console/query_timeline", { identity: PRIMARY, mode: "recent", limit: 1000 }))
+    const finals = async (scope = {}) => new Set(((await rpc("meta/console/query_timeline", { identity: PRIMARY, mode: "recent", limit: 1000 }))
       .frames ?? []).filter(frame => finalText(frame, { identity: PRIMARY, ...scope })).map(frame => frame.id));
     const seedStarted = Date.now();
     const turns = Math.max(1, seedTurns);
@@ -1994,11 +1994,11 @@ async function timeToTalk({ runs, seedTurns, seedWords, holdMs }) {
       const content = seedTurns < 1
         ? `Startup barrier ${nonce}. Use no tools. Reply exactly READY.`
         : `Seed turn ${turn} of ${turns}. Use no tools. Reply in about ${seedWords} words of plain prose that mention the number ${turn} and give facts about the word ${WORDS[turn % WORDS.length]}.`;
-      const accepted = await rpc("mobkit/console/send", { identity: PRIMARY, content, origin: "voice-time-to-talk", idempotency_key: crypto.randomUUID() });
+      const accepted = await rpc("meta/console/send", { identity: PRIMARY, content, origin: "voice-time-to-talk", idempotency_key: crypto.randomUUID() });
       await poll(`seed turn ${turn} final`, async () => [...await finals({ interaction_id: accepted.interaction_id })]
         .some(id => !before.has(id)), 120_000, 500);
     }
-    const original = (await rpc("mobkit/console/inspect_identity", { identity: PRIMARY })).identity;
+    const original = (await rpc("meta/console/inspect_identity", { identity: PRIMARY })).identity;
     // Let the last turn's checkpoint commit before reading the store.
     await sleep(1500);
     const size = sessionSize(directory, original.session_id);
@@ -2018,7 +2018,7 @@ async function timeToTalk({ runs, seedTurns, seedWords, holdMs }) {
       await sleep(400);
       // The console polls context_status once a second while the concurrent
       // summary is prepared; hold the call so that phase can settle.
-      const contextRows = () => requests.slice(begin).filter(row => row.method === "mobkit/console/voice/context_status" && row.ended);
+      const contextRows = () => requests.slice(begin).filter(row => row.method === "meta/console/voice/context_status" && row.ended);
       const preparation = row => row.result?.context_preparation ?? row.result?.preparation;
       const settled = row => ["provider_acknowledged", "failed"].includes(preparation(row)?.phase);
       if (holdMs > 0) await poll("context preparation settled", () => contextRows().some(settled), holdMs, 250).catch(() => {});
@@ -2036,7 +2036,7 @@ async function timeToTalk({ runs, seedTurns, seedWords, holdMs }) {
         transitions: transitions.map(entry => `${entry.key}@${entry.at}`) };
       const closeStart = Date.now();
       await page.getByRole("button", { name: "End voice conversation", exact: true }).click();
-      await poll("voice closed", () => requests.find(row => row.method === "mobkit/console/voice/close" &&
+      await poll("voice closed", () => requests.find(row => row.method === "meta/console/voice/close" &&
         row.started >= closeStart && row.result?.phase === "closed"), 30_000, 50);
       await poll("voice bar gone", async () => (await page.getByTestId("voice-bar").count()) === 0, 10_000, 50);
       stages.closeMs = Date.now() - closeStart;
@@ -2128,7 +2128,7 @@ async function main() {
   selfTest();
   const binary = buildGateway();
   const nonce = crypto.randomUUID();
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "mobkit-voice-live-"));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "meta-voice-live-"));
   fs.chmodSync(directory, 0o700);
   const facts = makeFacts(nonce);
   let gateway;
@@ -2146,7 +2146,7 @@ async function main() {
       await gateway?.stop();
     }
     // Own mkdtemp directory only; never touch the user's demo or another run.
-    if (passed && process.env.MOBKIT_VOICE_KEEP_ARTIFACTS !== "1") fs.rmSync(directory, { recursive: true });
+    if (passed && process.env.META_VOICE_KEEP_ARTIFACTS !== "1") fs.rmSync(directory, { recursive: true });
     else log("artifacts", { directory, contains: "redacted gateway log, evidence and screenshot; no credentials" });
   }
 }

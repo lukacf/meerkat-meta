@@ -18,13 +18,13 @@ MODE="${1:-smoke}"
 export RUST_MIN_STACK="${RUST_MIN_STACK:-33554432}"
 
 # Print the bound address the server announces in its log
-# ("MOBKIT_FIXTURE_READY {...}") after binding port 0. Reserving a free port
+# ("META_FIXTURE_READY {...}") after binding port 0. Reserving a free port
 # first and binding it later raced every other process on the host for it.
 bound_addr() {
   python3 - "$1" "$2" <<'PY'
 import json, os, sys, time
 log_path, server_pid = sys.argv[1], int(sys.argv[2])
-prefix = "MOBKIT_FIXTURE_READY "
+prefix = "META_FIXTURE_READY "
 deadline = time.time() + 600
 while time.time() < deadline:
     try:
@@ -84,7 +84,7 @@ echo "[access-control-pack] building console assets"
 (cd "$ROOT/console" && npm run build --silent)
 
 # Fresh work dir so the seeded access.toml is deterministic each run.
-WORK_DIR="$(mktemp -d -t mobkit-access-control-pack.XXXXXX)"
+WORK_DIR="$(mktemp -d -t meta-access-control-pack.XXXXXX)"
 export ACCESS_CONTROL_WORK_DIR="$WORK_DIR"
 
 if [[ "$MODE" == "--serve" ]]; then
@@ -94,7 +94,7 @@ if [[ "$MODE" == "--serve" ]]; then
   # kill the entire cargo/server tree via kill -- -PID.
   set -m
   (cd "$ROOT" && ACCESS_CONTROL_LISTEN_ADDR="$LISTEN_ADDR" \
-    cargo run -p meerkat-mobkit --example access_control_console) &
+    cargo run -p meerkat-meta --example access_control_console) &
   SERVER_PID=$!
   set +m
   wait_for_server "http://${LISTEN_ADDR}"
@@ -111,7 +111,7 @@ fi
 echo "[access-control-pack] starting example server"
 set -m
 (cd "$ROOT" && ACCESS_CONTROL_LISTEN_ADDR="127.0.0.1:0" \
-  cargo run -p meerkat-mobkit --example access_control_console > "$WORK_DIR/server.log" 2>&1) &
+  cargo run -p meerkat-meta --example access_control_console > "$WORK_DIR/server.log" 2>&1) &
 SERVER_PID=$!
 set +m
 LISTEN_ADDR="$(bound_addr "$WORK_DIR/server.log" "$SERVER_PID")"

@@ -20,7 +20,7 @@ test("a fixture that binds port 0 reports the port the OS bound", async () => {
     const server = http.createServer((req, res) => res.end("ok"));
     server.listen(Number(port), host, () => {
       process.stdout.write("starting\\n");
-      process.stdout.write("MOBKIT_FIXTURE_READY " + JSON.stringify({ addr: host + ":" + server.address().port }) + "\\n");
+      process.stdout.write("META_FIXTURE_READY " + JSON.stringify({ addr: host + ":" + server.address().port }) + "\\n");
     });
   `, { FIXTURE_ADDR: LOOPBACK_ANY_PORT });
   const forwarded = [];
@@ -44,7 +44,7 @@ test("a fixture that exits first rejects instead of waiting out the timeout", as
 });
 
 test("a ready line without a bound port is refused", async () => {
-  const unbound = child(`process.stdout.write('MOBKIT_FIXTURE_READY {"addr":"127.0.0.1:0"}\\n'); setTimeout(() => {}, 5000);`);
+  const unbound = child(`process.stdout.write('META_FIXTURE_READY {"addr":"127.0.0.1:0"}\\n'); setTimeout(() => {}, 5000);`);
   try {
     await assert.rejects(
       awaitFixtureReady(unbound, { label: "unbound fixture", timeoutMs: 10_000 }),

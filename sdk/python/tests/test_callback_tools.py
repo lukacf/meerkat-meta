@@ -2,8 +2,8 @@
 from functools import partial
 
 import pytest
-from meerkat_mobkit.agent_builder import CallbackDispatcher
-from meerkat_mobkit.models import SessionBuildOptions
+from meerkat_meta.agent_builder import CallbackDispatcher
+from meerkat_meta.models import SessionBuildOptions
 
 
 class _TestBuilder:

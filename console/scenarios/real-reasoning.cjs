@@ -6,7 +6,7 @@ const { randomUUID } = require("node:crypto");
 const { chromium } = require("playwright");
 const { startFixture, eventually, rpc } = require("../acceptance-runtime.cjs");
 
-const evidence = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+const evidence = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
 const source = "Check again again and check again.";
 const answer = "Review complete. Both independent checks support the release candidate.";
 const chunkChars = 6;
@@ -68,12 +68,12 @@ function initializationCancellation(request) {
   if (new URL(request.url()).pathname.endsWith("/timeline/stream")) return true;
   try {
     const body = JSON.parse(request.postData() || "{}");
-    return body.method === "mobkit/console/query_timeline" && body.params?.mode === "recent" && body.params?.limit === 200 && !body.params?.identity;
+    return body.method === "meta/console/query_timeline" && body.params?.mode === "recent" && body.params?.limit === 200 && !body.params?.identity;
   } catch { return false; }
 }
 
 async function repeatedReasoning(host) {
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "Use the coordinator's prebuilt fixture; this scenario must not compile Rust.");
+  assert(process.env.META_EXAMPLE_BIN_DIR, "Use the coordinator's prebuilt fixture; this scenario must not compile Rust.");
   const fixture = await startFixture();
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
@@ -130,7 +130,7 @@ async function repeatedReasoning(host) {
     const live = await captureStream(streamUrl); captures.push(live);
     await eventually(() => { live.check(); return live.events.some(event => event.type === "snapshot_complete"); }, "direct live capture ready before send");
     await fixture.control("model", { source: answer, reasoning_blocks: [source, source], delay_ms: 20, chunk_chars: chunkChars });
-    const sent = await rpc(fixture.baseUrl, "mobkit/console/send", {
+    const sent = await rpc(fixture.baseUrl, "meta/console/send", {
       identity: "router:main", origin: "console:reasoning-acceptance", origin_kind: "operator",
       idempotency_key: randomUUID(), content: "Check the release candidate twice and report the result.",
     });

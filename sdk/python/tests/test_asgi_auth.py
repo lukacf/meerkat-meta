@@ -7,10 +7,10 @@ import time
 
 import pytest
 
-from meerkat_mobkit.config import auth
-from meerkat_mobkit.runtime import (
+from meerkat_meta.config import auth
+from meerkat_meta.runtime import (
     AsgiApp,
-    MobKitRuntime,
+    MetaRuntime,
     _auth_config_to_dict,
     _serialize_config,
     _validate_bearer_token,
@@ -186,22 +186,22 @@ class TestValidateBearerTokenNonJwt:
 
 class TestAsgiAppGoogleAuthRejection:
     def test_google_config_raises_at_construction(self):
-        rt = MobKitRuntime.__new__(MobKitRuntime)
+        rt = MetaRuntime.__new__(MetaRuntime)
         with pytest.raises(ValueError, match="GoogleAuthConfig"):
             AsgiApp(runtime=rt, auth_config=auth.google("client-id"))
 
     def test_google_dict_config_raises_at_construction(self):
-        rt = MobKitRuntime.__new__(MobKitRuntime)
+        rt = MetaRuntime.__new__(MetaRuntime)
         with pytest.raises(ValueError, match="GoogleAuthConfig"):
             AsgiApp(runtime=rt, auth_config={"provider": "google", "client_id": "x"})
 
     def test_jwt_config_accepted(self):
-        rt = MobKitRuntime.__new__(MobKitRuntime)
+        rt = MetaRuntime.__new__(MetaRuntime)
         app = AsgiApp(runtime=rt, auth_config=auth.jwt("secret"))
         assert app._auth_config is not None
 
     def test_none_auth_accepted(self):
-        rt = MobKitRuntime.__new__(MobKitRuntime)
+        rt = MetaRuntime.__new__(MetaRuntime)
         app = AsgiApp(runtime=rt, auth_config=None)
         assert app._auth_config is None
 

@@ -6,7 +6,7 @@ const os = require("node:os");
 const { randomUUID } = require("node:crypto");
 const { chromium } = require("playwright");
 const { startFixture, eventually, rpc, snapshot } = require("../acceptance-runtime.cjs");
-const evidence = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+const evidence = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
 const answer = "Routine workspace review complete. Two initial reads succeeded, the missing file stayed visible, and the delayed review arrived intact.";
 const notes = "  Release notes\nKeep both spaces and this final newline.\n";
 function expectedTools(runId) {
@@ -83,7 +83,7 @@ async function capture(url) {
   return { events, check() { if (fault) throw fault; }, frames() { return events.flatMap(event => event.frame ? [event.frame] : []); }, async close() { abort.abort(); await task; } };
 }
 async function send(fixture, content) {
-  const response = await rpc(fixture.baseUrl, "mobkit/console/send", { identity: "router:main", content,
+  const response = await rpc(fixture.baseUrl, "meta/console/send", { identity: "router:main", content,
     origin: "console:routine-acceptance", origin_kind: "operator", idempotency_key: randomUUID(), handling_mode: "queue" });
   assert(response.body.result?.interaction_id, JSON.stringify(response.body)); return response.body.result;
 }
@@ -107,8 +107,8 @@ async function verifyRequests(fixture, runId) {
   return { calls, results, request };
 }
 async function routineScenario(host) {
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "Use the coordinator's newly built routine-tools fixture, without invoking Cargo.");
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), `mobkit-${host || "api"}-routine-`));
+  assert(process.env.META_EXAMPLE_BIN_DIR, "Use the coordinator's newly built routine-tools fixture, without invoking Cargo.");
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), `meta-${host || "api"}-routine-`));
   const fixture = await startFixture({ mode: "identity", routineTools: true, stateDir });
   const result = { host: host || "api", runId: `routine-${randomUUID().slice(0, 8)}`, errors: [], checks: [] };
   let browser, page, live; let initializing = true;
@@ -132,7 +132,7 @@ async function routineScenario(host) {
           if (new URL(request.url()).pathname.endsWith("/timeline/stream")) return;
           try {
             const body = JSON.parse(request.postData() || "{}");
-            if (body.method === "mobkit/console/query_timeline" && body.params?.mode === "recent" && body.params?.limit === 200 && !body.params?.identity) return;
+            if (body.method === "meta/console/query_timeline" && body.params?.mode === "recent" && body.params?.limit === 200 && !body.params?.identity) return;
           } catch {}
         }
         result.errors.push({ url: request.url(), error: request.failure()?.errorText });

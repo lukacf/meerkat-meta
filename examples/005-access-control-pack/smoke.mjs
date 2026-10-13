@@ -91,7 +91,7 @@ async function main() {
 
   // --- RPC enforcement ---------------------------------------------------
   const aliceDenied = await rpc(
-    "mobkit/console/send",
+    "meta/console/send",
     { identity: "scout-1", content: "hi", origin: "smoke", idempotency_key: "s1" },
     "alice@example.test",
   );
@@ -99,13 +99,13 @@ async function main() {
   assert.equal(aliceDenied.error?.data?.kind, "access_denied");
 
   const aliceAllowed = await rpc(
-    "mobkit/console/send",
+    "meta/console/send",
     { identity: "ops-lead", content: "hi", origin: "smoke", idempotency_key: "s2" },
     "alice@example.test",
   );
   assert.notEqual(aliceAllowed.error?.code, -32030, "alice send to ops-lead is allowed");
 
-  const anonAdmin = await rpc("mobkit/access/get", {}, null);
+  const anonAdmin = await rpc("meta/access/get", {}, null);
   assert.equal(anonAdmin.error?.code, -32030, "anonymous cannot read access config");
 
   // --- SSE gating --------------------------------------------------------

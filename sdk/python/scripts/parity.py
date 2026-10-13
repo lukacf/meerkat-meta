@@ -9,24 +9,24 @@ from pathlib import Path
 from typing import Any, Callable
 
 try:
-    from meerkat_mobkit._client import MobkitTypedClient
-    from meerkat_mobkit.helpers import build_console_modules_route, define_module_spec
-    from meerkat_mobkit.identity_first_models import DurableAgentSpec
-    from meerkat_mobkit.identity_first_providers import LeaseAcquireResult, LeaseGrant
-    from meerkat_mobkit.types import PersistedEvent, UnifiedAgentEvent
+    from meerkat_meta._client import MetaTypedClient
+    from meerkat_meta.helpers import build_console_modules_route, define_module_spec
+    from meerkat_meta.identity_first_models import DurableAgentSpec
+    from meerkat_meta.identity_first_providers import LeaseAcquireResult, LeaseGrant
+    from meerkat_meta.types import PersistedEvent, UnifiedAgentEvent
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from meerkat_mobkit._client import MobkitTypedClient  # type: ignore[no-redef]
-    from meerkat_mobkit.helpers import build_console_modules_route, define_module_spec  # type: ignore[no-redef]
-    from meerkat_mobkit.identity_first_models import DurableAgentSpec  # type: ignore[no-redef]
-    from meerkat_mobkit.identity_first_providers import LeaseAcquireResult, LeaseGrant  # type: ignore[no-redef]
-    from meerkat_mobkit.types import PersistedEvent, UnifiedAgentEvent  # type: ignore[no-redef]
+    from meerkat_meta._client import MetaTypedClient  # type: ignore[no-redef]
+    from meerkat_meta.helpers import build_console_modules_route, define_module_spec  # type: ignore[no-redef]
+    from meerkat_meta.identity_first_models import DurableAgentSpec  # type: ignore[no-redef]
+    from meerkat_meta.identity_first_providers import LeaseAcquireResult, LeaseGrant  # type: ignore[no-redef]
+    from meerkat_meta.types import PersistedEvent, UnifiedAgentEvent  # type: ignore[no-redef]
 
 
 def main() -> int:
-    gateway_bin = os.environ.get("MOBKIT_RPC_GATEWAY_BIN")
+    gateway_bin = os.environ.get("META_RPC_GATEWAY_BIN")
     if not gateway_bin:
-        print("MOBKIT_RPC_GATEWAY_BIN must be set", file=sys.stderr)
+        print("META_RPC_GATEWAY_BIN must be set", file=sys.stderr)
         return 2
 
     checks: list[dict[str, Any]] = []
@@ -38,10 +38,10 @@ def main() -> int:
         except Exception as exc:  # broad for per-check reporting
             checks.append({"name": name, "ok": False, "error": str(exc)})
 
-    client = MobkitTypedClient(gateway_bin)
+    client = MetaTypedClient(gateway_bin)
 
     check("typed client status success", lambda: _assert_eq(
-        client.rpc("py-status", "mobkit/status", {}),
+        client.rpc("py-status", "meta/status", {}),
         {
             "jsonrpc": "2.0",
             "id": "py-status",
@@ -55,15 +55,15 @@ def main() -> int:
     ))
 
     def _caps_check() -> None:
-        response = client.rpc("py-caps", "mobkit/capabilities", {})
+        response = client.rpc("py-caps", "meta/capabilities", {})
         methods = response.get("result", {}).get("methods")
-        if not isinstance(methods, list) or "mobkit/events/subscribe" not in methods:
+        if not isinstance(methods, list) or "meta/events/subscribe" not in methods:
             raise AssertionError(f"unexpected capabilities methods: {response}")
 
     check("typed client capabilities success", _caps_check)
 
     check("typed client invalid params exact json-rpc error", lambda: _assert_eq(
-        client.rpc("py-invalid", "mobkit/spawn_member", {}),
+        client.rpc("py-invalid", "meta/spawn_member", {}),
         {
             "jsonrpc": "2.0",
             "id": "py-invalid",
