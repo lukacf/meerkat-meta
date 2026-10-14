@@ -7,6 +7,155 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking
+
+- `meta_gateway storage-adopt-predecessor --predecessor-home <dir>` without
+  `--gateway-home` is now a usage error (exit 2) instead of moving the home
+  into the invoking user's derived gateway home. Name the destination with
+  `--gateway-home`, or pass `--user-gateway-home` to use the derived home.
+
+### Breaking (missing from the 0.9.0 notes)
+
+- An empty `runtime_options.access_config_path` or
+  `runtime_options.gating_config_path` no longer switches access control or
+  gating off. The 0.8 SDKs dropped an empty path before it reached the
+  gateway, so it read as off. Since 0.9.0 the SDK runtimes forward any
+  explicit path, the gateway refuses an empty one, and the builders'
+  `accessControl("")` / `access_control("")` / `gating("")` throw. To keep the
+  feature off, omit the key or send `null`; with the Python or TypeScript SDK,
+  do not call the builder method and keep nothing at `config/access.toml` /
+  `config/gating.toml` under the working directory, which the builders load
+  when present.
+- A `[profiles.<name>]` table that declares `system_prompt`, `prompt` or
+  `instructions` refuses init (`profile '<name>' declares 'system_prompt',
+  which a mob profile cannot honour`). MobKit 0.8.31 and earlier dropped these
+  keys without a warning, so the key had no effect on the profile's members;
+  removing it keeps that behaviour, and the member prompt comes from the
+  profile's `skills` (`[skills.<id>]`, inline or path).
+- `mob.toml` shapes that MobKit 0.8.x dropped silently now refuse:
+  `model_fallback` on a realm profile reference (`invalid_model_fallback`), a
+  `[runtime]` table with any key other than `model_fallback` (`unknown field
+  ..., expected model_fallback`), and top-level `[self_hosted]` / `[realm]`
+  tables (move them to the Meerkat `config.toml`).
+- `mob.toml` keys that MobKit 0.8.x ignored now take effect: `model_fallback`
+  (on a profile or under `[runtime]`) configures the model fallback chain, and
+  `tools.deny` denies the listed tools; a malformed value refuses the
+  definition or fails the member build.
+
+### Security
+
+- rustls updated to 0.23.46 (RUSTSEC-2026-0346, RUSTSEC-2026-0347,
+  RUSTSEC-2026-0348, RUSTSEC-2026-0349).
+- 0.9.0 is not exposed to these advisories: its `meta_gateway`, `rpc_gateway`
+  and `meta_repair` binaries use rustls only as a TLS client with the `ring`
+  provider and rustls's built-in session cache, without the `brotli` feature,
+  Encrypted Client Hello or post-quantum key exchange. The update removes
+  these advisories from `cargo deny` and `cargo audit` reports.
+
+### Added
+
+- `meta_repair --composition-manifests <state directory or manifest file>
+  [--apply]` reports each composition manifest that still uses the predecessor
+  creator field and, with `--apply`, renames the field in place. Each manifest
+  is reported `current`, `predecessor`, `rewritten`, `refused` (nothing
+  changed) or `failed` (the rename changed something before it could finish,
+  for example a replaced manifest that is not yet durable).
+
+### Changed
+
+- `meta_gateway storage-adopt-predecessor --state-dir <dir>` adopts that state
+  directory only. It no longer moves the invoking user's own gateway home
+  (`$XDG_STATE_HOME` or `~/.local/state`, `meerkat-mobkit` to `meerkat-meta`)
+  unless asked: pass `--user-gateway-home` for the previous behaviour, or name
+  the homes with `--gateway-home` and `--predecessor-home`. An unfinished
+  adoption still resumes with the homes its journal recorded.
+- CI skips the Rust, console, SDK and example jobs for a pull request that
+  changes only docs (outside `docs/rct/`), top-level Markdown or license
+  files, the workflows that CI does not run (`release.yml`, `e2e-live.yml`,
+  `publish-docs.yml`), `.github/CODEOWNERS`, `.github/release.yml` or
+  top-level `scripts/*.py`. A new `changes` job decides this from both paths
+  of every rename. Any other file, any classifier error, every push and every
+  dispatch runs the full matrix, and the required `gate` check accepts a
+  skipped job only for such a pull request.
+- The workspace unit tests and the integration tests run as separate jobs, and
+  the integration tests run as two halves split by test target name. Together
+  they run exactly the tests the single job ran (3899 selected tests in 163
+  binaries, checked with `cargo nextest list`), and a workflow test fails when
+  an integration test target would fall outside both halves. The console
+  browser scenarios run as two shards.
+- The meta-dev CI cache groups build with line tables only. On pushes to main,
+  one job drops each rust cache family's superseded main entries once the run
+  has saved a newer one; it is the only job with `actions: write`, and pull
+  request jobs keep a read-only token.
+- `rpc_gateway` refuses an empty `access_config_path` or `gating_config_path`
+  with a message that says an empty path no longer switches the feature off
+  and names how to keep it off, instead of a bare read error for `''`.
+- A refused profile prompt key (`system_prompt`, `prompt`, `instructions`) now
+  says, on both gateways and in `UnifiedRuntimeBuilder`, that MobKit 0.8.31
+  and earlier dropped the key so it had no effect, that removing it keeps that
+  behaviour, and which `[skills.<id>]` table sets the members' prompt.
+- CONTRIBUTING and the Meta skill say that a failed SDK registry upload does
+  not stop the crates from publishing, while the final all-registry readback
+  still fails the run.
+
+### Fixed
+
+- A store created by MobKit 0.8.x on persistent mob storage opens on Meta
+  after `meta_gateway storage-adopt-predecessor`. The composition manifest
+  beside its event log (`event_log.sqlite3.composition.json`) spells its
+  creator field `created_by_mobkit`, which Meta 0.9.0 refused at startup as a
+  malformed manifest (`-32019`, kind `malformed`). Meta now reads that
+  predecessor field name and writes only `created_by_meta`, so a store that
+  0.9.0 already adopted opens without further steps.
+- `meta_gateway storage-adopt-predecessor` now renames the creator field of
+  every composition manifest in the state directory, as part of its journaled,
+  resumable rename step, and the dry run lists each manifest. Only the field
+  name changes: every other byte of the manifest stays as it was, the recorded
+  mob definition included. Rerunning the verb on an installation that 0.9.0
+  adopted completes the rename, and the journal stays readable by 0.9.0.
+- A dry run of `storage-adopt-predecessor` over a finished adoption no longer
+  lists the already recorded realm id as a planned action.
+- The malformed composition manifest refusal now names restoring or repairing
+  the file first, and says that removing the mob storage discards the mob's
+  recorded events.
+- `meta_gateway` init refusals for an unparseable or refused `config/mob.toml`
+  now carry the reason; in 0.9.0 they read only `failed to parse <path>`.
+- Docs: a new upgrade guide, "Upgrading from MobKit 0.8.x"
+  (`docs/guides/upgrading-from-mobkit.mdx`), lists every adoption step and
+  `mob.toml` change with the exact error text. It also documents that a
+  profile key the TOML parse warns about and ignores (for example
+  `tools.mob_tasks`) can be removed from a persistent mob's config safely: the
+  key never reaches the composition Meta records and verifies, so removing or
+  adding it never makes the store refuse as `divergent`.
+- Console: the chat transcript keeps your reading position when an earlier
+  turn just above it is laid out again after its content grew while it was off
+  screen. The view no longer moves down by the difference right after a scroll
+  lands below that turn.
+- Console: an Access panel edit (admins, a rule or a group) opened just as the
+  access status loads is no longer closed again, and an edit opened under one
+  access scope is never shown under another.
+- The configuration reference for `[profiles.*.tools] deny` now says a
+  denied tool is not offered to the model; it said the tool stays listed.
+  Every call to a denied tool is still refused with `access_denied`.
+- CONTRIBUTING no longer says a release publishes documentation, and it lists
+  the current publication order: binary assets, the Python and TypeScript
+  SDKs, the `meta-extension-state` and `meerkat-meta` crates, then the
+  registry readback.
+- The repository no longer tracks three `.claude/skills` symlinks that pointed
+  at absolute paths on one operator's machine and dangled in every other
+  clone.
+- Identity-first: a refused role migration (`role_migration_not_applied`) now
+  stays parked for the roster spec it was refused against. Previously the
+  continuity repair supervisor's follow-up pass, or any later restore or
+  reconcile pass, retired the member the refusal had deliberately kept. The
+  supervisor no longer retries that identity; change the declaration or the
+  member's roster spec to try again.
+
+## [0.9.0] - 2026-10-14
+
+This section holds every change released in 0.8.32 through 0.8.49 and 0.9.0;
+those releases were published without separate stamped sections.
+
 ### Breaking (mob lifetime)
 
 - A mob is now publicly owned while any public owner remains: the
@@ -4565,8 +4714,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `system_prompt` import alias) is unchanged, so saved editor documents and
   the bundled client keep round-tripping; the mapping is documented at the
   projection and export sites. Meta's own test fixtures modelled the same
-  mistake with an inert profile-level `system_prompt` key that meerkat
-  silently drops; they now carry their prompts as inline skills, or omit them
+  mistake with a profile-level `system_prompt` key that meerkat refuses at
+  parse; they now carry their prompts as inline skills, or omit them
   where no turn reads a prompt.
 
 - **The durable-callback health projection no longer fails once per second
