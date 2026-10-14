@@ -426,6 +426,8 @@ The release owner then tags the same source as `vX.Y.Z` and invokes
 Promotion verifies and publishes the original bytes without rebuilding or
 signing again. Assets precede the Python and TypeScript SDKs, then the crates
 (`meta-extension-state`, then `meerkat-meta`) and an exact registry readback.
+A failed SDK registry upload does not stop the crates; the readback still fails
+the run while any registry lacks the exact version.
 Releases do not publish documentation (see Current Baseline).
 `REGISTRY_DRY_RUN=true` suppresses all publication;
 `PUBLISH_RELEASE_PACKAGES=false` selects asset-only promotion.

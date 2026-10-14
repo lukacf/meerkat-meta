@@ -169,7 +169,9 @@ candidate's jobs and assume the old selection still applies.
 
 Real publication proceeds in order: verified public binary assets, Python and
 TypeScript packages, the Rust crates (`meta-extension-state`, then
-`meerkat-meta`), then exact registry readback. Releases do not publish
+`meerkat-meta`), then exact registry readback. If an SDK registry upload
+fails, the crates still publish, but the readback then fails the run while any
+registry lacks the exact version. Releases do not publish
 documentation: the `Publish docs` workflow asks the docs site to mirror `docs/`
 on every push to `main` that touches `docs/`.
 New releases retain the original candidate manifest, selection, and provenance
