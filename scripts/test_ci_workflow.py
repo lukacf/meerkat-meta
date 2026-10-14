@@ -47,6 +47,37 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(len(re.findall(r"(?m)^\s+CARGO_TARGET_DIR:", source)), 1)
         self.assertIsNone(re.search(r"(?m)^\s+(workspaces|cache-targets):", source))
 
+    def test_rust_cache_saves_only_main_and_shares_identical_graphs(self):
+        """Cached build output makes each rust-cache entry about 1 GB.
+
+        Pull request entries are scoped to their own ref, so saving them only
+        evicts main's entries from the 10 GB repository cache. Jobs that
+        build the same dependency graph (same features, profile and
+        dev-dependency use) share one entry; every other job keeps its own.
+        """
+        expected = {
+            "fmt-lint": None,
+            "test": None,
+            "test-extension-state": None,
+            "test-voice": None,
+            "test-python": "meta-dev-bins",
+            "flow-editor": "meta-dev-bins",
+            "console": "meta-dev-examples",
+            "console-fixtures": "meta-dev-examples",
+            "console-acceptance": "meta-dev-examples",
+        }
+        source = CI_WORKFLOW.read_text()
+        self.assertEqual(source.count("uses: Swatinem/rust-cache@v2"), len(expected))
+        for name, shared_key in expected.items():
+            step = re.search(
+                r"- uses: Swatinem/rust-cache@v2\n((?: {8}.*\n)+)", job_block(name) + "\n"
+            )
+            self.assertIsNotNone(step, name)
+            settings = step.group(1)
+            self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", settings, name)
+            keys = re.findall(r"shared-key: (\S+)", settings)
+            self.assertEqual(keys, [shared_key] if shared_key else [], name)
+
     def test_workspace_nextest_preserves_all_failure_evidence(self):
         commands = [
             line.strip()

@@ -20,6 +20,14 @@ env:
   # outside the checkout; a disposable CI checkout has no such need. Local
   # runs set nothing and keep their per-worktree targets.
   CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  # With build output cached, a rust-cache entry is the registry plus one
+  # dependency graph's artifacts: about 1 GB compressed (a local Meta debug
+  # target's dependency share, 4.6 GiB, packs to 0.95 GB with zstd). Nine
+  # per-job entries, plus a copy for every pull request ref, would overrun
+  # the repository's 10 GB cache and evict main's entries. So only main
+  # saves, and jobs that build the same dependency graph share one entry:
+  # meta-dev-examples (examples and tests, with dev-dependency features)
+  # and meta-dev-bins (binaries only).
 
 jobs:
   fmt-lint:
@@ -31,6 +39,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/repo-cargo fmt --all -- --check
       - run: python3 scripts/check-conflict-markers
       - run: python3 scripts/test_check_conflict_markers.py
@@ -94,6 +104,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       # The idle CPU gate asserts an absolute per-30s CPU budget calibrated on
       # real hardware; GitHub's shared 2-vCPU runners read ~3-4s where real
@@ -118,6 +130,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/repo-cargo test -p meta-extension-state --locked
       - run: scripts/repo-cargo check -p meerkat-meta --locked --no-default-features
       - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features extension-state --lib --test extension_state -- -D warnings
@@ -138,6 +152,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features openai-live --lib --bin rpc_gateway --bin meta_gateway -- -D warnings
       # The shared host uses a loopback provider, never paid credentials.
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --lib --bin rpc_gateway --bin meta_gateway --test console_route_auth --test console_experience --test never_executed_persistence --test swarm_integration console_voice
@@ -155,6 +171,9 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: meta-dev-bins
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: python -m pip install 'sdk/python[dev]'
       # Gateway-backed structural tests materialize OpenAI profiles but never
       # issue provider requests. Meerkat resolves auth during construction, so
@@ -199,6 +218,9 @@ jobs:
           cache-dependency-path: console/package-lock.json
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: meta-dev-examples
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm --prefix console ci --silent --no-fund --no-audit
       - run: npm --prefix console run phase0:types --silent
       - run: npm --prefix console run contracts:console --silent
@@ -277,6 +299,9 @@ jobs:
           cache-dependency-path: console/package-lock.json
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: meta-dev-examples
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm --prefix console ci --silent --no-fund --no-audit
       - run: npm --prefix console run fixtures:console-customization --silent
 
@@ -295,6 +320,9 @@ jobs:
           cache-dependency-path: console/package-lock.json
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: meta-dev-examples
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm --prefix console ci --silent --no-fund --no-audit
       - run: npm --prefix console exec -- playwright install --with-deps chromium
       - name: Stock incident topology acceptance
@@ -320,6 +348,9 @@ jobs:
           cache-dependency-path: flow-editor/package-lock.json
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: meta-dev-bins
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm --prefix flow-editor ci --silent --no-fund --no-audit
       - run: npm --prefix flow-editor exec -- playwright install --with-deps chromium
       - run: CARGO_INCREMENTAL=0 scripts/repo-cargo build -p meerkat-meta --bin meta_flow_editor
