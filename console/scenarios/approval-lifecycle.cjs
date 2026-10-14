@@ -294,7 +294,9 @@ async function ownerEdges() {
     assert.deepEqual(successor.origin, origin);
     assert((await decide(fixture, created.pending_id)).body.error, "the predecessor cannot be decided twice");
 
-    const competitors = await Promise.all([decide(fixture, successor.pending_id, "approve", "reviewer-a"), decide(fixture, successor.pending_id, "reject", "reviewer-b")]);
+    // The fixture routes escalations to the fixture operator, so the successor's
+    // eligible approver is that operator: the race is between two of its decisions.
+    const competitors = await Promise.all([decide(fixture, successor.pending_id, "approve", "fixture-operator"), decide(fixture, successor.pending_id, "reject", "fixture-operator")]);
     assert.equal(competitors.filter(result => result.body.result).length, 1, "exactly one competing decision wins");
     assert.equal(competitors.filter(result => result.body.error).length, 1);
     assert.deepEqual(await pending(fixture), []);

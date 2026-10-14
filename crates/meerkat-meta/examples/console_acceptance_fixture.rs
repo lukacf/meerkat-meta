@@ -212,6 +212,14 @@ image_generation = {live_images}
             Err(error) => return Err(error.into()),
         }
     }
+    // Escalation is refused without a configured route, so the approval
+    // scenarios route it to the fixture operator, who decides the successor.
+    runtime
+        .set_gating_escalation_routes(meerkat_meta::runtime::GatingEscalationRoutes {
+            default: Some("fixture-operator".to_owned()),
+            routes: BTreeMap::new(),
+        })
+        .await;
     if !identity_mode {
         runtime
             .reconcile(

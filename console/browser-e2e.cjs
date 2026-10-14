@@ -1198,9 +1198,16 @@ async function runImageRenderingBrowserProof() {
       (images) => images.map((image) => image.getAttribute("src") || ""),
     );
     assert.equal(peerImageSources.length, 1);
+    // A tool card image is read through the console transport's readBlob and
+    // shown from a local object URL, so its src is a blob: URL; the mock must
+    // have served exactly the peer's blob.
     assert(
-      peerImageSources[0]?.endsWith("/blobs/sha256%3Apeer-image"),
-      `missing peer forwarded image ref inside tool call: ${JSON.stringify(peerImageSources)}`,
+      peerImageSources[0]?.startsWith("blob:"),
+      `peer forwarded image inside tool call should be a local object URL: ${JSON.stringify(peerImageSources)}`,
+    );
+    assert(
+      server.requests.some((request) => request.method === "GET" && request.url.split("?")[0] === "/blobs/sha256%3Apeer-image"),
+      `missing peer forwarded image blob read: ${JSON.stringify(server.requests.map((request) => request.url).filter((url) => url.startsWith("/blobs/")))}`,
     );
     const peerImagePlacement = await page.evaluate(() => {
       const image = document.querySelector(".cc-tool-call img.cc-tool-call__image");
