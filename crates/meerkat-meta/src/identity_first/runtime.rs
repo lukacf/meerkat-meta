@@ -1195,6 +1195,16 @@ impl std::fmt::Display for IdentityRuntimeError {
     }
 }
 
+/// Whether `entry` is Broken by a role-migration refusal recorded against
+/// exactly `spec`.
+fn role_migration_refused_for(entry: &IdentityEntry, spec: &DurableAgentSpec) -> bool {
+    entry.state == IdentityLifecycleState::Broken
+        && entry
+            .role_migration_refusal
+            .as_ref()
+            .is_some_and(|refusal| refusal.spec_digest == durable_spec_digest(spec))
+}
+
 /// Digest of the exact roster spec, for [`HostRejectedBuildPark`] scoping.
 /// Process-local (std hasher over the canonical JSON form): the park itself
 /// is in-memory, so cross-process stability is not required.
@@ -1424,6 +1434,21 @@ impl From<ContinuityStoreError> for IdentityRuntimeError {
 // Per-identity runtime state
 // ---------------------------------------------------------------------------
 
+/// A declared role migration the bridge refused for an identity's exact spec
+/// (`ContinuityFailureKind::RoleMigrationNotApplied`). The refusal is a
+/// deterministic wall for that spec and this activation's declaration, and it
+/// refused before any destructive step: the member the mob restored under its
+/// durable role stays live.
+#[derive(Debug, Clone)]
+pub(crate) struct RoleMigrationRefusal {
+    /// The refusal detail, reported again as the typed restore outcome of
+    /// every later pass that keeps the identity Broken.
+    pub reason: String,
+    /// Digest of the exact [`DurableAgentSpec`] the declaration was refused
+    /// against.
+    pub spec_digest: u64,
+}
+
 /// Tracks the live state for a single identity within the runtime.
 #[derive(Debug, Clone)]
 pub(crate) struct IdentityEntry {
@@ -1458,6 +1483,13 @@ pub(crate) struct IdentityEntry {
     /// bridge/callback churn) and the repair supervisor skips the identity.
     /// A changed spec clears it — the retry is then permitted.
     pub host_rejected_build_park: Option<HostRejectedBuildPark>,
+    /// Typed park for a refused declared role migration. While set AND the
+    /// recorded spec digest still matches the desired spec, the repair
+    /// supervisor skips the identity and reconcile does not clean up its
+    /// lower plane: that lower plane is the live member the refusal kept,
+    /// and retiring it is the destructive step the refusal exists to
+    /// prevent. A changed spec or any non-Broken projection clears it.
+    pub role_migration_refusal: Option<RoleMigrationRefusal>,
     /// Typed "session needs repair" hold: meerkat's audited-endpoint
     /// divergence reported by a resume, a registration reload, or the heal
     /// authority. While set, the repair supervisor skips the identity and
@@ -2405,6 +2437,19 @@ impl IdentityFirstRuntimeContext {
                 // cycle. A spec change clears the park (checked inside
                 // the accessor); until then this identity is parked, not
                 // repaired.
+                continue;
+            }
+            if self
+                .runtime
+                .role_migration_refusal(identity)
+                .await
+                .is_some()
+            {
+                // The bridge refused this spec's declared role migration
+                // before any destructive step and kept the restored member.
+                // A retry re-asks the same question, and its reconcile would
+                // retire that member: it stays Broken with its typed restore
+                // kind until the host changes the spec or the declaration.
                 continue;
             }
             if self.runtime.held_completion_owed(identity) {
@@ -5984,6 +6029,20 @@ impl IdentityRuntime {
                     .clone()
                     .filter(|park| park.spec_digest == durable_spec_digest(&spec))
             });
+            // A refused role migration is about the SPEC the declaration was
+            // refused against: a re-projected Broken entry with that spec
+            // keeps it (a retry re-asks the same question), while a changed
+            // spec or any non-Broken projection clears it.
+            let role_migration_refusal = if state == IdentityLifecycleState::Broken {
+                entries.get(&identity).and_then(|existing| {
+                    existing
+                        .role_migration_refusal
+                        .clone()
+                        .filter(|refusal| refusal.spec_digest == durable_spec_digest(&spec))
+                })
+            } else {
+                None
+            };
             let entry = IdentityEntry {
                 spec,
                 bootstrap_generation,
@@ -5995,6 +6054,7 @@ impl IdentityRuntime {
                 has_runtime_store: self.has_runtime_store,
                 continuity_unrecoverable,
                 host_rejected_build_park,
+                role_migration_refusal,
                 session_repair_required,
                 last_delivery_error: None,
                 last_reload: None,
@@ -8330,6 +8390,14 @@ impl IdentityRuntime {
                             } => ContinuityFailureKind::RoleMigrationNotApplied,
                             _ => ContinuityFailureKind::ResumeRejected,
                         };
+                        // A refused declared role migration kept the restored
+                        // member on purpose. Park it on this FIRST refusal, with
+                        // this exact detail, so no later pass retires that
+                        // member to re-ask the same question.
+                        if kind == ContinuityFailureKind::RoleMigrationNotApplied {
+                            self.mark_role_migration_refusal(identity, detail.clone())
+                                .await;
+                        }
                         return Err(IdentityRuntimeError::EmbodimentRejected(Box::new(
                             ContinuityFailure {
                                 identity: identity.clone(),
@@ -9338,9 +9406,15 @@ impl IdentityRuntime {
             }
             let reconciling_broken_entry = {
                 let entries = self.entries.read().await;
-                entries
-                    .get(&identity)
-                    .is_some_and(|entry| entry.state == IdentityLifecycleState::Broken)
+                entries.get(&identity).is_some_and(|entry| {
+                    entry.state == IdentityLifecycleState::Broken
+                        // The lower plane of a refused role migration is the
+                        // live member the refusal kept. Retiring it here is
+                        // the destructive step the refusal exists to prevent,
+                        // so it stays while the desired spec is the one the
+                        // declaration was refused against.
+                        && !role_migration_refused_for(entry, &desired_spec)
+                })
             };
             if reconciling_broken_entry {
                 self.cleanup_broken_lower_plane_locked(&identity).await?;
@@ -15702,6 +15776,7 @@ impl IdentityRuntime {
                         .host_rejected_build_park
                         .as_ref()
                         .is_none_or(|park| park.spec_digest != durable_spec_digest(&entry.spec))
+                    && !role_migration_refused_for(entry, &entry.spec)
                     && !self.held_completion_owed(identity)
             })
             .map(|(identity, _)| identity.clone())
@@ -15888,6 +15963,40 @@ impl IdentityRuntime {
         } else {
             entry.host_rejected_build_park = None;
             None
+        }
+    }
+
+    /// The refusal detail when the bridge refused a declared role migration
+    /// for this identity's current spec (see [`RoleMigrationRefusal`]).
+    pub(crate) async fn role_migration_refusal(&self, identity: &AgentIdentity) -> Option<String> {
+        self.entries
+            .read()
+            .await
+            .get(identity)
+            .filter(|entry| role_migration_refused_for(entry, &entry.spec))
+            .and_then(|entry| entry.role_migration_refusal.as_ref())
+            .map(|refusal| refusal.reason.clone())
+    }
+
+    /// Record a refused declared role migration against a Broken identity,
+    /// scoped to its current spec. Returns `false` (without writing) when
+    /// the identity is unknown or no longer Broken.
+    pub(crate) async fn mark_role_migration_refusal(
+        &self,
+        identity: &AgentIdentity,
+        reason: String,
+    ) -> bool {
+        let mut entries = self.entries.write().await;
+        match entries.get_mut(identity) {
+            Some(entry) if entry.state == IdentityLifecycleState::Broken => {
+                let spec_digest = durable_spec_digest(&entry.spec);
+                entry.role_migration_refusal = Some(RoleMigrationRefusal {
+                    reason,
+                    spec_digest,
+                });
+                true
+            }
+            _ => false,
         }
     }
 

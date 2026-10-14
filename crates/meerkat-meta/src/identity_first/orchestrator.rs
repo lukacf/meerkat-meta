@@ -604,6 +604,10 @@ async fn register_roster_metadata(
         // heal authority's unprovable verdict (CheckpointUnrecoverable) and
         // the audited-endpoint repair hold (RepairRequired), whose exit is the
         // operator's `rkat session repair-wholeblob` plus `reload_member`.
+        // A refused declared role migration owns it too: the refusal kept the
+        // restored member, and retiring that member for the ordinary cleanup
+        // is the destructive step the refusal exists to prevent. A changed
+        // spec clears it.
         let terminal_verdict: Option<(ContinuityFailureKind, String)> = if currently_active {
             None
         } else if let Some(verdict) = runtime.continuity_unrecoverable(identity).await {
@@ -611,6 +615,8 @@ async fn register_roster_metadata(
                 ContinuityFailureKind::CheckpointUnrecoverable,
                 verdict.reason,
             ))
+        } else if let Some(reason) = runtime.role_migration_refusal(identity).await {
+            Some((ContinuityFailureKind::RoleMigrationNotApplied, reason))
         } else {
             runtime.session_repair_required(identity).await.map(|hold| {
                 (

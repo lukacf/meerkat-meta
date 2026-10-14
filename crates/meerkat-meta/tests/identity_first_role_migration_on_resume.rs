@@ -18,9 +18,9 @@ use meerkat_core::types::StopReason;
 use meerkat_meta::identity_first::orchestrator::{RestoreFlowResult, RestoreOutcome};
 use meerkat_meta::identity_first::{
     AgentAddressability, AgentIdentity, AgentRuntimeServices, ContinuityFailureKind,
-    ContinuityStore, DurabilityPolicy, DurableAgentSpec, IdentityFirstRuntimeContext,
-    IdentityRuntime, IdentityRuntimeConfig, LocalContinuityStore, LocalLeaseProvider,
-    MobSessionBridge, MutableRosterProvider, RoleMigrationDeclaration,
+    ContinuityRepairRequestOutcome, ContinuityStore, DurabilityPolicy, DurableAgentSpec,
+    IdentityFirstRuntimeContext, IdentityRuntime, IdentityRuntimeConfig, LocalContinuityStore,
+    LocalLeaseProvider, MobSessionBridge, MutableRosterProvider, RoleMigrationDeclaration,
 };
 use meerkat_meta::mob_composition_manifest::persistent_mob_storage;
 use meerkat_meta::{DiscoverySpec, MetaConfig, MobBootstrapOptions, MobBootstrapSpec};
@@ -370,12 +370,16 @@ async fn a_declared_role_migration_from_the_wrong_role_is_refused_before_any_ret
         other => panic!("the mismatched declaration must be refused: {other:?}"),
     }
     // The host sees it on the activation result: `meta/init` returns this
-    // bootstrap status as `identity_bootstrap`.
-    let status = booted
+    // bootstrap status as `identity_bootstrap`. Read it once it is terminal:
+    // the settled pass wakes the continuity repair supervisor, and any pass
+    // that runs is in flight until it settles.
+    let (status, timed_out) = booted
         .unified
         .identity_runtime()
         .expect("identity-first runtime")
-        .identity_bootstrap_status();
+        .wait_identity_bootstrap_terminal(std::time::Duration::from_secs(30))
+        .await;
+    assert!(!timed_out, "the bootstrap status settles: {status:?}");
     assert!(
         !status.ready,
         "a refused migration leaves the boot not ready"
@@ -401,6 +405,99 @@ async fn a_declared_role_migration_from_the_wrong_role_is_refused_before_any_ret
             .await,
         Some(session_id),
         "the restored member still runs its own session"
+    );
+    booted.unified.shutdown().await;
+}
+
+/// A refused declaration is a terminal verdict for the spec it was refused
+/// against. A later pass over the same roster (a host refresh here; the
+/// continuity repair supervisor runs the same pass) keeps the member the
+/// refusal preserved instead of retiring it for the ordinary Broken cleanup,
+/// and the supervisor has nothing to retry (main CI run 38596087789).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_role_migration_is_not_retired_by_a_later_pass() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state_path = temp.path().join("state");
+    let mob_id = "role-migration-refused-later-pass";
+    let identity = AgentIdentity::parse(IDENTITY).unwrap();
+
+    let booted = boot(&state_path, mob_id, &[spec(FROM_ROLE)], Vec::new()).await;
+    let session_id = materialized_session(booted.result.as_ref().expect("boot 1 restores"));
+    booted.unified.shutdown().await;
+    drop(booted);
+
+    let booted = boot(
+        &state_path,
+        mob_id,
+        &[spec(TO_ROLE)],
+        vec![RoleMigrationDeclaration {
+            identity: identity.clone(),
+            from_role: ProfileName::from("predecessor"),
+        }],
+    )
+    .await;
+    match booted
+        .result
+        .as_ref()
+        .expect("boot 2 runs its restore")
+        .outcomes
+        .get(&identity)
+    {
+        Some(RestoreOutcome::Broken(failure)) => {
+            assert_eq!(failure.kind, ContinuityFailureKind::RoleMigrationNotApplied);
+        }
+        other => panic!("the mismatched declaration must be refused: {other:?}"),
+    }
+    let context = booted
+        .unified
+        .identity_first_context()
+        .expect("identity-first context");
+    let refreshed = context
+        .refresh_desired_topology()
+        .await
+        .expect("a later pass over the same roster runs");
+    match refreshed.outcomes.get(&identity) {
+        Some(RestoreOutcome::Broken(failure)) => {
+            assert_eq!(
+                failure.kind,
+                ContinuityFailureKind::RoleMigrationNotApplied,
+                "the later pass keeps the typed refusal: {}",
+                failure.detail
+            );
+        }
+        other => panic!("the later pass must keep the refusal: {other:?}"),
+    }
+    let members = booted.unified.mob_handle().list_members().await;
+    let [member] = members.as_slice() else {
+        panic!("the refused member was retired by the later pass: {members:?}");
+    };
+    assert_eq!(member.role.as_str(), FROM_ROLE);
+    assert_eq!(
+        booted
+            .unified
+            .mob_handle()
+            .resolve_bridge_session_id(&member.agent_identity)
+            .await,
+        Some(session_id),
+        "the kept member still runs its own session"
+    );
+    assert_eq!(
+        context.request_continuity_repair().await,
+        ContinuityRepairRequestOutcome::NothingToRepair,
+        "the repair supervisor does not retry a refused migration"
+    );
+    let (status, timed_out) = booted
+        .unified
+        .identity_runtime()
+        .expect("identity-first runtime")
+        .wait_identity_bootstrap_terminal(std::time::Duration::from_secs(30))
+        .await;
+    assert!(!timed_out, "the bootstrap status settles: {status:?}");
+    assert_eq!(status.counts.broken, 1);
+    let wire = serde_json::to_value(&status).expect("serialize the bootstrap status");
+    assert_eq!(
+        wire["identities"][IDENTITY]["restore"]["kind"], "role_migration_not_applied",
+        "the status keeps the typed refusal: {wire}"
     );
     booted.unified.shutdown().await;
 }
