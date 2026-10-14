@@ -7204,9 +7204,56 @@ model = "gpt-5.5"
         }
     }
 
+    /// Ask a non-waiting attach entry until it answers anything but `Busy`.
+    ///
+    /// The entry answers `Busy` while anyone holds the session's turn
+    /// boundary, and a committed turn does not prove that nobody does: the
+    /// post-commit checkpoint and every observation read take it too.
+    /// `Busy` grants nothing and leaves the decision to the caller's owner;
+    /// this owner waits on the boundary itself, never on a timer, and asks
+    /// again, within the structural backstop.
+    async fn attach_between_turns<F, Fut>(
+        sessions: &dyn meerkat_mob::MobSessionService,
+        session_id: &meerkat_core::types::SessionId,
+        mut attempt: F,
+    ) -> Result<
+        meerkat_core::mcp_attachment::LiveMcpAttachmentReceipt,
+        meerkat_core::mcp_attachment::LiveMcpAttachError,
+    >
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<
+                Output = Result<
+                    meerkat_core::mcp_attachment::LiveMcpAttachmentReceipt,
+                    meerkat_core::mcp_attachment::LiveMcpAttachError,
+                >,
+            >,
+    {
+        let deadline = tokio::time::Instant::now() + crate::test_wait::STRUCTURAL_BACKSTOP;
+        loop {
+            let answer = attempt().await;
+            if !matches!(
+                answer,
+                Err(meerkat_core::mcp_attachment::LiveMcpAttachError::Busy)
+            ) {
+                return answer;
+            }
+            match tokio::time::timeout_at(
+                deadline,
+                sessions.acquire_runtime_turn_finalization_guard(session_id),
+            )
+            .await
+            {
+                Ok(guard) => drop(guard.expect("the session's turn boundary")),
+                Err(_) => return answer,
+            }
+        }
+    }
+
     /// The member's live MCP attachment reaches its actual session owner's
     /// non-waiting entry. The owner refuses a session with no live actor as
-    /// not current (its own answer, not the trait default), and a live
+    /// not current (its own answer, not the trait default), answers `Busy`
+    /// at once while the session's turn boundary is held, and a live
     /// ungoverned member (no governed construction built it a router) has
     /// no attachment surface. Through the public identity entry an unknown
     /// identity is not current and the member gets its owner's answer.
@@ -7225,6 +7272,12 @@ model = "gpt-5.5"
             .mob_runtime()
             .controller_pin_source()
             .expect("the persistent runtime records its session owner");
+        let sessions = Arc::clone(
+            runtime
+                .mob_runtime()
+                .session_service()
+                .expect("the persistent runtime has a session service"),
+        );
 
         assert_eq!(
             owner
@@ -7239,11 +7292,29 @@ model = "gpt-5.5"
             )),
             "a session without a live actor is the owner's not-current refusal"
         );
+        // The entry never waits: under a held turn boundary it answers
+        // `Busy` at once and attaches nothing.
+        let held = sessions
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await
+            .expect("the session's turn boundary");
         assert_eq!(
             owner
                 .try_attach_live_mcp_server(&session_id, live_only_attachment())
                 .await
                 .map(|receipt| receipt.outcome),
+            Err(LiveMcpAttachError::Busy),
+            "a held turn boundary answers Busy at once"
+        );
+        drop(held);
+        let owner_entry = owner.as_ref();
+        let session = &session_id;
+        assert_eq!(
+            attach_between_turns(sessions.as_ref(), session, move || {
+                owner_entry.try_attach_live_mcp_server(session, live_only_attachment())
+            })
+            .await
+            .map(|receipt| receipt.outcome),
             Err(LiveMcpAttachError::Unsupported),
             "the live ungoverned member's actor has no attachment surface"
         );
@@ -7260,10 +7331,13 @@ model = "gpt-5.5"
             ))
         );
         let member = crate::identity_first::AgentIdentity::parse(RESTART_MEMBER).expect("identity");
+        let (view_entry, member_identity) = (&view, &member);
         assert_eq!(
-            view.attach_live_mcp_server(&member, live_only_attachment())
-                .await
-                .map(|receipt| receipt.outcome),
+            attach_between_turns(sessions.as_ref(), session, move || {
+                view_entry.attach_live_mcp_server(member_identity, live_only_attachment())
+            })
+            .await
+            .map(|receipt| receipt.outcome),
             Err(LiveMcpAttachError::Unsupported)
         );
     }

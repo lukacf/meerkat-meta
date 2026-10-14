@@ -2856,6 +2856,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   state; failed saves retain the draft, and typed refusal details stay private
   in both current and reconstructed conversation history.
 - Test hygiene with no product change:
+  - the live MCP attachment test asks its session owner's non-waiting
+    entry between turns: while the entry answers `Busy` it waits on the
+    session's turn boundary, which the post-commit checkpoint and
+    observation reads hold briefly after a commit, and it pins the `Busy`
+    answer under a boundary it holds itself;
   - the identity background lease renewal test waits for the renewal's own
     `LeaseUpdated` event instead of a 45 ms wall-clock window (#566);
   - the console stock-presentation scenario checks the table, link and image
