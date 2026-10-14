@@ -264,3 +264,31 @@ test("source sequences order frames within one stream epoch, never across epochs
   const legacy = restarted.map((f) => ({ ...f, data: { ...(f.data as Record<string, unknown>), source_epoch: undefined } }));
   assert.deepEqual(ids(legacy), ["new-1", "new-2", "old-1", "old-2"]);
 });
+
+test("extending a derivation never moves the boundary that holds older notices back", () => {
+  const session = "01a0f7d0-4be7-7d02-bce5-b29fc7d82249";
+  const frame = (id: string, event: string, cursor: number, timestampMs: number, data: Record<string, unknown>,
+    extra: Partial<ConsoleFrame> = {}): ConsoleFrame => ({
+    id, event, identity: "router:main", runtimeKey: "default", sessionId: session, cursor: `console:${cursor}`,
+    timestampMs, sourceKind: "console_event", data, ...extra,
+  });
+  const loaded = [
+    frame("asked", "user_input", 10, 9_000, { content: "Is the export done?" }),
+    frame("image", "runtime_notice_snapshot", 11, 9_200, {
+      session_id: session, complete: true, observed_through: "console:10", settled_attempts: [],
+      notices: [{ offset: 1, message: { role: "system_notice", kind: "generic", body: "Export finished.",
+        created_at: new Date(7_000).toISOString(),
+        runtime_origin: { session_id: session, run_id: "run-held", input_id: "input-held", append_ordinal: 0 } } }],
+    }, { sourceKind: "session_history" }),
+  ];
+  // The newest cursor, stamped before every loaded frame. In store order
+  // nothing else keeps this chunk from extending the previous fold.
+  const late = frame("late", "text_delta", 12, 6_000, { delta: "Checking." }, { runId: "run-late" });
+  const paged: TimelineDerivationOptions = { renderTextDeltas: true, hasOlderHistory: true };
+  const shows = (derivation: TimelineDerivation) => JSON.stringify(derivation.entries).includes("Export finished.");
+  const previous = deriveTimelineEntries(agent, loaded, paged);
+  assert.equal(shows(previous), false, "the notice predates every loaded frame");
+  const full = deriveTimelineEntries(agent, [...loaded, late], paged);
+  assert.equal(shows(full), true, "the older chunk extends the loaded range past the notice");
+  assert.deepEqual(deriveTimelineEntries(agent, [...loaded, late], paged, previous).entries, full.entries);
+});
