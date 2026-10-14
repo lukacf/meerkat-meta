@@ -9648,6 +9648,90 @@ rust_test(
 )
 
 rust_test(
+    name = "released_0_8_26_store_adoption_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-meta",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "released_0_8_26_store_adoption",
+    crate_root = "tests/released_0_8_26_store_adoption.rs",
+    crate_features = [],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+        "assets/release-targets.json",
+        "console-dist/console-app.css",
+        "console-dist/console-app.js",
+        "console-dist/index.html",
+        "examples/library_mode_reference.rs",
+        "flow-editor-dist/flow-editor.css",
+        "flow-editor-dist/flow-editor.js",
+        "flow-editor-dist/index.html",
+        "flow-editor-dist/react-globals.js",
+        "src/adaptive_layer_decision.schema.json",
+        "src/bin/meta_gateway.rs",
+        "src/bin/rpc_gateway.rs",
+        "src/identity_first/agent_memory.rs",
+        "src/identity_first/bridge.rs",
+        "src/identity_first/mod.rs",
+        "src/lib.rs",
+        "src/memory/distiller_prompt_v0.md",
+        "src/memory/hygienist_prompt_v0.md",
+        "src/memory/sqlite_store.rs",
+        "src/memory/steward_prompt_v0.md",
+        "src/mob_handle_runtime.rs",
+        "src/rpc_gateway.rs",
+        "src/unified_runtime/builder.rs",
+        "src/unified_runtime/http.rs",
+        "src/unified_runtime/lifecycle.rs",
+        "tests/fixtures/console_voice_v1.json",
+        "tests/fixtures/ledger_v1_closure/calendar-continuity-closure.json",
+        "tests/fixtures/ledger_v1_closure/continuity-schema.sql",
+        "tests/fixtures/legacy_empty_realm_profiles/realm_profiles.db",
+        "tests/fixtures/live_contracts_v1.json",
+        "tests/fixtures/role_migrations_init_params.json",
+        "tests/fixtures/security_idempotency/security-head-evolution.json",
+        "tests/fixtures/v0_8_10_released_session.json",
+        "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+    ],
+    srcs = [
+        "tests/released_0_8_26_store_adoption.rs",
+        "tests/support/gateway_shutdown.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.9.0",
+        "CARGO_BIN_NAME": "released_0_8_26_store_adoption",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-meta",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [
+        ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "16777216",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "crates/meerkat-meta",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-meta:meerkat_meta",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-meta",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "released_realm_upgrade_drive_test",
     aliases = aliases(
         package_name = "crates/meerkat-meta",
@@ -12709,6 +12793,7 @@ test_suite(
         ":profile_tool_deny_test",
         ":public_roster_resolver_test",
         ":reference_app_test",
+        ":released_0_8_26_store_adoption_test",
         ":released_realm_upgrade_drive_test",
         ":repair_queue_carry_test",
         ":repair_tool_result_bounds_test",

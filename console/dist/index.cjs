@@ -26574,10 +26574,24 @@ function cancelReveal(session) {
 }
 function rowGeometry(viewport) {
   const top = viewport.getBoundingClientRect().top + viewport.clientTop;
-  return Array.from(viewport.querySelectorAll(ROW_SELECTOR)).filter((row) => !row.closest("details:not([open])")).map((row) => {
+  const placeholderEnds = /* @__PURE__ */ new Map();
+  const rows = [];
+  for (const row of Array.from(viewport.querySelectorAll(ROW_SELECTOR))) {
+    if (row.closest("details:not([open])")) continue;
     const rect = row.getBoundingClientRect();
-    return { id: row.dataset.conversationRowId, top: rect.top - top, bottom: rect.bottom - top };
-  });
+    let bottom = rect.bottom;
+    const parked = row.closest("[hidden]");
+    if (parked && viewport.contains(parked)) {
+      let end = placeholderEnds.get(parked);
+      if (end === void 0) {
+        end = parked.getBoundingClientRect().bottom;
+        placeholderEnds.set(parked, end);
+      }
+      bottom = Math.min(bottom, end);
+    }
+    rows.push({ id: row.dataset.conversationRowId, top: rect.top - top, bottom: bottom - top });
+  }
+  return rows;
 }
 function rowGeometryOf(viewport, ids) {
   const top = viewport.getBoundingClientRect().top + viewport.clientTop;
@@ -26755,7 +26769,7 @@ function useConversationScrollController(options) {
     session.missingAnchor = false;
     session.anchor = { rowId, offset: CONVERSATION_ANCHOR_OFFSET_PX, neighbors: [] };
     applyLayout();
-    return rowGeometry(viewport).some((row) => row.id === rowId);
+    return rowGeometryOf(viewport, [rowId]).length > 0;
   }, [applyLayout]);
   (0, import_react6.useLayoutEffect)(() => {
     const previous3 = sessionRef.current;
@@ -51050,6 +51064,19 @@ function AccessPanel({
   const scope = JSON.stringify([status?.subject, status?.available, status?.can_administer]);
   const mutationScope = import_react32.default.useRef(scope);
   mutationScope.current = scope;
+  const [editScope, setEditScope] = import_react32.default.useState(scope);
+  if (editScope !== scope) {
+    setEditScope(scope);
+    setRuleDraft(null);
+    setAdminsDraft(null);
+    setGroupNameDraft("");
+    setGroupMembersDraft("");
+    setEditingGroup(null);
+    setSaveFailure(null);
+    setAdminsBase(null);
+    setRuleBase(null);
+    setGroupBase(null);
+  }
   const previewScope = JSON.stringify([
     scope,
     status?.owner_instance,
@@ -51076,17 +51103,6 @@ function AccessPanel({
   import_react32.default.useEffect(() => {
     setPreviewAction((value) => actions.includes(value) ? value : actions[0] ?? "");
   }, [actionCatalogKey]);
-  import_react32.default.useEffect(() => {
-    setRuleDraft(null);
-    setAdminsDraft(null);
-    setGroupNameDraft("");
-    setGroupMembersDraft("");
-    setEditingGroup(null);
-    setSaveFailure(null);
-    setAdminsBase(null);
-    setRuleBase(null);
-    setGroupBase(null);
-  }, [scope]);
   import_react32.default.useEffect(() => () => {
     previewVersion.current += 1;
   }, []);

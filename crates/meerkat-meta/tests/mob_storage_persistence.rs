@@ -1165,6 +1165,267 @@ async fn changed_definition_refuses_instead_of_booting_stale() {
     }
 }
 
+/// A `lead` profile, optionally carrying keys the TOML parse warns about and
+/// ignores, one in each shape that warning takes: an unknown key on the profile
+/// table, and an unknown key under its `tools` table (`mob_tasks`, which configs
+/// written for earlier releases carry).
+fn lead_toml(mob_id: &str, with_ignored_keys: bool, peer_description: &str) -> String {
+    let (profile_key, tools_key) = if with_ignored_keys {
+        ("display_name = \"Incident lead\"\n", "mob_tasks = true\n")
+    } else {
+        ("", "")
+    };
+    format!(
+        r#"
+[mob]
+id = "{mob_id}"
+
+[profiles.lead]
+model = "gpt-5.5"
+external_addressable = true
+peer_description = "{peer_description}"
+{profile_key}
+[profiles.lead.tools]
+comms = true
+{tools_key}"#
+    )
+}
+
+/// The keys [`lead_toml`] adds, as the parse reports them.
+const IGNORED_LEAD_KEYS: [&str; 2] = ["display_name", "tools.mob_tasks"];
+
+/// Parse a mob TOML the way both gateways do (`MobDefinition::from_toml`, which
+/// logs the ignored-key warning), after checking that the parse reports exactly
+/// `ignored` as the keys it ignores, so each pin below exercises that warning
+/// and not a key the profile accepts.
+fn definition_ignoring(toml: &str, ignored: &[&str]) -> MobDefinition {
+    let parsed = MobDefinition::parse_toml(toml).expect("parse mob definition");
+    let reported: Vec<&str> = parsed
+        .unknown_profile_keys
+        .iter()
+        .flat_map(|unknown| unknown.keys.iter().map(String::as_str))
+        .collect();
+    assert_eq!(
+        reported, ignored,
+        "the keys the parse warns about and ignores"
+    );
+    MobDefinition::from_toml(toml).expect("parse mob definition")
+}
+
+/// Create a persistent store from `created`, shut that runtime down, then boot
+/// `resumed` against the same path. That takes the resume branch, which
+/// verifies the composition before the mob actuates.
+async fn create_then_resume(
+    root: &Path,
+    created: MobDefinition,
+    resumed: MobDefinition,
+) -> Result<MobRuntime, MobRuntimeError> {
+    let mob_path = root.join("mob.sqlite3");
+    let session_root = root.join("sessions");
+    let first = boot(&mob_path, &session_root, created)
+        .await
+        .expect("the first bootstrap creates the store");
+    first
+        .handle()
+        .shutdown()
+        .await
+        .expect("shutdown the creating runtime");
+    drop(first);
+    boot(&mob_path, &session_root, resumed).await
+}
+
+/// The parse warns that it ignores a profile key such as `tools.mob_tasks`.
+/// Acting on that warning must not read as a composition change: the typed
+/// parse drops the key before the definition is recorded or compared, so a
+/// store created from a config with the key resumes from the config without
+/// it.
+#[tokio::test]
+async fn dropping_an_ignored_profile_key_resumes_the_store() {
+    const MOB_ID: &str = "ignored-profile-key-dropped";
+    let temp = tempfile::tempdir().expect("temp dir");
+    let resumed = create_then_resume(
+        temp.path(),
+        definition_ignoring(
+            &lead_toml(MOB_ID, true, "Incident lead"),
+            &IGNORED_LEAD_KEYS,
+        ),
+        definition_ignoring(&lead_toml(MOB_ID, false, "Incident lead"), &[]),
+    )
+    .await
+    .unwrap_or_else(|error| {
+        panic!("dropping keys the parse ignores must not be a divergence: {error}")
+    });
+    resumed
+        .handle()
+        .shutdown()
+        .await
+        .expect("shutdown the resumed runtime");
+}
+
+/// The reverse edit: a store created from a config without the ignored keys
+/// resumes from a config that adds them.
+#[tokio::test]
+async fn adding_an_ignored_profile_key_resumes_the_store() {
+    const MOB_ID: &str = "ignored-profile-key-added";
+    let temp = tempfile::tempdir().expect("temp dir");
+    let resumed = create_then_resume(
+        temp.path(),
+        definition_ignoring(&lead_toml(MOB_ID, false, "Incident lead"), &[]),
+        definition_ignoring(
+            &lead_toml(MOB_ID, true, "Incident lead"),
+            &IGNORED_LEAD_KEYS,
+        ),
+    )
+    .await
+    .unwrap_or_else(|error| {
+        panic!("adding keys the parse ignores must not be a divergence: {error}")
+    });
+    resumed
+        .handle()
+        .shutdown()
+        .await
+        .expect("shutdown the resumed runtime");
+}
+
+/// Ignored keys never mask a real change: an edit that drops them and also
+/// changes an accepted key is refused, naming only the accepted key.
+#[tokio::test]
+async fn a_meaningful_change_beside_a_dropped_ignored_key_still_diverges() {
+    const MOB_ID: &str = "ignored-profile-key-meaningful-change";
+    let temp = tempfile::tempdir().expect("temp dir");
+    let result = create_then_resume(
+        temp.path(),
+        definition_ignoring(
+            &lead_toml(MOB_ID, true, "Incident lead"),
+            &IGNORED_LEAD_KEYS,
+        ),
+        definition_ignoring(&lead_toml(MOB_ID, false, "Incident commander"), &[]),
+    )
+    .await;
+    match result {
+        Err(MobRuntimeError::CompositionProvenance(MobCompositionProvenanceError::Divergent {
+            fields,
+            ..
+        })) => assert_eq!(
+            fields,
+            vec!["profiles.lead.peer_description".to_string()],
+            "the refusal names the changed accepted key and never an ignored one"
+        ),
+        Err(other) => panic!("expected a composition divergence refusal, got: {other}"),
+        Ok(_) => panic!(
+            "a changed peer_description resumed: the comparison no longer sees a real \
+             change made in the same edit that drops ignored keys"
+        ),
+    }
+}
+
+/// Insert `key = value` into profile `profile` of a serialized definition.
+fn insert_profile_key(definition: &mut serde_json::Value, profile: &str, key: &str, value: &str) {
+    definition
+        .get_mut("profiles")
+        .and_then(|profiles| profiles.get_mut(profile))
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("the recorded definition carries the inline profile")
+        .insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+}
+
+/// meerkat 0.9 refuses a profile `system_prompt`, so an upgraded config must
+/// drop it. That edit never reads as a divergence: MobKit 0.8.31 and earlier
+/// dropped the key at parse, so no store they wrote records it, and this pins
+/// the worst case anyway. A recorded composition that carries the key, in its
+/// `MobCreated` event and its manifest, resumes from the config without it,
+/// because both sides are compared as typed definitions.
+#[tokio::test]
+async fn a_recorded_profile_system_prompt_does_not_diverge_the_config_without_it() {
+    const MOB_ID: &str = "recorded-profile-system-prompt";
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mob_path = temp.path().join("mob.sqlite3");
+    let session_root = temp.path().join("sessions");
+    let config = lead_toml(MOB_ID, false, "Incident lead");
+
+    let first = boot(&mob_path, &session_root, definition_ignoring(&config, &[]))
+        .await
+        .expect("the first bootstrap creates the store");
+    first
+        .handle()
+        .shutdown()
+        .await
+        .expect("shutdown the creating runtime");
+    drop(first);
+
+    let connection = rusqlite::Connection::open(&mob_path).expect("open the mob event log");
+    let mut created = Vec::new();
+    {
+        let mut rows = connection
+            .prepare("SELECT cursor, event_json FROM mob_events ORDER BY cursor")
+            .expect("prepare the event read");
+        let events = rows
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .expect("read the events");
+        for event in events {
+            let (cursor, bytes) = event.expect("read one event");
+            // A stored row is `{"schema_version": .., "event": <MobEvent>}`.
+            let mut stored: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("decode one event");
+            if stored["event"]["kind"]["type"] == "mob_created" {
+                insert_profile_key(
+                    &mut stored["event"]["kind"]["definition"],
+                    "lead",
+                    "system_prompt",
+                    "You lead the incident.",
+                );
+                created.push((
+                    cursor,
+                    serde_json::to_vec(&stored).expect("encode the event"),
+                ));
+            }
+        }
+    }
+    assert_eq!(created.len(), 1, "the log records one MobCreated event");
+    for (cursor, bytes) in created {
+        let rewritten = connection
+            .execute(
+                "UPDATE mob_events SET event_json = ?1 WHERE cursor = ?2",
+                rusqlite::params![bytes, cursor],
+            )
+            .expect("record the key in the MobCreated definition");
+        assert_eq!(rewritten, 1, "the MobCreated row now records the key");
+    }
+    drop(connection);
+
+    let manifest = manifest_path(&mob_path);
+    let mut recorded: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).expect("read the manifest"))
+            .expect("decode the manifest");
+    insert_profile_key(
+        &mut recorded["definition"],
+        "lead",
+        "system_prompt",
+        "You lead the incident.",
+    );
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&recorded).expect("encode the manifest"),
+    )
+    .expect("record the key in the manifest");
+
+    let resumed = boot(&mob_path, &session_root, definition_ignoring(&config, &[]))
+        .await
+        .unwrap_or_else(|error| {
+            panic!("a recorded system_prompt must not make the config without it diverge: {error}")
+        });
+    resumed
+        .handle()
+        .shutdown()
+        .await
+        .expect("shutdown the resumed runtime");
+}
+
 #[tokio::test]
 async fn released_synthesized_profile_definition_resumes_unchanged_operator_config() {
     const MOB_ID: &str = "legacy-synthesized-profile-resume";

@@ -410,6 +410,11 @@ try {
 }
 ```
 
+The comparison is over the parsed definition, so a profile key the TOML parse
+warns about and ignores (for example `tools.mob_tasks` in a config written for
+an earlier release) is never one of the `fields`: removing it to act on the
+warning, or adding it, does not cause this refusal.
+
 ## Gateway logging (stderr)
 
 The persistent gateway reports tracing lines, panic hooks, and storage

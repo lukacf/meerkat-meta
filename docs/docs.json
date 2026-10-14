@@ -58,7 +58,8 @@
               "guides/console",
               "guides/flow-editor",
               "guides/authentication",
-              "guides/deployment"
+              "guides/deployment",
+              "guides/upgrading-from-mobkit"
             ]
           }
         ]

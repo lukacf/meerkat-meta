@@ -325,7 +325,11 @@ adopts the member as it is:
 A refusal parks the identity Broken with the typed kind
 `role_migration_not_applied`, and the `meta/init` result reports it under
 `identity_bootstrap` (the identity is `broken` with that restore kind, and
-`ready` is false), so a refused migration is visible at boot.
+`ready` is false), so a refused migration is visible at boot. The park holds
+for the roster spec it was refused against: the continuity repair supervisor
+does not retry it, and no later restore or reconcile pass retires the member
+the refusal kept. Change the declaration (next boot) or the member's roster
+spec to try again.
 
 <Warning>
 A malformed or self-contradicting `role_migrations` payload refuses the boot
