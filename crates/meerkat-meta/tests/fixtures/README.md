@@ -61,6 +61,29 @@ shape is what the tests pin.
                       minted no resume rewrites for an unchanged system
                       prompt
 
+- released_0_8_26_store/ - one COMPLETE persistent store (`state/`) minted
+  by the released MobKit 0.8.26 rpc_gateway (release archive sha256
+  fdac071b0a1b3983c67e6a75fc279135aa9bff9dcae56d8caaaaa8bb9dfbafb1) over
+  stdin JSONL with no provider key (`runtime_options.demo_llm`):
+  mob_storage persistent, so `event_log.sqlite3` holds the mob's events
+  and `event_log.sqlite3.composition.json` carries the predecessor
+  creator field `created_by_mobkit`; one durable identity
+  (`learner:fixture-0001`, session 01a13aaa-4918-71e2-b44c-366e9b2d4de3)
+  with one driven turn; two agent memories in
+  `agent-memory/default.sqlite3`; one memory ledger assertion; the
+  predecessor database names and ledger domains and the `mobkit/` realm.
+  `mint_released_0_8_26_store.py` beside it is the capture driver (the
+  definition it used includes `tools.mob_tasks`, which 0.8.26 accepted,
+  and no profile `system_prompt`, which 0.8.26 ignored and 0.9 refuses);
+  `checksums.sha256` pins every file. Two things were left out of the
+  capture: the empty `blobs/` directory (git cannot track it; the test's
+  staging restores it) and the gateway peer key `peer_key.ed25519` (key
+  material; an installation without host pairings mints a new one on
+  boot). The mob supervisor key inside `event_log.sqlite3` was minted by
+  this capture and authorizes nothing outside it. All content is
+  synthetic. Never regenerate with current code and never open these files
+  in place. Consumed by tests/released_0_8_26_store_adoption.rs.
+
 - ledger_v1_closure/ - the continuity closure of one member session
   (019fae11-4dd7-7301-9754-67b646603fb3) carrying a 26-rewrite
   resume-system-prompt-refresh chain, with SYNTHETIC content. The row
