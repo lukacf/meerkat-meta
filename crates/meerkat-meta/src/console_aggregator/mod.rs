@@ -1175,6 +1175,30 @@ impl MetaConsoleAggregator {
         });
     }
 
+    /// Project `events` of `runtime_key`'s console event store into the log
+    /// and return once each is durable. Runtime shutdown calls it with the
+    /// events its final drains appended, right before
+    /// [`Self::unregister_runtime`] detaches the live projection, which may
+    /// stop before it receives them. Projection dedupes on the source event
+    /// id, so an event the live projection already wrote is not written
+    /// twice. Every event is attempted; the first failure is returned.
+    pub(crate) async fn project_runtime_events(
+        &self,
+        runtime_key: &str,
+        events: Vec<crate::console_contracts::ConsoleIdentityEventEnvelope>,
+    ) -> ConsoleLogResult<()> {
+        let mut first_error = None;
+        for envelope in events {
+            if let Err(error) =
+                project_console_event(self.inner.clone(), runtime_key, envelope).await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// Unregister a runtime (issue #254 follow-up): removes the registry
     /// entry (which also terminates the 5s session-history discovery loop on
     /// its next tick — it checks registration), signals the live-projection

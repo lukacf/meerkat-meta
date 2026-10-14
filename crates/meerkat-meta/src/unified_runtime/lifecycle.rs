@@ -332,6 +332,12 @@ impl UnifiedRuntime {
 
         // Phase 1: Drain in-flight events
         let drain_start = std::time::Instant::now();
+        // Phase 1 and the post-stop drain before Phase 3 share this window:
+        // the published shutdown horizon counts one event drain.
+        let drain_deadline = tokio::time::Instant::from_std(drain_start) + self.drain_timeout;
+        // The console events this shutdown's drains project follow this
+        // position; the post-stop drain makes each of them durable.
+        let console_drain_position = self.console_events.latest_event_id().await;
         let mut drained_count = 0_usize;
         let drain_result = tokio::time::timeout(self.drain_timeout, async {
             loop {
@@ -490,6 +496,14 @@ impl UnifiedRuntime {
         // reported settled counts as complete.
         let member_mcp_settlement = self.settle_member_mcp().await;
 
+        // The mob stop and terminal teardown above end a member's in-flight
+        // run after Phase 1 drained, so the run's terminal reaches the router
+        // only now. Drain once more and make the console frames durable
+        // before the router closes and the live projection detaches, or a
+        // turn the shutdown interrupted never gets its terminal frame.
+        self.drain_terminal_events_after_stop(drain_deadline, console_drain_position)
+            .await;
+
         // Phase 3: Close event router
         self.close_event_router().await;
 
@@ -514,6 +528,59 @@ impl UnifiedRuntime {
             mob_terminal_shutdown,
             child_mob_stand_down,
             member_mcp_settlement,
+        }
+    }
+
+    /// Shutdown's post-stop drain: at most two drain passes 50 ms apart, as
+    /// in Phase 1, then the console projection of every event this
+    /// shutdown's drains appended after `console_drain_position`, all
+    /// within `deadline`. Projection dedupes on the source event id, so
+    /// frames the live projection already wrote are not written twice.
+    async fn drain_terminal_events_after_stop(
+        &self,
+        deadline: tokio::time::Instant,
+        console_drain_position: Option<String>,
+    ) {
+        let drained = tokio::time::timeout_at(deadline, async {
+            for pass in 0..2 {
+                if pass > 0 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                if self.drain_mob_agent_events().await.is_err()
+                    || self.mob_event_ingress.lock().await.is_none()
+                {
+                    break;
+                }
+            }
+            let Some(projection) = self.console_projection.get() else {
+                return;
+            };
+            let events = match self
+                .console_events
+                .replay_all(console_drain_position.as_deref())
+                .await
+            {
+                Ok(events) => events,
+                // The position aged out of the replay buffer: project all
+                // the buffer still holds.
+                Err(_) => self
+                    .console_events
+                    .replay_all(None)
+                    .await
+                    .unwrap_or_default(),
+            };
+            if let Err(error) = projection.project_runtime_events("default", events).await {
+                tracing::warn!(
+                    %error,
+                    "shutdown could not persist every console frame of its final drain"
+                );
+            }
+        })
+        .await;
+        if drained.is_err() {
+            tracing::warn!(
+                "shutdown's post-stop event drain reached the end of the event drain window"
+            );
         }
     }
 
