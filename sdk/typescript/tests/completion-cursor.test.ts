@@ -323,11 +323,16 @@ describe("server-side completion waits", () => {
       calls.map((c) => c.method),
       ["meta/wait_for_completion", "meta/inspect_identity"],
     );
-    assert.deepEqual(calls[0]?.params, {
+    const { timeout_ms: timeoutMs, ...waitParams } = calls[0]?.params ?? {};
+    assert.deepEqual(waitParams, {
       identity: "triage:main",
       after: { epoch: 3, turns: 1 },
-      timeout_ms: 7000,
     });
+    // The SDK sends floor(deadline - now), so a millisecond may pass first.
+    assert.ok(
+      typeof timeoutMs === "number" && timeoutMs >= 6950 && timeoutMs <= 7000,
+      `the one server wait must carry the remaining 7000 ms budget, got ${String(timeoutMs)}`,
+    );
   });
 
   it("a server timeout rejects with the timeout error", async () => {

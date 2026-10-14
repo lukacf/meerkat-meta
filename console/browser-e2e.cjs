@@ -1841,20 +1841,35 @@ async function runChatPaneAutoScrollProof() {
     await pane.getByText("Historical worker line 48").waitFor({ timeout: 10_000 });
     await pane.getByText("AUTO_SCROLL_FINAL_VISIBLE").waitFor({ timeout: 10_000 });
     const body = pane.locator(".conv__body");
-    const scrollState = await body.evaluate((node) => ({
+    const sample = () => body.evaluate((node) => ({
       scrollTop: node.scrollTop,
       clientHeight: node.clientHeight,
       scrollHeight: node.scrollHeight,
       text: node.textContent || "",
     }));
-    const distanceFromBottom =
-      scrollState.scrollHeight - scrollState.clientHeight - scrollState.scrollTop;
+    const distanceOf = (state) => state.scrollHeight - state.clientHeight - state.scrollTop;
+    // The pane re-pins from its ResizeObserver after the grown message lays
+    // out, so the task that sees the new text can still read the scroll
+    // position from before that layout. Wait, bounded, for later frames to
+    // show the pinned position; an unpinned pane still fails at the deadline.
+    const pinnedBy = Date.now() + 5_000;
+    let framesWaited = 0;
+    let scrollState = await sample();
+    while (distanceOf(scrollState) > 4 && Date.now() < pinnedBy) {
+      await body.evaluate(() => new Promise((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+        setTimeout(resolve, 100);
+      }));
+      framesWaited += 1;
+      scrollState = await sample();
+    }
+    const distanceFromBottom = distanceOf(scrollState);
     assert(
       distanceFromBottom <= 4,
       `chat pane did not stay pinned to latest transcript content; distance=${distanceFromBottom} state=${JSON.stringify(scrollState)}`,
     );
 
-    process.stdout.write("browser chat pane auto-scroll ok\n");
+    process.stdout.write(`browser chat pane auto-scroll ok (frame waits before pinned: ${framesWaited})\n`);
   } finally {
     if (browser) {
       await browser.close();
