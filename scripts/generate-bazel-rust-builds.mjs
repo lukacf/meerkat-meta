@@ -5,17 +5,31 @@ import { dirname, relative, resolve } from "node:path";
 import { testSourcePaths as sharedTestSourcePaths } from "./rust-test-selector.mjs";
 
 const checkOnly = process.argv.includes("--check");
+// `--metadata <file>` generates from a recorded `cargo metadata
+// --format-version=1` document of this checkout instead of running it, for
+// example one taken with `--config` overlaying unpublished registry crates by
+// local paths. The document is used as recorded; nothing in it is rewritten.
+const metadataArg = process.argv.indexOf("--metadata");
+const metadataFile = metadataArg === -1 ? null : process.argv[metadataArg + 1];
+if (metadataArg !== -1 && !metadataFile) {
+  throw new Error("--metadata needs the path of a cargo metadata document");
+}
 
 const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
   encoding: "utf8",
 }).trim();
 const metadata = JSON.parse(
-  execFileSync("./scripts/repo-cargo", ["metadata", "--format-version=1"], {
-    cwd: root,
-    encoding: "utf8",
-    maxBuffer: 64 * 1024 * 1024,
-  }),
+  metadataFile
+    ? readFileSync(metadataFile, "utf8")
+    : execFileSync("./scripts/repo-cargo", ["metadata", "--format-version=1"], {
+        cwd: root,
+        encoding: "utf8",
+        maxBuffer: 64 * 1024 * 1024,
+      }),
 );
+if (metadataFile && metadata.workspace_root !== root) {
+  throw new Error(`${metadataFile} describes ${metadata.workspace_root}, not this checkout ${root}`);
+}
 
 const workspaceMembers = new Set(metadata.workspace_members);
 const localPackages = new Map(
@@ -26,11 +40,28 @@ const localPackages = new Map(
 const byName = new Map(
   [...localPackages.values()].map((pkg) => [pkg.name, pkg]),
 );
+// Every package that is not a workspace member is external to this workspace,
+// whatever its source: a registry crate, or a path package an overlay put in
+// place of an unpublished registry crate. Both are named the crate_universe
+// way, by name and version. The overlay does not make those versions
+// fetchable for Bazel, so it is reported rather than hidden.
 const externalByName = new Map();
-for (const pkg of metadata.packages.filter((pkg) => pkg.source !== null)) {
+for (const pkg of metadata.packages.filter((pkg) => !workspaceMembers.has(pkg.id))) {
   if (!externalByName.has(pkg.name)) externalByName.set(pkg.name, []);
   externalByName.get(pkg.name).push(pkg);
 }
+const overlaidPackages = metadata.packages.filter(
+  (pkg) => pkg.source === null && !workspaceMembers.has(pkg.id),
+);
+if (overlaidPackages.length > 0) {
+  console.warn(
+    `${overlaidPackages.length} non-workspace path package(s) are labeled as crate_universe ` +
+      "externals by name and version; Bazel resolves them only where crate_universe can fetch " +
+      "those versions",
+  );
+}
+const packagesById = new Map(metadata.packages.map((pkg) => [pkg.id, pkg]));
+const resolveNodesById = new Map((metadata.resolve?.nodes ?? []).map((node) => [node.id, node]));
 const packageDir = (pkg) => dirname(pkg.manifest_path);
 const packageKey = (pkg) => {
   const dir = relative(root, packageDir(pkg));
@@ -266,7 +297,14 @@ function rewriteRuntimeTestSupportDeps(deps, useAgentFactoryDeps) {
   });
 }
 
-function externalCrateLabel(dep) {
+function externalCrateLabel(consumer, dep) {
+  // The package this consumer's dependency resolved to, when the resolve graph
+  // carries the edge; otherwise (an optional dependency only a target's
+  // required features enable) the resolved packages of that name.
+  const resolved = (resolveNodesById.get(consumer.id)?.deps ?? [])
+    .map((edge) => packagesById.get(edge.pkg))
+    .find((pkg) => pkg?.name === dep.name && !workspaceMembers.has(pkg.id));
+  if (resolved) return `@crates//:${resolved.name}-${resolved.version}`;
   const candidates = externalByName.get(dep.name) ?? [];
   let pkg = candidates.length === 1 ? candidates[0] : null;
   if (!pkg && dep.req?.startsWith("^")) {
@@ -293,7 +331,7 @@ function optionalExternalDeps(pkg) {
       const depName = expansion.startsWith("dep:") ? expansion.slice(4) : null;
       if (!depName) continue;
       const dep = pkg.dependencies.find((candidate) => candidate.name === depName && candidate.source !== null);
-      const label = dep ? externalCrateLabel(dep) : null;
+      const label = dep ? externalCrateLabel(pkg, dep) : null;
       if (label) labels.add(label);
     }
   }
@@ -1771,7 +1809,7 @@ for (const pkg of localPackages.values()) {
   );
 }
 
-// The root BUILD.bazel is HAND-MAINTAINED in mobkit, not generated:
+// The root BUILD.bazel is HAND-MAINTAINED in meta, not generated:
 // writeRootBuild's meerkat-derived template references meerkat-only labels
 // (//meerkat-cli, //meerkat-rpc, test-fixtures/live_smoke/support.rs,
 // .claude/skills/meerkat-platform) that do not exist in this repo, and it

@@ -8,8 +8,8 @@ const { browserFailureMonitor, navigation } = require("./browser-failure-monitor
 
 const name = "real-checked-save-recovery";
 const mutationMethods = new Set(["set", "enable", "rules/upsert", "rules/delete", "groups/set", "groups/delete"]
-  .map(method => `mobkit/access/${method}`));
-const evidenceDir = process.env.MOBKIT_BROWSER_EVIDENCE
+  .map(method => `meta/access/${method}`));
+const evidenceDir = process.env.META_BROWSER_EVIDENCE
   || path.join(__dirname, "../../output/playwright/console-acceptance");
 
 async function ownerRpc(fixture, method, params = {}) {
@@ -36,7 +36,7 @@ async function openAccess(page, baseUrl, suffix = "") {
   await page.getByTestId("access-tab:preview").waitFor();
 }
 async function refresh(page) {
-  const response = page.waitForResponse(value => isRpc(value, "mobkit/access/get"));
+  const response = page.waitForResponse(value => isRpc(value, "meta/access/get"));
   await page.getByTestId("access-refresh").click();
   const body = await (await response).json();
   assert(!body.error, JSON.stringify(body));
@@ -50,7 +50,7 @@ async function preview(page, subject, allowed, attempts) {
   const observeRequest = request => {
     if (!request.url().endsWith("/console/rpc") || request.method() !== "POST") return;
     const body = request.postDataJSON();
-    if (["mobkit/capabilities", "mobkit/access/preview"].includes(body?.method)) {
+    if (["meta/capabilities", "meta/access/preview"].includes(body?.method)) {
       attempt.requests.push({ method: body.method, id: body.id, atMs: Date.now() });
     }
   };
@@ -63,7 +63,7 @@ async function preview(page, subject, allowed, attempts) {
     attempt.clickStartedAtMs = Date.now();
     // Handle both promises immediately so either failure reaches the artifact cleanup.
     const [response] = await Promise.all([
-      page.waitForResponse(value => isRpc(value, "mobkit/access/preview")),
+      page.waitForResponse(value => isRpc(value, "meta/access/preview")),
       page.getByTestId("access-preview-run").click().then(() => { attempt.clickCompletedAtMs = Date.now(); }),
     ]);
     const body = await response.json();
@@ -81,7 +81,7 @@ async function preview(page, subject, allowed, attempts) {
 }
 
 async function realCheckedSaveRecovery() {
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "Use the prebuilt console_acceptance_fixture; this scenario must not invoke Cargo.");
+  assert(process.env.META_EXAMPLE_BIN_DIR, "Use the prebuilt console_acceptance_fixture; this scenario must not invoke Cargo.");
   const fixture = await startFixture();
   let browser, monitor, page, failure;
   const browserWrites = [], readonlyWrites = [], checkpoints = [];
@@ -90,7 +90,7 @@ async function realCheckedSaveRecovery() {
     // Existing loopback fixture grants access.admin through its real allow-all
     // rule. This tests an open/bootstrap caller, not JWT principal isolation.
     await fixture.control("access", { mode: "open" });
-    const original = await ownerRpc(fixture, "mobkit/access/get");
+    const original = await ownerRpc(fixture, "meta/access/get");
     assert.equal(original.conditional_mutations, "checked_v1");
     assert.equal(typeof original.owner_instance, "string");
     assert(original.owner_instance.length > 0);
@@ -119,9 +119,9 @@ async function realCheckedSaveRecovery() {
     const admins = [...original.config.admins, "new-admin@example.test"];
     await draft.fill(admins.join(", "));
     const newerRule = { id: "checked-save-newer-rule", effect: "deny", subjects: ["reader@example.test"], actions: ["agent.send"], agents: ["router:main"] };
-    const competing = await ownerRpc(fixture, "mobkit/access/rules/upsert", checked(original, { rule: newerRule }));
+    const competing = await ownerRpc(fixture, "meta/access/rules/upsert", checked(original, { rule: newerRule }));
     assert.equal(competing.revision, original.revision + 1);
-    const newer = await ownerRpc(fixture, "mobkit/access/get");
+    const newer = await ownerRpc(fixture, "meta/access/get");
     assert.equal(newer.owner_instance, original.owner_instance);
     assert.equal(newer.revision, competing.revision);
     assert(newer.config.rules.some(rule => rule.id === newerRule.id));
@@ -132,7 +132,7 @@ async function realCheckedSaveRecovery() {
     await page.getByTestId("access-tab:overview").click();
     assert.equal(await draft.inputValue(), admins.join(", "), "refresh retains the unsaved draft");
 
-    const staleResponse = page.waitForResponse(value => isRpc(value, "mobkit/access/set"));
+    const staleResponse = page.waitForResponse(value => isRpc(value, "meta/access/set"));
     await save.click();
     const stale = await (await staleResponse).json();
     assert.equal(stale.error?.code, -32009, JSON.stringify(stale));
@@ -142,19 +142,19 @@ async function realCheckedSaveRecovery() {
     assert.equal(await draft.inputValue(), admins.join(", "));
     assert(await save.isDisabled());
     assert.deepEqual(browserWrites.map(value => value.params), [checked(original, { config: { ...original.config, admins } })]);
-    assert.deepEqual(await ownerRpc(fixture, "mobkit/access/get"), newer, "stale write leaves real owner config and revision unchanged");
+    assert.deepEqual(await ownerRpc(fixture, "meta/access/get"), newer, "stale write leaves real owner config and revision unchanged");
     await refresh(page);
     assert(await save.isDisabled(), "refresh alone must not rebase and retry the draft");
     assert.equal(browserWrites.length, 1);
     await page.getByRole("button", { name: "Review and reapply", exact: true }).click();
     assert.equal(browserWrites.length, 1, "explicit review itself sends no write");
     assert.equal(await draft.inputValue(), admins.join(", "));
-    const currentResponse = page.waitForResponse(value => isRpc(value, "mobkit/access/set"));
+    const currentResponse = page.waitForResponse(value => isRpc(value, "meta/access/set"));
     await save.click();
     const current = await (await currentResponse).json();
     assert.equal(current.result?.revision, newer.revision + 1, JSON.stringify(current));
     await draft.waitFor({ state: "detached" });
-    const committed = await ownerRpc(fixture, "mobkit/access/get");
+    const committed = await ownerRpc(fixture, "meta/access/get");
     assert.deepEqual(committed.config, { ...newer.config, admins }, "reviewed whole-config commit retains the competing rule");
     assert.equal(committed.revision, newer.revision + 1);
     assert.deepEqual(browserWrites[1].params, checked(newer, { config: { ...newer.config, admins } }));
@@ -181,7 +181,7 @@ async function realCheckedSaveRecovery() {
     assert.equal(await readonly.getByTestId(`access-rule-delete:${newerRule.id}`).count(), 0);
     await preview(readonly, "reader@example.test", false, previewAttempts);
     assert.equal(readonlyWrites.length, 0);
-    assert.deepEqual(await ownerRpc(fixture, "mobkit/access/get"), committed);
+    assert.deepEqual(await ownerRpc(fixture, "meta/access/get"), committed);
 
     await page.getByTestId("access-edit-admins").click();
     const recoveredAdmins = [...admins, "recovered-admin@example.test"];
@@ -190,7 +190,7 @@ async function realCheckedSaveRecovery() {
     // Fault only the next protected read at the real HTTP transport boundary.
     // No synthetic owner result, mutation result, or capability is returned.
     await page.route("**/console/rpc", async route => {
-      if (!rejectedReads && route.request().postDataJSON()?.method === "mobkit/access/get") {
+      if (!rejectedReads && route.request().postDataJSON()?.method === "meta/access/get") {
         rejectedReads += 1;
         monitor.expectFailure(route.request(), "deliberate protected-read transport outage", "net::ERR_FAILED");
         return route.abort("failed");
@@ -203,18 +203,18 @@ async function realCheckedSaveRecovery() {
     assert.equal(await draft.inputValue(), recoveredAdmins.join(", "));
     assert(await save.isDisabled(), "unavailable protected read blocks writes from cached state");
     assert.equal(browserWrites.length, 2);
-    assert.deepEqual(await ownerRpc(fixture, "mobkit/access/get"), committed);
+    assert.deepEqual(await ownerRpc(fixture, "meta/access/get"), committed);
     assert.deepEqual((await refresh(page)).config, committed.config);
     await page.getByTestId("access-error").waitFor({ state: "detached" });
     assert.equal(await draft.inputValue(), recoveredAdmins.join(", "));
     assert(await save.isEnabled());
     assert.equal(browserWrites.length, 2, "recovery refresh must not automatically save");
-    const recoveredResponse = page.waitForResponse(value => isRpc(value, "mobkit/access/set"));
+    const recoveredResponse = page.waitForResponse(value => isRpc(value, "meta/access/set"));
     await save.click();
     const recovered = await (await recoveredResponse).json();
     assert.equal(recovered.result?.revision, committed.revision + 1, JSON.stringify(recovered));
     await draft.waitFor({ state: "detached" });
-    const final = await ownerRpc(fixture, "mobkit/access/get");
+    const final = await ownerRpc(fixture, "meta/access/get");
     assert.deepEqual(final.config, { ...committed.config, admins: recoveredAdmins });
     assert.equal(final.revision, committed.revision + 1);
     assert.equal(final.owner_instance, original.owner_instance);

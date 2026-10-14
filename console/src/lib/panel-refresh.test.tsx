@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ConsoleApp } from "../ConsoleApp";
 import { buildControlTarget } from "./adapters";
 import { CONSOLE_RPC_METHODS } from "./contract";
-import type { MobKitConsoleTransport } from "./headless";
+import type { MetaConsoleTransport } from "./headless";
 import type { ConsoleFrame } from "../types";
 
 const CHAT = "identity:agent-000";
@@ -46,7 +46,7 @@ function experience() {
   };
 }
 
-interface Harness extends MobKitConsoleTransport {
+interface Harness extends MetaConsoleTransport {
   live?: (frame: ConsoleFrame) => void;
   topologyQueries: number;
   inFlight: number;
@@ -92,7 +92,7 @@ function seedDock(topologyVisible: boolean): void {
     mode: "console",
     target: { id: `chat:${CHAT}`, kind: "agent-chat", title: "Agent 0", identity: CHAT, memberId: CHAT },
   };
-  window.localStorage.setItem(`mobkit-console-dock-state:${JSON.stringify(["", "refresh-principal"])}`, JSON.stringify({
+  window.localStorage.setItem(`meta-console-dock-state:${JSON.stringify(["", "refresh-principal"])}`, JSON.stringify({
     tabs: [
       { id: "tab-1", presetId: "single", layout: { kind: "panel", panelId: "panel-1" } },
       { id: "tab-2", presetId: "single", layout: { kind: "panel", panelId: "panel-2" } },

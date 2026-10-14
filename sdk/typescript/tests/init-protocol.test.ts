@@ -1,5 +1,5 @@
 /**
- * mobkit/init: accepted, then settled (#550, part 2), against stand-in
+ * meta/init: accepted, then settled (#550, part 2), against stand-in
  * gateways. Twin of the Python `test_init_protocol.py`:
  * - a legal slow startup (a callback round trip, then a settlement later than
  *   the SDK's request timeout) settles ready;
@@ -19,11 +19,12 @@ import { join } from "node:path";
 import {
   COMPOSITION_PROVENANCE_CODE,
   CompositionProvenanceError,
+  GatewayStartupCleanupError,
   INIT_IN_PROGRESS_CODE,
   InitInProgressError,
   InitOutcomeUnknownError,
-  MobKit,
-  MobKitRuntime,
+  Meta,
+  MetaRuntime,
   RpcError,
   StorageResolutionError,
   isRpcError,
@@ -51,7 +52,7 @@ async function serveShutdown() {
   for (;;) {
     const message = await next();
     log({ after_init: message });
-    if (message.method === "mobkit/shutdown") {
+    if (message.method === "meta/shutdown") {
       emit({ jsonrpc: "2.0", id: message.id, result: { shutdown: true, runtime_cleanup_completed: true } });
       return;
     }
@@ -64,9 +65,9 @@ async function serveShutdown() {
   const accepted = () => emit({ jsonrpc: "2.0", id: init.id, result: {
     init_state: "accepted", init_id: initId, provider_callback_timeout_ms: 130000,
     stdio_shutdown_handshake: true, stdio_shutdown_horizon_ms: 30000 } });
-  const progress = (phase, forInit) => emit({ jsonrpc: "2.0", method: "mobkit/init_progress",
+  const progress = (phase, forInit) => emit({ jsonrpc: "2.0", method: "meta/init_progress",
     params: { init_id: forInit ?? initId, phase } });
-  const settled = (params, forInit) => emit({ jsonrpc: "2.0", method: "mobkit/init_settled",
+  const settled = (params, forInit) => emit({ jsonrpc: "2.0", method: "meta/init_settled",
     params: { init_id: forInit ?? initId, ...params } });
   await (async () => { STEPS })();
 })();
@@ -78,7 +79,7 @@ afterEach(() => {
 });
 
 function gateway(steps: string): { bin: string; record: string } {
-  const dir = mkdtempSync(join(tmpdir(), "mobkit-init-gateway-"));
+  const dir = mkdtempSync(join(tmpdir(), "meta-init-gateway-"));
   dirs.push(dir);
   const script = join(dir, "gateway.cjs");
   const record = join(dir, "record.jsonl");
@@ -97,14 +98,43 @@ function records(record: string): Array<Record<string, any>> {
   return readFileSync(record, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
-function runtime(bin: string, options: { timeoutMs?: number; initDeadlineMs?: number } = {}): MobKitRuntime {
-  const builder = MobKit.builder().gateway(bin);
-  if (options.timeoutMs !== undefined) builder.gatewayTimeoutMs(options.timeoutMs);
-  if (options.initDeadlineMs !== undefined) builder.initDeadline(options.initDeadlineMs);
-  return new MobKitRuntime((builder as any)._config);
+/**
+ * A gateway that negotiated the shutdown handshake and then exited leaves the
+ * runtime's stop nobody to ask, so that stop rejects: the startup error
+ * arrives exactly, as `startupError` and `cause` of the cleanup error, the
+ * stop's own record stays apart, and a retry has nothing left to clean up.
+ * Returns the original startup error.
+ */
+async function startupErrorBehindRejectedStop(rt: MetaRuntime, exitCode: number): Promise<any> {
+  let failure: unknown = null;
+  await assert.rejects(rt.connect(), (error: unknown) => {
+    failure = error;
+    return true;
+  });
+  assert.ok(failure instanceof GatewayStartupCleanupError, String(failure));
+  assert.equal(failure.cause, failure.startupError);
+  assert.match((failure.cleanupError as Error).message, /gateway shutdown failed after bounded cleanup/);
+  const record = {
+    state: "exited",
+    exitCode,
+    signal: null,
+    escalation: "none",
+    nativeShutdown: "unanswered",
+  };
+  assert.deepEqual(failure.cleanup.lastTermination(), record);
+  await failure.cleanup.shutdown();
+  assert.deepEqual(rt.lastGatewayTermination(), record);
+  return failure.startupError;
 }
 
-describe("mobkit/init accepted then settled", () => {
+function runtime(bin: string, options: { timeoutMs?: number; initDeadlineMs?: number } = {}): MetaRuntime {
+  const builder = Meta.builder().gateway(bin);
+  if (options.timeoutMs !== undefined) builder.gatewayTimeoutMs(options.timeoutMs);
+  if (options.initDeadlineMs !== undefined) builder.initDeadline(options.initDeadlineMs);
+  return new MetaRuntime((builder as any)._config);
+}
+
+describe("meta/init accepted then settled", () => {
   it("settles ready after a callback round trip, later than the request timeout", async () => {
     const { bin, record } = gateway(`
       accepted();
@@ -143,13 +173,11 @@ describe("mobkit/init accepted then settled", () => {
         process.exit(1);
       `);
       const rt = runtime(bin);
-      await assert.rejects(rt.connect(), (error: any) => {
-        assert.ok(error instanceof errorType);
-        assert.ok(!(error instanceof InitOutcomeUnknownError));
-        assert.equal(error.code, code);
-        assert.equal(error.data.durable_effects, durableEffects);
-        return true;
-      });
+      const error = await startupErrorBehindRejectedStop(rt, 1);
+      assert.ok(error instanceof errorType);
+      assert.ok(!(error instanceof InitOutcomeUnknownError));
+      assert.equal(error.code, code);
+      assert.equal(error.data.durable_effects, durableEffects);
     });
   }
 
@@ -165,14 +193,12 @@ describe("mobkit/init accepted then settled", () => {
       process.exit(1);
     `);
     const rt = runtime(bin);
-    await assert.rejects(rt.connect(), (error: any) => {
-      assert.ok(error instanceof CompositionProvenanceError);
-      assert.equal(error.code, COMPOSITION_PROVENANCE_CODE);
-      assert.equal(error.kind, "candidate_divergent");
-      assert.deepEqual(error.fields, ["profiles.lead.tools.deny"]);
-      assert.equal(error.data.durable_effects, "none");
-      return true;
-    });
+    const error = await startupErrorBehindRejectedStop(rt, 1);
+    assert.ok(error instanceof CompositionProvenanceError);
+    assert.equal(error.code, COMPOSITION_PROVENANCE_CODE);
+    assert.equal(error.kind, "candidate_divergent");
+    assert.deepEqual(error.fields, ["profiles.lead.tools.deny"]);
+    assert.equal(error.data.durable_effects, "none");
   });
 
   it("throws CompositionProvenanceError for a refusal answered as the init's error response", async () => {
@@ -214,13 +240,11 @@ describe("mobkit/init accepted then settled", () => {
       process.exit(3);
     `);
     const rt = runtime(bin);
-    await assert.rejects(rt.connect(), (error: any) => {
-      assert.ok(error instanceof InitOutcomeUnknownError);
-      assert.ok(!(error instanceof RpcError));
-      assert.equal(error.lastPhase, "prewarm");
-      assert.match(error.reason, /closed its stdout/);
-      return true;
-    });
+    const error = await startupErrorBehindRejectedStop(rt, 3);
+    assert.ok(error instanceof InitOutcomeUnknownError);
+    assert.ok(!(error instanceof RpcError));
+    assert.equal(error.lastPhase, "prewarm");
+    assert.match(error.reason, /closed its stdout/);
   });
 
   it("reports an init deadline as outcome unknown and asks the gateway to shut down", async () => {
@@ -237,7 +261,7 @@ describe("mobkit/init accepted then settled", () => {
       return true;
     });
     const methods = records(record).filter((entry) => entry.after_init).map((entry) => entry.after_init.method);
-    assert.deepEqual(methods, ["mobkit/shutdown"]);
+    assert.deepEqual(methods, ["meta/shutdown"]);
   });
 
   it("ignores a settlement for another init", async () => {
@@ -285,7 +309,7 @@ describe("mobkit/init accepted then settled", () => {
   });
 
   it("settles ready after a prewarm longer than the callback bound: the SDK arms no timer", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "mobkit-init-release-"));
+    const dir = mkdtempSync(join(tmpdir(), "meta-init-release-"));
     dirs.push(dir);
     const release = join(dir, "release");
     const { bin } = gateway(`
@@ -319,7 +343,7 @@ describe("mobkit/init accepted then settled", () => {
   });
 
   it("validates initDeadline", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     for (const bad of [0, -1, Number.POSITIVE_INFINITY, Number.NaN]) {
       assert.throws(() => builder.initDeadline(bad), TypeError);
     }
@@ -333,14 +357,14 @@ describe("init in progress refusal", () => {
     const { bin } = gateway(`
       emit({ jsonrpc: "2.0", id: init.id, result: { http_base_url: "http://127.0.0.1:5" } });
       const request = await next();
-      emit({ jsonrpc: "2.0", id: request.id, error: { code: -32018, message: "mobkit/status refused: mobkit/init has not settled yet",
-        data: { kind: "init_in_progress", method: "mobkit/status" } } });
+      emit({ jsonrpc: "2.0", id: request.id, error: { code: -32018, message: "meta/status refused: meta/init has not settled yet",
+        data: { kind: "init_in_progress", method: "meta/status" } } });
       await new Promise(() => {});
     `);
     const rt = runtime(bin);
     try {
       await rt.connect();
-      await assert.rejects((rt as any)._rpcUnchecked("mobkit/status", {}), (error: any) => {
+      await assert.rejects((rt as any)._rpcUnchecked("meta/status", {}), (error: any) => {
         assert.ok(error instanceof InitInProgressError);
         assert.equal(error.code, INIT_IN_PROGRESS_CODE);
         assert.equal(error.data.kind, "init_in_progress");
@@ -354,7 +378,7 @@ describe("init in progress refusal", () => {
 
 describe("CompositionProvenanceError", () => {
   it("is a typed RpcError with the pinned code that passes the structural check", () => {
-    const err = new CompositionProvenanceError("refused", "init:1", "mobkit/init", {
+    const err = new CompositionProvenanceError("refused", "init:1", "meta/init", {
       kind: "divergent",
       fields: ["profiles.default.model", 7, "profiles.worker"],
     });

@@ -13,6 +13,11 @@ export interface PendingApproval {
   actionId: string;
   action: string;
   actorId?: string;
+  requestedApprover?: string;
+  approvalRecipient?: string;
+  approvalChannel?: string;
+  approvalRouteId?: string;
+  approvalDeliveryId?: string;
   rationale?: string;
   riskTier?: string;
   status: "pending" | "settled" | "expired";
@@ -72,6 +77,9 @@ export function normalizePendingApproval(value: unknown): PendingApproval | null
     pendingId, actionId: text(raw.action_id) || "Unknown action scope",
     action: text(raw.action) || text(raw.summary) || text(raw.action_id) || "Approval requested",
     actorId: text(raw.actor_id), rationale: text(raw.rationale), riskTier: text(raw.risk_tier),
+    requestedApprover: text(raw.requested_approver), approvalRecipient: text(raw.approval_recipient),
+    approvalChannel: text(raw.approval_channel), approvalRouteId: text(raw.approval_route_id),
+    approvalDeliveryId: text(raw.approval_delivery_id),
     status: raw.status === "expired" ? "expired" : raw.status === "settled" ? "settled" : "pending",
     actions, createdAtMs: millis(raw.created_at_ms), deadlineAtMs: millis(raw.deadline_at_ms),
     ...(identity ? { origin: { identity, conversationId: text(record?.conversation_id), interactionId: text(record?.interaction_id) } } : {}),

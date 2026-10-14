@@ -11,7 +11,7 @@ if [[ -z "$version" ]]; then
   exit 2
 fi
 
-crate_manifest="${repo_root}/crates/meerkat-mobkit/Cargo.toml"
+crate_manifest="${repo_root}/crates/meerkat-meta/Cargo.toml"
 crates=()
 
 # Keep this helper aligned with the manifest instead of maintaining a second,

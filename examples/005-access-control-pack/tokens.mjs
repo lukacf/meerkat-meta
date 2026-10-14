@@ -6,7 +6,7 @@
 // the open console without standing up a real OIDC provider.
 import crypto from "node:crypto";
 
-export const ISSUER = "https://trusted.mobkit.localhost";
+export const ISSUER = "https://trusted.meta.localhost";
 export const AUDIENCE = "meerkat-console";
 const SECRET = "phase7-trusted-current-secret";
 const KID = "kid-current";

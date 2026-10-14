@@ -1,10 +1,12 @@
 import { consumeSseResponse } from "../../../packages/console-core/src/sse-reader";
 import { createTimelineSubscription, type ConsoleTimelineSubscription, type ConsoleTimelineSubscriptionOptions, type ConsoleStreamFailure } from "../../../packages/console-core/src/timeline-subscription";
 import {
+  displayableImageMediaType,
   normalizeConsoleInteractionRejectedError,
   normalizeReplayUnavailableError,
 } from "@console-core";
 import {
+  CONSOLE_BLOB_PATH_PREFIX,
   CONSOLE_REST_PATHS,
   CONSOLE_RPC_METHODS,
   CONSOLE_RPC_PATHS,
@@ -210,32 +212,65 @@ async function fetchWithConsoleTimeout(
   input: RequestInfo | URL,
   init: RequestInit,
   label: string,
+  timeoutMs?: number,
+  signal?: AbortSignal,
+): Promise<Response>;
+/// With `consume`, the timeout also covers reading the response: the timer
+/// stays armed until `consume` settles, so headers that arrive in time cannot
+/// hold a stalled body open past it. `consume`'s own failures (an HTTP status,
+/// an unusable body) keep their errors; only the timer becomes a timeout and a
+/// caller cancellation keeps its abort error.
+async function fetchWithConsoleTimeout<T>(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  label: string,
+  timeoutMs: number | undefined,
+  signal: AbortSignal | undefined,
+  consume: (response: Response) => Promise<T>,
+): Promise<T>;
+async function fetchWithConsoleTimeout<T>(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  label: string,
   timeoutMs = DEFAULT_CONSOLE_FETCH_TIMEOUT_MS,
   signal?: AbortSignal,
-): Promise<Response> {
+  consume?: (response: Response) => Promise<T>,
+): Promise<Response | T> {
   const controller = new AbortController();
   const timeoutReason = `${label} timeout after ${formatTimeoutReason(timeoutMs)}`;
   const timer = globalThis.setTimeout(() => controller.abort(timeoutReason), timeoutMs);
   const fetchSignal = signal ? AbortSignal.any([controller.signal, signal]) : controller.signal;
+  const timedOut = () => {
+    if (!controller.signal.aborted || typeof controller.signal.reason !== "string") return undefined;
+    const failure = new Error(controller.signal.reason) as ConsoleTransportFailure;
+    failure.transportFailure = "timeout";
+    failure.timeoutMs = timeoutMs;
+    return failure;
+  };
   try {
-    return await fetch(input, {
-      ...init,
-      signal: fetchSignal,
-    });
-  } catch (error) {
-    if (controller.signal.aborted && typeof controller.signal.reason === "string") {
-      const failure = new Error(controller.signal.reason) as ConsoleTransportFailure;
-      failure.transportFailure = "timeout";
-      failure.timeoutMs = timeoutMs;
-      throw failure;
+    let response: Response;
+    try {
+      response = await fetch(input, {
+        ...init,
+        signal: fetchSignal,
+      });
+    } catch (error) {
+      const timeout = timedOut();
+      if (timeout) throw timeout;
+      // A caller cancellation keeps its own abort error. Anything else is the
+      // fetch itself failing (DNS, refused, reset, offline, CORS): no HTTP
+      // response exists, so the gateway could not be reached or did not answer.
+      if (!signal?.aborted && error && typeof error === "object") {
+        (error as ConsoleTransportFailure).transportFailure = "connection_failed";
+      }
+      throw error;
     }
-    // A caller cancellation keeps its own abort error. Anything else is the
-    // fetch itself failing (DNS, refused, reset, offline, CORS): no HTTP
-    // response exists, so the gateway could not be reached or did not answer.
-    if (!signal?.aborted && error && typeof error === "object") {
-      (error as ConsoleTransportFailure).transportFailure = "connection_failed";
+    if (!consume) return response;
+    try {
+      return await consume(response);
+    } catch (error) {
+      throw timedOut() ?? error;
     }
-    throw error;
   } finally {
     globalThis.clearTimeout(timer);
   }
@@ -534,6 +569,36 @@ export async function uploadConsoleBlobMultipart(
     blob_id: blobId,
     url: typeof record.url === "string" ? record.url : undefined,
   };
+}
+
+/// Reads a stored blob for display: a same-origin GET carrying the browser's
+/// own credentials, like every request of this transport, so a session cookie
+/// or an authenticating front for `/blobs/{id}` applies to it. No token is put
+/// in the URL. Only displayable image bytes are returned. The timeout covers
+/// reading the body as well as the headers.
+export async function readConsoleBlob(
+  baseUrl: string,
+  blobId: string,
+  timeoutMs = DEFAULT_CONSOLE_FETCH_TIMEOUT_MS,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  return fetchWithConsoleTimeout(
+    `${baseUrl}${CONSOLE_BLOB_PATH_PREFIX}${encodeURIComponent(blobId)}`,
+    { method: "GET", credentials: "same-origin" },
+    "console blob read",
+    timeoutMs,
+    signal,
+    async (response) => {
+      if (!response.ok) {
+        throw new Error(`Blob read failed ${response.status} for ${blobId}`);
+      }
+      const mediaType = displayableImageMediaType(response.headers.get("content-type"));
+      if (!mediaType) {
+        throw new Error(`Blob ${blobId} is not a displayable image`);
+      }
+      return new Blob([await response.arrayBuffer()], { type: mediaType });
+    },
+  );
 }
 
 const TERMINAL_SSE_EVENTS = new Set([

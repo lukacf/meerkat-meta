@@ -84,7 +84,7 @@ export function deployPlanTraceState(document, plan, options = {}) {
       head: view.planUnavailableHead,
       body: view.planUnavailableBody,
     }];
-  const title = document?.mob_id || document?.name || "mobkit_flow";
+  const title = document?.mob_id || document?.name || "meta_flow";
   const subtitle = plan?.command || "";
   const packLabel = plan?.pack_path || "";
   return {
@@ -192,7 +192,7 @@ export function hostEventPayload(kind, { id, stage, ok } = {}) {
   const eventKind = String(kind || "");
   if (eventKind !== "created" && eventKind !== "saved" && eventKind !== "deployed") return null;
   return {
-    type: `mobkit-flow-editor:${eventKind}`,
+    type: `meta-flow-editor:${eventKind}`,
     id: String(id || ""),
     stage: String(stage || ""),
     ok: ok === true,
@@ -239,13 +239,13 @@ export function exportOutcome(document, result, options = {}) {
 
 export function requireExportArchiveMetadata(result) {
   if (!String(result?.content_base64 || "").trim()) {
-    throw new Error("mobkit/mobpacks/export did not return content_base64");
+    throw new Error("meta/mobpacks/export did not return content_base64");
   }
   if (!String(result?.media_type || "").trim()) {
-    throw new Error("mobkit/mobpacks/export did not return media_type");
+    throw new Error("meta/mobpacks/export did not return media_type");
   }
   if (!String(result?.filename || "").trim()) {
-    throw new Error("mobkit/mobpacks/export did not return filename");
+    throw new Error("meta/mobpacks/export did not return filename");
   }
 }
 

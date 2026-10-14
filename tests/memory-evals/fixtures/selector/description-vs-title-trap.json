@@ -4,8 +4,8 @@
     {
       "id": "mem-020",
       "kind": "Gotcha",
-      "title": "Two gateway binaries ship in mobkit",
-      "description": "Matters when an SDK client hangs silently on connect: the SDK must launch rpc_gateway, not mobkit_gateway (console/HTTP, no stdin loop). Check --version to tell them apart.",
+      "title": "Two gateway binaries ship in meta",
+      "description": "Matters when an SDK client hangs silently on connect: the SDK must launch rpc_gateway, not meta_gateway (console/HTTP, no stdin loop). Check --version to tell them apart.",
       "age_days": 80,
       "rank": 5
     },

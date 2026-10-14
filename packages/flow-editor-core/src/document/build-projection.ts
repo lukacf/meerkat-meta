@@ -55,13 +55,13 @@ import {
 export function buildDocument({ flow, studio, currentFlow, deploySettings, contract }) {
   const members = studio?.members || [];
   const schemas = studio?.schemas || [];
-  const displayName = currentFlow?.name || flow?.mobName || flow?.name || "MobKit flow";
+  const displayName = currentFlow?.name || flow?.mobName || flow?.name || "Meta flow";
   const mobSettings = normalizeMobSettings(studio?.mobSettings);
   const deploy = normalizeDeploySettings(deploySettings);
   const documentFlow = flowForDocument(flow);
   return {
     schema_version: SCHEMA_VERSION,
-    mob_id: slug(displayName, "mobkit_flow"),
+    mob_id: slug(displayName, "meta_flow"),
     name: displayName,
     mob_settings: mobSettings,
     members,

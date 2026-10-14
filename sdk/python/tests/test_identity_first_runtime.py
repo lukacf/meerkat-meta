@@ -1,6 +1,6 @@
 """TDD tests for identity-first runtime APIs (REQ-41).
 
-Tests that identity-first methods exist on MobKitRuntime and
+Tests that identity-first methods exist on MetaRuntime and
 delegate to the correct RPC methods with correct argument shapes.
 """
 import asyncio
@@ -12,18 +12,18 @@ import threading
 
 import pytest
 
-from meerkat_mobkit import IdentityBootstrapMode
-from meerkat_mobkit._transport import PersistentTransport
-from meerkat_mobkit.builder import MobKit
-from meerkat_mobkit.errors import NotConnectedError, RpcError
-from meerkat_mobkit.identity_first_models import (
+from meerkat_meta import IdentityBootstrapMode
+from meerkat_meta._transport import PersistentTransport, TransportTermination
+from meerkat_meta.builder import Meta
+from meerkat_meta.errors import NotConnectedError, RpcError, TransportReaderFailedError
+from meerkat_meta.identity_first_models import (
     DispatchInput,
     IdentityBootstrapState,
     IdentityBootstrapStatus,
     ImageBlock,
     TextBlock,
 )
-from meerkat_mobkit.runtime import MobKitRuntime
+from meerkat_meta.runtime import MetaRuntime
 
 
 def _write_test_gateway(tmp_path, body: str):
@@ -87,9 +87,9 @@ class FakeTransport:
         pass
 
 
-def _make_runtime(result=None) -> tuple[MobKitRuntime, FakeTransport]:
+def _make_runtime(result=None) -> tuple[MetaRuntime, FakeTransport]:
     transport = FakeTransport(result=result)
-    rt = MobKitRuntime.__new__(MobKitRuntime)
+    rt = MetaRuntime.__new__(MetaRuntime)
     rt._config = None
     rt._transport = transport
     rt._running = True
@@ -97,7 +97,7 @@ def _make_runtime(result=None) -> tuple[MobKitRuntime, FakeTransport]:
     rt._lifecycle_lock = asyncio.Lock()
     rt._shutdown_task = None
     # Import here to avoid circular issues
-    from meerkat_mobkit.agent_builder import CallbackDispatcher
+    from meerkat_meta.agent_builder import CallbackDispatcher
     rt._dispatcher = CallbackDispatcher()
     return rt, transport
 
@@ -118,51 +118,51 @@ def _bootstrap_status_result(**overrides):
 
 
 class TestIdentityFirstRuntimeAPIs:
-    """REQ-41: identity-first methods exist on MobKitRuntime."""
+    """REQ-41: identity-first methods exist on MetaRuntime."""
 
     def test_agent_method_exists(self):
-        assert hasattr(MobKitRuntime, "agent")
-        assert callable(getattr(MobKitRuntime, "agent"))
+        assert hasattr(MetaRuntime, "agent")
+        assert callable(getattr(MetaRuntime, "agent"))
 
     def test_send_method_exists(self):
-        assert hasattr(MobKitRuntime, "send")
-        assert callable(getattr(MobKitRuntime, "send"))
+        assert hasattr(MetaRuntime, "send")
+        assert callable(getattr(MetaRuntime, "send"))
 
     def test_dispatch_method_exists(self):
-        assert hasattr(MobKitRuntime, "dispatch")
-        assert callable(getattr(MobKitRuntime, "dispatch"))
+        assert hasattr(MetaRuntime, "dispatch")
+        assert callable(getattr(MetaRuntime, "dispatch"))
 
     def test_subscribe_method_exists(self):
-        assert hasattr(MobKitRuntime, "subscribe")
-        assert callable(getattr(MobKitRuntime, "subscribe"))
+        assert hasattr(MetaRuntime, "subscribe")
+        assert callable(getattr(MetaRuntime, "subscribe"))
 
     def test_status_method_exists(self):
-        assert hasattr(MobKitRuntime, "status")
-        assert callable(getattr(MobKitRuntime, "status"))
+        assert hasattr(MetaRuntime, "status")
+        assert callable(getattr(MetaRuntime, "status"))
 
     def test_respawn_method_exists(self):
-        assert hasattr(MobKitRuntime, "respawn")
-        assert callable(getattr(MobKitRuntime, "respawn"))
+        assert hasattr(MetaRuntime, "respawn")
+        assert callable(getattr(MetaRuntime, "respawn"))
 
     def test_retire_method_exists(self):
-        assert hasattr(MobKitRuntime, "retire")
-        assert callable(getattr(MobKitRuntime, "retire"))
+        assert hasattr(MetaRuntime, "retire")
+        assert callable(getattr(MetaRuntime, "retire"))
 
     def test_reset_method_exists(self):
-        assert hasattr(MobKitRuntime, "reset")
-        assert callable(getattr(MobKitRuntime, "reset"))
+        assert hasattr(MetaRuntime, "reset")
+        assert callable(getattr(MetaRuntime, "reset"))
 
     def test_delete_identity_method_exists(self):
-        assert hasattr(MobKitRuntime, "delete_identity")
-        assert callable(getattr(MobKitRuntime, "delete_identity"))
+        assert hasattr(MetaRuntime, "delete_identity")
+        assert callable(getattr(MetaRuntime, "delete_identity"))
 
     def test_identity_bootstrap_status_method_exists(self):
-        assert hasattr(MobKitRuntime, "identity_bootstrap_status")
-        assert callable(getattr(MobKitRuntime, "identity_bootstrap_status"))
+        assert hasattr(MetaRuntime, "identity_bootstrap_status")
+        assert callable(getattr(MetaRuntime, "identity_bootstrap_status"))
 
     def test_wait_identity_bootstrap_method_exists(self):
-        assert hasattr(MobKitRuntime, "wait_identity_bootstrap")
-        assert callable(getattr(MobKitRuntime, "wait_identity_bootstrap"))
+        assert hasattr(MetaRuntime, "wait_identity_bootstrap")
+        assert callable(getattr(MetaRuntime, "wait_identity_bootstrap"))
 
     @pytest.mark.asyncio
     async def test_shutdown_keeps_blocking_process_wait_off_event_loop(self):
@@ -207,7 +207,7 @@ class TestIdentityFirstRuntimeAPIs:
         second_shutdown = asyncio.create_task(rt.shutdown())
 
         with pytest.raises(NotConnectedError) as not_connected:
-            await rt._rpc("mobkit/status", {})
+            await rt._rpc("meta/status", {})
         assert "no transport available" in str(not_connected.value)
 
         bootstrap_started = asyncio.Event()
@@ -226,6 +226,85 @@ class TestIdentityFirstRuntimeAPIs:
         await asyncio.gather(first_shutdown, second_shutdown, reconnect)
         assert stop_calls == 1
         assert bootstrap_started.is_set()
+        assert rt.is_running
+
+    @pytest.mark.asyncio
+    async def test_a_failed_stop_keeps_the_transport_for_the_next_shutdown(self):
+        rt, transport = _make_runtime()
+        outcomes = [
+            RuntimeError(
+                "persistent transport: gateway process did not terminate after "
+                "bounded cleanup"
+            ),
+            None,
+        ]
+        stop_calls = 0
+
+        def stop():
+            nonlocal stop_calls
+            stop_calls += 1
+            outcome = outcomes.pop(0)
+            if outcome is not None:
+                raise outcome
+
+        transport.stop = stop
+        with pytest.raises(RuntimeError, match="did not terminate"):
+            await rt.shutdown()
+
+        # Admission stays closed while the runtime keeps the transport whose
+        # stop did not succeed.
+        assert not rt.is_running
+        assert rt._transport is transport
+        with pytest.raises(NotConnectedError):
+            await rt._rpc("meta/status", {})
+
+        await rt.shutdown()
+        assert stop_calls == 2
+        assert rt._transport is None
+        await rt.shutdown()
+        assert stop_calls == 2
+
+    @pytest.mark.asyncio
+    async def test_connect_settles_a_retained_transport_before_bootstrapping(self):
+        rt, transport = _make_runtime()
+        unsettled = RuntimeError(
+            "persistent transport: gateway process did not terminate after "
+            "bounded cleanup"
+        )
+        outcomes = [unsettled, unsettled, None]
+        stop_calls = 0
+
+        def stop():
+            nonlocal stop_calls
+            stop_calls += 1
+            outcome = outcomes.pop(0)
+            if outcome is not None:
+                raise outcome
+
+        bootstraps = 0
+
+        async def fake_bootstrap():
+            nonlocal bootstraps
+            bootstraps += 1
+            rt._running = True
+
+        transport.stop = stop
+        rt._bootstrap = fake_bootstrap
+        with pytest.raises(RuntimeError, match="did not terminate"):
+            await rt.shutdown()
+
+        # While the retained stop still fails, connect starts nothing.
+        with pytest.raises(RuntimeError, match="did not terminate"):
+            await rt.connect()
+        assert stop_calls == 2
+        assert bootstraps == 0
+        assert rt._transport is transport
+
+        # Once that stop succeeds, the same connect bootstraps.
+        await rt.connect()
+        assert stop_calls == 3
+        assert bootstraps == 1
+        assert rt._transport is None
         assert rt.is_running
 
     @pytest.mark.asyncio
@@ -265,19 +344,19 @@ for raw_line in sys.stdin:
         )
         tracking_transport = _tracking_transport_type()
         monkeypatch.setattr(
-            "meerkat_mobkit.runtime.PersistentTransport", tracking_transport
+            "meerkat_meta.runtime.PersistentTransport", tracking_transport
         )
 
-        # Normal MobKitBuilder.build() rejects this locally. Constructing the
+        # Normal MetaBuilder.build() rejects this locally. Constructing the
         # runtime directly keeps the gateway's defensive validation and failed
         # transport reaping covered for callers that bypass the builder.
         config = (
-            MobKit.builder()
+            Meta.builder()
             .gateway(str(gateway))
             .identity_bootstrap_mode(IdentityBootstrapMode.eager_materialize())
             ._config
         )
-        runtime = MobKitRuntime(config)
+        runtime = MetaRuntime(config)
         with pytest.raises(RpcError) as rejected:
             await runtime.connect()
 
@@ -342,22 +421,25 @@ for raw_line in sys.stdin:
         provider = FailOnceRoster()
         tracking_transport = _tracking_transport_type(env=dict(os.environ))
         monkeypatch.setattr(
-            "meerkat_mobkit.runtime.PersistentTransport", tracking_transport
+            "meerkat_meta.runtime.PersistentTransport", tracking_transport
         )
         config = (
-            MobKit.builder()
+            Meta.builder()
             .gateway(str(gateway))
             .roster(provider)
             .identity_bootstrap_mode(IdentityBootstrapMode.lazy_materialize())
             ._config
         )
-        runtime = MobKitRuntime(config)
+        runtime = MetaRuntime(config)
 
         with pytest.raises(RpcError, match="injected roster provider failure"):
             await runtime.connect()
 
         assert runtime._transport is None
         assert not runtime.is_running
+        # The failed gateway exited at stdin EOF; it offered no handshake.
+        exited = TransportTermination("exited", 0, None, "none", "not_negotiated")
+        assert runtime.last_gateway_termination == exited
         assert len(tracking_transport.instances) == 1
         failed_transport = tracking_transport.instances[0]
         failed_child = failed_transport.spawned_process
@@ -382,6 +464,8 @@ for raw_line in sys.stdin:
         assert runtime._transport is None
         assert live_transport.reaped_processes == [live_child]
         assert live_child.poll() is not None
+        assert live_transport.last_termination == exited
+        assert runtime.last_gateway_termination is live_transport.last_termination
 
 
 class TestSendMethod:
@@ -456,7 +540,7 @@ class TestDispatchMethod:
                 origin="connector", **pair,
             )
         assert len(transport.calls) == 1
-        assert transport.calls[0]["method"] == "mobkit/dispatch"
+        assert transport.calls[0]["method"] == "meta/dispatch"
         assert transport.calls[0]["params"] == {
             "identity": "gate:main",
             "dispatch_input": {
@@ -474,14 +558,14 @@ class TestLifecycleMethods:
     async def test_respawn_rpc(self):
         rt, transport = _make_runtime(result={"accepted": True})
         await rt.respawn("agent:1")
-        assert transport.calls[0]["method"] == "mobkit/respawn"
+        assert transport.calls[0]["method"] == "meta/respawn"
         assert transport.calls[0]["params"]["identity"] == "agent:1"
 
     @pytest.mark.asyncio
     async def test_retire_rpc(self):
         rt, transport = _make_runtime(result={"accepted": True})
         await rt.retire("agent:1")
-        assert transport.calls[0]["method"] == "mobkit/retire"
+        assert transport.calls[0]["method"] == "meta/retire"
         assert transport.calls[0]["params"]["identity"] == "agent:1"
 
     @pytest.mark.asyncio
@@ -500,7 +584,7 @@ class TestLifecycleMethods:
             "body": "Use your granted tools.",
         }
         result = await rt.activate_member_instruction("agent:1", activation)
-        assert transport.calls[0]["method"] == "mobkit/member_activate_instruction"
+        assert transport.calls[0]["method"] == "meta/member_activate_instruction"
         assert transport.calls[0]["params"] == {"identity": "agent:1", "activation": activation}
         assert result["receipt"]["disposition"] == "applied"
         # Default: the transport's own request timeout.
@@ -514,7 +598,7 @@ class TestLifecycleMethods:
     async def test_member_instruction_activations_rpc(self):
         rt, transport = _make_runtime(result={"identity": "agent:1", "page": {"records": []}})
         await rt.member_instruction_activations("agent:1", namespace="host", key="persona")
-        assert transport.calls[0]["method"] == "mobkit/member_instruction_activations"
+        assert transport.calls[0]["method"] == "meta/member_instruction_activations"
         assert transport.calls[0]["params"] == {
             "identity": "agent:1",
             "namespace": "host",
@@ -525,14 +609,14 @@ class TestLifecycleMethods:
     async def test_reset_rpc(self):
         rt, transport = _make_runtime(result={"accepted": True})
         await rt.reset("agent:1")
-        assert transport.calls[0]["method"] == "mobkit/reset"
+        assert transport.calls[0]["method"] == "meta/reset"
         assert transport.calls[0]["params"]["identity"] == "agent:1"
 
     @pytest.mark.asyncio
     async def test_delete_identity_rpc(self):
         rt, transport = _make_runtime(result={"accepted": True})
         await rt.delete_identity("agent:1")
-        assert transport.calls[0]["method"] == "mobkit/delete_identity"
+        assert transport.calls[0]["method"] == "meta/delete_identity"
         assert transport.calls[0]["params"]["identity"] == "agent:1"
 
 
@@ -564,7 +648,7 @@ class TestStatusMethod:
             },
         }
         rt, transport = _make_runtime(result=raw_status)
-        from meerkat_mobkit.identity_first_models import IdentityStatus
+        from meerkat_meta.identity_first_models import IdentityStatus
         result = await rt.status("triage:main")
         assert isinstance(result, IdentityStatus)
         assert result.identity == "triage:main"
@@ -584,7 +668,7 @@ class TestIdentityBootstrapMethods:
         result = await rt.identity_bootstrap_status()
 
         assert isinstance(result, IdentityBootstrapStatus)
-        assert transport.calls[0]["method"] == "mobkit/status_identity_bootstrap"
+        assert transport.calls[0]["method"] == "meta/status_identity_bootstrap"
         assert transport.calls[0]["params"] == {}
         assert result.identities["agent:b"].state is IdentityBootstrapState.WARMING
 
@@ -601,7 +685,7 @@ class TestIdentityBootstrapMethods:
         result = await rt.wait_identity_bootstrap()
 
         assert isinstance(result, IdentityBootstrapStatus)
-        assert transport.calls[0]["method"] == "mobkit/wait_identity_bootstrap"
+        assert transport.calls[0]["method"] == "meta/wait_identity_bootstrap"
         assert transport.calls[0]["params"] == {
             "target": "materialized",
             "timeout_ms": 60_000,
@@ -675,7 +759,7 @@ class TestAgentMethod:
     @pytest.mark.asyncio
     async def test_agent_returns_handle(self):
         rt, transport = _make_runtime()
-        from meerkat_mobkit.runtime import IdentityAgentHandle
+        from meerkat_meta.runtime import IdentityAgentHandle
         handle = rt.agent("triage:main")
         assert isinstance(handle, IdentityAgentHandle)
         assert handle._identity == "triage:main"
@@ -688,5 +772,86 @@ class TestSubscribeMethod:
     async def test_subscribe_rpc(self):
         rt, transport = _make_runtime(result={"stream_id": "stream-1"})
         result = await rt.subscribe("agent:1")
-        assert transport.calls[0]["method"] == "mobkit/subscribe"
+        assert transport.calls[0]["method"] == "meta/subscribe"
         assert transport.calls[0]["params"]["identity"] == "agent:1"
+
+
+class TestGatewayChildLifetime:
+    """An ended gateway child is reported and never silently replaced (#111)."""
+
+    @staticmethod
+    def _counting_transport_type():
+        class CountingTransport(PersistentTransport):
+            instances: list["CountingTransport"] = []
+
+            def __init__(self, gateway_bin: str):
+                super().__init__(gateway_bin)
+                self.children: list[subprocess.Popen[bytes]] = []
+                CountingTransport.instances.append(self)
+
+            def start(self) -> None:
+                super().start()
+                if self._process is not None and (
+                    not self.children or self.children[-1] is not self._process
+                ):
+                    self.children.append(self._process)
+
+        return CountingTransport
+
+    @pytest.mark.asyncio
+    async def test_an_ended_gateway_is_reported_and_not_replaced(self, tmp_path, monkeypatch):
+        gateway = _write_test_gateway(
+            tmp_path,
+            """import json
+import sys
+
+for raw_line in sys.stdin:
+    request = json.loads(raw_line)
+    if request.get("method") == "meta/init":
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {}}), flush=True)
+    else:
+        sys.exit(7)
+""",
+        )
+        counting = self._counting_transport_type()
+        monkeypatch.setattr("meerkat_meta.runtime.PersistentTransport", counting)
+        runtime = MetaRuntime(Meta.builder().gateway(str(gateway))._config)
+        await runtime.connect()
+        assert runtime.is_running
+        transport = counting.instances[0]
+        try:
+            with pytest.raises(TransportReaderFailedError):
+                await runtime._rpc("meta/status", {})
+            assert not runtime.is_running, "runtime still reports a running gateway"
+
+            # Neither async nor sync admission starts an uninitialized child.
+            with pytest.raises(TransportReaderFailedError):
+                await runtime._rpc("meta/status", {})
+            with pytest.raises(TransportReaderFailedError):
+                await asyncio.to_thread(runtime._rpc_sync, "meta/status", {})
+            assert len(transport.children) == 1, "a request started a replacement gateway"
+
+            ended = await runtime.wait_gateway_ended()
+            assert ended is not None and ended.exit_code == 7
+        finally:
+            await runtime.shutdown()
+
+        # Shutdown detaches admission but keeps the observation.
+        with pytest.raises(NotConnectedError):
+            await runtime._rpc("meta/status", {})
+        assert runtime.gateway_ended is ended
+        assert len(transport.children) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_childless_runtime_runs_without_a_gateway_record(self):
+        class Builder:
+            async def build_agent(self, options):
+                return None
+
+        runtime = MetaRuntime(Meta.builder().session_service(Builder())._config)
+        await runtime.connect()
+        try:
+            assert runtime.is_running
+            assert runtime.gateway_ended is None
+        finally:
+            await runtime.shutdown()

@@ -53,8 +53,8 @@ export interface TopologyPanelProps {
 }
 
 type EdgeMode = "all" | "focus";
-const VIEW_STORAGE = "mobkit-console-topology-view";
-const EDGE_STORAGE = "mobkit-console-topology-edges";
+const VIEW_STORAGE = "meta-console-topology-view";
+const EDGE_STORAGE = "meta-console-topology-edges";
 const VIEWS: Array<{ id: TopologyPanelView; label: string; help: string }> = [
   { id: "graph", label: "Graph", help: "Dense canvas graph with every node in one view" },
   { id: "roles", label: "Roles", help: "Flat roster grouped by role" },

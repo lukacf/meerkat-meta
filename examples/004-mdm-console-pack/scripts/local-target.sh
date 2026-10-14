@@ -88,7 +88,7 @@ case "$command" in
       exit 0
     fi
     rm -f "$binding_file"
-    (cd "$repo_root" && ./scripts/repo-cargo build -p meerkat-mobkit --example mdm_mob_target) >"$log_file" 2>&1
+    (cd "$repo_root" && ./scripts/repo-cargo build -p meerkat-meta --example mdm_mob_target) >"$log_file" 2>&1
     nohup "$(target_bin)" "${target_bin_args[@]}" >>"$log_file" 2>&1 </dev/null &
     echo $! >"$pid_file"
     for _ in {1..120}; do
@@ -106,7 +106,7 @@ case "$command" in
     ;;
   foreground)
     cd "$repo_root"
-    exec ./scripts/repo-cargo run -p meerkat-mobkit --example mdm_mob_target -- "${target_bin_args[@]}"
+    exec ./scripts/repo-cargo run -p meerkat-meta --example mdm_mob_target -- "${target_bin_args[@]}"
     ;;
   stop)
     if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then

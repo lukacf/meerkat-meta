@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
 
-import { MobKitBuilder } from "../src/builder.js";
-import { MobKitRuntime } from "../src/runtime.js";
+import { MetaBuilder } from "../src/builder.js";
+import { MetaRuntime } from "../src/runtime.js";
 
 it("uses the canonical job and monitor domain methods", async () => {
-  const runtime = new MobKitRuntime(new MobKitBuilder()._config);
+  const runtime = new MetaRuntime(new MetaBuilder()._config);
   const calls: Array<[string, Record<string, unknown>]> = [];
   (runtime as unknown as { _rpc: Function })._rpc = async (
     method: string,

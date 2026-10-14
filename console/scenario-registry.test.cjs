@@ -70,7 +70,7 @@ test("shipping runners discover every registered scenario and shard default acce
 
 const diagnostic = {
   id: "hard-stop", family: "runtime", backend: "real",
-  diagnostic: { reason: "Known terminal projection defect", issues: ["https://github.com/lukacf/meerkat-mobkit/issues/460"] },
+  diagnostic: { reason: "Known terminal projection defect", issues: ["https://github.com/lukacf/meerkat-meta/issues/460"] },
 };
 
 test("diagnostics are discoverable and explicitly selectable but excluded from default acceptance", () => {
@@ -96,7 +96,7 @@ test("diagnostic exclusions require a concrete reason and issue references", () 
 test("hard-interrupt repros retain executable registrations and linked diagnostic metadata", () => {
   const negative = require("./scenarios/real-routine-negative.cjs");
   const registered = [...negative.apiScenarios, ...negative.browserScenarios];
-  const issues = ["https://github.com/lukacf/meerkat-mobkit/issues/460", "https://github.com/lukacf/meerkat/issues/1233"];
+  const issues = ["https://github.com/lukacf/meerkat-meta/issues/460", "https://github.com/lukacf/meerkat/issues/1233"];
   for (const id of ["api-routine-interrupt", "real-stock-routine-interrupt", "real-shared-routine-interrupt"]) {
     const [selected] = selectScenarios(registered, [`--scenario=${id}`]).selected;
     assert.equal(selected.id, id);
@@ -139,7 +139,7 @@ test("explicit diagnostics never emit acceptance passes even if their run resolv
   assert.match(completed.stdout, /scenario:diagnostic:complete hard-stop/);
   assert.match(completed.stdout, /excluded from release acceptance/);
   assert.match(completed.stdout, /Known terminal projection defect/);
-  assert.match(completed.stdout, /https:\/\/github.com\/lukacf\/meerkat-mobkit\/issues\/460/);
+  assert.match(completed.stdout, /https:\/\/github.com\/lukacf\/meerkat-meta\/issues\/460/);
   const failed = runSyntheticRegistry(true);
   assert.equal(failed.status, 1);
   assert.match(failed.stderr, /diagnostic remains red/);

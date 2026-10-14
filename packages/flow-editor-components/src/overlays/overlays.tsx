@@ -2,7 +2,7 @@
 
 export function DeployPlanTrace({ open, onClose, onActiveStep, runKey, document, plan, deployView = null }) {
   const traceState = React.useMemo(() =>
-    window.MobKitFlowController.deployPlanTraceState(document, plan, { deployView }),
+    window.MetaFlowController.deployPlanTraceState(document, plan, { deployView }),
     [document, plan, deployView]);
   const [idx, setIdx] = React.useState(0);
   const bodyRef = React.useRef(null);
@@ -65,7 +65,7 @@ export function DeployPlanTrace({ open, onClose, onActiveStep, runKey, document,
 
 export function ValidateSheet({ open, onClose, onPublish, onDeployPlan, onDeployRun, results, stage, deployView = null, capabilities = null }) {
   if (!open) return null;
-  const sheetState = window.MobKitFlowController.validationSheetState(results, { stage, deployView, capabilities });
+  const sheetState = window.MetaFlowController.validationSheetState(results, { stage, deployView, capabilities });
   return (
     <div className="validate">
       <div className="validate__head">
@@ -97,7 +97,7 @@ export function ValidateSheet({ open, onClose, onPublish, onDeployPlan, onDeploy
 }
 
 function SourceCodePanel({ state, busy = false, compact = false, sourceView = null, sourcePath = "" }) {
-  const editorState = window.MobKitFlowController.sourceEditorState(state, { busy, compact, sourceView, sourcePath });
+  const editorState = window.MetaFlowController.sourceEditorState(state, { busy, compact, sourceView, sourcePath });
   if (editorState.showLoading) {
     return <pre className={editorState.bodyClass} role="textbox" aria-readonly="true">{editorState.loadingText}</pre>;
   }
@@ -114,14 +114,14 @@ function SourceCodePanel({ state, busy = false, compact = false, sourceView = nu
 export function SourceDrawer({ open, onClose, state, sourceView = null }) {
   const [sourcePath, setSourcePath] = React.useState("");
   const selectSourcePath = (path) => {
-    const result = window.MobKitFlowController.sourceFileSelectionTransition(state, path, sourcePath);
+    const result = window.MetaFlowController.sourceFileSelectionTransition(state, path, sourcePath);
     setSourcePath(result.sourcePath);
   };
   React.useEffect(() => {
     setSourcePath("");
   }, [state]);
   if (!open) return null;
-  const editorState = window.MobKitFlowController.sourceEditorState(state, { sourceView, sourcePath });
+  const editorState = window.MetaFlowController.sourceEditorState(state, { sourceView, sourcePath });
   return (
     <div className="source-drawer" data-own-scroll="">
       <div className="source-drawer__head">
@@ -153,14 +153,14 @@ export function SourceDrawer({ open, onClose, state, sourceView = null }) {
 export function InlineSourceEditor({ open, onClose, state, busy = false, surface = "basic", sourceView = null }) {
   const [sourcePath, setSourcePath] = React.useState("");
   const selectSourcePath = (path) => {
-    const result = window.MobKitFlowController.sourceFileSelectionTransition(state, path, sourcePath);
+    const result = window.MetaFlowController.sourceFileSelectionTransition(state, path, sourcePath);
     setSourcePath(result.sourcePath);
   };
   React.useEffect(() => {
     setSourcePath("");
   }, [state]);
   if (!open) return null;
-  const editorState = window.MobKitFlowController.sourceEditorState(state, { busy, compact: true, sourceView, sourcePath });
+  const editorState = window.MetaFlowController.sourceEditorState(state, { busy, compact: true, sourceView, sourcePath });
   return (
     <div className={"bld-toml bld-toml--" + surface} data-own-scroll="" onMouseDown={e => e.stopPropagation()}>
       <div className="bld-toml__head">

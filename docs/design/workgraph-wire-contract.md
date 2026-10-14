@@ -1,6 +1,6 @@
 # WorkGraph wire contract (mobkit 0.7.30)
 
-Historical binding contract for the `mobkit/workgraph/*` JSON-RPC group, the
+Historical binding contract for the `meta/workgraph/*` JSON-RPC group, the
 experience payload section, capabilities, ABAC actions, and SDK method names,
 with current qualifications called out below. The methods table and as-built
 notes retain the 0.7.30 account; they are not a complete current API inventory.
@@ -22,7 +22,7 @@ transactional invariants still apply. Item mutations and
 The audited MobKit 0.8.39 checkout pins Meerkat 0.8.40. Its scope contract
 supersedes the historical realm/namespace behavior described below:
 
-- Stock gateway and default MobKit construction derive the canonical
+- Stock gateway and default Meta construction derive the canonical
   `mob.<mob_id>` realm and use `WorkNamespace::default()`, not the bare mob
   definition ID as a realm.
 - All WorkGraph reads and mutations stay within the service's one immutable
@@ -39,7 +39,7 @@ supersedes the historical realm/namespace behavior described below:
   owner key (`WorkOwnerKey::as_mob_agent`) and refuse a member of another mob
   before the write (`-32602`, `data.kind = "attention_target_realm_mismatch"`).
   Bindings written before the rule are migrated at bootstrap
-  (`workgraph_realm` module; report on `mobkit/capabilities`).
+  (`workgraph_realm` module; report on `meta/capabilities`).
 - Library embedders can inject a composed `WorkGraphService`; its own fixed
   grant is authoritative rather than a universal requirement to use the stock
   namespace. This is not a caller-controlled grant-widening mechanism.
@@ -52,36 +52,36 @@ Read (ABAC `workgraph.view`):
 
 | Method | Params | Result |
 |---|---|---|
-| `mobkit/workgraph/snapshot` | `{namespace?, all_namespaces?, statuses?: string[], labels?: string[], include_terminal?, limit?}` | `WorkGraphSnapshot` |
-| `mobkit/workgraph/list` | same filter | `{items: WorkItem[]}` |
-| `mobkit/workgraph/get` | `{id, namespace?}` | `{item: WorkItem}` |
-| `mobkit/workgraph/ready` | `{namespace?, labels?, limit?}` | `{items: WorkItem[]}` |
-| `mobkit/workgraph/events` | `{namespace?, all_namespaces?, after_seq?, limit?}` | `{events: WorkGraphEvent[]}` |
-| `mobkit/workgraph/attention/list` | `{namespace?, status?}` — `status` accepts plain strings `active\|paused\|superseded\|stopped` (or upstream's tagged `{state: ...}` form) | `{attention: WorkAttentionBinding[]}` |
-| `mobkit/workgraph/goal/status` | `{binding_id, namespace?}` | `{item, attention}` |
+| `meta/workgraph/snapshot` | `{namespace?, all_namespaces?, statuses?: string[], labels?: string[], include_terminal?, limit?}` | `WorkGraphSnapshot` |
+| `meta/workgraph/list` | same filter | `{items: WorkItem[]}` |
+| `meta/workgraph/get` | `{id, namespace?}` | `{item: WorkItem}` |
+| `meta/workgraph/ready` | `{namespace?, labels?, limit?}` | `{items: WorkItem[]}` |
+| `meta/workgraph/events` | `{namespace?, all_namespaces?, after_seq?, limit?}` | `{events: WorkGraphEvent[]}` |
+| `meta/workgraph/attention/list` | `{namespace?, status?}` — `status` accepts plain strings `active\|paused\|superseded\|stopped` (or upstream's tagged `{state: ...}` form) | `{attention: WorkAttentionBinding[]}` |
+| `meta/workgraph/goal/status` | `{binding_id, namespace?}` | `{item, attention}` |
 
 Mutate (ABAC `workgraph.manage`; all honored on unified + console surfaces,
 console additionally gated by `can_mutate`):
 
 | Method | Params | Result |
 |---|---|---|
-| `mobkit/workgraph/create` | `CreateWorkItemRequest` fields (`title` required; `description?, priority?, completion_policy?, labels?, due_at?, not_before?, snoozed_until?, external_refs?, evidence_refs?, status?("open"\|"blocked"), namespace?`) | `{item}` |
-| `mobkit/workgraph/update` | `{id, expected_revision, title?, description?, priority?, labels?, due_at?, not_before?, snoozed_until?, namespace?}` | `{item}` |
-| `mobkit/workgraph/claim` | `{id, expected_revision, owner: {kind, id, display_name?}, lease_seconds?, namespace?}` | `{item}` |
-| `mobkit/workgraph/release` | `{id, expected_revision, namespace?}` | `{item}` |
-| `mobkit/workgraph/close` | `{id, expected_revision, status?("completed" default\|"cancelled"\|"failed"), namespace?}` | `{item}` |
-| `mobkit/workgraph/block` | `{id, expected_revision, namespace?}` (verified upstream: `block(realm_id, namespace, id, expected_revision)` — no blocker-linkage field; use `link` with kind=`blocks` for blocker edges) | `{item}` |
-| `mobkit/workgraph/link` | `{kind, from_id, to_id, namespace?}` | `{edge: WorkEdge}` (upstream returns a bare `WorkEdge`; mobkit wraps it) |
-| `mobkit/workgraph/evidence/add` | `{id, expected_revision, evidence: {kind, id, label?, summary?}, namespace?}` | `{item}` |
-| `mobkit/workgraph/policy/escalate` | `{binding_id, id, expected_revision, completion_policy, namespace?}` — witness (`AttentionContextProjection`) fetched SERVER-SIDE from `binding_id` | `{item}` |
-| `mobkit/workgraph/goal/create` | `{title, description?, target: {kind:"session", session_id} \| {kind:"identity", identity} \| {kind:"owner", owner_key:{kind,id}}, mode?("pursue" default), completion_policy?, delegated_authority?, namespace?}` — `identity` lowered via `lower_agent_identity_attention_target` with the runtime's mob id | `{item, attention}` |
-| `mobkit/workgraph/goal/confirm` | `{binding_id, expected_revision, evidence?: {kind, id, label?, summary?}, namespace?}` — console surface promotes authenticated principal via `with_trusted_principal` | `{item, attention}` |
-| `mobkit/workgraph/goal/request_close` | `{binding_id, expected_revision, status?, namespace?}` | `{item, attention}` |
-| `mobkit/workgraph/attention/pause` | `{binding_id, expected_revision, until?, namespace?}` | `{attention}` |
-| `mobkit/workgraph/attention/resume` | `{binding_id, expected_revision, namespace?}` | `{attention}` |
-| `mobkit/workgraph/attention/reassign` | `{binding_id, expected_revision, target: GoalAttentionTarget-or-identity form (as goal/create), namespace?}` — witness fetched server-side | `{previous, attention}` |
-| `mobkit/workgraph/attention/prune` | `{updated_before?: RFC3339, namespace?}` — deletes TERMINAL (superseded/stopped) binding rows only; the event stream keeps the audit history (meerkat 0.7.25, ask 24) | `{pruned}` |
-| `mobkit/workgraph/attention/break_glass_reassign` | CONSOLE SURFACE ONLY. `{binding_id, expected_revision, target (as reassign), reason (required, non-empty), namespace?}` — principal is the AUTHENTICATED console principal (never a wire param; unauthenticated consoles get `-32030`); bypasses the mode-derived authority for the one unrecoverable state (binding stuck on a wedged/retired agent with no coordinator); upstream records principal+reason in the workgraph event stream + WARN log (meerkat 0.7.25, ask 23). Not present on the host stdin surface or in its capabilities catalog. | `{previous, attention}` |
+| `meta/workgraph/create` | `CreateWorkItemRequest` fields (`title` required; `description?, priority?, completion_policy?, labels?, due_at?, not_before?, snoozed_until?, external_refs?, evidence_refs?, status?("open"\|"blocked"), namespace?`) | `{item}` |
+| `meta/workgraph/update` | `{id, expected_revision, title?, description?, priority?, labels?, due_at?, not_before?, snoozed_until?, namespace?}` | `{item}` |
+| `meta/workgraph/claim` | `{id, expected_revision, owner: {kind, id, display_name?}, lease_seconds?, namespace?}` | `{item}` |
+| `meta/workgraph/release` | `{id, expected_revision, namespace?}` | `{item}` |
+| `meta/workgraph/close` | `{id, expected_revision, status?("completed" default\|"cancelled"\|"failed"), namespace?}` | `{item}` |
+| `meta/workgraph/block` | `{id, expected_revision, namespace?}` (verified upstream: `block(realm_id, namespace, id, expected_revision)` — no blocker-linkage field; use `link` with kind=`blocks` for blocker edges) | `{item}` |
+| `meta/workgraph/link` | `{kind, from_id, to_id, namespace?}` | `{edge: WorkEdge}` (upstream returns a bare `WorkEdge`; meta wraps it) |
+| `meta/workgraph/evidence/add` | `{id, expected_revision, evidence: {kind, id, label?, summary?}, namespace?}` | `{item}` |
+| `meta/workgraph/policy/escalate` | `{binding_id, id, expected_revision, completion_policy, namespace?}` — witness (`AttentionContextProjection`) fetched SERVER-SIDE from `binding_id` | `{item}` |
+| `meta/workgraph/goal/create` | `{title, description?, target: {kind:"session", session_id} \| {kind:"identity", identity} \| {kind:"owner", owner_key:{kind,id}}, mode?("pursue" default), completion_policy?, delegated_authority?, namespace?}` — `identity` lowered via `lower_agent_identity_attention_target` with the runtime's mob id | `{item, attention}` |
+| `meta/workgraph/goal/confirm` | `{binding_id, expected_revision, evidence?: {kind, id, label?, summary?}, namespace?}` — console surface promotes authenticated principal via `with_trusted_principal` | `{item, attention}` |
+| `meta/workgraph/goal/request_close` | `{binding_id, expected_revision, status?, namespace?}` | `{item, attention}` |
+| `meta/workgraph/attention/pause` | `{binding_id, expected_revision, until?, namespace?}` | `{attention}` |
+| `meta/workgraph/attention/resume` | `{binding_id, expected_revision, namespace?}` | `{attention}` |
+| `meta/workgraph/attention/reassign` | `{binding_id, expected_revision, target: GoalAttentionTarget-or-identity form (as goal/create), namespace?}` — witness fetched server-side | `{previous, attention}` |
+| `meta/workgraph/attention/prune` | `{updated_before?: RFC3339, namespace?}` — deletes TERMINAL (superseded/stopped) binding rows only; the event stream keeps the audit history (meerkat 0.7.25, ask 24) | `{pruned}` |
+| `meta/workgraph/attention/break_glass_reassign` | CONSOLE SURFACE ONLY. `{binding_id, expected_revision, target (as reassign), reason (required, non-empty), namespace?}` — principal is the AUTHENTICATED console principal (never a wire param; unauthenticated consoles get `-32030`); bypasses the mode-derived authority for the one unrecoverable state (binding stuck on a wedged/retired agent with no coordinator); upstream records principal+reason in the workgraph event stream + WARN log (meerkat 0.7.25, ask 23). Not present on the host stdin surface or in its capabilities catalog. | `{previous, attention}` |
 
 ## Errors
 
@@ -102,13 +102,13 @@ console additionally gated by `can_mutate`):
 - Member of another mob as attention target: `-32602` with
   `data.kind = "attention_target_realm_mismatch"` and the typed fields
   `owner_key`, `mob_id`, `required_realm_id` (`mob.<mob_id>`), `realm_id`
-  (this runtime's realm). Raised by MobKit before the write and by Meerkat's
+  (this runtime's realm). Raised by Meta before the write and by Meerkat's
   `WorkGraphError::AttentionTargetRealmMismatch` if a write reaches it.
 - ABAC denial (console): `-32030` `access_denied` (standard).
 
 ## Capabilities + experience
 
-- `mobkit/capabilities` result gains `"workgraph": true|false` (service
+- `meta/capabilities` result gains `"workgraph": true|false` (service
   configured) beside `identity_first`; workgraph methods appear in the
   advertised methods list only when configured.
 - `GET /console/experience` gains:
@@ -147,7 +147,7 @@ Typed results both SDKs: `WorkGraphItem`, `WorkGraphEdge`,
 `WorkGraphEventEntry` (fields: seq, realm_id, namespace, item_id?, kind, at, payload — upstream `WorkGraphEvent`), `WorkGraphItemsResult`. Tolerant parsing (`.get()` /
 optional fields); retain `revision` fields verbatim.
 
-Builder opt-out both SDKs: Python `MobKitBuilder.workgraph(enabled: bool)`,
+Builder opt-out both SDKs: Python `MetaBuilder.workgraph(enabled: bool)`,
 TS `.workgraph(enabled: boolean)` → `runtime_options.workgraph` (bool,
 default true; the gateway also accepts a STRING directory for an explicit
 durable store location (`workgraph.sqlite3` created inside) —
@@ -210,7 +210,7 @@ namespace restriction below are superseded by the
   write that mints or revives a binding, with a typed `Conflict` naming the
   occupant (mapped to `-32042` here), and `MultipleActiveBindings` is gone —
   legacy duplicates arbitrate newest-wins with a loud diagnostic instead of
-  hard-failing every turn. Mobkit's admission (`WorkGraphAdmission`) is now
+  hard-failing every turn. Meta's admission (`WorkGraphAdmission`) is now
   DEFENSE-IN-DEPTH plus the pieces upstream does not own: session↔identity
   target aliasing through the roster/shared-session-store (upstream
   uniqueness keys the literal target), Paused-occupancy, and friendlier

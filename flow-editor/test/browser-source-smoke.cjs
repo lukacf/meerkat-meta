@@ -14,7 +14,7 @@ const repoRoot = path.join(__dirname, "..", "..");
 const binary = resolveFlowEditorBinary();
 // A spawned editor binds port 0 and announces the bound address; a fixed
 // port collides with anything else on the host using it.
-let baseUrl = process.env.MOBKIT_FLOW_EDITOR_BROWSER_URL;
+let baseUrl = process.env.META_FLOW_EDITOR_BROWSER_URL;
 const shouldSpawn = !baseUrl;
 
 // Liveness backstop for the structural waits below, NOT a performance budget.
@@ -31,7 +31,7 @@ function waitForReady(url, child) {
   return new Promise((resolve, reject) => {
     const poll = () => {
       if (child && child.exitCode !== null) {
-        reject(new Error(`mobkit_flow_editor exited before ready with status ${child.exitCode}`));
+        reject(new Error(`meta_flow_editor exited before ready with status ${child.exitCode}`));
         return;
       }
       const req = http.request(url, { method: "GET" }, (res) => {
@@ -62,7 +62,7 @@ async function chooseFirstRealAgentDefinition(page) {
     const option = options.find((candidate) => candidate.value && !candidate.disabled);
     return option?.value || "";
   });
-  if (!value) throw new Error("Agent Editor did not expose any real MobKit agent definitions");
+  if (!value) throw new Error("Agent Editor did not expose any real Meta agent definitions");
   await addDefinition.selectOption(value);
 }
 
@@ -117,18 +117,18 @@ async function main() {
   let serverReady = null;
   let draftDir = null;
   if (shouldSpawn) {
-    draftDir = fs.mkdtempSync(path.join(os.tmpdir(), "mobkit-flow-editor-source."));
+    draftDir = fs.mkdtempSync(path.join(os.tmpdir(), "meta-flow-editor-source."));
     server = spawn(binary, ["--listen", LOOPBACK_ANY_PORT], {
       cwd: repoRoot,
       env: {
         ...process.env,
-        MOBKIT_FLOW_EDITOR_DRAFT_STORE: path.join(draftDir, "drafts.json"),
+        META_FLOW_EDITOR_DRAFT_STORE: path.join(draftDir, "drafts.json"),
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
     // Listen for the ready line from the spawn on: output is not replayed
     // for a listener attached after the browser launch below.
-    serverReady = awaitFixtureReady(server, { label: "mobkit_flow_editor", timeoutMs: 60_000 });
+    serverReady = awaitFixtureReady(server, { label: "meta_flow_editor", timeoutMs: 60_000 });
     serverReady.catch(() => {}); // Awaited (and reported) inside the try below.
     server.stdout.on("data", (chunk) => process.stdout.write(chunk));
     server.stderr.on("data", (chunk) => process.stderr.write(chunk));
@@ -160,7 +160,7 @@ async function main() {
     await waitForSourceSections(page, ".bld-toml", ["[profiles.", "[flows."]);
     const mobToml = await sourceBox.innerText();
     if (!mobToml.includes("[profiles.") || !mobToml.includes("[flows.")) {
-      throw new Error(`inline mob.toml editor did not render MobKit source: ${mobToml.slice(0, 400)}`);
+      throw new Error(`inline mob.toml editor did not render Meta source: ${mobToml.slice(0, 400)}`);
     }
 
     const definitionButton = inlineEditor.locator(".source-file-row", { hasText: "definition.json" });
@@ -255,7 +255,7 @@ async function main() {
         throw new Error(`edited definition.json source did not include ${required}: ${editedDefinitionJson.slice(0, 600)}`);
       }
     }
-    await editedSource.locator(".source-file-row", { hasText: "mobkit/mob.toml" }).click();
+    await editedSource.locator(".source-file-row", { hasText: "meta/mob.toml" }).click();
     await page.waitForFunction(() => {
       const visiblePanel = Array.from(document.querySelectorAll(".bld-toml")).find((panel) => getComputedStyle(panel).display !== "none");
       const source = visiblePanel?.querySelector('[role="textbox"][aria-readonly="true"]');

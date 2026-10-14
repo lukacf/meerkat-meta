@@ -1,16 +1,16 @@
 ---
 title: "Rust SDK"
-description: "Use MobKit as a Rust library: bootstrap runtimes, route module calls, and manage operational subsystems programmatically."
+description: "Use Meta as a Rust library: bootstrap runtimes, route module calls, and manage operational subsystems programmatically."
 icon: "code"
 ---
 
-The Rust crate `meerkat-mobkit` is the primary interface for MobKit. All other interfaces (JSON-RPC, SDKs, console) are built on top of it.
+The Rust crate `meerkat-meta` is the primary interface for Meta. All other interfaces (JSON-RPC, SDKs, console) are built on top of it.
 
 ## Installation
 
 ```toml Cargo.toml
 [dependencies]
-meerkat-mobkit = "0.8.49"
+meerkat-meta = "0.9.0"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -22,10 +22,10 @@ processes; add module declarations only for executables or MCP transports your
 host actually supplies.
 
 ```rust
-use meerkat_mobkit::{start_mobkit_runtime, DiscoverySpec, MobKitConfig};
+use meerkat_meta::{start_meta_runtime, DiscoverySpec, MetaConfig};
 use std::time::Duration;
 
-let config = MobKitConfig {
+let config = MetaConfig {
     modules: vec![],
     discovery: DiscoverySpec {
         namespace: "my-app".into(),
@@ -34,17 +34,17 @@ let config = MobKitConfig {
     pre_spawn: vec![],
 };
 
-let runtime = start_mobkit_runtime(config, vec![], Duration::from_secs(30))?;
+let runtime = start_meta_runtime(config, vec![], Duration::from_secs(30))?;
 ```
 
 ## Core types
 
-### MobKitConfig
+### MetaConfig
 
 Top-level configuration for the module runtime.
 
 ```rust
-struct MobKitConfig {
+struct MetaConfig {
     modules: Vec<ModuleConfig>,
     discovery: DiscoverySpec,
     pre_spawn: Vec<PreSpawnData>,
@@ -100,29 +100,29 @@ struct ModuleEvent {
 
 ## Runtime functions
 
-### `start_mobkit_runtime`
+### `start_meta_runtime`
 
 Bootstrap a module-only runtime:
 
 ```rust
-fn start_mobkit_runtime(
-    config: MobKitConfig,
+fn start_meta_runtime(
+    config: MetaConfig,
     agent_events: Vec<EventEnvelope<UnifiedEvent>>,
     timeout: Duration,
-) -> Result<MobkitRuntimeHandle, MobkitRuntimeError>
+) -> Result<MetaRuntimeHandle, MetaRuntimeError>
 ```
 
-### `start_mobkit_runtime_with_options`
+### `start_meta_runtime_with_options`
 
 Bootstrap with additional options:
 
 ```rust
-fn start_mobkit_runtime_with_options(
-    config: MobKitConfig,
+fn start_meta_runtime_with_options(
+    config: MetaConfig,
     agent_events: Vec<EventEnvelope<UnifiedEvent>>,
     timeout: Duration,
     options: RuntimeOptions,
-) -> Result<MobkitRuntimeHandle, MobkitRuntimeError>
+) -> Result<MetaRuntimeHandle, MetaRuntimeError>
 ```
 
 ### `UnifiedRuntime::builder`
@@ -144,13 +144,13 @@ and pass it through the provider seam:
 
 ```rust
 use std::sync::Arc;
-use meerkat_mobkit::{AgentMemoryConfig, SqliteAgentMemoryStore, UnifiedRuntime};
+use meerkat_meta::{AgentMemoryConfig, SqliteAgentMemoryStore, UnifiedRuntime};
 
-let memory = Arc::new(SqliteAgentMemoryStore::open(".mobkit/state/agent-memory")?);
+let memory = Arc::new(SqliteAgentMemoryStore::open(".meta/state/agent-memory")?);
 
 let runtime = UnifiedRuntime::builder()
     .definition_path("config/mob.toml")
-    .persistent_state(".mobkit/state")
+    .persistent_state(".meta/state")
     .roster_provider(roster_provider)
     .agent_memory(memory, AgentMemoryConfig::default())
     .build()
@@ -167,7 +167,7 @@ Rust callers can write, read, and delete durable records through the unified
 runtime:
 
 ```rust
-use meerkat_mobkit::{AgentMemoryRecallRequest, AgentMemorySelection, NewAgentMemory};
+use meerkat_meta::{AgentMemoryRecallRequest, AgentMemorySelection, NewAgentMemory};
 
 let record = runtime
     .remember_agent_memory(
@@ -207,7 +207,7 @@ Route a typed call to a module:
 
 ```rust
 pub fn route_module_call(
-    runtime: &MobkitRuntimeHandle,
+    runtime: &MetaRuntimeHandle,
     request: &ModuleRouteRequest,
     timeout: Duration,
 ) -> Result<ModuleRouteResponse, ModuleRouteError>
@@ -219,7 +219,7 @@ Route a JSON-encoded request and receive a JSON-encoded response:
 
 ```rust
 pub fn route_module_call_rpc_json(
-    runtime: &MobkitRuntimeHandle,
+    runtime: &MetaRuntimeHandle,
     request_json: &str,
     timeout: Duration,
 ) -> Result<String, RpcRouteError>
@@ -231,7 +231,7 @@ pub fn route_module_call_rpc_json(
 
 ```rust
 fn validate_bigquery_naming(naming: &BigQueryNaming) -> Result<(), DecisionPolicyError>
-fn load_trusted_mobkit_modules_from_toml(toml: &str) -> Result<Vec<ModuleConfig>, DecisionPolicyError>
+fn load_trusted_meta_modules_from_toml(toml: &str) -> Result<Vec<ModuleConfig>, DecisionPolicyError>
 fn enforce_console_route_access(auth: &AuthPolicy, console: &ConsolePolicy, req: &ConsoleAccessRequest) -> Result<(), DecisionPolicyError>
 fn validate_runtime_ops_policy(policy: &RuntimeOpsPolicy) -> Result<(), DecisionPolicyError>
 fn validate_trusted_oidc_runtime_config(config: &TrustedOidcRuntimeConfig) -> Result<(), DecisionPolicyError>
@@ -255,7 +255,7 @@ requires app auth, and a state that trusts no key refuses every request. See
 when it runs.
 
 `gateway_composition` also exports the HTTP exposure vocabulary both binaries
-use: `GatewaySurface` (`RpcGateway` | `MobkitGateway`, `Display` is the binary
+use: `GatewaySurface` (`RpcGateway` | `MetaGateway`, `Display` is the binary
 name), `ConsoleAuthPosture::of(&decisions)` (`Open` | `ClosedToEveryCaller` |
 `Enforced`, the one classifier behind the bind gate and the non-loopback
 warning), `HttpBindPolicy`, `validate_http_bind_policy(surface, listen, policy)`,
@@ -323,7 +323,7 @@ Before binding, validate the requested `addr: SocketAddr` against your launch's
 `allow_remote` acknowledgement and decision state:
 
 ```rust
-use meerkat_mobkit::gateway_composition::{
+use meerkat_meta::gateway_composition::{
     validate_http_bind_policy, GatewaySurface, HttpBindPolicy,
 };
 
@@ -335,12 +335,12 @@ validate_http_bind_policy(
 ```
 
 `GatewaySurface` is the closed gateway diagnostic enum, not an arbitrary
-host name; use `GatewaySurface::MobkitGateway` instead when representing that surface.
+host name; use `GatewaySurface::MetaGateway` instead when representing that surface.
 The check applies the gateways' fail-closed rule: non-loopback needs enforced
 console auth or the `allow_remote` acknowledgement. After binding, call
 `warn_on_non_loopback_bind(surface, bound, &decisions)` for the gateways'
 WARN line. These helpers and `GatewayHttpBinding` live in
-`meerkat_mobkit::gateway_composition`. See [Deployment](/guides/deployment).
+`meerkat_meta::gateway_composition`. See [Deployment](/guides/deployment).
 
 ## See also
 

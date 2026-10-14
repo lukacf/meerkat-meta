@@ -5,7 +5,7 @@ export interface ConsoleReadOnlyOverrideInput {
 
 const READ_ONLY_QUERY_KEYS = [
   "console_read_only",
-  "mobkit_console_read_only",
+  "meta_console_read_only",
   "view_only",
 ];
 
@@ -35,8 +35,8 @@ function browserSearch(): string {
 
 function browserHostOverride(): unknown {
   if (typeof window === "undefined") return undefined;
-  return (window as Window & { __MOBKIT_CONSOLE_READ_ONLY__?: unknown })
-    .__MOBKIT_CONSOLE_READ_ONLY__;
+  return (window as Window & { __META_CONSOLE_READ_ONLY__?: unknown })
+    .__META_CONSOLE_READ_ONLY__;
 }
 
 export function resolveConsoleReadOnlyOverride(

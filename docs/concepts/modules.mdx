@@ -4,7 +4,7 @@ description: "Subprocess capability boundaries, core MCP tools, discovery, and s
 icon: "puzzle-piece"
 ---
 
-Modules are application-supplied subprocess capability boundaries. MobKit starts the configured modules, records startup health transitions, and routes module calls over either MCP or the generic JSON-line boundary.
+Modules are application-supplied subprocess capability boundaries. Meta starts the configured modules, records startup health transitions, and routes module calls over either MCP or the generic JSON-line boundary.
 
 Durable scheduling and gating are runtime services, not modules.
 
@@ -55,12 +55,12 @@ At bootstrap, every ID in `discovery.modules` must have a matching `ModuleConfig
 PreSpawnData {
     module_id: "router".to_string(),
     env: vec![
-        ("MOBKIT_MODULE_BOUNDARY".to_string(), "mcp".to_string()),
+        ("META_MODULE_BOUNDARY".to_string(), "mcp".to_string()),
     ],
 }
 ```
 
-Set `MOBKIT_MODULE_BOUNDARY=mcp` to select the MCP boundary. Other environment entries can carry module-specific configuration or secret references.
+Set `META_MODULE_BOUNDARY=mcp` to select the MCP boundary. Other environment entries can carry module-specific configuration or secret references.
 
 ## Core modules
 
@@ -72,15 +72,15 @@ Three module IDs have hard MCP requirements:
 | `delivery` | Dispatch a validated delivery request | `delivery.send` |
 | `memory` | Read conflict state for runtime gating | `memory.conflict_read` |
 
-For these IDs, a call fails closed if `MOBKIT_MODULE_BOUNDARY=mcp` is absent or the required tool is unavailable.
+For these IDs, a call fails closed if `META_MODULE_BOUNDARY=mcp` is absent or the required tool is unavailable.
 
 The following related runtime surfaces are not module tools:
 
 - Runtime-route list, add, and delete
 - Delivery history and idempotency
 - All gating evaluate, pending, decide, and audit operations
-- The operational assertion and conflict ledger: `mobkit/memory/stores`, `mobkit/memory/index`, and `mobkit/memory/query`
-- The separate identity agent-memory API: `mobkit/agent_memory/recall` when a provider is configured, plus `mobkit/agent_memory/remember`, `mobkit/agent_memory/forget`, `mobkit/agent_memory/update`, and `mobkit/agent_memory/manifest` when the provider supports each capability
+- The operational assertion and conflict ledger: `meta/memory/stores`, `meta/memory/index`, and `meta/memory/query`
+- The separate identity agent-memory API: `meta/agent_memory/recall` when a provider is configured, plus `meta/agent_memory/remember`, `meta/agent_memory/forget`, `meta/agent_memory/update`, and `meta/agent_memory/manifest` when the provider supports each capability
 - Agent-memory record-engine surfaces for quarantine review and steward consolidation
 
 The operational ledger and the identity agent-memory record layer are distinct authorities. The ledger owns assertion and conflict index/query state consumed by gating. Quarantine review and steward consolidation belong to the agent-memory record-engine layer.
@@ -107,7 +107,7 @@ A successful MCP probe emits `event_type: "mcp.ready"` with the discovered tool 
 
 ## Trusted module manifest
 
-`load_trusted_mobkit_modules_from_toml` accepts a `[[modules]]` manifest:
+`load_trusted_meta_modules_from_toml` accepts a `[[modules]]` manifest:
 
 ```toml
 [[modules]]

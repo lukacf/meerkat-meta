@@ -6,13 +6,13 @@ from typing import Any
 
 import pytest
 
-from meerkat_mobkit.agent_builder import CallbackDispatcher
-from meerkat_mobkit.jobs import (
+from meerkat_meta.agent_builder import CallbackDispatcher
+from meerkat_meta.jobs import (
     DetachedJobContext,
     DetachedJobExecution,
     DetachedJobResult,
 )
-from meerkat_mobkit.models import SessionBuildOptions
+from meerkat_meta.models import SessionBuildOptions
 
 
 AUTHORITY_1 = {"job_id": "job-1", "attempt_id": "attempt-1", "fence": 7}
@@ -151,7 +151,7 @@ async def test_start_returns_before_work_and_reports_with_exact_authority() -> N
     await asyncio.wait_for(entered.wait(), timeout=0.2)
     assert resolver_calls == [("network", ("network.read",))]
     assert rpc_calls[0] == (
-        "mobkit/jobs/progress",
+        "meta/jobs/progress",
         {
             "authority": AUTHORITY_1,
             "cursor": 1,
@@ -163,7 +163,7 @@ async def test_start_returns_before_work_and_reports_with_exact_authority() -> N
     release.set()
     await dispatcher.wait_for_job_tasks()
     assert rpc_calls[-1] == (
-        "mobkit/jobs/complete",
+        "meta/jobs/complete",
         {
             "authority": AUTHORITY_1,
             "completed_at_ms": rpc_calls[-1][1]["completed_at_ms"],
@@ -313,7 +313,7 @@ async def test_reconcile_only_reports_exact_live_authority_and_never_starts_work
     assert result == {"live_attempts": [AUTHORITY_1]}
     assert starts == 1
     heartbeat_method, heartbeat_params = rpc_calls[-1]
-    assert heartbeat_method == "mobkit/jobs/heartbeat"
+    assert heartbeat_method == "meta/jobs/heartbeat"
     assert heartbeat_params["authority"] == AUTHORITY_1
     assert heartbeat_params["lease_expires_at_ms"] > heartbeat_params["heartbeat_at_ms"]
     release.set()

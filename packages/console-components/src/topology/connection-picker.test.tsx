@@ -211,7 +211,7 @@ describe("ConnectionPicker", () => {
     );
 
     expect(screen.getByText("Loading…")).toBeInTheDocument();
-    expect(screen.getByText("Loading current connection status from MobKit.")).toBeInTheDocument();
+    expect(screen.getByText("Loading current connection status from Meta.")).toBeInTheDocument();
     expect(screen.queryByText("Not inspected")).toBeNull();
     expect(screen.queryByRole("button", { name: /Check .* connection availability/u })).toBeNull();
     expect(screen.queryByRole("button", { name: /Connect Triage to Commander/u })).toBeNull();
@@ -299,7 +299,7 @@ describe("ConnectionPicker", () => {
             actions: {
               connect: {
                 state: "denied",
-                reason: "Pair inspection denied; reconnection requires MobKit policy approval.",
+                reason: "Pair inspection denied; reconnection requires Meta policy approval.",
               },
             },
             message: "Inspection denied during reconnection preparation.",

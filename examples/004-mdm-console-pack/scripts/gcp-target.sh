@@ -27,7 +27,7 @@ Required environment or .env.gcp:
   GCP_ZONE
 
 Optional:
-  GCP_TARGET_PREFIX     default mobkit-mdm-target
+  GCP_TARGET_PREFIX     default meta-mdm-target
   GCP_MACHINE_TYPE      default e2-medium
   GCP_IMAGE_FAMILY      default debian-12
   GCP_IMAGE_PROJECT     default debian-cloud
@@ -70,7 +70,7 @@ name="${name:-$id}"
 : "${GCP_PROJECT:?GCP_PROJECT is required}"
 : "${GCP_ZONE:?GCP_ZONE is required}"
 
-prefix="${GCP_TARGET_PREFIX:-mobkit-mdm-target}"
+prefix="${GCP_TARGET_PREFIX:-meta-mdm-target}"
 machine_type="${GCP_MACHINE_TYPE:-e2-medium}"
 image_family="${GCP_IMAGE_FAMILY:-debian-12}"
 image_project="${GCP_IMAGE_PROJECT:-debian-cloud}"
@@ -99,7 +99,7 @@ ensure_instance() {
     --machine-type "$machine_type" \
     --image-family "$image_family" \
     --image-project "$image_project" \
-    --tags mobkit-mdm-target
+    --tags meta-mdm-target
 }
 
 internal_ip() {
@@ -116,11 +116,11 @@ sync_repo() {
     --exclude ./examples/004-mdm-console-pack/.state \
     -czf - . | "${ssh_base[@]}" --command "
       set -euo pipefail
-      rm -rf ~/meerkat-mobkit.next
-      mkdir -p ~/meerkat-mobkit.next
-      tar -xzf - -C ~/meerkat-mobkit.next
-      rm -rf ~/meerkat-mobkit
-      mv ~/meerkat-mobkit.next ~/meerkat-mobkit
+      rm -rf ~/meerkat-meta.next
+      mkdir -p ~/meerkat-meta.next
+      tar -xzf - -C ~/meerkat-meta.next
+      rm -rf ~/meerkat-meta
+      mv ~/meerkat-meta.next ~/meerkat-meta
     "
 }
 
@@ -159,11 +159,11 @@ remote_start() {
       sudo apt-get update
       sudo apt-get install -y build-essential pkg-config libssl-dev
     fi
-    cd ~/meerkat-mobkit
+    cd ~/meerkat-meta
     mkdir -p ~/.cache/mdm-mob-target /tmp/mdm-mob-target
     if [[ -f /tmp/mdm-${id}.pid ]]; then kill \"\$(cat /tmp/mdm-${id}.pid)\" 2>/dev/null || true; fi
     rm -f /tmp/mdm-mob-target/${id}.json
-    ./scripts/repo-cargo build -p meerkat-mobkit --example mdm_mob_target
+    ./scripts/repo-cargo build -p meerkat-meta --example mdm_mob_target
     target_bin=\"\$(./scripts/repo-cargo --print-env | awk -F= '\$1 == \"CARGO_TARGET_DIR\" { print \$2 }')/debug/examples/mdm_mob_target\"
     nohup \"\$target_bin\" \
       --id '${id}' \

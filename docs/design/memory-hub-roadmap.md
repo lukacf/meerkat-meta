@@ -1,4 +1,4 @@
-# Memory Hub Roadmap - an External Memory Hub as MobKit's Central Memory
+# Memory Hub Roadmap - an External Memory Hub as Meta's Central Memory
 
 Status: future-work direction (companion to
 [`agent-memory-architecture.md`](agent-memory-architecture.md), which is the
@@ -10,7 +10,7 @@ Date: 2026-07-01
 
 ## 1. Destination
 
-An external memory hub becomes MobKit's central memory hub — the durable system of record for
+An external memory hub becomes Meta's central memory hub — the durable system of record for
 knowledge, eventually the default memory backend and possibly a mandatory one.
 The memory hub is not just a graph database: it is an entity graph, a document +
 **vector** store, a **timeline** (events with temporal refinement), a truth layer
@@ -25,9 +25,9 @@ turn path (selector, injection, budgets, echo-safety), the lifecycle coupling
 tool surface, and a hot local store scoped to *working knowledge*. The division
 of labor, stated once and enforced by the initiative's bright-line ratchet:
 
-> **MobKit owns how to work. The memory hub owns what is true.**
+> **Meta owns how to work. The memory hub owns what is true.**
 
-MobKit's store never grows entities, relations, truth slots, embeddings, or
+Meta's store never grows entities, relations, truth slots, embeddings, or
 retrieval indexes. The moment a record is entity-shaped world knowledge rather
 than working knowledge, it is hub material.
 
@@ -45,7 +45,7 @@ and the integration boundary keeps them separable:
 2. **Wire-boundary provider (cheap, still private).** `HubMemoryProvider`
    speaks HTTP/MCP to a *configured endpoint* — **not** a crate dependency. No
    license coupling, no crates.io exposure, no version lockstep beyond
-   wire-schema stability, and both ends are ours. MobKit ships publicly with
+   wire-schema stability, and both ends are ours. Meta ships publicly with
    "bundled store by default; point `memory.hub` at a memory hub endpoint if you
    have one" — and initially only our own deployments (the downstream app) have one.
 3. **Mandatory hub (the real commitment, made later with evidence).** Requires
@@ -96,8 +96,8 @@ fallback. New deployments default to hub-backed memory; docs and examples flip.
 
 **Decision gate — mandatory hub.** Named preconditions, all evidence-based:
 
-- F1 provider proven in the downstream app's production across N MobKit releases with a
-  stable wire contract (the hub surfaces MobKit pins are versioned and
+- F1 provider proven in the downstream app's production across N Meta releases with a
+  stable wire contract (the hub surfaces Meta pins are versioned and
   stability-marked — worth marking **now**, while both efforts are in flight).
 - License sweep of the memory hub's dependency tree clean for MIT/Apache distribution
   (SurrealDB's ecosystem checked carefully: the server is BSL; SDK and embedded
@@ -114,7 +114,7 @@ fallback. New deployments default to hub-backed memory; docs and examples flip.
    `subject_allowlist` for identity-private records. The friction point is
    **operator scope** — realm-keyed in the initiative, but operators span realms
    in principle; cross-space queries don't exist. Either operator profiles live
-   in a dedicated space MobKit queries separately (with the initiative's
+   in a dedicated space Meta queries separately (with the initiative's
    declassification gate for realm-crossing facts), or the memory hub grows a sharing
    primitive. Decide before F2.
 2. **TM detection routing — RESOLVED (hub PR #25, merged 2026-07-02).**
@@ -137,7 +137,7 @@ fallback. New deployments default to hub-backed memory; docs and examples flip.
    CI-checked on the hub side the way its MCP tool counts already are.
 4. **Projection-cache consistency.** Outbox cursor semantics for the manifest
    projection (per-space monotonic seq exists; per-realm cursor storage and
-   replay on MobKit's side), and read-your-writes for an identity's own recent
+   replay on Meta's side), and read-your-writes for an identity's own recent
    records during hub round-trips.
 
 ## 5. Non-goals of the hub path
@@ -147,6 +147,6 @@ fallback. New deployments default to hub-backed memory; docs and examples flip.
   permanently; a knowledge graph rebuilt in markdown records is the memory hub
   re-invented badly. The layers stay distinct (hippocampal working memory /
   cortical semantic knowledge); the *judgment* is shared, the storage is not.
-- No MobKit-side retrieval machinery at any scale — hub candidates feed the
+- No Meta-side retrieval machinery at any scale — hub candidates feed the
   Selector; the bright line holds on both sides of the boundary.
-- No hub crate dependency in MobKit, in any phase.
+- No hub crate dependency in Meta, in any phase.

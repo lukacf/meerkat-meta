@@ -25,7 +25,7 @@ echo "release-hook: staging SDK version files"
 # The SDK manifests are a fixed set, matching what bump-sdk-versions.sh seds by
 # name. The BUILD.bazel files are NOT: they are generated per workspace crate,
 # so they are staged by PATHSPEC. Naming one of them here is what let
-# crates/mobkit-store-conformance/BUILD.bazel drift a release behind even after the
+# crates/meta-store-conformance/BUILD.bazel drift a release behind even after the
 # generator repaired it in the worktree, because the release commit simply did
 # not include the file.
 git add \

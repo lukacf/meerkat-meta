@@ -998,7 +998,7 @@ describe("Provider result types (REQ-49c)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// REQ-47: Identity-first runtime APIs on MobKitRuntime
+// REQ-47: Identity-first runtime APIs on MetaRuntime
 // ---------------------------------------------------------------------------
 
 describe("Identity-first runtime APIs (REQ-47)", () => {
@@ -1006,13 +1006,13 @@ describe("Identity-first runtime APIs (REQ-47)", () => {
   // them on a runtime with a mock transport. We stub _rpc to capture calls.
 
   async function makeRuntime() {
-    const { MobKitRuntime } = await import("../src/runtime.js");
+    const { MetaRuntime } = await import("../src/runtime.js");
     const calls: {
       method: string;
       params: Record<string, unknown>;
       options?: { transportTimeoutMs?: number };
     }[] = [];
-    const rt = new MobKitRuntime({
+    const rt = new MetaRuntime({
       mobConfigPath: null,
       sessionBuilder: null,
       sessionStore: null,
@@ -1046,7 +1046,7 @@ describe("Identity-first runtime APIs (REQ-47)", () => {
     ) => {
       calls.push({ method, params: params ?? {}, options });
       // Return type-appropriate stubs
-      if (method === "mobkit/status_identity") {
+      if (method === "meta/status_identity") {
         return {
           identity: params?.identity ?? "x:1",
           state: "active",
@@ -1071,7 +1071,7 @@ describe("Identity-first runtime APIs (REQ-47)", () => {
     const { rt, calls } = await makeRuntime();
     await rt.send("triage:main", "Hello!");
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].method, "mobkit/send");
+    assert.equal(calls[0].method, "meta/send");
     assert.equal(calls[0].params.identity, "triage:main");
     assert.equal(calls[0].params.content, "Hello!");
   });
@@ -1104,7 +1104,7 @@ describe("Identity-first runtime APIs (REQ-47)", () => {
       content: "Hello",
       origin: "connector",
     });
-    assert.equal(calls[0].method, "mobkit/dispatch");
+    assert.equal(calls[0].method, "meta/dispatch");
     assert.equal(calls[0].params.identity, "triage:main");
     assert.equal((calls[0].params.dispatch_input as Record<string, unknown>).origin, "connector");
   });
@@ -1112,7 +1112,7 @@ describe("Identity-first runtime APIs (REQ-47)", () => {
   it("agent(identity)", async () => {
     const { rt, calls } = await makeRuntime();
     const snap = await rt.agent("lead:main");
-    assert.equal(calls[0].method, "mobkit/status_identity");
+    assert.equal(calls[0].method, "meta/status_identity");
     assert.equal(calls[0].params.identity, "lead:main");
     assert.equal(snap.agentIdentity, "rt-1");
     assert.equal(snap.role, "worker");
@@ -1121,14 +1121,14 @@ describe("Identity-first runtime APIs (REQ-47)", () => {
   it("subscribe(identity)", async () => {
     const { rt, calls } = await makeRuntime();
     await rt.subscribe("worker:1");
-    assert.equal(calls[0].method, "mobkit/subscribe");
+    assert.equal(calls[0].method, "meta/subscribe");
     assert.equal(calls[0].params.identity, "worker:1");
   });
 
   it("status(identity) returns parsed IdentityStatus", async () => {
     const { rt, calls } = await makeRuntime();
     const status = await rt.status("triage:main");
-    assert.equal(calls[0].method, "mobkit/status_identity");
+    assert.equal(calls[0].method, "meta/status_identity");
     assert.equal(status.identity, "triage:main");
     assert.equal(status.lifecycleState, "active");
   });
@@ -1136,14 +1136,14 @@ describe("Identity-first runtime APIs (REQ-47)", () => {
   it("respawn(identity)", async () => {
     const { rt, calls } = await makeRuntime();
     await rt.respawn("worker:1");
-    assert.equal(calls[0].method, "mobkit/respawn");
+    assert.equal(calls[0].method, "meta/respawn");
     assert.equal(calls[0].params.identity, "worker:1");
   });
 
   it("retire(identity)", async () => {
     const { rt, calls } = await makeRuntime();
     await rt.retire("worker:1");
-    assert.equal(calls[0].method, "mobkit/retire");
+    assert.equal(calls[0].method, "meta/retire");
     assert.equal(calls[0].params.identity, "worker:1");
   });
 
@@ -1161,7 +1161,7 @@ describe("Identity-first runtime APIs (REQ-47)", () => {
       body: "Use your granted tools.",
     };
     await rt.activateMemberInstruction("worker:1", activation);
-    assert.equal(calls[0].method, "mobkit/member_activate_instruction");
+    assert.equal(calls[0].method, "meta/member_activate_instruction");
     assert.deepEqual(calls[0].params, { identity: "worker:1", activation });
     assert.equal(calls[0].options?.transportTimeoutMs, undefined);
     // A mid-turn call can block for a whole turn; the caller can widen this
@@ -1175,7 +1175,7 @@ describe("Identity-first runtime APIs (REQ-47)", () => {
   it("memberInstructionActivations(identity, query)", async () => {
     const { rt, calls } = await makeRuntime();
     await rt.memberInstructionActivations("worker:1", { namespace: "host", key: "persona" });
-    assert.equal(calls[0].method, "mobkit/member_instruction_activations");
+    assert.equal(calls[0].method, "meta/member_instruction_activations");
     assert.deepEqual(calls[0].params, {
       identity: "worker:1",
       namespace: "host",
@@ -1186,14 +1186,14 @@ describe("Identity-first runtime APIs (REQ-47)", () => {
   it("reset(identity)", async () => {
     const { rt, calls } = await makeRuntime();
     await rt.reset("worker:1");
-    assert.equal(calls[0].method, "mobkit/reset");
+    assert.equal(calls[0].method, "meta/reset");
     assert.equal(calls[0].params.identity, "worker:1");
   });
 
   it("deleteIdentity(identity)", async () => {
     const { rt, calls } = await makeRuntime();
     await rt.deleteIdentity("worker:1");
-    assert.equal(calls[0].method, "mobkit/delete_identity");
+    assert.equal(calls[0].method, "meta/delete_identity");
     assert.equal(calls[0].params.identity, "worker:1");
   });
 });
@@ -1325,8 +1325,8 @@ describe("Provider interfaces (REQ-48)", () => {
 
 describe("Builder identity-first extensions (REQ-50)", () => {
   it("continuityStore() is chainable", async () => {
-    const { MobKit } = await import("../src/builder.js");
-    const builder = MobKit.builder();
+    const { Meta } = await import("../src/builder.js");
+    const builder = Meta.builder();
     const store: import("../src/types.js").ContinuityStore = {
       async resolveMany() { return {}; },
       async loadSessionSnapshot() { return null; },
@@ -1339,8 +1339,8 @@ describe("Builder identity-first extensions (REQ-50)", () => {
   });
 
   it("leaseProvider() is chainable", async () => {
-    const { MobKit } = await import("../src/builder.js");
-    const builder = MobKit.builder();
+    const { Meta } = await import("../src/builder.js");
+    const builder = Meta.builder();
     const provider: import("../src/types.js").LeaseProvider = {
       async acquireLeases() { return {}; },
       async renewLeases() { return {}; },
@@ -1351,15 +1351,15 @@ describe("Builder identity-first extensions (REQ-50)", () => {
   });
 
   it("scratchDir() is chainable", async () => {
-    const { MobKit } = await import("../src/builder.js");
-    const builder = MobKit.builder();
+    const { Meta } = await import("../src/builder.js");
+    const builder = Meta.builder();
     const result = builder.scratchDir("/tmp/scratch");
     assert.equal(result, builder);
   });
 
   it("persistentState + continuityStore fails at build time", async () => {
-    const { MobKit } = await import("../src/builder.js");
-    const builder = MobKit.builder();
+    const { Meta } = await import("../src/builder.js");
+    const builder = Meta.builder();
     builder.persistentState("/tmp/state");
     builder.continuityStore({
       async resolveMany() { return {}; },
@@ -1375,8 +1375,8 @@ describe("Builder identity-first extensions (REQ-50)", () => {
   });
 
   it("persistentState + leaseProvider fails at build time", async () => {
-    const { MobKit } = await import("../src/builder.js");
-    const builder = MobKit.builder();
+    const { Meta } = await import("../src/builder.js");
+    const builder = Meta.builder();
     builder.persistentState("/tmp/state");
     builder.leaseProvider({
       async acquireLeases() { return {}; },
@@ -1390,8 +1390,8 @@ describe("Builder identity-first extensions (REQ-50)", () => {
   });
 
   it("external-authoritative path requires store, lease provider, and scratchDir", async () => {
-    const { MobKit } = await import("../src/builder.js");
-    const builder = MobKit.builder();
+    const { Meta } = await import("../src/builder.js");
+    const builder = Meta.builder();
     builder.continuityStore({
       async resolveMany() { return {}; },
       async loadSessionSnapshot() { return null; },
@@ -1408,8 +1408,8 @@ describe("Builder identity-first extensions (REQ-50)", () => {
   });
 
   it("stores config fields correctly", async () => {
-    const { MobKit } = await import("../src/builder.js");
-    const builder = MobKit.builder();
+    const { Meta } = await import("../src/builder.js");
+    const builder = Meta.builder();
     const store = {
       async resolveMany() { return {}; },
       async loadSessionSnapshot() { return null; },
@@ -1429,7 +1429,7 @@ describe("Builder identity-first extensions (REQ-50)", () => {
   });
 
   it("runtime init params advertise identity-first provider callbacks", async () => {
-    const { MobKitRuntime } = await import("../src/runtime.js");
+    const { MetaRuntime } = await import("../src/runtime.js");
     const continuityStore = {
       async resolveMany() { return {}; },
       async loadSessionSnapshot() { return null; },
@@ -1445,7 +1445,7 @@ describe("Builder identity-first extensions (REQ-50)", () => {
     const rosterProvider = { async roster() { return []; } };
     const topologyProvider = { async computeEdges() { return []; } };
     const agentCustomizer = { async customizeBuild() {} };
-    const rt = new MobKitRuntime({
+    const rt = new MetaRuntime({
       mobConfigPath: null,
       sessionBuilder: null,
       sessionStore: null,

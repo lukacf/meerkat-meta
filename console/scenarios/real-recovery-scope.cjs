@@ -10,7 +10,7 @@ const { startScopeProxy } = require("../recovery-scope-proxy.cjs");
 const { assertScopeCancellation } = require("../recovery-scope-oracle.cjs");
 const { browserFailureMonitor } = require("./browser-failure-monitor.cjs");
 
-const evidence = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+const evidence = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
 const identity = "router:main";
 
 async function timeline(fixture) {
@@ -28,7 +28,7 @@ async function seed(fixture, marker, turns) {
   for (let turn = 0; turn < turns; turn++) {
     const text = `${marker} ${turn + 1}.`;
     await fixture.control("model", { source: text, delay_ms: 0, chunk_chars: 1024 });
-    const accepted = await rpc(fixture.baseUrl, "mobkit/console/send", {
+    const accepted = await rpc(fixture.baseUrl, "meta/console/send", {
       identity, content: `Record ${text}`, origin: "console:scope-acceptance", origin_kind: "operator",
       idempotency_key: randomUUID(), handling_mode: "queue",
     });
@@ -61,9 +61,9 @@ async function quoteMarker(page, host, marker) {
 }
 
 async function scopeCancellation(host, phase) {
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "Use the coordinator's immutable prebuilt native fixture; do not build from a browser shard.");
+  assert(process.env.META_EXAMPLE_BIN_DIR, "Use the coordinator's immutable prebuilt native fixture; do not build from a browser shard.");
   const name = `real-${host}-scope-cancel-${phase}`;
-  const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "mobkit-scope-owners-"));
+  const stateRoot = await fs.mkdtemp(path.join(os.tmpdir(), "meta-scope-owners-"));
   const owners = {};
   let proxy, browser, page, monitor, result;
   await fs.mkdir(evidence, { recursive: true });

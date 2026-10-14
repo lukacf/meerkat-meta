@@ -1,7 +1,7 @@
 """TDD tests for AgentBuildContext/Draft/ToolDef (REQ-43a) and IdentityStatus/Health (REQ-43b)."""
 import pytest
 
-from meerkat_mobkit.identity_first_models import (
+from meerkat_meta.identity_first_models import (
     AgentBuildContext,
     AgentBuildDraft,
     ContinuityHealth,

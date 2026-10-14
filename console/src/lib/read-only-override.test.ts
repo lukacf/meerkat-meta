@@ -9,7 +9,7 @@ test("console read-only override accepts ACL-friendly query flags", () => {
     true,
   );
   assert.equal(
-    resolveConsoleReadOnlyOverride({ search: "?mobkit_console_read_only=1" }),
+    resolveConsoleReadOnlyOverride({ search: "?meta_console_read_only=1" }),
     true,
   );
   assert.equal(

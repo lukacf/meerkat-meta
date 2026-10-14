@@ -454,7 +454,7 @@ export function ConnectionPicker({
                     : operationStatus(receipt) || stateStatus(state);
                 const rawDetail = unresolvedDirectPair
                   ? pairIsResolving
-                    ? "Loading current connection status from MobKit."
+                    ? "Loading current connection status from Meta."
                     : "Current connection status is unavailable."
                   : receipt?.message
                     || affordance?.message

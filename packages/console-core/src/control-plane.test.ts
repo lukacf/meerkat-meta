@@ -19,7 +19,7 @@ import {
 } from "./control-plane";
 import { normalizeConsoleSidebarViewState } from "./sidebar";
 
-// Dual-runner: mobkit's console gates bundle this file with esbuild and run it
+// Dual-runner: meta's console gates bundle this file with esbuild and run it
 // under `node --test`; the meerkat-studio desktop app picks it up with vitest
 // (globals enabled). Resolve the registrar for whichever runner is active.
 type TestFn = (name: string, fn: () => void | Promise<void>) => void;
@@ -489,9 +489,9 @@ test("session_repair hold rides the status row and the inspect view and wins the
     session_id: " 01a000bb-b69e-7570-933d-ffd5d61d51ee ",
     hold: "audited_endpoint_divergence",
     diagnose_command:
-      "rkat --state-root /srv/state --realm mobkit session repair-wholeblob 01a000bb-b69e-7570-933d-ffd5d61d51ee --json",
+      "rkat --state-root /srv/state --realm meta session repair-wholeblob 01a000bb-b69e-7570-933d-ffd5d61d51ee --json",
     apply_command:
-      "rkat --state-root /srv/state --realm mobkit session repair-wholeblob 01a000bb-b69e-7570-933d-ffd5d61d51ee --apply --json",
+      "rkat --state-root /srv/state --realm meta session repair-wholeblob 01a000bb-b69e-7570-933d-ffd5d61d51ee --apply --json",
     detail: "session needs the sanctioned audited-endpoint repair",
   };
   const row = normalizeIdentityStatusRow({

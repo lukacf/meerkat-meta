@@ -1,261 +1,122 @@
 <p align="center">
-  <img src="docs/logo.png" alt="MobKit" width="160" />
+  <img src="docs/logo.png" alt="Meerkat Meta" width="160">
 </p>
 
-<h1 align="center">MobKit</h1>
+# Meerkat Meta
 
-<p align="center">
-  A thin convenience, gateway, SDK, and console layer for identity-first Meerkat mobs.
-</p>
+**Build an application around your agents.**
 
-<p align="center">
-  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License" /></a>
-  <a href="https://crates.io/crates/meerkat-mobkit"><img src="https://img.shields.io/crates/v/meerkat-mobkit.svg" alt="crates.io" /></a>
-  <a href="https://pypi.org/project/meerkat-mobkit/"><img src="https://img.shields.io/pypi/v/meerkat-mobkit.svg" alt="PyPI" /></a>
-  <a href="https://www.npmjs.com/package/@rkat/mobkit-sdk"><img src="https://img.shields.io/npm/v/@rkat/mobkit-sdk.svg" alt="npm" /></a>
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.94%2B-orange.svg?logo=rust" alt="Rust 1.94+" /></a>
-</p>
+Meerkat Meta composes Core agents into applications with lasting identities,
+memory, routing, access policy, approvals and a console. Use it for a personal
+assistant, a team of specialists or a system of agents that operates over time.
+It is open source and uses Core's provider-agnostic runtime.
 
----
+The instructions below build this checkout with its matching Python SDK and
+gateway. For packaged installation, follow the instructions for your release.
 
-MobKit is the application-facing convenience layer around identity-first Meerkat mobs. It gives host apps a stable way to boot a mob, project it into a console, expose JSON-RPC/REST/SSE control surfaces, and use Python or TypeScript SDKs without hand-wiring every Meerkat primitive.
+## Start a local runtime
 
-MobKit does not replace Meerkat or `meerkat-mob`. Meerkat owns the session runtime and agent loop. `meerkat-mob` is already identity-first: it owns the multi-agent runtime path, `AgentIdentity` vs `AgentRuntimeId` binding model, mob membership, lifecycle, wiring, flows, supervisor bridge, and mob event authority. `meerkat-mobkit` mostly packages convenience around that substrate: gateway startup, SDK ergonomics, provider adapters, operational-module wiring, and rebuildable console/timeline projections.
-
-<p align="center">
-  <img src="docs/images/mobkit-console.png" alt="HarborOps MobKit console with route planning, topology, roster, and signals panels" width="900" />
-</p>
-
-## What MobKit Is For
-
-MobKit is useful when a system needs agents that keep meaning over time:
-
-- **Personal agents** such as `identity:luka` that represent a person and receive direct conversational work
-- **Domain agents** such as `domain:calendar` or `domain:school` that own a durable capability
-- **Coordination agents** such as `triage:main`, `family-group:main`, or `gate:main` that route, summarize, or approve work
-- **Task agents** that can still be spawned for short-lived execution while the durable identities stay stable
-
-The important idea is that the app talks to identities, not throwaway runtime members. A runtime member can be created, resumed, retired, respawned, or rematerialized, but `identity:luka` remains the app-facing handle.
-
-## Identity-First Mobs
-
-Identity-first is a `meerkat-mob` contract that MobKit exposes conveniently.
-
-In `meerkat-mob`, stable member identity is separate from runtime binding:
-
-- **`AgentIdentity`.** The public member identity. It survives respawn and runtime-binding changes and keys public mob APIs.
-- **`AgentRuntimeId`.** The current runtime binding. It can rotate when a member is respawned or rebound.
-- **`FenceToken`.** A monotonic binding epoch used by guards to reject stale binding-level work.
-- **`Generation`.** The mob-member generation counter, incremented on respawn.
-
-MobKit's identity-facing surface should be read as convenience over that model. The SDKs, gateway, and console let an app address `identity:luka` or `triage:main`, inspect current binding state, and recover members without forcing the app to manage the underlying mob/session plumbing directly.
-
-That gives host apps a few concrete guarantees:
-
-- **Stable addressing.** Send to `identity:luka` or dispatch to `triage:main` using the same identity handle the mob uses internally.
-- **Runtime-binding transparency.** Console and SDK calls can show or act on the current runtime binding without making binding ids the public API.
-- **Recovery ergonomics.** MobKit can expose recover/respawn/rematerialize-style operator controls, but the semantic model remains the mob identity/binding model.
-- **Rebuildable projections.** Console timelines, identity rows, and sidebar grouping are projections of mob/runtime truth, not separate authorities.
-
-For local and embedded deployments, the default `.persistent_state(...)` layout combines SQLite-backed MobKit metadata, console logs, runtime state, and session state with filesystem-backed blob storage under one directory. Include the `blobs/` subtree in backups; copying only the SQLite files omits blob content. For externally authoritative deployments, MobKit can be paired with app-provided stores/providers, but those should adapt to the identity-first mob substrate rather than inventing a parallel identity authority.
-
-## Quick Start
-
-The Python and TypeScript packages are clients and do not bundle a gateway
-executable. Download `mobkit-rpc-gateway-<version>-<target>.tar.gz` for Unix or
-macOS, or `mobkit-rpc-gateway-<version>-<target>.zip` for Windows, from
-[GitHub Releases](https://github.com/lukacf/meerkat-mobkit/releases) and extract
-its `rpc_gateway` binary (`rpc_gateway.exe` on Windows). To build from this
-checkout instead, run
-`./scripts/repo-cargo build -p meerkat-mobkit --bin rpc_gateway --locked`, then
-run `./scripts/repo-cargo --print-env`; the debug binary is at
-`<CARGO_TARGET_DIR>/debug/rpc_gateway`.
-
-Create `config/mob.toml` relative to the directory from which you run the Python
-example (create `config/` if needed):
-
-```toml
-[mob]
-id = "personal-assistant"
-
-[profiles.personal]
-model = "gpt-5.5"
-external_addressable = true
-
-[profiles.personal.tools]
-comms = true
-
-[profiles.triage]
-model = "gpt-5.5"
-external_addressable = false
-
-[profiles.triage.tools]
-comms = true
-
-[profiles.calendar]
-model = "gpt-5.5"
-external_addressable = false
-
-[profiles.calendar.tools]
-comms = true
-```
-
-These profiles match the roster below: the personal agent is externally
-addressable, while triage and calendar are internal-only peers. Comms is enabled
-for the topology's peer connections. Set `OPENAI_API_KEY` in the launching
-environment for the selected OpenAI `gpt-5.5` model. After installing the Python
-SDK (see [Install](#install)), run the following in an async context, such as a
-notebook supporting top-level `await`, and replace the gateway path with your
-extracted or built executable:
-
-```python
-from meerkat_mobkit import MobKit
-from meerkat_mobkit.identity_first_models import DurableAgentSpec, ManagedPeerEdge
-
-
-class Roster:
-    async def roster(self, ctx):
-        return [
-            DurableAgentSpec(
-                identity="identity:luka",
-                profile="personal",
-                addressability="addressable",
-            ),
-            DurableAgentSpec(
-                identity="triage:main",
-                profile="triage",
-                addressability="internal_only",
-            ),
-            DurableAgentSpec(
-                identity="domain:calendar",
-                profile="calendar",
-                addressability="internal_only",
-            ),
-        ]
-
-
-class Topology:
-    async def compute_edges(self, target_identities, ctx):
-        return [
-            ManagedPeerEdge(a="identity:luka", b="triage:main"),
-            ManagedPeerEdge(a="triage:main", b="domain:calendar"),
-        ]
-
-
-rt = await (
-    MobKit.builder()
-    .mob("config/mob.toml")
-    .persistent_state(".mobkit/state")
-    .roster(Roster())
-    .topology_provider(Topology())
-    .gateway("/path/to/rpc_gateway")
-    .build()
-)
-
-luka = rt.agent("identity:luka")
-triage = rt.agent("triage:main")
-
-await triage.dispatch_text("New calendar event needs triage", origin="connector")
-# Waits for THIS send's own turn on a turn_driven member. On an untracked
-# member (autonomous_host, the default) it waits identity-wide and warns;
-# send_and_wait_outcome(...).attributed says whether the text is this turn's.
-answer = await luka.send_and_wait("What needs my attention before lunch?", timeout=60)
-print(answer)
-```
-
-## Console
-
-The bundled React console is served by the runtime and talks to the same contracts SDKs use:
-
-- `GET /console/experience` for console configuration, roster projection, identity status, and runtime capabilities
-- `POST /console/rpc` for console commands such as send, inspect identity, query timeline, routing, delivery, and gating
-- `GET /console/timeline` and `GET /console/timeline/stream` for replayable console frames and live continuation
-- `GET /console/identity/{identity}/stream` for identity-scoped event streams
-- `/blobs/{id}` and multipart console RPC for image and attachment flows
-
-Host apps can shape the stock console with `config/console.toml`: branding, theme, environment labels, layout presets, sidebar grouping, default pins, rail filters, action labels, and host-provided links. The console stays a projection of runtime truth; host apps own policy and domain-specific decisions.
-
-## Core Capabilities
-
-- **Unified runtime bootstrap.** Build a Meerkat mob and MobKit operational surface in one runtime.
-- **Identity-first convenience.** SDK, gateway, and console affordances for the `meerkat-mob` identity-first binding model.
-- **Operational modules.** Routing, delivery, scheduling, gating, memory, session-store adapters, metadata, and event transport.
-- **Console projection.** Roster, topology, conversations, activity signals, logs, health, approvals, timeline replay, and live SSE updates.
-- **SDKs.** Rust exports plus Python and TypeScript clients with typed identity-first, mob, event, memory, routing, delivery, and gating APIs.
-- **Auth and deployment controls.** JWT/OIDC validation, console route protection, peer keys, release metadata checks, and conventional config discovery.
-
-## Meerkat vs `meerkat-mob` vs `meerkat-mobkit`
-
-| | Meerkat | `meerkat-mob` | `meerkat-mobkit` |
-|---|---|---|---|
-| **Primary job** | Runs agent sessions | Runs the multi-agent runtime | Makes mobs easy to boot, expose, observe, and operate |
-| **Owns** | Agent loop, prompt assembly, tool execution, session runtime, session persistence primitives | MobMachine authority, `AgentIdentity` / `AgentRuntimeId` / `FenceToken` / `Generation`, membership, provisioning, lifecycle, wiring, flows, supervisor bridge, mob events | Gateway and builder ergonomics, provider adapters, JSON-RPC/REST/SSE packaging, SDK transport, operational-module wiring, console/timeline projections |
-| **App-facing handles** | Session ids and agent runtime APIs | `AgentIdentity`, `MobHandle`, member snapshots, mob events | The same mob identities surfaced through SDK handles, console rows, timelines, and convenience methods |
-| **Typical surface** | Rust crates, CLI, REST/RPC/MCP surfaces in the Meerkat repo | Rust mob APIs and event streams | Rust crate, `mobkit_gateway`, JSON-RPC, REST/SSE console routes, Python SDK, TypeScript SDK |
-| **Boundary rule** | If it changes how a single session executes, it belongs here | If it changes what a mob member is, how members bind, or how a mob transitions, it belongs here | If it is bootstrapping, packaging, projection, host integration, or operator ergonomics, it can live here |
-
-## Install
+From this checkout, with Rust 1.94+ and Python 3.10+:
 
 ```bash
-# Python
-pip install meerkat-mobkit
-
-# TypeScript
-npm install @rkat/mobkit-sdk
-
-# Rust
-cargo add meerkat-mobkit
+python3 -m venv .venv
+.venv/bin/python -m pip install -e ./sdk/python
+./scripts/repo-cargo build -p meerkat-meta --bin rpc_gateway --locked
+./scripts/repo-cargo --print-env
 ```
 
-## Repository Layout
+The last command prints `CARGO_TARGET_DIR`. Set `META_GATEWAY` to that
+location's `debug/rpc_gateway` executable, then save this as `first_runtime.py`:
 
-| Path | Description |
-|------|-------------|
-| `crates/meerkat-mobkit/` | Rust crate, gateway binaries, runtime adapters, RPC, HTTP, console contracts |
-| `sdk/python/` | Python SDK (`meerkat-mobkit` on PyPI) |
-| `sdk/typescript/` | TypeScript SDK (`@rkat/mobkit-sdk` on npm) |
-| `console/` | React console source and browser smoke harness |
-| `packages/console-core/` | Console data adapters and headless core logic |
-| `packages/console-components/` | Reusable React console components |
-| `docs/` | Mintlify documentation site |
-| `examples/` | Example packs and runtime demos |
+```python
+import asyncio
+import os
+from meerkat_meta import Meta
+
+async def main():
+    async with await (
+        Meta.builder()
+        .gateway(os.environ["META_GATEWAY"])
+        .build()
+    ) as runtime:
+        status = await runtime.mob_handle().status()
+        print("Running:", status.running)
+        print("Modules:", status.loaded_modules)
+
+asyncio.run(main())
+```
+
+```bash
+.venv/bin/python first_runtime.py
+```
+
+This starts a runtime, reads its status and shuts it down. It makes no model
+request and does not create a team. Next, follow the
+[quickstart](docs/quickstart.mdx) to supply a mob configuration, agent roster,
+provider access and console authentication. The Python and TypeScript SDKs
+control a gateway; they do not bundle its executable. Rust hosts can embed Meta.
+
+## What Meta adds
+
+- **An application composition point.** Configure agents, their relationships,
+  operational modules and persistent state together.
+- **Memory that has a lifecycle.** Keep records with provenance and trust,
+  recall a bounded selection, and optionally distill and consolidate in the
+  background. Untrusted observations can remain quarantined.
+- **Policy and approvals.** Control who can view or steer agents, and enforce
+  application-defined decisions for actions that need approval.
+- **Routing and operations.** Deliver work and results, supervise health, and
+  expose the same application through Rust, JSON-RPC/REST/SSE and SDK clients.
+- **A console.** Inspect conversations, identities, topology, memory, shared
+  work, approvals and the timeline in one browser interface.
+
+<p align="center">
+  <img src="docs/images/meta-console.png" alt="Meta console with conversations, topology and roster" width="900">
+</p>
+
+Core owns the agent loop, sessions, stable agent identity, spawning, mob
+lifecycle and communication. Meta composes those capabilities for the
+application; its console and timeline reflect the underlying runtime.
+For durable populations, use lasting identities and a roster. Temporary
+workers can still appear and retire for individual tasks.
+
+## Choose the other pieces independently
+
+- [Core](https://github.com/lukacf/meerkat) can run individual agents and mobs
+  without Meta. Start there when you want the runtime alone.
+- **Meerkat Connect** provides optional agent-led integration setup.
+  Meta can use your own integrations without it. Its native setup experience is being developed around a standalone terminal
+  and the Meta console, without a user-managed Connect server.
+
+The [Meerkat introduction](https://docs.rkat.ai/introduction) explains how the parts fit.
+**Meta Forge** guides application setup, authoring and deployment packaging.
+It is not required to use Meta.
+
+## Examples and documentation
+
+Use the [example packs](examples/README.md) to explore complete applications:
+incident response, research, specialized consoles and access control. Each pack
+states its prerequisites and whether it makes real model calls.
+
+- [Introduction](docs/introduction.mdx) and [quickstart](docs/quickstart.mdx).
+- [Memory](docs/concepts/memory.mdx), [access control](docs/concepts/access-control.mdx)
+  and [authentication](docs/guides/authentication.mdx).
+- [Unified runtime](docs/guides/unified-runtime.mdx) and
+  [architecture](docs/reference/architecture.mdx).
+- [Published documentation](https://docs.rkat.ai/meta/introduction).
 
 ## Development
 
 ```bash
-make ci                         # Local Make validation aggregate
-make test                       # Rust tests
-make test-python                # Python SDK tests
-npm --prefix sdk/typescript run validate  # TypeScript typecheck, build, and tests
-npm --prefix console run build  # Rebuild embedded console assets
+make test-python
+npm --prefix sdk/typescript run validate
 ```
 
-The local Make aggregate is not the complete hosted-CI pipeline. See
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) for the required console,
-voice, TypeScript, and other hosted gates.
-
-Useful focused checks:
-
-```bash
-npm --prefix console run phase0:types --silent
-npm --prefix console run embedded:freshness --silent
-./scripts/repo-cargo check -p meerkat-mobkit
-```
-
-## Documentation
-
-Full documentation is available in the [MobKit section of docs.rkat.ai](https://docs.rkat.ai/mobkit/introduction).
+Use `./scripts/repo-cargo` for targeted Rust commands and follow
+[CONTRIBUTING.md](CONTRIBUTING.md) for repository checks. Changes to the console
+must also update its embedded bundle through the existing build workflow.
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) and [Apache 2.0](LICENSE-APACHE).
-
-## Repository layout
-
-- `crates/` - the Rust workspace: `meerkat-mobkit` (library, `mobkit_gateway` and `rpc_gateway` binaries) and `mobkit-store-conformance`
-- `console/`, `flow-editor/`, `packages/` - the web console, the flow editor and their shared TypeScript packages; built bundles are embedded from `crates/meerkat-mobkit/console-dist` and `flow-editor-dist`
-- `sdk/` - the Python and TypeScript SDKs
-- `examples/` - example mob packs
-- `docs/` - published documentation (`docs/internal/` holds design reviews and audits)
-- `tests/` - cross-cutting test harnesses such as `tests/memory-evals`
-- `scripts/`, `tools/` - repository tooling, release scripts and the Bazel platform definitions
+MIT or Apache-2.0, at your option. See [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE).

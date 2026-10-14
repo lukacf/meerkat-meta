@@ -11,7 +11,7 @@
 import { EchoInput } from "../shared/echo-text";
 
 export function Inspector({ studio, selection, selectMember, selectInstance, clearSelection, editGraphNode = null, editGraphEdge = null, deleteGraphNode = null, deleteGraphEdge = null, template, templateSeed, templateView, launchView = null, graphView = null, conditionView = null, flow, contract }) {
-  const selectionState = window.MobKitFlowController.graphSelectionState({
+  const selectionState = window.MetaFlowController.graphSelectionState({
     selection,
     instances: studio.instances,
     edges: studio.edges,
@@ -37,7 +37,7 @@ function clearSelectionAfterOperation(result, clearSelection) {
 
 // ── Template (no selection) ──────────────────────────────────────
 function TemplateInspector({ studio, template, templateSeed, templateView }) {
-  const templateState = window.MobKitFlowController.graphTemplateInspectorState({ studio, template, templateSeed, templateView });
+  const templateState = window.MetaFlowController.graphTemplateInspectorState({ studio, template, templateSeed, templateView });
   return (
     <>
       <div className="inspector__head">
@@ -87,14 +87,14 @@ function TemplateInspector({ studio, template, templateSeed, templateView }) {
 function GateInspector({ studio, flow, inst, clearSelection, editGraphNode = null, editGraphEdge = null, deleteGraphNode = null, contract, graphView = null, conditionView = null }) {
   const change = (action, payload = {}) => editGraphNode?.(inst.id, action, payload);
   const kind = inst.gateKind;
-  const gateState = window.MobKitFlowController.graphGateControlState(inst, {
+  const gateState = window.MetaFlowController.graphGateControlState(inst, {
     edges: studio.edges,
     members: studio.members,
     contract,
     graphView,
   });
   const branchRows = kind === "branch"
-    ? window.MobKitFlowController.graphBranchConditionRows({
+    ? window.MetaFlowController.graphBranchConditionRows({
       inst,
       edges: studio.edges,
       instances: studio.instances,
@@ -231,7 +231,7 @@ function GateInspector({ studio, flow, inst, clearSelection, editGraphNode = nul
 
 // ── Instance (graph node) — TEMPLATE-ONLY fields + member summary ──
 function InstanceInspector({ studio, flow, inst, selectMember, clearSelection, editGraphNode = null, editGraphEdge = null, deleteGraphNode = null, contract, launchView = null, graphView = null, conditionView = null }) {
-  const instanceState = window.MobKitFlowController.graphInstanceControlState({
+  const instanceState = window.MetaFlowController.graphInstanceControlState({
     inst,
     instances: studio.instances,
     members: studio.members,
@@ -275,7 +275,7 @@ function InstanceInspector({ studio, flow, inst, selectMember, clearSelection, e
   }
 
   if (inst.isTerminal) {
-    const terminalState = window.MobKitFlowController.graphTerminalControlState(inst, contract, graphView);
+    const terminalState = window.MetaFlowController.graphTerminalControlState(inst, contract, graphView);
     return (
       <>
         <div className="inspector__head">
@@ -311,7 +311,7 @@ function InstanceInspector({ studio, flow, inst, selectMember, clearSelection, e
     );
   }
 
-  const launchState = window.MobKitFlowController.launchModeControlState(inst, contract, launchView);
+  const launchState = window.MetaFlowController.launchModeControlState(inst, contract, launchView);
 
   return (
     <>
@@ -430,7 +430,7 @@ function InstanceInspector({ studio, flow, inst, selectMember, clearSelection, e
 }
 
 function GraphCondValue({ field, value, onChange, conditionView = null }) {
-  const control = window.MobKitFlowController.conditionValueControl(field, value, conditionView);
+  const control = window.MetaFlowController.conditionValueControl(field, value, conditionView);
   if (control.kind === "enum") {
     return (
       <select className="field__select" value={control.value} onChange={e => onChange(e.target.value)}>
@@ -450,7 +450,7 @@ function GraphCondValue({ field, value, onChange, conditionView = null }) {
 
 // ── Edge ─────────────────────────────────────────────────────────
 function EdgeInspector({ studio, flow, edge, clearSelection, editGraphEdge = null, deleteGraphEdge = null, contract, graphView = null, conditionView = null }) {
-  const edgeState = window.MobKitFlowController.graphEdgeInspectorState({
+  const edgeState = window.MetaFlowController.graphEdgeInspectorState({
     edge,
     instances: studio.instances,
     members: studio.members,
@@ -540,14 +540,14 @@ function EdgeInspector({ studio, flow, edge, clearSelection, editGraphEdge = nul
 }
 
 // ── Add-node dialog ────────────────────────────────────────────────
-// In Graph view, you can place existing agents and MobKit flow gates.
+// In Graph view, you can place existing agents and Meta flow gates.
 // To define a new agent, jump to the Agents view.
 export function AddNodeMenu({ at, members, contract, graphView = null, onPick, onClose, onJumpToAgents }) {
   const [q, setQ] = React.useState("");
   React.useEffect(() => { setQ(""); }, [at]);
   if (!at) return null;
 
-  const menuState = window.MobKitFlowController.graphAddNodeMenuState({ members, contract, query: q, graphView });
+  const menuState = window.MetaFlowController.graphAddNodeMenuState({ members, contract, query: q, graphView });
 
   return (
     <div className="add-menu" data-own-scroll="" style={{ left: at.x, top: at.y }} onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()}>

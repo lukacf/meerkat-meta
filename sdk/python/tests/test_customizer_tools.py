@@ -8,8 +8,8 @@ map + ``callback/call_tool`` dispatch that ``build_agent`` uses, so resumed
 agents keep their identity-scoped tools (MCP, comms, etc.).
 """
 import pytest
-from meerkat_mobkit.agent_builder import CallbackDispatcher
-from meerkat_mobkit.identity_first_models import AgentBuildDraft
+from meerkat_meta.agent_builder import CallbackDispatcher
+from meerkat_meta.identity_first_models import AgentBuildDraft
 
 _CONTEXT = {"identity": "agent:alpha", "active_peers": [], "managed_edges": []}
 _SPEC = {"identity": "agent:alpha", "profile": "default"}

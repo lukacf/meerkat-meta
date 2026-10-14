@@ -1,6 +1,6 @@
 /**
  * Provisional assistant captions of one console voice call, read from
- * `mobkit/console/voice/captions`. Meerkat publishes the in-progress text of
+ * `meta/console/voice/captions`. Meerkat publishes the in-progress text of
  * each open assistant segment keyed by the segment's item id, the same id the
  * committed assistant row later lists in `realtime_origin.provider_item_ids`.
  * A caption carries the segment's whole text so far and replaces earlier text;
@@ -9,7 +9,7 @@
  * assistant's playback while the user speaks over it, restore it afterwards.
  */
 
-export const VOICE_CAPTIONS_METHOD = "mobkit/console/voice/captions";
+export const VOICE_CAPTIONS_METHOD = "meta/console/voice/captions";
 
 export type VoicePlaybackHint = "duck" | "restore";
 

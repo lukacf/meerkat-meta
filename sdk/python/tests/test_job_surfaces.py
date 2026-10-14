@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from meerkat_mobkit import MobKit, MobKitRuntime
+from meerkat_meta import Meta, MetaRuntime
 
 
 @pytest.mark.asyncio
 async def test_jobs_and_monitors_use_canonical_domain_methods() -> None:
-    runtime = MobKitRuntime(MobKit.builder()._config)
+    runtime = MetaRuntime(Meta.builder()._config)
     calls: list[tuple[str, dict]] = []
 
     async def rpc(method: str, params: dict | None = None):

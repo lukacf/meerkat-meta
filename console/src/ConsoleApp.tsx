@@ -18,7 +18,7 @@ import {
   ConsoleTransportStatus,
   useConsoleDockController,
 } from "@console-components";
-import type { MarkdownUrlPolicy, WorkGraphCardActions } from "@console-components";
+import type { ConversationBlobReader, MarkdownUrlPolicy, WorkGraphCardActions } from "@console-components";
 import type {
   ConsoleDockState,
   ConsoleTransportState,
@@ -58,14 +58,16 @@ import {
   createUserEntry,
   createWorkGraphHydrationGate,
   appendOptimisticConversationEntry,
+  buildOperatorPanelTarget,
   deriveTimelineEntries,
   framesContainWorkGraphCards,
   inferResponsePhaseFromFrames,
   mapFramesToTimelineEntries,
+  operatorPanelPath,
   optimisticUserMessageForPanel,
   resolvePanelResponsePhase,
   systemNoticeClearsBusyState,
-  type MobKitDockTarget,
+  type MetaDockTarget,
   type OptimisticUserMessage,
   type TimelineDerivation,
 } from "./lib/adapters";
@@ -80,8 +82,8 @@ import {
   ConsoleCapabilityUnavailableError,
   consoleCommandMethod,
   createHttpConsoleTransport,
-  createMobKitConsoleController,
-  type MobKitConsoleTransport,
+  createMetaConsoleController,
+  type MetaConsoleTransport,
 } from "./lib/headless";
 import {
   WORKGRAPH_CONFLICT_CODE,
@@ -156,6 +158,7 @@ import {
   trimIdentityLogCore,
 } from "./lib/identity-log";
 import { TimelinePanel } from "./panels/TimelinePanel";
+import { OperatorPanel } from "./panels/OperatorPanel";
 import { GatingInboxPanel } from "./panels/GatingInboxPanel";
 import { AccessPanel, type AccessPreviewResult } from "./panels/AccessPanel";
 import {
@@ -190,14 +193,14 @@ import {
 } from "./panels/Sidebar";
 import { SignalsRail } from "./panels/SignalsRail";
 import { ChatPane, type StagedAttachment } from "./panels/ChatPane";
-import { MobKitDock } from "./panels/MobKitDock";
+import { MetaDock } from "./panels/MetaDock";
 import { PendingStack, type PendingCheckView, type PendingDeliveredNotice, type PendingItem } from "./panels/PendingStack";
 import { beginConsoleSendAttempt, classifyConsoleSendFailure, consoleCheckDelivered, consoleCheckNotFound, createConsoleSendAttempt, describeConsoleCheckFailure, finishConsoleSendAttempt, reconcileConsoleSendReceipt, recoverConsoleSendAttempt, type ConsoleFrozenSendEnvelope, type ConsoleSendAttempt, type ConsoleSendFailure } from "../../packages/console-core/src/send-attempt";
 import { createConsoleContextRecord, validateConsoleContexts, type ConsoleContextRecord } from "../../packages/console-core/src/context-record";
 import { QuoteContextChips } from "../../packages/console-components/src/conversation/context-chips";
 import { editConsoleContextQuote } from "../../packages/console-core/src/context-edit";
 import type { ConsoleQuoteSelection } from "../../packages/console-components/src/conversation/context-selection";
-import { consoleSendStorageKey, loadConsoleSendAttempts, saveConsoleSendAttempts, readLegacyConsoleQueue, consoleLegacyQueueImported, consoleComposerTabId, loadConsoleComposerDraft, saveConsoleComposerDraft } from "./lib/send-attempt-storage";
+import { consoleSendStorageKey, loadConsoleSendAttempts, saveConsoleSendAttempts, readLegacyConsoleQueue, readPredecessorConsoleQueue, consoleLegacyQueueImported, consoleComposerTabId, loadConsoleComposerDraft, saveConsoleComposerDraft } from "./lib/send-attempt-storage";
 
 import { VoiceBar } from "./panels/VoiceBar";
 import { useVoiceController } from "./lib/use-voice-controller";
@@ -220,7 +223,7 @@ export interface ConsoleAppProps {
   markdownUrlPolicy?: MarkdownUrlPolicy;
   /// Test seam: supply a transport instead of the HTTP one built from
   /// `baseUrl`. Production entry points never set it.
-  transport?: MobKitConsoleTransport;
+  transport?: MetaConsoleTransport;
 }
 
 type RoutingPanelData = ReturnType<typeof buildRoutingSectionView>;
@@ -265,7 +268,7 @@ type MemoryPanelData = {
   dreamRunsDenied: boolean;
   auditVerdicts: MemoryAuditVerdictEntry[];
   auditVerdictsDenied: boolean;
-  /// The caller is advertised mobkit/memory/quarantine/decide (reviewer
+  /// The caller is advertised meta/memory/quarantine/decide (reviewer
   /// grant, mutable console). Per-identity grants are still enforced per
   /// call.
   canDecideQuarantine: boolean;
@@ -400,7 +403,7 @@ function isWorkGraphSignalFrame(frame: ConsoleFrame): boolean {
       : "";
   return name.startsWith("workgraph_");
 }
-const DOCK_LAYOUT_STORAGE_PREFIX = "mobkit-console-dock-state";
+const DOCK_LAYOUT_STORAGE_PREFIX = "meta-console-dock-state";
 
 function createIdempotencyKey(): string {
   return createConsoleId("console");
@@ -741,7 +744,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         current(generation);
         return value;
       };
-      const scoped: MobKitConsoleTransport = {
+      const scoped: MetaConsoleTransport = {
         loadExperience: () => call(() => source.loadExperience()),
         loadModules: source.loadModules ? () => call(() => source.loadModules!()) : undefined,
         capabilities: () => call(() => source.capabilities()),
@@ -749,6 +752,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         send: input => call(() => source.send(input)),
         executeCommand: source.executeCommand ? input => call(() => source.executeCommand!(input)) : undefined,
         upload: source.upload ? input => call(() => source.upload!(input)) : undefined,
+        readBlob: source.readBlob ? input => call(() => source.readBlob!(input)) : undefined,
         blobUrl: source.blobUrl ? id => { current(); return source.blobUrl!(id); } : undefined,
         subscribeTimeline(input, onFrame, options) {
           const generation = lifetimeRef.current.generation;
@@ -764,7 +768,13 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     [baseUrl, transport],
   );
   const consoleController = React.useMemo(
-    () => createMobKitConsoleController({ transport: consoleTransport }),
+    () => createMetaConsoleController({ transport: consoleTransport }),
+    [consoleTransport],
+  );
+  // Stored images are read with the transport's own authority and lifetime:
+  // the scoped transport refuses a read once this Console instance retires.
+  const blobReader = React.useMemo<ConversationBlobReader | undefined>(
+    () => consoleTransport.readBlob ? input => consoleTransport.readBlob!(input) : undefined,
     [consoleTransport],
   );
   const { voice, state: voiceState } = useVoiceController(baseUrl);
@@ -899,7 +909,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const [theme, setTheme] = React.useState<ConsoleTheme>(() => {
     try {
       return (
-        (localStorage.getItem("mobkit-console-theme") as ConsoleTheme) ||
+        (localStorage.getItem("meta-console-theme") as ConsoleTheme) ||
         "light"
       );
     } catch {
@@ -926,7 +936,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState<boolean>(
     () => {
       try {
-        return localStorage.getItem("mobkit-console-sidebar-collapsed") === "1";
+        return localStorage.getItem("meta-console-sidebar-collapsed") === "1";
       } catch {
         return false;
       }
@@ -937,7 +947,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       const next = !c;
       try {
         localStorage.setItem(
-          "mobkit-console-sidebar-collapsed",
+          "meta-console-sidebar-collapsed",
           next ? "1" : "0",
         );
       } catch {
@@ -949,7 +959,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
 
   const [railCollapsed, setRailCollapsed] = React.useState<boolean>(() => {
     try {
-      return localStorage.getItem("mobkit-console-rail-collapsed") === "1";
+      return localStorage.getItem("meta-console-rail-collapsed") === "1";
     } catch {
       return false;
     }
@@ -958,7 +968,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     setRailCollapsed((c) => {
       const next = !c;
       try {
-        localStorage.setItem("mobkit-console-rail-collapsed", next ? "1" : "0");
+        localStorage.setItem("meta-console-rail-collapsed", next ? "1" : "0");
       } catch {
         /* ignore */
       }
@@ -1133,7 +1143,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   function requireWorkbenchTarget(input: unknown): ConsoleWorkbenchTarget {
     const target = migrateConsoleWorkbenchTarget(input);
     if (!target) {
-      throw new Error("invalid MobKit console target");
+      throw new Error("invalid Meta console target");
     }
     return target;
   }
@@ -2054,7 +2064,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   // DOCK CONTROLLER
   // =========================================================================
 
-  const dock = useConsoleDockController<MobKitDockTarget>({
+  const dock = useConsoleDockController<MetaDockTarget>({
     createPanelState: ({ target }) => ({
       id: createConsoleId("panel"),
       target: target || null,
@@ -2076,7 +2086,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     try {
       const raw = localStorage.getItem(currentDockLayoutStorageKey);
       if (!raw) return;
-      const parsed = JSON.parse(raw) as ConsoleDockState<MobKitDockTarget>;
+      const parsed = JSON.parse(raw) as ConsoleDockState<MetaDockTarget>;
       const restored = normalizeConsoleDockState(parsed);
       if (restored.tabs.length === 0 || restored.panels.length === 0) return;
       // Saved labels and targets are preferences, not current authority. A
@@ -2253,7 +2263,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     }
     let changed = false;
     for (const panel of dockRef.current.viewState.panels) {
-      const target = panel.target as MobKitDockTarget | null;
+      const target = panel.target as MetaDockTarget | null;
       if (!target || target.kind !== "agent-chat") continue;
       if ((target.identity || target.memberId) !== identity) continue;
       if (updatePanelPhaseFromFrame(
@@ -2269,7 +2279,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   function clearPhaseForIdentity(identity: string): boolean {
     let changed = false;
     for (const panel of dockRef.current.viewState.panels) {
-      const target = panel.target as MobKitDockTarget | null;
+      const target = panel.target as MetaDockTarget | null;
       if (!target || target.kind !== "agent-chat") continue;
       if ((target.identity || target.memberId) !== identity) continue;
       if (commitPanelPhase(buildPanelConversationKey(panel.id, target), null)) {
@@ -2285,7 +2295,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   ): boolean {
     let changed = false;
     for (const panel of dockRef.current.viewState.panels) {
-      const target = panel.target as MobKitDockTarget | null;
+      const target = panel.target as MetaDockTarget | null;
       if (!target || target.kind !== "agent-chat") continue;
       if ((target.identity || target.memberId) !== identity) continue;
       if (commitPanelPhase(buildPanelConversationKey(panel.id, target), phase)) {
@@ -2302,7 +2312,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     const phase = inferResponsePhaseFromFrames(frames, null);
     let changed = false;
     for (const panel of dockRef.current.viewState.panels) {
-      const target = panel.target as MobKitDockTarget | null;
+      const target = panel.target as MetaDockTarget | null;
       if (!target || target.kind !== "agent-chat") continue;
       if ((target.identity || target.memberId) !== identity) continue;
       if (commitPanelPhase(buildPanelConversationKey(panel.id, target), phase)) {
@@ -2390,7 +2400,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     const configuredTheme = normalizeConsoleTheme(appearance.default_theme);
     if (configuredTheme) {
       try {
-        if (!localStorage.getItem("mobkit-console-theme"))
+        if (!localStorage.getItem("meta-console-theme"))
           setTheme(configuredTheme);
       } catch {
         setTheme(configuredTheme);
@@ -2401,7 +2411,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     );
     if (configuredVariant) {
       try {
-        if (!localStorage.getItem("mobkit-console-variant"))
+        if (!localStorage.getItem("meta-console-variant"))
           setVariant(configuredVariant);
       } catch {
         setVariant(configuredVariant);
@@ -2413,7 +2423,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     const configured = experience?.console_config?.layout?.sidebar_collapsed;
     if (typeof configured !== "boolean") return;
     try {
-      if (localStorage.getItem("mobkit-console-sidebar-collapsed") !== null)
+      if (localStorage.getItem("meta-console-sidebar-collapsed") !== null)
         return;
     } catch {
       /* ignore */
@@ -2425,7 +2435,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     const configured = experience?.console_config?.rail?.collapsed;
     if (typeof configured !== "boolean") return;
     try {
-      if (localStorage.getItem("mobkit-console-rail-collapsed") !== null)
+      if (localStorage.getItem("meta-console-rail-collapsed") !== null)
         return;
     } catch {
       /* ignore */
@@ -2494,7 +2504,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     setSelectedApprovalId(pendingId);
     dock.openTarget(buildControlTarget("gating"), "replace_focused");
   }
-  const hasVoiceHost = experience?.voice?.readiness_method === "mobkit/console/voice/readiness";
+  const hasVoiceHost = experience?.voice?.readiness_method === "meta/console/voice/readiness";
   const voiceReadiness = useVoiceReadiness(
     baseUrl,
     dock.focusedTarget?.kind === "agent-chat"
@@ -2605,7 +2615,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       return;
     }
     const layoutConfig = experience.console_config?.layout;
-    let target: MobKitDockTarget | null = null;
+    let target: MetaDockTarget | null = null;
     const configuredControl = normalizeNavKind(layoutConfig?.initial_control);
     if (configuredControl && visibleControls.includes(configuredControl)) {
       target = buildControlTarget(
@@ -2669,7 +2679,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     return dock.viewState.panels
       .filter((panel) => visible.has(panel.id))
       .map((panel) => panel.target)
-      .filter(Boolean) as MobKitDockTarget[];
+      .filter(Boolean) as MetaDockTarget[];
   }, [dock.viewState.panels, dock.viewState.tabs, dock.viewState.activeTabId]);
   const accessScope = JSON.stringify([baseUrl, storageNamespace, experience?.runtime_id, experience?.access?.subject]);
   const accessScopeRef = React.useRef(accessScope);
@@ -2952,7 +2962,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       // advertisement (the headless layer throws before dispatch).
       const code = jsonRpcErrorCode(err);
       const capabilityMissing =
-        err instanceof Error && err.message.startsWith("MobKit capability missing");
+        err instanceof Error && err.message.startsWith("Meta capability missing");
       if (code === -32601 || code === -32041 || capabilityMissing) {
         setWorkGraphData((current) => ({ ...current, unavailable: true, error: null }));
         return;
@@ -3047,7 +3057,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     [baseUrl],
   );
 
-  /// One quarantine decision (mobkit/memory/quarantine/decide), bound to the
+  /// One quarantine decision (meta/memory/quarantine/decide), bound to the
   /// content hash of the record the reviewer is looking at. Rejects with the
   /// transport's typed error; the panel renders refusals. The queue is
   /// re-read after every decision.
@@ -3149,7 +3159,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const refreshPanelData = React.useCallback(async () => {
     const openPanels = visiblePanelTargets;
     const inspects = openPanels.filter(
-      (t): t is Extract<MobKitDockTarget, { kind: "identity-inspect" }> =>
+      (t): t is Extract<MetaDockTarget, { kind: "identity-inspect" }> =>
         t.kind === "identity-inspect",
     );
     // Each kind refreshes independently, so one slow surface (topology on a
@@ -3284,7 +3294,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
 
   React.useEffect(() => {
     for (const panel of dock.viewState.panels) {
-      const target = panel.target as MobKitDockTarget | null;
+      const target = panel.target as MetaDockTarget | null;
       if (!target || target.kind !== "agent-chat") continue;
       const identity = target.identity || target.memberId;
       const log = getOrCreateLog(identity);
@@ -3387,7 +3397,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   // subscription when it repairs after a replay gap.
   const dockedChatIdentitiesRef = React.useRef<string[]>([]);
   dockedChatIdentitiesRef.current = dock.viewState.panels.flatMap((panel) => {
-    const target = panel.target as MobKitDockTarget | null;
+    const target = panel.target as MetaDockTarget | null;
     return target && target.kind === "agent-chat" ? [target.identity || target.memberId] : [];
   });
   const memoryRefreshTimerRef = React.useRef<number | null>(null);
@@ -3555,7 +3565,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   }
 
   function openDockTarget(
-    target: MobKitDockTarget,
+    target: MetaDockTarget,
     intent:
       | "replace_focused"
       | "new_tab"
@@ -3591,7 +3601,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   /// stack on the very next Send.
   async function submitMessageNow(
     panelId: string,
-    target: MobKitDockTarget,
+    target: MetaDockTarget,
     text: string,
     handlingMode: "queue" | "steer",
     attachments: File[] = [],
@@ -3754,7 +3764,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
 
   async function onSendMessage(
     panelId: string,
-    target: MobKitDockTarget | null,
+    target: MetaDockTarget | null,
     attachments: File[] = [],
     composerText?: string,
   ): Promise<boolean> {
@@ -3850,12 +3860,12 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
 
   function findChatTargetFor(
     identity: string,
-  ): { panelId: string; target: MobKitDockTarget } | null {
+  ): { panelId: string; target: MetaDockTarget } | null {
     // This is also called from the long-lived SSE subscription closure via
     // maybeDrainHead(); read the dock ref so pending queue auto-drain sees
     // panels opened after the first render.
     for (const panel of dockRef.current.viewState.panels) {
-      const t = panel.target as MobKitDockTarget | null;
+      const t = panel.target as MetaDockTarget | null;
       if (!t || t.kind !== "agent-chat") continue;
       if ((t.identity || t.memberId) === identity) {
         return { panelId: panel.id, target: t };
@@ -3869,7 +3879,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     const scope = sendScopeRef.current;
     const namespace = persistentSendScopeRef.current;
     const dispatchController = sendControllerRef.current;
-    const freeze = (): { attempting: PendingItem; target: { panelId: string; target: MobKitDockTarget } } | null => {
+    const freeze = (): { attempting: PendingItem; target: { panelId: string; target: MetaDockTarget } } | null => {
       if (!lifetimeRef.current.active || generation !== lifetimeRef.current.generation || scope !== sendScopeRef.current || dispatchController !== sendControllerRef.current || consoleReadOnlyRef.current) return null;
       if (namespace) pendingStackRef.current[identity] = loadPendingStack(identity);
       const item = getPendingStack(identity).find((candidate) => candidate.id === id);
@@ -4065,12 +4075,14 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     try {
       if (consoleLegacyQueueImported(storage, namespace, identity)) return;
       const legacy = readLegacyConsoleQueue(storage, identity);
-      const imported = legacy.map((item) => createConsoleSendAttempt({
+      const predecessor = readPredecessorConsoleQueue(storage, namespace, identity);
+      if (predecessor.kind === "blocked") throw new Error(predecessor.reason);
+      const imported = [...legacy.map((item) => createConsoleSendAttempt({
         id: `legacy:${item.id}`, scope: namespace, destination: identity, origin: "console:legacy-import",
         idempotencyKey: createIdempotencyKey(), text: item.text, now: item.addedAt,
-      }));
+      })), ...predecessor.attempts];
       await setPendingStack(identity, (previous) => [...previous, ...imported.filter((item) => !previous.some((old) => old.id === item.id))], true);
-      // Original legacy bytes are preserved, including after a successful import.
+      // Original legacy and predecessor bytes are preserved, including after a successful import.
     } catch (error) { setActionError(errorMessage(error)); }
   }
 
@@ -4080,13 +4092,13 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
 
   async function onLifecycleAction(
     identity: string,
-    method: "mobkit/retire" | "mobkit/respawn" | "mobkit/reset",
+    method: "meta/retire" | "meta/respawn" | "meta/reset",
   ) {
     if (consoleReadOnly) return;
     const command =
-      method === "mobkit/retire"
+      method === "meta/retire"
         ? CONSOLE_COMMAND_NAMES.retireIdentity
-        : method === "mobkit/respawn"
+        : method === "meta/respawn"
           ? CONSOLE_COMMAND_NAMES.respawnIdentity
           : CONSOLE_COMMAND_NAMES.resetIdentity;
     try {
@@ -4102,7 +4114,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       return;
     }
     const nextAgents = await loadExperience();
-    if (method !== "mobkit/retire") return;
+    if (method !== "meta/retire") return;
     if (
       nextAgents.some(
         (agent) => agent.identity === identity || agent.member_id === identity,
@@ -4198,7 +4210,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         "host_action",
       );
       if (!rebased) {
-        setActionError("MobKit no longer permits this topology change.");
+        setActionError("Meta no longer permits this topology change.");
         return;
       }
       await onTopologyMutation({
@@ -4609,6 +4621,12 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const openSidebarControl = React.useCallback((kind: NavKind) => {
     dockRef.current.openTarget(buildControlTarget(kind), "replace_focused");
   }, []);
+  const sidebarButtons = experience?.console_config?.sidebar?.buttons;
+  const openOperatorPanel = React.useCallback((buttonId: string) => {
+    const button = (sidebarButtons || []).find((candidate) => candidate.id === buttonId);
+    if (!button || !operatorPanelPath(button.panel)) return;
+    dockRef.current.openTarget(buildOperatorPanelTarget(button), "replace_focused");
+  }, [sidebarButtons]);
   const loadMemoryRecordDetailRef = React.useRef(loadMemoryRecordDetail);
   loadMemoryRecordDetailRef.current = loadMemoryRecordDetail;
   // "State here" pivot: a live memory signal opens the Memory panel, and
@@ -4695,7 +4713,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
 
   function renderChatPanel(panel: {
     id: string;
-    target?: MobKitDockTarget | null;
+    target?: MetaDockTarget | null;
   }) {
     const target = panel.target;
     if (!target || target.kind !== "agent-chat") return null;
@@ -4770,7 +4788,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     try {
       const storage = browserLocalStorage();
       const namespace = persistentSendScopeRef.current;
-      hasLegacyQueue = Boolean(storage && namespace && !consoleLegacyQueueImported(storage, namespace, identity) && storage.getItem(`mobkit-pending-stack:${identity}`));
+      hasLegacyQueue = Boolean(storage && namespace && !consoleLegacyQueueImported(storage, namespace, identity)
+        && (Boolean(storage.getItem(`mobkit-pending-stack:${identity}`)) || readPredecessorConsoleQueue(storage, namespace, identity).attempts.length > 0));
     } catch { /* Queue reader reports preserved invalid bytes separately. */ }
     const agentBusy = isIdentityBusy(identity);
     const stackSlot = <>
@@ -4844,6 +4863,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       <ChatPane
         agent={agent}
         markdownUrlPolicy={markdownUrlPolicy}
+        blobReader={blobReader}
         headerVariant="compact"
         displayLabels={chatDisplayLabels}
         approvalSnapshot={activeApprovals}
@@ -4898,12 +4918,12 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         }
         onRespawn={
           canRespawn
-            ? () => void onLifecycleAction(identity, "mobkit/respawn")
+            ? () => void onLifecycleAction(identity, "meta/respawn")
             : undefined
         }
         onRetire={
           canRetire
-            ? () => void onLifecycleAction(identity, "mobkit/retire")
+            ? () => void onLifecycleAction(identity, "meta/retire")
             : undefined
         }
         onStopRun={
@@ -4960,7 +4980,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   // =========================================================================
 
   function renderInspectPanel(
-    target: Extract<MobKitDockTarget, { kind: "identity-inspect" }>,
+    target: Extract<MetaDockTarget, { kind: "identity-inspect" }>,
   ) {
     const inspect = inspectByIdentity[target.identity];
     const agent = agents.find(
@@ -4993,7 +5013,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
                 data-testid={`inspect-action:${target.identity}:respawn`}
                 type="button"
                 onClick={() =>
-                  void onLifecycleAction(target.identity, "mobkit/respawn")
+                  void onLifecycleAction(target.identity, "meta/respawn")
                 }
               >
                 {configuredActionLabels.respawn}
@@ -5004,7 +5024,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
                 data-testid={`inspect-action:${target.identity}:reset`}
                 type="button"
                 onClick={() =>
-                  void onLifecycleAction(target.identity, "mobkit/reset")
+                  void onLifecycleAction(target.identity, "meta/reset")
                 }
               >
                 {configuredActionLabels.reset}
@@ -5015,7 +5035,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
                 data-testid={`inspect-action:${target.identity}:retire`}
                 type="button"
                 onClick={() =>
-                  void onLifecycleAction(target.identity, "mobkit/retire")
+                  void onLifecycleAction(target.identity, "meta/retire")
                 }
               >
                 {configuredActionLabels.retire}
@@ -5038,7 +5058,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
                   <p>
                     The durable session is intact but refused until it is
                     repaired. Run the diagnose command, then the repair
-                    command, then reload the member (mobkit/reload_member).
+                    command, then reload the member (meta/reload_member).
                   </p>
                   <code data-testid="inspect-session-repair-diagnose">
                     {inspect.session_repair.diagnose_command}
@@ -5127,7 +5147,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     const next: ConsoleTheme = theme === "dark" ? "light" : "dark";
     setTheme(next);
     try {
-      localStorage.setItem("mobkit-console-theme", next);
+      localStorage.setItem("meta-console-theme", next);
     } catch {
       /* ignore */
     }
@@ -5135,12 +5155,15 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
 
   function renderPanelBody(panel: {
     id: string;
-    target?: MobKitDockTarget | null;
+    target?: MetaDockTarget | null;
   }) {
-    const target = panel.target as MobKitDockTarget | null;
+    const target = panel.target as MetaDockTarget | null;
     if (!target) return <div className="console-panel">No panel target</div>;
     if (target.kind === "custom/panel") return <ConsoleCustomPanel target={target} focused={dock.viewState.focusedPanelId === panel.id} />;
     if (target.kind === "agent-chat") return renderChatPanel(panel);
+    if (target.kind === "operator-panel") {
+      return <OperatorPanel buttonId={target.buttonId} buttons={experience?.console_config?.sidebar?.buttons} />;
+    }
     if (target.kind === "identity-inspect") {
       return renderInspectPanel(target);
     }
@@ -5344,17 +5367,17 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     <ConsoleMcpAppsProvider value={effectiveMcpAppsHost ? { host: effectiveMcpAppsHost, authority: sendScope, readOnly: consoleReadOnly } : null}>
     <ConsolePanelsProvider value={panelProvider}>
     <div
-      className="cc-theme-scope mobkit-shell"
+      className="cc-theme-scope meta-shell"
       data-cc-theme={theme}
       data-cc-variant={variant}
       data-testid="meerkat-console"
     >
       <SpriteSheet />
-      {panelState.errors.length > 0 ? <div className="mobkit-action-error" role="alert">
+      {panelState.errors.length > 0 ? <div className="meta-action-error" role="alert">
         Custom panels could not load: {panelState.errors.join("; ")}
       </div> : null}
       {actionError && (
-        <div className="mobkit-action-error" data-testid="console-action-error" role="alert">
+        <div className="meta-action-error" data-testid="console-action-error" role="alert">
           <span>{actionError}</span>
           <button
             aria-label="Dismiss error"
@@ -5403,6 +5426,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           onSelect={selectSidebarAgent}
           onTogglePinnedAgent={togglePinnedAgent}
           onOpenControl={openSidebarControl}
+          onOpenOperatorPanel={openOperatorPanel}
           approvals={activeApprovals}
           onOpenApproval={openApproval}
         />
@@ -5413,7 +5437,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           onPointerDown={handleSidebarResize}
         />
         <div className="main">
-          <MobKitDock
+          <MetaDock
             viewState={dock.viewState}
             agents={agents}
             renderPanelBody={renderPanelBody}

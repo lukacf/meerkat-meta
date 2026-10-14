@@ -8,7 +8,7 @@
  * got someone else's output.
  *
  * `sendAndWait` / `dispatchAndWait` now send with `trackTurn` and wait on the
- * returned ticket through `mobkit/turn_result`, which reports THAT turn and
+ * returned ticket through `meta/turn_result`, which reports THAT turn and
  * its own output.
  */
 
@@ -16,7 +16,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  MobKitError,
+  MetaError,
   TurnFailedError,
   TurnNotDeliveredError,
   TurnUnknownError,
@@ -65,7 +65,7 @@ function inspection(preview: string | null, turns: number) {
 }
 
 /**
- * Model the gateway's server-side `mobkit/wait_for_completion`: walk the
+ * Model the gateway's server-side `meta/wait_for_completion`: walk the
  * scripted cursor states until one satisfies the wait; a script that ends
  * unsatisfied is the typed `timed_out`.
  */
@@ -92,7 +92,7 @@ function serveCompletionWait(
 
 /**
  * Runtime whose `_rpc` answers from a script: `sends` is consumed one per
- * send/dispatch, `turns` maps a ticket to the states `mobkit/turn_result`
+ * send/dispatch, `turns` maps a ticket to the states `meta/turn_result`
  * walks through (one per poll, holding the last), and `inspections` models the
  * identity-wide cursor moving for someone else's turn.
  */
@@ -103,9 +103,9 @@ async function makeRuntime(script: {
   /** Answer a pending `wait_for_turn` as ended by shutdown. */
   shuttingDown?: boolean;
 }) {
-  const { MobKitRuntime } = await import("../src/runtime.js");
+  const { MetaRuntime } = await import("../src/runtime.js");
   const calls: { method: string; params: Record<string, unknown> }[] = [];
-  const rt = new MobKitRuntime({
+  const rt = new MetaRuntime({
     mobConfigPath: null,
     sessionBuilder: null,
     sessionStore: null,
@@ -144,10 +144,10 @@ async function makeRuntime(script: {
     await Promise.resolve();
     const p = params ?? {};
     calls.push({ method, params: p });
-    if (method === "mobkit/send" || method === "mobkit/dispatch") {
+    if (method === "meta/send" || method === "meta/dispatch") {
       return sends.shift() ?? {};
     }
-    if (method === "mobkit/turn_result") {
+    if (method === "meta/turn_result") {
       const ticket = String(p.ticket);
       const states = turns[ticket] ?? [{ state: "unknown" }];
       const n = polls.get(ticket) ?? 0;
@@ -158,7 +158,7 @@ async function makeRuntime(script: {
         ...states[Math.min(n, states.length - 1)],
       };
     }
-    if (method === "mobkit/wait_for_turn") {
+    if (method === "meta/wait_for_turn") {
       // The gateway's server-side wait: answer once the ticket leaves
       // pending, or at the deadline (the script ends still pending).
       const ticket = String(p.ticket);
@@ -176,7 +176,7 @@ async function makeRuntime(script: {
       }
       return { ...settled, wait: "settled" };
     }
-    if (method === "mobkit/wait_for_completion") {
+    if (method === "meta/wait_for_completion") {
       cursorReads += 1;
       return serveCompletionWait(
         () => inspections[Math.min(inspectIndex++, inspections.length - 1)],
@@ -185,7 +185,7 @@ async function makeRuntime(script: {
         p,
       );
     }
-    if (method === "mobkit/completion_cursor") {
+    if (method === "meta/completion_cursor") {
       cursorReads += 1;
       const entry = inspections[Math.min(inspectIndex, inspections.length - 1)];
       inspectIndex += 1;
@@ -195,7 +195,7 @@ async function makeRuntime(script: {
         completion_cursor: entry?.completion_cursor ?? null,
       };
     }
-    if (method === "mobkit/inspect_identity") {
+    if (method === "meta/inspect_identity") {
       const entry =
         cursorReads > 0
           ? inspections[Math.min(inspectIndex - 1, inspections.length - 1)]
@@ -247,20 +247,20 @@ describe("sendAndWait waits for its own turn", () => {
 
     assert.equal(output, "A's reply");
     assert.deepEqual(warnings, []);
-    assert.equal(paramsOf("mobkit/send")[0]?.track_turn, true);
+    assert.equal(paramsOf("meta/send")[0]?.track_turn, true);
     assert.deepEqual(
-      paramsOf("mobkit/inspect_identity"),
+      paramsOf("meta/inspect_identity"),
       [],
       "a ticketed wait must not read the member",
     );
     assert.deepEqual(
-      paramsOf("mobkit/completion_cursor"),
+      paramsOf("meta/completion_cursor"),
       [],
       "a ticketed wait must not read the identity-wide cursor",
     );
-    assert.deepEqual(paramsOf("mobkit/turn_result"), [], "no client polling");
-    assert.equal(paramsOf("mobkit/wait_for_turn").length, 1);
-    assert.deepEqual(paramsOf("mobkit/wait_for_completion"), []);
+    assert.deepEqual(paramsOf("meta/turn_result"), [], "no client polling");
+    assert.equal(paramsOf("meta/wait_for_turn").length, 1);
+    assert.deepEqual(paramsOf("meta/wait_for_completion"), []);
   });
 
   it("gives concurrent sends each their own output", async () => {
@@ -307,7 +307,7 @@ describe("sendAndWait waits for its own turn", () => {
     );
 
     assert.equal(output, "dispatched reply");
-    assert.equal(paramsOf("mobkit/dispatch")[0]?.track_turn, true);
+    assert.equal(paramsOf("meta/dispatch")[0]?.track_turn, true);
   });
 });
 
@@ -427,7 +427,7 @@ describe("explicit fallback", () => {
       warnings[0] ?? "",
       /^TurnTrackingUnavailableWarning: .*predates turn tickets/,
     );
-    assert.deepEqual(paramsOf("mobkit/turn_result"), []);
+    assert.deepEqual(paramsOf("meta/turn_result"), []);
   });
 
   it("names why a turn could not be tracked", async () => {
@@ -468,12 +468,12 @@ describe("explicit fallback", () => {
 
     await assert.rejects(rt.sendAndWait("keeper", "alpha", FAST), (error) => {
       assert.ok(error instanceof TurnNotDeliveredError);
-      assert.ok(error instanceof MobKitError);
+      assert.ok(error instanceof MetaError);
       assert.equal(error.code, "not_delivered");
       assert.equal(error.reason, "no session bridge");
       return true;
     });
-    assert.deepEqual(paramsOf("mobkit/inspect_identity"), []);
+    assert.deepEqual(paramsOf("meta/inspect_identity"), []);
   });
 
   it("a plain send does not request tracking", async () => {
@@ -481,7 +481,7 @@ describe("explicit fallback", () => {
 
     const result = await rt.send("keeper", "alpha");
 
-    assert.equal(paramsOf("mobkit/send")[0]?.track_turn, undefined);
+    assert.equal(paramsOf("meta/send")[0]?.track_turn, undefined);
     assert.equal(result.turnTicket, null);
   });
 });

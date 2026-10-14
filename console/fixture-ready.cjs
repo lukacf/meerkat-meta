@@ -4,14 +4,14 @@
 // on loopback, and announce the address the OS actually bound as one stdout
 // line:
 //
-//   MOBKIT_FIXTURE_READY {"addr":"127.0.0.1:41234"}
+//   META_FIXTURE_READY {"addr":"127.0.0.1:41234"}
 //
 // A harness that instead reserved a free port, closed it and handed the
 // number to the child raced every other process on the host for that port
 // between the close and the child's bind (CI saw AddrInUse, OS error 98).
 // Binding port 0 in the process that serves leaves nothing to race.
 
-const READY_PREFIX = "MOBKIT_FIXTURE_READY ";
+const READY_PREFIX = "META_FIXTURE_READY ";
 
 /** The address a fixture should bind: any free loopback port. */
 const LOOPBACK_ANY_PORT = "127.0.0.1:0";

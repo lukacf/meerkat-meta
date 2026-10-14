@@ -45,6 +45,9 @@ export function OperationFeedbackView({ feedback, createdAt }: {
       {feedback.toolCallId ? (
         <span className="cc-operation-feedback__reference">Call {feedback.toolCallId}</span>
       ) : null}
+      {feedback.approvalId ? (
+        <span className="cc-operation-feedback__reference">Approval reference {feedback.approvalId}</span>
+      ) : null}
     </article>
   );
 }

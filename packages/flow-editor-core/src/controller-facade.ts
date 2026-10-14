@@ -1,5 +1,5 @@
 // @ts-nocheck — migration window only (removed by the S23 strictness
-// ratchet): createMobKitFlowController's `{ includeTestExports } = {}`
+// ratchet): createMetaFlowController's `{ includeTestExports } = {}`
 // options default raises TS2339 under .ts semantics, the same class of
 // error suppressed at file level across the moved modules. Resolution/
 // linkage stays guarded behaviorally: the export-keys parity test
@@ -7,28 +7,28 @@
 // missed import or re-export still fails the gate.
 //
 // Controller facade for the Flow Editor: assembles the exact
-// window.MobKitFlowController key set the JSX views consume stringly at
+// window.MetaFlowController key set the JSX views consume stringly at
 // hundreds of call sites. The object literal below moved byte-verbatim from
 // the controller.js residue (S19, the final extraction slice); the
-// window.__MOBKIT_FLOW_CONTROLLER_TEST__ gate became the includeTestExports
+// window.__META_FLOW_CONTROLLER_TEST__ gate became the includeTestExports
 // option so this module stays window-free — the ~10-line controller.js
 // bootstrap passes the flag in. Key-set parity with
 // test/controller-export-manifest.json is enforced by
 // controller-export-keys.test.cjs in every slice gate.
 import {
-  authoringProjectionFromMobKitDocument,
+  authoringProjectionFromMetaDocument,
   authoringProjectionFromOperationResult,
   catalogSkillRealmsPatch,
   deployDefaultsFromSchema,
   deploySettingsForUi,
-  emptyMobKitCatalogs,
+  emptyMetaCatalogs,
   flowFromHydratedDocument,
   flowImportedIdFromDocument,
   graphProjectionForDocument,
-  graphProjectionFromMobKitResult,
+  graphProjectionFromMetaResult,
   hydrateMobpackDocumentState,
   mergeSkillRealms,
-  mobKitCatalogsFromSchema,
+  metaCatalogsFromSchema,
   modelCatalogFromCatalogs,
   skillRealmsFromCatalogs,
   toolCatalogFromCatalogs,
@@ -436,8 +436,8 @@ import {
   studioUpdateSchemaPatch,
 } from "./studio/state";
 
-export function createMobKitFlowController({ includeTestExports } = {}) {
-  const MobKitFlowController = {
+export function createMetaFlowController({ includeTestExports } = {}) {
+  const MetaFlowController = {
     SCHEMA_VERSION,
     RPC_METHODS,
     configure,
@@ -453,8 +453,8 @@ export function createMobKitFlowController({ includeTestExports } = {}) {
     graphStructureSignature,
     graphProjectionForFlow,
     graphProjectionForDocument,
-    graphProjectionFromMobKitResult,
-    authoringProjectionFromMobKitDocument,
+    graphProjectionFromMetaResult,
+    authoringProjectionFromMetaDocument,
     authoringProjectionFromOperationResult,
     flowFromHydratedDocument,
     hydrateMobpackDocumentState,
@@ -715,8 +715,8 @@ export function createMobKitFlowController({ includeTestExports } = {}) {
     modelCatalogFromCatalogs,
     toolCatalogFromCatalogs,
     blankMobpackFromCatalogs,
-    emptyMobKitCatalogs,
-    mobKitCatalogsFromSchema,
+    emptyMetaCatalogs,
+    metaCatalogsFromSchema,
     skillRealmsFromCatalogs,
     mergeSkillRealms,
     graphCanvasViewState,
@@ -821,12 +821,12 @@ export function createMobKitFlowController({ includeTestExports } = {}) {
   };
 
   if (includeTestExports) {
-    Object.assign(MobKitFlowController, {
+    Object.assign(MetaFlowController, {
       buildDocument,
       authoringFlowForDocument,
       authoringDocumentFromState,
     });
   }
 
-  return MobKitFlowController;
+  return MetaFlowController;
 }

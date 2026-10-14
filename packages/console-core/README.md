@@ -24,7 +24,7 @@
 - placement-only browser dock targets
 - sidebar schema normalization
 - activity-rail view-model types
-- MobKit console target/adapters, contract constants, headless controller, network client, and runtime frame types
+- Meta console target/adapters, contract constants, headless controller, network client, and runtime frame types
 - rich-content parsing and structured block helpers
 
 ## What stays app-side
@@ -43,7 +43,7 @@
    - `ConversationViewState`
    - `ConsoleSidebarViewState`
    - `ConsoleActivityRailViewState`
-4. Use `createMobKitConsoleController` with a host transport or HTTP transport for MobKit console command/timeline flows.
+4. Use `createMetaConsoleController` with a host transport or HTTP transport for Meta console command/timeline flows.
 5. Keep any panel-local state in a host-owned map keyed by `panelId`.
 
 ## Workspace entrypoint
@@ -52,7 +52,7 @@ Import from `@console-core` inside this repository's console workspace. The root
 barrel is curated and explicit, but this package is currently private and is
 not an npm-public API promise.
 
-External hosts must not depend on this package name until MobKit makes an
+External hosts must not depend on this package name until Meta makes an
 explicit public-package or SDK-subpath decision. Compatibility aliases should
 not be treated as stable package API.
 

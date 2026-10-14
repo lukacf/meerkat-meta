@@ -1,9 +1,9 @@
 /**
- * MobKit runtime — the running instance returned by the builder.
+ * Meta runtime — the running instance returned by the builder.
  *
  * @example
  * ```ts
- * const rt = await MobKit.builder().mob("mob.toml").gateway(bin).build();
+ * const rt = await Meta.builder().mob("mob.toml").gateway(bin).build();
  * const handle = rt.mobHandle();
  *
  * const status = await handle.status();
@@ -18,7 +18,7 @@ import { request as httpsRequest } from "node:https";
 import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
-import type { MobKitBuilderConfig } from "./builder.js";
+import type { MetaBuilderConfig } from "./builder.js";
 import {
   CallbackDispatcher,
   type SessionAgentBuilder,
@@ -28,6 +28,8 @@ import {
   CAPABILITY_UNAVAILABLE_CODE,
   CONSOLE_TIMELINE_REPLAY_UNAVAILABLE_CODE,
   LEASE_LOST_CODE,
+  STALE_DELIVERY_SCOPE_CODE,
+  REGISTERED_SPEC_CHANGED_CODE,
   MEMORY_BACKEND_UNAVAILABLE_CODE,
   STORAGE_RESOLUTION_CODE,
   INIT_IN_PROGRESS_CODE,
@@ -38,6 +40,8 @@ import {
   CompositionProvenanceError,
   ConsoleTimelineReplayUnavailableError,
   LeaseLostError,
+  RegisteredSpecChangedError,
+  StaleScopeError,
   MemoryBackendUnavailableError,
   MobEventsStaleError,
   NotConnectedError,
@@ -46,6 +50,8 @@ import {
   InitInProgressError,
   TransportError,
   TransportReaderFailedError,
+  GatewayStartupCleanupError,
+  type GatewayCleanup,
   InitOutcomeUnknownError,
   PostAdmissionObservationError,
   TurnFailedError,
@@ -63,6 +69,7 @@ import {
   InitDeadlineExceeded,
   type InitWatch,
   PersistentTransport,
+  type TransportTermination,
   buildJsonRpcRequest,
 } from "./transport.js";
 import { parseSseStream, type SseEvent } from "./sse.js";
@@ -73,7 +80,7 @@ import {
   type AgentEventEnvelope,
   type MobEventEnvelope,
 } from "./events.js";
-import { discoverySpecToDict, type DiscoverySpec } from "./models.js";
+import { discoverySpecToDict, toolArtifactRefToWire, type DiscoverySpec } from "./models.js";
 import {
   LIVE_EXECUTION_IDENTITY_V1,
   activeLiveChannelHandleToWire,
@@ -166,6 +173,9 @@ import {
   completionCursorToDict,
   parseSendResult,
   parseDispatchResult,
+  parseScopedDispatchResult,
+  parseScopedRecovery,
+  deliveryScopeToDict,
   parseTurnResult,
   completionProgressSince,
   parseBlobGetResult,
@@ -255,7 +265,11 @@ import {
   type IdentityInspection,
   type AwaitedTurn,
   type SendResult,
+  type RegisteredSpec,
   type DispatchResult,
+  type DeliveryScope,
+  type ScopedDispatchResult,
+  type ScopedRecovery,
   type TurnResult,
   type CompletionCursor,
   type BlobGetResult,
@@ -522,7 +536,7 @@ function normalizeBlobUpload(
   };
 }
 
-// -- MobKitRuntime --------------------------------------------------------
+// -- MetaRuntime --------------------------------------------------------
 
 export interface JobsListOptions {
   readonly sessionId: string;
@@ -556,7 +570,7 @@ export interface MonitorStartOptions {
 /** Safe application-facing durable-job surface. */
 export class JobsHandle {
   /** @internal */
-  constructor(private readonly runtime: MobKitRuntime) {}
+  constructor(private readonly runtime: MetaRuntime) {}
 
   get(jobId: string): Promise<unknown> {
     return this.runtime._rpc("jobs/get", { job_id: jobId });
@@ -615,7 +629,7 @@ export class JobsHandle {
 /** Durable monitor convenience surface; lifecycle remains job-owned. */
 export class MonitorsHandle {
   /** @internal */
-  constructor(private readonly runtime: MobKitRuntime) {}
+  constructor(private readonly runtime: MetaRuntime) {}
 
   start(options: MonitorStartOptions): Promise<unknown> {
     const params: Record<string, unknown> = {
@@ -701,6 +715,12 @@ function rpcErrorFromPayload(
   if (code === LEASE_LOST_CODE) {
     return new LeaseLostError(message, rid, method, err.data);
   }
+  if (code === REGISTERED_SPEC_CHANGED_CODE) {
+    return new RegisteredSpecChangedError(message, rid, method, err.data);
+  }
+  if (code === STALE_DELIVERY_SCOPE_CODE) {
+    return new StaleScopeError(message, rid, method, err.data);
+  }
   if (code === MEMORY_BACKEND_UNAVAILABLE_CODE) {
     return new MemoryBackendUnavailableError(message, rid, method, err.data);
   }
@@ -730,13 +750,14 @@ function rpcErrorFromPayload(
 }
 
 /**
- * Running MobKit runtime instance.
+ * Running Meta runtime instance.
  *
  * Supports explicit lifecycle (`connect` / `shutdown`).
  */
-export class MobKitRuntime {
-  private _config: MobKitBuilderConfig;
+export class MetaRuntime {
+  private _config: MetaBuilderConfig;
   private _transport: PersistentTransport | null;
+  private readonly _injectedTransport: PersistentTransport | null;
   private _running = false;
   private _lifecycleTail: Promise<void> = Promise.resolve();
   private _lifecycleTailResult: Promise<void> | null = null;
@@ -745,18 +766,24 @@ export class MobKitRuntime {
   private _dispatcher = new CallbackDispatcher();
   private _rustHttpBase: string | null = null;
   private _rustHttpPublicBase: string | null = null;
+  // Set while a stop of `_transport` was requested and has not fulfilled:
+  // the runtime keeps that transport (and its live child) until it does.
+  private _stopPending = false;
+  // The transport this runtime last bootstrapped, for its termination record.
+  private _lastGatewayTransport: PersistentTransport | null = null;
   readonly jobs = new JobsHandle(this);
   readonly monitors = new MonitorsHandle(this);
 
   /** @internal */
-  constructor(config: MobKitBuilderConfig, transport?: PersistentTransport) {
+  constructor(config: MetaBuilderConfig, transport?: PersistentTransport) {
     this._config = config;
     this._transport = transport ?? null;
+    this._injectedTransport = transport ?? null;
   }
 
   /** @internal */
-  static async _create(config: MobKitBuilderConfig): Promise<MobKitRuntime> {
-    const runtime = new MobKitRuntime(config);
+  static async _create(config: MetaBuilderConfig): Promise<MetaRuntime> {
+    const runtime = new MetaRuntime(config);
     await runtime.connect();
     return runtime;
   }
@@ -777,21 +804,28 @@ export class MobKitRuntime {
       await previous;
       if (this._running) return;
 
+      // A retained transport whose stop has not fulfilled settles first, on
+      // that same owner: no second gateway child starts beside a live one,
+      // and the factory is not invoked until it does.
+      await this._settleRetainedTransport();
+
       try {
         await this._bootstrap();
       } catch (error) {
-        // A failed bootstrap must not leave an unowned child behind for a
-        // later connect attempt to overwrite.
+        // A failed bootstrap must not leave an unowned child behind: the
+        // runtime keeps the transport until its stop fulfils.
         const transport = this._transport;
-        this._transport = null;
         this._rustHttpBase = null;
         this._rustHttpPublicBase = null;
         if (transport !== null) {
           try {
-            await transport.stop();
-          } catch {
-            // Preserve the bootstrap error, which carries the actionable
-            // gateway/RPC failure.
+            await this._stopRetained(transport);
+          } catch (cleanupError) {
+            // Every rejected stop keeps the transport with this runtime, so
+            // its cleanup travels with the failure: no runtime may be
+            // returned. A rejection is not proof the process still runs; the
+            // stop's record tells what it observed.
+            throw new GatewayStartupCleanupError(error, cleanupError, this._gatewayCleanup());
           }
         }
         throw error;
@@ -817,11 +851,74 @@ export class MobKitRuntime {
     return connect;
   }
 
+  /**
+   * Stop `transport` and release it only once that stop fulfils. A rejected
+   * stop leaves it as this runtime's retained transport, with whatever it
+   * still owns, for a later `shutdown()` or `connect()` to retry.
+   */
+  private async _stopRetained(transport: PersistentTransport): Promise<void> {
+    this._stopPending = true;
+    await transport.stop();
+    if (this._transport === transport) this._transport = null;
+    this._stopPending = false;
+  }
+
+  /** Rejoin the stop of a retained transport, inside a queued lifecycle operation. */
+  private async _settleRetainedTransport(): Promise<void> {
+    const transport = this._transport;
+    if (this._stopPending && transport !== null) await this._stopRetained(transport);
+  }
+
+  /** This runtime's gateway cleanup, for a caller that has no runtime. */
+  private _gatewayCleanup(): GatewayCleanup {
+    return {
+      shutdown: () => this.shutdown(),
+      lastTermination: () => this.lastGatewayTermination(),
+    };
+  }
+
+  /**
+   * What the last stop of this runtime's gateway transport observed (see
+   * {@link PersistentTransport.lastTermination}), kept after `shutdown()`;
+   * `null` while that gateway runs, before any stop, or without a gateway.
+   * An exit 0 without escalation is the process outcome only.
+   */
+  lastGatewayTermination(): TransportTermination | null {
+    return (this._transport ?? this._lastGatewayTransport)?.lastTermination() ?? null;
+  }
+
+  /**
+   * Compose the gateway transport for one connect, before any init request:
+   * the configured `gatewayTransport()` factory, else the transport given to
+   * the constructor, else a default `PersistentTransport`. Subclasses may
+   * override it. The returned transport finishes its own trusted startup in
+   * `startAsync()`; remote RPC and model parameters never select it.
+   */
+  protected _makeGatewayTransport(gatewayBin: string): PersistentTransport {
+    const timeoutMs = this._config.gatewayTimeoutMs ?? undefined;
+    const factory = this._config.gatewayTransportFactory;
+    if (factory) {
+      const transport = factory({ gatewayBin, timeoutMs });
+      if (!(transport instanceof PersistentTransport)) {
+        throw new TypeError("gateway transport factory must return a PersistentTransport");
+      }
+      return transport;
+    }
+    if (this._injectedTransport !== null) return this._injectedTransport;
+    return new PersistentTransport(gatewayBin, { timeout: timeoutMs });
+  }
+
   private async _bootstrap(): Promise<void> {
     if (this._config.gatewayBin) {
-      this._transport = new PersistentTransport(this._config.gatewayBin, {
-        timeout: this._config.gatewayTimeoutMs ?? undefined,
-      });
+      const transport = this._makeGatewayTransport(this._config.gatewayBin);
+      this._transport = transport;
+      this._lastGatewayTransport = transport;
+      if (
+        this._config.gatewayTransportFactory ||
+        this._makeGatewayTransport !== MetaRuntime.prototype._makeGatewayTransport
+      ) {
+        transport.requireHostStartup();
+      }
 
       // Register builder FIRST — init may trigger callback/build_agent
       if (this._config.sessionBuilder) {
@@ -855,19 +952,20 @@ export class MobKitRuntime {
           this._config.jobCredentialResolver,
         );
       }
-      this._transport.setCallbackHandler(
+      transport.setCallbackHandler(
         this._dispatcher.handleCallback.bind(this._dispatcher),
       );
-      this._transport.start();
+      // Host-owned startup completes before any init request is written.
+      await transport.startAsync();
 
-      if (!this._transport.isRunning()) {
+      if (!transport.isRunning()) {
         throw new TransportError(
           `gateway binary failed to start: ${this._config.gatewayBin}`,
         );
       }
 
       try {
-        const initResult = await this._runInit(this._transport);
+        const initResult = await this._runInit(transport);
         if (
           typeof initResult === "object" &&
           initResult !== null &&
@@ -895,25 +993,25 @@ export class MobKitRuntime {
         if (isRpcError(err) || err instanceof InitOutcomeUnknownError) {
           throw err;
         }
-        if (this._transport !== null && !this._transport.isRunning()) {
+        if (!transport.isRunning()) {
           throw new TransportError("gateway process died during bootstrap");
         }
         throw new TransportError(
-          `mobkit/init failed: ${err instanceof Error ? err.message : String(err)}`,
+          `meta/init failed: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
     } else if (this._config.sessionBuilder) {
       this._dispatcher.registerBuilder(this._config.sessionBuilder);
     } else {
       console.warn(
-        "[mobkit] runtime started without gateway or session builder — " +
+        "[meta] runtime started without gateway or session builder — " +
           "RPC calls will fail with NotConnectedError",
       );
     }
   }
 
   /**
-   * Run `mobkit/init` as accepted-then-settled (#550).
+   * Run `meta/init` as accepted-then-settled (#550).
    *
    * The init id is generated and its watch registered before the request is
    * written. A gateway that supports the protocol answers `accepted` at once;
@@ -943,7 +1041,7 @@ export class MobKitRuntime {
     params: Record<string, unknown>,
   ): Promise<unknown> {
     const initId = watch.initId;
-    const method = "mobkit/init";
+    const method = "meta/init";
     const rid = nextRequestId(method);
     const request = buildJsonRpcRequest(rid, method, params);
     let response: Record<string, unknown>;
@@ -954,7 +1052,7 @@ export class MobKitRuntime {
     } catch (err) {
       const reason = err instanceof TransportReaderFailedError
         ? err.message
-        : `no answer to mobkit/init: ${err instanceof Error ? err.message : String(err)}`;
+        : `no answer to meta/init: ${err instanceof Error ? err.message : String(err)}`;
       throw new InitOutcomeUnknownError(initId, watch.lastPhase, reason);
     }
     if ("error" in response) {
@@ -999,7 +1097,7 @@ export class MobKitRuntime {
       throw rpcErrorFromPayload(
         {
           code: settled.code ?? -32603,
-          message: settled.message ?? "mobkit/init failed",
+          message: settled.message ?? "meta/init failed",
           data: errorData,
         },
         rid,
@@ -1009,13 +1107,18 @@ export class MobKitRuntime {
     throw new InitOutcomeUnknownError(
       initId,
       watch.lastPhase,
-      `unrecognized mobkit/init settlement outcome ${JSON.stringify(settled.outcome)}`,
+      `unrecognized meta/init settlement outcome ${JSON.stringify(settled.outcome)}`,
     );
   }
 
   private _buildInitParams(): Record<string, unknown> {
     const params: Record<string, unknown> = {};
-    if (this._config.mobConfigPath) {
+    if (this._config.preparedApplication) {
+      params.prepared_application = {
+        bundle_base64: Buffer.from(this._config.preparedApplication.bundle).toString("base64"),
+        digest: this._config.preparedApplication.digest,
+      };
+    } else if (this._config.mobConfigPath) {
       params.mob_config = readFileSync(this._config.mobConfigPath, "utf-8");
     }
     if (this._config.modules.length > 0) {
@@ -1023,7 +1126,10 @@ export class MobKitRuntime {
     }
     params.has_session_builder = Boolean(this._config.sessionBuilder);
     const runtimeOptions: Record<string, unknown> = {};
-    if (this._config.gatingConfigPath) {
+    if (
+      this._config.gatingConfigPath !== null &&
+      this._config.gatingConfigPath !== undefined
+    ) {
       runtimeOptions.gating_config_path = this._config.gatingConfigPath;
     }
     if (this._config.routingConfigPath) {
@@ -1050,7 +1156,10 @@ export class MobKitRuntime {
     if (this._config.consoleConfigPath) {
       runtimeOptions.console_config_path = this._config.consoleConfigPath;
     }
-    if (this._config.accessConfigPath) {
+    if (
+      this._config.accessConfigPath !== null &&
+      this._config.accessConfigPath !== undefined
+    ) {
       runtimeOptions.access_config_path = this._config.accessConfigPath;
     }
     if (this._config.meerkatConfigPath) {
@@ -1086,6 +1195,11 @@ export class MobKitRuntime {
       runtimeOptions.implicit_delegate_idle_retire_secs =
         this._config.implicitDelegateIdleRetireSecs;
     }
+    if (this._config.installedArtifacts !== undefined && this._config.installedArtifacts !== null) {
+      runtimeOptions.installed_artifacts = this._config.installedArtifacts.map(
+        toolArtifactRefToWire,
+      );
+    }
     if (this._config.maxSessions !== null) {
       runtimeOptions.max_sessions = this._config.maxSessions;
     }
@@ -1103,6 +1217,11 @@ export class MobKitRuntime {
       runtimeOptions.console_voice = openAiLiveGatewayConfigToWire(
         this._config.consoleVoiceConfig,
       );
+    }
+    const expectedRevision = this._config.declareSpecUpdateExpectedRevision;
+    if (expectedRevision !== undefined && expectedRevision !== null) {
+      runtimeOptions.mob_composition = { authority: "authoritative" };
+      runtimeOptions.declare_spec_update = { expected_revision: expectedRevision };
     }
     params.runtime_options = runtimeOptions;
     if (this._config.persistentState) {
@@ -1173,7 +1292,7 @@ export class MobKitRuntime {
   /**
    * Base URL for clients that reach the gateway through a proxy: the
    * `http_public_base_url` the launch advertised (see
-   * `MobKitBuilder.httpPublicBaseUrl`), falling back to `rustHttpBaseUrl`
+   * `MetaBuilder.httpPublicBaseUrl`), falling back to `rustHttpBaseUrl`
    * when none was declared. The SDK's own SSE, multipart and console RPC
    * calls keep using `rustHttpBaseUrl`: this process spawned the gateway
    * and shares its network namespace, so the same-host form always answers.
@@ -1219,10 +1338,11 @@ export class MobKitRuntime {
       await previous;
       this._running = false;
       const transport = this._transport;
-      this._transport = null;
       this._rustHttpBase = null;
       this._rustHttpPublicBase = null;
-      if (transport !== null) await transport.stop();
+      // Public RPC admission is closed (`_running`); the transport stays this
+      // runtime's until its stop fulfils, so a failed stop can be rejoined.
+      if (transport !== null) await this._stopRetained(transport);
     })();
 
     const shutdown = operation.finally(() => {
@@ -1249,7 +1369,7 @@ export class MobKitRuntime {
   /** Get agent snapshot by identity. */
   async agent(identity: string): Promise<MemberSnapshot> {
     const status = parseIdentityStatus(
-      await this._rpc("mobkit/status_identity", { identity }),
+      await this._rpc("meta/status_identity", { identity }),
     );
     return {
       agentIdentity: status.agentRuntimeId || status.identity,
@@ -1268,11 +1388,18 @@ export class MobKitRuntime {
    * `turnUnavailable` says why it could not be tracked. The returned
    * `completionBaseline` is an identity-wide barrier for
    * {@link waitForCompletion}. Never wait by comparing `outputPreview` text.
+   *
+   * A host that authored `content` from the identity's registered row
+   * ({@link registeredSpec}) passes that row's `specDigest` as
+   * `expectedSpecDigest`: the gateway re-checks it against the registered
+   * row under the identity's lifecycle lock before delivery and throws
+   * {@link RegisteredSpecChangedError}, with nothing submitted, when the row
+   * changed.
    */
   async send(
     identity: string,
     content: string | DispatchContentBlock[],
-    options: { trackTurn?: boolean } = {},
+    options: { trackTurn?: boolean; expectedSpecDigest?: string } = {},
   ): Promise<SendResult> {
     const params: Record<string, unknown> = { identity };
     if (typeof content === "string") {
@@ -1281,30 +1408,103 @@ export class MobKitRuntime {
       params.content = content.map(contentBlockToDict);
     }
     if (options.trackTurn) params.track_turn = true;
-    return parseSendResult(await this._rpc("mobkit/send", params));
+    if (options.expectedSpecDigest !== undefined) {
+      params.expected_spec_digest = options.expectedSpecDigest;
+    }
+    return parseSendResult(await this._rpc("meta/send", params));
+  }
+
+  /**
+   * The identity's REGISTERED roster row (`meta/registered_spec`): the full
+   * row the gateway holds and delivers under, including
+   * `additional_instructions`, with its canonical digest. Not the roster
+   * provider's desired row and not proof that the member's actor adopted
+   * every field. Informational: pass `specDigest` to {@link send} as
+   * `expectedSpecDigest` and the gateway re-checks it before delivery.
+   */
+  async registeredSpec(identity: string): Promise<RegisteredSpec> {
+    const raw = (await this._rpc("meta/registered_spec", { identity })) as Record<
+      string,
+      unknown
+    >;
+    return {
+      identity: String(raw.identity ?? identity),
+      spec: (raw.spec ?? {}) as Record<string, unknown>,
+      specDigest: String(raw.spec_digest),
+    };
   }
 
   /** Dispatch structured input to an identity (`trackTurn` as for {@link send}). */
   async dispatch(
     identity: string,
     input: DispatchInput,
-    options: { trackTurn?: boolean } = {},
-  ): Promise<DispatchResult> {
+    options?: { trackTurn?: boolean; expectedScope?: undefined },
+  ): Promise<DispatchResult>;
+  /**
+   * Scope-bound dispatch: exact content to the session `expectedScope` (a
+   * {@link DeliveryScope} from {@link status}, persisted beforehand) pins,
+   * never materialized, repaired, retargeted or prepared. Needs both
+   * `idempotencyKey` and `correlationId`, does not combine with `trackTurn`,
+   * resolves the admission receipt, and throws {@link StaleScopeError} when
+   * the scope moved. Recover a lost reply with {@link recoverDelivery} and
+   * the same scope.
+   */
+  async dispatch(
+    identity: string,
+    input: DispatchInput,
+    options: { trackTurn?: false; expectedScope: DeliveryScope },
+  ): Promise<ScopedDispatchResult>;
+  async dispatch(
+    identity: string,
+    input: DispatchInput,
+    options: { trackTurn?: boolean; expectedScope?: DeliveryScope } = {},
+  ): Promise<DispatchResult | ScopedDispatchResult> {
     const params: Record<string, unknown> = {
       identity,
       dispatch_input: dispatchInputToDict(input),
     };
+    if (options.expectedScope !== undefined) {
+      if (options.trackTurn) {
+        throw new TypeError("expectedScope does not combine with trackTurn");
+      }
+      params.expected_scope = deliveryScopeToDict(options.expectedScope);
+      return parseScopedDispatchResult(await this._rpc("meta/dispatch", params));
+    }
     if (options.trackTurn) params.track_turn = true;
-    return parseDispatchResult(await this._rpc("mobkit/dispatch", params));
+    return parseDispatchResult(await this._rpc("meta/dispatch", params));
   }
 
   /**
-   * Read one ticketed turn (`mobkit/turn_result`): its state and, once
+   * Read one scoped delivery's state from the scope's ORIGINAL session.
+   * Never reads the identity's current session and never resubmits. `absent`
+   * is an authoritative point-in-time miss and `unresolved` an unreachable
+   * original owner; neither is permission to retry. `timeoutMs` bounds the
+   * evidence read (gateway default when omitted).
+   */
+  async recoverDelivery(
+    identity: string,
+    scope: DeliveryScope,
+    options: { idempotencyKey: string; correlationId: string; timeoutMs?: number },
+  ): Promise<ScopedRecovery> {
+    const params: Record<string, unknown> = {
+      identity,
+      scope: deliveryScopeToDict(scope),
+      idempotency_key: options.idempotencyKey,
+      correlation_id: options.correlationId,
+    };
+    if (options.timeoutMs !== undefined) {
+      params.timeout_ms = Math.max(0, Math.floor(options.timeoutMs));
+    }
+    return parseScopedRecovery(await this._rpc("meta/recover_delivery", params));
+  }
+
+  /**
+   * Read one ticketed turn (`meta/turn_result`): its state and, once
    * completed, its OWN output.
    */
   async turnResult(identity: string, ticket: string): Promise<TurnResult> {
     return parseTurnResult(
-      await this._rpc("mobkit/turn_result", { identity, ticket }),
+      await this._rpc("meta/turn_result", { identity, ticket }),
     );
   }
 
@@ -1325,10 +1525,10 @@ export class MobKitRuntime {
    * when the turn failed, {@link TurnUnknownError} when the gateway knows no
    * such turn for this identity, and a timeout error.
    *
-   * Event-driven: one server-side `mobkit/wait_for_turn`, which the gateway
+   * Event-driven: one server-side `meta/wait_for_turn`, which the gateway
    * answers when the ticket settles. `timeoutMs` is the deadline.
    * `pollIntervalMs` applies only against a gateway predating that method,
-   * which is polled with `mobkit/turn_result` instead.
+   * which is polled with `meta/turn_result` instead.
    */
   async waitForTurn(
     identity: string,
@@ -1339,7 +1539,7 @@ export class MobKitRuntime {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const raw = await this._serverWait(
-        "mobkit/wait_for_turn",
+        "meta/wait_for_turn",
         { identity, ticket },
         deadline - Date.now(),
       );
@@ -1362,8 +1562,8 @@ export class MobKitRuntime {
   }
 
   /**
-   * Run a server-side wait (`mobkit/wait_for_completion`,
-   * `mobkit/wait_for_turn`) with `timeoutMs` as the caller's deadline. The
+   * Run a server-side wait (`meta/wait_for_completion`,
+   * `meta/wait_for_turn`) with `timeoutMs` as the caller's deadline. The
    * gateway answers when the awaited change happens (it waits on the
    * runtime's typed change signal) or, typed, at the deadline. Resolves
    * `null` against a gateway predating the method.
@@ -1388,7 +1588,7 @@ export class MobKitRuntime {
     }
   }
 
-  /** Compatibility wait for a gateway predating `mobkit/wait_for_turn`. */
+  /** Compatibility wait for a gateway predating `meta/wait_for_turn`. */
   private async _pollTurnCompat(
     identity: string,
     ticket: string,
@@ -1412,7 +1612,7 @@ export class MobKitRuntime {
   /**
    * Read the identity's completion cursor without touching its session.
    *
-   * `mobkit/completion_cursor` is a cursor-only read: the gateway answers
+   * `meta/completion_cursor` is a cursor-only read: the gateway answers
    * from the identity's in-memory completion cursor and never reads the
    * member session. {@link inspectIdentity} does read it (an execution
    * snapshot on the member's session task), which a tight completion poll
@@ -1425,7 +1625,7 @@ export class MobKitRuntime {
   async completionCursor(identity: string): Promise<CompletionCursor | null> {
     let raw: unknown;
     try {
-      raw = await this._rpc("mobkit/completion_cursor", { identity });
+      raw = await this._rpc("meta/completion_cursor", { identity });
     } catch (err) {
       if (isRpcError(err) && err.code === JSONRPC_METHOD_NOT_FOUND) {
         return (await this.inspectIdentity(identity)).completionCursor;
@@ -1439,7 +1639,7 @@ export class MobKitRuntime {
    * Wait until every identity has completed at least one turn (its
    * autonomous kickoff turn).
    *
-   * Event-driven: one server-side `mobkit/wait_for_completion` per identity
+   * Event-driven: one server-side `meta/wait_for_completion` per identity
    * (no baseline), which the gateway answers when the first completion is
    * recorded. It never reads the member session and does not poll; an
    * identity that has not materialized yet is simply waited for. `timeoutMs`
@@ -1465,7 +1665,7 @@ export class MobKitRuntime {
     const ready = async (identity: string): Promise<string | null> => {
       for (;;) {
         const raw = await this._serverWait(
-          "mobkit/wait_for_completion",
+          "meta/wait_for_completion",
           { identity },
           deadline - Date.now(),
         );
@@ -1505,7 +1705,7 @@ export class MobKitRuntime {
 
   /**
    * Compatibility readiness poll for a gateway predating
-   * `mobkit/wait_for_completion`, or a live alias with no cursor.
+   * `meta/wait_for_completion`, or a live alias with no cursor.
    */
   private async _pollReadyCompat(
     identity: string,
@@ -1548,7 +1748,7 @@ export class MobKitRuntime {
    * settle before the identity health monitor counts the same turn on the
    * cursor, so a later cursor wait can be satisfied by that earlier turn.
    *
-   * Event-driven: one server-side `mobkit/wait_for_completion`, which the
+   * Event-driven: one server-side `meta/wait_for_completion`, which the
    * gateway answers when a completion is recorded (it never reads the member
    * session and does not poll); the output is then read once. `timeoutMs` is
    * the deadline. `pollIntervalMs` applies only against a gateway predating
@@ -1567,7 +1767,7 @@ export class MobKitRuntime {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const raw = await this._serverWait(
-        "mobkit/wait_for_completion",
+        "meta/wait_for_completion",
         { identity, after: completionCursorToDict(baseline) },
         deadline - Date.now(),
       );
@@ -1611,7 +1811,7 @@ export class MobKitRuntime {
 
   /**
    * Compatibility wait for a gateway predating
-   * `mobkit/wait_for_completion`.
+   * `meta/wait_for_completion`.
    */
   private async _pollCursorPastCompat(
     identity: string,
@@ -1877,29 +2077,29 @@ export class MobKitRuntime {
 
   /** Subscribe to events for an identity. */
   async subscribe(identity: string): Promise<unknown> {
-    return this._rpc("mobkit/subscribe", { identity });
+    return this._rpc("meta/subscribe", { identity });
   }
 
   /** Get identity status. */
   async status(identity: string): Promise<IdentityStatus> {
     return parseIdentityStatus(
-      await this._rpc("mobkit/status_identity", { identity }),
+      await this._rpc("meta/status_identity", { identity }),
     );
   }
 
   /** Respawn an identity (non-destructive recovery). */
   async respawn(identity: string): Promise<unknown> {
-    return this._rpc("mobkit/respawn", { identity });
+    return this._rpc("meta/respawn", { identity });
   }
 
   /** Retire an identity. */
   async retire(identity: string): Promise<unknown> {
-    return this._rpc("mobkit/retire", { identity });
+    return this._rpc("meta/retire", { identity });
   }
 
   /** Reset an identity (destructive continuity reset). */
   async reset(identity: string): Promise<unknown> {
-    return this._rpc("mobkit/reset", { identity });
+    return this._rpc("meta/reset", { identity });
   }
 
   /**
@@ -1935,7 +2135,7 @@ export class MobKitRuntime {
     options: { transportTimeoutMs?: number } = {},
   ): Promise<Record<string, unknown>> {
     const raw = await this._rpc(
-      "mobkit/member_activate_instruction",
+      "meta/member_activate_instruction",
       { identity, activation },
       { transportTimeoutMs: options.transportTimeoutMs },
     );
@@ -1955,30 +2155,30 @@ export class MobKitRuntime {
     for (const [name, value] of Object.entries(query)) {
       if (value !== undefined) params[name] = value;
     }
-    const raw = await this._rpc("mobkit/member_instruction_activations", params);
+    const raw = await this._rpc("meta/member_instruction_activations", params);
     return raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
   }
 
   /** Delete an identity permanently. */
   async deleteIdentity(identity: string): Promise<unknown> {
-    return this._rpc("mobkit/delete_identity", { identity });
+    return this._rpc("meta/delete_identity", { identity });
   }
 
   /** Inspect identity continuity/runtime state. */
   async inspectIdentity(identity: string): Promise<IdentityInspection> {
     return parseIdentityInspection(
-      await this._rpc("mobkit/inspect_identity", { identity }),
+      await this._rpc("meta/inspect_identity", { identity }),
     );
   }
 
   /** Re-run identity-first reconciliation. */
   async reconcileIdentity(): Promise<unknown> {
-    return this._rpc("mobkit/reconcile_identity", {});
+    return this._rpc("meta/reconcile_identity", {});
   }
 
   /**
    * Ask the continuity repair supervisor for a pass now
-   * (`mobkit/request_continuity_repair`). The supervisor retries Broken
+   * (`meta/request_continuity_repair`). The supervisor retries Broken
    * identities on typed triggers (another member's embodiment settling, a
    * settled restore or reconcile pass, a refused delivery to the Broken
    * identity); this is the explicit one. Resolves what the request reached:
@@ -1987,20 +2187,20 @@ export class MobKitRuntime {
    */
   async requestContinuityRepair(): Promise<string> {
     const raw = asWireRecord(
-      await this._rpc("mobkit/request_continuity_repair", {}),
+      await this._rpc("meta/request_continuity_repair", {}),
     );
     return String(raw.continuity_repair ?? "");
   }
 
-  /** Identity bootstrap snapshot (`mobkit/status_identity_bootstrap`). */
+  /** Identity bootstrap snapshot (`meta/status_identity_bootstrap`). */
   async identityBootstrapStatus(): Promise<IdentityBootstrapStatus> {
     return parseIdentityBootstrapStatus(
-      await this._rpc("mobkit/status_identity_bootstrap", {}),
+      await this._rpc("meta/status_identity_bootstrap", {}),
     );
   }
 
   /**
-   * Wait for the identity bootstrap (`mobkit/wait_identity_bootstrap`):
+   * Wait for the identity bootstrap (`meta/wait_identity_bootstrap`):
    * `target` is `"materialized"` (default) or `"startup_ready"`. The gateway
    * answers when the barrier is terminal or at `timeoutMs`; each identity's
    * entry carries its typed `restore` progress during an eager pass.
@@ -2017,7 +2217,7 @@ export class MobKitRuntime {
         (params.timeout_ms as number) + SERVER_WAIT_TRANSPORT_HEADROOM_MS;
     }
     return parseIdentityBootstrapStatus(
-      await this._rpc("mobkit/wait_identity_bootstrap", params, {
+      await this._rpc("meta/wait_identity_bootstrap", params, {
         transportTimeoutMs,
       }),
     );
@@ -2044,7 +2244,7 @@ function settledTurn(
 // -- MobHandle ------------------------------------------------------------
 
 /**
- * Proxy for the MobKit RPC API. Returns typed result objects.
+ * Proxy for the Meta RPC API. Returns typed result objects.
  *
  * @example
  * ```ts
@@ -2055,28 +2255,28 @@ function settledTurn(
  */
 export class MobHandle {
   /** @internal */
-  constructor(private readonly _runtime: MobKitRuntime) {}
+  constructor(private readonly _runtime: MetaRuntime) {}
 
   // -- Status & capabilities ----------------------------------------------
 
   async status(): Promise<StatusResult> {
-    return parseStatusResult(await this._runtime._rpc("mobkit/status"));
+    return parseStatusResult(await this._runtime._rpc("meta/status"));
   }
 
   async capabilities(): Promise<CapabilitiesResult> {
     return parseCapabilitiesResult(
-      await this._runtime._rpc("mobkit/capabilities"),
+      await this._runtime._rpc("meta/capabilities"),
     );
   }
 
   async modelsCatalog(): Promise<ModelsCatalogResult> {
     return parseModelsCatalogResult(
-      await this._runtime._rpc("mobkit/models/catalog"),
+      await this._runtime._rpc("meta/models/catalog"),
     );
   }
 
   /**
-   * Run the read-only storage doctor over a MobKit state directory.
+   * Run the read-only storage doctor over a Meta state directory.
    *
    * `stateDir` is required until the gateway can report its own persistent
    * state directory (Phase M2); omitting it rejects with
@@ -2091,37 +2291,37 @@ export class MobHandle {
     if (options?.stateDir !== undefined) params.state_dir = options.stateDir;
     if (options?.identity !== undefined) params.identity = options.identity;
     return parseStorageDoctorResult(
-      await this._runtime._rpc("mobkit/storage/doctor", params),
+      await this._runtime._rpc("meta/storage/doctor", params),
     );
   }
 
   async toolsCatalog(): Promise<MobpackToolsCatalogResult> {
     return parseMobpackToolsCatalogResult(
-      await this._runtime._rpc("mobkit/tools/catalog"),
+      await this._runtime._rpc("meta/tools/catalog"),
     );
   }
 
   async skillsCatalog(): Promise<MobpackSkillsCatalogResult> {
     return parseMobpackSkillsCatalogResult(
-      await this._runtime._rpc("mobkit/skills/catalog"),
+      await this._runtime._rpc("meta/skills/catalog"),
     );
   }
 
   async agentDefinitions(): Promise<MobpackAgentDefinitionsResult> {
     return parseMobpackAgentDefinitionsResult(
-      await this._runtime._rpc("mobkit/agent_definitions/list"),
+      await this._runtime._rpc("meta/agent_definitions/list"),
     );
   }
 
   async mobpackTemplates(): Promise<MobpackTemplatesResult> {
     return parseMobpackTemplatesResult(
-      await this._runtime._rpc("mobkit/mobpacks/templates"),
+      await this._runtime._rpc("meta/mobpacks/templates"),
     );
   }
 
   async mobpackCatalogs(): Promise<MobpackCatalogsResult> {
     return parseMobpackCatalogsResult(
-      await this._runtime._rpc("mobkit/mobpacks/catalogs"),
+      await this._runtime._rpc("meta/mobpacks/catalogs"),
     );
   }
 
@@ -2135,7 +2335,7 @@ export class MobHandle {
     const params: Record<string, unknown> = { document };
     if (rkatValidate !== undefined) params.rkat_validate = rkatValidate;
     return parseMobpackValidationResult(
-      await this._runtime._rpc("mobkit/mobpacks/validate", params),
+      await this._runtime._rpc("meta/mobpacks/validate", params),
     );
   }
 
@@ -2144,7 +2344,7 @@ export class MobHandle {
     document: Record<string, unknown>,
   ): Promise<MobpackSourceResult> {
     return parseMobpackSourceResult(
-      await this._runtime._rpc("mobkit/mobpacks/source", { document }),
+      await this._runtime._rpc("meta/mobpacks/source", { document }),
     );
   }
 
@@ -2153,7 +2353,7 @@ export class MobHandle {
     document: Record<string, unknown>,
   ): Promise<MobpackExportResult> {
     return parseMobpackExportResult(
-      await this._runtime._rpc("mobkit/mobpacks/export", { document }),
+      await this._runtime._rpc("meta/mobpacks/export", { document }),
     );
   }
 
@@ -2171,21 +2371,21 @@ export class MobHandle {
       params.source_name = options.sourceName;
     }
     return parseMobpackImportResult(
-      await this._runtime._rpc("mobkit/mobpacks/import", params),
+      await this._runtime._rpc("meta/mobpacks/import", params),
     );
   }
 
   /** List mobpack draft registry rows. */
   async mobpackList(): Promise<MobpackDraftListResult> {
     return parseMobpackDraftListResult(
-      await this._runtime._rpc("mobkit/mobpacks/list", {}),
+      await this._runtime._rpc("meta/mobpacks/list", {}),
     );
   }
 
   /** Fetch a single mobpack draft registry row by id. */
   async mobpackGet(draftId: string): Promise<MobpackDraftGetResult> {
     return parseMobpackDraftGetResult(
-      await this._runtime._rpc("mobkit/mobpacks/get", { id: draftId }),
+      await this._runtime._rpc("meta/mobpacks/get", { id: draftId }),
     );
   }
 
@@ -2198,7 +2398,7 @@ export class MobHandle {
     if (options?.name !== undefined) params.name = options.name;
     if (options?.trigger !== undefined) params.trigger = options.trigger;
     return parseMobpackDraftSaveResult(
-      await this._runtime._rpc("mobkit/mobpacks/create", params),
+      await this._runtime._rpc("meta/mobpacks/create", params),
     );
   }
 
@@ -2220,7 +2420,7 @@ export class MobHandle {
       params.expected_etag = options.expectedEtag;
     }
     return parseMobpackDraftSaveResult(
-      await this._runtime._rpc("mobkit/mobpacks/save", params),
+      await this._runtime._rpc("meta/mobpacks/save", params),
     );
   }
 
@@ -2234,7 +2434,7 @@ export class MobHandle {
       params.expected_revision = expectedRevision;
     }
     return parseMobpackDraftDeleteResult(
-      await this._runtime._rpc("mobkit/mobpacks/delete", params),
+      await this._runtime._rpc("meta/mobpacks/delete", params),
     );
   }
 
@@ -2245,7 +2445,7 @@ export class MobHandle {
   ): Promise<MobpackDraftHistoryResult> {
     return parseMobpackDraftHistoryResult(
       await this._runtime._rpc(
-        "mobkit/mobpacks/undo",
+        "meta/mobpacks/undo",
         mobpackHistoryParams(draftId, options),
       ),
     );
@@ -2258,7 +2458,7 @@ export class MobHandle {
   ): Promise<MobpackDraftHistoryResult> {
     return parseMobpackDraftHistoryResult(
       await this._runtime._rpc(
-        "mobkit/mobpacks/redo",
+        "meta/mobpacks/redo",
         mobpackHistoryParams(draftId, options),
       ),
     );
@@ -2275,7 +2475,7 @@ export class MobHandle {
       params.expected_catalog_snapshot_id = expectedCatalogSnapshotId;
     }
     return parseMobpackApplyOperationResult(
-      await this._runtime._rpc("mobkit/mobpacks/apply_operation", params),
+      await this._runtime._rpc("meta/mobpacks/apply_operation", params),
     );
   }
 
@@ -2284,7 +2484,7 @@ export class MobHandle {
     document: Record<string, unknown>,
   ): Promise<MobpackDeployCommandResult> {
     return parseMobpackDeployCommandResult(
-      await this._runtime._rpc("mobkit/mobpacks/deploy_command", { document }),
+      await this._runtime._rpc("meta/mobpacks/deploy_command", { document }),
     );
   }
 
@@ -2296,7 +2496,7 @@ export class MobHandle {
     const params: Record<string, unknown> = { document };
     if (execute !== undefined) params.execute = execute;
     return parseMobpackDeployResult(
-      await this._runtime._rpc("mobkit/mobpacks/deploy", params),
+      await this._runtime._rpc("meta/mobpacks/deploy", params),
     );
   }
 
@@ -2305,7 +2505,7 @@ export class MobHandle {
   async spawn(spec: DiscoverySpec): Promise<SpawnResult> {
     return parseSpawnResult(
       await this._runtime._rpc(
-        "mobkit/spawn_member",
+        "meta/spawn_member",
         discoverySpecToDict(spec),
       ),
     );
@@ -2313,13 +2513,13 @@ export class MobHandle {
 
   async spawnMember(moduleId: string): Promise<SpawnResult> {
     return parseSpawnResult(
-      await this._runtime._rpc("mobkit/spawn_member", { module_id: moduleId }),
+      await this._runtime._rpc("meta/spawn_member", { module_id: moduleId }),
     );
   }
 
   async reconcile(modules: string[]): Promise<ReconcileResult> {
     return parseReconcileResult(
-      await this._runtime._rpc("mobkit/reconcile", { modules }),
+      await this._runtime._rpc("meta/reconcile", { modules }),
     );
   }
 
@@ -2334,7 +2534,7 @@ export class MobHandle {
     if (lastEventId !== undefined) params.last_event_id = lastEventId;
     if (agentId !== undefined) params.agent_id = agentId;
     return parseSubscribeResult(
-      await this._runtime._rpc("mobkit/events/subscribe", params),
+      await this._runtime._rpc("meta/events/subscribe", params),
     );
   }
 
@@ -2356,7 +2556,7 @@ export class MobHandle {
 
   async queryEvents(query?: EventQuery): Promise<PersistedEvent[]> {
     const params = query ? eventQueryToDict(query) : {};
-    const raw = await this._runtime._rpc("mobkit/query_events", params);
+    const raw = await this._runtime._rpc("meta/query_events", params);
     let events = raw;
     if (typeof raw === "object" && raw !== null) {
       const record = raw as Record<string, unknown>;
@@ -2383,7 +2583,7 @@ export class MobHandle {
   async queryMobEvents(query?: EventQuery): Promise<MobStructuralEvent[]> {
     const params = query ? eventQueryToDict(query) : {};
     try {
-      const raw = await this._runtime._rpc("mobkit/mob_events/query", params);
+      const raw = await this._runtime._rpc("meta/mob_events/query", params);
       return extractMobStructuralEvents(raw);
     } catch (err) {
       if (isRpcError(err) && err.code === MOB_EVENTS_STALE_CURSOR_CODE) {
@@ -2395,9 +2595,9 @@ export class MobHandle {
 
   /**
    * Replay structural mob events as an async iterator. Yields the
-   * snapshot frame returned by `mobkit/mob_events/subscribe`. Live
+   * snapshot frame returned by `meta/mob_events/subscribe`. Live
    * tailing for production streaming uses the SSE bridge at
-   * `/mobkit/mob_events/stream`.
+   * `/meta/mob_events/stream`.
    *
    * Throws {@link MobEventsStaleError} when `afterSeq` is past the
    * current ledger frontier.
@@ -2408,7 +2608,7 @@ export class MobHandle {
     const params = query ? eventQueryToDict(query) : {};
     let raw: unknown;
     try {
-      raw = await this._runtime._rpc("mobkit/mob_events/subscribe", params);
+      raw = await this._runtime._rpc("meta/mob_events/subscribe", params);
     } catch (err) {
       if (isRpcError(err) && err.code === MOB_EVENTS_STALE_CURSOR_CODE) {
         throw MobEventsStaleError.fromRpcError(err);
@@ -2459,11 +2659,11 @@ export class MobHandle {
     }
     if (uploads.length > 0) {
       return parseSendMessageResult(
-        await this._multipartRpc("mobkit/send_message", params, uploads),
+        await this._multipartRpc("meta/send_message", params, uploads),
       );
     }
     return parseSendMessageResult(
-      await this._runtime._rpc("mobkit/send_message", params),
+      await this._runtime._rpc("meta/send_message", params),
     );
   }
 
@@ -2472,7 +2672,7 @@ export class MobHandle {
 
   async getBlob(blobId: string): Promise<BlobGetResult> {
     return parseBlobGetResult(
-      await this._runtime._rpc("mobkit/blob/get", { blob_id: blobId }),
+      await this._runtime._rpc("meta/blob/get", { blob_id: blobId }),
     );
   }
 
@@ -2480,7 +2680,7 @@ export class MobHandle {
     const upload = normalizeBlobUpload(file, 0);
     return parseBlobUploadResult(
       await this._multipartRpc(
-        "mobkit/blob/upload",
+        "meta/blob/upload",
         {
           upload: {
             type: "image_upload",
@@ -2561,6 +2761,12 @@ export class MobHandle {
       if (code === LEASE_LOST_CODE) {
         throw new LeaseLostError(message, id, method, err.data);
       }
+      if (code === REGISTERED_SPEC_CHANGED_CODE) {
+        throw new RegisteredSpecChangedError(message, id, method, err.data);
+      }
+      if (code === STALE_DELIVERY_SCOPE_CODE) {
+        throw new StaleScopeError(message, id, method, err.data);
+      }
       if (code === MEMORY_BACKEND_UNAVAILABLE_CODE) {
         throw new MemoryBackendUnavailableError(message, id, method, err.data);
       }
@@ -2613,7 +2819,7 @@ export class MobHandle {
     if (options?.backend) params.backend = options.backend;
     if (options?.binding) params.binding = options.binding;
     return parseMemberSnapshot(
-      await this._runtime._rpc("mobkit/ensure_member", params),
+      await this._runtime._rpc("meta/ensure_member", params),
     );
   }
 
@@ -2621,7 +2827,7 @@ export class MobHandle {
     labelKey: string,
     labelValue: string,
   ): Promise<MemberSnapshot[]> {
-    const raw = await this._runtime._rpc("mobkit/find_members", {
+    const raw = await this._runtime._rpc("meta/find_members", {
       label_key: labelKey,
       label_value: labelValue,
     });
@@ -2634,7 +2840,7 @@ export class MobHandle {
   // -- Roster -------------------------------------------------------------
 
   async listMembers(): Promise<MemberSnapshot[]> {
-    const raw = await this._runtime._rpc("mobkit/list_members");
+    const raw = await this._runtime._rpc("meta/list_members");
     if (Array.isArray(raw)) {
       return raw.map(parseMemberSnapshot);
     }
@@ -2643,12 +2849,12 @@ export class MobHandle {
 
   async getMember(memberId: string): Promise<MemberSnapshot> {
     return parseMemberSnapshot(
-      await this._runtime._rpc("mobkit/get_member", { member_id: memberId }),
+      await this._runtime._rpc("meta/get_member", { member_id: memberId }),
     );
   }
 
   async retireMember(memberId: string): Promise<void> {
-    await this._runtime._rpc("mobkit/retire_member", {
+    await this._runtime._rpc("meta/retire_member", {
       member_id: memberId,
     });
   }
@@ -2660,7 +2866,7 @@ export class MobHandle {
    * {@link reloadMember}.
    */
   async respawnMember(memberId: string): Promise<void> {
-    await this._runtime._rpc("mobkit/respawn_member", {
+    await this._runtime._rpc("meta/respawn_member", {
       member_id: memberId,
     });
   }
@@ -2673,7 +2879,7 @@ export class MobHandle {
    */
   async reloadMember(memberId: string): Promise<MemberReloadResult> {
     return parseMemberReloadResult(
-      await this._runtime._rpc("mobkit/reload_member", { member_id: memberId }),
+      await this._runtime._rpc("meta/reload_member", { member_id: memberId }),
     );
   }
 
@@ -2684,13 +2890,13 @@ export class MobHandle {
    */
   async memberHealth(memberId: string): Promise<MemberHealth> {
     return parseMemberHealth(
-      await this._runtime._rpc("mobkit/member_health", { member_id: memberId }),
+      await this._runtime._rpc("meta/member_health", { member_id: memberId }),
     );
   }
 
   async memberStatus(memberId: string): Promise<RichMemberSnapshot> {
     return parseRichMemberSnapshot(
-      await this._runtime._rpc("mobkit/member_status", { member_id: memberId }),
+      await this._runtime._rpc("meta/member_status", { member_id: memberId }),
     );
   }
 
@@ -2701,7 +2907,7 @@ export class MobHandle {
 
   async identityResolvedToolsDetail(identity: string): Promise<IdentityResolvedToolsResult> {
     return parseIdentityResolvedToolsResult(
-      await this._runtime._rpc("mobkit/identity/resolved_tools", { identity }),
+      await this._runtime._rpc("meta/identity/resolved_tools", { identity }),
     );
   }
 
@@ -2722,12 +2928,12 @@ export class MobHandle {
    */
   async identityRoutingStatus(identity: string): Promise<IdentityRoutingStatusResult> {
     return parseIdentityRoutingStatusResult(
-      await this._runtime._rpc("mobkit/identity/routing_status", { identity }),
+      await this._runtime._rpc("meta/identity/routing_status", { identity }),
     );
   }
 
   async forceCancelMember(memberId: string): Promise<void> {
-    await this._runtime._rpc("mobkit/force_cancel_member", {
+    await this._runtime._rpc("meta/force_cancel_member", {
       member_id: memberId,
     });
   }
@@ -2744,7 +2950,7 @@ export class MobHandle {
     runId: string,
     reason: string,
   ): Promise<MemberRunStopReceipt> {
-    const raw = (await this._runtime._rpc("mobkit/stop_member_run", {
+    const raw = (await this._runtime._rpc("meta/stop_member_run", {
       member_id: memberId,
       run_id: runId,
       reason,
@@ -2757,7 +2963,7 @@ export class MobHandle {
         receipt.outcome !== "not_current" &&
         receipt.outcome !== "not_stoppable")
     ) {
-      throw new Error(`invalid mobkit/stop_member_run receipt: ${JSON.stringify(raw)}`);
+      throw new Error(`invalid meta/stop_member_run receipt: ${JSON.stringify(raw)}`);
     }
     return receipt;
   }
@@ -2778,7 +2984,7 @@ export class MobHandle {
     if (timeoutSeconds !== undefined) {
       params.timeout_ms = Math.round(timeoutSeconds * 1000);
     }
-    const raw = await this._runtime._rpc("mobkit/wait_ready", params);
+    const raw = await this._runtime._rpc("meta/wait_ready", params);
     if (typeof raw !== "object" || raw === null) {
       return { ready: [], timeout: false };
     }
@@ -2792,11 +2998,11 @@ export class MobHandle {
   // -- Flows --------------------------------------------------------------
 
   async cancelFlow(runId: string): Promise<void> {
-    await this._runtime._rpc("mobkit/cancel_flow", { run_id: runId });
+    await this._runtime._rpc("meta/cancel_flow", { run_id: runId });
   }
 
   async flowStatus(runId: string): Promise<MobRunSnapshot | null> {
-    const raw = await this._runtime._rpc("mobkit/flow_status", {
+    const raw = await this._runtime._rpc("meta/flow_status", {
       run_id: runId,
     });
     if (raw === null) return null;
@@ -2815,7 +3021,7 @@ export class MobHandle {
    * 0.6's `MobHandle::list_flows`. Order is unspecified.
    */
   async listFlows(): Promise<string[]> {
-    const raw = await this._runtime._rpc("mobkit/list_flows");
+    const raw = await this._runtime._rpc("meta/list_flows");
     if (Array.isArray(raw)) {
       return raw.map((id) => String(id));
     }
@@ -2838,7 +3044,7 @@ export class MobHandle {
   async listRuns(flowId?: string): Promise<MobRun[]> {
     const params: Record<string, unknown> = {};
     if (flowId !== undefined) params.flow_id = flowId;
-    const raw = await this._runtime._rpc("mobkit/list_runs", params);
+    const raw = await this._runtime._rpc("meta/list_runs", params);
     let runs: unknown[] = [];
     if (Array.isArray(raw)) {
       runs = raw;
@@ -2863,7 +3069,7 @@ export class MobHandle {
    * activation params (any JSON value).
    */
   async runFlow(flowId: string, params: unknown = null): Promise<string> {
-    const raw = await this._runtime._rpc("mobkit/run_flow", {
+    const raw = await this._runtime._rpc("meta/run_flow", {
       flow_id: flowId,
       params,
     });
@@ -2877,7 +3083,7 @@ export class MobHandle {
   }
 
   async collectCompleted(): Promise<Array<[string, RichMemberSnapshot]>> {
-    const raw = await this._runtime._rpc("mobkit/collect_completed");
+    const raw = await this._runtime._rpc("meta/collect_completed");
     const entries =
       typeof raw === "object" && raw !== null
         ? Array.isArray((raw as Record<string, unknown>).completed)
@@ -2908,7 +3114,7 @@ export class MobHandle {
     options?: Record<string, unknown>,
   ): Promise<RoutingResolution> {
     return parseRoutingResolution(
-      await this._runtime._rpc("mobkit/routing/resolve", {
+      await this._runtime._rpc("meta/routing/resolve", {
         recipient,
         ...(options ?? {}),
       }),
@@ -2916,7 +3122,7 @@ export class MobHandle {
   }
 
   async listRoutes(): Promise<RuntimeRouteResult[]> {
-    const raw = await this._runtime._rpc("mobkit/routing/routes/list");
+    const raw = await this._runtime._rpc("meta/routing/routes/list");
     const routes =
       typeof raw === "object" && raw !== null
         ? (((raw as Record<string, unknown>).routes as unknown[]) ?? [])
@@ -2938,7 +3144,7 @@ export class MobHandle {
       target_module: targetModule,
     };
     if (channel !== undefined) params.channel = channel;
-    const raw = await this._runtime._rpc("mobkit/routing/routes/add", params);
+    const raw = await this._runtime._rpc("meta/routing/routes/add", params);
     const routeData =
       typeof raw === "object" && raw !== null
         ? ((raw as Record<string, unknown>).route ?? raw)
@@ -2947,7 +3153,7 @@ export class MobHandle {
   }
 
   async deleteRoute(routeKey: string): Promise<RuntimeRouteResult> {
-    const raw = await this._runtime._rpc("mobkit/routing/routes/delete", {
+    const raw = await this._runtime._rpc("meta/routing/routes/delete", {
       route_key: routeKey,
     });
     const deletedData =
@@ -2963,7 +3169,7 @@ export class MobHandle {
     options: Record<string, unknown>,
   ): Promise<DeliveryResult> {
     return parseDeliveryResult(
-      await this._runtime._rpc("mobkit/delivery/send", options),
+      await this._runtime._rpc("meta/delivery/send", options),
     );
   }
 
@@ -2976,7 +3182,7 @@ export class MobHandle {
     if (recipient !== undefined) params.recipient = recipient;
     if (sink !== undefined) params.sink = sink;
     return parseDeliveryHistoryResult(
-      await this._runtime._rpc("mobkit/delivery/history", params),
+      await this._runtime._rpc("meta/delivery/history", params),
     );
   }
 
@@ -3003,12 +3209,12 @@ export class MobHandle {
         ? { query: queryOrOptions, ...(options ?? {}) }
         : { ...(queryOrOptions ?? {}) };
     return parseMemoryQueryResult(
-      await this._runtime._rpc("mobkit/memory/query", params),
+      await this._runtime._rpc("meta/memory/query", params),
     );
   }
 
   async memoryStores(): Promise<MemoryStoreInfo[]> {
-    const raw = await this._runtime._rpc("mobkit/memory/stores");
+    const raw = await this._runtime._rpc("meta/memory/stores");
     const stores =
       typeof raw === "object" && raw !== null
         ? (((raw as Record<string, unknown>).stores as unknown[]) ?? [])
@@ -3023,7 +3229,7 @@ export class MobHandle {
     options?: Record<string, unknown>,
   ): Promise<MemoryIndexResult> {
     return parseMemoryIndexResult(
-      await this._runtime._rpc("mobkit/memory/index", {
+      await this._runtime._rpc("meta/memory/index", {
         entity,
         topic,
         store,
@@ -3044,7 +3250,7 @@ export class MobHandle {
     if (memory.realm !== undefined) params.realm = memory.realm;
     if (memory.tags !== undefined) params.tags = [...memory.tags];
     return parseAgentMemoryRecord(
-      await this._runtime._rpc("mobkit/agent_memory/remember", params),
+      await this._runtime._rpc("meta/agent_memory/remember", params),
     );
   }
 
@@ -3059,7 +3265,7 @@ export class MobHandle {
     if (options.queryTerms !== undefined) params.query_terms = [...options.queryTerms];
     if (options.maxEntries !== undefined) params.max_entries = options.maxEntries;
     const result = parseAgentMemoryRecallResult(
-      await this._runtime._rpc("mobkit/agent_memory/recall", params),
+      await this._runtime._rpc("meta/agent_memory/recall", params),
     );
     return [...result.records];
   }
@@ -3072,7 +3278,7 @@ export class MobHandle {
     const params: Record<string, unknown> = { identity, memory_id: memoryId };
     if (options.realm !== undefined) params.realm = options.realm;
     return parseAgentMemoryForgetResult(
-      await this._runtime._rpc("mobkit/agent_memory/forget", params),
+      await this._runtime._rpc("meta/agent_memory/forget", params),
     );
   }
 
@@ -3095,7 +3301,7 @@ export class MobHandle {
     if (memory.realm !== undefined) params.realm = memory.realm;
     if (memory.tags !== undefined) params.tags = [...memory.tags];
     return parseAgentMemoryUpdateResult(
-      await this._runtime._rpc("mobkit/agent_memory/update", params),
+      await this._runtime._rpc("meta/agent_memory/update", params),
     );
   }
 
@@ -3113,7 +3319,7 @@ export class MobHandle {
     if (options.tier !== undefined) params.tier = options.tier;
     if (options.k !== undefined) params.k = options.k;
     const result = parseAgentMemoryManifestResult(
-      await this._runtime._rpc("mobkit/agent_memory/manifest", params),
+      await this._runtime._rpc("meta/agent_memory/manifest", params),
     );
     return [...result.records];
   }
@@ -3128,7 +3334,7 @@ export class MobHandle {
     const params: Record<string, unknown> = { module_id: moduleId, tool };
     if (args) params.arguments = args;
     return parseCallToolResult(
-      await this._runtime._rpc("mobkit/call_tool", params),
+      await this._runtime._rpc("meta/call_tool", params),
     );
   }
 
@@ -3139,7 +3345,7 @@ export class MobHandle {
   async sessionStoreBigQuery(
     options: Record<string, unknown>,
   ): Promise<unknown> {
-    return this._runtime._rpc("mobkit/session_store/bigquery", options);
+    return this._runtime._rpc("meta/session_store/bigquery", options);
   }
 
   // -- Gating -------------------------------------------------------------
@@ -3150,7 +3356,7 @@ export class MobHandle {
     options?: Record<string, unknown>,
   ): Promise<GatingEvaluateResult> {
     return parseGatingEvaluateResult(
-      await this._runtime._rpc("mobkit/gating/evaluate", {
+      await this._runtime._rpc("meta/gating/evaluate", {
         action,
         actor_id: actorId,
         ...(options ?? {}),
@@ -3159,7 +3365,7 @@ export class MobHandle {
   }
 
   async gatingPending(): Promise<GatingPendingEntry[]> {
-    const raw = await this._runtime._rpc("mobkit/gating/pending");
+    const raw = await this._runtime._rpc("meta/gating/pending");
     const entries =
       typeof raw === "object" && raw !== null
         ? (((raw as Record<string, unknown>).pending as unknown[]) ?? [])
@@ -3174,7 +3380,7 @@ export class MobHandle {
     options?: Record<string, unknown>,
   ): Promise<GatingDecisionResult> {
     return parseGatingDecisionResult(
-      await this._runtime._rpc("mobkit/gating/decide", {
+      await this._runtime._rpc("meta/gating/decide", {
         pending_id: pendingId,
         decision,
         approver_id: approverId,
@@ -3184,7 +3390,7 @@ export class MobHandle {
   }
 
   async gatingAudit(limit = 100): Promise<GatingAuditEntry[]> {
-    const raw = await this._runtime._rpc("mobkit/gating/audit", { limit });
+    const raw = await this._runtime._rpc("meta/gating/audit", { limit });
     const entries =
       typeof raw === "object" && raw !== null
         ? (((raw as Record<string, unknown>).entries as unknown[]) ?? [])
@@ -3194,7 +3400,7 @@ export class MobHandle {
 
   // -- WorkGraph ------------------------------------------------------------
   //
-  // Goals, work items, and attention bindings (`mobkit/workgraph/*`). Wire
+  // Goals, work items, and attention bindings (`meta/workgraph/*`). Wire
   // params are snake_case; option objects here are typed camelCase and
   // converted at the call site. See docs/design/workgraph-wire-contract.md.
 
@@ -3203,7 +3409,7 @@ export class MobHandle {
   ): Promise<WorkGraphSnapshotResult> {
     return parseWorkGraphSnapshotResult(
       await this._runtime._rpc(
-        "mobkit/workgraph/snapshot",
+        "meta/workgraph/snapshot",
         workGraphFilterOptionsToDict(options),
       ),
     );
@@ -3214,7 +3420,7 @@ export class MobHandle {
   ): Promise<WorkGraphItem[]> {
     const result = parseWorkGraphItemsResult(
       await this._runtime._rpc(
-        "mobkit/workgraph/list",
+        "meta/workgraph/list",
         workGraphFilterOptionsToDict(options),
       ),
     );
@@ -3227,7 +3433,7 @@ export class MobHandle {
   ): Promise<WorkGraphItem> {
     const params: Record<string, unknown> = { id };
     if (options?.namespace !== undefined) params.namespace = options.namespace;
-    const raw = await this._runtime._rpc("mobkit/workgraph/get", params);
+    const raw = await this._runtime._rpc("meta/workgraph/get", params);
     return parseWorkGraphItem(asWireRecord(raw).item);
   }
 
@@ -3236,7 +3442,7 @@ export class MobHandle {
   ): Promise<WorkGraphItem[]> {
     const result = parseWorkGraphItemsResult(
       await this._runtime._rpc(
-        "mobkit/workgraph/ready",
+        "meta/workgraph/ready",
         workGraphReadyOptionsToDict(options),
       ),
     );
@@ -3247,7 +3453,7 @@ export class MobHandle {
     options?: WorkGraphEventsOptions,
   ): Promise<WorkGraphEventEntry[]> {
     const raw = await this._runtime._rpc(
-      "mobkit/workgraph/events",
+      "meta/workgraph/events",
       workGraphEventsOptionsToDict(options),
     );
     const events = asWireRecord(raw).events;
@@ -3258,7 +3464,7 @@ export class MobHandle {
     options?: WorkGraphAttentionListOptions,
   ): Promise<WorkGraphAttentionBinding[]> {
     const raw = await this._runtime._rpc(
-      "mobkit/workgraph/attention/list",
+      "meta/workgraph/attention/list",
       workGraphAttentionListOptionsToDict(options),
     );
     const attention = asWireRecord(raw).attention;
@@ -3274,7 +3480,7 @@ export class MobHandle {
     const params: Record<string, unknown> = { binding_id: bindingId };
     if (options?.namespace !== undefined) params.namespace = options.namespace;
     return parseWorkGraphGoalResult(
-      await this._runtime._rpc("mobkit/workgraph/goal/status", params),
+      await this._runtime._rpc("meta/workgraph/goal/status", params),
     );
   }
 
@@ -3284,7 +3490,7 @@ export class MobHandle {
   ): Promise<WorkGraphItem> {
     const params = workGraphCreateOptionsToDict(options);
     params.title = title;
-    const raw = await this._runtime._rpc("mobkit/workgraph/create", params);
+    const raw = await this._runtime._rpc("meta/workgraph/create", params);
     return parseWorkGraphItem(asWireRecord(raw).item);
   }
 
@@ -3296,7 +3502,7 @@ export class MobHandle {
     const params = workGraphUpdateOptionsToDict(options);
     params.id = id;
     params.expected_revision = expectedRevision;
-    const raw = await this._runtime._rpc("mobkit/workgraph/update", params);
+    const raw = await this._runtime._rpc("meta/workgraph/update", params);
     return parseWorkGraphItem(asWireRecord(raw).item);
   }
 
@@ -3310,7 +3516,7 @@ export class MobHandle {
     params.id = id;
     params.expected_revision = expectedRevision;
     params.owner = workGraphOwnerInputToDict(owner);
-    const raw = await this._runtime._rpc("mobkit/workgraph/claim", params);
+    const raw = await this._runtime._rpc("meta/workgraph/claim", params);
     return parseWorkGraphItem(asWireRecord(raw).item);
   }
 
@@ -3324,7 +3530,7 @@ export class MobHandle {
       expected_revision: expectedRevision,
     };
     if (options?.namespace !== undefined) params.namespace = options.namespace;
-    const raw = await this._runtime._rpc("mobkit/workgraph/release", params);
+    const raw = await this._runtime._rpc("meta/workgraph/release", params);
     return parseWorkGraphItem(asWireRecord(raw).item);
   }
 
@@ -3336,7 +3542,7 @@ export class MobHandle {
     const params = workGraphCloseOptionsToDict(options);
     params.id = id;
     params.expected_revision = expectedRevision;
-    const raw = await this._runtime._rpc("mobkit/workgraph/close", params);
+    const raw = await this._runtime._rpc("meta/workgraph/close", params);
     return parseWorkGraphItem(asWireRecord(raw).item);
   }
 
@@ -3350,7 +3556,7 @@ export class MobHandle {
       expected_revision: expectedRevision,
     };
     if (options?.namespace !== undefined) params.namespace = options.namespace;
-    const raw = await this._runtime._rpc("mobkit/workgraph/block", params);
+    const raw = await this._runtime._rpc("meta/workgraph/block", params);
     return parseWorkGraphItem(asWireRecord(raw).item);
   }
 
@@ -3366,7 +3572,7 @@ export class MobHandle {
       to_id: toId,
     };
     if (options?.namespace !== undefined) params.namespace = options.namespace;
-    const raw = await this._runtime._rpc("mobkit/workgraph/link", params);
+    const raw = await this._runtime._rpc("meta/workgraph/link", params);
     return parseWorkGraphEdge(asWireRecord(raw).edge);
   }
 
@@ -3383,7 +3589,7 @@ export class MobHandle {
     };
     if (options?.namespace !== undefined) params.namespace = options.namespace;
     const raw = await this._runtime._rpc(
-      "mobkit/workgraph/evidence/add",
+      "meta/workgraph/evidence/add",
       params,
     );
     return parseWorkGraphItem(asWireRecord(raw).item);
@@ -3404,7 +3610,7 @@ export class MobHandle {
     };
     if (options?.namespace !== undefined) params.namespace = options.namespace;
     const raw = await this._runtime._rpc(
-      "mobkit/workgraph/policy/escalate",
+      "meta/workgraph/policy/escalate",
       params,
     );
     return parseWorkGraphItem(asWireRecord(raw).item);
@@ -3419,7 +3625,7 @@ export class MobHandle {
     params.title = title;
     params.target = workGraphGoalTargetToDict(target);
     return parseWorkGraphGoalResult(
-      await this._runtime._rpc("mobkit/workgraph/goal/create", params),
+      await this._runtime._rpc("meta/workgraph/goal/create", params),
     );
   }
 
@@ -3432,7 +3638,7 @@ export class MobHandle {
     params.binding_id = bindingId;
     params.expected_revision = expectedRevision;
     return parseWorkGraphGoalResult(
-      await this._runtime._rpc("mobkit/workgraph/goal/confirm", params),
+      await this._runtime._rpc("meta/workgraph/goal/confirm", params),
     );
   }
 
@@ -3445,7 +3651,7 @@ export class MobHandle {
     params.binding_id = bindingId;
     params.expected_revision = expectedRevision;
     return parseWorkGraphGoalResult(
-      await this._runtime._rpc("mobkit/workgraph/goal/request_close", params),
+      await this._runtime._rpc("meta/workgraph/goal/request_close", params),
     );
   }
 
@@ -3458,7 +3664,7 @@ export class MobHandle {
     params.binding_id = bindingId;
     params.expected_revision = expectedRevision;
     const raw = await this._runtime._rpc(
-      "mobkit/workgraph/attention/pause",
+      "meta/workgraph/attention/pause",
       params,
     );
     return parseWorkGraphAttentionBinding(asWireRecord(raw).attention);
@@ -3475,7 +3681,7 @@ export class MobHandle {
     };
     if (options?.namespace !== undefined) params.namespace = options.namespace;
     const raw = await this._runtime._rpc(
-      "mobkit/workgraph/attention/resume",
+      "meta/workgraph/attention/resume",
       params,
     );
     return parseWorkGraphAttentionBinding(asWireRecord(raw).attention);
@@ -3494,7 +3700,7 @@ export class MobHandle {
     };
     if (options?.namespace !== undefined) params.namespace = options.namespace;
     return parseWorkGraphAttentionReassignResult(
-      await this._runtime._rpc("mobkit/workgraph/attention/reassign", params),
+      await this._runtime._rpc("meta/workgraph/attention/reassign", params),
     );
   }
 
@@ -3515,14 +3721,14 @@ export class MobHandle {
     }
     if (options?.namespace !== undefined) params.namespace = options.namespace;
     const raw = await this._runtime._rpc(
-      "mobkit/workgraph/attention/prune",
+      "meta/workgraph/attention/prune",
       params,
     );
     const pruned = asWireRecord(raw).pruned;
     return typeof pruned === "number" ? pruned : 0;
   }
 
-  // -- Live (realtime) sessions — mobkit/live/* (mobkit 0.7.31) ------------
+  // -- Live (realtime) sessions — meta/live/* (mobkit 0.7.31) ------------
 
   /**
    * Open a realtime (live) channel on a member's session. Returns the
@@ -3534,7 +3740,7 @@ export class MobHandle {
     identity: string,
     options?: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    const raw = await this._runtime._rpc("mobkit/live/open", {
+    const raw = await this._runtime._rpc("meta/live/open", {
       identity,
       ...(options ?? {}),
     });
@@ -3594,7 +3800,7 @@ export class MobHandle {
         throw new CapabilityUnavailableError(
           `capability ${LIVE_EXECUTION_IDENTITY_V1} is not available`,
           "",
-          "mobkit/live/open",
+          "meta/live/open",
           { capability: LIVE_EXECUTION_IDENTITY_V1 },
         );
       }
@@ -3610,13 +3816,13 @@ export class MobHandle {
       );
     }
     const raw = asWireRecord(
-      await this._runtime._rpc("mobkit/live/open", params),
+      await this._runtime._rpc("meta/live/open", params),
     );
     if (executionIdentity !== undefined) {
       const pending = parsePendingLiveChannelHandle(raw);
       if (pending.targetIdentity !== identity) {
         throw new TypeError(
-          "strict mobkit/live/open returned a different target identity",
+          "strict meta/live/open returned a different target identity",
         );
       }
       if (!supportsLiveExecutionMode(
@@ -3626,7 +3832,7 @@ export class MobHandle {
         throw new CapabilityUnavailableError(
           "resolved live execution mode is not advertised",
           "",
-          "mobkit/live/open",
+          "meta/live/open",
           { execution_mode: pending.executionMode },
         );
       }
@@ -3642,7 +3848,7 @@ export class MobHandle {
     pending: PendingLiveChannelHandle,
   ): Promise<LivePlaybackOwnerReadiness> {
     const readiness = parseLivePlaybackOwnerReadiness(
-      await this._runtime._rpc("mobkit/live/playback_owner/register", {
+      await this._runtime._rpc("meta/live/playback_owner/register", {
         identity: pending.targetIdentity,
         channel_id: pending.channelId,
         pending_receipt: pending.pendingReceipt,
@@ -3680,7 +3886,7 @@ export class MobHandle {
       params.activation_receipt = active.activationReceipt;
     }
     const status = parseExperimentalLiveChannelStatus(
-      await this._runtime._rpc("mobkit/live/playback_owner/revoke", params),
+      await this._runtime._rpc("meta/live/playback_owner/revoke", params),
     );
     if (status.phase !== "revoked") {
       throw new TypeError("playback owner revoke did not return revoked custody");
@@ -3701,7 +3907,7 @@ export class MobHandle {
       params.activation_receipt = handle.activationReceipt;
     }
     const status = parseExperimentalLiveChannelStatus(
-      await this._runtime._rpc("mobkit/live/status", params),
+      await this._runtime._rpc("meta/live/status", params),
     );
     if (
       status.phase === "active" &&
@@ -3876,7 +4082,7 @@ export class MobHandle {
   ): Promise<LiveReplacementRequired> {
     activeLiveChannelHandleToWire(active);
     return parseLiveReplacementRequired(
-      await this._runtime._rpc("mobkit/live/replacement_required", {
+      await this._runtime._rpc("meta/live/replacement_required", {
         identity: active.targetIdentity,
         channel_id: active.channelId,
         activation_receipt: active.activationReceipt,
@@ -3936,7 +4142,7 @@ export class MobHandle {
       throw new TypeError("assistant output does not belong to active channel");
     }
     return parseLivePlaybackCompleteResult(
-      await this._runtime._rpc("mobkit/live/playback_complete", {
+      await this._runtime._rpc("meta/live/playback_complete", {
         identity: active.targetIdentity,
         channel_id: active.channelId,
         activation_receipt: active.activationReceipt,
@@ -3949,7 +4155,7 @@ export class MobHandle {
     identity: string,
     options?: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    const raw = await this._runtime._rpc("mobkit/live/status", {
+    const raw = await this._runtime._rpc("meta/live/status", {
       identity,
       ...(options ?? {}),
     });
@@ -3972,7 +4178,7 @@ export class MobHandle {
         params.activation_receipt = handle.activationReceipt;
       }
     }
-    const raw = await this._runtime._rpc("mobkit/live/close", params);
+    const raw = await this._runtime._rpc("meta/live/close", params);
     return asWireRecord(raw);
   }
 
@@ -3988,7 +4194,7 @@ export class MobHandle {
     dataBase64: string,
     options?: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    const raw = await this._runtime._rpc("mobkit/live/send_input", {
+    const raw = await this._runtime._rpc("meta/live/send_input", {
       identity,
       chunk: {
         kind: "image",
@@ -4010,7 +4216,7 @@ export class MobHandle {
     identity: string,
     options?: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    const raw = await this._runtime._rpc("mobkit/live/refresh", {
+    const raw = await this._runtime._rpc("meta/live/refresh", {
       identity,
       ...(options ?? {}),
     });
@@ -4028,7 +4234,7 @@ export class MobHandle {
     if (output.channelId !== active.channelId) {
       throw new TypeError("assistant output does not belong to active channel");
     }
-    const raw = await this._runtime._rpc("mobkit/live/truncate", {
+    const raw = await this._runtime._rpc("meta/live/truncate", {
       identity: active.targetIdentity,
       channel_id: active.channelId,
       activation_receipt: active.activationReceipt,
@@ -4045,7 +4251,7 @@ export class MobHandle {
   ): Promise<Record<string, unknown>> {
     activeLiveChannelHandleToWire(active);
     return asWireRecord(
-      await this._runtime._rpc("mobkit/live/refresh", {
+      await this._runtime._rpc("meta/live/refresh", {
         identity: active.targetIdentity,
         channel_id: active.channelId,
         activation_receipt: active.activationReceipt,
@@ -4062,7 +4268,7 @@ export class MobHandle {
   ): Promise<Record<string, unknown>> {
     activeLiveChannelHandleToWire(active);
     return asWireRecord(
-      await this._runtime._rpc("mobkit/live/send_input", {
+      await this._runtime._rpc("meta/live/send_input", {
         identity: active.targetIdentity,
         channel_id: active.channelId,
         activation_receipt: active.activationReceipt,
@@ -4082,7 +4288,7 @@ export class MobHandle {
   ): Promise<Record<string, unknown>> {
     activeLiveChannelHandleToWire(active);
     return asWireRecord(
-      await this._runtime._rpc("mobkit/live/commit_input", {
+      await this._runtime._rpc("meta/live/commit_input", {
         identity: active.targetIdentity,
         channel_id: active.channelId,
         activation_receipt: active.activationReceipt,
@@ -4096,7 +4302,7 @@ export class MobHandle {
   ): Promise<Record<string, unknown>> {
     activeLiveChannelHandleToWire(active);
     return asWireRecord(
-      await this._runtime._rpc("mobkit/live/interrupt", {
+      await this._runtime._rpc("meta/live/interrupt", {
         identity: active.targetIdentity,
         channel_id: active.channelId,
         activation_receipt: active.activationReceipt,
@@ -4107,7 +4313,7 @@ export class MobHandle {
   // -- Topology -----------------------------------------------------------
 
   async rediscover(): Promise<RediscoverReport | null> {
-    const raw = await this._runtime._rpc("mobkit/rediscover");
+    const raw = await this._runtime._rpc("meta/rediscover");
     if (
       typeof raw === "object" &&
       raw !== null &&
@@ -4120,14 +4326,14 @@ export class MobHandle {
 
   async reconcileEdges(): Promise<ReconcileEdgesReport> {
     return parseReconcileEdgesReport(
-      await this._runtime._rpc("mobkit/reconcile_edges"),
+      await this._runtime._rpc("meta/reconcile_edges"),
     );
   }
 
   // -- Cross-mob ----------------------------------------------------------
 
   async listExternalMobs(): Promise<CrossMobContactEntry[]> {
-    const raw = await this._runtime._rpc("mobkit/cross_mob/directory");
+    const raw = await this._runtime._rpc("meta/cross_mob/directory");
     const mobs =
       typeof raw === "object" && raw !== null
         ? Array.isArray((raw as Record<string, unknown>).mobs)
@@ -4138,7 +4344,7 @@ export class MobHandle {
   }
 
   async peerInfo(memberId: string): Promise<Record<string, string>> {
-    const raw = await this._runtime._rpc("mobkit/cross_mob/peer_info", {
+    const raw = await this._runtime._rpc("meta/cross_mob/peer_info", {
       member_id: memberId,
     });
     const out: Record<string, string> = {};
@@ -4151,7 +4357,7 @@ export class MobHandle {
   }
 
   async peerPubkey(): Promise<string> {
-    const raw = await this._runtime._rpc("mobkit/peer_pubkey");
+    const raw = await this._runtime._rpc("meta/peer_pubkey");
     return typeof raw === "object" && raw !== null
       ? String((raw as Record<string, unknown>).pubkey_b64 ?? "")
       : "";
@@ -4173,7 +4379,7 @@ export class MobHandle {
     if (options?.remotePubkeyB64) {
       params.remote_pubkey_b64 = options.remotePubkeyB64;
     }
-    await this._runtime._rpc("mobkit/cross_mob/wire_local", params);
+    await this._runtime._rpc("meta/cross_mob/wire_local", params);
   }
 
   async unwireLocal(
@@ -4192,7 +4398,7 @@ export class MobHandle {
     if (options?.remotePubkeyB64) {
       params.remote_pubkey_b64 = options.remotePubkeyB64;
     }
-    await this._runtime._rpc("mobkit/cross_mob/unwire_local", params);
+    await this._runtime._rpc("meta/cross_mob/unwire_local", params);
   }
 
   async wireCrossMob(
@@ -4263,7 +4469,7 @@ export class MobHandle {
     };
     if (Object.keys(helperOptions).length > 0) params.options = helperOptions;
     return parseHelperResult(
-      await this._runtime._rpc("mobkit/spawn_helper", params),
+      await this._runtime._rpc("meta/spawn_helper", params),
     );
   }
 
@@ -4294,7 +4500,7 @@ export class MobHandle {
     if (options?.forkContext) params.fork_context = options.forkContext;
     if (Object.keys(helperOptions).length > 0) params.options = helperOptions;
     return parseHelperResult(
-      await this._runtime._rpc("mobkit/fork_helper", params),
+      await this._runtime._rpc("meta/fork_helper", params),
     );
   }
 
@@ -4304,7 +4510,7 @@ export class MobHandle {
     sessionId: string,
   ): Promise<RichMemberSnapshot> {
     return parseRichMemberSnapshot(
-      await this._runtime._rpc("mobkit/attach_existing_session", {
+      await this._runtime._rpc("meta/attach_existing_session", {
         role,
         agent_identity: agentIdentity,
         session_id: sessionId,
@@ -4312,21 +4518,21 @@ export class MobHandle {
     );
   }
 
-  // -- Mob/run labels — mobkit-side sidecar metadata ----------------------
+  // -- Mob/run labels — meta-side sidecar metadata ----------------------
 
   /**
    * Replace the label set associated with this mob.
    *
-   * Mobkit owns these labels — they are separate from meerkat-mob's
+   * Meta owns these labels — they are separate from meerkat-mob's
    * member-level labels. Replacement is wholesale; pass `{}` to clear.
    */
   async setMobLabels(labels: Record<string, string>): Promise<void> {
-    await this._runtime._rpc("mobkit/mob_labels/set", { labels });
+    await this._runtime._rpc("meta/mob_labels/set", { labels });
   }
 
   /** Return the label set associated with this mob (or `{}`). */
   async getMobLabels(): Promise<Record<string, string>> {
-    const raw = await this._runtime._rpc("mobkit/mob_labels/get");
+    const raw = await this._runtime._rpc("meta/mob_labels/get");
     if (typeof raw !== "object" || raw === null) return {};
     const labels = (raw as Record<string, unknown>).labels;
     if (typeof labels !== "object" || labels === null) return {};
@@ -4339,7 +4545,7 @@ export class MobHandle {
 
   /** Remove the label set associated with this mob. */
   async deleteMobLabels(): Promise<void> {
-    await this._runtime._rpc("mobkit/mob_labels/delete");
+    await this._runtime._rpc("meta/mob_labels/delete");
   }
 
   /**
@@ -4350,7 +4556,7 @@ export class MobHandle {
     runId: string,
     labels: Record<string, string>,
   ): Promise<void> {
-    await this._runtime._rpc("mobkit/run_labels/set", {
+    await this._runtime._rpc("meta/run_labels/set", {
       run_id: runId,
       labels,
     });
@@ -4358,7 +4564,7 @@ export class MobHandle {
 
   /** Return the label set for `runId` (or `{}`). */
   async getRunLabels(runId: string): Promise<Record<string, string>> {
-    const raw = await this._runtime._rpc("mobkit/run_labels/get", {
+    const raw = await this._runtime._rpc("meta/run_labels/get", {
       run_id: runId,
     });
     if (typeof raw !== "object" || raw === null) return {};
@@ -4373,7 +4579,7 @@ export class MobHandle {
 
   /** Remove the label set for `runId`. */
   async deleteRunLabels(runId: string): Promise<void> {
-    await this._runtime._rpc("mobkit/run_labels/delete", { run_id: runId });
+    await this._runtime._rpc("meta/run_labels/delete", { run_id: runId });
   }
 }
 
@@ -4406,7 +4612,7 @@ export class ToolCaller {
  * Bridge for streaming SSE from the Rust backend's HTTP server.
  */
 export class SseBridge {
-  constructor(private readonly _runtime: MobKitRuntime) {}
+  constructor(private readonly _runtime: MetaRuntime) {}
 
   private _baseUrl(): string {
     const base = this._runtime.rustHttpBaseUrl;
@@ -4509,7 +4715,7 @@ export interface MemberRunStopContributor {
   terminal?: "completed" | "abandoned" | "superseded" | "coalesced" | "cancelled" | null;
 }
 
-/** meerkat's typed run-stop receipt, relayed verbatim by `mobkit/stop_member_run`. */
+/** meerkat's typed run-stop receipt, relayed verbatim by `meta/stop_member_run`. */
 export type MemberRunStopReceipt =
   | { outcome: "stopped"; run_id: string; contributors: MemberRunStopContributor[] }
   | { outcome: "not_current"; run_id: string; current_run_id?: string | null }

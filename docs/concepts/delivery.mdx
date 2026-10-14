@@ -4,16 +4,16 @@ description: "Trusted route resolution and MCP-backed delivery with optional bou
 icon: "paper-plane"
 ---
 
-MobKit separates route selection from message dispatch. The runtime owns trusted routing resolutions, rate limiting, bounded delivery history, and optional idempotency. The `router` and `delivery` modules provide the external MCP boundaries.
+Meta separates route selection from message dispatch. The runtime owns trusted routing resolutions, rate limiting, bounded delivery history, and optional idempotency. The `router` and `delivery` modules provide the external MCP boundaries.
 
 ## Delivery flow
 
 <Steps>
   <Step title="Resolve">
-    Call `mobkit/routing/resolve` with a recipient and optional channel, retry, backoff, and rate-limit values. The runtime calls the router module's `routing.resolve` MCP tool, applies any matching runtime-route override, mints a `route_id`, and retains the resulting `RoutingResolution` as trusted state.
+    Call `meta/routing/resolve` with a recipient and optional channel, retry, backoff, and rate-limit values. The runtime calls the router module's `routing.resolve` MCP tool, applies any matching runtime-route override, mints a `route_id`, and retains the resulting `RoutingResolution` as trusted state.
   </Step>
   <Step title="Send">
-    Call `mobkit/delivery/send` with the complete trusted `resolution`, a JSON `payload`, and an optional `idempotency_key`.
+    Call `meta/delivery/send` with the complete trusted `resolution`, a JSON `payload`, and an optional `idempotency_key`.
   </Step>
   <Step title="Replay or validate">
     With the delivery module loaded and a valid key, the runtime first checks for a retained idempotent replay. A matching payload and canonical resolution return the existing record without dispatch. Otherwise, a new send requires the supplied resolution to equal the retained issued resolution for its `route_id`; unknown or modified resolutions are rejected before dispatch.
@@ -55,19 +55,19 @@ The request defaults are `channel = "notification"`, `retry_max = 1`, `backoff_m
 
 <Warning>
 `retry_max` and `backoff_ms` currently shape synthetic attempt records; they
-do not cause MobKit to retry the MCP call or wait between attempts. A
+do not cause Meta to retry the MCP call or wait between attempts. A
 non-replayed send that reaches dispatch invokes `delivery.send` once.
 Implement any required real retry/backoff in the application delivery module
 or host policy. See [Delivery records and adapters](#delivery-records-and-adapters).
 </Warning>
 
-These sink strings are routing defaults, not a promise that MobKit ships an SMTP, SMS, or webhook adapter. The router module can override the sink and return a `target_module`; a matching runtime route can override both again. The current `mobkit/delivery/send` contract dispatches only a trusted resolution whose `target_module` is exactly `delivery`. Any other target is rejected before the delivery MCP boundary call, so alternate target values are representable for routing inspection but are not dispatchable. The `delivery` module owns actual dispatch.
+These sink strings are routing defaults, not a promise that Meta ships an SMTP, SMS, or webhook adapter. The router module can override the sink and return a `target_module`; a matching runtime route can override both again. The current `meta/delivery/send` contract dispatches only a trusted resolution whose `target_module` is exactly `delivery`. Any other target is rejected before the delivery MCP boundary call, so alternate target values are representable for routing inspection but are not dispatchable. The `delivery` module owns actual dispatch.
 
 Runtime routes can be listed, added, and deleted through:
 
-- `mobkit/routing/routes/list`
-- `mobkit/routing/routes/add`
-- `mobkit/routing/routes/delete`
+- `meta/routing/routes/list`
+- `meta/routing/routes/add`
+- `meta/routing/routes/delete`
 
 Runtime routes may use `*` recipient and channel matches. A matching route is applied after the router MCP response.
 
@@ -140,7 +140,7 @@ The runtime retains counters for the current and previous window. It charges the
 
 `DeliveryRecord` contains the delivery and route IDs, recipient, sink, target module, original payload, status, attempt records, first and final attempt timestamps, optional idempotency key, and optional `sink_adapter`.
 
-After the single MCP boundary call succeeds, MobKit synthesizes
+After the single MCP boundary call succeeds, Meta synthesizes
 `retry_max + 1` attempt rows: nonfinal rows are labeled `transient_failure`,
 and the final row carries the record's status. `final_attempt_ms` is computed
 from `first_attempt_ms + backoff_ms * retry_max` (with saturating arithmetic),
@@ -148,7 +148,7 @@ not measured after repeated sends. These rows are not evidence of actual
 retry attempts, observed transient failures, or elapsed backoff. A boundary
 error returns immediately instead of entering a retry loop.
 
-The `sink` comes from routing. The optional `sink_adapter` is recorded only when the delivery module returns a non-empty `adapter` string. MobKit does not maintain a fixed built-in adapter inventory in this contract.
+The `sink` comes from routing. The optional `sink_adapter` is recorded only when the delivery module returns a non-empty `adapter` string. Meta does not maintain a fixed built-in adapter inventory in this contract.
 
 Delivery dispatch emits a unified module event with:
 
@@ -156,7 +156,7 @@ Delivery dispatch emits a unified module event with:
 - `event_type: "send"`
 - payload fields `delivery_id`, `route_id`, `recipient`, `sink`, `status`, and `attempts`
 
-Query bounded history with `mobkit/delivery/history`. The request supports optional `recipient` and `sink` filters plus a capped `limit`.
+Query bounded history with `meta/delivery/history`. The request supports optional `recipient` and `sink` filters plus a capped `limit`.
 
 ## Clock ordering
 

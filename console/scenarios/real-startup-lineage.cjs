@@ -8,7 +8,7 @@ const { setTimeout: delay } = require("node:timers/promises");
 const { chromium } = require("playwright");
 const { startFixture, eventually, rpc, snapshot } = require("../acceptance-runtime.cjs");
 
-const evidence = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+const evidence = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
 const source = "## Acceptance reply\n\nReal runtime **Markdown**, a [safe link](https://example.com), and `code`.\n\n| Item | Value |\n| --- | --- |\n| Result | Ready |\n";
 const agentIdentity = "router:main";
 
@@ -237,14 +237,14 @@ function expectedCancellation(request) {
   if (new URL(request.url()).pathname.endsWith("/timeline/stream")) return true;
   try {
     const body = JSON.parse(request.postData() || "{}");
-    return body.method === "mobkit/console/query_timeline" && body.params?.mode === "recent" && body.params?.limit === 200 && !body.params?.identity;
+    return body.method === "meta/console/query_timeline" && body.params?.mode === "recent" && body.params?.limit === 200 && !body.params?.identity;
   } catch { return false; }
 }
 
 async function startupLineage(host) {
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "Use the coordinator's prebuilt typed-lineage fixture; never compile Rust in this scenario.");
+  assert(process.env.META_EXAMPLE_BIN_DIR, "Use the coordinator's prebuilt typed-lineage fixture; never compile Rust in this scenario.");
   const fixture = await startFixture();
-  const browser = await chromium.launch({ headless: process.env.MOBKIT_HEADED !== "1" });
+  const browser = await chromium.launch({ headless: process.env.META_HEADED !== "1" });
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
   const result = { host, source, errors: [], expectedCancellations: [], rendered: {} };
   let allowance = "initialization";
@@ -293,7 +293,7 @@ async function startupLineage(host) {
       identity: agentIdentity, origin: "console:startup-lineage-acceptance", origin_kind: "operator",
       content: "Give the startup report for this console session.", idempotency_key: randomUUID(), handling_mode: "queue",
     };
-    result.startupSend = await rpc(fixture.baseUrl, "mobkit/console/send", result.startupRequest);
+    result.startupSend = await rpc(fixture.baseUrl, "meta/console/send", result.startupRequest);
     assert.equal(result.startupSend.status, 200);
     assert(result.startupSend.body.result?.interaction_id && result.startupSend.body.result?.input_frame_id,
       JSON.stringify(result.startupSend.body));
@@ -305,7 +305,7 @@ async function startupLineage(host) {
     assert.deepEqual(assertStartupLineage(snapshotFrames, result.initialHistory).map(owner => owner.runId).sort(), result.initialOwners.map(owner => owner.runId).sort(), "real SSE replay preserves canonical startup runs");
 
     await fixture.control("model", { source, delay_ms: 20, chunk_chars: 8 });
-    const sent = await rpc(fixture.baseUrl, "mobkit/console/send", {
+    const sent = await rpc(fixture.baseUrl, "meta/console/send", {
       identity: agentIdentity, origin: "console:startup-lineage-acceptance", origin_kind: "operator",
       content: "Repeat the startup report as a separate review turn.", idempotency_key: randomUUID(), handling_mode: "queue",
     });

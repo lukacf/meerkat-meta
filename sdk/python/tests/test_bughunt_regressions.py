@@ -22,17 +22,18 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from meerkat_mobkit._sse import SseEvent
-from meerkat_mobkit._transport import (
+from meerkat_meta._sse import SseEvent
+from meerkat_meta._transport import (
     _GATEWAY_SHUTDOWN_GRACE_SECONDS,
     _PROCESS_KILL_GRACE_SECONDS,
     _PROCESS_TERMINATE_GRACE_SECONDS,
     _PROVIDER_CALLBACK_COMPLETION_SECONDS,
     PersistentTransport,
+    TransportTermination,
 )
-from meerkat_mobkit.errors import RpcError
-from meerkat_mobkit.events import AgentEvent, MobEvent
-from meerkat_mobkit.types import EventEnvelope, KeepAliveConfig
+from meerkat_meta.errors import RpcError
+from meerkat_meta.events import AgentEvent, MobEvent
+from meerkat_meta.types import EventEnvelope, KeepAliveConfig
 
 
 # -- Bug #4: AsgiApp /rpc no longer raises AttributeError on RpcError --
@@ -43,7 +44,7 @@ async def test_asgi_rpc_handler_returns_real_rpc_error_code_and_message():
     exist on RpcError), fell through to `except Exception`, and returned
     -32603 / `'RpcError' object has no attribute 'message'`.
     """
-    from meerkat_mobkit.runtime import AsgiApp
+    from meerkat_meta.runtime import AsgiApp
 
     runtime = MagicMock()
     runtime._rpc = AsyncMock(
@@ -51,7 +52,7 @@ async def test_asgi_rpc_handler_returns_real_rpc_error_code_and_message():
             code=-32001,
             message="boom",
             request_id="rid",
-            method="mobkit/status",
+            method="meta/status",
             data={"detail": "x"},
         )
     )
@@ -63,7 +64,7 @@ async def test_asgi_rpc_handler_returns_real_rpc_error_code_and_message():
     app._fallback_app = None
 
     request_body = json.dumps(
-        {"jsonrpc": "2.0", "id": 1, "method": "mobkit/status", "params": {}}
+        {"jsonrpc": "2.0", "id": 1, "method": "meta/status", "params": {}}
     ).encode()
 
     received: list[dict] = []
@@ -154,7 +155,7 @@ def test_provider_callback_uses_dedicated_completion_deadline(request_timeout):
         return future
 
     with patch(
-        "meerkat_mobkit._transport.asyncio.run_coroutine_threadsafe",
+        "meerkat_meta._transport.asyncio.run_coroutine_threadsafe",
         side_effect=schedule,
     ):
         transport._dispatch_callback(
@@ -197,7 +198,7 @@ def test_provider_callback_timeout_cancels_event_loop_future():
         return future
 
     with patch(
-        "meerkat_mobkit._transport.asyncio.run_coroutine_threadsafe",
+        "meerkat_meta._transport.asyncio.run_coroutine_threadsafe",
         side_effect=schedule,
     ):
         transport._dispatch_callback(
@@ -235,7 +236,7 @@ def test_provider_raised_timeout_error_is_not_rewritten_as_host_deadline():
         return future
 
     with patch(
-        "meerkat_mobkit._transport.asyncio.run_coroutine_threadsafe",
+        "meerkat_meta._transport.asyncio.run_coroutine_threadsafe",
         side_effect=schedule,
     ):
         transport._dispatch_callback(
@@ -284,7 +285,7 @@ def test_init_negotiates_explicit_gateway_shutdown_horizon():
         {
             "jsonrpc": "2.0",
             "id": "init-horizon",
-            "method": "mobkit/init",
+            "method": "meta/init",
             "params": {},
         }
     )
@@ -313,7 +314,7 @@ def test_init_uses_safe_shutdown_horizon_for_invalid_capability(invalid_horizon)
         {
             "jsonrpc": "2.0",
             "id": "init-invalid-horizon",
-            "method": "mobkit/init",
+            "method": "meta/init",
             "params": {},
         }
     )
@@ -331,7 +332,7 @@ def test_start_resets_shutdown_capabilities_for_replacement_process():
     process.stdout.readline.return_value = b""
 
     with patch(
-        "meerkat_mobkit._transport.subprocess.Popen",
+        "meerkat_meta._transport.subprocess.Popen",
         return_value=process,
     ):
         transport.start()
@@ -356,7 +357,7 @@ def test_stop_gives_gateway_full_cleanup_budget_before_termination():
     )
 
     with patch(
-        "meerkat_mobkit._transport.time.monotonic",
+        "meerkat_meta._transport.time.monotonic",
         side_effect=[100.0, 100.0],
     ):
         transport.stop()
@@ -371,6 +372,9 @@ def test_stop_gives_gateway_full_cleanup_budget_before_termination():
     process.kill.assert_called_once_with()
     transport._request_gateway_shutdown.assert_not_called()
     assert transport._process is None
+    assert transport.last_termination == TransportTermination(
+        "exited", 0, None, "sigkill", "not_negotiated"
+    )
 
 
 def test_stop_rejects_and_retains_unreaped_gateway_after_sigkill():
@@ -385,7 +389,7 @@ def test_stop_rejects_and_retains_unreaped_gateway_after_sigkill():
     transport._process = process
 
     with patch(
-        "meerkat_mobkit._transport.time.monotonic",
+        "meerkat_meta._transport.time.monotonic",
         side_effect=[100.0, 100.0],
     ), pytest.raises(RuntimeError, match="did not terminate after bounded cleanup"):
         transport.stop()
@@ -393,6 +397,27 @@ def test_stop_rejects_and_retains_unreaped_gateway_after_sigkill():
     process.terminate.assert_called_once_with()
     process.kill.assert_called_once_with()
     assert transport._process is process
+    assert transport.last_termination == TransportTermination(
+        "unknown", None, None, "sigkill", "not_negotiated"
+    )
+
+    # A later stop finishes the same child and keeps the attempted escalation;
+    # the child already had its horizon, so it is not waited out again.
+    process.wait.side_effect = None
+    process.wait.return_value = -9
+    with patch(
+        "meerkat_meta._transport.time.monotonic",
+        side_effect=[200.0, 200.0],
+    ):
+        transport.stop()
+
+    assert process.wait.call_args_list[-1] == call(timeout=0.0)
+    process.terminate.assert_called_once_with()
+    process.kill.assert_called_once_with()
+    assert transport._process is None
+    assert transport.last_termination == TransportTermination(
+        "exited", None, "SIGKILL", "sigkill", "not_negotiated"
+    )
 
 
 def test_stop_honors_negotiated_horizon_and_waits_for_gated_shutdown_callback():
@@ -408,8 +433,8 @@ def test_stop_honors_negotiated_horizon_and_waits_for_gated_shutdown_callback():
     def answer_shutdown(request, *, timeout, process):
         assert process is transport._process
         process.stdin.close.assert_not_called()
-        assert request["method"] == "mobkit/shutdown"
-        assert request["id"].startswith("mobkit-shutdown-")
+        assert request["method"] == "meta/shutdown"
+        assert request["id"].startswith("meta-shutdown-")
         assert timeout == 321.0
         gate.wait(timeout=2)
         gate.wait(timeout=2)
@@ -434,7 +459,7 @@ def test_stop_honors_negotiated_horizon_and_waits_for_gated_shutdown_callback():
     # Patch the transport module's `time` binding rather than the process-wide
     # `time.monotonic` function. `threading.Barrier` also uses monotonic time on
     # current Python versions and must remain real while this callback is gated.
-    with patch("meerkat_mobkit._transport.time") as transport_time:
+    with patch("meerkat_meta._transport.time") as transport_time:
         transport_time.monotonic.return_value = 100.0
         worker = threading.Thread(target=stop_transport)
         worker.start()
@@ -449,6 +474,9 @@ def test_stop_honors_negotiated_horizon_and_waits_for_gated_shutdown_callback():
     process.stdin.close.assert_called_once_with()
     process.wait.assert_called_once_with(timeout=321.0)
     assert transport._process is None
+    assert transport.last_termination == TransportTermination(
+        "exited", 0, None, "none", "acknowledged"
+    )
 
 
 _MISSING_CLEANUP_ATTESTATION = object()
@@ -480,7 +508,7 @@ def test_stop_rejects_non_true_cleanup_attestation_after_reaping_gateway(
     )
 
     with patch(
-        "meerkat_mobkit._transport.time.monotonic",
+        "meerkat_meta._transport.time.monotonic",
         side_effect=[100.0, 100.0],
     ), pytest.raises(RuntimeError, match="failed after bounded cleanup"):
         transport.stop()
@@ -488,6 +516,263 @@ def test_stop_rejects_non_true_cleanup_attestation_after_reaping_gateway(
     process.stdin.close.assert_called_once_with()
     process.wait.assert_called_once_with(timeout=321.0)
     assert transport._process is None
+    assert transport.last_termination == TransportTermination(
+        "exited", 0, None, "none", "refused"
+    )
+
+
+def _stop_with_shutdown_result(result):
+    transport = PersistentTransport("unused")
+    process = MagicMock()
+    process.poll.return_value = None
+    process.wait.return_value = 0
+    transport._process = process
+    transport._supports_shutdown_handshake = True
+    transport._shutdown_horizon_seconds = 321.0
+    transport._send_sync_running = MagicMock(
+        return_value={"jsonrpc": "2.0", "id": "shutdown", "result": result}
+    )
+    with patch(
+        "meerkat_meta._transport.time.monotonic",
+        side_effect=[100.0, 100.0],
+    ):
+        transport.stop()
+    process.wait.assert_called_once_with(timeout=321.0)
+    assert transport._process is None
+    return transport
+
+
+def test_stop_reaps_without_failing_on_process_exit_child_mob_retention():
+    # Cleanup is still incomplete; the only cause is durable child mobs held
+    # until the gateway exits, which the reap releases.
+    transport = _stop_with_shutdown_result(
+        {
+            "shutdown": False,
+            "runtime_cleanup_completed": False,
+            "runtime_cleanup_retained_until_exit": True,
+        }
+    )
+    assert transport.last_termination == TransportTermination(
+        "exited", 0, None, "none", "retained_until_exit"
+    )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"shutdown": False, "runtime_cleanup_completed": False},
+        {
+            "shutdown": False,
+            "runtime_cleanup_completed": False,
+            "runtime_cleanup_retained_until_exit": "true",
+        },
+        {
+            "shutdown": False,
+            "runtime_cleanup_completed": None,
+            "runtime_cleanup_retained_until_exit": True,
+        },
+    ],
+)
+def test_stop_still_fails_on_cleanup_that_is_not_process_exit_retention(result):
+    with pytest.raises(RuntimeError, match="failed after bounded cleanup"):
+        _stop_with_shutdown_result(result)
+
+
+# -- Termination record: what a stop observed for its own child --
+
+def _negotiated_transport(process, answer):
+    transport = PersistentTransport("unused")
+    transport._process = process
+    transport._supports_shutdown_handshake = True
+    transport._shutdown_horizon_seconds = 321.0
+    transport._send_sync_running = MagicMock(**answer)
+    return transport
+
+
+def _surviving_process():
+    process = MagicMock()
+    process.poll.return_value = None
+    process.wait.side_effect = subprocess.TimeoutExpired("rpc_gateway", 1)
+    return process
+
+
+@pytest.mark.parametrize(
+    ("status", "exit_code", "signal"),
+    [(0, 0, None), (3, 3, None), (-9, None, "SIGKILL"), (-15, None, "SIGTERM")],
+)
+def test_stop_records_the_observed_exit_status(status, exit_code, signal):
+    transport = PersistentTransport("unused")
+    process = MagicMock()
+    process.poll.return_value = None
+    process.wait.return_value = status
+    transport._process = process
+
+    transport.stop()
+
+    assert transport.last_termination == TransportTermination(
+        "exited", exit_code, signal, "none", "not_negotiated"
+    )
+
+
+def test_stop_records_an_unanswered_shutdown_request_apart_from_the_exit():
+    process = MagicMock()
+    process.poll.return_value = None
+    process.wait.return_value = 0
+    transport = _negotiated_transport(
+        process,
+        {
+            "side_effect": RuntimeError(
+                "persistent transport: timeout after 321.0s waiting for response"
+            )
+        },
+    )
+
+    with patch(
+        "meerkat_meta._transport.time.monotonic",
+        side_effect=[100.0, 100.0],
+    ), pytest.raises(RuntimeError, match="failed after bounded cleanup"):
+        transport.stop()
+
+    assert transport.last_termination == TransportTermination(
+        "exited", 0, None, "none", "unanswered"
+    )
+
+
+def test_a_later_stop_finishes_the_same_child_without_asking_it_again():
+    process = _surviving_process()
+    transport = _negotiated_transport(
+        process,
+        {
+            "return_value": {
+                "jsonrpc": "2.0",
+                "id": "shutdown",
+                "result": {"shutdown": True, "runtime_cleanup_completed": True},
+            }
+        },
+    )
+    with patch(
+        "meerkat_meta._transport.time.monotonic",
+        side_effect=[100.0, 100.0],
+    ), pytest.raises(RuntimeError, match="did not terminate after bounded cleanup"):
+        transport.stop()
+    assert transport._process is process
+    assert transport.last_termination == TransportTermination(
+        "unknown", None, None, "sigkill", "acknowledged"
+    )
+
+    process.wait.side_effect = [subprocess.TimeoutExpired("rpc_gateway", 1), -9]
+    with patch(
+        "meerkat_meta._transport.time.monotonic",
+        side_effect=[200.0, 200.0],
+    ):
+        transport.stop()
+
+    # The child's one shutdown request was answered; the stdin it used is
+    # closed, so asking again could only report a false failure. It already
+    # had its horizon: the later stop goes straight to the signals.
+    transport._send_sync_running.assert_called_once()
+    assert process.wait.call_args_list[-2:] == [
+        call(timeout=0.0),
+        call(timeout=_PROCESS_TERMINATE_GRACE_SECONDS),
+    ]
+    assert process.terminate.call_count == 2
+    assert transport._process is None
+    assert transport.last_termination == TransportTermination(
+        "exited", None, "SIGKILL", "sigkill", "acknowledged"
+    )
+
+
+def test_a_refused_shutdown_is_reported_by_the_stop_that_reaps_the_child():
+    process = _surviving_process()
+    transport = _negotiated_transport(
+        process,
+        {
+            "return_value": {
+                "jsonrpc": "2.0",
+                "id": "shutdown",
+                "error": {"code": -32000, "message": "cleanup refused"},
+            }
+        },
+    )
+    with patch(
+        "meerkat_meta._transport.time.monotonic",
+        side_effect=[100.0, 100.0],
+    ), pytest.raises(RuntimeError, match="did not terminate after bounded cleanup"):
+        transport.stop()
+    assert transport.last_termination == TransportTermination(
+        "unknown", None, None, "sigkill", "refused"
+    )
+
+    process.wait.side_effect = None
+    process.wait.return_value = 0
+    with patch(
+        "meerkat_meta._transport.time.monotonic",
+        side_effect=[200.0, 200.0],
+    ), pytest.raises(RuntimeError, match="shutdown failed after bounded cleanup") as failed:
+        transport.stop()
+    assert "cleanup refused" in str(failed.value.__cause__)
+    transport._send_sync_running.assert_called_once()
+    reaped = TransportTermination("exited", 0, None, "sigkill", "refused")
+    assert transport.last_termination == reaped
+
+    # The child is released: a further stop has nothing left to stop.
+    transport.stop()
+    assert transport.last_termination == reaped
+
+
+def test_a_stop_with_nothing_to_stop_never_overwrites_a_record():
+    transport = PersistentTransport("unused")
+    assert transport.last_termination is None
+    transport.stop()
+    assert transport.last_termination == TransportTermination(
+        "not_started", None, None, "none", "not_negotiated"
+    )
+
+    transport = PersistentTransport("unused")
+    process = MagicMock()
+    process.poll.return_value = None
+    process.wait.return_value = 0
+    transport._process = process
+    transport.stop()
+    recorded = transport.last_termination
+    transport.stop()
+    assert transport.last_termination is recorded
+    assert recorded == TransportTermination("exited", 0, None, "none", "not_negotiated")
+
+
+def test_a_new_child_starts_without_the_previous_record():
+    transport = PersistentTransport("unused")
+    stopped = MagicMock()
+    stopped.poll.return_value = None
+    stopped.wait.return_value = 0
+    transport._process = stopped
+    transport.stop()
+    assert transport.last_termination is not None
+
+    process = MagicMock()
+    process.poll.return_value = None
+    process.stdout.readline.return_value = b""
+    with patch(
+        "meerkat_meta._transport.subprocess.Popen",
+        return_value=process,
+    ):
+        transport.start()
+
+    assert transport.last_termination is None
+    transport._process = None
+
+
+def test_a_failed_spawn_records_not_started():
+    transport = PersistentTransport("unused")
+    with patch(
+        "meerkat_meta._transport.subprocess.Popen",
+        side_effect=FileNotFoundError("no gateway binary"),
+    ), pytest.raises(FileNotFoundError):
+        transport.start()
+
+    assert transport.last_termination == TransportTermination(
+        "not_started", None, None, "none", "not_negotiated"
+    )
 
 
 # -- Bug #16: numeric field coercion --
@@ -543,7 +828,7 @@ async def test_subscribe_mob_events_handles_bare_list_response():
     nothing. query_mob_events handled both shapes — divergent behavior
     silently dropped events.
     """
-    from meerkat_mobkit.runtime import MobHandle
+    from meerkat_meta.runtime import MobHandle
 
     runtime = MagicMock()
     runtime._rpc = AsyncMock(

@@ -1,3 +1,4 @@
+Redaction note (0.9): `Hub` is a pseudonymous, redacted name for a private external memory system, and `<local checkout>/` replaces local checkout paths; see [redaction note](README.md).
 
 
 ================ SYSTEM: Claude Code persistent auto-memory ("memdir") subsystem, including team memory sync, background extraction, autoDream consolidation, and model-based
@@ -506,29 +507,29 @@ LLM-extracted memories — MobKit's identity-first memory injection (mobkit comm
 (session.rs:4147) → CLI presets where only --tools full enables it and 'degrades with the build' (main.rs:626-636); ephemeral realm backends force-disable it (factory.rs:885-905).
 
 ## KEY FILES
-* (operator-retained path)/meerkat/meerkat-core/src/memory.rs — MemoryStore trait, MemoryOwner/scopes, MemoryMetadata/MemorySource/MessageRange data model,
+* `<local checkout>/meerkat/meerkat-core/src/memory.rs` — MemoryStore trait, MemoryOwner/scopes, MemoryMetadata/MemorySource/MessageRange data model,
 MemoryRankingPolicy/EmbeddingModel, typed MemoryStoreError taxonomy
-* (operator-retained path)/meerkat/meerkat-memory/src/hnsw.rs — HnswMemoryStore: per-session HNSW graphs + SQLite persistence, bag-of-words embedder, atomic batch with
+* `<local checkout>/meerkat/meerkat-memory/src/hnsw.rs` — HnswMemoryStore: per-session HNSW graphs + SQLite persistence, bag-of-words embedder, atomic batch with
 rollback/poison/self-heal
-* (operator-retained path)/meerkat/meerkat-memory/src/tool.rs — MemorySearchDispatcher: memory_search tool def, dispatch, result shaping (content/score/source_range, no session_id)
-* (operator-retained path)/meerkat/meerkat-memory/src/simple.rs — SimpleMemoryStore, test-only substring-match backend
-* (operator-retained path)/meerkat/meerkat-memory/src/lib.rs — capability (MemoryStore) + builtin skill registration via inventory
-* (operator-retained path)/meerkat/meerkat-memory/skills/memory-retrieval/SKILL.md — model-facing operating rules for memory use
-* (operator-retained path)/meerkat/meerkat-core/src/agent/state.rs — lines 1233-1431: compaction trigger → index_compaction_discards → commit-or-abort ordering
-* (operator-retained path)/meerkat/meerkat-core/src/types.rs — lines 1192-1280: MemoryIndexableContent / MemoryIndexExclusion typed indexability policy
-* (operator-retained path)/meerkat/meerkat/src/factory.rs — lines 5411-5472 memory wiring + fail-closed capability; 885-905 realm backend gating; feature memory-store-session in
+* `<local checkout>/meerkat/meerkat-memory/src/tool.rs` — MemorySearchDispatcher: memory_search tool def, dispatch, result shaping (content/score/source_range, no session_id)
+* `<local checkout>/meerkat/meerkat-memory/src/simple.rs` — SimpleMemoryStore, test-only substring-match backend
+* `<local checkout>/meerkat/meerkat-memory/src/lib.rs` — capability (MemoryStore) + builtin skill registration via inventory
+* `<local checkout>/meerkat/meerkat-memory/skills/memory-retrieval/SKILL.md` — model-facing operating rules for memory use
+* `<local checkout>/meerkat/meerkat-core/src/agent/state.rs` — lines 1233-1431: compaction trigger → index_compaction_discards → commit-or-abort ordering
+* `<local checkout>/meerkat/meerkat-core/src/types.rs` — lines 1192-1280: MemoryIndexableContent / MemoryIndexExclusion typed indexability policy
+* `<local checkout>/meerkat/meerkat/src/factory.rs` — lines 5411-5472 memory wiring + fail-closed capability; 885-905 realm backend gating; feature memory-store-session in
 meerkat/Cargo.toml:107
-* (operator-retained path)/meerkat/meerkat-cli/src/main.rs — lines 600-645 tool presets (only 'full' enables memory)
-* (operator-retained path)/meerkat/meerkat-mob/src/profile.rs and build.rs — per-mob-profile tools.memory flag → override_memory per member
-* (operator-retained path)/meerkat/docs/guides/memory.mdx — canonical design doc (compaction+memory interplay, config, store internals)
-* (operator-retained path)/meerkat/examples/014-semantic-memory-rs/main.rs — manual wiring example with SimpleMemoryStore
+* `<local checkout>/meerkat/meerkat-cli/src/main.rs` — lines 600-645 tool presets (only 'full' enables memory)
+* `<local checkout>/meerkat/meerkat-mob/src/profile.rs` and build.rs — per-mob-profile tools.memory flag → override_memory per member
+* `<local checkout>/meerkat/docs/guides/memory.mdx` — canonical design doc (compaction+memory interplay, config, store internals)
+* `<local checkout>/meerkat/examples/014-semantic-memory-rs/main.rs` — manual wiring example with SimpleMemoryStore
 
 
 ================ SYSTEM: MobKit current memory surface (operational memory ledger + identity-first agent memory injection + delegated meerkat session memory)
 
 ## OVERVIEW
 MobKit today has three distinct memory-adjacent layers. (1) An operational assertion/conflict ledger (`mobkit/memory/*`) living on the module runtime handle: exact-filter facts
-keyed by entity/topic/store, used by the gating subsystem for conflict checks, with an "elephant" backend that in reality only health-checks an HTTP endpoint and persists local
+keyed by entity/topic/store, used by the gating subsystem for conflict checks, with a "Hub" backend that in reality only health-checks an HTTP endpoint and persists local
 JSON. (2) Identity-first agent memory (`mobkit/agent_memory/*`, added in commit b7a8d228 "Add identity-first agent memory injection"): a pluggable AgentMemoryProvider trait with a
 bundled per-identity markdown hot store, explicit remember/recall/forget RPCs, and automatic prompt injection both at agent build (system-prompt additional_instructions) and per
 identity-first turn (prepended to the user message), with lexical contextual scoring, strict size/retention caps, and timeout/skip failure containment. (3) Meerkat's own session
@@ -542,8 +543,8 @@ metadata line `<!-- mobkit-agent-memory {"memory_id","tags","created_at_ms","upd
 exclusive file locks and rewrite the whole file; reads take shared locks. memory_id = `mem-<ns-timestamp>-<pid>-<seq>-<stable-hash(title,body)>` (agent_memory.rs:1090). Limits:
 title 200B, body 64KiB, <=32 tags of 64B, rendered record 80KiB. Operational ledger (runtime.rs:1030-1033): in-process `Vec<MemoryAssertion>` (assertion_id, entity, topic, store,
 fact, metadata JSON, indexed_at_ms) + `BTreeMap<(entity,topic,store), MemoryConflictSignal>`; 5 store names are labels only: knowledge_graph (default), vector, timeline, todo,
-top_of_mind. If `MemoryBackendConfig::Elephant{endpoint, state_path}` is configured, state is atomically persisted (tmp+rename) as pretty JSON to
-`<persistent_state>/elephant-memory-state.json` and reloaded at bootstrap (runtime/bootstrap.rs:87-162); NOTHING is ever sent to the memory hub beyond a TCP health-check `GET
+top_of_mind. If `MemoryBackendConfig::Hub{endpoint, state_path}` is configured, state is atomically persisted (tmp+rename) as pretty JSON to
+`<persistent_state>/hub-memory-state.json` and reloaded at bootstrap (runtime/bootstrap.rs:87-162); NOTHING is ever sent to the memory hub beyond a TCP health-check `GET
 /v1/health` (runtime/memory.rs:27-99). Without the backend the ledger is memory-only and lost on restart.
 
 ## WRITE PATH
@@ -593,7 +594,7 @@ runtime.rs:1419); conflict signals upsert one-per-(entity,topic,store) key; no d
 flag consumers (gating) must react to; nothing reconciles the contradicting facts.
 
 ## NOTABLE
-* The 'elephant' operational-memory backend is a facade: ElephantMemoryStoreAdapter only TCP health-checks GET /v1/health then reads/writes a local JSON file
+* The 'hub' operational-memory backend is a facade: HubMemoryStoreAdapter only TCP health-checks GET /v1/health then reads/writes a local JSON file
 (runtime/memory.rs:27-125); no data ever reaches the memory hub. Docs (docs/concepts/memory.mdx:30-32) position real hub enrichment as a future custom AgentMemoryProvider —
 planned, not implemented.
 * Deliberate hot/deep split: bundled markdown store is the synchronous 'hot identity memory' with a 500ms recall timeout and skip-on-failure policy so memory can never block
@@ -610,7 +611,7 @@ no-ops — fail-loud config philosophy throughout.
 (agent_memory.rs:1022-1050).
 * Parity gaps to avoid repeating: Rust MemoryIndexResult.conflict_active is dropped by both Python (types.py:848-864) and TypeScript (types.ts:498-513) MemoryIndexResult;
 docs/concepts/memory.mdx:139-147 documents a MemoryStoreInfo{endpoint,state_path,healthy} that doesn't exist (actual: {store, record_count}); Python memory_query('some string')
-sends a 'query' key the Rust parser silently ignores, returning unfiltered results (runtime.py:733-753 vs rpc/memory_methods.rs:471-511); Python ElephantMemoryConfig has
+sends a 'query' key the Rust parser silently ignores, returning unfiltered results (runtime.py:733-753 vs rpc/memory_methods.rs:471-511); Python HubMemoryConfig has
 space_id/collection/stores fields that to_dict() silently drops (config/memory.py:9-19).
 * The 5 'stores' (knowledge_graph/vector/timeline/todo/top_of_mind) are pure string labels with identical exact-filter semantics — aspirational taxonomy without differentiated
 behavior.
@@ -623,8 +624,8 @@ memory-store + memory-store-session); meerkat session semantic memory, MobKit ag
 ## KEY FILES
 * meerkat-mobkit/src/identity_first/agent_memory.rs — core of b7a8d228: AgentMemoryProvider trait, MarkdownAgentMemoryStore, AgentMemoryCustomizer (build-time injection),
 AgentMemoryRuntimeInjector (per-turn injection), lexical scoring, retention, injection formatting
-* meerkat-mobkit/src/runtime/memory.rs — operational assertion/conflict ledger on MobkitRuntimeHandle + legacy `elephant` health-check/local-JSON adapter
-* meerkat-mobkit/src/runtime.rs — MemoryBackendConfig/ElephantMemoryBackendConfig (462-472), MemoryAssertion/MemoryConflictSignal/MemoryIndex+Query types (713-822), ledger state
+* meerkat-mobkit/src/runtime/memory.rs — operational assertion/conflict ledger on MobkitRuntimeHandle + Hub health-check/local-JSON adapter
+* meerkat-mobkit/src/runtime.rs — MemoryBackendConfig/HubMemoryBackendConfig (462-472), MemoryAssertion/MemoryConflictSignal/MemoryIndex+Query types (713-822), ledger state
 fields (1030-1033), 4096 retention cap (1419)
 * meerkat-mobkit/src/rpc/memory_methods.rs — param parsing + byte/count limits for both mobkit/memory/* and mobkit/agent_memory/* RPCs
 * meerkat-mobkit/src/rpc.rs — RPC dispatch for memory/stores|index|query (863-960, 1876-1965) and agent_memory/remember|forget|recall (1966-2090), conditional capability
@@ -640,21 +641,21 @@ customize sites (1156, 3127)
 * meerkat-mobkit/src/runtime/gating.rs:63-110 — gating conflict check via local ledger or 'memory' MCP module tool memory.conflict_read
 * meerkat-mobkit/src/access/model.rs:13-15 — agent.memory.write / agent.memory.delete access actions
 * meerkat-mobkit/src/mob_handle_runtime.rs:2417,2835-2851 — CapabilityFlags.memory -> meerkat AgentFactory.memory() (meerkat session-memory delegation)
-* sdk/python/meerkat_mobkit/config/memory.py — ElephantMemoryConfig / memory.elephant(); to_dict drops space_id/collection/stores
+* sdk/python/meerkat_mobkit/config/memory.py — HubMemoryConfig / memory.hub(); to_dict drops space_id/collection/stores
 * sdk/python/meerkat_mobkit/builder.py:134-189 — .memory() and .agent_memory() builder methods
 * sdk/python/meerkat_mobkit/runtime.py — MobHandle memory_query (733), remember/recall/forget_agent_memory (755-814), memory_stores/memory_index (1536-1557)
 * sdk/python/meerkat_mobkit/types.py — MemoryQueryResult, MemoryStoreInfo, MemoryIndexResult (missing conflict_active), AgentMemoryRecord/RecallResult/ForgetResult
 * sdk/typescript/src/runtime.ts:1541-1615 — TS parity: memoryQuery/memoryStores/memoryIndex/rememberAgentMemory/recallAgentMemory/forgetAgentMemory
-* docs/concepts/memory.mdx — the two-surface architecture doc (hot agent memory vs hub deep memory vs meerkat session memory); contains stale MemoryStoreInfo section
+* docs/concepts/memory.mdx — the two-surface architecture doc (hot agent memory vs Hub deep memory vs meerkat session memory); contains stale MemoryStoreInfo section
 * docs/reference/configuration.mdx:98,303-315 — agent_memory gateway option + injection semantics reference
 * docs/api/rpc.mdx:237-324 — RPC method reference for both memory surfaces
 * sdk/python/tests/test_agent_memory_real_gateway.py — real gateway end-to-end smoke (boot identity runtime, remember, recall, verify markdown, forget)
 
 
-================ SYSTEM: External memory hub — core (data model, ingestion pipeline, storage, embeddings)
+================ SYSTEM: Hub — core (data model, ingestion pipeline, storage, embeddings)
 
 ## OVERVIEW
-The memory hub is a standalone Rust "unified knowledge system" product: an entity graph + LLM-powered assertion extraction + document/vector search + truth maintenance behind one HTTP
+Hub is a standalone Rust "unified knowledge system" product: an entity graph + LLM-powered assertion extraction + document/vector search + truth maintenance behind one HTTP
 API and MCP server, with ABAC security baked into every record. It runs over two swappable backends via a repository layer (crates/storage): SurrealDB (persistent default,
 SurrealQL migrations) or HubDB (crates/hub-db, a ~4.2k-line embedded in-memory graph/vector kernel with JSON snapshot import/export). Ingestion is source-first and
 staged: a durable work-item queue drives triage → metadata → render → doc-tree/chunking → embedding → LLM extraction → validated artifact commit → truth maintenance, with every
@@ -738,7 +739,7 @@ cannot mix in one index; query-time partition discovery filtered by caller clear
 commit_artifacts (typed commit_bundle), giving a durable, auditable gate between model interpretation and committed knowledge (scheduler/staged_commit.rs)
 * Progressive ingest depth decided by a cheap LLM triage (skip|metadata|retrieval|graph) with deterministic rule fallback and budget awareness — cost control is first-class (euro
 budgets, StopConditions, cost_ledger_daily, downgrade policy)
-* Extraction is a meerkat agent (the hub depends on Meerkat!): AgentFactory-built agent with the memory hub's own MCP agent profile as its tool surface plus a synthetic read_text_range
+* Extraction is a meerkat agent (Hub depends on Meerkat!): AgentFactory-built agent with Hub's own MCP agent profile as its tool surface plus a synthetic read_text_range
 tool for evidence verification; strict structured-output schema, direct non-agentic path for large texts — directly relevant prior art for MobKit since the same runtime is
 available
 * Evidence-mismatch tolerance: if the model's quoted evidence doesn't match the source text, the assertion is kept with evidence cleared rather than dropped

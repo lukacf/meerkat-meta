@@ -22,7 +22,7 @@ export function useStudioState(initial, onDirty, authoring = {}) {
 
   const snap = React.useCallback(() => {
     if (onDirty) onDirty();
-    const next = window.MobKitFlowController.studioHistorySnapshotPatch({
+    const next = window.MetaFlowController.studioHistorySnapshotPatch({
       history,
       future,
       state: studioState(),
@@ -32,14 +32,14 @@ export function useStudioState(initial, onDirty, authoring = {}) {
   }, [history, future, studioState, onDirty]);
 
   const undo = () => {
-    const next = window.MobKitFlowController.studioUndoPatch({ history, future, state: studioState() });
+    const next = window.MetaFlowController.studioUndoPatch({ history, future, state: studioState() });
     if (!next) return;
     setHistory(next.history);
     setFuture(next.future);
     return next;
   };
   const redo = () => {
-    const next = window.MobKitFlowController.studioRedoPatch({ history, future, state: studioState() });
+    const next = window.MetaFlowController.studioRedoPatch({ history, future, state: studioState() });
     if (!next) return;
     setHistory(next.history);
     setFuture(next.future);
@@ -60,8 +60,8 @@ export function GraphEditor({ state, selection, selectInstance, selectEdge, clea
   const [operationError, setOperationError] = React.useState("");
   const [hoverInId, setHoverInId] = React.useState(null);
   const [hoverCell, setHoverCell] = React.useState(null);
-  const canvasView = window.MobKitFlowController.graphCanvasViewState(graphView);
-  const modelInstances = window.MobKitFlowController.graphCanvasInstances({ instances: state.instances, graphView: canvasView });
+  const canvasView = window.MetaFlowController.graphCanvasViewState(graphView);
+  const modelInstances = window.MetaFlowController.graphCanvasInstances({ instances: state.instances, graphView: canvasView });
 
   // ── View transform (pan + zoom) ──
   const [view, setView] = React.useState({ scale: 1, tx: 0, ty: 0 });
@@ -69,7 +69,7 @@ export function GraphEditor({ state, selection, selectInstance, selectEdge, clea
   React.useEffect(() => { viewRef.current = view; }, [view]);
   const [panDrag, setPanDrag] = React.useState(null);
 
-  const gridState = window.MobKitFlowController.graphGridState({ instances: modelInstances, gridBase: grid });
+  const gridState = window.MetaFlowController.graphGridState({ instances: modelInstances, gridBase: grid });
   const g = gridState.grid;
   const totalW = gridState.totalW;
   const totalH = gridState.totalH;
@@ -77,20 +77,20 @@ export function GraphEditor({ state, selection, selectInstance, selectEdge, clea
     const fallbackText = fallback || canvasView.authoringOperationFallbackError;
     if (!applyAuthoringIntent) {
       const result = { ok: false, error: canvasView.authoringOperationUnavailableError };
-      setOperationError(window.MobKitFlowController.operationErrorText(result, fallbackText));
+      setOperationError(window.MetaFlowController.operationErrorText(result, fallbackText));
       return result;
     }
     try {
       const result = await applyAuthoringIntent(payload);
       if (result?.ok === false) {
-        setOperationError(window.MobKitFlowController.operationErrorText(result, fallbackText));
+        setOperationError(window.MetaFlowController.operationErrorText(result, fallbackText));
       } else {
         setOperationError("");
       }
       return result;
     } catch (error) {
       const result = { ok: false, error: error?.message || String(error || fallbackText) };
-      setOperationError(window.MobKitFlowController.operationErrorText(result, fallbackText));
+      setOperationError(window.MetaFlowController.operationErrorText(result, fallbackText));
       return result;
     }
   };
@@ -145,13 +145,13 @@ export function GraphEditor({ state, selection, selectInstance, selectEdge, clea
     e.stopPropagation();
     selectInstance(inst.id);
     const w = screenToWorld(e.clientX, e.clientY);
-    const b = window.MobKitFlowController.graphNodeBox(g, inst);
+    const b = window.MetaFlowController.graphNodeBox(g, inst);
     setDrag({ instId: inst.id, dx: w.x - b.x, dy: w.y - b.y, origCol: inst.col, origRow: inst.row });
   };
   const onPortDown = (e, inst) => {
     e.preventDefault();
     e.stopPropagation();
-    const p = window.MobKitFlowController.graphPortOut(g, inst);
+    const p = window.MetaFlowController.graphPortOut(g, inst);
     setConn({ from: p, fromId: inst.id, to: p });
   };
   const connectionTargetIdAt = (clientX, clientY, fromId) => {
@@ -233,7 +233,7 @@ export function GraphEditor({ state, selection, selectInstance, selectEdge, clea
       }
       if (drag) {
         const w = screenToWorld(e.clientX, e.clientY);
-        const cell = window.MobKitFlowController.graphDragCellAt(g, w, drag);
+        const cell = window.MetaFlowController.graphDragCellAt(g, w, drag);
         if (cell) setHoverCell(cell);
       }
       if (conn) {
@@ -247,14 +247,14 @@ export function GraphEditor({ state, selection, selectInstance, selectEdge, clea
     const up = (e) => {
       if (drag) {
         const w = screenToWorld(e.clientX, e.clientY);
-        const cell = window.MobKitFlowController.graphDragCellAt(g, w, drag);
+        const cell = window.MetaFlowController.graphDragCellAt(g, w, drag);
         if (cell && (cell.col !== drag.origCol || cell.row !== drag.origRow)) {
           applyGraphIntent({
             intent: "graph.moveNode",
             instanceId: drag.instId,
             cell,
             originalCell: { col: drag.origCol, row: drag.origRow },
-          }, "MobKit graph node move failed");
+          }, "Meta graph node move failed");
         }
         setDrag(null); setHoverCell(null);
       }
@@ -265,7 +265,7 @@ export function GraphEditor({ state, selection, selectInstance, selectEdge, clea
             intent: "graph.connectNodes",
             fromId: conn.fromId,
             toId: targetId,
-          }, "MobKit graph connection failed").then((result) => {
+          }, "Meta graph connection failed").then((result) => {
             if (result?.ok === false) return;
             const id = result?.selection?.id;
             if (id) selectEdge(id);
@@ -282,8 +282,8 @@ export function GraphEditor({ state, selection, selectInstance, selectEdge, clea
 
   const fit = view;
 
-  const cellRows = window.MobKitFlowController.graphCellCanvasRows({ grid: g, instances: modelInstances, hoverCell });
-  const headerRows = window.MobKitFlowController.graphGridHeaderCanvasRows({ grid: g });
+  const cellRows = window.MetaFlowController.graphCellCanvasRows({ grid: g, instances: modelInstances, hoverCell });
+  const headerRows = window.MetaFlowController.graphGridHeaderCanvasRows({ grid: g });
   const cells = cellRows.map(row => (
     <div key={row.key}
       className={row.className}
@@ -302,7 +302,7 @@ export function GraphEditor({ state, selection, selectInstance, selectEdge, clea
   ));
 
   const frameEls = state.frames.map(fr => {
-    const frameState = window.MobKitFlowController.graphFrameCanvasState({ frame: fr, grid: g });
+    const frameState = window.MetaFlowController.graphFrameCanvasState({ frame: fr, grid: g });
     return (
       <React.Fragment key={frameState.id}>
         <div className="frame" style={frameState.frameStyle} />
@@ -315,12 +315,12 @@ export function GraphEditor({ state, selection, selectInstance, selectEdge, clea
     const fi = state.instances.find(i => i.id === edge.from);
     const ti = state.instances.find(i => i.id === edge.to);
     if (!fi || !ti) return null;
-    const a = window.MobKitFlowController.graphPortOut(g, fi), b = window.MobKitFlowController.graphPortIn(g, ti);
-    const d = window.MobKitFlowController.graphEdgePath(a, b);
-    const mid = window.MobKitFlowController.graphEdgeMidpoint(a, b);
+    const a = window.MetaFlowController.graphPortOut(g, fi), b = window.MetaFlowController.graphPortIn(g, ti);
+    const d = window.MetaFlowController.graphEdgePath(a, b);
+    const mid = window.MetaFlowController.graphEdgeMidpoint(a, b);
     const isActive = activeStepId === edge.from;
     const isSelected = selection.kind === "edge" && selection.id === edge.id;
-    const edgeState = window.MobKitFlowController.graphEdgeCanvasState({
+    const edgeState = window.MetaFlowController.graphEdgeCanvasState({
       edge,
       to: ti,
       active: isActive,
@@ -348,13 +348,13 @@ export function GraphEditor({ state, selection, selectInstance, selectEdge, clea
     );
   });
 
-  const canvasAdornments = window.MobKitFlowController.graphCanvasAdornments({ instances: state.instances, graphView: canvasView });
+  const canvasAdornments = window.MetaFlowController.graphCanvasAdornments({ instances: state.instances, graphView: canvasView });
   const adornmentEls = canvasAdornments.map(adornment => (
     <SourceFileAdornmentView
       key={adornment.id}
       g={g}
       adornment={adornment}
-      adornmentState={window.MobKitFlowController.graphSourceFileAdornmentCanvasState({ adornment, graphView: canvasView })}
+      adornmentState={window.MetaFlowController.graphSourceFileAdornmentCanvasState({ adornment, graphView: canvasView })}
     />
   ));
   const nodeEls = modelInstances.map(inst => {
@@ -378,7 +378,7 @@ export function GraphEditor({ state, selection, selectInstance, selectEdge, clea
       <NodeView key={inst.id}
         g={g}
         inst={inst}
-        nodeState={window.MobKitFlowController.graphNodeCanvasState({ inst, members: state.members, density, graphView: canvasView, toolCatalog })}
+        nodeState={window.MetaFlowController.graphNodeCanvasState({ inst, members: state.members, density, graphView: canvasView, toolCatalog })}
         selected={selection.kind === "instance" && selection.id === inst.id}
         memberHighlight={memberFocus && inst.memberId === memberFocus}
         memberDim={!!memberFocus && inst.memberId !== memberFocus && !inst.isTerminal}
@@ -411,7 +411,7 @@ export function GraphEditor({ state, selection, selectInstance, selectEdge, clea
             <marker id="arr-dim" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="var(--subtle)"/></marker>
           </defs>
           {edgeEls}
-          {conn && <path d={window.MobKitFlowController.graphEdgePath(conn.from, conn.to)} className="edge-line is-ghost" markerEnd="url(#arr-acc)" />}
+          {conn && <path d={window.MetaFlowController.graphEdgePath(conn.from, conn.to)} className="edge-line is-ghost" markerEnd="url(#arr-acc)" />}
         </svg>
         {adornmentEls}
         {nodeEls}
@@ -438,7 +438,7 @@ export function GraphEditor({ state, selection, selectInstance, selectEdge, clea
 
 function SourceFileAdornmentView({ g, adornment, adornmentState }: any) {
   if (adornmentState.hidden) return null;
-  const b = window.MobKitFlowController.graphNodeBox(g, adornment);
+  const b = window.MetaFlowController.graphNodeBox(g, adornment);
   return (
     <a href={adornmentState.sourceActivationHash} data-source-id={adornment.id}
       className="source-file-adornment node--source-file"
@@ -458,7 +458,7 @@ function SourceFileAdornmentView({ g, adornment, adornmentState }: any) {
 }
 
 function NodeView({ g, inst, nodeState, selected, memberHighlight, memberDim, activeStep, hoverIn, onMouseDown, onPortDown, portDragTitle }: any) {
-  const b = window.MobKitFlowController.graphNodeBox(g, inst);
+  const b = window.MetaFlowController.graphNodeBox(g, inst);
 
   if (nodeState.isTerminal) {
     return (
@@ -510,8 +510,8 @@ function NodeView({ g, inst, nodeState, selected, memberHighlight, memberDim, ac
 }
 
 function GateView({ g, inst, selected, activeStep, hoverIn, onMouseDown, onPortDown, portDragTitle, state, contract, graphView }: any) {
-  const b = window.MobKitFlowController.graphNodeBox(g, inst);
-  const gateState = window.MobKitFlowController.graphGateCanvasState({ inst, edges: state.edges, contract, graphView });
+  const b = window.MetaFlowController.graphNodeBox(g, inst);
+  const gateState = window.MetaFlowController.graphGateCanvasState({ inst, edges: state.edges, contract, graphView });
 
   return (
     <div data-inst-id={inst.id}

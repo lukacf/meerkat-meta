@@ -8,18 +8,18 @@ code comments. This document is the recorded decision.
 
 ## The two authorities
 
-MobKit has two member-lifecycle authorities. "Identity-first vs
+Meta has two member-lifecycle authorities. "Identity-first vs
 session-based" is a false dichotomy — identity-first agents ARE session-owned
 (the bridge creates sessions like everything else). The real split is which
 authority owns the member's lifecycle:
 
-The table describes MobKit's intended allocation of responsibilities, not the
+The table describes Meta's intended allocation of responsibilities, not the
 storage limits of the underlying mob/session substrate.
 
 | | Mob plane (classic) | Identity plane |
 |---|---|---|
 | Owner | mob-actor roster (`MobHandle`) | `IdentityRuntime` |
-| Key | member `AgentIdentity`/member identifier (a MobKit-generated incarnation alias where applicable), not the per-runtime `AgentRuntimeId` | stable application `AgentIdentity` |
+| Key | member `AgentIdentity`/member identifier (a Meta-generated incarnation alias where applicable), not the per-runtime `AgentRuntimeId` | stable application `AgentIdentity` |
 | Durability | ephemeral-worker usage policy | continuity records, lease-fenced embodiment, resume-first restore |
 | Disposal | strict archive invariants (ask-20 class) | tolerant session-owned cleanup + Broken-identity repair task |
 | Stand-up | `spawn`/`ensure_member` (`SpawnMemberSpec`) | roster reconcile (`restore_flow`) |
@@ -74,7 +74,7 @@ Deployment census at decision time (audit-verified):
 - **The downstream app**: identity-first end to end for durables (SDK roster provider,
   `reconcile_identity` on boot, console lifecycle buttons hidden); mob plane
   used only for agent-spawned helper churn. Already doctrine-conformant.
-- **meerkat-studio**: currently all mob-plane via `mobkit_gateway`; migrates
+- **meerkat-studio**: currently all mob-plane via `meta_gateway`; migrates
   to identity semantics zero-flag-day via capabilities detection (their
   crews are definition-derived rosters; domain agents are single durable
   identities).
@@ -85,7 +85,7 @@ Deployment census at decision time (audit-verified):
 
 The K1/K2 field failures came from the two gateway binaries embedding the
 same `UnifiedRuntime` with divergent wiring: `rpc_gateway` got the full
-identity substrate, `mobkit_gateway` got none. The drift class is caused by
+identity substrate, `meta_gateway` got none. The drift class is caused by
 divergent **construction**, not by binary count.
 
 **Decided:** extract one shared runtime-construction path — identity
@@ -93,7 +93,7 @@ substrate always built (continuity store, lease provider, identity runtime;
 the roster may be empty) — and have both binaries call it. The actual binary
 merge is a later packaging step (target: 0.8), because the two binaries have
 deliberately different stdin contracts (`rpc_gateway`: stdin JSON-RPC loop;
-`mobkit_gateway`: one init line, then stdin-EOF keep-serving that
+`meta_gateway`: one init line, then stdin-EOF keep-serving that
 meerkat-studio's persistent-helpers feature depends on).
 
 Consumer contract to preserve through convergence AND the eventual merge
@@ -107,7 +107,7 @@ Consumer contract to preserve through convergence AND the eventual merge
 4. Roster materialization from definitions — a way to stand up N named
    members from a mob.toml/mobpack (identity roster or `ensure_member`
    re-dispatch, either is fine).
-5. `mobkit/capabilities` advertising the identity RPC set — consumers gate
+5. `meta/capabilities` advertising the identity RPC set — consumers gate
    on it and switch without a flag day.
 
 ## D3 - role migration is declared by the activation, never inferred (decided)
@@ -124,11 +124,11 @@ comms name and binding, with nothing afterwards pointing at the edit as the
 cause.
 
 **Decided:** migration authority is supplied by the ACTIVATION, per exact
-identity, and MobKit never derives it. The host names it at the top level of
+identity, and Meta never derives it. The host names it at the top level of
 the gateway boot payload, as a sibling of `runtime_options`:
 
 ```json
-"role_migrations": [{"identity": "domain:home-automation", "from_role": "domain"}]
+"role_migrations": [{"identity": "domain:automation", "from_role": "domain"}]
 ```
 
 The list is installed once on `MobSessionBridge`
@@ -136,8 +136,8 @@ The list is installed once on `MobSessionBridge`
 for exactly one boot, and is read only by an exact-identity map lookup
 (`declared_role_migration_in`). `resume_session` passes the looked-up
 predecessor role straight into `MemberLaunchMode::Resume { resume_from_role,
-.. }` and does nothing else with it. Nothing MobKit reads can create, widen or
-withdraw a declaration. MobKit never infers or widens migration authority and
+.. }` and does nothing else with it. Nothing Meta reads can create, widen or
+withdraw a declaration. Meta never infers or widens migration authority and
 does not recover from a role-migration refusal by altering the declaration or
 falling back to a fresh spawn. Separately, a custody- and durable-source-checked
 `MemberAlreadyExists` collision repair can retry the unchanged resume spec;
@@ -146,13 +146,13 @@ that repair does not change migration authority.
 The properties that make an activation-scoped carrier safe, each load-bearing:
 
 - **Boot-scoped by construction.** Nothing persists the declarations, and
-  MobKit has no store that could reconstruct them. Dropping an entry from the
+  Meta has no store that could reconstruct them. Dropping an entry from the
   next boot payload is how the authority goes away.
 - **Exact identity, in both directions.** The map is keyed by `AgentIdentity`,
   so no prefix, suffix or case variant of a declared identity inherits
   authority. Widening one declaration into a family of members is precisely the
   failure the typed refusal exists to prevent.
-- **Meerkat decides, MobKit only carries.** The declared predecessor is
+- **Meerkat decides, Meta only carries.** The declared predecessor is
   re-verified against durable state and a mismatch refuses with
   `MobError::MemberRoleMigrationRejected`, so a mistyped `from_role` cannot
   authorize an unintended restamp.
@@ -175,7 +175,7 @@ The properties that make an activation-scoped carrier safe, each load-bearing:
 Both gateway binaries wire it, and their names differ by one word.
 `rpc_gateway` reads it out of its untyped init params, refuses a malformed or
 conflicting payload at init scope with `-32602` answered on the request id, and
-then installs it inside the roster-provider branch. `mobkit_gateway` takes it
+then installs it inside the roster-provider branch. `meta_gateway` takes it
 as a typed `InitParams.role_migrations` field and installs it inside the
 identity-first block; its refusals both carry a null `id`, `-32602` when the
 typed init params fail to deserialize and `-32603` from the conflict check,
@@ -187,14 +187,14 @@ likewise arm nothing, because there is no identity plane to migrate on.
 Anything instructing an operator to launch a gateway must therefore name the
 binary: the wrong one boots far enough to look like it worked.
 
-Host side: `MobKitBuilder.role_migrations([...])` accepts
+Host side: `MetaBuilder.role_migrations([...])` accepts
 `RoleMigrationDeclaration` dataclasses or plain dicts, validates both, raises
 `ValueError` on a conflicting pair, and emits no `role_migrations` init-params
-key at all when unused (`sdk/python/meerkat_mobkit/builder.py`,
+key at all when unused (`sdk/python/meerkat_meta/builder.py`,
 `identity_first_models.py`, `runtime.py`). The TypeScript SDK's builder exposes
 no equivalent setter, so a TypeScript host cannot authorize a role-migrating
 resume today. The wire key names are pinned by one shared fixture,
-`crates/meerkat-mobkit/tests/fixtures/role_migrations_init_params.json`, read by both
+`crates/meerkat-meta/tests/fixtures/role_migrations_init_params.json`, read by both
 the Rust parser test (`identity_first::bridge` tests) and its Python twin
 (`sdk/python/tests/test_role_migrations.py`), so a rename on either side goes
 red instead of both staying green while a host arms nothing.
@@ -202,7 +202,7 @@ red instead of both staying green while a host arms nothing.
 ## Phases (1+2 ship together in 0.7.25, with meerkat 0.7.19)
 
 - **Phase 0 (shipped, #240):** opt-in `identity_first: true` on
-  `mobkit_gateway` + identity arms on the console member RPCs
+  `meta_gateway` + identity arms on the console member RPCs
   (`ensure_member` → roster upsert + reconcile; `retire_member` → tolerant
   identity retire; `respawn_member` → identity reset). Proof: retire/respawn
   of never-ran members succeeds — ask-20 class unreachable on this surface.
@@ -211,8 +211,8 @@ red instead of both staying green while a host arms nothing.
   none), the identity-named console RPCs' mob-plane fallbacks (the
   UI-reachable path), console-aggregator disposal-tolerance parity.
 - **Phase 2 (0.7.25):** shared gateway construction; `identity_first`
-  default-on in `mobkit_gateway` (opt-out `identity_first: false` kept for
-  one release, changelog-flagged); `mobkit/capabilities` advertises the
+  default-on in `meta_gateway` (opt-out `identity_first: false` kept for
+  one release, changelog-flagged); `meta/capabilities` advertises the
   identity set as baseline and frames the member set as the worker plane.
 - **Phase 3 (0.8):** binary merge as packaging; deprecate mob-plane NAMES
   for durable use only. The worker plane remains.

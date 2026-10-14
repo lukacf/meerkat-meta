@@ -39,13 +39,13 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 heavy-runtime = { max-threads = 2 }
 
 [[profile.default.overrides]]
-filter = 'package(meerkat-mobkit) & (binary(routing_delivery) + binary(list_runs) + binary(list_flows_run_flow) + binary(mob_events_cursor_persistence) + binary(mob_events_query_ledger) + binary(mob_events_streaming) + binary(access_control) + binary(unified_console) + binary(repair_queue_carry) + binary(mobkit_gateway_bootstrap) + binary(gateway_concurrent_dispatch) + binary(gateway_schedule_lease_release) + binary(gateway_exit_reason))'
+filter = 'package(meerkat-meta) & (binary(routing_delivery) + binary(list_runs) + binary(list_flows_run_flow) + binary(mob_events_cursor_persistence) + binary(mob_events_query_ledger) + binary(mob_events_streaming) + binary(access_control) + binary(unified_console) + binary(repair_queue_carry) + binary(meta_gateway_bootstrap) + binary(gateway_concurrent_dispatch) + binary(gateway_schedule_lease_release) + binary(gateway_exit_reason))'
 test-group = 'heavy-runtime'
 retries = 2
 
 # `gateway_exit_reason` joined 2026-09-03: same shape as
 # `gateway_schedule_lease_release` (spawns BOTH real gateway binaries, waits
-# for `mobkit/init`, signals or closes stdin, then reads the exit-reason
+# for `meta/init`, signals or closes stdin, then reads the exit-reason
 # lines off stderr), six process boots per run.
 
 # `gateway_concurrent_dispatch` joined 2026-08-25 alongside it, and it is the
@@ -60,8 +60,8 @@ retries = 2
 # Surfacing a stable reason slug is the real fix and is tracked separately; this
 # override only stops aggregate-load starvation from manufacturing the symptom.
 
-# `mobkit_gateway_bootstrap` joined 2026-08-25: it SPAWNS A REAL GATEWAY PROCESS
-# and waits up to 45s for it to answer mobkit/init, which is the most
+# `meta_gateway_bootstrap` joined 2026-08-25: it SPAWNS A REAL GATEWAY PROCESS
+# and waits up to 45s for it to answer meta/init, which is the most
 # starvation-prone shape in the suite - more so than the members already listed,
 # because the bound covers process start AND bootstrap. Under full-suite load all
 # three of its process-spawning tests timed out at exactly 45s in one run while
@@ -71,8 +71,8 @@ retries = 2
 # scheduling problem.
 
 # `gateway_schedule_lease_release` joined 2026-08-29. Same shape as
-# `mobkit_gateway_bootstrap` above and strictly heavier: it spawns a real gateway
-# process, waits for `mobkit/init`, then polls a SQLite row across a SIGTERM. It
+# `meta_gateway_bootstrap` above and strictly heavier: it spawns a real gateway
+# process, waits for `meta/init`, then polls a SQLite row across a SIGTERM. It
 # does that once per binary, for both gateways.
 #
 # Its bounds are sized against this profile's hard ceiling, not picked for
@@ -110,7 +110,7 @@ retries = 2
 # live frames; under peak suite load the burst window starves the same way the
 # heavy-runtime family does (passes 1/1 isolated). Same scoped remedy.
 [[profile.default.overrides]]
-filter = 'package(meerkat-mobkit) & test(live_event_burst_reaches_store_while_slow_backfill_is_running)'
+filter = 'package(meerkat-meta) & test(live_event_burst_reaches_store_while_slow_backfill_is_running)'
 retries = 2
 
 # The idle CPU gate measures the gateway's CPU-time over real 30s windows;
@@ -122,5 +122,5 @@ retries = 2
 # which is a real production assertion (it caught the 0.8.9 wave's O(document)
 # regression).
 [[profile.default.overrides]]
-filter = 'package(meerkat-mobkit) & test(converged_idle_gateway_consumes_near_zero_cpu)'
+filter = 'package(meerkat-meta) & test(converged_idle_gateway_consumes_near_zero_cpu)'
 threads-required = "num-cpus"

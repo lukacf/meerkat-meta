@@ -290,7 +290,7 @@ for (const [name, rpc] of [["shared", sharedRpc], ["stock", stockRpc]] as const)
         globalThis.fetch = (async (_url, init) => Response.json({
           jsonrpc: "2.0", id: JSON.parse(String(init?.body)).id, error,
         })) as typeof fetch;
-        await assert.rejects(rpc("", "mobkit/access/set", { checked_v1: {} }), (thrown: unknown) => {
+        await assert.rejects(rpc("", "meta/access/set", { checked_v1: {} }), (thrown: unknown) => {
           assert.deepEqual((thrown as { rpcError?: unknown }).rpcError, error);
           return true;
         });

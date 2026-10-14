@@ -4,7 +4,7 @@ description: "Why the gateways bind loopback, how to publish them behind a rever
 icon: "server"
 ---
 
-Both bundled gateways, the console/admin `mobkit_gateway` and the SDK-facing
+Both bundled gateways, the console/admin `meta_gateway` and the SDK-facing
 `rpc_gateway`, bind `127.0.0.1` on an ephemeral port unless the launch selects
 another address. This page explains the posture, the three shipped ways to
 publish a gateway, and the exposure gate a non-loopback bind has to pass.
@@ -13,7 +13,7 @@ publish a gateway, and the exposure gate a non-loopback bind has to pass.
 
 Everything a gateway serves over HTTP hangs off one listener: the bundled
 console, console JSON-RPC, blobs, SSE event streams, and (when enabled) the
-live WebSocket transport. `mobkit_gateway` serves its protected console
+live WebSocket transport. `meta_gateway` serves its protected console
 surfaces **open by default when top-level `auth_config` is absent**. Supplying
 that init parameter installs the shared JWT/OIDC configuration and requires
 app auth on those surfaces. `rpc_gateway` is fail-closed by default: it trusts
@@ -25,7 +25,7 @@ See [Authentication](/guides/authentication) for the shared auth shape.
 
 Loopback is therefore a security posture, not an oversight. The SDK process that
 spawns a gateway shares its network namespace and reads the exact
-`http_base_url` from the `mobkit/init` result, so nothing on the host needs a
+`http_base_url` from the `meta/init` result, so nothing on the host needs a
 fixed or public port.
 
 ## Publishing a gateway
@@ -40,7 +40,7 @@ on the same machine, a Kubernetes sidecar in the same pod, or a Docker
 container started with `--network container:<gateway>`. The port is ephemeral,
 so read it at runtime rather than configuring it.
 
-`mobkit_gateway` additionally records `http_base_url` in its runtime registry
+`meta_gateway` additionally records `http_base_url` in its runtime registry
 under the gateway state directory, so a same-host proxy can discover a resumed
 runtime without holding the init handshake.
 
@@ -55,7 +55,7 @@ allowed:
   <Tab title="Python (rpc_gateway)">
 ```python
 runtime = await (
-    MobKit.builder()
+    Meta.builder()
     .mob("config/mob.toml")
     .gateway("./rpc_gateway")
     .http_listen("0.0.0.0:8080")               # runtime_options.http_listen
@@ -70,7 +70,7 @@ print(runtime.rust_http_public_base_url)  # https://mob.example.com
   </Tab>
   <Tab title="TypeScript (rpc_gateway)">
 ```typescript
-const runtime = await MobKit.builder()
+const runtime = await Meta.builder()
   .mob("config/mob.toml")
   .gateway("./rpc_gateway")
   .httpListen("0.0.0.0:8080")
@@ -82,18 +82,18 @@ console.log(runtime.rustHttpBaseUrl);        // http://127.0.0.1:8080
 console.log(runtime.rustHttpPublicBaseUrl);  // https://mob.example.com
 ```
   </Tab>
-  <Tab title="mobkit_gateway">
+  <Tab title="meta_gateway">
 ```bash
-# Launch flags (or MOBKIT_HTTP_LISTEN_ADDR / MOBKIT_HTTP_ALLOW_REMOTE=1):
-mobkit_gateway --http-listen 0.0.0.0:8080 --allow-remote
+# Launch flags (or META_HTTP_LISTEN_ADDR / META_HTTP_ALLOW_REMOTE=1):
+meta_gateway --http-listen 0.0.0.0:8080 --allow-remote
 ```
 ```json
-// or in the mobkit/init params, which win over flags and environment:
+// or in the meta/init params, which win over flags and environment:
 { "http_listen": "0.0.0.0:8080", "allow_remote": true,
   "http_public_base_url": "https://mob.example.com" }
 ```
   </Tab>
-  <Tab title="Raw mobkit/init (rpc_gateway)">
+  <Tab title="Raw meta/init (rpc_gateway)">
 ```json
 { "runtime_options": {
     "http_listen": "0.0.0.0:8080",
@@ -124,7 +124,7 @@ none was declared) and TypeScript as `rustHttpPublicBaseUrl`.
 `UnifiedRuntime::run(listener, decisions, shutdown)` and `::serve(listener,
 decisions)` accept any `TcpListener`, and `GatewayHttpBinding::bind(addr)` is
 the shared admission type the binaries use. `examples/library_mode_reference.rs`
-(`MOBKIT_REF_ADDR`) is the template. A library host owns its own exposure
+(`META_REF_ADDR`) is the template. A library host owns its own exposure
 decision; run `validate_http_bind_policy` if you want the same gate.
 
 ## The exposure gate: auth or acknowledgement
@@ -145,12 +145,12 @@ is bootstrapped, unless one of two things is true in its admission-time state:
    fronts the listener.
 
 `rpc_gateway` applies its `runtime_options.auth_config` before this check.
-`mobkit_gateway` accepts the same JWT/OIDC shape as top-level `auth_config`,
+`meta_gateway` accepts the same JWT/OIDC shape as top-level `auth_config`,
 but its earlier exposure gate currently uses the open default decision state,
 not the later auth overlay used by the HTTP router. On that binary a
 non-loopback bind therefore still requires `allow_remote` (init param,
-`--allow-remote`, or `MOBKIT_HTTP_ALLOW_REMOTE=1`), even when auth is configured.
-On both binaries a refused bind answers `mobkit/init` with a `-32602` error on
+`--allow-remote`, or `META_HTTP_ALLOW_REMOTE=1`), even when auth is configured.
+On both binaries a refused bind answers `meta/init` with a `-32602` error on
 the request id whose message names the address and every way out.
 
 The listener is bound right behind the gate, before any bootstrap. A fixed
@@ -162,7 +162,7 @@ duration).
 
 At serving startup, every admitted non-loopback listener logs one WARN line on
 stderr naming the bound address and the final serving auth posture. On
-`mobkit_gateway` this includes any configured `auth_config` overlay, unlike the
+`meta_gateway` this includes any configured `auth_config` overlay, unlike the
 open decision state used by its earlier exposure gate. It cannot be silenced
 below WARN by the default filter.
 
@@ -182,7 +182,7 @@ with a WARN heartbeat every ten unchanged polls.
 Paused and Deleted parents can retain Pending occurrences without a firing
 fault. The DEBUG `schedule overdue pending parent attribution` record reports
 separate `active`, `paused`, `deleted`, and `unresolved` counts; the probe does
-not modify those rows. Enable `meerkat_mobkit::schedule_wiring=debug` in
+not modify those rows. Enable `meerkat_meta::schedule_wiring=debug` in
 `RUST_LOG` to see these buckets.
 
 Missing parent evidence or failed/poisoned reads log **observation incomplete**
@@ -218,14 +218,14 @@ stage alongside `libopus-dev`.
 
 ```yaml
 services:
-  mobkit:
+  meta:
     image: your-host-image
     command: ["python", "-m", "your_host"]   # builder: .http_listen("0.0.0.0:8080").allow_remote()
     expose: ["8080"]
   proxy:
     image: nginx
     ports: ["443:443"]
-    # nginx authenticates, then proxy_pass http://mobkit:8080;
+    # nginx authenticates, then proxy_pass http://meta:8080;
 ```
 
 The host image runs the SDK and the gateway together (the SDK spawns the
@@ -233,7 +233,7 @@ gateway over stdio and reaches it at `http_base_url`); only the proxy is
 published. If the proxy instead shares the gateway's network namespace, keep
 the loopback default and proxy to `http_base_url`.
 
-## Resume behaviour (`mobkit_gateway`)
+## Resume behaviour (`meta_gateway`)
 
 The HTTP listen address and the advertised `http_public_base_url` are both
 part of the runtime resume fingerprint, like `--control-listen`. Relaunching
@@ -250,7 +250,7 @@ construction the ones you declared.
 A member whose committed WholeBlob document fails meerkat's audited-endpoint
 guard (`SessionError::WholeBlobAuditedEndpointDivergence`) is parked with a
 typed `session_repair_required` hold instead of retrying: it shows as
-`needs_repair` in the console and on `mobkit/member_health`, and the hold
+`needs_repair` in the console and on `meta/member_health`, and the hold
 carries the two exact `rkat` commands for the runtime store this gateway
 opened. Both gateways derive that scope from their own storage composition,
 never from a guess:
@@ -261,14 +261,14 @@ never from a guess:
   `--apply --json` (repair; add `--accept-shorter` only when the diagnose
   report says the live transcript is shorter than the audited endpoint);
 - a composite storage provider's meerkat-level realm renders as
-  `rkat --state-root <state_dir> --realm mobkit session repair-wholeblob
+  `rkat --state-root <state_dir> --realm meta session repair-wholeblob
   <session_id> ...`;
 - an in-memory or declared-ephemeral runtime store has no document to repair,
   so no scope is derived and the commands keep explicit `<state-root>` /
   `<realm>` placeholders.
 
 Stop nothing: the member is already parked. Run the diagnose command, then
-the apply command, then `mobkit/reload_member` on the identity; the same
+the apply command, then `meta/reload_member` on the identity; the same
 verb, with no extra flag, resumes the same session and generation and clears
 the hold.
 
@@ -291,13 +291,13 @@ only when the reason is `signal`.
 |--------|-----------|---------|
 | `rpc_gateway` | `stdin_closed` | The launching process closed the gateway's stdin (EOF) or the read failed; the reader logs which just before. Exiting on EOF is by design: the SDK that owned the pipe is gone. |
 | `rpc_gateway` | `signal` | SIGINT or SIGTERM arrived while stdin was still open. |
-| `rpc_gateway` | `sdk_shutdown_handshake` | The SDK's `mobkit/shutdown` handshake asked for an orderly stop. |
-| `mobkit_gateway` | `signal` | SIGINT or SIGTERM. |
-| `mobkit_gateway` | `http_server_ended` | The HTTP server task ended on its own. A clean end proceeds to graceful shutdown; an abnormal one is also logged at ERROR and the process exits 1. |
-| `mobkit_gateway` | `stdin_guard_ended` | Not expected: the stdin guard parks forever after EOF. Named so it can never be silently absorbed. |
+| `rpc_gateway` | `sdk_shutdown_handshake` | The SDK's `meta/shutdown` handshake asked for an orderly stop. |
+| `meta_gateway` | `signal` | SIGINT or SIGTERM. |
+| `meta_gateway` | `http_server_ended` | The HTTP server task ended on its own. A clean end proceeds to graceful shutdown; an abnormal one is also logged at ERROR and the process exits 1. |
+| `meta_gateway` | `stdin_guard_ended` | Not expected: the stdin guard parks forever after EOF. Named so it can never be silently absorbed. |
 
-`mobkit_gateway` does not exit on stdin EOF. It logs `stdin closed by the
-launching process; mobkit_gateway keeps serving HTTP until SIGINT or SIGTERM`
+`meta_gateway` does not exit on stdin EOF. It logs `stdin closed by the
+launching process; meta_gateway keeps serving HTTP until SIGINT or SIGTERM`
 and stays up, so a later exit is attributed to what actually ended it. After a
 signal it exits once shutdown completes whether or not stdin is still open (a
 terminal, or a parent holding the pipe); both gateways exit explicitly on that
@@ -349,7 +349,7 @@ Two consequences matter to an operator:
   external and evidence refs, delegated authority, projection policy and the
   paused state carried; edges of the original item are not), and cancels the
   original goal, which stops its binding. A second bootstrap finds nothing to
-  move. `mobkit/capabilities` reports the run under `workgraph_realm_migration`
+  move. `meta/capabilities` reports the run under `workgraph_realm_migration`
   (`mode`, `scanned_bindings`, `skipped_terminal`, `migrated[]` with the old
   and new binding and item ids, and an `outcome` that records a failed scan or
   write instead of aborting the launch). Library hosts choose the mode with
@@ -358,25 +358,25 @@ Two consequences matter to an operator:
 
 ## Blob ids are not meerkat content blob ids
 
-A MobKit blob store applies one of two digest recipes depending on how an
+A Meta blob store applies one of two digest recipes depending on how an
 object enters it. Images that arrive through meerkat's `BlobStore` face
 (`Base64BlobStoreAdapter::put_image`, used by the gateway, the unified runtime
 and the console voice host) and images uploaded through the console
-(`mobkit/blob/upload`, multipart `image_upload` placeholders) are addressed
+(`meta/blob/upload`, multipart `image_upload` placeholders) are addressed
 with meerkat's `content_blob_id`, `sha256(canonical_media_type || 0x00 ||
 base64_text)` over the base64 form, so meerkat's read-back verification
 (durable fork preflight, realtime image hydration) accepts them. Objects
-written through MobKit's native `BinaryBlobStore::put_bytes` (non-image
-`mobkit/blob/*` objects), and image blobs written by MobKit builds that
-predate this rule, carry MobKit's own address, `sha256(media_type || 0x00 ||
-raw_bytes)` over the decoded bytes (`crates/meerkat-mobkit/src/blob_store.rs`,
+written through Meta's native `BinaryBlobStore::put_bytes` (non-image
+`meta/blob/*` objects), and image blobs written by Meta builds that
+predate this rule, carry Meta's own address, `sha256(media_type || 0x00 ||
+raw_bytes)` over the decoded bytes (`crates/meerkat-meta/src/blob_store.rs`,
 `compute_blob_id`). Both render as `sha256:<64 hex digits>`, so the same PNG
 under the two recipes carries two visually indistinguishable ids. The store
 resolves both forms through both faces, so references written before the rule
 keep hydrating; still, compare ids only within one recipe. When meerkat's
 read-back verification meets an image reference whose meerkat content address
 differs, it asks the store through `BlobStore::attest_address`;
-`Base64BlobStoreAdapter` recomputes MobKit's own recipe over the returned
+`Base64BlobStoreAdapter` recomputes Meta's own recipe over the returned
 payload and attests only an exact match. The attestation covers the media
 type stored beside the bytes, not the media type a transcript block declares
 for the reference; binding the two is the caller's side of the check. A
@@ -385,7 +385,7 @@ under its meerkat content address and points the child at it, leaving the
 source transcript and object in place, and realtime history hydration accepts
 the reference. The side by side
 recipe, provenance rules and the planned unification are documented in the
-meerkat storage operations runbook under "Blob digests in meerkat and MobKit".
+meerkat storage operations runbook under "Blob digests in meerkat and Meta".
 
 ## See also
 

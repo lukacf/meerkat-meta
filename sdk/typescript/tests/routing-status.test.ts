@@ -1,5 +1,5 @@
 /**
- * Executed contract for `mobkit/identity/routing_status`.
+ * Executed contract for `meta/identity/routing_status`.
  *
  * A typecheck proves the shapes line up; it does not prove the parser reads the
  * wire keys the gateway actually sends, nor that the method sends the params the
@@ -14,9 +14,9 @@ import assert from "node:assert/strict";
 import { parseIdentityRoutingStatusResult } from "../src/types.js";
 
 async function makeRuntime(answer: unknown | (() => never)) {
-  const { MobKitRuntime } = await import("../src/runtime.js");
+  const { MetaRuntime } = await import("../src/runtime.js");
   const calls: { method: string; params: Record<string, unknown> }[] = [];
-  const rt = new MobKitRuntime({
+  const rt = new MetaRuntime({
     mobConfigPath: null,
     sessionBuilder: null,
     sessionStore: null,
@@ -64,9 +64,9 @@ describe("identity routing status", () => {
     });
     const status = await rt.mobHandle().identityRoutingStatus("domain:security");
 
-    // The method string is the contract with MobKit's two dispatchers; a typo
+    // The method string is the contract with Meta's two dispatchers; a typo
     // here is a -32601 at runtime that no typecheck can see.
-    assert.equal(calls[0].method, "mobkit/identity/routing_status");
+    assert.equal(calls[0].method, "meta/identity/routing_status");
     assert.deepEqual(calls[0].params, { identity: "domain:security" });
 
     assert.equal(status.identity, "domain:security");
@@ -126,7 +126,7 @@ describe("identity routing status", () => {
       -32000,
       "routing_status unavailable: the roster reports no current session",
       "req-1",
-      "mobkit/identity/routing_status",
+      "meta/identity/routing_status",
       {
         kind: "routing_status_unavailable",
         reason: "no_current_session",

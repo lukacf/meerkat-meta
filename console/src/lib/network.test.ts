@@ -181,7 +181,7 @@ test("queryTimeline normalizes aggregate log frames", async () => {
 
   globalThis.fetch = (async () => new Response(JSON.stringify({
     jsonrpc: "2.0",
-    id: "mobkit/console/query_timeline:1",
+    id: "meta/console/query_timeline:1",
     result: {
       frames: [
         {
@@ -231,7 +231,7 @@ test("queryTimeline parsed production frames suppress raw peer prompt when struc
 
   globalThis.fetch = (async () => new Response(JSON.stringify({
     jsonrpc: "2.0",
-    id: "mobkit/console/query_timeline:1",
+    id: "meta/console/query_timeline:1",
     result: {
       frames: [
         {
@@ -313,7 +313,7 @@ test("queryTimeline normalizes replayable frame update markers", async () => {
 
   globalThis.fetch = (async () => new Response(JSON.stringify({
     jsonrpc: "2.0",
-    id: "mobkit/console/query_timeline:1",
+    id: "meta/console/query_timeline:1",
     result: {
       frames: [
         {
@@ -375,7 +375,7 @@ test("queryTimeline exposes typed replay-unavailable RPC errors", async () => {
 
   globalThis.fetch = (async () => new Response(JSON.stringify({
     jsonrpc: "2.0",
-    id: "mobkit/console/query_timeline:1",
+    id: "meta/console/query_timeline:1",
     error: {
       code: -32013,
       message: "query_timeline failed: replay unavailable",
@@ -419,7 +419,7 @@ test("sendConsole posts idempotent console send RPC", async () => {
     body = typeof init?.body === "string" ? init.body : "";
     return new Response(JSON.stringify({
       jsonrpc: "2.0",
-      id: "mobkit/console/send:1",
+      id: "meta/console/send:1",
       result: {
         interaction_id: "turn-1",
         identity: "agent-a",
@@ -441,7 +441,7 @@ test("sendConsole posts idempotent console send RPC", async () => {
       "console:panel",
       "idem-1",
     );
-    assert.match(body, /"method":"mobkit\/console\/send"/);
+    assert.match(body, /"method":"meta\/console\/send"/);
     assert.match(body, /"idempotency_key":"idem-1"/);
     assert.equal(result.input_frame_id, "console-frame-1");
     assert.equal(result.cursor, "console:1");
@@ -461,7 +461,7 @@ test("sendConsoleMultipart posts identity multipart sends with upload placeholde
     hasFilePart = Boolean(form.get("file:upload-test-0"));
     return new Response(JSON.stringify({
       jsonrpc: "2.0",
-      id: "mobkit/console/send:1",
+      id: "meta/console/send:1",
       result: {
         interaction_id: "turn-1",
         identity: "agent-a",
@@ -486,7 +486,7 @@ test("sendConsoleMultipart posts identity multipart sends with upload placeholde
       "console:panel",
       "idem-1",
     );
-    assert.match(payload, /"method":"mobkit\/console\/send"/);
+    assert.match(payload, /"method":"meta\/console\/send"/);
     assert.match(payload, /"identity":"agent-a"/);
     assert.match(payload, /"idempotency_key":"idem-1"/);
     assert.match(payload, /"upload_id":"upload-test-0"/);
@@ -508,7 +508,7 @@ test("sendConsoleMultipart preserves structured content before upload placeholde
     payload = JSON.parse(String(form.get("payload") || "{}")) as Record<string, unknown>;
     return new Response(JSON.stringify({
       jsonrpc: "2.0",
-      id: "mobkit/console/send:1",
+      id: "meta/console/send:1",
       result: {
         interaction_id: "turn-structured",
         identity: "agent-a",
@@ -563,7 +563,7 @@ test("uploadConsoleBlobMultipart posts blob upload multipart RPC with one file",
     hasFilePart = Boolean(form.get("file:upload-test-0"));
     return new Response(JSON.stringify({
       jsonrpc: "2.0",
-      id: "mobkit/blob/upload:1",
+      id: "meta/blob/upload:1",
       result: {
         blob_id: "blob-1",
         media_type: "image/png",
@@ -582,7 +582,7 @@ test("uploadConsoleBlobMultipart posts blob upload multipart RPC with one file",
       file: new File(["png"], "badge.png", { type: "image/png" }),
     });
     assert.equal(hasFilePart, true);
-    assert.equal(payload?.method, "mobkit/blob/upload");
+    assert.equal(payload?.method, "meta/blob/upload");
     assert.deepEqual((payload?.params as { upload?: Record<string, unknown> }).upload, {
       type: "image_upload",
       upload_id: "upload-test-0",
@@ -847,7 +847,7 @@ test("subscribeTimelineEvents reconnects from the last delivered cursor after st
 import { classifyConsoleSendFailure } from "../../../packages/console-core/src/send-attempt";
 
 // The typed 401 body the gateway answers on both console send doors
-// (crates/meerkat-mobkit tests/console_route_auth.rs pins the server side).
+// (crates/meerkat-meta tests/console_route_auth.rs pins the server side).
 const UNAUTHENTICATED_BODY = JSON.stringify({
   jsonrpc: "2.0",
   id: null,
@@ -993,7 +993,7 @@ test("access RPC preserves structured owner evidence and requires exact code and
   try {
     for (const row of cases) {
       globalThis.fetch = (async () => new Response(JSON.stringify({ jsonrpc: "2.0", id: "access-test", error: row.error }), { status: 200 })) as typeof fetch;
-      await assert.rejects(callConsoleRpc("http://console.test", "mobkit/access/set", { checked_v1: {} }), (error: unknown) => {
+      await assert.rejects(callConsoleRpc("http://console.test", "meta/access/set", { checked_v1: {} }), (error: unknown) => {
         assert.deepEqual((error as { rpcError?: unknown }).rpcError, row.error, "the transport must retain the owner's structured evidence");
         assert.equal(accessSaveFailure(error).kind, row.expected, "neither a coincidental code nor message text establishes the outcome");
         assert.doesNotMatch(accessSaveNotice(accessSaveFailure(error)), /private|missing field/);
@@ -1010,7 +1010,7 @@ test("ordinary console interaction code -32004 retains its existing send disposi
   try {
     await assert.rejects(sendConsole("http://console.test", "worker", "hello", "console:p", "idem-unavailable"), (error: unknown) => {
       assert.deepEqual((error as { rpcError?: unknown }).rpcError, body);
-      assert.equal((error as Error).message, "mobkit/console/send RPC error -32004: ordinary interaction unavailable");
+      assert.equal((error as Error).message, "meta/console/send RPC error -32004: ordinary interaction unavailable");
       const failure = classifyConsoleSendFailure(error);
       assert.equal(failure.state, "outcome-unknown");
       assert.equal(failure.kind, "refused");

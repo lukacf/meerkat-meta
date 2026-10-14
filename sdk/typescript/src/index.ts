@@ -1,12 +1,12 @@
 /**
- * MobKit TypeScript SDK - companion gateway and operator layer for Meerkat
+ * Meta TypeScript SDK - companion gateway and operator layer for Meerkat
  * agents and mobs.
  *
  * @example
  * ```ts
- * import { MobKit } from "@rkat/mobkit-sdk";
+ * import { Meta } from "@rkat/meta-sdk";
  *
- * const rt = await MobKit.builder()
+ * const rt = await Meta.builder()
  *   .mob("config/mob.toml")
  *   .gateway("./target/release/rpc_gateway")
  *   .build();
@@ -27,8 +27,8 @@
 
 // -- Builder + Runtime ----------------------------------------------------
 
-export { MobKit, MobKitBuilder } from "./builder.js";
-export type { MobKitBuilderConfig } from "./builder.js";
+export { Meta, MetaBuilder } from "./builder.js";
+export type { MetaBuilderConfig } from "./builder.js";
 export {
   LIVE_EXECUTION_CLIENT_CONTEXT_V1,
   LIVE_EXECUTION_FUNCTION_BRIDGE_V1,
@@ -78,7 +78,7 @@ export type {
   LiveTransportBootstrap,
 } from "./live.js";
 export {
-  MobKitRuntime,
+  MetaRuntime,
   MobHandle,
   ToolCaller,
   SseBridge,
@@ -117,7 +117,9 @@ export type { ContentBlock } from "./tool-content.js";
 export {
   parseForkBuildSource,
   SessionBuildOptions,
+  validateToolArtifactRef,
   type ForkBuildSource,
+  type ToolArtifactRef,
   type MobMemberBinding,
 } from "./models.js";
 export type {
@@ -157,9 +159,11 @@ export { CallbackDispatcher } from "./agent-builder.js";
 // -- Errors ---------------------------------------------------------------
 
 export {
-  MobKitError,
+  MetaError,
   TransportError,
   TransportReaderFailedError,
+  GatewayRestartRefusedError,
+  GatewayStartupCleanupError,
   InitOutcomeUnknownError,
   RpcError,
   MobEventsStaleError,
@@ -167,6 +171,8 @@ export {
   CAPABILITY_UNAVAILABLE_CODE,
   CONSOLE_TIMELINE_REPLAY_UNAVAILABLE_CODE,
   LEASE_LOST_CODE,
+  STALE_DELIVERY_SCOPE_CODE,
+  REGISTERED_SPEC_CHANGED_CODE,
   MEMORY_BACKEND_UNAVAILABLE_CODE,
   STORAGE_RESOLUTION_CODE,
   INIT_IN_PROGRESS_CODE,
@@ -176,6 +182,8 @@ export {
   CapabilityUnavailableError,
   ConsoleTimelineReplayUnavailableError,
   LeaseLostError,
+  StaleScopeError,
+  RegisteredSpecChangedError,
   MemoryBackendUnavailableError,
   StorageResolutionError,
   CompositionProvenanceError,
@@ -192,10 +200,11 @@ export {
   PostAdmissionObservationError,
   TurnWaitTimeoutError,
   WaitEndedError,
-  MobkitRpcError,
+  MetaRpcError,
   isRpcError,
   isMobEventsStaleError,
 } from "./errors.js";
+export type { GatewayCleanup } from "./errors.js";
 
 // -- Typed return models --------------------------------------------------
 
@@ -238,6 +247,7 @@ export {
   parseGatingEvaluateResult,
   parseGatingDecisionResult,
   parseGatingAuditEntry,
+  parseGatingOrigin,
   parseGatingPendingEntry,
   parseRediscoverReport,
   parseReconcileEdgesReport,
@@ -300,6 +310,11 @@ export {
   sendResultToDict,
   parseDispatchResult,
   dispatchResultToDict,
+  DELIVERY_SCOPE_VERSION,
+  parseDeliveryScope,
+  deliveryScopeToDict,
+  parseScopedDispatchResult,
+  parseScopedRecovery,
   parseCompletionCursor,
   parseIdentityBootstrapStatus,
   parseIdentityRestoreProgress,
@@ -388,6 +403,7 @@ export type {
   GatingEvaluateResult,
   GatingDecisionResult,
   GatingAuditEntry,
+  GatingOrigin,
   GatingPendingEntry,
   RediscoverReport,
   ReconcileEdgesReport,
@@ -443,6 +459,7 @@ export type {
   SessionCreatedContext,
   // Identity-first types
   DurableAgentSpec,
+  RegisteredSpec,
   DispatchInput,
   DispatchContentBlock,
   TextContentBlock,
@@ -457,6 +474,7 @@ export type {
   AgentBuildContext,
   RosterContext,
   AgentBuildDraft,
+  AgentBuildDraftToolOptions,
   IdentityStatus,
   IdentityInspection,
   IdentityBootstrapEntry,
@@ -464,6 +482,12 @@ export type {
   IdentityRestoreProgress,
   SendResult,
   DispatchResult,
+  DeliveryScope,
+  DeliveryScopeUnavailable,
+  DeliveryReceipt,
+  ScopedDispatchResult,
+  ScopedRecovery,
+  ScopedRecoveryState,
   CompletionCursor,
   CompletionProgress,
   TurnOutputStatus,
@@ -606,6 +630,10 @@ export type {
   CallbackHandler,
   FetchLike,
   FetchLikeResponse,
+  GatewayTransportFactory,
+  PersistentTransportOptions,
+  PersistentTransportStdioSlot,
+  TransportTermination,
 } from "./transport.js";
 
 // -- SSE (advanced usage) -------------------------------------------------
@@ -616,18 +644,18 @@ export type { SseEvent } from "./sse.js";
 // -- Low-level clients (backward compat) ----------------------------------
 
 export {
-  MobkitTypedClient,
-  MobkitAsyncClient,
+  MetaTypedClient,
+  MetaAsyncClient,
 } from "./client.js";
 
 export type {
-  MobkitStatusResult,
-  MobkitCapabilitiesResult,
-  MobkitReconcileResult,
-  MobkitSpawnMemberResult,
-  MobkitSubscribeScope,
-  MobkitSubscribeParams,
-  MobkitSubscribeKeepAlive,
-  MobkitEventEnvelope,
-  MobkitSubscribeResult,
+  MetaStatusResult,
+  MetaCapabilitiesResult,
+  MetaReconcileResult,
+  MetaSpawnMemberResult,
+  MetaSubscribeScope,
+  MetaSubscribeParams,
+  MetaSubscribeKeepAlive,
+  MetaEventEnvelope,
+  MetaSubscribeResult,
 } from "./client.js";

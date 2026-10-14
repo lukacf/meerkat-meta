@@ -1,15 +1,15 @@
 # MDM Mob Target Deployment
 
-This note describes the deployment model for the MobKit MDM console example in
+This note describes the deployment model for the Meta MDM console example in
 `examples/004-mdm-console-pack`.
 
 ## Roles
 
-- Console host: runs MobKit, the hive member, the browser console, persistent
-  MobKit state, and the externally reachable supervisor bridge.
+- Console host: runs Meta, the hive member, the browser console, persistent
+  Meta state, and the externally reachable supervisor bridge.
 - Target runtime: runs `mdm_mob_target` on each managed machine. It owns local
   credentials, sessions, shell/tool execution, comms identity, and state.
-- Meerkat/MobKit mob: owns peer wiring between hive and targets. Remote target
+- Meerkat/Meta mob: owns peer wiring between hive and targets. Remote target
   members are ordinary external mob members, not proxy records.
 
 The console host can ask targets to do work, but targets perform work locally.
@@ -74,7 +74,7 @@ MDM_SUPERVISOR_ADVERTISED_ADDRESS=tcp://<console-reachable-host>:5790 \
 
 ## Current Integration Gate
 
-The deployment helpers now create real target runtimes and real MobKit external
+The deployment helpers now create real target runtimes and real Meta external
 member bindings. The pack uses the workspace's checked-in exact Meerkat pins
 (0.8.40 at the audited baseline), not an independent pack dependency selection.
 Historically, Meerkat 0.6.30 supplied the typed bridge reply and production

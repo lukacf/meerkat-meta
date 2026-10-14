@@ -9,11 +9,27 @@ export type ConsoleSendLoad =
   | { kind: "ready"; attempts: ConsoleSendAttempt[] }
   | { kind: "blocked"; attempts: []; reason: string };
 export const consoleSendStorageKey = (namespace: string, destination: string): string =>
+  `meta-send-attempts:v1:${encodeURIComponent(namespace)}:${encodeURIComponent(destination)}`;
+
+/** The key the predecessor (pre-0.9) console saved the same queue document under. */
+export const predecessorConsoleSendStorageKey = (namespace: string, destination: string): string =>
   `mobkit-send-attempts:v1:${encodeURIComponent(namespace)}:${encodeURIComponent(destination)}`;
 
 export function loadConsoleSendAttempts(storage: ConsoleSendStorage, namespace: string, destination: string, now = Date.now()): ConsoleSendLoad {
+  return parseConsoleSendDocument(storage.getItem(consoleSendStorageKey(namespace, destination)), namespace, destination, now);
+}
+
+/**
+ * The queue the predecessor (pre-0.9) console saved for this scope, read only
+ * for the explicit "Older queued messages" import. Never consulted by
+ * {@link loadConsoleSendAttempts}; its bytes are preserved after import.
+ */
+export function readPredecessorConsoleQueue(storage: ConsoleSendStorage, namespace: string, destination: string, now = Date.now()): ConsoleSendLoad {
+  return parseConsoleSendDocument(storage.getItem(predecessorConsoleSendStorageKey(namespace, destination)), namespace, destination, now);
+}
+
+function parseConsoleSendDocument(raw: string | null, namespace: string, destination: string, now: number): ConsoleSendLoad {
   try {
-    const raw = storage.getItem(consoleSendStorageKey(namespace, destination));
     if (raw === null) return { kind: "ready", attempts: [] };
     const saved = JSON.parse(raw) as { version: number; namespace: string; destination: string; attempts: ConsoleSendAttempt[] };
     if (saved.version !== 1 || saved.namespace !== namespace || saved.destination !== destination || !Array.isArray(saved.attempts)) {
@@ -97,11 +113,11 @@ export function readLegacyConsoleQueue(storage: ConsoleSendStorage, destination:
 
 export interface ConsoleComposerDraft { text: string; contexts: ConsoleContextRecord[] }
 export const consoleComposerDraftKey = (namespace: string, destination: string, composerId?: string): string =>
-  composerId ? `mobkit-composer-draft:v2:${encodeURIComponent(namespace)}:${encodeURIComponent(destination)}:${encodeURIComponent(composerId)}`
-    : `mobkit-composer-draft:v1:${encodeURIComponent(namespace)}:${encodeURIComponent(destination)}`;
+  composerId ? `meta-composer-draft:v2:${encodeURIComponent(namespace)}:${encodeURIComponent(destination)}:${encodeURIComponent(composerId)}`
+    : `meta-composer-draft:v1:${encodeURIComponent(namespace)}:${encodeURIComponent(destination)}`;
 /** sessionStorage survives reload and is separate for independently opened tabs. */
 export function consoleComposerTabId(storage: ConsoleSendStorage | null, createId: () => string): string {
-  const key = "mobkit-composer-tab:v1";
+  const key = "meta-composer-tab:v1";
   try {
     const existing = storage?.getItem(key);
     if (existing?.trim()) return existing;

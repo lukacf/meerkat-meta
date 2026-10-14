@@ -1,19 +1,19 @@
 [workspace]
 members = [
-    "crates/meerkat-mobkit",
-    "crates/mobkit-extension-state",
-    "crates/mobkit-store-conformance",
+    "crates/meerkat-meta",
+    "crates/meta-extension-state",
+    "crates/meta-store-conformance",
 ]
 resolver = "2"
 
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-version = "0.8.49"
+version = "0.9.0"
 authors = ["Luka Crnkovic-Friis"]
-repository = "https://github.com/lukacf/meerkat-mobkit"
-homepage = "https://docs.rkat.ai/mobkit/introduction"
-documentation = "https://docs.rkat.ai/mobkit/introduction"
+repository = "https://github.com/lukacf/meerkat-meta"
+homepage = "https://docs.rkat.ai/meta/introduction"
+documentation = "https://docs.rkat.ai/meta/introduction"
 keywords = ["agent", "llm", "ai", "meerkat", "orchestration"]
 categories = ["development-tools", "api-bindings"]
 rust-version = "1.94.0"
@@ -138,7 +138,7 @@ opt-level = 0
 # ERROR: out of memory" on these crates even with CARGO_BUILD_JOBS=2. They are
 # cold-path, I/O-bound orchestration crates (the bazel-era release proved
 # opt-0 has no measurable runtime effect and turns 40-100 min LLVM runs into
-# seconds). The gateways' own crate (meerkat-mobkit) stays at the workspace
+# seconds). The gateways' own crate (meerkat-meta) stays at the workspace
 # opt-level.
 [profile.release.package.meerkat-core]
 opt-level = 0

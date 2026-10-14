@@ -12,7 +12,7 @@ function validEvidence() {
     observations: [
       { scope: "scope-a", path: "/console/timeline/stream", status: 409, startedAt: 15 },
       { scope: "scope-b", path: "/console/rpc", method: "POST", startedAt: 32, endedAt: 33, status: 200,
-        request: JSON.stringify({ method: "mobkit/console/query_timeline", params: { mode: "recent", limit: 200, identity: "router:main" } }),
+        request: JSON.stringify({ method: "meta/console/query_timeline", params: { mode: "recent", limit: 200, identity: "router:main" } }),
         response: JSON.stringify({ result: { frames: [{ id: "new:frame", payload: { text: "Replacement owner record" } }], latest_cursor: "new:cursor" } }) },
       { scope: "scope-b", path: "/console/timeline/stream?identity=router%3Amain", method: "GET", startedAt: 34, status: 200, cursor: "new:cursor" },
     ],
@@ -36,7 +36,7 @@ for (const [name, corrupt] of [
   ["old cursor transferred to new stream", value => { value.observations[2].cursor = "old:cursor"; }],
   ["replacement stream skips its owner frontier", value => { value.observations[2].cursor = "invented:cursor"; }],
   ["old scope opens another subscription", value => { value.observations.push({ scope: "scope-a", path: "/console/timeline/stream", startedAt: 41 }); }],
-  ["scope switch submits a message", value => { value.observations.push({ scope: "scope-b", path: "/console/rpc", method: "POST", startedAt: 35, request: JSON.stringify({ method: "mobkit/console/send" }) }); }],
+  ["scope switch submits a message", value => { value.observations.push({ scope: "scope-b", path: "/console/rpc", method: "POST", startedAt: 35, request: JSON.stringify({ method: "meta/console/send" }) }); }],
   ["owner receives an unintended model request", value => { value.modelRequestCounts.after[1]++; }],
   ["old draft remains", value => { value.draft = "old draft"; }],
   ["old quote remains", value => { value.contextCount = 1; }],
@@ -68,11 +68,11 @@ test("binds each stock stream to its own preceding global seed while ignoring pe
   evidence.host = "stock";
   evidence.observations[2].path = "/console/timeline/stream";
   const seed = evidence.observations[1];
-  seed.request = JSON.stringify({ method: "mobkit/console/query_timeline", params: { mode: "recent", limit: 200 } });
+  seed.request = JSON.stringify({ method: "meta/console/query_timeline", params: { mode: "recent", limit: 200 } });
   evidence.observations.push({ ...seed, startedAt: 35, endedAt: 36,
     response: seed.response.replace("new:cursor", "new:advanced-cursor") });
   evidence.observations.push({ ...seed, startedAt: 36, endedAt: 37,
-    request: JSON.stringify({ method: "mobkit/console/query_timeline", params: { mode: "recent", limit: 200, identity: "router:main" } }),
+    request: JSON.stringify({ method: "meta/console/query_timeline", params: { mode: "recent", limit: 200, identity: "router:main" } }),
     response: seed.response.replace("new:cursor", "new:unrelated-pane-cursor") });
   evidence.observations.push({ ...evidence.observations[2], startedAt: 38, cursor: "new:advanced-cursor" });
   assert.doesNotThrow(() => assertScopeCancellation(evidence));

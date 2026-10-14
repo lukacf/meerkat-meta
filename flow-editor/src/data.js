@@ -1,7 +1,7 @@
 /* global window */
-// MobKit Flow Editor boot constants only.
+// Meta Flow Editor boot constants only.
 // Live mobpack state, models, tools, skills, and agent definitions hydrate from
-// the MobKit schema RPC and live in the app/controller state planes.
+// the Meta schema RPC and live in the app/controller state planes.
 
 const GRID = {
   cols: 5,    // initial; grows dynamically based on instances
@@ -20,7 +20,7 @@ function cellXY(col, row) {
   };
 }
 
-window.MOBKIT_BOOT = {
+window.META_BOOT = {
   GRID,
   cellXY,
 };

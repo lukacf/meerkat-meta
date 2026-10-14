@@ -1,4 +1,30 @@
-# Changelog — @rkat/mobkit-sdk (TypeScript SDK)
+# Changelog — @rkat/meta-sdk (TypeScript SDK)
+
+## Unreleased
+
+- Breaking (access control): `MetaBuilder.accessControl(path)` now needs an
+  existing, valid access file. The gateway refuses to start with a missing
+  path, a directory, or an unreadable or invalid file instead of starting
+  with access control disabled, and an explicit empty path throws. A
+  configuration that names no admin grants administration to nobody; name
+  the first admin in the file. Omitting the call leaves access control off
+  only when nothing is at the conventional `config/access.toml` (a missing
+  or dangling parent directory counts as nothing there). Discovery now
+  forwards any other entry there (even a directory or a dangling
+  `access.toml` link) and any lookup error other than ENOENT, and the
+  gateway's strict loader refuses initialization when it cannot open, read,
+  parse or validate the file. The loader does not check the file type, so a
+  FIFO there blocks startup instead of refusing it.
+- Breaking (gating): `MetaBuilder.gating(path)` throws for an explicit empty
+  path, and the runtime forwards any explicit gating path instead of
+  dropping an empty one, so the gateway refuses it. Omitting the call leaves
+  gating off only when nothing is at the conventional `config/gating.toml`
+  (a missing or dangling parent directory counts as nothing there).
+  Discovery now forwards any other entry there (even a directory or a
+  dangling `gating.toml` link) and any lookup error other than ENOENT, and
+  the gateway refuses initialization when it cannot open or read the file or
+  rejects its contents. The loader does not check the file type, so a FIFO
+  there blocks startup instead of refusing it.
 
 ## 0.8.19
 
@@ -6,7 +32,7 @@
   exists, so a TypeScript host cannot authorize a role-migrating resume. A
   durable member whose role changed refuses to resume until some host declares
   the migration; use the Python builder, or send `role_migrations` at the top
-  level of a `mobkit/init` payload.
+  level of a `meta/init` payload.
 
 ## 0.8.16
 
@@ -17,7 +43,7 @@
   The response regains `session_id`, populating the existing
   `HelperResult.sessionId` that older releases left `null`.
 
-- Breaking: removed `MobKitBuilder.scheduling(...)`, static schedule-file
+- Breaking: removed `MetaBuilder.scheduling(...)`, static schedule-file
   discovery, and `MobHandle.schedulingEvaluate` / `schedulingDispatch`.
   Create durable schedules through Meerkat schedule tools or
   `ScheduleService`.
@@ -28,8 +54,8 @@
 
 - Gateway stderr (tracing lines, panic hooks, storage-migration progress) is
   piped to the host process's stderr by default; previously it was ignored
-  entirely. Opt out with `MOBKIT_GATEWAY_STDERR=devnull`, or append to a file
-  with `MOBKIT_GATEWAY_STDERR_FILE=<path>` — same shape as the Python SDK.
+  entirely. Opt out with `META_GATEWAY_STDERR=devnull`, or append to a file
+  with `META_GATEWAY_STDERR_FILE=<path>` — same shape as the Python SDK.
 
 ## 0.8.6
 
@@ -54,7 +80,7 @@
 
 ### Graceful gateway shutdown
 
-- `MobKitRuntime.shutdown()` now closes the persistent gateway's stdin and
+- `MetaRuntime.shutdown()` now closes the persistent gateway's stdin and
   awaits its runtime cleanup. Handshake-capable gateways advertise a bounded
   shutdown horizon (335 seconds for the stock gateway), keeping provider
   callbacks routable through their public 120-second completion contract and
@@ -69,12 +95,12 @@
 
 ### Identity-first agent memory
 
-- Added `MobKit.builder().agentMemory(...)` for gateway-backed
+- Added `Meta.builder().agentMemory(...)` for gateway-backed
   identity-first runtimes with persistent state.
 - Added `MobHandle.rememberAgentMemory(...)`,
   `MobHandle.recallAgentMemory(...)`, and
   `MobHandle.forgetAgentMemory(...)` for durable per-identity memory
-  records backed by `mobkit/agent_memory/*`.
+  records backed by `meta/agent_memory/*`.
 - Added strict exported types/parsers for `AgentMemoryRecord`,
   `AgentMemoryRecallResult`, and `AgentMemoryForgetResult`.
 
@@ -82,7 +108,7 @@
 
 ### Console fetch policy
 
-- Added `MobKit.builder().consoleFetchTimeoutMs(ms)` for gateway-backed
+- Added `Meta.builder().consoleFetchTimeoutMs(ms)` for gateway-backed
   runtimes. The value is sent as `runtime_options.console_fetch_timeout_ms`
   and projected through `/console/experience` for the bundled console.
 
@@ -107,7 +133,7 @@
 ### Streaming structural events + durable cursors
 
 Parity with the Python SDK: structural events are now durable
-end-to-end. Cursors come from the meerkat ledger and survive mobkit
+end-to-end. Cursors come from the meerkat ledger and survive meta
 restarts on SQLite-backed deployments.
 
 - `MobStructuralEvent.cursor` is the meerkat ledger cursor (not a
@@ -117,23 +143,23 @@ restarts on SQLite-backed deployments.
   `queryMobEvents()` / `subscribeMobEvents()` on JSON-RPC code
   `-32010`. Carries `afterCursor` and `latestCursor`. The shared
   `MOB_EVENTS_STALE_CURSOR_CODE` constant is exported.
-- `mobkit/mob_events/subscribe` returns a `subscribe_url` pointing
-  to the new `/mobkit/mob_events/stream?after_seq=...&...` SSE
+- `meta/mob_events/subscribe` returns a `subscribe_url` pointing
+  to the new `/meta/mob_events/stream?after_seq=...&...` SSE
   route; original filters echo back so the SSE handler picks up
   gaplessly with the same predicate.
-- `mobkit/mob_events/query` always returns a numeric
+- `meta/mob_events/query` always returns a numeric
   `next_after_seq` even on empty match (was `null`).
 
 ### `MobHandle.listRuns(flowId?)`
 
-New SDK method wrapping `mobkit/list_runs`. Returns `MobRun[]` with
+New SDK method wrapping `meta/list_runs`. Returns `MobRun[]` with
 the full meerkat ledger projection: `stepLedger`, `failureLedger`,
 `frames` (map keyed by frame id), `loops` (map keyed by loop id),
 `loopIterationLedger`, `flowState`, `activationParams`,
 `schemaVersion`, `rootStepOutputs`, `loopIterationOutputs`.
 Meerkat-internal sub-shapes pass through opaquely as `unknown`.
 
-New interfaces and parsers exported from `@rkat/mobkit-sdk`:
+New interfaces and parsers exported from `@rkat/meta-sdk`:
 `MobRun`, `MobRunStatus`, `StepRecord`, `FailureRecord`,
 `FrameRecord`, `LoopRecord`, `LoopIterationRecord` plus
 `parseMobRun` / `parseStepRecord` / etc.
@@ -147,7 +173,7 @@ New interfaces and parsers exported from `@rkat/mobkit-sdk`:
   hoisted-vs-nested monorepos all produce two `RpcError`
   constructors that fail `instanceof` for each other's instances.
   The structural checks survive the split.
-- `MobKitRuntime.start()` no longer rewrites `mobkit/init`
+- `MetaRuntime.start()` no longer rewrites `meta/init`
   `RpcError` as a generic `TransportError`. Original code/message/
   data flow through; only synthesizes `TransportError` when the
   subprocess actually died.
@@ -172,17 +198,17 @@ New interfaces and parsers exported from `@rkat/mobkit-sdk`:
 
 ### Cross-mob signed-peer surface
 
-- New `mobkit/peer_pubkey` RPC returns the local gateway's Ed25519
+- New `meta/peer_pubkey` RPC returns the local gateway's Ed25519
   signing pubkey as a base64 string. Use this to bootstrap trust before
-  populating a peer mobkit's contact directory with this gateway's
+  populating a peer meta's contact directory with this gateway's
   pubkey. (Rust + Python wrappers ship in parallel; TS wrapper to
   follow once the cross-process transport lands.)
-- `mobkit/cross_mob/wire_local` and `mobkit/cross_mob/unwire_local` now
+- `meta/cross_mob/wire_local` and `meta/cross_mob/unwire_local` now
   accept an optional `remote_pubkey_b64` (base64 of the peer gateway's
   Ed25519 verifying key). Non-inproc transports (`tcp://`, `uds://`)
   require it — the gateway rejects unsigned descriptors on real
   transports so meerkat-comms can verify envelope signatures at ingress.
-- `mobkit/cross_mob/directory` entries gain an optional `pubkey` field
+- `meta/cross_mob/directory` entries gain an optional `pubkey` field
   (base64) when the contact-directory TOML uses the new table form
   (`{ transport = "...", pubkey = "ed25519:..." }`). Bare-string entries
   remain backward compatible.
@@ -192,8 +218,8 @@ New interfaces and parsers exported from `@rkat/mobkit-sdk`:
 ### Structural mob events surface
 
 Added `MobHandle.queryMobEvents()` and `MobHandle.subscribeMobEvents()`,
-backed by the new `mobkit/mob_events/query` and
-`mobkit/mob_events/subscribe` JSON-RPC methods. The structural surface
+backed by the new `meta/mob_events/query` and
+`meta/mob_events/subscribe` JSON-RPC methods. The structural surface
 preserves the full `MobEventKind` vocabulary from meerkat-mob (25
 variants — `flow_started`, `step_dispatched`, `members_wired`,
 `supervisor_escalation`, ...) along with the `mobId`, `runId`,
@@ -217,8 +243,8 @@ references — see the table below. No behavioural changes.
 
 | Before | After | Surfaces |
 |--------|-------|----------|
-| `meerkatId` / `meerkat_id` | `agentIdentity` / `agent_identity` | `SpawnResult`, `MemberSnapshot`, `DiscoverySpec`, `mobkit/*` RPC params that accept a member identity |
-| `profile` (as a mob-member role) | `role` | `SpawnResult`, `MemberSnapshot`, `DiscoverySpec`, `mobkit/ensure_member`, `mobkit/attach_existing_session`, `mobkit/spawn_helper` / `fork_helper` options, admin-console live snapshots |
+| `meerkatId` / `meerkat_id` | `agentIdentity` / `agent_identity` | `SpawnResult`, `MemberSnapshot`, `DiscoverySpec`, `meta/*` RPC params that accept a member identity |
+| `profile` (as a mob-member role) | `role` | `SpawnResult`, `MemberSnapshot`, `DiscoverySpec`, `meta/ensure_member`, `meta/attach_existing_session`, `meta/spawn_helper` / `fork_helper` options, admin-console live snapshots |
 
 Rename in your code:
 
@@ -242,9 +268,9 @@ Rename in your code:
   meerkat's native `MemberState` enum) where 0.5 emitted `"active"` /
   `"retiring"`. Update any string-comparison code.
 
-- `mobkit/spawn_helper` and `mobkit/fork_helper` no longer emit
+- `meta/spawn_helper` and `meta/fork_helper` no longer emit
   `session_id` on the response. Meerkat 0.6 retires the helper before
-  the call returns, so mobkit cannot recover the bridge session id
+  the call returns, so meta cannot recover the bridge session id
   post-hoc. If your code correlated helper history via this id, you need
   an alternative route (subscribe to the helper's events during the
   call, or wait for an upstream `HelperResult.bridge_session_id` field).
@@ -266,22 +292,22 @@ Rename in your code:
 
 These are native Rust roster changes, not TypeScript SDK module-reconcile
 results. The SDK's `MobHandle.reconcile(modules)` is a different operation:
-it calls `mobkit/reconcile` and returns `ReconcileResult` with
+it calls `meta/reconcile` and returns `ReconcileResult` with
 `accepted`, `reconciledModules`, and `added`, not `failures` or `spawned`.
 
 ### Lightweight roster
 
-- `mobkit/list_members`, `mobkit/get_member`, `mobkit/find_members` no
+- `meta/list_members`, `meta/get_member`, `meta/find_members` no
   longer inject a `session_id` field per entry. Aligns with meerkat's
-  lightweight-roster design. Use `mobkit/member_status` to bridge a
+  lightweight-roster design. Use `meta/member_status` to bridge a
   member to a realtime session — its `MobMemberSnapshot` carries
   `current_session_id` natively.
 
 ### Removed RPCs
 
-- `mobkit/member_current_session_id` and `mobkit/member_session_ref`
+- `meta/member_current_session_id` and `meta/member_session_ref`
   are gone. Both were one-liners over an internal session-id lookup
-  and are subsumed by `mobkit/member_status`.
+  and are subsumed by `meta/member_status`.
 
 ### New: server-side readiness
 
@@ -296,15 +322,15 @@ it calls `mobkit/reconcile` and returns `ReconcileResult` with
 
 - `MobHandle.listFlows()` — returns the flow IDs declared by the mob's
   `[flows.*]` tables. Relays meerkat 0.6's `MobHandle::list_flows` via
-  the new `mobkit/list_flows` RPC.
+  the new `meta/list_flows` RPC.
 - `MobHandle.runFlow(flowId, params?)` — starts a flow run and returns
   its `run_id` string. Relays `MobHandle::run_flow` via
-  `mobkit/run_flow`.
+  `meta/run_flow`.
 
 ### Unchanged
 
 - The `DurableAgentSpec` identity-first surface keeps its `profile` field (it
   mirrors meerkat's internal Rust `DurableAgentSpec`, which is a different
   surface from `MobMemberListEntry`).
-- RPC method names (e.g. `mobkit/ensure_member`, `mobkit/spawn_helper`) are
+- RPC method names (e.g. `meta/ensure_member`, `meta/spawn_helper`) are
   unchanged. Only their parameter and response field names shifted.

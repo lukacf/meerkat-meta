@@ -2,7 +2,7 @@ import { conversationPresentationRows } from "../../packages/console-core/src/as
 import { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
-  buildConversationViewState, createHttpConsoleTransport, createMobKitConsoleController,
+  buildConversationViewState, createHttpConsoleTransport, createMetaConsoleController,
   mapFramesToTimelineEntries, resolvePanelResponsePhase, type ConsoleFrame, type ConsoleTransportState,
   createPendingApprovalResource, createConsoleContextRecord,
   serializeConsoleContextMessage, type ConsoleContextRecord, type PendingApprovalSnapshot,
@@ -56,11 +56,11 @@ function SharedHost() {
   const [contexts, setContexts] = useState<ConsoleContextRecord[]>([]);
   const [approvals, setApprovals] = useState<PendingApprovalSnapshot>();
   const [transportState, setTransportState] = useState<ConsoleTransportState>({ phase: "connecting", stale: true, freshness: "unknown" });
-  const controller = useMemo(() => createMobKitConsoleController({ transport: createHttpConsoleTransport({ baseUrl }) }), [baseUrl]);
+  const controller = useMemo(() => createMetaConsoleController({ transport: createHttpConsoleTransport({ baseUrl }) }), [baseUrl]);
   const approvalResource = useMemo(() => createPendingApprovalResource({
     scopeKey: scope,
-    load: signal => callConsoleRpc(baseUrl, "mobkit/gating/pending", {}, undefined, signal),
-    decide: (pendingId, decision, signal) => callConsoleRpc(baseUrl, "mobkit/gating/decide", {
+    load: signal => callConsoleRpc(baseUrl, "meta/gating/pending", {}, undefined, signal),
+    decide: (pendingId, decision, signal) => callConsoleRpc(baseUrl, "meta/gating/decide", {
       pending_id: pendingId, decision, approver_id: "acceptance-operator", reason: "Reviewed evidence",
     }, undefined, signal),
   }), [scope, baseUrl]);
@@ -84,7 +84,7 @@ function SharedHost() {
     };
     // Keep page metadata from the same authorized query used by the live
     // controller, without issuing a duplicate initial history request.
-    const scopedController = createMobKitConsoleController({ transport: {
+    const scopedController = createMetaConsoleController({ transport: {
       ...controller.transport,
       async queryTimeline(input) {
         const page = await controller.transport.queryTimeline(input);
@@ -176,7 +176,7 @@ function SharedHost() {
 
   return <main className="acceptance-host cc-theme-scope">
     <header>
-      <strong>Reusable MobKit conversation</strong>
+      <strong>Reusable Meta conversation</strong>
       <label>Agent <select aria-label="Agent" value={identity} onChange={event => setIdentity(event.target.value)}>
         <option>router:main</option><option>domain:delivery</option>
       </select></label>

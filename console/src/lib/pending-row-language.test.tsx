@@ -2,11 +2,11 @@ import React from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConsoleApp } from "../ConsoleApp";
-import type { MobKitConsoleTransport } from "./headless";
+import type { MetaConsoleTransport } from "./headless";
 import { beginConsoleSendAttempt, createConsoleSendAttempt, finishConsoleSendAttempt, type ConsoleSendAttempt } from "../../../packages/console-core/src/send-attempt";
 import { consoleSendStorageKey, saveConsoleSendAttempts } from "./send-attempt-storage";
 
-// Pending-row language and the explicit Check / Send again actions (MobKit
+// Pending-row language and the explicit Check / Send again actions (Meta
 // 0.8.45). Every Check ends in a visible result; Send again on an uncertain
 // row reuses the attempt's idempotency key, so the server replays or admits
 // it once.
@@ -17,19 +17,19 @@ const scope = "runtime/realm/principal";
 
 function seed() {
   const target = { id: `chat:${identity}`, kind: "agent-chat", title: agentLabel, identity, memberId: identity };
-  window.localStorage.setItem(`mobkit-console-dock-state:${scope}`, JSON.stringify({
+  window.localStorage.setItem(`meta-console-dock-state:${scope}`, JSON.stringify({
     tabs: [{ id: "tab-1", presetId: "single", layout: { kind: "panel", panelId: "panel-1" } }],
     panels: [{ id: "panel-1", mode: "console", target }], activeTabId: "tab-1", focusedPanelId: "panel-1",
   }));
 }
 // `durable` mirrors the gateway's `send_dedupe.durable`; undefined omits the
 // section, as an older gateway does.
-function transport(send: MobKitConsoleTransport["send"], brand?: string, durable?: boolean): MobKitConsoleTransport {
+function transport(send: MetaConsoleTransport["send"], brand?: string, durable?: boolean): MetaConsoleTransport {
   return {
     loadExperience: async () => ({ runtime_id: "queue-test", console_config: brand ? { brand: { label: brand } } : {},
       ...(durable === undefined ? {} : { send_dedupe: { durable } }), agent_sidebar: { live_snapshot: { agents: [{ identity, member_id: identity, agent_id: identity, label: agentLabel, kind: "member", state: "running", addressable: true, affordances: { can_send_message: true }, model_capabilities: { image_input: false } }] } }, activity_feed: { filter_presets: [], active_preset_id: "all" } }) as never,
     loadModules: async () => ({ modules: [] }) as never,
-    capabilities: async () => ({ version: "test", methods: ["mobkit/console/send", "mobkit/console/timeline", "mobkit/console/inspect_identity"] }) as never,
+    capabilities: async () => ({ version: "test", methods: ["meta/console/send", "meta/console/timeline", "meta/console/inspect_identity"] }) as never,
     queryTimeline: async () => ({ frames: [], available: true }),
     subscribeTimeline: () => () => {}, send,
     executeCommand: async (input) => ({ command: input.command, accepted: true, result: { identity: { identity } } }) as never,
@@ -93,7 +93,7 @@ describe("Check always ends in a visible result", () => {
   it("shows Checking at once, then a miss keeps the row uncertain with its options", async () => {
     saveConsoleSendAttempts(window.localStorage, scope, identity, [savedRow("outcome-unknown", { failureKind: "timeout" })]);
     const fake = transport(vi.fn());
-    let finish!: (page: Awaited<ReturnType<MobKitConsoleTransport["queryTimeline"]>>) => void;
+    let finish!: (page: Awaited<ReturnType<MetaConsoleTransport["queryTimeline"]>>) => void;
     let checking = false;
     fake.executeCommand = vi.fn(async (input) => { checking = true; return { command: input.command, accepted: true, result: { identity: { identity } } } as never; });
     fake.queryTimeline = vi.fn(async () => checking ? new Promise(resolve => { finish = resolve; }) : { available: true, frames: [] });

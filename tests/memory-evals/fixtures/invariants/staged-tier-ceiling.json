@@ -25,5 +25,5 @@
     ]
   },
   "expected": { "verdict": "reject", "error": "tier_not_staged_assignable", "op_index": 0 },
-  "notes": "Tier-ceiling invariant (arch doc §10.2, §11): operator and application trust tiers are assignable only by non-LLM principals through direct surfaces — never via any StagedMutationBatch, regardless of author or rationale. A staged retier to operator must be a validator reject. Executable check: tier tests in crates/meerkat-mobkit/src/memory/staged.rs; schema-validated only here."
+  "notes": "Tier-ceiling invariant (arch doc §10.2, §11): operator and application trust tiers are assignable only by non-LLM principals through direct surfaces — never via any StagedMutationBatch, regardless of author or rationale. A staged retier to operator must be a validator reject. Executable check: tier tests in crates/meerkat-meta/src/memory/staged.rs; schema-validated only here."
 }

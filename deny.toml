@@ -76,12 +76,12 @@ feature-depth = 1
 # meerkat-memory -> hnsw_rs; no vulnerability, no safe upgrade exists.
 # RUSTSEC-2026-0189: rmcp Streamable HTTP server transport host-header
 # validation. Transitive via meerkat-mcp 0.7.x, whose latest published patch
-# still requires rmcp 0.14; MobKit enables client transports, not the affected
+# still requires rmcp 0.14; Meta enables client transports, not the affected
 # transport-streamable-http-server feature. Remove when Meerkat lifts to
 # rmcp >= 1.4.0.
 # RUSTSEC-2026-0150: audiopus_sys 0.2.2 unmaintained. Transitive and ONLY
 # under `openai-live` (and therefore `experimental-gpt-live`):
-#     audiopus_sys 0.2.2 <- opus 0.3.1 <- meerkat-live <- meerkat <- mobkit
+#     audiopus_sys 0.2.2 <- opus 0.3.1 <- meerkat-live <- meerkat <- meta
 # The advisory is `informational = "unmaintained"` with `patched = []`, i.e. NO
 # vulnerability and no patched release; crates.io's latest audiopus_sys IS
 # 0.2.2, so "no safe upgrade" is a fact about the registry, not a deferral.
@@ -101,8 +101,8 @@ feature-depth = 1
 # then. Re-evaluate sooner if any build host adopts CMake 4, because at that
 # point this stops being informational and starts breaking builds.
 # RUSTSEC-2024-0449: unsafe-libyaml 0.2.11 is archived and unmaintained.
-# Retained serde_yaml 0.9.34+deprecated is used by MobKit's governance YAML
-# parser and by meerkat-skills at the accepted native Git revision ac411ddf.
+# Retained serde_yaml 0.9.34+deprecated is used by Meta's governance YAML
+# parser and by meerkat-skills in the 0.9 native pair (Meerkat Core 4bdb04d84).
 # The advisory lists no patched release. This accepts the maintenance risk;
 # it does not establish parser safety or rule out security defects.
 # Removal requires a coherent migration of both YAML paths, followed by a
@@ -112,7 +112,7 @@ feature-depth = 1
 # migration and behavior qualification; a local-only replacement is incomplete.
 # Reassess immediately if a concrete vulnerability is reported.
 ignore = [
-    { id = "RUSTSEC-2024-0449", reason = "Temporary acceptance of archived unsafe-libyaml retained by MobKit governance and native ac411 meerkat-skills through serde_yaml; no patched release is listed. Migrate both YAML paths and remove this exception when the audited graph no longer contains unsafe-libyaml; reassess immediately on a concrete vulnerability, and on advisory, graph, or native-source change." },
+    { id = "RUSTSEC-2024-0449", reason = "Temporary acceptance of archived unsafe-libyaml retained by Meta governance and native meerkat-skills through serde_yaml; no patched release is listed. Migrate both YAML paths and remove this exception when the audited graph no longer contains unsafe-libyaml; reassess immediately on a concrete vulnerability, and on advisory, graph, or native-source change." },
     "RUSTSEC-2026-0049",
     "RUSTSEC-2025-0141",
     "RUSTSEC-2026-0189",

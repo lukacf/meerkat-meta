@@ -6,9 +6,9 @@ the runtime that binds the `meerkat_schedule_*` tools now arms the firing
 host for that same store at session creation / executor attach, so
 tools-bound-but-undriven is no longer a representable topology. No composed
 "schedule domain" seam API shipped — the single-owner guarantee landed
-inside `SessionRuntime` instead, which mobkit does not use (no meerkat-rpc
-dependency). Per the audit below, mobkit's gateways already bind tools +
-host + watchdog from one `ScheduleService`, so NO mobkit code change was
+inside `SessionRuntime` instead, which meta does not use (no meerkat-rpc
+dependency). Per the audit below, meta's gateways already bind tools +
+host + watchdog from one `ScheduleService`, so NO meta code change was
 needed. Stranded-data recovery also resolves upstream: an embedder on
 0.7.25 gets a driver pointed at the previously-undriven store automatically
 (the downstream app's pending occurrences fire on their upgrade, subject to catch-up
@@ -37,21 +37,21 @@ binds the agent-facing schedule tools AND the firing host from the same
 authority (an undriven store is loud, never a silent write sink). Exact API
 shape may shift while it lands — verify against the released crate.
 
-## Mobkit audit (as of 0.7.29, meerkat =0.7.23 pins)
+## Meta audit (as of 0.7.29, meerkat =0.7.23 pins)
 
-Both defects were checked against mobkit's gateways. Findings:
+Both defects were checked against meta's gateways. Findings:
 
 - **Single writer, attach-first — already holds.** The only
-  `default_schedule_tools` writer in a mobkit process is
+  `default_schedule_tools` writer in a meta process is
   `schedule_wiring::attach_schedule_tools_with_identity_targets`, called at
   `FactoryAgentBuilder` construction, before the builder is consumed into a
   session service and before any member build can run:
   - rpc_gateway.rs: persistent branch builder + attach (all persistent-branch
     builds, including callback builds, flow through this one builder).
-  - mobkit_gateway.rs: same pattern in
+  - meta_gateway.rs: same pattern in
     `build_persistent_session_service`.
-  Mobkit does NOT depend on meerkat-rpc, so the second writer
-  (`SessionRuntime` self-seeding) is unreachable in a mobkit-only process.
+  Meta does NOT depend on meerkat-rpc, so the second writer
+  (`SessionRuntime` self-seeding) is unreachable in a meta-only process.
   The race bites deployments that ALSO construct meerkat-rpc surfaces
   against the same realm store (the downstream app).
 - **Tools ↔ firing authority — already coupled.** Whenever tools are
@@ -64,12 +64,12 @@ Both defects were checked against mobkit's gateways. Findings:
 - **Ephemeral branch: consistent no-schedule posture.** No store is opened,
   no tools attached, no host spawned — there is no silent write sink because
   there is no write path.
-- **Second store location.** Mobkit's gateways open
+- **Second store location.** Meta's gateways open
   `<state_dir>/schedule.sqlite` only. The realm-bundle schedule store inside
-  `sessions.sqlite3` is never opened by mobkit; stranded rows there are
-  written by non-mobkit surfaces sharing the state dir.
+  `sessions.sqlite3` is never opened by meta; stranded rows there are
+  written by non-meta surfaces sharing the state dir.
 
-Net: mobkit's current wiring is correct by construction but only
+Net: meta's current wiring is correct by construction but only
 *incidentally* — nothing prevents a future build path (or an embedder mixing
 surfaces in-process) from reintroducing a second binding.
 
@@ -97,14 +97,14 @@ surfaces in-process) from reintroducing a second binding.
    point-a-driver-once affordance. Guard rails either way:
    - never blind-open a foreign `sessions.sqlite3` with
      `SqliteScheduleStore::open` (open runs migrations and would CREATE
-     schedule tables in a file mobkit does not own — probe with a raw
+     schedule tables in a file meta does not own — probe with a raw
      read-only connection first);
    - refuse auto-migration when another process may be driving the source
      store (double-firing risk); loud log + explicit opt-in flag/RPC.
 
 ## Non-goals
 
-- No speculative mobkit-side migration before 0.7.25 lands (the upstream
-  seam may ship its own pointing/migration mechanism; a parallel mobkit
+- No speculative meta-side migration before 0.7.25 lands (the upstream
+  seam may ship its own pointing/migration mechanism; a parallel meta
   implementation risks colliding with it).
 - No change to the ephemeral-gateway posture (no store → no tools → no host).

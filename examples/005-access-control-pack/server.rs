@@ -1,10 +1,10 @@
 //! Access Control Pack — runnable console server demonstrating the optional
-//! ABAC layer end to end against the stock MobKit console.
+//! ABAC layer end to end against the stock Meta console.
 //!
 //! Exposed as Cargo example `access_control_console`:
 //!
 //! ```bash
-//! cargo run -p meerkat-mobkit --example access_control_console
+//! cargo run -p meerkat-meta --example access_control_console
 //! ```
 //!
 //! The server bootstraps a tiny mob (one lead, two scouts with `org` labels),
@@ -27,7 +27,7 @@
 //! Environment:
 //! - `ACCESS_CONTROL_LISTEN_ADDR` — listen address (default `127.0.0.1:7300`).
 //! - `ACCESS_CONTROL_WORK_DIR` — session + `access.toml` directory
-//!   (default `<temp>/mobkit-access-control-pack`). Delete it to reset the
+//!   (default `<temp>/meta-access-control-pack`). Delete it to reset the
 //!   seeded config; live console edits persist back into it.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -38,14 +38,14 @@ use std::time::Duration;
 use meerkat::{AgentFactory, Config, build_ephemeral_service};
 use meerkat_client::TestClient;
 // meerkat 0.7: the MeerkatId alias was deleted; member ids are AgentIdentity.
-use meerkat_mob::ids::AgentIdentity as MeerkatId;
-use meerkat_mob::{MobDefinition, MobStorage, SpawnMemberSpec};
-use meerkat_mobkit::{
+use meerkat_meta::{
     AccessControlConfig, AccessController, AccessGroup, AccessRule, AuthPolicy, BigQueryNaming,
-    ConsolePolicy, DiscoverySpec, MobBootstrapOptions, MobBootstrapSpec, MobKitConfig,
+    ConsolePolicy, DiscoverySpec, MetaConfig, MobBootstrapOptions, MobBootstrapSpec,
     RuntimeDecisionInputs, RuntimeOpsPolicy, TrustedOidcRuntimeConfig, UnifiedRuntime,
     build_runtime_decision_state,
 };
+use meerkat_mob::ids::AgentIdentity as MeerkatId;
+use meerkat_mob::{MobDefinition, MobStorage, SpawnMemberSpec};
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:7300";
 
@@ -73,7 +73,7 @@ restart_policy = "always"
 fn trusted_oidc() -> TrustedOidcRuntimeConfig {
     TrustedOidcRuntimeConfig {
         discovery_json:
-            r#"{"issuer":"https://trusted.mobkit.localhost","jwks_uri":"https://trusted.mobkit.localhost/.well-known/jwks.json"}"#
+            r#"{"issuer":"https://trusted.meta.localhost","jwks_uri":"https://trusted.meta.localhost/.well-known/jwks.json"}"#
                 .to_string(),
         jwks_json: r#"{"keys":[{"kid":"kid-current","kty":"oct","alg":"HS256","k":"cGhhc2U3LXRydXN0ZWQtY3VycmVudC1zZWNyZXQ"}]}"#
             .to_string(),
@@ -82,15 +82,15 @@ fn trusted_oidc() -> TrustedOidcRuntimeConfig {
     }
 }
 
-fn decision_state() -> meerkat_mobkit::RuntimeDecisionState {
+fn decision_state() -> meerkat_meta::RuntimeDecisionState {
     build_runtime_decision_state(RuntimeDecisionInputs {
         bigquery: BigQueryNaming {
             dataset: "access_control_pack".to_string(),
             table: "access_control_pack".to_string(),
         },
-        trusted_mobkit_toml: trusted_toml(),
+        trusted_meta_toml: trusted_toml(),
         auth: AuthPolicy {
-            default_provider: meerkat_mobkit::AuthProvider::GoogleOAuth,
+            default_provider: meerkat_meta::AuthProvider::GoogleOAuth,
             email_allowlist: vec![
                 "root@example.test".to_string(),
                 "alice@example.test".to_string(),
@@ -106,7 +106,7 @@ fn decision_state() -> meerkat_mobkit::RuntimeDecisionState {
         },
         ops: RuntimeOpsPolicy::default(),
         release_metadata_json: include_str!(
-            "../../crates/meerkat-mobkit/assets/release-targets.json"
+            "../../crates/meerkat-meta/assets/release-targets.json"
         )
         .to_string(),
     })
@@ -116,6 +116,7 @@ fn decision_state() -> meerkat_mobkit::RuntimeDecisionState {
 /// The seeded scenario written to `access.toml` on first run.
 fn seed_access_config() -> AccessControlConfig {
     AccessControlConfig {
+        approvers: Default::default(),
         enabled: true,
         admins: vec!["root@example.test".to_string()],
         groups: BTreeMap::from([(
@@ -160,7 +161,7 @@ fn main() {
     // flows, not direct execution of the prebuilt binary, so the example
     // sizes its own threads explicitly: the root future runs on a dedicated
     // 32 MiB thread and tokio workers get 32 MiB stacks (mirrors
-    // mobkit_gateway/rpc_gateway's explicit worker sizing).
+    // meta_gateway/rpc_gateway's explicit worker sizing).
     const STACK_SIZE: usize = 32 * 1024 * 1024;
     std::thread::Builder::new()
         .name("access-control-runtime".into())
@@ -182,7 +183,7 @@ async fn run() {
     let listen_addr =
         std::env::var("ACCESS_CONTROL_LISTEN_ADDR").unwrap_or_else(|_| DEFAULT_LISTEN_ADDR.into());
     let work_dir = std::env::var("ACCESS_CONTROL_WORK_DIR").map_or_else(
-        |_| std::env::temp_dir().join("mobkit-access-control-pack"),
+        |_| std::env::temp_dir().join("meta-access-control-pack"),
         std::path::PathBuf::from,
     );
     std::fs::create_dir_all(&work_dir).expect("work dir");
@@ -218,7 +219,7 @@ comms = true
             notify_orchestrator_on_resume: true,
             default_llm_client: Some(Arc::new(TestClient::default())),
         });
-    let module_config = MobKitConfig {
+    let module_config = MetaConfig {
         modules: vec![],
         discovery: DiscoverySpec {
             namespace: "access-control".to_string(),
@@ -262,7 +263,7 @@ comms = true
         )
         .expect("write access config");
     }
-    let controller = AccessController::load_or_default(&access_path).expect("access controller");
+    let controller = AccessController::load(&access_path).expect("access controller");
     runtime.set_access_controller(controller);
 
     let app = runtime.build_reference_app_router(decision_state());
@@ -273,7 +274,7 @@ comms = true
     println!("access control console listening on http://{bound}/console");
     // Harnesses pass a port-0 address and read the bound one from this line;
     // see console/fixture-ready.cjs.
-    println!("MOBKIT_FIXTURE_READY {{\"addr\":\"{bound}\"}}");
+    println!("META_FIXTURE_READY {{\"addr\":\"{bound}\"}}");
     println!("access config persisted at {}", access_path.display());
     println!("mint persona tokens with persona-proxy.mjs to browse as each identity");
     axum::serve(listener, app).await.expect("serve");

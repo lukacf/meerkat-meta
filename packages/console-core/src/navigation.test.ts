@@ -14,7 +14,7 @@ import {
 } from "./navigation";
 import { normalizeConsoleSidebarViewState } from "./sidebar";
 
-// Dual-runner: mobkit's console gates bundle this file with esbuild and run it
+// Dual-runner: meta's console gates bundle this file with esbuild and run it
 // under `node --test`; the meerkat-studio desktop app picks it up with vitest
 // (globals enabled). Resolve the registrar for whichever runner is active.
 type TestFn = (name: string, fn: () => void | Promise<void>) => void;

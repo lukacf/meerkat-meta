@@ -1,13 +1,13 @@
 const assert = require("node:assert/strict");
 
-global.window = { __MOBKIT_FLOW_CONTROLLER_TEST__: true };
+global.window = { __META_FLOW_CONTROLLER_TEST__: true };
 
-// The bundle links @flow-editor-core (window.MobKitFlowCore) with the
+// The bundle links @flow-editor-core (window.MetaFlowCore) with the
 // controller.js residue exactly like the shipped artifact; build it with
 // `node build.cjs --test-bundle`.
 require("../.tmp/controller-under-test.cjs");
 
-const controller = global.window.MobKitFlowController;
+const controller = global.window.MetaFlowController;
 assert.deepEqual(
   controller.authoringOperationFromIntent({
     intent: "settings.updateDeployField",
@@ -56,7 +56,7 @@ assert.deepEqual(controller.emptyAuthoringFlowState(), {
   steps: [],
 });
 const TEST_DEPLOY_VIEW_SCHEMA = {
-  brand_label: "MobKit · Flow Editor",
+  brand_label: "Meta · Flow Editor",
   flow_tab_label: "FLOW",
   agents_tab_label: "AGENTS",
   settings_tab_label: "SETTINGS",
@@ -84,21 +84,21 @@ const TEST_DEPLOY_VIEW_SCHEMA = {
   basic_mode_label: "Basic",
   graph_mode_title: "Graph Editor",
   graph_mode_label: "Graph",
-  validation_eyebrow: "VALIDATE · MobKit",
+  validation_eyebrow: "VALIDATE · Meta",
   validation_passed_label: "passed",
   validation_warnings_label: "warnings",
   validation_blocking_label: "blocking",
   close_label: "×",
   plan_eyebrow: "DEPLOY PLAN",
   plan_unavailable_head: "DEPLOY TRACE UNAVAILABLE",
-  plan_unavailable_body: "mobkit/mobpacks/deploy did not return plan_trace.",
+  plan_unavailable_body: "meta/mobpacks/deploy did not return plan_trace.",
   plan_first_label: "first",
   plan_step_label: "step",
   plan_previous_label: "‹",
   plan_next_label: "›",
 };
 const TEST_DEPLOY_VIEW = {
-  brandLabel: "MobKit · Flow Editor",
+  brandLabel: "Meta · Flow Editor",
   flowTabLabel: "FLOW",
   agentsTabLabel: "AGENTS",
   settingsTabLabel: "SETTINGS",
@@ -126,37 +126,37 @@ const TEST_DEPLOY_VIEW = {
   basicModeLabel: "Basic",
   graphModeTitle: "Graph Editor",
   graphModeLabel: "Graph",
-  validationEyebrow: "VALIDATE · MobKit",
+  validationEyebrow: "VALIDATE · Meta",
   validationPassedLabel: "passed",
   validationWarningsLabel: "warnings",
   validationBlockingLabel: "blocking",
   closeLabel: "×",
   planEyebrow: "DEPLOY PLAN",
   planUnavailableHead: "DEPLOY TRACE UNAVAILABLE",
-  planUnavailableBody: "mobkit/mobpacks/deploy did not return plan_trace.",
+  planUnavailableBody: "meta/mobpacks/deploy did not return plan_trace.",
   planFirstLabel: "first",
   planStepLabel: "step",
   planPreviousLabel: "‹",
   planNextLabel: "›",
 };
 const TEST_AGENT_ACCESS_VIEW_SCHEMA = {
-  tool_invalid_error: "Use a MobKit-listed runtime tool or configured MCP/Rust source.",
+  tool_invalid_error: "Use a Meta-listed runtime tool or configured MCP/Rust source.",
   tool_empty_error: "Choose a tool first.",
-  authoring_operation_unavailable_error: "MobKit authoring operation API is unavailable",
+  authoring_operation_unavailable_error: "Meta authoring operation API is unavailable",
   tool_title: "TOOL ACCESS",
   tool_hint: "Authority is calculated from this allowlist. Reviewed once here.",
   tool_missing_description: "—",
   tool_remove_label: "×",
   tool_add_select_placeholder: "+ add tool…",
   tool_source_label: "Configured tool source",
-  tool_source_placeholder: "choose from MobKit tool catalog",
+  tool_source_placeholder: "choose from Meta tool catalog",
   tool_add_button_label: "ADD",
-  inline_skill_realm_id: "mobkit/editor-inline",
+  inline_skill_realm_id: "meta/editor-inline",
   inline_skill_realm_label: "This mobpack",
-  inline_skill_realm_source: "mobkit/editor",
+  inline_skill_realm_source: "meta/editor",
   inline_skill_source: "inline",
-  inline_skill_default_description: "Inline MobKit skill stored in this mobpack.",
-  skill_default_description: "MobKit skill",
+  inline_skill_default_description: "Inline Meta skill stored in this mobpack.",
+  skill_default_description: "Meta skill",
   skill_selected_check_label: "✓",
   skill_remove_label: "×",
   skill_section_title: "SKILLS",
@@ -172,30 +172,30 @@ const TEST_AGENT_ACCESS_VIEW_SCHEMA = {
   skill_inline_missing_label_error: "Inline skill id or label is required.",
   skill_inline_missing_content_error: "Inline skill content is required.",
   skill_inline_invalid_id_error: "Inline skill id or label must contain letters or numbers.",
-  skill_no_realms_message: "MobKit did not provide skill realms for this document.",
+  skill_no_realms_message: "Meta did not provide skill realms for this document.",
   skill_realm_label: "Realm",
   skill_default_realm_suffix: " · default",
-  skill_unavailable_heading: "Unavailable in MobKit skill realms:",
+  skill_unavailable_heading: "Unavailable in Meta skill realms:",
   skill_outside_realm_heading: "Selected from other realms:",
 };
 const TEST_AGENT_ACCESS_VIEW = {
-  toolInvalidError: "Use a MobKit-listed runtime tool or configured MCP/Rust source.",
+  toolInvalidError: "Use a Meta-listed runtime tool or configured MCP/Rust source.",
   toolEmptyError: "Choose a tool first.",
-  authoringOperationUnavailableError: "MobKit authoring operation API is unavailable",
+  authoringOperationUnavailableError: "Meta authoring operation API is unavailable",
   toolTitle: "TOOL ACCESS",
   toolHint: "Authority is calculated from this allowlist. Reviewed once here.",
   toolMissingDescription: "—",
   toolRemoveLabel: "×",
   toolAddSelectPlaceholder: "+ add tool…",
   toolSourceLabel: "Configured tool source",
-  toolSourcePlaceholder: "choose from MobKit tool catalog",
+  toolSourcePlaceholder: "choose from Meta tool catalog",
   toolAddButtonLabel: "ADD",
-  inlineSkillRealmId: "mobkit/editor-inline",
+  inlineSkillRealmId: "meta/editor-inline",
   inlineSkillRealmLabel: "This mobpack",
-  inlineSkillRealmSource: "mobkit/editor",
+  inlineSkillRealmSource: "meta/editor",
   inlineSkillSource: "inline",
-  inlineSkillDefaultDescription: "Inline MobKit skill stored in this mobpack.",
-  skillDefaultDescription: "MobKit skill",
+  inlineSkillDefaultDescription: "Inline Meta skill stored in this mobpack.",
+  skillDefaultDescription: "Meta skill",
   skillSelectedCheckLabel: "✓",
   skillRemoveLabel: "×",
   skillSectionTitle: "SKILLS",
@@ -211,16 +211,16 @@ const TEST_AGENT_ACCESS_VIEW = {
   skillInlineMissingLabelError: "Inline skill id or label is required.",
   skillInlineMissingContentError: "Inline skill content is required.",
   skillInlineInvalidIdError: "Inline skill id or label must contain letters or numbers.",
-  skillNoRealmsMessage: "MobKit did not provide skill realms for this document.",
+  skillNoRealmsMessage: "Meta did not provide skill realms for this document.",
   skillRealmLabel: "Realm",
   skillDefaultRealmSuffix: " · default",
-  skillUnavailableHeading: "Unavailable in MobKit skill realms:",
+  skillUnavailableHeading: "Unavailable in Meta skill realms:",
   skillOutsideRealmHeading: "Selected from other realms:",
 };
 const TEST_SETTINGS_VIEW_SCHEMA = {
   option_separator: " · ",
-  unsupported_label_separator: " — not in MobKit ",
-  unsupported_reason_prefix: "Unsupported by the MobKit ",
+  unsupported_label_separator: " — not in Meta ",
+  unsupported_reason_prefix: "Unsupported by the Meta ",
   unsupported_reason_suffix: " contract.",
   canvas_title: "Canvas",
   edge_style_label: "Edges",
@@ -278,8 +278,8 @@ const TEST_SETTINGS_VIEW_SCHEMA = {
 };
 const TEST_SETTINGS_VIEW = {
   optionSeparator: " · ",
-  unsupportedLabelSeparator: " — not in MobKit ",
-  unsupportedReasonPrefix: "Unsupported by the MobKit ",
+  unsupportedLabelSeparator: " — not in Meta ",
+  unsupportedReasonPrefix: "Unsupported by the Meta ",
   unsupportedReasonSuffix: " contract.",
   canvasTitle: "Canvas",
   edgeStyleLabel: "Edges",
@@ -343,8 +343,8 @@ const TEST_LAUNCH_VIEW_SCHEMA = {
   fork_source_label: "Fork from",
   fork_context_label: "Fork context",
   graph_fork_context_label: "Context",
-  unsupported_label_separator: " — not in MobKit ",
-  unsupported_reason_prefix: "Unsupported by the MobKit ",
+  unsupported_label_separator: " — not in Meta ",
+  unsupported_reason_prefix: "Unsupported by the Meta ",
   unsupported_reason_suffix: " contract.",
   launch_modes_contract_label: "launch_modes",
   fork_contexts_contract_label: "mob_definition.fork_contexts",
@@ -367,8 +367,8 @@ const TEST_LAUNCH_VIEW = {
   forkSourceLabel: "Fork from",
   forkContextLabel: "Fork context",
   graphForkContextLabel: "Context",
-  unsupportedLabelSeparator: " — not in MobKit ",
-  unsupportedReasonPrefix: "Unsupported by the MobKit ",
+  unsupportedLabelSeparator: " — not in Meta ",
+  unsupportedReasonPrefix: "Unsupported by the Meta ",
   unsupportedReasonSuffix: " contract.",
   launchModesContractLabel: "launch_modes",
   forkContextsContractLabel: "mob_definition.fork_contexts",
@@ -385,58 +385,58 @@ const TEST_CONDITION_VIEW = {
 };
 const TEST_ERROR_VIEW_SCHEMA = {
   critical_glyph: "!",
-  generic_error_head: "MobKit error",
+  generic_error_head: "Meta error",
   deploy_failed_head: "Deploy failed",
   deploy_plan_failed_head: "Deploy plan failed",
-  deploy_error_meta: "mobkit/mobpacks/deploy",
+  deploy_error_meta: "meta/mobpacks/deploy",
   source_failed_head: "Source render failed",
-  source_error_meta: "mobkit/mobpacks/source",
-  validation_api_failed_head: "MobKit API unavailable",
+  source_error_meta: "meta/mobpacks/source",
+  validation_api_failed_head: "Meta API unavailable",
   rpc_error_meta: "/flow-editor/rpc",
-  authoring_operation_failed_head: "MobKit authoring operation failed",
-  authoring_operation_meta: "MobKit authoring",
+  authoring_operation_failed_head: "Meta authoring operation failed",
+  authoring_operation_meta: "Meta authoring",
   authoring_operation_fallback_heads: {
-    graph_projection: "MobKit graph projection failed",
-    graph_sync: "MobKit graph sync failed",
-    graph_node_insert: "MobKit graph node insert failed",
-    draft_save: "MobKit draft save failed",
+    graph_projection: "Meta graph projection failed",
+    graph_sync: "Meta graph sync failed",
+    graph_node_insert: "Meta graph node insert failed",
+    draft_save: "Meta draft save failed",
   },
   authoring_operation_stale_error: "stale authoring operation",
-  authoring_operation_missing_document_error: "MobKit authoring operation did not return a document",
+  authoring_operation_missing_document_error: "Meta authoring operation did not return a document",
   export_failed_head: "Export failed",
   import_failed_head: "Import failed",
   boot_open_missing_head: "Mob not found",
   boot_open_missing_meta: "flow-editor?open",
-  missing_editor_flow_head: "Imported mobpack is missing a MobKit editor flow",
-  missing_editor_flow_sub: "mobkit/mobpacks/import did not return document.flow.steps",
+  missing_editor_flow_head: "Imported mobpack is missing a Meta editor flow",
+  missing_editor_flow_sub: "meta/mobpacks/import did not return document.flow.steps",
   missing_editor_flow_meta: "missing_editor_flow",
 };
 const TEST_ERROR_VIEW = {
   criticalGlyph: "!",
-  genericErrorHead: "MobKit error",
+  genericErrorHead: "Meta error",
   deployFailedHead: "Deploy failed",
   deployPlanFailedHead: "Deploy plan failed",
-  deployErrorMeta: "mobkit/mobpacks/deploy",
+  deployErrorMeta: "meta/mobpacks/deploy",
   sourceFailedHead: "Source render failed",
-  sourceErrorMeta: "mobkit/mobpacks/source",
-  validationApiFailedHead: "MobKit API unavailable",
+  sourceErrorMeta: "meta/mobpacks/source",
+  validationApiFailedHead: "Meta API unavailable",
   rpcErrorMeta: "/flow-editor/rpc",
-  authoringOperationFailedHead: "MobKit authoring operation failed",
-  authoringOperationMeta: "MobKit authoring",
+  authoringOperationFailedHead: "Meta authoring operation failed",
+  authoringOperationMeta: "Meta authoring",
   authoringOperationFallbackHeads: {
-    graph_projection: "MobKit graph projection failed",
-    graph_sync: "MobKit graph sync failed",
-    graph_node_insert: "MobKit graph node insert failed",
-    draft_save: "MobKit draft save failed",
+    graph_projection: "Meta graph projection failed",
+    graph_sync: "Meta graph sync failed",
+    graph_node_insert: "Meta graph node insert failed",
+    draft_save: "Meta draft save failed",
   },
   authoringOperationStaleError: "stale authoring operation",
-  authoringOperationMissingDocumentError: "MobKit authoring operation did not return a document",
+  authoringOperationMissingDocumentError: "Meta authoring operation did not return a document",
   exportFailedHead: "Export failed",
   importFailedHead: "Import failed",
   bootOpenMissingHead: "Mob not found",
   bootOpenMissingMeta: "flow-editor?open",
-  missingEditorFlowHead: "Imported mobpack is missing a MobKit editor flow",
-  missingEditorFlowSub: "mobkit/mobpacks/import did not return document.flow.steps",
+  missingEditorFlowHead: "Imported mobpack is missing a Meta editor flow",
+  missingEditorFlowSub: "meta/mobpacks/import did not return document.flow.steps",
   missingEditorFlowMeta: "missing_editor_flow",
 };
 const TEST_NEW_FLOW_VIEW_SCHEMA = {
@@ -460,13 +460,13 @@ const TEST_FLOW_REGISTRY_VIEW_SCHEMA = {
   title_singular_suffix: "mob",
   title_plural_suffix: "mobs",
   create_label: "+ NEW MOB",
-  create_ready_title: "Create a MobKit mob",
-  create_unavailable_title: "MobKit authoring contract unavailable",
+  create_ready_title: "Create a Meta mob",
+  create_unavailable_title: "Meta authoring contract unavailable",
   drafts_section_label: "Drafts",
   runtime_section_label: "Running",
   runtime_readonly_hint: "Runtime flows are read-only projections; open one to fork it into a draft.",
   empty_title: "No mobs yet",
-  empty_text: "Create a mob to start authoring a deployable MobKit flow.",
+  empty_text: "Create a mob to start authoring a deployable Meta flow.",
   updated_just_now_label: "just now",
   columns: [
     { key: "name", label: "NAME" },
@@ -480,13 +480,13 @@ const TEST_FLOW_REGISTRY_VIEW = {
   titleSingularSuffix: "mob",
   titlePluralSuffix: "mobs",
   createLabel: "+ NEW MOB",
-  createReadyTitle: "Create a MobKit mob",
-  createUnavailableTitle: "MobKit authoring contract unavailable",
+  createReadyTitle: "Create a Meta mob",
+  createUnavailableTitle: "Meta authoring contract unavailable",
   draftsSectionLabel: "Drafts",
   runtimeSectionLabel: "Running",
   runtimeReadonlyHint: "Runtime flows are read-only projections; open one to fork it into a draft.",
   emptyTitle: "No mobs yet",
-  emptyText: "Create a mob to start authoring a deployable MobKit flow.",
+  emptyText: "Create a mob to start authoring a deployable Meta flow.",
   updatedJustNowLabel: "just now",
   columns: [
     { key: "name", label: "NAME" },
@@ -576,7 +576,7 @@ assert.deepEqual(controller.topRailState({
 }), {
   mobOpen: false,
   sectionTabs: [],
-  brandLabel: "MobKit · Flow Editor",
+  brandLabel: "Meta · Flow Editor",
   mobStatusTitle: "Active mob configuration",
   mobFileLabel: "mob.toml",
   contractState: "loading",
@@ -616,7 +616,7 @@ assert.deepEqual(controller.topRailState({
     { target: "agents-tab", view: "agents", label: "AGENTS", current: false },
     { target: "settings-tab", view: "settings", label: "SETTINGS", current: false },
   ],
-  brandLabel: "MobKit · Flow Editor",
+  brandLabel: "Meta · Flow Editor",
   mobStatusTitle: "Active mob configuration",
   mobFileLabel: "mob.toml",
   contractState: "api ready",
@@ -710,20 +710,20 @@ assert.deepEqual(controller.bootIntentFromQuery(undefined), { kind: "library", e
 
 // Host integration payloads: protocol-typed, minimal ({ type, id, stage,
 // ok }), and null for kinds outside the documented event set.
-assert.deepEqual(controller.hostEventPayload("created", { id: "f_a", stage: "draft", ok: true }), { type: "mobkit-flow-editor:created", id: "f_a", stage: "draft", ok: true });
-assert.deepEqual(controller.hostEventPayload("saved", { id: "f_a", stage: "valid", ok: true }), { type: "mobkit-flow-editor:saved", id: "f_a", stage: "valid", ok: true });
-assert.deepEqual(controller.hostEventPayload("deployed", { id: "f_a", stage: "draft", ok: false }), { type: "mobkit-flow-editor:deployed", id: "f_a", stage: "draft", ok: false });
-assert.deepEqual(controller.hostEventPayload("deployed", {}), { type: "mobkit-flow-editor:deployed", id: "", stage: "", ok: false });
+assert.deepEqual(controller.hostEventPayload("created", { id: "f_a", stage: "draft", ok: true }), { type: "meta-flow-editor:created", id: "f_a", stage: "draft", ok: true });
+assert.deepEqual(controller.hostEventPayload("saved", { id: "f_a", stage: "valid", ok: true }), { type: "meta-flow-editor:saved", id: "f_a", stage: "valid", ok: true });
+assert.deepEqual(controller.hostEventPayload("deployed", { id: "f_a", stage: "draft", ok: false }), { type: "meta-flow-editor:deployed", id: "f_a", stage: "draft", ok: false });
+assert.deepEqual(controller.hostEventPayload("deployed", {}), { type: "meta-flow-editor:deployed", id: "", stage: "", ok: false });
 assert.equal(controller.hostEventPayload("opened", { id: "f_a" }), null);
 assert.equal(controller.hostEventPayload("", { id: "f_a" }), null);
 
-assert.equal(controller.buildBlankDocument, undefined, "blank mobpack documents must come from MobKit schema, not a local builder");
+assert.equal(controller.buildBlankDocument, undefined, "blank mobpack documents must come from Meta schema, not a local builder");
 
 const schemaBlankMobpack = controller.blankMobpackFromCatalogs({
   blank_mobpack: {
     id: "blank",
     name: "Blank",
-    source: "mobkit/blank-mobpack",
+    source: "meta/blank-mobpack",
     trigger: "label · small-fix",
     version: "0.1.0",
     stage: "valid",
@@ -737,22 +737,22 @@ const schemaBlankMobpack = controller.blankMobpackFromCatalogs({
   },
 });
 assert.equal(schemaBlankMobpack.id, "blank");
-assert.equal(schemaBlankMobpack.source, "mobkit/blank-mobpack");
+assert.equal(schemaBlankMobpack.source, "meta/blank-mobpack");
 assert.equal(controller.blankMobpackFromCatalogs({
   blank_mobpack: {
     id: "blank",
     name: "Blank",
-    source: "mobkit/blank-mobpack",
+    source: "meta/blank-mobpack",
     version: "0.1.0",
     stage: "valid",
     document: { mob_id: "blank_mob" },
     deployability: { deployable: true },
-    provenance: { catalog: "mobkit/mobpacks/templates" },
+    provenance: { catalog: "meta/mobpacks/templates" },
   },
 }).deployability.deployable, true);
 assert.equal(controller.blankMobpackFromCatalogs({
   blank_mobpack: {
-    source: "mobkit/blank-mobpack",
+    source: "meta/blank-mobpack",
     document: { mob_id: "blank_mob" },
   },
 }), null);
@@ -760,7 +760,7 @@ assert.equal(controller.blankMobpackFromCatalogs({
   blank_mobpack: {
     id: "blank",
     name: "Blank",
-    source: "mobkit/blank-mobpack",
+    source: "meta/blank-mobpack",
     document: { mob_id: "blank_mob" },
   },
 }), null);
@@ -769,19 +769,19 @@ assert.deepEqual(controller.newFlowTemplateOptions([
   {
     id: "docs",
     name: "Docs",
-    source: "mobkit://samples/docs",
+    source: "meta://samples/docs",
     stage: "valid",
     validation: { ok: true },
     document: { flow: { description: "Reviews documentation changes." } },
   },
-  { id: "needs_source", name: "Needs Source", source: "mobkit://samples/needs-source", stage: "draft", validation: { ok: false } },
+  { id: "needs_source", name: "Needs Source", source: "meta://samples/needs-source", stage: "draft", validation: { ok: false } },
   { id: "", name: "Missing Id", validation: { ok: true } },
   { id: "missing_name", name: "", validation: { ok: true } },
 ], { canCreateBlank: false, blankTemplate: schemaBlankMobpack }), [
   {
     id: "blank",
     label: "Blank",
-    sub: "mobkit/blank-mobpack",
+    sub: "meta/blank-mobpack",
     tier: "valid",
     disabled: true,
   },
@@ -795,7 +795,7 @@ assert.deepEqual(controller.newFlowTemplateOptions([
   {
     id: "needs_source",
     label: "Needs Source",
-    sub: "mobkit://samples/needs-source",
+    sub: "meta://samples/needs-source",
     tier: "draft",
     disabled: false,
   },
@@ -854,7 +854,7 @@ assert.deepEqual(controller.newFlowModalState({
   {
     id: "docs",
     name: "Docs",
-    source: "mobkit://samples/docs",
+    source: "meta://samples/docs",
     stage: "valid",
     validation: { ok: true },
     document: { flow: { description: "Reviews documentation changes." } },
@@ -872,7 +872,7 @@ assert.deepEqual(controller.newFlowModalState({
     {
       id: "blank",
       label: "Blank",
-      sub: "mobkit/blank-mobpack",
+      sub: "meta/blank-mobpack",
       tier: "valid",
       disabled: true,
       className: "template-card",
@@ -955,7 +955,7 @@ assert.deepEqual(controller.flowRegistryViewState([
   title: "2 mobs",
   createLabel: "+ NEW MOB",
   createDisabled: true,
-  createTitle: "MobKit authoring contract unavailable",
+  createTitle: "Meta authoring contract unavailable",
   columns: [
     { key: "name", label: "NAME" },
     { key: "description", label: "DESCRIPTION" },
@@ -994,7 +994,7 @@ assert.deepEqual(controller.flowRegistryViewState([
   title: "1 mob",
   createLabel: "+ NEW MOB",
   createDisabled: false,
-  createTitle: "Create a MobKit mob",
+  createTitle: "Create a Meta mob",
   columns: [
     { key: "name", label: "NAME" },
     { key: "description", label: "DESCRIPTION" },
@@ -1091,7 +1091,7 @@ const emptyRegistryView = controller.flowRegistryViewState([], "", { canCreate: 
 assert.equal(emptyRegistryView.title, "0 mobs");
 assert.deepEqual(emptyRegistryView.empty, {
   title: "No mobs yet",
-  text: "Create a mob to start authoring a deployable MobKit flow.",
+  text: "Create a mob to start authoring a deployable Meta flow.",
 });
 assert.deepEqual(emptyRegistryView.sections, []);
 // Description derivation: document.flow.description, then row.description, then "".
@@ -1105,24 +1105,24 @@ assert.deepEqual(descriptionRows.map((row) => row.description), ["Document first
 assert.equal(controller.flowDraftIdFromSpec({ name: "Blank Created" }, [{ id: "f_blank_created" }]), "f_blank_created_2");
 assert.deepEqual(controller.authoringRpcMethodsFromSchema({
   commands: {
-    schema: "mobkit/mobpacks/schema",
-    catalogs: "mobkit/editor/catalogs",
-    validate: "mobkit/editor/validate",
-    source: "mobkit/editor/source",
-    export: "mobkit/editor/export",
-    import: "mobkit/editor/import",
-    deploy_command: "mobkit/editor/deploy_command",
-    deploy_rpc: "mobkit/editor/deploy",
+    schema: "meta/mobpacks/schema",
+    catalogs: "meta/editor/catalogs",
+    validate: "meta/editor/validate",
+    source: "meta/editor/source",
+    export: "meta/editor/export",
+    import: "meta/editor/import",
+    deploy_command: "meta/editor/deploy_command",
+    deploy_rpc: "meta/editor/deploy",
   },
 }), {
-  schema: "mobkit/mobpacks/schema",
-  catalogs: "mobkit/editor/catalogs",
-  validate: "mobkit/editor/validate",
-  source: "mobkit/editor/source",
-  export: "mobkit/editor/export",
-  import: "mobkit/editor/import",
-  deployCommand: "mobkit/editor/deploy_command",
-  deploy: "mobkit/editor/deploy",
+  schema: "meta/mobpacks/schema",
+  catalogs: "meta/editor/catalogs",
+  validate: "meta/editor/validate",
+  source: "meta/editor/source",
+  export: "meta/editor/export",
+  import: "meta/editor/import",
+  deployCommand: "meta/editor/deploy_command",
+  deploy: "meta/editor/deploy",
 });
 assert.deepEqual(controller.authoringRpcMethodsFromSchema({ commands: { catalogs: "" } }), {});
 const authoringOperations = controller.authoringOperationsFromSchema({
@@ -1130,7 +1130,7 @@ const authoringOperations = controller.authoringOperationsFromSchema({
     {
       type: "rename_schema_field",
       plane: "agent",
-      authority: "mobkit",
+      authority: "meta",
       requires: ["schema_id", "field_id", "new_name"],
       mutates: ["document.schemas", "document.flow", "document.edges"],
       projection_document_supported: true,
@@ -1141,7 +1141,7 @@ const authoringOperations = controller.authoringOperationsFromSchema({
 });
 assert.equal(authoringOperations.rename_schema_field.type, "rename_schema_field");
 assert.equal(authoringOperations.rename_schema_field.plane, "agent");
-assert.equal(authoringOperations.rename_schema_field.authority, "mobkit");
+assert.equal(authoringOperations.rename_schema_field.authority, "meta");
 assert.equal(authoringOperations.rename_schema_field.projectionDocumentSupported, true);
 assert.deepEqual(authoringOperations.rename_schema_field.requires, ["schema_id", "field_id", "new_name"]);
 assert.deepEqual(authoringOperations.rename_schema_field.mutates, ["document.schemas", "document.flow", "document.edges"]);
@@ -1168,10 +1168,10 @@ assert.deepEqual(controller.modelCatalogFromCatalogs({
       label: "GPT-5.5",
       vendor: "openai",
       deployability: { deployable: true },
-      provenance: { catalog: "mobkit/mobpacks/catalogs" },
+      provenance: { catalog: "meta/mobpacks/catalogs" },
     },
   ],
-})[0].provenance, { catalog: "mobkit/mobpacks/catalogs" });
+})[0].provenance, { catalog: "meta/mobpacks/catalogs" });
 
 assert.deepEqual(controller.toolCatalogFromCatalogs({
   tool_config: [{
@@ -1200,7 +1200,7 @@ assert.deepEqual(controller.toolCatalogFromCatalogs({
 }]);
 
 const catalogBoot = { grid: { cellW: 10 }, cellXY: () => ({ x: 0, y: 0 }), template: { col: 1 } };
-const emptyCatalogs = controller.emptyMobKitCatalogs(catalogBoot);
+const emptyCatalogs = controller.emptyMetaCatalogs(catalogBoot);
 assert.equal(emptyCatalogs.contractMeta.loaded, false);
 assert.equal(emptyCatalogs.grid, catalogBoot.grid);
 assert.equal(emptyCatalogs.cellXY, catalogBoot.cellXY);
@@ -1208,10 +1208,10 @@ assert.equal(emptyCatalogs.template, null);
 assert.equal(emptyCatalogs.conditionView, null);
 assert.equal(emptyCatalogs.errorView, null);
 assert.deepEqual(controller.skillRealmsFromCatalogs({ skill_realms: "starter" }), []);
-const schemaOnlyCatalogLeakState = controller.mobKitCatalogsFromSchema({
+const schemaOnlyCatalogLeakState = controller.metaCatalogsFromSchema({
   schema_version: "mobpack/v1",
-  media_type: "application/vnd.mobkit.mobpack+json",
-  validation_source: "mobkit/mobpacks/schema",
+  media_type: "application/vnd.meta.mobpack+json",
+  validation_source: "meta/mobpacks/schema",
   deploy_settings: {
     defaults: { command: "rkat mob run", surface: "cli" },
   },
@@ -1225,7 +1225,7 @@ const schemaOnlyCatalogLeakState = controller.mobKitCatalogsFromSchema({
     id: "schema_leak_agent",
     name: "Schema Leak Agent",
     role: "schema_leak_agent",
-    definitionType: "mobkit/profile-member",
+    definitionType: "meta/profile-member",
     source: "schema",
     model: "gpt-5.5",
     profileBinding: "inline",
@@ -1244,10 +1244,10 @@ assert.deepEqual(schemaOnlyCatalogLeakState.skillRealms, []);
 assert.deepEqual(schemaOnlyCatalogLeakState.agentDefinitions, []);
 assert.equal(schemaOnlyCatalogLeakState.blankMobpack, null);
 assert.equal(schemaOnlyCatalogLeakState.template, null);
-const separateCatalogPayloadState = controller.mobKitCatalogsFromSchema({
+const separateCatalogPayloadState = controller.metaCatalogsFromSchema({
   schema_version: "mobpack/v1",
-  media_type: "application/vnd.mobkit.mobpack+json",
-  validation_source: "mobkit/mobpacks/schema",
+  media_type: "application/vnd.meta.mobpack+json",
+  validation_source: "meta/mobpacks/schema",
   deploy_settings: {
     defaults: { command: "rkat mob run", surface: "cli" },
   },
@@ -1257,15 +1257,15 @@ const separateCatalogPayloadState = controller.mobKitCatalogsFromSchema({
 }, catalogBoot, {
   models: [{ id: "openai/gpt-5.5", label: "GPT-5.5", vendor: "openai" }],
   tool_catalog: [{ id: "shell", label: "shell", desc: "Shell", kind: "runtime", source: "meerkat_mob::ToolConfig" }],
-  skill_realms: [{ id: "mobkit/sample-mobpacks", source: "mobkit/sample-mobpack", skills: [{ id: "mob.review" }] }],
+  skill_realms: [{ id: "meta/sample-mobpacks", source: "meta/sample-mobpack", skills: [{ id: "mob.review" }] }],
   agent_definitions: [{
     id: "sample_reviewer",
     name: "Reviewer",
     role: "reviewer",
-    definitionType: "mobkit/profile-member",
-    source: "mobkit/mobpack-profile-member",
+    definitionType: "meta/profile-member",
+    source: "meta/mobpack-profile-member",
     sourceMobpack: "sample_review_pr",
-    sourceOrigin: "mobkit/sample-mobpack",
+    sourceOrigin: "meta/sample-mobpack",
     model: "gpt-5.5",
     profileBinding: "inline",
     runtimeMode: "turn_driven",
@@ -1276,7 +1276,7 @@ const separateCatalogPayloadState = controller.mobKitCatalogsFromSchema({
     version: "mobpack/v1",
     stage: "valid",
     trigger: "label · small-fix",
-    source: "mobkit/blank-mobpack",
+    source: "meta/blank-mobpack",
     document: {
       name: "Blank",
       mob_id: "blank",
@@ -1287,7 +1287,7 @@ const separateCatalogPayloadState = controller.mobKitCatalogsFromSchema({
   runtime_flows: [{
     id: "runtime_loaded_main",
     name: "Runtime Loaded Main",
-    source: "mobkit/runtime/flow_projection",
+    source: "meta/runtime/flow_projection",
     stage: "valid",
     trigger: "runtime · main",
     document: {
@@ -1302,17 +1302,17 @@ const separateCatalogPayloadState = controller.mobKitCatalogsFromSchema({
 assert.equal(separateCatalogPayloadState.contractMeta.schemaVersion, "mobpack/v1");
 assert.deepEqual(separateCatalogPayloadState.models.map((model) => model.id), ["openai/gpt-5.5"]);
 assert.deepEqual(separateCatalogPayloadState.toolCatalog.map((tool) => tool.id), ["shell"]);
-assert.deepEqual(separateCatalogPayloadState.skillRealms.map((realm) => realm.id), ["mobkit/sample-mobpacks"]);
+assert.deepEqual(separateCatalogPayloadState.skillRealms.map((realm) => realm.id), ["meta/sample-mobpacks"]);
 assert.deepEqual(separateCatalogPayloadState.agentDefinitions.map((definition) => definition.id), ["sample_reviewer"]);
 assert.deepEqual(separateCatalogPayloadState.runtimeFlows.map((row) => [row.id, row.source]), [
-  ["runtime_loaded_main", "mobkit/runtime/flow_projection"],
+  ["runtime_loaded_main", "meta/runtime/flow_projection"],
 ]);
 assert.equal(separateCatalogPayloadState.template.name, "Blank");
 
 const hydratedContractAndCatalogFixture = {
   schema_version: "mobpack/v1",
-  media_type: "application/vnd.mobkit.mobpack+json",
-  validation_source: "mobkit/mobpacks/schema",
+  media_type: "application/vnd.meta.mobpack+json",
+  validation_source: "meta/mobpacks/schema",
   deploy_settings: {
     defaults: {
       command: "rkat mob run",
@@ -1326,8 +1326,8 @@ const hydratedContractAndCatalogFixture = {
     editor_source_view: {
       drawer_eyebrow: "SOURCE · mob.toml",
       inline_title: "mob.toml",
-      primary_source_path: "mobkit/mob.toml",
-      loading_text: "rendering mob.toml from mobkit/mobpacks/source...",
+      primary_source_path: "meta/mob.toml",
+      loading_text: "rendering mob.toml from meta/mobpacks/source...",
       copy_label: "copy",
       close_label: "×",
     },
@@ -1339,18 +1339,18 @@ const hydratedContractAndCatalogFixture = {
       agents_heading: "AGENTS",
       schemas_heading: "SCHEMAS",
       add_schema_label: "+ new schema",
-      add_agent_title: "Create an agent from a MobKit profile-member definition.",
-      add_agent_unavailable_title: "MobKit schema contract has not provided agent definitions yet.",
+      add_agent_title: "Create an agent from a Meta profile-member definition.",
+      add_agent_unavailable_title: "Meta schema contract has not provided agent definitions yet.",
       add_agent_unavailable_label: "agents unavailable",
       add_agent_placeholder_label: "+ new agent...",
       add_agent_error_prefix: "Agent definition unavailable: ",
-      authoring_operation_unavailable_error: "MobKit authoring operation API is unavailable",
-      member_update_fallback_error: "MobKit member update failed",
-      tool_update_fallback_error: "MobKit tool update failed",
-      schema_assignment_fallback_error: "MobKit schema assignment failed",
+      authoring_operation_unavailable_error: "Meta authoring operation API is unavailable",
+      member_update_fallback_error: "Meta member update failed",
+      tool_update_fallback_error: "Meta tool update failed",
+      schema_assignment_fallback_error: "Meta schema assignment failed",
       schema_add_fallback_error: "add_schema failed",
       definition_catalog_title: "DEFINITION CATALOG",
-      definition_catalog_empty: "No MobKit profile-member definitions available.",
+      definition_catalog_empty: "No Meta profile-member definitions available.",
       definition_catalog_source_label: "source",
       definition_catalog_tools_label: "tools",
       definition_catalog_skills_label: "skills",
@@ -1435,8 +1435,8 @@ const hydratedContractAndCatalogFixture = {
       fields_title_prefix: "FIELDS",
       fields_title_template: "{prefix} · {count}",
       add_field_label: "+ field",
-      authoring_operation_unavailable_error: "MobKit authoring operation API is unavailable",
-      schema_operation_fallback_error: "MobKit schema operation failed",
+      authoring_operation_unavailable_error: "Meta authoring operation API is unavailable",
+      schema_operation_fallback_error: "Meta schema operation failed",
       field_add_fallback_error: "add_schema_field failed",
       header_labels: {
         name: "NAME",
@@ -1473,8 +1473,8 @@ const hydratedContractAndCatalogFixture = {
         { kind: "text", text: " flow." },
       ],
       source_toggle_label: "{ } mob.toml",
-      authoring_operation_unavailable_error: "MobKit authoring operation API is unavailable",
-      authoring_operation_fallback_error: "MobKit authoring operation failed",
+      authoring_operation_unavailable_error: "Meta authoring operation API is unavailable",
+      authoring_operation_fallback_error: "Meta authoring operation failed",
       member_step_panel_title_fallback: "Member step",
       member_step_panel_sub_fallback: "Assign a member to run this step",
       member_step_member_label: "Member (profile)",
@@ -1496,12 +1496,12 @@ const hydratedContractAndCatalogFixture = {
       member_step_schema_hint_prefix: "Emits ",
       member_step_schema_hint_tools_prefix: " · tools: ",
       member_step_schema_hint_empty_tools_label: "—",
-      tool_scope_not_in_catalog_reason: "not in MobKit tool catalog",
+      tool_scope_not_in_catalog_reason: "not in Meta tool catalog",
       tool_scope_not_enabled_reason: "not enabled on profile",
-      tool_scope_tool_description_fallback: "MobKit tool",
+      tool_scope_tool_description_fallback: "Meta tool",
       tool_scope_remove_label: "×",
       tool_scope_select_member_placeholder: "select a member first",
-      tool_scope_block_catalog_placeholder: "+ block MobKit tool...",
+      tool_scope_block_catalog_placeholder: "+ block Meta tool...",
       tool_scope_add_profile_placeholder: "+ add profile tool...",
       input_panel_icon: "▤",
       input_panel_title: "Input",
@@ -1540,8 +1540,8 @@ const hydratedContractAndCatalogFixture = {
       parallel_panel_sub: "fan_out to members, then fan_in and collect",
       branch_route_member_label: "Route member",
       parallel_join_member_label: "Join member",
-      branch_controller_placeholder_label: "— direct MobKit lanes —",
-      branch_empty_controller_hint: "Without a selected profile, MobKit conditions/parallel lanes attach directly to the first real member in each lane.",
+      branch_controller_placeholder_label: "— direct Meta lanes —",
+      branch_empty_controller_hint: "Without a selected profile, Meta conditions/parallel lanes attach directly to the first real member in each lane.",
       branch_condition_title: "Branch conditions",
       branch_condition_intro: "Read in order; the first match wins. Conditions read a member's structured output.",
       branch_condition_row_title_prefix: "Branch",
@@ -1728,7 +1728,7 @@ const hydratedContractAndCatalogFixture = {
           label: "Sub-mob",
           sub: "delegate to a nested mob, tested and packed on its own",
           disabled: true,
-          disabled_reason: "Current MobKit mob.toml flow semantics do not yet define deployable sub-mob nodes",
+          disabled_reason: "Current Meta mob.toml flow semantics do not yet define deployable sub-mob nodes",
         },
         {
           id: "wait",
@@ -1737,7 +1737,7 @@ const hydratedContractAndCatalogFixture = {
           label: "Wait for input",
           sub: "Pause the flow for required input before continuing",
           disabled: true,
-          disabled_reason: "Current MobKit mob.toml flow semantics do not yet define deployable wait-for-input nodes",
+          disabled_reason: "Current Meta mob.toml flow semantics do not yet define deployable wait-for-input nodes",
         },
       ],
     },
@@ -1756,8 +1756,8 @@ const hydratedContractAndCatalogFixture = {
       add_node_empty_prefix: "No matches for “",
       add_node_empty_suffix: "”",
       add_node_jump_label: "+ New agent in Agents →",
-      authoring_operation_unavailable_error: "MobKit authoring operation API is unavailable",
-      authoring_operation_fallback_error: "MobKit graph operation failed",
+      authoring_operation_unavailable_error: "Meta authoring operation API is unavailable",
+      authoring_operation_fallback_error: "Meta graph operation failed",
       gate_palette_rows: [
         { id: "branch", glyph: "⑂", label: "Branch gate", meta: "conditional split" },
         { id: "fork", glyph: "‖", label: "Parallel fork", meta: "fan_out lanes" },
@@ -1814,7 +1814,7 @@ const hydratedContractAndCatalogFixture = {
       terminal_eyebrow_template: "TERMINAL · {kind}",
       terminal_id_line_template: "{id} · cell ({col},{row})",
       terminal_authoring_locked_title: "Visual terminal node",
-      terminal_authoring_locked_hint: "Visual terminal nodes do not compile into deployable MobKit mob.toml. Delete this node or replace it with a real member, branch, join, or loop flow shape.",
+      terminal_authoring_locked_hint: "Visual terminal nodes do not compile into deployable Meta mob.toml. Delete this node or replace it with a real member, branch, join, or loop flow shape.",
       adaptive_authoring_locked_title: "Adaptive layer node",
       adaptive_authoring_locked_hint: "Adaptive layers are authored in Basic mode — FlowMaster, prompt, profile templates, and limits are edited there. Deleting this node deletes the adaptive step from the flow.",
       edge_eyebrow_template: "EDGE · {kind}",
@@ -1825,9 +1825,9 @@ const hydratedContractAndCatalogFixture = {
       gate_collection_title: "COLLECTION POLICY",
       gate_join_member_label: "Join member",
       gate_join_member_placeholder: "— select member —",
-      gate_join_member_hint: "MobKit uses this real profile to resolve non-all fan-in.",
+      gate_join_member_hint: "Meta uses this real profile to resolve non-all fan-in.",
       gate_dispatch_title: "DISPATCH MODE",
-      gate_dispatch_hint: "Exports as the MobKit parallel flow dispatch mode.",
+      gate_dispatch_hint: "Exports as the Meta parallel flow dispatch mode.",
       gate_conditions_title: "CONDITIONS",
       gate_empty_branch_hint: "add outgoing edges, then configure each as a typed condition or fallback",
       gate_wiring_title: "WIRING",
@@ -1848,7 +1848,7 @@ const hydratedContractAndCatalogFixture = {
       source_file_node_kind: "source",
       source_file_node_col_offset: 0,
       source_file_node_row_offset: -1,
-      source_file_activation_hash: "#mobkit-graph-source",
+      source_file_activation_hash: "#meta-graph-source",
       source_file_activation_selector: ".node--source-file",
       branch_condition_field_placeholder: "— field —",
       branch_condition_no_options_hint: "add input params or an upstream schema field for this condition",
@@ -1900,15 +1900,15 @@ const hydratedContractAndCatalogFixture = {
   },
   models: [{ id: "openai/gpt-5.5", label: "GPT-5.5", vendor: "openai" }],
   tool_catalog: [{ id: "builtins", label: "builtins", desc: "Built-ins", kind: "runtime", source: "meerkat_mob::ToolConfig", tag_class: "" }],
-  skill_realms: [{ id: "mobkit/sample-mobpacks", source: "mobkit/sample-mobpack", skills: [{ id: "mob.workpad" }] }],
+  skill_realms: [{ id: "meta/sample-mobpacks", source: "meta/sample-mobpack", skills: [{ id: "mob.workpad" }] }],
   agent_definitions: [{
     id: "sample_reviewer",
     name: "Reviewer",
     role: "reviewer",
-    definitionType: "mobkit/profile-member",
-    source: "mobkit/mobpack-profile-member",
+    definitionType: "meta/profile-member",
+    source: "meta/mobpack-profile-member",
     sourceMobpack: "sample_review_pr",
-    sourceOrigin: "mobkit/sample-mobpack",
+    sourceOrigin: "meta/sample-mobpack",
     model: "gpt-5.5",
     profileBinding: "inline",
     runtimeMode: "turn_driven",
@@ -1919,7 +1919,7 @@ const hydratedContractAndCatalogFixture = {
     version: "mobpack/v1",
     stage: "valid",
     trigger: "label · small-fix",
-    source: "mobkit/blank-mobpack",
+    source: "meta/blank-mobpack",
     document: {
       name: "Blank",
       mob_id: "blank",
@@ -1928,22 +1928,22 @@ const hydratedContractAndCatalogFixture = {
     },
   },
 };
-const hydratedCatalogs = controller.mobKitCatalogsFromSchema(hydratedContractAndCatalogFixture, catalogBoot, hydratedContractAndCatalogFixture);
+const hydratedCatalogs = controller.metaCatalogsFromSchema(hydratedContractAndCatalogFixture, catalogBoot, hydratedContractAndCatalogFixture);
 assert.equal(hydratedCatalogs.contractMeta.loaded, true);
 assert.equal(hydratedCatalogs.contractMeta.schemaVersion, "mobpack/v1");
 assert.equal(hydratedCatalogs.deployDefaults.command, "rkat mob run");
 assert.equal(hydratedCatalogs.mobDefinition.runtime_modes[0], "turn_driven");
 assert.deepEqual(hydratedCatalogs.models.map((model) => model.id), ["openai/gpt-5.5"]);
 assert.deepEqual(hydratedCatalogs.toolCatalog.map((tool) => tool.id), ["builtins"]);
-assert.deepEqual(hydratedCatalogs.skillRealms.map((realm) => realm.id), ["mobkit/sample-mobpacks"]);
+assert.deepEqual(hydratedCatalogs.skillRealms.map((realm) => realm.id), ["meta/sample-mobpacks"]);
 assert.deepEqual(hydratedCatalogs.agentDefinitions.map((definition) => definition.id), ["sample_reviewer"]);
 assert.deepEqual(hydratedCatalogs.newFlowView, TEST_NEW_FLOW_VIEW);
 assert.deepEqual(hydratedCatalogs.flowRegistryView, TEST_FLOW_REGISTRY_VIEW);
 assert.deepEqual(hydratedCatalogs.sourceView, {
   drawerEyebrow: "SOURCE · mob.toml",
   inlineTitle: "mob.toml",
-  primarySourcePath: "mobkit/mob.toml",
-  loadingText: "rendering mob.toml from mobkit/mobpacks/source...",
+  primarySourcePath: "meta/mob.toml",
+  loadingText: "rendering mob.toml from meta/mobpacks/source...",
   copyLabel: "copy",
   closeLabel: "×",
 });
@@ -1953,18 +1953,18 @@ assert.deepEqual(hydratedCatalogs.agentView, {
   agentsHeading: "AGENTS",
   schemasHeading: "SCHEMAS",
   addSchemaLabel: "+ new schema",
-  addAgentTitle: "Create an agent from a MobKit profile-member definition.",
-  addAgentUnavailableTitle: "MobKit schema contract has not provided agent definitions yet.",
+  addAgentTitle: "Create an agent from a Meta profile-member definition.",
+  addAgentUnavailableTitle: "Meta schema contract has not provided agent definitions yet.",
   addAgentUnavailableLabel: "agents unavailable",
   addAgentPlaceholderLabel: "+ new agent...",
   addAgentErrorPrefix: "Agent definition unavailable:",
-  authoringOperationUnavailableError: "MobKit authoring operation API is unavailable",
-  memberUpdateFallbackError: "MobKit member update failed",
-  toolUpdateFallbackError: "MobKit tool update failed",
-  schemaAssignmentFallbackError: "MobKit schema assignment failed",
+  authoringOperationUnavailableError: "Meta authoring operation API is unavailable",
+  memberUpdateFallbackError: "Meta member update failed",
+  toolUpdateFallbackError: "Meta tool update failed",
+  schemaAssignmentFallbackError: "Meta schema assignment failed",
   schemaAddFallbackError: "add_schema failed",
   definitionCatalogTitle: "DEFINITION CATALOG",
-  definitionCatalogEmpty: "No MobKit profile-member definitions available.",
+  definitionCatalogEmpty: "No Meta profile-member definitions available.",
   definitionCatalogSourceLabel: "source",
   definitionCatalogToolsLabel: "tools",
   definitionCatalogSkillsLabel: "skills",
@@ -2048,8 +2048,8 @@ assert.deepEqual(hydratedCatalogs.schemaView, {
   fieldsTitlePrefix: "FIELDS",
   fieldsTitleTemplate: "{prefix} · {count}",
   addFieldLabel: "+ field",
-  authoringOperationUnavailableError: "MobKit authoring operation API is unavailable",
-  schemaOperationFallbackError: "MobKit schema operation failed",
+  authoringOperationUnavailableError: "Meta authoring operation API is unavailable",
+  schemaOperationFallbackError: "Meta schema operation failed",
   fieldAddFallbackError: "add_schema_field failed",
   headerLabels: {
     name: "NAME",
@@ -2086,8 +2086,8 @@ assert.deepEqual(hydratedCatalogs.basicView, {
     { key: "text-4", kind: "text", text: " flow." },
   ],
   sourceToggleLabel: "{ } mob.toml",
-  authoringOperationUnavailableError: "MobKit authoring operation API is unavailable",
-  authoringOperationFallbackError: "MobKit authoring operation failed",
+  authoringOperationUnavailableError: "Meta authoring operation API is unavailable",
+  authoringOperationFallbackError: "Meta authoring operation failed",
   memberStepPanelTitleFallback: "Member step",
   memberStepPanelSubFallback: "Assign a member to run this step",
   memberStepMemberLabel: "Member (profile)",
@@ -2109,12 +2109,12 @@ assert.deepEqual(hydratedCatalogs.basicView, {
   memberStepSchemaHintPrefix: "Emits ",
   memberStepSchemaHintToolsPrefix: " · tools: ",
   memberStepSchemaHintEmptyToolsLabel: "—",
-  toolScopeNotInCatalogReason: "not in MobKit tool catalog",
+  toolScopeNotInCatalogReason: "not in Meta tool catalog",
   toolScopeNotEnabledReason: "not enabled on profile",
-  toolScopeToolDescriptionFallback: "MobKit tool",
+  toolScopeToolDescriptionFallback: "Meta tool",
   toolScopeRemoveLabel: "×",
   toolScopeSelectMemberPlaceholder: "select a member first",
-  toolScopeBlockCatalogPlaceholder: "+ block MobKit tool...",
+  toolScopeBlockCatalogPlaceholder: "+ block Meta tool...",
   toolScopeAddProfilePlaceholder: "+ add profile tool...",
   inputPanelIcon: "▤",
   inputPanelTitle: "Input",
@@ -2153,8 +2153,8 @@ assert.deepEqual(hydratedCatalogs.basicView, {
   parallelPanelSub: "fan_out to members, then fan_in and collect",
   branchRouteMemberLabel: "Route member",
   parallelJoinMemberLabel: "Join member",
-  branchControllerPlaceholderLabel: "— direct MobKit lanes —",
-  branchEmptyControllerHint: "Without a selected profile, MobKit conditions/parallel lanes attach directly to the first real member in each lane.",
+  branchControllerPlaceholderLabel: "— direct Meta lanes —",
+  branchEmptyControllerHint: "Without a selected profile, Meta conditions/parallel lanes attach directly to the first real member in each lane.",
   branchConditionTitle: "Branch conditions",
   branchConditionIntro: "Read in order; the first match wins. Conditions read a member's structured output.",
   branchConditionRowTitlePrefix: "Branch",
@@ -2353,7 +2353,7 @@ assert.deepEqual(hydratedCatalogs.basicView, {
       sub: "delegate to a nested mob, tested and packed on its own",
       isNew: false,
       disabled: true,
-      disabledReason: "Current MobKit mob.toml flow semantics do not yet define deployable sub-mob nodes",
+      disabledReason: "Current Meta mob.toml flow semantics do not yet define deployable sub-mob nodes",
     },
     {
       id: "wait",
@@ -2363,7 +2363,7 @@ assert.deepEqual(hydratedCatalogs.basicView, {
       sub: "Pause the flow for required input before continuing",
       isNew: false,
       disabled: true,
-      disabledReason: "Current MobKit mob.toml flow semantics do not yet define deployable wait-for-input nodes",
+      disabledReason: "Current Meta mob.toml flow semantics do not yet define deployable wait-for-input nodes",
     },
   ],
 });
@@ -2559,8 +2559,8 @@ assert.deepEqual(hydratedCatalogs.graphView, {
   addNodeEmptyPrefix: "No matches for “",
   addNodeEmptySuffix: "”",
   addNodeJumpLabel: "+ New agent in Agents →",
-  authoringOperationUnavailableError: "MobKit authoring operation API is unavailable",
-  authoringOperationFallbackError: "MobKit graph operation failed",
+  authoringOperationUnavailableError: "Meta authoring operation API is unavailable",
+  authoringOperationFallbackError: "Meta graph operation failed",
   gatePaletteRows: [
     { id: "branch", glyph: "⑂", label: "Branch gate", meta: "conditional split" },
     { id: "fork", glyph: "‖", label: "Parallel fork", meta: "fan_out lanes" },
@@ -2617,7 +2617,7 @@ assert.deepEqual(hydratedCatalogs.graphView, {
   terminalEyebrowTemplate: "TERMINAL · {kind}",
   terminalIdLineTemplate: "{id} · cell ({col},{row})",
   terminalAuthoringLockedTitle: "Visual terminal node",
-  terminalAuthoringLockedHint: "Visual terminal nodes do not compile into deployable MobKit mob.toml. Delete this node or replace it with a real member, branch, join, or loop flow shape.",
+  terminalAuthoringLockedHint: "Visual terminal nodes do not compile into deployable Meta mob.toml. Delete this node or replace it with a real member, branch, join, or loop flow shape.",
   adaptiveAuthoringLockedTitle: "Adaptive layer node",
   adaptiveAuthoringLockedHint: "Adaptive layers are authored in Basic mode — FlowMaster, prompt, profile templates, and limits are edited there. Deleting this node deletes the adaptive step from the flow.",
   edgeEyebrowTemplate: "EDGE · {kind}",
@@ -2628,9 +2628,9 @@ assert.deepEqual(hydratedCatalogs.graphView, {
   gateCollectionTitle: "COLLECTION POLICY",
   gateJoinMemberLabel: "Join member",
   gateJoinMemberPlaceholder: "— select member —",
-  gateJoinMemberHint: "MobKit uses this real profile to resolve non-all fan-in.",
+  gateJoinMemberHint: "Meta uses this real profile to resolve non-all fan-in.",
   gateDispatchTitle: "DISPATCH MODE",
-  gateDispatchHint: "Exports as the MobKit parallel flow dispatch mode.",
+  gateDispatchHint: "Exports as the Meta parallel flow dispatch mode.",
   gateConditionsTitle: "CONDITIONS",
   gateEmptyBranchHint: "add outgoing edges, then configure each as a typed condition or fallback",
   gateWiringTitle: "WIRING",
@@ -2651,7 +2651,7 @@ assert.deepEqual(hydratedCatalogs.graphView, {
   sourceFileNodeKind: "source",
   sourceFileNodeColOffset: 0,
   sourceFileNodeRowOffset: -1,
-  sourceFileActivationHash: "#mobkit-graph-source",
+  sourceFileActivationHash: "#meta-graph-source",
   sourceFileActivationSelector: ".node--source-file",
   branchConditionFieldPlaceholder: "— field —",
   branchConditionNoOptionsHint: "add input params or an upstream schema field for this condition",
@@ -2814,7 +2814,7 @@ assert.deepEqual(hydratedCatalogs.graphTemplateView, {
 assert.equal(hydratedCatalogs.grid, catalogBoot.grid);
 assert.deepEqual(hydratedCatalogs.template, {
   name: "Blank",
-  repo: "mobkit/blank-mobpack",
+  repo: "meta/blank-mobpack",
   version: "mobpack/v1",
   triggers: { labels: ["label · small-fix"], default: false },
 });
@@ -2837,7 +2837,7 @@ assert.deepEqual(controller.memberToolAccessPatch(
 ), {
   ok: false,
   id: "",
-  error: "Use a MobKit-listed runtime tool or configured MCP/Rust source.",
+  error: "Use a Meta-listed runtime tool or configured MCP/Rust source.",
   patch: null,
 });
 assert.deepEqual(controller.memberToolAccessPatch(
@@ -2878,9 +2878,9 @@ assert.deepEqual(controller.memberToolAccessState(
     {
       id: "missing",
       name: "missing",
-      description: "Use a MobKit-listed runtime tool or configured MCP/Rust source.",
+      description: "Use a Meta-listed runtime tool or configured MCP/Rust source.",
       unavailable: true,
-      reason: "Use a MobKit-listed runtime tool or configured MCP/Rust source.",
+      reason: "Use a Meta-listed runtime tool or configured MCP/Rust source.",
       runtimeAvailability: null,
       meta: null,
       className: "tool-row tool-row--invalid",
@@ -2899,10 +2899,10 @@ assert.deepEqual(controller.memberToolAccessState(
   addSelectValue: "",
   addSelectPlaceholder: "+ add tool…",
   sourceLabel: "Configured tool source",
-  sourcePlaceholder: "choose from MobKit tool catalog",
+  sourcePlaceholder: "choose from Meta tool catalog",
   addButtonLabel: "ADD",
   emptyToolError: "Choose a tool first.",
-  authoringOperationUnavailableError: "MobKit authoring operation API is unavailable",
+  authoringOperationUnavailableError: "Meta authoring operation API is unavailable",
 });
 const runtimeUnavailableTools = [
   { id: "builtins", label: "Built-ins", desc: "Built-in runtime tools" },
@@ -2913,7 +2913,7 @@ const runtimeUnavailableTools = [
     runtimeAvailability: {
       available: false,
       state: "unavailable",
-      reason: "current UnifiedRuntime does not expose the required MobKit cross-mob control-plane methods",
+      reason: "current UnifiedRuntime does not expose the required Meta cross-mob control-plane methods",
     },
   },
 ];
@@ -2925,7 +2925,7 @@ assert.deepEqual(controller.memberToolAccessPatch(
 ), {
   ok: false,
   id: "",
-  error: "Use a MobKit-listed runtime tool or configured MCP/Rust source.",
+  error: "Use a Meta-listed runtime tool or configured MCP/Rust source.",
   patch: null,
 });
 const runtimeUnavailableState = controller.memberToolAccessState(
@@ -2936,7 +2936,7 @@ const runtimeUnavailableState = controller.memberToolAccessState(
 assert.equal(runtimeUnavailableState.rows[0].unavailable, true);
 assert.equal(
   runtimeUnavailableState.rows[0].reason,
-  "current UnifiedRuntime does not expose the required MobKit cross-mob control-plane methods",
+  "current UnifiedRuntime does not expose the required Meta cross-mob control-plane methods",
 );
 assert.equal(runtimeUnavailableState.addableRows.find(row => row.id === "builtins").disabled, false);
 assert.deepEqual(controller.memberToolRemovePatch(
@@ -2977,8 +2977,8 @@ assert.deepEqual(controller.memberSkillAccessState({
   inlineCreateHint: "Creates an inline skill definition in this mobpack.",
   inlineAddLabel: "ADD SKILL",
   inlineErrorFallback: "Could not create inline skill.",
-  authoringOperationUnavailableError: "MobKit authoring operation API is unavailable",
-  noRealmsMessage: "MobKit did not provide skill realms for this document.",
+  authoringOperationUnavailableError: "Meta authoring operation API is unavailable",
+  noRealmsMessage: "Meta did not provide skill realms for this document.",
   realmLabel: "Realm",
   hasRealms: true,
   realmId: "docs",
@@ -3022,7 +3022,7 @@ assert.deepEqual(controller.memberSkillAccessState({
     label: "mob.missing",
     removeLabel: "×",
   }],
-  unavailableHeading: "Unavailable in MobKit skill realms:",
+  unavailableHeading: "Unavailable in Meta skill realms:",
   outsideRealmHeading: "Selected from other realms:",
 });
 assert.deepEqual(controller.memberSkillAccessState({
@@ -3139,18 +3139,18 @@ assert.deepEqual(controller.memberSkillRemovePatch(
 ), { ok: true, id: "mob.review", patch: { skills: ["mob.workpad"] } });
 const inlinePatch = controller.memberInlineSkillPatch(
   { skills: ["mob.workpad"] },
-  [{ id: "mobkit/sample-mobpacks", skills: [{ id: "mob.workpad" }] }],
+  [{ id: "meta/sample-mobpacks", skills: [{ id: "mob.workpad" }] }],
   { label: "Quality Gate", content: "Review and emit the QualityVerdict schema." },
   hydratedCatalogs.agentAccessView,
 );
 assert.equal(inlinePatch.id, "mob.quality.gate");
-assert.equal(inlinePatch.realmId, "mobkit/editor-inline");
+assert.equal(inlinePatch.realmId, "meta/editor-inline");
 assert.deepEqual(inlinePatch.patch, { skills: ["mob.workpad", "mob.quality.gate"] });
-assert.equal(inlinePatch.skillRealms[0].id, "mobkit/editor-inline");
-assert.equal(inlinePatch.skillRealms[0].source, "mobkit/editor");
+assert.equal(inlinePatch.skillRealms[0].id, "meta/editor-inline");
+assert.equal(inlinePatch.skillRealms[0].source, "meta/editor");
 assert.equal(inlinePatch.skillRealms[0].skills[0].source, "inline");
 assert.equal(inlinePatch.skillRealms[0].skills[0].content, "Review and emit the QualityVerdict schema.");
-assert.equal(inlinePatch.skillRealms[0].skills[0].desc, "Inline MobKit skill stored in this mobpack.");
+assert.equal(inlinePatch.skillRealms[0].skills[0].desc, "Inline Meta skill stored in this mobpack.");
 assert.throws(
   () => controller.memberInlineSkillPatch(
     { skills: [] },
@@ -3187,22 +3187,22 @@ const sampleRows = controller.sampleFlowsFromCatalogs({
       document: { mob_id: "missing_source" },
     },
     {
-      source: "mobkit/sample-mobpack",
+      source: "meta/sample-mobpack",
       document: { mob_id: "" },
     },
     {
-      source: "mobkit/sample-mobpack",
+      source: "meta/sample-mobpack",
       document: { mob_id: "document_id_only", name: "Document Id Only" },
     },
     {
       id: "document_name_only",
-      source: "mobkit/sample-mobpack",
+      source: "meta/sample-mobpack",
       document: { mob_id: "document_name_only", name: "Document Name Only" },
     },
     {
       id: "schema_source",
       name: "Schema source",
-      source: "mobkit/sample-mobpack",
+      source: "meta/sample-mobpack",
       stage: "valid",
       document: { mob_id: "schema_source", schema_version: "0.1" },
       validation: { ok: true },
@@ -3210,7 +3210,7 @@ const sampleRows = controller.sampleFlowsFromCatalogs({
     {
       id: "schema_source_with_trigger",
       name: "Schema source with trigger",
-      source: "mobkit/imported",
+      source: "meta/imported",
       trigger: "imported/mob.toml",
       stage: "draft",
       document: { mob_id: "schema_source_with_trigger" },
@@ -3225,13 +3225,13 @@ assert.deepEqual(sampleRows.map((row) => ({
 })), [
   {
     id: "schema_source",
-    source: "mobkit/sample-mobpack",
-    trigger: "mobkit/sample-mobpack",
+    source: "meta/sample-mobpack",
+    trigger: "meta/sample-mobpack",
     stage: "valid",
   },
   {
     id: "schema_source_with_trigger",
-    source: "mobkit/imported",
+    source: "meta/imported",
     trigger: "imported/mob.toml",
     stage: "draft",
   },
@@ -3240,8 +3240,8 @@ assert.deepEqual(sampleRows.map((row) => ({
 const bootstrapProjection = controller.flowCatalogBootstrapState({
   blank_mobpack: {
     id: "blank",
-    name: "Blank MobKit mobpack",
-    source: "mobkit/blank-mobpack",
+    name: "Blank Meta mobpack",
+    source: "meta/blank-mobpack",
     trigger: "blank · authoring",
     stage: "valid",
     document: { mob_id: "blank", schema_version: "0.1" },
@@ -3251,7 +3251,7 @@ const bootstrapProjection = controller.flowCatalogBootstrapState({
     {
       id: "starter",
       name: "Starter",
-      source: "mobkit/sample-mobpack",
+      source: "meta/sample-mobpack",
       trigger: "label · starter",
       stage: "valid",
       document: { mob_id: "starter", schema_version: "0.1" },
@@ -3260,7 +3260,7 @@ const bootstrapProjection = controller.flowCatalogBootstrapState({
     {
       id: "second",
       name: "Second",
-      source: "mobkit/sample-mobpack",
+      source: "meta/sample-mobpack",
       stage: "draft",
       document: { mob_id: "second", schema_version: "0.1" },
       validation: { ok: false },
@@ -3274,8 +3274,8 @@ assert.equal("initialHydration" in bootstrapProjection, false);
 const savedRegistryBootstrap = controller.flowCatalogBootstrapState({
   blank_mobpack: {
     id: "blank",
-    name: "Blank MobKit mobpack",
-    source: "mobkit/blank-mobpack",
+    name: "Blank Meta mobpack",
+    source: "meta/blank-mobpack",
     trigger: "blank · authoring",
     stage: "valid",
     document: { mob_id: "blank", schema_version: "0.1" },
@@ -3287,7 +3287,7 @@ const savedRegistryBootstrap = controller.flowCatalogBootstrapState({
     rows: [{
       id: "saved_flow",
       name: "Saved Flow",
-      source: "mobkit/mobpacks/save",
+      source: "meta/mobpacks/save",
       trigger: "saved",
       stage: "draft",
       document: { mob_id: "saved_flow", name: "Saved Flow", schema_version: "0.1" },
@@ -3298,7 +3298,7 @@ const savedRegistryBootstrap = controller.flowCatalogBootstrapState({
 assert.deepEqual(savedRegistryBootstrap.flows.map((row) => row.id), ["saved_flow"]);
 // The library is home: bootstrap projects rows only, never a startup hydration.
 assert.equal("initialHydration" in savedRegistryBootstrap, false);
-assert.equal(savedRegistryBootstrap.flows[0].source, "mobkit/mobpacks/save");
+assert.equal(savedRegistryBootstrap.flows[0].source, "meta/mobpacks/save");
 assert.equal(savedRegistryBootstrap.flows[0].document.mob_id, "saved_flow");
 
 const runtimeRegistryBootstrap = controller.flowCatalogBootstrapState({
@@ -3307,7 +3307,7 @@ const runtimeRegistryBootstrap = controller.flowCatalogBootstrapState({
     {
       id: "runtime_live_main",
       name: "live-mob · main",
-      source: "mobkit/runtime/flow_projection",
+      source: "meta/runtime/flow_projection",
       trigger: "runtime · main",
       stage: "valid",
       document: {
@@ -3324,7 +3324,7 @@ const runtimeRegistryBootstrap = controller.flowCatalogBootstrapState({
   registryResult: { rows: [] },
 });
 assert.deepEqual(runtimeRegistryBootstrap.flows.map((row) => row.id), ["runtime_live_main"]);
-assert.equal(runtimeRegistryBootstrap.flows[0].source, "mobkit/runtime/flow_projection");
+assert.equal(runtimeRegistryBootstrap.flows[0].source, "meta/runtime/flow_projection");
 assert.equal("initialHydration" in runtimeRegistryBootstrap, false);
 assert.equal(runtimeRegistryBootstrap.flows[0].document.mob_id, "live-mob");
 assert.equal(runtimeRegistryBootstrap.flows[0].trigger, "runtime · main");
@@ -3334,14 +3334,14 @@ const runtimeDedupedBootstrap = controller.flowCatalogBootstrapState({
   runtime_flows: [{
     id: "saved_flow",
     name: "Runtime duplicate",
-    source: "mobkit/runtime/flow_projection",
-    registry_source: "mobkit/runtime/flow_projection",
+    source: "meta/runtime/flow_projection",
+    registry_source: "meta/runtime/flow_projection",
     document_kind: "runtime_projection",
     runtime_projection: true,
     runtime_mob_id: "runtime_duplicate",
     runtime_flow_id: "main",
     deployability: { ready: true },
-    provenance: { catalog: "mobkit/runtime/flow_projection" },
+    provenance: { catalog: "meta/runtime/flow_projection" },
     document: { mob_id: "runtime_duplicate", flow: { name: "main", steps: [] } },
   }],
 }, {
@@ -3349,7 +3349,7 @@ const runtimeDedupedBootstrap = controller.flowCatalogBootstrapState({
     rows: [{
       id: "saved_flow",
       name: "Saved Flow",
-      source: "mobkit/mobpacks/save",
+      source: "meta/mobpacks/save",
       trigger: "saved",
       stage: "draft",
       document: { mob_id: "saved_flow", name: "Saved Flow", schema_version: "0.1" },
@@ -3358,14 +3358,14 @@ const runtimeDedupedBootstrap = controller.flowCatalogBootstrapState({
   },
 });
 assert.deepEqual(runtimeDedupedBootstrap.flows.map((row) => [row.id, row.source]), [
-  ["saved_flow", "mobkit/runtime/flow_projection"],
+  ["saved_flow", "meta/runtime/flow_projection"],
 ]);
 assert.equal(runtimeDedupedBootstrap.flows[0].runtime_projection, true);
 assert.equal(runtimeDedupedBootstrap.flows[0].document_kind, "runtime_projection");
 assert.equal(runtimeDedupedBootstrap.flows[0].runtime_mob_id, "runtime_duplicate");
 assert.equal(runtimeDedupedBootstrap.flows[0].runtime_flow_id, "main");
 assert.deepEqual(runtimeDedupedBootstrap.flows[0].deployability, { ready: true });
-assert.deepEqual(runtimeDedupedBootstrap.flows[0].provenance, { catalog: "mobkit/runtime/flow_projection" });
+assert.deepEqual(runtimeDedupedBootstrap.flows[0].provenance, { catalog: "meta/runtime/flow_projection" });
 
 assert.deepEqual(controller.flowCatalogBootstrapState({ sample_mobpacks: [] }), {
   templates: [],
@@ -3721,9 +3721,9 @@ const prunedSkillDocument = controller.buildDocument({
     edges: [],
     frames: [],
     skillRealms: [{
-      id: "mobkit/sample-mobpacks",
-      label: "mobkit/sample-mobpacks",
-      source: "mobkit/sample-mobpack",
+      id: "meta/sample-mobpacks",
+      label: "meta/sample-mobpacks",
+      source: "meta/sample-mobpack",
       skills: [
         { id: "mob.review", source: "inline", content: "Review the current work." },
         { id: "mob.unused", source: "inline", content: "Unused catalog skill." },
@@ -3739,9 +3739,9 @@ const prunedSkillDocument = controller.buildDocument({
   deploySettings: testDeploySettings(),
 });
 assert.deepEqual(prunedSkillDocument.skill_realms, [{
-  id: "mobkit/sample-mobpacks",
-  label: "mobkit/sample-mobpacks",
-  source: "mobkit/sample-mobpack",
+  id: "meta/sample-mobpacks",
+  label: "meta/sample-mobpacks",
+  source: "meta/sample-mobpack",
   skills: [
     { id: "mob.review", source: "inline", content: "Review the current work." },
   ],
@@ -3976,7 +3976,7 @@ assert.equal(schemaRename.flow.steps[0].expectedSchemaRef, "schemas/RenamedVerdi
 assert.equal(
   schemaRename.flow.steps[1].resultSchema,
   "RenamedVerdict",
-  "adaptive resultSchema must follow the schema rename (mirrors MobKit rewrite_adaptive_result_schema_references)",
+  "adaptive resultSchema must follow the schema rename (mirrors Meta rewrite_adaptive_result_schema_references)",
 );
 assert.deepEqual(schemaRename.selection, { kind: "schema", id: "RenamedVerdict" });
 
@@ -4211,7 +4211,7 @@ const memberStepPrunedFlow = controller.reconcileFlowMemberSteps({
     },
   ],
 }, [members[0]]);
-// Containers stay even when emptied — mirrors MobKit's
+// Containers stay even when emptied — mirrors Meta's
 // prune_step_array_for_members, which only drops member steps.
 assert.deepEqual(memberStepPrunedFlow.steps.map((step) => step.id), ["keep_top", "repeat_keep", "branch_keep", "parallel_drop"]);
 assert.deepEqual(memberStepPrunedFlow.steps[1].steps.map((step) => step.id), ["keep_repeat"]);
@@ -4740,11 +4740,11 @@ const [agentDefinition] = controller.agentDefinitionsFromCatalogs({
     role: "reviewer",
     name: "Reviewer",
     model: "gpt-5.5",
-    definitionType: "mobkit/profile-member",
-    source: "mobkit/mobpack-profile-member",
+    definitionType: "meta/profile-member",
+    source: "meta/mobpack-profile-member",
     sourceMobpack: "sample_review_pr",
     sourceMobpackName: "Review PR",
-    sourceOrigin: "mobkit/sample-mobpack",
+    sourceOrigin: "meta/sample-mobpack",
     sourceDocumentPath: "document.members[]",
     profileBinding: "inline",
     runtimeMode: "turn_driven",
@@ -4765,7 +4765,7 @@ const [agentDefinition] = controller.agentDefinitionsFromCatalogs({
 assert.equal(agentDefinition.backend, "sidecar");
 assert.equal(agentDefinition.sourceMobpack, "sample_review_pr");
 assert.equal(agentDefinition.sourceMobpackName, "Review PR");
-assert.equal(agentDefinition.sourceOrigin, "mobkit/sample-mobpack");
+assert.equal(agentDefinition.sourceOrigin, "meta/sample-mobpack");
 assert.equal(agentDefinition.schemaSourceDocumentPath, "document.schemas[]");
 assert.deepEqual(agentDefinition.toolDefinitions, [{ id: "mob", kind: "runtime", source: "meerkat_mob::ToolConfig" }]);
 assert.deepEqual(agentDefinition.skillDefinitions, [{ id: "mob.review", source: "inline", sourceMobpack: "sample_review_pr" }]);
@@ -4785,8 +4785,8 @@ assert.deepEqual(controller.agentDefinitionsFromCatalogs({
     role: "origin_less",
     name: "Origin Less",
     model: "gpt-5.5",
-    definitionType: "mobkit/profile-member",
-    source: "mobkit/mobpack-profile-member",
+    definitionType: "meta/profile-member",
+    source: "meta/mobpack-profile-member",
     sourceMobpack: "sample_origin_less",
     sourceDocumentPath: "document.members[]",
     profileBinding: "inline",
@@ -4800,8 +4800,8 @@ assert.deepEqual(controller.agentDefinitionsFromCatalogs({
     role: "partial",
     name: "Partial",
     model: "gpt-5.5",
-    definitionType: "mobkit/profile-member",
-    source: "mobkit/mobpack-profile-member",
+    definitionType: "meta/profile-member",
+    source: "meta/mobpack-profile-member",
     sourceMobpack: "sample_partial",
     sourceDocumentPath: "document.members[]",
   }],
@@ -4812,8 +4812,8 @@ assert.deepEqual(controller.agentDefinitionsFromCatalogs({
     id: "model_less",
     role: "model_less",
     name: "Model Less",
-    definitionType: "mobkit/profile-member",
-    source: "mobkit/mobpack-profile-member",
+    definitionType: "meta/profile-member",
+    source: "meta/mobpack-profile-member",
     sourceMobpack: "sample_partial",
     sourceDocumentPath: "document.members[]",
     profileBinding: "inline",
@@ -4849,24 +4849,24 @@ assert.deepEqual(controller.agentDefinitionsFromCatalogs({
     id: "",
     role: "missing_id",
     name: "Missing id",
-    definitionType: "mobkit/profile-member",
-    source: "mobkit/mobpack-profile-member",
+    definitionType: "meta/profile-member",
+    source: "meta/mobpack-profile-member",
     profileBinding: "inline",
     runtimeMode: "turn_driven",
   }, {
     id: "missing_role",
     role: "",
     name: "Missing role",
-    definitionType: "mobkit/profile-member",
-    source: "mobkit/mobpack-profile-member",
+    definitionType: "meta/profile-member",
+    source: "meta/mobpack-profile-member",
     profileBinding: "inline",
     runtimeMode: "turn_driven",
   }, {
     id: "missing_name",
     role: "missing_name",
     name: "",
-    definitionType: "mobkit/profile-member",
-    source: "mobkit/mobpack-profile-member",
+    definitionType: "meta/profile-member",
+    source: "meta/mobpack-profile-member",
     profileBinding: "inline",
     runtimeMode: "turn_driven",
   }],
@@ -5039,21 +5039,21 @@ const unsupportedDeployTweaksState = controller.tweaksControlState({
 });
 assert.deepEqual(unsupportedDeployTweaksState.surfaceOptions.at(-1), {
   value: "grpc",
-  label: "grpc — not in MobKit deploy_settings.surfaces",
+  label: "grpc — not in Meta deploy_settings.surfaces",
   disabled: true,
-  reason: "Unsupported by the MobKit deploy_settings.surfaces contract.",
+  reason: "Unsupported by the Meta deploy_settings.surfaces contract.",
 });
 assert.deepEqual(unsupportedDeployTweaksState.trustOptions.at(-1), {
   value: "dangerous",
-  label: "dangerous — not in MobKit deploy_settings.trust_policies",
+  label: "dangerous — not in Meta deploy_settings.trust_policies",
   disabled: true,
-  reason: "Unsupported by the MobKit deploy_settings.trust_policies contract.",
+  reason: "Unsupported by the Meta deploy_settings.trust_policies contract.",
 });
 assert.deepEqual(unsupportedDeployTweaksState.realmBackendOptions.at(-1), {
   value: "memory",
-  label: "memory — not in MobKit deploy_settings.realm_backends",
+  label: "memory — not in Meta deploy_settings.realm_backends",
   disabled: true,
-  reason: "Unsupported by the MobKit deploy_settings.realm_backends contract.",
+  reason: "Unsupported by the Meta deploy_settings.realm_backends contract.",
 });
 assert.deepEqual(controller.memberProfileBindingPatch({ role: "reviewer", name: "Reviewer" }, "realm_profile", agentContract), {});
 assert.deepEqual(controller.memberProfileBindingPatch({ realmProfile: "qa_profile" }, "inline", agentContract), {
@@ -5190,12 +5190,12 @@ const agentMembersForProjection = [
     runtimeMode: "turn_driven",
     backend: "session",
     sourceDefinition: {
-      definitionType: "mobkit/profile-member",
+      definitionType: "meta/profile-member",
       definitionId: "reviewer",
-      source: "mobkit/mobpack-profile-member",
+      source: "meta/mobpack-profile-member",
       sourceMobpack: "sample_review_pr",
       sourceMobpackName: "Review PR",
-      sourceOrigin: "mobkit/sample-mobpack",
+      sourceOrigin: "meta/sample-mobpack",
       sourceDocumentPath: "document.members[]",
       schemaSourceDocumentPath: "document.schemas[]",
       toolDefinitions: [{ id: "mob", source: "meerkat_mob::ToolConfig" }],
@@ -5221,7 +5221,7 @@ assert.deepEqual(controller.agentListState({
   agentsHeading: "AGENTS",
   schemasHeading: "SCHEMAS",
   addSchemaLabel: "+ new schema",
-  authoringOperationUnavailableError: "MobKit authoring operation API is unavailable",
+  authoringOperationUnavailableError: "Meta authoring operation API is unavailable",
   schemaAddFallbackError: "add_schema failed",
   emptyTitle: "AGENT LIBRARY",
   emptyLines: [
@@ -5565,7 +5565,7 @@ assert.deepEqual(agentEditorState.sourceProvenance, {
   rows: [
     { label: "Definition", value: "reviewer" },
     { label: "Mobpack", value: "Review PR" },
-    { label: "Origin", value: "mobkit/sample-mobpack" },
+    { label: "Origin", value: "meta/sample-mobpack" },
     { label: "Member path", value: "document.members[]" },
     { label: "Schema path", value: "document.schemas[]" },
     { label: "Tool refs", value: "mob (meerkat_mob::ToolConfig)" },
@@ -5635,7 +5635,7 @@ assert.deepEqual(controller.agentDefinitionOptions([{
 assert.deepEqual(controller.agentDefinitionOptions([]), { hasDefinitions: false, optionRows: [] });
 assert.deepEqual(controller.agentDefinitionCatalogState([], hydratedCatalogs.agentView), {
   title: "DEFINITION CATALOG",
-  empty: "No MobKit profile-member definitions available.",
+  empty: "No Meta profile-member definitions available.",
   hasRows: false,
   rows: [],
 });
@@ -5643,14 +5643,14 @@ assert.deepEqual(controller.agentDefinitionCatalogState([{
   id: "sample_review",
   role: "reviewer",
   label: "Quality Reviewer",
-  source: "mobkit/mobpack-profile-member",
+  source: "meta/mobpack-profile-member",
   sourceMobpackName: "Planner Coder Review",
-  sourceOrigin: "mobkit/sample-mobpack",
+  sourceOrigin: "meta/sample-mobpack",
   toolDefinitions: [{ id: "builtins", source: "meerkat_mob::ToolConfig" }],
   skillDefinitions: [{ id: "mob.review", sourceMobpack: "sample_planner_coder_review_loop" }],
 }], hydratedCatalogs.agentView), {
   title: "DEFINITION CATALOG",
-  empty: "No MobKit profile-member definitions available.",
+  empty: "No Meta profile-member definitions available.",
   hasRows: true,
   rows: [{
     id: "sample_review",
@@ -5659,16 +5659,16 @@ assert.deepEqual(controller.agentDefinitionCatalogState([{
     sourceLabel: "source",
     toolsLabel: "tools",
     skillsLabel: "skills",
-    source: "Planner Coder Review · mobkit/sample-mobpack",
+    source: "Planner Coder Review · meta/sample-mobpack",
     tools: "builtins (meerkat_mob::ToolConfig)",
     skills: "mob.review (sample_planner_coder_review_loop)",
     definition: {
       id: "sample_review",
       role: "reviewer",
       label: "Quality Reviewer",
-      source: "mobkit/mobpack-profile-member",
+      source: "meta/mobpack-profile-member",
       sourceMobpackName: "Planner Coder Review",
-      sourceOrigin: "mobkit/sample-mobpack",
+      sourceOrigin: "meta/sample-mobpack",
       toolDefinitions: [{ id: "builtins", source: "meerkat_mob::ToolConfig" }],
       skillDefinitions: [{ id: "mob.review", sourceMobpack: "sample_planner_coder_review_loop" }],
     },
@@ -5679,19 +5679,19 @@ assert.deepEqual(controller.agentDefinitionAddControlState([], hydratedCatalogs.
   optionRows: [],
   controlClass: "agents-list__add",
   disabled: true,
-  title: "MobKit schema contract has not provided agent definitions yet.",
+  title: "Meta schema contract has not provided agent definitions yet.",
   unavailableLabel: "agents unavailable",
-  authoringOperationUnavailableError: "MobKit authoring operation API is unavailable",
+  authoringOperationUnavailableError: "Meta authoring operation API is unavailable",
   placeholderOption: { value: "", label: "+ new agent..." },
   value: "",
 });
 assert.deepEqual(controller.agentDefinitionAddErrorState({
   ok: false,
-  error: "MobKit agent definition references unavailable tool(s): ghost",
+  error: "Meta agent definition references unavailable tool(s): ghost",
 }, hydratedCatalogs.agentView), {
   hasError: true,
-  text: "Agent definition unavailable: MobKit agent definition references unavailable tool(s): ghost",
-  rawError: "MobKit agent definition references unavailable tool(s): ghost",
+  text: "Agent definition unavailable: Meta agent definition references unavailable tool(s): ghost",
+  rawError: "Meta agent definition references unavailable tool(s): ghost",
 });
 assert.deepEqual(controller.agentDefinitionAddErrorState({ ok: true }, hydratedCatalogs.agentView), {
   hasError: false,
@@ -5731,9 +5731,9 @@ assert.deepEqual(controller.agentDefinitionAddControlState([{
   }],
   controlClass: "agents-list__add agents-list__add--select",
   disabled: false,
-  title: "Create an agent from a MobKit profile-member definition.",
+  title: "Create an agent from a Meta profile-member definition.",
   unavailableLabel: "agents unavailable",
-  authoringOperationUnavailableError: "MobKit authoring operation API is unavailable",
+  authoringOperationUnavailableError: "Meta authoring operation API is unavailable",
   placeholderOption: { value: "", label: "+ new agent..." },
   value: "",
 });
@@ -5859,11 +5859,11 @@ assert.equal(controller.uniqueSchemaFieldName([
 assert.equal(controller.schemaFieldAddPatch, undefined);
 assert.deepEqual(controller.schemaDefinitionAddErrorState({
   ok: false,
-  error: "MobKit schema is missing mob_definition.editor_schema_draft",
+  error: "Meta schema is missing mob_definition.editor_schema_draft",
 }), {
   hasError: true,
-  text: "MobKit schema is missing mob_definition.editor_schema_draft",
-  rawError: "MobKit schema is missing mob_definition.editor_schema_draft",
+  text: "Meta schema is missing mob_definition.editor_schema_draft",
+  rawError: "Meta schema is missing mob_definition.editor_schema_draft",
 });
 assert.deepEqual(controller.schemaDefinitionAddErrorState({ ok: true }), {
   hasError: false,
@@ -5877,11 +5877,11 @@ assert.deepEqual(controller.schemaDefinitionAddErrorState(null, "add_schema fail
 });
 assert.deepEqual(controller.schemaFieldAddErrorState({
   ok: false,
-  error: "MobKit schema is missing mob_definition.editor_schema_draft",
+  error: "Meta schema is missing mob_definition.editor_schema_draft",
 }), {
   hasError: true,
-  text: "MobKit schema is missing mob_definition.editor_schema_draft",
-  rawError: "MobKit schema is missing mob_definition.editor_schema_draft",
+  text: "Meta schema is missing mob_definition.editor_schema_draft",
+  rawError: "Meta schema is missing mob_definition.editor_schema_draft",
 });
 assert.deepEqual(controller.schemaFieldAddErrorState({ ok: true }), {
   hasError: false,
@@ -6162,7 +6162,7 @@ assert.deepEqual(controller.studioAddMemberPatch({
   runtimeMode: "turn_driven",
 }), {
   ok: false,
-  error: "MobKit schema contract must allow deployable inline profileBinding",
+  error: "Meta schema contract must allow deployable inline profileBinding",
   members: [{ id: "m_old" }],
   member: null,
 });
@@ -6231,7 +6231,7 @@ assert.deepEqual(controller.studioUpdateMemberPatch({
   members: [{ id: "m_real", name: "Real", role: "real", model: "gpt-5.5", profileBinding: "inline", runtimeMode: "turn_driven" }],
 }, "m_real", { runtimeMode: "turn_driven" }), {
   ok: false,
-  error: "MobKit schema contract must allow deployable inline profileBinding",
+  error: "Meta schema contract must allow deployable inline profileBinding",
   members: [{ id: "m_real", name: "Real", role: "real", model: "gpt-5.5", profileBinding: "inline", runtimeMode: "turn_driven" }],
 });
 assert.equal(controller.studioUpdateMemberPatch({
@@ -6559,7 +6559,7 @@ assert.deepEqual(controller.diagnosticsToRows({
     kind: "ok",
     glyph: "✓",
     head: "server row",
-    sub: "MobKit source",
+    sub: "Meta source",
     meta: "rkat mob validate",
   }],
   diagnostics: [{
@@ -6571,7 +6571,7 @@ assert.deepEqual(controller.diagnosticsToRows({
   kind: "ok",
   glyph: "✓",
   head: "server row",
-  sub: "MobKit source",
+  sub: "Meta source",
   meta: "rkat mob validate",
 }]);
 assert.deepEqual(controller.diagnosticsToRows({
@@ -6762,7 +6762,7 @@ assert.deepEqual(controller.deployPlanTraceState({ name: "fallback mob" }, {}, {
   steps: [{
     node: null,
     head: "DEPLOY TRACE UNAVAILABLE",
-    body: "mobkit/mobpacks/deploy did not return plan_trace.",
+    body: "meta/mobpacks/deploy did not return plan_trace.",
   }],
   eyebrow: "DEPLOY PLAN",
   title: "fallback mob",
@@ -6794,12 +6794,12 @@ assert.deepEqual(deployPlanError.validationRows[0], {
   glyph: "!",
   head: "Deploy plan failed",
   sub: "planner offline",
-  meta: "mobkit/mobpacks/deploy",
+  meta: "meta/mobpacks/deploy",
 });
 
 const deployRunError = controller.deployErrorOutcome(new Error("runner offline"), { execute: true, errorView: hydratedCatalogs.errorView });
 assert.equal(deployRunError.validationRows[0].head, "Deploy failed");
-assert.equal(deployRunError.validationRows[0].meta, "mobkit/mobpacks/deploy");
+assert.equal(deployRunError.validationRows[0].meta, "meta/mobpacks/deploy");
 
 assert.deepEqual(controller.validationSheetState([
   { kind: "ok", head: "mob" },
@@ -6814,7 +6814,7 @@ assert.deepEqual(controller.validationSheetState([
     { kind: "", head: "unclassified" },
   ],
   counts: { ok: 1, warn: 2, crit: 1 },
-  eyebrow: "VALIDATE · MobKit",
+  eyebrow: "VALIDATE · Meta",
   title: "1 passed · 2 warnings · 1 blocking",
   publishLabel: "PUBLISH",
   deployPlanLabel: "DEPLOY PLAN",
@@ -6843,9 +6843,9 @@ assert.deepEqual(controller.sourceErrorOutcome(new Error("missing toml"), { erro
   glyph: "!",
   head: "Source render failed",
   sub: "missing toml",
-  meta: "mobkit/mobpacks/source",
+  meta: "meta/mobpacks/source",
 });
-assert.equal(controller.validationErrorOutcome(new Error("rpc down"), { errorView: hydratedCatalogs.errorView }).validationRows[0].head, "MobKit API unavailable");
+assert.equal(controller.validationErrorOutcome(new Error("rpc down"), { errorView: hydratedCatalogs.errorView }).validationRows[0].head, "Meta API unavailable");
 assert.equal(controller.validationErrorOutcome(new Error("rpc down"), { errorView: hydratedCatalogs.errorView }).validationRows[0].meta, "/flow-editor/rpc");
 assert.equal(controller.exportErrorOutcome(new Error("pack failed"), { errorView: hydratedCatalogs.errorView }).validationRows[0].head, "Export failed");
 assert.equal(controller.exportErrorOutcome(new Error("pack failed"), { errorView: hydratedCatalogs.errorView }).validationRows[0].meta, "/flow-editor/rpc");
@@ -6961,7 +6961,7 @@ assert.equal(controller.inlineSourceRequestPath({
 }, {
   graphView: hydratedCatalogs.graphView,
   sourceView: hydratedCatalogs.sourceView,
-}), "mobkit/mob.toml");
+}), "meta/mob.toml");
 assert.equal(controller.inlineSourceRequestPath({
   sourcePath: "definition.json",
 }, {
@@ -6974,10 +6974,10 @@ const sourceProjection = controller.sourceDocumentFromSourceResult({
   mob_id: "source_proof",
   mob_toml: "[stale]",
 }, {
-  source: "mobkit/mobpacks/source",
+  source: "meta/mobpacks/source",
   mob_toml: "[top-level stale export text]",
   source_files: [{
-    path: "mobkit/mob.toml",
+    path: "meta/mob.toml",
     media_type: "text/toml",
     size_bytes: 26,
     content_base64: "unused",
@@ -6992,7 +6992,7 @@ const sourceProjection = controller.sourceDocumentFromSourceResult({
     text: "{\"mob\":{\"id\":\"source_proof\"}}\n",
   }],
   filename: "source-proof.mobpack",
-  media_type: "application/vnd.mobkit.mobpack",
+  media_type: "application/vnd.meta.mobpack",
   validation: {
     ok: true,
     display_rows: [{
@@ -7000,7 +7000,7 @@ const sourceProjection = controller.sourceDocumentFromSourceResult({
       glyph: "✓",
       head: "exported",
       sub: "mob.toml",
-      meta: "mobkit/mobpacks/export",
+      meta: "meta/mobpacks/export",
     }],
   },
 }, {
@@ -7010,13 +7010,13 @@ assert.equal(sourceProjection.document.name, "Source Proof");
 assert.equal(sourceProjection.document.mob_toml, "[stale]");
 assert.notEqual(sourceProjection.document.mob_toml, "[top-level stale export text]");
 assert.equal(sourceProjection.sourceDocument.filename, "source-proof.mobpack");
-assert.equal(sourceProjection.sourceDocument.media_type, "application/vnd.mobkit.mobpack");
-assert.equal(sourceProjection.sourceDocument.sourcePath, "mobkit/mob.toml");
+assert.equal(sourceProjection.sourceDocument.media_type, "application/vnd.meta.mobpack");
+assert.equal(sourceProjection.sourceDocument.sourcePath, "meta/mob.toml");
 assert.equal(sourceProjection.sourceDocument.sourceFile.media_type, "text/toml");
 assert.equal(sourceProjection.sourceDocument.sourceFile.text, "[mob]\nid = \"source_proof\"\n");
 assert.equal(sourceProjection.sourceDocument.sourceFiles.length, 2);
 assert.equal(sourceProjection.sourceDocument.sourceDigest, "2496e694a40dca7b5f535d6cb5969d867b6989aa9fa258535c048947073086fa");
-assert.equal(sourceProjection.sourceDocument.source, "mobkit/mobpacks/source");
+assert.equal(sourceProjection.sourceDocument.source, "meta/mobpacks/source");
 assert.deepEqual(sourceProjection.sourceDocument.sourceView, hydratedCatalogs.sourceView);
 assert.equal(sourceProjection.sourceDocument.validation.ok, true);
 assert.equal(sourceProjection.validationRows[0].head, "exported");
@@ -7026,15 +7026,15 @@ assert.deepEqual(controller.sourceEditorState(sourceProjection.sourceDocument), 
   sourceHtml: '<span class="toml-table">[mob]</span>\n<span class="toml-key">id</span> = "source_proof"\n',
   drawerEyebrow: "SOURCE · mob.toml",
   inlineTitle: "mob.toml",
-  sourceLabel: "mobkit/mobpacks/source · mobkit/mob.toml · source-proof.mobpack · application/vnd.mobkit.mobpack",
+  sourceLabel: "meta/mobpacks/source · meta/mob.toml · source-proof.mobpack · application/vnd.meta.mobpack",
   validationSource: "",
   bodyClass: "source-drawer__body",
-  selectedPath: "mobkit/mob.toml",
+  selectedPath: "meta/mob.toml",
   fileRows: [
     {
-      path: "mobkit/mob.toml",
-      label: "mobkit/mob.toml",
-      value: "mobkit/mob.toml",
+      path: "meta/mob.toml",
+      label: "meta/mob.toml",
+      value: "meta/mob.toml",
       selected: true,
       className: "source-file-row is-selected",
       meta: "text/toml · 26b",
@@ -7051,7 +7051,7 @@ assert.deepEqual(controller.sourceEditorState(sourceProjection.sourceDocument), 
     },
   ],
   showLoading: false,
-  loadingText: "rendering mob.toml from mobkit/mobpacks/source...",
+  loadingText: "rendering mob.toml from meta/mobpacks/source...",
   copyLabel: "copy",
   closeLabel: "×",
   copyDisabled: false,
@@ -7061,10 +7061,10 @@ const selectedDefinitionSource = controller.sourceEditorState(sourceProjection.s
 });
 assert.equal(selectedDefinitionSource.source, "{\"mob\":{\"id\":\"source_proof\"}}\n");
 assert.equal(selectedDefinitionSource.sourceHtml, "{\"mob\":{\"id\":\"source_proof\"}}\n");
-assert.equal(selectedDefinitionSource.sourceLabel, "mobkit/mobpacks/source · definition.json · source-proof.mobpack · application/vnd.mobkit.mobpack");
+assert.equal(selectedDefinitionSource.sourceLabel, "meta/mobpacks/source · definition.json · source-proof.mobpack · application/vnd.meta.mobpack");
 assert.equal(selectedDefinitionSource.selectedPath, "definition.json");
 assert.deepEqual(selectedDefinitionSource.fileRows.map((row) => [row.path, row.selected]), [
-  ["mobkit/mob.toml", false],
+  ["meta/mob.toml", false],
   ["definition.json", true],
 ]);
 assert.deepEqual(controller.sourceFileSelectionTransition(sourceProjection.sourceDocument, "definition.json"), {
@@ -7074,12 +7074,12 @@ assert.deepEqual(controller.sourceFileSelectionTransition(sourceProjection.sourc
   sourcePath: "definition.json",
 });
 assert.deepEqual(controller.sourceFileSelectionTransition(sourceProjection.sourceDocument, "missing.toml", ""), {
-  sourcePath: "mobkit/mob.toml",
+  sourcePath: "meta/mob.toml",
 });
 const escapedSourceEditorState = controller.sourceEditorState({
-  sourcePath: "mobkit/mob.toml",
+  sourcePath: "meta/mob.toml",
   sourceFiles: [{
-    path: "mobkit/mob.toml",
+    path: "meta/mob.toml",
     media_type: "text/toml",
     text: "# <unsafe & comment>\n[mob]\nid = \"safe\"\n",
     size_bytes: 39,
@@ -7102,7 +7102,7 @@ assert.deepEqual(controller.sourceEditorState({
   selectedPath: "",
   fileRows: [],
   showLoading: false,
-  loadingText: "rendering mob.toml from mobkit/mobpacks/source...",
+  loadingText: "rendering mob.toml from meta/mobpacks/source...",
   copyLabel: "copy",
   closeLabel: "×",
   copyDisabled: true,
@@ -7118,7 +7118,7 @@ assert.deepEqual(controller.sourceEditorState(null, { busy: true, compact: true,
   selectedPath: "",
   fileRows: [],
   showLoading: true,
-  loadingText: "rendering mob.toml from mobkit/mobpacks/source...",
+  loadingText: "rendering mob.toml from meta/mobpacks/source...",
   copyLabel: "copy",
   closeLabel: "×",
   copyDisabled: true,
@@ -7141,26 +7141,26 @@ assert.deepEqual(controller.sourceEditorState(null, { busy: true, compact: true 
 });
 assert.throws(
   () => controller.sourceDocumentFromSourceResult({ name: "Export result" }, {
-    source: "mobkit/mobpacks/export",
+    source: "meta/mobpacks/export",
     filename: "export-result.mobpack",
-    media_type: "application/vnd.mobkit.mobpack",
+    media_type: "application/vnd.meta.mobpack",
     content_base64: "unused",
     source_files: [{
-      path: "mobkit/mob.toml",
+      path: "meta/mob.toml",
       text: "[mob]\nid = \"export_result\"\n",
       sha256: "sha",
     }],
   }),
-  /source preview expected mobkit\/mobpacks\/source but received mobkit\/mobpacks\/export/,
+  /source preview expected meta\/mobpacks\/source but received meta\/mobpacks\/export/,
 );
 assert.throws(
   () => controller.sourceDocumentFromSourceResult({ name: "No files" }, { source_files: [] }),
-  /source preview expected mobkit\/mobpacks\/source but received\s*$/,
+  /source preview expected meta\/mobpacks\/source but received\s*$/,
 );
 assert.throws(
   () => controller.sourceDocumentFromSourceResult({ name: "Missing source" }, {
     source_files: [{
-      path: "mobkit/mob.toml",
+      path: "meta/mob.toml",
       media_type: "text/toml",
       size_bytes: 26,
       content_base64: "dG9tbA==",
@@ -7168,57 +7168,57 @@ assert.throws(
       text: "[mob]\nid = \"missing_source\"\n",
     }],
     filename: "missing-source.mobpack",
-    media_type: "application/vnd.mobkit.mobpack",
+    media_type: "application/vnd.meta.mobpack",
   }),
-  /source preview expected mobkit\/mobpacks\/source but received\s*$/,
+  /source preview expected meta\/mobpacks\/source but received\s*$/,
 );
 assert.throws(
   () => controller.sourceDocumentFromSourceResult({ name: "No TOML file" }, {
-    source: "mobkit/mobpacks/source",
+    source: "meta/mobpacks/source",
     source_files: [{ path: "manifest.toml", text: "name = \"missing\"" }],
   }, { sourceView: hydratedCatalogs.sourceView }),
-  /mobkit\/mobpacks\/source did not return primary source file mobkit\/mob\.toml/,
+  /meta\/mobpacks\/source did not return primary source file meta\/mob\.toml/,
 );
 assert.throws(
   () => controller.sourceDocumentFromSourceResult({ name: "No TOML text" }, {
-    source: "mobkit/mobpacks/source",
-    source_files: [{ path: "mobkit/mob.toml", text: "" }],
+    source: "meta/mobpacks/source",
+    source_files: [{ path: "meta/mob.toml", text: "" }],
   }, { sourceView: hydratedCatalogs.sourceView }),
-  /mobkit\/mobpacks\/source did not return primary source text mobkit\/mob\.toml/,
+  /meta\/mobpacks\/source did not return primary source text meta\/mob\.toml/,
 );
 assert.throws(
   () => controller.sourceDocumentFromSourceResult({ name: "No filename" }, {
-    source: "mobkit/mobpacks/source",
+    source: "meta/mobpacks/source",
     mob_toml: "[mob]\nid = \"no_filename\"\n",
-    source_files: [{ path: "mobkit/mob.toml", text: "[mob]\nid = \"no_filename\"\n" }],
-    media_type: "application/vnd.mobkit.mobpack",
+    source_files: [{ path: "meta/mob.toml", text: "[mob]\nid = \"no_filename\"\n" }],
+    media_type: "application/vnd.meta.mobpack",
   }, { sourceView: hydratedCatalogs.sourceView }),
-  /mobkit\/mobpacks\/source did not return filename/,
+  /meta\/mobpacks\/source did not return filename/,
 );
 assert.throws(
   () => controller.sourceDocumentFromSourceResult({ name: "No media" }, {
-    source: "mobkit/mobpacks/source",
+    source: "meta/mobpacks/source",
     mob_toml: "[mob]\nid = \"no_media\"\n",
-    source_files: [{ path: "mobkit/mob.toml", text: "[mob]\nid = \"no_media\"\n" }],
+    source_files: [{ path: "meta/mob.toml", text: "[mob]\nid = \"no_media\"\n" }],
     filename: "no-media.mobpack",
   }, { sourceView: hydratedCatalogs.sourceView }),
-  /mobkit\/mobpacks\/source did not return media_type/,
+  /meta\/mobpacks\/source did not return media_type/,
 );
 assert.throws(
   () => controller.sourceDocumentFromSourceResult({ name: "No sha" }, {
-    source: "mobkit/mobpacks/source",
+    source: "meta/mobpacks/source",
     mob_toml: "[mob]\nid = \"no_sha\"\n",
-    source_files: [{ path: "mobkit/mob.toml", text: "[mob]\nid = \"no_sha\"\n" }],
+    source_files: [{ path: "meta/mob.toml", text: "[mob]\nid = \"no_sha\"\n" }],
     filename: "no-sha.mobpack",
-    media_type: "application/vnd.mobkit.mobpack",
+    media_type: "application/vnd.meta.mobpack",
   }, { sourceView: hydratedCatalogs.sourceView }),
-  /mobkit\/mobpacks\/source did not return primary source sha256 mobkit\/mob.toml/,
+  /meta\/mobpacks\/source did not return primary source sha256 meta\/mob.toml/,
 );
 assert.throws(
   () => controller.sourceDocumentFromSourceResult({ name: "No aux content" }, {
-    source: "mobkit/mobpacks/source",
+    source: "meta/mobpacks/source",
     source_files: [{
-      path: "mobkit/mob.toml",
+      path: "meta/mob.toml",
       media_type: "text/toml",
       size_bytes: 27,
       content_base64: "dG9tbA==",
@@ -7232,15 +7232,15 @@ assert.throws(
       text: "{}",
     }],
     filename: "no-aux-content.mobpack",
-    media_type: "application/vnd.mobkit.mobpack",
+    media_type: "application/vnd.meta.mobpack",
   }, { sourceView: hydratedCatalogs.sourceView }),
-  /mobkit\/mobpacks\/source source_files\[1\] did not return content_base64/,
+  /meta\/mobpacks\/source source_files\[1\] did not return content_base64/,
 );
 assert.throws(
   () => controller.sourceDocumentFromSourceResult({ name: "No aux text" }, {
-    source: "mobkit/mobpacks/source",
+    source: "meta/mobpacks/source",
     source_files: [{
-      path: "mobkit/mob.toml",
+      path: "meta/mob.toml",
       media_type: "text/toml",
       size_bytes: 24,
       content_base64: "dG9tbA==",
@@ -7254,31 +7254,31 @@ assert.throws(
       sha256: "json-sha",
     }],
     filename: "no-aux-text.mobpack",
-    media_type: "application/vnd.mobkit.mobpack",
+    media_type: "application/vnd.meta.mobpack",
   }, { sourceView: hydratedCatalogs.sourceView }),
-  /mobkit\/mobpacks\/source source_files\[1\] did not return text/,
+  /meta\/mobpacks\/source source_files\[1\] did not return text/,
 );
 
 assert.deepEqual(controller.exportDownloadPayload({
   content_base64: "YWJj",
-  media_type: "application/vnd.mobkit.mobpack",
+  media_type: "application/vnd.meta.mobpack",
   filename: "source-proof.mobpack",
 }), {
   contentBase64: "YWJj",
-  mediaType: "application/vnd.mobkit.mobpack",
+  mediaType: "application/vnd.meta.mobpack",
   filename: "source-proof.mobpack",
 });
 assert.throws(
-  () => controller.exportDownloadPayload({ media_type: "application/vnd.mobkit.mobpack", filename: "missing-content.mobpack" }),
-  /mobkit\/mobpacks\/export did not return content_base64/,
+  () => controller.exportDownloadPayload({ media_type: "application/vnd.meta.mobpack", filename: "missing-content.mobpack" }),
+  /meta\/mobpacks\/export did not return content_base64/,
 );
 assert.throws(
   () => controller.exportDownloadPayload({ content_base64: "YWJj", filename: "missing-media.mobpack" }),
-  /mobkit\/mobpacks\/export did not return media_type/,
+  /meta\/mobpacks\/export did not return media_type/,
 );
 assert.throws(
-  () => controller.exportDownloadPayload({ content_base64: "YWJj", media_type: "application/vnd.mobkit.mobpack" }),
-  /mobkit\/mobpacks\/export did not return filename/,
+  () => controller.exportDownloadPayload({ content_base64: "YWJj", media_type: "application/vnd.meta.mobpack" }),
+  /meta\/mobpacks\/export did not return filename/,
 );
 
 assert.deepEqual(controller.importParamsFromDecodedFile({
@@ -7329,12 +7329,12 @@ assert.deepEqual(controller.importParamsFromDecodedFile({
 
 assert.deepEqual(controller.importParamsFromDecodedFile({
   filename: "docs.mobpack",
-  mediaType: "application/vnd.mobkit.mobpack",
+  mediaType: "application/vnd.meta.mobpack",
   kind: "binary",
   contentBase64: "YWJj",
 }), {
   source_name: "docs.mobpack",
-  source_media_type: "application/vnd.mobkit.mobpack",
+  source_media_type: "application/vnd.meta.mobpack",
   content_base64: "YWJj",
 });
 
@@ -8125,7 +8125,7 @@ const noContractParallelProjection = controller.graphProjectionForFlow(incomplet
 assert.deepEqual(
   Array.from(new Set(noContractParallelProjection.edges.map((edge) => edge.kind))),
   [""],
-  "Graph projection must not invent local edge kinds without the MobKit contract",
+  "Graph projection must not invent local edge kinds without the Meta contract",
 );
 
 const incompleteParallelDocument = controller.buildDocument({
@@ -8470,8 +8470,8 @@ const graphShapeContract = {
       all: "all — every upstream node",
       any: "any — any upstream node",
     },
-    option_unsupported_label_separator: " — not in MobKit ",
-    option_unsupported_reason_prefix: "Unsupported by the MobKit ",
+    option_unsupported_label_separator: " — not in Meta ",
+    option_unsupported_reason_prefix: "Unsupported by the Meta ",
     option_unsupported_reason_suffix: " contract.",
     condition_operators: ["==", ">", "<"],
     editor_schema_field_types: ["string", "enum"],
@@ -8574,7 +8574,7 @@ assert.equal(gateState.collectionTitle, "COLLECTION POLICY");
 assert.equal(gateState.quorumIncomingLabel, "of 2 incoming");
 assert.equal(gateState.joinMemberLabel, "Join member");
 assert.deepEqual(gateState.joinMemberPlaceholderOption, { value: "", label: "— select member —" });
-assert.equal(gateState.joinMemberHint, "MobKit uses this real profile to resolve non-all fan-in.");
+assert.equal(gateState.joinMemberHint, "Meta uses this real profile to resolve non-all fan-in.");
 const reskinnedGateState = controller.graphGateControlState({
   id: "join_1",
   gateKind: "join",
@@ -8594,7 +8594,7 @@ assert.equal(reskinnedGateState.eyebrow, "CONTROL join");
 assert.equal(reskinnedGateState.idLine, "join_1 @ 1/1");
 assert.equal(reskinnedGateState.quorumIncomingLabel, "0 upstream wires");
 assert.equal(gateState.dispatchTitle, "DISPATCH MODE");
-assert.equal(gateState.dispatchHint, "Exports as the MobKit parallel flow dispatch mode.");
+assert.equal(gateState.dispatchHint, "Exports as the Meta parallel flow dispatch mode.");
 assert.equal(gateState.conditionsTitle, "CONDITIONS");
 assert.equal(gateState.emptyBranchHint, "add outgoing edges, then configure each as a typed condition or fallback");
 assert.equal(gateState.wiringTitle, "WIRING");
@@ -9061,7 +9061,7 @@ assert.equal(sourceFileAdornmentState.isSourceFile, true);
 assert.equal(sourceFileAdornmentState.role, "button");
 assert.equal(sourceFileAdornmentState.ariaLabel, "Open mob.toml read-only source editor");
 assert.equal(sourceFileAdornmentState.sourceGlyph, "{ }");
-assert.equal(sourceFileAdornmentState.sourceActivationHash, "#mobkit-graph-source");
+assert.equal(sourceFileAdornmentState.sourceActivationHash, "#meta-graph-source");
 assert.equal(sourceFileAdornmentState.sourceActivationSelector, ".node--source-file");
 assert.equal(sourceFileAdornmentState.roleLabel, "source file");
 assert.equal(sourceFileAdornmentState.title, "mob.toml");
@@ -9211,7 +9211,7 @@ assert.equal(terminalControlState.selectedTerminalKind.label, "success — done"
 assert.equal(terminalControlState.authoringLockedTitle, "Visual terminal node");
 assert.equal(
   terminalControlState.authoringLockedHint,
-  "Visual terminal nodes do not compile into deployable MobKit mob.toml. Delete this node or replace it with a real member, branch, join, or loop flow shape."
+  "Visual terminal nodes do not compile into deployable Meta mob.toml. Delete this node or replace it with a real member, branch, join, or loop flow shape."
 );
 assert.equal(terminalControlState.editable, false);
 const reskinnedTerminalControlState = controller.graphTerminalControlState({
@@ -9876,11 +9876,11 @@ assert.deepEqual(controller.inputParamDeletePatch([
 assert.equal(controller.inputParamAddPatch, undefined);
 assert.deepEqual(controller.inputParamAddErrorState({
   ok: false,
-  error: "MobKit schema is missing mob_definition.editor_input_param_draft",
+  error: "Meta schema is missing mob_definition.editor_input_param_draft",
 }), {
   hasError: true,
-  text: "MobKit schema is missing mob_definition.editor_input_param_draft",
-  rawError: "MobKit schema is missing mob_definition.editor_input_param_draft",
+  text: "Meta schema is missing mob_definition.editor_input_param_draft",
+  rawError: "Meta schema is missing mob_definition.editor_input_param_draft",
 });
 assert.deepEqual(controller.inputParamAddErrorState({ ok: true }), {
   hasError: false,
@@ -10240,7 +10240,7 @@ const branchParallelControlState = controller.basicBranchParallelControlState({
 assert.equal(branchParallelControlState.isParallel, true);
 assert.equal(branchParallelControlState.panelTitle, "Parallel");
 assert.equal(branchParallelControlState.controllerLabel, "Join member");
-assert.equal(branchParallelControlState.controllerPlaceholderLabel, "— direct MobKit lanes —");
+assert.equal(branchParallelControlState.controllerPlaceholderLabel, "— direct Meta lanes —");
 assert.equal(branchParallelControlState.controllerRole, "m_reviewer");
 assert.deepEqual(branchParallelControlState.memberOptions.map((option) => [option.value, option.label]), [
   ["m_reviewer", "Reviewer · reviewer"],
@@ -10261,8 +10261,8 @@ assert.equal(branchParallelControlState.dependencyLabel, "depends_on mode");
 assert.equal(branchParallelControlState.dependencyValue, "custom_dependency");
 assert.equal(branchParallelControlState.dependencyOptions[1].label, "any — any upstream node");
 assert.equal(branchParallelControlState.selectedDependency.disabled, true);
-assert.equal(branchParallelControlState.selectedDependency.label, "custom_dependency — not in MobKit dependency_modes");
-assert.equal(branchParallelControlState.selectedDependency.reason, "Unsupported by the MobKit dependency_modes contract.");
+assert.equal(branchParallelControlState.selectedDependency.label, "custom_dependency — not in Meta dependency_modes");
+assert.equal(branchParallelControlState.selectedDependency.reason, "Unsupported by the Meta dependency_modes contract.");
 assert.match(branchParallelControlState.selectedDependency.reason, /dependency_modes/);
 const basicBranchControlState = controller.basicBranchParallelControlState({
   step: { id: "branch_1", type: "branch", branches: [{ id: "br1", condition: "", steps: [] }] },
@@ -10280,7 +10280,7 @@ const basicBranchControlState = controller.basicBranchParallelControlState({
 assert.equal(basicBranchControlState.isParallel, false);
 assert.equal(basicBranchControlState.panelTitle, "Branch");
 assert.equal(basicBranchControlState.controllerLabel, "Route member");
-assert.equal(basicBranchControlState.controllerPlaceholderLabel, "— direct MobKit lanes —");
+assert.equal(basicBranchControlState.controllerPlaceholderLabel, "— direct Meta lanes —");
 assert.equal(basicBranchControlState.addBranchLabel, "+ Add branch");
 assert.equal(basicBranchControlState.branchConditionTitle, "Branch conditions");
 assert.equal(basicBranchControlState.fallbackTitle, "Fallback");
@@ -10505,7 +10505,7 @@ assert.equal(controller.basicStepCardState({
   basicView: hydratedCatalogs.basicView,
 }).configured, false);
 // Member deletion reconciles adaptive refs but never drops the step
-// (mirrors MobKit's prune_adaptive_step_member_refs).
+// (mirrors Meta's prune_adaptive_step_member_refs).
 const prunedAdaptiveFlow = controller.reconcileFlowMemberSteps({
   name: "adaptive-prune-proof",
   steps: [
@@ -10861,7 +10861,7 @@ assert.equal(persistedRegistryProjection.rows[0].document, registryDocument);
 assert.equal(persistedRegistryProjection.rows[1], registryRows[1]);
 const runtimeProjectionRows = [{
   id: "runtime_main",
-  source: "mobkit/runtime/flow_projection",
+  source: "meta/runtime/flow_projection",
   document_kind: "runtime_projection",
   runtime_projection: true,
   runtime_mob_id: "runtime_mob",
@@ -11067,7 +11067,7 @@ assert.equal(hydratedStored.validationRows[0].meta, "import.ok");
 const apiGraphHydrated = controller.hydrateMobpackDocumentState({
   document: storedGraphDocument,
   graph_projection: {
-    source: "mobkit/mobpacks/graph_projection",
+    source: "meta/mobpacks/graph_projection",
     instances: [{ id: "api_step_1", memberId: "reviewer", col: 2, row: 1 }],
     edges: [{ id: "api_edge_1", from: "api_step_1", to: "done", kind: "next" }],
     frames: [{ id: "api_frame_1", kind: "Branch", col: 1, row: 1 }],
@@ -11081,16 +11081,16 @@ const apiGraphHydrated = controller.hydrateMobpackDocumentState({
 assert.deepEqual(apiGraphHydrated.graphProjection.instances.map(instance => instance.id), ["api_step_1"]);
 assert.deepEqual(apiGraphHydrated.graphProjection.edges.map(edge => edge.id), ["api_edge_1"]);
 assert.deepEqual(apiGraphHydrated.graphProjection.frames.map(frame => frame.id), ["api_frame_1"]);
-assert.equal(apiGraphHydrated.graphProjection.source, "mobkit/mobpacks/graph_projection");
-assert.equal(controller.graphProjectionFromMobKitResult(apiGraphHydrated.graphProjection).instances[0].id, "api_step_1");
+assert.equal(apiGraphHydrated.graphProjection.source, "meta/mobpacks/graph_projection");
+assert.equal(controller.graphProjectionFromMetaResult(apiGraphHydrated.graphProjection).instances[0].id, "api_step_1");
 
 const operationProjection = controller.authoringProjectionFromOperationResult({
-  source: "mobkit/mobpacks/apply_operation",
+  source: "meta/mobpacks/apply_operation",
   operation: "add_agent_definition",
   document: {
     ...storedGraphDocument,
     schemas: [{ id: "AddedVerdict", fields: [{ id: "f_verdict", name: "verdict", type: "string" }] }],
-    skill_realms: [{ id: "mobkit/editor-inline", skills: [{ id: "mob.editor.review", label: "Review", source: "inline", content: "Review carefully." }] }],
+    skill_realms: [{ id: "meta/editor-inline", skills: [{ id: "mob.editor.review", label: "Review", source: "inline", content: "Review carefully." }] }],
     members: [
       ...storedGraphDocument.members,
       { id: "m_added", name: "Added", role: "added", profileBinding: "inline", runtimeMode: "turn_driven", skills: ["mob.editor.review"] },
@@ -11166,7 +11166,7 @@ assert.deepEqual(missingFlowHydrated.schemas, []);
 assert.equal(missingFlowHydrated.deploySettings.maxTotalTokens, 64);
 assert.equal(missingFlowHydrated.mobSettings.backendDefault, "session");
 assert.equal(missingFlowHydrated.validationRows[0].kind, "crit");
-assert.equal(missingFlowHydrated.validationRows[0].head, "Imported mobpack is missing a MobKit editor flow");
+assert.equal(missingFlowHydrated.validationRows[0].head, "Imported mobpack is missing a Meta editor flow");
 assert.equal(missingFlowHydrated.validationRows[0].meta, "missing_editor_flow");
 
 const appendedRows = controller.flowRegistryAppendRowPatch(registryRows, importedRow);
@@ -11520,7 +11520,7 @@ async function exerciseAuthoringOperationRunner() {
         jsonrpc: "2.0",
         id: request.id,
         result: {
-          source: "mobkit/mobpacks/apply_operation",
+          source: "meta/mobpacks/apply_operation",
           operation: operation.type,
           document,
           selection: operation.selection || null,
@@ -11566,7 +11566,7 @@ async function exerciseAuthoringOperationRunner() {
     assert.equal(maxInFlight, 1);
     assert.equal(rpcCalls.length, 2);
     assert.equal(rpcCalls[0].url, "/runner-rpc");
-    assert.equal(rpcCalls[0].request.method, "mobkit/mobpacks/apply_operation");
+    assert.equal(rpcCalls[0].request.method, "meta/mobpacks/apply_operation");
     assert.equal(rpcCalls[0].request.params.operation.type, "update_deploy_settings");
     assert.equal(rpcCalls[0].request.params.operation.field, "prompt");
     assert.equal(rpcCalls[0].request.params.expected_catalog_snapshot_id, "catalog-snapshot-1");
@@ -11627,7 +11627,7 @@ async function exerciseAuthoringOperationRunner() {
           jsonrpc: "2.0",
           id: request.id,
           result: {
-            source: "mobkit/mobpacks/apply_operation",
+            source: "meta/mobpacks/apply_operation",
             operation: request.params.operation.type,
             document,
             selection: null,
@@ -11706,13 +11706,13 @@ async function exerciseReadOnlyRenderDraftGuardRetry() {
 
     // source: refused once with the guard, retried once without it, same document.
     calls = [];
-    global.fetch = conflictOnceThenResult({ source: "mobkit/mobpacks/source", source_files: [] });
-    assert.deepEqual(await controller.sourceDocument(document, guard), { source: "mobkit/mobpacks/source", source_files: [] });
+    global.fetch = conflictOnceThenResult({ source: "meta/mobpacks/source", source_files: [] });
+    assert.deepEqual(await controller.sourceDocument(document, guard), { source: "meta/mobpacks/source", source_files: [] });
     assert.equal(calls.length, 2, "one refusal, one retry");
-    assert.equal(calls[0].method, "mobkit/mobpacks/source");
+    assert.equal(calls[0].method, "meta/mobpacks/source");
     assert.equal(calls[0].params.expected_revision, 1);
     assert.equal(calls[0].params.expected_etag, guard.expected_etag);
-    assert.equal(calls[1].method, "mobkit/mobpacks/source");
+    assert.equal(calls[1].method, "meta/mobpacks/source");
     assert.equal(calls[1].params.expected_revision, undefined, "retry drops expected_revision");
     assert.equal(calls[1].params.expected_etag, undefined, "retry drops expected_etag");
     assert.equal(calls[1].params.id, "f_race_mob", "retry keeps the non-guard request options");

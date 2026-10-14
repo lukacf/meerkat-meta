@@ -1,7 +1,7 @@
 # Rust
 /target/
 
-# MobKit internal
+# Meta internal
 .rct/
 .rkat/
 .release-hook-done
@@ -62,5 +62,5 @@ Thumbs.db
 !.claude/commands/ship.md
 !.claude/skills/
 .claude/skills/*
-!.claude/skills/mobkit-platform/
-!.claude/skills/mobkit-platform/SKILL.md
+!.claude/skills/meta-platform/
+!.claude/skills/meta-platform/SKILL.md

@@ -1,5 +1,5 @@
 /**
- * Executed contract for `mobkit/stop_member_run`: the method sends the exact
+ * Executed contract for `meta/stop_member_run`: the method sends the exact
  * wire params the gateway dispatches on and relays meerkat's typed run-stop
  * receipt, failing closed on anything else.
  */
@@ -8,9 +8,9 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 async function makeRuntime(answer: unknown | (() => never)) {
-  const { MobKitRuntime } = await import("../src/runtime.js");
+  const { MetaRuntime } = await import("../src/runtime.js");
   const calls: { method: string; params: Record<string, unknown> }[] = [];
-  const rt = new MobKitRuntime({
+  const rt = new MetaRuntime({
     mobConfigPath: null,
     sessionBuilder: null,
     sessionStore: null,
@@ -54,7 +54,7 @@ describe("member run stop", () => {
     const result = await rt.mobHandle().stopMemberRun("w1", "r-1", "stop");
     assert.deepEqual(calls, [
       {
-        method: "mobkit/stop_member_run",
+        method: "meta/stop_member_run",
         params: { member_id: "w1", run_id: "r-1", reason: "stop" },
       },
     ]);

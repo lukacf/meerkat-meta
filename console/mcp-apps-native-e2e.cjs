@@ -3,7 +3,7 @@
 
 // Real stock Console -> native session admission -> physical stdio MCP server.
 // Uses the prebuilt native acceptance fixture and the current production UI.
-// MOBKIT_MCP_APPS_LONG_POLL=1 adds three live App pollers during a >65s model hold.
+// META_MCP_APPS_LONG_POLL=1 adds three live App pollers during a >65s model hold.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const http = require("node:http");
@@ -137,11 +137,11 @@ async function exerciseLivePolling({ baseUrl, page, apps, requests, evidence }) 
 }
 
 async function main() {
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "Set MOBKIT_EXAMPLE_BIN_DIR to the prebuilt native acceptance fixture; this harness never starts Cargo.");
+  assert(process.env.META_EXAMPLE_BIN_DIR, "Set META_EXAMPLE_BIN_DIR to the prebuilt native acceptance fixture; this harness never starts Cargo.");
   const repoRoot = path.resolve(__dirname, "..");
-  const longPolling = process.env.MOBKIT_MCP_APPS_LONG_POLL === '1';
+  const longPolling = process.env.META_MCP_APPS_LONG_POLL === '1';
   const expectedViews = longPolling ? 3 : 1;
-  const evidenceRoot = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(repoRoot, "output/playwright");
+  const evidenceRoot = process.env.META_BROWSER_EVIDENCE || path.join(repoRoot, "output/playwright");
   await fs.mkdir(evidenceRoot, { recursive: true });
   const evidence = await fs.mkdtemp(path.join(evidenceRoot, "mcp-apps-native-"));
   const stateDir = path.join(evidence, "state");
@@ -192,18 +192,18 @@ async function main() {
     sandbox = createSandboxServer({ allowedHostOrigins: [baseUrl] });
     const sandboxUrl = `${await listen(sandbox)}/sandbox.html`;
     child = spawn(spec.command, spec.args, { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"], env: {
-      ...process.env, MOBKIT_FIXTURE_ADDR: LOOPBACK_ANY_PORT, MOBKIT_FIXTURE_MODE: "identity",
-      MOBKIT_FIXTURE_LIVE_MODEL: "0", MOBKIT_FIXTURE_LIVE_IMAGES: "0", MOBKIT_FIXTURE_ROUTINE_TOOLS: "0",
-      MOBKIT_FIXTURE_STATE: stateDir, MOBKIT_FIXTURE_NODE: process.execPath,
-      MOBKIT_FIXTURE_MCP_APPS_SERVER: path.join(__dirname, "fixtures/mcp-apps-server.cjs"),
-      MOBKIT_FIXTURE_APP_HTML: htmlPath, MOBKIT_FIXTURE_APP_LOG: logPath,
-      MOBKIT_FIXTURE_APP_SANDBOX: sandboxUrl,
+      ...process.env, META_FIXTURE_ADDR: LOOPBACK_ANY_PORT, META_FIXTURE_MODE: "identity",
+      META_FIXTURE_LIVE_MODEL: "0", META_FIXTURE_LIVE_IMAGES: "0", META_FIXTURE_ROUTINE_TOOLS: "0",
+      META_FIXTURE_STATE: stateDir, META_FIXTURE_NODE: process.execPath,
+      META_FIXTURE_MCP_APPS_SERVER: path.join(__dirname, "fixtures/mcp-apps-server.cjs"),
+      META_FIXTURE_APP_HTML: htmlPath, META_FIXTURE_APP_LOG: logPath,
+      META_FIXTURE_APP_SANDBOX: sandboxUrl,
     } });
     const ready = awaitFixtureReady(child, { label: "native MCP Apps fixture", timeoutMs: 60_000 });
     for (const output of [child.stdout, child.stderr]) output.on("data", chunk => { logs = (logs + chunk).slice(-30_000); });
     ({ baseUrl: backendUrl } = await ready);
     await eventually(async () => {
-      const value = await rpc(baseUrl, "mobkit/wait_ready", { timeout_ms: 1000 });
+      const value = await rpc(baseUrl, "meta/wait_ready", { timeout_ms: 1000 });
       return value.body.result?.timeout === false && value.body.result.ready?.length === 2;
     }, "native members ready", 60_000);
     // The quick case streams beyond the host's 15-second setup limit. The long

@@ -1,5 +1,5 @@
 /**
- * Auth configuration for MobKit runtime.
+ * Auth configuration for Meta runtime.
  */
 
 // -- Google auth ----------------------------------------------------------

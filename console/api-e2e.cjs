@@ -23,7 +23,7 @@ async function faultClassification() {
         assert(!JSON.stringify(body).includes("private fixture"));
       }
       for (const prefix of ["", "/aggregate"]) {
-        const { body } = await rpc(fixture.baseUrl, "mobkit/console/query_timeline", { after: "console:0" }, prefix);
+        const { body } = await rpc(fixture.baseUrl, "meta/console/query_timeline", { after: "console:0" }, prefix);
         assert.equal(body.error.code, replay ? -32013 : -32000, `${fault} RPC ${prefix}`);
         assert(!JSON.stringify(body).includes("private fixture"));
       }
@@ -31,7 +31,7 @@ async function faultClassification() {
     for (const path of ["/console/timeline", "/console/timeline/stream", "/console/rpc"]) {
       const response = await fetch(`${fixture.baseUrl}/authenticated${path}`, path.endsWith("rpc") ? {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "mobkit/console/query_timeline", params: {} }),
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "meta/console/query_timeline", params: {} }),
       } : {});
       assert.equal(response.status, 401, path);
     }
@@ -42,7 +42,7 @@ async function faultClassification() {
 }
 
 async function ingressAndResume(mode) {
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "Use the coordinator's prebuilt fixture for both final ingress paths.");
+  assert(process.env.META_EXAMPLE_BIN_DIR, "Use the coordinator's prebuilt fixture for both final ingress paths.");
   const fixture = await startFixture({ mode });
   const evidence = { mode, errors: [] };
   try {
@@ -55,7 +55,7 @@ async function ingressAndResume(mode) {
     const expected = expectedContextContent(instruction, records);
     assert.deepEqual(content, expected, "the actual serializer matches the independent v1 wire contract");
     const beforeLimits = fixture.observations.length;
-    const serializeAndDispatch = values => rpc(fixture.baseUrl, "mobkit/console/send", {
+    const serializeAndDispatch = values => rpc(fixture.baseUrl, "meta/console/send", {
       identity: "router:main", content: serializeConsoleContextMessage(instruction, values),
     });
     assert.throws(() => serializeAndDispatch([...records, { ...records[7], id: "quote-8" }]), /at most 8 quotes/);
@@ -71,15 +71,15 @@ async function ingressAndResume(mode) {
     const before = await snapshot(fixture.baseUrl);
     assert.equal(before[0].event, "snapshot_started");
     fixture.dropNextSendResponse();
-    await assert.rejects(() => rpc(fixture.baseUrl, "mobkit/console/send", envelope));
+    await assert.rejects(() => rpc(fixture.baseUrl, "meta/console/send", envelope));
     const dropped = fixture.observations.find(item => item.dropped);
     assert(dropped, "the proxy must drop an actual completed server response");
     const first = JSON.parse(dropped.response);
     assert(first.result?.input_frame_id, JSON.stringify(first));
-    const replay = await rpc(fixture.baseUrl, "mobkit/console/send", envelope);
+    const replay = await rpc(fixture.baseUrl, "meta/console/send", envelope);
     assert.equal(replay.body.result?.interaction_id, first.result.interaction_id, JSON.stringify(replay.body));
     assert.equal(replay.body.result?.input_frame_id, first.result.input_frame_id);
-    const conflict = await rpc(fixture.baseUrl, "mobkit/console/send", { ...envelope, content: "changed" });
+    const conflict = await rpc(fixture.baseUrl, "meta/console/send", { ...envelope, content: "changed" });
     assert(conflict.body.error, "same key with a changed envelope must be rejected");
     const messages = await eventually(async () => {
       const requests = await (await fetch(`${fixture.backendUrl}/__fixture/requests`)).json();
@@ -120,7 +120,7 @@ async function ingressAndResume(mode) {
     throw error;
   } finally {
     try {
-      const dir = process.env.MOBKIT_API_EVIDENCE || path.join(__dirname, "../output/playwright/console-acceptance");
+      const dir = process.env.META_API_EVIDENCE || path.join(__dirname, "../output/playwright/console-acceptance");
       await fs.mkdir(dir, { recursive: true });
       await fs.writeFile(path.join(dir, `api-${mode}-ingress.json`), JSON.stringify({ ...evidence, observations: fixture.observations, logs: fixture.logs() }, null, 2));
     } finally { await fixture.close(); }
@@ -128,13 +128,13 @@ async function ingressAndResume(mode) {
 }
 
 async function restartIngress(mode) {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), `mobkit-send-${mode}-`));
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), `meta-send-${mode}-`));
   let fixture = await startFixture({ mode, stateDir });
   const envelope = { identity: "router:main", origin: "console:restart-proof", origin_kind: "operator",
     idempotency_key: `restart-${mode}`, handling_mode: "queue", content: "Retain this exact accepted intent across server restart." };
   try {
     await fixture.control("model", { source: "Restart proof accepted once.", delay_ms: 0, chunk_chars: 32 });
-    const first = await rpc(fixture.baseUrl, "mobkit/console/send", envelope);
+    const first = await rpc(fixture.baseUrl, "meta/console/send", envelope);
     assert(first.body.result?.input_frame_id, JSON.stringify(first));
     await eventually(async () => {
       const requests = await (await fetch(fixture.backendUrl + "/__fixture/requests")).json();
@@ -147,10 +147,10 @@ async function restartIngress(mode) {
     }, "original durable receipt and completion");
     await fixture.close();
     fixture = await startFixture({ mode, stateDir });
-    const replay = await rpc(fixture.baseUrl, "mobkit/console/send", envelope);
+    const replay = await rpc(fixture.baseUrl, "meta/console/send", envelope);
     assert.equal(replay.body.result?.interaction_id, first.body.result.interaction_id, JSON.stringify(replay));
     assert.equal(replay.body.result?.input_frame_id, original.id);
-    const changed = await rpc(fixture.baseUrl, "mobkit/console/send", { ...envelope, content: "Different intent" });
+    const changed = await rpc(fixture.baseUrl, "meta/console/send", { ...envelope, content: "Different intent" });
     assert(changed.body.error, "restart does not discard envelope conflict detection");
     const frames = (await (await fetch(fixture.baseUrl + "/console/timeline?identity=router%3Amain&mode=recent&limit=500")).json()).frames;
     assert.equal(frames.filter(frame => frame.id === original.id).length, 1);

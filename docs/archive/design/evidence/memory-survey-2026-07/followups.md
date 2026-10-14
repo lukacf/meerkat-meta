@@ -1,3 +1,4 @@
+Redaction note (0.9): `Hub` is a pseudonymous, redacted name for a private external memory system, and `<local checkout>/` replaces local checkout paths; see [redaction note](README.md).
 
 
 ================ GAP: Do injected memories re-enter the write paths (echo loops)? In MobKit+meerkat: inject_for_turn prepends the memory block to the actual delivered user message
@@ -147,7 +148,7 @@ the session being built/resumed (factory.rs:~5386). Note `open()` runs **per age
 
 ### MobKit capability pass-through
 
-- `(operator-retained path)/meerkat-mobkit/src/mob_handle_runtime.rs:2412-2417`:
+- `<local checkout>/meerkat-mobkit/.claude/worktrees/memory-system/meerkat-mobkit/src/mob_handle_runtime.rs:2412-2417`:
 `AgentFactory::new(&store_path)...comms(caps.comms).memory(caps.memory)`. `CapabilityFlags::default()` has `memory: true` (mob_handle_runtime.rs:2840, 2851). The persistent
 runtime variants do the same pass-through (lines 2600, 2700). So every MobKit-built member gets session-scoped semantic memory against `<store_path>/memory/memory.sqlite3` — one
 shared realm DB for all identities/generations under that runtime's store path.
@@ -156,11 +157,11 @@ shared realm DB for all identities/generations under that runtime's store path.
 
 Two layers interact:
 
-1. `IdentityRuntime::respawn` (`(operator-retained path)/meerkat-mobkit/src/identity_first/runtime.rs:2708-2820`) is itself non-destructive:
+1. `IdentityRuntime::respawn` (`<local checkout>/meerkat-mobkit/.claude/worktrees/memory-system/meerkat-mobkit/src/identity_first/runtime.rs:2708-2820`) is itself non-destructive:
 it re-fences the lease and reuses the **same** `ContinuityRecord` — same `session_id`, generation "does NOT advance" (comment at 2707); it only re-registers runtime state for the
 existing session id (`refresh_existing_session_runtime_state`, runtime.rs:2313-2336).
 2. But the shipped `mobkit/respawn` RPC then always performs a live member refresh: `rpc.rs:2937` `identity_rt.respawn` → `rpc.rs:2939` `respawn_rpc_runtime_member_id` →
-`rpc.rs:4376` `handle.respawn(member_id, None)`. Meerkat-mob's `handle_respawn` (`(operator-retained path)/meerkat/meerkat-mob/src/runtime/actor.rs:14189+`) is a retire-plus-replacement:
+`rpc.rs:4376` `handle.respawn(member_id, None)`. Meerkat-mob's `handle_respawn` (`<local checkout>/meerkat/meerkat-mob/src/runtime/actor.rs:14189+`) is a retire-plus-replacement:
 it retires the old member ("archives the session", actor.rs:14388-14393), discards the spec's `launch_mode` (actor.rs:14327), builds a fresh `CreateSessionRequest` with no
 `resume_session` (actor.rs:14553), and `admit_bridge_session_for_spawn` therefore mints `SessionId::new()` (actor.rs:801-817, admitted at 14570-14574). The RPC reads the new live
 session id and rebinds continuity to it via `rebind_session_after_live_respawn` (rpc.rs:2950-2972). The console does the identical dance (http_console.rs:5233;
@@ -315,22 +316,22 @@ the build-time and per-turn sets are provably identical. The only session-lifeti
 which bounds what *can* be recalled, not what accumulates in context. Duplication grows linearly with turn count, unbounded per session.
 
 Key files:
-- `(operator-retained path)/meerkat-mobkit/src/identity_first/agent_memory.rs` (customizer 448-481; injector 389-421; format 784-811; caps
+- `<local checkout>/meerkat-mobkit/.claude/worktrees/memory-system/meerkat-mobkit/src/identity_first/agent_memory.rs` (customizer 448-481; injector 389-421; format 784-811; caps
 25-38; normalize 505-521; recall 270-303)
-- `(operator-retained path)/meerkat-mobkit/src/identity_first/runtime.rs` (per-turn hook 2425-2444)
-- `(operator-retained path)/meerkat-mobkit/src/unified_runtime/builder.rs` (dual wiring 241-253, 588-598, 759)
-- `(operator-retained path)/meerkat-mobkit/src/bin/rpc_gateway.rs` (dual wiring 2634-2657)
-- `(operator-retained path)/claude-code/src/utils/attachments.ts` (contrast ladder 254-289)
+- `<local checkout>/meerkat-mobkit/.claude/worktrees/memory-system/meerkat-mobkit/src/identity_first/runtime.rs` (per-turn hook 2425-2444)
+- `<local checkout>/meerkat-mobkit/.claude/worktrees/memory-system/meerkat-mobkit/src/unified_runtime/builder.rs` (dual wiring 241-253, 588-598, 759)
+- `<local checkout>/meerkat-mobkit/.claude/worktrees/memory-system/meerkat-mobkit/src/bin/rpc_gateway.rs` (dual wiring 2634-2657)
+- `<local checkout>/cc/claude-code/src/utils/attachments.ts` (contrast ladder 254-289)
 
 
-================ GAP: How does the memory hub's truth maintenance actually DETECT a conflict — what exactly goes into the deterministic slot_key (subject + predicate + security_hash?
+================ GAP: How does Hub truth maintenance actually DETECT a conflict — what exactly goes into the deterministic slot_key (subject + predicate + security_hash?
 object normalization? temporal window?), what condition places two assertions into the same conflict_group (any differing object in one slot, or value-type-specific comparison?),
 and how does supersede_by_recency pick the winner and close the loser's validity window? The reports name the ConflictPolicy variants but never the detection/resolution mechanics,
 which is the piece MobKit's signal-only conflict ledger lacks.
 
 ANSWER:
-MEMORY HUB TRUTH MAINTENANCE — CONFLICT DETECTION AND RESOLUTION MECHANICS
-(all paths under (operator-retained path)/; line numbers from current working tree)
+HUB TRUTH MAINTENANCE — CONFLICT DETECTION AND RESOLUTION MECHANICS
+(all paths under `<local checkout>/hub`; line numbers from current working tree)
 
 =====================================================================
 1. THE DETERMINISTIC slot_key — EXACT COMPOSITION
@@ -457,7 +458,7 @@ winner_id, rationale} (mod.rs:1966-1997); winner_id is validated against the act
 
 Promotion never computes slot_key. `promote_assertions_inline` (crates/pipeline/src/scheduler/inline_promotion.rs:84-412) creates assertion + event + rel/attribute rows and
 accumulates RecordRefs {id, table: "rel"/"attribute"/"event", op} into ONE OutboxPayload "inline_promotion.completed" (lines 395-409). The TM worker in
-bin/hub-pipeline/src/main.rs (~5990-6153) polls system_event rows per space by seq cursor (with seq-reset detection), maps records→TriggerEvents (`trigger_from_record_ref`,
+bin/hub-pipeline/src/main.rs [pseudonymous, redacted binary name; the line numbers are from the original source tree named in this answer's header] (~5990-6153) polls system_event rows per space by seq cursor (with seq-reset detection), maps records→TriggerEvents (`trigger_from_record_ref`,
 mod.rs:3957-3972; slot_keys computed HERE at detection time from the fetched rows), calls `execute_tm_detect_conflicts_from_outbox_events`, then: executes each DirectCommit's
 tm_commit INLINE (main.rs:6088-6102) and enqueues one `tm_resolve_slot` work item per conflict group (priority 50, idempotency key `tm_resolve_slot:{group_id}:{last_seq}`,
 main.rs:6104-6137). A parallel work-queue lane exists: TM_DETECT_CONFLICTS_KIND items (payload = system_event ids) enqueue tm_resolve_slot + tm_commit items (main.rs:5283-5379);
@@ -551,11 +552,11 @@ them ("authoritative", "probably a user change ... you shouldn't just drop it").
 a corrupt or partial memory_summary.md into every session's developer instructions (subject only to an empty-check and token truncation) until the next successful consolidation
 happens to rewrite it.
 
-Key files: (operator-retained path)/codex/codex-rs/memories/write/src/phase2.rs (:253-279 failed = DB-only; :389-436 completion handler; :481-512 loop_agent failure synthesis),
-(operator-retained path)/codex/codex-rs/memories/write/src/workspace.rs (:13-20, :43-46), (operator-retained path)/codex/codex-rs/git-utils/src/baseline.rs (:69-102 reset = fresh commit of
-current tree; :78-92 ensure preserves .git; :157-160 index-only reset), (operator-retained path)/codex/codex-rs/ext/memories/src/prompts.rs (:27-51 no sentinel check),
-(operator-retained path)/codex/codex-rs/ext/memories/src/extension.rs (:51-71 injection), (operator-retained path)/codex/codex-rs/memories/write/templates/memories/consolidation.md (:136-148,
-:163-166, :189, :854), (operator-retained path)/codex/codex-rs/memories/write/src/lib.rs (:105-107 lease/heartbeat constants).
+Key files: `<local checkout>/cc/codex/codex-rs/memories/write/src/phase2.rs` (:253-279 failed = DB-only; :389-436 completion handler; :481-512 loop_agent failure synthesis),
+`<local checkout>/cc/codex/codex-rs/memories/write/src/workspace.rs` (:13-20, :43-46), `<local checkout>/cc/codex/codex-rs/git-utils/src/baseline.rs` (:69-102 reset = fresh commit of
+current tree; :78-92 ensure preserves .git; :157-160 index-only reset), `<local checkout>/cc/codex/codex-rs/ext/memories/src/prompts.rs` (:27-51 no sentinel check),
+`<local checkout>/cc/codex/codex-rs/ext/memories/src/extension.rs` (:51-71 injection), `<local checkout>/cc/codex/codex-rs/memories/write/templates/memories/consolidation.md` (:136-148,
+:163-166, :189, :854), `<local checkout>/cc/codex/codex-rs/memories/write/src/lib.rs` (:105-107 lease/heartbeat constants).
 
 
 ================ GAP: Can MobKit's MarkdownAgentMemoryStore ever update or supersede a memory, or do repeated/contradictory remembers only accumulate? memory_id embeds a
@@ -568,7 +569,7 @@ ANSWER:
 ANSWER: MobKit's MarkdownAgentMemoryStore can NEVER update or supersede a memory. There is no update/upsert path anywhere in the write chain; repeated and contradictory remembers
 strictly accumulate, and the only removal mechanisms are explicit `forget` by exact memory_id and the newest-first 512-record/8MiB retention cap. Contradiction resolution is
 entirely absent — not implemented anywhere, not even delegated to a prompt. All claims below verified in code; all paths under
-`(operator-retained path)/`.
+`<local checkout>/meerkat-mobkit/.claude/worktrees/memory-system/`.
 
 ## (a) Identical content saved twice produces two records — CONFIRMED
 

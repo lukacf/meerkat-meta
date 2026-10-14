@@ -3,7 +3,7 @@ import React from "react";
 export type ConsoleVariant = "rams" | "terminal" | "graphite";
 export type ConsoleTheme = "dark" | "light";
 
-const VARIANT_STORAGE = "mobkit-console-variant";
+const VARIANT_STORAGE = "meta-console-variant";
 
 export function useConsoleVariant(): [ConsoleVariant, (v: ConsoleVariant) => void] {
   const [v, setV] = React.useState<ConsoleVariant>(() => {

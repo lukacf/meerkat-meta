@@ -15,7 +15,7 @@ green()  { printf '\033[0;32m%s\033[0m\n' "$*"; }
 
 CARGO_VER=$("$CARGO" metadata --manifest-path "$ROOT/Cargo.toml" \
     --no-deps --format-version 1 \
-    | jq -r '.packages[] | select(.name == "meerkat-mobkit") | .version')
+    | jq -r '.packages[] | select(.name == "meerkat-meta") | .version')
 
 PY_VER=$(python3 -c "
 import pathlib
@@ -40,7 +40,7 @@ if [ -f "$MODULE_FILE" ]; then
 fi
 
 echo "Package versions:"
-echo "  Cargo (meerkat-mobkit):  $CARGO_VER"
+echo "  Cargo (meerkat-meta):  $CARGO_VER"
 echo "  Python SDK:                   $PY_VER"
 if [ -n "$TS_VER" ]; then
     echo "  TypeScript SDK:               $TS_VER"
@@ -82,7 +82,7 @@ fi
 # 2. Bazel rustc_env parity — drives env!("CARGO_PKG_VERSION") in the
 # bazel-built RELEASE binaries (and their --version). Drifted to 0.7.4 across
 # 0.7.5–0.7.7 because nothing checked it; now it does.
-BAZEL_FILE="$ROOT/crates/meerkat-mobkit/BUILD.bazel"
+BAZEL_FILE="$ROOT/crates/meerkat-meta/BUILD.bazel"
 if [ -f "$BAZEL_FILE" ]; then
     BAD_BAZEL=$(grep -oE '"CARGO_PKG_VERSION": "[^"]*"' "$BAZEL_FILE" \
         | grep -v "\"$CARGO_VER\"" | sort -u || true)
@@ -117,9 +117,9 @@ fi
 # cross minor versions, so an old snippet silently keeps users off the release.
 for DOC in "$ROOT/docs/quickstart.mdx" "$ROOT/docs/sdks/rust.mdx"; do
     if [ -f "$DOC" ]; then
-        DOC_VERSIONS=$(sed -n 's/.*meerkat-mobkit = "\([^"]*\)".*/\1/p' "$DOC" | sort -u)
+        DOC_VERSIONS=$(sed -n 's/.*meerkat-meta = "\([^"]*\)".*/\1/p' "$DOC" | sort -u)
         if [ -z "$DOC_VERSIONS" ]; then
-            red "FAIL: $DOC has no meerkat-mobkit installation version"
+            red "FAIL: $DOC has no meerkat-meta installation version"
             FAIL=1
         elif [ "$DOC_VERSIONS" != "$CARGO_VER" ]; then
             red "FAIL: $DOC install version mismatch ($DOC_VERSIONS != $CARGO_VER)"

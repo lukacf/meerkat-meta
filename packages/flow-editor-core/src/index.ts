@@ -1,10 +1,10 @@
-// @flow-editor-core — the MobKit Flow Editor's headless controller plane.
+// @flow-editor-core — the Meta Flow Editor's headless controller plane.
 //
 // Pure projection/transition logic extracted from the legacy
 // flow-editor/src/controller.js monolith, module by module. Framework-free:
 // no DOM access at load time, no React. The shell bundles this package as
-// the window.MobKitFlowCore IIFE and the controller.js bootstrap builds
-// window.MobKitFlowController from createMobKitFlowController.
+// the window.MetaFlowCore IIFE and the controller.js bootstrap builds
+// window.MetaFlowController from createMetaFlowController.
 export * from "./catalogs/hydration";
 export * from "./contract/options";
 export * from "./controller-facade";

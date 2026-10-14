@@ -1,5 +1,5 @@
 /**
- * Runtime-store durability declaration for MobKit runtime.
+ * Runtime-store durability declaration for Meta runtime.
  *
  * The gateway's runtime store (`runtime.sqlite` — session resume, archive,
  * retire) is persistent SQLite by default and needs no configuration.
@@ -9,14 +9,14 @@
  * module produces:
  *
  * ```ts
- * import { runtimeStore } from "@rkat/mobkit-sdk";
- * MobKit.builder().runtimeStore(runtimeStore.memory());
+ * import { runtimeStore } from "@rkat/meta-sdk";
+ * Meta.builder().runtimeStore(runtimeStore.memory());
  * ```
  *
  * which serializes to the `runtime_options.runtime_store =
  * {"storage": "memory"}` wire form. Sessions then do not survive gateway
  * restart, and the choice is visible in the storage census
- * (`mobkit/status` → `storage.slots`).
+ * (`meta/status` → `storage.slots`).
  */
 
 /**

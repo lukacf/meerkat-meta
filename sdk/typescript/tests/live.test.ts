@@ -29,7 +29,7 @@ import { parseCapabilitiesResult } from "../src/types.js";
 
 const fixture = JSON.parse(
   readFileSync(
-    new URL("../../../crates/meerkat-mobkit/tests/fixtures/live_contracts_v1.json", import.meta.url),
+    new URL("../../../crates/meerkat-meta/tests/fixtures/live_contracts_v1.json", import.meta.url),
     "utf8",
   ),
 ) as Record<string, unknown>;
@@ -38,9 +38,9 @@ describe("openai live gateway registration", () => {
   it("serializes the console voice summary bounds exactly and omits them when unset", () => {
     assert.deepEqual(
       openAiLiveGatewayConfigToWire({
-        principal: "user:luka",
+        principal: "user:example",
         realm: "example",
-        authBinding: { realm: "example", binding: "openai-api-key", profile: "luka" },
+        authBinding: { realm: "example", binding: "openai-api-key", profile: "example" },
         voice: "marin",
         sessionInstructions: "You are a test voice agent.",
         summary: { model: "gpt-5.4-mini", maxInputBytes: 32768, maxOutputBytes: 2048 },
@@ -48,7 +48,7 @@ describe("openai live gateway registration", () => {
       fixture.openai_live_gateway_config_with_summary,
     );
     const partial = openAiLiveGatewayConfigToWire({
-      principal: "user:luka",
+      principal: "user:example",
       realm: "example",
       authBinding: { realm: "example", binding: "openai-api-key" },
       voice: "marin",
@@ -57,7 +57,7 @@ describe("openai live gateway registration", () => {
     assert.deepEqual(partial.summary, { max_output_bytes: 1024 });
     assert.equal(
       "summary" in openAiLiveGatewayConfigToWire({
-        principal: "user:luka",
+        principal: "user:example",
         realm: "example",
         authBinding: { realm: "example", binding: "openai-api-key" },
         voice: "marin",
@@ -69,9 +69,9 @@ describe("openai live gateway registration", () => {
   it("serializes the public gpt-live-1 registration exactly", () => {
     assert.deepEqual(
       openAiLiveGatewayConfigToWire({
-        principal: "user:luka",
+        principal: "user:example",
         realm: "example",
-        authBinding: { realm: "example", binding: "openai-api-key", profile: "luka" },
+        authBinding: { realm: "example", binding: "openai-api-key", profile: "example" },
         voice: "marin",
         sessionInstructions: "You are a test voice agent.",
       }),
@@ -79,13 +79,13 @@ describe("openai live gateway registration", () => {
     );
     assert.deepEqual(
       openAiLiveGatewayConfigToWire({
-        principal: "user:luka",
+        principal: "user:example",
         realm: "example",
         authBinding: { realm: "example", binding: "openai-api-key" },
         voice: "marin",
       }),
       {
-        principal: "user:luka",
+        principal: "user:example",
         realm: "example",
         auth_binding: { realm: "example", binding: "openai-api-key" },
         voice: "marin",
@@ -102,7 +102,7 @@ describe("openai live gateway registration", () => {
 
   it("rejects cross-realm bindings, blank fields, and authority-bearing keys", () => {
     const base = {
-      principal: "user:luka",
+      principal: "user:example",
       realm: "example",
       authBinding: { realm: "example", binding: "openai-api-key" },
       voice: "marin",
@@ -149,7 +149,7 @@ describe("experimental live gateway registration", () => {
   it("serializes every authority-bearing field without defaults", () => {
     assert.deepEqual(
       experimentalLiveGatewayConfigToWire({
-        principal: "user:luka",
+        principal: "user:example",
         realm: "example",
         factoryKind: "openai-gpt-live",
         factoryVersion: "v1",
@@ -157,7 +157,7 @@ describe("experimental live gateway registration", () => {
         authBinding: {
           realm: "example",
           binding: "chatgpt-oauth",
-          profile: "luka",
+          profile: "example",
         },
         voice: "marin",
         executionProfiles: [
@@ -174,7 +174,7 @@ describe("experimental live gateway registration", () => {
   it("rejects an auth binding from another realm", () => {
     assert.throws(() =>
       experimentalLiveGatewayConfigToWire({
-        principal: "user:luka",
+        principal: "user:example",
         realm: "example",
         factoryKind: "openai-gpt-live",
         factoryVersion: "v1",
@@ -188,7 +188,7 @@ describe("experimental live gateway registration", () => {
   it("rejects caller-owned instructions in gateway config", () => {
     assert.throws(() =>
       experimentalLiveGatewayConfigToWire({
-        principal: "user:luka",
+        principal: "user:example",
         realm: "example",
         factoryKind: "openai-gpt-live",
         factoryVersion: "v1",
@@ -202,7 +202,7 @@ describe("experimental live gateway registration", () => {
 
   it("rejects malformed, reserved, duplicate, and authority-bearing profiles", () => {
     const base = {
-      principal: "user:luka",
+      principal: "user:example",
       realm: "example",
       factoryKind: "openai-gpt-live",
       factoryVersion: "v1",
@@ -336,7 +336,7 @@ describe("LiveChannelHandle", () => {
   it("parses the shared canonical handle fixture", () => {
     const handle = parseLiveChannelHandle(fixture.channel_handle);
     assert.equal(handle.channelId, "live-ch-1");
-    assert.equal(handle.targetIdentity, "identity:luka");
+    assert.equal(handle.targetIdentity, "identity:example");
     assert.equal(handle.transport.transport, "websocket");
     assert.equal(handle.continuity.mode, "transcript_only");
     assert.equal(handle.capabilities.imageIn, true);

@@ -75,7 +75,7 @@ const RENDER_CLASS_SOURCES: Record<string, { kind: ConversationEntrySourceKind; 
   ops_progress: { kind: "system_notice", label: "Progress update" },
 };
 
-/** MobKit `ConsoleTurnOrigin` (snake_case wire form) to a header label. */
+/** Meta `ConsoleTurnOrigin` (snake_case wire form) to a header label. */
 const TURN_ORIGIN_SOURCES: Record<string, { kind: ConversationEntrySourceKind; label: string }> = {
   operator: { kind: "operator", label: "Operator" },
   operator_probe: { kind: "operator_probe", label: "Operator probe" },
@@ -117,7 +117,7 @@ export function parseMemberCommsName(value: string | null | undefined): MemberCo
 const MEMBER_ID_MARKER = "mk--";
 
 /**
- * Decode a MobKit comms-safe roster member id back to its public alias,
+ * Decode a Meta comms-safe roster member id back to its public alias,
  * mirroring `member_comms_id::runtime_alias_str`: `mk--` + body where
  * `__` is `_`, `_c` is `:`, and `_x{hex}_` is the char with that code point.
  * Ids without the marker are already aliases. A malformed body returns the

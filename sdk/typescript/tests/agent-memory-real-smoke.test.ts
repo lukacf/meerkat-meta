@@ -6,15 +6,15 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { MobKit } from "../dist/index.js";
+import { Meta } from "../dist/index.js";
 
 const shouldRun =
-  process.env.MOBKIT_AGENT_MEMORY_REAL_API_SMOKE === "1";
+  process.env.META_AGENT_MEMORY_REAL_API_SMOKE === "1";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 function resolveGatewayBin(): string {
-  if (process.env.MOBKIT_RPC_GATEWAY_BIN) {
-    return process.env.MOBKIT_RPC_GATEWAY_BIN;
+  if (process.env.META_RPC_GATEWAY_BIN) {
+    return process.env.META_RPC_GATEWAY_BIN;
   }
   try {
     const output = execFileSync(
@@ -70,7 +70,7 @@ async function sendAndWaitForToken(
   baseUrl: string,
   idempotencyKey: string,
 ): Promise<string> {
-  const send = await consoleRpc(baseUrl, "mobkit/console/send", {
+  const send = await consoleRpc(baseUrl, "meta/console/send", {
     identity: "identity:memory-smoke",
     content: "Reply with only the secret smoke token from your persisted memory.",
     origin: "agent-memory-real-smoke",
@@ -82,7 +82,7 @@ async function sendAndWaitForToken(
   let observed = "";
   for (let attempt = 0; attempt < 90; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 2_000));
-    const page = await consoleRpc(baseUrl, "mobkit/console/query_timeline", {
+    const page = await consoleRpc(baseUrl, "meta/console/query_timeline", {
       identity: "identity:memory-smoke",
       mode: "recent",
       limit: 80,
@@ -99,7 +99,7 @@ describe("agent memory real API smoke", { skip: !shouldRun }, () => {
   it("injects persisted identity memory into a real gateway-backed turn", { timeout: 240_000 }, async () => {
     assert.ok(
       process.env.OPENAI_API_KEY,
-      "OPENAI_API_KEY is required when MOBKIT_AGENT_MEMORY_REAL_API_SMOKE=1",
+      "OPENAI_API_KEY is required when META_AGENT_MEMORY_REAL_API_SMOKE=1",
     );
     const root = mkdtempSync(join(tmpdir(), "mobkit-agent-memory-smoke-"));
     const configDir = join(root, "config");
@@ -122,7 +122,7 @@ source = "inline"
 content = "You are a terse smoke-test agent. Answer exactly what the user asks for."
 
 [profiles.memory_smoke]
-model = "${process.env.MOBKIT_AGENT_MEMORY_SMOKE_MODEL ?? "gpt-5.5"}"
+model = "${process.env.META_AGENT_MEMORY_SMOKE_MODEL ?? "gpt-5.5"}"
 external_addressable = true
 runtime_mode = "autonomous_host"
 skills = ["memory_smoke"]
@@ -150,9 +150,9 @@ memory = false
       }
     }
 
-    let runtime: Awaited<ReturnType<ReturnType<typeof MobKit.builder>["build"]>> | null = null;
+    let runtime: Awaited<ReturnType<ReturnType<typeof Meta.builder>["build"]>> | null = null;
     try {
-      runtime = await MobKit.builder()
+      runtime = await Meta.builder()
         .mob(mobToml)
         .gateway(gatewayBin)
         .persistentState(stateWriteDir)
@@ -207,7 +207,7 @@ memory = false
         writtenMemory,
       );
 
-      runtime = await MobKit.builder()
+      runtime = await Meta.builder()
         .mob(mobToml)
         .gateway(gatewayBin)
         .persistentState(stateRunDir)
@@ -250,7 +250,7 @@ memory = false
       if (runtime) {
         await runtime.shutdown();
       }
-      if (process.env.MOBKIT_KEEP_AGENT_MEMORY_SMOKE !== "1") {
+      if (process.env.META_KEEP_AGENT_MEMORY_SMOKE !== "1") {
         rmSync(root, { recursive: true, force: true });
       }
     }

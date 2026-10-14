@@ -1,4 +1,4 @@
-# Pre-commit configuration for MobKit
+# Pre-commit configuration for Meta
 # Install: pip install pre-commit
 # Setup: pre-commit install && pre-commit install --hook-type pre-push
 
@@ -30,10 +30,10 @@ repos:
         stages: [pre-push]
         # Byte-lossless corpus fixtures (release-minted realms, forensic
         # bundles with checksum manifests) must never be text-normalized.
-        exclude: ^crates/meerkat-mobkit/tests/fixtures/
+        exclude: ^crates/meerkat-meta/tests/fixtures/
       - id: end-of-file-fixer
         stages: [pre-push]
-        exclude: ^crates/meerkat-mobkit/tests/fixtures/
+        exclude: ^crates/meerkat-meta/tests/fixtures/
       - id: check-yaml
         stages: [pre-push]
       - id: check-toml

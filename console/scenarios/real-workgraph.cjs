@@ -8,7 +8,7 @@ const { randomUUID } = require("node:crypto");
 const { chromium } = require("playwright");
 const { startFixture, eventually, rpc } = require("../acceptance-runtime.cjs");
 
-const evidenceDir = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+const evidenceDir = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
 const sender = "router:main";
 const recipient = "domain:delivery";
 const graphSteps = [
@@ -19,7 +19,7 @@ const graphSteps = [
 ];
 
 function requirePrebuiltFixture() {
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "Set MOBKIT_EXAMPLE_BIN_DIR to the coordinator's prebuilt examples; this lane must not trigger Cargo.");
+  assert(process.env.META_EXAMPLE_BIN_DIR, "Set META_EXAMPLE_BIN_DIR to the coordinator's prebuilt examples; this lane must not trigger Cargo.");
 }
 
 async function ownerRpc(fixture, method, params = {}) {
@@ -32,7 +32,7 @@ async function ownerRpc(fixture, method, params = {}) {
 
 async function waitForMembers(fixture) {
   const response = await eventually(async () => {
-    const observed = await rpc(fixture.baseUrl, "mobkit/wait_ready", { timeout_ms: 1_000 });
+    const observed = await rpc(fixture.baseUrl, "meta/wait_ready", { timeout_ms: 1_000 });
     if (observed.body.error?.message?.includes("observation_lane_saturated")) return false;
     if (observed.body.result?.timeout === true) return false;
     return observed;
@@ -105,9 +105,9 @@ async function completedTranscript(fixture, identity, heading) {
 }
 
 async function canonicalSenderOwner(fixture) {
-  const peer = await ownerRpc(fixture, "mobkit/cross_mob/peer_info", { member_id: sender });
+  const peer = await ownerRpc(fixture, "meta/cross_mob/peer_info", { member_id: sender });
   // The runtime builds comms_name from the actual roster entry through
-  // MemberCommsName::new(mob_id, role, entry.agent_identity). MobKit's public
+  // MemberCommsName::new(mob_id, role, entry.agent_identity). Meta's public
   // alias can contain ':' while the canonical roster identity is encoded.
   // Lower the returned binding with WorkOwnerKey::mob_agent's wire contract.
   const parts = peer.comms_name?.split("/");
@@ -127,7 +127,7 @@ async function configureGraph(fixture, runId) {
 }
 
 async function apiSend(fixture, content) {
-  const accepted = await ownerRpc(fixture, "mobkit/console/send", {
+  const accepted = await ownerRpc(fixture, "meta/console/send", {
     identity: sender, content, origin: "console:workgraph-acceptance", origin_kind: "operator",
     idempotency_key: randomUUID(), handling_mode: "queue",
   });
@@ -164,7 +164,7 @@ async function graphEvidence(fixture, runId) {
     assert.equal(item(`claim-${part}`).status, "in_progress");
     assert.equal(item(`close-${part}`).status, "completed");
   }
-  const snapshot = await ownerRpc(fixture, "mobkit/workgraph/snapshot", { labels: [`fixture-${runId}`], include_terminal: true });
+  const snapshot = await ownerRpc(fixture, "meta/workgraph/snapshot", { labels: [`fixture-${runId}`], include_terminal: true });
   assert.equal(snapshot.items.length, 3);
   assert(snapshot.items.every(value => value.status === "completed"));
   assert.equal(snapshot.edges.filter(edge => edge.kind === "blocks").length, 2);
@@ -254,7 +254,7 @@ function authoritySetupCancellation(request) {
   if (new URL(request.url()).pathname.endsWith("/timeline/stream")) return true;
   try {
     const body = JSON.parse(request.postData() || "{}");
-    return body.method === "mobkit/console/query_timeline" && body.params?.mode === "recent"
+    return body.method === "meta/console/query_timeline" && body.params?.mode === "recent"
       && body.params?.limit === 200 && !body.params?.identity;
   } catch { return false; }
 }
@@ -304,7 +304,7 @@ async function browserSend(page, host, identity, content) {
     if (response.request().method() !== "POST") return false;
     try {
       const envelope = JSON.parse(response.request().postData() || "{}");
-      const request = envelope.method === "mobkit/console/send" ? envelope.params : response.url().endsWith("/send") ? envelope : null;
+      const request = envelope.method === "meta/console/send" ? envelope.params : response.url().endsWith("/send") ? envelope : null;
       return request?.identity === identity && (request.content === content
         || Array.isArray(request.content) && request.content.length === 1 && request.content[0].type === "text" && request.content[0].text === content);
     } catch { return false; }
@@ -345,7 +345,7 @@ async function captureFailure(fixture, name, error, page, monitor) {
 
 async function composedGraphAndPeer(host) {
   requirePrebuiltFixture();
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), `mobkit-${host}-workgraph-`));
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), `meta-${host}-workgraph-`));
   const fixture = await startFixture({ stateDir });
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
@@ -426,7 +426,7 @@ async function composedGraphAndPeer(host) {
 
 async function graphOwnerRestart() {
   requirePrebuiltFixture();
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "mobkit-workgraph-owner-"));
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "meta-workgraph-owner-"));
   let fixture = await startFixture({ stateDir });
   try {
     await waitForMembers(fixture);
@@ -436,7 +436,7 @@ async function graphOwnerRestart() {
     const peer = await peerEvidence(fixture, graph, content => apiSend(fixture, content));
     await fixture.close(); fixture = await startFixture({ stateDir });
     await waitForMembers(fixture);
-    const restored = await ownerRpc(fixture, "mobkit/workgraph/snapshot", { labels: [`fixture-${runId}`], include_terminal: true });
+    const restored = await ownerRpc(fixture, "meta/workgraph/snapshot", { labels: [`fixture-${runId}`], include_terminal: true });
     assert.deepEqual(restored.items, graph.snapshot.items, "owner restart preserves exact completed item revisions");
     assert.deepEqual(restored.edges, graph.snapshot.edges, "owner restart preserves exact dependency edges");
     const replayedPeer = await timeline(fixture, recipient);
@@ -490,12 +490,12 @@ async function graphEventPolls() {
     for (const step of ["events-first", "events-repeat", "events-empty"]) {
       const call = calls.find(call => call.id === `fixture-${runId}-${step}`);
       assert.equal(call.name, "workgraph_events");
-      const ownerResult = await ownerRpc(fixture, "mobkit/workgraph/events", call.args);
+      const ownerResult = await ownerRpc(fixture, "meta/workgraph/events", call.args);
       assert.deepEqual(ownerResult, results.get(step), "host RPC and agent tool read the same canonical event ledger");
     }
     const lastSeq = Math.max(...first.events.map(event => event.seq));
     assert.equal(calls.at(-1).args.after_seq, lastSeq, "the empty query starts after the actual observed watermark");
-    evidence.ownerItem = await ownerRpc(fixture, "mobkit/workgraph/get", { id: item.id });
+    evidence.ownerItem = await ownerRpc(fixture, "meta/workgraph/get", { id: item.id });
     assert.deepEqual(evidence.ownerItem.item, item, "event polling does not mutate the item");
     evidence.eventClocks = await page.evaluate(events => ({
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,

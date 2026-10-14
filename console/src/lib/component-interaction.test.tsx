@@ -187,7 +187,7 @@ test("stock Sidebar keyboard reorder announces movement and retains focus", asyn
     const focused = dom.window.document.activeElement as HTMLElement | null;
     assert.equal(focused?.getAttribute("data-testid"), "sidebar-section-toggle:Alpha");
     assert.deepEqual(
-      JSON.parse(dom.window.localStorage.getItem("mobkit-console-sidebar-section-order:component-interaction") || "[]"),
+      JSON.parse(dom.window.localStorage.getItem("meta-console-sidebar-section-order:component-interaction") || "[]"),
       ["Beta", "Alpha"],
     );
   } finally {
@@ -695,7 +695,7 @@ test("WorkGraphCard actions after a CAS conflict send the refetched revision, no
     },
     // The claim sent revision 1 while the item had moved to 5: conflict…
     buildWorkGraphOperatorResultFrame({
-      method: "mobkit/workgraph/claim",
+      method: "meta/workgraph/claim",
       params: { id: "item-cas", expected_revision: 1, owner: { kind: "principal", id: "ops@example.com" } },
       errorMessage: "workgraph conflict: stale revision 1, item is at 5",
       identity: "planner",
@@ -704,7 +704,7 @@ test("WorkGraphCard actions after a CAS conflict send the refetched revision, no
     }),
     // …and the automatic post-conflict re-read folds the live state.
     buildWorkGraphOperatorResultFrame({
-      method: "mobkit/workgraph/get",
+      method: "meta/workgraph/get",
       params: { id: "item-cas" },
       result: { item: item(5, "in_progress") },
       identity: "planner",

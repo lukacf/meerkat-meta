@@ -1,35 +1,35 @@
 ---
 title: "TypeScript SDK"
-description: "TypeScript SDK for MobKit with type-safe contracts, parity tests, and ESM/CommonJS support."
+description: "TypeScript SDK for Meta with type-safe contracts, parity tests, and ESM/CommonJS support."
 icon: "js"
 ---
 
-The TypeScript SDK (`@rkat/mobkit-sdk`) provides type-safe access to the MobKit JSON-RPC gateway from Node.js.
+The TypeScript SDK (`@rkat/meta-sdk`) provides type-safe access to the Meta JSON-RPC gateway from Node.js.
 
 ## Installation
 
 ```bash
-npm install @rkat/mobkit-sdk
+npm install @rkat/meta-sdk
 ```
 
 <Note>
   The npm package is client-only and does not contain `rpc_gateway`. Download
-  `mobkit-rpc-gateway-<version>-<target>.tar.gz` for Unix or macOS, or
-  `mobkit-rpc-gateway-<version>-<target>.zip` for Windows, and extract its
+  `meta-rpc-gateway-<version>-<target>.tar.gz` for Unix or macOS, or
+  `meta-rpc-gateway-<version>-<target>.zip` for Windows, and extract its
   `rpc_gateway` binary (`rpc_gateway.exe` on Windows). Alternatively, follow the
-  [source-build instructions](/quickstart#install). Pass that binary's path to
+  [source-build instructions](/quickstart#prepare-a-matching-sdk-and-gateway). Pass that binary's path to
   `.gateway(...)`.
 </Note>
 
 ## Quick start
 
 ```typescript
-import { MobKit, memory } from "@rkat/mobkit-sdk";
+import { Meta, memory } from "@rkat/meta-sdk";
 
-const rt = await MobKit.builder()
+const rt = await Meta.builder()
   .mob("config/mob.toml")
   .memory(memory.localJson())
-  .persistentState(".mobkit/state")
+  .persistentState(".meta/state")
   .consoleConfig("config/console.toml")
   .gateway("/path/to/rpc_gateway")
   .build();
@@ -82,8 +82,8 @@ propagates unchanged.
 identity-wide: any completion on the identity satisfies them.
 
 Every wait is server-side and event-driven: `waitForTurn` is one
-`mobkit/wait_for_turn` request, and `waitForCompletion` / `waitUntilReady` are
-one `mobkit/wait_for_completion` request per identity. The gateway answers
+`meta/wait_for_turn` request, and `waitForCompletion` / `waitUntilReady` are
+one `meta/wait_for_completion` request per identity. The gateway answers
 when the ticket settles or a completion is recorded, so nothing polls, and the
 member's output is read once, at completion. `timeoutMs` is only the deadline;
 `pollIntervalMs` applies only against a gateway that predates the server-side
@@ -95,16 +95,54 @@ A wait that ends before a completion (a failed or cancelled run, a Broken,
 retiring or deleted identity, or gateway shutdown) rejects with the typed
 `WaitEndedError`, whose `outcome` names why.
 
+## Scope-bound dispatch
+
+Capture the identity's scope from `status()`, persist it, and dispatch
+against it. A moved scope throws `StaleScopeError` with nothing submitted; a
+lost reply is recovered from the scope's original session.
+
+```typescript
+import { deliveryScopeToDict, parseDeliveryScope, StaleScopeError } from "@rkat/meta-sdk";
+
+const status = await runtime.status("domain:calendar");
+if (!status.deliveryScope) throw new Error(status.deliveryScopeUnavailable?.reason);
+const saved = deliveryScopeToDict(status.deliveryScope); // persist byte-exact
+
+try {
+  const { receipt } = await runtime.dispatch(
+    "domain:calendar",
+    { content: "occurrence 42", origin: "system", idempotencyKey: "occ-42", correlationId },
+    { expectedScope: parseDeliveryScope(saved) },
+  );
+  receipt.stage; // "ingress_accepted": not a durable-input claim
+} catch (error) {
+  if (error instanceof StaleScopeError) error.mismatch; // nothing was submitted
+}
+
+const recovery = await runtime.recoverDelivery("domain:calendar", parseDeliveryScope(saved), {
+  idempotencyKey: "occ-42",
+  correlationId,
+});
+// recovery.state: "absent" is a point-in-time miss, never permission to retry
+```
+
+`expectedScope` needs both keys, does not combine with `trackTurn`, and
+applies no delivery preparation. `parseDeliveryScope` throws
+`ContractMismatchError` for an unknown scope `version`; `status()` then
+leaves `deliveryScope` `null` and the rest usable. An unknown recovery state
+reads as `unresolved`, never `absent`. See
+[Scope-bound dispatch](/api/rpc#scope-bound-dispatch).
+
 ## Durable detached tools
 
 Long-running host work must declare detached execution rather than keeping a
 tool callback open:
 
 ```typescript
-import { DetachedJobExecution, DetachedJobResult, MobKit } from "@rkat/mobkit-sdk";
+import { DetachedJobExecution, DetachedJobResult, Meta } from "@rkat/meta-sdk";
 
-const runtime = await MobKit.builder()
-  .persistentState("state/mobkit")
+const runtime = await Meta.builder()
+  .persistentState("state/meta")
   .jobCredentials(resolveProfileCredentials)
   .sessionService({
     async buildAgent(draft) {
@@ -177,6 +215,13 @@ export interface UnifiedModuleEvent {
 export type UnifiedEvent = UnifiedAgentEvent | UnifiedModuleEvent;
 ```
 
+`handle.gatingDecide(...)` returns the decision plus `approverId`, `outcome`,
+`decidedAtMs`, `reason`, and `nextPendingId`. These added fields are optional for
+compatibility with existing TypeScript objects; parsed responses use `null` when
+a field is absent or malformed. Unknown outcome strings are preserved.
+`nextPendingId` identifies an escalation successor; the SDK does not automatically
+retry or execute the action. See [Gating](/concepts/gating) for decision semantics.
+
 `ModuleConfig` is not a public TypeScript SDK export. Pass module declaration
 objects to `.modules(...)`, whose public parameter type is `unknown[]`.
 
@@ -209,10 +254,10 @@ The SDK supports both ESM and CommonJS:
 
 ```typescript
 // ESM
-import { MobKit } from "@rkat/mobkit-sdk";
+import { Meta } from "@rkat/meta-sdk";
 
 // CommonJS
-const { MobKit } = require("@rkat/mobkit-sdk");
+const { Meta } = require("@rkat/meta-sdk");
 ```
 
 ### Cross-module identity check
@@ -223,7 +268,7 @@ constructors in the same process, **prefer the structural type guards
 over `instanceof`**:
 
 ```typescript
-import { isRpcError, isMobEventsStaleError } from "@rkat/mobkit-sdk";
+import { isRpcError, isMobEventsStaleError } from "@rkat/meta-sdk";
 
 try {
   await handle.queryMobEvents({ afterSeq: cursor });
@@ -243,7 +288,7 @@ try {
 Both APIs return the full meerkat ledger projection:
 
 ```typescript
-import { isMobEventsStaleError } from "@rkat/mobkit-sdk";
+import { isMobEventsStaleError } from "@rkat/meta-sdk";
 
 const events = await handle.queryMobEvents({
   eventTypes: ["flow_started", "flow_completed"],
@@ -254,7 +299,7 @@ for (const e of events) {
 }
 
 // MobStructuralEvent.cursor is the meerkat ledger cursor — durable
-// across mobkit restarts on persistent_state builds. Resume by
+// across meta restarts on persistent_state builds. Resume by
 // passing the highest-seen cursor as afterSeq.
 try {
   const more = await handle.queryMobEvents({ afterSeq: lastCursor });
@@ -273,7 +318,7 @@ for (const run of runs) {
 
 ## Mobpack authoring
 
-`MobHandle` wraps the full Flow Editor authoring surface (`mobkit/mobpacks/*`) with typed methods: `mobpackTemplates`, `mobpackCatalogs`, `mobpackValidate`, `mobpackSource`, `mobpackExport`, `mobpackImport`, `mobpackList`, `mobpackGet`, `mobpackCreate`, `mobpackSave`, `mobpackDelete`, `mobpackUndo`, `mobpackRedo`, `mobpackApplyOperation`, `mobpackDeployCommand`, and `mobpackDeploy`.
+`MobHandle` wraps the full Flow Editor authoring surface (`meta/mobpacks/*`) with typed methods: `mobpackTemplates`, `mobpackCatalogs`, `mobpackValidate`, `mobpackSource`, `mobpackExport`, `mobpackImport`, `mobpackList`, `mobpackGet`, `mobpackCreate`, `mobpackSave`, `mobpackDelete`, `mobpackUndo`, `mobpackRedo`, `mobpackApplyOperation`, `mobpackDeployCommand`, and `mobpackDeploy`.
 
 ```typescript
 // Create a draft from the blank template, validate, export
@@ -296,9 +341,9 @@ The TypeScript SDK targets the JSON-RPC gateway. Rust also exposes lower-level n
 External identity providers are all-or-nothing: configure `continuityStore()`, `leaseProvider()`, and `scratchDir()` together. The SDK sends the corresponding init flags to Rust, and provider callbacks use Rust's wire shape (`result` tags and `ttl`). `LeaseProvider.renewLeases(...)` is atomic from the caller's perspective: a rejected promise means no input grant was changed, while every returned `renewed` or `lost` result is already committed for that identity. Providers must not commit a replacement grant and then reject.
 Continuity stores should treat `checkpoint_version` as monotonic per identity and continuity generation. A live session rebind changes `session_id` without resetting the version; only destructive reset advances `generation` and starts the version stream over.
 
-Raw gateway memory config accepts `{ backend: "local_json", health_check_endpoint: url }`, with `health_check_endpoint` optional. The TypeScript helper is `memory.localJson({ healthCheckEndpoint: url })`; it translates that option to the snake_case wire key. The legacy `elephant` `{ backend, endpoint }` shape still works but is deprecated. Store, collection, and space selectors are retained on the helper object for app code but are not sent to the Rust gateway. Gateway auth config supports JWT validation; Google/OIDC helpers are model objects, not accepted by `mobkit/init` today.
+Raw gateway memory config accepts `{ backend: "local_json", health_check_endpoint: url }`, with `health_check_endpoint` optional; `local_json` is the only backend. The TypeScript helper is `memory.localJson({ healthCheckEndpoint: url })`; it translates that option to the snake_case wire key. The predecessor's backend helper was removed in 0.9 with no alias, and the gateway refuses its backend value at init. Gateway auth config supports JWT validation; Google/OIDC helpers are model objects, not accepted by `meta/init` today.
 
-The builder exposes no `roleMigrations(...)` setter and sends no `role_migrations` init param, so a TypeScript host cannot authorize a role-migrating resume: a durable member whose role changed keeps refusing to resume with `MobError::MemberRoleMigrationRequired`. Declaring the migration currently requires the Python builder's `.role_migrations([...])` or a hand-built `mobkit/init` payload; see the [configuration reference](/reference/configuration#member-role-migrations).
+The builder exposes no `roleMigrations(...)` setter and sends no `role_migrations` init param, so a TypeScript host cannot authorize a role-migrating resume: a durable member whose role changed keeps refusing to resume with `MobError::MemberRoleMigrationRequired`. Declaring the migration currently requires the Python builder's `.role_migrations([...])` or a hand-built `meta/init` payload; see the [configuration reference](/reference/configuration#member-role-migrations).
 
 The builder forwards `consoleConfig(path)` as `runtime_options.console_config_path`, which lets the bundled console consume the same `console_config` contract projected by `/console/experience`. The console default is fail-closed: with neither `auth(...)` nor `consoleAuthRequired(false)` the gateway trusts no signing key and refuses every console request with 401 (it logs a startup warning naming this). `consoleAuthRequired(false)` is the explicit opt-out; use it only for a local or host-protected console. The Python twin is `.console_auth_required(False)`.
 
@@ -315,11 +360,11 @@ is a startup error, never a silent in-memory fallback. The `runtimeStore`
 and `eventLog` config modules produce the explicit declarations:
 
 ```typescript
-import { MobKit, eventLog, runtimeStore } from "@rkat/mobkit-sdk";
+import { Meta, eventLog, runtimeStore } from "@rkat/meta-sdk";
 
-const runtime = await MobKit.builder()
+const runtime = await Meta.builder()
   .mob("config/mob.toml")
-  .persistentState("state/mobkit")
+  .persistentState("state/meta")
   // Declare an in-memory runtime store (sessions do not survive restart).
   .runtimeStore(runtimeStore.memory())
   // Declare a bounded queryable in-process event log — or eventLog.nullStore().
@@ -333,11 +378,11 @@ The resolved picture is the typed storage census: `StatusResult.storage` /
 `StorageSummary` (blob durability, the H2 incremental probe, and the
 per-slot `StorageSlotSummary` census with `domain`, `durabilityClass`,
 `resolution`, `backend`, `degraded`, `detail`); apply `parseStorageSummary`
-to the raw `storage` record of `mobkit/storage/doctor`. A fail-closed
+to the raw `storage` record of `meta/storage/doctor`. A fail-closed
 startup refusal — file-name twins, a store that failed to open — surfaces
 as the typed `StorageResolutionError` (code `-32014`,
 `STORAGE_RESOLUTION_CODE`), not a `TransportError`; its message names the
-remediation (`mobkit/storage/doctor`, or the explicit ephemeral
+remediation (`meta/storage/doctor`, or the explicit ephemeral
 declaration). Blob-store durability has no wire declaration today — it is
 declared by Rust embedders via `ephemeral_blobs(true)` /
 `binary_blob_store(...)` and reported read-only in the census.
@@ -353,7 +398,7 @@ lists the diverged definition fields as dotted paths, so a host can show what
 changed without parsing the message:
 
 ```typescript
-import { CompositionProvenanceError } from "@rkat/mobkit-sdk";
+import { CompositionProvenanceError } from "@rkat/meta-sdk";
 
 try {
   const runtime = await builder.build();
@@ -374,8 +419,8 @@ Two environment variables adjust this (same shape as the Python SDK):
 
 | Variable | Effect |
 |----------|--------|
-| `MOBKIT_GATEWAY_STDERR_FILE=<path>` | Append gateway stderr to a file |
-| `MOBKIT_GATEWAY_STDERR=devnull` | Discard gateway stderr entirely |
+| `META_GATEWAY_STDERR_FILE=<path>` | Append gateway stderr to a file |
+| `META_GATEWAY_STDERR=devnull` | Discard gateway stderr entirely |
 
 Discarding is the legacy pre-0.8.9 default and is not recommended: it hides
 panic output and makes a slow-but-working storage migration indistinguishable
@@ -385,7 +430,7 @@ from a hang.
 
 | Builder call | Effect |
 |--------------|--------|
-| `.onError(callback)` | Registers an `ErrorCallback` (`(event: ErrorEvent) => void`, or a promise of it). The gateway forwards every runtime `ErrorEvent` as the `mobkit/on_error` notification; the SDK parses it into `{ category, message, context }` and awaits your callback. |
+| `.onError(callback)` | Registers an `ErrorCallback` (`(event: ErrorEvent) => void`, or a promise of it). The gateway forwards every runtime `ErrorEvent` as the `meta/on_error` notification; the SDK parses it into `{ category, message, context }` and awaits your callback. |
 
 `category` is one of the `ErrorCategory` constants (`spawn_failure`,
 `reconcile_incomplete`, `checkpoint_failure`,
@@ -407,7 +452,7 @@ twin is `.on_error(callback)`.
 
 ## Startup: no built-in total deadline
 
-`connect()` runs `mobkit/init` as accepted-then-settled. The gateway accepts
+`connect()` runs `meta/init` as accepted-then-settled. The gateway accepts
 the init at once, reports each startup phase, and then settles it `ready` or
 `failed`. The SDK has **no built-in total deadline** for that wait. Startup
 legitimately includes provider callbacks (each bounded at 130 s by the
@@ -426,11 +471,11 @@ The wait ends only when one of these happens:
 - the gateway exits, or the transport reader fails. You get
   `InitOutcomeUnknownError`;
 - your own deadline runs out. Set it with
-  `MobKit.builder().initDeadline(ms)`, and running out also throws
+  `Meta.builder().initDeadline(ms)`, and running out also throws
   `InitOutcomeUnknownError`.
 
 `InitOutcomeUnknownError` carries `initId`, `lastPhase` (the last
-`mobkit/init_progress` phase seen, such as `"prewarm"` or `"restore"`) and
+`meta/init_progress` phase seen, such as `"prewarm"` or `"restore"`) and
 `reason`. That makes a stuck or interrupted init diagnosable. The gateway may
 already have changed native state, so the SDK never retries it automatically
 and asks the gateway to shut down.
@@ -447,7 +492,7 @@ and the gateway refuses an earlier request at once with `InitInProgressError`
 hang the caller's `await` forever. Override per-call:
 
 ```typescript
-import { createJsonRpcHttpTransport } from "@rkat/mobkit-sdk";
+import { createJsonRpcHttpTransport } from "@rkat/meta-sdk";
 
 const transport = createJsonRpcHttpTransport(endpoint, {
   timeoutMs: 5_000,

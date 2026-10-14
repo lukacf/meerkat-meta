@@ -54,7 +54,7 @@ export function directMemberAddValidation(member, members = [], contract = null)
     return { ok: false, error: "member id already exists" };
   }
   if (!deployableInlineProfileBindingAllowed(contract)) {
-    return { ok: false, error: "MobKit schema contract must allow deployable inline profileBinding" };
+    return { ok: false, error: "Meta schema contract must allow deployable inline profileBinding" };
   }
   if (profileBinding !== "inline") {
     return { ok: false, error: "direct member adds must use an inline deployable profileBinding" };
@@ -127,7 +127,7 @@ export function memberUpdateValidation(current, nextMember, patch = {}, contract
   const model = String(nextMember.model || "").trim();
   if ((touched.has("profileBinding") || touched.has("profile_binding") || touched.has("runtimeMode") || touched.has("runtime_mode"))
     && !deployableInlineProfileBindingAllowed(contract)) {
-    return { ok: false, error: "MobKit schema contract must allow deployable inline profileBinding" };
+    return { ok: false, error: "Meta schema contract must allow deployable inline profileBinding" };
   }
   if (binding && binding !== "inline") {
     return { ok: false, error: "member updates must keep deployable inline profileBinding" };

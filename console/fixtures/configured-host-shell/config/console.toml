@@ -71,7 +71,7 @@ empty_text = "Project records are host-owned."
 name = "Workers"
 collapsed = true
 empty_title = "No workers"
-empty_text = "Spawn workers from a MobKit action."
+empty_text = "Spawn workers from a Meta action."
 
 [actions]
 inspect_label = "Inspect"

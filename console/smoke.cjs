@@ -74,7 +74,7 @@ async function runSmoke() {
     backendSpec.args,
     {
       cwd: repoRoot,
-      env: { ...process.env, MOBKIT_REF_ADDR: LOOPBACK_ANY_PORT },
+      env: { ...process.env, META_REF_ADDR: LOOPBACK_ANY_PORT },
       stdio: ["ignore", "pipe", "pipe"],
     }
   );

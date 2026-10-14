@@ -9,7 +9,7 @@ const { startFixture, eventually, rpc } = require("../acceptance-runtime.cjs");
 const { geometry } = require("./real-conversation.cjs");
 
 const identity = "router:main";
-const evidenceDir = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+const evidenceDir = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
 const seedSource = "# Review context\n\n" + Array.from({ length: 18 }, (_, index) =>
   `### Evidence ${index + 1}\n\nThe release review includes the workgraph, agent communications and uploaded images. Keep this evidence available while a background review completes.\n\n`).join("");
 const notice = "Background review complete: preserve A\u030A, \u00e5 and \ud83d\ude80 exactly; check the WorkGraph prerequisites before publishing.";
@@ -49,15 +49,15 @@ function expectedNavigationCancellation(request) {
   if (new URL(request.url()).pathname.endsWith("/timeline/stream")) return true;
   try {
     const body = JSON.parse(request.postData() || "{}");
-    return body.method === "mobkit/console/query_timeline" && body.params?.mode === "recent"
+    return body.method === "meta/console/query_timeline" && body.params?.mode === "recent"
       && body.params?.limit === 200 && !body.params?.identity;
   } catch { return false; }
 }
 
 async function durableSteer(host, persistedBackgroundJob = false) {
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "Use the coordinator's prebuilt durable-steer fixture; never invoke Cargo from this browser case.");
+  assert(process.env.META_EXAMPLE_BIN_DIR, "Use the coordinator's prebuilt durable-steer fixture; never invoke Cargo from this browser case.");
   const fixture = await startFixture();
-  const browser = await chromium.launch({ headless: process.env.MOBKIT_HEADED !== "1" });
+  const browser = await chromium.launch({ headless: process.env.META_HEADED !== "1" });
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
   page.setDefaultTimeout(20_000);
   const barrierId = `durable-${host}-${randomUUID().slice(0, 8)}`;
@@ -96,7 +96,7 @@ async function durableSteer(host, persistedBackgroundJob = false) {
   const state = () => read(`${fixture.backendUrl}/__fixture/durable-steer?session_id=${encodeURIComponent(result.accepted.session_id)}&input_id=${encodeURIComponent(result.accepted.input_id)}`);
   const history = () => read(`${fixture.backendUrl}/__fixture/session-history?session_id=${encodeURIComponent(result.accepted.session_id)}`);
   async function send(content, key, target = identity) {
-    const response = await rpc(fixture.baseUrl, "mobkit/console/send", {
+    const response = await rpc(fixture.baseUrl, "meta/console/send", {
       identity: target, content, origin: "console:durable-steer-acceptance", origin_kind: "operator",
       handling_mode: "queue", idempotency_key: key,
     });
@@ -286,11 +286,11 @@ async function durableSteer(host, persistedBackgroundJob = false) {
       text: node.textContent }));
     assert(view.turnId, "correlated approval belongs to a concrete visible conversation turn");
     assert(view.text.includes("Review this exact background-check interaction"));
-    const pending = await rpc(fixture.baseUrl, "mobkit/gating/pending");
+    const pending = await rpc(fixture.baseUrl, "meta/gating/pending");
     const owner = pending.body.result?.pending.find(item => item.pending_id === result.approval.pending_id);
     assert.equal(owner?.origin?.interaction_id, result.started.interaction_id,
       "the runtime approval owner retains the exact active interaction");
-    assert.equal(fixture.observations.filter(item => item.request.includes('"method":"mobkit/gating/decide"')).length, 0,
+    assert.equal(fixture.observations.filter(item => item.request.includes('"method":"meta/gating/decide"')).length, 0,
       "reading the correlated approval never decides it");
     result.approvalViews ||= {};
     result.approvalViews[label] = view;

@@ -8,7 +8,7 @@ version       = "0"
 # Resolved through meerkat's model-client seam (§8.1). §8.3 calls for a
 # small fast tier; the calibration matrix refines the concrete id. Must stay
 # in sync with `SelectorProfile::embedded_default()`
-# (crates/meerkat-mobkit/src/memory/selector.rs) — a unit test enforces the prompt
+# (crates/meerkat-meta/src/memory/selector.rs) — a unit test enforces the prompt
 # half of that sync.
 model         = "claude-haiku-4-5"
 prompt_bundle = "prompts/selector-v0.md"

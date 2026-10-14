@@ -4,7 +4,7 @@ description: "HTTP endpoints for console access, experience metadata, module ins
 icon: "globe"
 ---
 
-MobKit serves a REST API over HTTP using Axum. The API provides console access, runtime inspection, timeline replay, JSON-RPC ingress, legacy console send compatibility, multipart upload/send, and blob retrieval.
+Meta serves a REST API over HTTP using Axum. The API provides console access, runtime inspection, timeline replay, JSON-RPC ingress, legacy console send compatibility, multipart upload/send, and blob retrieval.
 
 ## Base URL
 
@@ -12,9 +12,9 @@ MobKit serves a REST API over HTTP using Axum. The API provides console access, 
 <http_base_url>
 ```
 
-The console/admin `mobkit_gateway` and SDK-facing persistent `rpc_gateway`
+The console/admin `meta_gateway` and SDK-facing persistent `rpc_gateway`
 bind an available loopback port and report the exact `http_base_url` in their
-`mobkit/init` result. Use that value for every route on this page; do not
+`meta/init` result. Use that value for every route on this page; do not
 assume port 8080. A Rust library host chooses its own listener and must supply
 that base URL to its clients.
 
@@ -116,13 +116,13 @@ Without a console aggregator, this route returns `404` with
 `identity`, `display_name`, `runtime_key`, `runtime_member_id`, optional
 `session_id`, `visibility`, `addressable`, `health`, `labels`, and
 `topology_peers` when non-empty. Use
-[`mobkit/console/inspect_identity`](/api/rpc#mobkit%2Fconsole%2Finspect_identity)
+[`meta/console/inspect_identity`](/api/rpc#meta%2Fconsole%2Finspect_identity)
 for identity/peer inspection and `/console/experience` for affordances;
 neither identities nor inspection records contain an affordances field.
 
 ### `GET /console/timeline`
 
-Returns console timeline frames from the MobKit console log store. This endpoint is the REST equivalent of `mobkit/console/query_timeline`.
+Returns console timeline frames from the Meta console log store. This endpoint is the REST equivalent of `meta/console/query_timeline`.
 
 <Accordion title="Query parameters">
 | Param | Type | Required | Description |
@@ -165,7 +165,7 @@ Identity-filtered convenience route for the same console timeline stream. It set
 
 ### `POST /console/send`
 
-Legacy console send route backed by the console aggregator. New clients should prefer `POST /console/rpc` with `mobkit/console/send`.
+Legacy console send route backed by the console aggregator. New clients should prefer `POST /console/rpc` with `meta/console/send`.
 
 ### `POST /console/rpc`
 
@@ -177,10 +177,10 @@ Multipart JSON-RPC endpoint. Supported methods:
 
 | Method | Purpose |
 |--------|---------|
-| `mobkit/console/send` | Send console content with image upload placeholders. |
-| `mobkit/blob/upload` | Store a single blob/image and return a blob ID. |
+| `meta/console/send` | Send console content with image upload placeholders. |
+| `meta/blob/upload` | Store a single blob/image and return a blob ID. |
 
-For `mobkit/blob/upload`, send a `payload` part containing this JSON-RPC
+For `meta/blob/upload`, send a `payload` part containing this JSON-RPC
 request, plus exactly one binary part named `file:upload-1` with
 `Content-Type: image/png`:
 
@@ -188,7 +188,7 @@ request, plus exactly one binary part named `file:upload-1` with
 {
   "jsonrpc": "2.0",
   "id": "upload-1",
-  "method": "mobkit/blob/upload",
+  "method": "meta/blob/upload",
   "params": {
     "upload": {
       "upload_id": "upload-1",
@@ -243,14 +243,14 @@ Query values are percent-decoded. URL-encode reserved characters such as `=`,
 The token is validated against the fixed trusted OIDC snapshot and configured
 auth policy. See [authentication](/guides/authentication) for details.
 
-MobKit's built-in console auth is bearer-token based and does not rely on
+Meta's built-in console auth is bearer-token based and does not rely on
 cookies. Deployments that add cookie-backed console auth at a reverse proxy must
 also add CSRF/origin protection for mutating console routes.
 
 Set `ConsolePolicy.read_only` to `true` to serve the console in view-only mode.
 Read endpoints and streams remain available, while mutating JSON-RPC methods
-such as `mobkit/console/send`, `mobkit/blob/upload`, lifecycle controls, gating
-decisions, and metadata writes are omitted from `mobkit/capabilities` and return
+such as `meta/console/send`, `meta/blob/upload`, lifecycle controls, gating
+decisions, and metadata writes are omitted from `meta/capabilities` and return
 a read-only error if called directly.
 
 ## Error responses
@@ -283,7 +283,7 @@ Structured `/console/send` admission failures carry `{error, message, data}`:
 Preserve `data` when reporting these failures; a timeout does not by itself
 establish execution fate or retryability. These REST status mappings are
 distinct from the JSON-RPC policy codes documented in the
-[RPC reference](/api/rpc#mobkit-specific-error-codes).
+[RPC reference](/api/rpc#meta-specific-error-codes).
 
 ## See also
 

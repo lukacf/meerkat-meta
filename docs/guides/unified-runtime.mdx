@@ -1,10 +1,10 @@
 ---
 title: "Unified Runtime"
-description: "Combine a Meerkat mob with MobKit modules into a single managed runtime with merged events and coordinated lifecycle."
+description: "Combine a Meerkat mob with Meta modules into a single managed runtime with merged events and coordinated lifecycle."
 icon: "layer-group"
 ---
 
-The unified runtime is the production entry point for MobKit. It bootstraps a Meerkat mob and MobKit's module subsystems together, merges their event streams, and manages the combined lifecycle through a single handle.
+The unified runtime is the production entry point for Meta. It bootstraps a Meerkat mob and Meta's module subsystems together, merges their event streams, and manages the combined lifecycle through a single handle.
 
 ## Builder paths
 
@@ -12,11 +12,11 @@ For new hosts, build from a mob definition. `definition_path` loads TOML, while
 `definition` accepts an already parsed `MobDefinition`:
 
 ```rust
-use meerkat_mobkit::UnifiedRuntime;
+use meerkat_meta::UnifiedRuntime;
 
 let runtime = UnifiedRuntime::builder()
     .definition_path("config/mob.toml")
-    .persistent_state(".mobkit/state")
+    .persistent_state(".meta/state")
     .build()
     .await?;
 ```
@@ -29,19 +29,19 @@ On this definition-based path, only `definition(...)` or
 | `module_config` | Empty module and discovery configuration |
 | `timeout` | 30 seconds |
 | `persistent_state` | Ephemeral session service with an auto-created temporary directory |
-| `session_repair_scope` | Derived from the runtime store the build opened: `persistent_state` opens `<state_dir>/runtime.sqlite`, so a member parked with a `session_repair_required` hold names `rkat session repair-wholeblob <id> --runtime-store <state_dir>/runtime.sqlite`; a composite storage provider's meerkat-level realm renders as `rkat --state-root <state_dir> --realm mobkit ...`; a build with no persistent runtime store declares no scope and the commands keep explicit `<state-root>` / `<realm>` placeholders |
+| `session_repair_scope` | Derived from the runtime store the build opened: `persistent_state` opens `<state_dir>/runtime.sqlite`, so a member parked with a `session_repair_required` hold names `rkat session repair-wholeblob <id> --runtime-store <state_dir>/runtime.sqlite`; a composite storage provider's meerkat-level realm renders as `rkat --state-root <state_dir> --realm meta ...`; a build with no persistent runtime store declares no scope and the commands keep explicit `<state-root>` / `<realm>` placeholders |
 
 The older `mob_spec(...)` path accepts a pre-built `MobBootstrapSpec`. It still
 requires explicit module configuration and timeout because the spec already
 owns its session service and construction policy:
 
 ```rust
-use meerkat_mobkit::UnifiedRuntime;
+use meerkat_meta::UnifiedRuntime;
 use std::time::Duration;
 
 let runtime = UnifiedRuntime::builder()
     .mob_spec(mob_bootstrap_spec)
-    .module_config(mobkit_config)
+    .module_config(meta_config)
     .timeout(Duration::from_secs(30))
     .build()
     .await?;
@@ -55,7 +55,7 @@ If neither definition source nor `mob_spec` is present, the builder returns
 
 Rust hosts can enable the default-off `extension-state` Cargo feature and
 register an external `ToolBundleFactory`. The extension package owns its tools
-and payload schema; MobKit supplies durable storage and caller authority. The
+and payload schema; Meta supplies durable storage and caller authority. The
 following example uses a `durable-documents-test` factory with read and edit
 tools. Profile selection keeps the tools off agents that do not need them:
 
@@ -67,7 +67,7 @@ rust_bundles = ["durable-documents-test"]
 Register the package's factory on the host's configured persistent builder:
 
 ```rust
-use meerkat_mobkit::extension_state::ToolBundleRequirements;
+use meerkat_meta::extension_state::ToolBundleRequirements;
 
 let runtime = persistent_builder
     .register_tool_bundle_factory(
@@ -104,7 +104,7 @@ disabled or unconfigured, that layer adds no restriction. See
 [Access control](/concepts/access-control) for host rules.
 
 Document persistence does not change native member lifetime. In the current
-MobKit composition, `delegate` uses an ephemeral child mob and retires the
+Meta composition, `delegate` uses an ephemeral child mob and retires the
 helper and its fork descendants when delegation completes. Such members
 cannot be resumed after restart. Persistent root-mob members retain their
 native identity and lineage through the configured durable mob storage.
@@ -133,10 +133,10 @@ disabled or the extension feature compiled out, so a later re-enable can
 safely resolve ancestors. Disabling the factory does not remove stored
 documents, identity history or those triggers.
 
-The extension integration requires the published Meerkat 0.8.52 crate family,
-with exact versions declared in the repository manifests. Applications using
-the MobKit Git dependency should pin the reviewed revision and resolve their
-committed lockfile against those registry packages.
+The extension integration requires the Meerkat crate family at the exact
+versions declared in the repository manifests. Applications using the Meta Git
+dependency should pin the reviewed revision and resolve their committed
+lockfile against those packages.
 
 ## Bootstrap sequence
 
@@ -186,7 +186,7 @@ After successful bootstrap, the builder returns a `UnifiedRuntime` handle with a
 | `module_health_transitions().await` | `Vec<ModuleHealthTransition>` | Recorded module startup transitions |
 | `set_error_hook(hook)` | `()` | Install the operational error hook after construction; see [Error hook and logging](#error-hook-and-logging) |
 
-The raw `MobkitRuntimeHandle` is intentionally not exposed. Module operations
+The raw `MetaRuntimeHandle` is intentionally not exposed. Module operations
 such as routing, delivery, memory, and gating are methods on `UnifiedRuntime`.
 
 ### Reconciliation
@@ -248,7 +248,7 @@ console, Flow Editor, JSON-RPC, blob, and SSE surfaces. The router does not bind
 a socket by itself:
 
 ```rust
-use meerkat_mobkit::gateway_composition::GatewayHttpBinding;
+use meerkat_meta::gateway_composition::GatewayHttpBinding;
 use std::sync::Arc;
 
 let runtime = Arc::new(runtime);
@@ -287,7 +287,7 @@ Key routes in the reference app include:
 | `/blobs/{blob_id}` | GET | Blob/image retrieval |
 | `/agents/{agent_id}/events` | GET | Per-agent event SSE |
 | `/mob/events` | GET | Mob-merged event SSE |
-| `/mobkit/mob_events/stream` | GET | Structural mob-events SSE |
+| `/meta/mob_events/stream` | GET | Structural mob-events SSE |
 | `/flow-editor` | GET | Visual mobpack editor |
 | `/flow-editor/rpc` | POST | Mobpack-authoring JSON-RPC |
 
@@ -299,13 +299,13 @@ current liveness, or health. Startup results are available separately through
 ## Console voice and live from the builder
 
 A library embedder that fronts the console with its own authentication (for
-example Google sign-in in front of MobKit) can register the same live doors
+example Google sign-in in front of Meta) can register the same live doors
 the gateway binaries expose, without building a session service by hand:
 
 ```rust
-use meerkat_mobkit::console_auth_config::parse_console_auth_config;
-use meerkat_mobkit::public_live_config::PublicLiveRegistration;
-use meerkat_mobkit::unified_runtime::live_compose::LiveOptions;
+use meerkat_meta::console_auth_config::parse_console_auth_config;
+use meerkat_meta::public_live_config::PublicLiveRegistration;
+use meerkat_meta::unified_runtime::live_compose::LiveOptions;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -317,14 +317,14 @@ let registration = PublicLiveRegistration::parse(&json!({
     // optional: "summary": { "model": "...", "max_input_bytes": 65536, "max_output_bytes": 4096 }
 }))?;
 
-let runtime = meerkat_mobkit::UnifiedRuntime::builder()
+let runtime = meerkat_meta::UnifiedRuntime::builder()
     .definition(definition)
     .session_store(session_store)                 // persistent sessions are required
     .meerkat_config(host_config)                  // carries the realm's openai binding
     .console_voice(registration)                  // gpt-live-1 through the console
-    // external mobkit/live/* over /live/ws; the public origin is required
+    // external meta/live/* over /live/ws; the public origin is required
     // because only the embedder knows where it serves the router
-    .live(LiveOptions::new("wss://mobkit.example.com"))
+    .live(LiveOptions::new("wss://meta.example.com"))
     .build()
     .await?;
 let runtime = Arc::new(runtime);
@@ -355,7 +355,7 @@ What happens at build and at router time:
 - The doors compose once, after the runtime is shared:
   `UnifiedRuntime::compose_live` builds one live context (one adapter host,
   one WebSocket state, one voice-path arbiter) and, over it, the console voice
-  controller and the external `mobkit/live/*` handler. A success is bound once;
+  controller and the external `meta/live/*` handler. A success is bound once;
   an error is not cached, so a failing registration is retried on the next
   call. With both registered,
   they take turns on the voice path ("latest engaged wins") exactly as in the
@@ -367,7 +367,7 @@ What happens at build and at router time:
   `build_reference_app_router` keeps working unchanged for hosts without live
   doors.
 - Accessors after composition: `console_voice_controller()`, `live_context()`,
-  and `live_rpc_handler()` (dispatch `mobkit/live/*` from your own transport,
+  and `live_rpc_handler()` (dispatch `meta/live/*` from your own transport,
   for example an embodiment daemon).
 
 Two deployment notes for hosts that build with the `openai-live` feature: link
@@ -387,7 +387,7 @@ hook cannot break the runtime. An attached identity-first runtime receives the
 same hook.
 
 ```rust
-use meerkat_mobkit::{ErrorEvent, ErrorHook, UnifiedRuntime};
+use meerkat_meta::{ErrorEvent, ErrorHook, UnifiedRuntime};
 use std::sync::Arc;
 
 let hook: ErrorHook = Arc::new(|event: ErrorEvent| {
@@ -443,18 +443,18 @@ called, and the fire path emits it once per process for hosts that bootstrap
 directly and install no hook.
 
 **Gateways.** `rpc_gateway` installs a hook that forwards every event to the
-SDK as the `mobkit/on_error` JSON-RPC notification (params are the serialized
+SDK as the `meta/on_error` JSON-RPC notification (params are the serialized
 event); register a receiver with Python `.on_error(callback)` or TypeScript
 `.onError(callback)`. Because that forwarding hook is always installed, the
 absent-hook WARN never fires for SDK hosts; an SDK host that registers no
 callback sees only the gateway's stderr ERROR line, which the SDKs inherit by
 default (see [Gateway logging](/sdks/python#gateway-logging-stderr)).
-`mobkit_gateway` installs no hook and relies on the log sink alone. Both
+`meta_gateway` installs no hook and relies on the log sink alone. Both
 binaries install a stderr `tracing` subscriber whose default filter is
-`warn,meerkat_mobkit=info,<binary>=info`; `RUST_LOG` overrides it.
+`warn,meerkat_meta=info,<binary>=info`; `RUST_LOG` overrides it.
 
 **Rust library hosts must install a tracing subscriber before `build()`.**
-`meerkat-mobkit` emits `tracing` events and installs no subscriber of its own.
+`meerkat-meta` emits `tracing` events and installs no subscriber of its own.
 The default sink and the absent-hook notice are both `tracing` lines, so a host
 without a subscriber sees neither the failures nor the hint that nobody is
 listening. The minimum is a stderr subscriber honouring `RUST_LOG`:
@@ -463,7 +463,7 @@ listening. The minimum is a stderr subscriber honouring `RUST_LOG`:
 tracing_subscriber::fmt()
     .with_env_filter(
         tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,meerkat_mobkit=info")),
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,meerkat_meta=info")),
     )
     .with_writer(std::io::stderr)
     .init();
@@ -475,7 +475,7 @@ tracing_subscriber::fmt()
 |-------|-------|
 | `UnifiedRuntimeBuilderError::MissingRequiredField` | No definition/spec, or a required legacy-path field is missing |
 | `UnifiedRuntimeBootstrapError::Mob` | Meerkat mob failed to start |
-| `UnifiedRuntimeBootstrapError::Module` | MobKit module-runtime initialization failed |
+| `UnifiedRuntimeBootstrapError::Module` | Meta module-runtime initialization failed |
 | `UnifiedRuntimeBootstrapError::ModuleStartupThreadPanicked` | Module startup thread panicked |
 | `UnifiedRuntimeBootstrapError::ModuleStartupRollbackFailed` | Both startup and rollback failed |
 

@@ -41,7 +41,7 @@ function stockEndpointId(snapshot, identity) {
 async function waitForTopologyEdge(baseUrl, left, right, predicate, message, timeout = 30000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
-    const snapshot = await rpc(baseUrl, "mobkit/topology/query");
+    const snapshot = await rpc(baseUrl, "meta/topology/query");
     const edge = topologyEdge(snapshot, left, right);
     if (predicate(edge, snapshot)) return { edge, snapshot };
     await new Promise((resolve) => setTimeout(resolve, 150));
@@ -82,19 +82,19 @@ async function main() {
   assert.ok(baseUrl, "baseUrl is required");
   assert.ok(["--all", "--prepare", "--resume"].includes(phase), `unknown phase ${phase}`);
 
-  const capabilities = await rpc(baseUrl, "mobkit/capabilities");
+  const capabilities = await rpc(baseUrl, "meta/capabilities");
   for (const method of [
-    "mobkit/topology/query",
-    "mobkit/topology/plan",
-    "mobkit/topology/apply",
-    "mobkit/topology/operation/get",
-    "mobkit/topology/audit/query",
+    "meta/topology/query",
+    "meta/topology/plan",
+    "meta/topology/apply",
+    "meta/topology/operation/get",
+    "meta/topology/audit/query",
   ]) {
     assert.ok(capabilities.methods.includes(method), `missing topology capability ${method}`);
   }
   assert.equal(capabilities.topology_control?.mode, "editable");
   assert.equal(capabilities.topology_control?.can_bulk, false);
-  const initialTopology = await rpc(baseUrl, "mobkit/topology/query");
+  const initialTopology = await rpc(baseUrl, "meta/topology/query");
   const commanderEndpointId = stockEndpointId(initialTopology, "incident-commander");
 
   const browser = await chromium.launch({ headless: true });
@@ -132,7 +132,7 @@ async function main() {
         (edge) => edge?.actual === false && edge?.suppressed === true,
         "declared edge was not suppressed",
       );
-      await rpc(baseUrl, "mobkit/reconcile_edges");
+      await rpc(baseUrl, "meta/reconcile_edges");
       await waitForTopologyEdge(
         baseUrl,
         "incident-commander",
@@ -180,7 +180,7 @@ async function main() {
       );
     }
 
-    const audit = await rpc(baseUrl, "mobkit/topology/audit/query", {
+    const audit = await rpc(baseUrl, "meta/topology/audit/query", {
       after_seq: 0,
       limit: 20,
     });
@@ -199,7 +199,7 @@ async function main() {
       ),
       `topology audit must be ordered and attributed: ${JSON.stringify(audit)}`,
     );
-    const exhausted = await rpc(baseUrl, "mobkit/topology/audit/query", {
+    const exhausted = await rpc(baseUrl, "meta/topology/audit/query", {
       after_seq: audit.next_after_seq,
       limit: 20,
     });

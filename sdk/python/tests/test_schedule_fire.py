@@ -1,15 +1,15 @@
 """Tests for host-runnable schedule fires (callback/schedule_fire).
 
-Fix 1 SDK seam: ``MobKitBuilder.host_runnables([...])`` rides
+Fix 1 SDK seam: ``MetaBuilder.host_runnables([...])`` rides
 ``runtime_options.host_runnables`` at init, and incoming
 ``callback/schedule_fire`` requests dispatch to handlers registered via
-``MobKitRuntime.on_schedule_fire(name, handler)``.
+``MetaRuntime.on_schedule_fire(name, handler)``.
 """
 import pytest
 
-from meerkat_mobkit.agent_builder import CallbackDispatcher
-from meerkat_mobkit.builder import MobKitBuilder
-from meerkat_mobkit.runtime import MobKitRuntime
+from meerkat_meta.agent_builder import CallbackDispatcher
+from meerkat_meta.builder import MetaBuilder
+from meerkat_meta.runtime import MetaRuntime
 
 OCCURRENCE = {
     "schedule_id": "sch-1",
@@ -71,7 +71,7 @@ class TestScheduleFireDispatch:
 class TestRuntimeSeam:
     @pytest.mark.asyncio
     async def test_on_schedule_fire_registers_on_the_dispatcher(self):
-        runtime = MobKitRuntime(MobKitBuilder()._config)
+        runtime = MetaRuntime(MetaBuilder()._config)
         runtime.on_schedule_fire("digest", lambda occurrence: {"ok": True})
         result = await runtime._dispatcher.handle_callback(
             "callback/schedule_fire",
@@ -80,8 +80,8 @@ class TestRuntimeSeam:
         assert result == {"ok": True}
 
     def test_host_runnables_ride_init_params(self):
-        builder = MobKitBuilder().host_runnables(["digest", "backup.rotate"])
-        runtime = MobKitRuntime(builder._config)
+        builder = MetaBuilder().host_runnables(["digest", "backup.rotate"])
+        runtime = MetaRuntime(builder._config)
         params = runtime._build_init_params()
         assert params["runtime_options"]["host_runnables"] == [
             "digest",
@@ -89,10 +89,10 @@ class TestRuntimeSeam:
         ]
 
     def test_host_runnables_omitted_when_unset(self):
-        runtime = MobKitRuntime(MobKitBuilder()._config)
+        runtime = MetaRuntime(MetaBuilder()._config)
         params = runtime._build_init_params()
         assert "host_runnables" not in params["runtime_options"]
 
     def test_host_runnables_rejects_empty_names(self):
         with pytest.raises(ValueError, match="non-empty strings"):
-            MobKitBuilder().host_runnables(["digest", "  "])
+            MetaBuilder().host_runnables(["digest", "  "])

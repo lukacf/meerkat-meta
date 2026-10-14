@@ -19,8 +19,8 @@ const forbiddenImportPatterns = [
   /from\s+["'][^"']*headless/,
   /from\s+["'][^"']*network/,
   /from\s+["']electron["']/,
-  /createMobKitConsoleController/,
-  /useMobKitConsoleController/,
+  /createMetaConsoleController/,
+  /useMetaConsoleController/,
 ];
 
 function sourceFiles(dir: string): string[] {
@@ -73,7 +73,7 @@ test("console-core root barrel exposes reusable controller and adapter surfaces"
   const source = fs.readFileSync(coreIndex, "utf8");
   for (const symbol of [
     "CONSOLE_RPC_METHODS",
-    "createMobKitConsoleController",
+    "createMetaConsoleController",
     "createHttpConsoleTransport",
     "mapFramesToTimelineEntries",
     "buildConversationViewState",
@@ -109,7 +109,7 @@ test("stock console runtime path is backed by the headless controller", () => {
   const source = fs.readFileSync(stockConsoleAppSource, "utf8");
 
   assert.match(source, /\bcreateHttpConsoleTransport\b/);
-  assert.match(source, /\bcreateMobKitConsoleController\b/);
+  assert.match(source, /\bcreateMetaConsoleController\b/);
   assert.match(source, /\bconsoleController\.timeline\.query\b/);
   assert.match(source, /\bconsoleController\.timeline\.subscribeWithBackfill\b/);
   assert.match(source, /\bdispatchController\.commands\.sendMessage\b/);

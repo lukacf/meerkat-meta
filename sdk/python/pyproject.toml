@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "meerkat-mobkit"
-version = "0.8.49"
-description = "Python SDK for MobKit — companion orchestration platform for the Meerkat multi-agent runtime"
+name = "meerkat-meta"
+version = "0.9.0"
+description = "Python SDK for Meta — companion orchestration platform for the Meerkat multi-agent runtime"
 requires-python = ">=3.10"
 license = {text = "MIT OR Apache-2.0"}
 authors = [{name = "Luka Crnkovic-Friis"}]
@@ -25,9 +25,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://docs.rkat.ai/mobkit/introduction"
-Repository = "https://github.com/lukacf/meerkat-mobkit"
-Documentation = "https://docs.rkat.ai/mobkit/introduction"
+Homepage = "https://docs.rkat.ai/meta/introduction"
+Repository = "https://github.com/lukacf/meerkat-meta"
+Documentation = "https://docs.rkat.ai/meta/introduction"
 
 [project.optional-dependencies]
 dev = [
@@ -38,7 +38,12 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["meerkat_mobkit*"]
+include = ["meerkat_meta*"]
 
 [tool.setuptools.package-data]
-meerkat_mobkit = ["py.typed"]
+meerkat_meta = ["py.typed"]
+
+[tool.pytest.ini_options]
+# Short tracebacks do not print frame arguments. Transport fakes receive the
+# child's env (the whole process environment), and CI logs are public.
+addopts = "--tb=short"

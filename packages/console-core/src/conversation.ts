@@ -133,14 +133,18 @@ export interface ConversationMessageEntry extends ConversationTimelineEntryBase 
   runtimeEvent?: ConversationRuntimeEvent | null;
   /** Display-only projection of an explicit runtime refusal or audit diagnostic. */
   operationFeedback?: {
-    kind: "permission-refused" | "audit-unavailable" | "confinement-refused" | "hook-denied" | "hook-launch-failed";
+    kind: "permission-refused" | "audit-unavailable" | "confinement-refused" | "hook-denied" | "hook-launch-failed" | "review-unsatisfied" | "review-unavailable";
     title: string;
     detail: string;
     operationId?: string;
+    /** Opaque native approval reference for display/correlation only, never permission or proof of execution. */
+    approvalId?: string;
     toolCallId?: string;
     hookId?: string;
     confinementRefusal?: "invalid_requirement" | "invalid_launch" | "unsupported_requirement" | "backend_unavailable" | "preparation_failed";
     hookReasonCode?: "policy_violation" | "safety_violation" | "schema_violation" | "timeout" | "runtime_error";
+    reviewUnsatisfied?: "denied" | "escalated" | "context_changed" | "human_consent_required" | "already_consumed";
+    reviewUnavailable?: "deadline_expired" | "reviewer_failed" | "reviewer_missing" | "unsupported_entry" | "owner_unavailable" | "dispatch_ended";
   };
 }
 
@@ -153,7 +157,7 @@ export interface ConversationEntryOrigin {
    */
   sendOrigin?: string | null;
   /**
-   * Typed caller kind from a console send (`user_input.origin_kind`, MobKit
+   * Typed caller kind from a console send (`user_input.origin_kind`, Meta
    * `ConsoleTurnOrigin`): `operator`, `operator_probe`, `connector`,
    * `scheduler`, `policy`, `flow`, `system`.
    */

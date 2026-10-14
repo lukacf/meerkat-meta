@@ -2,7 +2,7 @@ name: Publish docs
 
 # Documentation represents whatever is on main. Every push to main that
 # touches docs/ tells docs.rkat.ai (lukacf/meerkat, workflow
-# "Publish MobKit docs") to regenerate its MobKit mirror from this exact
+# "Publish Meta docs") to regenerate its Meta mirror from this exact
 # commit. Releases do not publish documentation; a doc fix lands the moment
 # it merges. The manual trigger re-sends the current main head, for example
 # after a failed publication on the receiving side.
@@ -43,7 +43,7 @@ jobs:
           jq -n \
             --arg sha "$SOURCE_SHA" \
             '{
-              event_type: "mobkit-docs-updated",
+              event_type: "meta-docs-updated",
               client_payload: {
                 sha: $sha,
                 ref: "main"

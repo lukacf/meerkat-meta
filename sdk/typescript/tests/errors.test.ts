@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  MobKitError,
+  MetaError,
   TransportError,
   RpcError,
   CapabilityUnavailableError,
@@ -12,31 +12,31 @@ import {
   ContractMismatchError,
   LeaseLostError,
   NotConnectedError,
-  MobkitRpcError,
+  MetaRpcError,
 } from "../dist/index.js";
 
 // ---------------------------------------------------------------------------
-// MobKitError (base)
+// MetaError (base)
 // ---------------------------------------------------------------------------
 
-describe("MobKitError", () => {
+describe("MetaError", () => {
   it("is an instance of Error", () => {
-    const err = new MobKitError("base error");
+    const err = new MetaError("base error");
     assert.ok(err instanceof Error);
   });
 
-  it("is an instance of MobKitError", () => {
-    const err = new MobKitError("base error");
-    assert.ok(err instanceof MobKitError);
+  it("is an instance of MetaError", () => {
+    const err = new MetaError("base error");
+    assert.ok(err instanceof MetaError);
   });
 
-  it("has name set to MobKitError", () => {
-    const err = new MobKitError("msg");
-    assert.equal(err.name, "MobKitError");
+  it("has name set to MetaError", () => {
+    const err = new MetaError("msg");
+    assert.equal(err.name, "MetaError");
   });
 
   it("has the correct message", () => {
-    const err = new MobKitError("something went wrong");
+    const err = new MetaError("something went wrong");
     assert.equal(err.message, "something went wrong");
   });
 });
@@ -46,9 +46,9 @@ describe("MobKitError", () => {
 // ---------------------------------------------------------------------------
 
 describe("TransportError", () => {
-  it("extends MobKitError", () => {
+  it("extends MetaError", () => {
     const err = new TransportError("transport fail");
-    assert.ok(err instanceof MobKitError);
+    assert.ok(err instanceof MetaError);
   });
 
   it("is an instance of Error", () => {
@@ -72,9 +72,9 @@ describe("TransportError", () => {
 // ---------------------------------------------------------------------------
 
 describe("RpcError", () => {
-  it("extends MobKitError", () => {
+  it("extends MetaError", () => {
     const err = new RpcError(-32600, "invalid request", "req-1", "mob.status");
-    assert.ok(err instanceof MobKitError);
+    assert.ok(err instanceof MetaError);
   });
 
   it("is an instance of Error", () => {
@@ -113,9 +113,9 @@ describe("RpcError", () => {
 // ---------------------------------------------------------------------------
 
 describe("CapabilityUnavailableError", () => {
-  it("extends MobKitError", () => {
+  it("extends MetaError", () => {
     const err = new CapabilityUnavailableError("no memory");
-    assert.ok(err instanceof MobKitError);
+    assert.ok(err instanceof MetaError);
   });
 
   it("is an instance of Error", () => {
@@ -138,8 +138,8 @@ describe("LeaseLostError", () => {
     // -32004 is CAPABILITY_UNAVAILABLE_CODE (permanent capability gap). A
     // transient/recoverable lease loss must use -32005 and surface as its own
     // type so callers do not give up on an identity that needs a re-acquire.
-    const err = new LeaseLostError("lease lost: review:singleton", "rid", "mobkit/send");
-    assert.ok(err instanceof MobKitError);
+    const err = new LeaseLostError("lease lost: review:singleton", "rid", "meta/send");
+    assert.ok(err instanceof MetaError);
     assert.ok(err instanceof RpcError);
     assert.ok(!(err instanceof CapabilityUnavailableError));
     assert.equal(err.name, "LeaseLostError");
@@ -152,15 +152,15 @@ describe("LeaseLostError", () => {
 // ---------------------------------------------------------------------------
 
 describe("ConsoleTimelineReplayUnavailableError", () => {
-  it("extends MobKitError and uses the dedicated console timeline code", () => {
+  it("extends MetaError and uses the dedicated console timeline code", () => {
     const data = {
       error: "replay_unavailable",
       stream: "timeline",
       requested_cursor: "console:500",
       latest_cursor: "console:42",
     };
-    const err = new ConsoleTimelineReplayUnavailableError("replay unavailable", "rid", "mobkit/console/query_timeline", data);
-    assert.ok(err instanceof MobKitError);
+    const err = new ConsoleTimelineReplayUnavailableError("replay unavailable", "rid", "meta/console/query_timeline", data);
+    assert.ok(err instanceof MetaError);
     assert.equal(err.name, "ConsoleTimelineReplayUnavailableError");
     assert.equal(err.code, -32013);
     assert.deepEqual(err.data, data);
@@ -172,14 +172,14 @@ describe("ConsoleTimelineReplayUnavailableError", () => {
 // ---------------------------------------------------------------------------
 
 describe("WorkGraphUnavailableError", () => {
-  it("extends MobKitError and uses the dedicated workgraph-unavailable code", () => {
+  it("extends MetaError and uses the dedicated workgraph-unavailable code", () => {
     const err = new WorkGraphUnavailableError(
       "workgraph service not configured",
       "rid",
-      "mobkit/workgraph/snapshot",
+      "meta/workgraph/snapshot",
       { kind: "workgraph_unavailable" },
     );
-    assert.ok(err instanceof MobKitError);
+    assert.ok(err instanceof MetaError);
     assert.ok(err instanceof RpcError);
     assert.equal(err.name, "WorkGraphUnavailableError");
     assert.equal(err.code, -32041);
@@ -188,15 +188,15 @@ describe("WorkGraphUnavailableError", () => {
 });
 
 describe("WorkGraphConflictError", () => {
-  it("extends MobKitError and uses the dedicated CAS-conflict code", () => {
+  it("extends MetaError and uses the dedicated CAS-conflict code", () => {
     const data = { kind: "workgraph_conflict", detail: "revision mismatch" };
     const err = new WorkGraphConflictError(
       "revision conflict",
       "rid",
-      "mobkit/workgraph/update",
+      "meta/workgraph/update",
       data,
     );
-    assert.ok(err instanceof MobKitError);
+    assert.ok(err instanceof MetaError);
     assert.ok(err instanceof RpcError);
     assert.equal(err.name, "WorkGraphConflictError");
     assert.equal(err.code, -32042);
@@ -209,9 +209,9 @@ describe("WorkGraphConflictError", () => {
 // ---------------------------------------------------------------------------
 
 describe("ContractMismatchError", () => {
-  it("extends MobKitError", () => {
+  it("extends MetaError", () => {
     const err = new ContractMismatchError("version mismatch");
-    assert.ok(err instanceof MobKitError);
+    assert.ok(err instanceof MetaError);
   });
 
   it("is an instance of Error", () => {
@@ -230,9 +230,9 @@ describe("ContractMismatchError", () => {
 // ---------------------------------------------------------------------------
 
 describe("NotConnectedError", () => {
-  it("extends MobKitError", () => {
+  it("extends MetaError", () => {
     const err = new NotConnectedError("not connected");
-    assert.ok(err instanceof MobKitError);
+    assert.ok(err instanceof MetaError);
   });
 
   it("is an instance of Error", () => {
@@ -247,21 +247,21 @@ describe("NotConnectedError", () => {
 });
 
 // ---------------------------------------------------------------------------
-// MobkitRpcError (backward-compat alias)
+// MetaRpcError (backward-compat alias)
 // ---------------------------------------------------------------------------
 
-describe("MobkitRpcError (backward compat)", () => {
+describe("MetaRpcError (backward compat)", () => {
   it("is the same constructor as RpcError", () => {
-    assert.equal(MobkitRpcError, RpcError);
+    assert.equal(MetaRpcError, RpcError);
   });
 
   it("instances are instanceof RpcError", () => {
-    const err = new MobkitRpcError(-32600, "msg", "req-1", "mob.status");
+    const err = new MetaRpcError(-32600, "msg", "req-1", "mob.status");
     assert.ok(err instanceof RpcError);
   });
 
-  it("instances are instanceof MobKitError", () => {
-    const err = new MobkitRpcError(-32600, "msg", "req-1", "mob.status");
-    assert.ok(err instanceof MobKitError);
+  it("instances are instanceof MetaError", () => {
+    const err = new MetaRpcError(-32600, "msg", "req-1", "mob.status");
+    assert.ok(err instanceof MetaError);
   });
 });

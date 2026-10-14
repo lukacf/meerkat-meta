@@ -126,7 +126,7 @@ describe("isRpcError / isMobEventsStaleError (bug-hunt regression)", () => {
     const err = new ConsoleTimelineReplayUnavailableError(
       "replay unavailable",
       "rid",
-      "mobkit/console/query_timeline",
+      "meta/console/query_timeline",
     );
     assert.ok(isRpcError(err));
     assert.equal(err.code, -32013);
@@ -136,7 +136,7 @@ describe("isRpcError / isMobEventsStaleError (bug-hunt regression)", () => {
     const err = new WorkGraphUnavailableError(
       "workgraph service not configured",
       "rid",
-      "mobkit/workgraph/snapshot",
+      "meta/workgraph/snapshot",
     );
     assert.ok(isRpcError(err));
     assert.equal(err.code, -32041);

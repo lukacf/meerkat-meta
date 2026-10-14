@@ -1,5 +1,5 @@
 /**
- * Tests for MobKitRuntime and MobHandle with a mock RPC transport.
+ * Tests for MetaRuntime and MobHandle with a mock RPC transport.
  */
 
 import { describe, it, beforeEach } from "node:test";
@@ -9,8 +9,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
-  MobKit,
-  MobKitRuntime,
+  Meta,
+  MetaRuntime,
   MobHandle,
   ToolCaller,
   CapabilityUnavailableError,
@@ -18,6 +18,7 @@ import {
   RpcError,
   TransportError,
 } from "../dist/index.js";
+import type { AgentEvent } from "../dist/index.js";
 
 /**
  * A stand-in gateway that answers every JSON-RPC request on stdin with
@@ -62,7 +63,7 @@ interface RpcCall {
 }
 
 function createMockRuntime(): {
-  rt: MobKitRuntime;
+  rt: MetaRuntime;
   handle: MobHandle;
   calls: RpcCall[];
   setResponse: (
@@ -99,7 +100,7 @@ function createMockRuntime(): {
     topologyProvider: null,
   };
 
-  const rt = new MobKitRuntime(config);
+  const rt = new MetaRuntime(config);
   // Mark as running so MobHandle methods don't reject
   (rt as any)._running = true;
 
@@ -133,7 +134,7 @@ function createMockRuntime(): {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("MobKitRuntime", () => {
+describe("MetaRuntime", () => {
   it("mobHandle() returns a MobHandle", () => {
     const { handle } = createMockRuntime();
     assert.ok(handle instanceof MobHandle);
@@ -168,10 +169,15 @@ describe("MobKitRuntime", () => {
     await Promise.resolve();
 
     assert.equal(shutdownSettled, false);
+    assert.equal(rt.isRunning, false, "RPC admission closes before the gateway drain completes");
+    await assert.rejects(
+      (MetaRuntime.prototype as any)._rpc.call(rt, "meta/status", {}),
+      NotConnectedError,
+    );
     assert.equal(
       (rt as any)._transport,
-      null,
-      "RPC admission closes before the gateway drain completes",
+      transport,
+      "the runtime keeps the transport until its stop fulfils",
     );
 
     assert.ok(releaseStop);
@@ -201,9 +207,9 @@ describe("MobKitRuntime", () => {
     await Promise.resolve();
 
     assert.equal(stopCalls, 1);
-    assert.equal((rt as any)._transport, null);
+    assert.equal((rt as any)._transport, transport, "kept until its stop fulfils");
     await assert.rejects(
-      (MobKitRuntime.prototype as any)._rpc.call(rt, "mobkit/status", {}),
+      (MetaRuntime.prototype as any)._rpc.call(rt, "meta/status", {}),
       NotConnectedError,
     );
 
@@ -402,6 +408,32 @@ describe("MobKitRuntime", () => {
     );
   });
 
+  it("forwards an explicit access_config_path, never drops it", () => {
+    // Even an empty explicit path reaches the gateway, which refuses it;
+    // only an absent path is omitted.
+    const { rt } = createMockRuntime();
+    assert.equal(
+      "access_config_path" in (rt as any)._buildInitParams().runtime_options,
+      false,
+    );
+    (rt as any)._config.accessConfigPath = "";
+    const params = (rt as any)._buildInitParams();
+    assert.equal(params.runtime_options.access_config_path, "");
+  });
+
+  it("forwards an explicit gating_config_path, never drops it", () => {
+    // Even an empty explicit path reaches the gateway, which refuses it;
+    // only an absent path is omitted.
+    const { rt } = createMockRuntime();
+    assert.equal(
+      "gating_config_path" in (rt as any)._buildInitParams().runtime_options,
+      false,
+    );
+    (rt as any)._config.gatingConfigPath = "";
+    const params = (rt as any)._buildInitParams();
+    assert.equal(params.runtime_options.gating_config_path, "");
+  });
+
   it("builds meerkat_config_path runtime option", () => {
     const { rt } = createMockRuntime();
     (rt as any)._config.meerkatConfigPath = "/etc/example/config.toml";
@@ -472,13 +504,13 @@ describe("MobKitRuntime", () => {
   // the init-result parse block is what sets both base URLs (a test that
   // assigns _rustHttpPublicBase directly cannot notice that block vanishing).
   it("connect() records the local and advertised base URLs from the init result", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "mobkit-echo-gateway-"));
+    const dir = mkdtempSync(join(tmpdir(), "meta-echo-gateway-"));
     const gateway = writeEchoGateway(dir, {
       http_base_url: "http://127.0.0.1:1",
       http_public_base_url: "https://mob.example.com",
     });
-    const rt = new MobKitRuntime(
-      (MobKit.builder().gateway(gateway) as any)._config,
+    const rt = new MetaRuntime(
+      (Meta.builder().gateway(gateway) as any)._config,
     );
     try {
       await rt.connect();
@@ -491,13 +523,13 @@ describe("MobKitRuntime", () => {
   });
 
   it("connect() falls back to the local base when the init result declares no advertised base", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "mobkit-echo-gateway-"));
+    const dir = mkdtempSync(join(tmpdir(), "meta-echo-gateway-"));
     const gateway = writeEchoGateway(dir, {
       http_base_url: "http://127.0.0.1:1",
       http_public_base_url: null,
     });
-    const rt = new MobKitRuntime(
-      (MobKit.builder().gateway(gateway) as any)._config,
+    const rt = new MetaRuntime(
+      (Meta.builder().gateway(gateway) as any)._config,
     );
     try {
       await rt.connect();
@@ -632,7 +664,7 @@ describe("MobKitRuntime", () => {
 });
 
 describe("MobHandle.status()", () => {
-  it("sends mobkit/status and parses the result", async () => {
+  it("sends meta/status and parses the result", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       contract_version: "0.5.0",
@@ -642,7 +674,7 @@ describe("MobHandle.status()", () => {
 
     const result = await handle.status();
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].method, "mobkit/status");
+    assert.equal(calls[0].method, "meta/status");
     assert.equal(result.contractVersion, "0.5.0");
     assert.equal(result.running, true);
     assert.deepEqual(result.loadedModules, ["mod-a", "mod-b"]);
@@ -650,55 +682,55 @@ describe("MobHandle.status()", () => {
 });
 
 describe("MobHandle.capabilities()", () => {
-  it("sends mobkit/capabilities and parses the result", async () => {
+  it("sends meta/capabilities and parses the result", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       contract_version: "0.5.0",
-      methods: ["mobkit/status", "mobkit/capabilities"],
+      methods: ["meta/status", "meta/capabilities"],
       loaded_modules: ["mod-a"],
     }));
 
     const result = await handle.capabilities();
-    assert.equal(calls[0].method, "mobkit/capabilities");
+    assert.equal(calls[0].method, "meta/capabilities");
     assert.equal(result.contractVersion, "0.5.0");
-    assert.deepEqual(result.methods, ["mobkit/status", "mobkit/capabilities"]);
+    assert.deepEqual(result.methods, ["meta/status", "meta/capabilities"]);
     assert.deepEqual(result.loadedModules, ["mod-a"]);
   });
 });
 
 describe("MobHandle.storageDoctor()", () => {
-  it("sends mobkit/storage/doctor with snake_case params and parses the result", async () => {
+  it("sends meta/storage/doctor with snake_case params and parses the result", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
-      state_dir: "/var/lib/mobkit/state",
+      state_dir: "/var/lib/meta/state",
       diagnosis: {
         findings: [
           {
             severity: "error",
             code: "file-name-twins",
             message: "2 spellings of the 'sessions' store exist side by side",
-            path: "/var/lib/mobkit/state/sessions.db",
+            path: "/var/lib/meta/state/sessions.db",
           },
         ],
-        inventory: [{ realm: "state", root: "/var/lib/mobkit/state" }],
+        inventory: [{ realm: "state", root: "/var/lib/meta/state" }],
       },
       storage: { blob_durability: "persistent_disk" },
     }));
 
     const result = await handle.storageDoctor({
-      stateDir: "/var/lib/mobkit/state",
+      stateDir: "/var/lib/meta/state",
       identity: "domain:security",
     });
-    assert.equal(calls[0].method, "mobkit/storage/doctor");
+    assert.equal(calls[0].method, "meta/storage/doctor");
     assert.deepEqual(calls[0].params, {
-      state_dir: "/var/lib/mobkit/state",
+      state_dir: "/var/lib/meta/state",
       identity: "domain:security",
     });
-    assert.equal(result.stateDir, "/var/lib/mobkit/state");
+    assert.equal(result.stateDir, "/var/lib/meta/state");
     assert.equal(result.findings.length, 1);
     assert.equal(result.findings[0].code, "file-name-twins");
     assert.equal(result.findings[0].severity, "error");
-    assert.equal(result.findings[0].path, "/var/lib/mobkit/state/sessions.db");
+    assert.equal(result.findings[0].path, "/var/lib/meta/state/sessions.db");
     assert.equal(result.findings[0].realm, undefined);
     assert.equal(result.inventory.length, 1);
     assert.deepEqual(result.storage, { blob_durability: "persistent_disk" });
@@ -726,42 +758,42 @@ describe("MobHandle Rust gateway parity wrappers", () => {
 
     const result = await handle.sessionStoreBigQuery({ operation: "probe" });
 
-    assert.equal(calls[0].method, "mobkit/session_store/bigquery");
+    assert.equal(calls[0].method, "meta/session_store/bigquery");
     assert.deepEqual(calls[0].params, { operation: "probe" });
     assert.deepEqual(result, { rows: 1 });
   });
 
-  it("sends split MobKit editor catalog RPC names", async () => {
+  it("sends split Meta editor catalog RPC names", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse((method) => {
-      if (method === "mobkit/tools/catalog") {
+      if (method === "meta/tools/catalog") {
         return {
           schema_version: "mobpack.editor.v1",
           runtime_backed: false,
-          source: "mobkit/tool-config",
+          source: "meta/tool-config",
           tool_catalog: [{ id: "shell" }],
         };
       }
-      if (method === "mobkit/skills/catalog") {
+      if (method === "meta/skills/catalog") {
         return {
           schema_version: "mobpack.editor.v1",
           runtime_backed: false,
-          source: "mobkit/authoring-skill-realms",
-          skill_realms: [{ id: "mobkit/authoring" }],
+          source: "meta/authoring-skill-realms",
+          skill_realms: [{ id: "meta/authoring" }],
         };
       }
-      if (method === "mobkit/agent_definitions/list") {
+      if (method === "meta/agent_definitions/list") {
         return {
           schema_version: "mobpack.editor.v1",
           runtime_backed: false,
-          source: "mobkit/authoring-agent-definitions",
+          source: "meta/authoring-agent-definitions",
           agent_definitions: [{ id: "authoring:reviewer" }],
         };
       }
-      if (method === "mobkit/mobpacks/templates") {
+      if (method === "meta/mobpacks/templates") {
         return {
           schema_version: "mobpack.editor.v1",
-          source: "mobkit/mobpack-templates",
+          source: "meta/mobpack-templates",
           blank_mobpack: { document: {} },
           sample_mobpacks: [{ id: "sample" }],
           sample_agent_definitions: [{ id: "sample:reviewer" }],
@@ -771,10 +803,10 @@ describe("MobHandle Rust gateway parity wrappers", () => {
       return {
         schema_version: "mobpack.editor.v1",
         runtime_backed: false,
-        sources: { tools: "mobkit/tools/catalog" },
+        sources: { tools: "meta/tools/catalog" },
         templates: {},
         tool_catalog: [{ id: "shell" }],
-        skill_realms: [{ id: "mobkit/authoring" }],
+        skill_realms: [{ id: "meta/authoring" }],
         blank_mobpack: { document: {} },
         sample_mobpacks: [{ id: "sample" }],
         agent_definitions: [{ id: "authoring:reviewer" }],
@@ -785,16 +817,16 @@ describe("MobHandle Rust gateway parity wrappers", () => {
     });
 
     assert.deepEqual((await handle.toolsCatalog()).toolCatalog, [{ id: "shell" }]);
-    assert.deepEqual((await handle.skillsCatalog()).skillRealms, [{ id: "mobkit/authoring" }]);
+    assert.deepEqual((await handle.skillsCatalog()).skillRealms, [{ id: "meta/authoring" }]);
     assert.deepEqual((await handle.agentDefinitions()).agentDefinitions, [{ id: "authoring:reviewer" }]);
     assert.deepEqual((await handle.mobpackTemplates()).sampleMobpacks, [{ id: "sample" }]);
-    assert.deepEqual((await handle.mobpackCatalogs()).sources, { tools: "mobkit/tools/catalog" });
+    assert.deepEqual((await handle.mobpackCatalogs()).sources, { tools: "meta/tools/catalog" });
     assert.deepEqual(calls.map((call) => call.method), [
-      "mobkit/tools/catalog",
-      "mobkit/skills/catalog",
-      "mobkit/agent_definitions/list",
-      "mobkit/mobpacks/templates",
-      "mobkit/mobpacks/catalogs",
+      "meta/tools/catalog",
+      "meta/skills/catalog",
+      "meta/agent_definitions/list",
+      "meta/mobpacks/templates",
+      "meta/mobpacks/catalogs",
     ]);
   });
 });
@@ -808,7 +840,7 @@ describe("MobHandle mobpack authoring wrappers", () => {
     ],
     mob_id: "demo",
     flow_ids: ["flow_a"],
-    validation_source: "mobkit/mobpacks/validate",
+    validation_source: "meta/mobpacks/validate",
     deploy_command: "rkat mob deploy",
   };
 
@@ -817,8 +849,8 @@ describe("MobHandle mobpack authoring wrappers", () => {
     name: "Demo",
     version: "mobpack.editor.v1",
     stage: "draft",
-    trigger: "MobKit authoring draft",
-    source: "mobkit/mobpacks/create",
+    trigger: "Meta authoring draft",
+    source: "meta/mobpacks/create",
     revision,
     etag: `f_demo:${revision}`,
     updated_at_unix_ms: 1700000000000,
@@ -834,8 +866,8 @@ describe("MobHandle mobpack authoring wrappers", () => {
     ) => void,
   ): void {
     const responses: Record<string, unknown> = {
-      "mobkit/mobpacks/validate": validationPayload,
-      "mobkit/mobpacks/source": {
+      "meta/mobpacks/validate": validationPayload,
+      "meta/mobpacks/source": {
         filename: "demo.mobpack",
         media_type: "application/vnd.meerkat.mobpack",
         mob_toml: '[mob]\nid = "demo"\n',
@@ -849,9 +881,9 @@ describe("MobHandle mobpack authoring wrappers", () => {
           },
         ],
         validation: validationPayload,
-        source: "mobkit/mobpacks/source",
+        source: "meta/mobpacks/source",
       },
-      "mobkit/mobpacks/export": {
+      "meta/mobpacks/export": {
         filename: "demo.mobpack",
         media_type: "application/vnd.meerkat.mobpack",
         content_base64: "UEsDBA==",
@@ -859,76 +891,76 @@ describe("MobHandle mobpack authoring wrappers", () => {
         source_files: [],
         validation: validationPayload,
       },
-      "mobkit/mobpacks/import": {
+      "meta/mobpacks/import": {
         document: { mob_id: "demo" },
         validation: validationPayload,
-        source: "mobkit/mobpacks/import:mob.toml",
+        source: "meta/mobpacks/import:mob.toml",
         source_label: "demo.toml",
         source_media_type: "text/x-toml",
       },
-      "mobkit/mobpacks/list": {
-        source: "mobkit/mobpacks/list",
+      "meta/mobpacks/list": {
+        source: "meta/mobpacks/list",
         store_path: "/tmp/drafts.json",
         runtime_backed: false,
         rows: [draftRowPayload()],
       },
-      "mobkit/mobpacks/get": {
-        source: "mobkit/mobpacks/get",
+      "meta/mobpacks/get": {
+        source: "meta/mobpacks/get",
         store_path: "/tmp/drafts.json",
         runtime_backed: false,
         row: draftRowPayload(),
       },
-      "mobkit/mobpacks/create": {
-        source: "mobkit/mobpacks/create",
+      "meta/mobpacks/create": {
+        source: "meta/mobpacks/create",
         store_path: "/tmp/drafts.json",
         row: draftRowPayload(),
         rows: [draftRowPayload()],
       },
-      "mobkit/mobpacks/save": {
-        source: "mobkit/mobpacks/save",
+      "meta/mobpacks/save": {
+        source: "meta/mobpacks/save",
         store_path: "/tmp/drafts.json",
         row: draftRowPayload(2),
         rows: [draftRowPayload(2)],
       },
-      "mobkit/mobpacks/undo": {
-        source: "mobkit/mobpacks/undo",
+      "meta/mobpacks/undo": {
+        source: "meta/mobpacks/undo",
         store_path: "/tmp/drafts.json",
         stepped: true,
         row: draftRowPayload(3, false, true),
         rows: [draftRowPayload(3, false, true)],
       },
-      "mobkit/mobpacks/redo": {
-        source: "mobkit/mobpacks/redo",
+      "meta/mobpacks/redo": {
+        source: "meta/mobpacks/redo",
         store_path: "/tmp/drafts.json",
         stepped: false,
         reason: "nothing to redo",
         row: draftRowPayload(3, false, true),
         rows: [draftRowPayload(3, false, true)],
       },
-      "mobkit/mobpacks/delete": {
-        source: "mobkit/mobpacks/delete",
+      "meta/mobpacks/delete": {
+        source: "meta/mobpacks/delete",
         store_path: "/tmp/drafts.json",
         id: "f_demo",
         deleted: true,
         rows: [],
       },
-      "mobkit/mobpacks/apply_operation": {
-        source: "mobkit/mobpacks/apply_operation",
+      "meta/mobpacks/apply_operation": {
+        source: "meta/mobpacks/apply_operation",
         operation: "add_member",
         ok: true,
         document: { mob_id: "demo", members: [{ id: "reviewer" }] },
         selection: { kind: "agent", id: "reviewer" },
         validation: validationPayload,
       },
-      "mobkit/mobpacks/deploy_command": {
+      "meta/mobpacks/deploy_command": {
         command: "rkat mob deploy demo.mobpack",
         argv: ["rkat", "mob", "deploy", "demo.mobpack"],
         deploy_command: "rkat mob deploy",
         filename: "demo.mobpack",
         validation: validationPayload,
-        source: "meerkat_mobkit::mobpack::deploy_argv",
+        source: "meerkat_meta::mobpack::deploy_argv",
       },
-      "mobkit/mobpacks/deploy": {
+      "meta/mobpacks/deploy": {
         filename: "demo.mobpack",
         pack_path: "/tmp/demo.mobpack",
         pack_sha256: "deadbeef",
@@ -968,7 +1000,7 @@ describe("MobHandle mobpack authoring wrappers", () => {
       sourceName: "demo.toml",
     });
     assert.deepEqual(imported.document, { mob_id: "demo" });
-    assert.equal(imported.source, "mobkit/mobpacks/import:mob.toml");
+    assert.equal(imported.source, "meta/mobpacks/import:mob.toml");
 
     const listed = await handle.mobpackList();
     assert.equal(listed.rows[0].id, "f_demo");
@@ -1028,20 +1060,20 @@ describe("MobHandle mobpack authoring wrappers", () => {
     assert.equal(deployed.packSha256, "deadbeef");
 
     assert.deepEqual(calls.map((call) => call.method), [
-      "mobkit/mobpacks/validate",
-      "mobkit/mobpacks/source",
-      "mobkit/mobpacks/export",
-      "mobkit/mobpacks/import",
-      "mobkit/mobpacks/list",
-      "mobkit/mobpacks/get",
-      "mobkit/mobpacks/create",
-      "mobkit/mobpacks/save",
-      "mobkit/mobpacks/undo",
-      "mobkit/mobpacks/redo",
-      "mobkit/mobpacks/delete",
-      "mobkit/mobpacks/apply_operation",
-      "mobkit/mobpacks/deploy_command",
-      "mobkit/mobpacks/deploy",
+      "meta/mobpacks/validate",
+      "meta/mobpacks/source",
+      "meta/mobpacks/export",
+      "meta/mobpacks/import",
+      "meta/mobpacks/list",
+      "meta/mobpacks/get",
+      "meta/mobpacks/create",
+      "meta/mobpacks/save",
+      "meta/mobpacks/undo",
+      "meta/mobpacks/redo",
+      "meta/mobpacks/delete",
+      "meta/mobpacks/apply_operation",
+      "meta/mobpacks/deploy_command",
+      "meta/mobpacks/deploy",
     ]);
     assert.deepEqual(calls[0].params, { document, rkat_validate: true });
     assert.deepEqual(calls[1].params, { document });
@@ -1097,7 +1129,7 @@ describe("MobHandle mobpack authoring wrappers", () => {
 });
 
 describe("MobHandle.spawn()", () => {
-  it("sends mobkit/spawn_member with discovery spec", async () => {
+  it("sends meta/spawn_member with discovery spec", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       accepted: true,
@@ -1112,7 +1144,7 @@ describe("MobHandle.spawn()", () => {
       labels: { role: "helper" },
     });
 
-    assert.equal(calls[0].method, "mobkit/spawn_member");
+    assert.equal(calls[0].method, "meta/spawn_member");
     assert.equal(calls[0].params!.role, "assistant");
     assert.equal(calls[0].params!.agent_identity, "m-1");
     assert.deepEqual(calls[0].params!.labels, { role: "helper" });
@@ -1124,7 +1156,7 @@ describe("MobHandle.spawn()", () => {
 });
 
 describe("MobHandle.spawnMember()", () => {
-  it("sends mobkit/spawn_member with module_id", async () => {
+  it("sends meta/spawn_member with module_id", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       accepted: true,
@@ -1134,7 +1166,7 @@ describe("MobHandle.spawnMember()", () => {
     }));
 
     const result = await handle.spawnMember("mod-y");
-    assert.equal(calls[0].method, "mobkit/spawn_member");
+    assert.equal(calls[0].method, "meta/spawn_member");
     assert.deepEqual(calls[0].params, { module_id: "mod-y" });
     assert.equal(result.accepted, true);
     assert.equal(result.moduleId, "mod-y");
@@ -1144,7 +1176,7 @@ describe("MobHandle.spawnMember()", () => {
 });
 
 describe("MobHandle.reconcile()", () => {
-  it("sends mobkit/reconcile with modules array", async () => {
+  it("sends meta/reconcile with modules array", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       accepted: true,
@@ -1153,7 +1185,7 @@ describe("MobHandle.reconcile()", () => {
     }));
 
     const result = await handle.reconcile(["mod-a", "mod-b"]);
-    assert.equal(calls[0].method, "mobkit/reconcile");
+    assert.equal(calls[0].method, "meta/reconcile");
     assert.deepEqual(calls[0].params, { modules: ["mod-a", "mod-b"] });
     assert.equal(result.accepted, true);
     assert.deepEqual(result.reconciledModules, ["mod-a", "mod-b"]);
@@ -1162,7 +1194,7 @@ describe("MobHandle.reconcile()", () => {
 });
 
 describe("MobHandle.subscribeEvents()", () => {
-  it("sends mobkit/events/subscribe with scope", async () => {
+  it("sends meta/events/subscribe with scope", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       scope: "mob",
@@ -1181,7 +1213,7 @@ describe("MobHandle.subscribeEvents()", () => {
     }));
 
     const result = await handle.subscribeEvents("mob", "evt-0", "agent-1");
-    assert.equal(calls[0].method, "mobkit/events/subscribe");
+    assert.equal(calls[0].method, "meta/events/subscribe");
     assert.equal(calls[0].params!.scope, "mob");
     assert.equal(calls[0].params!.last_event_id, "evt-0");
     assert.equal(calls[0].params!.agent_id, "agent-1");
@@ -1209,8 +1241,134 @@ describe("MobHandle.subscribeEvents()", () => {
   });
 });
 
+describe("MobHandle native review subscription compatibility", () => {
+  for (const surface of ["agent", "mob"] as const) {
+    for (const approvalId of [undefined, "B6503200-06B6-4157-AFC0-2A3C8D124178"]) {
+      it(`${surface} subscription preserves ${approvalId ? "referenced" : "kind-only"} review feedback and subsequent events`, async () => {
+        const { rt, handle, calls } = createMockRuntime();
+        const memberId = "native-review-agent";
+        const callId = "  native-review-call  ";
+        const refusal = JSON.stringify({
+          error: "review_unsatisfied",
+          message: "operation review remains unsatisfied",
+          data: {
+            kind: approvalId ? "human_consent_required" : "denied",
+            ...(approvalId === undefined ? {} : { approval_id: approvalId }),
+          },
+        });
+        const unavailable = JSON.stringify({
+          error: "review_unavailable",
+          message: "operation reviewer is not installed",
+          data: { kind: "reviewer_missing" },
+        });
+        const modelNotices = [
+          { code: "REVIEW_UNSATISFIED", review: { review: "unsatisfied", kind: "denied" } },
+          { code: "REVIEW_UNAVAILABLE", review: { review: "unavailable", kind: "reviewer_missing" } },
+        ].map((payload) => ({
+          type: "system_notice",
+          message: {
+            role: "system_notice", kind: "generic", body: "Review feedback",
+            blocks: [{ type: "runtime_notice", category: "operation_review_required", detail: null, payload }],
+          },
+          future_detail: { version: 99, values: [null, "opaque"] },
+        }));
+        // This unknown event is deliberately not a native consent state. Its
+        // label/reference must not become a decision or an execution result.
+        const unknown = {
+          type: "future_review_diagnostic", status: "Approved",
+          approval_id: "B6503200-06B6-4157-AFC0-2A3C8D124178",
+          future_detail: { values: [null, { label: "opaque" }] },
+        };
+        // `result` is the existing Meta projection of native tool content.
+        // The optional reference is fixture wire data, not proof of issuance.
+        const payloads = [
+          { type: "run_started", session_id: "native-review-session", prompt: "Use permitted work" },
+          { type: "tool_execution_completed", id: callId, name: "write_file",
+            content: [{ type: "text", text: refusal }], result: refusal, is_error: true, duration_ms: 0 },
+          { type: "tool_result_received", id: callId, name: "write_file",
+            content: [{ type: "text", text: refusal }], is_error: true },
+          { type: "tool_execution_completed", id: "unavailable-call", name: "write_file",
+            content: [{ type: "text", text: unavailable }], result: unavailable, is_error: true, duration_ms: 0 },
+          ...modelNotices,
+          unknown,
+          { type: "tool_execution_completed", id: "permitted-call", name: "read_file",
+            content: [{ type: "text", text: "permitted sibling" }], result: "permitted sibling", is_error: false, duration_ms: 1 },
+          { type: "tool_result_received", id: "permitted-call", name: "read_file", is_error: false },
+          { type: "text_delta", delta: "Continuing with permitted work." },
+          { type: "run_completed", session_id: "native-review-session", result: "Actual terminal packet" },
+        ];
+        const originalPayloads = JSON.stringify(payloads);
+        const subscriptions: Array<{ scope: string; memberId?: string }> = [];
+        let closedSources = 0;
+        // Only the source is a fixture. Both public methods and their actual
+        // agent/mob envelope parsers run; this does not exercise HTTP/native execution.
+        async function* source(scope: "agent" | "mob", requestedMember?: string) {
+          subscriptions.push({ scope, ...(requestedMember === undefined ? {} : { memberId: requestedMember }) });
+          try {
+            for (const [index, payload] of payloads.entries()) {
+              yield {
+                id: String(index), event: payload.type,
+                data: JSON.stringify(scope === "agent" ? payload : {
+                  member_id: memberId, timestamp_ms: 1700000000000 + index, payload,
+                }),
+              };
+            }
+          } finally {
+            closedSources += 1;
+          }
+        }
+        const bridge = rt.sseBridge();
+        bridge.agentEvents = (id) => source("agent", id);
+        bridge.mobEvents = () => source("mob");
+        rt.sseBridge = () => bridge;
+
+        const events: AgentEvent[] = [];
+        const stream = surface === "agent" ? handle.subscribeAgent(memberId) : handle.subscribeMob();
+        for await (const envelope of stream) {
+          assert.equal("memberId" in envelope, surface === "mob");
+          if ("memberId" in envelope) {
+            assert.equal(envelope.memberId, memberId);
+            assert.equal(envelope.timestampMs, 1700000000000 + events.length);
+          } else {
+            assert.equal(envelope.eventType, payloads[events.length].type);
+          }
+          events.push(envelope.event);
+        }
+
+        assert.deepEqual(events.map((event) => event.type), payloads.map((payload) => payload.type));
+        const blocked = events[1];
+        assert.ok("id" in blocked && "result" in blocked && "isError" in blocked);
+        assert.deepEqual([blocked.id, blocked.result, blocked.isError], [callId, refusal, true]);
+        const detail = JSON.parse(blocked.result).data;
+        assert.equal(Object.hasOwn(detail, "approval_id"), approvalId !== undefined);
+        assert.equal(detail.approval_id, approvalId);
+        assert.deepEqual(events[2], { type: "tool_result_received", id: callId, name: "write_file", isError: true });
+        const unavailableResult = events[3];
+        assert.ok("result" in unavailableResult && "isError" in unavailableResult);
+        assert.deepEqual([unavailableResult.result, unavailableResult.isError], [unavailable, true]);
+        for (const [index, notice] of [...modelNotices, unknown].entries()) {
+          const projected = events[4 + index];
+          assert.ok("data" in projected);
+          assert.deepEqual(projected.data, notice);
+        }
+        assert.deepEqual(events[7], { type: "tool_execution_completed", id: "permitted-call", name: "read_file",
+          result: "permitted sibling", isError: false, durationMs: 1 });
+        assert.deepEqual(events[8], { type: "tool_result_received", id: "permitted-call", name: "read_file", isError: false });
+        assert.deepEqual(events[9], { type: "text_delta", delta: "Continuing with permitted work." });
+        assert.deepEqual(events[10], { type: "run_completed", sessionId: "native-review-session", result: "Actual terminal packet" });
+        assert.equal(events.some((event) => event.type === "run_failed"), false);
+        assert.deepEqual(subscriptions, [surface === "agent" ? { scope: "agent", memberId } : { scope: "mob" }]);
+        assert.equal(closedSources, 1);
+        assert.deepEqual(calls, []); // No automatic approval, retry, send or other RPC.
+        assert.equal(JSON.stringify(payloads), originalPayloads);
+        assert.equal(rt.isRunning, true);
+      });
+    }
+  }
+});
+
 describe("MobHandle.send()", () => {
-  it("sends mobkit/send_message and parses result", async () => {
+  it("sends meta/send_message and parses result", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       accepted: true,
@@ -1219,7 +1377,7 @@ describe("MobHandle.send()", () => {
     }));
 
     const result = await handle.send("m-1", "Hello!");
-    assert.equal(calls[0].method, "mobkit/send_message");
+    assert.equal(calls[0].method, "meta/send_message");
     assert.deepEqual(calls[0].params, { member_id: "m-1", message: "Hello!" });
     assert.equal(result.accepted, true);
     assert.equal(result.memberId, "m-1");
@@ -1269,7 +1427,7 @@ describe("MobHandle.send()", () => {
           string,
           any
         >;
-        assert.equal(payload.method, "mobkit/send_message");
+        assert.equal(payload.method, "meta/send_message");
         assert.deepEqual(payload.params, {
           member_id: "m-1",
           content: [
@@ -1379,7 +1537,7 @@ describe("MobHandle.sendMessage()", () => {
     }));
 
     const result = await handle.sendMessage("m-2", "Hi");
-    assert.equal(calls[0].method, "mobkit/send_message");
+    assert.equal(calls[0].method, "meta/send_message");
     assert.deepEqual(calls[0].params, { member_id: "m-2", message: "Hi" });
     assert.equal(result.accepted, true);
     assert.equal(result.memberId, "m-2");
@@ -1401,7 +1559,7 @@ describe("MobHandle.uploadBlob()", () => {
           string,
           any
         >;
-        assert.equal(payload.method, "mobkit/blob/upload");
+        assert.equal(payload.method, "meta/blob/upload");
         assert.deepEqual(payload.params, {
           upload: {
             type: "image_upload",
@@ -1482,7 +1640,7 @@ describe("MobHandle.uploadBlob()", () => {
         (err: unknown) =>
           err instanceof RpcError &&
           err.code === -32602 &&
-          err.method === "mobkit/blob/upload",
+          err.method === "meta/blob/upload",
       );
     } finally {
       globalThis.fetch = originalFetch;
@@ -1523,7 +1681,7 @@ describe("MobHandle.uploadBlob()", () => {
 });
 
 describe("MobHandle.ensureMember()", () => {
-  it("sends mobkit/ensure_member with all options", async () => {
+  it("sends meta/ensure_member with all options", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       agent_identity: "m-1",
@@ -1550,7 +1708,7 @@ describe("MobHandle.ensureMember()", () => {
       },
     });
 
-    assert.equal(calls[0].method, "mobkit/ensure_member");
+    assert.equal(calls[0].method, "meta/ensure_member");
     assert.equal(calls[0].params!.role, "assistant");
     assert.equal(calls[0].params!.agent_identity, "m-1");
     assert.deepEqual(calls[0].params!.labels, { role: "helper" });
@@ -1593,7 +1751,7 @@ describe("MobHandle.ensureMember()", () => {
 });
 
 describe("MobHandle.findMembers()", () => {
-  it("sends mobkit/find_members and returns array", async () => {
+  it("sends meta/find_members and returns array", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => [
       {
@@ -1613,7 +1771,7 @@ describe("MobHandle.findMembers()", () => {
     ]);
 
     const result = await handle.findMembers("role", "helper");
-    assert.equal(calls[0].method, "mobkit/find_members");
+    assert.equal(calls[0].method, "meta/find_members");
     assert.deepEqual(calls[0].params, {
       label_key: "role",
       label_value: "helper",
@@ -1633,7 +1791,7 @@ describe("MobHandle.findMembers()", () => {
 });
 
 describe("MobHandle.listMembers()", () => {
-  it("sends mobkit/list_members and returns array", async () => {
+  it("sends meta/list_members and returns array", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => [
       {
@@ -1646,7 +1804,7 @@ describe("MobHandle.listMembers()", () => {
     ]);
 
     const result = await handle.listMembers();
-    assert.equal(calls[0].method, "mobkit/list_members");
+    assert.equal(calls[0].method, "meta/list_members");
     assert.equal(result.length, 1);
     assert.equal(result[0].agentIdentity, "m-1");
   });
@@ -1661,7 +1819,7 @@ describe("MobHandle.listMembers()", () => {
 });
 
 describe("MobHandle.getMember()", () => {
-  it("sends mobkit/get_member and parses snapshot", async () => {
+  it("sends meta/get_member and parses snapshot", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       agent_identity: "m-1",
@@ -1672,7 +1830,7 @@ describe("MobHandle.getMember()", () => {
     }));
 
     const result = await handle.getMember("m-1");
-    assert.equal(calls[0].method, "mobkit/get_member");
+    assert.equal(calls[0].method, "meta/get_member");
     assert.deepEqual(calls[0].params, { member_id: "m-1" });
     assert.equal(result.agentIdentity, "m-1");
     assert.equal(result.role, "assistant");
@@ -1681,29 +1839,29 @@ describe("MobHandle.getMember()", () => {
 });
 
 describe("MobHandle.retireMember()", () => {
-  it("sends mobkit/retire_member", async () => {
+  it("sends meta/retire_member", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({}));
 
     await handle.retireMember("m-1");
-    assert.equal(calls[0].method, "mobkit/retire_member");
+    assert.equal(calls[0].method, "meta/retire_member");
     assert.deepEqual(calls[0].params, { member_id: "m-1" });
   });
 });
 
 describe("MobHandle.respawnMember()", () => {
-  it("sends mobkit/respawn_member", async () => {
+  it("sends meta/respawn_member", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({}));
 
     await handle.respawnMember("m-1");
-    assert.equal(calls[0].method, "mobkit/respawn_member");
+    assert.equal(calls[0].method, "meta/respawn_member");
     assert.deepEqual(calls[0].params, { member_id: "m-1" });
   });
 });
 
 describe("MobHandle.reloadMember()", () => {
-  it("sends mobkit/reload_member and parses the typed result", async () => {
+  it("sends meta/reload_member and parses the typed result", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       reloaded: true,
@@ -1716,7 +1874,7 @@ describe("MobHandle.reloadMember()", () => {
 
     const result = await handle.reloadMember("review:singleton");
     assert.equal(calls.length, 1, "never a second (respawn) call");
-    assert.equal(calls[0].method, "mobkit/reload_member");
+    assert.equal(calls[0].method, "meta/reload_member");
     assert.deepEqual(calls[0].params, { member_id: "review:singleton" });
     assert.deepEqual(result, {
       reloaded: true,
@@ -1759,18 +1917,18 @@ describe("MobHandle.memberHealth()", () => {
       assert.equal("retryable" in data, false);
       calls.length = 0;
       setResponse(() => {
-        throw new RpcError(-32603, "observation deadline", "request-1", "mobkit/send_message", data);
+        throw new RpcError(-32603, "observation deadline", "request-1", "meta/send_message", data);
       });
       await assert.rejects(handle.send("x", "turn"), (error: unknown) => {
         assert.ok(error instanceof RpcError);
         assert.deepEqual(error.data, data);
         return true;
       });
-      assert.deepEqual(calls.map(call => call.method), ["mobkit/send_message"]);
+      assert.deepEqual(calls.map(call => call.method), ["meta/send_message"]);
     });
   }
 
-  it("sends mobkit/member_health and parses the report", async () => {
+  it("sends meta/member_health and parses the report", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       identity: "review:singleton",
@@ -1790,7 +1948,7 @@ describe("MobHandle.memberHealth()", () => {
     }));
 
     const health = await handle.memberHealth("review:singleton");
-    assert.equal(calls[0].method, "mobkit/member_health");
+    assert.equal(calls[0].method, "meta/member_health");
     assert.deepEqual(calls[0].params, { member_id: "review:singleton" });
     assert.equal(health.identity, "review:singleton");
     assert.equal(health.memberId, "rt:review:singleton:4");
@@ -1825,7 +1983,7 @@ describe("MobHandle.memberHealth()", () => {
 });
 
 describe("MobHandle.resolveRouting()", () => {
-  it("sends mobkit/routing/resolve with recipient", async () => {
+  it("sends meta/routing/resolve with recipient", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       recipient: "user@example.com",
@@ -1835,7 +1993,7 @@ describe("MobHandle.resolveRouting()", () => {
     const result = await handle.resolveRouting("user@example.com", {
       hint: "email",
     });
-    assert.equal(calls[0].method, "mobkit/routing/resolve");
+    assert.equal(calls[0].method, "meta/routing/resolve");
     assert.equal(calls[0].params!.recipient, "user@example.com");
     assert.equal(calls[0].params!.hint, "email");
     assert.equal(result.recipient, "user@example.com");
@@ -1852,7 +2010,7 @@ describe("MobHandle.resolveRouting()", () => {
 });
 
 describe("MobHandle.listRoutes()", () => {
-  it("sends mobkit/routing/routes/list and parses routes", async () => {
+  it("sends meta/routing/routes/list and parses routes", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       routes: [
@@ -1867,7 +2025,7 @@ describe("MobHandle.listRoutes()", () => {
     }));
 
     const result = await handle.listRoutes();
-    assert.equal(calls[0].method, "mobkit/routing/routes/list");
+    assert.equal(calls[0].method, "meta/routing/routes/list");
     assert.equal(result.length, 1);
     assert.equal(result[0].routeKey, "rk-1");
     assert.equal(result[0].recipient, "user@example.org");
@@ -1878,7 +2036,7 @@ describe("MobHandle.listRoutes()", () => {
 });
 
 describe("MobHandle.addRoute()", () => {
-  it("sends mobkit/routing/routes/add with all params", async () => {
+  it("sends meta/routing/routes/add with all params", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       route: {
@@ -1897,7 +2055,7 @@ describe("MobHandle.addRoute()", () => {
       "notifier",
       "slack",
     );
-    assert.equal(calls[0].method, "mobkit/routing/routes/add");
+    assert.equal(calls[0].method, "meta/routing/routes/add");
     assert.equal(calls[0].params!.route_key, "rk-new");
     assert.equal(calls[0].params!.recipient, "alice");
     assert.equal(calls[0].params!.sink, "webhook");
@@ -1925,7 +2083,7 @@ describe("MobHandle.addRoute()", () => {
 });
 
 describe("MobHandle.deleteRoute()", () => {
-  it("sends mobkit/routing/routes/delete", async () => {
+  it("sends meta/routing/routes/delete", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       deleted: {
@@ -1938,7 +2096,7 @@ describe("MobHandle.deleteRoute()", () => {
     }));
 
     const result = await handle.deleteRoute("rk-del");
-    assert.equal(calls[0].method, "mobkit/routing/routes/delete");
+    assert.equal(calls[0].method, "meta/routing/routes/delete");
     assert.deepEqual(calls[0].params, { route_key: "rk-del" });
     assert.equal(result.routeKey, "rk-del");
     assert.equal(result.channel, null);
@@ -1946,7 +2104,7 @@ describe("MobHandle.deleteRoute()", () => {
 });
 
 describe("MobHandle.sendDelivery()", () => {
-  it("sends mobkit/delivery/send with options", async () => {
+  it("sends meta/delivery/send with options", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       delivered: true,
@@ -1957,7 +2115,7 @@ describe("MobHandle.sendDelivery()", () => {
       recipient: "alice",
       payload: "hi",
     });
-    assert.equal(calls[0].method, "mobkit/delivery/send");
+    assert.equal(calls[0].method, "meta/delivery/send");
     assert.deepEqual(calls[0].params, { recipient: "alice", payload: "hi" });
     assert.equal(result.delivered, true);
     assert.equal(result.deliveryId, "dlv-1");
@@ -1965,14 +2123,14 @@ describe("MobHandle.sendDelivery()", () => {
 });
 
 describe("MobHandle.deliveryHistory()", () => {
-  it("sends mobkit/delivery/history with defaults", async () => {
+  it("sends meta/delivery/history with defaults", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       deliveries: [{ id: "dlv-1" }],
     }));
 
     const result = await handle.deliveryHistory();
-    assert.equal(calls[0].method, "mobkit/delivery/history");
+    assert.equal(calls[0].method, "meta/delivery/history");
     assert.deepEqual(calls[0].params, { limit: 20 });
     assert.equal(result.deliveries.length, 1);
   });
@@ -1989,7 +2147,7 @@ describe("MobHandle.deliveryHistory()", () => {
 });
 
 describe("MobHandle.memoryQuery()", () => {
-  it("sends mobkit/memory/query", async () => {
+  it("sends meta/memory/query", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       assertions: [{
@@ -2004,7 +2162,7 @@ describe("MobHandle.memoryQuery()", () => {
     }));
 
     const result = await handle.memoryQuery({ entity: "foo", topic: "bar", store: "main" });
-    assert.equal(calls[0].method, "mobkit/memory/query");
+    assert.equal(calls[0].method, "meta/memory/query");
     assert.equal(calls[0].params!.entity, "foo");
     assert.equal(calls[0].params!.topic, "bar");
     assert.equal(calls[0].params!.store, "main");
@@ -2019,7 +2177,7 @@ describe("MobHandle.memoryQuery()", () => {
     }));
 
     const result = await handle.memoryQuery("search term", { store: "main" });
-    assert.equal(calls[0].method, "mobkit/memory/query");
+    assert.equal(calls[0].method, "meta/memory/query");
     assert.equal(calls[0].params!.query, "search term");
     assert.equal(calls[0].params!.store, "main");
     assert.equal(result.results.length, 1);
@@ -2027,7 +2185,7 @@ describe("MobHandle.memoryQuery()", () => {
 });
 
 describe("MobHandle.memoryStores()", () => {
-  it("sends mobkit/memory/stores and parses stores", async () => {
+  it("sends meta/memory/stores and parses stores", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       stores: [
@@ -2037,7 +2195,7 @@ describe("MobHandle.memoryStores()", () => {
     }));
 
     const result = await handle.memoryStores();
-    assert.equal(calls[0].method, "mobkit/memory/stores");
+    assert.equal(calls[0].method, "meta/memory/stores");
     assert.equal(result.length, 2);
     assert.equal(result[0].store, "main");
     assert.equal(result[0].recordCount, 42);
@@ -2047,7 +2205,7 @@ describe("MobHandle.memoryStores()", () => {
 });
 
 describe("MobHandle.memoryIndex()", () => {
-  it("sends mobkit/memory/index", async () => {
+  it("sends meta/memory/index", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       entity: "user-1",
@@ -2059,7 +2217,7 @@ describe("MobHandle.memoryIndex()", () => {
     const result = await handle.memoryIndex("user-1", "preferences", "main", {
       extra: true,
     });
-    assert.equal(calls[0].method, "mobkit/memory/index");
+    assert.equal(calls[0].method, "meta/memory/index");
     assert.equal(calls[0].params!.entity, "user-1");
     assert.equal(calls[0].params!.topic, "preferences");
     assert.equal(calls[0].params!.store, "main");
@@ -2072,7 +2230,7 @@ describe("MobHandle.memoryIndex()", () => {
 });
 
 describe("MobHandle.rememberAgentMemory()", () => {
-  it("sends mobkit/agent_memory/remember and parses the record", async () => {
+  it("sends meta/agent_memory/remember and parses the record", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       memory_id: "mem-1",
@@ -2090,7 +2248,7 @@ describe("MobHandle.rememberAgentMemory()", () => {
       tags: ["team", "calendar"],
     });
 
-    assert.equal(calls[0].method, "mobkit/agent_memory/remember");
+    assert.equal(calls[0].method, "meta/agent_memory/remember");
     assert.deepEqual(calls[0].params, {
       identity: "identity:luka",
       realm: "example",
@@ -2108,7 +2266,7 @@ describe("MobHandle.rememberAgentMemory()", () => {
 });
 
 describe("MobHandle.recallAgentMemory()", () => {
-  it("sends mobkit/agent_memory/recall and parses records", async () => {
+  it("sends meta/agent_memory/recall and parses records", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       records: [{
@@ -2129,7 +2287,7 @@ describe("MobHandle.recallAgentMemory()", () => {
       maxEntries: 4,
     });
 
-    assert.equal(calls[0].method, "mobkit/agent_memory/recall");
+    assert.equal(calls[0].method, "meta/agent_memory/recall");
     assert.deepEqual(calls[0].params, {
       identity: "identity:luka",
       realm: "example",
@@ -2145,7 +2303,7 @@ describe("MobHandle.recallAgentMemory()", () => {
 });
 
 describe("MobHandle.forgetAgentMemory()", () => {
-  it("sends mobkit/agent_memory/forget and parses the result", async () => {
+  it("sends meta/agent_memory/forget and parses the result", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       memory_id: "mem-1",
@@ -2156,7 +2314,7 @@ describe("MobHandle.forgetAgentMemory()", () => {
       realm: "example",
     });
 
-    assert.equal(calls[0].method, "mobkit/agent_memory/forget");
+    assert.equal(calls[0].method, "meta/agent_memory/forget");
     assert.deepEqual(calls[0].params, {
       identity: "identity:luka",
       memory_id: "mem-1",
@@ -2168,7 +2326,7 @@ describe("MobHandle.forgetAgentMemory()", () => {
 });
 
 describe("MobHandle.updateAgentMemory()", () => {
-  it("sends mobkit/agent_memory/update and parses the result", async () => {
+  it("sends meta/agent_memory/update and parses the result", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       memory_id: "mem-2",
@@ -2182,7 +2340,7 @@ describe("MobHandle.updateAgentMemory()", () => {
       tags: ["team"],
     });
 
-    assert.equal(calls[0].method, "mobkit/agent_memory/update");
+    assert.equal(calls[0].method, "meta/agent_memory/update");
     assert.deepEqual(calls[0].params, {
       identity: "identity:luka",
       memory_id: "mem-1",
@@ -2197,7 +2355,7 @@ describe("MobHandle.updateAgentMemory()", () => {
 });
 
 describe("MobHandle.manifestAgentMemory()", () => {
-  it("sends mobkit/agent_memory/manifest and parses record metas", async () => {
+  it("sends meta/agent_memory/manifest and parses record metas", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       records: [{
@@ -2216,7 +2374,7 @@ describe("MobHandle.manifestAgentMemory()", () => {
       k: 4,
     });
 
-    assert.equal(calls[0].method, "mobkit/agent_memory/manifest");
+    assert.equal(calls[0].method, "meta/agent_memory/manifest");
     assert.deepEqual(calls[0].params, {
       identity: "identity:luka",
       realm: "example",
@@ -2243,7 +2401,7 @@ describe("MobHandle.manifestAgentMemory()", () => {
 
     const result = await handle.manifestAgentMemory("identity:luka");
 
-    assert.equal(calls[0].method, "mobkit/agent_memory/manifest");
+    assert.equal(calls[0].method, "meta/agent_memory/manifest");
     assert.deepEqual(calls[0].params, { identity: "identity:luka" });
     assert.equal(result[0]!.rank, null);
     assert.equal(result[0]!.description, "");
@@ -2251,7 +2409,7 @@ describe("MobHandle.manifestAgentMemory()", () => {
 });
 
 describe("MobHandle.callTool()", () => {
-  it("sends mobkit/call_tool with args", async () => {
+  it("sends meta/call_tool with args", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       module_id: "google-workspace",
@@ -2262,7 +2420,7 @@ describe("MobHandle.callTool()", () => {
     const result = await handle.callTool("google-workspace", "gmail_search", {
       query: "is:unread",
     });
-    assert.equal(calls[0].method, "mobkit/call_tool");
+    assert.equal(calls[0].method, "meta/call_tool");
     assert.equal(calls[0].params!.module_id, "google-workspace");
     assert.equal(calls[0].params!.tool, "gmail_search");
     assert.deepEqual(calls[0].params!.arguments, { query: "is:unread" });
@@ -2293,7 +2451,7 @@ describe("MobHandle.toolCaller()", () => {
     assert.ok(caller instanceof ToolCaller);
 
     const result = await caller.call("search", { q: "test" });
-    assert.equal(calls[0].method, "mobkit/call_tool");
+    assert.equal(calls[0].method, "meta/call_tool");
     assert.equal(calls[0].params!.module_id, "ws");
     assert.equal(calls[0].params!.tool, "search");
     assert.deepEqual(calls[0].params!.arguments, { q: "test" });
@@ -2303,7 +2461,7 @@ describe("MobHandle.toolCaller()", () => {
 });
 
 describe("MobHandle.gatingEvaluate()", () => {
-  it("sends mobkit/gating/evaluate", async () => {
+  it("sends meta/gating/evaluate", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       action_id: "act-1",
@@ -2317,7 +2475,7 @@ describe("MobHandle.gatingEvaluate()", () => {
     const result = await handle.gatingEvaluate("delete_account", "user-1", {
       context: "admin",
     });
-    assert.equal(calls[0].method, "mobkit/gating/evaluate");
+    assert.equal(calls[0].method, "meta/gating/evaluate");
     assert.equal(calls[0].params!.action, "delete_account");
     assert.equal(calls[0].params!.actor_id, "user-1");
     assert.equal(calls[0].params!.context, "admin");
@@ -2331,7 +2489,7 @@ describe("MobHandle.gatingEvaluate()", () => {
 });
 
 describe("MobHandle.gatingPending()", () => {
-  it("sends mobkit/gating/pending and parses entries", async () => {
+  it("sends meta/gating/pending and parses entries", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       pending: [
@@ -2347,7 +2505,7 @@ describe("MobHandle.gatingPending()", () => {
     }));
 
     const result = await handle.gatingPending();
-    assert.equal(calls[0].method, "mobkit/gating/pending");
+    assert.equal(calls[0].method, "meta/gating/pending");
     assert.equal(result.length, 1);
     assert.equal(result[0].pendingId, "p-1");
     assert.equal(result[0].actionId, "a-1");
@@ -2359,30 +2517,77 @@ describe("MobHandle.gatingPending()", () => {
 });
 
 describe("MobHandle.gatingDecide()", () => {
-  it("sends mobkit/gating/decide", async () => {
+  for (const [decision, outcome, nextPendingId] of [
+    ["approve", "allowed", null],
+    ["reject", "safe_draft", null],
+    ["escalate", "pending_approval", "p-2"],
+  ] as const) {
+    it(`returns the ${decision} result without automatic follow-up`, async () => {
+      const { handle, calls, setResponse } = createMockRuntime();
+      setResponse(() => ({
+        pending_id: "p-1",
+        action_id: "a-1",
+        decision,
+        approver_id: "admin-1",
+        outcome,
+        decided_at_ms: 1700000000000,
+        reason: "Reviewed action",
+        next_pending_id: nextPendingId,
+      }));
+
+      const result = await handle.gatingDecide("p-1", decision, "admin-1", {
+        reason: "Reviewed action",
+      });
+      assert.deepEqual(calls, [{
+        method: "meta/gating/decide",
+        params: {
+          pending_id: "p-1",
+          decision,
+          approver_id: "admin-1",
+          reason: "Reviewed action",
+        },
+      }]);
+      assert.deepEqual(result, {
+        pendingId: "p-1",
+        actionId: "a-1",
+        decision,
+        approverId: "admin-1",
+        outcome,
+        decidedAtMs: 1700000000000,
+        reason: "Reviewed action",
+        nextPendingId,
+      });
+    });
+  }
+
+  it("returns an unknown outcome without making another RPC", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       pending_id: "p-1",
       action_id: "a-1",
-      decision: "approved",
+      decision: "approve",
+      outcome: "future_outcome",
     }));
 
-    const result = await handle.gatingDecide("p-1", "approved", "admin-1", {
-      note: "looks good",
-    });
-    assert.equal(calls[0].method, "mobkit/gating/decide");
-    assert.equal(calls[0].params!.pending_id, "p-1");
-    assert.equal(calls[0].params!.decision, "approved");
-    assert.equal(calls[0].params!.approver_id, "admin-1");
-    assert.equal(calls[0].params!.note, "looks good");
-    assert.equal(result.pendingId, "p-1");
-    assert.equal(result.actionId, "a-1");
-    assert.equal(result.decision, "approved");
+    const result = await handle.gatingDecide("p-1", "approve", "admin-1");
+    assert.deepEqual(calls, [{
+      method: "meta/gating/decide",
+      params: {
+        pending_id: "p-1",
+        decision: "approve",
+        approver_id: "admin-1",
+      },
+    }]);
+    assert.equal(result.outcome, "future_outcome");
+    assert.equal(result.approverId, null);
+    assert.equal(result.decidedAtMs, null);
+    assert.equal(result.reason, null);
+    assert.equal(result.nextPendingId, null);
   });
 });
 
 describe("MobHandle.gatingAudit()", () => {
-  it("sends mobkit/gating/audit with default limit", async () => {
+  it("sends meta/gating/audit with default limit", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       entries: [
@@ -2399,7 +2604,7 @@ describe("MobHandle.gatingAudit()", () => {
     }));
 
     const result = await handle.gatingAudit();
-    assert.equal(calls[0].method, "mobkit/gating/audit");
+    assert.equal(calls[0].method, "meta/gating/audit");
     assert.deepEqual(calls[0].params, { limit: 100 });
     assert.equal(result.length, 1);
     assert.equal(result[0].auditId, "aud-1");
@@ -2435,7 +2640,7 @@ describe("MobHandle.rediscover()", () => {
     }));
 
     const result = await handle.rediscover();
-    assert.equal(calls[0].method, "mobkit/rediscover");
+    assert.equal(calls[0].method, "meta/rediscover");
     assert.notEqual(result, null);
     assert.deepEqual(result!.spawned, ["mod-a"]);
     assert.equal(result!.edges.wiredEdges.length, 1);
@@ -2452,7 +2657,7 @@ describe("MobHandle.rediscover()", () => {
 });
 
 describe("MobHandle.reconcileEdges()", () => {
-  it("sends mobkit/reconcile_edges and parses report", async () => {
+  it("sends meta/reconcile_edges and parses report", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       desired_edges: [{ from: "a", to: "b" }],
@@ -2466,7 +2671,7 @@ describe("MobHandle.reconcileEdges()", () => {
     }));
 
     const result = await handle.reconcileEdges();
-    assert.equal(calls[0].method, "mobkit/reconcile_edges");
+    assert.equal(calls[0].method, "meta/reconcile_edges");
     assert.equal(result.desiredEdges.length, 1);
     assert.equal(result.wiredEdges.length, 1);
     assert.equal(result.isComplete, true);
@@ -2491,7 +2696,7 @@ describe("MobHandle.reconcileEdges()", () => {
 });
 
 describe("MobHandle.queryEvents()", () => {
-  it("sends mobkit/query_events and returns parsed events", async () => {
+  it("sends meta/query_events and returns parsed events", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => [
       {
@@ -2513,7 +2718,7 @@ describe("MobHandle.queryEvents()", () => {
     ]);
 
     const result = await handle.queryEvents({ sinceMs: 1000, limit: 50 });
-    assert.equal(calls[0].method, "mobkit/query_events");
+    assert.equal(calls[0].method, "meta/query_events");
     assert.equal(calls[0].params!.since_ms, 1000);
     assert.equal(calls[0].params!.limit, 50);
     assert.equal(result.length, 2);
@@ -2529,7 +2734,7 @@ describe("MobHandle.queryEvents()", () => {
     setResponse(() => []);
 
     const result = await handle.queryEvents();
-    assert.equal(calls[0].method, "mobkit/query_events");
+    assert.equal(calls[0].method, "meta/query_events");
     assert.deepEqual(calls[0].params, {});
     assert.deepEqual(result, []);
   });
@@ -2618,7 +2823,7 @@ const WG_ATTENTION_WIRE = {
 };
 
 describe("MobHandle.workgraphSnapshot()", () => {
-  it("sends mobkit/workgraph/snapshot with converted filter params", async () => {
+  it("sends meta/workgraph/snapshot with converted filter params", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       realm_id: "realm-1",
@@ -2638,7 +2843,7 @@ describe("MobHandle.workgraphSnapshot()", () => {
       includeTerminal: true,
       limit: 50,
     });
-    assert.equal(calls[0].method, "mobkit/workgraph/snapshot");
+    assert.equal(calls[0].method, "meta/workgraph/snapshot");
     assert.deepEqual(calls[0].params, {
       namespace: "default",
       all_namespaces: false,
@@ -2662,12 +2867,12 @@ describe("MobHandle.workgraphSnapshot()", () => {
 });
 
 describe("MobHandle.workgraphList()", () => {
-  it("sends mobkit/workgraph/list and returns unwrapped items", async () => {
+  it("sends meta/workgraph/list and returns unwrapped items", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({ items: [WG_ITEM_WIRE] }));
 
     const result = await handle.workgraphList({ labels: ["a"] });
-    assert.equal(calls[0].method, "mobkit/workgraph/list");
+    assert.equal(calls[0].method, "meta/workgraph/list");
     assert.deepEqual(calls[0].params, { labels: ["a"] });
     assert.equal(result.length, 1);
     assert.equal(result[0].id, "work_1");
@@ -2680,26 +2885,26 @@ describe("MobHandle.workgraphGet()", () => {
     setResponse(() => ({ item: WG_ITEM_WIRE }));
 
     const result = await handle.workgraphGet("work_1", { namespace: "default" });
-    assert.equal(calls[0].method, "mobkit/workgraph/get");
+    assert.equal(calls[0].method, "meta/workgraph/get");
     assert.deepEqual(calls[0].params, { id: "work_1", namespace: "default" });
     assert.equal(result.id, "work_1");
   });
 });
 
 describe("MobHandle.workgraphReady()", () => {
-  it("sends mobkit/workgraph/ready with converted options", async () => {
+  it("sends meta/workgraph/ready with converted options", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({ items: [WG_ITEM_WIRE] }));
 
     const result = await handle.workgraphReady({ labels: ["urgent"], limit: 5 });
-    assert.equal(calls[0].method, "mobkit/workgraph/ready");
+    assert.equal(calls[0].method, "meta/workgraph/ready");
     assert.deepEqual(calls[0].params, { labels: ["urgent"], limit: 5 });
     assert.equal(result.length, 1);
   });
 });
 
 describe("MobHandle.workgraphEvents()", () => {
-  it("sends mobkit/workgraph/events and unwraps events array", async () => {
+  it("sends meta/workgraph/events and unwraps events array", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       events: [
@@ -2716,7 +2921,7 @@ describe("MobHandle.workgraphEvents()", () => {
     }));
 
     const result = await handle.workgraphEvents({ afterSeq: 0, limit: 20 });
-    assert.equal(calls[0].method, "mobkit/workgraph/events");
+    assert.equal(calls[0].method, "meta/workgraph/events");
     assert.deepEqual(calls[0].params, { after_seq: 0, limit: 20 });
     assert.equal(result.length, 1);
     assert.equal(result[0].kind, "created");
@@ -2724,12 +2929,12 @@ describe("MobHandle.workgraphEvents()", () => {
 });
 
 describe("MobHandle.workgraphAttentionList()", () => {
-  it("sends mobkit/workgraph/attention/list and unwraps attention array", async () => {
+  it("sends meta/workgraph/attention/list and unwraps attention array", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({ attention: [WG_ATTENTION_WIRE] }));
 
     const result = await handle.workgraphAttentionList({ status: "active" });
-    assert.equal(calls[0].method, "mobkit/workgraph/attention/list");
+    assert.equal(calls[0].method, "meta/workgraph/attention/list");
     assert.deepEqual(calls[0].params, { status: "active" });
     assert.equal(result.length, 1);
     assert.equal(result[0].bindingId, "attention_1");
@@ -2744,7 +2949,7 @@ describe("MobHandle.workgraphGoalStatus()", () => {
     const result = await handle.workgraphGoalStatus("attention_1", {
       namespace: "default",
     });
-    assert.equal(calls[0].method, "mobkit/workgraph/goal/status");
+    assert.equal(calls[0].method, "meta/workgraph/goal/status");
     assert.deepEqual(calls[0].params, {
       binding_id: "attention_1",
       namespace: "default",
@@ -2764,7 +2969,7 @@ describe("MobHandle.workgraphCreate()", () => {
       labels: ["backend"],
       status: "blocked",
     });
-    assert.equal(calls[0].method, "mobkit/workgraph/create");
+    assert.equal(calls[0].method, "meta/workgraph/create");
     assert.deepEqual(calls[0].params, {
       title: "Ship the thing",
       priority: "high",
@@ -2791,7 +2996,7 @@ describe("MobHandle.workgraphUpdate()", () => {
       title: "New title",
       labels: [],
     });
-    assert.equal(calls[0].method, "mobkit/workgraph/update");
+    assert.equal(calls[0].method, "meta/workgraph/update");
     assert.deepEqual(calls[0].params, {
       id: "work_1",
       expected_revision: 3,
@@ -2813,7 +3018,7 @@ describe("MobHandle.workgraphClaim()", () => {
       { kind: "agent", id: "agent-1", displayName: "Agent One" },
       { leaseSeconds: 60 },
     );
-    assert.equal(calls[0].method, "mobkit/workgraph/claim");
+    assert.equal(calls[0].method, "meta/workgraph/claim");
     assert.deepEqual(calls[0].params, {
       id: "work_1",
       expected_revision: 1,
@@ -2830,7 +3035,7 @@ describe("MobHandle.workgraphRelease()", () => {
     setResponse(() => ({ item: WG_ITEM_WIRE }));
 
     await handle.workgraphRelease("work_1", 2, { namespace: "default" });
-    assert.equal(calls[0].method, "mobkit/workgraph/release");
+    assert.equal(calls[0].method, "meta/workgraph/release");
     assert.deepEqual(calls[0].params, {
       id: "work_1",
       expected_revision: 2,
@@ -2845,7 +3050,7 @@ describe("MobHandle.workgraphClose()", () => {
     setResponse(() => ({ item: WG_ITEM_WIRE }));
 
     await handle.workgraphClose("work_1", 4, { status: "cancelled" });
-    assert.equal(calls[0].method, "mobkit/workgraph/close");
+    assert.equal(calls[0].method, "meta/workgraph/close");
     assert.deepEqual(calls[0].params, {
       id: "work_1",
       expected_revision: 4,
@@ -2867,7 +3072,7 @@ describe("MobHandle.workgraphBlock()", () => {
     setResponse(() => ({ item: WG_ITEM_WIRE }));
 
     await handle.workgraphBlock("work_1", 1);
-    assert.equal(calls[0].method, "mobkit/workgraph/block");
+    assert.equal(calls[0].method, "meta/workgraph/block");
     assert.deepEqual(calls[0].params, { id: "work_1", expected_revision: 1 });
   });
 });
@@ -2878,7 +3083,7 @@ describe("MobHandle.workgraphLink()", () => {
     setResponse(() => ({ edge: WG_EDGE_WIRE }));
 
     const result = await handle.workgraphLink("blocks", "work_1", "work_2");
-    assert.equal(calls[0].method, "mobkit/workgraph/link");
+    assert.equal(calls[0].method, "meta/workgraph/link");
     assert.deepEqual(calls[0].params, {
       kind: "blocks",
       from_id: "work_1",
@@ -2915,7 +3120,7 @@ describe("MobHandle.workgraphAddEvidence()", () => {
       id: "ev-1",
       summary: "done",
     });
-    assert.equal(calls[0].method, "mobkit/workgraph/evidence/add");
+    assert.equal(calls[0].method, "meta/workgraph/evidence/add");
     assert.deepEqual(calls[0].params, {
       id: "work_1",
       expected_revision: 2,
@@ -2932,7 +3137,7 @@ describe("MobHandle.workgraphEscalatePolicy()", () => {
     await handle.workgraphEscalatePolicy("attention_1", "work_1", 1, {
       kind: "host_confirmed",
     });
-    assert.equal(calls[0].method, "mobkit/workgraph/policy/escalate");
+    assert.equal(calls[0].method, "meta/workgraph/policy/escalate");
     assert.deepEqual(calls[0].params, {
       binding_id: "attention_1",
       id: "work_1",
@@ -2952,7 +3157,7 @@ describe("MobHandle.workgraphGoalCreate()", () => {
       { kind: "session", sessionId: "sess-1" },
       { mode: "review" },
     );
-    assert.equal(calls[0].method, "mobkit/workgraph/goal/create");
+    assert.equal(calls[0].method, "meta/workgraph/goal/create");
     assert.deepEqual(calls[0].params, {
       title: "Track the migration",
       target: { kind: "session", session_id: "sess-1" },
@@ -2999,7 +3204,7 @@ describe("MobHandle.workgraphGoalConfirm()", () => {
     const result = await handle.workgraphGoalConfirm("attention_1", 2, {
       evidence: { kind: "self_attest", id: "ev-1" },
     });
-    assert.equal(calls[0].method, "mobkit/workgraph/goal/confirm");
+    assert.equal(calls[0].method, "meta/workgraph/goal/confirm");
     assert.deepEqual(calls[0].params, {
       binding_id: "attention_1",
       expected_revision: 2,
@@ -3017,7 +3222,7 @@ describe("MobHandle.workgraphGoalRequestClose()", () => {
     await handle.workgraphGoalRequestClose("attention_1", 3, {
       status: "failed",
     });
-    assert.equal(calls[0].method, "mobkit/workgraph/goal/request_close");
+    assert.equal(calls[0].method, "meta/workgraph/goal/request_close");
     assert.deepEqual(calls[0].params, {
       binding_id: "attention_1",
       expected_revision: 3,
@@ -3034,7 +3239,7 @@ describe("MobHandle.workgraphAttentionPause()", () => {
     const result = await handle.workgraphAttentionPause("attention_1", 1, {
       until: "2026-03-01T00:00:00Z",
     });
-    assert.equal(calls[0].method, "mobkit/workgraph/attention/pause");
+    assert.equal(calls[0].method, "meta/workgraph/attention/pause");
     assert.deepEqual(calls[0].params, {
       binding_id: "attention_1",
       expected_revision: 1,
@@ -3052,7 +3257,7 @@ describe("MobHandle.workgraphAttentionResume()", () => {
     const result = await handle.workgraphAttentionResume("attention_1", 2, {
       namespace: "default",
     });
-    assert.equal(calls[0].method, "mobkit/workgraph/attention/resume");
+    assert.equal(calls[0].method, "meta/workgraph/attention/resume");
     assert.deepEqual(calls[0].params, {
       binding_id: "attention_1",
       expected_revision: 2,
@@ -3073,7 +3278,7 @@ describe("MobHandle.workgraphAttentionReassign()", () => {
       3,
       { kind: "session", sessionId: "sess-2" },
     );
-    assert.equal(calls[0].method, "mobkit/workgraph/attention/reassign");
+    assert.equal(calls[0].method, "meta/workgraph/attention/reassign");
     assert.deepEqual(calls[0].params, {
       binding_id: "attention_1",
       expected_revision: 3,
@@ -3092,7 +3297,7 @@ describe("MobHandle.workgraphAttentionPrune()", () => {
     const pruned = await handle.workgraphAttentionPrune({
       updatedBefore: "2026-07-01T00:00:00Z",
     });
-    assert.equal(calls[0].method, "mobkit/workgraph/attention/prune");
+    assert.equal(calls[0].method, "meta/workgraph/attention/prune");
     assert.deepEqual(calls[0].params, {
       updated_before: "2026-07-01T00:00:00Z",
     });
@@ -3122,7 +3327,7 @@ describe("MobHandle live methods", () => {
       model: "gpt-realtime-2",
       instructions: "Use the current room voice.",
     });
-    assert.equal(calls[0].method, "mobkit/live/open");
+    assert.equal(calls[0].method, "meta/live/open");
     assert.deepEqual(calls[0].params, {
       identity: "robot",
       model: "gpt-realtime-2",
@@ -3132,20 +3337,20 @@ describe("MobHandle live methods", () => {
 
     setResponse(() => ({ open: true }));
     await handle.liveStatus("robot");
-    assert.equal(calls[1].method, "mobkit/live/status");
+    assert.equal(calls[1].method, "meta/live/status");
 
     setResponse(() => ({ closed: true }));
     await handle.liveClose("live-channel-1");
-    assert.equal(calls[2].method, "mobkit/live/close");
+    assert.equal(calls[2].method, "meta/live/close");
     assert.deepEqual(calls[2].params, { channel_id: "live-channel-1" });
 
     setResponse(() => ({ refreshed: true }));
     await handle.liveRefresh("robot");
-    assert.equal(calls[3].method, "mobkit/live/refresh");
+    assert.equal(calls[3].method, "meta/live/refresh");
 
     setResponse(() => ({ accepted: true }));
     await handle.liveSendInputImage("robot", "frame-0001", "image/jpeg", "aGVsbG8=");
-    assert.equal(calls[4].method, "mobkit/live/send_input");
+    assert.equal(calls[4].method, "meta/live/send_input");
     assert.deepEqual(calls[4].params, {
       identity: "robot",
       chunk: {
@@ -3168,7 +3373,7 @@ describe("MobHandle live methods", () => {
       { channelId: "chan-1", outputId: "opaque-output-1", contentIndex: 0 },
       1200,
     );
-    assert.equal(calls[5].method, "mobkit/live/truncate");
+    assert.equal(calls[5].method, "meta/live/truncate");
     assert.deepEqual(calls[5].params, {
       identity: "identity:robot",
       channel_id: "chan-1",
@@ -3180,9 +3385,9 @@ describe("MobHandle live methods", () => {
 
   it("serializes v1 execution identity and returns a typed handle", async () => {
     const { handle, calls, setResponse } = createMockRuntime();
-    setResponse((method) => method === "mobkit/capabilities" ? {
+    setResponse((method) => method === "meta/capabilities" ? {
       contract_version: "0.5.0",
-      methods: ["mobkit/live/open"],
+      methods: ["meta/live/open"],
       loaded_modules: [],
       feature_capabilities: [
         "live.execution_identity.v1",
@@ -3214,7 +3419,7 @@ describe("MobHandle live methods", () => {
 
     assert.equal(opened.channelId, "ch-typed");
     assert.equal(opened.targetIdentity, "identity:robot");
-    assert.equal(calls[0].method, "mobkit/capabilities");
+    assert.equal(calls[0].method, "meta/capabilities");
     assert.deepEqual(calls[1].params, {
       identity: "identity:robot",
       execution_identity: {
@@ -3228,7 +3433,7 @@ describe("MobHandle live methods", () => {
     const { handle, calls, setResponse } = createMockRuntime();
     setResponse(() => ({
       contract_version: "0.5.0",
-      methods: ["mobkit/live/open"],
+      methods: ["meta/live/open"],
       loaded_modules: [],
     }));
 
@@ -3238,7 +3443,7 @@ describe("MobHandle live methods", () => {
       }),
       CapabilityUnavailableError,
     );
-    assert.deepEqual(calls.map((call) => call.method), ["mobkit/capabilities"]);
+    assert.deepEqual(calls.map((call) => call.method), ["meta/capabilities"]);
   });
 
   it("rejects catalog and Responses bridge overrides before strict open", async () => {
@@ -3278,9 +3483,9 @@ describe("MobHandle live methods", () => {
 
   it("refuses a strict open response missing canonical target identity", async () => {
     const { handle, setResponse } = createMockRuntime();
-    setResponse((method) => method === "mobkit/capabilities" ? {
+    setResponse((method) => method === "meta/capabilities" ? {
       contract_version: "0.5.0",
-      methods: ["mobkit/live/open"],
+      methods: ["meta/live/open"],
       loaded_modules: [],
       feature_capabilities: ["live.execution_identity.v1"],
     } : ({
@@ -3324,7 +3529,7 @@ describe("MobHandle live methods", () => {
     const { handle, calls, setResponse } = createMockRuntime();
     const events: string[] = [];
     setResponse((method) => {
-      if (method === "mobkit/capabilities") return {
+      if (method === "meta/capabilities") return {
         contract_version: "0.5.0",
         methods: [],
         loaded_modules: [],
@@ -3333,7 +3538,7 @@ describe("MobHandle live methods", () => {
           "live.execution.function_bridge.v1",
         ],
       };
-      if (method === "mobkit/live/open") return {
+      if (method === "meta/live/open") return {
         channel_id: "chan-1",
         target_identity: "identity:robot",
         execution_mode: "function_bridge",
@@ -3356,12 +3561,12 @@ describe("MobHandle live methods", () => {
         },
         continuity: { mode: "transcript_only" },
       };
-      if (method === "mobkit/live/playback_owner/register") return {
+      if (method === "meta/live/playback_owner/register") return {
         channel_id: "chan-1",
         readiness_receipt: "ready-receipt",
       };
       if (method === "live/webrtc/answer") return { answer_sdp: "v=0\r\nanswer" };
-      if (method === "mobkit/live/status") return {
+      if (method === "meta/live/status") return {
         phase: "active",
         handle: {
           channel_id: "chan-1",
@@ -3370,7 +3575,7 @@ describe("MobHandle live methods", () => {
           activation_receipt: "active-receipt",
         },
       };
-      if (method === "mobkit/live/playback_owner/revoke") return {
+      if (method === "meta/live/playback_owner/revoke") return {
         phase: "revoked",
       };
       throw new Error(`unexpected method ${method}`);
@@ -3408,11 +3613,11 @@ describe("MobHandle live methods", () => {
       "activate:active-receipt",
     ]);
     assert.deepEqual(calls.map((call) => call.method), [
-      "mobkit/capabilities",
-      "mobkit/live/open",
-      "mobkit/live/playback_owner/register",
+      "meta/capabilities",
+      "meta/live/open",
+      "meta/live/playback_owner/register",
       "live/webrtc/answer",
-      "mobkit/live/status",
+      "meta/live/status",
     ]);
     assert.deepEqual(calls[2].params, {
       identity: "identity:robot",
@@ -3428,7 +3633,7 @@ describe("MobHandle live methods", () => {
     assert.equal((await active.ownerLost()).phase, "revoked");
     assert.equal(events.at(-1), "abort");
     assert.deepEqual(calls.at(-1), {
-      method: "mobkit/live/playback_owner/revoke",
+      method: "meta/live/playback_owner/revoke",
       params: {
         identity: "identity:robot",
         channel_id: "chan-1",
@@ -3443,7 +3648,7 @@ describe("MobHandle live methods", () => {
     const { handle, calls, setResponse } = createMockRuntime();
     const events: string[] = [];
     setResponse((method) => {
-      if (method === "mobkit/capabilities") return {
+      if (method === "meta/capabilities") return {
         contract_version: "0.5.0",
         methods: [],
         loaded_modules: [],
@@ -3452,7 +3657,7 @@ describe("MobHandle live methods", () => {
           "live.execution.function_bridge.v1",
         ],
       };
-      if (method === "mobkit/live/open") return {
+      if (method === "meta/live/open") return {
         channel_id: "chan-1",
         target_identity: "identity:robot",
         execution_mode: "function_bridge",
@@ -3475,13 +3680,13 @@ describe("MobHandle live methods", () => {
         },
         continuity: { mode: "transcript_only" },
       };
-      if (method === "mobkit/live/playback_owner/register") return {
+      if (method === "meta/live/playback_owner/register") return {
         channel_id: "chan-1",
         readiness_receipt: "ready-receipt",
       };
       if (method === "live/webrtc/answer") return { answer_sdp: "v=0\r\nanswer" };
-      if (method === "mobkit/live/status") return { phase: "revoked" };
-      if (method === "mobkit/live/close") return { closed: true };
+      if (method === "meta/live/status") return { phase: "revoked" };
+      if (method === "meta/live/close") return { closed: true };
       throw new Error(`unexpected method ${method}`);
     });
 
@@ -3513,12 +3718,12 @@ describe("MobHandle live methods", () => {
 
     assert.deepEqual(events, ["prepare", "answer", "abort"]);
     assert.deepEqual(calls.map((call) => call.method), [
-      "mobkit/capabilities",
-      "mobkit/live/open",
-      "mobkit/live/playback_owner/register",
+      "meta/capabilities",
+      "meta/live/open",
+      "meta/live/playback_owner/register",
       "live/webrtc/answer",
-      "mobkit/live/status",
-      "mobkit/live/close",
+      "meta/live/status",
+      "meta/live/close",
     ]);
     assert.deepEqual(calls.at(-1)?.params, {
       identity: "identity:robot",
@@ -3571,7 +3776,7 @@ describe("MobHandle live methods", () => {
     const result = await handle.liveReplacementRequired(active);
     assert.deepEqual(result, { required: false });
     assert.deepEqual(calls[0], {
-      method: "mobkit/live/replacement_required",
+      method: "meta/live/replacement_required",
       params: {
         identity: "identity:robot",
         channel_id: "chan-1",
@@ -3596,7 +3801,7 @@ describe("MobHandle live methods", () => {
     });
     assert.deepEqual(result, { status: "completed" });
     assert.deepEqual(calls[0], {
-      method: "mobkit/live/playback_complete",
+      method: "meta/live/playback_complete",
       params: {
         identity: "identity:robot",
         channel_id: "chan-1",
@@ -3608,7 +3813,7 @@ describe("MobHandle live methods", () => {
 
   it("streams an acknowledged output to playback completion and closes on teardown", async () => {
     const { rt, handle, calls, setResponse } = createMockRuntime();
-    setResponse((method) => method === "mobkit/live/playback_complete"
+    setResponse((method) => method === "meta/live/playback_complete"
       ? { status: "completed" }
       : { status: "closed" });
     const active = {
@@ -3622,7 +3827,7 @@ describe("MobHandle live methods", () => {
     await Promise.resolve();
 
     const accepted = await (rt as any)._dispatcher.handleCallback(
-      "mobkit/live/assistant_output_available",
+      "meta/live/assistant_output_available",
       {
         channel_id: "chan-1",
         output_id: "opaque-output-1",
@@ -3641,7 +3846,7 @@ describe("MobHandle live methods", () => {
 
     assert.deepEqual(calls, [
       {
-        method: "mobkit/live/playback_complete",
+        method: "meta/live/playback_complete",
         params: {
           identity: "identity:robot",
           channel_id: "chan-1",
@@ -3650,7 +3855,7 @@ describe("MobHandle live methods", () => {
         },
       },
       {
-        method: "mobkit/live/close",
+        method: "meta/live/close",
         params: {
           identity: "identity:robot",
           channel_id: "chan-1",
@@ -3672,7 +3877,7 @@ describe("MobHandle live methods", () => {
     const first = outputs.next();
     await Promise.resolve();
     const dispatch = (outputId: string) => (rt as any)._dispatcher.handleCallback(
-      "mobkit/live/assistant_output_available",
+      "meta/live/assistant_output_available",
       {
         channel_id: "chan-1",
         output_id: outputId,

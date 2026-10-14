@@ -1,5 +1,5 @@
-/* MobKit Flow Editor — fixed-grid mob graph editor.
-   Sibling to the MobKit Console: same token system, same chrome
+/* Meta Flow Editor — fixed-grid mob graph editor.
+   Sibling to the Meta Console: same token system, same chrome
    conventions, same skinning via [data-cc-variant] and [data-cc-theme]
    on the root. */
 * { box-sizing: border-box; }
@@ -146,7 +146,7 @@ body {
   grid-template-rows: 44px 1fr;
 }
 
-/* ── Topbar (matches MobKit Console .mobkit-topbar pattern) ── */
+/* ── Topbar (matches Meta Console .meta-topbar pattern) ── */
 .toprail {
   display: grid;
   grid-template-columns: auto auto minmax(84px, auto) minmax(72px, auto) minmax(0, 1fr) auto;

@@ -352,8 +352,8 @@ export function flowRegistryRowFromDocument({
 export function flowRegistryRowIsRuntimeProjection(row) {
   return row?.runtime_projection === true
     || row?.document_kind === "runtime_projection"
-    || row?.source === "mobkit/runtime/flow_projection"
-    || row?.registry_source === "mobkit/runtime/flow_projection";
+    || row?.source === "meta/runtime/flow_projection"
+    || row?.registry_source === "meta/runtime/flow_projection";
 }
 
 export function flowRegistryRememberDocumentPatch(rows, {
@@ -543,7 +543,7 @@ export function flowRegistryUpsertRowPatch(rows, row) {
 
 export function flowDraftIdFromSpec(spec, existingRows = []) {
   const draftSpec = spec && typeof spec === "object" ? spec : {};
-  const base = slug(draftSpec.name || draftSpec.template || "mobkit_flow", "mobkit_flow");
+  const base = slug(draftSpec.name || draftSpec.template || "meta_flow", "meta_flow");
   const prefix = base.startsWith("f_") ? base : `f_${base}`;
   const used = new Set((Array.isArray(existingRows) ? existingRows : [])
     .map((row) => String(row?.id || "").trim())
@@ -567,7 +567,7 @@ export function newFlowTemplateOptions(templates = [], { canCreateBlank = false,
     label: hasBlankDocument ? String(blankTemplate.name || "") : "Blank",
     sub: hasBlankDocument
       ? templateOptionDescription(blankTemplate)
-      : "Waiting for MobKit blank mobpack",
+      : "Waiting for Meta blank mobpack",
     tier: hasBlankDocument ? String(blankTemplate.stage || "") : "",
     disabled: !canCreateBlank || !hasBlankDocument,
   }];
@@ -671,7 +671,7 @@ export function sampleAgentDefinitionsFromCatalogs(schema) {
 export function normalizeAgentDefinitionsFromCatalog(definitions) {
   return definitions
     .filter((template) => template && typeof template === "object")
-    .filter((template) => String(template.definitionType || template.definition_type || "") === "mobkit/profile-member")
+    .filter((template) => String(template.definitionType || template.definition_type || "") === "meta/profile-member")
     .filter((template) => String(template.source || "").trim())
     .filter((template) => String(template.sourceMobpack || template.source_mobpack || "").trim())
     .filter((template) => String(template.sourceOrigin || template.source_origin || "").trim())

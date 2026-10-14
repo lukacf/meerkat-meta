@@ -15,7 +15,7 @@ nine more such methods in both decorators - see PR #390 / #391.
 This gate reads the trait from the pinned meerkat-mob source (via `cargo
 metadata`, so it is the exact version Cargo.lock resolves), reads the features
 Cargo enables on meerkat-mob (via `cargo tree`), and fails when any PRODUCTION
-`impl MobSessionService for X` block in crates/meerkat-mobkit/src lacks a method that
+`impl MobSessionService for X` block in crates/meerkat-meta/src lacks a method that
 exists under those features. Test doubles inside `#[cfg(test)]` modules are
 skipped with the same trap-aware scan as verify-decorator-authority.py.
 
@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "crates" / "meerkat-mobkit" / "src"
+SRC = ROOT / "crates" / "meerkat-meta" / "src"
 # Honour the repository wrapper when a caller sets it (CARGO=scripts/repo-cargo);
 # CI uses plain `cargo` with its own cache.
 CARGO = os.environ.get("CARGO", "cargo")
@@ -72,8 +72,8 @@ TRAIT_SPECS: tuple[TraitSpec, ...] = (
     # The base session-service traits the decorators also implement. Their
     # defaulted methods (`update_system_prompt`, `read_instruction_activation_records`,
     # the transcript rewrite/restore verbs, ...) default to typed `Unsupported`,
-    # so an unforwarded one silently refuses through MobKit's erased service:
-    # `mobkit/member_instruction_activations` read nothing until 2026-10-05.
+    # so an unforwarded one silently refuses through Meta's erased service:
+    # `meta/member_instruction_activations` read nothing until 2026-10-05.
     TraitSpec(
         name="SessionService",
         package="meerkat-core",
@@ -97,6 +97,12 @@ TRAIT_SPECS: tuple[TraitSpec, ...] = (
                 "default, so a decorator cannot bypass its own write-epoch, projection, "
                 "or recovery behaviour; the facade has not opted in"
             ),
+            "input_persist_ack_loss_fault_for_test": (
+                "meerkat-runtime store/mod.rs documents this test-support-only fault "
+                "seam as answered by SqliteRuntimeStore alone: every other store, "
+                "including a wrapper of a SqliteRuntimeStore, returns None, so a "
+                "control that needs the seam fails closed instead of arming nothing"
+            ),
         },
     ),
 )
@@ -108,7 +114,8 @@ def impl_pattern(trait: str) -> re.Pattern[str]:
 
 IMPL = impl_pattern(TRAIT)
 CFG_TEST = re.compile(r"^\s*#\[cfg\(test\)\]")
-MOD_LINE = re.compile(r"^(\s*)mod\s+\w+\s*\{")
+# A test module may carry a visibility (`pub(crate) mod support {`).
+MOD_LINE = re.compile(r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{")
 FN = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([a-z_0-9]+)\s*[<(]")
 CFG_FEATURE = re.compile(r'#\[cfg\(feature\s*=\s*"([^"]+)"\)\]')
 
@@ -155,7 +162,9 @@ def test_regions(lines: list[str]) -> list[tuple[int, int]]:
         depth = 0
         for k in range(j, len(lines)):
             depth += lines[k].count("{") - lines[k].count("}")
-            if depth <= 0 and k > j:
+            # MOD_LINE requires the `{`, so a balanced declaration line is a
+            # module that closes where it opens (`pub(crate) mod empty {}`).
+            if depth <= 0:
                 regions.append((i, k + 1))
                 break
         else:
@@ -245,7 +254,7 @@ def meerkat_mob_trait_source() -> str:
 
 def enabled_features(package: str) -> set[str]:
     out = subprocess.run(
-        [CARGO, "tree", "-p", "meerkat-mobkit", "-e", "features", "-i", package, "--depth", "1"],
+        [CARGO, "tree", "-p", "meerkat-meta", "-e", "features", "-i", package, "--depth", "1"],
         check=True,
         capture_output=True,
         text=True,

@@ -135,7 +135,7 @@ module.exports = {
   pipelineDecide: (pendingId) => `memory-pipeline-decide:${pendingId}`,
 
   // ── Quarantine decision (Biography of a quarantined identity record) ──
-  // Renders only when mobkit/memory/quarantine/decide is advertised to the
+  // Renders only when meta/memory/quarantine/decide is advertised to the
   // caller on a mutable console. Release/Tombstone send the detail's
   // content_hash; a refusal or denial renders QUARANTINE_ERROR in place, a
   // decision opens the resulting Biography with QUARANTINE_OUTCOME.

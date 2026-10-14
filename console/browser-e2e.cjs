@@ -514,7 +514,7 @@ function startMockConsoleServer(options = {}) {
       if (method === "POST" && url === "/console/rpc") {
         const payload = JSON.parse(body || "{}");
         const rpcId = payload.id || "rpc";
-        if (payload.method === "mobkit/capabilities") {
+        if (payload.method === "meta/capabilities") {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({
             jsonrpc: "2.0",
@@ -522,19 +522,19 @@ function startMockConsoleServer(options = {}) {
             result: {
               version: "browser-e2e",
               methods: [
-                "mobkit/capabilities",
-                "mobkit/console/send",
-                "mobkit/console/inspect_identity",
-                "mobkit/console/query_timeline",
-                "mobkit/blob/upload",
-                "mobkit/retire",
-                "mobkit/respawn",
-                "mobkit/reset",
-                "mobkit/routing/routes/list",
-                "mobkit/delivery/history",
-                "mobkit/gating/pending",
-                "mobkit/gating/audit",
-                "mobkit/gating/decide",
+                "meta/capabilities",
+                "meta/console/send",
+                "meta/console/inspect_identity",
+                "meta/console/query_timeline",
+                "meta/blob/upload",
+                "meta/retire",
+                "meta/respawn",
+                "meta/reset",
+                "meta/routing/routes/list",
+                "meta/delivery/history",
+                "meta/gating/pending",
+                "meta/gating/audit",
+                "meta/gating/decide",
                 ...(topologyControl ? topologyControl.methods || [] : []),
               ],
               ...(topologyControl ? { topology_control: topologyControl.capabilities || {} } : {}),
@@ -542,7 +542,7 @@ function startMockConsoleServer(options = {}) {
           }));
           return;
         }
-        if (payload.method === "mobkit/topology/query" && topologyControl) {
+        if (payload.method === "meta/topology/query" && topologyControl) {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({
             jsonrpc: "2.0",
@@ -558,7 +558,7 @@ function startMockConsoleServer(options = {}) {
         ) {
           return;
         }
-        if (payload.method === "mobkit/console/query_timeline") {
+        if (payload.method === "meta/console/query_timeline") {
           const identity = payload.params?.identity;
           let framesForIdentity = null;
           if (
@@ -622,7 +622,7 @@ function startMockConsoleServer(options = {}) {
           }));
           return;
         }
-        if (payload.method === "mobkit/console/inspect_identity") {
+        if (payload.method === "meta/console/inspect_identity") {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({
             jsonrpc: "2.0",
@@ -632,9 +632,9 @@ function startMockConsoleServer(options = {}) {
           return;
         }
         if (
-          payload.method === "mobkit/retire" ||
-          payload.method === "mobkit/respawn" ||
-          payload.method === "mobkit/reset"
+          payload.method === "meta/retire" ||
+          payload.method === "meta/respawn" ||
+          payload.method === "meta/reset"
         ) {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({
@@ -648,7 +648,7 @@ function startMockConsoleServer(options = {}) {
           }));
           return;
         }
-        if (payload.method === "mobkit/routing/routes/list") {
+        if (payload.method === "meta/routing/routes/list") {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({
             jsonrpc: "2.0",
@@ -659,7 +659,7 @@ function startMockConsoleServer(options = {}) {
                 recipient: "identity:luka",
                 channel: "identity",
                 sink: "console",
-                target_module: "mobkit",
+                target_module: "meta",
                 retry_max: 2,
                 backoff_ms: 25,
                 rate_limit_per_minute: 60,
@@ -668,7 +668,7 @@ function startMockConsoleServer(options = {}) {
           }));
           return;
         }
-        if (payload.method === "mobkit/delivery/history") {
+        if (payload.method === "meta/delivery/history") {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({
             jsonrpc: "2.0",
@@ -679,7 +679,7 @@ function startMockConsoleServer(options = {}) {
                 route_id: "route-control-1",
                 recipient: "identity:luka",
                 sink: "console",
-                target_module: "mobkit",
+                target_module: "meta",
                 status: "delivered",
                 first_attempt_ms: 1717171700,
                 final_attempt_ms: 1717171710,
@@ -689,7 +689,7 @@ function startMockConsoleServer(options = {}) {
           }));
           return;
         }
-        if (payload.method === "mobkit/gating/pending") {
+        if (payload.method === "meta/gating/pending") {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({
             jsonrpc: "2.0",
@@ -707,7 +707,7 @@ function startMockConsoleServer(options = {}) {
           }));
           return;
         }
-        if (payload.method === "mobkit/gating/audit") {
+        if (payload.method === "meta/gating/audit") {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({
             jsonrpc: "2.0",
@@ -723,7 +723,7 @@ function startMockConsoleServer(options = {}) {
           }));
           return;
         }
-        if (payload.method === "mobkit/gating/decide") {
+        if (payload.method === "meta/gating/decide") {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({
             jsonrpc: "2.0",
@@ -737,7 +737,7 @@ function startMockConsoleServer(options = {}) {
           }));
           return;
         }
-        if (payload.method === "mobkit/console/send") {
+        if (payload.method === "meta/console/send") {
           const identity = payload.params?.identity;
           if (
             typeof identity === "string" &&
@@ -773,7 +773,7 @@ function startMockConsoleServer(options = {}) {
           }
           return;
         }
-        if (payload.method === "mobkit/interact") {
+        if (payload.method === "meta/interact") {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({
             jsonrpc: "2.0",
@@ -785,7 +785,7 @@ function startMockConsoleServer(options = {}) {
           }));
           return;
         }
-        if (payload.method === "mobkit/send_message") {
+        if (payload.method === "meta/send_message") {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({
             jsonrpc: "2.0",
@@ -904,7 +904,7 @@ async function runReferenceBrowserProof() {
     backendSpec.args,
     {
       cwd: repoRoot,
-      env: { ...process.env, MOBKIT_REF_ADDR: LOOPBACK_ANY_PORT },
+      env: { ...process.env, META_REF_ADDR: LOOPBACK_ANY_PORT },
       stdio: ["ignore", "pipe", "pipe"],
     }
   );
@@ -956,7 +956,7 @@ async function runReferenceBrowserProof() {
     await openSidebarAgentChat(page, /router/i);
     await fillComposer(page, "browser proof message");
     const acceptance = page.waitForResponse(response => response.url() === `${baseUrl}/console/rpc`
-      && response.request().postData()?.includes('"method":"mobkit/console/send"'));
+      && response.request().postData()?.includes('"method":"meta/console/send"'));
     await clickSend(page);
     const acceptedResponse = await acceptance;
     const accepted = await acceptedResponse.json();
@@ -985,7 +985,7 @@ async function runReferenceBrowserProof() {
     const usesConsoleSendLane = observedRequests.some(
       (request) =>
         request.url === `${baseUrl}/console/rpc` &&
-        request.postData.includes('"method":"mobkit/console/send"'),
+        request.postData.includes('"method":"meta/console/send"'),
     ) && observedRequests.some(
       (request) =>
         request.method === "GET" && request.url.startsWith(`${baseUrl}/console/timeline/stream`),
@@ -1061,7 +1061,7 @@ async function runCanonicalSendBrowserProof() {
       const request = response.request();
       if (response.url() !== `${server.baseUrl}/console/rpc` || request.method() !== "POST") return false;
       const payload = request.postDataJSON();
-      return payload?.method === "mobkit/console/send"
+      return payload?.method === "meta/console/send"
         && payload.params?.identity === "legacy-router"
         && payload.params?.content === "legacy proof message";
     }, { timeout: 30_000 });
@@ -1071,13 +1071,13 @@ async function runCanonicalSendBrowserProof() {
     const sawIdentityLane = server.requests.some(
       (request) =>
         request.url === "/console/rpc" &&
-        request.body.includes('"method":"mobkit/console/send"') &&
+        request.body.includes('"method":"meta/console/send"') &&
         request.body.includes('"identity":"identity:luka"'),
     );
     const sawMemberLane = server.requests.some(
       (request) =>
         request.url === "/console/rpc" &&
-        request.body.includes('"method":"mobkit/console/send"') &&
+        request.body.includes('"method":"meta/console/send"') &&
         request.body.includes('"identity":"legacy-router"'),
     );
 
@@ -1198,9 +1198,16 @@ async function runImageRenderingBrowserProof() {
       (images) => images.map((image) => image.getAttribute("src") || ""),
     );
     assert.equal(peerImageSources.length, 1);
+    // A tool card image is read through the console transport's readBlob and
+    // shown from a local object URL, so its src is a blob: URL; the mock must
+    // have served exactly the peer's blob.
     assert(
-      peerImageSources[0]?.endsWith("/blobs/sha256%3Apeer-image"),
-      `missing peer forwarded image ref inside tool call: ${JSON.stringify(peerImageSources)}`,
+      peerImageSources[0]?.startsWith("blob:"),
+      `peer forwarded image inside tool call should be a local object URL: ${JSON.stringify(peerImageSources)}`,
+    );
+    assert(
+      server.requests.some((request) => request.method === "GET" && request.url.split("?")[0] === "/blobs/sha256%3Apeer-image"),
+      `missing peer forwarded image blob read: ${JSON.stringify(server.requests.map((request) => request.url).filter((url) => url.startsWith("/blobs/")))}`,
     );
     const peerImagePlacement = await page.evaluate(() => {
       const image = document.querySelector(".cc-tool-call img.cc-tool-call__image");
@@ -1378,7 +1385,7 @@ async function runBusyWorkerConsoleProof() {
 
     const steerRequest = server.requests.find((request) =>
       request.url === "/console/rpc" &&
-      request.body.includes('"method":"mobkit/console/send"') &&
+      request.body.includes('"method":"meta/console/send"') &&
       request.body.includes('"identity":"person-worker-alpha"') &&
       request.body.includes('"handling_mode":"steer"') &&
       request.body.includes("Please prioritize this audit note.")
@@ -1481,7 +1488,7 @@ async function runToolOnlyWorkerBusyQueueProof() {
 
     const directSend = server.requests.find((request) =>
       request.url === "/console/rpc" &&
-      request.body.includes('"method":"mobkit/console/send"') &&
+      request.body.includes('"method":"meta/console/send"') &&
       request.body.includes('"identity":"tool-only-worker"') &&
       request.body.includes(queuedText)
     );
@@ -1495,7 +1502,7 @@ async function runToolOnlyWorkerBusyQueueProof() {
 
     const steerRequest = server.requests.find((request) =>
       request.url === "/console/rpc" &&
-      request.body.includes('"method":"mobkit/console/send"') &&
+      request.body.includes('"method":"meta/console/send"') &&
       request.body.includes('"identity":"tool-only-worker"') &&
       request.body.includes('"handling_mode":"steer"') &&
       request.body.includes(queuedText)
@@ -1607,7 +1614,7 @@ async function runToolOnlyWorkerTerminalClearsBusyProof() {
 
     const directSend = server.requests.find((request) =>
       request.url === "/console/rpc" &&
-      request.body.includes('"method":"mobkit/console/send"') &&
+      request.body.includes('"method":"meta/console/send"') &&
       request.body.includes('"identity":"tool-only-worker"') &&
       request.body.includes(sendText)
     );
@@ -1724,7 +1731,7 @@ async function runNonCommsSystemNoticeDoesNotClearBusyProof() {
 
     const directSend = server.requests.find((request) =>
       request.url === "/console/rpc" &&
-      request.body.includes('"method":"mobkit/console/send"') &&
+      request.body.includes('"method":"meta/console/send"') &&
       request.body.includes('"identity":"tool-only-worker"') &&
       request.body.includes(queuedText)
     );
@@ -1834,20 +1841,35 @@ async function runChatPaneAutoScrollProof() {
     await pane.getByText("Historical worker line 48").waitFor({ timeout: 10_000 });
     await pane.getByText("AUTO_SCROLL_FINAL_VISIBLE").waitFor({ timeout: 10_000 });
     const body = pane.locator(".conv__body");
-    const scrollState = await body.evaluate((node) => ({
+    const sample = () => body.evaluate((node) => ({
       scrollTop: node.scrollTop,
       clientHeight: node.clientHeight,
       scrollHeight: node.scrollHeight,
       text: node.textContent || "",
     }));
-    const distanceFromBottom =
-      scrollState.scrollHeight - scrollState.clientHeight - scrollState.scrollTop;
+    const distanceOf = (state) => state.scrollHeight - state.clientHeight - state.scrollTop;
+    // The pane re-pins from its ResizeObserver after the grown message lays
+    // out, so the task that sees the new text can still read the scroll
+    // position from before that layout. Wait, bounded, for later frames to
+    // show the pinned position; an unpinned pane still fails at the deadline.
+    const pinnedBy = Date.now() + 5_000;
+    let framesWaited = 0;
+    let scrollState = await sample();
+    while (distanceOf(scrollState) > 4 && Date.now() < pinnedBy) {
+      await body.evaluate(() => new Promise((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+        setTimeout(resolve, 100);
+      }));
+      framesWaited += 1;
+      scrollState = await sample();
+    }
+    const distanceFromBottom = distanceOf(scrollState);
     assert(
       distanceFromBottom <= 4,
       `chat pane did not stay pinned to latest transcript content; distance=${distanceFromBottom} state=${JSON.stringify(scrollState)}`,
     );
 
-    process.stdout.write("browser chat pane auto-scroll ok\n");
+    process.stdout.write(`browser chat pane auto-scroll ok (frame waits before pinned: ${framesWaited})\n`);
   } finally {
     if (browser) {
       await browser.close();
@@ -2225,7 +2247,7 @@ async function runGlobalTimelineRecentSeedProof() {
     const timelineRequests = server.requests
       .filter((request) => request.url === "/console/rpc" && request.body)
       .map((request) => JSON.parse(request.body))
-      .filter((payload) => payload.method === "mobkit/console/query_timeline");
+      .filter((payload) => payload.method === "meta/console/query_timeline");
     const globalSeed = timelineRequests.find((payload) => !payload.params?.identity);
     assert.equal(globalSeed?.params?.mode, "recent");
     assert.equal(globalSeed?.params?.limit, 200);
@@ -2284,7 +2306,7 @@ async function runChatPaneRecentFirstPageProof() {
       .map((request) => JSON.parse(request.body))
       .filter(
         (payload) =>
-          payload.method === "mobkit/console/query_timeline" &&
+          payload.method === "meta/console/query_timeline" &&
           payload.params?.identity === "person-worker-alpha",
       );
     const firstIdentityRequest = identityRequests[0];
@@ -2351,7 +2373,7 @@ async function runChatPaneOlderHistoryDemandPagingProof() {
       .map((request) => JSON.parse(request.body))
       .filter(
         (payload) =>
-          payload.method === "mobkit/console/query_timeline" &&
+          payload.method === "meta/console/query_timeline" &&
           payload.params?.identity === "person-worker-alpha",
       );
     assert(
@@ -2415,7 +2437,7 @@ async function runChatPaneAsyncBackfillRestoresOlderHistoryProof() {
       .map((request) => JSON.parse(request.body))
       .filter(
         (payload) =>
-          payload.method === "mobkit/console/query_timeline" &&
+          payload.method === "meta/console/query_timeline" &&
           payload.params?.identity === "person-worker-alpha",
       );
     assert(
@@ -2482,7 +2504,7 @@ async function runChatPaneNonEmptyAsyncBackfillRestoresOlderHistoryProof() {
       .map((request) => JSON.parse(request.body))
       .filter(
         (payload) =>
-          payload.method === "mobkit/console/query_timeline" &&
+          payload.method === "meta/console/query_timeline" &&
           payload.params?.identity === "person-worker-alpha",
       );
     const recentRequests = identityRequests.filter(
@@ -2573,7 +2595,7 @@ async function runChatPaneReplayRecoveryReplacesStaleLocalLogProof() {
       .map((request) => JSON.parse(request.body))
       .filter(
         (payload) =>
-          payload.method === "mobkit/console/query_timeline" &&
+          payload.method === "meta/console/query_timeline" &&
           payload.params?.identity === "person-worker-alpha",
       );
     assert(
@@ -2904,34 +2926,34 @@ async function runHeadlessControlSurfaceBrowserProof() {
     await page.getByTestId("routing-panel").waitFor({ timeout: 10_000 });
     await page.getByTestId("routing-route:route-control-1").waitFor({ timeout: 10_000 });
     await page.getByTestId("routing-delivery:delivery-control-1").waitFor({ timeout: 10_000 });
-    await waitForRpcMethod(server, "mobkit/routing/routes/list");
-    await waitForRpcMethod(server, "mobkit/delivery/history");
+    await waitForRpcMethod(server, "meta/routing/routes/list");
+    await waitForRpcMethod(server, "meta/delivery/history");
 
     await page.getByTestId("nav:gating").click();
     await page.getByTestId("gating-panel").waitFor({ timeout: 10_000 });
     await page.getByTestId("gating-pending:gate-control-1").waitFor({ timeout: 10_000 });
-    await waitForRpcMethod(server, "mobkit/gating/pending");
-    await waitForRpcMethod(server, "mobkit/gating/audit");
+    await waitForRpcMethod(server, "meta/gating/pending");
+    await waitForRpcMethod(server, "meta/gating/audit");
     await page.getByTestId("gating-action:gate-control-1:approve").click();
-    await waitForRpcMethod(server, "mobkit/gating/decide", 1);
+    await waitForRpcMethod(server, "meta/gating/decide", 1);
     await page.getByTestId("gating-action:gate-control-1:reject").waitFor({ timeout: 10_000 });
     await page.getByTestId("gating-action:gate-control-1:reject").click();
-    await waitForRpcMethod(server, "mobkit/gating/decide", 2);
+    await waitForRpcMethod(server, "meta/gating/decide", 2);
     await page.getByTestId("gating-action:gate-control-1:escalate").waitFor({ timeout: 10_000 });
     await page.getByTestId("gating-action:gate-control-1:escalate").click();
-    await waitForRpcMethod(server, "mobkit/gating/decide", 3);
+    await waitForRpcMethod(server, "meta/gating/decide", 3);
 
     await openSidebarAgentChat(page, "Identity Luka");
     await page.getByTestId("conv-action:respawn").waitFor({ timeout: 10_000 });
     await page.getByTestId("conv-action:respawn").click();
-    await waitForRpcMethod(server, "mobkit/respawn");
+    await waitForRpcMethod(server, "meta/respawn");
     await page.getByTestId("conv-action:retire").waitFor({ timeout: 10_000 });
     await page.getByTestId("conv-action:retire").click();
-    await waitForRpcMethod(server, "mobkit/retire");
+    await waitForRpcMethod(server, "meta/retire");
     await page.getByTestId("conv-action:details").click();
     await page.getByTestId("inspect-action:identity:luka:reset").waitFor({ timeout: 10_000 });
     await page.getByTestId("inspect-action:identity:luka:reset").click();
-    await waitForRpcMethod(server, "mobkit/reset");
+    await waitForRpcMethod(server, "meta/reset");
 
     process.stdout.write("browser headless control surface ok\n");
   } finally {
@@ -2958,7 +2980,7 @@ async function runTopologyUnavailableBrowserProof() {
     );
     assert.equal(await page.getByText(/connect all/i).count(), 0);
     assert.equal(
-      rpcMethodsFromRequests(server.requests).includes("mobkit/topology/query"),
+      rpcMethodsFromRequests(server.requests).includes("meta/topology/query"),
       false,
       "the console must not probe an unadvertised topology RPC",
     );
@@ -2973,10 +2995,10 @@ async function runTopologyDeniedPairBrowserProof() {
   const server = await startMockConsoleServer({
     topologyControl: {
       methods: [
-        "mobkit/topology/query",
-        "mobkit/topology/plan",
-        "mobkit/topology/apply",
-        "mobkit/topology/operation/get",
+        "meta/topology/query",
+        "meta/topology/plan",
+        "meta/topology/apply",
+        "meta/topology/operation/get",
       ],
       capabilities: {
         mode: "editable",
@@ -3049,7 +3071,7 @@ async function runTopologyDeniedPairBrowserProof() {
     assert.equal(await page.getByText(/connect all/i).count(), 0);
     assert.equal(
       rpcMethodsFromRequests(server.requests).some((method) =>
-        method === "mobkit/topology/plan" || method === "mobkit/topology/apply"
+        method === "meta/topology/plan" || method === "meta/topology/apply"
       ),
       false,
       "disabled pair controls must never emit a mutation RPC",
@@ -3094,10 +3116,10 @@ async function runTopologyAmbiguousCommitBrowserProof() {
   };
   const topologyControl = {
     methods: [
-      "mobkit/topology/query",
-      "mobkit/topology/plan",
-      "mobkit/topology/apply",
-      "mobkit/topology/operation/get",
+      "meta/topology/query",
+      "meta/topology/plan",
+      "meta/topology/apply",
+      "meta/topology/operation/get",
     ],
     capabilities: {
       mode: "editable",
@@ -3110,7 +3132,7 @@ async function runTopologyAmbiguousCommitBrowserProof() {
     },
     query,
     handleRpc(payload, res) {
-      if (payload.method === "mobkit/topology/plan") {
+      if (payload.method === "meta/topology/plan") {
         sendResult(res, payload.id, {
           authority: "mock-mob",
           base_revision: payload.params.expected_revision,
@@ -3118,7 +3140,7 @@ async function runTopologyAmbiguousCommitBrowserProof() {
         });
         return true;
       }
-      if (payload.method === "mobkit/topology/operation/get") {
+      if (payload.method === "meta/topology/operation/get") {
         const receipt = [...committedByKey.values()].find((candidate) => (
           candidate.operation_id === payload.params.operation_id
         ));
@@ -3126,7 +3148,7 @@ async function runTopologyAmbiguousCommitBrowserProof() {
         sendResult(res, payload.id, receipt);
         return true;
       }
-      if (payload.method !== "mobkit/topology/apply") return false;
+      if (payload.method !== "meta/topology/apply") return false;
 
       applyPayloads.push(structuredClone(payload.params));
       const key = String(payload.params.idempotency_key || "");
@@ -3197,7 +3219,7 @@ async function runTopologyAmbiguousCommitBrowserProof() {
     assert.equal(physicalMutations, 1);
     assert.equal(committedByKey.size, 1);
     await resolve.click();
-    await waitForRpcMethod(server, "mobkit/topology/operation/get");
+    await waitForRpcMethod(server, "meta/topology/operation/get");
     await page.getByRole("button", { name: "Disconnect Legacy Router from Identity Luka" })
       .waitFor({ state: "visible", timeout: 10_000 });
 
@@ -3206,7 +3228,7 @@ async function runTopologyAmbiguousCommitBrowserProof() {
     assert.equal(applyPayloads.length, 2);
     assert.deepEqual(applyPayloads[1], applyPayloads[0], "Resolve must replay the exact apply payload");
     assert.equal(
-      rpcMethodsFromRequests(server.requests).filter((method) => method === "mobkit/topology/plan").length,
+      rpcMethodsFromRequests(server.requests).filter((method) => method === "meta/topology/plan").length,
       1,
       "Resolve must not silently replan or rebase",
     );
@@ -3219,19 +3241,36 @@ async function runTopologyAmbiguousCommitBrowserProof() {
 
 // UI contract test only: local HTTP fixtures do not install native authorization.
 async function runAuthorizationFeedbackProof() {
-  const evidence = process.env.MOBKIT_BROWSER_EVIDENCE || "/tmp/adr-001-console-browser-r2";
+  const evidence = process.env.META_BROWSER_EVIDENCE || "/tmp/adr-001-console-browser-r2";
   fs.mkdirSync(evidence, { recursive: true });
   const base = { identity: "identity:luka", session_id: "session-auth", run_id: "run-auth", interaction_id: "work-auth" };
   const frame = (id, kind, payload, index) => ({ ...base, id, kind, payload, cursor: `console:${index}`, timestamp_ms: Date.now() - 10000 + index });
+  const approvalId = "B6503200-06B6-4157-AFC0-2A3C8D124178";
+  const reviewFrames = (callId, error, kind, index, approvalReference) => {
+    const content = [{ type: "text", text: JSON.stringify({
+      error,
+      message: `PRIVATE_REVIEW_CANARY_${kind}`,
+      data: { kind, ...(approvalReference ? { approval_id: approvalReference } : {}) },
+    }) }];
+    const result = { id: callId, name: "write_calendar", is_error: true, content };
+    return [
+      frame(`${callId}-requested`, "tool_call_requested", { id: callId, name: "write_calendar", args: {} }, index),
+      frame(`${callId}-result`, "tool_result_received", result, index + 1),
+      frame(`${callId}-completed`, "tool_execution_completed", { ...result, duration_ms: 0 }, index + 2),
+    ];
+  };
   const frames = [
     frame("start", "run_started", {}, 1),
     frame("refusal", "system_notice", { message: { role: "system_notice", kind: "generic", body: "PRIVATE_NOTICE_CANARY", blocks: [{ type: "runtime_notice", category: "operation_refused", payload: { code: "operation_refused" } }] } }, 2),
-    frame("read", "tool_call_requested", { id: "read-call", name: "read_calendar", args: {} }, 3),
-    frame("read-result", "tool_result_received", { id: "read-call", name: "read_calendar", is_error: false, content: [{ type: "text", text: "Permitted calendar read completed" }] }, 4),
-    frame("audit", "operation_observation_failed", { operation_id: "op-read", phase: "outcome", private: "PRIVATE_AUDIT_CANARY" }, 5),
-    frame("answer", "text_complete", { text: "I continued with the permitted calendar read." }, 6),
-    frame("done", "run_completed", { result: "I continued with the permitted calendar read." }, 7),
-    frame("interaction-done", "interaction_complete", { result: "I continued with the permitted calendar read." }, 8),
+    ...reviewFrames("consent-call", "review_unsatisfied", "human_consent_required", 3, approvalId),
+    ...reviewFrames("unavailable-call", "review_unavailable", "reviewer_failed", 6),
+    ...reviewFrames("consumed-call", "review_unsatisfied", "already_consumed", 9),
+    frame("read", "tool_call_requested", { id: "read-call", name: "read_calendar", args: {} }, 12),
+    frame("read-result", "tool_result_received", { id: "read-call", name: "read_calendar", is_error: false, content: [{ type: "text", text: "Permitted calendar read completed" }] }, 13),
+    frame("audit", "operation_observation_failed", { operation_id: "op-read", phase: "outcome", private: "PRIVATE_AUDIT_CANARY" }, 14),
+    frame("answer", "text_complete", { text: "I continued with the permitted calendar read." }, 15),
+    frame("done", "run_completed", { result: "I continued with the permitted calendar read." }, 16),
+    frame("interaction-done", "interaction_complete", { result: "I continued with the permitted calendar read." }, 17),
   ];
   const server = await startMockConsoleServer({ timelineFramesByIdentity: { "identity:luka": frames } });
   let browser;
@@ -3241,6 +3280,8 @@ async function runAuthorizationFeedbackProof() {
     const page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
     const errors = [];
     page.on("pageerror", error => errors.push(String(error)));
+    let gatingDecisions = 0;
+    let gatingPendingReads = 0;
     let admin = true;
     let revision = 1;
     let mutations = 0;
@@ -3256,19 +3297,25 @@ async function runAuthorizationFeedbackProof() {
     await page.route("**/console/rpc", async route => {
       const request = route.request().postDataJSON();
       const reply = result => route.fulfill({ json: { jsonrpc: "2.0", id: request.id, result } });
-      if (request.method === "mobkit/capabilities") {
+      if (request.method === "meta/gating/decide") gatingDecisions += 1;
+      // A native owner reference is not an actionable Meta pending request.
+      if (request.method === "meta/gating/pending") {
+        gatingPendingReads += 1;
+        return reply({ pending: [] });
+      }
+      if (request.method === "meta/capabilities") {
         const response = await route.fetch(); const value = await response.json();
-        value.result.methods.push(...["status", "get", "set", "enable", "rules/upsert", "rules/delete", "groups/set", "groups/delete", "preview"].map(name => `mobkit/access/${name}`));
+        value.result.methods.push(...["status", "get", "set", "enable", "rules/upsert", "rules/delete", "groups/set", "groups/delete", "preview"].map(name => `meta/access/${name}`));
         return route.fulfill({ response, json: value });
       }
-      if (request.method === "mobkit/access/status") return reply(status());
-      if (request.method === "mobkit/access/get") return reply({ ...metadata(), config: { enabled: true, admins: ["admin@example.test"], rules: [], groups: {} } });
-      if (request.method === "mobkit/access/preview") {
+      if (request.method === "meta/access/status") return reply(status());
+      if (request.method === "meta/access/get") return reply({ ...metadata(), config: { enabled: true, admins: ["admin@example.test"], rules: [], groups: {} } });
+      if (request.method === "meta/access/preview") {
         previewStarted();
         await new Promise(resolve => { finishPreview = resolve; });
         return reply({ allowed: true, reason: "STALE_PREVIEW_CANARY" });
       }
-      if (request.method === "mobkit/access/rules/upsert") {
+      if (request.method === "meta/access/rules/upsert") {
         mutations += 1;
         return route.fulfill({ json: { jsonrpc: "2.0", id: request.id, error: { code: -32602, message: "Fixture owner rejected this rule" } } });
       }
@@ -3280,14 +3327,58 @@ async function runAuthorizationFeedbackProof() {
     await pane.getByText("Permission denied", { exact: true }).waitFor();
     await pane.getByText("Audit update unavailable", { exact: true }).waitFor();
     await pane.getByText("I continued with the permitted calendar read.", { exact: true }).first().waitFor();
-    assert.doesNotMatch(await page.locator("body").innerText(), /PRIVATE_NOTICE_CANARY|PRIVATE_AUDIT_CANARY/);
+    const consent = pane.locator('[data-feedback-kind="review-unsatisfied"]').filter({ hasText: "Call consent-call" });
+    const unavailable = pane.locator('[data-feedback-kind="review-unavailable"]').filter({ hasText: "Call unavailable-call" });
+    const consumed = pane.locator('[data-feedback-kind="review-unsatisfied"]').filter({ hasText: "Call consumed-call" });
+    for (const feedback of [consent, unavailable, consumed]) {
+      await feedback.waitFor({ state: "visible" });
+      assert.equal(await feedback.count(), 1, "result/completed twins must produce one feedback card per call");
+      assert.equal(await feedback.getAttribute("role"), "status");
+      assert.equal(await feedback.locator('button, a, input, select, textarea, [role="button"], [role="link"]').count(), 0,
+        "native review feedback must not infer a retry or approval action");
+      assert.doesNotMatch(await feedback.innerText(), /Permission denied|Run failed|Awaiting approval|Approved/);
+    }
+    assert.equal(await pane.locator('[data-feedback-kind="review-unsatisfied"]').count(), 2);
+    assert.equal(await pane.locator('[data-feedback-kind="review-unavailable"]').count(), 1);
+    assert.equal(await consent.getAttribute("aria-label"), "Review not satisfied");
+    assert.match(await consent.innerText(), /requires human consent/);
+    assert.equal(await consent.locator(".cc-operation-feedback__reference").filter({ hasText: "Approval reference" }).innerText(),
+      `Approval reference ${approvalId}`, "preserve the exact native reference as plain display text");
+    assert.equal(await pane.getByText(`Approval reference ${approvalId}`, { exact: true }).count(), 1);
+    assert.equal(await unavailable.getAttribute("aria-label"), "Review unavailable");
+    assert.match(await unavailable.innerText(), /could not provide a usable decision/);
+    assert.doesNotMatch(await unavailable.innerText(), /reviewer declined|Approval reference/);
+    assert.match(await consumed.innerText(), /does not establish the action's execution result; do not repeat/);
+    assert.doesNotMatch(await consumed.innerText(), /did not run|never entered|no effect|Approval reference/);
+    assert.equal(await pane.locator('[data-testid^="gating-pending:"], [data-testid^="gating-action:"]').count(), 0);
+    assert.equal(await pane.getByTestId("chat-event:run_failed").count(), 0);
+    assert.doesNotMatch(await pane.innerText(), /Run failed/);
+    const sibling = pane.locator(".cc-tool-call").filter({ has: page.locator('.cc-tool-call__name[title="read_calendar"]') });
+    await sibling.waitFor({ state: "visible" });
+    assert.equal(await sibling.count(), 1);
+    assert.match(await sibling.getAttribute("class"), /cc-tool-call--success/);
+    const siblingHeader = sibling.locator(".cc-tool-call__header");
+    if (await siblingHeader.getAttribute("aria-expanded") === "false") await siblingHeader.click();
+    await sibling.getByText("Permitted calendar read completed", { exact: true }).waitFor({ state: "visible" });
+    assert.doesNotMatch(await page.locator("body").textContent(), /PRIVATE_NOTICE_CANARY|PRIVATE_AUDIT_CANARY|PRIVATE_REVIEW_CANARY/);
+    assert.equal(gatingDecisions, 0, "viewing native review feedback must not submit a gating decision");
     await page.screenshot({ path: path.join(evidence, "operation-feedback.png"), fullPage: true });
+    await consent.screenshot({ path: path.join(evidence, "native-consent-reference.png") });
+    await unavailable.screenshot({ path: path.join(evidence, "native-review-unavailable.png") });
+    await consumed.screenshot({ path: path.join(evidence, "native-review-consumed.png") });
     const composer = page.getByTestId("chat-composer:identity:luka");
     await composer.fill("A permitted follow-up request");
     await composer.press("Enter");
     await page.waitForFunction(() => document.querySelector('[data-testid="chat-composer:identity:luka"]')?.value === "", null, { timeout: 10_000 });
-    await waitForRpcMethod(server, "mobkit/console/send");
-    assert(server.requests.some(row => row.body.includes("A permitted follow-up request")), "follow-up must reach the existing send owner");
+    await waitForRpcMethod(server, "meta/console/send");
+    const followUpRequests = server.requests.filter(row => row.url === "/console/rpc")
+      .map(row => JSON.parse(row.body)).filter(request => request.method === "meta/console/send");
+    assert.equal(followUpRequests.length, 1, "follow-up must reach the actual Meta send owner exactly once");
+    assert.equal(followUpRequests[0].params.identity, base.identity);
+    const followUpContent = followUpRequests[0].params.content;
+    assert.deepEqual(typeof followUpContent === "string" ? [{ type: "text", text: followUpContent }] : followUpContent,
+      [{ type: "text", text: "A permitted follow-up request" }]);
+    assert.equal(gatingDecisions, 0, "permitted follow-up must not infer approval from a native reference");
     await page.getByText("Access", { exact: true }).first().click();
     await page.getByRole("heading", { name: "Console access", exact: true }).waitFor();
     await page.getByTestId("access-toggle-enabled").waitFor();
@@ -3313,7 +3404,9 @@ async function runAuthorizationFeedbackProof() {
     assert.doesNotMatch(await page.locator("body").innerText(), /admin@example.test|draft-survives/);
     assert.equal(errors.length, 0, errors.join("\n"));
     await page.screenshot({ path: path.join(evidence, "console-access-revoked.png"), fullPage: true });
-    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "local mock HTTP", nativeAuthorizationInstalled: false, cases: ["typed local refusal", "separate audit outcome", "permitted follow-up", "stale preview discarded", "failed draft retained", "revoked data hidden"], mutations, errors }, null, 2));
+    assert.equal(gatingDecisions, 0);
+    assert(gatingPendingReads > 0, "the current Meta pending owner must supply the empty actionable-approval set");
+    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "local mock HTTP", nativeAuthorizationInstalled: false, browser: browser.version(), cases: ["typed local refusal", "native human-consent reference without actions", "review unavailable is distinct from denial", "already-consumed result stays uncertain", "result/completed twins deduplicated", "private diagnostics absent", "permitted sibling result and final answer retained", "no inferred gating decision", "separate audit outcome", "permitted follow-up", "stale preview discarded", "failed draft retained", "revoked data hidden"], approvalId, gatingDecisions, gatingPendingReads, followUpSendCount: followUpRequests.length, mutations, errors }, null, 2));
     process.stdout.write("authorization feedback browser contract passed (mock backend)\n");
   } finally {
     finishPreview?.();
@@ -3325,7 +3418,7 @@ async function runAuthorizationFeedbackProof() {
 // Real Chromium UI over the existing local HTTP host and mocked access RPC.
 // This does not install or execute the Rust access owner.
 async function runCheckedSaveBrowserProof(mode) {
-  const evidence = path.join(process.env.MOBKIT_BROWSER_EVIDENCE || path.join(repoRoot, "output/playwright/console-acceptance"), mode);
+  const evidence = path.join(process.env.META_BROWSER_EVIDENCE || path.join(repoRoot, "output/playwright/console-acceptance"), mode);
   fs.mkdirSync(evidence, { recursive: true });
   const initialGroup = { description: "Original group description", members: ["alice@example.test"] };
   const newerGroup = { ...initialGroup, description: "Another admin's updated description" };
@@ -3333,7 +3426,7 @@ async function runCheckedSaveBrowserProof(mode) {
   const newerRule = { id: "b-newer-rule", effect: "allow", subjects: ["reader@example.test"], actions: ["agent.view"], agents: ["worker"] };
   const state = { owner: "opaque-owner:one", revision: 10, config: structuredClone(original), applied: 0 };
   const writes = [], reads = [], errors = [], checkpoints = [];
-  const mutationMethods = new Set(["set", "enable", "rules/upsert", "rules/delete", "groups/set", "groups/delete"].map(name => `mobkit/access/${name}`));
+  const mutationMethods = new Set(["set", "enable", "rules/upsert", "rules/delete", "groups/set", "groups/delete"].map(name => `meta/access/${name}`));
   const metadata = () => ({ revision: state.revision, owner_instance: state.owner, conditional_mutations: "checked_v1" });
   const status = () => ({ available: true, enabled: true, can_administer: true, subject: "root@example.test", actions: ["agent.view"], ...metadata() });
   const server = await startMockConsoleServer();
@@ -3350,16 +3443,16 @@ async function runCheckedSaveBrowserProof(mode) {
     await page.route("**/console/rpc", async route => {
       const request = route.request().postDataJSON();
       const reply = payload => route.fulfill({ json: { jsonrpc: "2.0", id: request.id, ...payload } });
-      if (request.method === "mobkit/capabilities") {
+      if (request.method === "meta/capabilities") {
         const response = await route.fetch(); const value = await response.json();
-        value.result.methods.push("mobkit/access/status", "mobkit/access/get", ...mutationMethods);
+        value.result.methods.push("meta/access/status", "meta/access/get", ...mutationMethods);
         return route.fulfill({ response, json: value });
       }
-      if (request.method === "mobkit/access/status") {
+      if (request.method === "meta/access/status") {
         reads.push({ method: request.method, ...metadata() });
         return reply({ result: status() });
       }
-      if (request.method === "mobkit/access/get") {
+      if (request.method === "meta/access/get") {
         reads.push({ method: request.method, ...metadata() });
         return reply({ result: { config: state.config, ...metadata() } });
       }
@@ -3376,8 +3469,8 @@ async function runCheckedSaveBrowserProof(mode) {
         if (checked.expected_revision !== state.revision) {
           return reply({ error: { code: -32009, message: "PRIVATE_CONFLICT_CANARY", data: { kind: "access_revision_conflict", expected_revision: checked.expected_revision, actual_revision: state.revision } } });
         }
-        if (request.method === "mobkit/access/set") state.config = checked.config;
-        else if (request.method === "mobkit/access/groups/set" && checked.name === "ops") state.config = { ...state.config, groups: { ...state.config.groups, ops: checked.group } };
+        if (request.method === "meta/access/set") state.config = checked.config;
+        else if (request.method === "meta/access/groups/set" && checked.name === "ops") state.config = { ...state.config, groups: { ...state.config.groups, ops: checked.group } };
         else throw new Error(`unexpected checked mutation ${request.method}`);
         state.applied += 1; state.revision += 1;
         return reply({ result: { config: state.config, ...metadata() } });
@@ -3395,7 +3488,7 @@ async function runCheckedSaveBrowserProof(mode) {
       draft = page.getByTestId("access-group-members"); save = page.getByTestId("access-group-save");
       await draft.fill("carol@example.test");
       state.config = { ...state.config, groups: { ops: newerGroup } }; state.revision = 11;
-      const refreshed = page.waitForResponse(response => response.url().endsWith("/console/rpc") && response.request().postDataJSON()?.method === "mobkit/access/get");
+      const refreshed = page.waitForResponse(response => response.url().endsWith("/console/rpc") && response.request().postDataJSON()?.method === "meta/access/get");
       await page.getByTestId("access-refresh").click();
       await refreshed;
       await save.click({ trial: true });

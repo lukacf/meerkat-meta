@@ -1,6 +1,6 @@
-# Contributing to MobKit
+# Contributing to Meta
 
-Thank you for considering contributing to MobKit.
+Thank you for considering contributing to Meta.
 
 ## Development Setup
 
@@ -24,7 +24,7 @@ make build
 ./scripts/repo-cargo build --workspace
 
 # Python (no build step — pure Python)
-PYTHONPATH=sdk/python python3 -c "import meerkat_mobkit; print('OK')"
+PYTHONPATH=sdk/python python3 -c "import meerkat_meta; print('OK')"
 ```
 
 ### Testing
@@ -124,7 +124,7 @@ not placeholders). IDs are integers; digests are 64 lowercase hex characters:
 {
   "schema_version": 1,
   "kind": "accepted-candidate",
-  "repository": "lukacf/meerkat-mobkit",
+  "repository": "lukacf/meerkat-meta",
   "run_id": 123,
   "run_attempt": 1,
   "manifest_artifact": {
@@ -213,7 +213,7 @@ addition, even when the original ZIP also contains sibling binaries:
 {
   "schema_version": 1,
   "kind": "original-assets",
-  "repository": "lukacf/meerkat-mobkit",
+  "repository": "lukacf/meerkat-meta",
   "source_sha": "<full tagged source SHA>",
   "version": "0.8.31",
   "tag": "v0.8.31",
@@ -229,7 +229,7 @@ addition, even when the original ZIP also contains sibling binaries:
     "digest": "<original artifact ZIP SHA-256>",
     "target": "x86_64-pc-windows-msvc",
     "archives": [{
-      "name": "mobkit-rpc-gateway-0.8.31-x86_64-pc-windows-msvc.zip",
+      "name": "meta-rpc-gateway-0.8.31-x86_64-pc-windows-msvc.zip",
       "target": "x86_64-pc-windows-msvc",
       "binary": "rpc_gateway",
       "size": 1234,

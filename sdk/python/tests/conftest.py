@@ -1,1 +1,1 @@
-# Minimal conftest for MobKit SDK tests.
+# Minimal conftest for Meta SDK tests.

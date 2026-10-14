@@ -1,10 +1,10 @@
 /**
  * Human-readable summary of a failure frame's payload.
  *
- * meerkat >= 0.7 `run_failed` (projected by MobKit as `interaction_failed`)
+ * meerkat >= 0.7 `run_failed` (projected by Meta as `interaction_failed`)
  * carries its failure truth as the typed `error_report { class, reason,
  * message }`; the gateway also derives flat `error` and `reason` strings
- * from it. Frames persisted before that derivation, and frames MobKit mints
+ * from it. Frames persisted before that derivation, and frames Meta mints
  * itself (`reason: "superseded_by_later_run"`, `error: "<delivery failure>"`),
  * carry only one of the shapes, so every failure renderer reads them all in
  * one place: the typed report first, then the flat keys.

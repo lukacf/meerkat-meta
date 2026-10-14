@@ -78,7 +78,7 @@ describe("TopologyPanel", () => {
   });
 
   test("keeps role nodes passive instead of treating topology clicks as navigation", () => {
-    window.localStorage.setItem("mobkit-console-topology-view", "roles");
+    window.localStorage.setItem("meta-console-topology-view", "roles");
 
     render(<TopologyPanel activity={[]} agents={[]} nodes={NODES} />);
 

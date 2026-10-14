@@ -39,7 +39,7 @@ function authorityCancellation(request) {
   if (new URL(request.url()).pathname.endsWith("/timeline/stream")) return true;
   try {
     const body = JSON.parse(request.postData() || "{}");
-    return body.method === "mobkit/console/query_timeline" && body.params?.mode === "recent" && body.params?.limit === 200 && !body.params?.identity;
+    return body.method === "meta/console/query_timeline" && body.params?.mode === "recent" && body.params?.limit === 200 && !body.params?.identity;
   } catch { return false; }
 }
 async function openStock(page, fixture, monitor, reload = false) {
@@ -58,7 +58,7 @@ function requestSendPayload(request) {
       payload = payload.match(/name="payload"\r\n(?:[^\r\n]+\r\n)*\r\n([^\r\n]+)/)?.[1] || "";
     }
     const body = JSON.parse(payload);
-    return body.method === "mobkit/console/send" ? body.params : null;
+    return body.method === "meta/console/send" ? body.params : null;
   } catch { return null; }
 }
 async function send(page, fixture, instruction) {
@@ -363,8 +363,8 @@ async function liveModel() {
     const prompt = 'Use the WorkGraph tools in the authorized realm mob.console-acceptance to create exactly two independent tasks called Review diagram and Review badge, plus a third called Publish report. These are immediately available, unscheduled tasks. For each create call send only realm_id and title, for example {"realm_id":"mob.console-acceptance","title":"Review diagram"}. Do not send due_at, not_before or snoozed_until; absent scheduling is distinct from an epoch date or a distant-future date. Do not call workgraph_update. Link each review as a blocking prerequisite of Publish report. Read the ready set after creating both links. End with one Markdown table containing exactly these columns: Task, ID, Ready. Include all three tasks with exact tool-returned IDs; the Ready cells must be Yes or No from the ready set. Leave the tasks open; do not claim or close them. No other work is needed.';
     const accepted = await send(page, fixture, prompt);
     const terminal = await completed(fixture, accepted, "Publish report", 180_000);
-    const graph = await ownerRpc(fixture, "mobkit/workgraph/snapshot", { include_terminal: true });
-    const ready = await ownerRpc(fixture, "mobkit/workgraph/ready", {});
+    const graph = await ownerRpc(fixture, "meta/workgraph/snapshot", { include_terminal: true });
+    const ready = await ownerRpc(fixture, "meta/workgraph/ready", {});
     const items = assertOpenGraph(graph.snapshot || graph, ready);
     const current = await frames(fixture), scoped = interactionFrames(current, accepted);
     const calls = scoped.filter(frame => frame.kind === "tool_call_requested");

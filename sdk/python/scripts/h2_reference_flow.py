@@ -14,25 +14,25 @@ from typing import Any, Callable
 import httpx
 
 EXPECTED_CAPABILITY_METHODS = [
-    "mobkit/status",
-    "mobkit/capabilities",
-    "mobkit/reconcile",
-    "mobkit/spawn_member",
-    "mobkit/routing/resolve",
-    "mobkit/routing/routes/list",
-    "mobkit/routing/routes/add",
-    "mobkit/routing/routes/delete",
-    "mobkit/delivery/send",
-    "mobkit/delivery/history",
-    "mobkit/events/subscribe",
-    "mobkit/memory/stores",
-    "mobkit/memory/index",
-    "mobkit/memory/query",
-    "mobkit/session_store/bigquery",
-    "mobkit/gating/evaluate",
-    "mobkit/gating/pending",
-    "mobkit/gating/decide",
-    "mobkit/gating/audit",
+    "meta/status",
+    "meta/capabilities",
+    "meta/reconcile",
+    "meta/spawn_member",
+    "meta/routing/resolve",
+    "meta/routing/routes/list",
+    "meta/routing/routes/add",
+    "meta/routing/routes/delete",
+    "meta/delivery/send",
+    "meta/delivery/history",
+    "meta/events/subscribe",
+    "meta/memory/stores",
+    "meta/memory/index",
+    "meta/memory/query",
+    "meta/session_store/bigquery",
+    "meta/gating/evaluate",
+    "meta/gating/pending",
+    "meta/gating/decide",
+    "meta/gating/audit",
 ]
 EXPECTED_CONTRACT_VERSION = "0.5.0"
 
@@ -57,7 +57,7 @@ def _assert_eq(observed: Any, expected: Any, label: str) -> None:
 
 def _start_reference_app(gateway_bin: str, listener: socket.socket) -> subprocess.Popen[str]:
     app_dir = Path(__file__).resolve().parents[1] / "examples"
-    env = {**os.environ, "MOBKIT_RPC_GATEWAY_BIN": gateway_bin}
+    env = {**os.environ, "META_RPC_GATEWAY_BIN": gateway_bin}
     return subprocess.Popen(
         [
             sys.executable,
@@ -136,9 +136,9 @@ def _request_json(
 
 
 def main() -> int:
-    gateway_bin = os.environ.get("MOBKIT_RPC_GATEWAY_BIN")
+    gateway_bin = os.environ.get("META_RPC_GATEWAY_BIN")
     if not gateway_bin:
-        print("MOBKIT_RPC_GATEWAY_BIN must be set", file=sys.stderr)
+        print("META_RPC_GATEWAY_BIN must be set", file=sys.stderr)
         return 2
 
     checks: list[dict[str, Any]] = []
@@ -464,7 +464,7 @@ def main() -> int:
         )
         _assert_eq(
             typed_error.get("method"),
-            "mobkit/spawn_member",
+            "meta/spawn_member",
             "spawn_member typed error method mismatch",
         )
 
@@ -504,7 +504,7 @@ def main() -> int:
         )
         _assert_eq(
             typed_error.get("method"),
-            "mobkit/events/subscribe",
+            "meta/events/subscribe",
             "events typed error method mismatch",
         )
 

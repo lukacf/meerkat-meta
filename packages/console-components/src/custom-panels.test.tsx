@@ -62,7 +62,7 @@ describe("custom panel registration", () => {
 
   it("rejects collisions and reserved stock names", () => {
     expect(() => validateConsolePanels([panel, panel])).toThrow(/duplicate/);
-    expect(() => validateConsolePanels([{ ...panel, id: "mobkit/workgraph" }])).toThrow();
+    expect(() => validateConsolePanels([{ ...panel, id: "meta/workgraph" }])).toThrow();
   });
 
   it("preserves panel identity through the shared host-target migration", () => {

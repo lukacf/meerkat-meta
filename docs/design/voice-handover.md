@@ -6,12 +6,12 @@ Emergency WIP checkpoint, 2026-09-17. The user requested immediate commit and
 
 ## Start here
 
-- MobKit: [PR #408](https://github.com/lukacf/meerkat-mobkit/pull/408),
+- Meta: [PR #408](https://github.com/lukacf/meerkat-meta/pull/408),
   branch `luka-crnkovicfriis-abk-console-voice-mode`.
 - All 35 Meerkat dependencies are pinned together to the now-public
   `73a0b869afb872d16b39d9de2ef5bd74e1c4f8a1`, not local filesystem paths.
   Backup ref: `lukacf/meerkat`, branch
-  `wip/mobkit-voice-73a0b869-checkpoint`.
+  `wip/meta-voice-73a0b869-checkpoint`.
   Another equivalent ref is `luka-crnkovicfriis-abk-voice-qualified-73a0b869`.
 - That pin includes recovery/close repair, canonical human input, context-first
   assistant attribution, and concurrent summary bootstrap. **It has a confirmed
@@ -20,7 +20,7 @@ Emergency WIP checkpoint, 2026-09-17. The user requested immediate commit and
   separately at `ddf52762e279f9e58cb4bf21e665dee46aa187ed` on upstream branch
   `luka-crnkovicfriis-abk-async-voice-context` (557adda4 plus two late carrier
   edits; lineage rooted at 73).
-  It is incomplete/unqualified; **do not bind MobKit to it yet**.
+  It is incomplete/unqualified; **do not bind Meta to it yet**.
   Read [ASYNC_VOICE_CONTEXT_HANDOFF.md](https://github.com/lukacf/meerkat/blob/ddf52762e279f9e58cb4bf21e665dee46aa187ed/ASYNC_VOICE_CONTEXT_HANDOFF.md).
   The redacted failed-run log is committed there at
   `artifacts/evidence/s99-paid-73a0b869.log`.
@@ -29,7 +29,7 @@ Emergency WIP checkpoint, 2026-09-17. The user requested immediate commit and
   `wip/voice-legacy-original-workspace`. Its
   `VOICE_LEGACY_WORKSPACE_HANDOFF.md` identifies it as a historical archive,
   **not** the latest integration or a consumer pin. Do not merge it blindly.
-- Latest public release baseline checked: Meerkat **0.8.39**, MobKit **0.8.36**.
+- Latest public release baseline checked: Meerkat **0.8.39**, Meta **0.8.36**.
   These releases do not contain the complete new voice work. Recheck before
   selecting the next pair; do not republish either version.
 
@@ -37,7 +37,7 @@ The user's eventual objective is convincing realistic Live proof, independent
 PR review, green current CI, then merge and release the next pairing. The
 emergency checkpoint does not waive those gates.
 
-## Implemented in MobKit
+## Implemented in Meta
 
 Voice button and dual real-audio waveforms; independent mic/speaker mute and
 close; selected existing agent as background executor; persistent voice target
@@ -55,11 +55,11 @@ New work in this checkpoint:
   strict.
 - Console opts into `LiveContextBootstrapMode::Concurrent`. Audio can activate
   while a tool-free factual summary is generated using the background model.
-- `mobkit/console/voice/context_status` accepts exactly
+- `meta/console/voice/context_status` accepts exactly
   `{identity, request_id, channel_id}` and echoes that scope plus
   `context_preparation`. Stages are capturing/generating/delivering; terminal
   states are not_requested/provider_acknowledged/failed with 13 typed reasons.
-  See the shared `crates/meerkat-mobkit/tests/fixtures/console_voice_v1.json`.
+  See the shared `crates/meerkat-meta/tests/fixtures/console_voice_v1.json`.
 - Browser status observation is independent of media activation, bounded and
   request/channel-fenced. Failures are visible without muting connected audio.
   Replacement/close/dispose cancel observers; late replies cannot affect a new
@@ -70,11 +70,11 @@ New work in this checkpoint:
   (`superseded_by_console_voice`, `superseded_by_external_live`), the console
   error kind `voice_superseded`, readiness `reason: external_live_active` with
   a `holder`, `close_reason` on external status/close, and the stdio
-  notification `mobkit/live/superseded`. See docs/design/live-sessions.md,
+  notification `meta/live/superseded`. See docs/design/live-sessions.md,
   "One shared live owner".
 
 Important files: `console/src/lib/voice-{session,context}.ts`,
-`console/src/panels/VoiceBar.tsx`, `crates/meerkat-mobkit/src/console_voice{.rs,/}`,
+`console/src/panels/VoiceBar.tsx`, `crates/meerkat-meta/src/console_voice{.rs,/}`,
 `live_wiring.rs`, `http_console.rs`, `identity_first/{runtime,bridge}.rs`,
 `console_aggregator/mod.rs`, `mob_handle_runtime.rs`, `unified_runtime/http.rs`,
 `console_human_input_tests.rs`, and `tests/agent_events_identity_resolution.rs`.
@@ -85,14 +85,14 @@ Generated console/embedded bundles and Bazel metadata are included.
 On the exact immutable 73 source, before converting the equivalent sources
 from archive paths to public Git bindings:
 
-- Production `mobkit_gateway` build with `--features openai-live`.
+- Production `meta_gateway` build with `--features openai-live`.
 - 220 targeted Rust integration/unit tests; strict all-target
   `openai-live-test` Clippy; 112 UI tests including Rust/TS golden parity.
 - Real local WebRTC without provider calls: actual audio before a held context
   gate is released, ACK/failure states, mute/navigation/text/recovery/cleanup.
 - Independent browser and backend reviews: no significant issues.
 - These results are **not** current public-PR CI or proof of paid acceptance.
-  Last green published MobKit checkpoint was `f4028d886bd762ed2333612448d01166c0fa3a8f`,
+  Last green published Meta checkpoint was `f4028d886bd762ed2333612448d01166c0fa3a8f`,
   CI run `35161886190`. This emergency push skips push hooks by user request.
   Git-source fetch/rebuild was not completed locally before the emergency
   handoff. Lockfile changes only replace the 35 archive package sources with
@@ -159,12 +159,12 @@ and runtime token stores. Never replace failed assertions with weaker ones.
 
 ```bash
 export CARGO_INCREMENTAL=0
-./scripts/repo-cargo build -p meerkat-mobkit --bin mobkit_gateway --features openai-live
-./scripts/repo-cargo nextest run -p meerkat-mobkit --features openai-live-test \
+./scripts/repo-cargo build -p meerkat-meta --bin meta_gateway --features openai-live
+./scripts/repo-cargo nextest run -p meerkat-meta --features openai-live-test \
   --lib --test agent_events_identity_resolution \
   -E 'test(console_human) or test(console_voice) or test(identity_first::runtime) or test(console_aggregator) or test(live_contracts) or test(live_wiring) or binary(agent_events_identity_resolution)' \
   --no-fail-fast
-./scripts/repo-cargo clippy -p meerkat-mobkit --features openai-live-test --all-targets -- -D warnings
+./scripts/repo-cargo clippy -p meerkat-meta --features openai-live-test --all-targets -- -D warnings
 npm --prefix console run voice:test
 npm --prefix console run build
 node console/voice-e2e.cjs
@@ -174,7 +174,7 @@ node console/voice-e2e-live.cjs --help
 ```
 
 The paid command is `npm --prefix console run e2e:voice:live`; do not run it
-accidentally. `MOBKIT_VOICE_GATEWAY_BIN=/absolute/path` selects a prebuilt
+accidentally. `META_VOICE_GATEWAY_BIN=/absolute/path` selects a prebuilt
 matching gateway. Supply approved remote credentials through the environment,
 never through committed files. Synthetic WAVs replace microphone capture.
 

@@ -14,10 +14,10 @@ from pathlib import Path
 
 import pytest
 
-from meerkat_mobkit.builder import MobKit
-from meerkat_mobkit.identity_first_models import DurableAgentSpec, IdentityBootstrapMode
+from meerkat_meta.builder import Meta
+from meerkat_meta.identity_first_models import DurableAgentSpec, IdentityBootstrapMode
 
-_GATEWAY_BIN = os.environ.get("MOBKIT_GATEWAY_BIN", "").strip()
+_GATEWAY_BIN = os.environ.get("META_GATEWAY_BIN", "").strip()
 _IDENTITY = "domain:research"
 _TOOL = "lookup_workspace"
 
@@ -57,7 +57,7 @@ class _ToolCustomizer:
 
 async def _build(mob_toml: Path, state_dir: Path, customizer: _ToolCustomizer):
     return await (
-        MobKit.builder()
+        Meta.builder()
         .gateway(_GATEWAY_BIN)
         .mob(str(mob_toml))
         .persistent_state(str(state_dir))
@@ -76,7 +76,7 @@ def _live_scope_serves_the_tool(runtime) -> bool:
 
 @pytest.mark.skipif(
     not (_GATEWAY_BIN and os.path.isfile(_GATEWAY_BIN)),
-    reason="MOBKIT_GATEWAY_BIN not set to a built rpc_gateway",
+    reason="META_GATEWAY_BIN not set to a built rpc_gateway",
 )
 @pytest.mark.asyncio
 async def test_customizer_tools_are_still_advertised_after_a_restart(tmp_path):

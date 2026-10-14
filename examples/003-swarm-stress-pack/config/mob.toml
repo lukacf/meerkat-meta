@@ -6,7 +6,7 @@ source = "inline"
 content = """
 ## Swarm Stress Protocol
 
-You are part of a real LLM-backed stress test for MobKit and Meerkat. Keep
+You are part of a real LLM-backed stress test for Meta and Meerkat. Keep
 replies short, concrete, and focused on control-plane observability.
 
 - Acknowledge the target shard, wave, and mob.
@@ -47,7 +47,7 @@ model = "gemini-3.1-flash-lite-preview"
 external_addressable = true
 runtime_mode = "turn_driven"
 skills = ["swarm_stress_protocol", "coordinator_role"]
-peer_description = "Coordinator for one large synthetic MobKit stress mob."
+peer_description = "Coordinator for one large synthetic Meta stress mob."
 
 [profiles.swarm_coordinator.tools]
 builtins = true

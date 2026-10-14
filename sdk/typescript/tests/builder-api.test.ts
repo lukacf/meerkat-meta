@@ -5,7 +5,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { MobKit, MobKitBuilder } from "../dist/index.js";
+import { Meta, MetaBuilder } from "../dist/index.js";
 import { CallbackDispatcher } from "../dist/agent-builder.js";
 import { SessionBuildOptions } from "../dist/models.js";
 import type { SessionCreatedContext } from "../dist/types.js";
@@ -14,33 +14,33 @@ import type { SessionCreatedContext } from "../dist/types.js";
 // persistentState on builder
 // ---------------------------------------------------------------------------
 
-describe("MobKitBuilder.persistentState()", () => {
+describe("MetaBuilder.persistentState()", () => {
   it("returns this for chaining", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.persistentState("/tmp/test-state");
     assert.equal(result, builder);
   });
 
   it("sets persistentState on config", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     builder.persistentState("/tmp/test-state");
     assert.equal(builder._config.persistentState, "/tmp/test-state");
   });
 
   it("defaults to null", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     assert.equal(builder._config.persistentState, null);
   });
 });
 
-describe("MobKitBuilder.agentMemory()", () => {
+describe("MetaBuilder.agentMemory()", () => {
   it("defaults to disabled", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     assert.equal(builder._config.agentMemoryConfig, null);
   });
 
   it("stores true for default gateway configuration", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     const result = builder.agentMemory();
 
     assert.equal(result, builder);
@@ -48,7 +48,7 @@ describe("MobKitBuilder.agentMemory()", () => {
   });
 
   it("serializes camelCase options to gateway wire keys", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     builder.agentMemory({
       realm: "example",
       selection: "contextual",
@@ -69,7 +69,7 @@ describe("MobKitBuilder.agentMemory()", () => {
   });
 
   it("serializes taint knobs to gateway wire keys", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     builder.agentMemory({
       llmWrites: "quarantined",
       recorderTool: false,
@@ -92,7 +92,7 @@ describe("MobKitBuilder.agentMemory()", () => {
   });
 
   it("keeps only the retired selector off compatibility form", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     builder.agentMemory({ selector: "off" });
 
     assert.deepEqual(builder._config.agentMemoryConfig, {
@@ -105,7 +105,7 @@ describe("MobKitBuilder.agentMemory()", () => {
   });
 
   it("serializes the distiller block to gateway wire keys", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     builder.agentMemory({
       distiller: {
         enabled: true,
@@ -124,13 +124,13 @@ describe("MobKitBuilder.agentMemory()", () => {
       },
     });
 
-    const boolBuilder = MobKit.builder();
+    const boolBuilder = Meta.builder();
     boolBuilder.agentMemory({ distiller: true });
     assert.deepEqual(boolBuilder._config.agentMemoryConfig, { distiller: true });
   });
 
   it("serializes the steward block to gateway wire keys", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     builder.agentMemory({
       steward: {
         enabled: true,
@@ -153,13 +153,13 @@ describe("MobKitBuilder.agentMemory()", () => {
       },
     });
 
-    const boolBuilder = MobKit.builder();
+    const boolBuilder = Meta.builder();
     boolBuilder.agentMemory({ steward: true });
     assert.deepEqual(boolBuilder._config.agentMemoryConfig, { steward: true });
   });
 
   it("serializes operatorScope to the gateway wire key", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     builder.agentMemory({ store: "sqlite", operatorScope: "provisional" });
 
     assert.deepEqual(builder._config.agentMemoryConfig, {
@@ -169,7 +169,7 @@ describe("MobKitBuilder.agentMemory()", () => {
   });
 
   it("keeps only disabled hygienist compatibility forms", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     builder.agentMemory({
       hygienist: {
         enabled: false,
@@ -188,22 +188,22 @@ describe("MobKitBuilder.agentMemory()", () => {
       },
     });
 
-    const boolBuilder = MobKit.builder();
+    const boolBuilder = Meta.builder();
     boolBuilder.agentMemory({ hygienist: false });
     assert.deepEqual(boolBuilder._config.agentMemoryConfig, { hygienist: false });
 
     assert.throws(
-      () => MobKit.builder().agentMemory({ hygienist: true } as never),
+      () => Meta.builder().agentMemory({ hygienist: true } as never),
       /hygienist is PARKED and cannot be enabled/,
     );
     assert.throws(
-      () => MobKit.builder().agentMemory({ hygienist: {} } as never),
+      () => Meta.builder().agentMemory({ hygienist: {} } as never),
       /hygienist is PARKED and cannot be enabled/,
     );
   });
 
   it("rejects unknown options at runtime instead of silently dropping them", () => {
-    const builder = MobKit.builder();
+    const builder = Meta.builder();
     assert.throws(
       // Cast simulates a plain-JS caller; the TS type already rejects this.
       () => builder.agentMemory({ perTurnInjecton: "budgeted" } as never),
@@ -214,25 +214,25 @@ describe("MobKitBuilder.agentMemory()", () => {
   it("rejects unknown nested options at runtime", () => {
     assert.throws(
       () =>
-        MobKit.builder().agentMemory({
+        Meta.builder().agentMemory({
           distiller: { runsPerHour: 2, runsperhourTypo: 9 },
         } as never),
       /agentMemory distiller got unsupported option\(s\): runsperhourTypo/,
     );
     assert.throws(
-      () => MobKit.builder().agentMemory({ steward: { cadance: "*/6h" } } as never),
+      () => Meta.builder().agentMemory({ steward: { cadance: "*/6h" } } as never),
       /agentMemory steward got unsupported option\(s\): cadance/,
     );
     assert.throws(
       () =>
-        MobKit.builder().agentMemory({
+        Meta.builder().agentMemory({
           hygienist: { enabled: false, runsPerDya: 2 },
         } as never),
       /agentMemory hygienist got unsupported option\(s\): runsPerDya/,
     );
     assert.throws(
       () =>
-        MobKit.builder().agentMemory({
+        Meta.builder().agentMemory({
           contentTrust: { trustedMcpServrs: [] },
         } as never),
       /agentMemory contentTrust got unsupported option\(s\): trustedMcpServrs/,

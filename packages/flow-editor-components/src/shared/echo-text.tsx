@@ -1,6 +1,6 @@
 // EchoText — free-text inputs over server-authoritative state.
 //
-// Every keystroke in the editor round-trips mobkit/mobpacks/apply_operation
+// Every keystroke in the editor round-trips meta/mobpacks/apply_operation
 // and the document echo re-renders the input. A plainly controlled
 // input/textarea breaks under that: React restores the DOM to the (stale)
 // value prop after each onChange, snapping the caret to the end, so typing

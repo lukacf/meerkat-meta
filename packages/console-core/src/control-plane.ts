@@ -39,10 +39,10 @@ export function normalizeMemberProgress(value: unknown): MemberProgress | null {
   };
 }
 
-/// MobKit's typed "session needs repair" hold (`session_repair` on the
+/// Meta's typed "session needs repair" hold (`session_repair` on the
 /// identity status and inspect payloads): the member's durable session is
 /// intact but refused until the operator runs the two `rkat` commands and
-/// then `mobkit/reload_member`. Present only while the hold stands.
+/// then `meta/reload_member`. Present only while the hold stands.
 export interface IdentitySessionRepair {
   session_id: string;
   hold: string;

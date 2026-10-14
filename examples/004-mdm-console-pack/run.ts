@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import YAML from "yaml";
 
 import {
-  MobKit,
+  Meta,
   type MobHandle,
   type AgentBuildContext,
   type AgentBuildDraft,
@@ -152,14 +152,14 @@ function repoCargoEnv(): Record<string, string> {
 }
 
 function ensureGatewayBin(skipBuild: boolean): string {
-  if (process.env.MOBKIT_RPC_GATEWAY_BIN)
-    return process.env.MOBKIT_RPC_GATEWAY_BIN;
+  if (process.env.META_RPC_GATEWAY_BIN)
+    return process.env.META_RPC_GATEWAY_BIN;
   const env = repoCargoEnv();
   const gateway = join(env.CARGO_TARGET_DIR, "debug", "rpc_gateway");
   if (!skipBuild || !existsSync(gateway)) {
     const result = spawnSync(
       join(repoRoot, "scripts/repo-cargo"),
-      ["build", "-p", "meerkat-mobkit", "--bin", "rpc_gateway"],
+      ["build", "-p", "meerkat-meta", "--bin", "rpc_gateway"],
       { cwd: repoRoot, stdio: "inherit" },
     );
     if (result.status !== 0) throw new Error("failed to build rpc_gateway");
@@ -255,7 +255,7 @@ class MdmRosterProvider implements RosterProvider {
         labels: {
           console_group: "Fleet Control",
           site: "all",
-          platform: "mobkit",
+          platform: "meta",
           claim_state: "coordinator",
           durable_identity: "hive",
         },
@@ -357,7 +357,7 @@ async function waitForConsoleTerminal(
         kind?: string;
         payload?: Record<string, unknown>;
       }>;
-    }>(baseUrl, "mobkit/console/query_timeline", {
+    }>(baseUrl, "meta/console/query_timeline", {
       mode: "recent",
       identity: targetId,
       limit: 400,
@@ -380,7 +380,7 @@ async function waitForConsoleTerminal(
           kind?: string;
           payload?: Record<string, unknown>;
         }>;
-      }>(baseUrl, "mobkit/console/query_timeline", {
+      }>(baseUrl, "meta/console/query_timeline", {
         mode: "recent",
         identity: targetId,
         limit: 400,
@@ -425,7 +425,7 @@ async function waitForVerifiedHiveTerminal(
         kind?: string;
         payload?: Record<string, unknown>;
       }>;
-    }>(baseUrl, "mobkit/console/query_timeline", {
+    }>(baseUrl, "meta/console/query_timeline", {
       mode: "recent",
       identity: "hive",
       limit: 400,
@@ -475,7 +475,7 @@ async function runRealTargetSmoke(
   for (const target of targets) {
     const prompt = [
       "MDM real-target smoke.",
-      "This is a peer turn delivered through the MobKit/Meerkat mob path.",
+      "This is a peer turn delivered through the Meta/Meerkat mob path.",
       "Inspect the local target host before answering.",
       "Report hostname, OS/kernel, current user, and whether shell tools are available.",
       "Do not answer from roster labels or binding metadata.",
@@ -484,7 +484,7 @@ async function runRealTargetSmoke(
       interaction_id: string;
       session_id?: string;
       status: string;
-    }>(baseUrl, "mobkit/console/send", {
+    }>(baseUrl, "meta/console/send", {
       identity: target.id,
       content: prompt,
       origin: "mdm-real-target-smoke",
@@ -509,7 +509,7 @@ async function runRealTargetSmoke(
       interaction_id: string;
       session_id?: string;
       status: string;
-    }>(baseUrl, "mobkit/console/send", {
+    }>(baseUrl, "meta/console/send", {
       identity: "hive",
       content: [
         `Contact these managed targets through peer comms: ${targetList}.`,
@@ -572,7 +572,7 @@ async function main() {
   mkdirSync(stateDir, { recursive: true });
   const mobConfig = writeRuntimeMobConfig(args, stateDir);
 
-  let builder = MobKit.builder()
+  let builder = Meta.builder()
     .mob(mobConfig.path)
     .gateway(ensureGatewayBin(skipBuild))
     .consoleConfig(join(configDir, "console.toml"))
@@ -599,7 +599,7 @@ async function main() {
     console.log(`[mdm] topology: ${JSON.stringify(edgeReport)}`);
     const baseUrl = runtime.rustHttpBaseUrl;
     if (!baseUrl)
-      throw new Error("MobKit runtime did not expose an HTTP console URL");
+      throw new Error("Meta runtime did not expose an HTTP console URL");
     console.log(`[mdm] console: ${baseUrl}/console`);
     console.log(`[mdm] remote-targets: ${targets.length}`);
     console.log(`[mdm] supervisor-bridge: ${mobConfig.advertisedAddress}`);

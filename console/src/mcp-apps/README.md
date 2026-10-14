@@ -206,7 +206,7 @@ Build the stock Console and native `console_acceptance_fixture` first, then run
 the native browser lane against those artifacts:
 
 ```sh
-MOBKIT_EXAMPLE_BIN_DIR=/path/to/prebuilt/examples npm --prefix console run e2e:mcp-apps
+META_EXAMPLE_BIN_DIR=/path/to/prebuilt/examples npm --prefix console run e2e:mcp-apps
 ```
 
 That lane starts the real native member runtime and a stdio MCP server, loads
@@ -216,7 +216,7 @@ It writes screenshots and wire evidence under `output/playwright/` and never
 contacts a model provider.
 
 To also exercise live polling through a model turn longer than the host's
-request timeout, run the same lane with `MOBKIT_MCP_APPS_LONG_POLL=1`. This mounts
+request timeout, run the same lane with `META_MCP_APPS_LONG_POLL=1`. This mounts
 three native App views, polls through their original MCP connection throughout
 the held turn, and checks updates before and after 60 seconds. Core's persistent
 service regressions separately count storage operations to verify that calls

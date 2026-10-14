@@ -2,7 +2,7 @@ import { createConsoleApp } from "./index";
 
 function resolveBaseUrl(): string {
   const configured = document
-    .querySelector('meta[name="mobkit-base-url"]')
+    .querySelector('meta[name="meta-base-url"]')
     ?.getAttribute("content")
     ?.trim();
   if (configured) {

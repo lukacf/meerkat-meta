@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createMobKitConsoleController as sharedController, type MobKitConsoleTransport, type ConsoleTimelineSubscribeInput } from "./headless";
-import { createMobKitConsoleController as stockController } from "../../../console/src/lib/headless";
+import { createMetaConsoleController as sharedController, type MetaConsoleTransport, type ConsoleTimelineSubscribeInput } from "./headless";
+import { createMetaConsoleController as stockController } from "../../../console/src/lib/headless";
 import type { ConsoleFrame, ConsoleTimelinePage } from "./runtime-types";
 import type { ConsoleTransportState } from "./timeline-subscription";
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -20,7 +20,7 @@ function fixture(queries: Array<Promise<ConsoleTimelinePage> | ConsoleTimelinePa
       subscriptions.push(subscription);
       return () => { subscription.stopped = true; };
     },
-  } as MobKitConsoleTransport;
+  } as MetaConsoleTransport;
   return { transport, subscriptions, signals, queries: () => queryCount };
 }
 for (const [name, create] of [["shared", sharedController], ["stock", stockController]] as const) {

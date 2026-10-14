@@ -128,7 +128,7 @@ describe("detached callback jobs", () => {
     await started;
     assert.deepEqual(resolverCalls, [["network", ["network.read"]]]);
     assert.deepEqual(calls[0], [
-      "mobkit/jobs/progress",
+      "meta/jobs/progress",
       {
         authority: AUTHORITY_1,
         cursor: 1,
@@ -139,7 +139,7 @@ describe("detached callback jobs", () => {
 
     release();
     await dispatcher.waitForJobTasks();
-    assert.equal(calls.at(-1)?.[0], "mobkit/jobs/complete");
+    assert.equal(calls.at(-1)?.[0], "meta/jobs/complete");
     assert.deepEqual(calls.at(-1)?.[1].authority, AUTHORITY_1);
     assert.equal(calls.at(-1)?.[1].result_ref, "artifact:scan");
     assert.equal(JSON.stringify(calls).includes("secret-current-attempt"), false);
@@ -271,7 +271,7 @@ describe("detached callback jobs", () => {
     });
     assert.deepEqual(result, { live_attempts: [AUTHORITY_1] });
     assert.equal(runs, 0);
-    assert.equal(rpcCalls.at(-1)?.[0], "mobkit/jobs/heartbeat");
+    assert.equal(rpcCalls.at(-1)?.[0], "meta/jobs/heartbeat");
     assert.deepEqual(rpcCalls.at(-1)?.[1].authority, AUTHORITY_1);
     assert.ok(
       Number(rpcCalls.at(-1)?.[1].lease_expires_at_ms) >

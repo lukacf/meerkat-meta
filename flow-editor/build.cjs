@@ -9,7 +9,7 @@ const { build } = require("esbuild");
 const root = __dirname;
 const srcDir = path.join(root, "src");
 const defaultOutDir = path.join(root, "dist");
-const defaultRustOutDir = path.join(root, "../crates/meerkat-mobkit/flow-editor-dist");
+const defaultRustOutDir = path.join(root, "../crates/meerkat-meta/flow-editor-dist");
 const tmpDir = path.join(root, ".tmp");
 const corePackageEntry = path.join(root, "../packages/flow-editor-core/src/index.ts");
 const componentsPackageEntry = path.join(root, "../packages/flow-editor-components/src/index.ts");
@@ -30,14 +30,14 @@ async function buildCoreIife() {
     entryPoints: [corePackageEntry],
     bundle: true,
     format: "iife",
-    globalName: "MobKitFlowCore",
+    globalName: "MetaFlowCore",
     platform: "neutral",
     target: ["es2020"],
     write: false,
     nodePaths: [path.join(root, "node_modules")],
   });
   const code = result.outputFiles[0].text;
-  return `${code}\nwindow.MobKitFlowCore = MobKitFlowCore;\n`;
+  return `${code}\nwindow.MetaFlowCore = MetaFlowCore;\n`;
 }
 
 function hash(bytes) {
@@ -55,8 +55,8 @@ function renderHtml({ vendorVersion, appVersion, cssVersion }) {
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="mobkit-base-url" content="" />
-    <title>MobKit · Flow Editor</title>
+    <meta name="meta-base-url" content="" />
+    <title>Meta · Flow Editor</title>
     <link rel="stylesheet" href="/flow-editor/assets/flow-editor.css?v=${cssVersion}" />
   </head>
   <body>
@@ -170,17 +170,17 @@ async function assertFresh(generatedDir, expectedDir) {
 }
 
 // The projection suite loads the controller through this Node-requirable
-// bundle: the core package (window.MobKitFlowCore) followed by a bootstrap
+// bundle: the core package (window.MetaFlowCore) followed by a bootstrap
 // shim equivalent to the app shell's module-scope facade construction, with
-// the suite's window.__MOBKIT_FLOW_CONTROLLER_TEST__ flag mapped to the
+// the suite's window.__META_FLOW_CONTROLLER_TEST__ flag mapped to the
 // includeTestExports option so the test-gated assembler exports stay
 // reachable only through that explicit flag.
 async function buildTestBundle() {
   await fs.mkdir(tmpDir, { recursive: true });
   const coreIife = await buildCoreIife();
   const bootstrap = [
-    "window.MobKitFlowController = window.MobKitFlowCore.createMobKitFlowController({",
-    "  includeTestExports: !!window.__MOBKIT_FLOW_CONTROLLER_TEST__,",
+    "window.MetaFlowController = window.MetaFlowCore.createMetaFlowController({",
+    "  includeTestExports: !!window.__META_FLOW_CONTROLLER_TEST__,",
     "});",
     "",
   ].join("\n");
@@ -198,7 +198,7 @@ async function main() {
     await buildAssets({ outDir: defaultOutDir, rustOutDir: defaultRustOutDir });
     return;
   }
-  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "mobkit-flow-editor-build-"));
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "meta-flow-editor-build-"));
   try {
     const generatedDist = path.join(tempRoot, "dist");
     const generatedRustDist = path.join(tempRoot, "flow-editor-dist");

@@ -1,11 +1,11 @@
 /**
- * MobKit builder chain — chainable configuration for the runtime.
+ * Meta builder chain — chainable configuration for the runtime.
  *
  * @example
  * ```ts
- * import { MobKit } from "@rkat/mobkit-sdk";
+ * import { Meta } from "@rkat/meta-sdk";
  *
- * const rt = await MobKit.builder()
+ * const rt = await Meta.builder()
  *   .mob("config/mob.toml")
  *   .sessionService(builder, store)
  *   .roster(myRoster)
@@ -16,11 +16,13 @@
  * ```
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import type { SessionAgentBuilder, ErrorCallback } from "./agent-builder.js";
-import type { MobKitRuntime } from "./runtime.js";
+import { validateToolArtifactRef, type ToolArtifactRef } from "./models.js";
+import type { MetaRuntime } from "./runtime.js";
 import type { ExperimentalLiveGatewayConfig, OpenAiLiveGatewayConfig } from "./live.js";
 import type { JobCredentialResolver } from "./jobs.js";
+import type { GatewayTransportFactory } from "./transport.js";
 import type {
   ContinuityStore,
   LeaseProvider,
@@ -102,8 +104,16 @@ function rejectUnknownKeys(
 
 // -- Builder config -------------------------------------------------------
 
-export interface MobKitBuilderConfig {
+export interface MetaBuilderConfig {
   mobConfigPath: string | null;
+  /** Opaque prepared application bytes and their declared digest; transport only. */
+  preparedApplication?: { bundle: Uint8Array; digest: string } | null;
+  /**
+   * Revision the stored mob definition must have for this boot's definition
+   * to replace it (`runtime_options.declare_spec_update`); `null` declares
+   * no update.
+   */
+  declareSpecUpdateExpectedRevision?: number | null;
   sessionBuilder: SessionAgentBuilder | null;
   sessionStore: unknown;
   errorCallback: ErrorCallback | null;
@@ -128,10 +138,14 @@ export interface MobKitBuilderConfig {
   authConfig: unknown;
   implicitDelegateIdleRetireSecs: number | null | undefined;
   maxSessions: number | null;
+  /** Artifacts this host installed; `null` selects none. */
+  installedArtifacts?: ToolArtifactRef[] | null;
   gatewayTimeoutMs: number | null;
   gatewayBin: string | null;
+  /** Builds the gateway transport on each connect; `null` uses the default. */
+  gatewayTransportFactory?: GatewayTransportFactory | null;
   /**
-   * Caller cap, in milliseconds, on waiting for an accepted `mobkit/init` to
+   * Caller cap, in milliseconds, on waiting for an accepted `meta/init` to
    * settle. `null` waits until the gateway settles, exits, or the reader
    * fails. Running out throws `InitOutcomeUnknownError`.
    */
@@ -150,9 +164,11 @@ export interface MobKitBuilderConfig {
   consoleVoiceConfig?: OpenAiLiveGatewayConfig | null;
 }
 
-function defaultConfig(): MobKitBuilderConfig {
+function defaultConfig(): MetaBuilderConfig {
   return {
     mobConfigPath: null,
+    preparedApplication: null,
+    declareSpecUpdateExpectedRevision: null,
     sessionBuilder: null,
     sessionStore: null,
     errorCallback: null,
@@ -195,25 +211,69 @@ function defaultConfig(): MobKitBuilderConfig {
   };
 }
 
-// -- MobKitBuilder --------------------------------------------------------
+// -- MetaBuilder --------------------------------------------------------
 
 /**
- * Chainable builder for MobKit runtime configuration.
+ * Chainable builder for Meta runtime configuration.
  *
  * @example
  * ```ts
- * const rt = await MobKit.builder()
+ * const rt = await Meta.builder()
  *   .mob("config/mob.toml")
  *   .gateway("./target/release/rpc_gateway")
  *   .build();
  * ```
  */
-export class MobKitBuilder {
+export class MetaBuilder {
   /** @internal */
-  readonly _config: MobKitBuilderConfig = defaultConfig();
+  readonly _config: MetaBuilderConfig = defaultConfig();
 
   mob(configPath: string): this {
     this._config.mobConfigPath = configPath;
+    return this;
+  }
+
+  /**
+   * Start from an authenticated prepared application instead of mob TOML.
+   *
+   * `bundle` is the prepared application's bytes exactly as prepared and
+   * `digest` the digest declared for them. Both are transport only: the
+   * gateway's native host composition authenticates them before any
+   * definition, storage, identity or roster step, and refuses the start when
+   * it cannot. Mutually exclusive with mob().
+   */
+  preparedApplication(bundle: Uint8Array, digest: string): this {
+    if (!(bundle instanceof Uint8Array)) {
+      throw new TypeError("preparedApplication bundle must be a Uint8Array");
+    }
+    if (typeof digest !== "string" || digest.length === 0) {
+      throw new Error("preparedApplication digest must be a non-empty string");
+    }
+    this._config.preparedApplication = { bundle: Uint8Array.from(bundle), digest };
+    return this;
+  }
+
+  /**
+   * Apply this boot's mob definition as a one-shot revision-pinned update.
+   *
+   * The definition supplied by mob() or preparedApplication() is compared
+   * and swapped against the canonical definition in persistentState().
+   * `expectedRevision` must be the revision observed before constructing the
+   * replacement definition. Exact replay converges; a stale revision or
+   * different content at the successor revision raises the typed
+   * `StorageResolutionError` during `build()`.
+   *
+   * Use this only on the activation that is authorized to change the
+   * definition. Later ordinary restarts should omit the declaration.
+   */
+  declareSpecUpdate(expectedRevision: number): this {
+    if (typeof expectedRevision !== "number" || !Number.isSafeInteger(expectedRevision)) {
+      throw new TypeError("expectedRevision must be a non-negative integer");
+    }
+    if (expectedRevision < 0) {
+      throw new RangeError("expectedRevision must be a non-negative integer");
+    }
+    this._config.declareSpecUpdateExpectedRevision = expectedRevision;
     return this;
   }
 
@@ -228,9 +288,9 @@ export class MobKitBuilder {
    * declaration from the `eventLog` config module:
    *
    * ```ts
-   * import { eventLog } from "@rkat/mobkit-sdk";
-   * MobKit.builder().eventLog(eventLog.memory({ batchSize: 64 }));
-   * MobKit.builder().eventLog(eventLog.nullStore());
+   * import { eventLog } from "@rkat/meta-sdk";
+   * Meta.builder().eventLog(eventLog.memory({ batchSize: 64 }));
+   * Meta.builder().eventLog(eventLog.nullStore());
    * ```
    *
    * The gateway accepts only the declared ephemeral storage kinds
@@ -254,12 +314,12 @@ export class MobKitBuilder {
    * form:
    *
    * ```ts
-   * import { runtimeStore } from "@rkat/mobkit-sdk";
-   * MobKit.builder().runtimeStore(runtimeStore.memory());
+   * import { runtimeStore } from "@rkat/meta-sdk";
+   * Meta.builder().runtimeStore(runtimeStore.memory());
    * ```
    *
    * Sessions then do not survive gateway restart, and the choice shows up
-   * in the storage census (`mobkit/status` → `storage.slots`). Accepts the
+   * in the storage census (`meta/status` → `storage.slots`). Accepts the
    * typed config or the raw wire dict `{ storage: "memory" }`.
    */
   runtimeStore(
@@ -275,12 +335,27 @@ export class MobKitBuilder {
   }
 
   /**
-   * Enable ABAC access control backed by a TOML file (conventionally
-   * `config/access.toml`). A missing file starts disabled; console admin
-   * edits persist back to the same path. Without this (and without a
-   * conventional `config/access.toml`) access control is off entirely.
+   * Enable ABAC access control backed by an existing TOML file
+   * (conventionally `config/access.toml`). The gateway reads and validates
+   * the file at startup: a missing path, a directory, or an unreadable or
+   * invalid file refuses initialization, and an explicit empty path is
+   * rejected here. Name the first admin in the file; a configuration without
+   * admins grants administration to nobody. Console admin edits persist back
+   * to the same path. Without this, access control stays off only when
+   * nothing is at `config/access.toml` (a missing or dangling parent directory
+   * counts as nothing there). Any other entry there (even a directory or a
+   * dangling `access.toml` link) and any lookup error other than ENOENT is
+   * forwarded to the gateway's strict loader, which refuses initialization
+   * when it cannot open, read, parse or validate the file. The loader does
+   * not check the file type, so a FIFO there blocks startup instead of
+   * refusing it.
    */
   accessControl(configPath: string): this {
+    if (configPath === "") {
+      throw new Error(
+        "accessControl requires a non-empty path; omit it to keep access control off",
+      );
+    }
     this._config.accessConfigPath = configPath;
     return this;
   }
@@ -442,7 +517,24 @@ export class MobKitBuilder {
     return this;
   }
 
+  /**
+   * Load gating tiers and escalation from an existing config file
+   * (conventionally `config/gating.toml`). The gateway reads and validates
+   * the file at startup: a missing path, a directory, or an unreadable or
+   * invalid file refuses initialization, and an explicit empty path is
+   * rejected here. Without this, gating stays off only when nothing is at
+   * `config/gating.toml` (a missing or dangling parent directory counts as
+   * nothing there). Any other entry there (even a directory or a dangling
+   * `gating.toml` link) and any lookup error other than ENOENT is forwarded
+   * to the gateway's strict loader, which refuses initialization when it
+   * cannot open or read the file or rejects its contents. The loader does
+   * not check the file type, so a FIFO there blocks startup instead of
+   * refusing it.
+   */
   gating(configPath: string): this {
+    if (configPath === "") {
+      throw new Error("gating requires a non-empty path; omit it to keep gating off");
+    }
     this._config.gatingConfigPath = configPath;
     return this;
   }
@@ -717,6 +809,32 @@ export class MobKitBuilder {
     return this;
   }
 
+  /**
+   * Name the artifacts this host installed (extension packages, plugins).
+   *
+   * Emitted as `runtime_options.installed_artifacts` at the trusted
+   * bootstrap. With a set, every callback tool must name a
+   * {@link ToolArtifactRef} from it (`registerTool(..., { artifact })`) whose
+   * digest matches; an unknown, mismatched or missing reference refuses the
+   * build before any tool is published. Without a set, callback tools stay
+   * unassociated. Attribution only, never authority.
+   */
+  installedArtifacts(artifacts: Iterable<ToolArtifactRef>): this {
+    const list = [...artifacts].map(validateToolArtifactRef);
+    const seen = new Map<string, string>();
+    for (const artifact of list) {
+      const digest = seen.get(artifact.artifactId);
+      if (digest !== undefined && digest !== artifact.digest) {
+        throw new Error(
+          `installed artifact ${artifact.artifactId} is listed with two different digests`,
+        );
+      }
+      seen.set(artifact.artifactId, artifact.digest);
+    }
+    this._config.installedArtifacts = list;
+    return this;
+  }
+
   maxSessions(maxSessions: number): this {
     if (!Number.isInteger(maxSessions) || maxSessions <= 0) {
       throw new Error("maxSessions must be a positive integer");
@@ -739,7 +857,23 @@ export class MobKitBuilder {
   }
 
   /**
-   * Cap how long `connect()` waits for an accepted `mobkit/init`.
+   * Compose the local gateway process. Every `connect()` calls `factory`
+   * with the `gateway()` binary to build the transport it starts, in place
+   * of the default `PersistentTransport`, so a host can pass extra arguments,
+   * stdio slots or its own startup step. Host-local only: nothing about it is
+   * sent in RPC. `shutdown()` and a failed connect stop the returned
+   * transport. Requires `gateway()`.
+   */
+  gatewayTransport(factory: GatewayTransportFactory): this {
+    if (typeof factory !== "function") {
+      throw new TypeError("gateway transport factory must be callable");
+    }
+    this._config.gatewayTransportFactory = factory;
+    return this;
+  }
+
+  /**
+   * Cap how long `connect()` waits for an accepted `meta/init`.
    *
    * A gateway that accepted init keeps working through its startup phases
    * (provider callbacks, restore, prewarm) and then settles ready or failed.
@@ -766,7 +900,7 @@ export class MobKitBuilder {
    * Enable persistent state at the given path.
    *
    * When set, the gateway creates SQLite-backed session/runtime state,
-   * MobKit metadata, console logs, and binary blob storage under this
+   * Meta metadata, console logs, and binary blob storage under this
    * directory. Mob storage remains in-memory.
    */
   persistentState(path: string): this {
@@ -822,15 +956,38 @@ export class MobKitBuilder {
     return this;
   }
 
-  async build(): Promise<MobKitRuntime> {
+  async build(): Promise<MetaRuntime> {
     this._validateConfig();
     this._applyConventionDefaults();
     // Dynamic import to break circular dep (runtime imports from builder config type)
-    const { MobKitRuntime } = await import("./runtime.js");
-    return MobKitRuntime._create(this._config);
+    const { MetaRuntime } = await import("./runtime.js");
+    return MetaRuntime._create(this._config);
   }
 
   private _validateConfig(): void {
+    if (this._config.preparedApplication && this._config.mobConfigPath) {
+      throw new Error("preparedApplication() and mob() are mutually exclusive");
+    }
+    if (this._config.gatewayTransportFactory && !this._config.gatewayBin) {
+      throw new Error("gatewayTransport() requires gateway()");
+    }
+    if (
+      this._config.declareSpecUpdateExpectedRevision !== undefined &&
+      this._config.declareSpecUpdateExpectedRevision !== null
+    ) {
+      if (!this._config.mobConfigPath && !this._config.preparedApplication) {
+        throw new Error(
+          "declareSpecUpdate() requires mob() or preparedApplication() to supply " +
+            "the replacement definition",
+        );
+      }
+      if (!this._config.persistentState) {
+        throw new Error(
+          "declareSpecUpdate() requires persistentState() because ephemeral mob " +
+            "storage has no durable definition to update",
+        );
+      }
+    }
     const hasPersistent = this._config.persistentState !== null;
     const hasExternal =
       this._config.continuityStore !== null ||
@@ -867,14 +1024,14 @@ export class MobKitBuilder {
 
     if (this._config.accessConfigPath === null) {
       const candidate = "config/access.toml";
-      if (existsSync(candidate)) {
+      if (entryPresent(candidate)) {
         this._config.accessConfigPath = candidate;
       }
     }
 
     if (this._config.gatingConfigPath === null) {
       const candidate = "config/gating.toml";
-      if (existsSync(candidate)) {
+      if (entryPresent(candidate)) {
         this._config.gatingConfigPath = candidate;
       }
     }
@@ -889,10 +1046,26 @@ export class MobKitBuilder {
   }
 }
 
-// -- MobKit static factory ------------------------------------------------
+/**
+ * Whether the lookup of `path` finds an entry or fails other than with
+ * ENOENT. Discovery for a file whose presence opts into a security control:
+ * only ENOENT (nothing there, including a missing or dangling parent) means
+ * "off". A directory, a dangling final link, ENOTDIR or any other lookup
+ * error is reported so the strict loader handles it.
+ */
+function entryPresent(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ENOENT";
+  }
+}
 
-export class MobKit {
-  static builder(): MobKitBuilder {
-    return new MobKitBuilder();
+// -- Meta static factory ------------------------------------------------
+
+export class Meta {
+  static builder(): MetaBuilder {
+    return new MetaBuilder();
   }
 }

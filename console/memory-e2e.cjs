@@ -2,7 +2,7 @@
 
 // Memory console e2e (UI-P1.C): drives the real console bundle in
 // chromium against a REAL gateway whose sqlite memory store is seeded by
-// crates/meerkat-mobkit/examples/memory_console_reference.rs — 74 records
+// crates/meerkat-meta/examples/memory_console_reference.rs — 74 records
 // (3-record supersede chain, quarantined record with a secret-shaped
 // reason, 60 old filler rows so the 50-row default page leaves a keyset
 // cursor), dream audit rows, injection ledger rows, two pending gated
@@ -110,9 +110,9 @@ async function startSeededGateway(accessMode) {
         // Guards the known rustc 1.94.1 incremental-build ICE (same as the
         // CI flow-editor job).
         CARGO_INCREMENTAL: "0",
-        MOBKIT_MEMORY_E2E_ADDR: LOOPBACK_ANY_PORT,
-        MOBKIT_MEMORY_E2E_STATE: stateDir,
-        MOBKIT_MEMORY_E2E_ACCESS: accessMode,
+        META_MEMORY_E2E_ADDR: LOOPBACK_ANY_PORT,
+        META_MEMORY_E2E_STATE: stateDir,
+        META_MEMORY_E2E_ACCESS: accessMode,
       },
       stdio: ["ignore", "pipe", "pipe"],
     },
@@ -161,7 +161,7 @@ async function rpc(baseUrl, method, params = {}) {
 /// Resolve the seeded record ids through the panel RPCs — ids are
 /// store-generated, so the flows look them up instead of hardcoding.
 async function fetchSeedIds(baseUrl) {
-  const routerRows = await rpc(baseUrl, "mobkit/memory/panel/records", {
+  const routerRows = await rpc(baseUrl, "meta/memory/panel/records", {
     identity: "router",
     limit: 200,
   });
@@ -174,7 +174,7 @@ async function fetchSeedIds(baseUrl) {
   const quarantined = records.find((row) => row.status?.status === "quarantined");
   assert(quarantined, "seeded quarantined record missing from identity:router");
 
-  const deliveryRows = await rpc(baseUrl, "mobkit/memory/panel/records", {
+  const deliveryRows = await rpc(baseUrl, "meta/memory/panel/records", {
     identity: "delivery",
     limit: 200,
   });
@@ -183,7 +183,7 @@ async function fetchSeedIds(baseUrl) {
   );
   assert(deliveryFact, "seeded delivery fact missing");
 
-  const dreams = await rpc(baseUrl, "mobkit/memory/panel/dreams", {});
+  const dreams = await rpc(baseUrl, "meta/memory/panel/dreams", {});
   const dreamRun = (dreams.runs || []).find((run) => run.run_id === "run-dream-e2e-1");
   assert(dreamRun, `seeded dream run missing: ${JSON.stringify(dreams)}`);
   assert.equal((dreamRun.memory_ids || []).length, 2, "dream touched-record sample");
@@ -492,7 +492,7 @@ const openAccessFlows = [
         refusalText.includes("gated promotion") && refusalText.includes("Gating inbox"),
         `gated release refusal: ${refusalText}`,
       );
-      const after = await rpc(baseUrl, "mobkit/memory/panel/record", {
+      const after = await rpc(baseUrl, "meta/memory/panel/record", {
         memory_id: seed.quarantinedId,
       });
       assert.equal(
@@ -793,7 +793,7 @@ const grantFlows = [
       await page.getByTestId(T.VERDICT_STRIP).waitFor({ timeout: 15_000 });
 
       // KNOWN DEFECT soft-gate: the capability intersection removes
-      // panel/dreams from mobkit/capabilities for a scoped principal, and
+      // panel/dreams from meta/capabilities for a scoped principal, and
       // ConsoleApp.refreshMemoryData treats the resulting
       // capability-missing error as FATAL — the whole panel load aborts
       // (0 records + error banner) instead of degrading the dreams
@@ -865,7 +865,7 @@ async function main() {
   const repoCargo = path.join(repoRoot, "scripts", "repo-cargo");
   if (!fs.existsSync(repoCargo)) {
     process.stdout.write(
-      "memory e2e skipped: MobKit workspace scripts unavailable in vendored package\n",
+      "memory e2e skipped: Meta workspace scripts unavailable in vendored package\n",
     );
     return;
   }

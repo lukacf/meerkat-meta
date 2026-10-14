@@ -3,7 +3,7 @@
 
 The workspace declares `license = "MIT OR Apache-2.0"`, but cargo packages only
 files under the crate directory, so the root LICENSE-MIT and LICENSE-APACHE
-never reached the published `meerkat-mobkit` archive. The crate carries
+never reached the published `meerkat-meta` archive. The crate carries
 symlinks to the root files, which `cargo package` follows.
 
 This gate asks cargo for each published crate's package file list, so it also

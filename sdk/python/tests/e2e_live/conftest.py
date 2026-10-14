@@ -1,6 +1,6 @@
 """Gating for the real-API end-to-end lane.
 
-This directory is SKIPPED unless ``MOBKIT_E2E_LIVE=1``, so the ordinary
+This directory is SKIPPED unless ``META_E2E_LIVE=1``, so the ordinary
 ``make test-python`` run stays hermetic. When the lane IS requested, every
 missing precondition is a FAILURE, never a skip: a live lane that silently
 skips on a missing key or binary is a green check that gates nothing, which is
@@ -8,7 +8,7 @@ exactly the failure mode this lane exists to catch one layer down.
 
 Preconditions when requested:
   - ``ANTHROPIC_API_KEY`` (or ``RKAT_ANTHROPIC_API_KEY``) in the environment
-  - the ``rpc_gateway`` binary at ``MOBKIT_GATEWAY_BIN`` (``make e2e-live``
+  - the ``rpc_gateway`` binary at ``META_GATEWAY_BIN`` (``make e2e-live``
     builds it and sets this)
 """
 from __future__ import annotations
@@ -17,7 +17,7 @@ import os
 
 import pytest
 
-LIVE_FLAG = "MOBKIT_E2E_LIVE"
+LIVE_FLAG = "META_E2E_LIVE"
 
 
 def _requested() -> bool:
@@ -29,7 +29,7 @@ def anthropic_key() -> str:
 
 
 def gateway_bin() -> str:
-    return os.environ.get("MOBKIT_GATEWAY_BIN", "").strip()
+    return os.environ.get("META_GATEWAY_BIN", "").strip()
 
 
 def pytest_collection_modifyitems(config, items):
@@ -50,7 +50,7 @@ def live_preconditions() -> dict[str, str]:
     binary = gateway_bin()
     if not binary or not os.path.isfile(binary) or not os.access(binary, os.X_OK):
         missing.append(
-            f"MOBKIT_GATEWAY_BIN does not name an executable rpc_gateway (got {binary!r}); "
+            f"META_GATEWAY_BIN does not name an executable rpc_gateway (got {binary!r}); "
             "run `make e2e-live`, which builds and exports it"
         )
     if missing:

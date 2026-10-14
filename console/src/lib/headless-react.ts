@@ -1,18 +1,18 @@
 import * as React from "react";
 
 import {
-  createMobKitConsoleController,
-  type MobKitConsoleController,
-  type MobKitConsoleTransport,
+  createMetaConsoleController,
+  type MetaConsoleController,
+  type MetaConsoleTransport,
 } from "./headless";
 
-export function useMobKitConsoleController({
+export function useMetaConsoleController({
   transport,
 }: {
-  transport: MobKitConsoleTransport;
-}): MobKitConsoleController {
+  transport: MetaConsoleTransport;
+}): MetaConsoleController {
   return React.useMemo(
-    () => createMobKitConsoleController({ transport }),
+    () => createMetaConsoleController({ transport }),
     [transport],
   );
 }

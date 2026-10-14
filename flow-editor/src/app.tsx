@@ -1,11 +1,11 @@
-// MobKit Flow Editor shell (S23 end-state): a real module bundled by
+// Meta Flow Editor shell (S23 end-state): a real module bundled by
 // esbuild from this single entry. Views come from @flow-editor-components
 // and the controller plane from @flow-editor-core; React/ReactDOM still
 // resolve from the window globals react-globals.js provides (ambient
 // declarations in globals.d.ts). data.js must execute before this module
-// body so window.MOBKIT_BOOT exists — the import keeps that ordering.
+// body so window.META_BOOT exists — the import keeps that ordering.
 import "./data.js";
-import { createMobKitFlowController } from "@flow-editor-core";
+import { createMetaFlowController } from "@flow-editor-core";
 import {
   AddNodeMenu,
   AgentsView,
@@ -30,19 +30,19 @@ import {
 // stays as a deliberate back-compat surface: the browser smokes, the live
 // verification scripts, the @flow-editor-components views (which call the
 // facade through window at render time), and embedders all still reach the
-// controller through window.MobKitFlowController.
+// controller through window.MetaFlowController.
 //
 // The `: any` is migration-window typing: the views consume the facade
 // stringly through the window contract, and the shell keeps the same
 // looseness until the strictness ratchet (key-set parity is enforced by
 // controller-export-keys.test.cjs instead).
-const MobKitFlowController: any = createMobKitFlowController({ includeTestExports: false });
-window.MobKitFlowController = MobKitFlowController;
+const MetaFlowController: any = createMetaFlowController({ includeTestExports: false });
+window.MetaFlowController = MetaFlowController;
 
 // Deep-link boot intent, parsed exactly once from the query string. The
 // embedding contract (?open=<id>, ?intent=new[&template=<id>], ?embedded=1)
 // is documented in docs/guides/flow-editor.mdx.
-const BOOT_INTENT = MobKitFlowController.bootIntentFromQuery(window.location.search);
+const BOOT_INTENT = MetaFlowController.bootIntentFromQuery(window.location.search);
 
 const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
   "edgeStyle": "text",
@@ -52,16 +52,16 @@ const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
 }/*EDITMODE-END*/;
 
 const CATALOG_BOOT = {
-  grid: MOBKIT_BOOT.GRID,
-  cellXY: MOBKIT_BOOT.cellXY,
-  template: MOBKIT_BOOT.template,
+  grid: META_BOOT.GRID,
+  cellXY: META_BOOT.cellXY,
+  template: META_BOOT.template,
 };
 
 function App() {
   const [stage, setStage] = React.useState("draft");
   // Shared mob-flow step-tree — the single source of truth for both the
   // Build (editor) and Flow (diagram) views.
-  const [flow, setFlow] = React.useState(() => MobKitFlowController.emptyAuthoringFlowState());
+  const [flow, setFlow] = React.useState(() => MetaFlowController.emptyAuthoringFlowState());
   const [authoringDocument, setAuthoringDocument] = React.useState(null);
   const [stepSel, setStepSel] = React.useState(null);
   // Editor sub-mode: "basic" (vertical builder) | "advanced" (grid graph).
@@ -89,7 +89,7 @@ function App() {
   const [contract, setContract] = React.useState(null);
   const [capabilities, setCapabilities] = React.useState(null);
   const contractSkillRealms = React.useRef([]);
-  const [catalogs, setCatalogs] = React.useState(() => MobKitFlowController.emptyMobKitCatalogs(CATALOG_BOOT));
+  const [catalogs, setCatalogs] = React.useState(() => MetaFlowController.emptyMetaCatalogs(CATALOG_BOOT));
   const [sourceOpen, setSourceOpen] = React.useState(false);
   const [sourceDocument, setSourceDocument] = React.useState(null);
   const [inlineSourceOpen, setInlineSourceOpen] = React.useState(false);
@@ -100,9 +100,9 @@ function App() {
   const authoringDocumentRef = React.useRef(null);
   const sourceProjectionVersion = React.useRef(0);
   const [addAt, setAddAt] = React.useState(null);
-  const [deploySettings, setDeploySettings] = React.useState(() => MobKitFlowController.deployDefaultsFromSchema(null));
+  const [deploySettings, setDeploySettings] = React.useState(() => MetaFlowController.deployDefaultsFromSchema(null));
   const [deployCommandPreview, setDeployCommandPreview] = React.useState("");
-  const [mobSettings, setMobSettings] = React.useState(() => MobKitFlowController.mobDefaultsFromSchema(null));
+  const [mobSettings, setMobSettings] = React.useState(() => MetaFlowController.mobDefaultsFromSchema(null));
   const authoringRunnerContext = React.useRef({});
   const authoringOperationRunner = React.useRef(null);
   const projectionSyncInFlight = React.useRef(false);
@@ -132,7 +132,7 @@ function App() {
     attempts.counts[intent] = (attempts.counts[intent] || 0) + 1;
     if (attempts.counts[intent] > RECONCILE_MAX_ATTEMPTS_PER_EPOCH) {
       reconcileFailureEpoch.current = reconcileEpoch.current;
-      console.warn(`MobKit ${intent} did not converge; reconciliation paused until the next edit`);
+      console.warn(`Meta ${intent} did not converge; reconciliation paused until the next edit`);
       return false;
     }
     return true;
@@ -151,14 +151,14 @@ function App() {
   const latchReconcileFailure = (epochAtIssue) => (result) => {
     if (result?.ok === false && result?.document && reconcileEpoch.current === epochAtIssue) {
       reconcileFailureEpoch.current = epochAtIssue;
-      console.warn("MobKit system reconcile paused until the next edit:", result?.error || result?.validation?.display_rows?.[0]?.sub || "validation failed");
+      console.warn("Meta system reconcile paused until the next edit:", result?.error || result?.validation?.display_rows?.[0]?.sub || "validation failed");
     }
     return result;
   };
   if (!authoringOperationRunner.current) {
-    authoringOperationRunner.current = MobKitFlowController.createAuthoringOperationRunner({
+    authoringOperationRunner.current = MetaFlowController.createAuthoringOperationRunner({
       getAuthoringOperations: () => authoringRunnerContext.current.catalogs?.authoringOperations,
-      getCurrentDocument: () => authoringRunnerContext.current.currentMobKitDocument(),
+      getCurrentDocument: () => authoringRunnerContext.current.currentMetaDocument(),
       getDraftGuard: () => authoringRunnerContext.current.currentDraftGuard(),
       getCatalogSnapshot: () => authoringRunnerContext.current.catalogs?.catalogSnapshot,
       getCurrentRevision: () => authoringRunnerContext.current.currentAuthoringRevision(),
@@ -217,7 +217,7 @@ function App() {
   }, []);
   const clearSourceProjection = React.useCallback(() => {
     sourceProjectionVersion.current += 1;
-    applySourceProjectionPatch(MobKitFlowController.sourceProjectionClearTransition());
+    applySourceProjectionPatch(MetaFlowController.sourceProjectionClearTransition());
   }, [applySourceProjectionPatch]);
   const markDraft = React.useCallback(() => {
     if (projectionSyncInFlight.current) return;
@@ -226,7 +226,7 @@ function App() {
     setValidationResults([]);
     clearSourceProjection();
     if (currentFlowId) {
-      setFlows((rows) => MobKitFlowController.flowRegistryMarkDraftPatch(rows, currentFlowId));
+      setFlows((rows) => MetaFlowController.flowRegistryMarkDraftPatch(rows, currentFlowId));
     }
   }, [clearSourceProjection, currentFlowId]);
   const beginDocumentHydration = React.useCallback(() => {
@@ -239,11 +239,11 @@ function App() {
     const authoringHead = fallbackHead || errorView.authoringOperationFailedHead;
     const validation = resultOrError?.validation || null;
     const validationRows = validation
-      ? MobKitFlowController.diagnosticsToRows(validation)
+      ? MetaFlowController.diagnosticsToRows(validation)
       : null;
     const outcome = validationRows?.length
       ? { validationRows, stage: "draft" }
-      : MobKitFlowController.criticalErrorOutcome({
+      : MetaFlowController.criticalErrorOutcome({
           head: authoringHead,
           error: resultOrError?.error || resultOrError,
           meta: errorView.authoringOperationMeta,
@@ -251,7 +251,7 @@ function App() {
         });
     setValidationResults(outcome.validationRows);
     setStage(outcome.stage);
-    applyApiOverlayPatch(MobKitFlowController.validationSheetOpenTransition());
+    applyApiOverlayPatch(MetaFlowController.validationSheetOpenTransition());
     return outcome;
   }, [applyApiOverlayPatch, catalogs.errorView]);
   const authoringFailureHead = React.useCallback((key) =>
@@ -297,7 +297,7 @@ function App() {
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const canCreateAuthoring = !!catalogs.contractMeta.loaded && !contract?.error;
   const deployContractLoaded = !!catalogs.contractMeta.loaded;
-  const currentFlowSelection = MobKitFlowController.flowRegistrySelectionState(flows, currentFlowId);
+  const currentFlowSelection = MetaFlowController.flowRegistrySelectionState(flows, currentFlowId);
   const currentFlow = currentFlowSelection.row;
 
   React.useEffect(() => {
@@ -314,29 +314,29 @@ function App() {
   React.useEffect(() => {
     let cancelled = false;
     const abort = new AbortController();
-    MobKitFlowController.configure({ rpcUrl: rpcUrlFromShell() });
+    MetaFlowController.configure({ rpcUrl: rpcUrlFromShell() });
     const rpcOptions = { signal: abort.signal };
-    MobKitFlowController.loadSchema(rpcOptions)
+    MetaFlowController.loadSchema(rpcOptions)
       .then(async (schema) => {
-        MobKitFlowController.configureAuthoringMethodsFromSchema(schema);
-        const capabilityPayload = await MobKitFlowController.loadCapabilities(rpcOptions);
-        const catalogPayload = await MobKitFlowController.loadCatalogs(rpcOptions);
+        MetaFlowController.configureAuthoringMethodsFromSchema(schema);
+        const capabilityPayload = await MetaFlowController.loadCapabilities(rpcOptions);
+        const catalogPayload = await MetaFlowController.loadCatalogs(rpcOptions);
         // The library is home: list saved drafts for the registry rows and
         // land there. Nothing is auto-created and nothing hydrates until a
         // row is opened or a mob is created.
-        const registryPayload = await MobKitFlowController.listDocuments({}, rpcOptions).catch((error) => {
+        const registryPayload = await MetaFlowController.listDocuments({}, rpcOptions).catch((error) => {
           if (abort.signal.aborted) throw error;
           return { rows: [] };
         });
         if (cancelled) return;
         setCapabilities(capabilityPayload);
-        const nextCatalogs = MobKitFlowController.mobKitCatalogsFromSchema(schema, CATALOG_BOOT, catalogPayload);
+        const nextCatalogs = MetaFlowController.metaCatalogsFromSchema(schema, CATALOG_BOOT, catalogPayload);
         setCatalogs(nextCatalogs);
         setDeploySettings(nextCatalogs.deployDefaults);
         setMobSettings(nextCatalogs.mobDefaults);
         contractSkillRealms.current = nextCatalogs.skillRealms;
         studio.setSkillRealms(nextCatalogs.skillRealms);
-        const bootstrap = MobKitFlowController.flowCatalogBootstrapState(catalogPayload, {
+        const bootstrap = MetaFlowController.flowCatalogBootstrapState(catalogPayload, {
           registryResult: registryPayload,
         });
         setTemplates(bootstrap.templates);
@@ -360,7 +360,7 @@ function App() {
       const projection = pendingGraphProjection.current;
       pendingGraphProjection.current = null;
       skipNextGraphProjection.current = false;
-      graphProjectionSig.current = MobKitFlowController.graphStructureSignature(projection.instances || [], projection.edges || [], { members: projection.members || studio.members, contract: projection.contract || contract });
+      graphProjectionSig.current = MetaFlowController.graphStructureSignature(projection.instances || [], projection.edges || [], { members: projection.members || studio.members, contract: projection.contract || contract });
       studio.setInstances(projection.instances || []);
       studio.setEdges(projection.edges || []);
       studio.setFrames(projection.frames || []);
@@ -374,22 +374,22 @@ function App() {
       return;
     }
     if (editorMode === "advanced") return;
-    if (!MobKitFlowController?.graphProjectionDocument) return;
+    if (!MetaFlowController?.graphProjectionDocument) return;
     let cancelled = false;
     const abort = new AbortController();
     if (!authoringDocumentRef.current) return;
-    const projectionDocument = currentMobKitDocument();
-    MobKitFlowController.graphProjectionDocument({
+    const projectionDocument = currentMetaDocument();
+    MetaFlowController.graphProjectionDocument({
       ...projectionDocument,
       instances: [],
       edges: [],
       frames: [],
-    }, { ...MobKitFlowController.flowRegistryDraftGuard(currentFlow, currentFlowId), signal: abort.signal })
+    }, { ...MetaFlowController.flowRegistryDraftGuard(currentFlow, currentFlowId), signal: abort.signal })
       .then((projectionResult) => {
         if (cancelled) return;
-        const projection = MobKitFlowController.graphProjectionFromMobKitResult(projectionResult);
+        const projection = MetaFlowController.graphProjectionFromMetaResult(projectionResult);
         if (!projection) return;
-        graphProjectionSig.current = MobKitFlowController.graphStructureSignature(projection.instances || [], projection.edges || [], { members: studio.members, contract });
+        graphProjectionSig.current = MetaFlowController.graphStructureSignature(projection.instances || [], projection.edges || [], { members: studio.members, contract });
         studio.setInstances(projection.instances || []);
         studio.setEdges(projection.edges || []);
         studio.setFrames(projection.frames || []);
@@ -407,11 +407,11 @@ function App() {
 
   React.useEffect(() => {
     if (editorMode !== "advanced") return;
-    const sig = MobKitFlowController.graphStructureSignature(studio.instances, studio.edges, { members: studio.members, contract });
+    const sig = MetaFlowController.graphStructureSignature(studio.instances, studio.edges, { members: studio.members, contract });
     if (sig === graphProjectionSig.current) return;
     graphProjectionSig.current = sig;
     skipNextGraphProjection.current = true;
-    applyMobKitAuthoringOperation({
+    applyMetaAuthoringOperation({
       intent: "system.syncGraphToFlow",
       reason: "advanced_graph_changed",
     }).then((result) => {
@@ -425,7 +425,7 @@ function App() {
       previousMembersRef.current = studio.members;
       return;
     }
-    const result = MobKitFlowController.reconcileAuthoringForMembers({
+    const result = MetaFlowController.reconcileAuthoringForMembers({
       flow,
       instances: studio.instances,
       edges: studio.edges,
@@ -443,15 +443,15 @@ function App() {
       return;
     }
     if (!reconcileShouldRun("system.reconcileMembers")) return;
-    applyMobKitAuthoringOperation({
+    applyMetaAuthoringOperation({
       intent: "system.reconcileMembers",
     }).then(latchReconcileFailure(reconcileEpoch.current));
   }, [studio.members, flow, studio.instances, studio.edges, mobSettings]);
 
   React.useEffect(() => {
-    if (!MobKitFlowController?.reconcileConditionFieldAvailability) return;
+    if (!MetaFlowController?.reconcileConditionFieldAvailability) return;
     if (hydratingDocumentRef.current) return;
-    const result = MobKitFlowController.reconcileConditionFieldAvailability({
+    const result = MetaFlowController.reconcileConditionFieldAvailability({
       flow,
       edges: studio.edges,
       members: studio.members,
@@ -465,14 +465,14 @@ function App() {
       return;
     }
     if (!reconcileShouldRun("system.reconcileConditionFields")) return;
-    applyMobKitAuthoringOperation({
+    applyMetaAuthoringOperation({
       intent: "system.reconcileConditionFields",
     }).then(latchReconcileFailure(reconcileEpoch.current));
   }, [flow, studio.edges, studio.instances, studio.members, studio.schemas]);
 
   React.useEffect(() => {
     if (hydratingDocumentRef.current) return;
-    const result = MobKitFlowController.reconcileAuthoringWithContract({
+    const result = MetaFlowController.reconcileAuthoringWithContract({
       members: studio.members,
       skillRealms: studio.skillRealms,
       schemas: studio.schemas,
@@ -491,7 +491,7 @@ function App() {
       return;
     }
     if (!reconcileShouldRun("system.reconcileContractRefs")) return;
-    applyMobKitAuthoringOperation({
+    applyMetaAuthoringOperation({
       intent: "system.reconcileContractRefs",
     }).then(latchReconcileFailure(reconcileEpoch.current));
   }, [
@@ -510,8 +510,8 @@ function App() {
     authoringDocument,
   ]);
 
-  const selectInstance = (id) => setSelection(MobKitFlowController.graphSelectionProjection("instance", id));
-  const selectEdge = (id) => setSelection(MobKitFlowController.graphSelectionProjection("edge", id));
+  const selectInstance = (id) => setSelection(MetaFlowController.graphSelectionProjection("instance", id));
+  const selectEdge = (id) => setSelection(MetaFlowController.graphSelectionProjection("edge", id));
   const clearSelection = (nextSelection = { kind: null, id: null }) => setSelection(nextSelection || { kind: null, id: null });
 
   React.useEffect(() => {
@@ -521,7 +521,7 @@ function App() {
       if (e.key === "Backspace" || e.key === "Delete") {
         if (selection.kind === "instance") {
           const nextSelection = { kind: null, id: null };
-          applyMobKitAuthoringOperation({
+          applyMetaAuthoringOperation({
             intent: "graph.deleteNode",
             instanceId: selection.id,
           }).then((result) => {
@@ -531,7 +531,7 @@ function App() {
         }
         else if (selection.kind === "edge") {
           const nextSelection = { kind: null, id: null };
-          applyMobKitAuthoringOperation({
+          applyMetaAuthoringOperation({
             intent: "graph.deleteEdge",
             edgeId: selection.id,
           }).then((result) => {
@@ -546,7 +546,7 @@ function App() {
       }
       if (e.key === "Escape") {
         clearSelection(); closeGraphAddMenu();
-        applyApiOverlayPatch(MobKitFlowController.apiOverlayClearTransition()); clearSourceProjection();
+        applyApiOverlayPatch(MetaFlowController.apiOverlayClearTransition()); clearSourceProjection();
         if (creating) setCreating(null);
       }
     };
@@ -555,19 +555,19 @@ function App() {
   });
 
   const handleRequestAdd = (col, row) => {
-    const result = MobKitFlowController.graphAddMenuOpenProjection({ col, row, grid: catalogs.grid });
+    const result = MetaFlowController.graphAddMenuOpenProjection({ col, row, grid: catalogs.grid });
     setAddAt(result.addAt);
   };
   const closeGraphAddMenu = () => {
-    const result = MobKitFlowController.graphAddMenuCloseProjection();
+    const result = MetaFlowController.graphAddMenuCloseProjection();
     setAddAt(result.addAt);
   };
 
   const handlePick = (pick) => {
     if (!addAt) return;
-    const nextMenu = MobKitFlowController.graphAddMenuCloseProjection();
+    const nextMenu = MetaFlowController.graphAddMenuCloseProjection();
     setAddAt(nextMenu.addAt);
-    applyMobKitAuthoringOperation({
+    applyMetaAuthoringOperation({
       intent: "graph.insertNode",
       pick,
       cell: addAt,
@@ -581,7 +581,7 @@ function App() {
     }).catch((error) => showAuthoringFailure(error, authoringFailureHead("graph_node_insert")));
   };
 
-  // MobKit-owned undo/redo: the draft store keeps bounded document history
+  // Meta-owned undo/redo: the draft store keeps bounded document history
   // recorded by its own saves; stepping returns the restored row, which
   // hydrates like any other registry selection.
   const handleHistoryStep = async (direction) => {
@@ -589,19 +589,19 @@ function App() {
     setApiBusy(true);
     try {
       const stepper = direction === "redo"
-        ? MobKitFlowController.redoDocument
-        : MobKitFlowController.undoDocument;
+        ? MetaFlowController.redoDocument
+        : MetaFlowController.undoDocument;
       let result;
       try {
         result = await stepper({ id: currentFlowId, ...currentDraftGuard() });
       } catch (error) {
-        if (!MobKitFlowController.isDraftGuardConflictError(error)) throw error;
+        if (!MetaFlowController.isDraftGuardConflictError(error)) throw error;
         // An in-flight autosave just bumped the revision; the store is still
         // the single writer of history, so step it without the stale guard.
         result = await stepper({ id: currentFlowId });
       }
       if (!result?.stepped || !result?.row?.document) return;
-      setFlows((rows) => MobKitFlowController.flowRegistryUpsertRowPatch(rows, result.row));
+      setFlows((rows) => MetaFlowController.flowRegistryUpsertRowPatch(rows, result.row));
       hydrateMobpackDocument(
         { document: result.row.document, validation: result.row.validation || null },
         {
@@ -619,19 +619,19 @@ function App() {
   };
 
   const handleAgentNavigation = (id) => {
-    const next = MobKitFlowController.agentNavigationProjection(id);
+    const next = MetaFlowController.agentNavigationProjection(id);
     setAddAt(next.addAt);
     setView(next.view);
     setAgentSel(next.selection);
   };
   const handleTopRailNavigation = (target) => {
-    const next = MobKitFlowController.topRailNavigationTransition(view, target, { mobOpen: !!currentFlowId });
+    const next = MetaFlowController.topRailNavigationTransition(view, target, { mobOpen: !!currentFlowId });
     if (!next) return;
     setView(next.view);
   };
   React.useEffect(() => {
     if (view !== "agents") return;
-    const next = MobKitFlowController.agentDefaultSelectionProjection({
+    const next = MetaFlowController.agentDefaultSelectionProjection({
       selection: agentSel,
       members: studio.members,
       schemas: studio.schemas,
@@ -643,17 +643,17 @@ function App() {
     setAgentSel(next);
   }, [view, agentSel, studio.members, studio.schemas, catalogs.agentView]);
   const handleEditorModeSelection = (target) => {
-    const next = MobKitFlowController.editorModeTransition(target);
+    const next = MetaFlowController.editorModeTransition(target);
     if (!next) return;
     setEditorMode(next.editorMode);
   };
   const handleThemeToggle = () => {
-    const next = MobKitFlowController.themeToggleTransition(t.theme);
+    const next = MetaFlowController.themeToggleTransition(t.theme);
     setTweak(next.field, next.value);
   };
 
   const applyAuthoringDocumentProjection = (projection) => {
-    const plan = MobKitFlowController.authoringProjectionApplyPlan(projection, {
+    const plan = MetaFlowController.authoringProjectionApplyPlan(projection, {
       flow,
       studio: {
         members: studio.members,
@@ -682,22 +682,22 @@ function App() {
     if (plan.deploySettings.changed) setDeploySettings(plan.deploySettings.value);
     if (plan.mobSettings.changed) setMobSettings(plan.mobSettings.value);
   };
-  const currentMobKitDocument = () => {
+  const currentMetaDocument = () => {
     if (authoringDocumentRef.current) return authoringDocumentRef.current;
-    throw new Error(catalogs.errorView.authoringOperationMissingDocumentError || "MobKit authoring operation did not return a document");
+    throw new Error(catalogs.errorView.authoringOperationMissingDocumentError || "Meta authoring operation did not return a document");
   };
-  const currentDraftGuard = () => MobKitFlowController.flowRegistryDraftGuard(currentFlow, currentFlowId);
-  const buildMobKitProjectedDocument = async (overrides = {}) => {
+  const currentDraftGuard = () => MetaFlowController.flowRegistryDraftGuard(currentFlow, currentFlowId);
+  const buildMetaProjectedDocument = async (overrides = {}) => {
     const requestToken = currentAuthoringRevision();
     if (editorMode !== "advanced") {
       try {
-        const document = currentMobKitDocument();
+        const document = currentMetaDocument();
         return { document, requestToken };
       } catch (error) {
         return { document: null, requestToken, error: error?.message || String(error) };
       }
     }
-    const result = await applyMobKitAuthoringOperation({
+    const result = await applyMetaAuthoringOperation({
       intent: "system.syncGraphToFlow",
       reason: "build_projected_document",
     });
@@ -715,7 +715,7 @@ function App() {
   };
   authoringRunnerContext.current = {
     catalogs,
-    currentMobKitDocument,
+    currentMetaDocument,
     currentDraftGuard,
     currentAuthoringRevision,
     authoringRevisionIsCurrent,
@@ -723,40 +723,40 @@ function App() {
     applyAuthoringDocumentProjection,
     markDraft,
   };
-  const applyMobKitAuthoringOperation = React.useCallback((operation) => {
+  const applyMetaAuthoringOperation = React.useCallback((operation) => {
     if (!String(operation?.intent || "").startsWith("system.")) {
       reconcileEpoch.current += 1;
     }
     return authoringOperationRunner.current(operation);
   }, []);
-  const mobKitStudio = {
+  const metaStudio = {
     ...studio,
   };
   const editGraphNode = React.useCallback((id, action, payload = {}) =>
-    applyMobKitAuthoringOperation({
+    applyMetaAuthoringOperation({
       intent: "graph.editNode",
       instanceId: id,
       action,
       payload,
-    }), [applyMobKitAuthoringOperation]);
+    }), [applyMetaAuthoringOperation]);
   const editGraphEdge = React.useCallback((id, action, payload = {}) =>
-    applyMobKitAuthoringOperation({
+    applyMetaAuthoringOperation({
       intent: "graph.editEdge",
       edgeId: id,
       action,
       payload,
-    }), [applyMobKitAuthoringOperation]);
+    }), [applyMetaAuthoringOperation]);
   const saveRegistryDocument = (rowPatch) => {
     if (!rowPatch?.document) return;
-    MobKitFlowController.saveDocument(rowPatch)
+    MetaFlowController.saveDocument(rowPatch)
       .then((result) => {
         if (result?.row) {
-          setFlows((rows) => MobKitFlowController.flowRegistryUpsertRowPatch(rows, result.row));
+          setFlows((rows) => MetaFlowController.flowRegistryUpsertRowPatch(rows, result.row));
           emitHostEvent("saved", { id: result.row.id, stage: result.row.stage, ok: true });
         }
       })
       .catch((error) => {
-        if (MobKitFlowController.isDraftGuardConflictError(error)) {
+        if (MetaFlowController.isDraftGuardConflictError(error)) {
           // A concurrent writer already bumped the draft revision. This save
           // carries the older document, so retrying it would overwrite the
           // newer draft. Refetch the authoritative server row to adopt its
@@ -768,14 +768,14 @@ function App() {
           // re-sends the same expected_revision, conflicts again, and re-arms
           // itself forever (~250 RPC/s autosave loop). Exit requires a
           // revision the server will accept.
-          console.warn("MobKit draft save superseded; refreshing draft revision before re-persisting:", error?.message || error);
+          console.warn("Meta draft save superseded; refreshing draft revision before re-persisting:", error?.message || error);
           const conflictId = rowPatch?.id || rowPatch?.document?.mob_id || currentFlowId;
-          MobKitFlowController.getDocument(conflictId)
+          MetaFlowController.getDocument(conflictId)
             .then((refreshed) => {
               const serverRow = refreshed?.row;
               if (serverRow) {
                 setFlows((rows) =>
-                  MobKitFlowController.flowRegistryRefreshGuardPatch(rows, conflictId, serverRow));
+                  MetaFlowController.flowRegistryRefreshGuardPatch(rows, conflictId, serverRow));
               }
               persistedDocumentSig.current = "";
               setFlows((rows) => (Array.isArray(rows) ? [...rows] : rows));
@@ -800,10 +800,10 @@ function App() {
         abort.abort();
       };
     }
-    buildMobKitProjectedDocument()
+    buildMetaProjectedDocument()
       .then(({ document, stale }) => {
         if (cancelled || stale || !document) return null;
-        return MobKitFlowController.deployCommandPreviewForDocument(document, { ...currentDraftGuard(), signal: abort.signal });
+        return MetaFlowController.deployCommandPreviewForDocument(document, { ...currentDraftGuard(), signal: abort.signal });
       })
       .then((preview) => {
         if (!cancelled) {
@@ -843,7 +843,7 @@ function App() {
     // bound, by which point an in-flight autosave may have advanced a row's
     // revision. Clobbering that back to the stale snapshot re-arms the
     // save-conflict loop.
-    const projection = MobKitFlowController.flowRegistryPersistOutcomeProjection(flowsRef.current, {
+    const projection = MetaFlowController.flowRegistryPersistOutcomeProjection(flowsRef.current, {
       currentFlowId,
       outcome,
     });
@@ -858,11 +858,11 @@ function App() {
     if (!currentFlowId || !currentFlow) return;
     let document;
     try {
-      document = currentMobKitDocument();
+      document = currentMetaDocument();
     } catch {
       return;
     }
-    const persistence = MobKitFlowController.flowRegistryPersistDocumentProjection(flows, {
+    const persistence = MetaFlowController.flowRegistryPersistDocumentProjection(flows, {
       currentFlowId,
       document,
       validation: null,
@@ -900,24 +900,24 @@ function App() {
     let requestToken = null;
     setApiBusy(true);
     try {
-      const projected = await buildMobKitProjectedDocument();
+      const projected = await buildMetaProjectedDocument();
       if (projected.stale || !projected.document) return;
       const document = projected.document;
       requestToken = projected.requestToken;
-      const plan = await MobKitFlowController.deployDocument(document, { execute: false, ...currentDraftGuard() });
+      const plan = await MetaFlowController.deployDocument(document, { execute: false, ...currentDraftGuard() });
       if (!authoringRevisionIsCurrent(requestToken)) return;
-      const outcome = MobKitFlowController.deployOutcome(document, plan, { execute: false });
-      window.__mobkitFlowLastDocument = document;
-      window.__mobkitFlowLastDeployPlanTrace = plan;
+      const outcome = MetaFlowController.deployOutcome(document, plan, { execute: false });
+      window.__metaFlowLastDocument = document;
+      window.__metaFlowLastDeployPlanTrace = plan;
       persistCurrentOutcome(outcome);
       setValidationResults(outcome.validationRows);
       setStage(outcome.stage);
-      applyApiOverlayPatch(MobKitFlowController.deployPlanTraceReadyTransition(document, plan));
+      applyApiOverlayPatch(MetaFlowController.deployPlanTraceReadyTransition(document, plan));
     } catch (error) {
       if (requestToken !== null && !authoringRevisionIsCurrent(requestToken)) return;
-      const outcome = MobKitFlowController.deployErrorOutcome(error, { execute: false, errorView: catalogs.errorView });
+      const outcome = MetaFlowController.deployErrorOutcome(error, { execute: false, errorView: catalogs.errorView });
       setValidationResults(outcome.validationRows);
-      applyApiOverlayPatch(MobKitFlowController.validationSheetOpenTransition());
+      applyApiOverlayPatch(MetaFlowController.validationSheetOpenTransition());
       setStage(outcome.stage);
     } finally {
       setApiBusy(false);
@@ -925,15 +925,15 @@ function App() {
   };
 
   const renderCurrentSourceDocument = async (requestToken, projectedDocument = null) => {
-    const document = projectedDocument || (await buildMobKitProjectedDocument()).document;
+    const document = projectedDocument || (await buildMetaProjectedDocument()).document;
     if (!document) return null;
-    const result = await MobKitFlowController.sourceDocument(document, currentDraftGuard());
-    const projection = MobKitFlowController.sourceDocumentFromSourceResult(document, result, {
+    const result = await MetaFlowController.sourceDocument(document, currentDraftGuard());
+    const projection = MetaFlowController.sourceDocumentFromSourceResult(document, result, {
       sourceView: catalogs.sourceView,
     });
     if (!sourceProjectionIsCurrent(requestToken)) return null;
-    window.__mobkitFlowLastDocument = document;
-    window.__mobkitFlowLastSource = result;
+    window.__metaFlowLastDocument = document;
+    window.__metaFlowLastSource = result;
     setValidationResults(projection.validationRows);
     setStage(projection.stage);
     return projection.sourceDocument;
@@ -947,18 +947,18 @@ function App() {
     let requestToken = null;
     setApiBusy(true);
     try {
-      const projected = await buildMobKitProjectedDocument();
+      const projected = await buildMetaProjectedDocument();
       if (projected.stale || !projected.document) return;
       const document = projected.document;
       requestToken = beginSourceProjection();
       const nextSourceDocument = await renderCurrentSourceDocument(requestToken, document);
       if (!nextSourceDocument || !sourceProjectionIsCurrent(requestToken)) return;
-      applySourceProjectionPatch(MobKitFlowController.sourceDrawerReadyTransition(nextSourceDocument));
+      applySourceProjectionPatch(MetaFlowController.sourceDrawerReadyTransition(nextSourceDocument));
     } catch (error) {
       if (requestToken !== null && !sourceProjectionIsCurrent(requestToken)) return;
-      const outcome = MobKitFlowController.sourceErrorOutcome(error, { errorView: catalogs.errorView });
+      const outcome = MetaFlowController.sourceErrorOutcome(error, { errorView: catalogs.errorView });
       setValidationResults(outcome.validationRows);
-      applyApiOverlayPatch(MobKitFlowController.validationSheetOpenTransition());
+      applyApiOverlayPatch(MetaFlowController.validationSheetOpenTransition());
       setStage(outcome.stage);
     } finally {
       setApiBusy(false);
@@ -971,7 +971,7 @@ function App() {
 
   const handleInlineSource = async (surface = "basic", sourceRequest = null) => {
     let requestToken = null;
-    const toggle = MobKitFlowController.inlineSourceToggleTransition({
+    const toggle = MetaFlowController.inlineSourceToggleTransition({
       open: inlineSourceOpen,
       currentSurface: inlineSourceSurface,
       targetSurface: surface,
@@ -981,39 +981,39 @@ function App() {
       applySourceProjectionPatch(toggle.patch);
       return;
     }
-    const requestedSourcePath = MobKitFlowController.inlineSourceRequestPath(sourceRequest, {
+    const requestedSourcePath = MetaFlowController.inlineSourceRequestPath(sourceRequest, {
       sourceView: catalogs.sourceView,
       graphView: catalogs.graphView,
     });
     applySourceProjectionPatch(toggle.patch);
     setApiBusy(true);
     try {
-      const projected = await buildMobKitProjectedDocument();
+      const projected = await buildMetaProjectedDocument();
       if (projected.stale || !projected.document) return;
       const document = projected.document;
       requestToken = beginSourceProjection();
-      applySourceProjectionPatch(MobKitFlowController.inlineSourcePendingTransition(surface));
+      applySourceProjectionPatch(MetaFlowController.inlineSourcePendingTransition(surface));
       const nextSourceDocument = await renderCurrentSourceDocument(requestToken, document);
       if (!nextSourceDocument || !sourceProjectionIsCurrent(requestToken)) return;
-      applySourceProjectionPatch(MobKitFlowController.inlineSourceReadyTransition({
+      applySourceProjectionPatch(MetaFlowController.inlineSourceReadyTransition({
         ...nextSourceDocument,
         ...(requestedSourcePath ? { sourcePath: requestedSourcePath } : {}),
       }));
     } catch (error) {
       if (requestToken !== null && !sourceProjectionIsCurrent(requestToken)) return;
-      const outcome = MobKitFlowController.sourceErrorOutcome(error, { errorView: catalogs.errorView });
+      const outcome = MetaFlowController.sourceErrorOutcome(error, { errorView: catalogs.errorView });
       setValidationResults(outcome.validationRows);
-      applyApiOverlayPatch(MobKitFlowController.validationSheetOpenTransition());
+      applyApiOverlayPatch(MetaFlowController.validationSheetOpenTransition());
       setStage(outcome.stage);
     } finally {
-      applySourceProjectionPatch(MobKitFlowController.inlineSourceBusyTransition(false));
+      applySourceProjectionPatch(MetaFlowController.inlineSourceBusyTransition(false));
       setApiBusy(false);
     }
   };
 
   React.useEffect(() => {
     const openGraphSourceFromHash = () => {
-      const canvasView = MobKitFlowController.graphCanvasViewState(catalogs.graphView);
+      const canvasView = MetaFlowController.graphCanvasViewState(catalogs.graphView);
       if (!canvasView.sourceFileActivationHash || window.location.hash !== canvasView.sourceFileActivationHash) return;
       window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
       handleInlineSource("graph", { sourcePath: canvasView.sourcePath || catalogs.sourceView.primarySourcePath });
@@ -1027,26 +1027,26 @@ function App() {
     let requestToken = null;
     setApiBusy(true);
     try {
-      const projected = await buildMobKitProjectedDocument();
+      const projected = await buildMetaProjectedDocument();
       if (projected.stale || !projected.document) return;
       const document = projected.document;
       requestToken = projected.requestToken;
-      const result = await MobKitFlowController.validateDocument(document, currentDraftGuard());
+      const result = await MetaFlowController.validateDocument(document, currentDraftGuard());
       if (!authoringRevisionIsCurrent(requestToken)) return;
-      const outcome = MobKitFlowController.validationOutcome(document, result);
-      window.__mobkitFlowLastDocument = document;
-      window.__mobkitFlowLastValidation = result;
+      const outcome = MetaFlowController.validationOutcome(document, result);
+      window.__metaFlowLastDocument = document;
+      window.__metaFlowLastValidation = result;
       persistCurrentOutcome(outcome);
       setValidationResults(outcome.validationRows);
       setStage(outcome.stage);
     } catch (error) {
       if (requestToken !== null && !authoringRevisionIsCurrent(requestToken)) return;
-      const outcome = MobKitFlowController.validationErrorOutcome(error, { errorView: catalogs.errorView });
+      const outcome = MetaFlowController.validationErrorOutcome(error, { errorView: catalogs.errorView });
       setValidationResults(outcome.validationRows);
       setStage(outcome.stage);
     } finally {
       if (requestToken === null || authoringRevisionIsCurrent(requestToken)) {
-        applyApiOverlayPatch(MobKitFlowController.validationSheetOpenTransition());
+        applyApiOverlayPatch(MetaFlowController.validationSheetOpenTransition());
       }
       setApiBusy(false);
     }
@@ -1056,27 +1056,27 @@ function App() {
     let requestToken = null;
     setApiBusy(true);
     try {
-      const projected = await buildMobKitProjectedDocument();
+      const projected = await buildMetaProjectedDocument();
       if (projected.stale || !projected.document) return;
       const document = projected.document;
       requestToken = projected.requestToken;
-      const result = await MobKitFlowController.exportDocument(document, currentDraftGuard());
+      const result = await MetaFlowController.exportDocument(document, currentDraftGuard());
       if (!authoringRevisionIsCurrent(requestToken)) return;
-      const outcome = MobKitFlowController.exportOutcome(document, result);
-      window.__mobkitFlowLastDocument = document;
-      window.__mobkitFlowLastExport = result;
+      const outcome = MetaFlowController.exportOutcome(document, result);
+      window.__metaFlowLastDocument = document;
+      window.__metaFlowLastExport = result;
       persistCurrentOutcome(outcome);
-      if (!window.__mobkitFlowDisableDownload) {
+      if (!window.__metaFlowDisableDownload) {
         downloadExportResult(result);
       }
       setValidationResults(outcome.validationRows);
       setStage(outcome.stage);
-      applyApiOverlayPatch(MobKitFlowController.validationSheetCloseTransition());
+      applyApiOverlayPatch(MetaFlowController.validationSheetCloseTransition());
     } catch (error) {
       if (requestToken !== null && !authoringRevisionIsCurrent(requestToken)) return;
-      const outcome = MobKitFlowController.exportErrorOutcome(error, { errorView: catalogs.errorView });
+      const outcome = MetaFlowController.exportErrorOutcome(error, { errorView: catalogs.errorView });
       setValidationResults(outcome.validationRows);
-      applyApiOverlayPatch(MobKitFlowController.validationSheetOpenTransition());
+      applyApiOverlayPatch(MetaFlowController.validationSheetOpenTransition());
       setStage(outcome.stage);
     } finally {
       setApiBusy(false);
@@ -1087,14 +1087,14 @@ function App() {
     let requestToken = null;
     setApiBusy(true);
     try {
-      const projected = await buildMobKitProjectedDocument();
+      const projected = await buildMetaProjectedDocument();
       if (projected.stale || !projected.document) return;
       const document = projected.document;
       requestToken = projected.requestToken;
-      const result = await MobKitFlowController.deployDocument(document, { execute, ...currentDraftGuard() });
-      const outcome = MobKitFlowController.deployOutcome(document, result, { execute });
-      window.__mobkitFlowLastDocument = document;
-      window.__mobkitFlowLastDeploy = result;
+      const result = await MetaFlowController.deployDocument(document, { execute, ...currentDraftGuard() });
+      const outcome = MetaFlowController.deployOutcome(document, result, { execute });
+      window.__metaFlowLastDocument = document;
+      window.__metaFlowLastDeploy = result;
       // An execute:true deploy is an authoritative host side effect that
       // already ran: persist its outcome and fire the `deployed` host event
       // even if the user edited mid-run (authoring revision moved on).
@@ -1109,12 +1109,12 @@ function App() {
       if (!revisionCurrent) return;
       setValidationResults(outcome.validationRows);
       setStage(outcome.stage);
-      applyApiOverlayPatch(MobKitFlowController.validationSheetOpenTransition());
+      applyApiOverlayPatch(MetaFlowController.validationSheetOpenTransition());
     } catch (error) {
       if (requestToken !== null && !authoringRevisionIsCurrent(requestToken)) return;
-      const outcome = MobKitFlowController.deployErrorOutcome(error, { execute, errorView: catalogs.errorView });
+      const outcome = MetaFlowController.deployErrorOutcome(error, { execute, errorView: catalogs.errorView });
       setValidationResults(outcome.validationRows);
-      applyApiOverlayPatch(MobKitFlowController.validationSheetOpenTransition());
+      applyApiOverlayPatch(MetaFlowController.validationSheetOpenTransition());
       setStage(outcome.stage);
     } finally {
       setApiBusy(false);
@@ -1122,7 +1122,7 @@ function App() {
   };
   const handleDeployPlan = () => handleDeploy({ execute: false });
   const handleDeployRun = () => handleDeploy({ execute: true });
-  const basicSourceToggle = MobKitFlowController.inlineSourceToggleButtonState({
+  const basicSourceToggle = MetaFlowController.inlineSourceToggleButtonState({
     open: inlineSourceOpen,
     currentSurface: inlineSourceSurface,
     targetSurface: "basic",
@@ -1132,7 +1132,7 @@ function App() {
 
   const hydrateMobpackDocument = (result, options: any = {}) => {
     const activeContract = options.contract || contract;
-    const hydration = MobKitFlowController.hydrateMobpackDocumentState(result, {
+    const hydration = MetaFlowController.hydrateMobpackDocumentState(result, {
       id: options.id,
       existingRows: options.existingRows,
       addToRegistry: options.addToRegistry,
@@ -1147,10 +1147,10 @@ function App() {
     if (hydration.ok === false) {
       setValidationResults(hydration.validationRows || []);
       setStage(hydration.stage || "draft");
-      applyApiOverlayPatch(MobKitFlowController.validationSheetOpenTransition());
+      applyApiOverlayPatch(MetaFlowController.validationSheetOpenTransition());
       return;
     }
-    const hydrationPersistence = MobKitFlowController.flowRegistryDocumentPersistence({
+    const hydrationPersistence = MetaFlowController.flowRegistryDocumentPersistence({
       currentFlowId: hydration.id,
       document: hydration.document,
       validation: hydration.validation,
@@ -1162,7 +1162,7 @@ function App() {
     beginDocumentHydration();
     setCurrentAuthoringDocument(hydration.document);
     hydratingDocumentRef.current = true;
-    setCatalogs((current) => MobKitFlowController.catalogSkillRealmsPatch(current, hydration.skillRealms));
+    setCatalogs((current) => MetaFlowController.catalogSkillRealmsPatch(current, hydration.skillRealms));
     studio.setSkillRealms(hydration.skillRealms);
     studio.setMembers(hydration.members);
     studio.setSchemas(hydration.schemas);
@@ -1177,20 +1177,20 @@ function App() {
       });
     }
     if (hydration.addToRegistry) {
-      setFlows(fs => MobKitFlowController.flowRegistryUpsertRowPatch(fs, hydration.registryRow));
+      setFlows(fs => MetaFlowController.flowRegistryUpsertRowPatch(fs, hydration.registryRow));
     }
     setCurrentFlowId(hydration.id);
     setStage(hydration.stage);
     setValidationResults(hydration.validationRows);
     if (hydration.openEditor) setView("editor");
     const graphProjectionToken = currentAuthoringRevision();
-    MobKitFlowController.graphProjectionDocument(hydration.document)
+    MetaFlowController.graphProjectionDocument(hydration.document)
       .then((projectionResult) => {
         if (!authoringRevisionIsCurrent(graphProjectionToken)) return;
-        const projection = MobKitFlowController.graphProjectionFromMobKitResult(projectionResult);
+        const projection = MetaFlowController.graphProjectionFromMetaResult(projectionResult);
         if (!projection) return;
         hydratingDocumentRef.current = true;
-        graphProjectionSig.current = MobKitFlowController.graphStructureSignature(projection.instances || [], projection.edges || [], {
+        graphProjectionSig.current = MetaFlowController.graphStructureSignature(projection.instances || [], projection.edges || [], {
           members: hydration.members,
           contract: activeContract,
         });
@@ -1230,19 +1230,19 @@ function App() {
     if (!bootIntentPending.current || !canCreateAuthoring) return;
     bootIntentPending.current = false;
     if (BOOT_INTENT.kind === "new") {
-      setCreating(MobKitFlowController.newFlowInitialState({
+      setCreating(MetaFlowController.newFlowInitialState({
         blankTemplate: catalogs.blankMobpack,
         template: BOOT_INTENT.template,
         templates,
       }));
       return;
     }
-    const selection = MobKitFlowController.flowRegistrySelectionState(flows, BOOT_INTENT.id);
+    const selection = MetaFlowController.flowRegistrySelectionState(flows, BOOT_INTENT.id);
     if (openFlowRegistrySelection(selection)) return;
-    const outcome = MobKitFlowController.bootIntentOpenFailureOutcome(BOOT_INTENT, { errorView: catalogs.errorView });
+    const outcome = MetaFlowController.bootIntentOpenFailureOutcome(BOOT_INTENT, { errorView: catalogs.errorView });
     setValidationResults(outcome.validationRows);
     setStage(outcome.stage);
-    applyApiOverlayPatch(MobKitFlowController.validationSheetOpenTransition());
+    applyApiOverlayPatch(MetaFlowController.validationSheetOpenTransition());
   }, [canCreateAuthoring, flows, templates, catalogs]);
 
   const handleImportFile = async (event) => {
@@ -1251,21 +1251,21 @@ function App() {
     if (!file) return;
     setApiBusy(true);
     try {
-      const result = await MobKitFlowController.importDocument(await importParamsFromFile(file));
-      window.__mobkitFlowLastImport = result;
+      const result = await MetaFlowController.importDocument(await importParamsFromFile(file));
+      window.__metaFlowLastImport = result;
       hydrateImportedDocument(result);
     } catch (error) {
-      const outcome = MobKitFlowController.importErrorOutcome(error, { filename: file.name, errorView: catalogs.errorView });
+      const outcome = MetaFlowController.importErrorOutcome(error, { filename: file.name, errorView: catalogs.errorView });
       setValidationResults(outcome.validationRows);
-      applyApiOverlayPatch(MobKitFlowController.validationSheetOpenTransition());
+      applyApiOverlayPatch(MetaFlowController.validationSheetOpenTransition());
       setStage(outcome.stage);
     } finally {
       setApiBusy(false);
     }
   };
 
-  const shellState = MobKitFlowController.topRailState({ contract, deploySettings, stage, view, mobOpen: !!currentFlowId, theme: t.theme, deployView: catalogs.deployView, capabilities });
-  const switcherState = MobKitFlowController.mobSwitcherState(flows, currentFlowId, { deployView: catalogs.deployView });
+  const shellState = MetaFlowController.topRailState({ contract, deploySettings, stage, view, mobOpen: !!currentFlowId, theme: t.theme, deployView: catalogs.deployView, capabilities });
+  const switcherState = MetaFlowController.mobSwitcherState(flows, currentFlowId, { deployView: catalogs.deployView });
 
   return (
     <div className={"app density--" + t.density + " inspector--" + t.inspectorLayout + " view--" + view}>
@@ -1276,7 +1276,7 @@ function App() {
         currentFlowName={currentFlow?.name || "—"}
         switcherState={switcherState}
         onOpenMob={(id) => {
-          const selection = MobKitFlowController.flowRegistrySelectionState(flows, id);
+          const selection = MetaFlowController.flowRegistrySelectionState(flows, id);
           openFlowRegistrySelection(selection);
         }}
         contract={contract}
@@ -1305,14 +1305,14 @@ function App() {
           flows={flows}
           currentFlowId={currentFlowId}
           onOpen={(id) => {
-            const selection = MobKitFlowController.flowRegistrySelectionState(flows, id);
+            const selection = MetaFlowController.flowRegistrySelectionState(flows, id);
             openFlowRegistrySelection(selection);
           }}
           canCreate={canCreateAuthoring}
           flowRegistryView={catalogs.flowRegistryView}
           onNew={() => {
             if (!canCreateAuthoring) return;
-            setCreating(MobKitFlowController.newFlowInitialState({ blankTemplate: catalogs.blankMobpack }));
+            setCreating(MetaFlowController.newFlowInitialState({ blankTemplate: catalogs.blankMobpack }));
           }}
         />
       )}
@@ -1324,7 +1324,7 @@ function App() {
       {view === "editor" && editorMode === "advanced" && (
         <div className="stage-area" onClick={(e) => { if (e.target === e.currentTarget) closeGraphAddMenu(); }}>
           <GraphEditor
-            state={mobKitStudio}
+            state={metaStudio}
             selection={selection}
             selectInstance={selectInstance}
             selectEdge={selectEdge}
@@ -1339,7 +1339,7 @@ function App() {
             contract={contract}
             graphView={catalogs.graphView}
             toolCatalog={catalogs.toolCatalog}
-            applyAuthoringIntent={applyMobKitAuthoringOperation}
+            applyAuthoringIntent={applyMetaAuthoringOperation}
           />
             <InlineSourceEditor
               open={inlineSourceOpen && inlineSourceSurface === "graph"}
@@ -1360,7 +1360,7 @@ function App() {
           />
           <aside className="inspector">
             <Inspector
-              studio={mobKitStudio}
+              studio={metaStudio}
               selection={selection}
               flow={flow}
               template={currentFlow}
@@ -1376,11 +1376,11 @@ function App() {
               clearSelection={clearSelection}
               editGraphNode={editGraphNode}
               editGraphEdge={editGraphEdge}
-              deleteGraphNode={(id) => applyMobKitAuthoringOperation({
+              deleteGraphNode={(id) => applyMetaAuthoringOperation({
                 intent: "graph.deleteNode",
                 instanceId: id,
               })}
-              deleteGraphEdge={(id) => applyMobKitAuthoringOperation({
+              deleteGraphEdge={(id) => applyMetaAuthoringOperation({
                 intent: "graph.deleteEdge",
                 edgeId: id,
               })}
@@ -1391,7 +1391,7 @@ function App() {
 
       {view === "editor" && editorMode === "basic" && (
         <BuilderView
-          studio={mobKitStudio}
+          studio={metaStudio}
           mode="build"
           flow={flow}
           setFlow={setAuthoringFlow}
@@ -1409,7 +1409,7 @@ function App() {
           basicView={catalogs.basicView}
           launchView={catalogs.launchView}
           conditionView={catalogs.conditionView}
-          applyAuthoringIntent={applyMobKitAuthoringOperation}
+          applyAuthoringIntent={applyMetaAuthoringOperation}
         />
       )}
 
@@ -1424,13 +1424,13 @@ function App() {
           contract={contract}
           deployCommandPreview={deployCommandPreview}
           settingsView={catalogs.settingsView}
-          applyAuthoringIntent={applyMobKitAuthoringOperation}
+          applyAuthoringIntent={applyMetaAuthoringOperation}
         />
       )}
 
       {view === "agents" && (
         <AgentsView
-          studio={mobKitStudio}
+          studio={metaStudio}
           agentSel={agentSel}
           setAgentSel={setAgentSel}
           contract={contract}
@@ -1442,7 +1442,7 @@ function App() {
           toolCatalog={catalogs.toolCatalog}
           modelCatalog={catalogs.models}
           agentDefinitions={catalogs.agentDefinitions}
-          applyAgentIntent={applyMobKitAuthoringOperation}
+          applyAgentIntent={applyMetaAuthoringOperation}
           agentView={catalogs.agentView}
           agentDetailView={catalogs.agentDetailView}
           agentAccessView={catalogs.agentAccessView}
@@ -1454,7 +1454,7 @@ function App() {
         <NewFlowModal
           state={creating}
           setState={setCreating}
-          templateOptions={MobKitFlowController.newFlowTemplateOptions(templates, {
+          templateOptions={MetaFlowController.newFlowTemplateOptions(templates, {
             canCreateBlank: canCreateAuthoring,
             blankTemplate: catalogs.blankMobpack,
           })}
@@ -1463,10 +1463,10 @@ function App() {
             if (!canCreateAuthoring) return;
             setApiBusy(true);
             try {
-              const result = await MobKitFlowController.createDocument(spec);
+              const result = await MetaFlowController.createDocument(spec);
               const row = result?.row;
               if (!row?.document) return;
-              setFlows(Array.isArray(result?.rows) ? result.rows : MobKitFlowController.flowRegistryUpsertRowPatch(flows, row));
+              setFlows(Array.isArray(result?.rows) ? result.rows : MetaFlowController.flowRegistryUpsertRowPatch(flows, row));
               hydrateMobpackDocument(
                 { document: row.document, validation: row.validation || null },
                 {
@@ -1479,9 +1479,9 @@ function App() {
               emitHostEvent("created", { id: row.id, stage: row.stage, ok: true });
               setCreating(null);
             } catch (error) {
-              const outcome = MobKitFlowController.importErrorOutcome(error, { filename: "mobkit/mobpacks/create", errorView: catalogs.errorView });
+              const outcome = MetaFlowController.importErrorOutcome(error, { filename: "meta/mobpacks/create", errorView: catalogs.errorView });
               setValidationResults(outcome.validationRows);
-              applyApiOverlayPatch(MobKitFlowController.validationSheetOpenTransition());
+              applyApiOverlayPatch(MetaFlowController.validationSheetOpenTransition());
               setStage(outcome.stage);
             } finally {
               setApiBusy(false);
@@ -1490,15 +1490,15 @@ function App() {
         />
       )}
 
-      <DeployPlanTrace open={deployPlanOpen} onClose={() => applyApiOverlayPatch(MobKitFlowController.deployPlanTraceCloseTransition())} onActiveStep={setActiveStepId} runKey={deployPlanKey} document={deployPlanDocument} plan={deployPlanResult} deployView={catalogs.deployView} />
-      <ValidateSheet open={validate} onClose={() => applyApiOverlayPatch(MobKitFlowController.validationSheetCloseTransition())} onPublish={handlePublish} onDeployPlan={handleDeployPlan} onDeployRun={handleDeployRun} results={validationResults} stage={stage} deployView={catalogs.deployView} capabilities={capabilities} />
+      <DeployPlanTrace open={deployPlanOpen} onClose={() => applyApiOverlayPatch(MetaFlowController.deployPlanTraceCloseTransition())} onActiveStep={setActiveStepId} runKey={deployPlanKey} document={deployPlanDocument} plan={deployPlanResult} deployView={catalogs.deployView} />
+      <ValidateSheet open={validate} onClose={() => applyApiOverlayPatch(MetaFlowController.validationSheetCloseTransition())} onPublish={handlePublish} onDeployPlan={handleDeployPlan} onDeployRun={handleDeployRun} results={validationResults} stage={stage} deployView={catalogs.deployView} capabilities={capabilities} />
       <SourceDrawer open={sourceOpen} onClose={clearSourceProjection} state={sourceDocument} sourceView={catalogs.sourceView} />
     </div>
   );
 }
 
 function rpcUrlFromShell() {
-  const meta = document.querySelector('meta[name="mobkit-base-url"]');
+  const meta = document.querySelector('meta[name="meta-base-url"]');
   const base = (meta?.getAttribute("content") || "").trim().replace(/\/+$/, "");
   return `${base}/flow-editor/rpc`;
 }
@@ -1508,7 +1508,7 @@ function rpcUrlFromShell() {
 // ({ type, id, stage, ok }) — a window CustomEvent for same-document
 // listeners and a parent postMessage for iframe hosts.
 function emitHostEvent(kind, detail) {
-  const payload = MobKitFlowController.hostEventPayload(kind, detail);
+  const payload = MetaFlowController.hostEventPayload(kind, detail);
   if (!payload) return;
   window.dispatchEvent(new CustomEvent(payload.type, { detail: payload }));
   if (window.parent !== window) {
@@ -1517,7 +1517,7 @@ function emitHostEvent(kind, detail) {
 }
 
 function downloadExportResult(result) {
-  const download = MobKitFlowController.exportDownloadPayload(result);
+  const download = MetaFlowController.exportDownloadPayload(result);
   const bytes = Uint8Array.from(atob(download.contentBase64), (char) => char.charCodeAt(0));
   const blob = new Blob([bytes], { type: download.mediaType });
   const url = URL.createObjectURL(blob);
@@ -1536,7 +1536,7 @@ async function importParamsFromFile(file) {
   const mediaType = file.type || "";
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
-  return MobKitFlowController.importParamsFromDecodedFile({
+  return MetaFlowController.importParamsFromDecodedFile({
     filename,
     mediaType,
     text: new TextDecoder("utf-8").decode(bytes),
@@ -1620,7 +1620,7 @@ function TopRail({ stage, view, onNavigate, currentFlowName, switcherState, onOp
 
 // ── Mob library view ──────────────────────────────────────────────
 function FlowsView({ flows, currentFlowId, onOpen, onNew, canCreate, flowRegistryView = null }) {
-  const registryState = MobKitFlowController.flowRegistryViewState(flows, currentFlowId, {
+  const registryState = MetaFlowController.flowRegistryViewState(flows, currentFlowId, {
     canCreate,
     flowRegistryView,
     nowUnixMs: Date.now(),
@@ -1670,8 +1670,8 @@ function FlowsView({ flows, currentFlowId, onOpen, onNew, canCreate, flowRegistr
 
 // ── New Mob modal (single step: name + template) ─────────────────
 function NewFlowModal({ state, setState, onCreate, templateOptions = [], newFlowView = null }) {
-  const setField = (field, value) => setState((current) => MobKitFlowController.newFlowModalFieldPatch(current, field, value));
-  const modalState = MobKitFlowController.newFlowModalState(state, templateOptions, newFlowView);
+  const setField = (field, value) => setState((current) => MetaFlowController.newFlowModalFieldPatch(current, field, value));
+  const modalState = MetaFlowController.newFlowModalState(state, templateOptions, newFlowView);
 
   return (
     <div className="modal-backdrop" onClick={() => setState(null)}>
@@ -1701,7 +1701,7 @@ function NewFlowModal({ state, setState, onCreate, templateOptions = [], newFlow
           <button
             className="btn btn--primary btn--sm"
             disabled={modalState.createDisabled}
-            onClick={() => onCreate(MobKitFlowController.newFlowModalCreateSpec(modalState))}
+            onClick={() => onCreate(MetaFlowController.newFlowModalCreateSpec(modalState))}
           >{modalState.createLabel}</button>
         </div>
       </div>
@@ -1753,7 +1753,7 @@ function Tweaks({ t, setTweak, deploySettings, mobSettings, members = [], modelC
       ...operation,
     });
   };
-  const controlState = MobKitFlowController.tweaksControlState({
+  const controlState = MetaFlowController.tweaksControlState({
     deploySettings,
     mobSettings,
     members,
@@ -1845,7 +1845,7 @@ function Tweaks({ t, setTweak, deploySettings, mobSettings, members = [], modelC
 }
 
 function RoleWiringEditor({ value, profileOptions, settingsView, onAction }) {
-  const wiringState = MobKitFlowController.mobRoleWiringEditorState(value, profileOptions, settingsView);
+  const wiringState = MetaFlowController.mobRoleWiringEditorState(value, profileOptions, settingsView);
   const updateSource = (index, value) => {
     onAction && onAction({ action: "set_source", index, value });
   };
@@ -1883,7 +1883,7 @@ function RoleWiringEditor({ value, profileOptions, settingsView, onAction }) {
 }
 
 function AdvancedMobSettingsEditor({ value, settingsView, onChange }) {
-  const advancedState = MobKitFlowController.advancedMobSettingsEditorState(value, settingsView);
+  const advancedState = MetaFlowController.advancedMobSettingsEditorState(value, settingsView);
   const [draft, setDraft] = React.useState(advancedState.text);
   const [error, setError] = React.useState("");
   React.useEffect(() => {
@@ -1892,7 +1892,7 @@ function AdvancedMobSettingsEditor({ value, settingsView, onChange }) {
   }, [advancedState.text]);
   const commit = (next) => {
     setDraft(next);
-    const result = MobKitFlowController.advancedMobSettingsDraftPatch(next, settingsView);
+    const result = MetaFlowController.advancedMobSettingsDraftPatch(next, settingsView);
     setError(result.error || "");
     if (result.ok) onChange(result.value);
   };

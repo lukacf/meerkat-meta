@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from meerkat_mobkit.live import (
+from meerkat_meta.live import (
     LIVE_EXECUTION_CLIENT_CONTEXT_V1,
     LIVE_EXECUTION_FUNCTION_BRIDGE_V1,
     LIVE_EXECUTION_IDENTITY_V1,
@@ -27,21 +27,21 @@ from meerkat_mobkit.live import (
     supports_live_execution_mode,
     supports_live_execution_identity_v1,
 )
-from meerkat_mobkit.types import CapabilitiesResult
+from meerkat_meta.types import CapabilitiesResult
 
 
 @pytest.fixture(scope="module")
 def contracts_fixture():
-    path = Path(__file__).parents[3] / "crates/meerkat-mobkit/tests/fixtures/live_contracts_v1.json"
+    path = Path(__file__).parents[3] / "crates/meerkat-meta/tests/fixtures/live_contracts_v1.json"
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def test_openai_live_gateway_registration_matches_shared_fixture(contracts_fixture):
     config = OpenAiLiveGatewayConfig(
-        principal="user:luka",
+        principal="user:example",
         realm="example",
         auth_binding=LiveAuthBindingRef(
-            realm="example", binding="openai-api-key", profile="luka"
+            realm="example", binding="openai-api-key", profile="example"
         ),
         voice="marin",
         session_instructions="You are a test voice agent.",
@@ -52,13 +52,13 @@ def test_openai_live_gateway_registration_matches_shared_fixture(contracts_fixtu
         == contracts_fixture["openai_live_public_profile_id"]
     )
     minimal = OpenAiLiveGatewayConfig(
-        principal="user:luka",
+        principal="user:example",
         realm="example",
         auth_binding=LiveAuthBindingRef(realm="example", binding="openai-api-key"),
         voice="marin",
     )
     assert minimal.to_dict() == {
-        "principal": "user:luka",
+        "principal": "user:example",
         "realm": "example",
         "auth_binding": {"realm": "example", "binding": "openai-api-key"},
         "voice": "marin",
@@ -68,21 +68,21 @@ def test_openai_live_gateway_registration_matches_shared_fixture(contracts_fixtu
 def test_openai_live_gateway_registration_rejects_drift():
     with pytest.raises(ValueError, match="realm must equal"):
         OpenAiLiveGatewayConfig(
-            principal="user:luka",
+            principal="user:example",
             realm="example",
             auth_binding=LiveAuthBindingRef(realm="other", binding="openai-api-key"),
             voice="marin",
         ).to_dict()
     with pytest.raises(ValueError, match="voice"):
         OpenAiLiveGatewayConfig(
-            principal="user:luka",
+            principal="user:example",
             realm="example",
             auth_binding=LiveAuthBindingRef(realm="example", binding="openai-api-key"),
             voice=" ",
         ).to_dict()
     with pytest.raises(ValueError, match="session_instructions"):
         OpenAiLiveGatewayConfig(
-            principal="user:luka",
+            principal="user:example",
             realm="example",
             auth_binding=LiveAuthBindingRef(realm="example", binding="openai-api-key"),
             voice="marin",
@@ -90,7 +90,7 @@ def test_openai_live_gateway_registration_rejects_drift():
         ).to_dict()
     with pytest.raises(TypeError):
         OpenAiLiveGatewayConfig(
-            principal="user:luka",
+            principal="user:example",
             realm="example",
             auth_binding={"realm": "example", "binding": "openai-api-key"},
             voice="marin",
@@ -98,7 +98,7 @@ def test_openai_live_gateway_registration_rejects_drift():
     for field in ["model", "provider", "factory_kind", "gate0_qualification"]:
         with pytest.raises(TypeError):
             OpenAiLiveGatewayConfig(
-                principal="user:luka",
+                principal="user:example",
                 realm="example",
                 auth_binding=LiveAuthBindingRef(realm="example", binding="openai-api-key"),
                 voice="marin",
@@ -110,13 +110,13 @@ def test_experimental_live_gateway_registration_is_explicit_and_strict(
     contracts_fixture,
 ):
     config = ExperimentalLiveGatewayConfig(
-        principal="user:luka",
+        principal="user:example",
         realm="example",
         factory_kind="openai-gpt-live",
         factory_version="v1",
         gate0_qualification="gate0-v1",
         auth_binding=LiveAuthBindingRef(
-            realm="example", binding="chatgpt-oauth", profile="luka"
+            realm="example", binding="chatgpt-oauth", profile="example"
         ),
         voice="marin",
         execution_profiles=(
@@ -129,7 +129,7 @@ def test_experimental_live_gateway_registration_is_explicit_and_strict(
     assert config.to_dict() == contracts_fixture["experimental_gateway_config"]
     with pytest.raises(ValueError, match="realm must equal"):
         ExperimentalLiveGatewayConfig(
-            principal="user:luka",
+            principal="user:example",
             realm="example",
             factory_kind="openai-gpt-live",
             factory_version="v1",
@@ -144,7 +144,7 @@ def test_experimental_live_gateway_registration_is_explicit_and_strict(
 def test_experimental_live_execution_profiles_reject_authority_and_drift():
     def config_with(*profiles):
         return ExperimentalLiveGatewayConfig(
-            principal="user:luka",
+            principal="user:example",
             realm="example",
             factory_kind="openai-gpt-live",
             factory_version="v1",
@@ -265,7 +265,7 @@ def test_channel_handle_matches_shared_fixture(contracts_fixture):
     wire = contracts_fixture["channel_handle"]
     handle = LiveChannelHandle.from_dict(wire)
     assert handle.channel_id == "live-ch-1"
-    assert handle.target_identity == "identity:luka"
+    assert handle.target_identity == "identity:example"
     assert handle.transport.transport == "websocket"
     assert handle.continuity.mode == "transcript_only"
     assert handle.to_dict() == wire
@@ -376,10 +376,10 @@ def test_assistant_output_address_is_strict_and_opaque():
 
 def test_openai_live_gateway_summary_bounds_match_shared_fixture(contracts_fixture):
     config = OpenAiLiveGatewayConfig(
-        principal="user:luka",
+        principal="user:example",
         realm="example",
         auth_binding=LiveAuthBindingRef(
-            realm="example", binding="openai-api-key", profile="luka"
+            realm="example", binding="openai-api-key", profile="example"
         ),
         voice="marin",
         session_instructions="You are a test voice agent.",
@@ -389,7 +389,7 @@ def test_openai_live_gateway_summary_bounds_match_shared_fixture(contracts_fixtu
     )
     assert config.to_dict() == contracts_fixture["openai_live_gateway_config_with_summary"]
     partial = OpenAiLiveGatewayConfig(
-        principal="user:luka",
+        principal="user:example",
         realm="example",
         auth_binding=LiveAuthBindingRef(realm="example", binding="openai-api-key"),
         voice="marin",
@@ -397,7 +397,7 @@ def test_openai_live_gateway_summary_bounds_match_shared_fixture(contracts_fixtu
     )
     assert partial.to_dict()["summary"] == {"max_output_bytes": 1024}
     assert "summary" not in OpenAiLiveGatewayConfig(
-        principal="user:luka",
+        principal="user:example",
         realm="example",
         auth_binding=LiveAuthBindingRef(realm="example", binding="openai-api-key"),
         voice="marin",
@@ -411,7 +411,7 @@ def test_openai_live_gateway_summary_bounds_match_shared_fixture(contracts_fixtu
     ]:
         with pytest.raises(ValueError):
             OpenAiLiveGatewayConfig(
-                principal="user:luka",
+                principal="user:example",
                 realm="example",
                 auth_binding=LiveAuthBindingRef(realm="example", binding="openai-api-key"),
                 voice="marin",
@@ -419,7 +419,7 @@ def test_openai_live_gateway_summary_bounds_match_shared_fixture(contracts_fixtu
             ).to_dict()
     with pytest.raises(TypeError):
         OpenAiLiveGatewayConfig(
-            principal="user:luka",
+            principal="user:example",
             realm="example",
             auth_binding=LiveAuthBindingRef(realm="example", binding="openai-api-key"),
             voice="marin",

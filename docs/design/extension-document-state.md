@@ -6,23 +6,23 @@ claim passing runtime acceptance or a released upstream dependency.
 
 ## Decision
 
-MobKit supplies durable, access-controlled extension documents through the
+Meta supplies durable, access-controlled extension documents through the
 deployment's configured storage provider. Each optional extension package owns
 its commands, payload schema and evaluation. Enabling an extension does not
 create a second database configuration or expose a generic state-editing tool
 to agents.
 
 Implement the generic contract and reference SQLite backend in a small
-`mobkit-extension-state` crate with no Meerkat dependency. MobKit's optional
+`meta-extension-state` crate with no Meerkat dependency. Meta's optional
 adapter resolves runtime authority and provides the configured store. This
 allows fast storage/policy tests without compiling the agent runtime.
-MobKit's dependency on that crate and its runtime factory adapter are behind
+Meta's dependency on that crate and its runtime factory adapter are behind
 an optional feature that is off by default. Omitting the feature introduces no
 document store open, tool definitions, prompts or runtime initialization.
 
 ## Existing seams and gaps
 
-- `crates/meerkat-mobkit/src/storage_provider.rs:93` lists the current store
+- `crates/meerkat-meta/src/storage_provider.rs:93` lists the current store
   set. There is no generic extension document store.
 - `storage_provider.rs:141` is the composite provider boundary. Its existing
   fail-closed rule requires declared durable storage or an explicit error.
@@ -192,13 +192,13 @@ roster does not by itself remove a persisted creation edge or document grant.
 
 ## Provider capability and bootstrap sequence
 
-Add a defaulted optional `MobKitStorageProvider::open_extension_state(context)`
+Add a defaulted optional `MetaStorageProvider::open_extension_state(context)`
 capability. The default returns typed `Unsupported`. This avoids a new required
-field in every downstream `MobKitRealmStoreSet` initializer. The result contains
+field in every downstream `MetaRealmStoreSet` initializer. The result contains
 the store and its durability declaration. Open it once when at least one
 registered extension requires it, and bind package namespaces over that store.
 
-The disk provider chooses its path through `MobKitStorageLayout`. Non-disk
+The disk provider chooses its path through `MetaStorageLayout`. Non-disk
 providers supply their own backend through the same configured provider.
 Unsupported, failed-open or nonpersistent storage refuses activation of a
 package that requires durability. There is no package-local SQLite or memory
@@ -220,7 +220,7 @@ session/member bindings, validates the current caller binding, obtains durable
 lineage, and intersects host ABAC. Lookup failures propagate; an empty roster
 projection is not evidence of no ancestry.
 
-Required order, owned entirely by MobKit bootstrap:
+Required order, owned entirely by Meta bootstrap:
 
 1. Resolve the deployment's provider and all required document capabilities.
 2. Create the deferred authority resolver and factory-built dispatchers; register
@@ -239,7 +239,7 @@ a mutable global, reconstruct the provider, or capture a parent-bound closure.
 
 ## Export and protected artifact handling
 
-Raw document bytes stay behind the document service. MobKit's existing
+Raw document bytes stay behind the document service. Meta's existing
 `/blobs/{id}` route is a bearer-capability surface, not document ACL enforcement.
 Do not return its blob IDs or URLs for protected documents or their exports.
 Protected exports are deferred from this contract. Extensions return bounded
@@ -290,7 +290,7 @@ conditions, incorporated above:
 
 1. Idempotency fingerprints identify the original request, and authorized
    receipt lookup precedes document evaluation or stale-revision rejection.
-2. The MobKit extension-state dependency and adapter remain default-off.
+2. The Meta extension-state dependency and adapter remain default-off.
 3. Persist proven root versus legacy-unknown provenance and require explicit
    durable-identity successor continuity.
 4. Prove same-mob and cross-mob lineage paths; missing support fails typed.
@@ -302,7 +302,7 @@ document as evidence of runtime behavior.
 
 ## Minimal file plan and alternatives
 
-- New `crates/mobkit-extension-state`: typed documents/ACLs/revisions, policy
+- New `crates/meta-extension-state`: typed documents/ACLs/revisions, policy
   evaluator, provider-facing contract, SQLite reference implementation and
   independent conformance tests. No domain-specific payload concepts or Meerkat
   dependencies.
@@ -313,7 +313,7 @@ document as evidence of runtime behavior.
 - A small optional adapter module: typed dynamic caller/lineage resolver and
   intersection with host policy. No authority in extension payloads or schemas.
 - Upstream Meerkat PR: durable ordinary-spawn/delegate provenance and any missing
-  pre-activation/query seams. MobKit integration follows its released contract.
+  pre-activation/query seams. Meta integration follows its released contract.
 - Extension repositories: domain engines, tool schemas and package factories
   consuming the service.
 
@@ -325,7 +325,7 @@ unnecessarily source-breaking for providers that do not enable extensions.
 
 ## Native integration contract
 
-Enable MobKit's `extension-state` feature explicitly and register a factory with
+Enable Meta's `extension-state` feature explicitly and register a factory with
 `register_tool_bundle_factory("durable-documents-test", requirements, factory)`. Requirements
 name its document namespace and the read/edit tools. The factory receives a
 provider-owned `DocumentService` and a `ToolCallerResolver`; it resolves each
@@ -357,10 +357,9 @@ and does not alter general tool admission or provider-native tool capabilities.
 A canceled publication returns authority unavailable. Existing historical
 bindings remain readable while a replacement is pending or fails.
 
-The native integration uses the published Meerkat 0.8.52 crate family with
-exact registry requirements and a committed lockfile. Applications consuming
-MobKit through Git pin the reviewed revision and resolve the same registry
-family. Additional child tool bundles are propagated into native delegated
+The native integration uses the Meerkat crate family with exact version
+requirements and a committed lockfile. Applications consuming Meta through Git
+pin the reviewed revision and resolve the same crate family. Additional child tool bundles are propagated into native delegated
 mob composition so the same per-call resolver works there.
 
 A failed stable-identity materialization reserves its exact host target until a
@@ -395,7 +394,7 @@ the extension store or constructing its dispatchers. This version supports
 the bundled local continuity authority and custom providers implementing the
 full retained-history contract.
 
-Enabling local history explicitly migrates the owning `mobkit-continuity`
+Enabling local history explicitly migrates the owning `meta-continuity`
 domain to schema version 3. History tables, coverage, retention triggers and
 backfill commit together; conflicting exact bindings roll the migration back.
 The version 3 stamp deliberately refuses older binaries that cannot retain
@@ -413,7 +412,7 @@ bindings from records, snapshots and head rows. The v3 lockout prevents an
 older writer from silently creating a gap in this history.
 
 Document durability does not widen native member lifetime. The current
-MobKit composition gives implicit delegate child mobs in-memory journals;
+Meta composition gives implicit delegate child mobs in-memory journals;
 completing a delegate retires its helper and fork descendants. The cross-mob
 acceptance fixture therefore checks live private/share/fork/revoke behavior
 and durable original documents after truthful retirement. Persistent

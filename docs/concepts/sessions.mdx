@@ -1,16 +1,16 @@
 ---
 title: "Sessions"
-description: "How MobKit's session-store adapters relate to Meerkat's canonical runtime-backed session lifecycle."
+description: "How Meta's session-store adapters relate to Meerkat's canonical runtime-backed session lifecycle."
 icon: "database"
 ---
 
-Meerkat owns the canonical session and runtime lifecycle: input acceptance, turn execution, deduplication, retire/reset semantics, and durable recovery. MobKit adds session-store adapters that support MobKit's operational workflows, console views, and integration surfaces.
+Meerkat owns the canonical session and runtime lifecycle: input acceptance, turn execution, deduplication, retire/reset semantics, and durable recovery. Meta adds session-store adapters that support Meta's operational workflows, console views, and integration surfaces.
 
 <Note>
-This page describes MobKit-specific storage adapters. It does not replace Meerkat's own runtime-backed session durability model.
+This page describes Meta-specific storage adapters. It does not replace Meerkat's own runtime-backed session durability model.
 </Note>
 
-## MobKit storage backends
+## Meta storage backends
 
 | Backend | Use case | Description |
 |---------|----------|-------------|
@@ -25,15 +25,15 @@ by all session IDs written to that store. It is not the default canonical
 gateway session store.
 
 ```rust
-use meerkat_mobkit::JsonFileSessionStore;
+use meerkat_meta::JsonFileSessionStore;
 
-let store = JsonFileSessionStore::new("/var/mobkit/sessions.json");
+let store = JsonFileSessionStore::new("/var/meta/sessions.json");
 ```
 
 **Lock-based concurrency.** `append_rows` acquires one shared write lock,
 reads the existing array, appends the supplied rows, and rewrites the data
 file. The default lock path is `data_path.with_extension("lock")`
-(`/var/mobkit/sessions.lock` above); override it with `with_lock_path(...)`.
+(`/var/meta/sessions.lock` above); override it with `with_lock_path(...)`.
 The `JsonStoreLockRecord` contains `owner_pid` and `created_at_ms`.
 
 **Stale lock recovery.** During write-lock acquisition, a valid lock record
@@ -52,9 +52,9 @@ to a configured dataset and table. Supply `project_id` and an OAuth
 `access_token` from the host's configuration and credential handling:
 
 ```rust
-use meerkat_mobkit::BigQuerySessionStoreAdapter;
+use meerkat_meta::BigQuerySessionStoreAdapter;
 
-let store = BigQuerySessionStoreAdapter::new_native("mobkit_sessions", "session_rows")
+let store = BigQuerySessionStoreAdapter::new_native("meta_sessions", "session_rows")
     .with_project_id(project_id)
     .with_access_token(access_token);
 ```
@@ -127,7 +127,7 @@ adapter's insertion and materialization behavior.
 
 ## Materialization
 
-MobKit provides two materialization functions for session inspection:
+Meta provides two materialization functions for session inspection:
 
 - **`materialize_latest_session_rows`** -- returns the row with the greatest
   `updated_at_ms` per session; a later input row wins a timestamp tie
@@ -137,19 +137,19 @@ MobKit provides two materialization functions for session inspection:
 "Live" here means storage visibility, not that the session is currently
 active or executing. Use runtime/member inspection for execution liveness.
 
-These power MobKit's operational session inspection features and adapter-specific APIs.
+These power Meta's operational session inspection features and adapter-specific APIs.
 
 ## On-disk layout and durability
 
 On persistent gateway launches (`persistent_state`), session state lives in
-the state directory under names owned by `MobKitStorageLayout`, MobKit's
+the state directory under names owned by `MetaStorageLayout`, Meta's
 single path authority: the canonical session database is `sessions.sqlite3`
 (Meerkat's realm spelling), and the runtime store — session resume, archive,
 retire — is `runtime.sqlite`. Legacy spellings (`sessions.db`,
 `sessions.sqlite`) remain readable through canonical-name-first probing: a
 single existing spelling is used where it lies, but two spellings of the
 same store refuse startup (error `-32014`, "file-name twins") and point at
-`mobkit/storage/doctor` — renames happen only through the storage migrate
+`meta/storage/doctor` — renames happen only through the storage migrate
 verb.
 
 Durability is fail-closed: a runtime store that cannot open is a startup
@@ -157,13 +157,13 @@ error, never a silent in-memory fallback. Running sessions in-memory on a
 persistent launch requires the explicit declaration
 `runtime_options.runtime_store = {"storage": "memory"}`
 (`runtime_store.memory()` / `runtimeStore.memory()` in the SDKs), and the
-choice is visible in the storage census on `mobkit/status` →
+choice is visible in the storage census on `meta/status` →
 `storage.slots`. See
 [Configuration → Storage layout and durability](/reference/configuration#storage-layout-and-durability).
 
 ## Runtime correlation
 
-An accepted `mobkit/send_message` response includes a best-effort `session_id`
+An accepted `meta/send_message` response includes a best-effort `session_id`
 correlation value. Use a non-empty value for follow-up session inspection and
 debugging, but do not treat it as an atomic receipt identifying the exact
 accepting session across concurrent identity rebinding.
@@ -176,5 +176,5 @@ unknown: it is not a usable session ID and does not mean delivery failed.
 ## See also
 
 - [Configuration](/reference/configuration) -- session store settings, storage layout, durability classes
-- [RPC API](/api/rpc) -- `session_store.*` methods, `mobkit/storage/doctor`
+- [RPC API](/api/rpc) -- `session_store.*` methods, `meta/storage/doctor`
 - [BigQuery naming](/reference/decisions) -- naming validation rules

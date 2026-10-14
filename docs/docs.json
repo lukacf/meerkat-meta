@@ -1,7 +1,7 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "name": "MobKit",
-  "description": "Companion product and composition layer for the Meerkat multi-agent runtime",
+  "name": "Meerkat Meta",
+  "description": "Compose Core agents into applications with memory, routing, policy, approvals and a console.",
   "theme": "maple",
   "colors": {
     "primary": "#607F51",
@@ -14,7 +14,11 @@
   },
   "navbar": {
     "links": [
-      { "label": "GitHub", "href": "https://github.com/lukacf/meerkat-mobkit" }
+      {
+        "label": "Introduction",
+        "href": "https://docs.rkat.ai/introduction"
+      },
+      { "label": "GitHub", "href": "https://github.com/lukacf/meerkat-meta" }
     ]
   },
   "redirects": [
@@ -112,7 +116,7 @@
   },
   "footer": {
     "socials": {
-      "github": "https://github.com/lukacf/meerkat-mobkit"
+      "github": "https://github.com/lukacf/meerkat-meta"
     }
   }
 }

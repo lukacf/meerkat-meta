@@ -6,7 +6,7 @@ import pytest
 
 
 def make_mock_mob_handle(rpc_responses=None):
-    from meerkat_mobkit.runtime import MobHandle
+    from meerkat_meta.runtime import MobHandle
 
     runtime = MagicMock()
     calls = []
@@ -26,7 +26,7 @@ def make_mock_mob_handle(rpc_responses=None):
 @pytest.mark.asyncio
 async def test_query_mob_events_uses_correct_method_and_returns_typed():
     handle, calls = make_mock_mob_handle({
-        "mobkit/mob_events/query": {
+        "meta/mob_events/query": {
             "events": [
                 {
                     "event_id": "mob-evt-1",
@@ -43,10 +43,10 @@ async def test_query_mob_events_uses_correct_method_and_returns_typed():
             "next_after_seq": 1,
         }
     })
-    from meerkat_mobkit import EventQuery, MobStructuralEvent
+    from meerkat_meta import EventQuery, MobStructuralEvent
 
     result = await handle.query_mob_events(EventQuery(mob_id="mob-A", run_id="run-x"))
-    assert calls[0][0] == "mobkit/mob_events/query"
+    assert calls[0][0] == "meta/mob_events/query"
     assert calls[0][1]["mob_id"] == "mob-A"
     assert calls[0][1]["run_id"] == "run-x"
     assert len(result) == 1
@@ -59,7 +59,7 @@ async def test_query_mob_events_uses_correct_method_and_returns_typed():
 @pytest.mark.asyncio
 async def test_query_mob_events_accepts_dict_query():
     handle, calls = make_mock_mob_handle({
-        "mobkit/mob_events/query": {"events": [], "next_after_seq": None}
+        "meta/mob_events/query": {"events": [], "next_after_seq": None}
     })
     result = await handle.query_mob_events({"mob_id": "mob-A"})
     assert calls[0][1] == {"mob_id": "mob-A"}
@@ -69,7 +69,7 @@ async def test_query_mob_events_accepts_dict_query():
 @pytest.mark.asyncio
 async def test_query_mob_events_default_empty_params():
     handle, calls = make_mock_mob_handle({
-        "mobkit/mob_events/query": {"events": []}
+        "meta/mob_events/query": {"events": []}
     })
     await handle.query_mob_events()
     assert calls[0][1] == {}
@@ -78,7 +78,7 @@ async def test_query_mob_events_default_empty_params():
 @pytest.mark.asyncio
 async def test_subscribe_mob_events_yields_typed_envelopes():
     handle, _ = make_mock_mob_handle({
-        "mobkit/mob_events/subscribe": {
+        "meta/mob_events/subscribe": {
             "stream": "mob_events",
             "events": [
                 {
@@ -107,7 +107,7 @@ async def test_subscribe_mob_events_yields_typed_envelopes():
             "next_after_seq": 2,
         }
     })
-    from meerkat_mobkit import EventQuery, MobStructuralEvent
+    from meerkat_meta import EventQuery, MobStructuralEvent
 
     received = []
     async for event in handle.subscribe_mob_events(EventQuery(mob_id="mob-A")):
@@ -121,7 +121,7 @@ async def test_subscribe_mob_events_yields_typed_envelopes():
 
 @pytest.mark.asyncio
 async def test_event_query_to_dict_includes_new_filters():
-    from meerkat_mobkit import EventQuery
+    from meerkat_meta import EventQuery
 
     query = EventQuery(
         mob_id="mob-A",
@@ -139,7 +139,7 @@ async def test_event_query_to_dict_includes_new_filters():
 
 
 def test_mob_structural_event_from_dict_handles_optional_fields():
-    from meerkat_mobkit import MobStructuralEvent
+    from meerkat_meta import MobStructuralEvent
 
     event = MobStructuralEvent.from_dict({
         "event_id": "mob-evt-1",

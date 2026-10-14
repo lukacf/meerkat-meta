@@ -70,7 +70,7 @@
         "protocol": "JSON-RPC 2.0"
       },
       "methods": {
-        "mobkit/console/send": {
+        "meta/console/send": {
           "request": {
             "type_ref": "TYPE-022",
             "required_fields": [
@@ -95,7 +95,7 @@
             }
           ]
         },
-        "mobkit/console/query_timeline": {
+        "meta/console/query_timeline": {
           "request": {
             "type_ref": "TYPE-021"
           },

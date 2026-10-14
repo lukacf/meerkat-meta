@@ -13,8 +13,8 @@ import warnings
 
 import pytest
 
-from meerkat_mobkit.errors import CompletionCursorUnavailableError
-from meerkat_mobkit.identity_first_models import (
+from meerkat_meta.errors import CompletionCursorUnavailableError
+from meerkat_meta.identity_first_models import (
     CompletionCursor,
     CompletionProgress,
     DispatchInput,
@@ -22,13 +22,13 @@ from meerkat_mobkit.identity_first_models import (
     IdentityInspection,
     SendResult,
 )
-from meerkat_mobkit.runtime import IdentityAgentHandle, MobKitRuntime
+from meerkat_meta.runtime import IdentityAgentHandle, MetaRuntime
 
 # These scripts model a gateway that returns no turn ticket, so the
 # ``*_and_wait`` calls here run the explicit identity-wide fallback (the
 # ticketed path is covered in test_identity_first_turn_tickets.py).
 pytestmark = pytest.mark.filterwarnings(
-    "ignore::meerkat_mobkit.errors.TurnTrackingUnavailableWarning"
+    "ignore::meerkat_meta.errors.TurnTrackingUnavailableWarning"
 )
 
 
@@ -39,12 +39,12 @@ class ScriptedTransport:
     holding the last entry once exhausted, so a test can model "still
     running, still running, done" without racing a clock.
 
-    ``mobkit/wait_for_completion`` models the gateway's server-side wait: it
+    ``meta/wait_for_completion`` models the gateway's server-side wait: it
     walks the script until an entry satisfies the wait (see
     ``_serve_completion_wait``). After a wait that resolved,
-    ``mobkit/inspect_identity`` answers the entry the wait resolved on (the
+    ``meta/inspect_identity`` answers the entry the wait resolved on (the
     output a waiter reads once, at completion); otherwise it walks the script
-    itself, as does ``mobkit/completion_cursor``. ``legacy_gateway=True``
+    itself, as does ``meta/completion_cursor``. ``legacy_gateway=True``
     models a gateway predating the server-side wait and the cursor read: both
     are "method not found".
     """
@@ -70,11 +70,11 @@ class ScriptedTransport:
     def send_sync(self, request):
         self.calls.append(request)
         method = request.get("method")
-        if method == "mobkit/send":
+        if method == "meta/send":
             result = self._send
-        elif method == "mobkit/dispatch":
+        elif method == "meta/dispatch":
             result = self._dispatch
-        elif method == "mobkit/completion_cursor":
+        elif method == "meta/completion_cursor":
             if self._legacy_gateway:
                 return {
                     "jsonrpc": "2.0",
@@ -87,7 +87,7 @@ class ScriptedTransport:
                 "state": "active",
                 "completion_cursor": entry.get("completion_cursor"),
             }
-        elif method == "mobkit/wait_for_completion":
+        elif method == "meta/wait_for_completion":
             if self._legacy_gateway:
                 return {
                     "jsonrpc": "2.0",
@@ -96,7 +96,7 @@ class ScriptedTransport:
                 }
             result = _serve_completion_wait(self._walk, self._at_end, request.get("params") or {})
             self._pinned = result["outcome"] in ("completed", "incarnation_changed")
-        elif method == "mobkit/inspect_identity":
+        elif method == "meta/inspect_identity":
             if self._pinned:
                 index = min(self._index - 1, len(self._inspections) - 1)
                 result = self._inspections[index]
@@ -129,24 +129,24 @@ class ScriptedTransport:
     @property
     def inspect_calls(self) -> int:
         return sum(
-            1 for call in self.calls if call.get("method") == "mobkit/inspect_identity"
+            1 for call in self.calls if call.get("method") == "meta/inspect_identity"
         )
 
     @property
     def cursor_calls(self) -> int:
         return sum(
-            1 for call in self.calls if call.get("method") == "mobkit/completion_cursor"
+            1 for call in self.calls if call.get("method") == "meta/completion_cursor"
         )
 
     @property
     def wait_calls(self) -> int:
         return sum(
-            1 for call in self.calls if call.get("method") == "mobkit/wait_for_completion"
+            1 for call in self.calls if call.get("method") == "meta/wait_for_completion"
         )
 
 
 def _serve_completion_wait(walk, at_end, params: dict) -> dict:
-    """Model the gateway's server-side ``mobkit/wait_for_completion``: walk
+    """Model the gateway's server-side ``meta/wait_for_completion``: walk
     the scripted cursor states (each a later moment) until one satisfies the
     wait. A script that ends unsatisfied is the typed ``timed_out``."""
     after = params.get("after")
@@ -164,15 +164,15 @@ def _serve_completion_wait(walk, at_end, params: dict) -> dict:
             return {**base, "outcome": "timed_out"}
 
 
-def _make_runtime(transport) -> MobKitRuntime:
-    rt = MobKitRuntime.__new__(MobKitRuntime)
+def _make_runtime(transport) -> MetaRuntime:
+    rt = MetaRuntime.__new__(MetaRuntime)
     rt._config = None
     rt._transport = transport
     rt._running = True
     rt._rust_http_base = None
     rt._lifecycle_lock = asyncio.Lock()
     rt._shutdown_task = None
-    from meerkat_mobkit.agent_builder import CallbackDispatcher
+    from meerkat_meta.agent_builder import CallbackDispatcher
 
     rt._dispatcher = CallbackDispatcher()
     return rt
@@ -385,7 +385,7 @@ class TestWaitForCompletion:
 class TestServerSideWaits:
     """``inspect_identity`` reads the member session (an execution snapshot
     on its session task, which can hold a staged run on meerkat 0.8.45+). The
-    completion waits are one server-side ``mobkit/wait_for_completion`` each,
+    completion waits are one server-side ``meta/wait_for_completion`` each,
     which the gateway answers on the typed completion signal, and read the
     member once, at completion. Nothing polls."""
 
@@ -406,8 +406,8 @@ class TestServerSideWaits:
 
         assert output == "new"
         assert [call["method"] for call in transport.calls] == [
-            "mobkit/wait_for_completion",
-            "mobkit/inspect_identity",
+            "meta/wait_for_completion",
+            "meta/inspect_identity",
         ]
         wait = transport.calls[0]["params"]
         assert wait == {
@@ -506,13 +506,13 @@ class TestServerSideWaits:
 
     @pytest.mark.asyncio
     async def test_other_rpc_errors_are_not_mistaken_for_an_old_gateway(self):
-        from meerkat_mobkit.errors import RpcError
+        from meerkat_meta.errors import RpcError
 
         class FailingTransport(ScriptedTransport):
             def send_sync(self, request):
                 if request.get("method") in (
-                    "mobkit/completion_cursor",
-                    "mobkit/wait_for_completion",
+                    "meta/completion_cursor",
+                    "meta/wait_for_completion",
                 ):
                     self.calls.append(request)
                     return {
@@ -544,7 +544,7 @@ class TestTypedWaitOutcomes:
         original = transport.send_sync
 
         def send_sync(request):
-            if request.get("method") == "mobkit/wait_for_completion":
+            if request.get("method") == "meta/wait_for_completion":
                 transport.calls.append(request)
                 return {
                     "jsonrpc": "2.0",
@@ -565,7 +565,7 @@ class TestTypedWaitOutcomes:
         "outcome", ["run_failed", "broken", "retiring", "identity_gone", "shutting_down"]
     )
     async def test_wait_for_completion_raises_the_typed_outcome(self, outcome):
-        from meerkat_mobkit.errors import WaitEndedError
+        from meerkat_meta.errors import WaitEndedError
 
         transport = self._transport(outcome)
         handle = IdentityAgentHandle(_make_runtime(transport), "triage:main")
@@ -584,13 +584,13 @@ class TestTypedWaitOutcomes:
 
     @pytest.mark.asyncio
     async def test_wait_for_turn_raises_on_shutdown(self):
-        from meerkat_mobkit.errors import WaitEndedError
+        from meerkat_meta.errors import WaitEndedError
 
         transport = ScriptedTransport()
         original = transport.send_sync
 
         def send_sync(request):
-            if request.get("method") == "mobkit/wait_for_turn":
+            if request.get("method") == "meta/wait_for_turn":
                 transport.calls.append(request)
                 return {
                     "jsonrpc": "2.0",
@@ -616,7 +616,7 @@ class TestTypedWaitOutcomes:
         original = transport.send_sync
 
         def send_sync(request):
-            if request.get("method") == "mobkit/request_continuity_repair":
+            if request.get("method") == "meta/request_continuity_repair":
                 transport.calls.append(request)
                 return {
                     "jsonrpc": "2.0",
@@ -766,7 +766,7 @@ class TestDispatchTextConvenience:
 
         assert output == "ACK"
         dispatched = next(
-            call for call in transport.calls if call["method"] == "mobkit/dispatch"
+            call for call in transport.calls if call["method"] == "meta/dispatch"
         )
         assert dispatched["params"]["dispatch_input"]["origin"] == "connector"
         assert dispatched["params"]["dispatch_input"]["correlation_id"] == "event-1"
@@ -802,7 +802,7 @@ class TestPerIdentityCorrelation:
         polled = {
             call["params"]["identity"]
             for call in transport.calls
-            if call["method"] == "mobkit/wait_for_completion"
+            if call["method"] == "meta/wait_for_completion"
         }
         assert polled == {"triage:main"}, (
             f"the waiter must poll only its own identity, polled {polled}"

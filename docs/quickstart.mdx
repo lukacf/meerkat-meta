@@ -1,50 +1,50 @@
 ---
 title: "Quickstart"
-description: "Bootstrap a MobKit runtime with modules and a Meerkat mob. Single binary, operational from the first call."
+description: "Start a Meta application runtime with a matching gateway and SDK, then add agents and the console."
 icon: "rocket"
 ---
 
-## Install
+This guide starts with the Meta application runtime. If you only need to run an
+agent or a mob, [Core's quickstart](https://docs.rkat.ai/quickstart) is enough.
+[Component choice](https://docs.rkat.ai/ecosystem) explains the optional pieces.
 
-<Tabs>
-  <Tab title="Rust crate">
-    ```toml Cargo.toml
-    [dependencies]
-    meerkat-mobkit = "0.8.49"
-    tokio = { version = "1", features = ["full"] }
-    ```
-  </Tab>
-  <Tab title="TypeScript">
-    ```bash
-    npm install @rkat/mobkit-sdk
-    ```
-  </Tab>
-  <Tab title="Python">
-    ```bash
-    pip install meerkat-mobkit
-    ```
-  </Tab>
-</Tabs>
+## Prepare a matching SDK and gateway
 
 <Note>
-  The Python and TypeScript packages are clients and do not bundle a gateway
-  executable. Download `mobkit-rpc-gateway-<version>-<target>.tar.gz` for Unix
-  or macOS, or `mobkit-rpc-gateway-<version>-<target>.zip` for Windows, from
-  [GitHub Releases](https://github.com/lukacf/meerkat-mobkit/releases) and
-  extract its `rpc_gateway` binary (`rpc_gateway.exe` on Windows). Linux
-  archives published after v0.8.30 are built against glibc 2.31 (Debian 11)
-  and load on any distribution with glibc 2.31 or newer; the v0.8.30 Linux
-  archives were built on Ubuntu 24.04 and need glibc 2.39. For a source
-  build, run
-  `./scripts/repo-cargo build -p meerkat-mobkit --bin rpc_gateway --locked`,
-  then run `./scripts/repo-cargo --print-env`; the debug binary is at
-  `<CARGO_TARGET_DIR>/debug/rpc_gateway`. Pass the extracted or built path to
-  `.gateway(...)`.
+Python and TypeScript clients need a compatible gateway executable. The source
+path below builds the gateway and SDK from the same checkout. For a packaged
+installation, use the instructions and checksums supplied with your release.
 </Note>
+
+From this source checkout, with Rust 1.94+ and Python 3.10+:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e ./sdk/python
+./scripts/repo-cargo build -p meerkat-meta --bin rpc_gateway --locked
+./scripts/repo-cargo --print-env
+```
+
+The final command prints `CARGO_TARGET_DIR`. The built gateway is its
+`debug/rpc_gateway` executable. Pass that absolute path to `.gateway(...)` in
+the examples below. Run Python snippets in an async entry point; the
+[repository README](https://github.com/lukacf/meerkat-meta#start-a-local-runtime)
+has a complete `asyncio.run` example that reads status and shuts down cleanly.
+
+When native release archives are available, use `rpc_gateway` from the matching
+`meta-rpc-gateway-<version>-<target>` archive and install the matching
+`meerkat-meta` Python package or `@rkat/meta-sdk` TypeScript package. Follow that
+release's platform and checksum instructions. Rust hosts use the `meerkat-meta`
+crate directly:
+
+```toml
+[dependencies]
+meerkat-meta = "0.9.0"
+```
 
 ## Bootstrap a runtime
 
-The fastest way to get a running system is `start_mobkit_runtime`. It takes a
+The fastest way to get a running system is `start_meta_runtime`. It takes a
 module configuration, agent event stream, and a startup timeout. Host-supplied
 modules are optional, so this runnable baseline starts with an empty module and
 discovery list.
@@ -52,13 +52,13 @@ discovery list.
 <Tabs>
   <Tab title="Rust">
     ```rust
-    use meerkat_mobkit::{
-        start_mobkit_runtime, DiscoverySpec, EventEnvelope, MobKitConfig,
+    use meerkat_meta::{
+        start_meta_runtime, DiscoverySpec, EventEnvelope, MetaConfig,
         UnifiedEvent,
     };
     use std::time::Duration;
 
-    let config = MobKitConfig {
+    let config = MetaConfig {
         modules: vec![],
         discovery: DiscoverySpec {
             namespace: "my-app".to_string(),
@@ -70,7 +70,7 @@ discovery list.
     let agent_events: Vec<EventEnvelope<UnifiedEvent>> = vec![];
     let timeout = Duration::from_secs(30);
 
-    let mut runtime = start_mobkit_runtime(config, agent_events, timeout)?;
+    let mut runtime = start_meta_runtime(config, agent_events, timeout)?;
     println!("Loaded modules: {:?}", runtime.loaded_modules());
 
     for event in &runtime.merged_events {
@@ -80,11 +80,10 @@ discovery list.
   </Tab>
   <Tab title="TypeScript">
     ```typescript
-    import { MobKit } from "@rkat/mobkit-sdk";
+    import { Meta } from "@rkat/meta-sdk";
 
-    const rt = await MobKit.builder()
-      .mob("config/mob.toml")
-      .persistentState(".mobkit/state")
+    const rt = await Meta.builder()
+      .persistentState(".meta/state")
       .gateway("/path/to/rpc_gateway")
       .build();
 
@@ -95,9 +94,9 @@ discovery list.
   </Tab>
   <Tab title="Python">
     ```python
-    from meerkat_mobkit import MobKit
+    from meerkat_meta import Meta
 
-    async with await MobKit.builder().gateway("/path/to/rpc_gateway").build() as rt:
+    async with await Meta.builder().gateway("/path/to/rpc_gateway").build() as rt:
         handle = rt.mob_handle()
         status = await handle.status()
         print("Running:", status.running)
@@ -108,10 +107,10 @@ discovery list.
 
 ## Use the unified runtime
 
-For production deployments that combine a Meerkat mob with MobKit modules, use the `UnifiedRuntime` builder:
+For production deployments that combine a Meerkat mob with Meta modules, use the `UnifiedRuntime` builder:
 
 ```rust
-use meerkat_mobkit::UnifiedRuntime;
+use meerkat_meta::UnifiedRuntime;
 
 let runtime = UnifiedRuntime::builder()
     .mob_spec(mob_spec)
@@ -147,29 +146,31 @@ shut it down when finished, and a console host should retain that cleanup on exi
 
 The console shows the agent sidebar, conversation workspace, signals rail, topology, logs, and health overview. The bundled app seeds from REST, sends through JSON-RPC, and tails replayable timeline frames over SSE.
 
-## Identity-first (durable identity apps)
+## Keep agents available across sessions
 
-For apps with durable agent identities, use the identity-first API:
+For durable agent identities, use a roster and the identity-first API. The
+following sketch shows how a personal agent connects to a triage agent;
+`MOB_TOML` supplies their profiles as described in [roster](/concepts/roster):
 
 ```python
-from meerkat_mobkit import MobKit
-from meerkat_mobkit.identity_first_models import DurableAgentSpec, ManagedPeerEdge
+from meerkat_meta import Meta
+from meerkat_meta.identity_first_models import DurableAgentSpec, ManagedPeerEdge
 
 # Define your roster
 class MyRoster:
     async def roster(self, context):
         return [
-            DurableAgentSpec(identity="identity:alice", profile="personal", addressability="addressable"),
+            DurableAgentSpec(identity="identity:person", profile="personal", addressability="addressable"),
             DurableAgentSpec(identity="triage:main", profile="triage", addressability="internal_only"),
         ]
 
 class MyTopology:
     async def compute_edges(self, target_identities, context):
-        return [ManagedPeerEdge(a="identity:alice", b="triage:main")]
+        return [ManagedPeerEdge(a="identity:person", b="triage:main")]
 
 # Boot the runtime
 rt = await (
-    MobKit.builder()
+    Meta.builder()
     .mob_inline(MOB_TOML)
     .persistent_state("./state")
     .roster(MyRoster())
@@ -180,7 +181,7 @@ rt = await (
 
 # Use identity-scoped handles
 triage = rt.agent("triage:main")
-alice = rt.agent("identity:alice")
+personal = rt.agent("identity:person")
 
 # On turn_driven members (runtime_mode = "turn_driven"), send_and_wait /
 # dispatch_and_wait wait for the turn they started, by its turn ticket, and
@@ -194,7 +195,7 @@ output = await triage.dispatch_text_and_wait(
     "New event from connector", origin="connector", timeout=60,
 )
 
-await alice.send_and_wait("What's happening today?", timeout=60)
+await personal.send_and_wait("What's happening today?", timeout=60)
 ```
 
 <Note>

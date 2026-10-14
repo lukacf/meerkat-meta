@@ -2,8 +2,8 @@
 
 const assert = require("node:assert/strict");
 const {
-  MobkitAsyncClient,
-  MobkitRpcError,
+  MetaAsyncClient,
+  MetaRpcError,
   buildConsoleRoute,
   buildConsoleModulesRoute,
   buildConsoleExperienceRoute,
@@ -39,7 +39,7 @@ function assertDeepEqual(actual, expected, label) {
 }
 
 async function run() {
-  const gatewayBin = process.env.MOBKIT_RPC_GATEWAY_BIN;
+  const gatewayBin = process.env.META_RPC_GATEWAY_BIN;
 
   const asyncTransport = async (request) => {
     if (!request || request.jsonrpc !== "2.0" || typeof request.id !== "string") {
@@ -48,7 +48,7 @@ async function run() {
 
     const params = request.params || {};
 
-    if (request.method === "mobkit/status") {
+    if (request.method === "meta/status") {
       return {
         jsonrpc: "2.0",
         id: request.id,
@@ -60,25 +60,25 @@ async function run() {
       };
     }
 
-    if (request.method === "mobkit/capabilities") {
+    if (request.method === "meta/capabilities") {
       return {
         jsonrpc: "2.0",
         id: request.id,
         result: {
           contract_version: EXPECTED_CONTRACT_VERSION,
           methods: [
-            "mobkit/status",
-            "mobkit/capabilities",
-            "mobkit/reconcile",
-            "mobkit/spawn_member",
-            "mobkit/events/subscribe",
+            "meta/status",
+            "meta/capabilities",
+            "meta/reconcile",
+            "meta/spawn_member",
+            "meta/events/subscribe",
           ],
           loaded_modules: ["routing", "delivery"],
         },
       };
     }
 
-    if (request.method === "mobkit/reconcile") {
+    if (request.method === "meta/reconcile") {
       const modules = Array.isArray(params.modules) ? params.modules.filter((item) => typeof item === "string") : [];
       return {
         jsonrpc: "2.0",
@@ -91,7 +91,7 @@ async function run() {
       };
     }
 
-    if (request.method === "mobkit/spawn_member") {
+    if (request.method === "meta/spawn_member") {
       const moduleId = typeof params.module_id === "string" ? params.module_id.trim() : "";
       if (!moduleId) {
         return {
@@ -114,7 +114,7 @@ async function run() {
       };
     }
 
-    if (request.method === "mobkit/events/subscribe") {
+    if (request.method === "meta/events/subscribe") {
       const scope = params.scope === "agent" || params.scope === "interaction" ? params.scope : "mob";
       if (scope === "agent" && typeof params.agent_id !== "string") {
         return {
@@ -167,7 +167,7 @@ async function run() {
     };
   };
 
-  const client = new MobkitAsyncClient(asyncTransport);
+  const client = new MetaAsyncClient(asyncTransport);
 
   await check("async client status typed result", async () => {
     const status = await client.status("ts-prod-status");
@@ -180,10 +180,10 @@ async function run() {
 
   await check("async client capabilities typed result", async () => {
     const caps = await client.capabilities("ts-prod-caps");
-    if (!caps.methods.includes("mobkit/events/subscribe")) {
+    if (!caps.methods.includes("meta/events/subscribe")) {
       throw new Error(`missing events subscribe capability: ${JSON.stringify(caps.methods)}`);
     }
-    if (!caps.methods.includes("mobkit/reconcile") || !caps.methods.includes("mobkit/spawn_member")) {
+    if (!caps.methods.includes("meta/reconcile") || !caps.methods.includes("meta/spawn_member")) {
       throw new Error(`missing key methods: ${JSON.stringify(caps.methods)}`);
     }
   });
@@ -225,10 +225,10 @@ async function run() {
     } catch (error) {
       observed = error;
     }
-    if (!(observed instanceof MobkitRpcError)) {
-      throw new Error(`expected MobkitRpcError, got ${String(observed)}`);
+    if (!(observed instanceof MetaRpcError)) {
+      throw new Error(`expected MetaRpcError, got ${String(observed)}`);
     }
-    if (observed.code !== -32602 || observed.method !== "mobkit/spawn_member") {
+    if (observed.code !== -32602 || observed.method !== "meta/spawn_member") {
       throw new Error(`unexpected rpc error metadata: ${JSON.stringify({
         code: observed.code,
         method: observed.method,
@@ -239,10 +239,10 @@ async function run() {
 
   await check("async factory fromGatewayBin status success", async () => {
     if (!gatewayBin) {
-      throw new Error("MOBKIT_RPC_GATEWAY_BIN must be set for fromGatewayBin checks");
+      throw new Error("META_RPC_GATEWAY_BIN must be set for fromGatewayBin checks");
     }
 
-    const factoryClient = MobkitAsyncClient.fromGatewayBin(gatewayBin);
+    const factoryClient = MetaAsyncClient.fromGatewayBin(gatewayBin);
     const status = await factoryClient.status("ts-prod-factory-gateway-status");
     assertDeepEqual(status, {
       contract_version: EXPECTED_CONTRACT_VERSION,
@@ -252,7 +252,7 @@ async function run() {
   });
 
   await check("async factory fromGatewayBin transport errors surface", async () => {
-    const factoryClient = MobkitAsyncClient.fromGatewayBin("/__mobkit__/missing/sdk-test-gateway");
+    const factoryClient = MetaAsyncClient.fromGatewayBin("/__meta__/missing/sdk-test-gateway");
     let observed = null;
     try {
       await factoryClient.status("ts-prod-factory-gateway-missing");
@@ -270,7 +270,7 @@ async function run() {
 
   await check("async factory fromHttp status success", async () => {
     let observedCall = null;
-    const factoryClient = MobkitAsyncClient.fromHttp("https://mobkit.local/rpc", {
+    const factoryClient = MetaAsyncClient.fromHttp("https://meta.local/rpc", {
       headers: { "x-sdk-productization": "true" },
       fetchImpl: async (url, init = {}) => {
         observedCall = { url, init };
@@ -298,7 +298,7 @@ async function run() {
       loaded_modules: ["routing", "delivery"],
     }, "unexpected fromHttp status");
 
-    if (!observedCall || observedCall.url !== "https://mobkit.local/rpc") {
+    if (!observedCall || observedCall.url !== "https://meta.local/rpc") {
       throw new Error(`unexpected fromHttp endpoint: ${JSON.stringify(observedCall)}`);
     }
     if (!observedCall.init || observedCall.init.method !== "POST") {
@@ -309,13 +309,13 @@ async function run() {
       throw new Error(`missing custom header in fromHttp request: ${JSON.stringify(headers)}`);
     }
     const payload = JSON.parse(String(observedCall.init.body || "{}"));
-    if (payload.method !== "mobkit/status") {
+    if (payload.method !== "meta/status") {
       throw new Error(`unexpected fromHttp rpc payload: ${JSON.stringify(payload)}`);
     }
   });
 
   await check("async factory fromHttp transport errors surface", async () => {
-    const factoryClient = MobkitAsyncClient.fromHttp("https://mobkit.local/rpc", {
+    const factoryClient = MetaAsyncClient.fromHttp("https://meta.local/rpc", {
       fetchImpl: async () => ({
         ok: false,
         status: 503,

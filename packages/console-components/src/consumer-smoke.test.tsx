@@ -43,7 +43,7 @@ function buildConversationViewState(): ConversationViewState {
       kind: "message",
       variant: "plain",
       identity: { id: "user", label: "You", role: "user", presentation: "user" },
-      text: "Open the shared console in MobKit.",
+      text: "Open the shared console in Meta.",
     },
     {
       id: "assistant-1",
@@ -99,8 +99,8 @@ function buildEmptyState(): ConversationEmptyStateSpec {
     suggestions: [
       {
         id: "prototype-vendor",
-        label: "Prototype the MobKit vendor pass.",
-        value: "Prototype the MobKit vendor pass.",
+        label: "Prototype the Meta vendor pass.",
+        value: "Prototype the Meta vendor pass.",
         iconName: "i-pencil",
       },
     ],
@@ -220,7 +220,7 @@ describe("shared console public API", () => {
     expect(screen.getByText("The dock, sidebar, and transcript are ready to vendor.")).toBeInTheDocument();
     expect(screen.getByText("Transcript-only mounting works through the root exports too.")).toBeInTheDocument();
     expect(screen.getByText("Ready for the next target")).toBeInTheDocument();
-    expect(screen.getByText("Prototype the MobKit vendor pass.")).toBeInTheDocument();
+    expect(screen.getByText("Prototype the Meta vendor pass.")).toBeInTheDocument();
   });
 });
 

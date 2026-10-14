@@ -1,40 +1,40 @@
 ---
 title: "Architecture"
-description: "MobKit ownership boundaries, gateway profiles, composition, storage projections, module routing, console surfaces, and security."
+description: "Meta ownership boundaries, gateway profiles, composition, storage projections, module routing, console surfaces, and security."
 icon: "layer-group"
 ---
 
-MobKit is a Rust composition crate plus gateway binaries, SDKs, examples, a
+Meta is a Rust composition crate plus gateway binaries, SDKs, examples, a
 Flow Editor, and a React console. It is a companion to Meerkat, not a second
 multi-agent runtime.
 
 Meerkat owns individual-agent execution and multi-agent mob orchestration:
 session construction, prompt and tool execution, stable `AgentIdentity`, mob
 membership, spawn, lifecycle, wiring, flows, comms, coordination, and machine
-authority. MobKit owns application-facing composition around that substrate:
+authority. Meta owns application-facing composition around that substrate:
 startup, host desired-state providers, module routing and delivery, operational
-policy, MobKit persistence projections, gateway and SDK transport, console
+policy, Meta persistence projections, gateway and SDK transport, console
 timeline projection, and operator UX.
 
 ## Design principles
 
-1. **One upstream runtime authority** - MobKit invokes Meerkat mob operations;
+1. **One upstream runtime authority** - Meta invokes Meerkat mob operations;
    it does not become a second authority for membership, lifecycle, wiring, or
    session truth.
 2. **Data at process boundaries** - module and gateway communication uses
    typed serialized messages. In-process Rust hosts may use typed traits and
    builders without inventing a second wire contract.
 3. **Projection, not authority** - console rows, timelines, identity views,
-   and MobKit continuity records reflect runtime and host desired state. Their
+   and Meta continuity records reflect runtime and host desired state. Their
    persistence does not turn them into a shadow `MobMachine`.
 4. **Deliberate gateway profiles** - Rust library embedding, SDK-facing
-   `rpc_gateway`, and console/admin `mobkit_gateway` share a composition root
+   `rpc_gateway`, and console/admin `meta_gateway` share a composition root
    but intentionally expose different authorities.
 5. **Fail closed** - persistent storage slots, module capabilities, auth,
    access control, and signed remote contacts refuse missing authority instead
    of silently weakening the deployment.
 
-Applications decide desired identities, topology, and domain policy. MobKit
+Applications decide desired identities, topology, and domain policy. Meta
 adapts that intent into Meerkat operations and packages the resulting truth
 for SDK and console consumers. Meerkat remains the authority that admits and
 executes mob transitions.
@@ -48,16 +48,16 @@ graph TD
     OPERATOR["Operator browser"]
     LIB["Rust library host"]
     RPCG["rpc_gateway<br/>SDK stdio + HTTP in persistent mode"]
-    HTTPG["mobkit_gateway<br/>console/admin HTTP"]
-    UNIFIED["MobKit composition<br/>startup, adapters, policy, projections"]
+    HTTPG["meta_gateway<br/>console/admin HTTP"]
+    UNIFIED["Meta composition<br/>startup, adapters, policy, projections"]
     MOB["Meerkat mob runtime<br/>identity, spawn, lifecycle, wiring,<br/>flows, comms, coordination"]
     SESSION["Meerkat session runtime<br/>agent loop, prompts, tools, durability"]
-    MODULES["MobKit module runtime<br/>supervision, routing, delivery, events"]
-    POLICY["MobKit policy<br/>auth, ABAC, topology controls"]
-    STORES["MobKit storage provider<br/>continuity, leases, timeline, metadata,<br/>blobs, schedule, agent memory"]
+    MODULES["Meta module runtime<br/>supervision, routing, delivery, events"]
+    POLICY["Meta policy<br/>auth, ABAC, topology controls"]
+    STORES["Meta storage provider<br/>continuity, leases, timeline, metadata,<br/>blobs, schedule, agent memory"]
     CONSOLE["Console and Flow Editor<br/>REST / JSON-RPC / SSE projections"]
-    SCHEDULING["MobKit scheduling runtime"]
-    GATING["MobKit gating runtime"]
+    SCHEDULING["Meta scheduling runtime"]
+    GATING["Meta gating runtime"]
 
     subgraph subsystems["Application-supplied MCP modules"]
         ROUTER["Router"]
@@ -94,18 +94,18 @@ graph TD
 |---|---|---|
 | Rust library host | `UnifiedRuntimeBuilder` and direct typed adapters | The application chooses the exact providers, stores, and HTTP bind address. |
 | `rpc_gateway` | SDK-facing JSON-RPC over stdio; persistent launches also serve HTTP and the callback plane | SDK init options live mostly under strict `runtime_options`; this profile owns callback/provider bridges and SQLite console-log persistence. |
-| `mobkit_gateway` | Console/admin HTTP after a one-request init handshake | It does not accept post-init SDK JSON-RPC or expose the SDK callback plane; its console timeline is in memory. |
+| `meta_gateway` | Console/admin HTTP after a one-request init handshake | It does not accept post-init SDK JSON-RPC or expose the SDK callback plane; its console timeline is in memory. |
 
 The binaries can both show a console, but that does not make them substitutes.
 An SDK host launches `rpc_gateway`. A console/admin deployment that does not
-need the SDK callback plane uses `mobkit_gateway`.
+need the SDK callback plane uses `meta_gateway`.
 
 ## Crate structure
 
 The core Rust crate is organized around explicit boundary modules:
 
 ```
-crates/meerkat-mobkit/src/
+crates/meerkat-meta/src/
 ├── lib.rs                    # Public API exports and module map
 ├── access/                   # Optional deny-by-default console ABAC
 ├── auth/                     # JWT/OIDC validation and signed peer keys
@@ -126,8 +126,8 @@ crates/meerkat-mobkit/src/
 ├── memory/                   # Memory records, guards, engines, SQLite store
 ├── mob_handle_runtime.rs     # Adapter over the Meerkat mob runtime
 ├── schedule_wiring.rs        # Schedule service and host-target composition
-├── storage_layout.rs         # Single MobKit path authority
-├── storage_provider.rs       # Declared realm-wide MobKit store set
+├── storage_layout.rs         # Single Meta path authority
+├── storage_provider.rs       # Declared realm-wide Meta store set
 ├── storage_health.rs         # Fail-closed durability resolution
 ├── storage_doctor.rs         # Read-only live-safe diagnosis
 ├── storage_migrate.rs        # Offline migrate and prune operations
@@ -138,7 +138,7 @@ crates/meerkat-mobkit/src/
 ├── rpc.rs                    # JSON-RPC handler + method groups
 ├── runtime/                  # Module routing, delivery, policy, stores
 ├── unified_runtime/          # Composition, events, HTTP, edge reconcile
-├── types.rs                  # MobKit module and transport structures
+├── types.rs                  # Meta module and transport structures
 └── mocks.rs                  # Test utilities
 ```
 
@@ -171,10 +171,10 @@ Gating evaluation is an in-process runtime authority, not an MCP module tool.
 The identity-scoped agent-memory APIs are also separate from this three-tool
 module boundary.
 
-This module-facing memory path is separate from MobKit's identity-scoped agent
+This module-facing memory path is separate from Meta's identity-scoped agent
 memory record layer under `memory/`. The bundled hot record store is SQLite
 with deterministic recall and staged write validation. An external memory hub is an optional
-deeper backend, not the definition of all MobKit memory.
+deeper backend, not the definition of all Meta memory.
 
 ### Subprocess path (custom modules)
 
@@ -194,7 +194,7 @@ The event transport merges two event sources:
 ```mermaid
 graph LR
     AGENT["Agent Events<br/>(from Meerkat)"] --> MERGE["Event Transport<br/>(timestamp merge)"]
-    MODULE["Module Events<br/>(from MobKit)"] --> MERGE
+    MODULE["Module Events<br/>(from Meta)"] --> MERGE
     MERGE --> UNIFIED["Unified Stream<br/>(merged_events)"]
 ```
 
@@ -211,7 +211,7 @@ probes:
 | Generic subprocess | The process emits one valid normalized event before the startup timeout; the child remains tracked by the runtime. | `Starting` -> `Failed`; exhaustion ends at `Stopped` and emits a `supervisor.warning`. | `OnFailure` retries failed starts within its configured budget. `Always` can deliberately restart successful starts within its separate budget. |
 | MCP module | A one-shot MCP tool probe succeeds and the runtime emits `mcp.ready`. | `Starting` -> `Failed` -> `Stopped`, with a `supervisor.warning`. | MCP startup does not enter the generic subprocess restart loop. |
 
-These transitions describe startup supervision, not a claim that MobKit owns
+These transitions describe startup supervision, not a claim that Meta owns
 Meerkat member lifecycle. Mob member state changes still go through the
 Meerkat mob runtime.
 
@@ -226,12 +226,12 @@ The runtime merges several Axum route families into one HTTP server:
 | Console RPC | `/console/rpc`, `/console/rpc/multipart` | Console commands, identity inspection, send, blob upload |
 | Console SSE | `/console/timeline/stream`, `/console/identity/{identity}/stream` | Timeline replay and live continuation |
 | Blob serving | `/blobs/{blob_id}` | Console image/blob content |
-| Runtime SSE | `/agents/{agent_id}/events`, `/mob/events`, `/mobkit/mob_events/stream` | Agent, merged mob, and structural mob observation |
+| Runtime SSE | `/agents/{agent_id}/events`, `/mob/events`, `/meta/mob_events/stream` | Agent, merged mob, and structural mob observation |
 | Flow Editor | `/flow-editor`, `/flow-editor/assets/*`, `/flow-editor/rpc` | Mobpack authoring and validation UI plus JSON-RPC |
 
 Routers are merged into a single `axum::Router` served on the configured port.
 The runtime-mounted Flow Editor shares console authentication and applies its
-own author/deploy access requirements. The standalone `mobkit_flow_editor`
+own author/deploy access requirements. The standalone `meta_flow_editor`
 binary has no access controller, while the dispatcher still keeps host deploy
 sinks fail-closed unless explicitly granted.
 
@@ -256,32 +256,32 @@ sinks fail-closed unless explicitly granted.
 | `meerkat-core` | Agent events, session and interaction types, shared contracts |
 | `meerkat-mob` | Authoritative mob identity, member specs, lifecycle, wiring, flows, and events |
 | `meerkat-comms` | Signed peer transport used by cross-mob and gateway wiring |
-| `meerkat-contracts` | Stable wire projections for MobKit gateway and SDK boundaries |
+| `meerkat-contracts` | Stable wire projections for Meta gateway and SDK boundaries |
 | `meerkat-mcp` | MCP protocol and module boundary types |
 | `meerkat-client` | LLM client construction delegated into mob bootstrap |
 | `meerkat-runtime` / `meerkat-session` / `meerkat-store` / `meerkat-sqlite` | Runtime, session, store, fence, and persistence adapters |
-| `meerkat-schedule` | Durable schedule service composed into MobKit operator surfaces |
+| `meerkat-schedule` | Durable schedule service composed into Meta operator surfaces |
 
 ## Storage and persistence projections
 
-`MobKitStorageLayout` is the single MobKit path authority. A
-`MobKitStorageProvider` wraps or accompanies Meerkat's realm storage provider
-and opens the realm-wide MobKit stores for continuity, lease fencing, event
+`MetaStorageLayout` is the single Meta path authority. A
+`MetaStorageProvider` wraps or accompanies Meerkat's realm storage provider
+and opens the realm-wide Meta stores for continuity, lease fencing, event
 log, console timeline, metadata, blobs, agent memory, and schedule state.
-Those stores are MobKit-owned projections and operational records; canonical
+Those stores are Meta-owned projections and operational records; canonical
 Meerkat session and mob state stay upstream.
 
 Every persistent slot carries a `DurabilityDeclaration`. Startup must resolve
 it to a durable backend, an explicitly declared ephemeral choice, or an error.
 There is no silent in-memory fallback for persistent mode. Use the live-safe
-`mobkit/storage/doctor` operation for diagnosis. Mutating migration and pruning
-run offline through `mobkit_gateway storage-migrate` and `storage-prune`.
+`meta/storage/doctor` operation for diagnosis. Mutating migration and pruning
+run offline through `meta_gateway storage-migrate` and `storage-prune`.
 
 ## Security model
 
 1. **Upstream machine authority** - Meerkat admits mob identity, lifecycle,
-   wiring, and session transitions. MobKit policy cannot bypass those machines.
-2. **Trusted modules** - only modules declared in trusted MobKit configuration
+   wiring, and session transitions. Meta policy cannot bypass those machines.
+2. **Trusted modules** - only modules declared in trusted Meta configuration
    are loaded.
 3. **Authentication** - JWT/OIDC validation and allowlists decide who reaches
    protected console surfaces.

@@ -8,6 +8,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import type { GatingDecisionResult } from "../dist/index.js";
 
 import {
   MEMBER_STATE_ACTIVE,
@@ -38,6 +39,7 @@ import {
   parseGatingEvaluateResult,
   parseGatingDecisionResult,
   parseGatingAuditEntry,
+  parseGatingOrigin,
   parseGatingPendingEntry,
   parseRediscoverReport,
   parseReconcileEdgesReport,
@@ -918,15 +920,88 @@ describe("parseGatingEvaluateResult", () => {
 // ---------------------------------------------------------------------------
 
 describe("parseGatingDecisionResult", () => {
-  it("parses valid wire-format object", () => {
-    const result = parseGatingDecisionResult({
-      pending_id: "pend-1",
-      action_id: "act-1",
-      decision: "approved",
+  for (const [decision, outcome, nextPendingId] of [
+    ["approve", "allowed", null],
+    ["reject", "safe_draft", null],
+    ["escalate", "pending_approval", "pend-2"],
+  ] as const) {
+    it(`preserves the native ${decision} result`, () => {
+      const result = parseGatingDecisionResult({
+        pending_id: "pend-1",
+        action_id: "act-1",
+        decision,
+        approver_id: "reviewer-1",
+        outcome,
+        decided_at_ms: 1700000000000,
+        reason: "Reviewed action",
+        next_pending_id: nextPendingId,
+      });
+      assert.deepEqual(result, {
+        pendingId: "pend-1",
+        actionId: "act-1",
+        decision,
+        approverId: "reviewer-1",
+        outcome,
+        decidedAtMs: 1700000000000,
+        reason: "Reviewed action",
+        nextPendingId,
+      });
     });
-    assert.equal(result.pendingId, "pend-1");
-    assert.equal(result.actionId, "act-1");
-    assert.equal(result.decision, "approved");
+  }
+
+  it("accepts legacy three-field construction and payloads", () => {
+    const legacy: GatingDecisionResult = {
+      pendingId: "pend-1",
+      actionId: "act-1",
+      decision: "approve",
+    };
+    assert.deepEqual(
+      parseGatingDecisionResult({
+        pending_id: legacy.pendingId,
+        action_id: legacy.actionId,
+        decision: legacy.decision,
+      }),
+      {
+        ...legacy,
+        approverId: null,
+        outcome: null,
+        decidedAtMs: null,
+        reason: null,
+        nextPendingId: null,
+      },
+    );
+  });
+
+  it("preserves unknown outcome strings without inferring allowance", () => {
+    const result = parseGatingDecisionResult({
+      decision: "approve",
+      outcome: "future_outcome",
+      reason: "",
+      decided_at_ms: 0,
+    });
+    assert.equal(result.outcome, "future_outcome");
+    assert.equal(result.reason, "");
+    assert.equal(result.decidedAtMs, 0);
+  });
+
+  it("keeps null or malformed optional fields unknown", () => {
+    for (const value of [null, false, 42, {}, []]) {
+      const result = parseGatingDecisionResult({
+        approver_id: value,
+        outcome: value,
+        reason: value,
+        next_pending_id: value,
+      });
+      assert.equal(result.approverId, null);
+      assert.equal(result.outcome, null);
+      assert.equal(result.reason, null);
+      assert.equal(result.nextPendingId, null);
+    }
+    for (const decided_at_ms of [
+      null, false, "123", -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1,
+    ]) {
+      assert.equal(parseGatingDecisionResult({ decided_at_ms }).decidedAtMs, null);
+    }
   });
 
   it("defaults missing fields", () => {
@@ -934,6 +1009,11 @@ describe("parseGatingDecisionResult", () => {
     assert.equal(result.pendingId, "");
     assert.equal(result.actionId, "");
     assert.equal(result.decision, "");
+    assert.equal(result.approverId, null);
+    assert.equal(result.outcome, null);
+    assert.equal(result.decidedAtMs, null);
+    assert.equal(result.reason, null);
+    assert.equal(result.nextPendingId, null);
   });
 });
 
@@ -982,6 +1062,85 @@ describe("parseGatingAuditEntry", () => {
     assert.equal(result.actorId, "");
     assert.equal(result.riskTier, null);
     assert.equal(result.outcome, "");
+    assert.equal(result.pendingId, null);
+    assert.deepEqual(result.detail, {});
+  });
+
+  it("preserves the pending id and the owner's detail", () => {
+    const detail = {
+      approver_id: "human:reviewer",
+      decision: "approve",
+      next_pending_id: null,
+      origin: { identity: "agent:writer" },
+    };
+    const result = parseGatingAuditEntry({
+      audit_id: "aud-2",
+      timestamp_ms: 2000,
+      event_type: "approval_decided",
+      action_id: "act-1",
+      pending_id: "pend-1",
+      actor_id: "agent:writer",
+      risk_tier: "r3",
+      outcome: "allowed",
+      detail,
+    });
+    assert.equal(result.pendingId, "pend-1");
+    assert.deepEqual(result.detail, detail);
+    assert.notEqual(result.detail, detail);
+  });
+
+  it("keeps malformed pending ids and details unknown", () => {
+    for (const pending_id of [null, "", " ", 7, {}]) {
+      for (const detail of [null, "text", [1], 3]) {
+        const result = parseGatingAuditEntry({ pending_id, detail });
+        assert.equal(result.pendingId, null);
+        assert.deepEqual(result.detail, {});
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseGatingOrigin
+// ---------------------------------------------------------------------------
+
+describe("parseGatingOrigin", () => {
+  it("preserves the recorded origin", () => {
+    assert.deepEqual(
+      parseGatingOrigin({
+        identity: "person:alice",
+        conversation_id: "conv-1",
+        interaction_id: "int-1",
+      }),
+      { identity: "person:alice", conversationId: "conv-1", interactionId: "int-1" },
+    );
+    assert.deepEqual(parseGatingOrigin({ identity: "person:alice" }), {
+      identity: "person:alice",
+      conversationId: null,
+      interactionId: null,
+    });
+  });
+
+  it("returns null for an absent or malformed origin", () => {
+    for (const value of [
+      undefined, null, "person:alice", [], {}, { identity: "" }, { identity: 3 },
+      { conversation_id: "conv-1" },
+    ]) {
+      assert.equal(parseGatingOrigin(value), null);
+    }
+  });
+
+  it("is carried on pending entries", () => {
+    const pending = parseGatingPendingEntry({
+      pending_id: "p1", action_id: "a1", action: "publish", actor_id: "agent:writer",
+      origin: { identity: "person:alice", conversation_id: "conv-1" },
+    });
+    assert.deepEqual(pending.origin, {
+      identity: "person:alice",
+      conversationId: "conv-1",
+      interactionId: null,
+    });
+    assert.equal(parseGatingPendingEntry({ pending_id: "p1" }).origin, null);
   });
 });
 
@@ -990,6 +1149,43 @@ describe("parseGatingAuditEntry", () => {
 // ---------------------------------------------------------------------------
 
 describe("parseGatingPendingEntry", () => {
+  it("preserves the owner's requested approver, notification references and deadline", () => {
+    const result = parseGatingPendingEntry({
+      pending_id: "p1", action_id: "a1", action: "publish", actor_id: "agent:writer",
+      risk_tier: "r3", created_at_ms: 1700000000000, deadline_at_ms: 1700000060000,
+      requested_approver: "human:reviewer", approval_recipient: "review-queue",
+      approval_channel: "notification", approval_route_id: "route:1",
+      approval_delivery_id: "delivery:1", rationale: "Requested publication",
+    });
+    assert.equal(result.actorId, "agent:writer");
+    assert.equal(result.requestedApprover, "human:reviewer");
+    assert.equal(result.approvalRecipient, "review-queue");
+    assert.equal(result.approvalChannel, "notification");
+    assert.equal(result.approvalRouteId, "route:1");
+    assert.equal(result.approvalDeliveryId, "delivery:1");
+    assert.equal(result.deadlineAtMs, 1700000060000);
+    assert.equal(result.rationale, "Requested publication");
+  });
+
+  it("keeps absent or malformed optional routing facts unknown", () => {
+    for (const raw of [{}, {
+      requested_approver: 7, approval_recipient: {}, approval_channel: " ",
+      approval_route_id: false, approval_delivery_id: [], deadline_at_ms: "60000", rationale: false,
+    }]) {
+      const result = parseGatingPendingEntry(raw);
+      assert.equal(result.requestedApprover, null);
+      assert.equal(result.approvalRecipient, null);
+      assert.equal(result.approvalChannel, null);
+      assert.equal(result.approvalRouteId, null);
+      assert.equal(result.approvalDeliveryId, null);
+      assert.equal(result.deadlineAtMs, null);
+      assert.equal(result.rationale, null);
+    }
+    for (const deadline_at_ms of [-1, NaN, Infinity, true, 1.5]) {
+      assert.equal(parseGatingPendingEntry({ deadline_at_ms }).deadlineAtMs, null);
+    }
+  });
+
   it("parses valid wire-format object", () => {
     const result = parseGatingPendingEntry({
       pending_id: "pend-1",
@@ -1506,7 +1702,7 @@ describe("parseErrorEvent", () => {
   });
 
   // The full set is gated against the Rust `ErrorEvent` enum by
-  // crates/meerkat-mobkit/tests/sdk_error_category_parity.rs; this asserts the exact
+  // crates/meerkat-meta/tests/sdk_error_category_parity.rs; this asserts the exact
   // tags so a rename here cannot pass by editing both sides of that gate.
   it("ErrorCategory constants match expected values", () => {
     assert.deepEqual({ ...ErrorCategory }, {
@@ -1578,11 +1774,11 @@ describe("eventQueryToDict", () => {
 // ---------------------------------------------------------------------------
 
 describe("mobpack editor catalog parsers", () => {
-  it("parses split MobKit catalog payloads", () => {
+  it("parses split Meta catalog payloads", () => {
     const tools = parseMobpackToolsCatalogResult({
       schema_version: "mobpack.editor.v1",
       runtime_backed: false,
-      source: "mobkit/tool-config",
+      source: "meta/tool-config",
       authoring_provider: { id: "standalone_authoring", runtime_binding: "unbound" },
       runtime_unavailable_reason: "standalone",
       tool_catalog: [{ id: "shell", tag_class: "ops" }],
@@ -1596,17 +1792,17 @@ describe("mobpack editor catalog parsers", () => {
     const skills = parseMobpackSkillsCatalogResult({
       schema_version: "mobpack.editor.v1",
       runtime_backed: false,
-      source: "mobkit/authoring-skill-realms",
+      source: "meta/authoring-skill-realms",
       authoring_provider: { id: "standalone_authoring" },
-      skill_realms: [{ id: "mobkit/authoring", skills: [] }],
+      skill_realms: [{ id: "meta/authoring", skills: [] }],
     });
     assert.equal(skills.authoringProvider.id, "standalone_authoring");
-    assert.deepEqual(skills.skillRealms, [{ id: "mobkit/authoring", skills: [] }]);
+    assert.deepEqual(skills.skillRealms, [{ id: "meta/authoring", skills: [] }]);
 
     const definitions = parseMobpackAgentDefinitionsResult({
       schema_version: "mobpack.editor.v1",
       runtime_backed: false,
-      source: "mobkit/authoring-agent-definitions",
+      source: "meta/authoring-agent-definitions",
       authoring_provider: { id: "standalone_authoring" },
       agent_definitions: [{ id: "authoring:reviewer", role: "reviewer" }],
     });
@@ -1617,7 +1813,7 @@ describe("mobpack editor catalog parsers", () => {
 
     const templates = parseMobpackTemplatesResult({
       schema_version: "mobpack.editor.v1",
-      source: "mobkit/mobpack-templates",
+      source: "meta/mobpack-templates",
       authoring_provider: { id: "standalone_authoring" },
       runtime_unavailable_reason: "standalone",
       blank_mobpack: { document: { members: [] } },
@@ -1632,16 +1828,16 @@ describe("mobpack editor catalog parsers", () => {
     assert.deepEqual(templates.sampleAgentDefinitions, [{ id: "sample:reviewer" }]);
   });
 
-  it("parses composed MobKit catalog snapshots", () => {
+  it("parses composed Meta catalog snapshots", () => {
     const result = parseMobpackCatalogsResult({
       schema_version: "mobpack.editor.v1",
       runtime_backed: false,
       authoring_provider: { id: "standalone_authoring", runtime_binding: "unbound" },
       runtime_unavailable_reason: "standalone",
-      sources: { tools: "mobkit/tools/catalog" },
+      sources: { tools: "meta/tools/catalog" },
       templates: { blank_mobpack: {} },
       tool_catalog: [{ id: "shell" }],
-      skill_realms: [{ id: "mobkit/authoring" }],
+      skill_realms: [{ id: "meta/authoring" }],
       blank_mobpack: { document: {} },
       sample_mobpacks: [{ id: "sample" }],
       agent_definitions: [{ id: "authoring:reviewer" }],
@@ -1661,9 +1857,9 @@ describe("mobpack editor catalog parsers", () => {
     });
     assert.equal(result.authoringProvider.runtime_binding, "unbound");
     assert.equal(result.runtimeUnavailableReason, "standalone");
-    assert.equal(result.sources.tools, "mobkit/tools/catalog");
+    assert.equal(result.sources.tools, "meta/tools/catalog");
     assert.deepEqual(result.toolCatalog, [{ id: "shell" }]);
-    assert.deepEqual(result.skillRealms, [{ id: "mobkit/authoring" }]);
+    assert.deepEqual(result.skillRealms, [{ id: "meta/authoring" }]);
     assert.equal(result.models[0].displayName, "GPT-5");
     assert.equal(result.providerDefaults[0].defaultModelId, "gpt-5");
   });
@@ -1696,7 +1892,7 @@ describe("mobpack authoring parsers", () => {
       ],
       mob_id: "demo",
       flow_ids: ["flow_a"],
-      validation_source: "mobkit/mobpacks/validate",
+      validation_source: "meta/mobpacks/validate",
       deploy_command: "rkat mob deploy",
     });
     assert.equal(validation.ok, false);
@@ -1735,7 +1931,7 @@ describe("mobpack authoring parsers", () => {
         },
       ],
       validation: { ok: true },
-      source: "mobkit/mobpacks/source",
+      source: "meta/mobpacks/source",
     });
     assert.equal(source.filename, "demo.mobpack");
     assert.equal(source.sourceFiles[0].path, "mob.toml");
@@ -1760,12 +1956,12 @@ describe("mobpack authoring parsers", () => {
     const imported = parseMobpackImportResult({
       document: { mob_id: "demo" },
       validation: { ok: true },
-      source: "mobkit/mobpacks/import:archive",
+      source: "meta/mobpacks/import:archive",
       source_label: "demo.mobpack",
       source_media_type: "application/vnd.meerkat.mobpack",
     });
     assert.deepEqual(imported.document, { mob_id: "demo" });
-    assert.equal(imported.source, "mobkit/mobpacks/import:archive");
+    assert.equal(imported.source, "meta/mobpacks/import:archive");
     assert.equal(imported.sourceLabel, "demo.mobpack");
   });
 
@@ -1775,8 +1971,8 @@ describe("mobpack authoring parsers", () => {
       name: "Demo",
       version: "mobpack.editor.v1",
       stage: "draft",
-      trigger: "MobKit authoring draft",
-      source: "mobkit/mobpacks/create",
+      trigger: "Meta authoring draft",
+      source: "meta/mobpacks/create",
       revision: 3,
       etag: "f_demo:3",
       updated_at_unix_ms: 1700000000000,
@@ -1800,7 +1996,7 @@ describe("mobpack authoring parsers", () => {
     assert.equal(bareRow.canRedo, null);
 
     const listed = parseMobpackDraftListResult({
-      source: "mobkit/mobpacks/list",
+      source: "meta/mobpacks/list",
       store_path: "/tmp/drafts.json",
       runtime_backed: true,
       rows: [rowPayload],
@@ -1810,7 +2006,7 @@ describe("mobpack authoring parsers", () => {
     assert.equal(listed.rows[0].id, "f_demo");
 
     const got = parseMobpackDraftGetResult({
-      source: "mobkit/mobpacks/get",
+      source: "meta/mobpacks/get",
       runtime_backed: true,
       row: rowPayload,
     });
@@ -1818,7 +2014,7 @@ describe("mobpack authoring parsers", () => {
     assert.equal(got.row.revision, 3);
 
     const saved = parseMobpackDraftSaveResult({
-      source: "mobkit/mobpacks/save",
+      source: "meta/mobpacks/save",
       store_path: "/tmp/drafts.json",
       row: rowPayload,
       rows: [rowPayload],
@@ -1827,7 +2023,7 @@ describe("mobpack authoring parsers", () => {
     assert.equal(saved.rows.length, 1);
 
     const deleted = parseMobpackDraftDeleteResult({
-      source: "mobkit/mobpacks/delete",
+      source: "meta/mobpacks/delete",
       store_path: "/tmp/drafts.json",
       id: "f_demo",
       deleted: true,
@@ -1851,13 +2047,13 @@ describe("mobpack authoring parsers", () => {
       can_redo: true,
     };
     const stepped = parseMobpackDraftHistoryResult({
-      source: "mobkit/mobpacks/undo",
+      source: "meta/mobpacks/undo",
       store_path: "/tmp/drafts.json",
       stepped: true,
       row: rowPayload,
       rows: [rowPayload],
     });
-    assert.equal(stepped.source, "mobkit/mobpacks/undo");
+    assert.equal(stepped.source, "meta/mobpacks/undo");
     assert.equal(stepped.storePath, "/tmp/drafts.json");
     assert.equal(stepped.stepped, true);
     assert.equal(stepped.reason, null);
@@ -1867,7 +2063,7 @@ describe("mobpack authoring parsers", () => {
     assert.equal(stepped.rows[0].id, "f_demo");
 
     const blocked = parseMobpackDraftHistoryResult({
-      source: "mobkit/mobpacks/redo",
+      source: "meta/mobpacks/redo",
       store_path: "/tmp/drafts.json",
       stepped: false,
       reason: "nothing to redo",
@@ -1881,7 +2077,7 @@ describe("mobpack authoring parsers", () => {
 
   it("parses apply-operation results with and without selection", () => {
     const applied = parseMobpackApplyOperationResult({
-      source: "mobkit/mobpacks/apply_operation",
+      source: "meta/mobpacks/apply_operation",
       operation: "add_member",
       ok: true,
       document: { mob_id: "demo", members: [{ id: "reviewer" }] },
@@ -1894,7 +2090,7 @@ describe("mobpack authoring parsers", () => {
     assert.equal(applied.validation.ok, true);
 
     const noSelection = parseMobpackApplyOperationResult({
-      source: "mobkit/mobpacks/apply_operation",
+      source: "meta/mobpacks/apply_operation",
       operation: "delete_member",
       ok: true,
       document: { mob_id: "demo" },
@@ -1911,7 +2107,7 @@ describe("mobpack authoring parsers", () => {
       deploy_command: "rkat mob deploy",
       filename: "demo.mobpack",
       validation: { ok: true },
-      source: "meerkat_mobkit::mobpack::deploy_argv",
+      source: "meerkat_meta::mobpack::deploy_argv",
     });
     assert.equal(preview.command, "rkat mob deploy demo.mobpack");
     assert.deepEqual(preview.argv, ["rkat", "mob", "deploy", "demo.mobpack"]);

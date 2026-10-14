@@ -4,7 +4,7 @@ description: "Release candidate tracking, traceability matrix, validation, and g
 icon: "clipboard-check"
 ---
 
-MobKit includes governance validators for implementation-tracking documents.
+Meta includes governance validators for implementation-tracking documents.
 They check governance declarations, traceability row format, recognized
 statuses, and required evidence text. They do not discover every contract,
 verify the truth of status claims, or establish release completeness.
@@ -22,7 +22,7 @@ governance_state: realignment_in_progress
 document text. The file name is a label for errors, not a path it reads:
 
 ```rust
-use meerkat_mobkit::validate_governance_state;
+use meerkat_meta::validate_governance_state;
 
 validate_governance_state("spec.yaml", "governance_state: realignment_in_progress\n")?;
 ```
@@ -46,11 +46,11 @@ validator proves:
 ### Validation
 
 ```rust
-use meerkat_mobkit::validate_traceability_statuses;
+use meerkat_meta::validate_traceability_statuses;
 
 let traceability = r#"rows:
   - status: TYPED
-    evidence: [crates/meerkat-mobkit/src/governance.rs]
+    evidence: [crates/meerkat-meta/src/governance.rs]
 "#;
 validate_traceability_statuses(traceability)?;
 ```
@@ -70,7 +70,7 @@ selected historical checklist of source tokens. Supply the checkout
 explicitly, or set `MEERKAT_REPO`; there is no machine-specific default:
 
 ```rust
-use meerkat_mobkit::{BaselineVerificationReport, verify_meerkat_baseline_symbols};
+use meerkat_meta::{BaselineVerificationReport, verify_meerkat_baseline_symbols};
 use std::path::Path;
 
 let report: BaselineVerificationReport =
@@ -85,7 +85,7 @@ dependency manifests and compilation/tests for compatibility validation.
 ### Required symbols
 
 `REQUIRED_MEERKAT_SYMBOLS` contains that selected historical checklist, not
-an exhaustive inventory of MobKit's current dependency entry points. An
+an exhaustive inventory of Meta's current dependency entry points. An
 unsatisfied checklist entry produces `BaselineVerificationError::MissingSymbols`.
 
 ## Governance contracts
@@ -128,13 +128,13 @@ Baseline verification uses a separate `BaselineVerificationError`:
 
 ## CLI tools
 
-MobKit's binaries include these validation and operational tools:
+Meta's binaries include these validation and operational tools:
 
 | Binary | Purpose |
 |--------|---------|
 | `baseline_check` | Optional historical source-token smoke check |
 | `governance_check` | Validate governance state and traceability |
-| `mobkit_gateway` | JSON-RPC gateway |
+| `meta_gateway` | JSON-RPC gateway |
 | `mcp_fixture` | MCP test fixture |
 
 Use the two check binaries in CI for their respective validation scopes;

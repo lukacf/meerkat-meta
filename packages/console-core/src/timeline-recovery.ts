@@ -1,5 +1,5 @@
 import type { ConsoleFrame, ConsoleTimelinePage } from "./runtime-types";
-import type { ConsoleTimelineSubscribeInput, MobKitConsoleTransport } from "./headless";
+import type { ConsoleTimelineSubscribeInput, MetaConsoleTransport } from "./headless";
 import { acceptConsoleFrame, ConsoleConsumerError } from "./sse-reader";
 import { timelineCursor, type ConsoleTransportState } from "./timeline-subscription";
 
@@ -7,7 +7,7 @@ const MIN_TIMELINE_DEDUP_KEYS = 1_000;
 
 /** One lifetime owns seed, live reader and every gap repair for this scope. */
 export async function subscribeTimelineWithRecovery(
-  transport: Pick<MobKitConsoleTransport, "queryTimeline" | "subscribeTimeline">,
+  transport: Pick<MetaConsoleTransport, "queryTimeline" | "subscribeTimeline">,
   input: ConsoleTimelineSubscribeInput,
   onFrame: (frame: ConsoleFrame) => void,
   onReplayGap?: () => void,

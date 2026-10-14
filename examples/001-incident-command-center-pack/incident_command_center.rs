@@ -26,20 +26,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::sleep;
 
-use meerkat_mobkit::decisions::{AuthPolicy, BigQueryNaming, ConsolePolicy, RuntimeOpsPolicy};
-use meerkat_mobkit::mob_handle_runtime::{SessionCreatedContext, SessionHook};
-use meerkat_mobkit::runtime::{
+use meerkat_meta::decisions::{AuthPolicy, BigQueryNaming, ConsolePolicy, RuntimeOpsPolicy};
+use meerkat_meta::mob_handle_runtime::{SessionCreatedContext, SessionHook};
+use meerkat_meta::runtime::{
     DeliverySendRequest, GatingDecideRequest, GatingDecision, GatingEvaluateRequest,
     GatingPendingEntry, GatingRiskTier, RuntimeRoute,
 };
-use meerkat_mobkit::unified_runtime::{DesiredPeerEdge, EdgeDiscovery, UnifiedRuntime};
-use meerkat_mobkit::{
-    AgentMemoryConfig, DiscoverySpec, MobKitConfig, ModuleConfig, PreSpawnData, RestartPolicy,
+use meerkat_meta::unified_runtime::{DesiredPeerEdge, EdgeDiscovery, UnifiedRuntime};
+use meerkat_meta::{
+    AgentMemoryConfig, DiscoverySpec, MetaConfig, ModuleConfig, PreSpawnData, RestartPolicy,
     RuntimeDecisionInputs, RuntimeDecisionState, SqliteAgentMemoryStore, TopologyControlPolicy,
     TrustedOidcRuntimeConfig, build_runtime_decision_state,
 };
 
-const BOUNDARY_ENV_KEY: &str = "MOBKIT_MODULE_BOUNDARY";
+const BOUNDARY_ENV_KEY: &str = "META_MODULE_BOUNDARY";
 const BOUNDARY_ENV_VALUE_MCP: &str = "mcp";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -52,7 +52,7 @@ pub struct IncidentScenario {
     pub identities: Vec<IncidentIdentity>,
     #[serde(default)]
     pub links: Vec<IncidentLink>,
-    /// Optional operator topology control. The MobKit default is disabled;
+    /// Optional operator topology control. The Meta default is disabled;
     /// this stock example opts in explicitly in scenario.yaml.
     #[serde(default)]
     pub topology_control: TopologyControlPolicy,
@@ -260,7 +260,7 @@ async fn build_runtime_bundle_with_client(
             dataset: format!("{}_dataset", scenario.namespace.replace('-', "_")),
             table: "console_events".to_string(),
         },
-        trusted_mobkit_toml: trusted_modules_toml(),
+        trusted_meta_toml: trusted_modules_toml(),
         auth: AuthPolicy::default(),
         trusted_oidc: trusted_oidc(),
         console: ConsolePolicy {
@@ -269,7 +269,7 @@ async fn build_runtime_bundle_with_client(
         },
         ops: RuntimeOpsPolicy::default(),
         release_metadata_json: include_str!(
-            "../../crates/meerkat-mobkit/assets/release-targets.json"
+            "../../crates/meerkat-meta/assets/release-targets.json"
         )
         .to_string(),
     })
@@ -336,7 +336,7 @@ pub async fn seed_runtime(runtime: &UnifiedRuntime, scenario: &IncidentScenario)
 
     for delivery in &scenario.deliveries {
         let resolution = runtime
-            .resolve_routing(meerkat_mobkit::runtime::RoutingResolveRequest {
+            .resolve_routing(meerkat_meta::runtime::RoutingResolveRequest {
                 recipient: delivery.recipient.clone(),
                 channel: Some(delivery.channel.clone()),
                 retry_max: None,
@@ -490,6 +490,12 @@ pub async fn seed_escalation_chain(
     pending_id: &str,
     approver_id: &str,
 ) -> Result<GatingPendingEntry> {
+    runtime
+        .set_gating_escalation_routes(meerkat_meta::GatingEscalationRoutes {
+            default: Some("incident-commander".to_string()),
+            ..meerkat_meta::GatingEscalationRoutes::default()
+        })
+        .await;
     let escalation = runtime
         .decide_gating_action(GatingDecideRequest {
             pending_id: pending_id.to_string(),
@@ -806,9 +812,9 @@ fn identity_to_spawn_spec(identity: &IncidentIdentity) -> SpawnMemberSpec {
     .with_labels(labels)
 }
 
-fn example_module_config(scenario: &IncidentScenario) -> Result<MobKitConfig> {
+fn example_module_config(scenario: &IncidentScenario) -> Result<MetaConfig> {
     let fixture_binary = fixture_binary_path()?;
-    Ok(MobKitConfig {
+    Ok(MetaConfig {
         modules: vec![
             fixture_module("router", &fixture_binary),
             fixture_module("delivery", &fixture_binary),
@@ -881,7 +887,7 @@ fn fixture_binary_path() -> Result<PathBuf> {
     // appear to build successfully and then fail module reconciliation with a
     // nonexistent command path.
     let status = Command::new("cargo")
-        .args(["build", "-p", "meerkat-mobkit", "--bin", "mcp_fixture"])
+        .args(["build", "-p", "meerkat-meta", "--bin", "mcp_fixture"])
         .current_dir(workspace_root)
         .env("CARGO_TARGET_DIR", &target_dir)
         .status()
@@ -950,7 +956,7 @@ mod fixture_binary_path_tests {
 
     #[test]
     fn configured_target_dir_is_the_fixture_build_and_lookup_root() {
-        let workspace_root = Path::new("/workspace/mobkit");
+        let workspace_root = Path::new("/workspace/meta");
         let target_dir = PathBuf::from("/isolated/cargo-target");
 
         let resolved = incident_fixture_target_dir(
@@ -972,7 +978,7 @@ mod fixture_binary_path_tests {
 
     #[test]
     fn relative_target_dir_is_resolved_like_the_fallback_cargo_build() {
-        let workspace_root = Path::new("/workspace/mobkit");
+        let workspace_root = Path::new("/workspace/meta");
 
         assert_eq!(
             incident_fixture_target_dir(
@@ -986,7 +992,7 @@ mod fixture_binary_path_tests {
 
     #[test]
     fn direct_example_execution_infers_its_target_root_without_env() {
-        let workspace_root = Path::new("/workspace/mobkit");
+        let workspace_root = Path::new("/workspace/meta");
 
         assert_eq!(
             incident_fixture_target_dir(
@@ -1002,7 +1008,7 @@ mod fixture_binary_path_tests {
 
     #[test]
     fn workspace_target_is_the_cargo_default_without_other_context() {
-        let workspace_root = Path::new("/workspace/mobkit");
+        let workspace_root = Path::new("/workspace/meta");
 
         assert_eq!(
             incident_fixture_target_dir(workspace_root, None, None),
@@ -1063,7 +1069,7 @@ restart_policy = "never"
 fn trusted_oidc() -> TrustedOidcRuntimeConfig {
     TrustedOidcRuntimeConfig {
         discovery_json:
-            r#"{"issuer":"https://trusted.mobkit.local","jwks_uri":"https://trusted.mobkit.local/.well-known/jwks.json"}"#
+            r#"{"issuer":"https://trusted.meta.local","jwks_uri":"https://trusted.meta.local/.well-known/jwks.json"}"#
                 .to_string(),
         jwks_json: r#"{"keys":[{"kid":"kid-current","kty":"oct","alg":"HS256","k":"cGhhc2U3LXRydXN0ZWQtY3VycmVudC1zZWNyZXQ"}]}"#
             .to_string(),
@@ -1088,7 +1094,7 @@ impl ScenarioEdgeDiscovery {
 impl EdgeDiscovery for ScenarioEdgeDiscovery {
     fn discover_edges(
         &self,
-        active_members: Vec<meerkat_mobkit::unified_runtime::edge_types::EdgeMemberView>,
+        active_members: Vec<meerkat_meta::unified_runtime::edge_types::EdgeMemberView>,
     ) -> Pin<Box<dyn futures::Future<Output = Vec<DesiredPeerEdge>> + Send + '_>> {
         let desired = Arc::clone(&self.desired);
         Box::pin(async move {
@@ -1186,7 +1192,7 @@ impl SessionHook for IncidentSessionHook {
         session_id: &meerkat_core::types::SessionId,
         ctx: &SessionCreatedContext,
     ) {
-        if std::env::var_os("MOBKIT_TRACE_INCIDENT_STARTUP").is_some() {
+        if std::env::var_os("META_TRACE_INCIDENT_STARTUP").is_some() {
             tracing::warn!(
                 session_id = %session_id,
                 model = %ctx.model,
@@ -1210,6 +1216,7 @@ fn incident_tool_provenance() -> ToolProvenance {
     ToolProvenance {
         kind: ToolSourceKind::Callback,
         source_id: "incident-command-center".into(),
+        artifact: None,
     }
 }
 
@@ -1244,7 +1251,7 @@ impl AgentToolDispatcher for IncidentToolDispatcher {
     }
 
     async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
-        if std::env::var_os("MOBKIT_TRACE_INCIDENT_STARTUP").is_some() {
+        if std::env::var_os("META_TRACE_INCIDENT_STARTUP").is_some() {
             tracing::warn!(
                 tool = %call.name,
                 tool_call_id = %call.id,

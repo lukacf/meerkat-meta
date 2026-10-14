@@ -1,6 +1,6 @@
 module(
-    name = "meerkat_mobkit",
-    version = "0.8.49",
+    name = "meerkat_meta",
+    version = "0.9.0",
 )
 
 bazel_dep(name = "rules_rust", version = "0.70.0")
@@ -44,7 +44,7 @@ crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 # agent-factory bridge code; that script can't run under crate_universe (it can't
 # locate the workspace-generated suffix), so mirror meerkat's own BUILD targets:
 # turn the build script off, hardcode the suffix env, and force the internal bridge
-# features the script would otherwise enable. (mobkit's Cargo.toml enables the
+# features the script would otherwise enable. (meta's Cargo.toml enables the
 # `live` feature so meerkat-live is in the lock and crate_universe resolves it.)
 crate.annotation(
     crate = "meerkat",

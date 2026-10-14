@@ -1,4 +1,4 @@
-/** Versioned live channel contracts shared with the MobKit wire boundary. */
+/** Versioned live channel contracts shared with the Meta wire boundary. */
 
 export const LIVE_EXECUTION_IDENTITY_V1 = "live.execution_identity.v1" as const;
 export const LIVE_EXECUTION_FUNCTION_BRIDGE_V1 =

@@ -44,12 +44,12 @@ export function validateSourceFileMetadata(apiSource, file, index) {
 
 export function sourceDocumentFromSourceResult(document, result, options = {}) {
   const apiSource = String(result?.source || "").trim();
-  if (apiSource !== "mobkit/mobpacks/source") {
-    throw new Error(`source preview expected mobkit/mobpacks/source but received ${apiSource}`);
+  if (apiSource !== "meta/mobpacks/source") {
+    throw new Error(`source preview expected meta/mobpacks/source but received ${apiSource}`);
   }
   const sourceView = sourceViewForState(null, options.sourceView);
   const primarySourcePath = sourceView.primarySourcePath;
-  if (!primarySourcePath) throw new Error(`${apiSource} did not receive primary source path from MobKit schema`);
+  if (!primarySourcePath) throw new Error(`${apiSource} did not receive primary source path from Meta schema`);
   const files = Array.isArray(result?.source_files) ? result.source_files : [];
   if (!files.length) throw new Error(`${apiSource} did not return source_files`);
   const primarySourceFile = files.find((file) => String(file?.path || "") === primarySourcePath);
@@ -88,11 +88,11 @@ export function sourceDocumentFromSourceResult(document, result, options = {}) {
 
 export function exportDownloadPayload(result) {
   const contentBase64 = String(result?.content_base64 || "").trim();
-  if (!contentBase64) throw new Error("mobkit/mobpacks/export did not return content_base64");
+  if (!contentBase64) throw new Error("meta/mobpacks/export did not return content_base64");
   const mediaType = String(result?.media_type || "").trim();
-  if (!mediaType) throw new Error("mobkit/mobpacks/export did not return media_type");
+  if (!mediaType) throw new Error("meta/mobpacks/export did not return media_type");
   const filename = String(result?.filename || "").trim();
-  if (!filename) throw new Error("mobkit/mobpacks/export did not return filename");
+  if (!filename) throw new Error("meta/mobpacks/export did not return filename");
   return {
     contentBase64,
     mediaType,
@@ -178,7 +178,7 @@ export function inlineSourceRequestPath(request = null, options = {}) {
     || requestedKind === graphView.sourceFileNodeKind
     || request?.isSourceFile
   ) {
-    return sourceView.primarySourcePath || "mobkit/mob.toml";
+    return sourceView.primarySourcePath || "meta/mob.toml";
   }
   return "";
 }

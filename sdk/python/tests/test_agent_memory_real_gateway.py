@@ -12,7 +12,7 @@ store, which is the concrete promise
 still has `store = "markdown"` pinned.
 
 Run:
-    scripts/repo-cargo build -p meerkat-mobkit --bin rpc_gateway
+    scripts/repo-cargo build -p meerkat-meta --bin rpc_gateway
     PYTHONPATH=sdk/python python3 -m pytest sdk/python/tests/test_agent_memory_real_gateway.py -q
 """
 from __future__ import annotations
@@ -23,12 +23,12 @@ import subprocess
 
 import pytest
 
-from meerkat_mobkit.builder import MobKit
-from meerkat_mobkit.identity_first_models import DurableAgentSpec
+from meerkat_meta.builder import Meta
+from meerkat_meta.identity_first_models import DurableAgentSpec
 
 
 def _resolve_gateway_bin() -> str:
-    override = os.environ.get("MOBKIT_GATEWAY_BIN", "").strip()
+    override = os.environ.get("META_GATEWAY_BIN", "").strip()
     if override:
         return override
     repo_root = Path(__file__).resolve().parents[3]
@@ -56,7 +56,7 @@ _skip_no_binary = pytest.mark.skipif(
     not _GATEWAY_BIN or not os.path.isfile(_GATEWAY_BIN),
     reason=(
         f"Gateway binary not found at {_GATEWAY_BIN} - run: "
-        "./scripts/repo-cargo build -p meerkat-mobkit --bin rpc_gateway"
+        "./scripts/repo-cargo build -p meerkat-meta --bin rpc_gateway"
     ),
 )
 
@@ -75,11 +75,11 @@ comms = true
 
 
 # A pre-migration markdown file exactly as the retired MarkdownAgentMemoryStore
-# rendered it: "# MobKit Agent Memory" banner, then per record a "## <title>"
+# rendered it: "# Meta Agent Memory" banner, then per record a "## <title>"
 # heading, an HTML-comment metadata line carrying the id/tags/timestamps, the
 # body, and the record-end marker.
 _SEEDED_MARKDOWN = """\
-# MobKit Agent Memory
+# Meta Agent Memory
 
 ## Imported smoke token
 <!-- mobkit-agent-memory {"memory_id":"mem-py-import-1","tags":["python","import"],\
@@ -139,7 +139,7 @@ async def test_python_agent_memory_imports_legacy_markdown_and_forgets(tmp_path)
     markdown_file.write_text(_SEEDED_MARKDOWN)
 
     runtime = await (
-        MobKit.builder()
+        Meta.builder()
         .gateway(_GATEWAY_BIN)
         .mob(str(mob_toml))
         .persistent_state(str(state_dir))
@@ -209,7 +209,7 @@ async def test_python_agent_memory_defaults_to_sqlite_store(tmp_path):
     state_dir.mkdir()
 
     runtime = await (
-        MobKit.builder()
+        Meta.builder()
         .gateway(_GATEWAY_BIN)
         .mob(str(mob_toml))
         .persistent_state(str(state_dir))

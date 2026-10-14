@@ -1,8 +1,8 @@
 /**
  * Module authoring helpers and console route builders.
  *
- * These are public utilities for defining MobKit modules, tools, and
- * admin console routes. Matches the Python SDK's `meerkat_mobkit.helpers`.
+ * These are public utilities for defining Meta modules, tools, and
+ * admin console routes. Matches the Python SDK's `meerkat_meta.helpers`.
  */
 
 // -- Types ----------------------------------------------------------------

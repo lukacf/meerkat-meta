@@ -1,11 +1,11 @@
 /**
- * Tests for backward-compatible low-level MobkitAsyncClient.
+ * Tests for backward-compatible low-level MetaAsyncClient.
  */
 
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
-import { MobkitAsyncClient, RpcError, MobkitRpcError } from "../dist/index.js";
+import { MetaAsyncClient, RpcError, MetaRpcError } from "../dist/index.js";
 
 // ---------------------------------------------------------------------------
 // Mock transport helper
@@ -18,7 +18,7 @@ interface TransportCall {
 }
 
 function createMockClient(): {
-  client: MobkitAsyncClient;
+  client: MetaAsyncClient;
   calls: TransportCall[];
   setResponse: (fn: (req: any) => unknown) => void;
 } {
@@ -35,7 +35,7 @@ function createMockClient(): {
   };
 
   // Construct with the mock transport
-  const client = new MobkitAsyncClient(mockTransport as any);
+  const client = new MetaAsyncClient(mockTransport as any);
 
   return {
     client,
@@ -48,13 +48,13 @@ function createMockClient(): {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("MobkitRpcError backward compat", () => {
-  it("MobkitRpcError is the same as RpcError", () => {
-    assert.equal(MobkitRpcError, RpcError);
+describe("MetaRpcError backward compat", () => {
+  it("MetaRpcError is the same as RpcError", () => {
+    assert.equal(MetaRpcError, RpcError);
   });
 
-  it("MobkitRpcError instances are instances of RpcError", () => {
-    const err = new MobkitRpcError(-32600, "invalid", "req-1", "test/method");
+  it("MetaRpcError instances are instances of RpcError", () => {
+    const err = new MetaRpcError(-32600, "invalid", "req-1", "test/method");
     assert.ok(err instanceof RpcError);
     assert.equal(err.code, -32600);
     assert.equal(err.message, "invalid");
@@ -63,8 +63,8 @@ describe("MobkitRpcError backward compat", () => {
   });
 });
 
-describe("MobkitAsyncClient.status()", () => {
-  it("sends mobkit/status and returns typed result", async () => {
+describe("MetaAsyncClient.status()", () => {
+  it("sends meta/status and returns typed result", async () => {
     const { client, calls, setResponse } = createMockClient();
     setResponse((req: any) => ({
       jsonrpc: "2.0",
@@ -77,7 +77,7 @@ describe("MobkitAsyncClient.status()", () => {
     }));
 
     const result = await client.status("test-status");
-    assert.equal(calls[0].method, "mobkit/status");
+    assert.equal(calls[0].method, "meta/status");
     assert.equal(calls[0].id, "test-status");
     assert.deepEqual(calls[0].params, {});
     assert.equal(result.contract_version, "0.5.0");
@@ -86,30 +86,30 @@ describe("MobkitAsyncClient.status()", () => {
   });
 });
 
-describe("MobkitAsyncClient.capabilities()", () => {
-  it("sends mobkit/capabilities and returns typed result", async () => {
+describe("MetaAsyncClient.capabilities()", () => {
+  it("sends meta/capabilities and returns typed result", async () => {
     const { client, calls, setResponse } = createMockClient();
     setResponse((req: any) => ({
       jsonrpc: "2.0",
       id: req.id,
       result: {
         contract_version: "0.5.0",
-        methods: ["mobkit/status", "mobkit/capabilities"],
+        methods: ["meta/status", "meta/capabilities"],
         loaded_modules: ["mod-a", "mod-b"],
       },
     }));
 
     const result = await client.capabilities("test-caps");
-    assert.equal(calls[0].method, "mobkit/capabilities");
+    assert.equal(calls[0].method, "meta/capabilities");
     assert.equal(calls[0].id, "test-caps");
     assert.equal(result.contract_version, "0.5.0");
-    assert.deepEqual(result.methods, ["mobkit/status", "mobkit/capabilities"]);
+    assert.deepEqual(result.methods, ["meta/status", "meta/capabilities"]);
     assert.deepEqual(result.loaded_modules, ["mod-a", "mod-b"]);
   });
 });
 
-describe("MobkitAsyncClient.reconcile()", () => {
-  it("sends mobkit/reconcile and returns typed result", async () => {
+describe("MetaAsyncClient.reconcile()", () => {
+  it("sends meta/reconcile and returns typed result", async () => {
     const { client, calls, setResponse } = createMockClient();
     setResponse((req: any) => ({
       jsonrpc: "2.0",
@@ -122,7 +122,7 @@ describe("MobkitAsyncClient.reconcile()", () => {
     }));
 
     const result = await client.reconcile(["mod-a", "mod-b"], "test-reconcile");
-    assert.equal(calls[0].method, "mobkit/reconcile");
+    assert.equal(calls[0].method, "meta/reconcile");
     assert.deepEqual(calls[0].params, { modules: ["mod-a", "mod-b"] });
     assert.equal(result.accepted, true);
     assert.deepEqual(result.reconciled_modules, ["mod-a", "mod-b"]);
@@ -130,8 +130,8 @@ describe("MobkitAsyncClient.reconcile()", () => {
   });
 });
 
-describe("MobkitAsyncClient.spawnMember()", () => {
-  it("sends mobkit/spawn_member and returns typed result", async () => {
+describe("MetaAsyncClient.spawnMember()", () => {
+  it("sends meta/spawn_member and returns typed result", async () => {
     const { client, calls, setResponse } = createMockClient();
     setResponse((req: any) => ({
       jsonrpc: "2.0",
@@ -143,15 +143,15 @@ describe("MobkitAsyncClient.spawnMember()", () => {
     }));
 
     const result = await client.spawnMember("mod-x", "test-spawn");
-    assert.equal(calls[0].method, "mobkit/spawn_member");
+    assert.equal(calls[0].method, "meta/spawn_member");
     assert.deepEqual(calls[0].params, { module_id: "mod-x" });
     assert.equal(result.accepted, true);
     assert.equal(result.module_id, "mod-x");
   });
 });
 
-describe("MobkitAsyncClient.subscribeEvents()", () => {
-  it("sends mobkit/events/subscribe and returns typed result", async () => {
+describe("MetaAsyncClient.subscribeEvents()", () => {
+  it("sends meta/events/subscribe and returns typed result", async () => {
     const { client, calls, setResponse } = createMockClient();
     setResponse((req: any) => ({
       jsonrpc: "2.0",
@@ -177,7 +177,7 @@ describe("MobkitAsyncClient.subscribeEvents()", () => {
       { scope: "mob", last_event_id: "evt-0", agent_id: "a-1" },
       "test-subscribe",
     );
-    assert.equal(calls[0].method, "mobkit/events/subscribe");
+    assert.equal(calls[0].method, "meta/events/subscribe");
     assert.equal(calls[0].params.scope, "mob");
     assert.equal(calls[0].params.last_event_id, "evt-0");
     assert.equal(calls[0].params.agent_id, "a-1");
@@ -211,7 +211,7 @@ describe("MobkitAsyncClient.subscribeEvents()", () => {
   });
 });
 
-describe("MobkitAsyncClient RPC error handling", () => {
+describe("MetaAsyncClient RPC error handling", () => {
   it("throws RpcError on error response", async () => {
     const { client, setResponse } = createMockClient();
     setResponse((req: any) => ({
@@ -230,14 +230,14 @@ describe("MobkitAsyncClient RPC error handling", () => {
         assert.equal(err.code, -32601);
         assert.equal(err.message, "Method not found");
         assert.equal(err.requestId, "err-test");
-        assert.equal(err.method, "mobkit/status");
+        assert.equal(err.method, "meta/status");
         return true;
       },
     );
   });
 });
 
-describe("MobkitAsyncClient invalid response handling", () => {
+describe("MetaAsyncClient invalid response handling", () => {
   it("throws on invalid JSON-RPC envelope", async () => {
     const { client, setResponse } = createMockClient();
     setResponse(() => ({ not_jsonrpc: true }));
@@ -271,7 +271,7 @@ describe("MobkitAsyncClient invalid response handling", () => {
   });
 });
 
-describe("MobkitAsyncClient.rpc() raw access", () => {
+describe("MetaAsyncClient.rpc() raw access", () => {
   it("returns raw JsonRpcResponse", async () => {
     const { client, setResponse } = createMockClient();
     setResponse((req: any) => ({

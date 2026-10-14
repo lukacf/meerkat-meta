@@ -12,8 +12,8 @@ from typing import Any, Awaitable, Callable, cast
 from urllib.error import URLError
 
 try:
-    from meerkat_mobkit._client import MobkitAsyncTypedClient, MobkitRpcError
-    from meerkat_mobkit.helpers import (
+    from meerkat_meta._client import MetaAsyncTypedClient, MetaRpcError
+    from meerkat_meta.helpers import (
         ModuleSpec,
         build_console_experience_route,
         build_console_modules_route,
@@ -27,8 +27,8 @@ try:
     )
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from meerkat_mobkit._client import MobkitAsyncTypedClient, MobkitRpcError  # type: ignore[no-redef]
-    from meerkat_mobkit.helpers import (  # type: ignore[no-redef]
+    from meerkat_meta._client import MetaAsyncTypedClient, MetaRpcError  # type: ignore[no-redef]
+    from meerkat_meta.helpers import (  # type: ignore[no-redef]
         ModuleSpec,
         build_console_experience_route,
         build_console_modules_route,
@@ -44,8 +44,8 @@ except ModuleNotFoundError:
 
 async def main() -> int:
     checks: list[dict[str, Any]] = []
-    gateway_bin = os.environ.get("MOBKIT_RPC_GATEWAY_BIN")
-    client_module = sys.modules[MobkitAsyncTypedClient.__module__]
+    gateway_bin = os.environ.get("META_RPC_GATEWAY_BIN")
+    client_module = sys.modules[MetaAsyncTypedClient.__module__]
     expected_contract_version = "0.5.0"
 
     async def check(name: str, fn: Callable[[], Awaitable[None]]) -> None:
@@ -63,7 +63,7 @@ async def main() -> int:
         method = request.get("method")
         params = request.get("params") if isinstance(request.get("params"), dict) else {}
 
-        if method == "mobkit/status":
+        if method == "meta/status":
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -74,24 +74,24 @@ async def main() -> int:
                 },
             }
 
-        if method == "mobkit/capabilities":
+        if method == "meta/capabilities":
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
                     "contract_version": expected_contract_version,
                     "methods": [
-                        "mobkit/status",
-                        "mobkit/capabilities",
-                        "mobkit/reconcile",
-                        "mobkit/spawn_member",
-                        "mobkit/events/subscribe",
+                        "meta/status",
+                        "meta/capabilities",
+                        "meta/reconcile",
+                        "meta/spawn_member",
+                        "meta/events/subscribe",
                     ],
                     "loaded_modules": ["routing", "delivery"],
                 },
             }
 
-        if method == "mobkit/reconcile":
+        if method == "meta/reconcile":
             modules = [
                 item for item in params.get("modules", []) if isinstance(item, str)
             ]
@@ -105,7 +105,7 @@ async def main() -> int:
                 },
             }
 
-        if method == "mobkit/spawn_member":
+        if method == "meta/spawn_member":
             module_id = params.get("module_id")
             if not isinstance(module_id, str) or not module_id.strip():
                 return {
@@ -125,7 +125,7 @@ async def main() -> int:
                 },
             }
 
-        if method == "mobkit/events/subscribe":
+        if method == "meta/events/subscribe":
             scope = params.get("scope")
             if scope not in {"mob", "agent", "interaction"}:
                 scope = "mob"
@@ -174,7 +174,7 @@ async def main() -> int:
             },
         }
 
-    client = MobkitAsyncTypedClient(transport)
+    client = MetaAsyncTypedClient(transport)
 
     async def status_check() -> None:
         status = await client.status("py-prod-status")
@@ -193,11 +193,11 @@ async def main() -> int:
     async def caps_check() -> None:
         caps = await client.capabilities("py-prod-caps")
         methods = caps["methods"]
-        if "mobkit/events/subscribe" not in methods:
+        if "meta/events/subscribe" not in methods:
             raise AssertionError(
                 f"missing events subscribe capability: {methods}"
             )
-        if "mobkit/reconcile" not in methods or "mobkit/spawn_member" not in methods:
+        if "meta/reconcile" not in methods or "meta/spawn_member" not in methods:
             raise AssertionError(f"missing key methods: {methods}")
 
     await check("async client capabilities typed result", caps_check)
@@ -250,9 +250,9 @@ async def main() -> int:
         except Exception as exc:  # broad for explicit type assertion
             observed = exc
 
-        if not isinstance(observed, MobkitRpcError):
-            raise AssertionError(f"expected MobkitRpcError, got {observed}")
-        if observed.code != -32602 or observed.method != "mobkit/spawn_member":
+        if not isinstance(observed, MetaRpcError):
+            raise AssertionError(f"expected MetaRpcError, got {observed}")
+        if observed.code != -32602 or observed.method != "meta/spawn_member":
             raise AssertionError(
                 f"unexpected rpc error metadata: code={observed.code} method={observed.method} request_id={observed.request_id}"
             )
@@ -262,9 +262,9 @@ async def main() -> int:
     async def gateway_factory_status_check() -> None:
         if not gateway_bin:
             raise AssertionError(
-                "MOBKIT_RPC_GATEWAY_BIN must be set for from_gateway_bin checks"
+                "META_RPC_GATEWAY_BIN must be set for from_gateway_bin checks"
             )
-        factory_client = MobkitAsyncTypedClient.from_gateway_bin(gateway_bin)
+        factory_client = MetaAsyncTypedClient.from_gateway_bin(gateway_bin)
         status = await factory_client.status("py-prod-factory-gateway-status")
         _assert_eq(
             status,
@@ -279,8 +279,8 @@ async def main() -> int:
     await check("async factory fromGatewayBin status success", gateway_factory_status_check)
 
     async def gateway_factory_error_check() -> None:
-        factory_client = MobkitAsyncTypedClient.from_gateway_bin(
-            "/__mobkit__/missing/sdk-test-gateway"
+        factory_client = MetaAsyncTypedClient.from_gateway_bin(
+            "/__meta__/missing/sdk-test-gateway"
         )
         observed: Exception | None = None
         try:
@@ -331,8 +331,8 @@ async def main() -> int:
         original_read_http_body = getattr(client_module, "_read_http_body")
         setattr(client_module, "_read_http_body", fake_read_http_body)
         try:
-            factory_client = MobkitAsyncTypedClient.from_http(
-                "https://mobkit.local/rpc",
+            factory_client = MetaAsyncTypedClient.from_http(
+                "https://meta.local/rpc",
                 headers={"x-sdk-productization": "true"},
                 timeout_seconds=0.25,
             )
@@ -349,7 +349,7 @@ async def main() -> int:
             },
             "unexpected from_http status",
         )
-        if observed.get("url") != "https://mobkit.local/rpc":
+        if observed.get("url") != "https://meta.local/rpc":
             raise AssertionError(f"unexpected from_http endpoint: {observed}")
         if observed.get("method") != "POST":
             raise AssertionError(f"unexpected from_http method: {observed}")
@@ -359,7 +359,7 @@ async def main() -> int:
         if headers.get("x-sdk-productization") != "true":
             raise AssertionError(f"missing custom header in from_http request: {headers}")
         payload = cast(dict[str, Any], observed.get("payload") or {})
-        if payload.get("method") != "mobkit/status":
+        if payload.get("method") != "meta/status":
             raise AssertionError(f"unexpected from_http rpc payload: {payload}")
 
     await check("async factory fromHttp status success", http_factory_status_check)
@@ -372,8 +372,8 @@ async def main() -> int:
         observed: Exception | None = None
         setattr(client_module, "_read_http_body", failing_read_http_body)
         try:
-            factory_client = MobkitAsyncTypedClient.from_http(
-                "https://mobkit.local/rpc"
+            factory_client = MetaAsyncTypedClient.from_http(
+                "https://meta.local/rpc"
             )
             try:
                 await factory_client.status("py-prod-factory-http-error")

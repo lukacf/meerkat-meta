@@ -1,4 +1,4 @@
-# MobKit Agent Memory Architecture
+# Meta Agent Memory Architecture
 
 Status: architecture of record for the **memory initiative** (internal design
 note — `docs/design/` is deliberately outside the public docs navigation, per
@@ -8,13 +8,13 @@ Date: 2026-07-01 (rev 4 — post external reviews ×2 and post 31-agent adversar
 review; restructured into initiative + future work)
 
 Scope: this document specifies the system **this initiative builds**: a fully
-functional, operational memory system running on MobKit's bundled store, complete
+functional, operational memory system running on Meta's bundled store, complete
 without any external service. The longer-term trajectory - an external memory hub as the central
 memory hub, eventually a default and possibly mandatory backend — lives in
 [`memory-hub-roadmap.md`](memory-hub-roadmap.md). That trajectory constrains schema
 and layering decisions here (§12) but gates nothing in this plan.
 
-Evidence base: five-system survey (Claude Code, Codex, Meerkat, MobKit, an external memory hub)
+Evidence base: five-system survey (Claude Code, Codex, Meerkat, Meta, an external memory hub)
 with adversarially verified findings, committed at
 [`../archive/design/evidence/memory-survey-2026-07/`](../archive/design/evidence/memory-survey-2026-07/). File:line citations below
 refer to the surveyed checkouts (2026-07-01); the archive README carries the
@@ -24,7 +24,7 @@ staleness caveat.
 
 ## 1. Thesis
 
-Memory is what makes identity real. MobKit already made the architectural bet that
+Memory is what makes identity real. Meta already made the architectural bet that
 identities are durable and sessions are disposable embodiments (materialize /
 resume / respawn / reset). Today that bet is only half-kept: an identity survives
 respawn, but almost everything it learned does not. The shipped `agent_memory`
@@ -46,23 +46,23 @@ stylistic preference; it is the verified lesson of the two production systems th
 work. Claude Code and Codex both ship **zero embeddings and zero heuristic
 ranking** — recall quality comes from LLM selection over well-written
 descriptions, and store quality comes from LLM curation under content discipline.
-Every place the shipped MobKit layer uses a heuristic today (stopword-filtered
+Every place the shipped Meta layer uses a heuristic today (stopword-filtered
 term overlap, score threshold 2) is a place the survey found producing weak or
 degenerate behavior. One corollary stated early because it shapes §8.3: "no
 heuristics" applies to *judgment*, not to *ordering computed by prior judgment* —
 an LLM-ranked working set consulted cheaply at runtime is judgment cached, not a
 heuristic.
 
-Two platform facts make MobKit the best possible host for this loop, and the
+Two platform facts make Meta the best possible host for this loop, and the
 design leans on both:
 
-1. **Memory operations are agent work, and MobKit's entire job is orchestrating
+1. **Memory operations are agent work, and Meta's entire job is orchestrating
    agent work.** Extraction, consolidation, promotion, and audit run as ordinary
    scheduled identities (the *steward*, app-enabled per §8.5) with
    capability-scoped tool surfaces — observable in the console, governed by ABAC,
    dogfooding the platform.
 2. **The platform gives us primitives the CLI harnesses lack**: identity lifecycle
-   seams as consolidation triggers (MobKit's identity layer —
+   seams as consolidation triggers (Meta's identity layer —
    materialize / resume-fallback / respawn / reset / retire — built over
    meerkat-mob's identity-keyed member lifecycle events), O(1) copy-on-write
    session forking (`Session::fork`), `meerkat-schedule` for dream cadence,
@@ -153,7 +153,7 @@ These are code-verified behaviors of the shipped system, not hypotheticals
 |---|--------|----------|
 | D1 | **Echo loop**: the per-turn injection block is baked into the delivered user message and persists in the transcript; meerkat indexes `Message::User` text at compaction with no filter for the injection marker → every compaction deposits a copy into session semantic memory, polluting `memory_search` linearly | `identity_first/runtime.rs:2425-2444`, meerkat `types.rs:1201-1203` |
 | D2 | **Unbounded re-injection**: a stable top-8 (~18.5 KB rendered) is re-selected deterministically and re-injected verbatim into *every* non-Steer user message, plus a build-time system-prompt copy; no per-turn aggregate cap, no session budget, no cross-turn dedup (the injector cannot even see a session id) | `agent_memory.rs:367-421`, contrast CC's 4 KB/20 KB/60 KB ladder |
-| D3 | **Lifecycle orphaning**: respawn (always mob-level retire+spawn), reset, and resume-fallback rotate the SessionId; meerkat memory has no delete API, so the old session's rows are unreachable forever — and `HnswMemoryStore::open` re-embeds *every* row (orphans included) on *every* agent build in the realm | meerkat `factory.rs:5411-5472`, `hnsw.rs:300-355`, mobkit `rpc.rs:2937-2972` |
+| D3 | **Lifecycle orphaning**: respawn (always mob-level retire+spawn), reset, and resume-fallback rotate the SessionId; meerkat memory has no delete API, so the old session's rows are unreachable forever — and `HnswMemoryStore::open` re-embeds *every* row (orphans included) on *every* agent build in the realm | meerkat `factory.rs:5411-5472`, `hnsw.rs:300-355`, meta `rpc.rs:2937-2972` |
 | D4 | **Append-only store**: no update/supersede at the `AgentMemoryProvider` trait level; identical remembers duplicate (codified in tests as correct); a correction and its stale predecessor co-inject as siblings with no preference rule even in the prompt | `agent_memory.rs:552-582, 1090-1099` |
 | D5 | **Misleading "elephant" backend**: `MemoryBackendConfig::Elephant` health-checks `GET /v1/health` and persists local JSON; no data ever reaches the memory hub — but it is a public config surface, so it is deprecated and renamed honestly, not deleted (migration path in §15 P0) | `runtime/memory.rs:27-125` |
 
@@ -459,10 +459,10 @@ content-hash duplicate short-circuits to the existing id; per-record byte caps;
 per-scope record-count and byte floors that *warn the steward* rather than
 silently evicting (retention pressure is a dream input, not a FIFO).
 
-RPC surface: existing `mobkit/agent_memory/{remember,recall,forget}` stay
+RPC surface: existing `meta/agent_memory/{remember,recall,forget}` stay
 wire-compatible; add `update` (supersede), `manifest`, `propose`, and
-`mobkit/mob_memory/*` mirrors. **As built:** `update` and `manifest` shipped
-(plus the read-only `mobkit/memory/panel/*` family §9.3 grew); a standalone
+`meta/mob_memory/*` mirrors. **As built:** `update` and `manifest` shipped
+(plus the read-only `meta/memory/panel/*` family §9.3 grew); a standalone
 `propose` RPC and the `mob_memory/*` mirrors were not built — agent-side
 proposing goes through the memory tool's `propose_to_mob`. Configured/bound
 shared scopes contribute metadata to the composed build-time index; the
@@ -470,7 +470,7 @@ current bundled explicit recall/manifest RPCs and automatic selected-body
 recall remain identity-scoped (§8.2). Wider shared-body recall is follow-up
 work. Markdown **import**
 shipped as a one-shot migration when a realm is first accessed and that realm's
-SQLite connection opens, but the `mobkit memory export` command
+SQLite connection opens, but the `meta memory export` command
 has not — records remain inspectable via the panel RPCs and sqlite tooling
 until it lands. SDK/docs drift found by the survey is re-verified
 at implementation time rather than asserted here — current state as of this
@@ -480,9 +480,12 @@ the drift is in `docs/concepts/memory.mdx`, a docs fix); Python's `memory_query`
 key (decide: implement or retire the shim); `conflict_active` parity in
 Python/TS `MemoryIndexResult` to be re-checked in the same pass.
 
-The operational ledger (`mobkit/memory/*`) is unchanged and stays what it is —
+The operational ledger (`meta/memory/*`) is unchanged and stays what it is —
 runtime assertions and conflict signals for gating. Its misleadingly-named
 `elephant` backend is deprecated and renamed in P0 (D5) with config compatibility.
+(0.9 qualification: P0 originally retained that config compatibility; 0.9
+removes it. The retired `elephant` kind is refused when configuration is
+decoded, and the backend must be configured as `kind = "local_json"`.)
 The conflict-signal channel gains one new producer: the steward (§8.5).
 
 ---
@@ -503,7 +506,7 @@ touch the turn path.
 
 ### 8.1 Invocation seam and resource guards
 
-**Invocation.** MobKit makes zero direct provider calls today, and this design
+**Invocation.** Meta makes zero direct provider calls today, and this design
 does not change that (dogma rule 7: providers stay behind their owning seams).
 
 - **Selector**: obtains its model client host-side through meerkat's existing
@@ -517,7 +520,7 @@ does not change that (dogma rule 7: providers stay behind their owning seams).
   override-disabled so their builds do not pay the D3 re-embed tax; each has its
   own auth binding and ABAC principal (§10).
 
-**Resource guards.** Every stage here burns LLM calls, and MobKit multiplies
+**Resource guards.** Every stage here burns LLM calls, and Meta multiplies
 stages by identities × interactions × mobs — unlike CC/Codex (one user, one
 session). The steward's event gates and the Distiller's throttles scale *with*
 activity; what is missing without guards is the load-*inverse* control Codex
@@ -617,7 +620,7 @@ index**, tiered:
    ceiling the *supported* answer is hub candidate generation (hub hybrid
    search feeding this same selector — roadmap F2); the bundled store's job is
    working memory, and a working set of ten thousand records is a curation
-   failure the dream should have consolidated, not a retrieval problem MobKit
+   failure the dream should have consolidated, not a retrieval problem Meta
    should grow indexes for.
 
 Selection mechanics: small fast model, manifest + incoming turn text +
@@ -691,7 +694,7 @@ evidence window includes tainted content (§10.1) are quarantined.
 
 ### 8.5 Steward — the dreaming consolidator
 
-**Provisioning: mechanism from MobKit, policy from the app.** MobKit ships the
+**Provisioning: mechanism from Meta, policy from the app.** Meta ships the
 steward *harness* — the staging API, containment envelope, default prompt bundle,
 and a schedule template — as an opt-in capability, following the platform's
 existing opt-in precedents (`access.toml` presence enables ABAC; `schedules.toml`
@@ -764,7 +767,7 @@ writes are the system's only path for:
   > nudge carries no rationale either; quarantined content stays
   > reviewer-only after a release, tombstone or forget retires it.
   > Operators reach it through the console's
-  > `mobkit/memory/quarantine/decide`, identity scope only, with
+  > `meta/memory/quarantine/decide`, identity scope only, with
   > `memory.quarantine.review` plus the identity's read/view and
   > write (release) or delete (tombstone) grants (§10.3). Cross-scope
   > promotion still rides the gating flow. The steward's `release` and
@@ -807,7 +810,7 @@ semantically pristine.
   (`session/rewrite_transcript` / `session/transcript_revision` /
   `session/restore_transcript_revision`) — the primitive already exists upstream,
   session identity is unchanged, originals are restorable, and the operation is
-  audited. MobKit's contribution is the curator: an LLM pass that drops dead tool
+  audited. Meta's contribution is the curator: an LLM pass that drops dead tool
   results, collapses repeated scaffolding, and preserves decisions with
   rationale, staged and applied through the same validate/commit discipline as
   the steward (a revision proposal is a `StagedMutationBatch` against the
@@ -896,7 +899,7 @@ indexing, not universal exclusion from every possible extraction path.
 Meerkat's exclusion seam was per-message, so labeling that fused message would
 have excluded either nothing or the operator's real words along with the
 injection. Closing D1 required **both** Meerkat's typed injected-context class
-and MobKit's separate injected-body delivery; the default flipped to budgeted
+and Meta's separate injected-body delivery; the default flipped to budgeted
 when that path landed on 2026-07-01. The gateway parser carried its own literal
 `off` fallback for the object form until 0.8.31 and silently kept every
 object-form client on the old default; it now derives the fallback from the
@@ -940,7 +943,7 @@ a peer message or echoed web content can forge "remembered operator preferences"
 verbatim, inheriting whatever authority the model grants real memory. Two
 deterministic mitigations ship with the coordinator: (1) **inbound defanging** —
 the send path scans inbound message and tool content for reserved envelope
-markers (the header pattern, `<mobkit_memory_observation>` syntax, provenance
+markers (the header pattern, `<meta_memory_observation>` syntax, provenance
 labels) and neutralizes them before delivery; (2) a per-session/embodiment nonce
 in the envelope header, never exposed via tool results, RPC responses, files, or
 logs — *bar-raising, not authoritative*, since anything in context can leak via
@@ -989,7 +992,7 @@ as a deliverable rather than asserting "the runtime knows":
 - **Signal derivation — coarse in P1, complete in P2.** The signal is derived
   from existing typed facts — tool events joined with `ToolDef.provenance`
   (`ToolSourceKind::Mcp` + server source id) and provider-native search blocks
-  (`ServerToolKind::WebSearch`) — against a new MobKit-owned **content-trust
+  (`ServerToolKind::WebSearch`) — against a new Meta-owned **content-trust
   configuration**: which tool sources count as untrusted for memory purposes
   (web/fetch always untrusted; MCP servers untrusted by default with an explicit
   trusted allowlist, mirroring Codex's `pollutes_memory`). Note meerkat's
@@ -1000,7 +1003,7 @@ as a deliverable rather than asserting "the runtime knows":
   without it (a memory tool that can be poisoned for a whole phase is worse than
   no memory tool). Its one honest gap is a race: a write in the same turn as the
   session's *first* untrusted ingestion can beat the observe stream. **P2 adds
-  the MobKit-side completion** — comms propagation and Distiller
+  the Meta-side completion** — comms propagation and Distiller
   evidence-range taint — while the race close itself (taint visibility at
   tool-dispatch time) is **upstream-gated** on the §13 ask and lands when it
   does; until then the race stays a documented gap, not a claimed close.
@@ -1016,7 +1019,7 @@ as a deliverable rather than asserting "the runtime knows":
   turn it distills.
 - **Taint crosses comms.** Intra-mob peer messages are trusted-or-dropped by
   construction, so a prompt-injected agent A can otherwise launder payloads
-  through peer B, whose own session ingested nothing untrusted. MobKit knows the
+  through peer B, whose own session ingested nothing untrusted. Meta knows the
   mob topology and each member's session: when a write's evidence window includes
   messages received from a peer whose session was tainted at send time, the write
   quarantines. (Blanket-quarantining all peer content would gut the mob-memory
@@ -1143,7 +1146,7 @@ cost of "no heuristics," paid explicitly:
 The roadmap makes an external service the memory hub; this initiative makes that a
 migration instead of a rewrite, by restraint:
 
-- **MobKit's store never grows**: entities, relations, truth slots, embeddings,
+- **Meta's store never grows**: entities, relations, truth slots, embeddings,
   chunking, FTS/vector indexes, freshness engines. The moment a record is
   entity-shaped *world knowledge* ("the staging DB host is X") rather than
   *working knowledge* ("prefer the staging DB for smoke tests"), it is hub
@@ -1158,7 +1161,7 @@ migration instead of a rewrite, by restraint:
   unchanged. This costs nothing now and is the single highest-leverage
   compatibility decision.
 - **Judgment sharing**: calibration profiles are one artifact family across
-  MobKit and the memory hub (§11) — one conflict-resolution prompt lineage, not two
+  Meta and the memory hub (§11) — one conflict-resolution prompt lineage, not two
   drifting ones.
 - **No service coupling in this initiative**: everything above runs with zero
   external services. The wire-boundary hub provider, evidence ingestion,
@@ -1175,7 +1178,7 @@ behavior, and each removes a class of defect at the right layer when it lands:
 1. **Typed injected-context message class** — a first-class injected-context
    delivery class that `indexable_content()` excludes from compaction indexing
    (D1; the per-message seam is `types.rs:1201-1203`). Explicitly coupled to a
-   mobkit-side change (§9.1): mobkit must stop fusing injections into user text
+   meta-side change (§9.1): meta must stop fusing injections into user text
    and deliver them as a separate typed message — the ask and the restructuring
    land together, and channel authenticity (§9.1 anti-spoofing) is the second
    rationale. Interim: per-turn push defaults off.
@@ -1192,7 +1195,7 @@ behavior, and each removes a class of defect at the right layer when it lands:
    (§8.6) makes compaction itself zero-LLM-cost, CC-SM-compact style.
 5. **(Later)** Taint metadata on comms envelopes — `Envelope` today is
    `{id, from, to, kind, sig}` with no metadata field, so cross-agent taint
-   propagation (§10.1) is mobkit-side (topology + session-taint join) until an
+   propagation (§10.1) is meta-side (topology + session-taint join) until an
    envelope-level flag exists. Related smaller ask: taint visibility at
    tool-dispatch time so the Recorder classifies synchronously instead of racing
    the observe stream.

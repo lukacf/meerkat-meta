@@ -1,25 +1,25 @@
-# MobKit
+# Meta
 
-Companion product and composition layer for the [Meerkat](https://github.com/lukacf/meerkat) multi-agent runtime. Meerkat owns agent and mob runtime authority. MobKit composes modules, identity continuity, operational policies, gateways, SDKs, projections, and the admin console around it.
+Companion product and composition layer for the [Meerkat](https://github.com/lukacf/meerkat) multi-agent runtime. Meerkat owns agent and mob runtime authority. Meta composes modules, identity continuity, operational policies, gateways, SDKs, projections, and the admin console around it.
 
 ## Key paths
 
 | Area | Path |
 |------|------|
-| Rust crate | `crates/meerkat-mobkit/` |
-| Console/admin gateway | `crates/meerkat-mobkit/src/bin/mobkit_gateway.rs` |
-| SDK stdin-RPC gateway | `crates/meerkat-mobkit/src/bin/rpc_gateway.rs` |
-| Python SDK | `sdk/python/meerkat_mobkit/` |
+| Rust crate | `crates/meerkat-meta/` |
+| Console/admin gateway | `crates/meerkat-meta/src/bin/meta_gateway.rs` |
+| SDK stdin-RPC gateway | `crates/meerkat-meta/src/bin/rpc_gateway.rs` |
+| Python SDK | `sdk/python/meerkat_meta/` |
 | Python tests | `sdk/python/tests/` |
 | TypeScript SDK | `sdk/typescript/` |
 | Docs (Mintlify) | `docs/` |
 
 ## Python SDK
 
-Package: `meerkat-mobkit` (import as `meerkat_mobkit`).
+Package: `meerkat-meta` (import as `meerkat_meta`).
 
 The SDK version follows the workspace version and is checked by
-`make verify-version-parity`. Treat `sdk/python/meerkat_mobkit/__init__.py` as
+`make verify-version-parity`. Treat `sdk/python/meerkat_meta/__init__.py` as
 the exact export inventory rather than copying a complete list here. Major
 families include builders and runtimes, identity-first providers and models,
 mob and member operations, jobs, WorkGraph, routing and delivery, memory,
@@ -29,7 +29,7 @@ The open member-state vocabulary currently exports `active`, `retiring`,
 `broken`, `completed`, and `unknown` constants. Callers must still tolerate
 future values.
 
-Module authoring helpers (`ModuleSpec`, `define_module`, etc.) live in `meerkat_mobkit.helpers` — not top-level.
+Module authoring helpers (`ModuleSpec`, `define_module`, etc.) live in `meerkat_meta.helpers` — not top-level.
 
 Private internals (underscore-prefixed): `_client.py`, `_transport.py`, `_sse.py`.
 

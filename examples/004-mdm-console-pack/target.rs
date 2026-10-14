@@ -28,7 +28,7 @@ use meerkat_store::{JsonlStore, MemoryBlobStore, SessionFilter, SessionStore};
 use serde::Serialize;
 
 const SYSTEM_PROMPT: &str = "\
-You are a remote managed target named '{name}' in a MobKit MDM mob.
+You are a remote managed target named '{name}' in a Meta MDM mob.
 You run on the target host and may use unrestricted shell tools on this host.
 When hive or the operator asks for hardware, OS, process, file, network, or
 system state, inspect the real local machine before answering.
@@ -751,7 +751,7 @@ fn main() {
     // and real-target-smoke.sh launch the built example directly), so the
     // example sizes its own threads explicitly: the root future runs on a
     // dedicated 32 MiB thread and tokio workers get 32 MiB stacks (mirrors
-    // mobkit_gateway/rpc_gateway's explicit worker sizing).
+    // meta_gateway/rpc_gateway's explicit worker sizing).
     const STACK_SIZE: usize = 32 * 1024 * 1024;
     std::thread::Builder::new()
         .name("mdm-target-runtime".into())

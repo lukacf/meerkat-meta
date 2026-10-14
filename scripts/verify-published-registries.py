@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify that one MobKit release is publicly readable from every registry."""
+"""Verify that one Meta release is publicly readable from every registry."""
 
 from __future__ import annotations
 
@@ -13,10 +13,10 @@ from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
 
 
-CRATE_NAME = "meerkat-mobkit"
-EXTENSION_CRATE_NAME = "mobkit-extension-state"
-PYPI_NAME = "meerkat-mobkit"
-NPM_NAME = "@rkat/mobkit-sdk"
+CRATE_NAME = "meerkat-meta"
+EXTENSION_CRATE_NAME = "meta-extension-state"
+PYPI_NAME = "meerkat-meta"
+NPM_NAME = "@rkat/meta-sdk"
 
 
 class RegistryVerificationError(RuntimeError):
@@ -37,7 +37,7 @@ def _read_json(url: str, *, timeout: float = 30.0) -> dict[str, Any]:
         url,
         headers={
             "Accept": "application/json",
-            "User-Agent": "meerkat-mobkit-release-verifier",
+            "User-Agent": "meerkat-meta-release-verifier",
         },
     )
     with urlopen(request, timeout=timeout) as response:
@@ -50,7 +50,7 @@ def _read_json(url: str, *, timeout: float = 30.0) -> dict[str, Any]:
 def _download_artifact(url: str, *, timeout: float = 60.0) -> bytes:
     request = Request(
         url,
-        headers={"User-Agent": "meerkat-mobkit-release-verifier"},
+        headers={"User-Agent": "meerkat-meta-release-verifier"},
     )
     with urlopen(request, timeout=timeout) as response:
         payload = response.read()

@@ -1,5 +1,5 @@
 /**
- * Typed event hierarchy for MobKit SDK streaming.
+ * Typed event hierarchy for Meta SDK streaming.
  *
  * Events form a discriminated union on the `type` field (snake_case to match
  * the wire protocol). All other fields use idiomatic camelCase.

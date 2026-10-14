@@ -15,9 +15,9 @@ import tempfile
 
 import pytest
 
-from meerkat_mobkit.builder import MobKit
-from meerkat_mobkit.models import SessionBuildOptions
-from meerkat_mobkit.errors import RpcError
+from meerkat_meta.builder import Meta
+from meerkat_meta.models import SessionBuildOptions
+from meerkat_meta.errors import RpcError
 
 
 # ---------------------------------------------------------------------------
@@ -29,9 +29,9 @@ from meerkat_mobkit.errors import RpcError
 # path below is the repository's plain cargo target directory; running from a
 # feature worktree would silently test the wrong artifact (and hide the wire
 # drift the branch introduces). Prefer an explicit override:
-#   MOBKIT_GATEWAY_BIN=$(./scripts/repo-cargo --print-env CARGO_TARGET_DIR)/debug/rpc_gateway
+#   META_GATEWAY_BIN=$(./scripts/repo-cargo --print-env CARGO_TARGET_DIR)/debug/rpc_gateway
 def _resolve_gateway_bin() -> str:
-    override = os.environ.get("MOBKIT_GATEWAY_BIN", "").strip()
+    override = os.environ.get("META_GATEWAY_BIN", "").strip()
     if override:
         return override
     return os.path.join(
@@ -54,7 +54,7 @@ _skip_no_key = pytest.mark.skipif(
 
 _skip_no_binary = pytest.mark.skipif(
     not os.path.isfile(_GATEWAY_BIN),
-    reason=f"Gateway binary not found at {_GATEWAY_BIN} — run: ./scripts/repo-cargo build -p meerkat-mobkit --bin rpc_gateway",
+    reason=f"Gateway binary not found at {_GATEWAY_BIN} — run: ./scripts/repo-cargo build -p meerkat-meta --bin rpc_gateway",
 )
 
 
@@ -137,9 +137,9 @@ class MinimalAgentBuilder:
 # ---------------------------------------------------------------------------
 
 async def _boot_runtime(state_dir: str, mob_toml_path: str):
-    """Boot a real rpc_gateway subprocess and return a connected MobKitRuntime."""
+    """Boot a real rpc_gateway subprocess and return a connected MetaRuntime."""
     return await (
-        MobKit.builder()
+        Meta.builder()
         .gateway(_GATEWAY_BIN)
         .mob(mob_toml_path)
         .persistent_state(state_dir)
@@ -232,10 +232,10 @@ class TestDS01TeamBootstrapAndMixedDelivery:
         try:
             handle = rt.mob_handle()
             caps = await handle.capabilities()
-            assert "mobkit/send_message" in caps.methods
-            assert "mobkit/ensure_member" in caps.methods
-            assert "mobkit/list_members" in caps.methods
-            assert "mobkit/respawn_member" in caps.methods
+            assert "meta/send_message" in caps.methods
+            assert "meta/ensure_member" in caps.methods
+            assert "meta/list_members" in caps.methods
+            assert "meta/respawn_member" in caps.methods
         finally:
             await rt.shutdown()
 

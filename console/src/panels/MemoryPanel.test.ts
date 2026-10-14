@@ -249,26 +249,26 @@ test("a per-method capability miss classifies as denied (intersection under enfo
   // Exact shape thrown by requireCapability (headless.ts): a plain Error,
   // raised client-side before the RPC, with no rpcError annotation. Under an
   // enforced view the server drops methods the principal cannot call from
-  // mobkit/capabilities — e.g. a scoped read grant loses panel/dreams — so
+  // meta/capabilities — e.g. a scoped read grant loses panel/dreams — so
   // the miss is denial by intersection, not a fatal panel error.
   assert.equal(
-    memorySectionOutcome(new Error("MobKit capability missing for mobkit/memory/panel/dreams")),
+    memorySectionOutcome(new Error("Meta capability missing for meta/memory/panel/dreams")),
     "denied",
   );
   assert.equal(
     memorySectionOutcome(
-      new Error("MobKit capability missing for mobkit/memory/panel/quarantine"),
+      new Error("Meta capability missing for meta/memory/panel/quarantine"),
     ),
     "denied",
   );
   // The prefix must anchor at the start: mentions elsewhere are not misses.
   assert.equal(
-    memorySectionOutcome(new Error("saw 'MobKit capability missing for x' in logs")),
+    memorySectionOutcome(new Error("saw 'Meta capability missing for x' in logs")),
     "error",
   );
   // Non-Error values with a matching-looking message do not classify.
   assert.equal(
-    memorySectionOutcome("MobKit capability missing for mobkit/memory/panel/dreams"),
+    memorySectionOutcome("Meta capability missing for meta/memory/panel/dreams"),
     "error",
   );
 });

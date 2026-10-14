@@ -87,7 +87,7 @@ export function authoringOperationAvailability(operations, type) {
     type: operationType,
     supported: !!entry,
     operation: entry || null,
-    error: entry || !operationType ? "" : `MobKit authoring operation unavailable: ${operationType}`,
+    error: entry || !operationType ? "" : `Meta authoring operation unavailable: ${operationType}`,
   };
 }
 
@@ -216,11 +216,11 @@ export async function callRpc(method, params, options = {}) {
     }),
   });
   if (!response.ok) {
-    throw new Error(`MobKit API ${response.status}`);
+    throw new Error(`Meta API ${response.status}`);
   }
   const payload = await response.json();
   if (payload.error) {
-    throw new Error(payload.error.message || "MobKit API error");
+    throw new Error(payload.error.message || "Meta API error");
   }
   return payload.result;
 }

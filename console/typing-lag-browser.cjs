@@ -58,11 +58,11 @@ const RESTARTED = Boolean(arg("restarted", false));
 const SCENARIOS = String(arg("scenarios", "idle,streaming")).split(",");
 const TRACE = Boolean(arg("trace", false));
 // p95 budget in ms, one number for every scenario or per scenario
-// ("idle=16,streaming=40"). MOBKIT_TYPING_LAG_BUDGET overrides the flag.
+// ("idle=16,streaming=40"). META_TYPING_LAG_BUDGET overrides the flag.
 // Wall-clock budgets vary with the runner, so by default they are reported,
-// not enforced; MOBKIT_TYPING_LAG_ENFORCE_TIMING=1 or --enforce-timing makes
+// not enforced; META_TYPING_LAG_ENFORCE_TIMING=1 or --enforce-timing makes
 // them failures (local perf work). Structural limits always fail.
-const ENFORCE_TIMING = process.env.MOBKIT_TYPING_LAG_ENFORCE_TIMING === "1" || Boolean(arg("enforce-timing", false));
+const ENFORCE_TIMING = process.env.META_TYPING_LAG_ENFORCE_TIMING === "1" || Boolean(arg("enforce-timing", false));
 // Transcript entries presented per streamed token. Every entry was presented
 // again on each token; a continued derivation presents only the open text.
 const MAX_PRESENTED_ENTRIES_PER_TOKEN = arg("max-presented-entries-per-token", null) === null ? null : Number(arg("max-presented-entries-per-token"));
@@ -87,7 +87,7 @@ const MAX_DAY_LABEL_FORMATS_PER_TOKEN = arg("max-day-label-formats-per-token", n
 // Streamed text alone renders on every third animation frame, so at 60 Hz
 // at most about 20 per second; every token used to render.
 const MAX_STREAM_COMMITS_PER_SECOND = arg("max-stream-commits-per-second", null) === null ? null : Number(arg("max-stream-commits-per-second"));
-const BUDGET_SPEC = process.env.MOBKIT_TYPING_LAG_BUDGET || arg("budget-p95", null);
+const BUDGET_SPEC = process.env.META_TYPING_LAG_BUDGET || arg("budget-p95", null);
 const BUDGET_P95 = BUDGET_SPEC === null || BUDGET_SPEC === true ? null : parseBudget(String(BUDGET_SPEC));
 
 function parseBudget(spec) {

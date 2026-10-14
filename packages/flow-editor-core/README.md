@@ -1,6 +1,6 @@
 # flow-editor-core
 
-`@flow-editor-core` is the MobKit Flow Editor's headless controller plane:
+`@flow-editor-core` is the Meta Flow Editor's headless controller plane:
 the pure projection and transition logic extracted module by module from the
 legacy `flow-editor/src/controller.js` monolith. Framework-free — no React,
 no DOM access, no `window` (the shell owns the global assignment).
@@ -25,8 +25,8 @@ no DOM access, no `window` (the shell owns the global assignment).
 - `source/view.ts` — source documents, drawers, TOML highlighting
 - `registry/flow-registry.ts` — flow registry rows and bootstrap state
 - `document/build-projection.ts` — authoring document build and projection
-- `catalogs/hydration.ts` — MobKit catalog projections and mobpack document hydration
-- `controller-facade.ts` — `createMobKitFlowController`
+- `catalogs/hydration.ts` — Meta catalog projections and mobpack document hydration
+- `controller-facade.ts` — `createMetaFlowController`
 
 ## How the shell consumes it
 
@@ -34,15 +34,15 @@ no DOM access, no `window` (the shell owns the global assignment).
 `src/index.ts` and bundles the package into the single `flow-editor.js` IIFE
 together with the shell and `@flow-editor-components`. The shell entry
 (`flow-editor/src/app.tsx`) constructs the facade once at module scope and
-assigns `window.MobKitFlowController` as a deliberate back-compat surface.
+assigns `window.MetaFlowController` as a deliberate back-compat surface.
 The projection test lane (`node build.cjs --test-bundle`) instead bundles the
-package index as a `window.MobKitFlowCore` IIFE plus a bootstrap shim, so the
+package index as a `window.MetaFlowCore` IIFE plus a bootstrap shim, so the
 Node test suite loads the same code the browser runs.
 
 ## The facade contract
 
-`createMobKitFlowController({ includeTestExports })` assembles the exact
-`window.MobKitFlowController` key set the views consume stringly, with
+`createMetaFlowController({ includeTestExports })` assembles the exact
+`window.MetaFlowController` key set the views consume stringly, with
 additional test-only exports behind `includeTestExports`. Both sets are
 recorded in the checked-in manifest. Key-set parity with
 `flow-editor/test/controller-export-manifest.json` is enforced by
@@ -64,6 +64,6 @@ access, no `require`/Node imports).
 
 ## Workspace-private
 
-This package is private to the MobKit repository. `@flow-editor-core` is a
+This package is private to the Meta repository. `@flow-editor-core` is a
 build-time alias, not an npm-published package name; external consumers must
-not depend on it until MobKit makes an explicit public-package decision.
+not depend on it until Meta makes an explicit public-package decision.

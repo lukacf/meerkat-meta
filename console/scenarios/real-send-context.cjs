@@ -8,26 +8,26 @@ const { chromium } = require("playwright");
 const { startFixture, eventually, rpc } = require("../acceptance-runtime.cjs");
 const { browserFailureMonitor, navigation } = require("./browser-failure-monitor.cjs");
 
-const evidence = process.env.MOBKIT_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
+const evidence = process.env.META_BROWSER_EVIDENCE || path.join(__dirname, "../../output/playwright/console-acceptance");
 const identity = "router:main";
 const quote = 'A\u030A, \u00e5, \ud83d\ude80 and literal <tag>; repeated phrase, repeated phrase';
 const source = '# Review evidence\n\nBefore **A\u030A, \u00e5, \ud83d\ude80** and `literal <tag>`; repeated phrase, repeated phrase; done.\n\nA second paragraph keeps the quote distinct from this conclusion.\n';
 
 function sendObservations(fixture) {
   return fixture.observations.filter(item => item.method === "POST" &&
-    (item.path.endsWith("/send") || item.request.includes('"method":"mobkit/console/send"')));
+    (item.path.endsWith("/send") || item.request.includes('"method":"meta/console/send"')));
 }
 function wireEnvelope(observation) {
   const body = JSON.parse(observation.request);
-  return body.method === "mobkit/console/send" ? body.params : body;
+  return body.method === "meta/console/send" ? body.params : body;
 }
 const namespace = fixture => `${fixture.baseUrl}/acceptance-realm/operator-a`;
-const queueKey = (fixture, storageNamespace = namespace(fixture)) => `mobkit-send-attempts:v1:${encodeURIComponent(storageNamespace)}:${encodeURIComponent(identity)}`;
+const queueKey = (fixture, storageNamespace = namespace(fixture)) => `meta-send-attempts:v1:${encodeURIComponent(storageNamespace)}:${encodeURIComponent(identity)}`;
 async function savedAttempts(page, fixture, storageNamespace = namespace(fixture)) {
   return page.evaluate(key => JSON.parse(localStorage.getItem(key) || '{"attempts":[]}').attempts, queueKey(fixture, storageNamespace));
 }
 async function draftDocuments(page) {
-  return page.evaluate(() => Object.keys(sessionStorage).filter(key => key.startsWith("mobkit-composer-draft:v2:"))
+  return page.evaluate(() => Object.keys(sessionStorage).filter(key => key.startsWith("meta-composer-draft:v2:"))
     .map(key => ({ key, ...JSON.parse(sessionStorage.getItem(key)) })));
 }
 async function timeline(fixture) {
@@ -52,7 +52,7 @@ async function saveEvidence(fixture, name, extra) {
 }
 async function inBrowser(name, run) {
   // Never silently start a Cargo build from a browser shard.
-  assert(process.env.MOBKIT_EXAMPLE_BIN_DIR, "Set MOBKIT_EXAMPLE_BIN_DIR to the coordinator's prebuilt fixture directory.");
+  assert(process.env.META_EXAMPLE_BIN_DIR, "Set META_EXAMPLE_BIN_DIR to the coordinator's prebuilt fixture directory.");
   const fixture = await startFixture();
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
@@ -102,7 +102,7 @@ async function compose(page, text, host = "stock", scope = pane(page, host)) {
   }
 }
 async function sendApi(fixture, content, idempotencyKey) {
-  const response = await rpc(fixture.baseUrl, "mobkit/console/send", {
+  const response = await rpc(fixture.baseUrl, "meta/console/send", {
     identity, content, origin: "console:send-context-fixture", origin_kind: "operator",
     idempotency_key: idempotencyKey, handling_mode: "queue",
   });
@@ -376,7 +376,7 @@ async function lostAcknowledgement(withQuote = false, { host = "stock" } = {}) {
     // without an implicit transport retry obscuring application behavior.
     await page.route("**/console/rpc", async route => {
       const body = route.request().postDataJSON();
-      if (body?.method !== "mobkit/console/send" || dropped) return route.continue();
+      if (body?.method !== "meta/console/send" || dropped) return route.continue();
       const response = await route.fetch({ maxRetries: 0 });
       const responseText = await response.text();
       const observation = sendObservations(fixture).findLast(item => item.request === route.request().postData());
@@ -408,7 +408,7 @@ async function lostAcknowledgement(withQuote = false, { host = "stock" } = {}) {
       const row = page.getByTestId(`pending-item:${saved.id}`);
       await row.getByText(/^Couldn't reach .+ \(offline or signed out\)\.$/).waitFor();
       assert.doesNotMatch(await row.innerText(), /Failed to fetch|acceptance|receipt/i, "no protocol terms on the row");
-      // This fixture keeps send dedupe in memory (no MOBKIT_FIXTURE_STATE),
+      // This fixture keeps send dedupe in memory (no META_FIXTURE_STATE),
       // so a same-key resend is not offered: Check and Discard only.
       const experience = await (await fetch(`${fixture.baseUrl}/console/experience`)).json();
       assert.equal(experience.send_dedupe?.durable, false, "in-memory fixture store reports non-durable send dedupe");
@@ -540,7 +540,7 @@ async function sharedQueuedSteer() {
     await fixture.control("model", { source: acknowledgementText, delay_ms: 0, chunk_chars: 4096 });
     // The reusable host receives the same real queued/steer API timeline as
     // stock. Its response grouping and copy controls are exercised in-browser.
-    const response = await rpc(fixture.baseUrl, "mobkit/console/send", {
+    const response = await rpc(fixture.baseUrl, "meta/console/send", {
       identity, content: queued, handling_mode: "steer", idempotency_key: "shared-steer-second",
       origin: "console:shared-steer-acceptance", origin_kind: "operator",
     });

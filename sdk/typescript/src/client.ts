@@ -1,5 +1,5 @@
 /**
- * Low-level JSON-RPC clients for MobKit.
+ * Low-level JSON-RPC clients for Meta.
  *
  * These are the original typed client classes preserved for backward
  * compatibility. For new code, prefer the high-level {@link MobHandle} API
@@ -21,57 +21,57 @@ import {
 
 // -- Wire-format result types (snake_case, backward compat) ---------------
 
-export type MobkitStatusResult = {
+export type MetaStatusResult = {
   contract_version: string;
   running: boolean;
   loaded_modules: string[];
 };
 
-export type MobkitCapabilitiesResult = {
+export type MetaCapabilitiesResult = {
   contract_version: string;
   feature_capabilities?: string[];
   methods: string[];
   loaded_modules: string[];
 };
 
-export type MobkitReconcileResult = {
+export type MetaReconcileResult = {
   accepted: boolean;
   reconciled_modules: string[];
   added: number;
 };
 
-export type MobkitSpawnMemberResult = {
+export type MetaSpawnMemberResult = {
   accepted: boolean;
   module_id: string;
 };
 
-export type MobkitSubscribeScope = "mob" | "agent" | "interaction";
+export type MetaSubscribeScope = "mob" | "agent" | "interaction";
 
-export type MobkitSubscribeParams = {
-  scope?: MobkitSubscribeScope;
+export type MetaSubscribeParams = {
+  scope?: MetaSubscribeScope;
   last_event_id?: string;
   agent_id?: string;
 };
 
-export type MobkitSubscribeKeepAlive = {
+export type MetaSubscribeKeepAlive = {
   interval_ms: number;
   event: string;
 };
 
-export type MobkitEventEnvelope = {
+export type MetaEventEnvelope = {
   event_id: string;
   source: string;
   timestamp_ms: number;
   event: unknown;
 };
 
-export type MobkitSubscribeResult = {
-  scope: MobkitSubscribeScope;
+export type MetaSubscribeResult = {
+  scope: MetaSubscribeScope;
   replay_from_event_id: string | null;
-  keep_alive: MobkitSubscribeKeepAlive;
+  keep_alive: MetaSubscribeKeepAlive;
   keep_alive_comment: string;
   event_frames: string[];
-  events: MobkitEventEnvelope[];
+  events: MetaEventEnvelope[];
 };
 
 // -- Type guards ----------------------------------------------------------
@@ -85,7 +85,7 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
-function isMobkitStatusResult(value: unknown): value is MobkitStatusResult {
+function isMetaStatusResult(value: unknown): value is MetaStatusResult {
   const o = asValueObject(value);
   return (
     typeof o.contract_version === "string" &&
@@ -94,9 +94,9 @@ function isMobkitStatusResult(value: unknown): value is MobkitStatusResult {
   );
 }
 
-function isMobkitCapabilitiesResult(
+function isMetaCapabilitiesResult(
   value: unknown,
-): value is MobkitCapabilitiesResult {
+): value is MetaCapabilitiesResult {
   const o = asValueObject(value);
   return (
     typeof o.contract_version === "string" &&
@@ -106,9 +106,9 @@ function isMobkitCapabilitiesResult(
   );
 }
 
-function isMobkitReconcileResult(
+function isMetaReconcileResult(
   value: unknown,
-): value is MobkitReconcileResult {
+): value is MetaReconcileResult {
   const o = asValueObject(value);
   return (
     typeof o.accepted === "boolean" &&
@@ -118,16 +118,16 @@ function isMobkitReconcileResult(
   );
 }
 
-function isMobkitSpawnMemberResult(
+function isMetaSpawnMemberResult(
   value: unknown,
-): value is MobkitSpawnMemberResult {
+): value is MetaSpawnMemberResult {
   const o = asValueObject(value);
   return typeof o.accepted === "boolean" && typeof o.module_id === "string";
 }
 
-function isMobkitSubscribeResult(
+function isMetaSubscribeResult(
   value: unknown,
-): value is MobkitSubscribeResult {
+): value is MetaSubscribeResult {
   const o = asValueObject(value);
   if (o.scope !== "mob" && o.scope !== "agent" && o.scope !== "interaction") {
     return false;
@@ -211,7 +211,7 @@ function unwrapTypedResult<TResult>(
 }
 
 function buildSubscribeParams(
-  params: MobkitSubscribeParams,
+  params: MetaSubscribeParams,
 ): Record<string, unknown> {
   const next: Record<string, unknown> = {};
   if (params.scope !== undefined) next.scope = params.scope;
@@ -222,9 +222,9 @@ function buildSubscribeParams(
   return next;
 }
 
-// -- MobkitTypedClient (sync) ---------------------------------------------
+// -- MetaTypedClient (sync) ---------------------------------------------
 
-export class MobkitTypedClient {
+export class MetaTypedClient {
   private readonly syncTransport: JsonRpcSyncTransport;
 
   constructor(private readonly gatewayBin: string) {
@@ -240,72 +240,72 @@ export class MobkitTypedClient {
     return parseJsonRpcResponse(payload, id);
   }
 
-  status(requestId = "status"): MobkitStatusResult {
+  status(requestId = "status"): MetaStatusResult {
     return unwrapTypedResult(
-      this.rpc(requestId, "mobkit/status", {}),
+      this.rpc(requestId, "meta/status", {}),
       requestId,
-      "mobkit/status",
-      isMobkitStatusResult,
+      "meta/status",
+      isMetaStatusResult,
     );
   }
 
-  capabilities(requestId = "capabilities"): MobkitCapabilitiesResult {
+  capabilities(requestId = "capabilities"): MetaCapabilitiesResult {
     return unwrapTypedResult(
-      this.rpc(requestId, "mobkit/capabilities", {}),
+      this.rpc(requestId, "meta/capabilities", {}),
       requestId,
-      "mobkit/capabilities",
-      isMobkitCapabilitiesResult,
+      "meta/capabilities",
+      isMetaCapabilitiesResult,
     );
   }
 
   reconcile(
     modules: string[],
     requestId = "reconcile",
-  ): MobkitReconcileResult {
+  ): MetaReconcileResult {
     return unwrapTypedResult(
-      this.rpc(requestId, "mobkit/reconcile", { modules }),
+      this.rpc(requestId, "meta/reconcile", { modules }),
       requestId,
-      "mobkit/reconcile",
-      isMobkitReconcileResult,
+      "meta/reconcile",
+      isMetaReconcileResult,
     );
   }
 
   spawnMember(
     moduleId: string,
     requestId = "spawn_member",
-  ): MobkitSpawnMemberResult {
+  ): MetaSpawnMemberResult {
     return unwrapTypedResult(
-      this.rpc(requestId, "mobkit/spawn_member", { module_id: moduleId }),
+      this.rpc(requestId, "meta/spawn_member", { module_id: moduleId }),
       requestId,
-      "mobkit/spawn_member",
-      isMobkitSpawnMemberResult,
+      "meta/spawn_member",
+      isMetaSpawnMemberResult,
     );
   }
 
   subscribeEvents(
-    params: MobkitSubscribeParams = {},
+    params: MetaSubscribeParams = {},
     requestId = "events_subscribe",
-  ): MobkitSubscribeResult {
+  ): MetaSubscribeResult {
     return unwrapTypedResult(
       this.rpc(
         requestId,
-        "mobkit/events/subscribe",
+        "meta/events/subscribe",
         buildSubscribeParams(params),
       ),
       requestId,
-      "mobkit/events/subscribe",
-      isMobkitSubscribeResult,
+      "meta/events/subscribe",
+      isMetaSubscribeResult,
     );
   }
 }
 
-// -- MobkitAsyncClient (async) --------------------------------------------
+// -- MetaAsyncClient (async) --------------------------------------------
 
-export class MobkitAsyncClient {
+export class MetaAsyncClient {
   constructor(private readonly transport: JsonRpcTransport) {}
 
-  static fromGatewayBin(gatewayBin: string): MobkitAsyncClient {
-    return new MobkitAsyncClient(createGatewayAsyncTransport(gatewayBin));
+  static fromGatewayBin(gatewayBin: string): MetaAsyncClient {
+    return new MetaAsyncClient(createGatewayAsyncTransport(gatewayBin));
   }
 
   static fromHttp(
@@ -314,8 +314,8 @@ export class MobkitAsyncClient {
       headers?: Record<string, string>;
       fetchImpl?: FetchLike;
     } = {},
-  ): MobkitAsyncClient {
-    return new MobkitAsyncClient(
+  ): MetaAsyncClient {
+    return new MetaAsyncClient(
       createJsonRpcHttpTransport(endpoint, options),
     );
   }
@@ -341,59 +341,59 @@ export class MobkitAsyncClient {
     return unwrapTypedResult(response, id, method, isExpected);
   }
 
-  async status(requestId = "status"): Promise<MobkitStatusResult> {
+  async status(requestId = "status"): Promise<MetaStatusResult> {
     return this.request(
       requestId,
-      "mobkit/status",
+      "meta/status",
       {},
-      isMobkitStatusResult,
+      isMetaStatusResult,
     );
   }
 
   async capabilities(
     requestId = "capabilities",
-  ): Promise<MobkitCapabilitiesResult> {
+  ): Promise<MetaCapabilitiesResult> {
     return this.request(
       requestId,
-      "mobkit/capabilities",
+      "meta/capabilities",
       {},
-      isMobkitCapabilitiesResult,
+      isMetaCapabilitiesResult,
     );
   }
 
   async reconcile(
     modules: string[],
     requestId = "reconcile",
-  ): Promise<MobkitReconcileResult> {
+  ): Promise<MetaReconcileResult> {
     return this.request(
       requestId,
-      "mobkit/reconcile",
+      "meta/reconcile",
       { modules },
-      isMobkitReconcileResult,
+      isMetaReconcileResult,
     );
   }
 
   async spawnMember(
     moduleId: string,
     requestId = "spawn_member",
-  ): Promise<MobkitSpawnMemberResult> {
+  ): Promise<MetaSpawnMemberResult> {
     return this.request(
       requestId,
-      "mobkit/spawn_member",
+      "meta/spawn_member",
       { module_id: moduleId },
-      isMobkitSpawnMemberResult,
+      isMetaSpawnMemberResult,
     );
   }
 
   async subscribeEvents(
-    params: MobkitSubscribeParams = {},
+    params: MetaSubscribeParams = {},
     requestId = "events_subscribe",
-  ): Promise<MobkitSubscribeResult> {
+  ): Promise<MetaSubscribeResult> {
     return this.request(
       requestId,
-      "mobkit/events/subscribe",
+      "meta/events/subscribe",
       buildSubscribeParams(params),
-      isMobkitSubscribeResult,
+      isMetaSubscribeResult,
     );
   }
 }

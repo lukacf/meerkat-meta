@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Memory bright-line ratchet — docs/design/agent-memory-architecture.md §12.
 
-MobKit's memory modules must never grow retrieval-index or embedding
+Meta's memory modules must never grow retrieval-index or embedding
 machinery: that is external memory hub material. This gate enforces the ratchet in
 two passes:
 
-  1. Deny-list scan of crates/meerkat-mobkit/Cargo.toml dependency names
+  1. Deny-list scan of crates/meerkat-meta/Cargo.toml dependency names
      (case-insensitive substring match) for retrieval-index / embedding
      crates.
   2. Source scan of the memory modules
-     (crates/meerkat-mobkit/src/identity_first/agent_memory*.rs and, forward-
-     compatibly, crates/meerkat-mobkit/src/memory*) for SQL full-text-index
+     (crates/meerkat-meta/src/identity_first/agent_memory*.rs and, forward-
+     compatibly, crates/meerkat-meta/src/memory*) for SQL full-text-index
      patterns (FTS5/FTS4, CREATE VIRTUAL TABLE, SQL MATCH) and
      embedding/vector identifiers.
 
@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CARGO_TOML = REPO_ROOT / "crates" / "meerkat-mobkit" / "Cargo.toml"
+CARGO_TOML = REPO_ROOT / "crates" / "meerkat-meta" / "Cargo.toml"
 ALLOWLIST_PATH = REPO_ROOT / "scripts" / "memory-bright-line-allow.txt"
 DESIGN_DOC = "docs/design/agent-memory-architecture.md"
 
@@ -72,7 +72,7 @@ BRIGHT_LINE_QUOTE = f"""\
 This violates the memory bright line ({DESIGN_DOC} §12,
 "Hub-compatibility discipline"):
 
-  "MobKit's store never grows: entities, relations, truth slots, embeddings,
+  "Meta's store never grows: entities, relations, truth slots, embeddings,
    chunking, FTS/vector indexes, freshness engines. The moment a record is
    entity-shaped *world knowledge* ... rather than *working knowledge* ...,
    it is hub material ... Enforced as a ratchet: a CI gate forbids
@@ -80,7 +80,7 @@ This violates the memory bright line ({DESIGN_DOC} §12,
    meerkat governance-gate tradition."
 
 Retrieval-index and embedding machinery belongs in the memory hub
-(docs/design/memory-hub-roadmap.md), not in MobKit. If a hit is a genuine
+(docs/design/memory-hub-roadmap.md), not in Meta. If a hit is a genuine
 false positive, add an entry with a justification comment to
 scripts/memory-bright-line-allow.txt (crate name for dependency hits,
 `src:<path>:<pattern-name>` for source hits)."""
@@ -114,7 +114,7 @@ def load_allowlist():
 
 def cargo_dependency_names():
     """Yield (crate_name, lineno) for every dependency declared in
-    crates/meerkat-mobkit/Cargo.toml, including `package = "..."` renames and
+    crates/meerkat-meta/Cargo.toml, including `package = "..."` renames and
     `[dependencies.<name>]` table headers."""
     if not CARGO_TOML.exists():
         fail_config(f"missing {CARGO_TOML}")
@@ -154,7 +154,7 @@ def scan_dependencies(allowlist):
         for denied in DENIED_CRATE_SUBSTRINGS:
             if denied in lowered:
                 violations.append(
-                    f"crates/meerkat-mobkit/Cargo.toml:{lineno}: dependency `{name}` "
+                    f"crates/meerkat-meta/Cargo.toml:{lineno}: dependency `{name}` "
                     f"matches denied crate substring \"{denied}\""
                 )
                 break
@@ -162,7 +162,7 @@ def scan_dependencies(allowlist):
 
 
 def memory_source_files():
-    src = REPO_ROOT / "crates" / "meerkat-mobkit" / "src"
+    src = REPO_ROOT / "crates" / "meerkat-meta" / "src"
     files = sorted(src.glob("identity_first/agent_memory*.rs"))
     files += sorted(src.glob("memory*.rs"))
     for directory in sorted(src.glob("memory*/")):
@@ -199,7 +199,7 @@ def main():
     file_count = len(memory_source_files())
     print(
         "check-memory-bright-line: OK "
-        f"(crates/meerkat-mobkit/Cargo.toml dependencies clean; {file_count} "
+        f"(crates/meerkat-meta/Cargo.toml dependencies clean; {file_count} "
         "memory-module source file(s) clean)"
     )
 

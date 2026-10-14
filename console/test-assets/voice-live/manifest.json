@@ -1,5 +1,5 @@
 {
-  "provenance": "Original synthetic speech authored for MobKit paid voice acceptance; no human microphone recording or third-party audio samples.",
+  "provenance": "Original synthetic speech authored for Meta paid voice acceptance; no human microphone recording or third-party audio samples.",
   "generation": {
     "engine": "macOS say",
     "voice": "Samantha",

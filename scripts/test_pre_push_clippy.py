@@ -28,8 +28,8 @@ class PrePushClippyDispatchTests(unittest.TestCase):
             self.assertNotIn(key, fields, f"Review the additional {key} dispatch filter")
         selector = re.compile(fields["files"])
         for path in (
-            "crates/meerkat-mobkit/src/lib.rs", "src/main.rs", "build.rs",
-            "Cargo.toml", "Cargo.lock", "crates/meerkat-mobkit/Cargo.toml",
+            "crates/meerkat-meta/src/lib.rs", "src/main.rs", "build.rs",
+            "Cargo.toml", "Cargo.lock", "crates/meerkat-meta/Cargo.toml",
             "nested/Cargo.lock", "rust-toolchain.toml", "rust-toolchain",
         ):
             with self.subTest(selected=path):

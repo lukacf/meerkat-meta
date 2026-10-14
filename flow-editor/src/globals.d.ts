@@ -17,7 +17,7 @@ declare global {
   const ReactDOM: any;
   // Boot layout constants assigned to window by data.js, which app.tsx
   // imports for execution order before reading them.
-  const MOBKIT_BOOT: any;
+  const META_BOOT: any;
 
   // Loose JSX for the migration window: the package programs get this for
   // free (no resolvable react means no JSX prop checking); the shell program
@@ -34,17 +34,17 @@ declare global {
     // Back-compat controller surface for browser smokes, live verification
     // scripts, the @flow-editor-components views, and embedders; app.tsx
     // assigns its module-scoped facade here.
-    MobKitFlowController: any;
-    MOBKIT_BOOT: any;
+    MetaFlowController: any;
+    META_BOOT: any;
     // Live verification breadcrumbs the API action handlers publish.
-    __mobkitFlowLastDocument?: any;
-    __mobkitFlowLastDeployPlanTrace?: any;
-    __mobkitFlowLastValidation?: any;
-    __mobkitFlowLastExport?: any;
-    __mobkitFlowLastDeploy?: any;
-    __mobkitFlowLastSource?: any;
-    __mobkitFlowLastImport?: any;
-    __mobkitFlowDisableDownload?: any;
+    __metaFlowLastDocument?: any;
+    __metaFlowLastDeployPlanTrace?: any;
+    __metaFlowLastValidation?: any;
+    __metaFlowLastExport?: any;
+    __metaFlowLastDeploy?: any;
+    __metaFlowLastSource?: any;
+    __metaFlowLastImport?: any;
+    __metaFlowDisableDownload?: any;
   }
 }
 

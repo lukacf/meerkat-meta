@@ -62,6 +62,11 @@ jobs:
       # CI test binaries therefore carry no debuginfo; panics keep their
       # messages but backtraces lose file:line. Local builds are unaffected.
       CARGO_PROFILE_DEV_DEBUG: "0"
+      # The in-process held-bootstrap and native-grant tests resolve a
+      # provider identity while they build members but never call the
+      # provider. This is the same fake value the gateway test fixtures give
+      # their child processes, not a secret.
+      OPENAI_API_KEY: sk-regression-test
     steps:
       # The workspace debug build (meerkat 0.7.25 dep tree + all test
       # binaries) plus the rust-cache restore no longer fits beside the
@@ -104,11 +109,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: scripts/repo-cargo test -p mobkit-extension-state --locked
-      - run: scripts/repo-cargo check -p meerkat-mobkit --locked --no-default-features
-      - run: scripts/repo-cargo clippy -p meerkat-mobkit --locked --features extension-state --lib --test extension_state -- -D warnings
-      - run: scripts/repo-cargo test -p meerkat-mobkit --locked --features extension-state --test extension_state
-      - run: scripts/repo-cargo test -p meerkat-mobkit --locked --features extension-state --lib extension_
+      - run: scripts/repo-cargo test -p meta-extension-state --locked
+      - run: scripts/repo-cargo check -p meerkat-meta --locked --no-default-features
+      - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features extension-state --lib --test extension_state -- -D warnings
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --test extension_state
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --lib extension_
 
   test-voice:
     name: test-voice
@@ -124,12 +129,12 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: scripts/repo-cargo clippy -p meerkat-mobkit --locked --features openai-live --lib --bin rpc_gateway --bin mobkit_gateway -- -D warnings
+      - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features openai-live --lib --bin rpc_gateway --bin meta_gateway -- -D warnings
       # The shared host uses a loopback provider, never paid credentials.
-      - run: scripts/repo-cargo test -p meerkat-mobkit --locked --features openai-live --lib --bin rpc_gateway --bin mobkit_gateway --test console_route_auth --test console_experience --test never_executed_persistence --test swarm_integration console_voice
-      - run: scripts/repo-cargo test -p meerkat-mobkit --locked --features openai-live --bin rpc_gateway gateway_openai_live_registration
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --lib --bin rpc_gateway --bin meta_gateway --test console_route_auth --test console_experience --test never_executed_persistence --test swarm_integration console_voice
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --lib gateway_openai_live_registration
       # Reuse this feature build for classic/identity restarts with and without voice.
-      - run: scripts/repo-cargo test -p meerkat-mobkit --locked --features openai-live --test mobkit_gateway_bootstrap persistent_http_restarts
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --test meta_gateway_bootstrap persistent_http_restarts
 
   test-python:
     name: test-python
@@ -148,7 +153,7 @@ jobs:
       # depending on repository secrets or silently skipping the gateway lane.
       - run: make test-python
         env:
-          OPENAI_API_KEY: mobkit-ci-bootstrap-only-not-a-secret
+          OPENAI_API_KEY: meta-ci-bootstrap-only-not-a-secret
 
   # The console lane was one serial job whose two heaviest steps accounted for
   # 22.3 of its ~38 minutes, while all nine npm check scripts took 0.0m each.
@@ -209,29 +214,29 @@ jobs:
       # has no style, layout or paint, so only a browser can see this
       # regress. Fails only on runner-independent work counts (layout objects
       # per keystroke, full derivations and turn renders per streamed token);
-      # wall-clock p95 is printed as advisory (MOBKIT_TYPING_LAG_ENFORCE_TIMING=1
+      # wall-clock p95 is printed as advisory (META_TYPING_LAG_ENFORCE_TIMING=1
       # makes it a failure for local perf work).
       - run: npm --prefix console run perf:typing:browser --silent
       # One immutable backend build serves every browser/API scenario below.
       - name: Build console acceptance backends
         run: |
-          scripts/repo-cargo build -p meerkat-mobkit --example library_mode_reference --example console_acceptance_fixture --example memory_console_reference --example workgraph_console_reference
+          scripts/repo-cargo build -p meerkat-meta --example library_mode_reference --example console_acceptance_fixture --example memory_console_reference --example workgraph_console_reference
           target_dir="$(scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')"
-          echo "MOBKIT_EXAMPLE_BIN_DIR=${target_dir}/debug/examples" >> "$GITHUB_ENV"
-      - run: scripts/repo-cargo test -p meerkat-mobkit --example console_acceptance_fixture
+          echo "META_EXAMPLE_BIN_DIR=${target_dir}/debug/examples" >> "$GITHUB_ENV"
+      - run: scripts/repo-cargo test -p meerkat-meta --example console_acceptance_fixture
       - name: Native MCP Apps rendering and reload
         timeout-minutes: 5
         run: npm --prefix console run e2e:mcp-apps --silent
         env:
-          MOBKIT_BROWSER_EVIDENCE: ${{ github.workspace }}/output/playwright/console-acceptance/mcp-apps
+          META_BROWSER_EVIDENCE: ${{ github.workspace }}/output/playwright/console-acceptance/mcp-apps
       # The model remains held for more than the native HTTP action timeout.
       # Three mounted Apps must keep polling through the same MCP connection.
       - name: Native MCP Apps polling during an active model turn
         timeout-minutes: 5
         run: npm --prefix console run e2e:mcp-apps --silent
         env:
-          MOBKIT_MCP_APPS_LONG_POLL: "1"
-          MOBKIT_BROWSER_EVIDENCE: ${{ github.workspace }}/output/playwright/console-acceptance/mcp-apps
+          META_MCP_APPS_LONG_POLL: "1"
+          META_BROWSER_EVIDENCE: ${{ github.workspace }}/output/playwright/console-acceptance/mcp-apps
       - run: node console/api-e2e.cjs
       - run: node console/browser-e2e.cjs
       - run: node console/voice-e2e.cjs
@@ -249,7 +254,7 @@ jobs:
           if-no-files-found: error
 
   # Needs Rust but NOT playwright: the script bundles with esbuild, runs
-  # `node --test`, then `cargo test -p meerkat-mobkit --test
+  # `node --test`, then `cargo test -p meerkat-meta --test
   # console_customization_fixtures`, which is where its 12 minutes go.
   console-fixtures:
     name: console-fixtures
@@ -308,7 +313,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: npm --prefix flow-editor ci --silent --no-fund --no-audit
       - run: npm --prefix flow-editor exec -- playwright install --with-deps chromium
-      - run: CARGO_INCREMENTAL=0 scripts/repo-cargo build -p meerkat-mobkit --bin mobkit_flow_editor
+      - run: CARGO_INCREMENTAL=0 scripts/repo-cargo build -p meerkat-meta --bin meta_flow_editor
       - run: npm --prefix flow-editor run test:controller --silent
       - run: npm --prefix flow-editor run test:visual-contract --silent
       - run: npm --prefix flow-editor run test:browser-source --silent

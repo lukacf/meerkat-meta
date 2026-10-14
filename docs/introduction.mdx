@@ -1,120 +1,75 @@
 ---
-title: "Introduction"
-description: "MobKit is the application gateway, policy, SDK, persistence-projection, and console layer for Meerkat agents and mobs."
+title: "Meerkat Meta"
+description: "Compose Core agents into applications with memory, routing, policy, approvals and an operator console."
 icon: "boxes-stacked"
 ---
 
-MobKit lets an application boot, expose, observe, and operate a production
-Meerkat mob without hand-wiring every host integration. You describe desired
-agents, topology, and operational policy. MobKit packages gateway startup,
-module routing, policy enforcement, persistence projections, SDKs, and a live
-operator console around that runtime.
+Meerkat Meta is the application layer around Meerkat Core. It brings lasting
+agent identities, memory, routing, access policy, approvals and a console into
+one composition. Use it when agents need an operational home and a way for
+people and other systems to work with them over time.
 
-[Meerkat](https://github.com/lukacf/meerkat) already owns both individual-agent
-execution and multi-agent mob orchestration: prompt assembly, tools, sessions,
-stable member identity, spawning, lifecycle, wiring, flows, comms, and
-coordination. MobKit is the companion product and gateway layer. It invokes
-those primitives and projects them for applications and operators; it does not
-replace `meerkat-mob` or maintain a second mob authority.
-
-```python
-rt = await (
-    MobKit.builder()
-    .mob("mob.toml")
-    .persistent_state("./state")
-    .roster(my_roster)
-    .gateway("./rpc_gateway")
-    .build()
-)
-
-triage = rt.agent("triage:main")
-luka = rt.agent("identity:luka")
-
-await triage.dispatch_text("New event", origin="connector")
-# On a turn_driven member (runtime_mode = "turn_driven"), send_and_wait waits
-# for THIS send's turn by its ticket and returns that turn's own output,
-# whatever else the identity is doing. An autonomous_host member (the default
-# mode) cannot be tracked per turn: the send is still delivered once, and the
-# call waits identity-wide with a TurnTrackingUnavailableWarning (another
-# delivery can satisfy that wait; send_and_wait_outcome says attributed=False).
-output = await luka.send_and_wait("What's happening?", timeout=60)
-```
-
-```mermaid
-flowchart TB
-    APP["Your application"] --> MOBKIT["MobKit companion layer<br/>startup, module routing, policy,<br/>persistence projections, SDKs, console"]
-    MOBKIT --> MEERKAT["Meerkat runtime<br/>agent sessions and mob identity,<br/>spawn, lifecycle, wiring, flows, comms"]
-    MEERKAT --> TEAM["Durable and ephemeral members<br/>domain, personal, coordination, task"]
-```
-
-## What you can build
-
-MobKit's primary pattern is layered agent architectures — but it's not limited to any single topology:
-
-- **Domain agents** that own a capability (email, calendar, code review, data analysis)
-- **Personal agents** that represent a user and delegate to domain agents
-- **Group agents** that coordinate across a team or initiative
-- **Task agents** that are spawned on demand for short-lived work
-
-You define profiles and wiring in a Meerkat mob config. MobKit's startup and
-roster layers submit desired members and topology to the Meerkat mob runtime,
-invoke its spawn, retire, respawn, and wiring operations, and reconcile the
-host's desired state against the resulting runtime projection.
-
-## What MobKit provides
-
-- **Unified startup.** Bootstrap a Meerkat mob and MobKit operational modules
-  through one composition root, with health supervision and bounded rollback.
-- **Identity-first convenience.** Expose Meerkat `AgentIdentity` through roster
-  providers, topology providers, lease-fenced host continuity records, SDK
-  handles, and console projections.
-- **Operator workflows.** Invoke Meerkat member lifecycle and topology
-  operations, then reconcile application desired state with runtime truth.
-- **Operational subsystems.** Compose module routing and delivery, approval
-  gates, durable scheduling adapters, WorkGraph integration, and optional
-  memory record and retrieval providers.
-- **Admin console.** Serve a React workbench with identity and roster views,
-  conversations, topology, approvals, health, timeline replay, and live SSE.
-- **Persistence projections.** Store MobKit continuity, lease, metadata,
-  timeline, blob, schedule, and agent-memory records through a declared storage
-  provider. Persistent mode fails closed instead of silently falling back to
-  memory. Meerkat remains the owner of canonical session and mob durability.
-- **Authentication and policy.** Apply JWT/OIDC authentication, coarse
-  server-side read-only policy, and optional deny-by-default ABAC across
-  console REST, RPC, and SSE.
-- **SDKs.** Use Python and TypeScript clients with typed returns and contract
-  parity tests against the Rust core.
-
-## MobKit and Meerkat
-
-| | Meerkat | MobKit |
-|---|---|---|
-| **Role** | Agent and multi-agent mob runtime | Companion application and operator layer |
-| **Owns** | Agent loop, prompt assembly, tools, sessions, mob orchestration, `AgentIdentity`, membership, spawn, lifecycle, wiring, flows, comms, coordination | Gateway startup, host desired-state providers, module routing and delivery, operational policy, MobKit persistence projections, SDK transport, console and timeline UX |
-| **Interface** | Rust crates, CLI, REST, JSON-RPC, MCP, and SDKs | Rust composition crate, `rpc_gateway`, `mobkit_gateway`, JSON-RPC/REST/SSE packaging, Python and TypeScript SDKs, console |
-
-Meerkat runs agents and mobs. MobKit makes that runtime convenient to embed,
-integrate, expose, and operate as a product.
-
-## Explore the documentation
+Core already runs agents and multi-agent mobs. Meta adds the application
+composition and operating experience on top of those runtime contracts.
+It does not require Meerkat Connect.
 
 <CardGroup cols={2}>
-  <Card title="Quickstart" icon="rocket" href="/quickstart">
-    Bootstrap a runtime with modules and a Meerkat mob in under a minute.
+  <Card title="Start a runtime" icon="rocket" href="/quickstart">
+    Connect an SDK, configure the application and open its console.
   </Card>
-  <Card title="Core Concepts" icon="shapes" href="/concepts/modules">
-    Modules, events, gating, delivery, durable scheduling, memory, and sessions.
-  </Card>
-  <Card title="Guides" icon="book-open" href="/guides/unified-runtime">
-    Step-by-step walkthroughs for the unified runtime, module system, and console.
-  </Card>
-  <Card title="Architecture" icon="layer-group" href="/reference/architecture">
-    Internal architecture, crate structure, and design decisions.
-  </Card>
-  <Card title="APIs" icon="plug" href="/api/rpc">
-    JSON-RPC, REST, and SSE protocol references.
-  </Card>
-  <Card title="SDKs" icon="code" href="/sdks/rust">
-    Rust, TypeScript, and Python SDK documentation.
+  <Card title="Choose your starting point" icon="compass" href="https://docs.rkat.ai/introduction">
+    Compare Core, Meta and optional integration setup.
   </Card>
 </CardGroup>
+
+## From a personal agent to a working organization
+
+An application can combine personal agents, domain specialists and coordinators
+with temporary workers. Profiles describe capabilities. A roster describes the
+lasting identities you want to keep available. Topology describes who can
+communicate. Core executes and coordinates the agents; Meta packages the
+application's desired state, persistence providers and operational interfaces.
+
+An agent's stable identity remains its address when its runtime binding changes.
+Use this for enduring roles. Short-lived workers need not become a permanent
+population of identities.
+
+## What you get
+
+| Area | Purpose |
+| --- | --- |
+| Memory | Records with provenance and trust, bounded recall, optional distillation and background consolidation |
+| Policy | Authenticated access, attribute-based view/steer rules and application-defined approval decisions |
+| Operations | Routing, delivery, health supervision and persistent application state |
+| Console | Conversations, roster, topology, shared work, memory, approvals and timeline inspection |
+| Integration surfaces | Rust composition, JSON-RPC, REST, SSE and Python/TypeScript SDKs |
+
+Memory is an agent capability, not just another chat history. Its
+[record and retrieval system](/concepts/memory) can preserve useful experience,
+keep untrusted writes separate and select what belongs in the next context.
+Applications choose their providers and policy.
+
+The console is a view of the same system the SDKs operate. Its projections do
+not replace Core's session, mob or lifecycle state. See the
+[unified runtime guide](/guides/unified-runtime) for the composition boundary.
+
+## Add only what your application needs
+
+Use your own tools and integrations, or add **Connect** for agent-led setup.
+Connect is optional. Its native setup experience is being developed around a
+standalone terminal and the Meta console, without a user-managed Connect server. A conversational frontend still needs
+an application host with suitable routing, identity and delivery.
+
+Meerkat Connect does not become a mandatory Core dependency.
+
+**Meta Forge** guides setup, application authoring and deployment packaging.
+The [example packs](https://github.com/lukacf/meerkat-meta/tree/main/examples)
+show repository-maintained applications and state their exact prerequisites.
+
+## Continue
+
+Start with the [quickstart](/quickstart), then
+[authentication](/guides/authentication), [memory](/concepts/memory) and
+[access control](/concepts/access-control). The
+[architecture reference](/reference/architecture) covers the runtime boundary
+in more depth.

@@ -1,0 +1,364 @@
+//! Test-only inner `RuntimeStore` for decorator forwarding tests.
+//!
+//! A real in-memory store answers every required method. The methods whose
+//! trait defaults refuse, answer none or route around the inner store instead
+//! record their call and answer something the default never would, so a
+//! decorator that leaves one to its default fails [`assert_forwards_to`].
+
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use meerkat_runtime::store::{
+    ContinuationAdmission, ContinuationAdmissionOutcome, ContinuationAdmissionTransition,
+    ContinuationKeyBinding, KeyedRuntimeDeliveryCasOutcome, RuntimeDeliveryAuthorityRecord,
+    RuntimeDeliveryStoreRecord, RuntimeStoreControllerCustody, RuntimeStoreError,
+    RuntimeStoreExecutionClaim, RuntimeStoreExecutionCustody,
+};
+use meerkat_runtime::{HostingCapability, LogicalRuntimeId, RuntimeStore};
+
+const REFUSAL: &str = "forwarding probe: controller mutation custody";
+const DELIVERY_GENERATION: u64 = 41;
+
+pub(crate) struct ForwardingRuntimeStoreProbe {
+    inner: meerkat_runtime::InMemoryRuntimeStore,
+    custody: RuntimeStoreExecutionCustody,
+    admission: ContinuationAdmission,
+    calls: Mutex<Vec<&'static str>>,
+}
+
+impl Default for ForwardingRuntimeStoreProbe {
+    fn default() -> Self {
+        Self {
+            inner: meerkat_runtime::InMemoryRuntimeStore::new(),
+            custody: RuntimeStoreExecutionCustody::new(),
+            admission: ContinuationAdmission::Applied {
+                session_id: meerkat_core::types::SessionId::new(),
+                input_id: meerkat_core::lifecycle::InputId::new(),
+            },
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl ForwardingRuntimeStoreProbe {
+    fn record(&self, call: &'static str) {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(call);
+    }
+
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+fn binding(owner: &str, key: &str) -> ContinuationKeyBinding {
+    ContinuationKeyBinding {
+        owner: owner.to_string(),
+        key: key.to_string(),
+        address: LogicalRuntimeId::new("forwarding-probe"),
+        delivery_id: "probe-delivery".to_string(),
+        submission_digest: "probe-digest".to_string(),
+        committed_at_ms: 7,
+    }
+}
+
+/// Drive every forwarded method through `store`, a decorator over `probe`,
+/// and require the probe's own answer from exactly one call of each.
+pub(crate) async fn assert_forwards_to(
+    store: &dyn RuntimeStore,
+    probe: &Arc<ForwardingRuntimeStoreProbe>,
+) {
+    assert!(
+        store
+            .execution_custody()
+            .is_some_and(|custody| std::ptr::eq(custody, &raw const probe.custody)),
+        "the inner store's own execution custody"
+    );
+    let claim = RuntimeStoreExecutionCustody::new()
+        .try_acquire_shared()
+        .expect("an ordinary claim");
+    assert!(matches!(
+        store.try_controller_mutation_custody(&claim),
+        Err(RuntimeStoreError::Unsupported(reason)) if reason == REFUSAL
+    ));
+    assert!(matches!(
+        store.hosting_capability(),
+        HostingCapability::ProcessLocal
+    ));
+    assert_eq!(
+        store
+            .load_continuation_key_binding("owner", "key")
+            .await
+            .expect("the inner store's binding"),
+        Some(binding("owner", "key"))
+    );
+    let address = LogicalRuntimeId::new("forwarded-address");
+    assert_eq!(
+        store
+            .compare_and_swap_runtime_delivery_authority_with_key_binding(
+                &address,
+                Some(3),
+                RuntimeDeliveryAuthorityRecord::from_parts(4, b"{}".to_vec()),
+                RuntimeDeliveryStoreRecord::from_parts("delivery", 1, b"{}".to_vec()),
+                binding("owner", "bound"),
+            )
+            .await
+            .expect("the inner store's outcome"),
+        KeyedRuntimeDeliveryCasOutcome::KeyAlreadyBound(binding("owner", "bound"))
+    );
+    assert_eq!(
+        store
+            .load_continuation_admission(&address, "delivery")
+            .await
+            .expect("the inner store's admission"),
+        Some(probe.admission.clone())
+    );
+    assert_eq!(
+        store
+            .transition_continuation_admission(
+                &address,
+                "delivery",
+                ContinuationAdmissionTransition::Apply {
+                    session_id: probe.admission.session_id().clone(),
+                    input_id: probe.admission.input_id().clone(),
+                },
+            )
+            .await
+            .expect("the inner store's outcome"),
+        ContinuationAdmissionOutcome::Transitioned(probe.admission.clone())
+    );
+    assert_eq!(
+        store
+            .load_delivery_generation()
+            .await
+            .expect("the inner store's generation"),
+        DELIVERY_GENERATION
+    );
+    assert_eq!(
+        probe.calls(),
+        vec![
+            "execution_custody",
+            "try_controller_mutation_custody",
+            "hosting_capability",
+            "load_continuation_key_binding",
+            "compare_and_swap_runtime_delivery_authority_with_key_binding",
+            "load_continuation_admission",
+            "transition_continuation_admission",
+            "load_delivery_generation",
+        ],
+        "each method reaches the inner store exactly once"
+    );
+}
+
+// The decorator verifier (scripts/verify-session-service-decorators.py)
+// skips only impls inside a `#[cfg(test)]` module. This whole file is
+// test-only, so the double's impl says so where the verifier looks.
+#[cfg(test)]
+mod store_impl {
+    use super::*;
+
+    #[async_trait]
+    impl RuntimeStore for ForwardingRuntimeStoreProbe {
+        fn session_authority_ops(&self) -> &dyn meerkat_runtime::store::RuntimeSessionAuthorityOps {
+            self.inner.session_authority_ops()
+        }
+
+        fn execution_custody(&self) -> Option<&RuntimeStoreExecutionCustody> {
+            self.record("execution_custody");
+            Some(&self.custody)
+        }
+
+        fn try_controller_mutation_custody<'a>(
+            &'a self,
+            _claim: &'a RuntimeStoreExecutionClaim,
+        ) -> Result<Box<dyn RuntimeStoreControllerCustody + 'a>, RuntimeStoreError> {
+            self.record("try_controller_mutation_custody");
+            Err(RuntimeStoreError::Unsupported(REFUSAL.to_string()))
+        }
+
+        fn hosting_capability(&self) -> HostingCapability {
+            self.record("hosting_capability");
+            HostingCapability::ProcessLocal
+        }
+
+        async fn load_continuation_key_binding(
+            &self,
+            owner: &str,
+            key: &str,
+        ) -> Result<Option<ContinuationKeyBinding>, RuntimeStoreError> {
+            self.record("load_continuation_key_binding");
+            Ok(Some(binding(owner, key)))
+        }
+
+        async fn compare_and_swap_runtime_delivery_authority_with_key_binding(
+            &self,
+            _runtime_id: &LogicalRuntimeId,
+            _expected_revision: Option<u64>,
+            _replacement: RuntimeDeliveryAuthorityRecord,
+            _inserted_delivery: RuntimeDeliveryStoreRecord,
+            binding: ContinuationKeyBinding,
+        ) -> Result<KeyedRuntimeDeliveryCasOutcome, RuntimeStoreError> {
+            self.record("compare_and_swap_runtime_delivery_authority_with_key_binding");
+            Ok(KeyedRuntimeDeliveryCasOutcome::KeyAlreadyBound(binding))
+        }
+
+        async fn load_continuation_admission(
+            &self,
+            _address: &LogicalRuntimeId,
+            _delivery_id: &str,
+        ) -> Result<Option<ContinuationAdmission>, RuntimeStoreError> {
+            self.record("load_continuation_admission");
+            Ok(Some(self.admission.clone()))
+        }
+
+        async fn transition_continuation_admission(
+            &self,
+            _address: &LogicalRuntimeId,
+            _delivery_id: &str,
+            _transition: ContinuationAdmissionTransition,
+        ) -> Result<ContinuationAdmissionOutcome, RuntimeStoreError> {
+            self.record("transition_continuation_admission");
+            Ok(ContinuationAdmissionOutcome::Transitioned(
+                self.admission.clone(),
+            ))
+        }
+
+        async fn load_delivery_generation(&self) -> Result<u64, RuntimeStoreError> {
+            self.record("load_delivery_generation");
+            Ok(DELIVERY_GENERATION)
+        }
+
+        async fn commit_session_snapshot(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            session_delta: meerkat_runtime::store::SerializedSessionSnapshot,
+        ) -> Result<(), RuntimeStoreError> {
+            self.inner
+                .commit_session_snapshot(runtime_id, session_delta)
+                .await
+        }
+
+        async fn commit_prepared_whole_blob_rewrite_boundary(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            boundary: meerkat_runtime::store::PreparedWholeBlobRewriteStoreParts,
+        ) -> Result<meerkat_runtime::store::WholeBlobStoreAuthority, RuntimeStoreError> {
+            self.inner
+                .commit_prepared_whole_blob_rewrite_boundary(runtime_id, boundary)
+                .await
+        }
+
+        async fn atomic_apply(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            session_delta: Option<meerkat_runtime::store::SerializedSessionSnapshot>,
+            receipt: meerkat_core::lifecycle::RunBoundaryReceipt,
+            input_updates: Vec<meerkat_runtime::input_state::InputStatePersistenceRecord>,
+            session_store_key: Option<meerkat_core::types::SessionId>,
+        ) -> Result<(), RuntimeStoreError> {
+            self.inner
+                .atomic_apply(
+                    runtime_id,
+                    session_delta,
+                    receipt,
+                    input_updates,
+                    session_store_key,
+                )
+                .await
+        }
+
+        async fn load_input_states(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<Vec<meerkat_runtime::InputStateRow>, RuntimeStoreError> {
+            self.inner.load_input_states(runtime_id).await
+        }
+
+        async fn load_boundary_receipt(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            run_id: &meerkat_core::lifecycle::RunId,
+            sequence: u64,
+        ) -> Result<Option<meerkat_core::lifecycle::RunBoundaryReceipt>, RuntimeStoreError>
+        {
+            self.inner
+                .load_boundary_receipt(runtime_id, run_id, sequence)
+                .await
+        }
+
+        async fn load_session_snapshot(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<Option<Arc<Vec<u8>>>, RuntimeStoreError> {
+            self.inner.load_session_snapshot(runtime_id).await
+        }
+
+        async fn clear_session_snapshot(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<(), RuntimeStoreError> {
+            self.inner.clear_session_snapshot(runtime_id).await
+        }
+
+        async fn replace_session_snapshot_if_current(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected_current: &[u8],
+            replacement: Vec<u8>,
+        ) -> Result<bool, RuntimeStoreError> {
+            self.inner
+                .replace_session_snapshot_if_current(runtime_id, expected_current, replacement)
+                .await
+        }
+
+        async fn clear_session_snapshot_if_current(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected_current: &[u8],
+        ) -> Result<bool, RuntimeStoreError> {
+            self.inner
+                .clear_session_snapshot_if_current(runtime_id, expected_current)
+                .await
+        }
+
+        async fn persist_input_state(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            state: &meerkat_runtime::input_state::InputStatePersistenceRecord,
+        ) -> Result<(), RuntimeStoreError> {
+            self.inner.persist_input_state(runtime_id, state).await
+        }
+
+        async fn load_input_state(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            input_id: &meerkat_core::lifecycle::InputId,
+        ) -> Result<Option<meerkat_runtime::input_state::StoredInputState>, RuntimeStoreError>
+        {
+            self.inner.load_input_state(runtime_id, input_id).await
+        }
+
+        async fn load_machine_lifecycle_record(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<Option<Vec<u8>>, RuntimeStoreError> {
+            self.inner.load_machine_lifecycle_record(runtime_id).await
+        }
+
+        async fn commit_machine_lifecycle(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            commit: meerkat_runtime::store::MachineLifecycleCommit,
+            input_states: &[meerkat_runtime::input_state::InputStatePersistenceRecord],
+        ) -> Result<(), RuntimeStoreError> {
+            self.inner
+                .commit_machine_lifecycle(runtime_id, commit, input_states)
+                .await
+        }
+    }
+}

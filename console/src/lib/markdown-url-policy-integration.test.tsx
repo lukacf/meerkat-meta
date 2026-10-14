@@ -2,13 +2,13 @@ import React from "react";
 import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { ConsoleApp } from "../ConsoleApp";
-import type { MobKitConsoleTransport } from "./headless";
+import type { MetaConsoleTransport } from "./headless";
 import { acceptanceMarkdownUrlPolicy } from "../../fixtures/markdown-url-policy";
 
 const identity = "policy-agent";
-const source = "[Review](/release/review) [App review](mobkit:review) [Denied](https://denied.invalid/link) ![Approved image](https://host.test/blobs/approved) ![Denied image](https://denied.invalid/image.png)";
+const source = "[Review](/release/review) [App review](meta:review) [Denied](https://denied.invalid/link) ![Approved image](https://host.test/blobs/approved) ![Denied image](https://denied.invalid/image.png)";
 
-function transport(): MobKitConsoleTransport {
+function transport(): MetaConsoleTransport {
   return {
     loadExperience: async () => ({ runtime_id: "policy-test", storage_scope: "policy-principal", console_config: {}, agent_sidebar: { live_snapshot: { agents: [{ identity, member_id: identity, agent_id: identity, label: "Policy agent", kind: "member", state: "running", addressable: true, affordances: { can_send_message: true } }] } }, activity_feed: { filter_presets: [], active_preset_id: "all" } }) as never,
     loadModules: async () => ({ modules: [] }) as never,
@@ -23,7 +23,7 @@ beforeEach(() => {
   vi.stubGlobal("localStorage", window.localStorage);
   window.localStorage.clear(); window.sessionStorage.clear();
   const target = { id: "chat:policy-agent", kind: "agent-chat", title: "Policy agent", identity, memberId: identity };
-  window.localStorage.setItem(`mobkit-console-dock-state:${JSON.stringify(["", "policy-principal"])}`, JSON.stringify({
+  window.localStorage.setItem(`meta-console-dock-state:${JSON.stringify(["", "policy-principal"])}`, JSON.stringify({
     tabs: [{ id: "tab", presetId: "single", layout: { kind: "panel", panelId: "panel" } }],
     panels: [{ id: "panel", mode: "console", target }], activeTabId: "tab", focusedPanelId: "panel",
   }));

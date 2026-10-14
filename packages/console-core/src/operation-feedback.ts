@@ -30,6 +30,42 @@ const hookReasons = {
   runtime_error: "Runtime error",
 } as const satisfies Record<NonNullable<Feedback["hookReasonCode"]>, string>;
 
+const reviewUnsatisfiedDetails = {
+  denied: "The reviewer declined this action. Other permitted work can continue.",
+  escalated: "This action requires further review. Other permitted work can continue.",
+  context_changed: "The review no longer matches this action's current context. Other permitted work can continue.",
+  human_consent_required: "This action requires human consent. Other permitted work can continue.",
+  already_consumed: "This review was already used. This notice does not establish the action's execution result; do not repeat it based on this notice.",
+} as const satisfies Record<NonNullable<Feedback["reviewUnsatisfied"]>, string>;
+
+const reviewUnavailableDetails = {
+  deadline_expired: "The review deadline elapsed. Other permitted work can continue.",
+  reviewer_failed: "The reviewer could not provide a usable decision. Other permitted work can continue.",
+  reviewer_missing: "No reviewer is configured for this action. Other permitted work can continue.",
+  unsupported_entry: "This action cannot use the available review entry path. Other permitted work can continue.",
+  owner_unavailable: "The review owner is unavailable. Other permitted work can continue.",
+  dispatch_ended: "This review's dispatch has ended. This notice does not establish the action's execution result; do not repeat it based on this notice.",
+} as const satisfies Record<NonNullable<Feedback["reviewUnavailable"]>, string>;
+
+function reviewFeedback(error: unknown, reason: unknown, toolCallId?: string): Feedback | null {
+  if (typeof reason !== "string") return null;
+  if (error === "review_unsatisfied" && Object.hasOwn(reviewUnsatisfiedDetails, reason)) {
+    const reviewUnsatisfied = reason as keyof typeof reviewUnsatisfiedDetails;
+    return { kind: "review-unsatisfied", title: "Review not satisfied",
+      detail: reviewUnsatisfiedDetails[reviewUnsatisfied], reviewUnsatisfied,
+      ...(toolCallId === undefined ? {} : { toolCallId }),
+    };
+  }
+  if (error === "review_unavailable" && Object.hasOwn(reviewUnavailableDetails, reason)) {
+    const reviewUnavailable = reason as keyof typeof reviewUnavailableDetails;
+    return { kind: "review-unavailable", title: "Review unavailable",
+      detail: reviewUnavailableDetails[reviewUnavailable], reviewUnavailable,
+      ...(toolCallId === undefined ? {} : { toolCallId }),
+    };
+  }
+  return null;
+}
+
 function identifier(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
@@ -86,6 +122,19 @@ export function operationFeedbackFromFrame(frame: Frame): Feedback | null {
       return block?.type === "runtime_notice" && block.category === "operation_refused"
         && record(block.payload)?.code === "operation_refused";
     })) return refused();
+    if (Array.isArray(message.blocks)) {
+      for (const value of message.blocks) {
+        const block = record(value);
+        if (block?.type !== "runtime_notice" || block.category !== "operation_review_required") continue;
+        const payload = record(block.payload);
+        const review = record(payload?.review);
+        const error = payload?.code === "REVIEW_UNSATISFIED" && review?.review === "unsatisfied"
+          ? "review_unsatisfied"
+          : payload?.code === "REVIEW_UNAVAILABLE" && review?.review === "unavailable" ? "review_unavailable" : null;
+        const feedback = reviewFeedback(error, review?.kind);
+        if (feedback) return feedback;
+      }
+    }
   }
   if ((frame.event === "tool_result_received" || frame.event === "tool_execution_completed")
       && data.is_error === true && Array.isArray(data.content) && data.content.length === 1) {
@@ -97,6 +146,17 @@ export function operationFeedbackFromFrame(frame: Frame): Feedback | null {
       const toolCallId = identifier(data.tool_call_id ?? data.id);
       if (!toolCallId) return null;
       const detail = record(payload?.data);
+      if (payload?.error === "review_unsatisfied" || payload?.error === "review_unavailable") {
+        if (typeof payload.message !== "string") return null;
+        const feedback = reviewFeedback(payload.error, detail?.kind, toolCallId);
+        const approvalId = detail?.approval_id;
+        // Native ApprovalId serializes as a UUID. Preserve its exact value as display data only.
+        if (feedback?.kind === "review-unsatisfied" && typeof approvalId === "string" && approvalId.length === 36
+            && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(approvalId)) {
+          return { ...feedback, approvalId };
+        }
+        return feedback;
+      }
       if (payload?.error === "confinement_refused") {
         return confinementFeedback(detail?.refusal, toolCallId);
       }

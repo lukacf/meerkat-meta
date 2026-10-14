@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MobKit release protocol v1: immutable candidates and add-only publication.
+"""Meta release protocol v1: immutable candidates and add-only publication.
 
 Selections are strict JSON objects (all hashes are lowercase SHA-256 hex):
   accepted-candidate: schema_version=1, kind, repository, run_id, run_attempt,
@@ -47,14 +47,14 @@ assert SPEC is not None and SPEC.loader is not None
 assets = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(assets)
 
-REPOSITORY = "lukacf/meerkat-mobkit"
+REPOSITORY = "lukacf/meerkat-meta"
 WORKFLOW = ".github/workflows/release.yml"
 MAIN = "refs/heads/main"
 MANIFEST = "candidate-manifest.json"
 SELECTION = "candidate-selection.json"
 PROVENANCE = "provenance.jsonl"
 SLSA = "https://slsa.dev/provenance/v1"
-BINARY_NAMES = dict(zip(assets.ARCHIVE_PREFIXES, ("mobkit_gateway", "rpc_gateway", "mobkit_repair")))
+BINARY_NAMES = dict(zip(assets.ARCHIVE_PREFIXES, ("meta_gateway", "rpc_gateway", "meta_repair")))
 MAX_MEMBER = 2 * 1024**3
 
 
@@ -262,7 +262,7 @@ def validate_artifacts(items, version, *, complete, attempt):
         names.add(item["name"])
         targets.add(target)
         if complete:
-            require(item["name"] == f"mobkit-gateway-binaries-{target}-{attempt}",
+            require(item["name"] == f"meta-gateway-binaries-{target}-{attempt}",
                     "artifact name/attempt mismatch")
         require(isinstance(item["archives"], list) and 0 < len(item["archives"]) <= 3,
                 "invalid artifact archive inventory")
@@ -558,8 +558,8 @@ def collect(args):
     verify_run(args.ci_run_id, args.ci_run_attempt, sha, ci=True)
     pages = api(repo_endpoint(f"actions/runs/{run_id}/artifacts?per_page=100"), pages=True)
     listing = [item for page in pages for item in page["artifacts"]]
-    expected = {f"mobkit-gateway-binaries-{target}-{attempt}": target for target, _ in assets.TARGET_ARCHIVES}
-    selected = [a for a in listing if a["name"].startswith("mobkit-gateway-binaries-")]
+    expected = {f"meta-gateway-binaries-{target}-{attempt}": target for target, _ in assets.TARGET_ARCHIVES}
+    selected = [a for a in listing if a["name"].startswith("meta-gateway-binaries-")]
     require(len(selected) == 5 and {a["name"] for a in selected} == set(expected),
             "missing/duplicate/unexpected target artifacts or mixed attempts")
     require(len({a["id"] for a in selected}) == 5, "duplicate artifact IDs")
@@ -643,7 +643,7 @@ def stage_candidate(selected, output_dir, proof_dir, work):
     verify_remote_tag(tag, sha)
     info = verify_run(selected["run_id"], selected["run_attempt"], sha)
     identity = {**selected["manifest_artifact"],
-                "name": f"mobkit-candidate-manifest-{selected['run_attempt']}"}
+                "name": f"meta-candidate-manifest-{selected['run_attempt']}"}
     packed = download_artifact(identity, info, work)
     folder = unpack_artifact(packed, work / "manifest", [MANIFEST, PROVENANCE, "index.json", "checksums.sha256"])
     manifest = read_json(folder / MANIFEST)
@@ -874,7 +874,7 @@ def publish(args):
             require(release_inventory(release) == inventory, "release changed before write")
         else:
             run(["gh", "release", "create", tag, "--repo", repository(), "--verify-tag",
-                 "--draft", "--title", tag, "--notes", "Original accepted MobKit candidate; see attached selection and provenance."])
+                 "--draft", "--title", tag, "--notes", "Original accepted Meta candidate; see attached selection and provenance."])
             release = newly_created_release_for_tag(tag)
             require(release is not None and release["draft"] is True, "new draft release missing")
             require(not release_inventory(release), "new draft unexpectedly contains assets")

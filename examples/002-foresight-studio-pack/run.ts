@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import YAML from "yaml";
 
 import {
-  MobKit,
+  Meta,
   type AgentBuildContext,
   type AgentBuildDraft,
   type AgentCustomizer,
@@ -92,19 +92,19 @@ function repoCargoEnv(): Record<string, string> {
 }
 
 function ensureGatewayBin(skipBuild: boolean): string {
-  if (process.env.MOBKIT_RPC_GATEWAY_BIN) {
-    return process.env.MOBKIT_RPC_GATEWAY_BIN;
+  if (process.env.META_RPC_GATEWAY_BIN) {
+    return process.env.META_RPC_GATEWAY_BIN;
   }
   const env = repoCargoEnv();
   const gateway = join(env.CARGO_TARGET_DIR, "debug", "rpc_gateway");
   if (!skipBuild || !existsSync(gateway)) {
     const result = spawnSync(
       join(repoRoot, "scripts/repo-cargo"),
-      ["build", "-p", "meerkat-mobkit", "--bin", "rpc_gateway"],
+      ["build", "-p", "meerkat-meta", "--bin", "rpc_gateway"],
       { cwd: repoRoot, stdio: "inherit" },
     );
     if (result.status !== 0) {
-      throw new Error("failed to build meerkat-mobkit rpc_gateway");
+      throw new Error("failed to build meerkat-meta rpc_gateway");
     }
   }
   return gateway;
@@ -367,7 +367,7 @@ async function main() {
     console.log("[foresight] using deterministic demo LLM");
   }
 
-  let builder = MobKit.builder()
+  let builder = Meta.builder()
     .mob(join(configDir, "mob.toml"))
     .gateway(ensureGatewayBin(skipBuild))
     .consoleConfig(join(configDir, "console.toml"))

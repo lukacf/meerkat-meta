@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { MobKit, MobKitRuntime, type MobKitBuilder } from "../dist/index.js";
+import { Meta, MetaRuntime, type MetaBuilder } from "../dist/index.js";
 
 const registration = {
   principal: "alice@example.com",
@@ -10,8 +10,8 @@ const registration = {
   sessionInstructions: "Be concise.",
 };
 
-function runtimeOptions(builder: MobKitBuilder): object {
-  const runtime = new MobKitRuntime(builder._config);
+function runtimeOptions(builder: MetaBuilder): object {
+  const runtime = new MetaRuntime(builder._config);
   const buildInit: unknown = Reflect.get(runtime, "_buildInitParams");
   assert.ok(typeof buildInit === "function");
   const params: unknown = buildInit.call(runtime);
@@ -22,13 +22,13 @@ function runtimeOptions(builder: MobKitBuilder): object {
 }
 
 test("console voice remains omitted until explicitly registered", () => {
-  const builder = MobKit.builder();
+  const builder = Meta.builder();
   assert.equal(builder._config.consoleVoiceConfig, null);
   assert.equal("console_voice" in runtimeOptions(builder), false);
 });
 
 test("console voice serializes the authenticated HTTP registration without enabling stdio live", () => {
-  const builder = MobKit.builder();
+  const builder = Meta.builder();
   assert.equal(builder.consoleVoice(registration), builder);
   const options = runtimeOptions(builder);
   assert.ok("console_voice" in options);
@@ -45,14 +45,14 @@ test("console voice serializes the authenticated HTTP registration without enabl
 
 test("console voice reuses strict public binding validation", () => {
   assert.throws(
-    () => runtimeOptions(MobKit.builder().consoleVoice({
+    () => runtimeOptions(Meta.builder().consoleVoice({
       ...registration,
       authBinding: { ...registration.authBinding, realm: "another-realm" },
     })),
     /realm/,
   );
   assert.throws(
-    () => runtimeOptions(MobKit.builder().consoleVoice(
+    () => runtimeOptions(Meta.builder().consoleVoice(
       Object.assign({}, registration, { apiKey: "invalid-fixture-only" }),
     )),
     /unknown field apiKey/,

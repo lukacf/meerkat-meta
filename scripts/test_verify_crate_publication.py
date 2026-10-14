@@ -57,7 +57,7 @@ class CratePublicationGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_a_member_that_is_neither_published_nor_withheld_fails(self):
-        # The mobkit-store-conformance shape: no publish key, never published.
+        # The meta-store-conformance shape: no publish key, never published.
         result = self.gate({
             "alpha": '[package]\nname = "alpha"\nversion = "0.1.0"\n',
             "beta": '[package]\nname = "beta"\nversion = "0.1.0"\n',
@@ -96,7 +96,7 @@ class CratePublicationGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_a_typo_in_the_release_publish_flag_fails(self):
-        # `-p meerkat-mobkitt` currently fails at the publish step, mid-release.
+        # `-p meerkat-metat` currently fails at the publish step, mid-release.
         result = self.gate(
             {"alpha": '[package]\nname = "alpha"\nversion = "0.1.0"\n'},
             release_yml="  run: cargo publish -p alphaa --locked\n",

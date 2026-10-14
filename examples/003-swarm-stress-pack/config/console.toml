@@ -1,8 +1,8 @@
 title = "Swarm Stress"
 
 [brand]
-label = "MobKit Load Lab"
-logo_alt = "MobKit Load Lab"
+label = "Meta Load Lab"
+logo_alt = "Meta Load Lab"
 
 [appearance]
 default_theme = "dark"
@@ -43,7 +43,7 @@ hidden_controls = []
 [[sidebar.buttons]]
 id = "burst-runbook"
 label = "Burst Runbook"
-href = "https://example.test/mobkit/swarm-stress/runbook"
+href = "https://example.test/meta/swarm-stress/runbook"
 target = "_blank"
 
 [[sidebar.buttons]]

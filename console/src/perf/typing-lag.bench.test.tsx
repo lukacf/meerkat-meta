@@ -1,5 +1,5 @@
 /**
- * Structural typing-lag benchmark for the MobKit console.
+ * Structural typing-lag benchmark for the Meta console.
  *
  * Mounts the real ConsoleApp under jsdom with a fake transport: 160 agents in
  * the sidebar, one docked chat panel whose identity carries a transcript of
@@ -24,7 +24,7 @@ import { act, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ConsoleApp } from "../ConsoleApp";
-import type { MobKitConsoleTransport } from "../lib/headless";
+import type { MetaConsoleTransport } from "../lib/headless";
 import {
   installRenderCounts,
   resetRenderCounts,
@@ -106,7 +106,7 @@ function transcript(identity: string, count: number): ConsoleFrame[] {
   return frames;
 }
 
-interface FakeTransport extends MobKitConsoleTransport {
+interface FakeTransport extends MetaConsoleTransport {
   live?: (frame: ConsoleFrame) => void;
   /// Number of timeline HTTP queries issued so far (idle-rate assertion).
   timelineQueries: number;
@@ -143,7 +143,7 @@ function seedDockedChat(panelCount = 1): void {
   // Mirrors ConsoleApp's dock persistence key and ConsoleDockState shape so the
   // app restores focused chat panel(s) at mount: panel-1 for CHAT_IDENTITY,
   // further panels for the next agents in the roster, laid out as a grid.
-  const key = `mobkit-console-dock-state:${JSON.stringify(["", "bench-principal"])}`;
+  const key = `meta-console-dock-state:${JSON.stringify(["", "bench-principal"])}`;
   const panels = Array.from({ length: panelCount }, (_, i) => {
     const identity = i === 0 ? CHAT_IDENTITY : agentRow(i).identity;
     return {

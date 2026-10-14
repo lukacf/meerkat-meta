@@ -104,6 +104,8 @@ export interface ConversationRichToolCallBlock {
   name: string;
   arguments: string;
   result?: string;
+  /** Images the tool returned in its result content, in order. */
+  images?: ConversationRichImageBlock[];
   status: "pending" | "success" | "error";
   completionEvidence?: ToolCompletionEvidence;
   /** Canonical peer identity for exact authorized display-label lookup. */
@@ -181,7 +183,7 @@ const HIDDEN_PEER_DISPLAY_INTENTS = new Set([
 ]);
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// `peer_message`, `peer_request`, and `peer_response` are public MobKit
+// `peer_message`, `peer_request`, and `peer_response` are public Meta
 // message-kind names, not opaque peer ids. Keep them available to explanatory
 // prose (including inline code) while continuing to hide generated tokens such
 // as `peer-merge-123` and `peer_some-runtime-id`.
@@ -199,13 +201,6 @@ export function normalizeProjectDisplayLabel(value: string | null | undefined): 
   const text = String(value || "").trim();
   if (!text) {
     return "";
-  }
-  const lower = text.toLowerCase();
-  if (lower === "hsns" || lower === "hsns_clean") {
-    return "HSNS";
-  }
-  if (lower === "homecore") {
-    return "HomeCore";
   }
   return text
     .split(/[\s_-]+/u)
@@ -246,7 +241,7 @@ export function safeConsoleHref(value: string): string | null {
 export interface RenderConversationInlineMarkdownOptions {
   // Display normalization rewrites/strips peer-protocol tokens and tidies
   // punctuation for meerkat-studio's conversational surface. Consumers that
-  // need faithful rendering of raw agent text (e.g. the MobKit console)
+  // need faithful rendering of raw agent text (e.g. the Meta console)
   // disable it — matching the parse-side `displayNormalization` option.
   displayNormalization?: boolean;
 }
@@ -325,7 +320,7 @@ function normalizeEmbeddedMachinePeerTokens(text: string): string {
       .replace(EMBEDDED_PEER_RESPONSE_TOKEN_RE, "response token")
       .replace(EMBEDDED_MACHINE_PEER_TOKEN_RE, " ")
       .replace(/\bcontaining\s*([.;])/gi, "$1")
-      .replace(/^MobKit live peer smoke[.:]?\s*/i, "Peer check. ")
+      .replace(/^Meta live peer smoke[.:]?\s*/i, "Peer check. ")
       .replace(/\s+([,.;:!?])/g, "$1")
       .replace(/:\s*([.;])/g, "$1")
       .replace(/([.;:!?]){2,}/g, "$1")
@@ -363,7 +358,7 @@ function normalizePeerSteeringPrompt(text: string): string {
     return `Sent a peer message to ${projectLabel} thread.`;
   }
 
-  const standalonePeerInstruction = source.match(/^Use your MobKit peer tools only\b[\s\S]*?\bto the peered\s+(.+?)\s+thread\b/i);
+  const standalonePeerInstruction = source.match(/^Use your Meta peer tools only\b[\s\S]*?\bto the peered\s+(.+?)\s+thread\b/i);
   if (standalonePeerInstruction) {
     const projectLabel = normalizeProjectDisplayLabel(standalonePeerInstruction[1]) || standalonePeerInstruction[1].trim();
     const peerLabel = `${projectLabel} thread`;
@@ -375,15 +370,15 @@ function normalizePeerSteeringPrompt(text: string): string {
     }
     return `Sent a peer message to ${peerLabel}.`;
   }
-  if (/^Use your MobKit peer tools only\b/i.test(source)) {
+  if (/^Use your Meta peer tools only\b/i.test(source)) {
     return "";
   }
 
   const legacyTrustedPeerInstruction = /\bFind your trusted peer\b[\s\S]*?\bsend_message\b[\s\S]*?\bhandling_mode\b/i.test(source);
   const connectedMatch = source.match(
-    /^Connected to\s+(.+?)\.\s+(?:Each thread keeps its own transcript and can message the other through MobKit|Each thread keeps its own transcript\. They can now message each other)\./is,
+    /^Connected to\s+(.+?)\.\s+(?:Each thread keeps its own transcript and can message the other through Meta|Each thread keeps its own transcript\. They can now message each other)\./is,
   );
-  if (connectedMatch && (/\bUse your MobKit peer tools only\b/i.test(source) || legacyTrustedPeerInstruction)) {
+  if (connectedMatch && (/\bUse your Meta peer tools only\b/i.test(source) || legacyTrustedPeerInstruction)) {
     const peerLabel = normalizeConversationDisplayLabel(connectedMatch[1]) || connectedMatch[1].trim();
     if (legacyTrustedPeerInstruction) {
       const action = /\bplease reply\b/i.test(source)
@@ -754,7 +749,7 @@ export interface ConversationRichParseOptions {
    * machine peer-token scrubbing, steering-prompt rewrites, punctuation
    * tidying) before parsing. Defaults to true — the meerkat-studio desktop
    * transcript relies on it. Consumers that do their own envelope handling
-   * on the parsed output (e.g. the mobkit console adapters) should pass
+   * on the parsed output (e.g. the meta console adapters) should pass
    * `{ displayNormalization: false }` to parse the text faithfully.
    */
   displayNormalization?: boolean;

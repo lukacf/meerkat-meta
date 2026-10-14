@@ -31,7 +31,7 @@ fn main() {
     // flows, not direct execution of the prebuilt binary, so the example
     // sizes its own threads explicitly: the root future runs on a dedicated
     // 32 MiB thread and tokio workers get 32 MiB stacks (mirrors
-    // mobkit_gateway/rpc_gateway's explicit worker sizing).
+    // meta_gateway/rpc_gateway's explicit worker sizing).
     const STACK_SIZE: usize = 32 * 1024 * 1024;
     std::thread::Builder::new()
         .name("icc-runtime".into())
@@ -55,8 +55,7 @@ fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "meerkat_mobkit=info,axum=info".to_string()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "meerkat_meta=info,axum=info".to_string()),
         )
         .with_target(false)
         .compact()
@@ -88,7 +87,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("incident command center listening on http://{bound}");
     // Harnesses pass a port-0 address and read the bound one from this line;
     // see console/fixture-ready.cjs.
-    println!("MOBKIT_FIXTURE_READY {{\"addr\":\"{bound}\"}}");
+    println!("META_FIXTURE_READY {{\"addr\":\"{bound}\"}}");
     println!("GET  /console");
     println!("GET  /console/experience");
     println!("POST /console/rpc");

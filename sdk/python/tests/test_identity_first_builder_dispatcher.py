@@ -1,16 +1,16 @@
 """TDD tests for builder extensions (REQ-44) and callback dispatcher routing (REQ-45)."""
 import pytest
 
-from meerkat_mobkit.builder import MobKit, MobKitBuilder
-from meerkat_mobkit.agent_builder import CallbackDispatcher
-from meerkat_mobkit.identity_first_models import (
+from meerkat_meta.builder import Meta, MetaBuilder
+from meerkat_meta.agent_builder import CallbackDispatcher
+from meerkat_meta.identity_first_models import (
     AgentBuildContext,
     AgentBuildDraft,
     DurableAgentSpec,
     ManagedPeerEdge,
     RosterContext,
 )
-from meerkat_mobkit.identity_first_providers import (
+from meerkat_meta.identity_first_providers import (
     ContinuityRecord,
     ContinuityResolveState,
     LeaseAcquireResult,
@@ -30,15 +30,15 @@ class TestBuilderContinuityStore:
         class FakeStore:
             pass
 
-        b = MobKit.builder().continuity_store(FakeStore())
-        assert isinstance(b, MobKitBuilder)
+        b = Meta.builder().continuity_store(FakeStore())
+        assert isinstance(b, MetaBuilder)
 
     def test_continuity_store_sets_config(self):
         class FakeStore:
             pass
 
         store = FakeStore()
-        b = MobKit.builder().continuity_store(store)
+        b = Meta.builder().continuity_store(store)
         assert b._config.continuity_store is store
 
 
@@ -47,25 +47,25 @@ class TestBuilderLeaseProvider:
         class FakeLease:
             pass
 
-        b = MobKit.builder().lease_provider(FakeLease())
-        assert isinstance(b, MobKitBuilder)
+        b = Meta.builder().lease_provider(FakeLease())
+        assert isinstance(b, MetaBuilder)
 
     def test_lease_provider_sets_config(self):
         class FakeLease:
             pass
 
         lp = FakeLease()
-        b = MobKit.builder().lease_provider(lp)
+        b = Meta.builder().lease_provider(lp)
         assert b._config.lease_provider is lp
 
 
 class TestBuilderScratchDir:
     def test_scratch_dir_returns_builder(self):
-        b = MobKit.builder().scratch_dir("/tmp/scratch")
-        assert isinstance(b, MobKitBuilder)
+        b = Meta.builder().scratch_dir("/tmp/scratch")
+        assert isinstance(b, MetaBuilder)
 
     def test_scratch_dir_sets_config(self):
-        b = MobKit.builder().scratch_dir("/tmp/scratch")
+        b = Meta.builder().scratch_dir("/tmp/scratch")
         assert b._config.scratch_dir == "/tmp/scratch"
 
 
@@ -78,7 +78,7 @@ class TestBuilderMutualExclusivity:
             pass
 
         b = (
-            MobKit.builder()
+            Meta.builder()
             .persistent_state("/tmp/state")
             .continuity_store(FakeStore())
             .lease_provider(FakeStore())
@@ -94,7 +94,7 @@ class TestBuilderMutualExclusivity:
             pass
 
         b = (
-            MobKit.builder()
+            Meta.builder()
             .continuity_store(FakeStore())
             .lease_provider(FakeStore())
             .scratch_dir("/tmp/scratch")

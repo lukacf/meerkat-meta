@@ -153,79 +153,11 @@ describe("memory.localJson", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// memory.elephant() — deprecated alias, keeps the legacy wire shape
-// ---------------------------------------------------------------------------
-
-describe("memory.elephant", () => {
-  it("creates ElephantMemoryConfig with defaults", () => {
-    const config = memory.elephant("http://localhost:8080");
-    assert.equal(config.endpoint, "http://localhost:8080");
-    assert.equal(config.spaceId, null);
-    assert.equal(config.collection, null);
-    assert.deepEqual(config.stores, []);
-  });
-
-  it("allows custom spaceId", () => {
-    const config = memory.elephant("http://e:8080", { spaceId: "sp-1" });
-    assert.equal(config.spaceId, "sp-1");
-  });
-
-  it("allows custom collection", () => {
-    const config = memory.elephant("http://e:8080", { collection: "col-1" });
-    assert.equal(config.collection, "col-1");
-  });
-
-  it("allows custom stores", () => {
-    const config = memory.elephant("http://e:8080", {
-      stores: ["store-a", "store-b"],
-    });
-    assert.deepEqual(config.stores, ["store-a", "store-b"]);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// memory.elephantMemoryConfigToDict()
-// ---------------------------------------------------------------------------
-
-describe("memory.elephantMemoryConfigToDict", () => {
-  it("produces minimal dict when defaults are used", () => {
-    const config = memory.elephant("http://mem:9090");
-    const dict = memory.elephantMemoryConfigToDict(config);
-    assert.equal(dict.backend, "elephant");
-    assert.equal(dict.endpoint, "http://mem:9090");
-    // Optional fields are omitted when null/empty
-    assert.equal(dict.space_id, undefined);
-    assert.equal(dict.collection, undefined);
-    assert.equal(dict.stores, undefined);
-  });
-
-  it("omits spaceId because the Rust gateway does not accept it", () => {
-    const config = memory.elephant("http://e:8080", { spaceId: "sp-x" });
-    const dict = memory.elephantMemoryConfigToDict(config);
-    assert.equal(dict.space_id, undefined);
-  });
-
-  it("omits collection because the Rust gateway does not accept it", () => {
-    const config = memory.elephant("http://e:8080", { collection: "col-y" });
-    const dict = memory.elephantMemoryConfigToDict(config);
-    assert.equal(dict.collection, undefined);
-  });
-
-  it("omits stores because the Rust gateway does not accept them", () => {
-    const config = memory.elephant("http://e:8080", {
-      stores: ["s1", "s2"],
-    });
-    const dict = memory.elephantMemoryConfigToDict(config);
-    assert.equal(dict.stores, undefined);
-  });
-
-  it("preserves config stores locally without sending them to the gateway", () => {
-    const original = ["s1"];
-    const config = memory.elephant("http://e:8080", { stores: original });
-    const dict = memory.elephantMemoryConfigToDict(config);
-    assert.deepEqual(config.stores, ["s1"]);
-    assert.equal(dict.stores, undefined);
+describe("memory module", () => {
+  it("exports localJson as the only backend helper", () => {
+    // The predecessor's backend helpers are removed with no alias; the
+    // gateway refuses that backend value at init.
+    assert.deepEqual(Object.keys(memory).sort(), ["localJson"]);
   });
 });
 

@@ -5,9 +5,9 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const root = path.join(__dirname, "..");
-const zipPath = process.env.MOBKIT_EDITOR_HANDOFF_ZIP ||
-  path.join(os.homedir(), "Downloads", "Meerkat-MobKit Editor-handoff.zip");
-const zipRoot = "meerkat-mobkit-editor/project";
+const zipPath = process.env.META_EDITOR_HANDOFF_ZIP ||
+  path.join(os.homedir(), "Downloads", "Meerkat-Meta Editor-handoff.zip");
+const zipRoot = "meerkat-meta-editor/project";
 
 function fromZip(entry) {
   const result = spawnSync("unzip", ["-p", zipPath, `${zipRoot}/${entry}`], { encoding: "utf8" });
@@ -34,10 +34,10 @@ function diff(entry) {
 }
 
 if (!fs.existsSync(zipPath)) {
-  if (process.env.MOBKIT_EDITOR_REQUIRE_HANDOFF === "1") {
-    throw new Error(`handoff zip not found at ${zipPath}; set MOBKIT_EDITOR_HANDOFF_ZIP to the designer handoff archive`);
+  if (process.env.META_EDITOR_REQUIRE_HANDOFF === "1") {
+    throw new Error(`handoff zip not found at ${zipPath}; set META_EDITOR_HANDOFF_ZIP to the designer handoff archive`);
   }
-  process.stdout.write(`handoff zip not found at ${zipPath}; visual contract skipped (set MOBKIT_EDITOR_REQUIRE_HANDOFF=1 to make this an error)\n`);
+  process.stdout.write(`handoff zip not found at ${zipPath}; visual contract skipped (set META_EDITOR_REQUIRE_HANDOFF=1 to make this an error)\n`);
   process.exit(0);
 }
 
@@ -178,4 +178,4 @@ const unexpected = styleDiff.filter((line) => {
   return !allowedCssDelta(sign, line);
 });
 
-assert.deepEqual(unexpected, [], "styles.css drifted from the handoff outside the allowed MobKit-state additions");
+assert.deepEqual(unexpected, [], "styles.css drifted from the handoff outside the allowed Meta-state additions");
