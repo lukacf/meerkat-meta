@@ -99,6 +99,8 @@ function Harness({ rows = baseRows, conversation = "test", viewportKey, submitte
         rowReads.set(row.id, (rowReads.get(row.id) ?? 0) + 1);
         return rect(rowTop - viewport.scrollTop, row.height);
       };
+      // A parked turn's placeholder: its measured size, from its row's top.
+      if (row.parked !== undefined) node.parentElement!.getBoundingClientRect = () => rect(rowTop - viewport.scrollTop, row.parked!);
       top += advance(row);
     }
   });
@@ -213,7 +215,7 @@ describe("conversation scroll intent", () => {
     expect(viewport.scrollTop).toBe(900);
     expect(screen.getByTestId("mode")).toHaveTextContent("following-end");
   });
-  test("a parked turn's row never holds the reading position across its unpark", () => {
+  test("a parked turn's row reaching into the viewport past its placeholder never holds the reading position", () => {
     // Main CI run 38511905113: a scroll put the reading heading at the top
     // of a turn right below a parked turn whose content had outgrown its
     // placeholder by 98 px. The parked turn's last row, laid out past its
@@ -240,6 +242,24 @@ describe("conversation scroll intent", () => {
     view.rerender(<Harness rows={rows.map((row) => row.id === "peer-b" ? { ...row, parked: undefined } : row)} />);
     expect(seedTop()).toBe(-46);
     expect(viewport.scrollTop).toBe(286);
+  });
+  test("a reader within a parked turn's placeholder keeps that turn's rows in place across its unpark", () => {
+    // A jump can land inside a parked turn before the window mounts it. Its
+    // rows already lie where they will be, so its row holds the position and
+    // only what follows the grown turn moves.
+    const rows: Row[] = [
+      { id: "older", height: 300 },
+      { id: "parked", height: 400, parked: 300 },
+      { id: "after", height: 1000 },
+    ];
+    const view = render(<Harness rows={rows} />);
+    const viewport = screen.getByTestId("viewport");
+    const parkedTop = () => viewport.querySelector('[data-conversation-row-id="parked"]')!.getBoundingClientRect().top;
+    userScroll(viewport, 350);
+    expect(parkedTop()).toBe(-50);
+    view.rerender(<Harness rows={rows.map((row) => row.id === "parked" ? { ...row, parked: undefined } : row)} />);
+    expect(parkedTop()).toBe(-50);
+    expect(viewport.scrollTop).toBe(350);
   });
   test("preserves the row through history prepend, earlier disclosure growth and viewport resize", () => {
     const view = render(<Harness />);

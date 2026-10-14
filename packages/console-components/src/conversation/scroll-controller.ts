@@ -88,27 +88,38 @@ function cancelReveal(session: Session): void {
   session.awaitingAnchor = false;
 }
 
-/** A row the reader can see: outside a collapsed disclosure and outside an
- * element the transcript hides, such as a parked turn of a windowed
- * transcript. A parked turn keeps its rows in the DOM (for find-in-page) in
- * a placeholder of its last measured size, and they lay out as if it were
- * unparked: once the turn has outgrown that measurement, its last rows
- * overlap the rows rendered below it. Such a row cannot hold the reading
- * position, because unparking moves everything below it while it stays. */
-function rowRenders(row: HTMLElement, viewport: HTMLElement): boolean {
-  if (row.closest("details:not([open])")) return false;
-  const hidden = row.closest("[hidden]");
-  return hidden === null || !viewport.contains(hidden);
-}
-
-/** Geometry of every row the reader can see, the candidates for a captured
- * reading anchor and its neighbors. */
+/** Geometry of every row outside a collapsed disclosure: the candidates for
+ * a captured reading anchor and its neighbors.
+ *
+ * A parked turn of a windowed transcript (an element the transcript hides)
+ * keeps its rows in the DOM for find-in-page, in a placeholder of the turn's
+ * last measured size. They lay out as if the turn were unparked, each where
+ * it will be once it is. When the turn has outgrown that measurement, its
+ * last rows reach past the placeholder, over rows rendered below it, and a
+ * reader at that point sees those rows instead. A parked row therefore
+ * extends only to its placeholder's end: one that reaches into the viewport
+ * only past it never becomes the anchor, since unparking moves everything
+ * below the placeholder while that row stays. */
 function rowGeometry(viewport: HTMLElement): ConversationRowGeometry[] {
   const top = viewport.getBoundingClientRect().top + viewport.clientTop;
-  return Array.from(viewport.querySelectorAll<HTMLElement>(ROW_SELECTOR)).filter((row) => rowRenders(row, viewport)).map((row) => {
+  const placeholderEnds = new Map<Element, number>();
+  const rows: ConversationRowGeometry[] = [];
+  for (const row of Array.from(viewport.querySelectorAll<HTMLElement>(ROW_SELECTOR))) {
+    if (row.closest("details:not([open])")) continue;
     const rect = row.getBoundingClientRect();
-    return { id: row.dataset.conversationRowId!, top: rect.top - top, bottom: rect.bottom - top };
-  });
+    let bottom = rect.bottom;
+    const parked = row.closest("[hidden]");
+    if (parked && viewport.contains(parked)) {
+      let end = placeholderEnds.get(parked);
+      if (end === undefined) {
+        end = parked.getBoundingClientRect().bottom;
+        placeholderEnds.set(parked, end);
+      }
+      bottom = Math.min(bottom, end);
+    }
+    rows.push({ id: row.dataset.conversationRowId!, top: rect.top - top, bottom: bottom - top });
+  }
+  return rows;
 }
 
 /** Geometry of just these rows (absent or collapsed rows are omitted), with

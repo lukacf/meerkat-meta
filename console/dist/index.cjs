@@ -26563,17 +26563,26 @@ function cancelReveal(session) {
   }
   session.awaitingAnchor = false;
 }
-function rowRenders(row, viewport) {
-  if (row.closest("details:not([open])")) return false;
-  const hidden = row.closest("[hidden]");
-  return hidden === null || !viewport.contains(hidden);
-}
 function rowGeometry(viewport) {
   const top = viewport.getBoundingClientRect().top + viewport.clientTop;
-  return Array.from(viewport.querySelectorAll(ROW_SELECTOR)).filter((row) => rowRenders(row, viewport)).map((row) => {
+  const placeholderEnds = /* @__PURE__ */ new Map();
+  const rows = [];
+  for (const row of Array.from(viewport.querySelectorAll(ROW_SELECTOR))) {
+    if (row.closest("details:not([open])")) continue;
     const rect = row.getBoundingClientRect();
-    return { id: row.dataset.conversationRowId, top: rect.top - top, bottom: rect.bottom - top };
-  });
+    let bottom = rect.bottom;
+    const parked = row.closest("[hidden]");
+    if (parked && viewport.contains(parked)) {
+      let end = placeholderEnds.get(parked);
+      if (end === void 0) {
+        end = parked.getBoundingClientRect().bottom;
+        placeholderEnds.set(parked, end);
+      }
+      bottom = Math.min(bottom, end);
+    }
+    rows.push({ id: row.dataset.conversationRowId, top: rect.top - top, bottom: bottom - top });
+  }
+  return rows;
 }
 function rowGeometryOf(viewport, ids) {
   const top = viewport.getBoundingClientRect().top + viewport.clientTop;
