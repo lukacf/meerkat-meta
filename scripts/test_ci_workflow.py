@@ -32,6 +32,55 @@ class CiWorkflowTests(unittest.TestCase):
             self.assertTrue(installs, f"{name} must install its build toolchain")
             self.assertEqual(set(installs), {version}, name)
 
+    def test_rust_cache_covers_the_wrapper_target(self):
+        """rust-cache saves `<workspace>/target`; repo-cargo must build there.
+
+        Without an explicit CARGO_TARGET_DIR, scripts/repo-cargo builds under
+        ~/.cache, so every rust-cache step restored and saved a directory
+        nothing was built in. Nothing failed - jobs were only slow - so pin the
+        single workflow-wide target and refuse remaps that would split the two
+        paths again.
+        """
+        source = CI_WORKFLOW.read_text()
+        header = source.split("\njobs:\n", 1)[0]
+        self.assertIn("\n  CARGO_TARGET_DIR: ${{ github.workspace }}/target\n", header)
+        self.assertEqual(len(re.findall(r"(?m)^\s+CARGO_TARGET_DIR:", source)), 1)
+        self.assertIsNone(re.search(r"(?m)^\s+(workspaces|cache-targets):", source))
+
+    def test_rust_cache_saves_only_main_and_shares_identical_graphs(self):
+        """Cached build output makes each rust-cache entry about 1 GB.
+
+        Pull request entries are scoped to their own ref, so saving them only
+        evicts main's entries from the 10 GB repository cache. Jobs that
+        build the same dependency graph (same features, profile and
+        dev-dependency use) share one entry; every other job keeps its own.
+        """
+        expected = {
+            "fmt-lint": None,
+            "test": None,
+            "test-extension-state": None,
+            "extension-state-lint": None,
+            "test-voice": None,
+            "voice-clippy": None,
+            "test-python": "meta-dev-bins",
+            "flow-editor": "meta-dev-bins",
+            "console": "meta-dev-examples",
+            "console-browser": "meta-dev-examples",
+            "console-fixtures": "meta-dev-examples",
+            "console-acceptance": "meta-dev-examples",
+        }
+        source = CI_WORKFLOW.read_text()
+        self.assertEqual(source.count("uses: Swatinem/rust-cache@v2"), len(expected))
+        for name, shared_key in expected.items():
+            step = re.search(
+                r"- uses: Swatinem/rust-cache@v2\n((?: {8}.*\n)+)", job_block(name) + "\n"
+            )
+            self.assertIsNotNone(step, name)
+            settings = step.group(1)
+            self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", settings, name)
+            keys = re.findall(r"shared-key: (\S+)", settings)
+            self.assertEqual(keys, [shared_key] if shared_key else [], name)
+
     def test_workspace_nextest_preserves_all_failure_evidence(self):
         commands = [
             line.strip()
@@ -77,14 +126,59 @@ class CiWorkflowTests(unittest.TestCase):
             block,
         )
 
+    def test_extension_state_lint_and_tests_run_as_parallel_jobs(self):
+        """check and clippy only emit metadata; the tests need full builds.
+
+        Every command of the former serial job still runs exactly once,
+        split between the two jobs.
+        """
+        def runs(name):
+            return [
+                line.strip()[len("- run: "):]
+                for line in job_block(name).splitlines()
+                if line.strip().startswith("- run: ")
+            ]
+
+        self.assertEqual(
+            runs("extension-state-lint"),
+            [
+                "scripts/repo-cargo check -p meerkat-meta --locked --no-default-features",
+                "scripts/repo-cargo clippy -p meerkat-meta --locked --features extension-state "
+                "--lib --test extension_state -- -D warnings",
+            ],
+        )
+        self.assertEqual(
+            runs("test-extension-state"),
+            [
+                "scripts/repo-cargo test -p meta-extension-state --locked",
+                "scripts/repo-cargo test -p meerkat-meta --locked --features extension-state "
+                "--test extension_state",
+                "scripts/repo-cargo test -p meerkat-meta --locked --features extension-state "
+                "--lib extension_",
+            ],
+        )
+        for name in ("extension-state-lint", "test-extension-state"):
+            self.assertIn('CARGO_INCREMENTAL: "0"', job_block(name))
+            self.assertIn("CARGO_PROFILE_DEV_DEBUG: line-tables-only", job_block(name))
+
     def test_voice_feature_runs_real_host_tests_and_strict_lint(self):
         block = job_block("test-voice")
         self.assertIn("--locked --features openai-live", block)
         self.assertIn("--test console_route_auth --test console_experience --test never_executed_persistence --test swarm_integration console_voice", block)
         self.assertIn("gateway_openai_live_registration", block)
-        self.assertIn("clippy -p meerkat-meta", block)
-        self.assertIn("-- -D warnings", block)
         self.assertIn('CARGO_INCREMENTAL: "0"', block)
+        # The strict lint runs in parallel, in its own job, on the same features.
+        runs = [line for line in block.splitlines() if line.strip().startswith("- run:")]
+        self.assertFalse([line for line in runs if " clippy " in line], runs)
+        lint = job_block("voice-clippy")
+        self.assertEqual(
+            lint.count(
+                "- run: scripts/repo-cargo clippy -p meerkat-meta --locked --features openai-live "
+                "--lib --bin rpc_gateway --bin meta_gateway -- -D warnings\n"
+            ),
+            1,
+        )
+        self.assertIn('CARGO_INCREMENTAL: "0"', lint)
 
     def test_voice_lane_runs_the_live_registration_test_from_the_library(self):
         # src/bin/rpc_gateway.rs is a one-line wrapper around
@@ -138,6 +232,53 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertLess(block.index("Build console acceptance backends"), block.index(command))
         self.assertLess(block.index(command), block.index("node console/api-e2e.cjs"))
 
+    def test_console_browser_and_perf_run_beside_console(self):
+        """The two longest console steps run in their own jobs, each exactly once.
+
+        perf:typing:browser bundles its own host and needs no Rust. The
+        browser scenarios need the acceptance backends and freshly built
+        console bundles, in that order.
+        """
+        source = CI_WORKFLOW.read_text()
+        for command, count in (
+            ("- run: npm --prefix console run perf:typing:browser --silent\n", 1),
+            ("- run: node console/browser-e2e.cjs\n", 1),
+            ("run: npm --prefix console run e2e:mcp-apps --silent\n", 2),
+            ("- run: node console/api-e2e.cjs\n", 1),
+        ):
+            self.assertEqual(source.count(command), count, command)
+
+        perf = job_block("console-perf")
+        self.assertIn("- run: npm --prefix console run perf:typing:browser --silent\n", perf)
+        self.assertIn("playwright install --with-deps chromium", perf)
+        self.assertNotIn("repo-cargo", perf)
+
+        browser = job_block("console-browser")
+        order = [
+            "- run: npm --prefix console run build --silent\n",
+            "- run: npm --prefix console run build:acceptance --silent\n",
+            "playwright install --with-deps chromium",
+            "- name: Build console acceptance backends\n",
+            "- name: Native MCP Apps rendering and reload\n",
+            "- name: Native MCP Apps polling during an active model turn\n",
+            "- run: node console/browser-e2e.cjs\n",
+            "name: console-browser-${{ github.run_id }}\n",
+        ]
+        positions = [browser.index(marker) for marker in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("META_EXAMPLE_BIN_DIR=${target_dir}/debug/examples", browser)
+
+        console = job_block("console")
+        for kept in (
+            "- run: node console/api-e2e.cjs\n",
+            "- run: node console/voice-e2e.cjs\n",
+            "- run: node console/memory-e2e.cjs\n",
+            "- run: node console/workgraph-e2e.cjs\n",
+            "- run: npm --prefix console run embedded:freshness --silent\n",
+            "name: console-${{ github.run_id }}\n",
+        ):
+            self.assertIn(kept, console)
+
     def test_gate_requires_every_job_it_lists(self):
         """A job absent from `gate` can fail without failing the check suite.
 
@@ -159,10 +300,15 @@ class CiWorkflowTests(unittest.TestCase):
         must_gate = {
             "fmt-lint",
             "test",
+            "test-extension-state",
+            "extension-state-lint",
             "test-voice",
+            "voice-clippy",
             "test-python",
             "test-typescript",
             "console",
+            "console-browser",
+            "console-perf",
             "console-fixtures",
             "console-acceptance",
             "flow-editor",

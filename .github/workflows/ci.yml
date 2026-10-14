@@ -11,6 +11,23 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Swatinem/rust-cache restores and saves <workspace>/target, while
+  # scripts/repo-cargo defaults to a per-worktree target under ~/.cache, so no
+  # job cached a compiled artifact: test-voice in run 38020666512 restored
+  # 538 MB, none of it build output, then spent 15m09 in clippy and 25m43
+  # building tests. repo-cargo keeps an explicit CARGO_TARGET_DIR, so CI names
+  # the directory rust-cache covers. CONTRIBUTING.md keeps local custom roots
+  # outside the checkout; a disposable CI checkout has no such need. Local
+  # runs set nothing and keep their per-worktree targets.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  # With build output cached, a rust-cache entry is the registry plus one
+  # dependency graph's artifacts: about 1 GB compressed (a local Meta debug
+  # target's dependency share, 4.6 GiB, packs to 0.95 GB with zstd). Nine
+  # per-job entries, plus a copy for every pull request ref, would overrun
+  # the repository's 10 GB cache and evict main's entries. So only main
+  # saves, and jobs that build the same dependency graph share one entry:
+  # meta-dev-examples (examples and tests, with dev-dependency features)
+  # and meta-dev-bins (binaries only).
 
 jobs:
   fmt-lint:
@@ -22,6 +39,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/repo-cargo fmt --all -- --check
       - run: python3 scripts/check-conflict-markers
       - run: python3 scripts/test_check_conflict_markers.py
@@ -85,6 +104,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       # The idle CPU gate asserts an absolute per-30s CPU budget calibrated on
       # real hardware; GitHub's shared 2-vCPU runners read ~3-4s where real
@@ -106,14 +127,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: scripts/repo-cargo test -p meta-extension-state --locked
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --test extension_state
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --lib extension_
+
+  # test-extension-state's check and clippy, split out: both only emit
+  # metadata, so they share little with the two full test builds, which
+  # ran after them in one job (run 38506503806: check 12m22 and clippy
+  # 14m10, then the tests 21m52 and 8m24).
+  extension-state-lint:
+    name: extension-state-lint
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: scripts/repo-cargo test -p meta-extension-state --locked
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/repo-cargo check -p meerkat-meta --locked --no-default-features
       - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features extension-state --lib --test extension_state -- -D warnings
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --test extension_state
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --lib extension_
 
   test-voice:
     name: test-voice
@@ -126,15 +167,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features openai-live --lib --bin rpc_gateway --bin meta_gateway -- -D warnings
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The shared host uses a loopback provider, never paid credentials.
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --lib --bin rpc_gateway --bin meta_gateway --test console_route_auth --test console_experience --test never_executed_persistence --test swarm_integration console_voice
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --lib gateway_openai_live_registration
       # Reuse this feature build for classic/identity restarts with and without voice.
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --test meta_gateway_bootstrap persistent_http_restarts
+
+  # test-voice's strict lint, split out: clippy only emits metadata, so it
+  # shares little with the full test build beyond host build scripts and
+  # proc macros, and in one job the two ran back to back (run 38506503806:
+  # clippy 19m03, then the test build 32m16).
+  voice-clippy:
+    name: voice-clippy
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_BUILD_JOBS: "2"
+      # The feature union triggers the repository's Rust 1.97 incremental ICE.
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features openai-live --lib --bin rpc_gateway --bin meta_gateway -- -D warnings
 
   test-python:
     name: test-python
@@ -146,6 +208,9 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: meta-dev-bins
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: python -m pip install 'sdk/python[dev]'
       # Gateway-backed structural tests materialize OpenAI profiles but never
       # issue provider requests. Meerkat resolves auth during construction, so
@@ -175,6 +240,11 @@ jobs:
   # rise while wall clock falls. That is the trade, not a free win.
   #
   # All three are named in `gate`. A job absent from `gate` is not a gate.
+  #
+  # Run 38506503806 (2026-10-14): besides its backend build, `console` still
+  # spent 22m01 in non-Rust steps, 9m31 of them in perf:typing:browser and
+  # 10m06 in the browser scenarios (browser-e2e 8m47, MCP Apps 1m19). Those
+  # now run beside it in console-perf and console-browser, also in `gate`.
   console:
     name: console
     runs-on: ubuntu-24.04
@@ -190,6 +260,9 @@ jobs:
           cache-dependency-path: console/package-lock.json
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: meta-dev-examples
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm --prefix console ci --silent --no-fund --no-audit
       - run: npm --prefix console run phase0:types --silent
       - run: npm --prefix console run contracts:console --silent
@@ -209,14 +282,6 @@ jobs:
       - run: npm --prefix console run embedded:freshness --silent
       - run: npm --prefix console run build:acceptance --silent
       - run: npm --prefix console exec -- playwright install --with-deps chromium
-      # Real-browser composer typing with a full identity log and a
-      # FlowForensics-shaped session, idle and while a reply streams. jsdom
-      # has no style, layout or paint, so only a browser can see this
-      # regress. Fails only on runner-independent work counts (layout objects
-      # per keystroke, full derivations and turn renders per streamed token);
-      # wall-clock p95 is printed as advisory (META_TYPING_LAG_ENFORCE_TIMING=1
-      # makes it a failure for local perf work).
-      - run: npm --prefix console run perf:typing:browser --silent
       # One immutable backend build serves every browser/API scenario below.
       - name: Build console acceptance backends
         run: |
@@ -224,6 +289,53 @@ jobs:
           target_dir="$(scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')"
           echo "META_EXAMPLE_BIN_DIR=${target_dir}/debug/examples" >> "$GITHUB_ENV"
       - run: scripts/repo-cargo test -p meerkat-meta --example console_acceptance_fixture
+      - run: node console/api-e2e.cjs
+      - run: node console/voice-e2e.cjs
+      # Validate paid-lane evidence and continuous silent audio without credentials.
+      - run: node console/voice-e2e-live.cjs --self-test
+      - run: node console/voice-e2e-live.cjs --self-test-audio
+      - run: node console/memory-e2e.cjs
+      - run: node console/workgraph-e2e.cjs
+      - name: Upload console evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: console-${{ github.run_id }}
+          path: output/playwright/console-acceptance/
+          if-no-files-found: error
+
+  # The browser scenarios against the real acceptance backends, split from
+  # `console`. They need the same backend build, which the shared
+  # meta-dev-examples cache serves, and freshly built console bundles: the
+  # scenarios read console/dist and the backends embed
+  # crates/meerkat-meta/console-dist, both written by `run build`.
+  console-browser:
+    name: console-browser
+    runs-on: ubuntu-24.04
+    env:
+      # Rust 1.97 incremental compilation can ICE in async identity iteration.
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: meta-dev-examples
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: npm --prefix console ci --silent --no-fund --no-audit
+      - run: npm --prefix console run build --silent
+      - run: npm --prefix console run build:acceptance --silent
+      - run: npm --prefix console exec -- playwright install --with-deps chromium
+      - name: Build console acceptance backends
+        run: |
+          scripts/repo-cargo build -p meerkat-meta --example library_mode_reference --example console_acceptance_fixture --example memory_console_reference --example workgraph_console_reference
+          target_dir="$(scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')"
+          echo "META_EXAMPLE_BIN_DIR=${target_dir}/debug/examples" >> "$GITHUB_ENV"
       - name: Native MCP Apps rendering and reload
         timeout-minutes: 5
         run: npm --prefix console run e2e:mcp-apps --silent
@@ -237,14 +349,7 @@ jobs:
         env:
           META_MCP_APPS_LONG_POLL: "1"
           META_BROWSER_EVIDENCE: ${{ github.workspace }}/output/playwright/console-acceptance/mcp-apps
-      - run: node console/api-e2e.cjs
       - run: node console/browser-e2e.cjs
-      - run: node console/voice-e2e.cjs
-      # Validate paid-lane evidence and continuous silent audio without credentials.
-      - run: node console/voice-e2e-live.cjs --self-test
-      - run: node console/voice-e2e-live.cjs --self-test-audio
-      - run: node console/memory-e2e.cjs
-      - run: node console/workgraph-e2e.cjs
       - name: Upload console browser evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -252,6 +357,29 @@ jobs:
           name: console-browser-${{ github.run_id }}
           path: output/playwright/console-acceptance/
           if-no-files-found: error
+
+  # The composer typing check, split from `console`. It bundles its own
+  # host with esbuild and needs no Rust.
+  console-perf:
+    name: console-perf
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - run: npm --prefix console ci --silent --no-fund --no-audit
+      - run: npm --prefix console exec -- playwright install --with-deps chromium
+      # Real-browser composer typing with a full identity log and a
+      # FlowForensics-shaped session, idle and while a reply streams. jsdom
+      # has no style, layout or paint, so only a browser can see this
+      # regress. Fails only on runner-independent work counts (layout objects
+      # per keystroke, full derivations and turn renders per streamed token);
+      # wall-clock p95 is printed as advisory (META_TYPING_LAG_ENFORCE_TIMING=1
+      # makes it a failure for local perf work).
+      - run: npm --prefix console run perf:typing:browser --silent
 
   # Needs Rust but NOT playwright: the script bundles with esbuild, runs
   # `node --test`, then `cargo test -p meerkat-meta --test
@@ -268,6 +396,9 @@ jobs:
           cache-dependency-path: console/package-lock.json
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: meta-dev-examples
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm --prefix console ci --silent --no-fund --no-audit
       - run: npm --prefix console run fixtures:console-customization --silent
 
@@ -286,6 +417,9 @@ jobs:
           cache-dependency-path: console/package-lock.json
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: meta-dev-examples
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm --prefix console ci --silent --no-fund --no-audit
       - run: npm --prefix console exec -- playwright install --with-deps chromium
       - name: Stock incident topology acceptance
@@ -311,6 +445,9 @@ jobs:
           cache-dependency-path: flow-editor/package-lock.json
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: meta-dev-bins
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm --prefix flow-editor ci --silent --no-fund --no-audit
       - run: npm --prefix flow-editor exec -- playwright install --with-deps chromium
       - run: CARGO_INCREMENTAL=0 scripts/repo-cargo build -p meerkat-meta --bin meta_flow_editor
@@ -348,7 +485,7 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [fmt-lint, test, test-extension-state, test-voice, test-python, test-typescript, console, console-fixtures, console-acceptance, flow-editor, audit]
+    needs: [fmt-lint, test, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, test-typescript, console, console-browser, console-perf, console-fixtures, console-acceptance, flow-editor, audit]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results
@@ -356,10 +493,14 @@ jobs:
           if [[ "${{ needs.fmt-lint.result }}" != "success" ||
                 "${{ needs.test.result }}" != "success" ||
                 "${{ needs.test-extension-state.result }}" != "success" ||
+                "${{ needs.extension-state-lint.result }}" != "success" ||
                 "${{ needs.test-voice.result }}" != "success" ||
+                "${{ needs.voice-clippy.result }}" != "success" ||
                 "${{ needs.test-python.result }}" != "success" ||
                 "${{ needs.test-typescript.result }}" != "success" ||
                 "${{ needs.console.result }}" != "success" ||
+                "${{ needs.console-browser.result }}" != "success" ||
+                "${{ needs.console-perf.result }}" != "success" ||
                 "${{ needs.console-fixtures.result }}" != "success" ||
                 "${{ needs.console-acceptance.result }}" != "success" ||
                 "${{ needs.flow-editor.result }}" != "success" ||
@@ -368,10 +509,14 @@ jobs:
             echo "  fmt-lint:     ${{ needs.fmt-lint.result }}"
             echo "  test:         ${{ needs.test.result }}"
             echo "  test-extension-state: ${{ needs.test-extension-state.result }}"
+            echo "  extension-state-lint: ${{ needs.extension-state-lint.result }}"
             echo "  test-voice:   ${{ needs.test-voice.result }}"
+            echo "  voice-clippy: ${{ needs.voice-clippy.result }}"
             echo "  test-python:  ${{ needs.test-python.result }}"
           echo "  test-typescript:    ${{ needs.test-typescript.result }}"
             echo "  console:      ${{ needs.console.result }}"
+            echo "  console-browser: ${{ needs.console-browser.result }}"
+            echo "  console-perf: ${{ needs.console-perf.result }}"
             echo "  console-fixtures:   ${{ needs.console-fixtures.result }}"
             echo "  console-acceptance: ${{ needs.console-acceptance.result }}"
             echo "  flow-editor:  ${{ needs.flow-editor.result }}"

@@ -245,10 +245,56 @@ async function durableSteer(host, persistedBackgroundJob = false) {
     result.views[label] = rendered;
     return rendered;
   }
-  async function assertDraftAndReading() {
+  // The reading anchor's position once it has come to rest. Layout passes
+  // after a programmatic scroll (the transcript window, the scroll
+  // controller's anchor restore) can move the view again in the frames after
+  // it lands: main CI run 38511905113 read its baseline about 98 px from
+  // where the view came to rest, before any delivery. Both readings are taken
+  // only once the heading has held its exact offset for `stableMs` of frames.
+  // An anchor that keeps moving fails here; one that comes to rest elsewhere
+  // fails the comparison. The evidence JSON keeps, for every reading, the box
+  // read at once (what a single read would have compared), each offset change
+  // while it settled and the resting box, so a failure can be classified from
+  // the artifact alone.
+  async function restingReading(label, { stableMs = 500, timeoutMs = 5_000 } = {}) {
+    const immediate = await viewport().getByRole("heading", { name: "Evidence 3", exact: true })
+      .boundingBox({ timeout: 1_000 }).catch(error => ({ error: String(error?.message || error) }));
+    const reading = await viewport().evaluate((root, { stableMs, timeoutMs }) => new Promise((resolve) => {
+      const started = performance.now();
+      const moves = [];
+      let lastY;
+      let since = started;
+      const anchor = () => {
+        const heading = [...root.querySelectorAll('h1, h2, h3, h4, h5, h6, [role="heading"]')]
+          .find((node) => node.textContent.trim() === "Evidence 3" && !node.closest("[hidden]"));
+        if (!heading) return null;
+        const { x, y, width, height } = heading.getBoundingClientRect();
+        return { x, y, width, height };
+      };
+      const tick = () => {
+        const rect = anchor();
+        const y = rect ? rect.y : null;
+        const now = performance.now();
+        if (y !== lastY) {
+          moves.push({ atMs: Math.round(now - started), y });
+          lastY = y;
+          since = now;
+        }
+        if (rect && now - since >= stableMs) resolve({ rested: true, rect, waitedMs: Math.round(now - started), moves });
+        else if (now - started >= timeoutMs) resolve({ rested: false, rect, waitedMs: Math.round(now - started), moves });
+        else requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    }), { stableMs, timeoutMs });
+    (result.readings ||= {})[label] = { immediate, ...reading };
+    assert(reading.rested, `${label}: the reading anchor comes to rest within ${timeoutMs} ms`);
+    return reading.rect;
+  }
+  async function assertDraftAndReading(label) {
     const current = await composer().evaluate(node => ({ value: node.value, start: node.selectionStart, end: node.selectionEnd, focused: document.activeElement === node }));
     assert.deepEqual(current, result.draftBefore, "streaming the notice preserves draft, selection and keyboard focus");
-    const after = await viewport().getByRole("heading", { name: "Evidence 3", exact: true }).boundingBox();
+    const after = await restingReading(label);
+    (result.readingAfter ||= {})[label] = after;
     assert(after && Math.abs(after.y - result.readingBefore.y) <= 2, "background delivery preserves the exact reading anchor");
   }
   async function inspectAssistantDuration(label) {
@@ -371,7 +417,7 @@ async function durableSteer(host, persistedBackgroundJob = false) {
     await viewport().getByRole("heading", { name: "Evidence 3", exact: true }).scrollIntoViewIfNeeded();
     result.draftBefore = await composer().evaluate(node => ({ value: node.value, start: node.selectionStart, end: node.selectionEnd, focused: document.activeElement === node }));
     assert.equal(result.draftBefore.focused, true);
-    result.readingBefore = await viewport().getByRole("heading", { name: "Evidence 3", exact: true }).boundingBox();
+    result.readingBefore = await restingReading("before");
     assert(result.readingBefore);
     await capture("waiting-with-draft");
 
@@ -407,7 +453,7 @@ async function durableSteer(host, persistedBackgroundJob = false) {
     assert.equal(result.duringRun.current_run_id, result.runStart.run_id, "the append is visible before the same run completes");
     const duringView = await inspectNotice("during-run", true);
     await inspectApproval("during-run");
-    await assertDraftAndReading();
+    await assertDraftAndReading("during-run");
     result.afterLiveReading = await state();
     assert(inputStillRunning(result.afterLiveReading), "live notice and preserved typing/reading were observed before the original run completed");
     await capture("notice-preserves-reading");
@@ -458,7 +504,7 @@ async function durableSteer(host, persistedBackgroundJob = false) {
     assert.equal(answer.role, "block_assistant");
     assert.equal(answer.identity.run_id, result.runStart.run_id);
     assert.equal(assistantText(answer), finalSource);
-    await assertDraftAndReading();
+    await assertDraftAndReading("completed");
     const completedView = await inspectNotice("completed");
     await inspectApproval("completed");
     assert.deepEqual(completedView.rows, duringView.rows, "the exact live notice row and content survive the committed history reconciliation");
