@@ -1299,17 +1299,24 @@ fn print_migrate_report_text(report: &meerkat_meta::MetaMigrateReport) {
 }
 
 const STORAGE_ADOPT_PREDECESSOR_USAGE: &str = "usage: meta_gateway storage-adopt-predecessor \
-     --state-dir <dir> [--gateway-home <dir>] [--predecessor-home <dir>] [--apply] [--json]\n\
+     --state-dir <dir> [--gateway-home <dir>] [--predecessor-home <dir>] \
+     [--user-gateway-home] [--apply] [--json]\n\
      One-shot, offline adoption of one predecessor (pre-0.9) installation: \
      renames the metadata and console database files and the gateway's \
      memory ledger file (at its one fixed path in the state directory; no \
      other path is searched or touched), rewrites the schema ledger domains \
-     and the metadata table, retargets the steward dream schedule, and \
-     moves the predecessor gateway home with its established peer key, \
-     host pins, control audiences and flow-editor drafts. The \
-     gateway home defaults to the derived XDG home and the predecessor home \
-     to its predecessor sibling. An unfinished adoption resumes with the \
-     homes its journal recorded; named homes that differ are refused.\n\
+     and the metadata table, renames the creator field of each mob \
+     composition manifest (*.composition.json) in the state directory, \
+     keeping every other byte, retargets the steward dream schedule, and \
+     moves a predecessor gateway home in scope with its established peer \
+     key, host pins, control audiences and flow-editor drafts.\n\
+     Scope: the state directory alone unless a gateway home is in scope. \
+     --gateway-home names the home a predecessor home becomes, and the \
+     predecessor home defaults to its predecessor sibling. \
+     --user-gateway-home brings the invoking user's own gateway home into \
+     scope (the derived XDG home and its predecessor sibling); it is never \
+     in scope otherwise. An unfinished adoption resumes with the homes its \
+     journal recorded; named homes that differ are refused.\n\
      --state-dir must be the installation's state directory, exactly as the \
      startup refusal names it: the persistent_state of rpc_gateway and the \
      SDK builders, or the store_path directory of meta_gateway (the parent \
@@ -1317,12 +1324,14 @@ const STORAGE_ADOPT_PREDECESSOR_USAGE: &str = "usage: meta_gateway storage-adopt
      Precondition: every process using the installation is stopped; the \
      run refuses while a runtime registry lists a live process, and fences \
      every database it touches. The fence covers SQLite databases only: \
-     nothing fences the memory ledger's JSON writer, so the stopped \
-     installation is what keeps it away, and a ledger changed since \
-     planning is detected, not prevented. A leftover stage of an \
-     interrupted ledger write, or a renamed ledger beside the predecessor \
-     one, is refused for manual resolution. Each rename is made durable \
-     with directory fsyncs on Unix only.\n\
+     nothing fences the memory ledger's JSON writer or the composition \
+     manifests, so the stopped installation is what keeps writers away, and \
+     a ledger or manifest changed since planning is detected, not \
+     prevented. A leftover stage of an interrupted ledger write or manifest \
+     rename, a renamed ledger beside the predecessor one, or a manifest \
+     whose creator field cannot be judged, is refused for manual \
+     resolution. Each rename is made durable with directory fsyncs on Unix \
+     only.\n\
      Dry-run by default and read-only. --apply writes the adoption journal \
      (meta-adoption.json in the state directory) before its first change \
      and stops at the first failure; rerun to resume an unfinished \
@@ -1336,6 +1345,7 @@ fn run_storage_adopt_predecessor(args: &[String]) -> i32 {
     let mut state_dir: Option<PathBuf> = None;
     let mut gateway_home: Option<PathBuf> = None;
     let mut predecessor_home: Option<PathBuf> = None;
+    let mut user_gateway_home = false;
     let mut apply = false;
     let mut json = false;
     let mut iter = args.iter();
@@ -1344,6 +1354,10 @@ fn run_storage_adopt_predecessor(args: &[String]) -> i32 {
             "--state-dir" => &mut state_dir,
             "--gateway-home" => &mut gateway_home,
             "--predecessor-home" => &mut predecessor_home,
+            "--user-gateway-home" => {
+                user_gateway_home = true;
+                continue;
+            }
             "--apply" => {
                 apply = true;
                 continue;
@@ -1373,12 +1387,29 @@ fn run_storage_adopt_predecessor(args: &[String]) -> i32 {
         eprintln!("--state-dir is required\n{STORAGE_ADOPT_PREDECESSOR_USAGE}");
         return 2;
     };
+    if predecessor_home.is_some() && gateway_home.is_none() && !user_gateway_home {
+        eprintln!(
+            "--predecessor-home needs the gateway home it becomes: name it with \
+             --gateway-home, or pass --user-gateway-home for the derived home\n\
+             {STORAGE_ADOPT_PREDECESSOR_USAGE}"
+        );
+        return 2;
+    }
     // Named homes bind; derived ones are defaults that an unfinished
     // adoption replaces with the homes its journal recorded.
     let homes_explicit = gateway_home.is_some() || predecessor_home.is_some();
+    // The invoking user's own gateway home is that user's state, not part of
+    // the installation `--state-dir` names: it is derived only on request.
     let gateway_home = match gateway_home {
         Some(home) => Some(home),
-        None => meerkat_meta::storage_layout::derived_gateway_home().ok(),
+        None if user_gateway_home => match meerkat_meta::storage_layout::derived_gateway_home() {
+            Ok(home) => Some(home),
+            Err(error) => {
+                eprintln!("--user-gateway-home: {error}");
+                return 1;
+            }
+        },
+        None => None,
     };
     let predecessor_home = predecessor_home.or_else(|| {
         gateway_home

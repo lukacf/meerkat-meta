@@ -28,12 +28,25 @@ use serde::{Deserialize, Serialize};
 /// Current manifest schema version.
 pub const MANIFEST_VERSION: u32 = 1;
 
+/// File-name suffix of a composition manifest: [`manifest_path`] appends it
+/// to the mob storage file name.
+pub const MANIFEST_FILE_SUFFIX: &str = ".composition.json";
+
 /// Provenance record written beside a persistent mob storage path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MobCompositionManifest {
     /// Schema version of this file.
     pub manifest_version: u32,
-    /// Meta version that created the storage path.
+    /// Version of the release that created the storage path.
+    ///
+    /// Also read under its predecessor (pre-0.9) spelling,
+    /// [`crate::storage_predecessor::PREDECESSOR_MANIFEST_CREATOR_FIELD`]: the
+    /// predecessor wrote this same version-1 schema with only this field
+    /// named differently, beside every persistent mob storage it created.
+    /// Written only as `created_by_meta`; predecessor adoption renames the
+    /// field on disk. A manifest that carries both spellings is malformed:
+    /// nothing here picks one.
+    #[serde(alias = "created_by_mobkit")]
     pub created_by_meta: String,
     /// The composition the storage path was created for.
     pub definition: MobDefinition,
@@ -60,7 +73,7 @@ pub fn manifest_path(mob_storage_path: &Path) -> PathBuf {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "mob".to_string());
-    file_name.push_str(".composition.json");
+    file_name.push_str(MANIFEST_FILE_SUFFIX);
     mob_storage_path.with_file_name(file_name)
 }
 
@@ -134,7 +147,9 @@ impl std::fmt::Display for MobCompositionProvenanceError {
                 f,
                 "the mob composition provenance at {} is not a readable manifest: {} \
                  (resuming blind could boot a stale composition that looks healthy; \
-                 restore the file, or remove the mob storage to recreate it)",
+                 restore the file from a backup, or inspect and repair it by hand; \
+                 removing the mob storage instead recreates it empty and discards the \
+                 mob's recorded events)",
                 manifest.display(),
                 message
             ),
@@ -961,5 +976,113 @@ mod tests {
         ] {
             assert!(other.composition_provenance().is_none(), "{other}");
         }
+    }
+
+    fn definition(model: &str) -> MobDefinition {
+        MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"predecessor-manifest\"\n\n[profiles.lead]\nmodel = \"{model}\"\n"
+        ))
+        .expect("test definition")
+    }
+
+    /// A version-1 manifest as the predecessor (pre-0.9) release wrote it:
+    /// its creator field spelled `created_by_mobkit` and no normalization
+    /// flag, exactly the shape of a MobKit 0.8.26 store.
+    fn predecessor_manifest(definition: &MobDefinition, creator: &str) -> serde_json::Value {
+        json!({
+            "manifest_version": 1,
+            "created_by_mobkit": creator,
+            "definition": definition,
+            "created_by_authority": "authoritative",
+        })
+    }
+
+    fn write_manifest_beside(storage: &Path, manifest: &serde_json::Value) {
+        std::fs::write(
+            manifest_path(storage),
+            serde_json::to_vec_pretty(manifest).expect("manifest serializes"),
+        )
+        .expect("write manifest");
+    }
+
+    /// The predecessor spelling of the creator field reads as the creator
+    /// version, and a manifest is only ever written with the current one.
+    #[test]
+    fn a_predecessor_manifest_reads_its_creator_and_writes_the_current_spelling() {
+        let record: MobCompositionManifest =
+            serde_json::from_value(predecessor_manifest(&definition("gpt-5.5"), "0.8.26"))
+                .expect("a predecessor manifest decodes");
+        assert_eq!(record.created_by_meta, "0.8.26");
+        assert_eq!(record.legacy_synthesized_profile_normalization, None);
+
+        let written = serde_json::to_value(&record).expect("manifest serializes");
+        assert_eq!(written["created_by_meta"], json!("0.8.26"));
+        assert!(written.get("created_by_mobkit").is_none(), "{written}");
+    }
+
+    /// A store a predecessor release created resumes against its own
+    /// manifest: no malformed refusal, and the recorded creator version
+    /// still selects the released-representation allowance (a 0.8.26
+    /// writer is a synthesizing release, a 0.9 writer is not).
+    #[test]
+    fn a_predecessor_manifest_is_judged_like_a_current_one() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage = temp.path().join("event_log.sqlite3");
+        let recorded = definition("gpt-5.5");
+        write_manifest_beside(&storage, &predecessor_manifest(&recorded, "0.8.26"));
+        verify_before_resume(&storage, &recorded, &recorded)
+            .expect("a predecessor manifest verifies an unchanged definition");
+
+        // The supplied definition differs, and only its released (legacy)
+        // representation matches the stored one.
+        let supplied = definition("gpt-5.4");
+        assert!(matches!(
+            verify_before_resume(&storage, &recorded, &supplied),
+            Err(MobCompositionProvenanceError::Divergent { .. })
+        ));
+        assert!(matches!(
+            verify_legacy_synthesized_definition_before_resume(
+                &storage, 1, &recorded, &supplied, &recorded,
+            ),
+            Ok(LegacyDefinitionResume::Recorded)
+        ));
+
+        // The same file written by a 0.9 release earns no allowance.
+        write_manifest_beside(
+            &storage,
+            &json!({
+                "manifest_version": 1,
+                "created_by_meta": "0.9.1",
+                "definition": recorded,
+                "created_by_authority": "authoritative",
+            }),
+        );
+        assert!(matches!(
+            verify_legacy_synthesized_definition_before_resume(
+                &storage, 1, &recorded, &supplied, &recorded,
+            ),
+            Err(MobCompositionProvenanceError::Divergent { .. })
+        ));
+    }
+
+    /// Both spellings at once is not a manifest this build can judge:
+    /// nothing picks one.
+    #[test]
+    fn a_manifest_carrying_both_creator_spellings_is_malformed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage = temp.path().join("event_log.sqlite3");
+        let recorded = definition("gpt-5.5");
+        let mut manifest = predecessor_manifest(&recorded, "0.8.26");
+        manifest["created_by_meta"] = json!("0.9.1");
+        write_manifest_beside(&storage, &manifest);
+        let refusal = verify_before_resume(&storage, &recorded, &recorded);
+        assert!(
+            matches!(
+                &refusal,
+                Err(MobCompositionProvenanceError::Malformed { message, .. })
+                    if message.contains("duplicate field")
+            ),
+            "{refusal:?}"
+        );
     }
 }

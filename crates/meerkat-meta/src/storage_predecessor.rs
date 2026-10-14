@@ -3,10 +3,11 @@
 //! Before 0.9 this product shipped under a different name, and several
 //! durable names carried it: two database file names, the gateway's memory
 //! ledger file, four schema ledger domains, one SQLite table, the gateway
-//! home directory, the flow-editor draft store file and the steward dream
-//! schedule's host runnable. 0.9 renames all of them. This module is the
-//! only place that knows the predecessor spellings, and it uses them for
-//! exactly two things:
+//! home directory, the flow-editor draft store file, the steward dream
+//! schedule's host runnable and the creator field of the composition
+//! manifest beside each persistent mob storage. 0.9 renames all of them.
+//! This module is the only place that knows the predecessor spellings, and
+//! it uses them for exactly three things:
 //!
 //! 1. **Typed refusal.** [`predecessor_state_files`] and
 //!    [`predecessor_gateway_home_beside`] let the layout refuse to open a
@@ -25,11 +26,20 @@
 //!    adoption journal, and then runs its steps in order: database file
 //!    renames (WAL-safe, with registered rename markers), the memory ledger
 //!    file (a same-directory rename of its committed bytes), ledger domain
-//!    rows and the metadata table, the steward dream schedule (through the
-//!    schedule service), the gateway home with its established peer key,
-//!    host pins and control audiences, and the draft store. The run stops at
-//!    the first failure. Every refusal happens before the first change;
-//!    every failure after it is reported as such, never as "unchanged".
+//!    rows and the metadata table, the composition manifests (their creator
+//!    field renamed in place, every other byte kept), the steward dream
+//!    schedule (through the schedule service), the gateway home with its
+//!    established peer key, host pins and control audiences, and the draft
+//!    store. The run stops at the first failure. Every refusal happens
+//!    before the first change; every failure after it is reported as such,
+//!    never as "unchanged".
+//! 3. **One read alias.** The composition manifest reads its creator field
+//!    under [`PREDECESSOR_MANIFEST_CREATOR_FIELD`] too. That name is a field
+//!    inside a file the store keeps, not a file or table name a renamed
+//!    default could start empty beside, so reading it cannot fork state; it
+//!    keeps a store that was adopted before the manifest step existed
+//!    opening. [`repair_composition_manifest`] (`meta_repair
+//!    --composition-manifests`) renames it on such a store.
 //!
 //! The journal ([`ADOPTION_JOURNAL_FILE_NAME`]) is the completion evidence.
 //! Until it records every step finished, startup refuses
@@ -39,8 +49,11 @@
 //! The maintenance fence covers SQLite databases only. Nothing fences the
 //! memory ledger's JSON writer: the stopped installation is what keeps it
 //! away, and revalidating the ledger's bytes under the fence detects a
-//! change without excluding one. Directory fsyncs, which make each rename
-//! durable, run on Unix only.
+//! change without excluding one. The composition manifests are JSON files
+//! too, written only when their mob storage is created; the stock event log
+//! beside its manifest is fenced, and each manifest's bytes are revalidated
+//! the same way before its creator field is renamed. Directory fsyncs, which
+//! make each rename durable, run on Unix only.
 //!
 //! Session rows the predecessor repair tool rewrote keep their markers;
 //! the repair tool recognizes them ([`PREDECESSOR_REPAIR_MARKER_PREFIX`])
@@ -111,6 +124,15 @@ pub const PREDECESSOR_DRAFT_STORE_FILE_NAME: &str = "meerkat-mobkit-flow-editor-
 pub const PREDECESSOR_MEMORY_LEDGER_FILE_NAME: &str = "elephant-memory-state.json";
 /// Predecessor name of the steward dream host runnable.
 pub const PREDECESSOR_STEWARD_DREAM_RUNNABLE: &str = "mobkit.memory.steward.dream";
+/// Predecessor spelling of the creator field in the composition manifest
+/// beside each persistent mob storage
+/// ([`crate::mob_composition_manifest::MobCompositionManifest::created_by_meta`]).
+/// The manifest reader accepts it as an alias; adoption (its
+/// [`AdoptionStep::Ledger`] step) and `meta_repair --composition-manifests`
+/// ([`repair_composition_manifest`]) rename it on disk.
+pub const PREDECESSOR_MANIFEST_CREATOR_FIELD: &str = "created_by_mobkit";
+/// The creator field's current spelling.
+const MANIFEST_CREATOR_FIELD: &str = "created_by_meta";
 /// The environment variables the predecessor (pre-0.9) gateways, repair
 /// tool, flow editor and SDKs read. Each is now spelled `META_` with the
 /// same suffix. Matched by exact name: a host's own variables that merely
@@ -274,6 +296,15 @@ pub enum AdoptionStep {
     /// The stock gateway's memory ledger file: a same-directory rename of
     /// its committed bytes to the canonical name.
     MemoryLedgerFile,
+    /// Every in-place rename of a predecessor name inside stored data: the
+    /// schema ledger domain rows and the metadata table, then the creator
+    /// field ([`PREDECESSOR_MANIFEST_CREATOR_FIELD`]) of every composition
+    /// manifest in the state directory, every other manifest byte kept.
+    ///
+    /// The manifests ride this step rather than a step of their own so a
+    /// journal stays readable by every 0.9 release: an earlier one refuses a
+    /// step name it does not know (see above), which would turn adoption into
+    /// a one-way door against a binary rollback.
     Ledger,
     StewardSchedule,
     GatewayHome,
@@ -704,6 +735,7 @@ pub enum PredecessorItem {
     MemoryLedger,
     LedgerDomain,
     MetadataTable,
+    CompositionManifest,
     StewardSchedule,
     GatewayHome,
     PeerIdentity,
@@ -823,7 +855,20 @@ struct StatePlan {
     /// The memory ledger file still carries its predecessor name.
     memory_ledger_move: Option<LedgerFileMove>,
     ledgers: Vec<LedgerPlan>,
+    /// Composition manifests whose creator field still has its predecessor
+    /// spelling.
+    composition_manifests: Vec<ManifestRename>,
     schedules: Vec<String>,
+}
+
+/// One composition manifest whose creator field still has its predecessor
+/// spelling: renamed in place, every other byte kept. Its bytes keep their
+/// digest from planning to the rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestRename {
+    path: PathBuf,
+    /// SHA-256 of the bytes the plan saw.
+    digest: [u8; 32],
 }
 
 /// The memory ledger file's rename: its committed bytes keep their digest
@@ -873,9 +918,9 @@ struct EstablishedIdentity {
 ///   reads or writes (existing databases, predecessor sources and renamed
 ///   destinations) from before revalidation until the gateway-home steps
 ///   have finished. The fence covers SQLite databases only. Nothing fences
-///   the memory ledger's JSON writer: the precondition is what keeps it
-///   away, and revalidating the ledger's digest detects a change since
-///   planning without excluding one.
+///   the memory ledger's JSON writer or the composition manifests: the
+///   precondition is what keeps writers away, and revalidating each file's
+///   digest detects a change since planning without excluding one.
 /// - Each rename is followed by an fsync of the directories it touched on
 ///   Unix only; elsewhere its durability rests on the filesystem's own
 ///   ordering.
@@ -1005,6 +1050,7 @@ pub async fn adopt_predecessor_state(request: &PredecessorAdoptRequest) -> Prede
         record_plan(
             &state_plan,
             &home_plan,
+            !realm_recorded,
             PredecessorOutcome::Planned,
             &mut report,
         );
@@ -1105,7 +1151,10 @@ pub async fn adopt_predecessor_state(request: &PredecessorAdoptRequest) -> Prede
         let finished = match step {
             AdoptionStep::DatabaseFiles => apply_file_moves(&state_plan, &mut report),
             AdoptionStep::MemoryLedgerFile => apply_memory_ledger_move(&state_plan, &mut report),
-            AdoptionStep::Ledger => apply_ledgers(&state_plan, &mut report),
+            AdoptionStep::Ledger => {
+                apply_ledgers(&state_plan, &mut report)
+                    && apply_composition_manifests(&state_plan, &mut report)
+            }
             AdoptionStep::StewardSchedule => {
                 apply_schedules(state_dir, &state_plan, &mut report).await
             }
@@ -1143,13 +1192,17 @@ pub async fn adopt_predecessor_state(request: &PredecessorAdoptRequest) -> Prede
     report
 }
 
+/// Record the dry run's plan. `record_realm_id` is false once the journal
+/// already records the predecessor realm id: there is nothing left to plan
+/// for it.
 fn record_plan(
     state_plan: &StatePlan,
     home_plan: &HomePlan,
+    record_realm_id: bool,
     outcome: PredecessorOutcome,
     report: &mut PredecessorAdoptReport,
 ) {
-    if state_plan.keep_predecessor_realm {
+    if state_plan.keep_predecessor_realm && record_realm_id {
         record_realm(outcome.clone(), report);
     }
     for (from, to) in &state_plan.file_moves {
@@ -1166,6 +1219,9 @@ fn record_plan(
     }
     for ledger in &state_plan.ledgers {
         record_ledger(ledger, outcome.clone(), report);
+    }
+    for planned in &state_plan.composition_manifests {
+        record_composition_manifest(planned, outcome.clone(), report);
     }
     for schedule_id in &state_plan.schedules {
         report.record(
@@ -1216,6 +1272,20 @@ fn record_memory_ledger(
         planned.from.display().to_string(),
         planned.from.display().to_string(),
         planned.to.display().to_string(),
+        outcome,
+    );
+}
+
+fn record_composition_manifest(
+    planned: &ManifestRename,
+    outcome: PredecessorOutcome,
+    report: &mut PredecessorAdoptReport,
+) {
+    report.record(
+        PredecessorItem::CompositionManifest,
+        planned.path.display().to_string(),
+        PREDECESSOR_MANIFEST_CREATOR_FIELD,
+        MANIFEST_CREATOR_FIELD,
         outcome,
     );
 }
@@ -1355,6 +1425,27 @@ fn plan_state(state_dir: &Path, report: &mut PredecessorAdoptReport) -> Option<S
         ),
     }
 
+    match composition_manifests_in(state_dir) {
+        Ok(manifests) => {
+            for manifest in manifests {
+                match plan_composition_manifest(&manifest) {
+                    Ok(Some(planned)) => plan.composition_manifests.push(planned),
+                    Ok(None) => {}
+                    Err(reason) => report.refuse(
+                        PredecessorItem::CompositionManifest,
+                        manifest.display().to_string(),
+                        reason,
+                    ),
+                }
+            }
+        }
+        Err(reason) => report.refuse(
+            PredecessorItem::CompositionManifest,
+            state_dir.display().to_string(),
+            reason,
+        ),
+    }
+
     let mut databases = enumerate_state_dir_databases(state_dir);
     databases.extend(plan.file_moves.iter().map(|(from, _)| from.clone()));
     databases.sort();
@@ -1478,6 +1569,12 @@ fn ledger_names(path: &Path) -> impl Iterator<Item = PathBuf> {
 /// SHA-256 of a ledger file's committed bytes. Anything but a regular file
 /// refuses: a link or a directory at the ledger's name is resolved by hand.
 fn ledger_digest(path: &Path) -> Result<[u8; 32], String> {
+    regular_file_bytes(path).map(|bytes| Sha256::digest(bytes).into())
+}
+
+/// The bytes of the regular file at `path`. Anything else refuses: a link or
+/// a directory at a name adoption rewrites is resolved by hand.
+fn regular_file_bytes(path: &Path) -> Result<Vec<u8>, String> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| format!("inspect {}: {error}", path.display()))?;
     if !metadata.file_type().is_file() {
@@ -1486,8 +1583,178 @@ fn ledger_digest(path: &Path) -> Result<[u8; 32], String> {
             path.display()
         ));
     }
-    let bytes = std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    Ok(Sha256::digest(bytes).into())
+    std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))
+}
+
+/// Every composition manifest directly in `dir`: each entry whose name ends
+/// in [`crate::mob_composition_manifest::MANIFEST_FILE_SUFFIX`], sorted.
+/// Subdirectories are not searched: a persistent mob storage keeps its
+/// manifest beside it, and the stock one is the event log in the state
+/// directory itself.
+pub fn composition_manifests_in(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|error| format!("list {}: {error}", dir.display()))?;
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("list {}: {error}", dir.display()))?;
+        if entry.file_name().to_str().is_some_and(|name| {
+            name.ends_with(crate::mob_composition_manifest::MANIFEST_FILE_SUFFIX)
+        }) {
+            found.push(entry.path());
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// How a composition manifest spells its creator field.
+enum ManifestCreator {
+    /// `created_by_meta`: nothing to rename.
+    Current,
+    /// [`PREDECESSOR_MANIFEST_CREATOR_FIELD`], at this byte range of its
+    /// quoted key.
+    Predecessor(std::ops::Range<usize>),
+}
+
+/// Read-only inspection of one composition manifest: `Some` when its creator
+/// field still has its predecessor spelling. Refused for manual resolution,
+/// before any change: a manifest that is not a regular file or not a JSON
+/// object, one that names no creator field or more than one, and the stage
+/// of an interrupted rename beside it.
+fn plan_composition_manifest(path: &Path) -> Result<Option<ManifestRename>, String> {
+    let stage = staged_manifest_path(path);
+    if present(&stage) {
+        return Err(format!(
+            "{} is the stage of an interrupted manifest rename; the manifest itself is intact \
+             (the rename replaces it in one step). Remove the stage, then rerun",
+            stage.display()
+        ));
+    }
+    let bytes = regular_file_bytes(path)?;
+    match manifest_creator(&bytes).map_err(|reason| format!("{}: {reason}", path.display()))? {
+        ManifestCreator::Current => Ok(None),
+        ManifestCreator::Predecessor(_) => Ok(Some(ManifestRename {
+            path: path.to_path_buf(),
+            digest: Sha256::digest(&bytes).into(),
+        })),
+    }
+}
+
+/// Which creator field the manifest `bytes` carry, judged on the top-level
+/// keys only: a key of the same name nested inside the recorded definition
+/// is data, not the creator field.
+fn manifest_creator(bytes: &[u8]) -> Result<ManifestCreator, String> {
+    let keys = top_level_keys(bytes).ok_or(
+        "not a JSON object, so not a readable composition manifest; restore it (startup \
+         refuses it as malformed too)",
+    )?;
+    let mut predecessor = keys
+        .iter()
+        .filter(|(key, _)| key == PREDECESSOR_MANIFEST_CREATOR_FIELD)
+        .map(|(_, span)| span.clone());
+    let current = keys
+        .iter()
+        .filter(|(key, _)| key == MANIFEST_CREATOR_FIELD)
+        .count();
+    match (predecessor.next(), predecessor.next(), current) {
+        (None, _, 1) => Ok(ManifestCreator::Current),
+        (Some(span), None, 0) => Ok(ManifestCreator::Predecessor(span)),
+        (None, _, 0) => Err(format!(
+            "names no creator field ({MANIFEST_CREATOR_FIELD} or \
+             {PREDECESSOR_MANIFEST_CREATOR_FIELD}), so it is not a manifest this build can \
+             judge; restore it"
+        )),
+        _ => Err(format!(
+            "carries more than one creator field ({MANIFEST_CREATOR_FIELD} and/or \
+             {PREDECESSOR_MANIFEST_CREATOR_FIELD}); refusing to pick one (inspect it and keep \
+             the one naming the release that created the store)"
+        )),
+    }
+}
+
+/// The top-level keys of the JSON object `bytes`, each with the byte range
+/// of its quoted key, in document order; `None` unless `bytes` is one JSON
+/// object. Duplicate keys are all listed (a decoder would keep only one).
+fn top_level_keys(bytes: &[u8]) -> Option<Vec<(String, std::ops::Range<usize>)>> {
+    // Validated first, so the scan below only ever sees well-formed JSON:
+    // structural characters inside strings are skipped with the strings,
+    // and no byte of a multi-byte UTF-8 sequence is a quote or a backslash.
+    if !serde_json::from_slice::<serde_json::Value>(bytes).is_ok_and(|value| value.is_object()) {
+        return None;
+    }
+    let mut keys = Vec::new();
+    let mut depth = 0_usize;
+    let mut expect_key = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'"' {
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+                let end = index + 1;
+                if depth == 1 && expect_key {
+                    keys.push((
+                        serde_json::from_slice::<String>(bytes.get(start..end)?).ok()?,
+                        start..end,
+                    ));
+                }
+                expect_key = false;
+                index = end;
+                continue;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                expect_key = depth == 1;
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            b',' => expect_key = depth == 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    Some(keys)
+}
+
+/// `bytes` with the predecessor creator key at `key` renamed, every other
+/// byte kept, proven to decode to the same document with the key moved.
+fn renamed_manifest(bytes: &[u8], key: std::ops::Range<usize>) -> Result<Vec<u8>, String> {
+    let replacement =
+        serde_json::to_vec(MANIFEST_CREATOR_FIELD).map_err(|error| error.to_string())?;
+    let (Some(before), Some(after)) = (bytes.get(..key.start), bytes.get(key.end..)) else {
+        return Err("the creator key lies outside the manifest".to_string());
+    };
+    let renamed = [before, replacement.as_slice(), after].concat();
+    let mut expected: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let moved = expected
+        .as_object_mut()
+        .and_then(|object| {
+            let value = object.remove(PREDECESSOR_MANIFEST_CREATOR_FIELD)?;
+            object.insert(MANIFEST_CREATOR_FIELD.to_string(), value);
+            Some(())
+        })
+        .is_some();
+    let actual: Option<serde_json::Value> = serde_json::from_slice(&renamed).ok();
+    if !moved || actual.as_ref() != Some(&expected) {
+        return Err(
+            "renaming the creator key would change more than the key; nothing was written"
+                .to_string(),
+        );
+    }
+    Ok(renamed)
+}
+
+/// The staged sibling a manifest rename goes through.
+fn staged_manifest_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".next");
+    path.with_file_name(name)
 }
 
 /// Read-only inspection of the schedule store: the ids of every live
@@ -1796,6 +2063,208 @@ fn revalidate_ledger_move(planned: &LedgerFileMove) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Rename the creator field of every planned composition manifest in place.
+fn apply_composition_manifests(plan: &StatePlan, report: &mut PredecessorAdoptReport) -> bool {
+    for planned in &plan.composition_manifests {
+        // Under adoption every error is a failure: the run has already
+        // changed state (its journal), whatever this rename did.
+        let outcome = match rename_manifest_creator(planned) {
+            Ok(()) => PredecessorOutcome::Applied,
+            Err(error) => PredecessorOutcome::Failed(error.to_string()),
+        };
+        let failed = matches!(outcome, PredecessorOutcome::Failed(_));
+        record_composition_manifest(planned, outcome, report);
+        if failed {
+            return false;
+        }
+    }
+    true
+}
+
+/// Why one composition manifest rename did not finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestRepairError {
+    /// Refused before anything changed: the manifest and its directory are
+    /// as they were.
+    Refused(String),
+    /// Failed after something changed. Either the renamed manifest replaced
+    /// the original but the replacement is not yet durable (a crash before
+    /// the directory is synced may bring the original back), or this rename's
+    /// own stage could not be removed again. Inspect before rerunning.
+    Failed(String),
+}
+
+impl ManifestRepairError {
+    /// How a report names this outcome: `refused` or `failed`.
+    pub const fn outcome(&self) -> &'static str {
+        match self {
+            Self::Refused(_) => "refused",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    /// The reason, for a human.
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Refused(detail) | Self::Failed(detail) => detail,
+        }
+    }
+}
+
+impl std::fmt::Display for ManifestRepairError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.detail())
+    }
+}
+
+impl std::error::Error for ManifestRepairError {}
+
+/// Rename one planned manifest's creator field in place, keeping every other
+/// byte. The bytes must still be the planned ones (a check, not an
+/// exclusion: the stopped installation keeps writers away), and the
+/// replacement is atomic: an owner-only stage written beside the manifest,
+/// given the manifest's permissions, synced, renamed over it, and the
+/// directory synced.
+///
+/// A failure before the replacement is [`ManifestRepairError::Refused`]: the
+/// manifest is as it was, and this rename's own stage is removed again. A
+/// failure after it (the directory sync), or a stage that cannot be removed,
+/// is [`ManifestRepairError::Failed`].
+fn rename_manifest_creator(planned: &ManifestRename) -> Result<(), ManifestRepairError> {
+    rename_manifest_creator_with(planned, sync_parent)
+}
+
+/// [`rename_manifest_creator`] with the directory sync supplied, so a test
+/// can fail it after the replacement.
+fn rename_manifest_creator_with(
+    planned: &ManifestRename,
+    sync_directory: impl Fn(&Path) -> Result<(), String>,
+) -> Result<(), ManifestRepairError> {
+    use std::io::Write as _;
+    let bytes = regular_file_bytes(&planned.path).map_err(ManifestRepairError::Refused)?;
+    if <[u8; 32]>::from(Sha256::digest(&bytes)) != planned.digest {
+        return Err(ManifestRepairError::Refused(format!(
+            "{} changed since planning; another process is writing it",
+            planned.path.display()
+        )));
+    }
+    let ManifestCreator::Predecessor(key) =
+        manifest_creator(&bytes).map_err(ManifestRepairError::Refused)?
+    else {
+        return Err(ManifestRepairError::Refused(format!(
+            "{} no longer carries the predecessor creator field",
+            planned.path.display()
+        )));
+    };
+    let renamed = renamed_manifest(&bytes, key).map_err(ManifestRepairError::Refused)?;
+    let permissions = std::fs::metadata(&planned.path)
+        .map_err(|error| {
+            ManifestRepairError::Refused(format!("inspect {}: {error}", planned.path.display()))
+        })?
+        .permissions();
+    let stage = staged_manifest_path(&planned.path);
+    let mut file = create_manifest_stage(&stage).map_err(|error| {
+        ManifestRepairError::Refused(format!("create {}: {error}", stage.display()))
+    })?;
+    // From here the stage is ours: a failure removes it, and only it. Its
+    // owner-only mode covers the bytes until the manifest's own permissions
+    // replace it.
+    let written = file
+        .write_all(&renamed)
+        .and_then(|()| file.set_permissions(permissions))
+        .and_then(|()| file.sync_all());
+    drop(file);
+    let replaced = written
+        .map_err(|error| format!("write {}: {error}", stage.display()))
+        .and_then(|()| {
+            std::fs::rename(&stage, &planned.path).map_err(|error| {
+                format!(
+                    "rename {} -> {}: {error}",
+                    stage.display(),
+                    planned.path.display()
+                )
+            })
+        });
+    if let Err(error) = replaced {
+        return Err(match std::fs::remove_file(&stage) {
+            Ok(()) => ManifestRepairError::Refused(error),
+            Err(remove) if remove.kind() == std::io::ErrorKind::NotFound => {
+                ManifestRepairError::Refused(error)
+            }
+            Err(remove) => ManifestRepairError::Failed(format!(
+                "{error}; the stage {} could not be removed ({remove}) and is left behind",
+                stage.display()
+            )),
+        });
+    }
+    // The manifest is replaced; only the replacement's durability is left.
+    sync_directory(&planned.path).map_err(|error| {
+        ManifestRepairError::Failed(format!(
+            "{} now holds the renamed manifest, but the replacement is not yet durable: \
+             {error} (a crash before its directory is synced may bring back the original; \
+             a rerun reports which one is in place)",
+            planned.path.display()
+        ))
+    })
+}
+
+/// Create a manifest rename's stage exclusively and, on Unix, owner-only, so
+/// the manifest's bytes are never readable to others before its own
+/// permissions are applied. Elsewhere the platform's default applies.
+fn create_manifest_stage(stage: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(stage)
+}
+
+/// What [`repair_composition_manifest`] found, or did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestRepair {
+    /// The creator field already has its current spelling.
+    Current,
+    /// The creator field still has its predecessor spelling (dry run).
+    Predecessor,
+    /// The creator field was renamed in place.
+    Rewritten,
+}
+
+/// Inspect one composition manifest and, under [`MigrateMode::Apply`],
+/// rename a predecessor creator field in place: the adoption step's rename
+/// for one file, behind `meta_repair --composition-manifests`. Every other
+/// byte is kept, and a manifest this cannot judge (not a regular file, not a
+/// JSON object, no creator field or more than one, an interrupted rename's
+/// stage beside it) is refused unchanged. A failure after the replacement is
+/// [`ManifestRepairError::Failed`], never a refusal. Like adoption, it relies
+/// on every process using the store being stopped.
+pub fn repair_composition_manifest(
+    path: &Path,
+    mode: MigrateMode,
+) -> Result<ManifestRepair, ManifestRepairError> {
+    repair_composition_manifest_with(path, mode, sync_parent)
+}
+
+/// [`repair_composition_manifest`] with the directory sync supplied.
+fn repair_composition_manifest_with(
+    path: &Path,
+    mode: MigrateMode,
+    sync_directory: impl Fn(&Path) -> Result<(), String>,
+) -> Result<ManifestRepair, ManifestRepairError> {
+    let Some(planned) = plan_composition_manifest(path).map_err(ManifestRepairError::Refused)?
+    else {
+        return Ok(ManifestRepair::Current);
+    };
+    if mode != MigrateMode::Apply {
+        return Ok(ManifestRepair::Predecessor);
+    }
+    rename_manifest_creator_with(&planned, sync_directory).map(|()| ManifestRepair::Rewritten)
 }
 
 fn apply_ledgers(plan: &StatePlan, report: &mut PredecessorAdoptReport) -> bool {
@@ -3741,5 +4210,366 @@ mod tests {
             "the stage and every file keep their bytes"
         );
         assert!(!state.join(ADOPTION_JOURNAL_FILE_NAME).exists());
+    }
+
+    /// A composition manifest beside its event log, in a hand-written layout
+    /// whose every byte the rename must keep. The recorded definition carries
+    /// the creator field's name as nested data (a key, array elements and
+    /// escaped text): none of it is the creator field.
+    const PREDECESSOR_MANIFEST: &str = concat!(
+        "{\n",
+        "  \"manifest_version\": 1,\n",
+        "  \"created_by_mobkit\":   \"0.8.26\",\n",
+        "  \"definition\": {\"id\": \"m\", \"created_by_mobkit\": [\"created_by_mobkit\"], \"note\": \"a \\\"created_by_mobkit\\\", {not: a} key\"},\n",
+        "  \"created_by_authority\": \"authoritative\"\n",
+        "}\n",
+    );
+
+    fn adopted_manifest_text() -> String {
+        let renamed = PREDECESSOR_MANIFEST.replacen(
+            "\"created_by_mobkit\":   ",
+            "\"created_by_meta\":   ",
+            1,
+        );
+        assert_ne!(renamed, PREDECESSOR_MANIFEST);
+        renamed
+    }
+
+    /// The stock manifest: beside the layout's event log.
+    fn manifest_file(state: &Path) -> PathBuf {
+        crate::mob_composition_manifest::manifest_path(
+            &MetaStorageLayout::with_injected_roots(state.to_path_buf(), None).event_log_db(),
+        )
+    }
+
+    fn manifest_actions(report: &PredecessorAdoptReport) -> Vec<&PredecessorAction> {
+        report
+            .actions
+            .iter()
+            .filter(|action| action.item == PredecessorItem::CompositionManifest)
+            .collect()
+    }
+
+    /// The manifest step renames the top-level creator field and nothing
+    /// else, is journaled, and a rerun finds nothing to do, its dry run
+    /// included (the predecessor realm id, recorded by then, is not planned
+    /// again).
+    #[tokio::test]
+    async fn a_predecessor_manifest_is_renamed_in_place_and_journaled() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path();
+        write_predecessor_metadata_db(&state.join(PREDECESSOR_METADATA_DB_FILE_NAMES[0]));
+        std::fs::create_dir(state.join(PREDECESSOR_REALM_ID)).unwrap();
+        std::fs::write(manifest_file(state), PREDECESSOR_MANIFEST).unwrap();
+
+        let dry = adopt_predecessor_state(&request(state, MigrateMode::DryRun)).await;
+        assert!(!dry.has_errors(), "{:?}", dry.errors);
+        let planned = manifest_actions(&dry);
+        assert_eq!(planned.len(), 1, "{:?}", dry.actions);
+        assert_eq!(planned[0].outcome, PredecessorOutcome::Planned);
+        assert_eq!(
+            planned[0].subject,
+            manifest_file(state).display().to_string()
+        );
+        assert_eq!(planned[0].from, PREDECESSOR_MANIFEST_CREATOR_FIELD);
+        assert_eq!(planned[0].to, MANIFEST_CREATOR_FIELD);
+        assert_eq!(
+            std::fs::read_to_string(manifest_file(state)).unwrap(),
+            PREDECESSOR_MANIFEST,
+            "the dry run is read-only"
+        );
+
+        let apply = adopt_predecessor_state(&request(state, MigrateMode::Apply)).await;
+        assert!(!apply.has_errors(), "{:?}", apply.errors);
+        assert!(apply.changed_state && apply.complete, "{apply:?}");
+        let applied = manifest_actions(&apply);
+        assert_eq!(applied.len(), 1, "{:?}", apply.actions);
+        assert_eq!(applied[0].outcome, PredecessorOutcome::Applied);
+        assert_eq!(
+            std::fs::read_to_string(manifest_file(state)).unwrap(),
+            adopted_manifest_text(),
+            "only the top-level creator key changes"
+        );
+        assert!(!staged_manifest_path(&manifest_file(state)).exists());
+        let journal = read_adoption_journal(state).unwrap().unwrap();
+        assert_eq!(journal.status, AdoptionStatus::Complete);
+        assert_eq!(journal.completed, BTreeSet::from(AdoptionStep::ALL));
+
+        for (mode, label) in [
+            (MigrateMode::DryRun, "dry run"),
+            (MigrateMode::Apply, "apply"),
+        ] {
+            let again = adopt_predecessor_state(&request(state, mode)).await;
+            assert!(!again.has_errors(), "{label}: {:?}", again.errors);
+            assert!(again.actions.is_empty(), "{label}: {:?}", again.actions);
+            assert!(again.complete && !again.changed_state, "{label}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(manifest_file(state)).unwrap(),
+            adopted_manifest_text()
+        );
+    }
+
+    /// An adoption that completed before the manifest step existed (0.9.0)
+    /// leaves a predecessor manifest behind. Startup does not refuse it (the
+    /// manifest reads its predecessor field), the dry run plans the rename
+    /// and reports the adoption incomplete, and apply renames it instead of
+    /// taking the already-complete shortcut.
+    #[tokio::test]
+    async fn a_manifest_found_after_a_completed_adoption_is_renamed_not_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path();
+        write_adoption_journal(
+            state,
+            &AdoptionJournal {
+                version: ADOPTION_JOURNAL_VERSION,
+                status: AdoptionStatus::Complete,
+                predecessor_home: None,
+                gateway_home: None,
+                completed: AdoptionStep::ALL.into(),
+                realm_id: None,
+            },
+        )
+        .unwrap();
+        std::fs::write(manifest_file(state), PREDECESSOR_MANIFEST).unwrap();
+        MetaStorageLayout::with_injected_roots(state.to_path_buf(), None)
+            .metadata_db()
+            .expect("a predecessor manifest does not block startup");
+
+        let dry = adopt_predecessor_state(&request(state, MigrateMode::DryRun)).await;
+        assert!(!dry.has_errors(), "{:?}", dry.errors);
+        assert!(!dry.complete, "a planned rename is not a complete adoption");
+        assert_eq!(manifest_actions(&dry).len(), 1, "{:?}", dry.actions);
+
+        let apply = adopt_predecessor_state(&request(state, MigrateMode::Apply)).await;
+        assert!(!apply.has_errors(), "{:?}", apply.errors);
+        assert!(apply.changed_state && apply.complete, "{apply:?}");
+        assert_eq!(
+            std::fs::read_to_string(manifest_file(state)).unwrap(),
+            adopted_manifest_text()
+        );
+        let journal = read_adoption_journal(state).unwrap().unwrap();
+        assert_eq!(journal.status, AdoptionStatus::Complete);
+        assert_eq!(journal.completed, BTreeSet::from(AdoptionStep::ALL));
+    }
+
+    async fn assert_manifest_refused_unchanged(state: &Path, case: &str) {
+        let before = snapshot(state);
+        for mode in [MigrateMode::DryRun, MigrateMode::Apply] {
+            let report = adopt_predecessor_state(&request(state, mode)).await;
+            assert!(report.has_errors(), "{case}: {report:?}");
+            assert!(!report.changed_state, "{case}: {report:?}");
+            assert!(
+                manifest_actions(&report)
+                    .iter()
+                    .any(|action| matches!(action.outcome, PredecessorOutcome::Refused(_))),
+                "{case}: {:?}",
+                report.actions
+            );
+        }
+        assert_eq!(snapshot(state), before, "{case}: nothing changes");
+        assert!(read_adoption_journal(state).unwrap().is_none(), "{case}");
+    }
+
+    /// A manifest the rename cannot judge refuses before any change: not a
+    /// JSON object, no creator field, both creator fields, the predecessor
+    /// field twice, an interrupted rename's stage beside it, and (on Unix) a
+    /// link at the manifest's name.
+    #[tokio::test]
+    async fn a_manifest_that_cannot_be_judged_refuses_before_any_change() {
+        let unjudgeable = [
+            ("not a JSON object", "{\"created_by_mobkit\": \"0.8.26\""),
+            (
+                "no creator field",
+                "{\"manifest_version\": 1, \"definition\": {}}",
+            ),
+            (
+                "both creator fields",
+                "{\"created_by_mobkit\": \"0.8.26\", \"created_by_meta\": \"0.9.1\"}",
+            ),
+            (
+                "the predecessor field twice",
+                "{\"created_by_mobkit\": \"0.8.26\", \"created_by_mobkit\": \"0.8.27\"}",
+            ),
+        ];
+        for (case, bytes) in unjudgeable {
+            let temp = tempfile::tempdir().unwrap();
+            let state = temp.path();
+            write_predecessor_metadata_db(&state.join(PREDECESSOR_METADATA_DB_FILE_NAMES[0]));
+            std::fs::write(manifest_file(state), bytes).unwrap();
+            assert_manifest_refused_unchanged(state, case).await;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path();
+        write_predecessor_metadata_db(&state.join(PREDECESSOR_METADATA_DB_FILE_NAMES[0]));
+        std::fs::write(manifest_file(state), PREDECESSOR_MANIFEST).unwrap();
+        std::fs::write(staged_manifest_path(&manifest_file(state)), b"{\"partial").unwrap();
+        assert_manifest_refused_unchanged(state, "an interrupted rename's stage").await;
+
+        #[cfg(unix)]
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let state = temp.path();
+            write_predecessor_metadata_db(&state.join(PREDECESSOR_METADATA_DB_FILE_NAMES[0]));
+            let target = state.join("linked-manifest.json");
+            std::fs::write(&target, PREDECESSOR_MANIFEST).unwrap();
+            std::os::unix::fs::symlink(&target, manifest_file(state)).unwrap();
+            assert_manifest_refused_unchanged(state, "a link").await;
+        }
+    }
+
+    /// The rename rechecks the bytes it planned: a manifest changed since
+    /// planning fails the step, is never overwritten, and no stage is left.
+    #[test]
+    fn the_manifest_rename_rechecks_its_bytes_and_never_overwrites() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path();
+        std::fs::write(manifest_file(state), PREDECESSOR_MANIFEST).unwrap();
+        let mut report = PredecessorAdoptReport::default();
+        let plan = plan_state(state, &mut report).expect("the manifest plans");
+        assert_eq!(plan.composition_manifests.len(), 1);
+        let changed = PREDECESSOR_MANIFEST.replace("0.8.26", "0.8.27");
+        std::fs::write(manifest_file(state), &changed).unwrap();
+        assert!(!apply_composition_manifests(&plan, &mut report));
+        assert!(matches!(
+            report.actions.last().map(|action| &action.outcome),
+            Some(PredecessorOutcome::Failed(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(manifest_file(state)).unwrap(),
+            changed
+        );
+        assert!(!staged_manifest_path(&manifest_file(state)).exists());
+    }
+
+    /// The repair entry point detects, renames, then finds the manifest
+    /// current, also for a predecessor key written with a JSON escape; the
+    /// manifest reads the same creator version before and after.
+    #[test]
+    fn repair_detects_renames_and_then_finds_the_manifest_current() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("mob.sqlite3.composition.json");
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            "[mob]\nid = \"repair\"\n\n[profiles.lead]\nmodel = \"gpt-5.5\"\n",
+        )
+        .unwrap();
+        let escaped_key = "created_by_mobki\\u0074";
+        let bytes = format!(
+            "{{\"manifest_version\":1,\"{escaped_key}\":\"0.8.26\",\"definition\":{},\
+             \"created_by_authority\":\"authoritative\"}}",
+            serde_json::to_string(&definition).unwrap()
+        );
+        std::fs::write(&manifest, &bytes).unwrap();
+        let creator = |path: &Path| {
+            serde_json::from_slice::<crate::mob_composition_manifest::MobCompositionManifest>(
+                &std::fs::read(path).unwrap(),
+            )
+            .unwrap()
+            .created_by_meta
+        };
+        assert_eq!(creator(&manifest), "0.8.26");
+
+        assert_eq!(
+            repair_composition_manifest(&manifest, MigrateMode::DryRun),
+            Ok(ManifestRepair::Predecessor)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            bytes,
+            "detection is read-only"
+        );
+        assert_eq!(
+            repair_composition_manifest(&manifest, MigrateMode::Apply),
+            Ok(ManifestRepair::Rewritten)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            bytes.replace(escaped_key, MANIFEST_CREATOR_FIELD)
+        );
+        assert_eq!(creator(&manifest), "0.8.26");
+        assert_eq!(
+            repair_composition_manifest(&manifest, MigrateMode::Apply),
+            Ok(ManifestRepair::Current)
+        );
+    }
+
+    /// The stage that receives the renamed manifest is owner-only from its
+    /// creation, before any byte is written, so the manifest's contents are
+    /// never readable to others before its own permissions apply; the
+    /// replaced manifest keeps its original mode.
+    #[cfg(unix)]
+    #[test]
+    fn the_rename_stage_is_owner_only_and_the_manifest_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp.path().join("probe.composition.json.next");
+        let stage = create_manifest_stage(&probe).unwrap();
+        assert_eq!(
+            stage.metadata().unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the stage is created owner-only"
+        );
+        drop(stage);
+        for mode in [0o600_u32, 0o640, 0o644] {
+            let manifest = temp
+                .path()
+                .join(format!("mob-{mode:o}.sqlite3.composition.json"));
+            std::fs::write(&manifest, PREDECESSOR_MANIFEST).unwrap();
+            std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                repair_composition_manifest(&manifest, MigrateMode::Apply),
+                Ok(ManifestRepair::Rewritten)
+            );
+            assert_eq!(
+                std::fs::metadata(&manifest).unwrap().permissions().mode() & 0o777,
+                mode,
+                "the manifest keeps mode {mode:o}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&manifest).unwrap(),
+                adopted_manifest_text()
+            );
+        }
+    }
+
+    /// A failure after the renamed manifest replaced the original (here the
+    /// directory sync) is reported failed, never refused: the replacement
+    /// happened and its durability is uncertain. A refusal still changes
+    /// nothing.
+    #[test]
+    fn a_failure_after_the_replacement_is_failed_not_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("mob.sqlite3.composition.json");
+        std::fs::write(&manifest, PREDECESSOR_MANIFEST).unwrap();
+        let error = repair_composition_manifest_with(&manifest, MigrateMode::Apply, |_: &Path| {
+            Err("injected directory sync failure".to_string())
+        })
+        .expect_err("the directory sync failure surfaces");
+        assert_eq!(error.outcome(), "failed", "{error:?}");
+        assert!(
+            matches!(
+                &error,
+                ManifestRepairError::Failed(detail)
+                    if detail.contains("injected directory sync failure")
+                        && detail.contains("not yet durable")
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            adopted_manifest_text(),
+            "the replacement happened"
+        );
+        assert!(!staged_manifest_path(&manifest).exists());
+
+        let ambiguous = temp.path().join("other.sqlite3.composition.json");
+        let both = "{\"created_by_mobkit\": \"0.8.26\", \"created_by_meta\": \"0.9.1\"}";
+        std::fs::write(&ambiguous, both).unwrap();
+        let refusal =
+            repair_composition_manifest_with(&ambiguous, MigrateMode::Apply, |_: &Path| Ok(()))
+                .expect_err("an ambiguous manifest refuses");
+        assert_eq!(refusal.outcome(), "refused", "{refusal:?}");
+        assert_eq!(std::fs::read_to_string(&ambiguous).unwrap(), both);
     }
 }
