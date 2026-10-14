@@ -51038,6 +51038,19 @@ function AccessPanel({
   const scope = JSON.stringify([status?.subject, status?.available, status?.can_administer]);
   const mutationScope = import_react32.default.useRef(scope);
   mutationScope.current = scope;
+  const [editScope, setEditScope] = import_react32.default.useState(scope);
+  if (editScope !== scope) {
+    setEditScope(scope);
+    setRuleDraft(null);
+    setAdminsDraft(null);
+    setGroupNameDraft("");
+    setGroupMembersDraft("");
+    setEditingGroup(null);
+    setSaveFailure(null);
+    setAdminsBase(null);
+    setRuleBase(null);
+    setGroupBase(null);
+  }
   const previewScope = JSON.stringify([
     scope,
     status?.owner_instance,
@@ -51064,17 +51077,6 @@ function AccessPanel({
   import_react32.default.useEffect(() => {
     setPreviewAction((value) => actions.includes(value) ? value : actions[0] ?? "");
   }, [actionCatalogKey]);
-  import_react32.default.useEffect(() => {
-    setRuleDraft(null);
-    setAdminsDraft(null);
-    setGroupNameDraft("");
-    setGroupMembersDraft("");
-    setEditingGroup(null);
-    setSaveFailure(null);
-    setAdminsBase(null);
-    setRuleBase(null);
-    setGroupBase(null);
-  }, [scope]);
   import_react32.default.useEffect(() => () => {
     previewVersion.current += 1;
   }, []);

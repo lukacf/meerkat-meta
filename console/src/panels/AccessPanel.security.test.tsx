@@ -365,6 +365,31 @@ describe("checked access edits", () => {
     }
   });
 
+  // Edits belong to the scope they were opened under, and the first commit
+  // under a changed scope already shows none of them. The reset used to run
+  // as an effect after that commit, so an editor opened against the commit
+  // (the integration suite's checked saves, right as the status loaded) was
+  // closed again by the reset still pending from it.
+  it("discards edits in the commit that shows a changed scope and keeps one opened under it", () => {
+    const input = props();
+    const committed: boolean[] = [];
+    // A layout effect reads the DOM of its own commit, before that commit's
+    // passive effects run.
+    function CommitProbe() {
+      React.useLayoutEffect(() => { committed.push(screen.queryByTestId("access-admins-input") !== null); });
+      return null;
+    }
+    const view = render(<><AccessPanel {...input} /><CommitProbe /></>);
+    fireEvent.click(screen.getByTestId("access-edit-admins"));
+    expect(screen.getByTestId("access-admins-input")).toBeVisible();
+    committed.length = 0;
+    view.rerender(<><AccessPanel {...input} status={{ ...input.status, subject: "next-admin@example.test" }} /><CommitProbe /></>);
+    expect(committed).toEqual([false]);
+    expect(screen.queryByTestId("access-admins-input")).toBeNull();
+    fireEvent.click(screen.getByTestId("access-edit-admins"));
+    expect(screen.getByTestId("access-admins-input")).toBeVisible();
+  });
+
   it("keeps an invalid rule draft editable against its own base without a review step", async () => {
     const input = props();
     input.onUpsertRule = vi.fn().mockResolvedValueOnce({ kind: "invalid" }).mockResolvedValueOnce(true);

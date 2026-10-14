@@ -199,6 +199,17 @@ export function AccessPanel({
   const scope = JSON.stringify([status?.subject, status?.available, status?.can_administer]);
   const mutationScope = React.useRef(scope);
   mutationScope.current = scope;
+  // Edits belong to the scope they were opened under. A changed scope
+  // discards them in the render that shows it: an effect would discard them
+  // one passive flush later, so the first commit under the new scope still
+  // showed the old edit, and an edit opened against that commit was dropped.
+  const [editScope, setEditScope] = React.useState(scope);
+  if (editScope !== scope) {
+    setEditScope(scope);
+    setRuleDraft(null); setAdminsDraft(null); setGroupNameDraft("");
+    setGroupMembersDraft(""); setEditingGroup(null); setSaveFailure(null);
+    setAdminsBase(null); setRuleBase(null); setGroupBase(null);
+  }
   // Refresh hides the observation until current state is available. An
   // unchanged snapshot must not discard an answer racing that refresh.
   const previewScope = JSON.stringify([scope, status?.owner_instance, status?.revision, status?.enabled, config,
@@ -216,11 +227,6 @@ export function AccessPanel({
   React.useEffect(() => {
     setPreviewAction(value => actions.includes(value) ? value : (actions[0] ?? ""));
   }, [actionCatalogKey]);
-  React.useEffect(() => {
-    setRuleDraft(null); setAdminsDraft(null); setGroupNameDraft("");
-    setGroupMembersDraft(""); setEditingGroup(null); setSaveFailure(null);
-    setAdminsBase(null); setRuleBase(null); setGroupBase(null);
-  }, [scope]);
   React.useEffect(() => () => { previewVersion.current += 1; }, []);
   React.useEffect(() => {
     if (tab === "preview" && inspectFocusPending.current) {
