@@ -644,7 +644,9 @@ jobs:
 
   # Pushes to main only, after every job that saves a rust cache has
   # succeeded and so has restored and saved its entry: drops each family's
-  # main entries created before this run, when the run saved a newer one.
+  # main entries created before this run when a newer one exists, normally
+  # this run's save (a concurrent main run's counts too). It cannot undo an
+  # eviction the cache quota forced earlier.
   # This is the only job with actions: write. It never runs for a pull
   # request, so pull request code never holds that permission. Best
   # effort: a failure here must not turn the exact-main run red, which

@@ -2,6 +2,9 @@
 """Focused contracts for the pull-request CI workflow."""
 
 import fnmatch
+import json
+import subprocess
+import tempfile
 import unittest
 import re
 import tomllib
@@ -10,6 +13,64 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
+
+# The target kinds `cargo test` tests by default. Examples are only built,
+# and benches and build scripts are left out, unless a manifest sets their
+# test flag.
+TESTED_BY_DEFAULT = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro", "bin", "test"}
+NOT_TESTED_BY_DEFAULT = {"example", "bench", "custom-build"}
+
+
+def cargo_workspace_members(root: Path) -> list[dict]:
+    """The workspace members as Cargo itself reads them: listed, glob and
+    implicit path members alike, with their targets in any valid TOML
+    spelling. `cargo metadata --no-deps` resolves nothing and needs no network."""
+    result = subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--offline", "--format-version", "1"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    metadata = json.loads(result.stdout)
+    members = set(metadata["workspace_members"])
+    return [package for package in metadata["packages"] if package["id"] in members]
+
+
+def split_coverage_problems(packages: list[dict], patterns: list[str]) -> list[str]:
+    """Why the CI test jobs would not run what `cargo test` runs by default.
+
+    `test` runs --lib --bins and builds --examples, and each integration
+    half runs --test <pattern>. Their union is cargo's default selection
+    only while every target keeps its kind's default test flag and has no
+    required features, and every integration test target matches exactly
+    one pattern. Turning autotests off would silently drop the files under
+    tests/ from every run, so it is refused too.
+    """
+    problems = []
+    for package in packages:
+        manifest = tomllib.loads(Path(package["manifest_path"]).read_text())
+        if manifest.get("package", {}).get("autotests") is False:
+            problems.append(f"{package['name']}: autotests = false")
+        for target in package["targets"]:
+            kinds = set(target["kind"])
+            label = f"{package['name']} {'/'.join(target['kind'])} {target['name']}"
+            if kinds <= TESTED_BY_DEFAULT:
+                default = True
+            elif kinds <= NOT_TESTED_BY_DEFAULT:
+                default = False
+            else:
+                problems.append(f"{label}: unknown target kind")
+                continue
+            if target.get("test") is not default:
+                problems.append(f"{label}: test flag {target.get('test')}, default {default}")
+            if target.get("required-features"):
+                problems.append(f"{label}: required-features {target['required-features']}")
+            if kinds == {"test"}:
+                matched = [pattern for pattern in patterns if fnmatch.fnmatchcase(target["name"], pattern)]
+                if len(matched) != 1:
+                    problems.append(f"{label}: matches {matched}")
+    return problems
 
 
 def job_block(name: str) -> str:
@@ -126,24 +187,16 @@ class CiWorkflowTests(unittest.TestCase):
         default test selection: lib and bin unit tests in `test`, and the
         integration tests in two `test-integration` halves split by target
         name, one of which also builds the examples. All use the same filter
-        and --no-fail-fast. That union is the default selection only while
-        every target keeps its default test flag, and the halves cover every
-        integration test only while cargo finds them all under tests/."""
-        workspace = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]
-        integration_tests = []
-        for member in workspace["members"]:
-            manifest = (ROOT / member / "Cargo.toml").read_text()
-            self.assertIsNone(re.search(r"(?m)^\s*(test|autotests)\s*=|^\[\[test\]\]", manifest), member)
-            tests = ROOT / member / "tests"
-            integration_tests += [path.stem for path in tests.glob("*.rs")]
-            integration_tests += [path.parent.name for path in tests.glob("*/main.rs")]
-        self.assertGreater(len(integration_tests), 100)
+        and --no-fail-fast. split_coverage_problems holds the conditions under
+        which that union is the default selection, on Cargo's own reading of
+        every workspace member."""
         block = job_block("test-integration")
         patterns = re.findall(r'(?m)^          - tests: "([^"]+)"$', block)
         self.assertEqual(len(patterns), 2, patterns)
-        for name in integration_tests:
-            matched = [pattern for pattern in patterns if fnmatch.fnmatchcase(name, pattern)]
-            self.assertEqual(len(matched), 1, f"integration test {name} matches {matched}")
+        members = cargo_workspace_members(ROOT)
+        integration_tests = [t for package in members for t in package["targets"] if t["kind"] == ["test"]]
+        self.assertGreater(len(integration_tests), 100)
+        self.assertEqual(split_coverage_problems(members, patterns), [])
         self.assertIn("    strategy:\n      fail-fast: false\n", block)
         filter_ = (
             "-E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) "
@@ -171,6 +224,107 @@ class CiWorkflowTests(unittest.TestCase):
         source = CI_WORKFLOW.read_text()
         self.assertEqual(source.count("scripts/repo-cargo build --workspace --examples"), 1)
         self.assertEqual(source.count("scripts/repo-cargo nextest run --workspace"), 2)
+
+    def test_the_split_coverage_guard_reads_targets_as_cargo_does(self):
+        """Targets, test flags and autotests in any valid TOML spelling, and
+        glob or implicit path members, all reach the guard: it reads `cargo
+        metadata` and parses manifests as TOML, never the manifest text."""
+        package = '[package]\nname = "{}"\nversion = "0.0.0"\nedition = "2021"\n'
+        probe = package.format("guard-probe")
+        cases = {
+            "spaces inside the brackets": (
+                {
+                    "Cargo.toml": probe + '\n[[ test ]]\nname = "_extra_contract"\npath = "extra/contract.rs"\n\n[workspace]\n',
+                    "extra/contract.rs": "",
+                },
+                ["guard-probe test _extra_contract: matches []"],
+            ),
+            "quoted keys": (
+                {
+                    "Cargo.toml": probe + '\n[["test"]]\n"name" = "_quoted_contract"\n"path" = "extra/q.rs"\n\n[workspace]\n',
+                    "extra/q.rs": "",
+                },
+                ["guard-probe test _quoted_contract: matches []"],
+            ),
+            "an inline array of tables": (
+                {
+                    "Cargo.toml": 'test = [{ name = "_inline_contract", path = "extra/i.rs" }]\n\n' + probe + "\n[workspace]\n",
+                    "extra/i.rs": "",
+                },
+                ["guard-probe test _inline_contract: matches []"],
+            ),
+            "a quoted test flag on a bin": (
+                {
+                    "Cargo.toml": probe + '\n[[bin]]\nname = "probe"\n"test" = false\n\n[workspace]\n',
+                    "src/bin/probe.rs": "fn main() {}\n",
+                },
+                ["guard-probe bin probe: test flag False, default True"],
+            ),
+            "an inline test flag on an example": (
+                {
+                    "Cargo.toml": 'example = [{ name = "demo", test = true }]\n\n' + probe + "\n[workspace]\n",
+                    "examples/demo.rs": "fn main() {}\n",
+                },
+                ["guard-probe example demo: test flag True, default False"],
+            ),
+            "autotests off through dotted keys": (
+                {
+                    "Cargo.toml": (
+                        'package.name = "guard-probe"\npackage.version = "0.0.0"\npackage.edition = "2021"\n'
+                        "package.autotests = false\n\n[workspace]\n"
+                    ),
+                    "tests/alpha.rs": "",
+                },
+                ["guard-probe: autotests = false"],
+            ),
+            "a glob member": (
+                {
+                    "Cargo.toml": '[workspace]\nmembers = ["crates/*"]\nresolver = "2"\n',
+                    "crates/c/Cargo.toml": package.format("c"),
+                    "crates/c/src/lib.rs": "",
+                    "crates/c/tests/Upper.rs": "",
+                },
+                ["c test Upper: matches []"],
+            ),
+            "an implicit path member": (
+                {
+                    "Cargo.toml": '[workspace]\nmembers = ["a"]\nresolver = "2"\n',
+                    "a/Cargo.toml": package.format("a") + '\n[dependencies]\nb = { path = "../b" }\n',
+                    "a/src/lib.rs": "",
+                    "b/Cargo.toml": package.format("b"),
+                    "b/src/lib.rs": "",
+                    "b/tests/_hidden.rs": "",
+                },
+                ["b test _hidden: matches []"],
+            ),
+            "required features": (
+                {
+                    "Cargo.toml": probe + (
+                        '\n[features]\nslow = []\n\n[[test]]\nname = "gated"\npath = "extra/gated.rs"\n'
+                        'required-features = ["slow"]\n\n[workspace]\n'
+                    ),
+                    "extra/gated.rs": "",
+                },
+                ["guard-probe test gated: required-features ['slow']"],
+            ),
+            # Control: explicit and discovered targets the patterns cover pass.
+            "covered targets": (
+                {
+                    "Cargo.toml": probe + '\n[[test]]\nname = "middle"\npath = "extra/middle.rs"\n\n[workspace]\n',
+                    "extra/middle.rs": "",
+                    "tests/zeta.rs": "",
+                },
+                [],
+            ),
+        }
+        for case, (files, expected) in cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                for relative, content in {"src/lib.rs": "", **files}.items():
+                    path = Path(tmp) / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(content)
+                members = cargo_workspace_members(Path(tmp))
+                self.assertEqual(split_coverage_problems(members, ["[a-i]*", "[j-z]*"]), expected)
 
     def test_decorator_authority_gate_actually_runs_in_ci(self):
         """A structural gate nobody invokes is a control that cannot fail.
