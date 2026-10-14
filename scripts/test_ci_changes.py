@@ -3,14 +3,55 @@
 non-CI-workflow pull requests skip the Rust and console jobs."""
 
 import importlib.util
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location("ci_changes", ROOT / "scripts/ci-changes.py")
+SCRIPT = ROOT / "scripts/ci-changes.py"
+SPEC = importlib.util.spec_from_file_location("ci_changes", SCRIPT)
 ci_changes = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ci_changes)
+
+
+def classify_commit(base: dict[str, str], head: dict[str, str]) -> str:
+    """Run ci-changes.py as CI does, in a new repository whose HEAD commit
+    turns the `base` tree into the `head` tree ({path: text}), so git
+    itself lists the changed paths. Returns the GITHUB_OUTPUT text."""
+    # A git hook exports GIT_DIR and GIT_INDEX_FILE; neither they nor the
+    # caller's git configuration may reach the scratch repository.
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+    env.update(GIT_AUTHOR_NAME="ci", GIT_AUTHOR_EMAIL="ci@example.invalid")
+    env.update(GIT_COMMITTER_NAME="ci", GIT_COMMITTER_EMAIL="ci@example.invalid")
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        output = Path(tmp) / "output"
+
+        def git(*args: str) -> None:
+            subprocess.run(["git", *args], cwd=repo, env=env, check=True, capture_output=True)
+
+        git("init", "-q")
+        for tree in (base, head):
+            for path in set(base) - set(tree):
+                (repo / path).unlink()
+            for path, text in tree.items():
+                (repo / path).parent.mkdir(parents=True, exist_ok=True)
+                (repo / path).write_text(text, encoding="utf-8")
+            git("add", "-A")
+            git("commit", "-q", "-m", "tree")
+        subprocess.run(
+            [sys.executable, str(SCRIPT), "--event", "pull_request", "--github-output", str(output)],
+            cwd=repo,
+            env=env,
+            check=True,
+            capture_output=True,
+        )
+        return output.read_text(encoding="utf-8")
 
 
 class CiChangesTests(unittest.TestCase):
@@ -59,6 +100,35 @@ class CiChangesTests(unittest.TestCase):
         self.assertTrue(self.full("README.md", event="push"))
         self.assertTrue(self.full("README.md", event="workflow_dispatch"))
         self.assertTrue(self.full())
+
+    def test_a_rename_out_of_a_built_tree_runs_everything(self):
+        # Moving a component the console still imports into docs/ takes it
+        # out of the console build. git reports the move as one rename, whose
+        # destination alone is skippable.
+        component = "export function ConsoleApp() {\n  return null;\n}\n" * 4
+        index = "import { ConsoleApp } from './ConsoleApp';\n"
+        base = {"console/src/ConsoleApp.tsx": component, "console/src/index.tsx": index}
+        head = {"docs/ConsoleApp.tsx": component, "console/src/index.tsx": index}
+        self.assertEqual(classify_commit(base, head), "full=true\n")
+
+    def test_a_docs_only_commit_read_from_git_skips_the_heavy_jobs(self):
+        # Control for the test above: the same path from git to verdict
+        # skips a commit that edits, adds and renames files within docs/.
+        guide = "# Guide\n\nSteps.\n" * 8
+        base = {"docs/guide.md": guide, "docs/old.md": "old\n", "crates/x.rs": "fn main() {}\n"}
+        head = {
+            "docs/guides/guide.md": guide,
+            "docs/old.md": "new\n",
+            "docs/added.md": "added\n",
+            "crates/x.rs": "fn main() {}\n",
+        }
+        self.assertEqual(classify_commit(base, head), "full=false\n")
+
+    def test_names_git_would_quote_are_read_verbatim(self):
+        # Without -z, git quotes this name and no rule could match it.
+        base = {"docs/notes.md": "x\n"}
+        head = {"docs/notes.md": "x\n", "docs/caf\u00e9 notes.md": "y\n"}
+        self.assertEqual(classify_commit(base, head), "full=false\n")
 
     def test_main_writes_the_github_output_line(self):
         with tempfile.TemporaryDirectory() as tmp:

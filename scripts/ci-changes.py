@@ -9,9 +9,11 @@ the list, a change to ci.yml itself (the pull request must prove its own CI)
 and an empty or unreadable diff.
 
 Usage: ci-changes.py --event NAME [--github-output FILE] [PATH ...]
-Paths default to `git diff --name-only HEAD^1 HEAD`, the pull request's own
-changes when HEAD is GitHub's merge commit for it. Prints `full=true` or
-`full=false` and appends the same line to FILE.
+Paths default to `git diff --no-renames --name-only -z HEAD^1 HEAD`, the
+pull request's own changes when HEAD is GitHub's merge commit for it. A
+rename counts as both of its paths, so moving a file the jobs read into
+docs/ still runs them. Prints `full=true` or `full=false` and appends the
+same line to FILE.
 """
 
 import argparse
@@ -55,13 +57,15 @@ def needs_full_run(event: str, paths: list[str]) -> bool:
 
 
 def changed_paths() -> list[str]:
+    # With rename detection git lists only a rename's destination, which
+    # hides the removal of its source. -z keeps unusual names unquoted.
     result = subprocess.run(
-        ["git", "diff", "--name-only", "HEAD^1", "HEAD"],
+        ["git", "diff", "--no-renames", "--name-only", "-z", "HEAD^1", "HEAD"],
         check=True,
         capture_output=True,
         text=True,
     )
-    return [line for line in result.stdout.splitlines() if line]
+    return [path for path in result.stdout.split("\0") if path]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -74,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     if not paths and args.event == "pull_request":
         try:
             paths = changed_paths()
-        except (OSError, subprocess.CalledProcessError) as error:
+        except (OSError, subprocess.CalledProcessError, UnicodeDecodeError) as error:
             print(f"cannot list changed files ({error}); running the full matrix")
             paths = []
     full = needs_full_run(args.event, paths)
