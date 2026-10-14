@@ -80,6 +80,10 @@ class CiWorkflowTests(unittest.TestCase):
             self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", settings, name)
             keys = re.findall(r"shared-key: (\S+)", settings)
             self.assertEqual(keys, [shared_key] if shared_key else [], name)
+            if shared_key:
+                # rust-cache hashes the job environment into the key, so a
+                # group shares one entry only while its jobs agree on it.
+                self.assertIn("      CARGO_PROFILE_DEV_DEBUG: line-tables-only\n", job_block(name), name)
 
     def test_workspace_nextest_preserves_all_failure_evidence(self):
         commands = [

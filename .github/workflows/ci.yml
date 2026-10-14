@@ -28,6 +28,11 @@ env:
   # saves, and jobs that build the same dependency graph share one entry:
   # meta-dev-examples (examples and tests, with dev-dependency features)
   # and meta-dev-bins (binaries only).
+  #
+  # Both groups build with line tables only, like test-voice and
+  # test-extension-state: full debuginfo made them the two largest entries
+  # (1.37 GB each against 0.92-1.08 GB for the other test builds), and no
+  # job runs a debugger. Panic locations and backtraces keep file:line.
 
 jobs:
   # Decides whether this run needs the Rust, console, SDK and example jobs.
@@ -237,6 +242,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -287,6 +294,7 @@ jobs:
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
     env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # Rust 1.97 incremental compilation can ICE in async identity iteration.
       CARGO_INCREMENTAL: "0"
     steps:
@@ -363,6 +371,7 @@ jobs:
       matrix:
         shard: [1, 2]
     env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # Rust 1.97 incremental compilation can ICE in async identity iteration.
       CARGO_INCREMENTAL: "0"
     steps:
@@ -445,6 +454,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -468,6 +479,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -498,6 +511,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
