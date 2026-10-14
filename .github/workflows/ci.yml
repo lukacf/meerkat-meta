@@ -33,6 +33,13 @@ env:
   # test-extension-state: full debuginfo made them the two largest entries
   # (1.37 GB each against 0.92-1.08 GB for the other test builds), and no
   # job runs a debugger. Panic locations and backtraces keep file:line.
+  #
+  # On main, a job whose restore found no exact key saves a new generation
+  # when it ends. Its last step first drops its family's entries created
+  # before this run (scripts/ci-drop-superseded-caches.sh), so CI never
+  # holds two generations of a family and its saves stop evicting other
+  # entries, release.yml's among them. Only that step needs actions: write,
+  # granted per job; it runs only on main pushes.
 
 jobs:
   # Decides whether this run needs the Rust, console, SDK and example jobs.
@@ -61,12 +68,17 @@ jobs:
   fmt-lint:
     name: fmt-lint
     runs-on: ubuntu-24.04
+    # actions: write lets main drop its superseded rust caches.
+    permissions:
+      actions: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/repo-cargo fmt --all -- --check
@@ -79,6 +91,7 @@ jobs:
       - run: python3 scripts/test_verify_session_service_decorators.py
       - run: python3 scripts/test_ci_workflow.py
       - run: python3 scripts/test_ci_changes.py
+      - run: python3 scripts/test_ci_drop_caches.py
       - run: python3 scripts/test_repo_cargo.py
       - run: python3 scripts/test_pre_push_clippy.py
       - run: python3 scripts/test_release_version_scripts.py
@@ -97,12 +110,23 @@ jobs:
       - uses: taiki-e/install-action@cargo-machete
       - run: scripts/repo-cargo clippy --workspace --all-targets -- -D warnings
       - run: scripts/repo-cargo machete --with-metadata
+      # Last, so every job sharing this cache has restored the previous
+      # generation first; rust-cache saves the new one right after.
+      - name: Drop superseded rust caches
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rust-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci-drop-superseded-caches.sh fmt-lint
 
   test:
     name: test
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    # actions: write lets main drop its superseded rust caches.
+    permissions:
+      actions: write
+      contents: read
     env:
       # ~88 debug test binaries each statically link the full meerkat stack.
       # With the 0.7.31 realtime deps, full debuginfo blew past the runner
@@ -135,6 +159,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
@@ -147,12 +172,23 @@ jobs:
       # The live-event burst test remains CPU-speed-sensitive. History backfill
       # saturation uses a deterministic read barrier and runs in this gate.
       - run: scripts/repo-cargo nextest run --workspace -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)' --no-fail-fast
+      # Last, so every job sharing this cache has restored the previous
+      # generation first; rust-cache saves the new one right after.
+      - name: Drop superseded rust caches
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rust-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci-drop-superseded-caches.sh test
 
   test-extension-state:
     name: test-extension-state
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-latest
+    # actions: write lets main drop its superseded rust caches.
+    permissions:
+      actions: write
+      contents: read
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_BUILD_JOBS: "2"
@@ -161,11 +197,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/repo-cargo test -p meta-extension-state --locked
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --test extension_state
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --lib extension_
+      # Last, so every job sharing this cache has restored the previous
+      # generation first; rust-cache saves the new one right after.
+      - name: Drop superseded rust caches
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rust-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci-drop-superseded-caches.sh test-extension-state
 
   # test-extension-state's check and clippy, split out: both only emit
   # metadata, so they share little with the two full test builds, which
@@ -176,6 +220,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-latest
+    # actions: write lets main drop its superseded rust caches.
+    permissions:
+      actions: write
+      contents: read
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_BUILD_JOBS: "2"
@@ -186,16 +234,28 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/repo-cargo check -p meerkat-meta --locked --no-default-features
       - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features extension-state --lib --test extension_state -- -D warnings
+      # Last, so every job sharing this cache has restored the previous
+      # generation first; rust-cache saves the new one right after.
+      - name: Drop superseded rust caches
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rust-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci-drop-superseded-caches.sh extension-state-lint
 
   test-voice:
     name: test-voice
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    # actions: write lets main drop its superseded rust caches.
+    permissions:
+      actions: write
+      contents: read
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_BUILD_JOBS: "2"
@@ -205,6 +265,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # The shared host uses a loopback provider, never paid credentials.
@@ -212,6 +273,13 @@ jobs:
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --lib gateway_openai_live_registration
       # Reuse this feature build for classic/identity restarts with and without voice.
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --test meta_gateway_bootstrap persistent_http_restarts
+      # Last, so every job sharing this cache has restored the previous
+      # generation first; rust-cache saves the new one right after.
+      - name: Drop superseded rust caches
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rust-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci-drop-superseded-caches.sh test-voice
 
   # test-voice's strict lint, split out: clippy only emits metadata, so it
   # shares little with the full test build beyond host build scripts and
@@ -222,6 +290,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    # actions: write lets main drop its superseded rust caches.
+    permissions:
+      actions: write
+      contents: read
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_BUILD_JOBS: "2"
@@ -233,15 +305,27 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features openai-live --lib --bin rpc_gateway --bin meta_gateway -- -D warnings
+      # Last, so every job sharing this cache has restored the previous
+      # generation first; rust-cache saves the new one right after.
+      - name: Drop superseded rust caches
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rust-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci-drop-superseded-caches.sh voice-clippy
 
   test-python:
     name: test-python
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    # actions: write lets main drop its superseded rust caches.
+    permissions:
+      actions: write
+      contents: read
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
@@ -251,6 +335,7 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           shared-key: meta-dev-bins
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -262,6 +347,13 @@ jobs:
       - run: make test-python
         env:
           OPENAI_API_KEY: meta-ci-bootstrap-only-not-a-secret
+      # Last, so every job sharing this cache has restored the previous
+      # generation first; rust-cache saves the new one right after.
+      - name: Drop superseded rust caches
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rust-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci-drop-superseded-caches.sh meta-dev-bins
 
   # The console lane was one serial job whose two heaviest steps accounted for
   # 22.3 of its ~38 minutes, while all nine npm check scripts took 0.0m each.
@@ -293,6 +385,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    # actions: write lets main drop its superseded rust caches.
+    permissions:
+      actions: write
+      contents: read
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # Rust 1.97 incremental compilation can ICE in async identity iteration.
@@ -306,6 +402,7 @@ jobs:
           cache-dependency-path: console/package-lock.json
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           shared-key: meta-dev-examples
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -349,6 +446,13 @@ jobs:
           name: console-${{ github.run_id }}
           path: output/playwright/console-acceptance/
           if-no-files-found: error
+      # Last, so every job sharing this cache has restored the previous
+      # generation first; rust-cache saves the new one right after.
+      - name: Drop superseded rust caches
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rust-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci-drop-superseded-caches.sh meta-dev-examples
 
   # The browser scenarios against the real acceptance backends, split from
   # `console`. They need the same backend build, which the shared
@@ -366,6 +470,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    # actions: write lets main drop its superseded rust caches.
+    permissions:
+      actions: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -383,6 +491,7 @@ jobs:
           cache-dependency-path: console/package-lock.json
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           shared-key: meta-dev-examples
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -420,6 +529,13 @@ jobs:
           # Leg 1 always writes MCP Apps evidence; leg 2 writes only what
           # its scenarios capture.
           if-no-files-found: ${{ matrix.shard == 1 && 'error' || 'warn' }}
+      # Last, so every job sharing this cache has restored the previous
+      # generation first; rust-cache saves the new one right after.
+      - name: Drop superseded rust caches
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rust-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci-drop-superseded-caches.sh meta-dev-examples
 
   # The composer typing check, split from `console`. It bundles its own
   # host with esbuild and needs no Rust.
@@ -454,6 +570,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    # actions: write lets main drop its superseded rust caches.
+    permissions:
+      actions: write
+      contents: read
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
@@ -465,11 +585,19 @@ jobs:
           cache-dependency-path: console/package-lock.json
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           shared-key: meta-dev-examples
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm --prefix console ci --silent --no-fund --no-audit
       - run: npm --prefix console run fixtures:console-customization --silent
+      # Last, so every job sharing this cache has restored the previous
+      # generation first; rust-cache saves the new one right after.
+      - name: Drop superseded rust caches
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rust-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci-drop-superseded-caches.sh meta-dev-examples
 
   # Needs playwright (it captures screenshots) and builds its OWN example -
   # incident_command_center plus mcp_fixture - so it does not depend on
@@ -479,6 +607,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    # actions: write lets main drop its superseded rust caches.
+    permissions:
+      actions: write
+      contents: read
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
@@ -490,6 +622,7 @@ jobs:
           cache-dependency-path: console/package-lock.json
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           shared-key: meta-dev-examples
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -505,12 +638,23 @@ jobs:
           path: output/playwright/incident-topology-*.png
           if-no-files-found: warn
           retention-days: 7
+      # Last, so every job sharing this cache has restored the previous
+      # generation first; rust-cache saves the new one right after.
+      - name: Drop superseded rust caches
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rust-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci-drop-superseded-caches.sh meta-dev-examples
 
   flow-editor:
     name: flow-editor
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    # actions: write lets main drop its superseded rust caches.
+    permissions:
+      actions: write
+      contents: read
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
@@ -522,6 +666,7 @@ jobs:
           cache-dependency-path: flow-editor/package-lock.json
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           shared-key: meta-dev-bins
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -532,6 +677,13 @@ jobs:
       - run: npm --prefix flow-editor run test:visual-contract --silent
       - run: npm --prefix flow-editor run test:browser-source --silent
       - run: npm --prefix flow-editor run test:browser-interactions --silent
+      # Last, so every job sharing this cache has restored the previous
+      # generation first; rust-cache saves the new one right after.
+      - name: Drop superseded rust caches
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rust-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci-drop-superseded-caches.sh meta-dev-bins
 
   # The TypeScript SDK suite ran nowhere. 705 tests across 20 files existed and
   # gated nothing, so a wrong RPC method name or a parser reading the wrong wire
