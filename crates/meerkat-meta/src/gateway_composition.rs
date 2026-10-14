@@ -1252,8 +1252,8 @@ pub fn describe_mob_definition_error(error: &meerkat_mob::MobError) -> String {
     match error {
         meerkat_mob::MobError::UnsupportedProfileKey { profile, key } => format!(
             "{error}. MobKit 0.8.31 and earlier dropped '{key}' without a warning, so the \
-             members of profile '{profile}' ran on the default prompt, and removing the key \
-             keeps that behaviour. To give them a prompt, list a skill in the profile \
+             key had no effect on the members of profile '{profile}', and removing the key \
+             keeps that behaviour. To set their prompt, list a skill in the profile \
              (skills = [\"<id>\"] under [profiles.{profile}]) and define it as a [skills.<id>] \
              table with source = \"inline\" and content = \"...\""
         ),

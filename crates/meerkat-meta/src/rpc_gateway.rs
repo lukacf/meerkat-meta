@@ -3886,6 +3886,7 @@ group_by = ["labels.console_group", "group"]
                 "Invalid mob_config TOML: ".to_string(),
                 format!("profile 'planner' declares '{key}', which a mob profile cannot honour"),
                 format!("MobKit 0.8.31 and earlier dropped '{key}' without a warning"),
+                "so the key had no effect on the members of profile 'planner'".to_string(),
                 "removing the key keeps that behaviour".to_string(),
                 "[skills.<id>]".to_string(),
             ] {

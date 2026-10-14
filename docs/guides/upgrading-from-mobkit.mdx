@@ -110,12 +110,13 @@ the init refusal read only `failed to parse <workspace>/config/mob.toml`;
 0.9.1 includes the reason.
 
 **Why:** a profile has no prompt field. MobKit 0.8.31 and earlier dropped
-these keys without a warning, so the members of that profile ran on the
-default prompt.
+these keys without a warning, so the key had no effect on the members of that
+profile: their prompt came from the profile's `skills`, another supported
+source or the default, never from this key.
 
 **Do:** delete the key. That keeps exactly the behaviour the deployment had,
-and it never makes a persistent store `divergent`. To give the members a
-prompt, list a skill in the profile:
+and it never makes a persistent store `divergent`. To set the members' prompt,
+list a skill in the profile:
 
 ```toml
 [profiles.planner]

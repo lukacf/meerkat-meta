@@ -3422,6 +3422,7 @@ mod tests {
         assert!(
             error.contains("declares 'system_prompt', which a mob profile cannot honour")
                 && error.contains("MobKit 0.8.31 and earlier dropped 'system_prompt'")
+                && error.contains("so the key had no effect on the members of profile 'planner'")
                 && error.contains("removing the key keeps that behaviour"),
             "{error}"
         );
