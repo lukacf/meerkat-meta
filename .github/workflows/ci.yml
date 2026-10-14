@@ -24,12 +24,48 @@ env:
   # dependency graph's artifacts: about 1 GB compressed (a local Meta debug
   # target's dependency share, 4.6 GiB, packs to 0.95 GB with zstd). Nine
   # per-job entries, plus a copy for every pull request ref, would overrun
-  # the repository's 10 GB cache and evict main's entries. So only main
+  # the repository's 20 GB cache and evict main's entries. So only main
   # saves, and jobs that build the same dependency graph share one entry:
   # meta-dev-examples (examples and tests, with dev-dependency features)
   # and meta-dev-bins (binaries only).
+  #
+  # Both groups build with line tables only, like test-voice and
+  # test-extension-state: full debuginfo made them the two largest entries
+  # (1.37 GB each against 0.92-1.08 GB for the other test builds), and no
+  # job runs a debugger. Panic locations and backtraces keep file:line.
+  #
+  # On main, a job whose restore found no exact key saves a new generation
+  # when it ends. Once every such job has succeeded, the
+  # drop-superseded-caches job deletes each family's older main entries
+  # (scripts/ci-drop-superseded-caches.sh), so CI keeps one generation per
+  # family and its saves stop evicting other entries, release.yml's among
+  # them. That job alone holds actions: write, and it runs only for pushes
+  # to main, never for a pull request.
 
 jobs:
+  # Decides whether this run needs the Rust, console, SDK and example jobs.
+  # A pull request that changes only docs or the non-CI workflows skips them
+  # (scripts/ci-changes.py names the files); pushes and dispatches always run
+  # everything, so main keeps the full green run release.yml requires.
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    outputs:
+      full: ${{ steps.classify.outputs.full }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A pull request checks out GitHub's merge commit; its first
+          # parent is the base, so the diff is the pull request's own change.
+          fetch-depth: 2
+      - id: classify
+        # Fails closed: if the classifier errors, the run is full.
+        run: |
+          if ! python3 scripts/ci-changes.py --event "${{ github.event_name }}" --github-output "$GITHUB_OUTPUT"; then
+            echo "classifier failed; running the full matrix"
+            echo "full=true" >> "$GITHUB_OUTPUT"
+          fi
+
   fmt-lint:
     name: fmt-lint
     runs-on: ubuntu-24.04
@@ -50,6 +86,8 @@ jobs:
       - run: python3 scripts/verify-session-service-decorators.py
       - run: python3 scripts/test_verify_session_service_decorators.py
       - run: python3 scripts/test_ci_workflow.py
+      - run: python3 scripts/test_ci_changes.py
+      - run: python3 scripts/test_ci_drop_caches.py
       - run: python3 scripts/test_repo_cargo.py
       - run: python3 scripts/test_pre_push_clippy.py
       - run: python3 scripts/test_release_version_scripts.py
@@ -69,8 +107,17 @@ jobs:
       - run: scripts/repo-cargo clippy --workspace --all-targets -- -D warnings
       - run: scripts/repo-cargo machete --with-metadata
 
+  # Unit tests run in one job and integration tests in two halves. As one
+  # job, the build took 12.8-16.4 minutes and the run 5.1-6.2 (October
+  # 2026). On 4 CPUs with warm dependencies, the unit tests and bins build
+  # in 330 s. Each integration half needs the meerkat-meta library (about
+  # 230 s); after it, all integration tests together take 231 s and the
+  # examples 38 s. All three jobs build the same dependency graph, so
+  # they share the test job's cache.
   test:
     name: test
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
     env:
       # ~88 debug test binaries each statically link the full meerkat stack.
@@ -89,7 +136,7 @@ jobs:
     steps:
       # The workspace debug build (meerkat 0.7.25 dep tree + all test
       # binaries) plus the rust-cache restore no longer fits beside the
-      # runner's preinstalled toolchains — three consecutive runs died to
+      # runner's preinstalled toolchains - three consecutive runs died to
       # ENOSPC mid-link. Reclaim ~30GB of images we never use (mirrors
       # meerkat's release-lane reclaim, meerkat#858).
       - name: Reclaim runner disk
@@ -105,6 +152,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       # The idle CPU gate asserts an absolute per-30s CPU budget calibrated on
@@ -115,10 +163,78 @@ jobs:
       # via .config/nextest.toml) and in the release-gate protocol.
       # The live-event burst test remains CPU-speed-sensitive. History backfill
       # saturation uses a deterministic read barrier and runs in this gate.
-      - run: scripts/repo-cargo nextest run --workspace -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)' --no-fail-fast
+      - run: scripts/repo-cargo nextest run --workspace --lib --bins -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)' --no-fail-fast
+
+  test-integration:
+    name: test-integration (${{ matrix.tests }})
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Integration test targets by first letter: [a-i] holds about 60% of
+        # their build time and two thirds of their run time, so the other
+        # half also builds the examples. scripts/test_ci_workflow.py checks
+        # that every integration test target matches exactly one pattern.
+        include:
+          - tests: "[a-i]*"
+          - tests: "[j-z]*"
+            examples: true
+    env:
+      # ~88 debug test binaries each statically link the full meerkat stack.
+      # With the 0.7.31 realtime deps, full debuginfo blew past the runner
+      # disk even after the reclaim step, and line-tables-only bought room.
+      # With the Meerkat 0.8.52 dependency graph even line tables no longer
+      # fit: links died with ENOSPC (71 MB left of 119 GB free at job start).
+      # CI test binaries therefore carry no debuginfo; panics keep their
+      # messages but backtraces lose file:line. Local builds are unaffected.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      # The in-process held-bootstrap and native-grant tests resolve a
+      # provider identity while they build members but never call the
+      # provider. This is the same fake value the gateway test fixtures give
+      # their child processes, not a secret.
+      OPENAI_API_KEY: sk-regression-test
+    steps:
+      # The workspace debug build (meerkat 0.7.25 dep tree + all test
+      # binaries) plus the rust-cache restore no longer fits beside the
+      # runner's preinstalled toolchains - three consecutive runs died to
+      # ENOSPC mid-link. Reclaim ~30GB of images we never use (mirrors
+      # meerkat's release-lane reclaim, meerkat#858).
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
+            /usr/share/swift /usr/local/julia* /opt/microsoft \
+            /usr/local/share/powershell /usr/share/miniconda \
+            /usr/local/share/chromium /usr/local/share/vcpkg
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@nextest
+      # The idle CPU gate asserts an absolute per-30s CPU budget calibrated on
+      # real hardware; GitHub's shared 2-vCPU runners read ~3-4s where real
+      # machines read 0.5-2s, even with exclusive nextest scheduling - the
+      # runner class is not a valid measurement environment for the assertion.
+      # The gate stays armed in local full-suite runs (exclusively scheduled
+      # via .config/nextest.toml) and in the release-gate protocol.
+      # The live-event burst test remains CPU-speed-sensitive. History backfill
+      # saturation uses a deterministic read barrier and runs in this gate.
+      - run: scripts/repo-cargo nextest run --workspace --test '${{ matrix.tests }}' -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)' --no-fail-fast
+      # cargo's default test selection also builds every example, to prove
+      # it compiles and links; one integration half does that here.
+      - if: matrix.examples
+        run: scripts/repo-cargo build --workspace --examples
 
   test-extension-state:
     name: test-extension-state
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -140,6 +256,8 @@ jobs:
   # 14m10, then the tests 21m52 and 8m24).
   extension-state-lint:
     name: extension-state-lint
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -158,6 +276,8 @@ jobs:
 
   test-voice:
     name: test-voice
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -182,6 +302,8 @@ jobs:
   # clippy 19m03, then the test build 32m16).
   voice-clippy:
     name: voice-clippy
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -200,7 +322,11 @@ jobs:
 
   test-python:
     name: test-python
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -247,8 +373,11 @@ jobs:
   # now run beside it in console-perf and console-browser, also in `gate`.
   console:
     name: console
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
     env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # Rust 1.97 incremental compilation can ICE in async identity iteration.
       CARGO_INCREMENTAL: "0"
     steps:
@@ -309,10 +438,23 @@ jobs:
   # meta-dev-examples cache serves, and freshly built console bundles: the
   # scenarios read console/dist and the backends embed
   # crates/meerkat-meta/console-dist, both written by `run build`.
+  #
+  # Two shards: browser-e2e's 100 scenarios took 9.5-10.1 minutes in one
+  # leg (runs 38536518805, 38547674877, 38550484431), and the scenario
+  # registry deals each to exactly one --shard=i/n leg
+  # (console/scenario-registry.test.cjs). Each leg builds the backends;
+  # MCP Apps run in leg 1.
   console-browser:
     name: console-browser
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # Rust 1.97 incremental compilation can ICE in async identity iteration.
       CARGO_INCREMENTAL: "0"
     steps:
@@ -337,6 +479,7 @@ jobs:
           target_dir="$(scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')"
           echo "META_EXAMPLE_BIN_DIR=${target_dir}/debug/examples" >> "$GITHUB_ENV"
       - name: Native MCP Apps rendering and reload
+        if: matrix.shard == 1
         timeout-minutes: 5
         run: npm --prefix console run e2e:mcp-apps --silent
         env:
@@ -344,24 +487,29 @@ jobs:
       # The model remains held for more than the native HTTP action timeout.
       # Three mounted Apps must keep polling through the same MCP connection.
       - name: Native MCP Apps polling during an active model turn
+        if: matrix.shard == 1
         timeout-minutes: 5
         run: npm --prefix console run e2e:mcp-apps --silent
         env:
           META_MCP_APPS_LONG_POLL: "1"
           META_BROWSER_EVIDENCE: ${{ github.workspace }}/output/playwright/console-acceptance/mcp-apps
-      - run: node console/browser-e2e.cjs
+      - run: node console/browser-e2e.cjs --shard=${{ matrix.shard }}/2
       - name: Upload console browser evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: console-browser-${{ github.run_id }}
+          name: console-browser-${{ github.run_id }}-${{ matrix.shard }}
           path: output/playwright/console-acceptance/
-          if-no-files-found: error
+          # Leg 1 always writes MCP Apps evidence; leg 2 writes only what
+          # its scenarios capture.
+          if-no-files-found: ${{ matrix.shard == 1 && 'error' || 'warn' }}
 
   # The composer typing check, split from `console`. It bundles its own
   # host with esbuild and needs no Rust.
   console-perf:
     name: console-perf
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -386,7 +534,11 @@ jobs:
   # console_customization_fixtures`, which is where its 12 minutes go.
   console-fixtures:
     name: console-fixtures
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -407,7 +559,11 @@ jobs:
   # library_mode_reference or on any step left in `console`.
   console-acceptance:
     name: console-acceptance
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -435,7 +591,11 @@ jobs:
 
   flow-editor:
     name: flow-editor
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -482,44 +642,72 @@ jobs:
       # 'warn'" before any check runs). Re-float once upstream fixes v2.
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe
 
+  # Pushes to main only, after every job that saves a rust cache has
+  # succeeded and so has restored and saved its entry: drops each family's
+  # main entries created before this run when a newer one exists, normally
+  # this run's save (a concurrent main run's counts too). It cannot undo an
+  # eviction the cache quota forced earlier.
+  # This is the only job with actions: write. It never runs for a pull
+  # request, so pull request code never holds that permission. Best
+  # effort: a failure here must not turn the exact-main run red, which
+  # release.yml requires to be green.
+  drop-superseded-caches:
+    name: drop-superseded-caches
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [fmt-lint, test, test-integration, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, console, console-browser, console-fixtures, console-acceptance, flow-editor]
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Drop superseded rust caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci-drop-superseded-caches.sh fmt-lint test test-extension-state extension-state-lint test-voice voice-clippy meta-dev-bins meta-dev-examples
+
   gate:
     name: gate
     if: always()
-    needs: [fmt-lint, test, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, test-typescript, console, console-browser, console-perf, console-fixtures, console-acceptance, flow-editor, audit]
+    needs: [changes, fmt-lint, test, test-integration, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, test-typescript, console, console-browser, console-perf, console-fixtures, console-acceptance, flow-editor, audit]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results
+        env:
+          FULL: ${{ needs.changes.outputs.full }}
         run: |
-          if [[ "${{ needs.fmt-lint.result }}" != "success" ||
-                "${{ needs.test.result }}" != "success" ||
-                "${{ needs.test-extension-state.result }}" != "success" ||
-                "${{ needs.extension-state-lint.result }}" != "success" ||
-                "${{ needs.test-voice.result }}" != "success" ||
-                "${{ needs.voice-clippy.result }}" != "success" ||
-                "${{ needs.test-python.result }}" != "success" ||
-                "${{ needs.test-typescript.result }}" != "success" ||
-                "${{ needs.console.result }}" != "success" ||
-                "${{ needs.console-browser.result }}" != "success" ||
-                "${{ needs.console-perf.result }}" != "success" ||
-                "${{ needs.console-fixtures.result }}" != "success" ||
-                "${{ needs.console-acceptance.result }}" != "success" ||
-                "${{ needs.flow-editor.result }}" != "success" ||
-                "${{ needs.audit.result }}" != "success" ]]; then
-            echo "One or more jobs failed or were cancelled."
-            echo "  fmt-lint:     ${{ needs.fmt-lint.result }}"
-            echo "  test:         ${{ needs.test.result }}"
-            echo "  test-extension-state: ${{ needs.test-extension-state.result }}"
-            echo "  extension-state-lint: ${{ needs.extension-state-lint.result }}"
-            echo "  test-voice:   ${{ needs.test-voice.result }}"
-            echo "  voice-clippy: ${{ needs.voice-clippy.result }}"
-            echo "  test-python:  ${{ needs.test-python.result }}"
-          echo "  test-typescript:    ${{ needs.test-typescript.result }}"
-            echo "  console:      ${{ needs.console.result }}"
-            echo "  console-browser: ${{ needs.console-browser.result }}"
-            echo "  console-perf: ${{ needs.console-perf.result }}"
-            echo "  console-fixtures:   ${{ needs.console-fixtures.result }}"
-            echo "  console-acceptance: ${{ needs.console-acceptance.result }}"
-            echo "  flow-editor:  ${{ needs.flow-editor.result }}"
-            echo "  audit:        ${{ needs.audit.result }}"
+          status=0
+          # check <job> <result> <required|skippable>: a skippable job may be
+          # skipped only when `changes` classified the run as docs-only.
+          check() {
+            if [[ "$2" == "success" ]]; then
+              echo "  $1: success"
+            elif [[ "$3" == "skippable" && "$2" == "skipped" && "${FULL}" == "false" ]]; then
+              echo "  $1: skipped (docs or non-CI workflow change only)"
+            else
+              echo "  $1: $2"
+              status=1
+            fi
+          }
+          check changes "${{ needs.changes.result }}" required
+          check fmt-lint "${{ needs.fmt-lint.result }}" required
+          check test "${{ needs.test.result }}" skippable
+          check test-integration "${{ needs.test-integration.result }}" skippable
+          check test-extension-state "${{ needs.test-extension-state.result }}" skippable
+          check extension-state-lint "${{ needs.extension-state-lint.result }}" skippable
+          check test-voice "${{ needs.test-voice.result }}" skippable
+          check voice-clippy "${{ needs.voice-clippy.result }}" skippable
+          check test-python "${{ needs.test-python.result }}" skippable
+          check test-typescript "${{ needs.test-typescript.result }}" required
+          check console "${{ needs.console.result }}" skippable
+          check console-browser "${{ needs.console-browser.result }}" skippable
+          check console-perf "${{ needs.console-perf.result }}" skippable
+          check console-fixtures "${{ needs.console-fixtures.result }}" skippable
+          check console-acceptance "${{ needs.console-acceptance.result }}" skippable
+          check flow-editor "${{ needs.flow-editor.result }}" skippable
+          check audit "${{ needs.audit.result }}" required
+          if [[ "${status}" != 0 ]]; then
+            echo "One or more jobs failed, were cancelled, or were skipped without a docs-only classification."
             exit 1
           fi

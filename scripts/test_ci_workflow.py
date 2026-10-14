@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Focused contracts for the pull-request CI workflow."""
 
+import fnmatch
+import json
+import subprocess
+import tempfile
 import unittest
 import re
 import tomllib
@@ -9,6 +13,64 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
+
+# The target kinds `cargo test` tests by default. Examples are only built,
+# and benches and build scripts are left out, unless a manifest sets their
+# test flag.
+TESTED_BY_DEFAULT = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro", "bin", "test"}
+NOT_TESTED_BY_DEFAULT = {"example", "bench", "custom-build"}
+
+
+def cargo_workspace_members(root: Path) -> list[dict]:
+    """The workspace members as Cargo itself reads them: listed, glob and
+    implicit path members alike, with their targets in any valid TOML
+    spelling. `cargo metadata --no-deps` resolves nothing and needs no network."""
+    result = subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--offline", "--format-version", "1"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    metadata = json.loads(result.stdout)
+    members = set(metadata["workspace_members"])
+    return [package for package in metadata["packages"] if package["id"] in members]
+
+
+def split_coverage_problems(packages: list[dict], patterns: list[str]) -> list[str]:
+    """Why the CI test jobs would not run what `cargo test` runs by default.
+
+    `test` runs --lib --bins and builds --examples, and each integration
+    half runs --test <pattern>. Their union is cargo's default selection
+    only while every target keeps its kind's default test flag and has no
+    required features, and every integration test target matches exactly
+    one pattern. Turning autotests off would silently drop the files under
+    tests/ from every run, so it is refused too.
+    """
+    problems = []
+    for package in packages:
+        manifest = tomllib.loads(Path(package["manifest_path"]).read_text())
+        if manifest.get("package", {}).get("autotests") is False:
+            problems.append(f"{package['name']}: autotests = false")
+        for target in package["targets"]:
+            kinds = set(target["kind"])
+            label = f"{package['name']} {'/'.join(target['kind'])} {target['name']}"
+            if kinds <= TESTED_BY_DEFAULT:
+                default = True
+            elif kinds <= NOT_TESTED_BY_DEFAULT:
+                default = False
+            else:
+                problems.append(f"{label}: unknown target kind")
+                continue
+            if target.get("test") is not default:
+                problems.append(f"{label}: test flag {target.get('test')}, default {default}")
+            if target.get("required-features"):
+                problems.append(f"{label}: required-features {target['required-features']}")
+            if kinds == {"test"}:
+                matched = [pattern for pattern in patterns if fnmatch.fnmatchcase(target["name"], pattern)]
+                if len(matched) != 1:
+                    problems.append(f"{label}: matches {matched}")
+    return problems
 
 
 def job_block(name: str) -> str:
@@ -51,13 +113,14 @@ class CiWorkflowTests(unittest.TestCase):
         """Cached build output makes each rust-cache entry about 1 GB.
 
         Pull request entries are scoped to their own ref, so saving them only
-        evicts main's entries from the 10 GB repository cache. Jobs that
+        evicts main's entries from the 20 GB repository cache. Jobs that
         build the same dependency graph (same features, profile and
         dev-dependency use) share one entry; every other job keeps its own.
         """
         expected = {
             "fmt-lint": None,
-            "test": None,
+            "test": "test",
+            "test-integration": "test",
             "test-extension-state": None,
             "extension-state-lint": None,
             "test-voice": None,
@@ -71,6 +134,8 @@ class CiWorkflowTests(unittest.TestCase):
         }
         source = CI_WORKFLOW.read_text()
         self.assertEqual(source.count("uses: Swatinem/rust-cache@v2"), len(expected))
+        hashed_env = re.compile(r"(?m)^      ((?:CARGO|CC|CFLAGS|CXX|CMAKE|RUST)\w*): (.*)$")
+        group_envs = {}
         for name, shared_key in expected.items():
             step = re.search(
                 r"- uses: Swatinem/rust-cache@v2\n((?: {8}.*\n)+)", job_block(name) + "\n"
@@ -80,16 +145,186 @@ class CiWorkflowTests(unittest.TestCase):
             self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", settings, name)
             keys = re.findall(r"shared-key: (\S+)", settings)
             self.assertEqual(keys, [shared_key] if shared_key else [], name)
+            if shared_key:
+                # rust-cache hashes the job environment into the key, so a
+                # group shares one entry only while its jobs agree on it.
+                # CARGO_INCREMENTAL is 0 in every job either way: the
+                # toolchain action and rust-cache both set it before the hash.
+                env = [e for e in hashed_env.findall(job_block(name)) if e != ("CARGO_INCREMENTAL", '"0"')]
+                group_envs.setdefault(shared_key, set()).add(tuple(env))
+            if (shared_key or "").startswith("meta-dev-"):
+                self.assertIn("      CARGO_PROFILE_DEV_DEBUG: line-tables-only\n", job_block(name), name)
+        for shared_key, envs in group_envs.items():
+            self.assertEqual(len(envs), 1, f"{shared_key}: {envs}")
+        header = source.split("\njobs:\n", 1)[0]
+        self.assertIn("\npermissions:\n  contents: read\n", header)
+        # Jobs that run pull request code stay read-only. Only the cleanup
+        # job may delete caches: it runs for pushes to main alone, after every
+        # job that saves a rust cache, and drops exactly their families.
+        self.assertEqual(re.findall(r"(?m)^ +permissions:$", source), ["    permissions:"])
+        self.assertEqual(re.findall(r"(?m)^ +actions: write$", source), ["      actions: write"])
+        drop = job_block("drop-superseded-caches")
+        self.assertIn("    if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n", drop)
+        self.assertIn("    continue-on-error: true\n", drop)
+        self.assertIn("    permissions:\n      actions: write\n      contents: read\n", drop)
+        needs = re.search(r"(?m)^    needs: \[(.*)\]$", drop).group(1).split(", ")
+        self.assertEqual(sorted(needs), sorted(expected))
+        families = []
+        for name, shared_key in expected.items():
+            if (shared_key or name) not in families:
+                families.append(shared_key or name)
+        actions = [line.strip() for line in drop.splitlines() if re.match(r" +(- )?(uses|run): ", line)]
+        self.assertEqual(
+            actions,
+            ["- uses: actions/checkout@v4", f"run: scripts/ci-drop-superseded-caches.sh {' '.join(families)}"],
+        )
+        self.assertNotIn("drop-superseded-caches", job_block("gate"))
+        self.assertNotIn("steps.rust-cache", source)
+        self.assertIn("- run: python3 scripts/test_ci_drop_caches.py\n", job_block("fmt-lint"))
 
     def test_workspace_nextest_preserves_all_failure_evidence(self):
-        commands = [
-            line.strip()
-            for line in job_block("test").splitlines()
-            if line.strip().startswith("- run: scripts/repo-cargo nextest run --workspace")
-        ]
+        """The workspace tests run as three jobs that together cover cargo's
+        default test selection: lib and bin unit tests in `test`, and the
+        integration tests in two `test-integration` halves split by target
+        name, one of which also builds the examples. All use the same filter
+        and --no-fail-fast. split_coverage_problems holds the conditions under
+        which that union is the default selection, on Cargo's own reading of
+        every workspace member."""
+        block = job_block("test-integration")
+        patterns = re.findall(r'(?m)^          - tests: "([^"]+)"$', block)
+        self.assertEqual(len(patterns), 2, patterns)
+        members = cargo_workspace_members(ROOT)
+        integration_tests = [t for package in members for t in package["targets"] if t["kind"] == ["test"]]
+        self.assertGreater(len(integration_tests), 100)
+        self.assertEqual(split_coverage_problems(members, patterns), [])
+        self.assertIn("    strategy:\n      fail-fast: false\n", block)
+        filter_ = (
+            "-E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) "
+            "and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)'"
+        )
+        expected = {
+            "test": f"scripts/repo-cargo nextest run --workspace --lib --bins {filter_} --no-fail-fast",
+            "test-integration": (
+                f"scripts/repo-cargo nextest run --workspace --test '${{{{ matrix.tests }}}}' {filter_} --no-fail-fast"
+            ),
+        }
+        for name, command in expected.items():
+            commands = [
+                line.strip()[len("- run: "):]
+                for line in job_block(name).splitlines()
+                if line.strip().startswith("- run: scripts/repo-cargo nextest run")
+            ]
+            self.assertEqual(commands, [command], name)
+            self.assertIn("- name: Reclaim runner disk\n", job_block(name))
+            self.assertIn('CARGO_PROFILE_DEV_DEBUG: "0"', job_block(name))
+            self.assertIn("OPENAI_API_KEY: sk-regression-test", job_block(name))
+        # Exactly one half builds the examples.
+        self.assertEqual(block.count("            examples: true\n"), 1)
+        self.assertIn("      - if: matrix.examples\n        run: scripts/repo-cargo build --workspace --examples\n", block)
+        source = CI_WORKFLOW.read_text()
+        self.assertEqual(source.count("scripts/repo-cargo build --workspace --examples"), 1)
+        self.assertEqual(source.count("scripts/repo-cargo nextest run --workspace"), 2)
 
-        self.assertEqual(len(commands), 1, commands)
-        self.assertIn(" --no-fail-fast", commands[0])
+    def test_the_split_coverage_guard_reads_targets_as_cargo_does(self):
+        """Targets, test flags and autotests in any valid TOML spelling, and
+        glob or implicit path members, all reach the guard: it reads `cargo
+        metadata` and parses manifests as TOML, never the manifest text."""
+        package = '[package]\nname = "{}"\nversion = "0.0.0"\nedition = "2021"\n'
+        probe = package.format("guard-probe")
+        cases = {
+            "spaces inside the brackets": (
+                {
+                    "Cargo.toml": probe + '\n[[ test ]]\nname = "_extra_contract"\npath = "extra/contract.rs"\n\n[workspace]\n',
+                    "extra/contract.rs": "",
+                },
+                ["guard-probe test _extra_contract: matches []"],
+            ),
+            "quoted keys": (
+                {
+                    "Cargo.toml": probe + '\n[["test"]]\n"name" = "_quoted_contract"\n"path" = "extra/q.rs"\n\n[workspace]\n',
+                    "extra/q.rs": "",
+                },
+                ["guard-probe test _quoted_contract: matches []"],
+            ),
+            "an inline array of tables": (
+                {
+                    "Cargo.toml": 'test = [{ name = "_inline_contract", path = "extra/i.rs" }]\n\n' + probe + "\n[workspace]\n",
+                    "extra/i.rs": "",
+                },
+                ["guard-probe test _inline_contract: matches []"],
+            ),
+            "a quoted test flag on a bin": (
+                {
+                    "Cargo.toml": probe + '\n[[bin]]\nname = "probe"\n"test" = false\n\n[workspace]\n',
+                    "src/bin/probe.rs": "fn main() {}\n",
+                },
+                ["guard-probe bin probe: test flag False, default True"],
+            ),
+            "an inline test flag on an example": (
+                {
+                    "Cargo.toml": 'example = [{ name = "demo", test = true }]\n\n' + probe + "\n[workspace]\n",
+                    "examples/demo.rs": "fn main() {}\n",
+                },
+                ["guard-probe example demo: test flag True, default False"],
+            ),
+            "autotests off through dotted keys": (
+                {
+                    "Cargo.toml": (
+                        'package.name = "guard-probe"\npackage.version = "0.0.0"\npackage.edition = "2021"\n'
+                        "package.autotests = false\n\n[workspace]\n"
+                    ),
+                    "tests/alpha.rs": "",
+                },
+                ["guard-probe: autotests = false"],
+            ),
+            "a glob member": (
+                {
+                    "Cargo.toml": '[workspace]\nmembers = ["crates/*"]\nresolver = "2"\n',
+                    "crates/c/Cargo.toml": package.format("c"),
+                    "crates/c/src/lib.rs": "",
+                    "crates/c/tests/Upper.rs": "",
+                },
+                ["c test Upper: matches []"],
+            ),
+            "an implicit path member": (
+                {
+                    "Cargo.toml": '[workspace]\nmembers = ["a"]\nresolver = "2"\n',
+                    "a/Cargo.toml": package.format("a") + '\n[dependencies]\nb = { path = "../b" }\n',
+                    "a/src/lib.rs": "",
+                    "b/Cargo.toml": package.format("b"),
+                    "b/src/lib.rs": "",
+                    "b/tests/_hidden.rs": "",
+                },
+                ["b test _hidden: matches []"],
+            ),
+            "required features": (
+                {
+                    "Cargo.toml": probe + (
+                        '\n[features]\nslow = []\n\n[[test]]\nname = "gated"\npath = "extra/gated.rs"\n'
+                        'required-features = ["slow"]\n\n[workspace]\n'
+                    ),
+                    "extra/gated.rs": "",
+                },
+                ["guard-probe test gated: required-features ['slow']"],
+            ),
+            # Control: explicit and discovered targets the patterns cover pass.
+            "covered targets": (
+                {
+                    "Cargo.toml": probe + '\n[[test]]\nname = "middle"\npath = "extra/middle.rs"\n\n[workspace]\n',
+                    "extra/middle.rs": "",
+                    "tests/zeta.rs": "",
+                },
+                [],
+            ),
+        }
+        for case, (files, expected) in cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                for relative, content in {"src/lib.rs": "", **files}.items():
+                    path = Path(tmp) / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(content)
+                members = cargo_workspace_members(Path(tmp))
+                self.assertEqual(split_coverage_problems(members, ["[a-i]*", "[j-z]*"]), expected)
 
     def test_decorator_authority_gate_actually_runs_in_ci(self):
         """A structural gate nobody invokes is a control that cannot fail.
@@ -242,7 +477,7 @@ class CiWorkflowTests(unittest.TestCase):
         source = CI_WORKFLOW.read_text()
         for command, count in (
             ("- run: npm --prefix console run perf:typing:browser --silent\n", 1),
-            ("- run: node console/browser-e2e.cjs\n", 1),
+            ("node console/browser-e2e.cjs", 1),
             ("run: npm --prefix console run e2e:mcp-apps --silent\n", 2),
             ("- run: node console/api-e2e.cjs\n", 1),
         ):
@@ -261,11 +496,16 @@ class CiWorkflowTests(unittest.TestCase):
             "- name: Build console acceptance backends\n",
             "- name: Native MCP Apps rendering and reload\n",
             "- name: Native MCP Apps polling during an active model turn\n",
-            "- run: node console/browser-e2e.cjs\n",
-            "name: console-browser-${{ github.run_id }}\n",
+            "- run: node console/browser-e2e.cjs --shard=${{ matrix.shard }}/2\n",
+            "name: console-browser-${{ github.run_id }}-${{ matrix.shard }}\n",
         ]
         positions = [browser.index(marker) for marker in order]
         self.assertEqual(positions, sorted(positions))
+        # Two legs, each dealt its own scenarios by the registry's --shard=i/2;
+        # the matrix and the shard count must agree. MCP Apps run once.
+        self.assertIn("      matrix:\n        shard: [1, 2]\n", browser)
+        self.assertIn("      fail-fast: false\n", browser)
+        self.assertEqual(browser.count("        if: matrix.shard == 1\n"), 2)
         self.assertIn("META_EXAMPLE_BIN_DIR=${target_dir}/debug/examples", browser)
 
         console = job_block("console")
@@ -283,23 +523,28 @@ class CiWorkflowTests(unittest.TestCase):
         """A job absent from `gate` can fail without failing the check suite.
 
         `needs` alone does not gate: with `if: always()` the gate runs
-        regardless, so a job missing from the result comparison is advisory
-        only.
+        regardless, so a job missing from the result checks is advisory only.
 
         Correspondence ALONE is not enough, and this test asserted only that
         until review caught it: deleting a job from `needs` and from the
-        comparison together keeps the two lists in agreement, so the job goes
-        on running and gates nothing while this test stays green. The roster
+        checks together keeps the two lists in agreement, so the job goes on
+        running and gates nothing while this test stays green. The roster
         below is therefore a floor - every gating job must be present - and the
         correspondence check runs on top of it.
+
+        A job may be skipped only when `changes` classified the pull request as
+        docs-only (FULL is exactly "false"); every skippable job is one the
+        classification gates, and every other job must succeed.
         """
         block = job_block("gate")
         needs = block.split("needs: [", 1)[1].split("]", 1)[0]
         listed = {name.strip() for name in needs.split(",")}
 
         must_gate = {
+            "changes",
             "fmt-lint",
             "test",
+            "test-integration",
             "test-extension-state",
             "extension-state-lint",
             "test-voice",
@@ -322,14 +567,27 @@ class CiWorkflowTests(unittest.TestCase):
             f"consistent while silently making it advisory.",
         )
 
-        for name in listed:
-            self.assertIn(
-                'needs.%s.result }}" != "success"' % name,
-                block,
-                f"{name} is in `needs` but its result is never compared, so it "
-                f"cannot fail the gate",
-            )
+        checks = dict(re.findall(r'(?m)^\s+check ([a-z-]+) "\$\{\{ needs\.\1\.result \}\}" (required|skippable)$', block))
+        self.assertEqual(set(checks), listed, "every job in `needs` is checked exactly by name")
+        self.assertIn('"$3" == "skippable" && "$2" == "skipped" && "${FULL}" == "false"', block)
+        self.assertIn("FULL: ${{ needs.changes.outputs.full }}", block)
+        for name, mode in checks.items():
+            gated = "    if: needs.changes.outputs.full == 'true'\n" in job_block(name)
+            self.assertEqual(mode == "skippable", gated, name)
+            if gated:
+                self.assertIn("    needs: changes\n", job_block(name))
+        self.assertEqual(checks["changes"], "required")
 
+    def test_changes_job_classifies_the_pull_request_and_fails_closed(self):
+        block = job_block("changes")
+        self.assertIn("fetch-depth: 2", block)
+        self.assertIn(
+            'python3 scripts/ci-changes.py --event "${{ github.event_name }}" --github-output "$GITHUB_OUTPUT"',
+            block,
+        )
+        self.assertIn('echo "full=true" >> "$GITHUB_OUTPUT"', block)
+        self.assertNotIn("if:", block)
+        self.assertIn("- run: python3 scripts/test_ci_changes.py\n", job_block("fmt-lint"))
 
 
 if __name__ == "__main__":
