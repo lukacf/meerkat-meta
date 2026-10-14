@@ -432,8 +432,26 @@ async fn installed_runtime(
     installed_runtime_with(dir, mob_id, custody, roster, hook, None, None).await
 }
 
+/// The fake OpenAI key members built on the provider default resolve their
+/// provider identity with: the same value the gateway fixtures give their
+/// child processes, not a secret.
+const FIXTURE_OPENAI_KEY: &str = "sk-regression-test";
+
+/// Agent config whose global realm binds OpenAI to [`FIXTURE_OPENAI_KEY`],
+/// so members never depend on an ambient `OPENAI_API_KEY`. They never call
+/// the provider: no prompt is admitted on this machine.
+fn fixture_provider_config() -> meerkat::Config {
+    let mut config = meerkat::Config::default();
+    config.realm.insert(
+        meerkat_core::connection::GLOBAL_REALM_SLUG.to_string(),
+        meerkat_core::RealmConfigSection::from_inline_api_keys(&[("openai", FIXTURE_OPENAI_KEY)]),
+    );
+    config
+}
+
 /// [`installed_runtime`] whose members are built on `client` and created
-/// through `session_hook`, when given.
+/// through `session_hook`, when given. Without a client, members are built
+/// on the provider default with the fixture's own key.
 async fn installed_runtime_with(
     dir: &tempfile::TempDir,
     mob_id: &str,
@@ -453,9 +471,10 @@ async fn installed_runtime_with(
         .native_grant_work_configuration(host_configuration())
         .member_runtime_registration_hook(hook)
         .tool_consequence_policy_registry(host_registry());
-    if let Some(client) = client {
-        builder = builder.default_llm_client(client);
-    }
+    builder = match client {
+        Some(client) => builder.default_llm_client(client),
+        None => builder.meerkat_config(fixture_provider_config()),
+    };
     if let Some(session_hook) = session_hook {
         builder = builder.session_hook(session_hook);
     }
