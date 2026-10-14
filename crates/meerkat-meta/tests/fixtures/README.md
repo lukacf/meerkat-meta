@@ -82,7 +82,8 @@ shape is what the tests pin.
   boot). The mob supervisor key inside `event_log.sqlite3` was minted by
   this capture and authorizes nothing outside it. All content is
   synthetic. Never regenerate with current code and never open these files
-  in place. Consumed by tests/released_0_8_26_store_adoption.rs.
+  in place. Excluded from the published crate. Consumed by
+  tests/released_0_8_26_store_adoption.rs.
 
 - ledger_v1_closure/ - the continuity closure of one member session
   (019fae11-4dd7-7301-9754-67b646603fb3) carrying a 26-rewrite
