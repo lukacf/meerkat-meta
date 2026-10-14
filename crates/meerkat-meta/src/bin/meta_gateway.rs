@@ -526,8 +526,16 @@ fn load_definition(
     if let Some(path) = &paths.mob_toml {
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let definition = MobDefinition::from_toml(&text)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        // The init refusal reports this error's Display, which for a context
+        // error is the context alone; carry meerkat's refusal (and the
+        // upgrade note for a refused profile prompt key) in the message.
+        let definition = MobDefinition::from_toml(&text).map_err(|error| {
+            anyhow!(
+                "failed to parse {}: {}",
+                path.display(),
+                meerkat_meta::gateway_composition::describe_mob_definition_error(&error)
+            )
+        })?;
         // The definition parser drops `[self_hosted]` and `[realm]` without a
         // diagnostic; refuse them by name (the typed message names
         // `meerkat_config_path` as the file that carries them).
@@ -3386,6 +3394,36 @@ mod tests {
 
         assert!(
             error.contains("[self_hosted]") && error.contains("meerkat_config_path"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    /// A profile `system_prompt` in the workspace mob.toml is refused, and the
+    /// init refusal carries meerkat's message and the upgrade note instead of
+    /// only "failed to parse <path>".
+    #[test]
+    fn load_definition_refusal_carries_the_profile_prompt_upgrade_remedy() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let config = temp.path().join("config");
+        fs::create_dir_all(&config)?;
+        fs::write(
+            config.join("mob.toml"),
+            "[mob]\nid = \"m\"\n\n[profiles.planner]\nmodel = \"gpt-5.5\"\n\
+             system_prompt = \"Plan.\"\n",
+        )?;
+        let paths = conventional_paths(temp.path());
+
+        let error = load_definition(temp.path(), "fingerprint", &paths)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+
+        assert!(
+            error.contains("declares 'system_prompt', which a mob profile cannot honour")
+                && error.contains("MobKit 0.8.31 and earlier dropped 'system_prompt'")
+                && error.contains("so the key had no effect on the members of profile 'planner'")
+                && error.contains("removing the key keeps that behaviour"),
             "{error}"
         );
         Ok(())

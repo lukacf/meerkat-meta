@@ -353,7 +353,10 @@ export class MetaBuilder {
   accessControl(configPath: string): this {
     if (configPath === "") {
       throw new Error(
-        "accessControl requires a non-empty path; omit it to keep access control off",
+        "accessControl requires a non-empty path: since Meta 0.9.0 an empty path no " +
+          "longer switches access control off. To keep access control off, do not call " +
+          "accessControl(), and keep nothing at config/access.toml under the working " +
+          "directory, which the builder loads when present",
       );
     }
     this._config.accessConfigPath = configPath;
@@ -533,7 +536,12 @@ export class MetaBuilder {
    */
   gating(configPath: string): this {
     if (configPath === "") {
-      throw new Error("gating requires a non-empty path; omit it to keep gating off");
+      throw new Error(
+        "gating requires a non-empty path: since Meta 0.9.0 an empty path no longer " +
+          "switches gating off. To keep gating off, do not call gating(), and keep nothing " +
+          "at config/gating.toml under the working directory, which the builder loads " +
+          "when present",
+      );
     }
     this._config.gatingConfigPath = configPath;
     return this;
