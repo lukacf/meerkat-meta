@@ -52,7 +52,7 @@ class CiWorkflowTests(unittest.TestCase):
         """Cached build output makes each rust-cache entry about 1 GB.
 
         Pull request entries are scoped to their own ref, so saving them only
-        evicts main's entries from the 10 GB repository cache. Jobs that
+        evicts main's entries from the 20 GB repository cache. Jobs that
         build the same dependency graph (same features, profile and
         dev-dependency use) share one entry; every other job keeps its own.
         """

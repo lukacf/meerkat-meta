@@ -24,7 +24,7 @@ env:
   # dependency graph's artifacts: about 1 GB compressed (a local Meta debug
   # target's dependency share, 4.6 GiB, packs to 0.95 GB with zstd). Nine
   # per-job entries, plus a copy for every pull request ref, would overrun
-  # the repository's 10 GB cache and evict main's entries. So only main
+  # the repository's 20 GB cache and evict main's entries. So only main
   # saves, and jobs that build the same dependency graph share one entry:
   # meta-dev-examples (examples and tests, with dev-dependency features)
   # and meta-dev-bins (binaries only).
