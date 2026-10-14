@@ -81,11 +81,6 @@ jobs:
       # CI test binaries therefore carry no debuginfo; panics keep their
       # messages but backtraces lose file:line. Local builds are unaffected.
       CARGO_PROFILE_DEV_DEBUG: "0"
-      # The in-process held-bootstrap and native-grant tests resolve a
-      # provider identity while they build members but never call the
-      # provider. This is the same fake value the gateway test fixtures give
-      # their child processes, not a secret.
-      OPENAI_API_KEY: sk-regression-test
     steps:
       # The workspace debug build (meerkat 0.7.25 dep tree + all test
       # binaries) plus the rust-cache restore no longer fits beside the

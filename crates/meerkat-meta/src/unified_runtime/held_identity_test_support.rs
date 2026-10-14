@@ -215,6 +215,23 @@ pub(crate) fn member(identity: &AgentIdentity) -> DurableAgentSpec {
     }
 }
 
+/// The fake OpenAI key these fixtures' members resolve their provider
+/// identity with: the same value the gateway fixtures give their child
+/// processes, not a secret.
+const FIXTURE_OPENAI_KEY: &str = "sk-regression-test";
+
+/// Agent config whose global realm binds OpenAI to [`FIXTURE_OPENAI_KEY`].
+/// Members built on it resolve their provider identity from the fixture,
+/// never from an ambient `OPENAI_API_KEY`; they never call the provider.
+fn fixture_provider_config() -> meerkat::Config {
+    let mut config = meerkat::Config::default();
+    config.realm.insert(
+        meerkat_core::connection::GLOBAL_REALM_SLUG.to_string(),
+        meerkat_core::RealmConfigSection::from_inline_api_keys(&[("openai", FIXTURE_OPENAI_KEY)]),
+    );
+    config
+}
+
 /// A governed runtime whose fresh members can be held, not yet carrying an
 /// identity context.
 pub(crate) async fn governed_runtime(dir: &tempfile::TempDir, mob_prefix: &str) -> UnifiedRuntime {
@@ -225,6 +242,7 @@ pub(crate) async fn governed_runtime(dir: &tempfile::TempDir, mob_prefix: &str) 
     .expect("mob definition");
     UnifiedRuntime::builder()
         .definition(definition)
+        .meerkat_config(fixture_provider_config())
         .persistent_state(dir.path().join("state"))
         .native_grant_work_configuration(host_configuration())
         .member_runtime_registration_hook(Arc::new(SelectingHook))
