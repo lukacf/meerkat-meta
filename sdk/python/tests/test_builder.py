@@ -758,6 +758,14 @@ class TestConventionDefaults:
         with pytest.raises(ValueError, match="non-empty"):
             Meta.builder().gating("")
 
+    def test_explicit_empty_gating_path_names_how_to_keep_gating_off(self):
+        with pytest.raises(ValueError) as excinfo:
+            Meta.builder().gating("")
+        assert (
+            "an empty path no longer switches gating off. To keep gating off, do not call "
+            "gating(), and keep nothing at config/gating.toml"
+        ) in str(excinfo.value)
+
     def test_explicit_gating_path_is_forwarded_never_dropped(self, tmp_path, monkeypatch):
         # An explicit gating path, even an empty one set directly, reaches the
         # gateway, which refuses it; only an absent path is omitted.
@@ -790,6 +798,14 @@ class TestConventionDefaults:
     def test_explicit_empty_access_path_is_rejected(self):
         with pytest.raises(ValueError, match="non-empty"):
             Meta.builder().access_control("")
+
+    def test_explicit_empty_access_path_names_how_to_keep_access_control_off(self):
+        with pytest.raises(ValueError) as excinfo:
+            Meta.builder().access_control("")
+        assert (
+            "an empty path no longer switches access control off. To keep access control "
+            "off, do not call access_control(), and keep nothing at config/access.toml"
+        ) in str(excinfo.value)
 
     def test_explicit_access_path_is_forwarded_never_dropped(self, tmp_path, monkeypatch):
         # An explicit path, even an empty one set directly, reaches the gateway,

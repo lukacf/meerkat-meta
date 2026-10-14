@@ -3816,6 +3816,46 @@ group_by = ["labels.console_group", "group"]
         }
     }
 
+    /// An empty access or gating path no longer switches the feature off (the
+    /// predecessor SDKs dropped it), so the gateway refuses it. The refusal
+    /// says that and names how to keep the feature off, instead of a bare read
+    /// error for `''`.
+    #[test]
+    fn an_empty_access_or_gating_path_refusal_names_how_to_keep_the_feature_off() {
+        for (option, feature, builder_call, conventional_file) in [
+            (
+                "access_config_path",
+                "access control",
+                "accessControl()",
+                "config/access.toml",
+            ),
+            (
+                "gating_config_path",
+                "gating",
+                "gating()",
+                "config/gating.toml",
+            ),
+        ] {
+            let params = json!({ "runtime_options": { option: "" } });
+            let err = match parse_gateway_runtime_options(&params, None) {
+                Ok(_) => panic!("an empty {option} must refuse initialization"),
+                Err(err) => err,
+            };
+            for expected in [
+                format!("runtime_options.{option} is empty"),
+                format!("an empty path no longer switches {feature} off"),
+                format!("omit runtime_options.{option} or set it to null"),
+                builder_call.to_string(),
+                conventional_file.to_string(),
+            ] {
+                assert!(
+                    err.contains(&expected),
+                    "the {option} refusal must say {expected:?}: {err}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn gateway_runtime_options_parse_access_config_path() {
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -8255,6 +8295,7 @@ fn parse_gateway_runtime_options(
     match runtime_options.get("gating_config_path") {
         None | Some(Value::Null) => {}
         Some(Value::String(path)) => {
+            OptInConfigPath::Gating.refuse_empty(path)?;
             parsed.gating = parse_gateway_gating_config_path(path)?;
         }
         Some(_) => {
@@ -8276,6 +8317,7 @@ fn parse_gateway_runtime_options(
     match runtime_options.get("access_config_path") {
         None | Some(Value::Null) => {}
         Some(Value::String(path)) => {
+            OptInConfigPath::Access.refuse_empty(path)?;
             parsed.access =
                 Some(crate::AccessController::load(path).map_err(|err| {
                     format!("runtime_options.access_config_path is invalid: {err}")
@@ -8609,6 +8651,54 @@ fn parse_gateway_runtime_options(
         }
     }
     Ok(parsed)
+}
+
+/// A `runtime_options` path that opts into a feature: an absent or null path
+/// keeps the feature off, and a present path must name a file that loads.
+#[derive(Debug, Clone, Copy)]
+enum OptInConfigPath {
+    /// `gating_config_path`: gating tiers and escalation.
+    Gating,
+    /// `access_config_path`: Console access control.
+    Access,
+}
+
+impl OptInConfigPath {
+    /// Refuse an explicit empty path, saying what changed and how to keep the
+    /// feature off.
+    ///
+    /// Before 0.9.0 the SDK runtimes dropped an empty path, so it read as
+    /// "off". The gateway keeps refusing it rather than reading it as off: a
+    /// templated config whose value came out empty would otherwise start
+    /// without access control or gating, the fail-open start the strict
+    /// loaders refuse. The bare read error for `''` says neither.
+    fn refuse_empty(self, path: &str) -> Result<(), String> {
+        if !path.is_empty() {
+            return Ok(());
+        }
+        let (option, feature, builder_call, conventional_file) = match self {
+            Self::Gating => (
+                "gating_config_path",
+                "gating",
+                "gating()",
+                "config/gating.toml",
+            ),
+            Self::Access => (
+                "access_config_path",
+                "access control",
+                "access_control() (Python) or accessControl() (TypeScript)",
+                "config/access.toml",
+            ),
+        };
+        Err(format!(
+            "runtime_options.{option} is empty. Since Meta 0.9.0 an empty path no longer \
+             switches {feature} off: a configured path must name a file that loads. To keep \
+             {feature} off, omit runtime_options.{option} or set it to null. With the Python \
+             or TypeScript SDK, do not call the builder's {builder_call}, and keep nothing \
+             at {conventional_file} under the working directory, which the builder loads \
+             when present."
+        ))
+    }
 }
 
 fn read_gateway_config_file(path: &str, option_name: &str) -> Result<Value, String> {
