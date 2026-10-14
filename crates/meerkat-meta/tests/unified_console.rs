@@ -2681,3 +2681,285 @@ async fn history_rebuild_projects_a_tool_only_step_as_a_tool_call_not_an_empty_c
         pretty()
     );
 }
+
+const PARKED_TOOL_MEMBER: &str = "console-parked-tool";
+const PARKED_TOOL: &str = "parked_probe";
+/// Failure bound for each wait of the parked-turn shutdown scenario.
+const PARKED_TURN_FAILURE_BOUND: Duration = Duration::from_mins(1);
+
+/// A host tool whose call stays in flight until the mob has stopped. A turn
+/// that calls it is parked inside the call when shutdown begins, and its run
+/// can end only after the mob stop, which shutdown starts after its first
+/// event drain.
+struct ParkedToolBundle {
+    entered: Arc<tokio::sync::Notify>,
+    mob: Arc<std::sync::OnceLock<meerkat_mob::MobHandle>>,
+}
+
+#[async_trait::async_trait]
+impl meerkat_core::AgentToolDispatcher for ParkedToolBundle {
+    fn tools(&self) -> Arc<[Arc<meerkat_core::types::ToolDef>]> {
+        vec![Arc::new(meerkat_core::types::ToolDef::new(
+            PARKED_TOOL,
+            "Returns once the mob has stopped.",
+            json!({"type": "object", "properties": {}}),
+        ))]
+        .into()
+    }
+
+    async fn dispatch(
+        &self,
+        call: meerkat_core::types::ToolCallView<'_>,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+        self.entered.notify_one();
+        if let Some(mob) = self.mob.get().cloned() {
+            // Bounded: a stop that never comes ends the call, and the
+            // scenario then fails on its own assertions. Only an observed
+            // state other than Running releases the call early.
+            let _ = tokio::time::timeout(PARKED_TURN_FAILURE_BOUND, async {
+                while !matches!(
+                    mob.status().await,
+                    Ok(state) if state != meerkat_mob::MobState::Running
+                ) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+        }
+        Ok(meerkat_core::ToolDispatchOutcome::sync_result(
+            meerkat_core::types::ToolResult::new(
+                call.id.to_string(),
+                "released by the mob stop".to_string(),
+                false,
+            ),
+        ))
+    }
+
+    fn capabilities(&self) -> meerkat_core::agent::DispatcherCapabilities {
+        meerkat_core::agent::DispatcherCapabilities::default()
+    }
+}
+
+/// Scripted LLM for the parked-turn scenario: a `parked-` prompt calls the
+/// parked tool and answers once the call returned; any host-minted turn gets
+/// a plain text answer.
+struct ParkedTurnClient;
+
+impl LlmClient for ParkedTurnClient {
+    fn project_replay_messages(&self, messages: &[Message]) -> Result<Vec<Message>, LlmError> {
+        Ok(messages.to_vec())
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: &'a LlmRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
+        let provider = LlmClient::provider(self);
+        if !last_user_prompt(request).starts_with("parked-") {
+            return text_only_turn(request, provider, "Acknowledged.");
+        }
+        if matches!(request.messages.last(), Some(Message::ToolResults { .. })) {
+            return text_only_turn(request, provider, "The parked call returned.");
+        }
+        let [usage, done] = llm_usage::usage_then_done(request, provider, StopReason::ToolUse);
+        Box::pin(stream::iter(vec![
+            Ok(LlmEvent::ToolCallComplete {
+                id: "parked-call".to_string(),
+                name: PARKED_TOOL.to_string(),
+                args: json!({}),
+                meta: None,
+            }),
+            Ok(usage),
+            Ok(done),
+        ]))
+    }
+
+    fn provider(&self) -> Provider {
+        Provider::Other
+    }
+
+    fn health_check<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), LlmError>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A turn parked inside a tool call when the gateway shuts down gracefully
+/// ends with a terminal frame in the durable console log.
+///
+/// The mob stop ends the parked turn's run after shutdown's first event
+/// drain, so the run's terminal reached the event router only after that
+/// drain and was dropped when the router closed: read from the send's
+/// accepted cursor after a restart, the log had no terminal for the
+/// interaction. The scenario runs the persistent gateway's shape: a SQLite
+/// console store, the gateway's own drain task stopped before the runtime
+/// shutdown, and then a fresh store over the same file, which is what the
+/// next boot reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_parked_in_a_tool_call_at_shutdown_keeps_a_durable_terminal_frame() {
+    use meerkat_meta::ConsoleLogStore as _;
+
+    let mob_id = format!(
+        "parked-turn-shutdown-{}",
+        NEXT_TEST_MOB_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let definition = MobDefinition::from_toml(&format!(
+        r#"
+[mob]
+id = "{mob_id}"
+
+[profiles.lead]
+model = "gpt-5.5"
+external_addressable = true
+
+[profiles.lead.tools]
+comms = true
+rust_bundles = ["parked"]
+"#
+    ))
+    .expect("parse parked-turn mob definition");
+
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let session_path = temp_dir.path().join("sessions");
+    std::fs::create_dir_all(&session_path).expect("session path");
+    let console_db = temp_dir.path().join("console.sqlite3");
+    let factory = AgentFactory::new(&session_path).comms(true);
+    let session_service = Arc::new(build_ephemeral_service(factory, Config::default(), 16));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let mob_slot = Arc::new(std::sync::OnceLock::new());
+    let mob_spec = MobBootstrapSpec::new(definition, MobStorage::in_memory(), session_service)
+        .with_options(MobBootstrapOptions {
+            allow_ephemeral_sessions: true,
+            notify_orchestrator_on_resume: true,
+            default_llm_client: Some(Arc::new(ParkedTurnClient)),
+        })
+        .register_tool_bundle(
+            "parked",
+            Arc::new(ParkedToolBundle {
+                entered: Arc::clone(&entered),
+                mob: Arc::clone(&mob_slot),
+            }),
+        );
+    let mut runtime = UnifiedRuntime::bootstrap(
+        mob_spec,
+        MetaConfig {
+            modules: vec![],
+            discovery: DiscoverySpec {
+                namespace: mob_id.clone(),
+                modules: vec![],
+            },
+            pre_spawn: vec![],
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("bootstrap parked-turn runtime");
+    // The persistent gateway's console store: the log a restart reads.
+    runtime.set_console_log_store(Arc::new(
+        meerkat_meta::SqliteConsoleLogStore::open(&console_db).expect("open console store"),
+    ));
+    let _ = mob_slot.set(runtime.mob_handle());
+    let runtime = Arc::new(runtime);
+    // The gateways drain runtime events on their own task and stop it before
+    // the runtime shutdown, as `GatewayComposition::shutdown` does.
+    let event_drain = Arc::clone(&runtime).spawn_event_drain_task();
+
+    let mut spec = SpawnMemberSpec::from_wire(
+        "lead".to_string(),
+        MobMemberId::from(PARKED_TOOL_MEMBER).to_string(),
+        None,
+        None,
+        None,
+    );
+    spec.runtime_mode = Some(MobRuntimeMode::TurnDriven);
+    runtime.spawn(spec).await.expect("spawn turn_driven member");
+
+    let app = runtime.build_reference_app_router(decision_state(false));
+    let send_json = post_console_rpc(
+        &app,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "send-parked",
+            "method": "meta/console/send",
+            "params": {
+                "identity": PARKED_TOOL_MEMBER,
+                "origin": "test",
+                "idempotency_key": "parked-turn",
+                "content": "parked-turn"
+            }
+        }),
+    )
+    .await;
+    assert!(
+        send_json.get("error").is_none() || send_json["error"].is_null(),
+        "console send failed: {send_json}"
+    );
+    let interaction_id = send_json["result"]["interaction_id"]
+        .as_str()
+        .expect("an accepted send names its interaction")
+        .to_string();
+    let accepted_cursor = send_json["result"]["cursor"]
+        .as_str()
+        .expect("an accepted send names its cursor")
+        .to_string();
+
+    tokio::time::timeout(PARKED_TURN_FAILURE_BOUND, entered.notified())
+        .await
+        .expect("the turn entered the parked tool call");
+
+    event_drain.abort();
+    let _ = event_drain.await;
+    let shutdown = runtime.shutdown().await;
+    assert_mob_stop_allows_boundary_cancel(shutdown.mob_stop);
+    drop(app);
+    drop(runtime);
+
+    let store =
+        meerkat_meta::SqliteConsoleLogStore::open(&console_db).expect("reopen console store");
+    let mut frames = Vec::new();
+    let mut after = Some(meerkat_meta::ConsoleCursor::from(accepted_cursor.as_str()));
+    loop {
+        let page = store
+            .query_frames(meerkat_meta::ConsoleTimelineQuery {
+                identity: None,
+                conversation_id: None,
+                after: after.clone(),
+                limit: 500,
+            })
+            .await
+            .expect("query the durable console log");
+        let Some(last) = page.frames.last() else {
+            break;
+        };
+        after = Some(last.cursor.clone());
+        frames.extend(page.frames);
+    }
+    let interaction_frames: Vec<(String, String)> = frames
+        .iter()
+        .filter(|frame| frame.interaction_id.as_deref() == Some(interaction_id.as_str()))
+        .map(|frame| (frame.kind.clone(), format!("{:?}", frame.source.kind)))
+        .collect();
+    let live_terminals: Vec<&str> = frames
+        .iter()
+        .filter(|frame| {
+            frame.interaction_id.as_deref() == Some(interaction_id.as_str())
+                && frame.source.kind != meerkat_meta::ConsoleFrameSourceKind::SessionHistory
+                && matches!(
+                    frame.kind.as_str(),
+                    "interaction_complete" | "interaction_failed"
+                )
+        })
+        .map(|frame| frame.kind.as_str())
+        .collect();
+    eprintln!("parked turn {interaction_id} live terminals after restart: {live_terminals:?}");
+    assert!(
+        !live_terminals.is_empty(),
+        "the parked turn has no terminal frame after the accepted cursor {accepted_cursor}; \
+         its frames (kind, source): {interaction_frames:?}"
+    );
+}

@@ -1959,6 +1959,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A turn interrupted by a graceful gateway shutdown now ends with a terminal
+  console frame. The mob stop ends a member's in-flight run after shutdown's
+  first event drain, so the run's terminal reached the event router only
+  after that drain and was dropped when the router closed: read from the
+  send's accepted cursor after a restart, the console log had no
+  `interaction_failed` or `interaction_complete` for the interaction.
+  `UnifiedRuntime::shutdown` now drains once more after the mob stop, in the
+  first drain's two-pass style and within what is left of its window (the
+  published shutdown horizon still counts one event drain), and writes the
+  console frames of both drains to the log before the live projection
+  detaches. A crash or SIGKILL mid-turn can still leave a turn without a
+  terminal frame (see the console events documentation).
 - Gateway shutdown no longer reports complete cleanup while a member's MCP
   server is still running. A stdio MCP server's close takes up to its EOF and
   TERM graces plus a kill backstop (18 s by default), longer than the 5 s

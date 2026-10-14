@@ -280,6 +280,16 @@ impl ConsoleEventStore {
         )
     }
 
+    /// The newest buffered event's id: a position for [`Self::replay_all`].
+    pub(crate) async fn latest_event_id(&self) -> Option<String> {
+        self.state
+            .read()
+            .await
+            .all_events
+            .back()
+            .map(|event| event.event_id.clone())
+    }
+
     pub(crate) async fn reserve_interaction_value(
         &self,
         identity: &str,

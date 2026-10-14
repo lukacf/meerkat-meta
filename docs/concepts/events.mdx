@@ -87,6 +87,8 @@ The console `interaction_failed` frame Meta projects from `run_failed` carries t
 
 A retried LLM call (a 429, a network timeout) surfaces as `retrying` events before either terminal; a non-retryable failure (a 401 on a bad key) reaches `run_failed` in one round trip. The `user_input` frame of a console send terminates at `delivered` by design (the send was admitted); the turn's outcome is the sibling `interaction_complete` or `interaction_failed` frame, not a status change on the input frame.
 
+A turn still running when the gateway shuts down gracefully (`meta/shutdown`, or SIGTERM to the gateway process) also gets its terminal frame. The shutdown's mob stop ends the run, and the shutdown drains the run's terminal into the console log before the gateway exits: `interaction_failed` when the stop cancelled the run, `interaction_complete` when the run finished first. A crash or SIGKILL mid-turn can leave the turn without a terminal frame. After a restart Meerkat settles some interrupted runs without publishing a terminal, by design, so the caller's own timeout is the outcome it sees. Bound any wait on an `interaction_id` with a timeout, or check the member's status.
+
 ### Merged module event names
 
 Meta itself generates these module event types in the merged envelope log:
