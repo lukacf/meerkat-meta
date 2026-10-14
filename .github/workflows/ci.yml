@@ -107,6 +107,12 @@ jobs:
       - run: scripts/repo-cargo clippy --workspace --all-targets -- -D warnings
       - run: scripts/repo-cargo machete --with-metadata
 
+  # Unit and integration tests run as two jobs. As one job, the build took
+  # 12.8-16.4 minutes and the run 5.1-6.2 (October 2026). On 4 CPUs with
+  # warm dependencies, the unit tests and bins build in 330 s and the
+  # examples in 38 s more; the integration tests need the meerkat-meta
+  # library (about 230 s) and then 231 s. Both jobs build the same
+  # dependency graph, so test-integration shares the test job's cache.
   test:
     name: test
     needs: changes
@@ -145,6 +151,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       # The idle CPU gate asserts an absolute per-30s CPU budget calibrated on
@@ -155,7 +162,61 @@ jobs:
       # via .config/nextest.toml) and in the release-gate protocol.
       # The live-event burst test remains CPU-speed-sensitive. History backfill
       # saturation uses a deterministic read barrier and runs in this gate.
-      - run: scripts/repo-cargo nextest run --workspace -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)' --no-fail-fast
+      - run: scripts/repo-cargo nextest run --workspace --lib --bins -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)' --no-fail-fast
+      # cargo's default test selection also builds every example, to prove
+      # it compiles and links; the integration job does not, so do it here.
+      - run: scripts/repo-cargo build --workspace --examples
+
+  test-integration:
+    name: test-integration
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      # ~88 debug test binaries each statically link the full meerkat stack.
+      # With the 0.7.31 realtime deps, full debuginfo blew past the runner
+      # disk even after the reclaim step, and line-tables-only bought room.
+      # With the Meerkat 0.8.52 dependency graph even line tables no longer
+      # fit: links died with ENOSPC (71 MB left of 119 GB free at job start).
+      # CI test binaries therefore carry no debuginfo; panics keep their
+      # messages but backtraces lose file:line. Local builds are unaffected.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      # The in-process held-bootstrap and native-grant tests resolve a
+      # provider identity while they build members but never call the
+      # provider. This is the same fake value the gateway test fixtures give
+      # their child processes, not a secret.
+      OPENAI_API_KEY: sk-regression-test
+    steps:
+      # The workspace debug build (meerkat 0.7.25 dep tree + all test
+      # binaries) plus the rust-cache restore no longer fits beside the
+      # runner's preinstalled toolchains - three consecutive runs died to
+      # ENOSPC mid-link. Reclaim ~30GB of images we never use (mirrors
+      # meerkat's release-lane reclaim, meerkat#858).
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
+            /usr/share/swift /usr/local/julia* /opt/microsoft \
+            /usr/local/share/powershell /usr/share/miniconda \
+            /usr/local/share/chromium /usr/local/share/vcpkg
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@nextest
+      # The idle CPU gate asserts an absolute per-30s CPU budget calibrated on
+      # real hardware; GitHub's shared 2-vCPU runners read ~3-4s where real
+      # machines read 0.5-2s, even with exclusive nextest scheduling - the
+      # runner class is not a valid measurement environment for the assertion.
+      # The gate stays armed in local full-suite runs (exclusively scheduled
+      # via .config/nextest.toml) and in the release-gate protocol.
+      # The live-event burst test remains CPU-speed-sensitive. History backfill
+      # saturation uses a deterministic read barrier and runs in this gate.
+      - run: scripts/repo-cargo nextest run --workspace --test '*' -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)' --no-fail-fast
 
   test-extension-state:
     name: test-extension-state
@@ -578,7 +639,7 @@ jobs:
   drop-superseded-caches:
     name: drop-superseded-caches
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [fmt-lint, test, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, console, console-browser, console-fixtures, console-acceptance, flow-editor]
+    needs: [fmt-lint, test, test-integration, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, console, console-browser, console-fixtures, console-acceptance, flow-editor]
     runs-on: ubuntu-24.04
     continue-on-error: true
     permissions:
@@ -594,7 +655,7 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [changes, fmt-lint, test, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, test-typescript, console, console-browser, console-perf, console-fixtures, console-acceptance, flow-editor, audit]
+    needs: [changes, fmt-lint, test, test-integration, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, test-typescript, console, console-browser, console-perf, console-fixtures, console-acceptance, flow-editor, audit]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results
@@ -617,6 +678,7 @@ jobs:
           check changes "${{ needs.changes.result }}" required
           check fmt-lint "${{ needs.fmt-lint.result }}" required
           check test "${{ needs.test.result }}" skippable
+          check test-integration "${{ needs.test-integration.result }}" skippable
           check test-extension-state "${{ needs.test-extension-state.result }}" skippable
           check extension-state-lint "${{ needs.extension-state-lint.result }}" skippable
           check test-voice "${{ needs.test-voice.result }}" skippable

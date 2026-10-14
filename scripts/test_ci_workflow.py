@@ -57,7 +57,8 @@ class CiWorkflowTests(unittest.TestCase):
         """
         expected = {
             "fmt-lint": None,
-            "test": None,
+            "test": "test",
+            "test-integration": "test",
             "test-extension-state": None,
             "extension-state-lint": None,
             "test-voice": None,
@@ -71,6 +72,8 @@ class CiWorkflowTests(unittest.TestCase):
         }
         source = CI_WORKFLOW.read_text()
         self.assertEqual(source.count("uses: Swatinem/rust-cache@v2"), len(expected))
+        hashed_env = re.compile(r"(?m)^      ((?:CARGO|CC|CFLAGS|CXX|CMAKE|RUST)\w*): (.*)$")
+        group_envs = {}
         for name, shared_key in expected.items():
             step = re.search(
                 r"- uses: Swatinem/rust-cache@v2\n((?: {8}.*\n)+)", job_block(name) + "\n"
@@ -83,7 +86,14 @@ class CiWorkflowTests(unittest.TestCase):
             if shared_key:
                 # rust-cache hashes the job environment into the key, so a
                 # group shares one entry only while its jobs agree on it.
+                # CARGO_INCREMENTAL is 0 in every job either way: the
+                # toolchain action and rust-cache both set it before the hash.
+                env = [e for e in hashed_env.findall(job_block(name)) if e != ("CARGO_INCREMENTAL", '"0"')]
+                group_envs.setdefault(shared_key, set()).add(tuple(env))
+            if (shared_key or "").startswith("meta-dev-"):
                 self.assertIn("      CARGO_PROFILE_DEV_DEBUG: line-tables-only\n", job_block(name), name)
+        for shared_key, envs in group_envs.items():
+            self.assertEqual(len(envs), 1, f"{shared_key}: {envs}")
         header = source.split("\njobs:\n", 1)[0]
         self.assertIn("\npermissions:\n  contents: read\n", header)
         # Jobs that run pull request code stay read-only. Only the cleanup
@@ -111,14 +121,36 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertIn("- run: python3 scripts/test_ci_drop_caches.py\n", job_block("fmt-lint"))
 
     def test_workspace_nextest_preserves_all_failure_evidence(self):
-        commands = [
-            line.strip()
-            for line in job_block("test").splitlines()
-            if line.strip().startswith("- run: scripts/repo-cargo nextest run --workspace")
-        ]
-
-        self.assertEqual(len(commands), 1, commands)
-        self.assertIn(" --no-fail-fast", commands[0])
+        """The workspace tests run as two jobs that together cover cargo's
+        default test selection: lib and bin unit tests plus the examples
+        build in `test`, integration tests in `test-integration`, with the
+        same filter and --no-fail-fast in both. That union is the default
+        selection only while every target keeps its default test flag."""
+        workspace = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]
+        for member in workspace["members"]:
+            manifest = (ROOT / member / "Cargo.toml").read_text()
+            self.assertIsNone(re.search(r"(?m)^\s*test\s*=", manifest), member)
+        filter_ = (
+            "-E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) "
+            "and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)'"
+        )
+        expected = {
+            "test": f"scripts/repo-cargo nextest run --workspace --lib --bins {filter_} --no-fail-fast",
+            "test-integration": f"scripts/repo-cargo nextest run --workspace --test '*' {filter_} --no-fail-fast",
+        }
+        for name, command in expected.items():
+            commands = [
+                line.strip()[len("- run: "):]
+                for line in job_block(name).splitlines()
+                if line.strip().startswith("- run: scripts/repo-cargo nextest run")
+            ]
+            self.assertEqual(commands, [command], name)
+            self.assertIn("- name: Reclaim runner disk\n", job_block(name))
+            self.assertIn('CARGO_PROFILE_DEV_DEBUG: "0"', job_block(name))
+            self.assertIn("OPENAI_API_KEY: sk-regression-test", job_block(name))
+        self.assertIn("- run: scripts/repo-cargo build --workspace --examples\n", job_block("test"))
+        source = CI_WORKFLOW.read_text()
+        self.assertEqual(source.count("scripts/repo-cargo nextest run --workspace"), 2)
 
     def test_decorator_authority_gate_actually_runs_in_ci(self):
         """A structural gate nobody invokes is a control that cannot fail.
@@ -338,6 +370,7 @@ class CiWorkflowTests(unittest.TestCase):
             "changes",
             "fmt-lint",
             "test",
+            "test-integration",
             "test-extension-state",
             "extension-state-lint",
             "test-voice",
