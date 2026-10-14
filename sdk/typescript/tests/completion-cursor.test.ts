@@ -66,7 +66,8 @@ async function makeRuntime(script: {
 }) {
   const { MetaRuntime } = await import("../src/runtime.js");
   const { RpcError } = await import("../src/errors.js");
-  const calls: { method: string; params: Record<string, unknown> }[] = [];
+  /** Every RPC the fake gateway received, with the wall-clock time it arrived. */
+  const calls: { method: string; params: Record<string, unknown>; atMs: number }[] = [];
   const rt = new MetaRuntime({
     mobConfigPath: null,
     sessionBuilder: null,
@@ -105,7 +106,7 @@ async function makeRuntime(script: {
     method: string,
     params?: Record<string, unknown>,
   ) => {
-    calls.push({ method, params: params ?? {} });
+    calls.push({ method, params: params ?? {}, atMs: Date.now() });
     if (method === "meta/send") return script.send ?? {};
     if (method === "meta/dispatch") return script.dispatch ?? {};
     if (
@@ -312,6 +313,7 @@ describe("server-side completion waits", () => {
       ],
     });
 
+    const startedAtMs = Date.now();
     const output = await rt.waitForCompletion(
       "triage:main",
       { epoch: 3, turns: 1 },
@@ -328,10 +330,17 @@ describe("server-side completion waits", () => {
       identity: "triage:main",
       after: { epoch: 3, turns: 1 },
     });
-    // The SDK sends floor(deadline - now), so a millisecond may pass first.
+    // The wait carries the budget left when it is sent, floor(deadline -
+    // now): never more than the caller's 7000 ms, and never less than what
+    // remained when the gateway received it. Time that passes before the
+    // send narrows the budget; it never fails the bound.
+    const elapsedBeforeReceiptMs = (calls[0]?.atMs ?? Number.NaN) - startedAtMs;
     assert.ok(
-      typeof timeoutMs === "number" && timeoutMs >= 6950 && timeoutMs <= 7000,
-      `the one server wait must carry the remaining 7000 ms budget, got ${String(timeoutMs)}`,
+      typeof timeoutMs === "number" &&
+        Number.isInteger(timeoutMs) &&
+        timeoutMs <= 7000 &&
+        timeoutMs >= 7000 - elapsedBeforeReceiptMs,
+      `the one server wait must carry the remaining budget (7000 ms less the ${String(elapsedBeforeReceiptMs)} ms before it was received), got ${String(timeoutMs)}`,
     );
   });
 
