@@ -19,8 +19,9 @@ use meerkat_meta::identity_first::orchestrator::{RestoreFlowResult, RestoreOutco
 use meerkat_meta::identity_first::{
     AgentAddressability, AgentIdentity, AgentRuntimeServices, ContinuityFailureKind,
     ContinuityRepairRequestOutcome, ContinuityStore, DurabilityPolicy, DurableAgentSpec,
-    IdentityFirstRuntimeContext, IdentityRuntime, IdentityRuntimeConfig, LocalContinuityStore,
-    LocalLeaseProvider, MobSessionBridge, MutableRosterProvider, RoleMigrationDeclaration,
+    IdentityFirstRuntimeContext, IdentityLifecycleState, IdentityRuntime, IdentityRuntimeConfig,
+    LocalContinuityStore, LocalLeaseProvider, MobSessionBridge, MutableRosterProvider,
+    RoleMigrationDeclaration,
 };
 use meerkat_meta::mob_composition_manifest::persistent_mob_storage;
 use meerkat_meta::{DiscoverySpec, MetaConfig, MobBootstrapOptions, MobBootstrapSpec};
@@ -498,6 +499,79 @@ async fn a_refused_role_migration_is_not_retired_by_a_later_pass() {
     assert_eq!(
         wire["identities"][IDENTITY]["restore"]["kind"], "role_migration_not_applied",
         "the status keeps the typed refusal: {wire}"
+    );
+    booted.unified.shutdown().await;
+}
+
+/// The park belongs to the embodiment it was refused for. A successful reset
+/// replaces that embodiment, so a later, unrelated failure of the new session
+/// is an ordinary Broken identity the repair supervisor retries, not one the
+/// old same-spec refusal keeps parked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_supersedes_a_refused_role_migration() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let state_path = temp.path().join("state");
+    let mob_id = "role-migration-refused-then-reset";
+    let identity = AgentIdentity::parse(IDENTITY).unwrap();
+
+    let booted = boot(&state_path, mob_id, &[spec(FROM_ROLE)], Vec::new()).await;
+    let refused_session = materialized_session(booted.result.as_ref().expect("boot 1 restores"));
+    booted.unified.shutdown().await;
+    drop(booted);
+
+    let booted = boot(
+        &state_path,
+        mob_id,
+        &[spec(TO_ROLE)],
+        vec![RoleMigrationDeclaration {
+            identity: identity.clone(),
+            from_role: ProfileName::from("predecessor"),
+        }],
+    )
+    .await;
+    match booted
+        .result
+        .as_ref()
+        .expect("boot 2 runs its restore")
+        .outcomes
+        .get(&identity)
+    {
+        Some(RestoreOutcome::Broken(failure)) => {
+            assert_eq!(failure.kind, ContinuityFailureKind::RoleMigrationNotApplied);
+        }
+        other => panic!("the mismatched declaration must be refused: {other:?}"),
+    }
+    let runtime = booted
+        .unified
+        .identity_runtime()
+        .expect("identity-first runtime");
+    let context = booted
+        .unified
+        .identity_first_context()
+        .expect("identity-first context");
+    assert_eq!(
+        context.request_continuity_repair().await,
+        ContinuityRepairRequestOutcome::NothingToRepair,
+        "the refusal is parked before the reset"
+    );
+
+    let reset = runtime
+        .reset(&identity)
+        .await
+        .expect("a same-spec reset succeeds");
+    assert_ne!(
+        reset.session_id, refused_session,
+        "the reset installs a new embodiment"
+    );
+    // An unrelated failure of the new session.
+    runtime
+        .set_state(&identity, IdentityLifecycleState::Broken)
+        .await
+        .expect("mark the new embodiment Broken");
+    assert_ne!(
+        context.request_continuity_repair().await,
+        ContinuityRepairRequestOutcome::NothingToRepair,
+        "the new embodiment's failure is repairable: the old refusal no longer parks it"
     );
     booted.unified.shutdown().await;
 }

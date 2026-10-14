@@ -1195,14 +1195,23 @@ impl std::fmt::Display for IdentityRuntimeError {
     }
 }
 
-/// Whether `entry` is Broken by a role-migration refusal recorded against
-/// exactly `spec`.
-fn role_migration_refused_for(entry: &IdentityEntry, spec: &DurableAgentSpec) -> bool {
-    entry.state == IdentityLifecycleState::Broken
-        && entry
-            .role_migration_refusal
-            .as_ref()
-            .is_some_and(|refusal| refusal.spec_digest == durable_spec_digest(spec))
+/// The role-migration refusal that still holds for an action on `spec`:
+/// `entry` is Broken on the exact embodiment the refusal was recorded for,
+/// and `spec` is the spec it was refused against. Every consumer passes the
+/// spec it is about to act on (the entry's current spec, or a pass's
+/// incoming roster spec), so a changed spec never inherits the refusal.
+fn role_migration_refusal_for<'a>(
+    entry: &'a IdentityEntry,
+    spec: &DurableAgentSpec,
+) -> Option<&'a RoleMigrationRefusal> {
+    if entry.state != IdentityLifecycleState::Broken {
+        return None;
+    }
+    let refusal = entry.role_migration_refusal.as_ref()?;
+    let same_embodiment = entry.continuity.as_ref().is_some_and(|record| {
+        record.session_id == refusal.session_id && record.generation == refusal.generation
+    });
+    (same_embodiment && refusal.spec_digest == durable_spec_digest(spec)).then_some(refusal)
 }
 
 /// Digest of the exact roster spec, for [`HostRejectedBuildPark`] scoping.
@@ -1447,6 +1456,12 @@ pub(crate) struct RoleMigrationRefusal {
     /// Digest of the exact [`DurableAgentSpec`] the declaration was refused
     /// against.
     pub spec_digest: u64,
+    /// The durable session and generation whose resume was refused. A
+    /// superseding embodiment (a reset, a respawn, a later successful
+    /// resume) is a different identity state the refusal never described,
+    /// so the park holds only while the entry still names this exact one.
+    pub session_id: meerkat_core::types::SessionId,
+    pub generation: ContinuityGeneration,
 }
 
 /// Tracks the live state for a single identity within the runtime.
@@ -2441,7 +2456,7 @@ impl IdentityFirstRuntimeContext {
             }
             if self
                 .runtime
-                .role_migration_refusal(identity)
+                .role_migration_refusal(identity, None)
                 .await
                 .is_some()
             {
@@ -6030,15 +6045,19 @@ impl IdentityRuntime {
                     .filter(|park| park.spec_digest == durable_spec_digest(&spec))
             });
             // A refused role migration is about the SPEC the declaration was
-            // refused against: a re-projected Broken entry with that spec
+            // refused against and the embodiment whose resume was refused: a
+            // re-projected Broken entry of that embodiment with that spec
             // keeps it (a retry re-asks the same question), while a changed
-            // spec or any non-Broken projection clears it.
+            // spec, another embodiment or any non-Broken projection clears it.
             let role_migration_refusal = if state == IdentityLifecycleState::Broken {
                 entries.get(&identity).and_then(|existing| {
-                    existing
-                        .role_migration_refusal
-                        .clone()
-                        .filter(|refusal| refusal.spec_digest == durable_spec_digest(&spec))
+                    existing.role_migration_refusal.clone().filter(|refusal| {
+                        refusal.spec_digest == durable_spec_digest(&spec)
+                            && continuity.as_ref().is_some_and(|record| {
+                                record.session_id == refusal.session_id
+                                    && record.generation == refusal.generation
+                            })
+                    })
                 })
             } else {
                 None
@@ -8395,7 +8414,7 @@ impl IdentityRuntime {
                         // this exact detail, so no later pass retires that
                         // member to re-ask the same question.
                         if kind == ContinuityFailureKind::RoleMigrationNotApplied {
-                            self.mark_role_migration_refusal(identity, detail.clone())
+                            self.mark_role_migration_refusal(identity, detail.clone(), &record)
                                 .await;
                         }
                         return Err(IdentityRuntimeError::EmbodimentRejected(Box::new(
@@ -8793,6 +8812,8 @@ impl IdentityRuntime {
             entry.lease = Some(Self::lease_entry_from_grant(&grant));
             entry.state = IdentityLifecycleState::Active;
             entry.checkpoint_version = record.checkpoint_version;
+            // A successful embodiment supersedes any refused one.
+            entry.role_migration_refusal = None;
         }
         self.emit_event(
             identity,
@@ -9413,7 +9434,7 @@ impl IdentityRuntime {
                         // the destructive step the refusal exists to prevent,
                         // so it stays while the desired spec is the one the
                         // declaration was refused against.
-                        && !role_migration_refused_for(entry, &desired_spec)
+                        && role_migration_refusal_for(entry, &desired_spec).is_none()
                 })
             };
             if reconciling_broken_entry {
@@ -9932,6 +9953,7 @@ impl IdentityRuntime {
                     entry.pending_lease_release = None;
                     entry.lease = Some(Self::lease_entry_from_grant(grant));
                     entry.state = IdentityLifecycleState::Active;
+                    entry.role_migration_refusal = None;
                     Ok(())
                 }
                 Some(entry) => Err(IdentityRuntimeError::Internal(format!(
@@ -14280,6 +14302,7 @@ impl IdentityRuntime {
         });
         entry.state = IdentityLifecycleState::Active;
         entry.checkpoint_version = record.checkpoint_version;
+        entry.role_migration_refusal = None;
         drop(entries);
         self.mark_bootstrap_from_lifecycle(identity, IdentityLifecycleState::Active, None);
 
@@ -15037,6 +15060,10 @@ impl IdentityRuntime {
             entry.lease = Some(Self::lease_entry_from_grant(&grant));
             entry.state = IdentityLifecycleState::Active;
             entry.checkpoint_version = new_record.checkpoint_version;
+            // The reset installed a new embodiment: a refusal of the old one
+            // no longer describes this identity. Rollbacks restore the
+            // snapshot, park included.
+            entry.role_migration_refusal = None;
             tracing::debug!(
                 identity = %identity,
                 runtime_id = %new_record.agent_runtime_id,
@@ -15183,6 +15210,7 @@ impl IdentityRuntime {
         entry.lease = Some(Self::lease_entry_from_grant(&grant));
         entry.state = IdentityLifecycleState::Active;
         entry.checkpoint_version = CheckpointVersion::new(0);
+        entry.role_migration_refusal = None;
         drop(entries);
         if let Some(injector) = self.agent_memory.read().await.as_ref() {
             injector.clear_taint_for_identity(identity);
@@ -15776,7 +15804,7 @@ impl IdentityRuntime {
                         .host_rejected_build_park
                         .as_ref()
                         .is_none_or(|park| park.spec_digest != durable_spec_digest(&entry.spec))
-                    && !role_migration_refused_for(entry, &entry.spec)
+                    && role_migration_refusal_for(entry, &entry.spec).is_none()
                     && !self.held_completion_owed(identity)
             })
             .map(|(identity, _)| identity.clone())
@@ -15967,24 +15995,29 @@ impl IdentityRuntime {
     }
 
     /// The refusal detail when the bridge refused a declared role migration
-    /// for this identity's current spec (see [`RoleMigrationRefusal`]).
-    pub(crate) async fn role_migration_refusal(&self, identity: &AgentIdentity) -> Option<String> {
-        self.entries
-            .read()
-            .await
-            .get(identity)
-            .filter(|entry| role_migration_refused_for(entry, &entry.spec))
-            .and_then(|entry| entry.role_migration_refusal.as_ref())
+    /// that still holds for an action on `spec` (see
+    /// [`role_migration_refusal_for`]). `None` acts on the entry's current
+    /// spec.
+    pub(crate) async fn role_migration_refusal(
+        &self,
+        identity: &AgentIdentity,
+        spec: Option<&DurableAgentSpec>,
+    ) -> Option<String> {
+        let entries = self.entries.read().await;
+        let entry = entries.get(identity)?;
+        role_migration_refusal_for(entry, spec.unwrap_or(&entry.spec))
             .map(|refusal| refusal.reason.clone())
     }
 
     /// Record a refused declared role migration against a Broken identity,
-    /// scoped to its current spec. Returns `false` (without writing) when
-    /// the identity is unknown or no longer Broken.
+    /// scoped to its current spec and to `record`, the embodiment whose
+    /// resume was refused. Returns `false` (without writing) when the
+    /// identity is unknown or no longer Broken.
     pub(crate) async fn mark_role_migration_refusal(
         &self,
         identity: &AgentIdentity,
         reason: String,
+        record: &ContinuityRecord,
     ) -> bool {
         let mut entries = self.entries.write().await;
         match entries.get_mut(identity) {
@@ -15993,6 +16026,8 @@ impl IdentityRuntime {
                 entry.role_migration_refusal = Some(RoleMigrationRefusal {
                     reason,
                     spec_digest,
+                    session_id: record.session_id.clone(),
+                    generation: record.generation,
                 });
                 true
             }
