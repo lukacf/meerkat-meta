@@ -240,6 +240,11 @@ jobs:
   # rise while wall clock falls. That is the trade, not a free win.
   #
   # All three are named in `gate`. A job absent from `gate` is not a gate.
+  #
+  # Run 38506503806 (2026-10-14): besides its backend build, `console` still
+  # spent 22m01 in non-Rust steps, 9m31 of them in perf:typing:browser and
+  # 10m06 in the browser scenarios (browser-e2e 8m47, MCP Apps 1m19). Those
+  # now run beside it in console-perf and console-browser, also in `gate`.
   console:
     name: console
     runs-on: ubuntu-24.04
@@ -277,14 +282,6 @@ jobs:
       - run: npm --prefix console run embedded:freshness --silent
       - run: npm --prefix console run build:acceptance --silent
       - run: npm --prefix console exec -- playwright install --with-deps chromium
-      # Real-browser composer typing with a full identity log and a
-      # FlowForensics-shaped session, idle and while a reply streams. jsdom
-      # has no style, layout or paint, so only a browser can see this
-      # regress. Fails only on runner-independent work counts (layout objects
-      # per keystroke, full derivations and turn renders per streamed token);
-      # wall-clock p95 is printed as advisory (META_TYPING_LAG_ENFORCE_TIMING=1
-      # makes it a failure for local perf work).
-      - run: npm --prefix console run perf:typing:browser --silent
       # One immutable backend build serves every browser/API scenario below.
       - name: Build console acceptance backends
         run: |
@@ -292,6 +289,53 @@ jobs:
           target_dir="$(scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')"
           echo "META_EXAMPLE_BIN_DIR=${target_dir}/debug/examples" >> "$GITHUB_ENV"
       - run: scripts/repo-cargo test -p meerkat-meta --example console_acceptance_fixture
+      - run: node console/api-e2e.cjs
+      - run: node console/voice-e2e.cjs
+      # Validate paid-lane evidence and continuous silent audio without credentials.
+      - run: node console/voice-e2e-live.cjs --self-test
+      - run: node console/voice-e2e-live.cjs --self-test-audio
+      - run: node console/memory-e2e.cjs
+      - run: node console/workgraph-e2e.cjs
+      - name: Upload console evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: console-${{ github.run_id }}
+          path: output/playwright/console-acceptance/
+          if-no-files-found: error
+
+  # The browser scenarios against the real acceptance backends, split from
+  # `console`. They need the same backend build, which the shared
+  # meta-dev-examples cache serves, and freshly built console bundles: the
+  # scenarios read console/dist and the backends embed
+  # crates/meerkat-meta/console-dist, both written by `run build`.
+  console-browser:
+    name: console-browser
+    runs-on: ubuntu-24.04
+    env:
+      # Rust 1.97 incremental compilation can ICE in async identity iteration.
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: meta-dev-examples
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: npm --prefix console ci --silent --no-fund --no-audit
+      - run: npm --prefix console run build --silent
+      - run: npm --prefix console run build:acceptance --silent
+      - run: npm --prefix console exec -- playwright install --with-deps chromium
+      - name: Build console acceptance backends
+        run: |
+          scripts/repo-cargo build -p meerkat-meta --example library_mode_reference --example console_acceptance_fixture --example memory_console_reference --example workgraph_console_reference
+          target_dir="$(scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')"
+          echo "META_EXAMPLE_BIN_DIR=${target_dir}/debug/examples" >> "$GITHUB_ENV"
       - name: Native MCP Apps rendering and reload
         timeout-minutes: 5
         run: npm --prefix console run e2e:mcp-apps --silent
@@ -305,14 +349,7 @@ jobs:
         env:
           META_MCP_APPS_LONG_POLL: "1"
           META_BROWSER_EVIDENCE: ${{ github.workspace }}/output/playwright/console-acceptance/mcp-apps
-      - run: node console/api-e2e.cjs
       - run: node console/browser-e2e.cjs
-      - run: node console/voice-e2e.cjs
-      # Validate paid-lane evidence and continuous silent audio without credentials.
-      - run: node console/voice-e2e-live.cjs --self-test
-      - run: node console/voice-e2e-live.cjs --self-test-audio
-      - run: node console/memory-e2e.cjs
-      - run: node console/workgraph-e2e.cjs
       - name: Upload console browser evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -320,6 +357,29 @@ jobs:
           name: console-browser-${{ github.run_id }}
           path: output/playwright/console-acceptance/
           if-no-files-found: error
+
+  # The composer typing check, split from `console`. It bundles its own
+  # host with esbuild and needs no Rust.
+  console-perf:
+    name: console-perf
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - run: npm --prefix console ci --silent --no-fund --no-audit
+      - run: npm --prefix console exec -- playwright install --with-deps chromium
+      # Real-browser composer typing with a full identity log and a
+      # FlowForensics-shaped session, idle and while a reply streams. jsdom
+      # has no style, layout or paint, so only a browser can see this
+      # regress. Fails only on runner-independent work counts (layout objects
+      # per keystroke, full derivations and turn renders per streamed token);
+      # wall-clock p95 is printed as advisory (META_TYPING_LAG_ENFORCE_TIMING=1
+      # makes it a failure for local perf work).
+      - run: npm --prefix console run perf:typing:browser --silent
 
   # Needs Rust but NOT playwright: the script bundles with esbuild, runs
   # `node --test`, then `cargo test -p meerkat-meta --test
@@ -425,7 +485,7 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [fmt-lint, test, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, test-typescript, console, console-fixtures, console-acceptance, flow-editor, audit]
+    needs: [fmt-lint, test, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, test-typescript, console, console-browser, console-perf, console-fixtures, console-acceptance, flow-editor, audit]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results
@@ -439,6 +499,8 @@ jobs:
                 "${{ needs.test-python.result }}" != "success" ||
                 "${{ needs.test-typescript.result }}" != "success" ||
                 "${{ needs.console.result }}" != "success" ||
+                "${{ needs.console-browser.result }}" != "success" ||
+                "${{ needs.console-perf.result }}" != "success" ||
                 "${{ needs.console-fixtures.result }}" != "success" ||
                 "${{ needs.console-acceptance.result }}" != "success" ||
                 "${{ needs.flow-editor.result }}" != "success" ||
@@ -453,6 +515,8 @@ jobs:
             echo "  test-python:  ${{ needs.test-python.result }}"
           echo "  test-typescript:    ${{ needs.test-typescript.result }}"
             echo "  console:      ${{ needs.console.result }}"
+            echo "  console-browser: ${{ needs.console-browser.result }}"
+            echo "  console-perf: ${{ needs.console-perf.result }}"
             echo "  console-fixtures:   ${{ needs.console-fixtures.result }}"
             echo "  console-acceptance: ${{ needs.console-acceptance.result }}"
             echo "  flow-editor:  ${{ needs.flow-editor.result }}"

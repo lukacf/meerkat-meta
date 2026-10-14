@@ -65,6 +65,7 @@ class CiWorkflowTests(unittest.TestCase):
             "test-python": "meta-dev-bins",
             "flow-editor": "meta-dev-bins",
             "console": "meta-dev-examples",
+            "console-browser": "meta-dev-examples",
             "console-fixtures": "meta-dev-examples",
             "console-acceptance": "meta-dev-examples",
         }
@@ -231,6 +232,53 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertLess(block.index("Build console acceptance backends"), block.index(command))
         self.assertLess(block.index(command), block.index("node console/api-e2e.cjs"))
 
+    def test_console_browser_and_perf_run_beside_console(self):
+        """The two longest console steps run in their own jobs, each exactly once.
+
+        perf:typing:browser bundles its own host and needs no Rust. The
+        browser scenarios need the acceptance backends and freshly built
+        console bundles, in that order.
+        """
+        source = CI_WORKFLOW.read_text()
+        for command, count in (
+            ("- run: npm --prefix console run perf:typing:browser --silent\n", 1),
+            ("- run: node console/browser-e2e.cjs\n", 1),
+            ("run: npm --prefix console run e2e:mcp-apps --silent\n", 2),
+            ("- run: node console/api-e2e.cjs\n", 1),
+        ):
+            self.assertEqual(source.count(command), count, command)
+
+        perf = job_block("console-perf")
+        self.assertIn("- run: npm --prefix console run perf:typing:browser --silent\n", perf)
+        self.assertIn("playwright install --with-deps chromium", perf)
+        self.assertNotIn("repo-cargo", perf)
+
+        browser = job_block("console-browser")
+        order = [
+            "- run: npm --prefix console run build --silent\n",
+            "- run: npm --prefix console run build:acceptance --silent\n",
+            "playwright install --with-deps chromium",
+            "- name: Build console acceptance backends\n",
+            "- name: Native MCP Apps rendering and reload\n",
+            "- name: Native MCP Apps polling during an active model turn\n",
+            "- run: node console/browser-e2e.cjs\n",
+            "name: console-browser-${{ github.run_id }}\n",
+        ]
+        positions = [browser.index(marker) for marker in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("META_EXAMPLE_BIN_DIR=${target_dir}/debug/examples", browser)
+
+        console = job_block("console")
+        for kept in (
+            "- run: node console/api-e2e.cjs\n",
+            "- run: node console/voice-e2e.cjs\n",
+            "- run: node console/memory-e2e.cjs\n",
+            "- run: node console/workgraph-e2e.cjs\n",
+            "- run: npm --prefix console run embedded:freshness --silent\n",
+            "name: console-${{ github.run_id }}\n",
+        ):
+            self.assertIn(kept, console)
+
     def test_gate_requires_every_job_it_lists(self):
         """A job absent from `gate` can fail without failing the check suite.
 
@@ -259,6 +307,8 @@ class CiWorkflowTests(unittest.TestCase):
             "test-python",
             "test-typescript",
             "console",
+            "console-browser",
+            "console-perf",
             "console-fixtures",
             "console-acceptance",
             "flow-editor",
