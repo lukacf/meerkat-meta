@@ -242,7 +242,7 @@ class CiWorkflowTests(unittest.TestCase):
         source = CI_WORKFLOW.read_text()
         for command, count in (
             ("- run: npm --prefix console run perf:typing:browser --silent\n", 1),
-            ("- run: node console/browser-e2e.cjs\n", 1),
+            ("node console/browser-e2e.cjs", 1),
             ("run: npm --prefix console run e2e:mcp-apps --silent\n", 2),
             ("- run: node console/api-e2e.cjs\n", 1),
         ):
@@ -261,11 +261,16 @@ class CiWorkflowTests(unittest.TestCase):
             "- name: Build console acceptance backends\n",
             "- name: Native MCP Apps rendering and reload\n",
             "- name: Native MCP Apps polling during an active model turn\n",
-            "- run: node console/browser-e2e.cjs\n",
-            "name: console-browser-${{ github.run_id }}\n",
+            "- run: node console/browser-e2e.cjs --shard=${{ matrix.shard }}/2\n",
+            "name: console-browser-${{ github.run_id }}-${{ matrix.shard }}\n",
         ]
         positions = [browser.index(marker) for marker in order]
         self.assertEqual(positions, sorted(positions))
+        # Two legs, each dealt its own scenarios by the registry's --shard=i/2;
+        # the matrix and the shard count must agree. MCP Apps run once.
+        self.assertIn("      matrix:\n        shard: [1, 2]\n", browser)
+        self.assertIn("      fail-fast: false\n", browser)
+        self.assertEqual(browser.count("        if: matrix.shard == 1\n"), 2)
         self.assertIn("META_EXAMPLE_BIN_DIR=${target_dir}/debug/examples", browser)
 
         console = job_block("console")

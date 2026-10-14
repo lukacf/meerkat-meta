@@ -347,11 +347,21 @@ jobs:
   # meta-dev-examples cache serves, and freshly built console bundles: the
   # scenarios read console/dist and the backends embed
   # crates/meerkat-meta/console-dist, both written by `run build`.
+  #
+  # Two shards: browser-e2e's 100 scenarios took 9.5-10.1 minutes in one
+  # leg (runs 38536518805, 38547674877, 38550484431), and the scenario
+  # registry deals each to exactly one --shard=i/n leg
+  # (console/scenario-registry.test.cjs). Each leg builds the backends;
+  # MCP Apps run in leg 1.
   console-browser:
     name: console-browser
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     env:
       # Rust 1.97 incremental compilation can ICE in async identity iteration.
       CARGO_INCREMENTAL: "0"
@@ -377,6 +387,7 @@ jobs:
           target_dir="$(scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')"
           echo "META_EXAMPLE_BIN_DIR=${target_dir}/debug/examples" >> "$GITHUB_ENV"
       - name: Native MCP Apps rendering and reload
+        if: matrix.shard == 1
         timeout-minutes: 5
         run: npm --prefix console run e2e:mcp-apps --silent
         env:
@@ -384,19 +395,22 @@ jobs:
       # The model remains held for more than the native HTTP action timeout.
       # Three mounted Apps must keep polling through the same MCP connection.
       - name: Native MCP Apps polling during an active model turn
+        if: matrix.shard == 1
         timeout-minutes: 5
         run: npm --prefix console run e2e:mcp-apps --silent
         env:
           META_MCP_APPS_LONG_POLL: "1"
           META_BROWSER_EVIDENCE: ${{ github.workspace }}/output/playwright/console-acceptance/mcp-apps
-      - run: node console/browser-e2e.cjs
+      - run: node console/browser-e2e.cjs --shard=${{ matrix.shard }}/2
       - name: Upload console browser evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: console-browser-${{ github.run_id }}
+          name: console-browser-${{ github.run_id }}-${{ matrix.shard }}
           path: output/playwright/console-acceptance/
-          if-no-files-found: error
+          # Leg 1 always writes MCP Apps evidence; leg 2 writes only what
+          # its scenarios capture.
+          if-no-files-found: ${{ matrix.shard == 1 && 'error' || 'warn' }}
 
   # The composer typing check, split from `console`. It bundles its own
   # host with esbuild and needs no Rust.
