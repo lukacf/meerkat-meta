@@ -66,14 +66,17 @@
 //! storage) still spells its creator field `created_by_mobkit`. `<path>` is
 //! one manifest, or a state directory whose top-level manifests are all
 //! inspected. Dry run by default: each manifest is reported `current`,
-//! `predecessor` or `refused` (with the reason). `--apply` renames the field
-//! of each `predecessor` manifest in place (reported `rewritten`), keeping
-//! every other byte, the recorded definition included. Predecessor adoption
-//! (`meta_gateway storage-adopt-predecessor`) does the same as one of its
-//! steps; this mode serves a store adopted before that step existed, and a
-//! manifest outside a state directory. Stop every process using the store
-//! first. It cannot combine with `--db` or the session modes. Exit code 0
-//! when no manifest was refused, 1 otherwise.
+//! `predecessor` or `refused` (with the reason; nothing changed). `--apply`
+//! renames the field of each `predecessor` manifest in place (reported
+//! `rewritten`), keeping every other byte, the recorded definition included;
+//! a manifest whose rename changed something before failing (replaced but
+//! not yet durable, or a stage left behind) is reported `failed`, with the
+//! reason. Predecessor adoption (`meta_gateway storage-adopt-predecessor`)
+//! does the same as one of its steps; this mode serves a store adopted
+//! before that step existed, and a manifest outside a state directory. Stop
+//! every process using the store first. It cannot combine with `--db` or the
+//! session modes. Exit code 0 when no manifest was refused or failed, 1
+//! otherwise.
 
 use std::sync::Arc;
 
@@ -387,7 +390,8 @@ async fn run() -> Result<i32, Box<dyn std::error::Error>> {
 #[derive(Debug, serde::Serialize)]
 struct ManifestReport {
     path: String,
-    /// `current`, `predecessor`, `rewritten` or `refused`.
+    /// `current`, `predecessor`, `rewritten`, `refused` (nothing changed) or
+    /// `failed` (something changed: see the detail).
     outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
@@ -399,6 +403,7 @@ struct ManifestRepairReport {
     applied: bool,
     manifests: Vec<ManifestReport>,
     refused: usize,
+    failed: usize,
 }
 
 /// The `--composition-manifests` mode: inspect, and with `apply` rename, the
@@ -427,6 +432,7 @@ fn repair_composition_manifests(
         meerkat_meta::MigrateMode::DryRun
     };
     let mut refused = 0usize;
+    let mut failed = 0usize;
     let mut reports = Vec::with_capacity(manifests.len());
     for manifest in manifests {
         let path = manifest.display().to_string();
@@ -443,13 +449,25 @@ fn repair_composition_manifests(
                     detail: None,
                 });
             }
-            Err(detail) => {
-                refused += 1;
-                eprintln!("meta-repair: {path} REFUSED: {detail}");
+            Err(error) => {
+                let counter = match error {
+                    meerkat_meta::storage_predecessor::ManifestRepairError::Refused(_) => {
+                        &mut refused
+                    }
+                    meerkat_meta::storage_predecessor::ManifestRepairError::Failed(_) => {
+                        &mut failed
+                    }
+                };
+                *counter += 1;
+                let outcome = error.outcome();
+                eprintln!(
+                    "meta-repair: {path} {}: {error}",
+                    outcome.to_ascii_uppercase()
+                );
                 reports.push(ManifestReport {
                     path,
-                    outcome: "refused".to_string(),
-                    detail: Some(detail),
+                    outcome: outcome.to_string(),
+                    detail: Some(error.detail().to_string()),
                 });
             }
         }
@@ -459,13 +477,14 @@ fn repair_composition_manifests(
         applied: apply,
         manifests: reports,
         refused,
+        failed,
     })?;
     println!("{rendered}");
     if let Some(path) = report_path {
         std::fs::write(path, &rendered)?;
         eprintln!("meta-repair: report written to {path}");
     }
-    Ok(i32::from(refused != 0))
+    Ok(i32::from(refused + failed != 0))
 }
 
 /// Repair one session through the typed rewrite door. Every failure is a

@@ -849,7 +849,8 @@ fn meta_repair_detects_and_repairs_a_predecessor_composition_manifest() {
             "mode": "composition_manifests",
             "applied": false,
             "manifests": [{ "path": manifest, "outcome": "predecessor" }],
-            "refused": 0
+            "refused": 0,
+            "failed": 0
         })
     );
     assert_eq!(
@@ -865,7 +866,8 @@ fn meta_repair_detects_and_repairs_a_predecessor_composition_manifest() {
             "mode": "composition_manifests",
             "applied": true,
             "manifests": [{ "path": manifest, "outcome": "rewritten" }],
-            "refused": 0
+            "refused": 0,
+            "failed": 0
         })
     );
     assert_eq!(manifest_text(&state), adopted_manifest());

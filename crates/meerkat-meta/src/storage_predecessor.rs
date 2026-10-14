@@ -2068,9 +2068,11 @@ fn revalidate_ledger_move(planned: &LedgerFileMove) -> Result<(), String> {
 /// Rename the creator field of every planned composition manifest in place.
 fn apply_composition_manifests(plan: &StatePlan, report: &mut PredecessorAdoptReport) -> bool {
     for planned in &plan.composition_manifests {
+        // Under adoption every error is a failure: the run has already
+        // changed state (its journal), whatever this rename did.
         let outcome = match rename_manifest_creator(planned) {
             Ok(()) => PredecessorOutcome::Applied,
-            Err(error) => PredecessorOutcome::Failed(error),
+            Err(error) => PredecessorOutcome::Failed(error.to_string()),
         };
         let failed = matches!(outcome, PredecessorOutcome::Failed(_));
         record_composition_manifest(planned, outcome, report);
@@ -2081,38 +2083,94 @@ fn apply_composition_manifests(plan: &StatePlan, report: &mut PredecessorAdoptRe
     true
 }
 
+/// Why one composition manifest rename did not finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestRepairError {
+    /// Refused before anything changed: the manifest and its directory are
+    /// as they were.
+    Refused(String),
+    /// Failed after something changed. Either the renamed manifest replaced
+    /// the original but the replacement is not yet durable (a crash before
+    /// the directory is synced may bring the original back), or this rename's
+    /// own stage could not be removed again. Inspect before rerunning.
+    Failed(String),
+}
+
+impl ManifestRepairError {
+    /// How a report names this outcome: `refused` or `failed`.
+    pub const fn outcome(&self) -> &'static str {
+        match self {
+            Self::Refused(_) => "refused",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    /// The reason, for a human.
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Refused(detail) | Self::Failed(detail) => detail,
+        }
+    }
+}
+
+impl std::fmt::Display for ManifestRepairError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.detail())
+    }
+}
+
+impl std::error::Error for ManifestRepairError {}
+
 /// Rename one planned manifest's creator field in place, keeping every other
 /// byte. The bytes must still be the planned ones (a check, not an
 /// exclusion: the stopped installation keeps writers away), and the
-/// replacement is atomic: a stage written beside the manifest, synced,
-/// renamed over it, and the directory synced. A failure leaves the manifest
-/// as it was and removes only this rename's own stage.
-fn rename_manifest_creator(planned: &ManifestRename) -> Result<(), String> {
+/// replacement is atomic: an owner-only stage written beside the manifest,
+/// given the manifest's permissions, synced, renamed over it, and the
+/// directory synced.
+///
+/// A failure before the replacement is [`ManifestRepairError::Refused`]: the
+/// manifest is as it was, and this rename's own stage is removed again. A
+/// failure after it (the directory sync), or a stage that cannot be removed,
+/// is [`ManifestRepairError::Failed`].
+fn rename_manifest_creator(planned: &ManifestRename) -> Result<(), ManifestRepairError> {
+    rename_manifest_creator_with(planned, sync_parent)
+}
+
+/// [`rename_manifest_creator`] with the directory sync supplied, so a test
+/// can fail it after the replacement.
+fn rename_manifest_creator_with(
+    planned: &ManifestRename,
+    sync_directory: impl Fn(&Path) -> Result<(), String>,
+) -> Result<(), ManifestRepairError> {
     use std::io::Write as _;
-    let bytes = regular_file_bytes(&planned.path)?;
+    let bytes = regular_file_bytes(&planned.path).map_err(ManifestRepairError::Refused)?;
     if <[u8; 32]>::from(Sha256::digest(&bytes)) != planned.digest {
-        return Err(format!(
+        return Err(ManifestRepairError::Refused(format!(
             "{} changed since planning; another process is writing it",
             planned.path.display()
-        ));
+        )));
     }
-    let ManifestCreator::Predecessor(key) = manifest_creator(&bytes)? else {
-        return Err(format!(
+    let ManifestCreator::Predecessor(key) =
+        manifest_creator(&bytes).map_err(ManifestRepairError::Refused)?
+    else {
+        return Err(ManifestRepairError::Refused(format!(
             "{} no longer carries the predecessor creator field",
             planned.path.display()
-        ));
+        )));
     };
-    let renamed = renamed_manifest(&bytes, key)?;
+    let renamed = renamed_manifest(&bytes, key).map_err(ManifestRepairError::Refused)?;
     let permissions = std::fs::metadata(&planned.path)
-        .map_err(|error| format!("inspect {}: {error}", planned.path.display()))?
+        .map_err(|error| {
+            ManifestRepairError::Refused(format!("inspect {}: {error}", planned.path.display()))
+        })?
         .permissions();
     let stage = staged_manifest_path(&planned.path);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&stage)
-        .map_err(|error| format!("create {}: {error}", stage.display()))?;
-    // From here the stage is ours: a failure removes it, and only it.
+    let mut file = create_manifest_stage(&stage).map_err(|error| {
+        ManifestRepairError::Refused(format!("create {}: {error}", stage.display()))
+    })?;
+    // From here the stage is ours: a failure removes it, and only it. Its
+    // owner-only mode covers the bytes until the manifest's own permissions
+    // replace it.
     let written = file
         .write_all(&renamed)
         .and_then(|()| file.set_permissions(permissions))
@@ -2131,16 +2189,39 @@ fn rename_manifest_creator(planned: &ManifestRename) -> Result<(), String> {
         });
     if let Err(error) = replaced {
         return Err(match std::fs::remove_file(&stage) {
-            Ok(()) => error,
-            Err(remove) if remove.kind() == std::io::ErrorKind::NotFound => error,
-            Err(remove) => format!(
+            Ok(()) => ManifestRepairError::Refused(error),
+            Err(remove) if remove.kind() == std::io::ErrorKind::NotFound => {
+                ManifestRepairError::Refused(error)
+            }
+            Err(remove) => ManifestRepairError::Failed(format!(
                 "{error}; the stage {} could not be removed ({remove}) and is left behind",
                 stage.display()
-            ),
+            )),
         });
     }
-    // The manifest is replaced; only the rename's durability is left.
-    sync_parent(&planned.path)
+    // The manifest is replaced; only the replacement's durability is left.
+    sync_directory(&planned.path).map_err(|error| {
+        ManifestRepairError::Failed(format!(
+            "{} now holds the renamed manifest, but the replacement is not yet durable: \
+             {error} (a crash before its directory is synced may bring back the original; \
+             a rerun reports which one is in place)",
+            planned.path.display()
+        ))
+    })
+}
+
+/// Create a manifest rename's stage exclusively and, on Unix, owner-only, so
+/// the manifest's bytes are never readable to others before its own
+/// permissions are applied. Elsewhere the platform's default applies.
+fn create_manifest_stage(stage: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(stage)
 }
 
 /// What [`repair_composition_manifest`] found, or did.
@@ -2160,19 +2241,30 @@ pub enum ManifestRepair {
 /// for one file, behind `meta_repair --composition-manifests`. Every other
 /// byte is kept, and a manifest this cannot judge (not a regular file, not a
 /// JSON object, no creator field or more than one, an interrupted rename's
-/// stage beside it) is refused unchanged. Like adoption, it relies on every
-/// process using the store being stopped.
+/// stage beside it) is refused unchanged. A failure after the replacement is
+/// [`ManifestRepairError::Failed`], never a refusal. Like adoption, it relies
+/// on every process using the store being stopped.
 pub fn repair_composition_manifest(
     path: &Path,
     mode: MigrateMode,
-) -> Result<ManifestRepair, String> {
-    let Some(planned) = plan_composition_manifest(path)? else {
+) -> Result<ManifestRepair, ManifestRepairError> {
+    repair_composition_manifest_with(path, mode, sync_parent)
+}
+
+/// [`repair_composition_manifest`] with the directory sync supplied.
+fn repair_composition_manifest_with(
+    path: &Path,
+    mode: MigrateMode,
+    sync_directory: impl Fn(&Path) -> Result<(), String>,
+) -> Result<ManifestRepair, ManifestRepairError> {
+    let Some(planned) = plan_composition_manifest(path).map_err(ManifestRepairError::Refused)?
+    else {
         return Ok(ManifestRepair::Current);
     };
     if mode != MigrateMode::Apply {
         return Ok(ManifestRepair::Predecessor);
     }
-    rename_manifest_creator(&planned).map(|()| ManifestRepair::Rewritten)
+    rename_manifest_creator_with(&planned, sync_directory).map(|()| ManifestRepair::Rewritten)
 }
 
 fn apply_ledgers(plan: &StatePlan, report: &mut PredecessorAdoptReport) -> bool {
@@ -4400,5 +4492,84 @@ mod tests {
             repair_composition_manifest(&manifest, MigrateMode::Apply),
             Ok(ManifestRepair::Current)
         );
+    }
+
+    /// The stage that receives the renamed manifest is owner-only from its
+    /// creation, before any byte is written, so the manifest's contents are
+    /// never readable to others before its own permissions apply; the
+    /// replaced manifest keeps its original mode.
+    #[cfg(unix)]
+    #[test]
+    fn the_rename_stage_is_owner_only_and_the_manifest_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp.path().join("probe.composition.json.next");
+        let stage = create_manifest_stage(&probe).unwrap();
+        assert_eq!(
+            stage.metadata().unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the stage is created owner-only"
+        );
+        drop(stage);
+        for mode in [0o600_u32, 0o640, 0o644] {
+            let manifest = temp
+                .path()
+                .join(format!("mob-{mode:o}.sqlite3.composition.json"));
+            std::fs::write(&manifest, PREDECESSOR_MANIFEST).unwrap();
+            std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                repair_composition_manifest(&manifest, MigrateMode::Apply),
+                Ok(ManifestRepair::Rewritten)
+            );
+            assert_eq!(
+                std::fs::metadata(&manifest).unwrap().permissions().mode() & 0o777,
+                mode,
+                "the manifest keeps mode {mode:o}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&manifest).unwrap(),
+                adopted_manifest_text()
+            );
+        }
+    }
+
+    /// A failure after the renamed manifest replaced the original (here the
+    /// directory sync) is reported failed, never refused: the replacement
+    /// happened and its durability is uncertain. A refusal still changes
+    /// nothing.
+    #[test]
+    fn a_failure_after_the_replacement_is_failed_not_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("mob.sqlite3.composition.json");
+        std::fs::write(&manifest, PREDECESSOR_MANIFEST).unwrap();
+        let error = repair_composition_manifest_with(&manifest, MigrateMode::Apply, |_: &Path| {
+            Err("injected directory sync failure".to_string())
+        })
+        .expect_err("the directory sync failure surfaces");
+        assert_eq!(error.outcome(), "failed", "{error:?}");
+        assert!(
+            matches!(
+                &error,
+                ManifestRepairError::Failed(detail)
+                    if detail.contains("injected directory sync failure")
+                        && detail.contains("not yet durable")
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            adopted_manifest_text(),
+            "the replacement happened"
+        );
+        assert!(!staged_manifest_path(&manifest).exists());
+
+        let ambiguous = temp.path().join("other.sqlite3.composition.json");
+        let both = "{\"created_by_mobkit\": \"0.8.26\", \"created_by_meta\": \"0.9.1\"}";
+        std::fs::write(&ambiguous, both).unwrap();
+        let refusal =
+            repair_composition_manifest_with(&ambiguous, MigrateMode::Apply, |_: &Path| Ok(()))
+                .expect_err("an ambiguous manifest refuses");
+        assert_eq!(refusal.outcome(), "refused", "{refusal:?}");
+        assert_eq!(std::fs::read_to_string(&ambiguous).unwrap(), both);
     }
 }
