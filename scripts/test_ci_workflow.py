@@ -59,6 +59,7 @@ class CiWorkflowTests(unittest.TestCase):
             "fmt-lint": None,
             "test": None,
             "test-extension-state": None,
+            "extension-state-lint": None,
             "test-voice": None,
             "voice-clippy": None,
             "test-python": "meta-dev-bins",
@@ -123,6 +124,41 @@ class CiWorkflowTests(unittest.TestCase):
             "- run: npm --prefix sdk/typescript run validate --silent",
             block,
         )
+
+    def test_extension_state_lint_and_tests_run_as_parallel_jobs(self):
+        """check and clippy only emit metadata; the tests need full builds.
+
+        Every command of the former serial job still runs exactly once,
+        split between the two jobs.
+        """
+        def runs(name):
+            return [
+                line.strip()[len("- run: "):]
+                for line in job_block(name).splitlines()
+                if line.strip().startswith("- run: ")
+            ]
+
+        self.assertEqual(
+            runs("extension-state-lint"),
+            [
+                "scripts/repo-cargo check -p meerkat-meta --locked --no-default-features",
+                "scripts/repo-cargo clippy -p meerkat-meta --locked --features extension-state "
+                "--lib --test extension_state -- -D warnings",
+            ],
+        )
+        self.assertEqual(
+            runs("test-extension-state"),
+            [
+                "scripts/repo-cargo test -p meta-extension-state --locked",
+                "scripts/repo-cargo test -p meerkat-meta --locked --features extension-state "
+                "--test extension_state",
+                "scripts/repo-cargo test -p meerkat-meta --locked --features extension-state "
+                "--lib extension_",
+            ],
+        )
+        for name in ("extension-state-lint", "test-extension-state"):
+            self.assertIn('CARGO_INCREMENTAL: "0"', job_block(name))
+            self.assertIn("CARGO_PROFILE_DEV_DEBUG: line-tables-only", job_block(name))
 
     def test_voice_feature_runs_real_host_tests_and_strict_lint(self):
         block = job_block("test-voice")
@@ -216,6 +252,8 @@ class CiWorkflowTests(unittest.TestCase):
         must_gate = {
             "fmt-lint",
             "test",
+            "test-extension-state",
+            "extension-state-lint",
             "test-voice",
             "voice-clippy",
             "test-python",

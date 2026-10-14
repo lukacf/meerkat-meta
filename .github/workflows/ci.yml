@@ -127,16 +127,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: scripts/repo-cargo test -p meta-extension-state --locked
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --test extension_state
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --lib extension_
+
+  # test-extension-state's check and clippy, split out: both only emit
+  # metadata, so they share little with the two full test builds, which
+  # ran after them in one job (run 38506503806: check 12m22 and clippy
+  # 14m10, then the tests 21m52 and 8m24).
+  extension-state-lint:
+    name: extension-state-lint
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: scripts/repo-cargo test -p meta-extension-state --locked
       - run: scripts/repo-cargo check -p meerkat-meta --locked --no-default-features
       - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features extension-state --lib --test extension_state -- -D warnings
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --test extension_state
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --lib extension_
 
   test-voice:
     name: test-voice
@@ -407,7 +425,7 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [fmt-lint, test, test-extension-state, test-voice, voice-clippy, test-python, test-typescript, console, console-fixtures, console-acceptance, flow-editor, audit]
+    needs: [fmt-lint, test, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, test-typescript, console, console-fixtures, console-acceptance, flow-editor, audit]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results
@@ -415,6 +433,7 @@ jobs:
           if [[ "${{ needs.fmt-lint.result }}" != "success" ||
                 "${{ needs.test.result }}" != "success" ||
                 "${{ needs.test-extension-state.result }}" != "success" ||
+                "${{ needs.extension-state-lint.result }}" != "success" ||
                 "${{ needs.test-voice.result }}" != "success" ||
                 "${{ needs.voice-clippy.result }}" != "success" ||
                 "${{ needs.test-python.result }}" != "success" ||
@@ -428,6 +447,7 @@ jobs:
             echo "  fmt-lint:     ${{ needs.fmt-lint.result }}"
             echo "  test:         ${{ needs.test.result }}"
             echo "  test-extension-state: ${{ needs.test-extension-state.result }}"
+            echo "  extension-state-lint: ${{ needs.extension-state-lint.result }}"
             echo "  test-voice:   ${{ needs.test-voice.result }}"
             echo "  voice-clippy: ${{ needs.voice-clippy.result }}"
             echo "  test-python:  ${{ needs.test-python.result }}"
