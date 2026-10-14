@@ -778,7 +778,8 @@ pub fn default_gateway_home() -> Result<PathBuf, StorageLayoutError> {
 }
 
 /// The ambient gateway home derivation without the predecessor refusal:
-/// the target the predecessor adoption verb moves a predecessor home to.
+/// the target the predecessor adoption verb moves the invoking user's own
+/// predecessor home to, when asked (`--user-gateway-home`).
 pub fn derived_gateway_home() -> Result<PathBuf, StorageLayoutError> {
     gateway_home_from(
         std::env::var("XDG_STATE_HOME").ok().as_deref(),

@@ -1,7 +1,8 @@
 //! Gateway maintenance subcommand contract (storage-unification M6):
 //! `meta_gateway storage-migrate --state-dir <dir> [--apply] [--adopt
 //! <path>] [--json]` and `meta_gateway storage-prune --state-dir <dir>
-//! [--apply] [--older-than-days N] [--json]`.
+//! [--apply] [--older-than-days N] [--json]`, plus the scope of
+//! `meta_gateway storage-adopt-predecessor`.
 //!
 //! Both verbs bypass the stdin init handshake entirely and are dry-run by
 //! default; the state directory is mutated only with `--apply`. Exit codes:
@@ -94,6 +95,132 @@ fn report_json(stdout: &str) -> serde_json::Value {
     serde_json::from_str(stdout).unwrap_or_else(|error| {
         panic!("stdout is not a JSON report ({error}): {stdout}");
     })
+}
+
+/// `run_verb` with the invoking user's ambient roots (`HOME`,
+/// `XDG_STATE_HOME`) pointed under `home`.
+fn run_verb_with_home(verb: &str, args: &[&str], home: &Path) -> VerbOutput {
+    let output = Command::new(env!("CARGO_BIN_EXE_meta_gateway"))
+        .arg(verb)
+        .args(args)
+        .env("HOME", home)
+        .env("XDG_STATE_HOME", home.join(".local").join("state"))
+        .output()
+        .expect("spawn meta_gateway");
+    VerbOutput {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// A predecessor (pre-0.9) metadata database: its ledger row and its table.
+fn write_predecessor_metadata_db(path: &Path) {
+    let conn = rusqlite::Connection::open(path).expect("create predecessor db");
+    conn.execute_batch(
+        "CREATE TABLE meerkat_schema (domain TEXT PRIMARY KEY, version INTEGER NOT NULL);
+         INSERT INTO meerkat_schema (domain, version) VALUES ('mobkit-metadata', 1);
+         CREATE TABLE mobkit_metadata (
+             mob_id TEXT NOT NULL,
+             key    TEXT NOT NULL,
+             value  TEXT NOT NULL,
+             PRIMARY KEY (mob_id, key)
+         );",
+    )
+    .expect("write predecessor db");
+}
+
+fn action_items(report: &serde_json::Value) -> Vec<String> {
+    report["actions"]
+        .as_array()
+        .expect("report actions")
+        .iter()
+        .map(|action| action["item"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// `--state-dir` alone adopts that installation and nothing else: the
+/// invoking user's own predecessor gateway home is left out of the plan.
+/// `--user-gateway-home` widens the scope to it (the derived XDG home and
+/// its predecessor sibling).
+#[test]
+fn adopt_predecessor_stays_in_the_state_dir_unless_the_user_home_is_asked_for() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    write_predecessor_metadata_db(&state.join("mobkit_metadata.sqlite3"));
+    let home = dir.path().join("home");
+    let xdg_state = home.join(".local").join("state");
+    let user_predecessor_home = xdg_state.join("meerkat-mobkit");
+    std::fs::create_dir_all(&user_predecessor_home).expect("user predecessor home");
+    std::fs::write(
+        user_predecessor_home.join("meerkat-mobkit-flow-editor-drafts.json"),
+        b"{}",
+    )
+    .expect("user drafts");
+    let state_arg = state.to_str().unwrap();
+
+    let scoped = run_verb_with_home(
+        "storage-adopt-predecessor",
+        &["--state-dir", state_arg, "--json"],
+        &home,
+    );
+    assert_eq!(scoped.code, 0, "stderr: {}", scoped.stderr);
+    let report = report_json(&scoped.stdout);
+    let items = action_items(&report);
+    assert!(
+        items.iter().any(|item| item == "database_file"),
+        "{report:#}"
+    );
+    for item in ["gateway_home", "peer_identity", "draft_store"] {
+        assert!(
+            !items.iter().any(|planned| planned == item),
+            "a state-directory adoption must not plan the user's {item}: {report:#}"
+        );
+    }
+    assert!(
+        !scoped
+            .stdout
+            .contains(user_predecessor_home.to_str().unwrap()),
+        "the user's predecessor home is out of scope: {}",
+        scoped.stdout
+    );
+
+    let widened = run_verb_with_home(
+        "storage-adopt-predecessor",
+        &["--state-dir", state_arg, "--user-gateway-home", "--json"],
+        &home,
+    );
+    assert_eq!(widened.code, 0, "stderr: {}", widened.stderr);
+    let report = report_json(&widened.stdout);
+    let home_moves: Vec<&serde_json::Value> = report["actions"]
+        .as_array()
+        .expect("report actions")
+        .iter()
+        .filter(|action| action["item"] == "gateway_home")
+        .collect();
+    assert_eq!(home_moves.len(), 1, "{report:#}");
+    assert_eq!(home_moves[0]["outcome"], "planned", "{report:#}");
+    assert_eq!(
+        home_moves[0]["from"],
+        user_predecessor_home.display().to_string(),
+        "{report:#}"
+    );
+    assert_eq!(
+        home_moves[0]["to"],
+        xdg_state.join("meerkat-meta").display().to_string(),
+        "{report:#}"
+    );
+    assert!(
+        action_items(&report)
+            .iter()
+            .any(|item| item == "draft_store"),
+        "{report:#}"
+    );
+    assert!(
+        user_predecessor_home.is_dir() && !xdg_state.join("meerkat-meta").exists(),
+        "a dry run moves nothing"
+    );
 }
 
 #[test]
