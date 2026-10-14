@@ -26563,9 +26563,14 @@ function cancelReveal(session) {
   }
   session.awaitingAnchor = false;
 }
+function rowRenders(row, viewport) {
+  if (row.closest("details:not([open])")) return false;
+  const hidden = row.closest("[hidden]");
+  return hidden === null || !viewport.contains(hidden);
+}
 function rowGeometry(viewport) {
   const top = viewport.getBoundingClientRect().top + viewport.clientTop;
-  return Array.from(viewport.querySelectorAll(ROW_SELECTOR)).filter((row) => !row.closest("details:not([open])")).map((row) => {
+  return Array.from(viewport.querySelectorAll(ROW_SELECTOR)).filter((row) => rowRenders(row, viewport)).map((row) => {
     const rect = row.getBoundingClientRect();
     return { id: row.dataset.conversationRowId, top: rect.top - top, bottom: rect.bottom - top };
   });
@@ -26746,7 +26751,7 @@ function useConversationScrollController(options) {
     session.missingAnchor = false;
     session.anchor = { rowId, offset: CONVERSATION_ANCHOR_OFFSET_PX, neighbors: [] };
     applyLayout();
-    return rowGeometry(viewport).some((row) => row.id === rowId);
+    return rowGeometryOf(viewport, [rowId]).length > 0;
   }, [applyLayout]);
   (0, import_react6.useLayoutEffect)(() => {
     const previous3 = sessionRef.current;

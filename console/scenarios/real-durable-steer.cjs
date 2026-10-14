@@ -246,16 +246,18 @@ async function durableSteer(host, persistedBackgroundJob = false) {
     return rendered;
   }
   // The reading anchor's position once it has come to rest. Layout passes
-  // after a programmatic scroll (the transcript window, the scroll
-  // controller's anchor restore) can move the view again in the frames after
-  // it lands: main CI run 38511905113 read its baseline about 98 px from
-  // where the view came to rest, before any delivery. Both readings are taken
-  // only once the heading has held its exact offset for `stableMs` of frames.
-  // An anchor that keeps moving fails here; one that comes to rest elsewhere
-  // fails the comparison. The evidence JSON keeps, for every reading, the box
-  // read at once (what a single read would have compared), each offset change
-  // while it settled and the resting box, so a failure can be classified from
-  // the artifact alone.
+  // after a programmatic scroll (the transcript window mounting the turns
+  // around it, the scroll controller's anchor restore) run in the frames
+  // after it lands, so a reading is taken only once the heading has held its
+  // exact offset for `stableMs` of frames. Main CI run 38511905113 read its
+  // baseline 98 px from where the view came to rest, before any delivery: the
+  // controller had anchored on a row of the parked turn above, which had
+  // outgrown its placeholder, and unparking moved the heading instead (fixed
+  // in the scroll controller). An anchor that keeps moving fails here; one
+  // that comes to rest elsewhere fails the comparison. The evidence JSON
+  // keeps, for every reading, the box read at once (what a single read would
+  // have compared), each offset change while it settled and the resting box,
+  // so a failure can be classified from the artifact alone.
   async function restingReading(label, { stableMs = 500, timeoutMs = 5_000 } = {}) {
     const immediate = await viewport().getByRole("heading", { name: "Evidence 3", exact: true })
       .boundingBox({ timeout: 1_000 }).catch(error => ({ error: String(error?.message || error) }));

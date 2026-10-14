@@ -88,18 +88,35 @@ function cancelReveal(session: Session): void {
   session.awaitingAnchor = false;
 }
 
+/** A row the reader can see: outside a collapsed disclosure and outside an
+ * element the transcript hides, such as a parked turn of a windowed
+ * transcript. A parked turn keeps its rows in the DOM (for find-in-page) in
+ * a placeholder of its last measured size, and they lay out as if it were
+ * unparked: once the turn has outgrown that measurement, its last rows
+ * overlap the rows rendered below it. Such a row cannot hold the reading
+ * position, because unparking moves everything below it while it stays. */
+function rowRenders(row: HTMLElement, viewport: HTMLElement): boolean {
+  if (row.closest("details:not([open])")) return false;
+  const hidden = row.closest("[hidden]");
+  return hidden === null || !viewport.contains(hidden);
+}
+
+/** Geometry of every row the reader can see, the candidates for a captured
+ * reading anchor and its neighbors. */
 function rowGeometry(viewport: HTMLElement): ConversationRowGeometry[] {
   const top = viewport.getBoundingClientRect().top + viewport.clientTop;
-  return Array.from(viewport.querySelectorAll<HTMLElement>(ROW_SELECTOR)).filter((row) => !row.closest("details:not([open])")).map((row) => {
+  return Array.from(viewport.querySelectorAll<HTMLElement>(ROW_SELECTOR)).filter((row) => rowRenders(row, viewport)).map((row) => {
     const rect = row.getBoundingClientRect();
     return { id: row.dataset.conversationRowId!, top: rect.top - top, bottom: rect.bottom - top };
   });
 }
 
 /** Geometry of just these rows (absent or collapsed rows are omitted), with
- * the same coordinates and filtering as `rowGeometry`. Holding an anchor
- * steady needs only the anchor row; reading every mounted row on each
- * streamed commit made every token pay for the whole transcript's rects. */
+ * the same coordinates as `rowGeometry`. A row in a parked turn is found:
+ * its own box lies where it will be once unparked, so an anchor or jump
+ * that names it lands right. Holding an anchor steady needs only the anchor
+ * row; reading every mounted row on each streamed commit made every token
+ * pay for the whole transcript's rects. */
 function rowGeometryOf(viewport: HTMLElement, ids: readonly string[]): ConversationRowGeometry[] {
   const top = viewport.getBoundingClientRect().top + viewport.clientTop;
   const rows: ConversationRowGeometry[] = [];
@@ -319,7 +336,7 @@ export function useConversationScrollController(options: ConversationScrollContr
     session.anchor = { rowId, offset: CONVERSATION_ANCHOR_OFFSET_PX, neighbors: [] };
     applyLayout();
     // No smooth scrolling: a rail jump is exact, including under reduced motion.
-    return rowGeometry(viewport).some((row) => row.id === rowId);
+    return rowGeometryOf(viewport, [rowId]).length > 0;
   }, [applyLayout]);
 
   useLayoutEffect(() => {
