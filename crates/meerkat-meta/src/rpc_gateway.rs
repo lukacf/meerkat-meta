@@ -485,6 +485,18 @@ fn gateway_agent_config(options: &GatewayRuntimeOptions) -> Config {
     config
 }
 
+/// Parse the init `mob_config` TOML. A refusal keeps meerkat's message and
+/// adds what an operator upgrading from MobKit needs to know
+/// (`gateway_composition::describe_mob_definition_error`).
+fn parse_mob_config(mob_config_toml: &str) -> Result<MobDefinition, String> {
+    MobDefinition::from_toml(mob_config_toml).map_err(|error| {
+        format!(
+            "Invalid mob_config TOML: {}",
+            crate::gateway_composition::describe_mob_definition_error(&error)
+        )
+    })
+}
+
 /// The init-time model check, delegated to meerkat-mob's `validate_definition`
 /// and narrowed to `DiagnosticCode::UnknownModel`.
 ///
@@ -3851,6 +3863,35 @@ group_by = ["labels.console_group", "group"]
                 assert!(
                     err.contains(&expected),
                     "the {option} refusal must say {expected:?}: {err}"
+                );
+            }
+        }
+    }
+
+    /// meerkat refuses a profile prompt key that MobKit 0.8.31 and earlier
+    /// dropped without a warning, so an upgraded `mob_config` that kept one
+    /// stops at init. The refusal keeps meerkat's remedy and adds the upgrade
+    /// fact: removing the key keeps the behaviour the deployment had.
+    #[test]
+    fn a_refused_profile_prompt_key_names_the_upgrade_remedy() {
+        for key in ["system_prompt", "prompt", "instructions"] {
+            let mob_config = format!(
+                "[mob]\nid = \"m\"\n\n[profiles.planner]\nmodel = \"gpt-5.5\"\n{key} = \"Plan.\"\n"
+            );
+            let err = match parse_mob_config(&mob_config) {
+                Ok(_) => panic!("a profile {key} must refuse initialization"),
+                Err(err) => err,
+            };
+            for expected in [
+                "Invalid mob_config TOML: ".to_string(),
+                format!("profile 'planner' declares '{key}', which a mob profile cannot honour"),
+                format!("MobKit 0.8.31 and earlier dropped '{key}' without a warning"),
+                "removing the key keeps that behaviour".to_string(),
+                "[skills.<id>]".to_string(),
+            ] {
+                assert!(
+                    err.contains(&expected),
+                    "the {key} refusal must say {expected:?}: {err}"
                 );
             }
         }
@@ -15312,13 +15353,8 @@ external_addressable = true
 
     let definition = match &prepared {
         Some(prepared) => prepared.definition.clone(),
-        None => MobDefinition::from_toml(mob_config_toml).map_err(|error| {
-            fail_init(
-                &request_id,
-                -32602,
-                format!("Invalid mob_config TOML: {error}"),
-            )
-        })?,
+        None => parse_mob_config(mob_config_toml)
+            .map_err(|message| fail_init(&request_id, -32602, message))?,
     };
     let image_generation = mob_definition_may_use_image_generation(&definition);
     let shell = mob_definition_may_use_shell(&definition);

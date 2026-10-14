@@ -1237,6 +1237,30 @@ pub fn refuse_host_config_tables_in_mob_toml(
     }
 }
 
+/// Describe a `MobDefinition::from_toml` failure for the operator who wrote
+/// the `mob.toml`, adding what Meerkat's own message cannot know about an
+/// upgrade from MobKit.
+///
+/// Meerkat refuses a profile prompt key (`system_prompt`, `prompt`,
+/// `instructions`) because no profile field carries it, and its message names
+/// where the member prompt lives. MobKit 0.8.31 and earlier dropped such a key
+/// without a warning, so an upgraded config that kept it now stops at init
+/// although the key never did anything. The description says so: removing
+/// the key keeps the behaviour the deployment had. Every other failure keeps
+/// Meerkat's message unchanged.
+pub fn describe_mob_definition_error(error: &meerkat_mob::MobError) -> String {
+    match error {
+        meerkat_mob::MobError::UnsupportedProfileKey { profile, key } => format!(
+            "{error}. MobKit 0.8.31 and earlier dropped '{key}' without a warning, so the \
+             members of profile '{profile}' ran on the default prompt, and removing the key \
+             keeps that behaviour. To give them a prompt, list a skill in the profile \
+             (skills = [\"<id>\"] under [profiles.{profile}]) and define it as a [skills.<id>] \
+             table with source = \"inline\" and content = \"...\""
+        ),
+        other => other.to_string(),
+    }
+}
+
 /// Why a meerkat host `config.toml` could not become a gateway's agent
 /// config. Both binaries refuse init on it: an operator who pointed the
 /// gateway at a file expects that file in force, and booting from
