@@ -34,6 +34,16 @@ serve credentials, sensitive files, or application APIs on the sandbox origin.
 The proxy needs Node's standard library and `src/mcp-apps/sandbox.js`, with no
 npm dependencies.
 
+Released gateway binaries, the Python package and the npm package do not
+include the proxy. Outside a source checkout, copy `console/mcp-apps-sandbox.cjs`
+and `console/src/mcp-apps/sandbox.js` from the release tag that matches the
+gateway. Keep the second file at `src/mcp-apps/sandbox.js` relative to the
+first, and start the proxy with `node mcp-apps-sandbox.cjs` and the same
+environment variables. The proxy and the Console embedded in the gateway
+share an internal sandbox protocol, so upgrade them together. Check the copies
+against the SHA-256 digests in the release notes; `docs/guides/console.mdx`
+lists the 0.9.0 values.
+
 Omitting the URL or setting a realm override to an empty string retains text
 tool results and disables the corresponding HTTP app operations. Native live
 operations also require an MCP connection that negotiated MCP Apps. Gateways
