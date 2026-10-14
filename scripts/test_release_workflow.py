@@ -596,7 +596,19 @@ class RegistryReadbackWorkflowTests(unittest.TestCase):
                     dry == "false",
                 )
         self.assertIn("publish_sdk_packages", job_needs("publish_registries"))
-        self.assertIn("needs.publish_sdk_packages.result == 'success'", job_condition("publish_registries"))
+        self.assertIn(
+            "(needs.publish_sdk_packages.result == 'success' || "
+            "needs.publish_sdk_packages.result == 'failure')",
+            job_condition("publish_registries"),
+        )
+        # The crates no longer wait for SDK success, so this readback is what
+        # keeps a missing registry failing the run: it stays in the crate job,
+        # gated only on a real publication, and runs the all-registry verifier.
+        self.assertEqual(condition, "needs.resolve_release.outputs.dry_run == 'false'")
+        self.assertIn('python scripts/verify-published-registries.py --version "$VERSION"',
+                      step_script("Verify exact packages are public on every registry",
+                                  "publish_registries"))
+        self.assertNotIn("continue-on-error:", job_block("publish_registries"))
 
 
 class RegistryPublicationShellTests(unittest.TestCase):
@@ -800,8 +812,11 @@ class ReleaseProtocolConditionsTests(unittest.TestCase):
             for status in ("failure", "skipped", "cancelled"):
                 with self.subTest(upstream=upstream, status=status):
                     results = release_results(protocol_context(), {upstream: status})
+                    # A failed SDK registry no longer stops the crates; a
+                    # skipped or cancelled SDK job still does.
+                    ran = (upstream, status) == ("publish_sdk_packages", "failure")
                     for job in downstream:
-                        self.assertEqual(results[job], "skipped", job)
+                        self.assertEqual(results[job], "success" if ran else "skipped", job)
                     self.assertEqual(results["build_binaries"], "skipped")
 
     def test_actual_condition_success_guards_across_all_dependency_results(self):
@@ -825,6 +840,9 @@ class ReleaseProtocolConditionsTests(unittest.TestCase):
             ("publish_registries", "existing", True, True,
              {"release_validate", "publish_sdk_packages"}),
         )
+        # publish_registries follows an SDK job that ran, whether it succeeded
+        # or failed; a skipped or cancelled SDK job still stops it.
+        accepted = {("publish_registries", "publish_sdk_packages"): ("success", "failure")}
         for job, mode, publish, dry, required in scenarios:
             self.assertIn("always()", job_condition(job))
             # resolve_release is already required by validation (and by the
@@ -837,7 +855,9 @@ class ReleaseProtocolConditionsTests(unittest.TestCase):
                 context.update({f"needs_{need}_result": value for need, value in results.items()})
                 with self.subTest(job=job, mode=mode, dry=dry, results=results):
                     self.assertEqual(
-                        job_runs(job, **context), all(results[need] == "success" for need in required)
+                        job_runs(job, **context),
+                        all(results[need] in accepted.get((job, need), ("success",))
+                            for need in required),
                     )
 
     def test_ordinary_jobs_require_implicit_success_of_every_declared_need(self):

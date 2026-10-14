@@ -724,6 +724,10 @@ jobs:
 
   publish_registries:
     name: Publish crate + SDK packages
+    # The crates publish after the SDK job whether it succeeded or failed, so
+    # one refused SDK registry cannot strand them. A skipped or cancelled SDK
+    # job still stops them, and the final all-registry readback still fails
+    # the run while any registry lacks the exact version.
     if: >-
       always() &&
       github.event_name == 'workflow_dispatch' &&
@@ -736,7 +740,8 @@ jobs:
         needs.verify_release_assets.result == 'success' &&
         (needs.resolve_release.outputs.dry_run == 'true' ||
          needs.publish_github_release.result == 'success'))) &&
-      needs.publish_sdk_packages.result == 'success'
+      (needs.publish_sdk_packages.result == 'success' ||
+       needs.publish_sdk_packages.result == 'failure')
     needs: [resolve_release, release_validate, verify_release_assets, publish_github_release, publish_sdk_packages]
     runs-on: ubuntu-24.04
     steps:
