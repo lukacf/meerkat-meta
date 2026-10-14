@@ -265,7 +265,11 @@ jobs:
           - runs-on: macos-15
             target: aarch64-apple-darwin
             archive_ext: tar.gz
-          - runs-on: macos-15-large
+          # x86_64 macOS builds natively on the free standard Intel label, as
+          # Meerkat's release workflow does. The billed macos-15-large label
+          # refuses to start when the account's Actions spending limit is
+          # reached, which failed candidate run 38521788616.
+          - runs-on: macos-15-intel
             target: x86_64-apple-darwin
             archive_ext: tar.gz
           - runs-on: windows-latest
