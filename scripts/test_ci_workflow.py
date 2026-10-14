@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Focused contracts for the pull-request CI workflow."""
 
+import fnmatch
 import unittest
 import re
 import tomllib
@@ -121,22 +122,38 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertIn("- run: python3 scripts/test_ci_drop_caches.py\n", job_block("fmt-lint"))
 
     def test_workspace_nextest_preserves_all_failure_evidence(self):
-        """The workspace tests run as two jobs that together cover cargo's
-        default test selection: lib and bin unit tests plus the examples
-        build in `test`, integration tests in `test-integration`, with the
-        same filter and --no-fail-fast in both. That union is the default
-        selection only while every target keeps its default test flag."""
+        """The workspace tests run as three jobs that together cover cargo's
+        default test selection: lib and bin unit tests in `test`, and the
+        integration tests in two `test-integration` halves split by target
+        name, one of which also builds the examples. All use the same filter
+        and --no-fail-fast. That union is the default selection only while
+        every target keeps its default test flag, and the halves cover every
+        integration test only while cargo finds them all under tests/."""
         workspace = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]
+        integration_tests = []
         for member in workspace["members"]:
             manifest = (ROOT / member / "Cargo.toml").read_text()
-            self.assertIsNone(re.search(r"(?m)^\s*test\s*=", manifest), member)
+            self.assertIsNone(re.search(r"(?m)^\s*(test|autotests)\s*=|^\[\[test\]\]", manifest), member)
+            tests = ROOT / member / "tests"
+            integration_tests += [path.stem for path in tests.glob("*.rs")]
+            integration_tests += [path.parent.name for path in tests.glob("*/main.rs")]
+        self.assertGreater(len(integration_tests), 100)
+        block = job_block("test-integration")
+        patterns = re.findall(r'(?m)^          - tests: "([^"]+)"$', block)
+        self.assertEqual(len(patterns), 2, patterns)
+        for name in integration_tests:
+            matched = [pattern for pattern in patterns if fnmatch.fnmatchcase(name, pattern)]
+            self.assertEqual(len(matched), 1, f"integration test {name} matches {matched}")
+        self.assertIn("    strategy:\n      fail-fast: false\n", block)
         filter_ = (
             "-E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) "
             "and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)'"
         )
         expected = {
             "test": f"scripts/repo-cargo nextest run --workspace --lib --bins {filter_} --no-fail-fast",
-            "test-integration": f"scripts/repo-cargo nextest run --workspace --test '*' {filter_} --no-fail-fast",
+            "test-integration": (
+                f"scripts/repo-cargo nextest run --workspace --test '${{{{ matrix.tests }}}}' {filter_} --no-fail-fast"
+            ),
         }
         for name, command in expected.items():
             commands = [
@@ -148,8 +165,11 @@ class CiWorkflowTests(unittest.TestCase):
             self.assertIn("- name: Reclaim runner disk\n", job_block(name))
             self.assertIn('CARGO_PROFILE_DEV_DEBUG: "0"', job_block(name))
             self.assertIn("OPENAI_API_KEY: sk-regression-test", job_block(name))
-        self.assertIn("- run: scripts/repo-cargo build --workspace --examples\n", job_block("test"))
+        # Exactly one half builds the examples.
+        self.assertEqual(block.count("            examples: true\n"), 1)
+        self.assertIn("      - if: matrix.examples\n        run: scripts/repo-cargo build --workspace --examples\n", block)
         source = CI_WORKFLOW.read_text()
+        self.assertEqual(source.count("scripts/repo-cargo build --workspace --examples"), 1)
         self.assertEqual(source.count("scripts/repo-cargo nextest run --workspace"), 2)
 
     def test_decorator_authority_gate_actually_runs_in_ci(self):

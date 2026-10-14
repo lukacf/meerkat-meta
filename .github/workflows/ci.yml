@@ -107,12 +107,13 @@ jobs:
       - run: scripts/repo-cargo clippy --workspace --all-targets -- -D warnings
       - run: scripts/repo-cargo machete --with-metadata
 
-  # Unit and integration tests run as two jobs. As one job, the build took
-  # 12.8-16.4 minutes and the run 5.1-6.2 (October 2026). On 4 CPUs with
-  # warm dependencies, the unit tests and bins build in 330 s and the
-  # examples in 38 s more; the integration tests need the meerkat-meta
-  # library (about 230 s) and then 231 s. Both jobs build the same
-  # dependency graph, so test-integration shares the test job's cache.
+  # Unit tests run in one job and integration tests in two halves. As one
+  # job, the build took 12.8-16.4 minutes and the run 5.1-6.2 (October
+  # 2026). On 4 CPUs with warm dependencies, the unit tests and bins build
+  # in 330 s. Each integration half needs the meerkat-meta library (about
+  # 230 s); after it, all integration tests together take 231 s and the
+  # examples 38 s. All three jobs build the same dependency graph, so
+  # they share the test job's cache.
   test:
     name: test
     needs: changes
@@ -163,15 +164,23 @@ jobs:
       # The live-event burst test remains CPU-speed-sensitive. History backfill
       # saturation uses a deterministic read barrier and runs in this gate.
       - run: scripts/repo-cargo nextest run --workspace --lib --bins -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)' --no-fail-fast
-      # cargo's default test selection also builds every example, to prove
-      # it compiles and links; the integration job does not, so do it here.
-      - run: scripts/repo-cargo build --workspace --examples
 
   test-integration:
-    name: test-integration
+    name: test-integration (${{ matrix.tests }})
     needs: changes
     if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Integration test targets by first letter: [a-i] holds about 60% of
+        # their build time and two thirds of their run time, so the other
+        # half also builds the examples. scripts/test_ci_workflow.py checks
+        # that every integration test target matches exactly one pattern.
+        include:
+          - tests: "[a-i]*"
+          - tests: "[j-z]*"
+            examples: true
     env:
       # ~88 debug test binaries each statically link the full meerkat stack.
       # With the 0.7.31 realtime deps, full debuginfo blew past the runner
@@ -216,7 +225,11 @@ jobs:
       # via .config/nextest.toml) and in the release-gate protocol.
       # The live-event burst test remains CPU-speed-sensitive. History backfill
       # saturation uses a deterministic read barrier and runs in this gate.
-      - run: scripts/repo-cargo nextest run --workspace --test '*' -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)' --no-fail-fast
+      - run: scripts/repo-cargo nextest run --workspace --test '${{ matrix.tests }}' -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)' --no-fail-fast
+      # cargo's default test selection also builds every example, to prove
+      # it compiles and links; one integration half does that here.
+      - if: matrix.examples
+        run: scripts/repo-cargo build --workspace --examples
 
   test-extension-state:
     name: test-extension-state
