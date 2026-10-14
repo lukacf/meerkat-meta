@@ -84,27 +84,30 @@ class CiWorkflowTests(unittest.TestCase):
                 # rust-cache hashes the job environment into the key, so a
                 # group shares one entry only while its jobs agree on it.
                 self.assertIn("      CARGO_PROFILE_DEV_DEBUG: line-tables-only\n", job_block(name), name)
-            # On main, the job's LAST step drops its family's earlier
-            # generations, right before rust-cache saves the new one, and only
-            # jobs with that step hold actions: write.
-            block = job_block(name)
-            self.assertIn("      - uses: Swatinem/rust-cache@v2\n        id: rust-cache\n", block, name)
-            drop = (
-                "      - name: Drop superseded rust caches\n"
-                "        if: github.event_name == 'push' && github.ref == 'refs/heads/main' "
-                "&& steps.rust-cache.outputs.cache-hit != 'true'\n"
-                "        env:\n"
-                "          GH_TOKEN: ${{ github.token }}\n"
-                f"        run: scripts/ci-drop-superseded-caches.sh {shared_key or name}\n"
-            )
-            self.assertIn(drop, block, name)
-            steps = re.findall(r"(?m)^      - ", block)
-            self.assertEqual(block.rindex("\n      - ") + 1, block.index(drop), f"{name}: drop step is not last")
-            self.assertTrue(steps)
-            self.assertIn("    permissions:\n      actions: write\n      contents: read\n", block, name)
         header = source.split("\njobs:\n", 1)[0]
         self.assertIn("\npermissions:\n  contents: read\n", header)
-        self.assertEqual(source.count("      actions: write\n"), len(expected))
+        # Jobs that run pull request code stay read-only. Only the cleanup
+        # job may delete caches: it runs for pushes to main alone, after every
+        # job that saves a rust cache, and drops exactly their families.
+        self.assertEqual(re.findall(r"(?m)^ +permissions:$", source), ["    permissions:"])
+        self.assertEqual(re.findall(r"(?m)^ +actions: write$", source), ["      actions: write"])
+        drop = job_block("drop-superseded-caches")
+        self.assertIn("    if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n", drop)
+        self.assertIn("    continue-on-error: true\n", drop)
+        self.assertIn("    permissions:\n      actions: write\n      contents: read\n", drop)
+        needs = re.search(r"(?m)^    needs: \[(.*)\]$", drop).group(1).split(", ")
+        self.assertEqual(sorted(needs), sorted(expected))
+        families = []
+        for name, shared_key in expected.items():
+            if (shared_key or name) not in families:
+                families.append(shared_key or name)
+        actions = [line.strip() for line in drop.splitlines() if re.match(r" +(- )?(uses|run): ", line)]
+        self.assertEqual(
+            actions,
+            ["- uses: actions/checkout@v4", f"run: scripts/ci-drop-superseded-caches.sh {' '.join(families)}"],
+        )
+        self.assertNotIn("drop-superseded-caches", job_block("gate"))
+        self.assertNotIn("steps.rust-cache", source)
         self.assertIn("- run: python3 scripts/test_ci_drop_caches.py\n", job_block("fmt-lint"))
 
     def test_workspace_nextest_preserves_all_failure_evidence(self):
