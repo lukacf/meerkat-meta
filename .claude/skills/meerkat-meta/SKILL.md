@@ -1,9 +1,9 @@
 ---
-name: meta-platform
-description: "Meta platform architecture, SDK patterns, console/runtime surfaces, release workflow, and Rust core internals. Use this skill whenever working on the meerkat-meta repository, adding SDK features, writing tests, debugging console/RPC/SSE behavior, updating Meerkat dependencies, understanding Meta's relationship to Meerkat, releasing Meta, or authoring Meta examples."
+name: meerkat-meta
+description: "Meerkat Meta (meerkat-meta) architecture, SDK patterns, console/runtime surfaces, gateways, release workflow, and Rust core internals. Use this skill whenever working on the meerkat-meta repository: adding SDK features (PyPI meerkat-meta, npm @rkat/meta-sdk), writing tests, debugging console/RPC/SSE behavior, running or changing the meta_gateway, rpc_gateway or meta_repair binaries, updating Meerkat dependencies, understanding Meta's relationship to Meerkat, releasing Meta, or authoring Meta examples."
 ---
 
-# Meta Platform
+# Meerkat Meta
 
 Meta is the companion composition and product layer around the Meerkat multi-agent runtime. Meerkat owns agent and mob construction, member identity and lifecycle, spawning, wiring, comms, sessions, tools, and the core agent loop. Meta composes that authority with module supervision, routing and delivery, identity continuity bridges, REST/JSON-RPC/SSE gateways, console projections, operational policy, SDKs, and examples.
 
@@ -11,22 +11,89 @@ Apps own desired roster and product policy. Meerkat machines admit member and se
 
 ## Current Baseline
 
-Primary repo: `meerkat-meta` (operator-retained path)
+Repository: `lukacf/meerkat-meta`. One workspace version covers every artifact:
+
+| Artifact | Name |
+| --- | --- |
+| Rust crate (library `meerkat_meta`) | `meerkat-meta` |
+| Rust crate for opaque extension documents (the `meerkat-meta` feature `extension-state`) | `meta-extension-state` |
+| Python SDK (import `meerkat_meta`) | PyPI `meerkat-meta` |
+| TypeScript SDK | npm `@rkat/meta-sdk` |
+| Console/admin gateway | `meta_gateway` (release archive `meta-gateway`) |
+| SDK stdin JSON-RPC gateway | `rpc_gateway` (release archive `meta-rpc-gateway`) |
+| Operator repair of member transcripts | `meta_repair` (release archive `meta-repair`) |
+
+`crates/meta-store-conformance` is a workspace-only conformance crate
+(`publish = false`). `meta_flow_editor` is a development binary that CI builds;
+it is not released.
 
 The authoritative Meta release line is `[workspace.package].version` in the
-root `Cargo.toml`. `make verify-version-parity` checks the Python and TypeScript
-SDK package versions, the TypeScript lockfile's root versions, the root Bazel
-module, the primary `crates/meerkat-meta/BUILD.bazel` version fields, and canonical
-Rust installation snippets. Separately, run
+root `Cargo.toml`; the 0.9 line pairs with Meerkat 0.9. `make verify-version-parity`
+checks the Python and TypeScript SDK package versions, the TypeScript lockfile's
+root versions, the root Bazel module, the primary `crates/meerkat-meta/BUILD.bazel`
+version fields, and canonical Rust installation snippets. Separately, run
 `node scripts/generate-bazel-rust-builds.mjs --check` to check generated
 per-crate BUILD freshness.
 
 For the current Meerkat dependency family, read the exact requirements in
 `crates/meerkat-meta/Cargo.toml` and `crates/meta-store-conformance/Cargo.toml`, including
-dev-dependencies, and the resolved versions in `Cargo.lock`. Verify these before
-release or dependency work rather than relying on a duplicated version snapshot.
+dev-dependencies, and the resolved versions in `Cargo.lock`. The family is
+exact-pinned (`=X.Y.Z`). Verify these before release or dependency work rather
+than relying on a duplicated version snapshot.
 
 There should be no vendored `meerkat-comms` patch in this repo. Durable image forwarding belongs upstream in Meerkat; do not restore old vendoring.
+
+Docs: Mintlify sources live in `docs/` (`docs/docs.json`). The `Publish docs`
+workflow (`.github/workflows/publish-docs.yml`) asks the Meerkat docs site to
+mirror them on every push to `main` that touches `docs/`; releases do not
+publish documentation. The mirror is served under `https://docs.rkat.ai/mobkit/`
+(the site path keeps the predecessor name), and the Meerkat repository's
+`docs/mobkit/_source.json` records the mirrored Meta commit.
+
+## 0.9 Rename And Upgrade Notes
+
+0.9 renamed the product from MobKit to Meta as a clean break with no aliases;
+historical CHANGELOG entries keep the old name. Current names:
+
+- crate, Python distribution and repository `meerkat-meta`; Rust library and
+  Python import `meerkat_meta`; npm `@rkat/meta-sdk`;
+- `Meta`-prefixed public types (for example `MetaConfig`, `MetaBuilder`,
+  `MetaStorageLayout`, `MetaTypedClient`), JSON-RPC methods and notifications
+  under `meta/`, HTTP routes under `/meta/...`;
+- `META_` environment variables. The gateways and the flow editor refuse to
+  start while a variable the predecessor read is set;
+- detached-job callbacks on Meerkat's `meta/jobs/*` methods, so Meta 0.9 needs
+  Meerkat 0.9.
+
+Existing installations carry over only through one explicit offline step.
+Startup refuses typed (`StorageLayoutError::PredecessorState`,
+`PredecessorGatewayHome`, `AdoptionIncomplete`, ...) instead of starting empty
+beside predecessor state. Stop every process that uses the installation, then:
+
+```bash
+meta_gateway storage-adopt-predecessor --state-dir <dir>            # dry run, read-only
+meta_gateway storage-adopt-predecessor --state-dir <dir> --apply    # optional --gateway-home / --predecessor-home
+```
+
+`--state-dir` is exactly the directory the refusal names (the
+`persistent_state` of `rpc_gateway` and the SDK builders, or the store
+directory of `meta_gateway`). Apply writes a `meta-adoption.json` journal and
+resumes from it. An adopted installation keeps the meerkat-level realm id
+`mobkit`; a fresh one uses `meta` (`DEFAULT_MEERKAT_LEVEL_REALM_ID`).
+
+Other 0.9 contract changes to keep in mind:
+
+- A mob stays publicly owned while the `UnifiedRuntime` or any handle, runtime
+  or identity view exported from it lives. Dropping the last one without
+  `shutdown()` hands the runtime to a retained teardown that closes admission
+  once the mob is idle. `identity_runtime()`, `identity_first_context()` and
+  `session_bridge()` return owned views (`PublicIdentityRuntime`,
+  `PublicIdentityFirstContext`, `PublicSessionBridge`) that carry that owner.
+- The memory backend config keeps only `MemoryBackendConfig::LocalJson`
+  (`kind = "local_json"`); any other kind is refused, never reinterpreted.
+- `AccessController::load_or_default` is gone: `AccessController::load` reads
+  and validates an explicitly configured access file, and a missing or invalid
+  file is a typed `AccessConfigError`.
 
 ## Repo Map
 
@@ -34,6 +101,7 @@ There should be no vendored `meerkat-comms` patch in this repo. Durable image fo
 | --- | --- |
 | `crates/meerkat-meta/` | Rust crate, runtime, HTTP, JSON-RPC, gateway binaries, and embedded console bundle. |
 | `crates/meerkat-meta/src/lib.rs` | Public exports and the fastest map of current modules. Read this before trusting notes. |
+| `crates/meerkat-meta/src/bin/` | `meta_gateway`, `rpc_gateway`, `meta_repair`, the `meta_flow_editor` dev binary, and internal check/eval binaries. |
 | `crates/meerkat-meta/src/mob_handle_runtime.rs` | `MobRuntime` / `RealMobRuntime`, mob bootstrap, member operations, session hooks, identity bridge points. |
 | `crates/meerkat-meta/src/runtime/` | Runtime subsystems: bootstrap, routing/delivery, gating, scheduling, memory, metadata, event transport, cross-mob control, session stores, supervisor. |
 | `crates/meerkat-meta/src/unified_runtime/` | Unified runtime builder, discovery, lifecycle, mob ops, event log, console/mob event projection, edge reconciliation, cross-mob wiring. |
@@ -43,12 +111,16 @@ There should be no vendored `meerkat-comms` patch in this repo. Durable image fo
 | `crates/meerkat-meta/src/rpc.rs` and `src/rpc/` | JSON-RPC dispatcher and method groups for console ingress, mob ops/events, routing/delivery, gating, memory, scheduling, session store, subscriptions. |
 | `crates/meerkat-meta/src/identity_first/` | Identity-first continuity, local store/lease, bridge, orchestrator, gateway bridges, contracts. |
 | `crates/meerkat-meta/src/contact_directory.rs`, `src/auth/peer_keys.rs` | Cross-mob contacts and signed peer-key handling. |
+| `crates/meta-extension-state/` | Provider-owned extension documents with atomic access control and retries (`ExtensionDocumentStore`). |
+| `crates/meta-store-conformance/` | Workspace-only storage conformance harness for Meta store backends (per-trait chapters, extending Meerkat's `meerkat-store-conformance`). |
 | `console/` | React console app source, tests, Vite/build entrypoints, generated `console/dist`. |
 | `packages/console-core/` | Reusable console contracts, conversation/activity/sidebar/dock logic, formatting, rich content. |
 | `packages/console-components/` | Reusable console UI components and CSS tokens/themes. |
 | `crates/meerkat-meta/console-dist/` | Embedded console bundle copied from `console/dist` by `npm run build`. |
+| `flow-editor/` | Flow editor app source. `npm --prefix flow-editor run build` also writes the bundle that `crates/meerkat-meta/flow-editor-dist/` embeds; `flow_editor_router` serves it at `/flow-editor` (the `meta_flow_editor` dev binary). |
 | `sdk/python/` | Python SDK, gateway subprocess transport, identity-first models/providers, tests. |
 | `sdk/typescript/` | TypeScript SDK, fetch/SSE client, runtime builders, tests. |
+| `docs/` | Mintlify documentation sources (mirrored to the Meerkat docs site). |
 | `examples/001-incident-command-center-pack/` | Self-contained Incident Commander example pack. Keep example-specific source here. |
 | `examples/002-foresight-studio-pack/` | TypeScript SDK example with identity-first providers, callback tools, and a heavily customized console. |
 | `scripts/repo-cargo` | Preferred Cargo wrapper for this repo. |
@@ -83,7 +155,7 @@ Key facts:
 - The closed action vocabulary lives in `access/model.rs::ACCESS_ACTIONS`. It covers agent view/send/lifecycle, scoped memory, gating, WorkGraph, mob observation, topology, mobpack author/deploy, runtime administration, and access administration. Do not maintain a shorter shadow list in surface code.
 - Enforcement seams: experience filtering + affordance intersection in `runtime/console_ingress.rs` (`handle_console_rest_json_route_with_snapshot_and_access`), RPC gating + result filtering + `meta/access/*` admin methods in `http_console.rs` (`console_rpc_access_requirement`, `handle_access_admin_rpc`), SSE gating in `http_sse.rs` (`sse_access_context`).
 - `mob.observe` gates the whole-mob event surfaces (`/mob/events`, `/meta/mob_events/stream`, `meta/mob_events/query`/`subscribe`) but does NOT override per-agent `agent.view`: events are filtered per source/`agent_identity`, mob-level (unattributed) events flow on `mob.observe` alone. "Observe all" = `mob.observe` + `agent.view` on `*`.
-- Spawn-lineage inheritance: agent-spawned members carry a `spawned_by` console label (recorded by `src/console_spawn.rs`); agent checks walk the member plus its spawn ancestors (`evaluate_access_lineage`, depth 8, cycle-safe), so rules matching the parent also match its spawned members, with deny-overrides preserved across the chain. Lineage is runtime-derived ONLY: `spawned_by`/`via_tool` claims in caller-controlled labels (spawn specs, roster) are stripped at every enforcement seam (`sanitize_unverified_lineage_labels`) — only the in-memory spawn registry may assert them.
+- Spawn-lineage inheritance: agent-spawned members carry a `spawned_by` console label (recorded by `src/console_spawn.rs`); agent checks walk the member plus its spawn ancestors (`evaluate_access_lineage`, depth 8, cycle-safe), so rules matching the parent also match its spawned members, with deny-overrides preserved across the chain. Lineage is runtime-derived ONLY: `spawned_by`/`via_tool` claims in caller-controlled labels (spawn specs, roster) are stripped at every enforcement seam (`sanitize_unverified_lineage_labels`) - only the in-memory spawn registry may assert them.
 - `/blobs/{id}` is a capability surface (content-addressed `sha256:` ids, deduped across agents, no per-agent ACL) — authn + hash-unguessability, not an `agent.view` boundary.
 - Live config: successful `AccessController` config mutations validate and advance the revision. They persist TOML only when a persistence path is configured through `load` (an existing, valid file; a missing or invalid one is an error) or `with_persist_path`; `AccessController::new` and `disabled` remain in-memory unless a path is attached. A configuration that names no admin grants administration to nobody. Per-request `AccessView` snapshots and cached agent label/role attributes from roster projections let label selectors work on identity-only surfaces.
 - Console UI: `console/src/panels/AccessPanel.tsx`, nav kind `access` appears only when `experience.access.can_administer`.
@@ -101,7 +173,7 @@ Key files:
 - `crates/meerkat-meta/src/config_convention.rs` discovers `config/console.toml`.
 - `crates/meerkat-meta/src/bin/meta_gateway.rs` loads the conventional config and applies the TUX init `realm` overlay.
 - `crates/meerkat-meta/src/bin/rpc_gateway.rs` accepts `runtime_options.console_config_path`.
-- `sdk/typescript/src/builder.ts` exposes `Meta.builder().consoleConfig("config/console.toml")` for RPC-gateway embedders, plus `.consoleAuthRequired(false)` for explicit local unauthenticated console demos.
+- `sdk/typescript/src/builder.ts` exposes `Meta.builder().consoleConfig("config/console.toml")` for RPC-gateway embedders, plus `.consoleAuthRequired(false)` for explicit local unauthenticated console demos; the Python builder has `console_config(path)`.
 - `crates/meerkat-meta/src/runtime/console_ingress.rs` projects `console_config` and uses `title` for the base panel title.
 - `console/src/ConsoleApp.tsx`, `console/src/panels/Topbar.tsx`, and `console/src/panels/Sidebar.tsx` consume the config.
 
@@ -206,7 +278,7 @@ Current console UX decisions to preserve:
 
 Comms delivers work; observation chooses scope. Do not design APIs that mix send and observe into one operation.
 
-Cross-mob support includes in-process wiring and signed TCP/UDS contacts. Real transports require real Ed25519 peer pubkeys. In-process descriptors can stay unsigned because the in-process router authorizes through the identity map.
+Cross-mob support includes in-process wiring and signed TCP/UDS contacts. Real transports require real Ed25519 peer pubkeys. In-process descriptors can stay unsigned because the in-process router authorizes through the identity map. The signing and digest contexts changed with the 0.9 rename, so a 0.9 gateway cannot exchange signed control requests or host facts with a pre-0.9 gateway.
 
 Useful files:
 
@@ -261,7 +333,7 @@ The Incident Commander example is self-contained:
 - `examples/001-incident-command-center-pack/ts_smoke.ts`
 - `examples/001-incident-command-center-pack/python_smoke.py`
 
-Cargo example name: `incident_command_center`, pointing at `../examples/001-incident-command-center-pack/server.rs`.
+Cargo example name: `incident_command_center`, declared in `crates/meerkat-meta/Cargo.toml` with path `../../examples/001-incident-command-center-pack/server.rs`.
 
 Useful commands:
 
@@ -271,7 +343,7 @@ Useful commands:
 ./scripts/repo-cargo run -p meerkat-meta --example incident_command_center
 ```
 
-Default listen address: `127.0.0.1:63210`. Override with `INCIDENT_COMMAND_CENTER_LISTEN_ADDR`.
+Default listen address: `127.0.0.1:63210` (the scenario's `listen_addr`). Override with `INCIDENT_COMMAND_CENTER_LISTEN_ADDR`.
 
 ## Development Workflow
 
@@ -352,9 +424,11 @@ obtain consumer acceptance against those bytes.
 The release owner then tags the same source as `vX.Y.Z` and invokes
 `make release-promote RELEASE_TAG=vX.Y.Z ARTIFACT_SELECTION=<json-file>`.
 Promotion verifies and publishes the original bytes without rebuilding or
-signing again. Assets precede SDKs, crate, registry readback, and the immutable
-Meta documentation dispatch to Meerkat. `REGISTRY_DRY_RUN=true` suppresses all
-publication; `PUBLISH_RELEASE_PACKAGES=false` selects asset-only promotion.
+signing again. Assets precede the Python and TypeScript SDKs, then the crates
+(`meta-extension-state`, then `meerkat-meta`) and an exact registry readback.
+Releases do not publish documentation (see Current Baseline).
+`REGISTRY_DRY_RUN=true` suppresses all publication;
+`PUBLISH_RELEASE_PACKAGES=false` selects asset-only promotion.
 
 Use `make release-registry-retry RELEASE_TAG=vX.Y.Z` for registry-only retry
 (optional `REGISTRY_DRY_RUN=true`), and `make release-assets-recover
@@ -365,10 +439,11 @@ dispatch the current workflow on main with the old tag as data. Missing original
 or conflicting hashes fail closed. See CONTRIBUTING.md for receipt/recovery
 contracts and the full event/mode matrix.
 
-Verify all three registries directly:
+Verify all registries directly:
 
 ```bash
 ./scripts/repo-cargo search meerkat-meta --limit 1
+./scripts/repo-cargo search meta-extension-state --limit 1
 npm view @rkat/meta-sdk version
 python -m pip index versions meerkat-meta
 ```
@@ -392,6 +467,7 @@ Rust:
 - `crates/meerkat-meta/tests/mob_events_*.rs`
 - `crates/meerkat-meta/tests/routing_delivery.rs`
 - `crates/meerkat-meta/tests/sse_auth_gate.rs`
+- `catalogs_response_exposes_filesystem_skill_catalog` in `crates/meerkat-meta/src/mobpack.rs` pins this skill: the repo's `.claude/skills/meerkat-meta/` is the expected filesystem skill (id `meerkat-meta`). Rename both together.
 
 Console:
 
