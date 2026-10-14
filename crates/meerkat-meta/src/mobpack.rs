@@ -33343,16 +33343,16 @@ depends_on_mode = "all"
             "dynamic skill realms must be loaded through meta/mobpacks/catalogs"
         );
         let realms = catalogs["skill_realms"].as_array().expect("skill realms");
-        let meta_platform = realms
+        let meerkat_meta = realms
             .iter()
             .find(|realm| realm["source"] == "filesystem")
             .and_then(|realm| realm["skills"].as_array())
-            .and_then(|skills| skills.iter().find(|skill| skill["id"] == "meta-platform"))
-            .expect("meta-platform filesystem skill");
-        assert_eq!(meta_platform["source"], "path");
-        assert_eq!(meta_platform["origin"], "filesystem");
+            .and_then(|skills| skills.iter().find(|skill| skill["id"] == "meerkat-meta"))
+            .expect("meerkat-meta filesystem skill");
+        assert_eq!(meerkat_meta["source"], "path");
+        assert_eq!(meerkat_meta["origin"], "filesystem");
         assert!(
-            meta_platform["path"]
+            meerkat_meta["path"]
                 .as_str()
                 .is_some_and(|path| path.ends_with("SKILL.md"))
         );

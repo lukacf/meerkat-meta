@@ -62,5 +62,5 @@ Thumbs.db
 !.claude/commands/ship.md
 !.claude/skills/
 .claude/skills/*
-!.claude/skills/meta-platform/
-!.claude/skills/meta-platform/SKILL.md
+!.claude/skills/meerkat-meta/
+!.claude/skills/meerkat-meta/SKILL.md
