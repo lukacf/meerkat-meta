@@ -283,21 +283,25 @@ class CiWorkflowTests(unittest.TestCase):
         """A job absent from `gate` can fail without failing the check suite.
 
         `needs` alone does not gate: with `if: always()` the gate runs
-        regardless, so a job missing from the result comparison is advisory
-        only.
+        regardless, so a job missing from the result checks is advisory only.
 
         Correspondence ALONE is not enough, and this test asserted only that
         until review caught it: deleting a job from `needs` and from the
-        comparison together keeps the two lists in agreement, so the job goes
-        on running and gates nothing while this test stays green. The roster
+        checks together keeps the two lists in agreement, so the job goes on
+        running and gates nothing while this test stays green. The roster
         below is therefore a floor - every gating job must be present - and the
         correspondence check runs on top of it.
+
+        A job may be skipped only when `changes` classified the pull request as
+        docs-only (FULL is exactly "false"); every skippable job is one the
+        classification gates, and every other job must succeed.
         """
         block = job_block("gate")
         needs = block.split("needs: [", 1)[1].split("]", 1)[0]
         listed = {name.strip() for name in needs.split(",")}
 
         must_gate = {
+            "changes",
             "fmt-lint",
             "test",
             "test-extension-state",
@@ -322,14 +326,27 @@ class CiWorkflowTests(unittest.TestCase):
             f"consistent while silently making it advisory.",
         )
 
-        for name in listed:
-            self.assertIn(
-                'needs.%s.result }}" != "success"' % name,
-                block,
-                f"{name} is in `needs` but its result is never compared, so it "
-                f"cannot fail the gate",
-            )
+        checks = dict(re.findall(r'(?m)^\s+check ([a-z-]+) "\$\{\{ needs\.\1\.result \}\}" (required|skippable)$', block))
+        self.assertEqual(set(checks), listed, "every job in `needs` is checked exactly by name")
+        self.assertIn('"$3" == "skippable" && "$2" == "skipped" && "${FULL}" == "false"', block)
+        self.assertIn("FULL: ${{ needs.changes.outputs.full }}", block)
+        for name, mode in checks.items():
+            gated = "    if: needs.changes.outputs.full == 'true'\n" in job_block(name)
+            self.assertEqual(mode == "skippable", gated, name)
+            if gated:
+                self.assertIn("    needs: changes\n", job_block(name))
+        self.assertEqual(checks["changes"], "required")
 
+    def test_changes_job_classifies_the_pull_request_and_fails_closed(self):
+        block = job_block("changes")
+        self.assertIn("fetch-depth: 2", block)
+        self.assertIn(
+            'python3 scripts/ci-changes.py --event "${{ github.event_name }}" --github-output "$GITHUB_OUTPUT"',
+            block,
+        )
+        self.assertIn('echo "full=true" >> "$GITHUB_OUTPUT"', block)
+        self.assertNotIn("if:", block)
+        self.assertIn("- run: python3 scripts/test_ci_changes.py\n", job_block("fmt-lint"))
 
 
 if __name__ == "__main__":

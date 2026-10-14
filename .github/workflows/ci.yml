@@ -30,6 +30,29 @@ env:
   # and meta-dev-bins (binaries only).
 
 jobs:
+  # Decides whether this run needs the Rust, console, SDK and example jobs.
+  # A pull request that changes only docs or the non-CI workflows skips them
+  # (scripts/ci-changes.py names the files); pushes and dispatches always run
+  # everything, so main keeps the full green run release.yml requires.
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    outputs:
+      full: ${{ steps.classify.outputs.full }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A pull request checks out GitHub's merge commit; its first
+          # parent is the base, so the diff is the pull request's own change.
+          fetch-depth: 2
+      - id: classify
+        # Fails closed: if the classifier errors, the run is full.
+        run: |
+          if ! python3 scripts/ci-changes.py --event "${{ github.event_name }}" --github-output "$GITHUB_OUTPUT"; then
+            echo "classifier failed; running the full matrix"
+            echo "full=true" >> "$GITHUB_OUTPUT"
+          fi
+
   fmt-lint:
     name: fmt-lint
     runs-on: ubuntu-24.04
@@ -50,6 +73,7 @@ jobs:
       - run: python3 scripts/verify-session-service-decorators.py
       - run: python3 scripts/test_verify_session_service_decorators.py
       - run: python3 scripts/test_ci_workflow.py
+      - run: python3 scripts/test_ci_changes.py
       - run: python3 scripts/test_repo_cargo.py
       - run: python3 scripts/test_pre_push_clippy.py
       - run: python3 scripts/test_release_version_scripts.py
@@ -71,6 +95,8 @@ jobs:
 
   test:
     name: test
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
     env:
       # ~88 debug test binaries each statically link the full meerkat stack.
@@ -89,7 +115,7 @@ jobs:
     steps:
       # The workspace debug build (meerkat 0.7.25 dep tree + all test
       # binaries) plus the rust-cache restore no longer fits beside the
-      # runner's preinstalled toolchains — three consecutive runs died to
+      # runner's preinstalled toolchains - three consecutive runs died to
       # ENOSPC mid-link. Reclaim ~30GB of images we never use (mirrors
       # meerkat's release-lane reclaim, meerkat#858).
       - name: Reclaim runner disk
@@ -119,6 +145,8 @@ jobs:
 
   test-extension-state:
     name: test-extension-state
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -140,6 +168,8 @@ jobs:
   # 14m10, then the tests 21m52 and 8m24).
   extension-state-lint:
     name: extension-state-lint
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -158,6 +188,8 @@ jobs:
 
   test-voice:
     name: test-voice
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -182,6 +214,8 @@ jobs:
   # clippy 19m03, then the test build 32m16).
   voice-clippy:
     name: voice-clippy
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -200,6 +234,8 @@ jobs:
 
   test-python:
     name: test-python
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -247,6 +283,8 @@ jobs:
   # now run beside it in console-perf and console-browser, also in `gate`.
   console:
     name: console
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
     env:
       # Rust 1.97 incremental compilation can ICE in async identity iteration.
@@ -311,6 +349,8 @@ jobs:
   # crates/meerkat-meta/console-dist, both written by `run build`.
   console-browser:
     name: console-browser
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
     env:
       # Rust 1.97 incremental compilation can ICE in async identity iteration.
@@ -362,6 +402,8 @@ jobs:
   # host with esbuild and needs no Rust.
   console-perf:
     name: console-perf
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -386,6 +428,8 @@ jobs:
   # console_customization_fixtures`, which is where its 12 minutes go.
   console-fixtures:
     name: console-fixtures
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -407,6 +451,8 @@ jobs:
   # library_mode_reference or on any step left in `console`.
   console-acceptance:
     name: console-acceptance
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -435,6 +481,8 @@ jobs:
 
   flow-editor:
     name: flow-editor
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -485,41 +533,43 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [fmt-lint, test, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, test-typescript, console, console-browser, console-perf, console-fixtures, console-acceptance, flow-editor, audit]
+    needs: [changes, fmt-lint, test, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, test-typescript, console, console-browser, console-perf, console-fixtures, console-acceptance, flow-editor, audit]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results
+        env:
+          FULL: ${{ needs.changes.outputs.full }}
         run: |
-          if [[ "${{ needs.fmt-lint.result }}" != "success" ||
-                "${{ needs.test.result }}" != "success" ||
-                "${{ needs.test-extension-state.result }}" != "success" ||
-                "${{ needs.extension-state-lint.result }}" != "success" ||
-                "${{ needs.test-voice.result }}" != "success" ||
-                "${{ needs.voice-clippy.result }}" != "success" ||
-                "${{ needs.test-python.result }}" != "success" ||
-                "${{ needs.test-typescript.result }}" != "success" ||
-                "${{ needs.console.result }}" != "success" ||
-                "${{ needs.console-browser.result }}" != "success" ||
-                "${{ needs.console-perf.result }}" != "success" ||
-                "${{ needs.console-fixtures.result }}" != "success" ||
-                "${{ needs.console-acceptance.result }}" != "success" ||
-                "${{ needs.flow-editor.result }}" != "success" ||
-                "${{ needs.audit.result }}" != "success" ]]; then
-            echo "One or more jobs failed or were cancelled."
-            echo "  fmt-lint:     ${{ needs.fmt-lint.result }}"
-            echo "  test:         ${{ needs.test.result }}"
-            echo "  test-extension-state: ${{ needs.test-extension-state.result }}"
-            echo "  extension-state-lint: ${{ needs.extension-state-lint.result }}"
-            echo "  test-voice:   ${{ needs.test-voice.result }}"
-            echo "  voice-clippy: ${{ needs.voice-clippy.result }}"
-            echo "  test-python:  ${{ needs.test-python.result }}"
-          echo "  test-typescript:    ${{ needs.test-typescript.result }}"
-            echo "  console:      ${{ needs.console.result }}"
-            echo "  console-browser: ${{ needs.console-browser.result }}"
-            echo "  console-perf: ${{ needs.console-perf.result }}"
-            echo "  console-fixtures:   ${{ needs.console-fixtures.result }}"
-            echo "  console-acceptance: ${{ needs.console-acceptance.result }}"
-            echo "  flow-editor:  ${{ needs.flow-editor.result }}"
-            echo "  audit:        ${{ needs.audit.result }}"
+          status=0
+          # check <job> <result> <required|skippable>: a skippable job may be
+          # skipped only when `changes` classified the run as docs-only.
+          check() {
+            if [[ "$2" == "success" ]]; then
+              echo "  $1: success"
+            elif [[ "$3" == "skippable" && "$2" == "skipped" && "${FULL}" == "false" ]]; then
+              echo "  $1: skipped (docs or non-CI workflow change only)"
+            else
+              echo "  $1: $2"
+              status=1
+            fi
+          }
+          check changes "${{ needs.changes.result }}" required
+          check fmt-lint "${{ needs.fmt-lint.result }}" required
+          check test "${{ needs.test.result }}" skippable
+          check test-extension-state "${{ needs.test-extension-state.result }}" skippable
+          check extension-state-lint "${{ needs.extension-state-lint.result }}" skippable
+          check test-voice "${{ needs.test-voice.result }}" skippable
+          check voice-clippy "${{ needs.voice-clippy.result }}" skippable
+          check test-python "${{ needs.test-python.result }}" skippable
+          check test-typescript "${{ needs.test-typescript.result }}" required
+          check console "${{ needs.console.result }}" skippable
+          check console-browser "${{ needs.console-browser.result }}" skippable
+          check console-perf "${{ needs.console-perf.result }}" skippable
+          check console-fixtures "${{ needs.console-fixtures.result }}" skippable
+          check console-acceptance "${{ needs.console-acceptance.result }}" skippable
+          check flow-editor "${{ needs.flow-editor.result }}" skippable
+          check audit "${{ needs.audit.result }}" required
+          if [[ "${status}" != 0 ]]; then
+            echo "One or more jobs failed, were cancelled, or were skipped without a docs-only classification."
             exit 1
           fi
