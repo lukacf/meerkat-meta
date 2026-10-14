@@ -100,7 +100,7 @@ make release-candidate SOURCE_SHA=<full-merged-commit-sha>
 
 The existing release workflow builds all five targets and all three executables,
 checks Linux portability, signs macOS executables, and packages them once.
-Candidate mode never runs GitHub release, registry, or documentation publishers.
+Candidate mode never runs GitHub release or registry publishers.
 Archive versions come from the pinned workspace, not the branch name.
 
 The completed candidate run's summary contains a versioned JSON selection.
@@ -148,7 +148,7 @@ then explicitly promotes the accepted selection:
 make release-promote RELEASE_TAG=vX.Y.Z \
   ARTIFACT_SELECTION=/absolute/path/accepted-candidate.json
 
-# Asset-only promotion (no registries or docs):
+# Asset-only promotion (no registries):
 make release-promote RELEASE_TAG=vX.Y.Z \
   ARTIFACT_SELECTION=/absolute/path/accepted-candidate.json \
   PUBLISH_RELEASE_PACKAGES=false
@@ -168,7 +168,10 @@ refuses publication; there is no fallback build. Do not rerun an accepted
 candidate's jobs and assume the old selection still applies.
 
 Real publication proceeds in order: verified public binary assets, Python and
-TypeScript packages, Rust crate, exact registry readback, then immutable docs.
+TypeScript packages, the Rust crates (`meta-extension-state`, then
+`meerkat-meta`), then exact registry readback. Releases do not publish
+documentation: the `Publish docs` workflow asks the docs site to mirror `docs/`
+on every push to `main` that touches `docs/`.
 New releases retain the original candidate manifest, selection, and provenance
 proofs. Existing flat `index.json` and `checksums.sha256` keep their archive-only
 contract.
@@ -273,10 +276,10 @@ builds or publishes assets. `P` means `publish_release_packages`, and `D` means
 | `candidate` | Exact source; P=false, D=false | Candidate build only |
 | `candidate` | P=true or D=true | Refuse contradictory publication inputs |
 | `promote` | Tag + selection; P=false, D=false | Publish original assets only |
-| `promote` | Tag + selection; P=true, D=false | Assets, registries, then docs |
+| `promote` | Tag + selection; P=true, D=false | Assets, then registries |
 | `promote` | Tag + selection; P=false, D=true | Candidate verification only |
 | `promote` | Tag + selection; P=true, D=true | Candidate verification + package dry-runs; no publication |
-| `existing` | Tag; P=true, D=false | Registry retry after public asset verification; then docs |
+| `existing` | Tag; P=true, D=false | Registry retry after public asset verification |
 | `existing` | Tag; P=true, D=true | Tagged package dry-runs only |
 | `existing` | P=false, either D | Validation only |
 | `existing` | No tag; P=true, D=true | Pure package dry-run; the only exact-main CI exemption |
