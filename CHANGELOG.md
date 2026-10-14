@@ -97,6 +97,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - CONTRIBUTING and the Meta skill say that a failed SDK registry upload does
   not stop the crates from publishing, while the final all-registry readback
   still fails the run.
+- The Console guide and the MCP Apps host README now document how to run the
+  MCP Apps sandbox proxy outside a source checkout. No gateway binary, Python
+  package or npm package ships the proxy. Copy `console/mcp-apps-sandbox.cjs`
+  and `console/src/mcp-apps/sandbox.js` from the release tag that matches the
+  gateway, keeping `src/mcp-apps/sandbox.js` relative to the `.cjs` file, and
+  start the proxy with `node mcp-apps-sandbox.cjs`. It needs only the Node
+  standard library. Upgrade it together with the gateway, because it shares an
+  internal protocol with the embedded Console. Sandbox proxy SHA-256 for this
+  release (both files unchanged since 0.9.0):
+  - `console/mcp-apps-sandbox.cjs`:
+    `157fed890922c4c3fe7c9b7a6319455f0604e9c789818f9c38d45bc115a98ad6`
+  - `console/src/mcp-apps/sandbox.js`:
+    `4e3592ba5b8bf198322126ccb27919a8d4c4c1976a198f9c497c16833f6c3024`
 
 ### Fixed
 
