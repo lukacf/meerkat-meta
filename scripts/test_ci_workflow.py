@@ -60,6 +60,7 @@ class CiWorkflowTests(unittest.TestCase):
             "test": None,
             "test-extension-state": None,
             "test-voice": None,
+            "voice-clippy": None,
             "test-python": "meta-dev-bins",
             "flow-editor": "meta-dev-bins",
             "console": "meta-dev-examples",
@@ -128,9 +129,19 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertIn("--locked --features openai-live", block)
         self.assertIn("--test console_route_auth --test console_experience --test never_executed_persistence --test swarm_integration console_voice", block)
         self.assertIn("gateway_openai_live_registration", block)
-        self.assertIn("clippy -p meerkat-meta", block)
-        self.assertIn("-- -D warnings", block)
         self.assertIn('CARGO_INCREMENTAL: "0"', block)
+        # The strict lint runs in parallel, in its own job, on the same features.
+        runs = [line for line in block.splitlines() if line.strip().startswith("- run:")]
+        self.assertFalse([line for line in runs if " clippy " in line], runs)
+        lint = job_block("voice-clippy")
+        self.assertEqual(
+            lint.count(
+                "- run: scripts/repo-cargo clippy -p meerkat-meta --locked --features openai-live "
+                "--lib --bin rpc_gateway --bin meta_gateway -- -D warnings\n"
+            ),
+            1,
+        )
+        self.assertIn('CARGO_INCREMENTAL: "0"', lint)
 
     def test_voice_lane_runs_the_live_registration_test_from_the_library(self):
         # src/bin/rpc_gateway.rs is a one-line wrapper around
@@ -206,6 +217,7 @@ class CiWorkflowTests(unittest.TestCase):
             "fmt-lint",
             "test",
             "test-voice",
+            "voice-clippy",
             "test-python",
             "test-typescript",
             "console",

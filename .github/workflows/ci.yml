@@ -149,17 +149,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The shared host uses a loopback provider, never paid credentials.
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --lib --bin rpc_gateway --bin meta_gateway --test console_route_auth --test console_experience --test never_executed_persistence --test swarm_integration console_voice
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --lib gateway_openai_live_registration
+      # Reuse this feature build for classic/identity restarts with and without voice.
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --test meta_gateway_bootstrap persistent_http_restarts
+
+  # test-voice's strict lint, split out: clippy only emits metadata, so it
+  # shares little with the full test build beyond host build scripts and
+  # proc macros, and in one job the two ran back to back (run 38506503806:
+  # clippy 19m03, then the test build 32m16).
+  voice-clippy:
+    name: voice-clippy
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_BUILD_JOBS: "2"
+      # The feature union triggers the repository's Rust 1.97 incremental ICE.
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features openai-live --lib --bin rpc_gateway --bin meta_gateway -- -D warnings
-      # The shared host uses a loopback provider, never paid credentials.
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --lib --bin rpc_gateway --bin meta_gateway --test console_route_auth --test console_experience --test never_executed_persistence --test swarm_integration console_voice
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --lib gateway_openai_live_registration
-      # Reuse this feature build for classic/identity restarts with and without voice.
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --test meta_gateway_bootstrap persistent_http_restarts
 
   test-python:
     name: test-python
@@ -388,7 +407,7 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [fmt-lint, test, test-extension-state, test-voice, test-python, test-typescript, console, console-fixtures, console-acceptance, flow-editor, audit]
+    needs: [fmt-lint, test, test-extension-state, test-voice, voice-clippy, test-python, test-typescript, console, console-fixtures, console-acceptance, flow-editor, audit]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results
@@ -397,6 +416,7 @@ jobs:
                 "${{ needs.test.result }}" != "success" ||
                 "${{ needs.test-extension-state.result }}" != "success" ||
                 "${{ needs.test-voice.result }}" != "success" ||
+                "${{ needs.voice-clippy.result }}" != "success" ||
                 "${{ needs.test-python.result }}" != "success" ||
                 "${{ needs.test-typescript.result }}" != "success" ||
                 "${{ needs.console.result }}" != "success" ||
@@ -409,6 +429,7 @@ jobs:
             echo "  test:         ${{ needs.test.result }}"
             echo "  test-extension-state: ${{ needs.test-extension-state.result }}"
             echo "  test-voice:   ${{ needs.test-voice.result }}"
+            echo "  voice-clippy: ${{ needs.voice-clippy.result }}"
             echo "  test-python:  ${{ needs.test-python.result }}"
           echo "  test-typescript:    ${{ needs.test-typescript.result }}"
             echo "  console:      ${{ needs.console.result }}"
