@@ -9,12 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- With the `extension-state` feature, destroying a child mob whose members
-  resolved extension documents left the extension authority registry holding
-  the child's read handle. The destroy answered `Incomplete` ("storage
-  cleanup outstanding: the observer drain refused: 3 owner handle(s) still
-  observe this mob database"), the child's database, file watch and threads
-  stayed, and its id could not be reused. The registry now drops a destroyed
+- With the `extension-state` feature and any extension tool bundle or
+  document MCP binding configured, the extension authority registry kept the
+  read handle of every child mob the agent mob-tool state activated, whether
+  or not its members ever resolved extension documents. Destroying such a
+  child answered `Incomplete` ("storage cleanup outstanding: the observer
+  drain refused: 3 owner handle(s) still observe this mob database"), the
+  child's database, file watch and threads stayed, and its id could not be
+  reused. The registry now drops a destroyed
   child through the agent mob-tool state's after-destroy hook
   (`MobMcpState::set_after_destroy`) before the destroy's storage cleanup
   runs, so the destroy completes and removes the child's storage. The hook
