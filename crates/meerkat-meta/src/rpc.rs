@@ -107,15 +107,17 @@ async fn mobpack_runtime_catalog_state(
     runtime: &UnifiedRuntime,
 ) -> crate::mobpack::MobpackRuntimeCatalogState {
     let loaded_modules = runtime.loaded_modules().await;
-    let runtime_flow_rows = crate::mobpack::runtime_flow_registry_rows_from_definition(
-        runtime.mob_handle().definition(),
-    );
-    let runtime_agent_definition_sources =
-        crate::mobpack::runtime_agent_definition_sources_from_definition(
-            runtime.mob_handle().definition(),
-        );
-    let runtime_skill_realms =
-        crate::mobpack::runtime_skill_realms_from_definition(runtime.mob_handle().definition());
+    let mob_handle = runtime.mob_handle();
+    let definition = mob_handle.definition();
+    // The runtime projects its own definition, as the host.
+    let (runtime_flow_rows, runtime_agent_definition_sources, runtime_skill_realms) =
+        crate::mobpack::with_host_path_skill_reads(|| {
+            (
+                crate::mobpack::runtime_flow_registry_rows_from_definition(definition),
+                crate::mobpack::runtime_agent_definition_sources_from_definition(definition),
+                crate::mobpack::runtime_skill_realms_from_definition(definition),
+            )
+        });
     let mut runtime_methods = vec![
         "meta/capabilities".to_string(),
         "meta/models/catalog".to_string(),
@@ -173,32 +175,46 @@ async fn handle_unified_mobpack_authoring_rpc(
         | "meta/mobpacks/apply_operation" => Some(mobpack_runtime_catalog_state(runtime).await),
         _ => None,
     };
+    // The host's own JSON-RPC channel (stdio, in-process SDK hosts): path
+    // skills read as the host.
+    crate::mobpack::with_host_path_skill_reads(|| {
+        unified_mobpack_authoring_response(
+            method,
+            params,
+            response_id,
+            runtime_catalog_state.as_ref(),
+        )
+    })
+}
+
+fn unified_mobpack_authoring_response(
+    method: &str,
+    params: &Value,
+    response_id: Value,
+    runtime_catalog_state: Option<&crate::mobpack::MobpackRuntimeCatalogState>,
+) -> JsonRpcResponse {
     let result = match method {
         "meta/mobpacks/catalogs" => Ok(crate::mobpack::mobpack_catalogs_response_with_runtime(
-            runtime_catalog_state.as_ref(),
+            runtime_catalog_state,
         )),
         "meta/tools/catalog" => Ok(crate::mobpack::mobpack_tools_catalog_response_with_runtime(
-            runtime_catalog_state.as_ref(),
+            runtime_catalog_state,
         )),
-        "meta/skills/catalog" => Ok(
-            crate::mobpack::mobpack_skills_catalog_response_with_runtime(
-                runtime_catalog_state.as_ref(),
-            ),
-        ),
+        "meta/skills/catalog" => {
+            Ok(crate::mobpack::mobpack_skills_catalog_response_with_runtime(runtime_catalog_state))
+        }
         "meta/agent_definitions/list" => Ok(
-            crate::mobpack::mobpack_agent_definitions_response_with_runtime(
-                runtime_catalog_state.as_ref(),
-            ),
+            crate::mobpack::mobpack_agent_definitions_response_with_runtime(runtime_catalog_state),
         ),
         "meta/mobpacks/templates" => Ok(crate::mobpack::mobpack_templates_response_with_runtime(
-            runtime_catalog_state.as_ref(),
+            runtime_catalog_state,
         )),
         _ => {
             return handle_mobpack_authoring_rpc_with_runtime(
                 method,
                 params,
                 response_id.clone(),
-                runtime_catalog_state.as_ref(),
+                runtime_catalog_state,
             )
             .unwrap_or_else(|| JsonRpcResponse {
                 jsonrpc: JSONRPC_VERSION.to_string(),
@@ -241,6 +257,20 @@ pub(crate) fn handle_mobpack_authoring_rpc(
 }
 
 pub(crate) fn handle_mobpack_authoring_rpc_with_runtime(
+    method: &str,
+    params: &Value,
+    response_id: Value,
+    runtime: Option<&crate::mobpack::MobpackRuntimeCatalogState>,
+) -> Option<JsonRpcResponse> {
+    // A caller that set no path skill read policy reads only the files the
+    // skills catalog lists: host reads are an explicit choice of the entry
+    // point (see `crate::mobpack::with_host_path_skill_reads`).
+    crate::mobpack::with_path_skill_reads_or_untrusted(runtime, || {
+        mobpack_authoring_response(method, params, response_id, runtime)
+    })
+}
+
+fn mobpack_authoring_response(
     method: &str,
     params: &Value,
     response_id: Value,
@@ -721,17 +751,20 @@ pub fn handle_meta_rpc_json(
             }
         }
         method if MOBPACK_AUTHORING_METHODS.contains(&method) => {
-            handle_mobpack_authoring_rpc(method, &request.params, response_id.clone())
-                .unwrap_or_else(|| JsonRpcResponse {
-                    jsonrpc: JSONRPC_VERSION.to_string(),
-                    id: response_id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32601,
-                        message: "Method not found".to_string(),
-                        data: None,
-                    }),
-                })
+            // The host's own JSON-RPC channel: path skills read as the host.
+            crate::mobpack::with_host_path_skill_reads(|| {
+                handle_mobpack_authoring_rpc(method, &request.params, response_id.clone())
+            })
+            .unwrap_or_else(|| JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: response_id,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32601,
+                    message: "Method not found".to_string(),
+                    data: None,
+                }),
+            })
         }
         "meta/reconcile" => {
             let modules = match params::required_string_array(&request.params, "modules") {

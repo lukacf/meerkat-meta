@@ -14451,80 +14451,248 @@ fn append_archive_file<W: Write>(
         .map_err(|err| format!("failed to append {path}: {err}"))
 }
 
-/// The catalog an untrusted Flow Editor request may read path skills from.
-/// The listed files are resolved on the first path skill read, so a request
-/// that reads none scans no skill directory.
-struct UntrustedPathSkillReads {
-    runtime: Option<MobpackRuntimeCatalogState>,
-    listed: std::cell::OnceCell<BTreeSet<PathBuf>>,
+/// Which path skill files the mobpack operation running on this thread may
+/// read. A path skill names a host file whose bytes the source preview, the
+/// archive and its digests carry back to the caller, so only a trusted
+/// caller reads any path a document names.
+enum PathSkillReads {
+    /// Any file a document names. Set by [`with_host_path_skill_reads`].
+    Host,
+    /// Only the files the skills catalog lists, the runtime's own skills
+    /// included (see [`ListedSkillFiles`]). Set by
+    /// [`with_untrusted_path_skill_reads`]. The list is resolved on the
+    /// first read, so an operation that reads no path skill scans no skill
+    /// directory.
+    Catalog {
+        runtime_skill_paths: Vec<String>,
+        listed: std::cell::OnceCell<ListedSkillFiles>,
+    },
 }
 
 std::thread_local! {
-    /// Set while an untrusted Flow Editor request runs on this thread (see
-    /// [`with_untrusted_path_skill_reads`]). `None`, the default for every
-    /// trusted caller (the SDK's stdio RPC, Rust callers), reads the path a
-    /// document names.
-    static UNTRUSTED_PATH_SKILL_READS: std::cell::RefCell<Option<UntrustedPathSkillReads>> =
+    /// The read policy of the mobpack operation on this thread. Unset reads
+    /// like [`PathSkillReads::Catalog`] without a runtime: a read on a thread
+    /// that no entry point set up (another thread, or a new caller that set
+    /// no policy) reads only the files the skills catalog lists.
+    static PATH_SKILL_READS: std::cell::RefCell<Option<PathSkillReads>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Run `f` reading path skills only from the skill files the skills catalog
-/// lists (`runtime` included). The Flow Editor HTTP surfaces run a caller
-/// without host access this way: its document is untrusted input, and a path
-/// skill names a host file whose bytes the source preview, the archive and
-/// its digests carry back to the caller.
+fn path_skill_reads_set() -> bool {
+    PATH_SKILL_READS.with(|reads| reads.borrow().is_some())
+}
+
+fn with_path_skill_reads<R>(reads: PathSkillReads, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<PathSkillReads>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            PATH_SKILL_READS.with(|reads| *reads.borrow_mut() = previous);
+        }
+    }
+    let _restore = Restore(PATH_SKILL_READS.with(|current| current.borrow_mut().replace(reads)));
+    f()
+}
+
+/// Run `f` as the host: a path skill reads whatever file its document names.
+///
+/// Mobpack operations read path skills only from the files the skills
+/// catalog lists unless a trusted entry point runs them this way. Meta's own
+/// trusted entry points do: the stdio and in-process JSON-RPC dispatch
+/// (`handle_unified_rpc_json`, `handle_meta_rpc_json`), and a runtime
+/// projecting its own definition. A Rust host that calls the mobpack
+/// functions directly with a document it trusts wraps the call in this.
+///
+/// A policy already set on this thread stays in force, so a trusted entry
+/// point reached while an untrusted request runs never widens what that
+/// request may read.
+pub fn with_host_path_skill_reads<R>(f: impl FnOnce() -> R) -> R {
+    if path_skill_reads_set() {
+        return f();
+    }
+    with_path_skill_reads(PathSkillReads::Host, f)
+}
+
+/// Run `f` as a caller without host access: a path skill reads only a file
+/// the skills catalog lists, `runtime`'s skills included. The Flow Editor
+/// HTTP routes run such a caller's request this way.
 pub(crate) fn with_untrusted_path_skill_reads<R>(
     runtime: Option<&MobpackRuntimeCatalogState>,
     f: impl FnOnce() -> R,
 ) -> R {
-    struct Restore(Option<UntrustedPathSkillReads>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let previous = self.0.take();
-            UNTRUSTED_PATH_SKILL_READS.with(|reads| *reads.borrow_mut() = previous);
-        }
-    }
-    let untrusted = UntrustedPathSkillReads {
-        runtime: runtime.cloned(),
-        listed: std::cell::OnceCell::new(),
-    };
-    let _restore =
-        Restore(UNTRUSTED_PATH_SKILL_READS.with(|reads| reads.borrow_mut().replace(untrusted)));
-    f()
+    with_path_skill_reads(
+        PathSkillReads::Catalog {
+            runtime_skill_paths: runtime_path_skill_paths(runtime),
+            listed: std::cell::OnceCell::new(),
+        },
+        f,
+    )
 }
 
-/// Every path skill file the skills catalog lists, canonicalized.
-fn listed_path_skill_files(runtime: Option<&MobpackRuntimeCatalogState>) -> BTreeSet<PathBuf> {
-    skill_realms_response_with_runtime_state(runtime)
-        .as_array()
+/// Run `f` under the read policy its caller set on this thread, or as a
+/// caller without host access (see [`with_untrusted_path_skill_reads`]) when
+/// it set none.
+pub(crate) fn with_path_skill_reads_or_untrusted<R>(
+    runtime: Option<&MobpackRuntimeCatalogState>,
+    f: impl FnOnce() -> R,
+) -> R {
+    if path_skill_reads_set() {
+        return f();
+    }
+    with_untrusted_path_skill_reads(runtime, f)
+}
+
+/// The path skill files the runtime's own definition names.
+fn runtime_path_skill_paths(runtime: Option<&MobpackRuntimeCatalogState>) -> Vec<String> {
+    runtime
         .into_iter()
-        .flatten()
+        .flat_map(|state| state.runtime_skill_realms.iter())
         .filter_map(|realm| realm.get("skills").and_then(Value::as_array))
         .flatten()
         .filter(|skill| skill.get("source").and_then(Value::as_str) == Some("path"))
         .filter_map(|skill| skill.get("path").and_then(Value::as_str))
-        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .map(str::to_string)
         .collect()
 }
 
-/// Whether this thread may read the path skill file at `path`. A path that
-/// does not resolve is refused like an unlisted one, so the answer says
-/// nothing about which host files exist.
-fn path_skill_read_permitted(path: &str) -> bool {
-    UNTRUSTED_PATH_SKILL_READS.with(|reads| {
-        reads.borrow().as_ref().is_none_or(|untrusted| {
-            let listed = untrusted
-                .listed
-                .get_or_init(|| listed_path_skill_files(untrusted.runtime.as_ref()));
-            std::fs::canonicalize(path).is_ok_and(|canonical| listed.contains(&canonical))
-        })
+/// What identifies a listed skill file: the device and inode of the file
+/// itself, so a read checks the file it opened, not a path that may name
+/// another file by then.
+#[cfg(unix)]
+type SkillFileIdentity = (u64, u64);
+/// Without file identities, the file's real path.
+#[cfg(not(unix))]
+type SkillFileIdentity = PathBuf;
+
+/// The path skill files a caller without host access may read.
+struct ListedSkillFiles(BTreeSet<SkillFileIdentity>);
+
+impl ListedSkillFiles {
+    /// Every `SKILL.md` the skills catalog finds in a catalog directory whose
+    /// real path stays under that directory's real path (a link in a skill
+    /// directory lists no file outside it), and every path skill the
+    /// runtime's own definition names.
+    fn from_catalog(runtime_skill_paths: &[String]) -> Self {
+        let mut identities = BTreeSet::new();
+        for (_, _, dir) in skill_catalog_dirs() {
+            let Ok(root) = std::fs::canonicalize(&dir) else {
+                continue;
+            };
+            identities.extend(
+                discover_skills_in_dir(&dir)
+                    .iter()
+                    .filter_map(|skill| skill.get("path").and_then(Value::as_str))
+                    .filter_map(|path| std::fs::canonicalize(path).ok())
+                    .filter(|real| real.starts_with(&root))
+                    .filter_map(|real| skill_file_identity(&real)),
+            );
+        }
+        identities.extend(
+            runtime_skill_paths
+                .iter()
+                .filter_map(|path| std::fs::canonicalize(path).ok())
+                .filter_map(|real| skill_file_identity(&real)),
+        );
+        Self(identities)
+    }
+
+    /// Read the listed file that `path` names. The read opens the path once
+    /// and checks the identity of the file it opened, so a path swapped
+    /// between the check and the read yields no other file.
+    #[cfg(unix)]
+    fn read(&self, path: &str) -> Result<Vec<u8>, PathSkillReadError> {
+        use std::os::unix::fs::MetadataExt;
+        let listed = |metadata: &std::fs::Metadata| {
+            metadata.is_file() && self.0.contains(&(metadata.dev(), metadata.ino()))
+        };
+        // Checking the path before opening it keeps the read from opening an
+        // unlisted file (a device, a FIFO) unless the path changes between.
+        if !std::fs::metadata(path).is_ok_and(|metadata| listed(&metadata)) {
+            return Err(PathSkillReadError::NotListed);
+        }
+        let mut file =
+            open_skill_file(Path::new(path)).map_err(|_| PathSkillReadError::NotListed)?;
+        if !file.metadata().is_ok_and(|metadata| listed(&metadata)) {
+            return Err(PathSkillReadError::NotListed);
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(PathSkillReadError::Unreadable)?;
+        Ok(bytes)
+    }
+
+    /// Read the listed file that `path` names, from the real path checked.
+    #[cfg(not(unix))]
+    fn read(&self, path: &str) -> Result<Vec<u8>, PathSkillReadError> {
+        let real = std::fs::canonicalize(path).map_err(|_| PathSkillReadError::NotListed)?;
+        if !self.0.contains(&real) {
+            return Err(PathSkillReadError::NotListed);
+        }
+        std::fs::read(&real).map_err(PathSkillReadError::Unreadable)
+    }
+}
+
+#[cfg(unix)]
+fn skill_file_identity(real: &Path) -> Option<SkillFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(real)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn skill_file_identity(real: &Path) -> Option<SkillFileIdentity> {
+    std::fs::metadata(real)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|_| real.to_path_buf())
+}
+
+/// Open a skill file without blocking, so a path swapped to a FIFO after the
+/// check cannot hang the read.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_skill_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    Ok(std::fs::File::from(fd))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn open_skill_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+enum PathSkillReadError {
+    /// Not a file this caller may read. Every reason reads alike, so a
+    /// refusal says nothing about which host files exist.
+    NotListed,
+    Unreadable(std::io::Error),
+}
+
+/// Read the path skill file `path` under this thread's read policy.
+fn read_path_skill_file(path: &str) -> Result<Vec<u8>, PathSkillReadError> {
+    PATH_SKILL_READS.with(|reads| match reads.borrow().as_ref() {
+        Some(PathSkillReads::Host) => std::fs::read(path).map_err(PathSkillReadError::Unreadable),
+        Some(PathSkillReads::Catalog {
+            runtime_skill_paths,
+            listed,
+        }) => listed
+            .get_or_init(|| ListedSkillFiles::from_catalog(runtime_skill_paths))
+            .read(path),
+        None => ListedSkillFiles::from_catalog(&[]).read(path),
     })
 }
 
 fn path_skill_not_permitted(skill_id: &str, path: &str) -> String {
     format!(
         "selected path skill '{skill_id}' names {path}, which is not a skill file this server \
-         lists; reading other host files needs the mobpack.deploy grant or the host deploy opt-in"
+         lists; reading other host files needs host access (on the Flow Editor, the \
+         mobpack.deploy grant or the host deploy opt-in)"
     )
 }
 
@@ -14554,12 +14722,17 @@ fn selected_path_skill_files(
                 .ok_or_else(|| {
                     format!("selected path skill '{skill_id}' has no filesystem path")
                 })?;
-            if !path_skill_read_permitted(path) {
-                return Err(path_skill_not_permitted(&skill_id, path));
+            match read_path_skill_file(path) {
+                Ok(bytes) => bytes,
+                Err(PathSkillReadError::NotListed) => {
+                    return Err(path_skill_not_permitted(&skill_id, path));
+                }
+                Err(PathSkillReadError::Unreadable(err)) => {
+                    return Err(format!(
+                        "failed to read selected path skill '{skill_id}' at {path}: {err}"
+                    ));
+                }
             }
-            std::fs::read(path).map_err(|err| {
-                format!("failed to read selected path skill '{skill_id}' at {path}: {err}")
-            })?
         };
         if let Some(existing) = files.get(&archive_path) {
             if existing != &bytes {
@@ -21939,18 +22112,18 @@ fn validate_selected_path_skill_files(document: &MobpackDocument) -> Vec<Mobpack
             {
                 continue;
             }
-            if !path_skill_read_permitted(path) {
-                diagnostics.push(MobpackDiagnostic {
-                    severity: "error".to_string(),
-                    code: "selected_skill_path_not_permitted".to_string(),
-                    message: path_skill_not_permitted(&skill_id, path),
-                    path: Some(format!("skill_realms.skills[{skill_id}].path")),
-                });
-                continue;
-            }
-            match std::fs::read(path) {
+            match read_path_skill_file(path) {
                 Ok(bytes) => bytes,
-                Err(err) => {
+                Err(PathSkillReadError::NotListed) => {
+                    diagnostics.push(MobpackDiagnostic {
+                        severity: "error".to_string(),
+                        code: "selected_skill_path_not_permitted".to_string(),
+                        message: path_skill_not_permitted(&skill_id, path),
+                        path: Some(format!("skill_realms.skills[{skill_id}].path")),
+                    });
+                    continue;
+                }
+                Err(PathSkillReadError::Unreadable(err)) => {
                     diagnostics.push(MobpackDiagnostic {
                         severity: "error".to_string(),
                         code: "selected_skill_file_unreadable".to_string(),
@@ -27199,7 +27372,9 @@ message = "Plan the work"
             }]
         }]);
 
-        let result = export_mobpack(&json!({ "document": document })).expect("export");
+        let result =
+            with_host_path_skill_reads(|| export_mobpack(&json!({ "document": document })))
+                .expect("export");
         assert!(result.validation.ok, "{:?}", result.validation.diagnostics);
         assert!(result.mob_toml.contains(r#"[skills."mob.platform"]"#));
         assert!(result.mob_toml.contains(r#"source = "path""#));
@@ -27670,7 +27845,7 @@ depends_on_mode = "all"
             }]
         }]);
 
-        let result = validate_document(&document);
+        let result = with_host_path_skill_reads(|| validate_document(&document));
 
         assert!(!result.ok);
         assert!(result.diagnostics.iter().any(|diagnostic| {
@@ -27699,7 +27874,9 @@ depends_on_mode = "all"
                 "path": skill_path
             }]
         }]);
-        let exported = export_mobpack(&json!({ "document": document })).expect("export");
+        let exported =
+            with_host_path_skill_reads(|| export_mobpack(&json!({ "document": document })))
+                .expect("export");
         std::fs::remove_file(&skill_path).expect("remove original skill");
 
         let imported =
@@ -35606,6 +35783,237 @@ branch = "choice"
                 .unwrap()
                 .iter()
                 .any(|branch| branch["condition"] == "params.choice == left")
+        );
+    }
+
+    /// A document whose first member selects one path skill naming `path`.
+    fn document_selecting_path_skill(path: &Path) -> MobpackDocument {
+        let mut document = document_with_expected_schema_ref();
+        document.mob_toml = None;
+        document.members.as_array_mut().unwrap()[0]["skills"] = json!(["probe.skill"]);
+        document.skill_realms = json!([{
+            "id": "local/probe",
+            "label": "Local probe",
+            "source": "filesystem",
+            "skills": [{
+                "id": "probe.skill",
+                "label": "Probe",
+                "source": "path",
+                "path": path
+            }]
+        }]);
+        document
+    }
+
+    /// The repository's own skill file, which the skills catalog lists.
+    fn catalog_listed_skill_file() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.claude/skills/meerkat-meta/SKILL.md")
+    }
+
+    fn refused_as_unlisted<T>(read: Result<T, String>) -> Result<T, bool> {
+        read.map_err(|error| error.contains("not a skill file this server lists"))
+    }
+
+    /// Security regression: a read with no read policy set reads only the
+    /// skill files the catalog lists. That covers a new caller of the
+    /// authoring dispatcher that sets no policy, and a read that moves to
+    /// another thread than the one its caller restricted.
+    #[test]
+    fn path_skill_reads_with_no_policy_set_read_only_listed_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("id_secret");
+        std::fs::write(&secret, "NO-POLICY-SECRET-81c3").expect("write secret");
+        let document = document_selecting_path_skill(&secret);
+
+        let source = crate::rpc::handle_mobpack_authoring_rpc_with_runtime(
+            "meta/mobpacks/source",
+            &json!({ "document": document }),
+            json!(1),
+            None,
+        )
+        .expect("authoring method");
+        let validation = validate_document(&document);
+        let on_another_thread = with_untrusted_path_skill_reads(None, || {
+            let document = document.clone();
+            std::thread::spawn(move || selected_path_skill_files(&document))
+                .join()
+                .expect("reader thread")
+        });
+        let listed =
+            selected_path_skill_files(&document_selecting_path_skill(&catalog_listed_skill_file()));
+
+        assert!(
+            !serde_json::to_string(&source)
+                .expect("response json")
+                .contains("NO-POLICY-SECRET-81c3"),
+            "{source:#?}"
+        );
+        assert!(
+            validation
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "selected_skill_path_not_permitted"),
+            "{validation:#?}"
+        );
+        assert_eq!(refused_as_unlisted(on_another_thread), Err(true));
+        assert_eq!(
+            listed.map(|files| files.into_values().collect::<Vec<_>>()),
+            Ok(vec![
+                std::fs::read(catalog_listed_skill_file()).expect("listed skill file")
+            ])
+        );
+    }
+
+    /// Security regression: the allowlist check and the read see one file.
+    /// A path that resolves through a symlink to an unlisted file is refused,
+    /// and a symlink swapped between a listed file and an unlisted one while
+    /// reads run never yields the unlisted file's bytes.
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_path_skill_reads_never_follow_a_swapped_symlink_to_an_unlisted_file() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("id_secret");
+        std::fs::write(&secret, "SWAPPED-LINK-SECRET-27af").expect("write secret");
+        let listed = catalog_listed_skill_file();
+        let listed_bytes = std::fs::read(&listed).expect("listed skill file");
+        let link = dir.path().join("SKILL.md");
+        std::os::unix::fs::symlink(&secret, &link).expect("link to the secret");
+        let document = document_selecting_path_skill(&link);
+
+        let through_link =
+            with_untrusted_path_skill_reads(None, || selected_path_skill_files(&document));
+        assert_eq!(refused_as_unlisted(through_link), Err(true));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapper = {
+            let stop = Arc::clone(&stop);
+            let staged = dir.path().join("SKILL.md.next");
+            std::thread::spawn(move || {
+                let mut swaps = 0_u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let target = if swaps.is_multiple_of(2) {
+                        &listed
+                    } else {
+                        &secret
+                    };
+                    let _ = std::fs::remove_file(&staged);
+                    if std::os::unix::fs::symlink(target, &staged).is_ok()
+                        && std::fs::rename(&staged, &link).is_ok()
+                    {
+                        swaps += 1;
+                    }
+                }
+                swaps
+            })
+        };
+        let (mut leaked, mut listed_reads, mut refused) = (0_u32, 0_u32, 0_u32);
+        let started = std::time::Instant::now();
+        with_untrusted_path_skill_reads(None, || {
+            for round in 1_u32.. {
+                match selected_path_skill_files(&document) {
+                    Ok(files) if files.values().any(|bytes| bytes == &listed_bytes) => {
+                        listed_reads += 1;
+                    }
+                    Ok(_) => leaked += 1,
+                    Err(_) => refused += 1,
+                }
+                // Enough rounds to cross many swaps both ways, and both
+                // outcomes seen even if the swapper started late.
+                let enough = round >= 20_000 && listed_reads > 0 && refused > 0;
+                if leaked > 0 || enough || started.elapsed() > std::time::Duration::from_secs(30) {
+                    break;
+                }
+            }
+        });
+        stop.store(true, Ordering::Relaxed);
+        let swaps = swapper.join().expect("swapper thread");
+
+        assert_eq!(
+            leaked, 0,
+            "an unlisted file was read ({listed_reads} listed reads, {refused} refusals, \
+             {swaps} swaps)"
+        );
+        assert!(
+            listed_reads > 0 && refused > 0,
+            "{listed_reads} listed reads, {refused} refusals, {swaps} swaps"
+        );
+    }
+
+    /// Set in the child process of the escaped skill link test, to its
+    /// scratch directory.
+    #[cfg(unix)]
+    const ESCAPED_SKILL_LINKS_CHILD: &str = "META_TEST_ESCAPED_SKILL_LINKS";
+
+    /// Security regression: an entry in a skill directory that links outside
+    /// that directory does not make its target readable to an untrusted
+    /// caller. The allowlist keeps a catalog file only when its real path
+    /// stays under the real path of the skill directory it was found in.
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_path_skill_reads_refuse_skill_links_that_leave_the_skill_dir() {
+        if let Some(scratch) = std::env::var_os(ESCAPED_SKILL_LINKS_CHILD) {
+            let skills = PathBuf::from(scratch).join("skills");
+            let read = |path: PathBuf| {
+                with_untrusted_path_skill_reads(None, || {
+                    selected_path_skill_files(&document_selecting_path_skill(&path))
+                })
+                .map(|files| files.into_values().collect::<Vec<_>>())
+            };
+            assert_eq!(
+                (
+                    read(skills.join("inside/SKILL.md")),
+                    read(skills.join("linked-inside/SKILL.md")),
+                    refused_as_unlisted(read(skills.join("linked-dir/SKILL.md"))),
+                    refused_as_unlisted(read(skills.join("linked-file/SKILL.md"))),
+                ),
+                (
+                    Ok(vec![b"INSIDE-SKILL".to_vec()]),
+                    Ok(vec![b"INSIDE-SKILL".to_vec()]),
+                    Err(true),
+                    Err(true),
+                )
+            );
+            return;
+        }
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let skills = scratch.path().join("skills");
+        std::fs::create_dir_all(skills.join("inside")).expect("inside skill dir");
+        std::fs::write(skills.join("inside/SKILL.md"), "INSIDE-SKILL").expect("inside skill");
+        std::os::unix::fs::symlink(skills.join("inside"), skills.join("linked-inside"))
+            .expect("link inside the skill dir");
+        let outside = scratch.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        std::fs::write(outside.join("SKILL.md"), "ESCAPED-DIR-SECRET").expect("outside skill");
+        std::os::unix::fs::symlink(&outside, skills.join("linked-dir")).expect("dir link");
+        std::fs::create_dir_all(skills.join("linked-file")).expect("linked file dir");
+        std::fs::write(scratch.path().join("id_secret"), "ESCAPED-FILE-SECRET")
+            .expect("outside file");
+        std::os::unix::fs::symlink(
+            scratch.path().join("id_secret"),
+            skills.join("linked-file/SKILL.md"),
+        )
+        .expect("file link");
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "mobpack::tests::untrusted_path_skill_reads_refuse_skill_links_that_leave_the_skill_dir",
+                "--exact",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(ESCAPED_SKILL_LINKS_CHILD, scratch.path())
+            .env("META_SKILL_DIRS", &skills)
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

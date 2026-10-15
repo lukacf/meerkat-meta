@@ -40,10 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Now `apply_operation` never runs `rkat` (on every surface), `store_path` is
   refused with `-32602` on every Flow Editor method, and a path skill is
   read only when `meta/skills/catalog` lists that file; any other path is a
-  `selected_skill_path_not_permitted` validation error. Host access is the
-  caller's own per-call `mobpack.deploy` decision, so a deny rule withholds
-  it even beside an allow rule such as `mobpack.*`. Callers with host
-  access, and the SDK's stdio RPC, may still name such paths.
+  `selected_skill_path_not_permitted` validation error. A listed file counts
+  only while its real path stays inside the skill directory it was found
+  in, and the server reads the file it checked (it compares the opened
+  file's device and inode), so a link swapped between the check and the
+  read reaches no other file. Host access is the caller's own per-call
+  `mobpack.deploy` decision, so a deny rule withholds it even beside an
+  allow rule such as `mobpack.*`. Callers with host access, and the SDKs'
+  stdio and in-process RPC, may still name such paths.
 - Importing a mobpack archive (`meta/mobpacks/import`, and the draft methods
   that re-import a stored archive) refuses an archive that expands past
   32 MiB or holds more than 4096 entries. Before, a request under the HTTP
@@ -58,9 +62,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   validation.
 - Without host access, the Flow Editor HTTP routes refuse `store_path` and
   pack only path skills that `meta/skills/catalog` lists (see Security).
+- Rust code that calls the mobpack functions directly (`export_mobpack`,
+  `validate_mobpack`, `import_mobpack` and the rest of `meerkat_meta::mobpack`)
+  reads path skills only from files the skills catalog lists, unless it runs
+  them under the new `meerkat_meta::with_host_path_skill_reads`. The SDKs'
+  stdio and in-process JSON-RPC read as the host, as before.
 
 ### Added
 
+- `meerkat_meta::with_host_path_skill_reads(f)` runs mobpack functions as
+  the host, so a path skill reads any file its document names (see
+  Breaking).
 - `--allow-flow-editor-host-deploy` on `meta_gateway` and on
   `rpc_gateway --persistent`, and `allow_flow_editor_host_deploy(bool)` on
   `UnifiedRuntimeBuilder` and `UnifiedRuntime`, let the runtime-mounted Flow

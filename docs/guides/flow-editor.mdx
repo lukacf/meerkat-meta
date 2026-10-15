@@ -213,11 +213,18 @@ host path it names:
   read only when `meta/skills/catalog` lists that file. Any other path is a
   `selected_skill_path_not_permitted` validation error, so source, export and
   deploy refuse the document instead of packing the file.
+- A listed file counts only while its real path stays inside the skill
+  directory it was found in: a link from a skill directory to a file outside
+  it lists nothing. The server reads the file it checked, comparing the
+  opened file's device and inode, so a path swapped between the check and
+  the read reaches no other file.
 
 Host access is the caller's own per-call `mobpack.deploy` decision: a deny
 rule withholds it even when an allow rule such as `mobpack.*` also matches.
-Callers with host access, and the SDK's stdio RPC, which is the host's own
-channel, may name such paths.
+Callers with host access, and the SDKs' stdio and in-process RPC, which are
+the host's own channels, may name such paths. A Rust host that calls the
+`meerkat_meta::mobpack` functions directly gets the same catalog-only reads
+unless it runs them under `meerkat_meta::with_host_path_skill_reads`.
 
 ## Embedding
 

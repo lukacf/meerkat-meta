@@ -1319,22 +1319,26 @@ impl UnifiedRuntime {
                 "meta/cross_mob/send".to_string(),
             ]);
         }
+        let mob_handle = self.mob_handle();
+        let definition = mob_handle.definition();
+        // The runtime projects its own definition, as the host.
+        let (runtime_flow_rows, runtime_agent_definition_sources, runtime_skill_realms) =
+            crate::mobpack::with_host_path_skill_reads(|| {
+                (
+                    crate::mobpack::runtime_flow_registry_rows_from_definition(definition),
+                    crate::mobpack::runtime_agent_definition_sources_from_definition(definition),
+                    crate::mobpack::runtime_skill_realms_from_definition(definition),
+                )
+            });
         crate::mobpack::MobpackRuntimeCatalogState {
             loaded_modules,
             runtime_methods,
             has_contact_directory: self.has_contact_directory(),
             has_peer_mob_handles,
             has_inproc_contacts: self.has_inproc_contacts(),
-            runtime_flow_rows: crate::mobpack::runtime_flow_registry_rows_from_definition(
-                self.mob_handle().definition(),
-            ),
-            runtime_agent_definition_sources:
-                crate::mobpack::runtime_agent_definition_sources_from_definition(
-                    self.mob_handle().definition(),
-                ),
-            runtime_skill_realms: crate::mobpack::runtime_skill_realms_from_definition(
-                self.mob_handle().definition(),
-            ),
+            runtime_flow_rows,
+            runtime_agent_definition_sources,
+            runtime_skill_realms,
         }
     }
 

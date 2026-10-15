@@ -470,7 +470,9 @@ fn handle_flow_editor_rpc_with_auth(
     runtime_catalog: Option<&MobpackRuntimeCatalogState>,
 ) -> Value {
     if auth.host_access {
-        return dispatch_flow_editor_rpc(request, auth, runtime_catalog);
+        return crate::mobpack::with_host_path_skill_reads(|| {
+            dispatch_flow_editor_rpc(request, auth, runtime_catalog)
+        });
     }
     if let Some(refusal) = caller_store_path_refusal(&request) {
         return refusal;

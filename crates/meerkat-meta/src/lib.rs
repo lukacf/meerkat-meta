@@ -230,6 +230,7 @@ pub use mobpack::{
     MOBPACK_MEDIA_TYPE, MOBPACK_SCHEMA_VERSION, MobpackDeployCommandResult, MobpackDiagnostic,
     MobpackDocument, MobpackExportResult, MobpackValidationResult, deploy_command_preview,
     export_mobpack, import_mobpack, mobpack_schema_response, validate_mobpack,
+    with_host_path_skill_reads,
 };
 pub use mocks::{MockModuleProcess, MockProcessError};
 pub use process::{ProcessBoundaryError, run_process_json_line};
