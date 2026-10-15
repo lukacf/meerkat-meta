@@ -123,8 +123,8 @@ pub(crate) fn open_disk_store(
 fn mob_id_still_named(mob_id: &str) -> String {
     format!(
         "mob id '{mob_id}' is still named by extension documents of this realm, as their \
-         owner (Owner::Mob) or in an audience grant or deny (Audience::Mob), and no live mob \
-         has it: a new mob under it would inherit what they grant. Choose another mob id, or \
+         owner (Owner::Mob) or in an audience grant or deny (Audience::Mob): a new mob under \
+         it would inherit what they grant. Choose another mob id, or \
          have a host or operator with access to the extension store clear every reference \
          first: transfer each document the id owns to another owner, and remove or replace \
          each Audience::Mob grant or deny naming it (an owner transfer leaves those). The \
@@ -256,7 +256,7 @@ impl NativeAuthorityRegistry {
     /// would inherit what those documents grant it. Before the state creates
     /// any mob (an agent's `mob_create`, a temporary council, a create with
     /// no owner session), this refuses an id that a live document of this
-    /// realm still names while no live mob has it.
+    /// realm still names.
     ///
     /// - The one exemption is the implicit delegation mob that its own
     ///   session's runtime path creates or recreates: Meerkat reports that
@@ -265,17 +265,21 @@ impl NativeAuthorityRegistry {
     ///   same session's delegation mob. A mob a caller names is never
     ///   reported as one, whatever its id, and a create without an owner
     ///   session gets no exemption.
-    /// - Any other id is refused while documents name it, also for the
-    ///   owner session that created the destroyed mob: ownership is by id,
-    ///   not by mob instance.
+    /// - Any other id is refused while documents name it, whatever the
+    ///   registry binds under it, also for the owner session that created
+    ///   the destroyed mob: ownership is by id, not by mob instance.
     /// - A store that cannot answer, a registry that is gone and a failed
     ///   read all refuse the create.
     ///
-    /// The check reads every live document of the realm. It is not ordered
-    /// against a document write already in flight: a write whose caller
-    /// authority was resolved while the destroyed mob was live (the
-    /// embedding host's tool resolves the caller, then mutates) can still
-    /// commit a reference to the id after the check passed.
+    /// The check reads every live document of the realm under the store's
+    /// one connection, so document reads and writes of every session wait
+    /// for it, and a refusal tells the caller that some document names the
+    /// id, also one it cannot read. It is not ordered against a document
+    /// write already in flight: a write whose caller authority was resolved
+    /// while the destroyed mob was live (the embedding host's tool resolves
+    /// the caller, then mutates) can still commit a reference to the id
+    /// after the check passed. Restoring a persisted mob is no create and is
+    /// never checked.
     pub(crate) fn before_create(
         self: &Arc<Self>,
         store: Arc<dyn documents::ExtensionDocumentStore>,
@@ -307,11 +311,9 @@ impl NativeAuthorityRegistry {
         store: &dyn documents::ExtensionDocumentStore,
         mob_id: &str,
     ) -> Result<(), String> {
-        if self.handle(mob_id).is_ok() {
-            // A live mob has the id: the documents are its own, and the
-            // create fails as a duplicate.
-            return Ok(());
-        }
+        // Whatever the registry binds under the id is no reason to skip
+        // the check: a mob that activates under it may replace a stopped
+        // binding, and would inherit what the documents grant the id.
         match store.references_mob(&self.realm, mob_id).await {
             Ok(false) => Ok(()),
             Ok(true) => Err(mob_id_still_named(mob_id)),
@@ -1131,6 +1133,97 @@ comms = true
         registry.after_destroy()(children[1].mob_id());
         assert_eq!(bound(), BTreeSet::from([handle.mob_id().to_string()]));
         drop(children);
+        handle.stop().await.unwrap();
+    }
+
+    /// A live binding under an id does not let a create skip the reference
+    /// check: a mob that binds the id at its activation could be another
+    /// mob than the bound one (a stopped binding is replaced), so the
+    /// documents naming the id are checked whatever the registry holds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_a_live_binding_does_not_skip_the_mob_reference_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            r#"
+[mob]
+id = "bound-and-named"
+[profiles.worker]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+[profiles.worker.tools]
+comms = true
+"#,
+        )
+        .unwrap();
+        let spec = crate::MobBootstrapSpec::persistent(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            dir.path().to_path_buf(),
+            4,
+            Arc::new(
+                meerkat_store::SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
+                    .unwrap(),
+            ),
+        )
+        .unwrap()
+        .with_options(crate::MobBootstrapOptions {
+            allow_ephemeral_sessions: false,
+            notify_orchestrator_on_resume: false,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        });
+        let sessions = spec.session_service.clone();
+        let runtime = crate::MobRuntime::bootstrap(spec).await.unwrap();
+        let handle = runtime.handle();
+        let registry = NativeAuthorityRegistry::new(
+            "test".into(),
+            handle.mob_id().to_string(),
+            sessions.clone(),
+            None,
+            None,
+        );
+        registry.before_activation()(handle.read_handle())
+            .await
+            .unwrap();
+        let mob_id = handle.mob_id().to_string();
+        assert!(registry.handle(&mob_id).is_ok(), "the id is bound and live");
+
+        let store: Arc<dyn documents::ExtensionDocumentStore> = Arc::new(
+            documents::SqliteExtensionDocumentStore::open(dir.path().join("documents.sqlite3"))
+                .unwrap(),
+        );
+        let manager = HostAccessContext::new(
+            "test",
+            Principal::Agent("manager".into()),
+            VerifiedLineage::root(),
+            HostPolicy::ALLOW,
+        )
+        .unwrap()
+        .with_memberships(BTreeSet::new(), BTreeSet::from([mob_id.clone()]), false)
+        .unwrap();
+        DocumentService::new("test", "notes", Arc::clone(&store))
+            .unwrap()
+            .mutate(
+                &manager,
+                &documents::RequestIdentity::new("named", b"named").unwrap(),
+                documents::Mutation::Create(documents::NewDocument {
+                    content: documents::DocumentContent {
+                        title: "named".into(),
+                        content_type: "application/test".into(),
+                        schema_version: 1,
+                        payload: vec![1],
+                    },
+                    owner: Some(Owner::Mob(mob_id.clone())),
+                    access: documents::DocumentAccess::default(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let refused = registry
+            .check_mob_id_unnamed(store.as_ref(), &mob_id)
+            .await
+            .expect_err("documents name the id, bound or not");
+        assert!(refused.contains(&mob_id), "{refused}");
         handle.stop().await.unwrap();
     }
 
