@@ -31,6 +31,7 @@ VERSION = "0.8.31"
 TAG = "v" + VERSION
 REPO = helper.REPOSITORY
 RUN = 101
+TRAILING_RUN = 102
 ATTEMPT = 2
 CI = 99
 
@@ -284,10 +285,10 @@ class CandidateProtocolTests(unittest.TestCase):
             for name in names:
                 archive.write(folder / name, name)
 
-    def add_artifact(self, aid, name, packed):
+    def add_artifact(self, aid, name, packed, run_id=RUN):
         metadata = {
             "id": aid, "name": name, "expired": False, "digest": "sha256:" + helper.assets.sha256(packed),
-            "workflow_run": {"id": RUN, "head_sha": SHA, "repository_id": 42, "head_repository_id": 42},
+            "workflow_run": {"id": run_id, "head_sha": SHA, "repository_id": 42, "head_repository_id": 42},
         }
         self.state["api"][helper.repo_endpoint(f"actions/artifacts/{aid}")] = metadata
         self.state["api"][helper.repo_endpoint(f"actions/artifacts/{aid}/zip")] = {"bytes_file": str(packed)}
@@ -353,6 +354,505 @@ class CandidateProtocolTests(unittest.TestCase):
                 "state": "uploaded", "local_file": str(path),
             })
         self.save()
+
+    def tier_candidate(self, tier, run_id, manifest_aid):
+        """A schema 2 candidate run that built and binds exactly one tier.
+
+        The run's artifact listing holds only that tier's targets, each
+        archive attested by that run; collection, the manifest artifact and
+        the emitted selection follow release.yml's candidate jobs.
+        """
+        run = dict(self.run_info(), id=run_id)
+        self.state["api"][helper.repo_endpoint(f"actions/runs/{run_id}")] = run
+        listing = []
+        for offset, target in enumerate(helper.assets.TIER_TARGETS[tier]):
+            extension = dict(helper.assets.TARGET_ARCHIVES)[target]
+            folder = self.root / f"run-{run_id}-{target}"
+            folder.mkdir()
+            names = [f"{prefix}-{VERSION}-{target}.{extension}" for prefix in helper.BINARY_NAMES]
+            for name in names:
+                shutil.copyfile(self.target_files[name], folder / name)
+                self.state["verification"][name] = verified_fixture(
+                    name, helper.assets.sha256(folder / name), run_id=run_id)
+            (folder / helper.PROVENANCE).write_text(f'{{"run":{run_id},"target":"{target}"}}\n')
+            packed = self.root / f"artifact-{run_id}-{target}.zip"
+            self.pack(packed, folder, [*names, helper.PROVENANCE])
+            listing.append(self.add_artifact(run_id * 10 + offset, f"meta-gateway-binaries-{target}-{ATTEMPT}",
+                                             packed, run_id))
+        self.state["api"][helper.repo_endpoint(f"actions/runs/{run_id}/artifacts?per_page=100")] = [
+            {"artifacts": listing, "total_count": len(listing)}]
+        self.save()
+        directory = self.root / f"candidate-{tier}"
+        with mock.patch.dict(os.environ, {"GITHUB_RUN_ID": str(run_id), "RELEASE_MODE": "candidate",
+                                          "RELEASE_TIER": tier}):
+            self.command("collect", "--output-dir", str(directory), "--ci-run-id", str(CI),
+                         "--ci-run-attempt", "1", "--tier", tier)
+        _, manifest_name, _ = helper.tier_proof_names(tier)
+        manifest = helper.read_json(directory / manifest_name)
+        self.state["verification"][manifest_name] = verified_fixture(
+            manifest_name, helper.assets.sha256(directory / manifest_name), run_id=run_id)
+        (directory / helper.PROVENANCE).write_text(f'{{"manifest":{run_id}}}\n')
+        packed = self.root / f"candidate-{tier}.zip"
+        self.pack(packed, directory, [manifest_name, helper.PROVENANCE, *helper.assets.metadata_names(tier)])
+        metadata = self.add_artifact(manifest_aid, f"meta-candidate-manifest-{ATTEMPT}", packed, run_id)
+        self.state["api"][helper.repo_endpoint(f"actions/runs/{run_id}")].update(
+            status="completed", conclusion="success")
+        self.save()
+        stdout, _ = self.command("selection", "--manifest-file", str(directory / manifest_name),
+                                 "--artifact-id", str(manifest_aid), "--artifact-digest", metadata["digest"][7:])
+        return json.loads(stdout), manifest
+
+    def promote_core(self):
+        """Collect, accept, stage and publish the schema 2 core tier."""
+        core, manifest = self.tier_candidate("core", RUN, 300)
+        os.environ.update(RELEASE_MODE="promote", SOURCE_SHA="", ARTIFACT_SELECTION=json.dumps(core))
+        self.command("stage", "--output-dir", str(self.root / "release-assets"),
+                     "--proof-dir", str(self.root / "release-proofs"))
+        self.publish()
+        return core, manifest
+
+    def assets_mode(self, selected):
+        os.environ.update(RELEASE_MODE="assets", SOURCE_SHA="", ARTIFACT_SELECTION=json.dumps(selected),
+                          PUBLISH_RELEASE_PACKAGES="false", REGISTRY_DRY_RUN="false")
+
+    def release_files(self):
+        return {asset["name"]: (asset["id"], Path(asset["local_file"]).read_bytes())
+                for asset in self.state["release"]["assets"]}
+
+    def test_schema2_core_promotion_publishes_only_the_core_tier(self):
+        core, manifest = self.promote_core()
+        self.assertEqual((core["schema_version"], core["tier"]), (2, "core"))
+        self.assertEqual((manifest["schema_version"], manifest["tier"]), (2, "core"))
+        self.assertEqual({item["target"] for item in manifest["artifacts"]},
+                         set(helper.assets.TIER_TARGETS["core"]))
+        self.assertFalse(self.state["release"]["draft"])
+        self.assertEqual(set(self.release_files()), helper.tier_file_names(VERSION, "core"))
+        index = json.loads(self.release_files()["index.json"][1])
+        self.assertEqual(index["tier"], "core")
+        self.assertEqual(index["artifacts"], helper.assets.expected_archive_names(VERSION, "core"))
+        # Verification and registry retry need the core tier only.
+        self.state["calls"] = []
+        self.save()
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        stdout, _ = self.command("verify-published")
+        self.assertIn("trailing tier not added yet", stdout)
+        self.assertFalse(self.writes())
+
+    def test_trailing_tier_is_added_add_only_and_bound_to_the_published_core_receipt(self):
+        self.promote_core()
+        before = self.release_files()
+        trailing, manifest = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        self.assertEqual((trailing["schema_version"], trailing["tier"]), (2, "trailing"))
+        self.state["calls"] = []
+        self.save()
+        self.assets_mode(trailing)
+        self.command("recover")
+        after = self.release_files()
+        self.assertEqual(set(after), set(before) | helper.tier_file_names(VERSION, "trailing"))
+        for name, (asset_id, content) in before.items():
+            self.assertEqual(after[name], (asset_id, content), name)
+        uploads = [Path(call["args"][3]).name for call in self.writes()]
+        self.assertTrue(all(call["args"][1] == "upload" for call in self.writes()))
+        self.assertEqual(uploads[0], "candidate-selection-trailing.json")
+        self.assertEqual(set(uploads[-2:]), {"index-trailing.json", "checksums-trailing.sha256"})
+        # Each file only after everything that verifies it.
+        position = uploads.index
+        self.assertLess(position("manifest-provenance-trailing.jsonl"), position("candidate-manifest-trailing.json"))
+        bundles = [position(f"target-{t}-provenance.jsonl") for t in helper.assets.TIER_TARGETS["trailing"]]
+        archives = [position(name) for name in helper.assets.expected_archive_names(VERSION, "trailing")]
+        self.assertLess(position("candidate-manifest-trailing.json"), min(bundles))
+        self.assertLess(max(bundles), min(archives))
+        index = json.loads(after["index-trailing.json"][1])
+        self.assertEqual((index["tier"], index["artifacts"]),
+                         ("trailing", helper.assets.expected_archive_names(VERSION, "trailing")))
+        # A retry adds nothing, and verification now covers both tiers.
+        self.state["calls"] = []
+        self.save()
+        self.command("recover")
+        self.assertFalse(self.writes())
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        stdout, _ = self.command("verify-published")
+        self.assertIn("verified the trailing tier", stdout)
+
+    def test_tier_mismatch_refuses(self):
+        # The collection step's tier must be the resolver's.
+        with mock.patch.dict(os.environ, {"RELEASE_TIER": "trailing"}):
+            _, error = self.command("collect", "--output-dir", str(self.root / "mismatch"),
+                                    "--ci-run-id", str(CI), "--ci-run-attempt", "1", "--tier", "core",
+                                    success=False)
+        self.assertIn("collection tier differs", error)
+        # A core collection refuses a run that also built trailing targets.
+        with mock.patch.dict(os.environ, {"RELEASE_TIER": "core"}):
+            _, error = self.command("collect", "--output-dir", str(self.root / "mixed"),
+                                    "--ci-run-id", str(CI), "--ci-run-attempt", "1", "--tier", "core",
+                                    success=False)
+        self.assertIn("unexpected target artifacts", error)
+        core, _ = self.tier_candidate("core", RUN, 300)
+        # A selection claiming another tier than its attested manifest.
+        relabelled = dict(core, tier="trailing")
+        os.environ.update(RELEASE_MODE="assets", ARTIFACT_SELECTION=json.dumps(relabelled))
+        _, error = self.command("stage", "--output-dir", str(self.root / "a1"),
+                                "--proof-dir", str(self.root / "p1"), success=False)
+        self.assertIn("schema/tier mismatch", error)
+        # Promotion refuses a trailing selection before reading any artifact.
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        os.environ.update(RELEASE_MODE="promote", ARTIFACT_SELECTION=json.dumps(trailing))
+        self.state["calls"] = []
+        self.save()
+        _, error = self.command("stage", "--output-dir", str(self.root / "a2"),
+                                "--proof-dir", str(self.root / "p2"), success=False)
+        self.assertIn("promotion accepts only a core selection", error)
+        self.assertFalse(self.state["calls"])
+        self.assertFalse(self.writes())
+
+    def test_trailing_without_a_published_core_receipt_refuses_before_writes(self):
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        self.assets_mode(trailing)
+        # No release at all.
+        _, error = self.command("recover", success=False)
+        self.assertIn("cannot create a release", error)
+        # A release without the core receipt.
+        core_archive = self.target_files[f"meta-gateway-{VERSION}-x86_64-unknown-linux-gnu.tar.gz"]
+        self.seed_release([core_archive])
+        _, error = self.command("recover", success=False)
+        self.assertIn("requires the published core receipt", error)
+        # A draft (promotion not finished) is not a published core.
+        self.seed_release([core_archive], draft=True)
+        _, error = self.command("recover", success=False)
+        self.assertIn("published release only", error)
+        self.assertFalse(self.writes())
+
+    def test_trailing_tier_refuses_a_schema_1_release(self):
+        # A schema 1 receipt binds all five targets already, not a core tier.
+        self.staged()
+        self.publish()
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        self.assets_mode(trailing)
+        self.state["calls"] = []
+        self.save()
+        _, error = self.command("recover", success=False)
+        self.assertIn("schema 2 core receipt", error)
+        self.assertFalse(self.writes())
+
+    def test_trailing_name_collision_with_different_bytes_refuses_before_writes(self):
+        self.promote_core()
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        squatter = self.root / f"meta-gateway-{VERSION}-x86_64-pc-windows-msvc.zip"
+        squatter.write_bytes(b"not the attested trailing archive")
+        self.state["release"]["assets"].append({
+            "id": 990, "name": squatter.name, "size": squatter.stat().st_size, "state": "uploaded",
+            "digest": "sha256:" + helper.assets.sha256(squatter), "local_file": str(squatter)})
+        self.state["calls"] = []
+        self.save()
+        before = self.release_files()
+        self.assets_mode(trailing)
+        _, error = self.command("recover", success=False)
+        self.assertIn(f"existing release asset conflict: {squatter.name}", error)
+        self.assertFalse(self.writes())
+        self.assertEqual(self.release_files(), before)
+
+    def test_partial_trailing_tier_never_blocks_core_verification(self):
+        self.promote_core()
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        self.assets_mode(trailing)
+        self.state["fail_upload"] = "meta-gateway-0.8.31-x86_64-apple-darwin.tar.gz"
+        self.save()
+        self.command("recover", success=False)
+        self.assertIn("candidate-selection-trailing.json", self.release_files())
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        stdout, _ = self.command("verify-published")
+        self.assertIn("trailing tier incomplete", stdout)
+        # Once complete, a tampered trailing archive fails verification.
+        self.state.pop("fail_upload")
+        self.save()
+        self.assets_mode(trailing)
+        self.command("recover")
+        archive = next(a for a in self.state["release"]["assets"] if a["name"].endswith("windows-msvc.zip"))
+        Path(archive["local_file"]).write_bytes(b"tampered after publication")
+        archive["digest"] = "sha256:" + helper.assets.sha256(Path(archive["local_file"]))
+        archive["size"] = Path(archive["local_file"]).stat().st_size
+        self.save()
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        self.command("verify-published", success=False)
+
+    def append_release_asset(self, path, *, asset_id):
+        content = path.read_bytes()
+        self.state["release"]["assets"].append({
+            "id": asset_id, "name": path.name, "size": len(content), "state": "uploaded",
+            "digest": "sha256:" + hashlib.sha256(content).hexdigest(), "local_file": str(path)})
+        self.save()
+
+    def test_probe_1_a_trailing_file_on_a_failed_promotion_draft_never_goes_public(self):
+        core, _ = self.tier_candidate("core", RUN, 300)
+        os.environ.update(RELEASE_MODE="promote", SOURCE_SHA="", ARTIFACT_SELECTION=json.dumps(core))
+        self.command("stage", "--output-dir", str(self.root / "release-assets"),
+                     "--proof-dir", str(self.root / "release-proofs"))
+        planted = self.root / f"meta-gateway-{VERSION}-x86_64-pc-windows-msvc.zip"
+        planted.write_bytes(b"planted while the promotion was interrupted")
+        self.seed_release([self.root / "release-proofs" / helper.SELECTION, planted], draft=True)
+        self.state["calls"] = []
+        self.save()
+        _, error = self.publish(success=False)
+        self.assertIn("trailing files on an unpublished release", error)
+        self.assertFalse(self.writes())
+        self.assertTrue(self.state["release"]["draft"])
+
+    def test_probe_2_a_replaced_trailing_archive_fails_verification_even_while_incomplete(self):
+        self.promote_core()
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        self.assets_mode(trailing)
+        self.state["fail_upload"] = f"meta-rpc-gateway-{VERSION}-x86_64-pc-windows-msvc.zip"
+        self.save()
+        self.command("recover", success=False)
+        replaced = next(a for a in self.state["release"]["assets"]
+                        if a["name"] == f"meta-gateway-{VERSION}-x86_64-apple-darwin.tar.gz")
+        # A well-formed archive of the right member, with other bytes.
+        Path(replaced["local_file"]).write_bytes(archive_bytes("meta_gateway", b"replaced after upload", "tar.gz"))
+        replaced["digest"] = "sha256:" + helper.assets.sha256(Path(replaced["local_file"]))
+        replaced["size"] = Path(replaced["local_file"]).stat().st_size
+        self.save()
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        _, error = self.command("verify-published", success=False)
+        self.assertIn("does not match its manifest record", error)
+
+    def test_probe_3_a_planted_trailing_receipt_and_archive_fail_and_block_nothing_silently(self):
+        self.promote_core()
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        planted_receipt = self.root / "candidate-selection-trailing.json"
+        planted_receipt.write_text(json.dumps(dict(trailing, run_id=999)))
+        planted_archive = self.root / f"meta-repair-{VERSION}-x86_64-pc-windows-msvc.zip"
+        planted_archive.write_bytes(b"planted archive")
+        self.append_release_asset(planted_receipt, asset_id=1990)
+        self.append_release_asset(planted_archive, asset_id=1991)
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        # The planted receipt names a run that does not exist.
+        _, error = self.command("verify-published", success=False)
+        self.assertIn("actions/runs/999", error)
+        # Naming the real run with another manifest artifact fails its record.
+        planted_receipt.write_text(json.dumps(dict(trailing, manifest_artifact=dict(
+            trailing["manifest_artifact"], digest="c" * 64))))
+        receipt_asset = next(a for a in self.state["release"]["assets"] if a["id"] == 1990)
+        receipt_asset["digest"] = "sha256:" + helper.assets.sha256(planted_receipt)
+        receipt_asset["size"] = planted_receipt.stat().st_size
+        self.save()
+        _, error = self.command("verify-published", success=False)
+        self.assertIn("selected manifest artifact digest mismatch", error)
+        # The real trailing tier refuses to bind over the planted files
+        # before any write; an operator removes them first.
+        self.state["calls"] = []
+        self.save()
+        self.assets_mode(trailing)
+        _, error = self.command("recover", success=False)
+        self.assertIn("existing release asset conflict", error)
+        self.assertIn(f"names run {TRAILING_RUN}/{ATTEMPT}", error)
+        self.assertIn("operator cleanup required", error)
+        self.assertFalse(self.writes())
+
+    def test_a_tampered_trailing_index_fails_verification_while_an_archive_is_missing(self):
+        self.promote_core()
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        self.assets_mode(trailing)
+        self.command("recover")
+        missing = next(a for a in self.state["release"]["assets"]
+                       if a["name"] == f"meta-repair-{VERSION}-x86_64-pc-windows-msvc.zip")
+        self.state["release"]["assets"].remove(missing)
+        index = next(a for a in self.state["release"]["assets"] if a["name"] == "index-trailing.json")
+        Path(index["local_file"]).write_text('{"tampered": true}\n')
+        index["digest"] = "sha256:" + helper.assets.sha256(Path(index["local_file"]))
+        index["size"] = Path(index["local_file"]).stat().st_size
+        self.save()
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        _, error = self.command("verify-published", success=False)
+        self.assertIn("published trailing index-trailing.json hash mismatch", error)
+
+    def test_promotion_rerun_verifies_trailing_files_already_on_the_public_release(self):
+        core, _ = self.promote_core()
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        self.assets_mode(trailing)
+        self.command("recover")
+        replaced = next(a for a in self.state["release"]["assets"]
+                        if a["name"] == f"meta-gateway-{VERSION}-x86_64-apple-darwin.tar.gz")
+        Path(replaced["local_file"]).write_bytes(archive_bytes("meta_gateway", b"swapped", "tar.gz"))
+        replaced["digest"] = "sha256:" + helper.assets.sha256(Path(replaced["local_file"]))
+        replaced["size"] = Path(replaced["local_file"]).stat().st_size
+        self.state["calls"] = []
+        self.save()
+        os.environ.update(RELEASE_MODE="promote", ARTIFACT_SELECTION=json.dumps(core))
+        _, error = self.publish(success=False)
+        self.assertIn("does not match its manifest record", error)
+        self.assertFalse(self.writes())
+
+    def partial_trailing(self, stop_before):
+        """Promote the core, then add the trailing tier until `stop_before`
+        fails to upload; returns the trailing selection."""
+        self.promote_core()
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        self.assets_mode(trailing)
+        self.state["fail_upload"] = stop_before
+        self.save()
+        self.command("recover", success=False)
+        self.state.pop("fail_upload")
+        self.save()
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        return trailing
+
+    def replace_release_asset(self, name, content):
+        asset = next(a for a in self.state["release"]["assets"] if a["name"] == name)
+        Path(asset["local_file"]).write_bytes(content)
+        asset["digest"] = "sha256:" + hashlib.sha256(content).hexdigest()
+        asset["size"] = len(content)
+        self.save()
+
+    def test_a_receipt_alone_is_bound_through_its_run_before_it_counts_as_verified(self):
+        self.partial_trailing("manifest-provenance-trailing.jsonl")
+        names = {asset["name"] for asset in self.state["release"]["assets"]}
+        self.assertIn("candidate-selection-trailing.json", names)
+        self.assertNotIn("candidate-manifest-trailing.json", names)
+        self.state["calls"] = []
+        self.save()
+        stdout, _ = self.command("verify-published")
+        self.assertIn("every present file verified", stdout)
+        reads = [call["args"][1] for call in self.state["calls"] if call["args"][0] == "api"]
+        self.assertIn(helper.repo_endpoint("actions/artifacts/301/zip"), reads)
+        self.assertIn(helper.repo_endpoint(f"actions/runs/{TRAILING_RUN}"), reads)
+
+    def test_a_planted_manifest_bundle_beside_a_receipt_fails(self):
+        trailing = self.partial_trailing("candidate-manifest-trailing.json")
+        self.replace_release_asset("manifest-provenance-trailing.jsonl", b'{"planted": true}\n')
+        _, error = self.command("verify-published", success=False)
+        self.assertIn("manifest bundle is not the candidate's", error)
+
+    def test_target_bundles_waiting_for_their_archives_must_be_the_candidates(self):
+        first_archive = helper.trailing_upload_order(helper.tier_file_names(VERSION, "trailing"))[5]
+        self.assertTrue(first_archive.startswith("meta-"), first_archive)
+        self.partial_trailing(first_archive)
+        stdout, _ = self.command("verify-published")
+        self.assertIn("every present file verified", stdout)
+        self.replace_release_asset("target-x86_64-pc-windows-msvc-provenance.jsonl", b'{"planted": true}\n')
+        _, error = self.command("verify-published", success=False)
+        self.assertIn("is not the candidate's", error)
+
+    def test_verification_requires_green_candidate_and_ci_runs(self):
+        self.promote_core()
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        self.assets_mode(trailing)
+        self.command("recover")
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        self.command("verify-published")
+        for endpoint, change, message in (
+            (f"actions/runs/{TRAILING_RUN}", {"conclusion": "failure"}, "not completed-success"),
+            (f"actions/runs/{RUN}", {"conclusion": "cancelled"}, "not completed-success"),
+            (f"actions/runs/{CI}", {"conclusion": "failure"}, "not completed-success"),
+        ):
+            with self.subTest(endpoint=endpoint):
+                original = dict(self.state["api"][helper.repo_endpoint(endpoint)])
+                self.state["api"][helper.repo_endpoint(endpoint)].update(change)
+                self.save()
+                _, error = self.command("verify-published", success=False)
+                self.assertIn(message, error)
+                self.state["api"][helper.repo_endpoint(endpoint)] = original
+                self.save()
+
+    def test_core_verification_requires_the_manifests_ci_run_green(self):
+        self.promote_core()
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        self.command("verify-published")
+        self.state["api"][helper.repo_endpoint(f"actions/runs/{CI}")].update(conclusion="failure")
+        self.save()
+        _, error = self.command("verify-published", success=False)
+        self.assertIn("not completed-success", error)
+
+    def test_assets_outside_the_tier_file_names_fail_verification(self):
+        self.promote_core()
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        for name in ("install.sh", f"meta-gateway-{VERSION}-riscv64gc-unknown-linux-gnu.tar.gz"):
+            with self.subTest(name=name):
+                extra = self.root / name
+                extra.write_bytes(b"planted")
+                self.append_release_asset(extra, asset_id=1980)
+                _, error = self.command("verify-published", success=False)
+                self.assertIn(f"unexpected release assets: {name}", error)
+                self.state["release"]["assets"] = [a for a in self.state["release"]["assets"] if a["id"] != 1980]
+                self.save()
+        self.command("verify-published")
+
+    def test_a_schema_1_release_refuses_extra_assets_too(self):
+        self.staged()
+        self.publish()
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        extra = self.root / "install.sh"
+        extra.write_bytes(b"planted")
+        self.append_release_asset(extra, asset_id=1981)
+        _, error = self.command("verify-published", success=False)
+        self.assertIn("unexpected release assets: install.sh", error)
+
+    def test_local_dispatch_refuses_a_trailing_promotion(self):
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        selection = self.root / "accepted-trailing.json"
+        selection.write_text(json.dumps(trailing))
+        self.state["calls"] = []
+        self.save()
+        os.environ.update(RELEASE_MODE="", SOURCE_SHA="", RELEASE_TIER="", RELEASE_TAG=TAG,
+                          ARTIFACT_SELECTION_FILE=str(selection), PUBLISH_RELEASE_PACKAGES="true")
+        _, error = self.command("dispatch", "--mode", "promote", success=False)
+        self.assertIn("promotion accepts only a core selection", error)
+        self.assertFalse(self.state["calls"])
+        os.environ.update(PUBLISH_RELEASE_PACKAGES="false")
+        self.command("dispatch", "--mode", "assets")
+        self.assertEqual(json.loads(self.state["calls"][-1]["inputs"]["artifact_selection"]), trailing)
+
+    def test_promotion_of_a_trailing_selection_fails_at_resolution(self):
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        os.environ.update(RELEASE_MODE="promote", SOURCE_SHA="", RELEASE_TIER="",
+                          ARTIFACT_SELECTION=json.dumps(trailing))
+        _, error = self.command("resolve", success=False)
+        self.assertIn("promotion accepts only a core selection", error)
+        os.environ["RELEASE_MODE"] = "assets"
+        self.command("resolve")
+
+    def test_schema_1_documents_keep_verifying_and_schema_2_requires_its_tier(self):
+        v1_selection, v1_manifest = self.staged()
+        self.assertEqual(v1_selection["schema_version"], 1)
+        self.assertNotIn("tier", v1_selection)
+        self.publish()
+        self.state["calls"] = []
+        self.save()
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        self.command("verify-published")
+        self.assertFalse(self.writes())
+        for change, message in (
+            ({"tier": "core"}, "schema 1 has no tier"),
+            ({"schema_version": 2}, "schema 2 requires tier"),
+            ({"schema_version": 2, "tier": "everything"}, "schema 2 requires tier"),
+            ({"schema_version": 3}, "unsupported schema version"),
+        ):
+            with self.subTest(change=change):
+                with self.assertRaisesRegex(helper.ProtocolError, message):
+                    helper.validate_manifest(dict(v1_manifest, **change))
+                with self.assertRaisesRegex(helper.ProtocolError, message):
+                    helper.validate_selection(dict(v1_selection, **change))
+        # A schema 2 manifest must hold exactly its tier's targets.
+        core, core_manifest = self.tier_candidate("core", 103, 302)
+        widened = dict(core_manifest, artifacts=v1_manifest["artifacts"])
+        with self.assertRaisesRegex(helper.ProtocolError, "target outside the candidate tier|invalid target"):
+            helper.validate_manifest(widened)
+
+    def test_collection_refuses_rather_than_waits_while_main_ci_is_not_green(self):
+        """Builds start right after the merge, so collection is where main CI
+        must already be green; an unfinished run is refused at once."""
+        endpoint = helper.repo_endpoint(f"actions/runs/{CI}")
+        for status, conclusion in (("in_progress", None), ("queued", None), ("completed", "failure")):
+            with self.subTest(status=status, conclusion=conclusion):
+                self.state["api"][endpoint].update(status=status, conclusion=conclusion)
+                self.state["calls"] = []
+                self.save()
+                _, error = self.command("collect", "--output-dir", str(self.root / f"refused-{status}"),
+                                        "--ci-run-id", str(CI), "--ci-run-attempt", "1", success=False)
+                self.assertIn("not completed-success", error)
+                reads = [c for c in self.state["calls"] if c["args"][:2] == ["api", endpoint]]
+                self.assertEqual(len(reads), 1, "collection polled main CI instead of refusing")
+                self.assertFalse(any("/zip" in c["args"][1] for c in self.state["calls"] if c["args"][0] == "api"))
+                self.assertFalse((self.root / f"refused-{status}").exists())
 
     def test_download_media_negotiation_uses_explicit_endpoint_intent(self):
         aid = self.artifact_ids[0]
@@ -946,12 +1446,20 @@ class CandidateProtocolTests(unittest.TestCase):
         self.staged()
         self.publish()
         self.state["calls"] = []
-        self.state["fail_endpoints"] = [key for key in self.state["api"] if "/actions/" in key]
+        # Artifacts expire after their retention; the runs and the artifact
+        # records stay readable, and verification needs nothing more.
+        for key, value in self.state["api"].items():
+            if "/actions/artifacts/" in key and isinstance(value, dict) and "expired" in value:
+                value["expired"] = True
+        self.state["fail_endpoints"] = [key for key in self.state["api"] if key.endswith("/zip")]
         self.save()
         self.command("verify-published")
         self.assertFalse(self.writes())
-        self.assertFalse(any("/actions/" in call["args"][1] for call in self.state["calls"]
-                             if call["args"][0] == "api"))
+        reads = [call["args"][1] for call in self.state["calls"] if call["args"][0] == "api"]
+        self.assertFalse([read for read in reads if read.endswith("/zip")])
+        # The receipt's run, its manifest artifact record and the CI run are read.
+        for endpoint in (f"actions/runs/{RUN}", "actions/artifacts/300", f"actions/runs/{CI}"):
+            self.assertIn(helper.repo_endpoint(endpoint), reads)
 
     def test_deleted_receipt_does_not_downgrade_candidate_era_to_legacy(self):
         self.staged()
@@ -1180,18 +1688,26 @@ class CandidateProtocolTests(unittest.TestCase):
         self.assertFalse(self.writes())
 
     def test_resolver_candidate_equality_main_and_boolean_contract(self):
-        os.environ["RELEASE_TAG"] = ""
+        os.environ.update(RELEASE_TAG="", RELEASE_TIER="core")
         stdout, _ = self.command("resolve")
         value = json.loads(stdout)
         self.assertEqual(value["tag"], TAG)
         self.assertEqual(value["ci_bypass"], "false")
         self.assertEqual(value["sha"], SHA)
+        self.assertEqual(value["tier"], "core")
+        for tier in helper.assets.TIERS:
+            with mock.patch.dict(os.environ, {"RELEASE_TIER": tier}):
+                stdout, _ = self.command("resolve")
+            # One candidate run builds exactly its tier's legs.
+            matrix = json.loads(json.loads(stdout)["build_matrix"])
+            self.assertEqual([leg["target"] for leg in matrix["include"]],
+                             list(helper.assets.TIER_TARGETS[tier]))
         for name, value in [
             ("SOURCE_SHA", ""), ("SOURCE_SHA", OTHER_SHA), ("GITHUB_SHA", OTHER_SHA),
             ("GITHUB_WORKFLOW_SHA", OTHER_SHA), ("GITHUB_REF", "refs/heads/feature"),
             ("RELEASE_TAG", TAG), ("ARTIFACT_SELECTION", "{}"),
             ("REGISTRY_DRY_RUN", "true"), ("PUBLISH_RELEASE_PACKAGES", "true"),
-            ("PUBLISH_RELEASE_PACKAGES", "False"),
+            ("PUBLISH_RELEASE_PACKAGES", "False"), ("RELEASE_TIER", ""), ("RELEASE_TIER", "all"),
         ]:
             with self.subTest(name=name, value=value), mock.patch.dict(os.environ, {name: value}):
                 self.command("resolve", success=False)
@@ -1252,7 +1768,7 @@ class CandidateProtocolTests(unittest.TestCase):
         self.command("resolve", success=False)
 
     def test_dispatch_real_cli_uses_json_stdin_main_owner_auth_no_tag_write(self):
-        os.environ.update(RELEASE_TAG="", ARTIFACT_SELECTION="")
+        os.environ.update(RELEASE_TAG="", ARTIFACT_SELECTION="", RELEASE_TIER="trailing")
         result = subprocess.run([sys.executable, str(SCRIPT), "dispatch", "--mode", "candidate"],
                                 capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1264,6 +1780,7 @@ class CandidateProtocolTests(unittest.TestCase):
         self.assertFalse(call["github_api_token"])
         self.assertEqual(call["inputs"]["source_sha"], SHA)
         self.assertEqual(call["inputs"]["release_mode"], "candidate")
+        self.assertEqual(call["inputs"]["candidate_tier"], "trailing")
         self.assertIn("tag pushes validate only", result.stderr)
         self.assertNotIn("fixture-workflow-token", result.stdout + result.stderr)
         self.assertFalse(self.writes())
@@ -1304,7 +1821,7 @@ class CandidateProtocolTests(unittest.TestCase):
         env = os.environ.copy()
         for key in ("RELEASE_MODE", "SOURCE_SHA", "RELEASE_TAG", "ARTIFACT_SELECTION",
                     "ARTIFACT_SELECTION_FILE", "PUBLISH_RELEASE_PACKAGES", "REGISTRY_DRY_RUN",
-                    "MAKEFLAGS", "MAKEOVERRIDES", "MFLAGS"):
+                    "RELEASE_TIER", "TIER", "MAKEFLAGS", "MAKEOVERRIDES", "MFLAGS"):
             env.pop(key, None)
         result = subprocess.run(["make", "--no-print-directory", target, *variables],
                                 cwd=SCRIPT.resolve().parent.parent, env=env,
@@ -1325,7 +1842,8 @@ class CandidateProtocolTests(unittest.TestCase):
         path = self.root / "accepted candidate;not-a-command.json"
         path.write_text(json.dumps(accepted))
         cases = [
-            ("release-candidate", [f"SOURCE_SHA={SHA}"], "candidate", "false", "false", ""),
+            ("release-candidate", [f"SOURCE_SHA={SHA}", "TIER=core"], "candidate", "false", "false", ""),
+            ("release-candidate", [f"SOURCE_SHA={SHA}", "TIER=trailing"], "candidate", "false", "false", ""),
             ("release-promote", [f"RELEASE_TAG={TAG}", f"ARTIFACT_SELECTION={path}"],
              "promote", "true", "false", accepted),
             ("release-promote", [f"RELEASE_TAG={TAG}", f"ARTIFACT_SELECTION={path}",
@@ -1350,6 +1868,8 @@ class CandidateProtocolTests(unittest.TestCase):
                 self.assertEqual(call["inputs"]["registry_dry_run"], dry)
                 self.assertEqual(call["inputs"]["source_sha"], SHA if mode == "candidate" else "")
                 self.assertEqual(call["inputs"]["release_tag"], "" if mode == "candidate" else TAG)
+                self.assertEqual(call["inputs"]["candidate_tier"],
+                                 next((v[5:] for v in variables if v.startswith("TIER=")), ""))
                 receipt = call["inputs"]["artifact_selection"]
                 self.assertEqual(json.loads(receipt) if receipt else "", selected)
                 self.assertFalse(call["gh_token"])
@@ -1361,6 +1881,10 @@ class CandidateProtocolTests(unittest.TestCase):
     def test_make_facades_refuse_missing_conflicting_or_invalid_inputs_before_gh(self):
         for target, variables in [
             ("release-candidate", []),
+            ("release-candidate", [f"SOURCE_SHA={SHA}"]),
+            ("release-candidate", [f"SOURCE_SHA={SHA}", "TIER=all"]),
+            ("release-candidate", [f"SOURCE_SHA={SHA}", "TIER=core", "PUBLISH_RELEASE_PACKAGES=true"]),
+            ("release-registry-retry", [f"RELEASE_TAG={TAG}", "TIER=core"]),
             ("release-candidate", [f"SOURCE_SHA={SHA}", "PUBLISH_RELEASE_PACKAGES=true"]),
             ("release-candidate", [f"SOURCE_SHA={SHA}", "REGISTRY_DRY_RUN=invalid"]),
             ("release-promote", []),

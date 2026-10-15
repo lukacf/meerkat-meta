@@ -247,12 +247,14 @@ release-dry-run-smoke: release-preflight-smoke publish-dry-run publish-dry-run-p
 # Protocol v1: tag pushes validate only; these dispatches never create tags.
 release-candidate: export RELEASE_MODE = candidate
 release-candidate: export SOURCE_SHA := $(SOURCE_SHA)
+release-candidate: export RELEASE_TIER := $(TIER)
 release-candidate: export PUBLISH_RELEASE_PACKAGES = false
 release-candidate: export REGISTRY_DRY_RUN = false
-release-candidate: ## Build immutable candidate on main (SOURCE_SHA required); never publish
+release-candidate: ## Build one tier's immutable candidate on main (SOURCE_SHA, TIER=core|trailing required); never publish
 	@python3 scripts/release-candidate.py dispatch --mode candidate
 
 release-promote: export RELEASE_TAG := $(RELEASE_TAG)
+release-promote: export RELEASE_TIER := $(TIER)
 release-promote: export ARTIFACT_SELECTION_FILE = $(ARTIFACT_SELECTION)
 release-promote: export PUBLISH_RELEASE_PACKAGES ?= true
 release-promote: export REGISTRY_DRY_RUN ?= false
@@ -260,12 +262,14 @@ release-promote: ## Promote accepted original bytes (RELEASE_TAG, ARTIFACT_SELEC
 	@python3 scripts/release-candidate.py dispatch --mode promote
 
 release-registry-retry: export RELEASE_TAG := $(RELEASE_TAG)
+release-registry-retry: export RELEASE_TIER := $(TIER)
 release-registry-retry: export PUBLISH_RELEASE_PACKAGES = true
 release-registry-retry: export REGISTRY_DRY_RUN ?= false
 release-registry-retry: ## Retry registries only, never touch GitHub assets (RELEASE_TAG required)
 	@python3 scripts/release-candidate.py dispatch --mode existing
 
 release-assets-recover: export RELEASE_TAG := $(RELEASE_TAG)
+release-assets-recover: export RELEASE_TIER := $(TIER)
 release-assets-recover: export ARTIFACT_SELECTION_FILE = $(ARTIFACT_SELECTION)
 release-assets-recover: export PUBLISH_RELEASE_PACKAGES = false
 release-assets-recover: export REGISTRY_DRY_RUN = false
@@ -276,7 +280,7 @@ release-assets-recover: ## Add missing original assets only (RELEASE_TAG, ARTIFA
 
 help: ## Show this help
 	@echo "$(GREEN)Meta Makefile targets:$(NC)"
-	@echo "Release protocol v1: tag pushes validate only; release-promote publishes accepted bytes."
+	@echo "Release protocol: tag pushes validate only; release-candidate TIER=core|trailing builds one tier; release-promote publishes the accepted core tier; release-assets-recover adds the trailing tier."
 	@echo ""
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  $(YELLOW)%-24s$(NC) %s\n", $$1, $$2}'

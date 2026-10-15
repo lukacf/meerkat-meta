@@ -2,6 +2,7 @@
 """Offline behavioral contracts for release protocol v1 and registry publication."""
 
 import hashlib
+import importlib.util
 import itertools
 import json
 import os
@@ -17,6 +18,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
+_CANDIDATE_SPEC = importlib.util.spec_from_file_location("release_candidate", ROOT / "scripts/release-candidate.py")
+release_candidate = importlib.util.module_from_spec(_CANDIDATE_SPEC)
+_CANDIDATE_SPEC.loader.exec_module(release_candidate)
 
 
 @contextmanager
@@ -158,12 +162,17 @@ def job_runs(name: str, **context) -> bool:
     return condition and (bool(explicit_status) or all(s == "success" for s in statuses))
 
 
+# Dependency order: a candidate's build legs overlap exact-main CI, so they
+# precede the gate that collection waits on.
 JOBS = (
-    "resolve_release", "require_ci_green", "release_validate", "build_binaries",
+    "resolve_release", "build_binaries", "require_ci_green", "release_validate",
     "collect_candidate", "verify_release_assets", "publish_github_release",
     "publish_sdk_packages", "verify_crate_packages", "publish_registries",
 )
-WORK_JOBS = JOBS[3:]
+WORK_JOBS = (
+    "build_binaries", "collect_candidate", "verify_release_assets", "publish_github_release",
+    "publish_sdk_packages", "verify_crate_packages", "publish_registries",
+)
 
 
 def protocol_context(mode="promote", publish=True, dry=False, *, event="workflow_dispatch",
@@ -331,7 +340,10 @@ def scalar(block: str, key: str, indent: str) -> str:
 
 
 def matrix_targets(job: str = "build_binaries") -> list[str]:
-    return re.findall(r"^\s+target: (\S+)$", job_block(job), re.M)
+    """Every build leg's target: the resolver emits one tier's legs from
+    release-candidate.py BUILD_LEGS as the build_binaries matrix."""
+    assert job == "build_binaries"
+    return [leg["target"] for leg in release_candidate.BUILD_LEGS]
 
 
 def evaluate_expression(expression: str, **context):
@@ -868,7 +880,37 @@ class ReleaseProtocolConditionsTests(unittest.TestCase):
                 results = release_results(
                     protocol_context(mode, publish, dry), failures={upstream: status}
                 )
-                self.assertFalse({job for job in WORK_JOBS if results[job] == "success"})
+                # A candidate's legs build beside exact-main CI; a failed CI
+                # gate or validation still binds, attests and publishes nothing.
+                overlap = {"build_binaries"} if mode == "candidate" and upstream != "resolve_release" else set()
+                self.assertEqual({job for job in WORK_JOBS if results[job] == "success"}, overlap)
+
+    def test_candidate_builds_overlap_ci_and_collection_refuses_without_green_ci(self):
+        """The legs need only the resolver; the CI gate runs after every leg
+        succeeded and before validation and collection, and refuses rather
+        than waits (ExactMainCiGateTests run its script)."""
+        self.assertEqual(job_needs("build_binaries"), ["resolve_release"])
+        self.assertEqual(job_needs("require_ci_green"), ["resolve_release", "build_binaries"])
+        self.assertEqual(job_needs("collect_candidate"),
+                         ["resolve_release", "require_ci_green", "release_validate", "build_binaries"])
+        for gate in ("failure", "cancelled", "skipped"):
+            with self.subTest(gate=gate):
+                results = release_results(protocol_context("candidate"), {"require_ci_green": gate})
+                self.assertEqual(results["build_binaries"], "success")
+                self.assertEqual(results["collect_candidate"], "skipped")
+        # A failed leg never reaches the gate, so nothing is bound either.
+        results = release_results(protocol_context("candidate"), {"build_binaries": "failure"})
+        self.assertEqual((results["require_ci_green"], results["collect_candidate"]), ("skipped", "skipped"))
+
+    def test_the_ci_gate_runs_after_candidate_builds_and_first_in_every_other_mode(self):
+        self.assertIn("always()", job_condition("require_ci_green"))
+        for mode in ("candidate", "promote", "existing", "assets", "tag"):
+            for resolved, built in itertools.product(("success", "failure", "skipped", "cancelled"), repeat=2):
+                context = protocol_context(mode, event="push" if mode == "tag" else "workflow_dispatch")
+                context.update(needs_resolve_release_result=resolved, needs_build_binaries_result=built)
+                expected = resolved == "success" and built == ("success" if mode == "candidate" else "skipped")
+                with self.subTest(mode=mode, resolved=resolved, built=built):
+                    self.assertEqual(job_runs("require_ci_green", **context), expected)
 
     def test_full_publication_stops_at_each_failed_boundary(self):
         for upstream, downstream in (
@@ -931,7 +973,7 @@ class ReleaseProtocolConditionsTests(unittest.TestCase):
                     )
 
     def test_ordinary_jobs_require_implicit_success_of_every_declared_need(self):
-        for job, mode in (("require_ci_green", "candidate"), ("release_validate", "candidate"),
+        for job, mode in (("release_validate", "candidate"),
                           ("build_binaries", "candidate"), ("collect_candidate", "candidate"),
                           ("verify_release_assets", "promote"), ("verify_crate_packages", "promote")):
             self.assertNotIn("always()", job_condition(job))
@@ -1076,6 +1118,18 @@ class ImmutableReleaseWorkflowTests(unittest.TestCase):
             "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin",
             "x86_64-apple-darwin", "x86_64-pc-windows-msvc",
         })
+        # Each candidate run builds exactly its tier's legs, from the resolver.
+        self.assertIn("      matrix: ${{ fromJSON(needs.resolve_release.outputs.build_matrix) }}\n",
+                      job_block("build_binaries") + "\n")
+        self.assertIn("      build_matrix: ${{ steps.resolve.outputs.build_matrix }}\n", job_block("resolve_release"))
+        self.assertIn("      tier: ${{ steps.resolve.outputs.tier }}\n", job_block("resolve_release"))
+        self.assertIn("RELEASE_TIER: ${{ inputs.candidate_tier }}",
+                      step_block("Resolve release mode and source", "resolve_release"))
+        for tier, targets in release_candidate.assets.TIER_TARGETS.items():
+            matrix = release_candidate.build_matrix(tier)
+            self.assertEqual([leg["target"] for leg in matrix["include"]], list(targets))
+            for leg in matrix["include"]:
+                self.assertEqual(set(leg), {"runs-on", "target", "archive_ext"})
         script = step_script("Build gateway binaries")
         self.assertEqual(set(re.findall(r"--bin (\w+)", script)),
                          {"meta_gateway", "rpc_gateway", "meta_repair"})
@@ -1119,17 +1173,30 @@ class ImmutableReleaseWorkflowTests(unittest.TestCase):
                                      ("path", f"{directory}/*")):
                     self.assertEqual(scalar(artifact, field, "          "), value)
         manifest = step_block("Attest candidate manifest", "collect_candidate")
+        # Either tier's manifest; a candidate run collects exactly one.
         self.assertEqual(scalar(manifest, "subject-path", "          "),
-                         "candidate/candidate-manifest.json")
+                         "candidate/candidate-manifest*.json")
+        for tier in release_candidate.assets.TIERS:
+            self.assertTrue(release_candidate.tier_proof_names(tier)[1].startswith("candidate-manifest"))
 
     def test_collection_binds_ci_and_upload_identity_before_emitting_acceptance(self):
         block = job_block("collect_candidate")
         self.assertEqual(job_needs("collect_candidate"),
-                         ["resolve_release", "require_ci_green", "build_binaries"])
+                         ["resolve_release", "require_ci_green", "release_validate", "build_binaries"])
+        self.assertIn("RELEASE_TIER: ${{ needs.resolve_release.outputs.tier }}", block)
         for field in ("run_id", "run_attempt"):
             self.assertIn(f"${{{{ needs.require_ci_green.outputs.{field} }}}}", block)
         collect = step_script("Collect verified original artifacts", "collect_candidate")
-        self.assertIn('--ci-run-id "$CI_RUN_ID" --ci-run-attempt "$CI_RUN_ATTEMPT"', collect)
+        self.assertIn('--ci-run-id "$CI_RUN_ID" --ci-run-attempt "$CI_RUN_ATTEMPT" --tier "$RELEASE_TIER"', collect)
+        emit = step_script("Emit explicit acceptance selection", "collect_candidate")
+        for tier in release_candidate.assets.TIERS:
+            # The selection reads the manifest under its tier's release name.
+            expected = release_candidate.tier_proof_names(tier)[1]
+            result = subprocess.run(["bash", "-c", emit.replace("python3 scripts/release-candidate.py selection",
+                                                                'echo "$manifest" #')],
+                                    env={**os.environ, "RELEASE_TIER": tier, "ARTIFACT_ID": "1",
+                                         "ARTIFACT_DIGEST": "a"}, capture_output=True, text=True)
+            self.assertEqual(result.stdout.strip(), f"candidate/{expected}", result.stderr)
         selection = step_block("Emit explicit acceptance selection", "collect_candidate")
         self.assertIn("ARTIFACT_ID: ${{ steps.manifest.outputs.artifact-id }}", selection)
         self.assertIn("ARTIFACT_DIGEST: ${{ steps.manifest.outputs.artifact-digest }}", selection)
@@ -1240,7 +1307,9 @@ class ExactMainCiGateTests(unittest.TestCase):
     def test_release_validate_waits_on_the_gate_rather_than_merely_coexisting(self):
         block = job_block("release_validate")
         self.assertEqual(job_needs("release_validate"), ["resolve_release", "require_ci_green"])
-        self.assertEqual(job_needs("require_ci_green"), ["resolve_release"])
+        # The gate waits on the candidate builds (which skip in every other
+        # mode), never on validation.
+        self.assertEqual(job_needs("require_ci_green"), ["resolve_release", "build_binaries"])
         self.assertIn("RELEASE_SHA: ${{ needs.resolve_release.outputs.sha }}",
                       job_block("require_ci_green"))
         self.assertIn("CI_BYPASS: ${{ needs.resolve_release.outputs.ci_bypass }}",
@@ -1470,10 +1539,14 @@ class LinuxReleaseContainerTests(unittest.TestCase):
         self.assertTrue(checked, "the gate was never invoked")
 
 
-def matrix_entries(job: str = "build_binaries") -> list[dict[str, str]]:
-    """The `include:` entries of a job's matrix, as `key: value` maps."""
+def matrix_entries(job: str = "build_binaries", text: str | None = None) -> list[dict[str, str]]:
+    """The build legs: the resolver's table for build_binaries, or a static
+    `include:` matrix parsed from `text`, as `key: value` maps."""
+    if text is None:
+        assert job == "build_binaries"
+        return [dict(leg) for leg in release_candidate.BUILD_LEGS]
     entries: list[dict[str, str]] = []
-    for line in job_block(job).splitlines():
+    for line in text.splitlines():
         start = re.fullmatch(r"          - ([a-z_-]+): (\S+)", line)
         field = re.fullmatch(r"            ([a-z_-]+): (\S+)", line)
         if start:

@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-"""Meta release protocol v1: immutable candidates and add-only publication.
+"""Meta release protocol: immutable candidates and add-only publication.
+
+Schema 1 (candidates and releases up to v0.9.1) binds all five targets in one
+candidate. Schema 2 splits them into tiers (verify-release-assets.py
+TIER_TARGETS): every candidate run builds and binds exactly one tier, both
+tiers come from the same source SHA, promotion publishes only a core
+selection, and the trailing tier is added afterwards, add-only, by assets-mode
+recovery bound to the published core receipt. Verification and registry
+retry require the core tier only.
 
 Selections are strict JSON objects (all hashes are lowercase SHA-256 hex):
   accepted-candidate: schema_version=1, kind, repository, run_id, run_attempt,
-    manifest_artifact={id, digest, manifest_sha256}.
+    manifest_artifact={id, digest, manifest_sha256}; schema_version=2 adds
+    tier ("core" or "trailing").
   original-assets: schema_version=1, kind, repository, source_sha, version, tag,
     run_id, run_attempt, metadata={"index.json": hash, "checksums.sha256": hash},
     artifacts=[{id, name, digest, target, archives=[archive_record, ...]}, ...].
@@ -14,6 +23,7 @@ inner={name, size, sha256}. IDs, attempts and sizes are positive JSON integers.
 Candidate manifests have schema_version=1, kind="candidate-manifest", repository,
 source_sha, version, tag, run_id, run_attempt, workflow={path, sha, ref},
 ci={run_id, run_attempt}, artifacts (the complete matrix), and metadata.
+Schema 2 manifests add tier, and their artifacts and metadata are that tier's.
 The external selection identifies the manifest artifact, avoiding a self-hash.
 Neither a selection nor decoded provenance alone authorizes publication:
 original attestations must pass gh's cryptographic verifier and strict policy.
@@ -53,6 +63,23 @@ MAIN = "refs/heads/main"
 MANIFEST = "candidate-manifest.json"
 SELECTION = "candidate-selection.json"
 PROVENANCE = "provenance.jsonl"
+MANIFEST_PROVENANCE = "manifest-provenance.jsonl"
+RELEASE_NOTES = (
+    "Original accepted Meta candidate; see the attached selections and provenance. "
+    "Linux x86_64 and aarch64 and macOS arm64 archives are listed in index.json and checksums.sha256. "
+    "macOS x86_64 and Windows archives may arrive later, listed in index-trailing.json and "
+    "checksums-trailing.sha256."
+)
+SCHEMAS = (1, 2)
+# Every release build leg. A schema 2 candidate run builds one tier's legs;
+# the resolver emits them as the build_binaries matrix.
+BUILD_LEGS = (
+    {"runs-on": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu", "archive_ext": "tar.gz"},
+    {"runs-on": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu", "archive_ext": "tar.gz"},
+    {"runs-on": "macos-15", "target": "aarch64-apple-darwin", "archive_ext": "tar.gz"},
+    {"runs-on": "macos-15", "target": "x86_64-apple-darwin", "archive_ext": "tar.gz"},
+    {"runs-on": "windows-latest", "target": "x86_64-pc-windows-msvc", "archive_ext": "zip"},
+)
 SLSA = "https://slsa.dev/provenance/v1"
 BINARY_NAMES = dict(zip(assets.ARCHIVE_PREFIXES, ("meta_gateway", "rpc_gateway", "meta_repair")))
 MAX_MEMBER = 2 * 1024**3
@@ -226,6 +253,37 @@ def binary_member_name(binary, target):
     return binary
 
 
+def tier_proof_names(tier):
+    """(receipt, manifest, manifest bundle) names on a release for a tier.
+
+    Schema 1 and the core tier keep the original names; the trailing tier's
+    carry its name, so adding them never touches a published core file.
+    """
+    if tier in (None, "core"):
+        return SELECTION, MANIFEST, MANIFEST_PROVENANCE
+    require(tier in assets.TIERS, "unknown candidate tier")
+    return f"candidate-selection-{tier}.json", f"candidate-manifest-{tier}.json", f"manifest-provenance-{tier}.jsonl"
+
+
+def tier_targets(tier):
+    return tuple(t for t, _ in assets.TARGET_ARCHIVES) if tier is None else assets.TIER_TARGETS[tier]
+
+
+def schema_tier(value):
+    """None for schema 1; the validated tier for schema 2."""
+    require(type(value.get("schema_version")) is int and value["schema_version"] in SCHEMAS,
+            "unsupported schema version")
+    if value["schema_version"] == 1:
+        require("tier" not in value, "schema 1 has no tier")
+        return None
+    require(value.get("tier") in assets.TIERS, "schema 2 requires tier core or trailing")
+    return value["tier"]
+
+
+def build_matrix(tier):
+    return {"include": [leg for leg in BUILD_LEGS if leg["target"] in tier_targets(tier)]}
+
+
 def validate_archive_record(record, version, target):
     exact_keys(record, "name target binary size sha256 inner", "archive")
     require(record["target"] == target, "archive target mismatch")
@@ -244,8 +302,9 @@ def validate_archive_record(record, version, target):
     digest(record["inner"]["sha256"])
 
 
-def validate_artifacts(items, version, *, complete, attempt):
-    require(isinstance(items, list) and 0 < len(items) <= len(assets.TARGET_ARCHIVES),
+def validate_artifacts(items, version, *, complete, attempt, tier=None):
+    allowed = tier_targets(tier)
+    require(isinstance(items, list) and 0 < len(items) <= len(allowed),
             "invalid target artifact inventory")
     ids, names, targets, archives_seen = set(), set(), set(), set()
     for item in items:
@@ -254,6 +313,7 @@ def validate_artifacts(items, version, *, complete, attempt):
         digest(item["digest"])
         target = item["target"]
         require(target in dict(assets.TARGET_ARCHIVES), "unknown target")
+        require(target in allowed, "target outside the candidate tier")
         require(isinstance(item["name"], str) and re.fullmatch(r"[A-Za-z0-9_.-]+", item["name"]),
                 "invalid artifact name")
         require(item["id"] not in ids and item["name"] not in names and target not in targets,
@@ -273,22 +333,21 @@ def validate_artifacts(items, version, *, complete, attempt):
         if complete:
             require(len(item["archives"]) == 3, "missing target archives")
     if complete:
-        require(archives_seen == set(assets.expected_archive_names(version)), "missing targets/archives")
+        require(archives_seen == set(assets.expected_archive_names(version, tier)), "missing targets/archives")
 
 
 def validate_identity(value):
-    require(value["schema_version"] == 1 and type(value["schema_version"]) is int,
-            "unsupported schema version")
+    schema_tier(value)
     require(value["repository"] == repository(), "selection repository mismatch")
     integer(value["run_id"], "run ID")
     integer(value["run_attempt"], "run attempt")
 
 
-def validate_source(value):
+def validate_source(value, tier=None):
     digest(value["source_sha"], "source SHA", 40)
     valid_tag(value["tag"])
     require(value["tag"] == "v" + value["version"], "tag/version mismatch")
-    exact_keys(value["metadata"], "index.json checksums.sha256", "metadata")
+    exact_keys(value["metadata"], " ".join(assets.metadata_names(tier)), "metadata")
     for value_hash in value["metadata"].values():
         digest(value_hash)
 
@@ -296,7 +355,9 @@ def validate_source(value):
 def validate_selection(value, *, original=False):
     require(isinstance(value, dict), "selection must be an object")
     if value.get("kind") == "accepted-candidate":
-        exact_keys(value, "schema_version kind repository run_id run_attempt manifest_artifact", "selection")
+        tier = schema_tier(value)
+        exact_keys(value, "schema_version kind repository run_id run_attempt manifest_artifact"
+                   + ("" if tier is None else " tier"), "selection")
         validate_identity(value)
         exact_keys(value["manifest_artifact"], "id digest manifest_sha256", "manifest artifact")
         integer(value["manifest_artifact"]["id"], "manifest artifact ID")
@@ -306,6 +367,7 @@ def validate_selection(value, *, original=False):
         require(original and value.get("kind") == "original-assets", "accepted-candidate selection required")
         exact_keys(value, "schema_version kind repository source_sha version tag run_id run_attempt metadata artifacts",
                    "original-assets selection")
+        require(value["schema_version"] == 1, "original-assets selections are schema 1")
         validate_identity(value)
         validate_source(value)
         validate_artifacts(value["artifacts"], value["version"], complete=False, attempt=value["run_attempt"])
@@ -317,10 +379,12 @@ def selection_env(*, original=False):
 
 
 def validate_manifest(value):
-    exact_keys(value, "schema_version kind repository source_sha version tag run_id run_attempt workflow ci artifacts metadata",
-               "candidate manifest")
+    require(isinstance(value, dict), "candidate manifest must be an object")
+    tier = schema_tier(value)
+    exact_keys(value, "schema_version kind repository source_sha version tag run_id run_attempt workflow ci artifacts metadata"
+               + ("" if tier is None else " tier"), "candidate manifest")
     validate_identity(value)
-    validate_source(value)
+    validate_source(value, tier)
     require(value["kind"] == "candidate-manifest", "invalid manifest kind")
     exact_keys(value["workflow"], "path sha ref", "workflow")
     require(value["workflow"] == {"path": WORKFLOW, "sha": value["source_sha"], "ref": MAIN},
@@ -328,14 +392,19 @@ def validate_manifest(value):
     exact_keys(value["ci"], "run_id run_attempt", "CI")
     integer(value["ci"]["run_id"], "CI run")
     integer(value["ci"]["run_attempt"], "CI attempt")
-    validate_artifacts(value["artifacts"], value["version"], complete=True, attempt=value["run_attempt"])
+    validate_artifacts(value["artifacts"], value["version"], complete=True, attempt=value["run_attempt"], tier=tier)
     return value
+
+
+def selection_tier(selected):
+    return None if selected["schema_version"] == 1 else selected["tier"]
 
 
 def resolve():
     repository()
     event, ref = os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF", "")
     head = digest(git("rev-parse", "HEAD"), "checkout SHA", 40)
+    tier = ""
     if event == "push" and ref.startswith("refs/tags/v"):
         mode, tag, publish, dry = "tag", valid_tag(ref.removeprefix("refs/tags/")), False, False
     else:
@@ -345,20 +414,25 @@ def resolve():
         tag = os.environ.get("RELEASE_TAG", "")
         source = os.environ.get("SOURCE_SHA", "")
         selected = os.environ.get("ARTIFACT_SELECTION", "")
+        tier = os.environ.get("RELEASE_TIER", "")
         publish, dry = env_bool("PUBLISH_RELEASE_PACKAGES"), env_bool("REGISTRY_DRY_RUN")
         if mode == "candidate":
             require(ref == MAIN, "candidate dispatch must use main")
             require(not tag and not selected and not publish and not dry, "contradictory candidate inputs")
+            require(tier in assets.TIERS, "candidate dispatch requires tier core or trailing")
             digest(source, "explicit SOURCE_SHA", 40)
             require(source == os.environ.get("GITHUB_SHA") == os.environ.get("GITHUB_WORKFLOW_SHA") == head,
                     "candidate source/event/workflow/checkout SHA mismatch")
         else:
             require(not source, "SOURCE_SHA is only valid for candidate")
+            require(not tier, "a candidate tier is only valid for candidate")
             if mode in ("promote", "assets") or tag:
                 require(ref == MAIN, "tagged release dispatch must use main")
                 valid_tag(tag)
             if mode in ("promote", "assets"):
-                selection_env(original=mode == "assets")
+                chosen = selection_env(original=mode == "assets")
+                if mode == "promote":
+                    require_promotable(chosen)
             else:
                 require(not selected, "selection is not valid for existing mode")
                 require(tag or not publish or dry, "untagged real registry publication refused")
@@ -377,6 +451,10 @@ def resolve():
         "tag": "v" + version if mode == "candidate" else tag,
         "publish_packages": str(publish).lower(), "dry_run": str(dry).lower(),
         "ci_bypass": str(mode == "existing" and not tag and publish and dry).lower(),
+        "tier": tier,
+        # build_binaries skips outside candidate mode before reading its
+        # matrix; it still receives a valid one.
+        "build_matrix": json.dumps(build_matrix(tier or "core"), separators=(",", ":"), sort_keys=True),
     }
     if os.environ.get("GITHUB_OUTPUT"):
         with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as handle:
@@ -547,6 +625,9 @@ def verify_provenance(path, bundle, sha, run_id, attempt, *, ref=MAIN, event="wo
 
 def collect(args):
     require(os.environ.get("RELEASE_MODE") == "candidate", "collect is candidate-only")
+    tier = args.tier
+    require((tier or "") == os.environ.get("RELEASE_TIER", ""),
+            "collection tier differs from the resolved candidate tier")
     require(not env_bool("PUBLISH_RELEASE_PACKAGES") and not env_bool("REGISTRY_DRY_RUN"),
             "candidate collection cannot request publication")
     sha, version, tag = source_context()
@@ -558,11 +639,11 @@ def collect(args):
     verify_run(args.ci_run_id, args.ci_run_attempt, sha, ci=True)
     pages = api(repo_endpoint(f"actions/runs/{run_id}/artifacts?per_page=100"), pages=True)
     listing = [item for page in pages for item in page["artifacts"]]
-    expected = {f"meta-gateway-binaries-{target}-{attempt}": target for target, _ in assets.TARGET_ARCHIVES}
+    expected = {f"meta-gateway-binaries-{target}-{attempt}": target for target in tier_targets(tier)}
     selected = [a for a in listing if a["name"].startswith("meta-gateway-binaries-")]
-    require(len(selected) == 5 and {a["name"] for a in selected} == set(expected),
+    require(len(selected) == len(expected) and {a["name"] for a in selected} == set(expected),
             "missing/duplicate/unexpected target artifacts or mixed attempts")
-    require(len({a["id"] for a in selected}) == 5, "duplicate artifact IDs")
+    require(len({a["id"] for a in selected}) == len(expected), "duplicate artifact IDs")
     require(not args.output_dir.exists(), "candidate output directory already exists")
     with workspace() as work:
         downloaded = work / "targets"
@@ -573,7 +654,7 @@ def collect(args):
                     "missing artifact ZIP digest")
             identity = {"id": item["id"], "name": item["name"], "digest": item["digest"][7:]}
             target = expected[item["name"]]
-            archive_names = [n for n in assets.expected_archive_names(version) if f"-{target}." in n]
+            archive_names = [n for n in assets.expected_archive_names(version, tier) if f"-{target}." in n]
             packed = download_artifact(identity, info, work)
             folder = unpack_artifact(packed, downloaded / target, [*archive_names, PROVENANCE])
             archive_records = []
@@ -582,32 +663,38 @@ def collect(args):
                 archive_records.append(describe_archive(folder / name, version, target))
             records.append({**identity, "target": target, "archives": archive_records})
         prepared = work / "prepared"
-        assets.prepare_assets(downloaded, prepared, tag)
+        assets.prepare_assets(downloaded, prepared, tag, tier)
         manifest = {
-            "schema_version": 1, "kind": "candidate-manifest", "repository": repository(),
+            "schema_version": 1 if tier is None else 2, "kind": "candidate-manifest", "repository": repository(),
             "source_sha": sha, "version": version, "tag": tag,
             "workflow": {"path": WORKFLOW, "sha": sha, "ref": MAIN},
             "run_id": run_id, "run_attempt": attempt,
             "ci": {"run_id": args.ci_run_id, "run_attempt": args.ci_run_attempt},
             "artifacts": records,
-            "metadata": {name: assets.sha256(prepared / name) for name in ("index.json", "checksums.sha256")},
+            "metadata": {name: assets.sha256(prepared / name) for name in assets.metadata_names(tier)},
         }
+        if tier is not None:
+            manifest["tier"] = tier
         validate_manifest(manifest)
         args.output_dir.mkdir()
-        write_new(args.output_dir / MANIFEST, json_bytes(manifest))
+        write_new(args.output_dir / tier_proof_names(tier)[1], json_bytes(manifest))
         for name in manifest["metadata"]:
             write_new(args.output_dir / name, (prepared / name).read_bytes())
-    print(f"collected exact candidate {run_id}/{attempt}; no release or tag writes")
+    print(f"collected exact {tier or 'schema 1'} candidate {run_id}/{attempt}; no release or tag writes")
 
 
 def selection(args):
     manifest = validate_manifest(read_json(args.manifest_file))
+    tier = schema_tier(manifest)
+    require(args.manifest_file.name == tier_proof_names(tier)[1], "manifest file name does not match its tier")
     value = {
-        "schema_version": 1, "kind": "accepted-candidate", "repository": manifest["repository"],
+        "schema_version": manifest["schema_version"], "kind": "accepted-candidate", "repository": manifest["repository"],
         "run_id": manifest["run_id"], "run_attempt": manifest["run_attempt"],
         "manifest_artifact": {"id": args.artifact_id, "digest": digest(args.artifact_digest),
                               "manifest_sha256": assets.sha256(args.manifest_file)},
     }
+    if tier is not None:
+        value["tier"] = tier
     validate_selection(value)
     require(args.artifact_id not in {item["id"] for item in manifest["artifacts"]},
             "manifest artifact ID duplicates target artifact")
@@ -623,6 +710,8 @@ def selection(args):
 
 def match_manifest_selection(manifest, selected, path, sha, version, tag):
     validate_manifest(manifest)
+    require(manifest["schema_version"] == selected["schema_version"]
+            and schema_tier(manifest) == selection_tier(selected), "candidate schema/tier mismatch")
     require(manifest["run_id"] == selected["run_id"] and manifest["run_attempt"] == selected["run_attempt"],
             "manifest run/attempt mismatch")
     require(manifest["source_sha"] == sha and manifest["version"] == version and manifest["tag"] == tag,
@@ -637,26 +726,54 @@ def check_metadata(manifest, folder):
         require(assets.sha256(folder / name) == expected_hash, f"original {name} hash mismatch")
 
 
+def verify_prepared(folder, tag, tier):
+    """The flat assets of schema 1, of the core tier, or of the trailing tier alone."""
+    if tier is None:
+        assets.verify_assets(folder, tag)
+    elif tier == "core":
+        assets.verify_assets(folder, tag, ("core",))
+    else:
+        assets.verify_tier_assets(folder, tag, tier)
+
+
+def tier_file_names(version, tier):
+    """Every release file a tier owns: archives, metadata and proofs."""
+    receipt, manifest_name, bundle = tier_proof_names(tier)
+    return (set(assets.expected_archive_names(version, tier)) | set(assets.metadata_names(tier))
+            | {receipt, manifest_name, bundle} | {f"target-{t}-provenance.jsonl" for t in tier_targets(tier)})
+
+
+def manifest_members(tier):
+    """The files of a candidate run's manifest artifact for a tier."""
+    return {tier_proof_names(tier)[1], PROVENANCE, *assets.metadata_names(tier)}
+
+
 def stage_candidate(selected, output_dir, proof_dir, work):
     sha, version, tag = source_context()
+    tier = selection_tier(selected)
+    receipt, manifest_name, manifest_bundle = tier_proof_names(tier)
     require(not output_dir.exists() and not proof_dir.exists(), "staging directories already exist")
     verify_remote_tag(tag, sha)
     info = verify_run(selected["run_id"], selected["run_attempt"], sha)
     identity = {**selected["manifest_artifact"],
                 "name": f"meta-candidate-manifest-{selected['run_attempt']}"}
     packed = download_artifact(identity, info, work)
-    folder = unpack_artifact(packed, work / "manifest", [MANIFEST, PROVENANCE, "index.json", "checksums.sha256"])
-    manifest = read_json(folder / MANIFEST)
-    match_manifest_selection(manifest, selected, folder / MANIFEST, sha, version, tag)
-    verify_provenance(folder / MANIFEST, folder / PROVENANCE, sha, selected["run_id"], selected["run_attempt"])
+    with zipfile.ZipFile(packed) as archive:
+        present = {info.filename for info in zip_members(archive)}
+    require(not any(present == manifest_members(other) != manifest_members(tier) for other in (None, *assets.TIERS)),
+            "candidate schema/tier mismatch: the selection names another tier than its manifest artifact")
+    folder = unpack_artifact(packed, work / "manifest", sorted(manifest_members(tier)))
+    manifest = read_json(folder / manifest_name)
+    match_manifest_selection(manifest, selected, folder / manifest_name, sha, version, tag)
+    verify_provenance(folder / manifest_name, folder / PROVENANCE, sha, selected["run_id"], selected["run_attempt"])
     verify_run(manifest["ci"]["run_id"], manifest["ci"]["run_attempt"], sha, ci=True)
     check_metadata(manifest, folder)
     prepared, proofs = work / "verified-assets", work / "verified-proofs"
     prepared.mkdir()
     proofs.mkdir()
-    write_new(proofs / MANIFEST, (folder / MANIFEST).read_bytes())
-    write_new(proofs / SELECTION, json_bytes(selected))
-    write_new(proofs / "manifest-provenance.jsonl", (folder / PROVENANCE).read_bytes())
+    write_new(proofs / manifest_name, (folder / manifest_name).read_bytes())
+    write_new(proofs / receipt, json_bytes(selected))
+    write_new(proofs / manifest_bundle, (folder / PROVENANCE).read_bytes())
     for item in manifest["artifacts"]:
         packed = download_artifact(item, info, work)
         names = [record["name"] for record in item["archives"]]
@@ -671,7 +788,7 @@ def stage_candidate(selected, output_dir, proof_dir, work):
         write_new(proofs / f"target-{item['target']}-provenance.jsonl", (target_dir / PROVENANCE).read_bytes())
     for name in manifest["metadata"]:
         write_new(prepared / name, (folder / name).read_bytes())
-    assets.verify_assets(prepared, tag)
+    verify_prepared(prepared, tag, tier)
     check_metadata(manifest, prepared)
     verify_run(selected["run_id"], selected["run_attempt"], sha)
     verify_remote_tag(tag, sha)
@@ -682,9 +799,19 @@ def stage_candidate(selected, output_dir, proof_dir, work):
 def stage(args):
     require(os.environ.get("RELEASE_MODE") in ("promote", "assets"), "stage requires promote/assets mode")
     selected = selection_env()
+    if os.environ.get("RELEASE_MODE") == "promote":
+        require_promotable(selected)
     with workspace() as work:
         stage_candidate(selected, args.output_dir, args.proof_dir, work)
     print("verified and staged original candidate bytes; no publication")
+
+
+def require_promotable(selected):
+    # Schema 1 selections bind all five targets (candidates collected before
+    # tiers); schema 2 promotes the core tier only. The trailing tier is added
+    # to the published release by assets-mode recovery.
+    require(selection_tier(selected) in (None, "core"),
+            "promotion accepts only a core selection; add the trailing tier with assets-mode recovery")
 
 
 def release_for_tag(tag):
@@ -747,12 +874,33 @@ def protocol_source(sha):
     return "scripts/release-candidate.py" in files
 
 
+def verify_selected_run(selected, sha):
+    """The selection's candidate run completed successfully from this source,
+    and the manifest artifact it names is that run's, with that digest. The
+    artifact may have expired; its record must still match."""
+    info = verify_run(selected["run_id"], selected["run_attempt"], sha)
+    artifact_id = integer(selected["manifest_artifact"]["id"], "manifest artifact ID")
+    value = api(repo_endpoint(f"actions/artifacts/{artifact_id}"))
+    require(value["id"] == artifact_id and value["name"] == f"meta-candidate-manifest-{selected['run_attempt']}",
+            "selected manifest artifact identity/name mismatch")
+    require(value["digest"] == "sha256:" + digest(selected["manifest_artifact"]["digest"]),
+            "selected manifest artifact digest mismatch")
+    owner = value["workflow_run"]
+    require(owner["id"] == info["id"] and owner["head_sha"] == info["head_sha"]
+            and owner["repository_id"] == info["repository"]["id"],
+            "selected manifest artifact belongs to another run")
+    return info
+
+
 def verify_published_proofs(folder, selected, sha, version, tag):
-    manifest_path = folder / MANIFEST
+    _, manifest_name, manifest_bundle = tier_proof_names(selection_tier(selected))
+    verify_selected_run(selected, sha)
+    manifest_path = folder / manifest_name
     manifest = read_json(manifest_path)
     match_manifest_selection(manifest, selected, manifest_path, sha, version, tag)
-    verify_provenance(manifest_path, folder / "manifest-provenance.jsonl", sha,
+    verify_provenance(manifest_path, folder / manifest_bundle, sha,
                       selected["run_id"], selected["run_attempt"])
+    verify_run(manifest["ci"]["run_id"], manifest["ci"]["run_attempt"], sha, ci=True)
     check_metadata(manifest, folder)
     for item in manifest["artifacts"]:
         bundle = folder / f"target-{item['target']}-provenance.jsonl"
@@ -763,13 +911,93 @@ def verify_published_proofs(folder, selected, sha, version, tag):
     return manifest
 
 
-def verify_flat_subset(folder, destination, tag):
+def verify_flat_subset(folder, destination, tag, tier=None):
     destination.mkdir()
-    names = [*assets.expected_archive_names(tag[1:]), "index.json", "checksums.sha256"]
+    names = [*assets.expected_archive_names(tag[1:], tier), *assets.metadata_names(tier)]
     for name in names:
         require((folder / name).is_file(), f"missing published original asset: {name}")
         shutil.copyfile(folder / name, destination / name)
-    assets.verify_assets(destination, tag)
+    verify_prepared(destination, tag, tier)
+
+
+def verify_present_trailing(folder, inventory, sha, version, tag, work):
+    """Verify every trailing-tier file a public release carries, however
+    many of them there are; only absent files are tolerated.
+
+    The receipt must be a schema 2 trailing selection whose candidate run
+    completed successfully from this source and owns the manifest artifact
+    it names. The manifest comes from the release when present, otherwise
+    from that artifact, the way stage_candidate reads it: it must match the
+    receipt and the release's source, version and tag, carry a valid
+    attestation, and name a green CI run. Every present attestation bundle
+    must be the one the candidate retained (the manifest's verifies the
+    manifest; a target's verifies its archives, or equals the target
+    artifact's when none of them is present yet). Every present archive must
+    match its manifest record and its target's attestation, and every
+    present index or checksums file its manifest hash. Returns the number of
+    trailing files still absent.
+    """
+    files = tier_file_names(version, "trailing")
+    present = files & set(inventory)
+    receipt, manifest_name, manifest_bundle = tier_proof_names("trailing")
+    if not present:
+        return len(files)
+    require(receipt in present, "trailing assets present without the trailing receipt")
+    selected = validate_selection(read_json(folder / receipt))
+    require(selection_tier(selected) == "trailing", "trailing receipt is not a trailing selection")
+    info = verify_selected_run(selected, sha)
+    if manifest_name in present:
+        require(manifest_bundle in present, "trailing manifest present without its attestation bundle")
+        source = folder
+    else:
+        dependents = present & (set(assets.expected_archive_names(version, "trailing"))
+                                | set(assets.metadata_names("trailing")))
+        require(not dependents, "trailing assets present without the trailing manifest")
+        identity = {**selected["manifest_artifact"], "name": f"meta-candidate-manifest-{selected['run_attempt']}"}
+        packed = download_artifact(identity, info, work)
+        source = unpack_artifact(packed, work / "trailing-manifest", sorted(manifest_members("trailing")))
+        if manifest_bundle in present:
+            require(assets.sha256(folder / manifest_bundle) == assets.sha256(source / PROVENANCE),
+                    "published trailing manifest bundle is not the candidate's")
+    manifest_path = source / manifest_name
+    manifest = read_json(manifest_path)
+    match_manifest_selection(manifest, selected, manifest_path, sha, version, tag)
+    bundle_path = folder / manifest_bundle if source is folder else source / PROVENANCE
+    verify_provenance(manifest_path, bundle_path, sha, selected["run_id"], selected["run_attempt"])
+    verify_run(manifest["ci"]["run_id"], manifest["ci"]["run_attempt"], sha, ci=True)
+    for name, expected_hash in manifest["metadata"].items():
+        if name in present:
+            require(assets.sha256(folder / name) == expected_hash, f"published trailing {name} hash mismatch")
+    for item in manifest["artifacts"]:
+        bundle = f"target-{item['target']}-provenance.jsonl"
+        archives = [record for record in item["archives"] if record["name"] in present]
+        if bundle in present and not archives:
+            packed = download_artifact(item, info, work)
+            names = [record["name"] for record in item["archives"]]
+            unpacked = unpack_artifact(packed, work / f"trailing-{item['target']}", [*names, PROVENANCE])
+            require(assets.sha256(folder / bundle) == assets.sha256(unpacked / PROVENANCE),
+                    f"published {bundle} is not the candidate's")
+        for record in archives:
+            require(bundle in present, f"trailing archive {record['name']} present without its attestation bundle")
+            path = folder / record["name"]
+            require(describe_archive(path, version, item["target"]) == record,
+                    f"published trailing archive {record['name']} does not match its manifest record")
+            verify_provenance(path, folder / bundle, sha, selected["run_id"], selected["run_attempt"])
+    return len(files - present)
+
+
+def verify_published_trailing(folder, inventory, work, sha, version, tag):
+    """The trailing tier may still be absent or partly added: registry retry
+    and verification depend on the core tier only, but every trailing file
+    that is present verifies, and a complete tier verifies as a set."""
+    pending = verify_present_trailing(folder, inventory, sha, version, tag, work)
+    if pending == len(tier_file_names(version, "trailing")):
+        print("trailing tier not added yet")
+    elif pending:
+        print(f"trailing tier incomplete: every present file verified, {pending} pending assets-mode recovery")
+    else:
+        verify_flat_subset(folder, work / "flat-trailing", tag, "trailing")
+        print("verified the trailing tier")
 
 
 def verify_published(_args=None):
@@ -781,11 +1009,26 @@ def verify_published(_args=None):
         folder = work / "published"
         inventory = release_inventory(release)
         download_release_inventory(inventory, folder)
-        verify_flat_subset(folder, work / "flat", tag)
-        if protocol_source(sha):
+        candidate_era = protocol_source(sha)
+        tier = None
+        if candidate_era:
             require(SELECTION in inventory, "candidate-era release is missing its selection proof")
             selected = validate_selection(read_json(folder / SELECTION))
+            tier = selection_tier(selected)
+            require(tier in (None, "core"), "a release's receipt must bind its core tier")
+        if candidate_era:
+            allowed = tier_file_names(version, tier)
+            if tier == "core":
+                allowed |= tier_file_names(version, "trailing")
+        else:
+            allowed = set(assets.expected_archive_names(version)) | set(assets.metadata_names())
+        unexpected = sorted(set(inventory) - allowed)
+        require(not unexpected, f"unexpected release assets: {', '.join(unexpected)}")
+        verify_flat_subset(folder, work / "flat", tag, tier)
+        if candidate_era:
             verify_published_proofs(folder, selected, sha, version, tag)
+            if tier == "core":
+                verify_published_trailing(folder, inventory, work, sha, version, tag)
         verify_remote_tag(tag, sha)
         require(release_inventory(release) == inventory, "published release inventory changed during verification")
     print(f"verified complete public release {tag} at {sha}; no writes")
@@ -801,14 +1044,16 @@ def flat_local_files(folder):
 
 
 def validate_staging(args, selected, sha, version, tag, work):
-    expected_assets = set(assets.expected_archive_names(version)) | {"index.json", "checksums.sha256"}
-    expected_proofs = {MANIFEST, SELECTION, "manifest-provenance.jsonl"} | {
-        f"target-{target}-provenance.jsonl" for target, _ in assets.TARGET_ARCHIVES}
+    require_promotable(selected)
+    tier = selection_tier(selected)
+    expected_assets = set(assets.expected_archive_names(version, tier)) | set(assets.metadata_names(tier))
+    expected_proofs = {MANIFEST, SELECTION, MANIFEST_PROVENANCE} | {
+        f"target-{target}-provenance.jsonl" for target in tier_targets(tier)}
     local_assets, local_proofs = flat_local_files(args.assets_dir), flat_local_files(args.proof_dir)
     require(set(local_assets) == expected_assets and set(local_proofs) == expected_proofs,
             "staged asset/proof inventory mismatch")
     require(read_json(local_proofs[SELECTION]) == selected, "staged acceptance receipt mismatch")
-    assets.verify_assets(args.assets_dir, tag)
+    verify_prepared(args.assets_dir, tag, tier)
     combined = work / "combined"
     combined.mkdir()
     for name, path in {**local_assets, **local_proofs}.items():
@@ -820,11 +1065,24 @@ def validate_staging(args, selected, sha, version, tag, work):
     return {name: combined / name for name in {*local_assets, *local_proofs}}
 
 
-def check_existing(inventory, downloaded, expected, selected):
+def check_existing(inventory, downloaded, expected, selected, *, version=None, draft=None,
+                   sha=None, tag=None, work=None):
     if inventory:
         require(SELECTION in inventory, "unbound partial release: acceptance receipt missing; operator cleanup required")
         require(read_json(downloaded / SELECTION) == selected, "existing release receipt mismatch")
+    # A published schema 2 core release may already carry the trailing tier,
+    # added by recovery after promotion; every such file present must verify
+    # against the trailing receipt. Promotion makes a draft public, and no
+    # trailing file may ride along: the trailing tier is added only to the
+    # published release.
+    trailing = tier_file_names(version, "trailing") if selection_tier(selected) == "core" else set()
+    carried = (trailing & set(inventory)) - set(expected)
+    if carried:
+        require(draft is False, "trailing files on an unpublished release; operator cleanup required")
+        verify_present_trailing(downloaded, inventory, sha, version, tag, work)
     for name in inventory:
+        if name in carried:
+            continue
         require(name in expected, f"unrecognized existing release asset: {name}")
         require(assets.sha256(downloaded / name) == assets.sha256(expected[name]),
                 f"existing release asset conflict: {name}")
@@ -867,14 +1125,17 @@ def publish(args):
             require(SELECTION in inventory, "unbound partial release: acceptance receipt missing; operator cleanup required")
             downloaded = work / "existing"
             download_release_inventory(inventory, downloaded)
-            check_existing(inventory, downloaded, expected, selected)
+            check_existing(inventory, downloaded, expected, selected, version=version,
+                           draft=release["draft"], sha=sha, tag=tag, work=work)
             original = snapshot_hashes(inventory, downloaded)
+            # Trailing files already added stay exactly as they are.
+            expected.update({name: downloaded / name for name in inventory if name not in expected})
         verify_remote_tag(tag, sha)
         if release is not None:
             require(release_inventory(release) == inventory, "release changed before write")
         else:
             run(["gh", "release", "create", tag, "--repo", repository(), "--verify-tag",
-                 "--draft", "--title", tag, "--notes", "Original accepted Meta candidate; see attached selection and provenance."])
+                 "--draft", "--title", tag, "--notes", RELEASE_NOTES])
             release = newly_created_release_for_tag(tag)
             require(release is not None and release["draft"] is True, "new draft release missing")
             require(not release_inventory(release), "new draft unexpectedly contains assets")
@@ -939,6 +1200,58 @@ def recover_original(selected, release, inventory, existing, work, sha, version,
     return additions
 
 
+def trailing_additions(selected, release, inventory, existing, work, sha, version, tag):
+    """Stage the trailing tier for the published release it extends.
+
+    It binds to the published core receipt: the release must be public and
+    carry a schema 2 core receipt whose attested manifest names the same
+    source, version and tag. Every file already on the release must be a
+    core file or a byte-identical trailing file; anything else refuses
+    before any write.
+    """
+    require(release["draft"] is False, "the trailing tier extends a published release only")
+    require(SELECTION in inventory, "trailing tier requires the published core receipt")
+    core = validate_selection(read_json(existing / SELECTION))
+    require(selection_tier(core) == "core", "trailing tier requires a schema 2 core receipt")
+    verify_published_proofs(existing, core, sha, version, tag)
+    stage_work = work / "stage-work"
+    stage_work.mkdir()
+    output, proofs = work / "staged", work / "proofs"
+    stage_candidate(selected, output, proofs, stage_work)
+    full = {**flat_local_files(output), **flat_local_files(proofs)}
+    require(set(full) == tier_file_names(version, "trailing"), "staged trailing inventory mismatch")
+    core_files = tier_file_names(version, "core")
+    receipt = tier_proof_names("trailing")[0]
+    bound = ""
+    if receipt in inventory:
+        try:
+            other = read_json(existing / receipt)
+            bound = f" (the release's trailing receipt names run {other.get('run_id')}/{other.get('run_attempt')})"
+        except (ProtocolError, ValueError, AttributeError):
+            bound = " (the release's trailing receipt is unreadable)"
+    for name in inventory:
+        if name in full:
+            require(assets.sha256(existing / name) == assets.sha256(full[name]),
+                    f"existing release asset conflict: {name}{bound}; operator cleanup required")
+        else:
+            require(name in core_files, f"unrecognized existing release asset: {name}; operator cleanup required")
+    return full
+
+
+def trailing_upload_order(names):
+    """Receipt first (binds the tier), then each file only after everything
+    that verifies it: the manifest's attestation bundle, the manifest, the
+    targets' attestation bundles, the archives, and the tier's index and
+    checksums last, so a listed archive is always already present. An
+    interrupted addition therefore never leaves a present file that cannot
+    be verified."""
+    receipt, manifest_name, manifest_bundle = tier_proof_names("trailing")
+    metadata = set(assets.metadata_names("trailing"))
+    order = {receipt: 0, manifest_bundle: 1, manifest_name: 2}
+    rank = lambda name: (order.get(name, 5 if name in metadata else 4 if assets.is_archive(Path(name)) else 3), name)
+    return sorted(names, key=rank)
+
+
 def recover(_args=None):
     require(os.environ.get("RELEASE_MODE") == "assets"
             and not env_bool("REGISTRY_DRY_RUN") and not env_bool("PUBLISH_RELEASE_PACKAGES"),
@@ -953,13 +1266,18 @@ def recover(_args=None):
         existing = work / "existing"
         download_release_inventory(inventory, existing)
         original = snapshot_hashes(inventory, existing)
-        if selected["kind"] == "accepted-candidate":
+        order = sorted
+        if selected["kind"] == "accepted-candidate" and selection_tier(selected) == "trailing":
+            additions = trailing_additions(selected, release, inventory, existing, work, sha, version, tag)
+            order = trailing_upload_order
+        elif selected["kind"] == "accepted-candidate":
             stage_work = work / "stage-work"
             stage_work.mkdir()
             output, proofs = work / "staged", work / "proofs"
             stage_candidate(selected, output, proofs, stage_work)
             full = {**flat_local_files(output), **flat_local_files(proofs)}
-            check_existing(inventory, existing, full, selected)
+            check_existing(inventory, existing, full, selected, version=version,
+                           draft=release["draft"], sha=sha, tag=tag, work=work)
             require(SELECTION in inventory, "candidate recovery requires the existing selection receipt")
             additions = full
         else:
@@ -972,7 +1290,7 @@ def recover(_args=None):
                 expected[name] = path
         verify_remote_tag(tag, sha)
         require(release_inventory(release) == inventory, "release changed before recovery write")
-        for name in sorted(set(additions) - set(inventory)):
+        for name in order(set(additions) - set(inventory)):
             verify_remote_tag(tag, sha)
             upload(tag, additions[name])
         readback(release, expected, original, work, sha, tag)
@@ -984,28 +1302,33 @@ def dispatch(args):
     source, tag = os.environ.get("SOURCE_SHA", ""), os.environ.get("RELEASE_TAG", "")
     path = os.environ.get("ARTIFACT_SELECTION_FILE", "")
     publish, dry = env_bool("PUBLISH_RELEASE_PACKAGES"), env_bool("REGISTRY_DRY_RUN")
+    tier = os.environ.get("RELEASE_TIER", "")
     selected = ""
     if mode == "candidate":
         digest(source, "SOURCE_SHA", 40)
         require(not tag and not path and not publish and not dry, "contradictory candidate inputs")
+        require(tier in assets.TIERS, "TIER must be core or trailing")
     else:
         require(not source, "SOURCE_SHA is only valid for candidate")
+        require(not tier, "TIER is only valid for candidate")
         valid_tag(tag)
         if mode in ("promote", "assets"):
             require(path, "ARTIFACT_SELECTION_FILE is required")
-            selected = json.dumps(validate_selection(read_json(Path(path)), original=mode == "assets"),
-                                  separators=(",", ":"), sort_keys=True)
+            chosen = validate_selection(read_json(Path(path)), original=mode == "assets")
+            if mode == "promote":
+                require_promotable(chosen)
+            selected = json.dumps(chosen, separators=(",", ":"), sort_keys=True)
         else:
             require(not path and publish, "registry retry requires publication enabled and no selection")
         if mode == "assets":
             require(not publish and not dry, "assets recovery requires both publication booleans false")
     inputs = {"release_mode": mode, "source_sha": source, "release_tag": tag,
               "artifact_selection": selected, "publish_release_packages": str(publish).lower(),
-              "registry_dry_run": str(dry).lower()}
+              "registry_dry_run": str(dry).lower(), "candidate_tier": tier}
     env = os.environ.copy()
     env.pop("GH_TOKEN", None)
     env.pop("GITHUB_API_TOKEN", None)
-    print("Release protocol v1: tag pushes validate only; publication requires explicit accepted-byte promotion.",
+    print("Release protocol: tag pushes validate only; publication requires explicit accepted-byte promotion.",
           file=sys.stderr)
     run(["gh", "workflow", "run", "release.yml", "--repo", REPOSITORY, "--ref", "main", "--json"],
         data=json_bytes(inputs), env=env)
@@ -1020,6 +1343,8 @@ def parse_args(argv=None):
     collect_parser.add_argument("--output-dir", type=Path, required=True)
     collect_parser.add_argument("--ci-run-id", type=int, required=True)
     collect_parser.add_argument("--ci-run-attempt", type=int, required=True)
+    collect_parser.add_argument("--tier", choices=assets.TIERS,
+                                help="collect one tier (schema 2); omitted only for schema 1 fixtures")
     select_parser = commands.add_parser("selection")
     select_parser.add_argument("--manifest-file", type=Path, required=True)
     select_parser.add_argument("--artifact-id", type=int, required=True)

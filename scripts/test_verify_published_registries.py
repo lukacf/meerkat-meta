@@ -167,6 +167,17 @@ class PublishedRegistryTests(unittest.TestCase):
         self.assertEqual(calls, 8)
         self.assertEqual(sleeps, [0.25])
 
+    def test_registry_readback_never_reads_github_release_assets(self):
+        """Registry retry and its readback require the core tier only: the
+        readback reads crates.io, PyPI and npm and nothing on the GitHub
+        release, so a trailing tier still being added cannot hold it up."""
+        checks = registries._registry_checks("0.9.2")
+        hosts = {url.split("/")[2] for _, url, _ in checks}
+        self.assertEqual(hosts, {"crates.io", "pypi.org", "registry.npmjs.org"})
+        source = SCRIPT.read_text()
+        for marker in ("github.com", "api.github", "releases/", "gh release"):
+            self.assertNotIn(marker, source)
+
     def test_crates_io_must_serve_the_verified_crate_bytes(self):
         verified = {
             "meerkat-meta": artifact_digest("https://crates.example/meerkat-meta-0.8.0.crate", "sha256"),
