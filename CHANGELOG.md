@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the semver gate): the agent-memory
+  recorder's `memory` tool now names the memory operation each call performs,
+  with Meerkat 0.9.2's typed operation targets. Every plan it resolves carries
+  its own witness with `ToolOperationTarget::MemoryOperation`: `remember` and
+  `update` are a `Write`, `forget` a `Delete` and `recall` a `Read` of the
+  member's identity scope, and `propose_to_mob` a `Propose` to its mob scope.
+  The scope is always the one the recorder pinned when the member was built,
+  never one taken from the call's arguments. A host operation policy that
+  mapped the `memory` tool as an operation without a target now receives
+  that target, and under a targeted grant basis the tool uses only the
+  lineage selected for its memory scope, never the base lineage. Stock
+  governed realms keep refusing it, as they did while it had no target.
+- Behaviour-only: under governed work the `memory` tool reads or writes
+  memory only when the dispatch's prepared authorization names exactly the
+  operation the call performs. A wrapper that forwards its
+  `dispatch_with_context` but resolves its own plan without that target, or
+  with another scope's, is refused with `authorization_refused` (malformed
+  facts) before any memory access, and a plan the recorder did not resolve
+  for the call's own operation is refused as `ExecutionOwnerChanged`.
+  Forward `resolve_execution_plan` and `dispatch_resolved_with_context` to
+  the recorder instead. Ungoverned dispatch is unchanged.
+- Behaviour-only: in a session, a `memory` call with an unknown action, or
+  `propose_to_mob` from a member that is not in a mob, now fails at plan
+  resolution with `invalid_arguments` and the same reason, where the tool
+  returned it as an error result.
+
+### Added
+
+- `MemoryScope::operation_scope_ref` and `AGENT_MEMORY_TARGET_OWNER`
+  (`meerkat_meta::memory`): the typed reference by which Meta's memory tools
+  name a memory scope in operation targets, `MemoryScopeRef::Host` with owner
+  `meta.agent_memory` and scope `<kind>/<realm>/<key>` (`%` and `/`
+  percent-escaped in the realm and key). A host operation policy maps it to
+  its own action, and a targeted grant selects one lineage for exactly that
+  scope.
+
 ## [0.9.1] - 2026-10-15
 
 ### Breaking

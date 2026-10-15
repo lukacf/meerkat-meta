@@ -63,6 +63,41 @@ impl MemoryScope {
             Self::Realm { .. } => "",
         }
     }
+
+    /// This scope as the typed memory operation targets of Meta's memory
+    /// tools name it: owner [`AGENT_MEMORY_TARGET_OWNER`], and scope
+    /// `<kind>/<realm>/<key>` with `%` and `/` percent-escaped in the realm
+    /// and the key, so two scopes never share a reference. A host's
+    /// operation policy maps it to its own action, and a targeted grant
+    /// selects one lineage for exactly this scope.
+    pub fn operation_scope_ref(&self) -> meerkat_core::MemoryScopeRef {
+        meerkat_core::MemoryScopeRef::Host {
+            owner: AGENT_MEMORY_TARGET_OWNER.to_string(),
+            scope: format!(
+                "{}/{}/{}",
+                self.kind_str(),
+                escape_scope_ref_part(self.realm()),
+                escape_scope_ref_part(self.key()),
+            ),
+        }
+    }
+}
+
+/// The stable name Meta's agent memory carries as the owner of every typed
+/// memory operation target its tools produce
+/// ([`MemoryScope::operation_scope_ref`]).
+pub const AGENT_MEMORY_TARGET_OWNER: &str = "meta.agent_memory";
+
+fn escape_scope_ref_part(part: &str) -> String {
+    let mut escaped = String::with_capacity(part.len());
+    for ch in part.chars() {
+        match ch {
+            '%' => escaped.push_str("%25"),
+            '/' => escaped.push_str("%2F"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// Closed record taxonomy (§7.1). `OpenLoop` is the prospective-memory kind:
@@ -504,6 +539,60 @@ mod tests {
         assert_eq!(content_hash("a", "b"), content_hash("a", "b"));
         assert_ne!(content_hash("ab", "c"), content_hash("a", "bc"));
         assert_eq!(content_hash("t", "b").len(), 64);
+    }
+
+    /// Typed memory targets name Meta's memory owner and a scope reference
+    /// that keeps every scope distinct: the kind, realm and key never run
+    /// into each other, whatever separators the names contain.
+    #[test]
+    fn operation_scope_refs_are_owned_by_meta_memory_and_never_collide() {
+        let host = |scope: &str| meerkat_core::MemoryScopeRef::Host {
+            owner: AGENT_MEMORY_TARGET_OWNER.to_string(),
+            scope: scope.to_string(),
+        };
+        let identity = |realm: &str, identity: &str| MemoryScope::Identity {
+            realm: realm.to_string(),
+            identity: identity.to_string(),
+        };
+        let cases = [
+            (
+                identity("family", "identity:luka"),
+                "identity/family/identity:luka",
+            ),
+            (
+                MemoryScope::Mob {
+                    realm: "family".to_string(),
+                    mob: "identity:luka".to_string(),
+                },
+                "mob/family/identity:luka",
+            ),
+            (
+                MemoryScope::Operator {
+                    realm: "family".to_string(),
+                    operator: "ops".to_string(),
+                },
+                "operator/family/ops",
+            ),
+            (
+                MemoryScope::Realm {
+                    realm: "family".to_string(),
+                },
+                "realm/family/",
+            ),
+            (identity("a/b", "c"), "identity/a%2Fb/c"),
+            (identity("a", "b/c"), "identity/a/b%2Fc"),
+            (identity("a%2Fb", "c"), "identity/a%252Fb/c"),
+        ];
+        for (scope, expected) in &cases {
+            assert_eq!(scope.operation_scope_ref(), host(expected), "{scope:?}");
+            assert!(scope.operation_scope_ref().is_named());
+        }
+        let refs: std::collections::BTreeSet<String> = cases
+            .iter()
+            .map(|(_, expected)| (*expected).to_string())
+            .collect();
+        assert_eq!(refs.len(), cases.len(), "every scope has its own reference");
+        assert_eq!(AGENT_MEMORY_TARGET_OWNER, "meta.agent_memory");
     }
 
     #[test]
