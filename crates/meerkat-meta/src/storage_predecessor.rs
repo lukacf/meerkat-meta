@@ -32,7 +32,11 @@
 //!    established peer key, host pins and control audiences, and the draft
 //!    store. The run stops at the first failure. Every refusal happens
 //!    before the first change; every failure after it is reported as such,
-//!    never as "unchanged".
+//!    never as "unchanged". Given the mob definitions the installation boots
+//!    with ([`PredecessorDefinitionCheck`]), planning also names each key a
+//!    predecessor release dropped from the definition it recorded for a
+//!    store and Meta 0.9 applies, and refuses until the operator removes or
+//!    acknowledges it; adoption itself never changes a recorded definition.
 //! 3. **One read alias.** The composition manifest reads its creator field
 //!    under [`PREDECESSOR_MANIFEST_CREATOR_FIELD`] too. That name is a field
 //!    inside a file the store keeps, not a file or table name a renamed
@@ -81,9 +85,11 @@ use meerkat::{
     HostRunnableName, HostRunnableTargetBinding, ScheduleService, SqliteScheduleStore,
     TargetBinding, UpdateScheduleRequest,
 };
+use meerkat_mob::MobDefinition;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::mob_composition_manifest::MobCompositionManifest;
 use crate::storage_layout::{
     CANONICAL_CONSOLE_DB_FILE_NAME, CANONICAL_METADATA_DB_FILE_NAME, GATEWAY_HOME_DIR_NAME,
     MetaStorageLayout,
@@ -788,6 +794,11 @@ pub struct PredecessorAdoptReport {
     pub complete: bool,
     #[serde(default)]
     pub actions: Vec<PredecessorAction>,
+    /// Per persistent mob storage, the keys of a supplied mob definition
+    /// that the predecessor release which created the store dropped and
+    /// Meta 0.9 applies ([`PredecessorDefinitionCheck`]).
+    #[serde(default)]
+    pub ignored_keys: Vec<PredecessorIgnoredKeys>,
     #[serde(default)]
     pub notes: Vec<String>,
     /// Refusals and failures. Non-empty means a nonzero exit.
@@ -844,6 +855,270 @@ impl PredecessorAdoptReport {
             PredecessorOutcome::Refused(reason.into()),
         );
     }
+}
+
+/// The mob definitions an installation boots with, given to adoption to
+/// check against the persistent mob storages the predecessor created.
+///
+/// A predecessor release read its `mob.toml` with Meerkat's definition
+/// parser, which dropped a key that release's definition did not carry
+/// without a diagnostic. A config written with the key ran without it, and a
+/// store that release created recorded its definition without it. Meta 0.9
+/// reads the key: the store's first resume refuses as divergent, and
+/// applying the key changes what its members do. Adoption names each such
+/// key before it changes anything, and refuses until the operator removes
+/// it (keeping the behaviour the store has run with) or acknowledges it
+/// ([`Self::acknowledge_ignored_keys`]). An acknowledgement changes no
+/// recorded definition: the key takes effect only once the stored
+/// definition is advanced through the declared definition-update ceremony,
+/// and resuming never applies it.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct PredecessorDefinitionCheck {
+    /// Each definition with the source a report names it by, such as its
+    /// `mob.toml` path.
+    pub definitions: Vec<(String, MobDefinition)>,
+    /// Report the keys a predecessor release dropped as acknowledged
+    /// instead of refusing.
+    pub acknowledge_ignored_keys: bool,
+}
+
+impl PredecessorDefinitionCheck {
+    pub fn new(definitions: Vec<(String, MobDefinition)>, acknowledge_ignored_keys: bool) -> Self {
+        Self {
+            definitions,
+            acknowledge_ignored_keys,
+        }
+    }
+}
+
+/// The keys a supplied mob definition sets that the predecessor release
+/// which created one persistent mob storage dropped, and Meta 0.9 applies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PredecessorIgnoredKeys {
+    /// The store's composition manifest.
+    pub manifest: String,
+    /// The mob the store and the definition name.
+    pub mob_id: String,
+    /// The source of the supplied definition.
+    pub source: String,
+    /// The release that created the store, as its manifest records it.
+    pub created_by: String,
+    /// Dotted paths of the keys, as a divergence refusal names them.
+    pub keys: Vec<String>,
+    /// The operator acknowledged them; otherwise adoption refused.
+    pub acknowledged: bool,
+}
+
+/// The first predecessor release whose mob definition carried a profile's
+/// or `[runtime]`'s `model_fallback` (with its Meerkat 0.8.37); earlier
+/// releases dropped the key.
+const MODEL_FALLBACK_RECORDED_SINCE: (u64, u64, u64) = (0, 8, 34);
+/// The first predecessor release whose mob definition carried a profile's
+/// `tools.deny` (with its Meerkat 0.8.51); earlier releases dropped the key.
+const TOOLS_DENY_RECORDED_SINCE: (u64, u64, u64) = (0, 8, 46);
+
+/// `major.minor.patch` of a release version, as a composition manifest
+/// records its creator; `None` for anything else.
+fn release_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.').map(|part| part.parse::<u64>().ok());
+    let release = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(release)
+}
+
+/// The keys predecessor release `release` dropped from a mob definition, as
+/// a report names them; `None` when it dropped none of them.
+fn dropped_keys(release: (u64, u64, u64)) -> Option<&'static str> {
+    if release < MODEL_FALLBACK_RECORDED_SINCE {
+        Some("model_fallback and tools.deny")
+    } else if release < TOOLS_DENY_RECORDED_SINCE {
+        Some("tools.deny")
+    } else {
+        None
+    }
+}
+
+/// The keys `supplied` sets that `recorded` lacks because `created_by`, the
+/// predecessor release that recorded it, dropped them: dotted paths, as a
+/// divergence refusal names them, sorted. `None` when `created_by` is not a
+/// release version, so which keys it dropped cannot be told.
+///
+/// Only a profile both definitions declare inline is compared: a profile
+/// the store does not record is a composition change of its own.
+fn predecessor_ignored_keys(
+    created_by: &str,
+    recorded: &MobDefinition,
+    supplied: &MobDefinition,
+) -> Option<Vec<String>> {
+    let release = release_version(created_by)?;
+    let model_fallback = release < MODEL_FALLBACK_RECORDED_SINCE;
+    let tools_deny = release < TOOLS_DENY_RECORDED_SINCE;
+    let mut keys = Vec::new();
+    if model_fallback
+        && supplied.runtime.model_fallback.is_some()
+        && recorded.runtime.model_fallback.is_none()
+    {
+        keys.push("runtime.model_fallback".to_string());
+    }
+    for (name, binding) in &supplied.profiles {
+        let (Some(profile), Some(stored)) = (
+            binding.as_inline(),
+            recorded
+                .profiles
+                .get(name)
+                .and_then(|stored| stored.as_inline()),
+        ) else {
+            continue;
+        };
+        if model_fallback && profile.model_fallback.is_some() && stored.model_fallback.is_none() {
+            keys.push(format!("profiles.{name}.model_fallback"));
+        }
+        if tools_deny && !profile.tools.deny.is_empty() && stored.tools.deny.is_empty() {
+            keys.push(format!("profiles.{name}.tools.deny"));
+        }
+    }
+    keys.sort();
+    Some(keys)
+}
+
+/// What checking the supplied mob definitions found, by read-only
+/// inspection of the composition manifests.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DefinitionCheck {
+    ignored_keys: Vec<PredecessorIgnoredKeys>,
+    /// `(subject, reason)` of each refusal.
+    refusals: Vec<(String, String)>,
+    notes: Vec<String>,
+}
+
+impl DefinitionCheck {
+    fn record(&self, report: &mut PredecessorAdoptReport) {
+        report.ignored_keys.clone_from(&self.ignored_keys);
+        report.notes.extend(self.notes.iter().cloned());
+        report.errors.extend(
+            self.refusals
+                .iter()
+                .map(|(subject, reason)| format!("refused, nothing changed: {subject}: {reason}")),
+        );
+    }
+}
+
+/// Check `check`'s definitions against every persistent mob storage in
+/// `state_dir`, by the definition and creator its composition manifest
+/// records. Reads the manifests only.
+fn check_definitions(state_dir: &Path, check: &PredecessorDefinitionCheck) -> DefinitionCheck {
+    let mut found = DefinitionCheck::default();
+    // A directory or manifest the plan cannot judge is refused by the plan.
+    let Ok(manifests) = composition_manifests_in(state_dir) else {
+        return found;
+    };
+    let mut stores = Vec::new();
+    for path in manifests {
+        let decoded = regular_file_bytes(&path).and_then(|bytes| {
+            serde_json::from_slice::<MobCompositionManifest>(&bytes)
+                .map_err(|error| error.to_string())
+        });
+        match decoded {
+            Ok(record) => stores.push((path, record)),
+            Err(reason) if !check.definitions.is_empty() => found.refusals.push((
+                path.display().to_string(),
+                format!("cannot check the supplied mob definitions against it: {reason}"),
+            )),
+            Err(_) => {}
+        }
+    }
+    if check.definitions.is_empty() {
+        for (path, record) in &stores {
+            if let Some(keys) = release_version(&record.created_by_meta).and_then(dropped_keys) {
+                found.notes.push(format!(
+                    "{}: predecessor release {} created this store and dropped {keys} from \
+                     the mob definition it recorded; pass the definition the installation \
+                     boots with (--mob-config <mob.toml>) to check it for keys Meta 0.9 applies",
+                    path.display(),
+                    record.created_by_meta
+                ));
+            }
+        }
+        return found;
+    }
+    let mut checked = vec![false; stores.len()];
+    for (source, supplied) in &check.definitions {
+        let mut matched = false;
+        for (index, (path, record)) in stores.iter().enumerate() {
+            if record.definition.id != supplied.id {
+                continue;
+            }
+            matched = true;
+            checked[index] = true;
+            let manifest = path.display().to_string();
+            let created_by = &record.created_by_meta;
+            let Some(keys) = predecessor_ignored_keys(created_by, &record.definition, supplied)
+            else {
+                found.notes.push(format!(
+                    "{manifest}: its creator {created_by:?} is not a release version, so the \
+                     keys it dropped from the mob definition in {source} cannot be told"
+                ));
+                continue;
+            };
+            if keys.is_empty() {
+                continue;
+            }
+            let named = keys.join(", ");
+            if check.acknowledge_ignored_keys {
+                found.notes.push(format!(
+                    "{manifest}: acknowledged keys of the mob definition in {source} that \
+                     predecessor release {created_by} dropped and Meta 0.9 applies: {named}. \
+                     They take effect only once the stored definition is advanced with the \
+                     one-shot mob definition update; until then the store's first resume \
+                     refuses as divergent"
+                ));
+            } else {
+                found.refusals.push((
+                    manifest.clone(),
+                    format!(
+                        "the mob definition in {source} sets keys that predecessor release \
+                         {created_by}, which created this store, dropped without a diagnostic \
+                         and Meta 0.9 applies: {named}. The store recorded its definition \
+                         without them, so its first resume refuses as divergent. Remove them \
+                         from {source} to keep the behaviour this store has run with, or rerun \
+                         with --acknowledge-ignored-keys and advance the stored definition once \
+                         with the one-shot mob definition update to apply them"
+                    ),
+                ));
+            }
+            found.ignored_keys.push(PredecessorIgnoredKeys {
+                manifest,
+                mob_id: supplied.id.to_string(),
+                source: source.clone(),
+                created_by: created_by.clone(),
+                keys,
+                acknowledged: check.acknowledge_ignored_keys,
+            });
+        }
+        if !matched {
+            found.notes.push(format!(
+                "no persistent mob storage in {} records mob {} ({source}); its definition was \
+                 not compared",
+                state_dir.display(),
+                supplied.id
+            ));
+        }
+    }
+    for ((path, record), checked) in stores.iter().zip(checked) {
+        if !checked
+            && release_version(&record.created_by_meta)
+                .and_then(dropped_keys)
+                .is_some()
+        {
+            found.notes.push(format!(
+                "{}: no supplied mob definition names mob {}, so it was not checked",
+                path.display(),
+                record.definition.id
+            ));
+        }
+    }
+    found
 }
 
 /// Planned state-directory work, computed by read-only inspection.
@@ -932,6 +1207,20 @@ struct EstablishedIdentity {
 /// Steps run in order and the run stops at the first failure, so no step
 /// runs after a failed prerequisite.
 pub async fn adopt_predecessor_state(request: &PredecessorAdoptRequest) -> PredecessorAdoptReport {
+    adopt_predecessor_state_with_definitions(request, &PredecessorDefinitionCheck::default()).await
+}
+
+/// [`adopt_predecessor_state`], also checking the mob definitions the
+/// installation boots with ([`PredecessorDefinitionCheck`]). Planning names
+/// each key a predecessor release dropped from the definition a store
+/// recorded and Meta 0.9 applies ([`PredecessorAdoptReport::ignored_keys`]),
+/// and refuses before any change unless the check acknowledges them.
+/// Without definitions it notes each store whose creating release dropped
+/// such keys.
+pub async fn adopt_predecessor_state_with_definitions(
+    request: &PredecessorAdoptRequest,
+    check: &PredecessorDefinitionCheck,
+) -> PredecessorAdoptReport {
     let mut report = PredecessorAdoptReport {
         mode: request.mode,
         state_dir: request.state_dir.clone(),
@@ -1024,6 +1313,8 @@ pub async fn adopt_predecessor_state(request: &PredecessorAdoptRequest) -> Prede
     refuse_live_runtimes(state_dir, &scope, &mut report);
     let state_plan = plan_state(state_dir, &mut report);
     let home_plan = plan_home(&scope, &mut report);
+    let definitions = check_definitions(state_dir, check);
+    definitions.record(&mut report);
     if report.has_errors() {
         return report;
     }
@@ -1080,6 +1371,7 @@ pub async fn adopt_predecessor_state(request: &PredecessorAdoptRequest) -> Prede
     if !journal_unchanged
         || revalidated_state.as_ref() != Some(&state_plan)
         || revalidated_home.as_ref() != Some(&home_plan)
+        || check_definitions(state_dir, check) != definitions
     {
         report.refuse(
             PredecessorItem::Custody,
@@ -4571,5 +4863,271 @@ mod tests {
                 .expect_err("an ambiguous manifest refuses");
         assert_eq!(refusal.outcome(), "refused", "{refusal:?}");
         assert_eq!(std::fs::read_to_string(&ambiguous).unwrap(), both);
+    }
+
+    /// A mob definition as a predecessor release recorded it: one profile,
+    /// with nothing beyond what every release carried.
+    fn recorded_definition() -> MobDefinition {
+        MobDefinition::from_toml("[mob]\nid = \"m\"\n\n[profiles.lead]\nmodel = \"gpt-5.5\"\n")
+            .unwrap()
+    }
+
+    /// The same definition with the three keys predecessor releases before
+    /// 0.8.34 dropped: a mob-wide and a profile model fallback, and a tool
+    /// deny list.
+    fn definition_with_dropped_keys() -> MobDefinition {
+        MobDefinition::from_toml(
+            "[mob]\nid = \"m\"\n\n[runtime.model_fallback]\nenabled = false\n\n\
+             [profiles.lead]\nmodel = \"gpt-5.5\"\n\n[profiles.lead.model_fallback]\n\
+             enabled = false\n\n[profiles.lead.tools]\ndeny = [\"shell\"]\n",
+        )
+        .unwrap()
+    }
+
+    const DROPPED_KEYS: [&str; 3] = [
+        "profiles.lead.model_fallback",
+        "profiles.lead.tools.deny",
+        "runtime.model_fallback",
+    ];
+
+    fn key_paths(paths: &[&str]) -> Option<Vec<String>> {
+        Some(paths.iter().map(|path| (*path).to_string()).collect())
+    }
+
+    /// The stock composition manifest as predecessor release `release` wrote
+    /// it, recording `definition`.
+    fn write_recorded_manifest(state: &Path, release: &str, definition: &MobDefinition) {
+        let manifest = serde_json::json!({
+            "manifest_version": 1,
+            "created_by_mobkit": release,
+            "definition": definition,
+            "created_by_authority": "authoritative",
+        });
+        std::fs::write(
+            manifest_file(state),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn definition_check(
+        definition: MobDefinition,
+        acknowledge_ignored_keys: bool,
+    ) -> PredecessorDefinitionCheck {
+        PredecessorDefinitionCheck::new(
+            vec![("mob.toml".to_string(), definition)],
+            acknowledge_ignored_keys,
+        )
+    }
+
+    /// The keys reported are the ones the creating release dropped, by the
+    /// first release whose definition carried each: `model_fallback` from
+    /// 0.8.34, `tools.deny` from 0.8.46. Keys the store recorded, an
+    /// unchanged definition and a profile the store never recorded are not
+    /// reported, and a creator that is not a release version is not judged.
+    #[test]
+    fn the_reported_keys_are_the_ones_the_creating_release_dropped() {
+        let recorded = recorded_definition();
+        let supplied = definition_with_dropped_keys();
+        for (release, expected) in [
+            ("0.8.9", key_paths(&DROPPED_KEYS)),
+            ("0.8.33", key_paths(&DROPPED_KEYS)),
+            ("0.8.34", key_paths(&["profiles.lead.tools.deny"])),
+            ("0.8.45", key_paths(&["profiles.lead.tools.deny"])),
+            ("0.8.46", key_paths(&[])),
+            ("0.8.49", key_paths(&[])),
+            ("0.9.1", key_paths(&[])),
+        ] {
+            assert_eq!(
+                predecessor_ignored_keys(release, &recorded, &supplied),
+                expected,
+                "{release}"
+            );
+        }
+        assert_eq!(
+            predecessor_ignored_keys("0.8.26", &recorded, &recorded),
+            key_paths(&[]),
+            "an unchanged definition"
+        );
+        assert_eq!(
+            predecessor_ignored_keys("0.8.26", &supplied, &supplied),
+            key_paths(&[]),
+            "keys the store recorded"
+        );
+        let new_profile = MobDefinition::from_toml(
+            "[mob]\nid = \"m\"\n\n[profiles.lead]\nmodel = \"gpt-5.5\"\n\n\
+             [profiles.other]\nmodel = \"gpt-5.5\"\n\n[profiles.other.tools]\ndeny = [\"shell\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            predecessor_ignored_keys("0.8.26", &recorded, &new_profile),
+            key_paths(&[]),
+            "a profile the store never recorded"
+        );
+        for creator in ["0.8", "0.8.26.1", "0.8.26-dev", "mobkit"] {
+            assert_eq!(
+                predecessor_ignored_keys(creator, &recorded, &supplied),
+                None,
+                "{creator}"
+            );
+        }
+    }
+
+    /// Keys the predecessor release that created a store dropped, and Meta
+    /// 0.9 applies, are named and refused before any change, by the dry run
+    /// and by apply, until they are acknowledged; adoption then completes and
+    /// still reports them. The definition the store recorded reports nothing.
+    #[tokio::test]
+    async fn keys_the_creating_release_dropped_refuse_until_acknowledged() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path();
+        write_predecessor_metadata_db(&state.join(PREDECESSOR_METADATA_DB_FILE_NAMES[0]));
+        write_recorded_manifest(state, "0.8.26", &recorded_definition());
+        let before = snapshot(state);
+        let manifest = manifest_file(state).display().to_string();
+        let reported = |acknowledged| {
+            vec![PredecessorIgnoredKeys {
+                manifest: manifest.clone(),
+                mob_id: "m".to_string(),
+                source: "mob.toml".to_string(),
+                created_by: "0.8.26".to_string(),
+                keys: DROPPED_KEYS.map(String::from).to_vec(),
+                acknowledged,
+            }]
+        };
+
+        let unchanged = adopt_predecessor_state_with_definitions(
+            &request(state, MigrateMode::DryRun),
+            &definition_check(recorded_definition(), false),
+        )
+        .await;
+        assert!(!unchanged.has_errors(), "{:?}", unchanged.errors);
+        assert_eq!(unchanged.ignored_keys, Vec::new());
+
+        for mode in [MigrateMode::DryRun, MigrateMode::Apply] {
+            let report = adopt_predecessor_state_with_definitions(
+                &request(state, mode),
+                &definition_check(definition_with_dropped_keys(), false),
+            )
+            .await;
+            assert_eq!(report.ignored_keys, reported(false), "{mode:?}");
+            assert!(!report.changed_state, "{mode:?}");
+            assert_eq!(report.errors.len(), 1, "{mode:?}: {:?}", report.errors);
+            let error = &report.errors[0];
+            assert!(
+                error.starts_with(&format!("refused, nothing changed: {manifest}: ")),
+                "{error}"
+            );
+            for needle in DROPPED_KEYS.into_iter().chain([
+                "predecessor release 0.8.26",
+                "mob.toml",
+                "--acknowledge-ignored-keys",
+            ]) {
+                assert!(error.contains(needle), "{needle:?} missing from {error}");
+            }
+        }
+        assert_eq!(snapshot(state), before, "a refusal changes nothing");
+        assert!(read_adoption_journal(state).unwrap().is_none());
+
+        let applied = adopt_predecessor_state_with_definitions(
+            &request(state, MigrateMode::Apply),
+            &definition_check(definition_with_dropped_keys(), true),
+        )
+        .await;
+        assert!(!applied.has_errors(), "{:?}", applied.errors);
+        assert!(applied.changed_state && applied.complete, "{applied:?}");
+        assert_eq!(applied.ignored_keys, reported(true));
+        assert!(
+            applied
+                .notes
+                .iter()
+                .any(|note| note.contains("acknowledged") && note.contains(DROPPED_KEYS[1])),
+            "{:?}",
+            applied.notes
+        );
+    }
+
+    /// Without definitions, a store whose creating release dropped keys is
+    /// noted with the flag that checks it. A definition that names no store,
+    /// and a store no definition names, are noted, never refused. A manifest
+    /// whose definition does not decode cannot be checked: refused when
+    /// definitions are given, and adopted as before when none are.
+    #[tokio::test]
+    async fn unchecked_and_unmatched_definitions_are_noted_not_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path();
+        write_predecessor_metadata_db(&state.join(PREDECESSOR_METADATA_DB_FILE_NAMES[0]));
+        write_recorded_manifest(state, "0.8.40", &recorded_definition());
+
+        let unchecked = adopt_predecessor_state(&request(state, MigrateMode::DryRun)).await;
+        assert!(!unchecked.has_errors(), "{:?}", unchecked.errors);
+        assert_eq!(unchecked.ignored_keys, Vec::new());
+        assert!(
+            unchecked
+                .notes
+                .iter()
+                .any(|note| note.contains("--mob-config")
+                    && note.contains("predecessor release 0.8.40")
+                    && note.contains("tools.deny")
+                    && !note.contains("model_fallback")),
+            "{:?}",
+            unchecked.notes
+        );
+
+        let other = MobDefinition::from_toml(
+            "[mob]\nid = \"other\"\n\n[profiles.lead]\nmodel = \"gpt-5.5\"\n\n\
+             [profiles.lead.tools]\ndeny = [\"shell\"]\n",
+        )
+        .unwrap();
+        let unmatched = adopt_predecessor_state_with_definitions(
+            &request(state, MigrateMode::DryRun),
+            &definition_check(other, false),
+        )
+        .await;
+        assert!(!unmatched.has_errors(), "{:?}", unmatched.errors);
+        assert_eq!(unmatched.ignored_keys, Vec::new());
+        for needle in ["records mob other", "names mob m"] {
+            assert!(
+                unmatched.notes.iter().any(|note| note.contains(needle)),
+                "{needle:?} missing from {:?}",
+                unmatched.notes
+            );
+        }
+
+        write_recorded_manifest(state, "0.8.46", &recorded_definition());
+        let current = adopt_predecessor_state(&request(state, MigrateMode::DryRun)).await;
+        assert!(
+            !current
+                .notes
+                .iter()
+                .any(|note| note.contains("--mob-config")),
+            "a release that dropped nothing is not noted: {:?}",
+            current.notes
+        );
+
+        std::fs::write(
+            manifest_file(state),
+            "{\"manifest_version\": 1, \"created_by_mobkit\": \"0.8.26\", \"definition\": {\"profiles\": 1}}",
+        )
+        .unwrap();
+        let undecodable = adopt_predecessor_state_with_definitions(
+            &request(state, MigrateMode::DryRun),
+            &definition_check(recorded_definition(), false),
+        )
+        .await;
+        assert!(
+            undecodable
+                .errors
+                .iter()
+                .any(|error| error.contains("cannot check the supplied mob definitions")),
+            "{:?}",
+            undecodable.errors
+        );
+        let adopted_as_before = adopt_predecessor_state(&request(state, MigrateMode::DryRun)).await;
+        assert!(
+            !adopted_as_before.has_errors(),
+            "{:?}",
+            adopted_as_before.errors
+        );
     }
 }

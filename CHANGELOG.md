@@ -7,7 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `meta_gateway storage-adopt-predecessor --mob-config <file>` checks the mob
+  definition an installation boots with (repeat it for each mob) against every
+  persistent mob storage the predecessor created. It names each key that the
+  release which created a store dropped without a diagnostic and Meta 0.9
+  applies: a profile's or `[runtime]`'s `model_fallback` on a store created by
+  MobKit 0.8.33 or earlier, and a profile's `tools.deny` on a store created by
+  0.8.45 or earlier. Adoption refuses before any change until each such key is
+  removed, which keeps the behaviour the store has run with, or acknowledged
+  with `--acknowledge-ignored-keys`. An acknowledgement changes no recorded
+  definition: the keys take effect only once the stored definition is
+  advanced with the one-shot mob definition update, and until then the
+  store's first resume refuses as `divergent`, as in 0.9.1. The JSON report
+  lists them under `ignored_keys`. Without `--mob-config`, a note names each
+  store whose creating release dropped such keys. A `--mob-config` the
+  gateway would refuse is refused before planning. Library callers use
+  `storage_predecessor::adopt_predecessor_state_with_definitions` with a
+  `PredecessorDefinitionCheck`.
+
 ### Fixed
+
+- Docs: the upgrading guide and the 0.9.1 notes said MobKit 0.8.x ignored
+  `model_fallback` and `tools.deny`. MobKit 0.8.33 and earlier ignored
+  `model_fallback`, and 0.8.45 and earlier ignored `tools.deny`; later 0.8
+  releases applied them, and their stores recorded them.
 
 - Console: an operation refusal reads "Action refused" instead of
   "Permission denied". The host refuses an operation for a policy denial, for
