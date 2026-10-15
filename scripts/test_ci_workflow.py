@@ -386,6 +386,8 @@ class CiWorkflowTests(unittest.TestCase):
             [
                 "scripts/repo-cargo test -p meta-extension-state --locked",
                 "scripts/repo-cargo test -p meerkat-meta --locked --features extension-state "
+                "--lib --test extension_state --no-run",
+                "scripts/repo-cargo test -p meerkat-meta --locked --features extension-state "
                 "--test extension_state",
                 "scripts/repo-cargo test -p meerkat-meta --locked --features extension-state "
                 "--lib -- extension_ document_mcp_child_supply",
@@ -394,6 +396,32 @@ class CiWorkflowTests(unittest.TestCase):
         for name in ("extension-state-lint", "test-extension-state"):
             self.assertIn('CARGO_INCREMENTAL: "0"', job_block(name))
             self.assertIn("CARGO_PROFILE_DEV_DEBUG: line-tables-only", job_block(name))
+
+    def test_extension_state_test_targets_build_together_before_they_run(self):
+        """The integration test and the --lib harness are separate compilations
+        of meerkat-meta; one `--no-run` invocation builds both in parallel, so
+        it must name every target the later meerkat-meta steps run, with the
+        same package, features and flags, and come before them."""
+        steps = [
+            line.strip()[len("- run: "):]
+            for line in job_block("test-extension-state").splitlines()
+            if line.strip().startswith("- run: scripts/repo-cargo test -p meerkat-meta ")
+        ]
+        build, *runs = steps
+        self.assertTrue(build.endswith(" --no-run"), build)
+        prefix = "scripts/repo-cargo test -p meerkat-meta --locked --features extension-state "
+        self.assertTrue(all(step.startswith(prefix) for step in steps), steps)
+        built = set(re.findall(r"--(lib|test \S+)", build.split(" -- ")[0]))
+        ran = {target for step in runs for target in re.findall(r"--(lib|test \S+)", step.split(" -- ")[0])}
+        self.assertEqual(built, ran)
+
+    def test_no_job_caps_build_parallelism(self):
+        """A CARGO_BUILD_JOBS cap shrinks rustc's jobserver too, so it halved
+        LLVM codegen on the crates that bound the build. The dev-profile jobs
+        run uncapped, like the rest of the workflow."""
+        code = [line for line in CI_WORKFLOW.read_text().splitlines() if not line.strip().startswith("#")]
+        self.assertEqual([line for line in code if "CARGO_BUILD_JOBS" in line], [])
+        self.assertEqual([line for line in code if re.search(r"repo-cargo .*(\s-j\s*\d|--jobs)", line)], [])
 
     def test_voice_feature_runs_real_host_tests_and_strict_lint(self):
         block = job_block("test-voice")

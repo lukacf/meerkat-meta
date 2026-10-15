@@ -41,6 +41,15 @@ env:
   # family and its saves stop evicting other entries, release.yml's among
   # them. That job alone holds actions: write, and it runs only for pushes
   # to main, never for a pull request.
+  #
+  # No job caps CARGO_BUILD_JOBS. test-voice, voice-clippy,
+  # test-extension-state and extension-state-lint carried a cap of 2 copied
+  # from release.yml's release-profile memory limit, while every other job
+  # builds the same crates in the dev profile at the runner's 4. Cargo hands
+  # rustc its jobserver, so the cap also halved LLVM's codegen threads on the
+  # crates that bound the build (meerkat-mob, meerkat-meta): in run
+  # 38714502600 test-voice spent 19m06 on Meerkat Core and 14m22 on
+  # meerkat-meta, against 14-18 and 6-7 in the uncapped console jobs.
 
 jobs:
   # Decides whether this run needs the Rust, console, SDK and example jobs.
@@ -226,6 +235,12 @@ jobs:
       - if: matrix.examples
         run: scripts/repo-cargo build --workspace --examples
 
+  # The two meerkat-meta test targets are separate compilations of the
+  # library: the integration test links it as a dependency, the --lib run
+  # compiles it again with cfg(test). Run one after the other they built
+  # serially (run 38714502600: 25m52 then 10m20) while rustc's front end
+  # kept one of the 4 CPUs busy, so one `--no-run` invocation builds both
+  # in parallel and the filtered runs below only execute them.
   test-extension-state:
     name: test-extension-state
     needs: changes
@@ -233,7 +248,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
@@ -242,6 +256,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/repo-cargo test -p meta-extension-state --locked
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --lib --test extension_state --no-run
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --test extension_state
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --lib -- extension_ document_mcp_child_supply
 
@@ -256,7 +271,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
@@ -276,7 +290,6 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_BUILD_JOBS: "2"
       # The feature union triggers the repository's Rust 1.97 incremental ICE.
       CARGO_INCREMENTAL: "0"
     steps:
@@ -302,7 +315,6 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_BUILD_JOBS: "2"
       # The feature union triggers the repository's Rust 1.97 incremental ICE.
       CARGO_INCREMENTAL: "0"
     steps:
