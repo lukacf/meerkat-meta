@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   test fixtures give their members and child gateways their own fake key, so
   the integration tests, like the unit tests since 0.9.1, run without one.
   `scripts/test_ci_workflow.py` checks that neither job sets it.
+- `Cargo.lock` updates chacha20 from 0.10.1, which crates.io yanked, to
+  0.10.2. No Meta build compiles it: the lockfile records it only under
+  reqwest's optional HTTP/3 support (rand 0.10 for quinn-proto), which no
+  workspace feature enables, so no build or test changes.
 
 ## [0.9.1] - 2026-10-15
 
