@@ -23718,7 +23718,14 @@ function orderBySource(nodes) {
   }
   return ordered.length === nodes.length ? ordered : nodes.map((node2) => node2.frame);
 }
-function reconcileRuntimeAppendFrames(frames) {
+function loadedTimelineStartMs(frames) {
+  let start2 = Number.POSITIVE_INFINITY;
+  for (const frame of frames) {
+    if (typeof frame.timestampMs === "number" && frame.timestampMs < start2) start2 = frame.timestampMs;
+  }
+  return start2;
+}
+function reconcileRuntimeAppendFrames(frames, options = {}) {
   const snapshots = /* @__PURE__ */ new Map();
   const positionSnapshots = [];
   for (const frame of frames) {
@@ -23797,15 +23804,17 @@ function reconcileRuntimeAppendFrames(frames) {
   }
   for (const [scope, snapshot] of snapshots) {
     for (const { offset, message, origin } of snapshot.notices) {
+      const key = logicalKey(snapshot.frame, origin);
       const frame = {
         ...snapshot.frame,
         event: "system_notice",
-        id: logicalKey(snapshot.frame, origin),
+        id: key,
         runId: origin.run_id,
         sourceCursor: "".concat(snapshot.frame.sessionId, ":").concat(offset),
         timestampMs: Date.parse(String(message.created_at)),
         data: { message }
       };
+      if (options.unloadedBeforeMs !== void 0 && frame.timestampMs < options.unloadedBeforeMs && !candidates.has(key)) continue;
       const before = nodes.findIndex((node2) => typeof node2.frame.timestampMs === "number" && node2.frame.timestampMs > frame.timestampMs);
       append(
         { frame, scope, origin, position: [offset], canonical: true, observedThrough: snapshot.observedThrough, sequenceScope: scope },
@@ -47617,7 +47626,7 @@ function fullTimelineDerivation(agent, frames, options) {
   return { entries: fold.finish(), resume };
 }
 function sameTimelineOptions(left, right) {
-  return Boolean(left.renderInteractionStartsAsUser) === Boolean(right.renderInteractionStartsAsUser) && left.renderTextDeltas !== false === (right.renderTextDeltas !== false) && Boolean(left.suppressEmbeddedRunStartedPrompt) === Boolean(right.suppressEmbeddedRunStartedPrompt) && left.blobBaseUrl === right.blobBaseUrl && (left.textMode ?? "markdown") === (right.textMode ?? "markdown");
+  return Boolean(left.renderInteractionStartsAsUser) === Boolean(right.renderInteractionStartsAsUser) && left.renderTextDeltas !== false === (right.renderTextDeltas !== false) && Boolean(left.suppressEmbeddedRunStartedPrompt) === Boolean(right.suppressEmbeddedRunStartedPrompt) && left.blobBaseUrl === right.blobBaseUrl && (left.textMode ?? "markdown") === (right.textMode ?? "markdown") && Boolean(left.hasOlderHistory) === Boolean(right.hasOlderHistory);
 }
 function extendTimelineDerivation(previous3, agent, frames, options) {
   const resume = previous3.resume;
@@ -47637,6 +47646,7 @@ function extendTimelineDerivation(previous3, agent, frames, options) {
     if (frame.event !== "text_delta" || options.renderTextDeltas === false || frame.sourceKind === "session_history" || isRealtimeHistoryMessage(frame) || typeof frame.timestampMs !== "number") return null;
     const cursor = cursorSeq(frame.cursor);
     if (cursor === null || cursor <= maxCursor) return null;
+    if (frame.timestampMs < (resume.fold.unloadedBeforeMs ?? Number.NEGATIVE_INFINITY)) return null;
     maxCursor = cursor;
     const scope = sequenceScopeOf(frame);
     const sequence = sourceSequence(frame);
@@ -47715,7 +47725,8 @@ function structurallyEqual(left, right) {
 function createTimelineFold(agent, frames, options) {
   const textMode = options.textMode ?? "markdown";
   const sortedFrames = options.renderInteractionStartsAsUser ? sortFramesForTranscript(frames) : frames.slice();
-  const orderedFrames = reconcileRuntimeAppendFrames(reconcileAssistantMessageFrames(reconcileAssistantHistoryPositions(sortedFrames)));
+  const unloadedBeforeMs = options.hasOlderHistory ? loadedTimelineStartMs(frames) : void 0;
+  const orderedFrames = reconcileRuntimeAppendFrames(reconcileAssistantMessageFrames(reconcileAssistantHistoryPositions(sortedFrames)), { unloadedBeforeMs });
   const canonicalToolCounterparts = canonicalAssistantToolCounterparts(orderedFrames);
   const realtimeHistoryIds = new Set(orderedFrames.filter(isRealtimeHistoryMessage).map((frame) => frame.id));
   const entries = [];
@@ -48301,6 +48312,7 @@ function createTimelineFold(agent, frames, options) {
   }
   return {
     sortedFrames,
+    unloadedBeforeMs,
     orderedLength: () => orderedFrames.length,
     step,
     finish,
@@ -62551,6 +62563,9 @@ var MAX_IDENTITY_LOG_EVENTS = 5e3;
 var IDENTITY_LOG_TRIM_SLACK = 500;
 var HIDDEN_TAB_FLUSH_MS = 250;
 var STREAM_TEXT_FRAMES = 3;
+function identityHasOlderHistory(log) {
+  return log.hasServerLog === true && Boolean(log.oldestTimelineCursor) && log.olderHistoryExhausted !== true;
+}
 function normalizeConsoleTheme(value) {
   return value === "dark" || value === "light" ? value : null;
 }
@@ -63563,17 +63578,19 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     const cached2 = derivedTranscriptRef.current[identity];
     const agentKey = agent ? JSON.stringify(agent) : "";
     if (cached2 && cached2.agentKey === agentKey) agent = cached2.agent;
-    if (cached2 && cached2.version === log.version && cached2.agent === agent) {
+    const hasOlderHistory = identityHasOlderHistory(log);
+    if (cached2 && cached2.version === log.version && cached2.agent === agent && cached2.hasOlderHistory === hasOlderHistory) {
       return cached2;
     }
     const sortedFrames = framesVisibleInPanel(getSortedFrames(identity), panelId);
     const derivation = deriveTimelineEntries(agent, sortedFrames, {
       renderInteractionStartsAsUser: true,
       renderTextDeltas: true,
-      blobBaseUrl: baseUrl
+      blobBaseUrl: baseUrl,
+      hasOlderHistory
     }, cached2?.derivation);
     const conversationEntries = derivation.entries;
-    const next = { version: log.version, agent, sortedFrames, conversationEntries, derivation, agentKey };
+    const next = { version: log.version, agent, sortedFrames, conversationEntries, derivation, agentKey, hasOlderHistory };
     derivedTranscriptRef.current[identity] = next;
     return next;
   }
@@ -66065,7 +66082,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         respawnLabel: configuredActionLabels.respawn,
         retireLabel: configuredActionLabels.retire,
         sendLabel: configuredActionLabels.send,
-        hasOlderHistory: identityLog.hasServerLog === true && Boolean(identityLog.oldestTimelineCursor) && identityLog.olderHistoryExhausted !== true,
+        hasOlderHistory: identityHasOlderHistory(identityLog),
         loadingOlderHistory: identityLog.olderHistoryLoading === true,
         onLoadOlder: () => void loadOlderIdentityTimeline(identity),
         stackSlot,

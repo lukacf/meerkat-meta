@@ -5,7 +5,7 @@ import { userMessageRenderKey } from "./user-message-identity";
 import { realtimeMessageOrigin, isRealtimeHistoryMessage } from "./realtime-message-identity";
 import { assistantMessageKey, assistantMessageRenderKey, hasAssistantMessageIdCarrier } from "./assistant-message-identity";
 import { canonicalAssistantToolCounterparts, reconcileAssistantMessageFrames } from "./assistant-message-projection";
-import { reconcileAssistantHistoryPositions, reconcileRuntimeAppendFrames, runtimeAppendNoticeKey } from "./runtime-append-projection";
+import { loadedTimelineStartMs, reconcileAssistantHistoryPositions, reconcileRuntimeAppendFrames, runtimeAppendNoticeKey } from "./runtime-append-projection";
 import { toolCompletionFromFrame, unknownToolCompletion, type ToolCompletionEvidence } from "./tool-completion";
 import { parseConsoleContextMessage } from "./context-record";
 import { memberKickoffNotice, memberKickoffPhaseLabel } from "./member-kickoff";
@@ -3633,6 +3633,11 @@ export function mapFramesToTimelineEntries(
     suppressEmbeddedRunStartedPrompt?: boolean;
     blobBaseUrl?: string;
     textMode?: ConversationTextMode;
+    /** The frames are the newest pages of a longer timeline whose older
+     * pages are not loaded yet. Session notices older than every loaded
+     * frame then wait for those pages instead of rendering above much newer
+     * rows. */
+    hasOlderHistory?: boolean;
   } = {},
 ): ConversationTimelineEntry[] {
   // Live streams keep store order so unscoped comms events do not jump
@@ -3641,7 +3646,7 @@ export function mapFramesToTimelineEntries(
   const textMode = options.textMode ?? "legacy";
   const orderedFrames = reconcileRuntimeAppendFrames(reconcileAssistantMessageFrames(reconcileAssistantHistoryPositions(options.renderInteractionStartsAsUser
     ? sortFramesForTranscript(frames)
-    : frames)));
+    : frames)), { unloadedBeforeMs: options.hasOlderHistory ? loadedTimelineStartMs(frames) : undefined });
   const canonicalToolCounterparts = canonicalAssistantToolCounterparts(orderedFrames);
   const realtimeHistoryIds = new Set(orderedFrames.filter(isRealtimeHistoryMessage).map(frame => frame.id));
   const entries: ConversationTimelineEntry[] = [];

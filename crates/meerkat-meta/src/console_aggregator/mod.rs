@@ -3628,10 +3628,41 @@ fn explicit_identity_query_needs_session_history_backfill(frames: &[ConsoleFrame
 }
 
 fn dedupe_identity_records(records: Vec<ConsoleIdentityRecord>) -> Vec<ConsoleIdentityRecord> {
+    // Since the roster lowering a live roster row's member id is its bare
+    // durable identity, while the identity's durable row names the generated
+    // binding `rt:{identity}:{generation}`. Decode before comparing, as
+    // `live_record_realizes_durable_binding` does: a roster row named by its
+    // identity realizes the one generated binding of that identity in the
+    // same runtime, source mob and session, and lists under that binding's
+    // public alias. Different generations never merge.
+    let mut bindings: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for record in &records {
+        if let Some(identity) =
+            crate::member_comms_id::durable_identity_from_runtime_alias(&record.runtime_member_id)
+        {
+            bindings
+                .entry(identity_record_dedupe_key(record, &identity))
+                .or_default()
+                .insert(record.runtime_member_id.clone());
+        }
+    }
     let mut by_identity: BTreeMap<String, ConsoleIdentityRecord> = BTreeMap::new();
-    for record in records {
+    for mut record in records {
+        let realized = crate::member_comms_id::durable_identity_label(&record.labels)
+            .filter(|identity| {
+                crate::member_comms_id::live_member_is_identity(&record.runtime_member_id, identity)
+            })
+            .and_then(|identity| bindings.get(&identity_record_dedupe_key(&record, identity)))
+            .filter(|aliases| aliases.len() == 1)
+            .and_then(|aliases| aliases.first().cloned());
+        if let Some(alias) = realized {
+            record.runtime_member_id = alias;
+        }
         by_identity
-            .entry(identity_record_dedupe_key(&record))
+            .entry(identity_record_dedupe_key(
+                &record,
+                &record.runtime_member_id,
+            ))
             .and_modify(|current| {
                 if identity_record_prefer(&record, current) {
                     *current = record.clone();
@@ -3642,7 +3673,7 @@ fn dedupe_identity_records(records: Vec<ConsoleIdentityRecord>) -> Vec<ConsoleId
     by_identity.into_values().collect()
 }
 
-fn identity_record_dedupe_key(record: &ConsoleIdentityRecord) -> String {
+fn identity_record_dedupe_key(record: &ConsoleIdentityRecord, runtime_member_id: &str) -> String {
     format!(
         "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
         record.identity,
@@ -3652,7 +3683,7 @@ fn identity_record_dedupe_key(record: &ConsoleIdentityRecord) -> String {
             .get("source_mob_id")
             .map(String::as_str)
             .unwrap_or(""),
-        record.runtime_member_id,
+        runtime_member_id,
         record.session_id.as_deref().unwrap_or("")
     )
 }
@@ -11031,6 +11062,45 @@ comms = true
     }
 
     #[test]
+    fn dedupe_identity_records_merges_a_live_roster_row_into_its_generated_binding() {
+        // Since the roster lowering, a live roster row's member id is the bare
+        // durable identity, while the durable row names the generated binding.
+        let mut durable = identity_record_for_test("test/review:singleton");
+        durable.runtime_member_id = "rt:review:singleton:0".to_string();
+        let mut live = identity_record_for_test("test/review:singleton");
+        live.runtime_member_id = "review:singleton".to_string();
+        live.labels
+            .insert("agent_identity".to_string(), "review:singleton".to_string());
+
+        let records = dedupe_identity_records(vec![durable.clone(), live.clone()]);
+        assert_eq!(
+            records.len(),
+            1,
+            "a live roster row named by its identity realizes the durable binding: {records:#?}"
+        );
+        assert_eq!(
+            records[0].runtime_member_id, "rt:review:singleton:0",
+            "the merged row keeps the binding's public runtime alias"
+        );
+
+        let mut other_session = live.clone();
+        other_session.session_id = Some("session-other".to_string());
+        assert_eq!(
+            dedupe_identity_records(vec![durable.clone(), other_session]).len(),
+            2,
+            "a roster row on another session is a split-brain, not the same binding"
+        );
+
+        let mut other_generation = durable.clone();
+        other_generation.runtime_member_id = "rt:review:singleton:1".to_string();
+        assert_eq!(
+            dedupe_identity_records(vec![durable, other_generation, live]).len(),
+            3,
+            "two generations of the binding stay apart, and the roster row realizes neither alone"
+        );
+    }
+
+    #[test]
     fn stale_durable_record_error_detects_session_split_brain() {
         let mut durable = identity_record_for_test("test/review:singleton");
         durable.runtime_member_id = "rt:review:singleton:0".to_string();
@@ -13806,6 +13876,66 @@ comms = true
                 .iter()
                 .any(|record| record.identity == "agent:beta"),
             "member-only spawned workers should remain visible in identity-first listings: {identities:#?}"
+        );
+
+        let _ = runtime.mob_handle().stop().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identity_first_list_identities_lists_a_live_identity_once()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let runtime = build_empty_runtime("identity-live-once-test").await;
+        let mut labels = BTreeMap::new();
+        labels.insert("agent_identity".to_string(), "agent:alpha".to_string());
+        spawn_trusted_identity_projected_member(
+            &runtime,
+            SpawnMemberSpec::from_wire(
+                "worker".to_string(),
+                "agent:alpha".to_string(),
+                Some("You are alpha.".into()),
+                None,
+                None,
+            )
+            .with_labels(labels),
+        )
+        .await;
+        let live_session = runtime
+            .mob_handle()
+            .resolve_bridge_session_id_observation(&crate::member_comms_id::mob_member_id(
+                "agent:alpha",
+            ))
+            .await
+            .ok_or("the live roster row must have an observable bridge session")?;
+        // A healthy binding: the durable row names `rt:agent:alpha:0` on the
+        // live row's own session.
+        let identity_runtime =
+            identity_runtime_for_test_with_sessions(&[("agent:alpha", live_session.clone())])
+                .await?;
+        let aggregator = MetaConsoleAggregator::in_memory();
+        aggregator.register_runtime_handles_with_policy(
+            "identity-first",
+            "",
+            runtime.mob_runtime().clone(),
+            Some(identity_runtime),
+            runtime.console_events(),
+            Arc::new(AllowAllConsoleVisibilityPolicy),
+        );
+
+        let identities = aggregator.list_identities().await?;
+        let alpha = identities
+            .iter()
+            .filter(|record| record.identity == "agent:alpha")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            alpha.len(),
+            1,
+            "a live identity lists once, not as its durable binding and its roster row: {identities:#?}"
+        );
+        assert_eq!(alpha[0].runtime_member_id, "rt:agent:alpha:0");
+        assert_eq!(
+            alpha[0].session_id.as_deref(),
+            Some(live_session.to_string().as_str())
         );
 
         let _ = runtime.mob_handle().stop().await;
