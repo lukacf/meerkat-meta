@@ -74,7 +74,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   skill content, summed over every skill entry, passes 16 MiB, so the copies
   made after a document enters (the import reply, source and export, a
   saved draft) stay a small constant times that. One validation reports at
-  most 1000 diagnostics, ending with `diagnostics_truncated`. A pax global
+  most 1000 diagnostics, ending with `diagnostics_truncated`. Rendering is
+  bounded too, whatever the document's shape: the rendered `mob.toml`, the
+  `definition.json` parsed from it and the expected schema files beside it
+  are each refused past 16 MiB (a schema shared by many members was copied
+  into every one), and a document with more than 1000 members, more than 256
+  branches in one parallel or branch step, or more than 1024 branches in its
+  flow is refused before it is rendered (branches after a parallel step
+  without a join each depended on every branch before them). A stored draft
+  whose document passes the skill content cap is listed and fetched as a
+  placeholder with the reason. A pax global
   header, which `git archive` writes, is skipped, and a contiguous file
   reads as a regular one. Before, a request under the HTTP body limit could
   expand into gigabytes of memory: a member's bytes were read with no
@@ -149,6 +158,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The Flow Editor draft store has no total size or draft count limit yet:
   each draft is bounded (its document's skill content is capped at 16 MiB),
   but the number of drafts is not. Store-wide limits are planned for 0.9.3.
+- The Flow Editor's remaining resource limits continue in 0.9.3: draft store
+  totals, and validation, whose peak memory stays linear in its (capped)
+  input.
 
 ## [0.9.1] - 2026-10-15
 

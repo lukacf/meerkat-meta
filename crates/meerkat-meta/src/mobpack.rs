@@ -4435,6 +4435,13 @@ fn strip_draft_history_fields(row: &mut Value) {
 }
 
 fn normalize_mobpack_draft_row(row: &Value) -> Value {
+    // A stored document past the skill content cap is never returned (a
+    // store written before the cap, or by hand): list and get answer with a
+    // placeholder that says why.
+    let stored = row.get("document").map_or(0, value_skill_content_bytes);
+    if stored > MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES {
+        return refused_draft_row(row, &document_skill_content_too_large(stored));
+    }
     let mut row = row.clone();
     strip_draft_history_fields(&mut row);
     let Some(artifact) = row.get("artifact") else {
@@ -4474,6 +4481,34 @@ fn normalize_mobpack_draft_row(row: &Value) -> Value {
         }
     }
     row
+}
+
+/// A draft row whose document is not returned, with why. It keeps the row's
+/// identity and revision so the editor can list it and delete it.
+fn refused_draft_row(row: &Value, reason: &str) -> Value {
+    let mut placeholder = [
+        "id",
+        "name",
+        "version",
+        "stage",
+        "trigger",
+        "source",
+        "updated_at_unix_ms",
+        "registry_source",
+        "revision",
+        "draft_revision",
+        "etag",
+        "draft_etag",
+    ]
+    .into_iter()
+    .filter_map(|key| row.get(key).map(|value| (key.to_string(), value.clone())))
+    .collect::<serde_json::Map<_, _>>();
+    placeholder.insert("document".to_string(), Value::Null);
+    placeholder.insert("document_authority".to_string(), json!("refused"));
+    placeholder.insert("document_refusal".to_string(), json!(reason));
+    placeholder.insert("can_undo".to_string(), json!(false));
+    placeholder.insert("can_redo".to_string(), json!(false));
+    Value::Object(placeholder)
 }
 
 pub fn list_mobpack_drafts(params: &Value) -> Result<Value, String> {
@@ -13005,14 +13040,29 @@ fn validate_document_with_rkat(
 }
 
 pub fn deploy_command_preview(params: &Value) -> Result<MobpackDeployCommandResult, String> {
-    let document = params
+    let raw_document = params
         .get("document")
-        .ok_or_else(|| "meta/mobpacks/deploy_command requires document".to_string())
-        .and_then(document_from_value)?;
-    let mut render_params = params.clone();
-    if let Some(object) = render_params.as_object_mut() {
-        object.insert("document".to_string(), json!(document));
+        .ok_or_else(|| "meta/mobpacks/deploy_command requires document".to_string())?;
+    // The document cap applies before the document is parsed or cloned.
+    let total = value_skill_content_bytes(raw_document);
+    if total > MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES {
+        return Err(document_skill_content_too_large(total));
     }
+    let document = document_from_value(raw_document)?;
+    // The rendered source takes the parsed document, not a second copy of the
+    // request's.
+    let mut render_params = params
+        .as_object()
+        .map(|object| {
+            object
+                .iter()
+                .filter(|(key, _)| key.as_str() != "document")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<serde_json::Map<_, _>>()
+        })
+        .unwrap_or_default();
+    render_params.insert("document".to_string(), json!(document));
+    let render_params = Value::Object(render_params);
     let rendered = render_mobpack_source_for(&render_params, "meta/mobpacks/deploy_command")
         .map_err(|err| {
             if err == "cannot render source for invalid mobpack document" {
@@ -14144,6 +14194,9 @@ fn deployable_mobpack_archive_files(
     document: &MobpackDocument,
     mob_toml: &str,
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    if mob_toml.len() > MOBPACK_MAX_RENDERED_BYTES {
+        return Err(rendered_output_too_large("mob.toml"));
+    }
     let definition = meerkat_mob::MobDefinition::from_toml(mob_toml)
         .map_err(|err| format!("failed to parse mob.toml for archive export: {err}"))?;
     let expected_schema_files =
@@ -14156,6 +14209,9 @@ fn deployable_mobpack_archive_files(
         })?;
     let definition_json = serde_json::to_vec_pretty(&definition)
         .map_err(|err| format!("failed to encode definition.json: {err}"))?;
+    if definition_json.len() > MOBPACK_MAX_RENDERED_BYTES {
+        return Err(rendered_output_too_large("definition.json"));
+    }
     let editor_json = serde_json::to_vec_pretty(&json!({
         "schema_version": MOBPACK_SCHEMA_VERSION,
         "media_type": MOBPACK_MEDIA_TYPE,
@@ -15094,6 +15150,12 @@ fn hydrate_path_skill_content_from_archive(
 /// [`MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES`]. Import, every document
 /// method and draft save take their document here.
 fn document_from_params(params: &Value) -> Result<MobpackDocument, String> {
+    if params.get("content_base64").is_none() {
+        let total = value_skill_content_bytes(params.get("document").unwrap_or(params));
+        if total > MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES {
+            return Err(document_skill_content_too_large(total));
+        }
+    }
     let document = document_from_params_uncapped(params)?;
     let total = document_skill_content_bytes(&document);
     if total > MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES {
@@ -15168,10 +15230,22 @@ const MOBPACK_ARCHIVE_MAX_PARSED_MEMBER_BYTES: u64 = 1024 * 1024;
 /// constant times this.
 const MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES: usize = 16 * 1024 * 1024;
 
+/// The skill content a raw document value carries (through any `document`
+/// wrappers), summed over every skill entry, without parsing or cloning it.
+fn value_skill_content_bytes(mut value: &Value) -> usize {
+    while let Some(inner) = value.get("document") {
+        value = inner;
+    }
+    realms_skill_content_bytes(value.get("skill_realms").unwrap_or(&Value::Null))
+}
+
 /// The skill content `document` carries, summed over every skill entry.
 fn document_skill_content_bytes(document: &MobpackDocument) -> usize {
-    document
-        .skill_realms
+    realms_skill_content_bytes(&document.skill_realms)
+}
+
+fn realms_skill_content_bytes(realms: &Value) -> usize {
+    realms
         .as_array()
         .into_iter()
         .flatten()
@@ -16956,7 +17030,15 @@ struct RenderState<'a> {
 }
 
 fn render_editor_document_mob_toml(document: &MobpackDocument) -> Result<String, String> {
-    let mut lines = Vec::new();
+    // The structure caps bound what compiling the flow builds; the bounded
+    // sink bounds what rendering writes, whatever the document's shape.
+    if let Some(refusal) = validate_document_structure_caps(document)
+        .into_iter()
+        .next()
+    {
+        return Err(refusal.message);
+    }
+    let mut lines = RenderedLines::new();
     let members = document
         .members
         .as_array()
@@ -17014,6 +17096,9 @@ fn render_editor_document_mob_toml(document: &MobpackDocument) -> Result<String,
 
     let mut selected_skills = BTreeMap::<String, Value>::new();
     for member in &members {
+        if lines.full() {
+            break;
+        }
         for skill in string_vec(member.get("skills")) {
             if selected_skills.contains_key(&skill) {
                 continue;
@@ -17026,6 +17111,9 @@ fn render_editor_document_mob_toml(document: &MobpackDocument) -> Result<String,
     }
 
     for (skill, source) in selected_skills {
+        if lines.full() {
+            break;
+        }
         lines.push(format!("[skills.{}]", toml_key(&skill)));
         let source_kind = source
             .get("source")
@@ -17068,11 +17156,132 @@ fn render_editor_document_mob_toml(document: &MobpackDocument) -> Result<String,
     lines.push(String::new());
 
     for step in &compiled.steps {
+        if lines.full() {
+            break;
+        }
         emit_rendered_flow_step(&mut lines, step);
     }
     emit_rendered_frame_toml(&mut lines, "main", "root", &compiled.root);
 
-    Ok(format!("{}\n", lines.join("\n").trim_end()))
+    lines.finish()
+}
+
+/// The most bytes one rendered output holds: the rendered `mob.toml`, the
+/// `definition.json` parsed from it, and the expected schema files written
+/// beside it. Rendering copies document content once per reference (a shared
+/// schema into every member or step that names it, one step's dependencies
+/// into every branch after it), so the output, not only the input, is bounded.
+const MOBPACK_MAX_RENDERED_BYTES: usize = 16 * 1024 * 1024;
+
+fn rendered_output_too_large(what: &str) -> String {
+    format!(
+        "the rendered {what} passes {} MiB; refusing to render it",
+        MOBPACK_MAX_RENDERED_BYTES >> 20
+    )
+}
+
+/// The lines of a rendered `mob.toml`, refused past
+/// [`MOBPACK_MAX_RENDERED_BYTES`]: once full it keeps no more lines, and the
+/// render loops stop at [`RenderedLines::full`].
+struct RenderedLines {
+    lines: Vec<String>,
+    bytes: usize,
+}
+
+impl RenderedLines {
+    fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    fn push(&mut self, line: String) {
+        if self.full() {
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(line.len().saturating_add(1));
+        if !self.full() {
+            self.lines.push(line);
+        }
+    }
+
+    fn full(&self) -> bool {
+        self.bytes > MOBPACK_MAX_RENDERED_BYTES
+    }
+
+    fn finish(self) -> Result<String, String> {
+        if self.full() {
+            return Err(rendered_output_too_large("mob.toml"));
+        }
+        Ok(format!("{}\n", self.lines.join("\n").trim_end()))
+    }
+}
+
+/// The most members one document may have.
+const MOBPACK_MAX_MEMBERS: usize = 1000;
+/// The most branches one parallel or branch step may have.
+const MOBPACK_MAX_STEP_BRANCHES: usize = 256;
+/// The most branches one flow may have, nested steps included. Branches
+/// after a parallel step without a join each depend on every branch before
+/// them, so the branch counts bound what compiling the flow builds.
+const MOBPACK_MAX_FLOW_BRANCHES: usize = 1024;
+
+/// Structure caps checked before a document is rendered: at most
+/// [`MOBPACK_MAX_MEMBERS`] members, [`MOBPACK_MAX_STEP_BRANCHES`] branches in
+/// one step and [`MOBPACK_MAX_FLOW_BRANCHES`] in the flow.
+fn validate_document_structure_caps(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let members = document.members.as_array().map_or(0, Vec::len);
+    if members > MOBPACK_MAX_MEMBERS {
+        diagnostics.push(MobpackDiagnostic {
+            severity: "error".to_string(),
+            code: "too_many_members".to_string(),
+            message: format!(
+                "mobpack document has {members} members, more than {MOBPACK_MAX_MEMBERS}; \
+                 refusing to render it"
+            ),
+            path: Some("members".to_string()),
+        });
+    }
+    let mut flow_branches = 0_usize;
+    let mut pending = vec![document.flow.get("steps")];
+    while let Some(steps) = pending.pop() {
+        for step in steps.and_then(Value::as_array).into_iter().flatten() {
+            if let Some(branches) = step.get("branches").and_then(Value::as_array) {
+                if branches.len() > MOBPACK_MAX_STEP_BRANCHES {
+                    let id = step.get("id").and_then(Value::as_str).unwrap_or("step");
+                    diagnostics.push(MobpackDiagnostic {
+                        severity: "error".to_string(),
+                        code: "too_many_step_branches".to_string(),
+                        message: format!(
+                            "flow step '{id}' has {} branches, more than \
+                             {MOBPACK_MAX_STEP_BRANCHES}; refusing to render it",
+                            branches.len()
+                        ),
+                        path: Some(format!("flow.steps[{id}].branches")),
+                    });
+                }
+                flow_branches = flow_branches.saturating_add(branches.len());
+                pending.extend(branches.iter().map(|branch| branch.get("steps")));
+            }
+            pending.push(step.get("fallback"));
+            pending.push(step.get("steps"));
+            pending.push(step.get("body"));
+        }
+    }
+    if flow_branches > MOBPACK_MAX_FLOW_BRANCHES {
+        diagnostics.push(MobpackDiagnostic {
+            severity: "error".to_string(),
+            code: "too_many_flow_branches".to_string(),
+            message: format!(
+                "flow has {flow_branches} branches in all, more than \
+                 {MOBPACK_MAX_FLOW_BRANCHES}; refusing to render it"
+            ),
+            path: Some("flow.steps".to_string()),
+        });
+    }
+    diagnostics
 }
 
 fn compile_editor_flow(steps: &[Value], members: &[&Value]) -> RenderedFlow {
@@ -17628,7 +17837,7 @@ fn find_rendered_step_node_mut<'a>(
     None
 }
 
-fn emit_rendered_wiring(lines: &mut Vec<String>, settings: &EditorMobSettings) {
+fn emit_rendered_wiring(lines: &mut RenderedLines, settings: &EditorMobSettings) {
     let role_wiring = settings.role_wiring();
     if settings.bool("autoWireOrchestrator") || !role_wiring.is_empty() {
         lines.push("[wiring]".to_string());
@@ -17650,7 +17859,7 @@ fn emit_rendered_wiring(lines: &mut Vec<String>, settings: &EditorMobSettings) {
     }
 }
 
-fn emit_rendered_backend(lines: &mut Vec<String>, settings: &EditorMobSettings) {
+fn emit_rendered_backend(lines: &mut RenderedLines, settings: &EditorMobSettings) {
     let backend_default = settings
         .string("backendDefault")
         .unwrap_or_else(|| "session".to_string());
@@ -17667,7 +17876,7 @@ fn emit_rendered_backend(lines: &mut Vec<String>, settings: &EditorMobSettings) 
     }
 }
 
-fn emit_rendered_advanced_mob_settings(lines: &mut Vec<String>, settings: &EditorMobSettings) {
+fn emit_rendered_advanced_mob_settings(lines: &mut RenderedLines, settings: &EditorMobSettings) {
     let Some(advanced) = settings.advanced_object() else {
         return;
     };
@@ -17688,10 +17897,13 @@ fn emit_rendered_advanced_mob_settings(lines: &mut Vec<String>, settings: &Edito
 }
 
 fn emit_rendered_profile(
-    lines: &mut Vec<String>,
+    lines: &mut RenderedLines,
     member: &Value,
     schemas: &BTreeMap<String, Value>,
 ) {
+    if lines.full() {
+        return;
+    }
     let name = editor_profile_name(member);
     lines.push(format!("[profiles.{}]", toml_key(&name)));
     let realm_profile = member
@@ -17820,7 +18032,7 @@ fn emit_rendered_profile(
     }
 }
 
-fn emit_rendered_flow_step(lines: &mut Vec<String>, step: &RenderedStep) {
+fn emit_rendered_flow_step(lines: &mut RenderedLines, step: &RenderedStep) {
     lines.push(format!("[flows.main.steps.{}]", toml_key(&step.id)));
     lines.push(format!("role = {}", toml_string(&step.role)));
     lines.push(format!("message = {}", toml_string(&step.message)));
@@ -17882,12 +18094,15 @@ fn emit_rendered_flow_step(lines: &mut Vec<String>, step: &RenderedStep) {
 }
 
 fn emit_rendered_frame_toml(
-    lines: &mut Vec<String>,
+    lines: &mut RenderedLines,
     flow_id: &str,
     path: &str,
     frame: &RenderedFrame,
 ) {
     for node in &frame.nodes {
+        if lines.full() {
+            return;
+        }
         match node {
             RenderedNode::Step(step) => {
                 lines.push(format!(
@@ -18323,10 +18538,13 @@ fn toml_value(value: &Value) -> String {
     }
 }
 
-fn emit_json_toml(lines: &mut Vec<String>, table: &str, value: &Value) {
+fn emit_json_toml(lines: &mut RenderedLines, table: &str, value: &Value) {
     let Some(map) = value.as_object() else {
         return;
     };
+    if lines.full() {
+        return;
+    }
     lines.push(format!("[{table}]"));
     for (key, val) in map {
         // TOML has no null: absent optional fields (e.g. meerkat 0.7's
@@ -18366,6 +18584,7 @@ fn validate_document(document: &MobpackDocument) -> MobpackValidationResult {
             path: Some("name".to_string()),
         });
     }
+    diagnostics.extend(validate_document_structure_caps(document));
     diagnostics.extend(validate_removed_budget_split_policies(document));
     diagnostics.extend(validate_launch_modes(document));
     diagnostics.extend(validate_deploy_settings(&document.deploy));
@@ -23799,6 +24018,10 @@ fn expected_schema_files_from_definition(
 ) -> Result<BTreeMap<String, Value>, Vec<MobpackDiagnostic>> {
     let mut files = BTreeMap::new();
     let mut diagnostics = Vec::new();
+    // Each distinct path holds its own copy of a profile's schema, so the
+    // copies are counted (each schema's size measured once per profile).
+    let mut schema_bytes = BTreeMap::<String, usize>::new();
+    let mut written = 0_usize;
 
     for (flow_id, flow) in &definition.flows {
         for (step_id, step) in &flow.steps {
@@ -23848,6 +24071,18 @@ fn expected_schema_files_from_definition(
                     });
                 }
             } else {
+                let size = *schema_bytes
+                    .entry(step.role.to_string())
+                    .or_insert_with(|| serde_json::to_vec(schema).map_or(0, |bytes| bytes.len()));
+                written = written.saturating_add(size);
+                if written > MOBPACK_MAX_RENDERED_BYTES {
+                    return Err(vec![MobpackDiagnostic {
+                        severity: "error".to_string(),
+                        code: "rendered_output_too_large".to_string(),
+                        message: rendered_output_too_large("expected schema files"),
+                        path: Some(path),
+                    }]);
+                }
                 files.insert(archive_path, schema.clone());
             }
         }
@@ -37330,6 +37565,188 @@ branch = "choice"
             output.status.success() && stdout.contains("1 passed"),
             "child failed:\n{stdout}\n{}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Security regression: rendering copies a shared schema into every
+    /// member that names it, so a small document can render a huge
+    /// `mob.toml`. The rendered output stops at 16 MiB and is refused.
+    #[test]
+    fn rendering_refuses_output_past_its_cap_when_members_share_a_schema() {
+        let mut document = document_with_reviewer_output_schema();
+        document.mob_toml = None;
+        document.schemas[0]["fields"][0]["description"] = json!("d".repeat(512 << 10));
+        let reviewer = document.members[1].clone();
+        let members = document.members.as_array_mut().unwrap();
+        for index in 0..64 {
+            let mut member = reviewer.clone();
+            member["id"] = json!(format!("m_copy_{index}"));
+            member["name"] = json!(format!("copy{index}"));
+            members.push(member);
+        }
+
+        let rendered = render_editor_document_mob_toml(&document);
+
+        assert_eq!(
+            rendered
+                .map(|text| text.len())
+                .map_err(|error| error.contains("16 MiB")),
+            Err(true)
+        );
+    }
+
+    /// Security regression: a flow's structure is capped before it is
+    /// rendered: at most 1000 members, and at most 256 branches in one
+    /// parallel or branch step (two parallel steps without a join make every
+    /// branch of the second depend on every branch of the first).
+    #[test]
+    fn documents_past_the_structure_caps_are_refused_before_rendering() {
+        let parallel = |id: &str, branches: usize| {
+            json!({
+                "id": id,
+                "type": "parallel",
+                "dispatchMode": "fan_out",
+                "collectionPolicy": { "type": "all" },
+                "branches": (0..branches)
+                    .map(|index| json!({
+                        "steps": [{
+                            "id": format!("{id}_b{index}"),
+                            "type": "member",
+                            "role": "m_planner",
+                            "instruction": "Work"
+                        }]
+                    }))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let mut wide = document_with_reviewer_output_schema();
+        wide.mob_toml = None;
+        wide.flow = json!({
+            "name": "wide",
+            "steps": [parallel("p1", 300), parallel("p2", 300)]
+        });
+        let mut crowded = document_with_reviewer_output_schema();
+        crowded.mob_toml = None;
+        let planner = crowded.members[0].clone();
+        let members = crowded.members.as_array_mut().unwrap();
+        for index in 0..1_000 {
+            let mut member = planner.clone();
+            member["id"] = json!(format!("m_crowd_{index}"));
+            member["name"] = json!(format!("crowd{index}"));
+            members.push(member);
+        }
+
+        assert_eq!(
+            (
+                render_editor_document_mob_toml(&wide)
+                    .map(|text| text.len())
+                    .map_err(|error| error.contains("branches")),
+                render_editor_document_mob_toml(&crowded)
+                    .map(|text| text.len())
+                    .map_err(|error| error.contains("members")),
+            ),
+            (Err(true), Err(true))
+        );
+    }
+
+    /// A stored draft whose document is past the skill content cap is listed
+    /// and fetched as a placeholder that says why, never as the stored
+    /// document.
+    #[test]
+    fn stored_drafts_past_the_content_cap_list_as_placeholders() {
+        let store = tempfile::tempdir().expect("tempdir");
+        let store_path = store.path().join("drafts.json");
+        let mut document = serde_json::to_value(valid_document()).expect("document json");
+        document["skill_realms"] = json!([{
+            "id": "local/big",
+            "source": "filesystem",
+            "skills": [{ "id": "big", "source": "inline", "content": "x".repeat(17 << 20) }]
+        }]);
+        let rows = json!({
+            "big": {
+                "id": "big",
+                "name": "Big",
+                "stage": "draft",
+                "document": document,
+                "artifact": { "kind": "mobpack_archive", "content_base64": "bm90IGFuIGFyY2hpdmU=" }
+            }
+        });
+        std::fs::write(&store_path, serde_json::to_vec(&rows).expect("rows")).expect("store");
+
+        let listed = list_mobpack_drafts(&json!({ "store_path": store_path })).expect("list");
+        let fetched =
+            get_mobpack_draft(&json!({ "id": "big", "store_path": store_path })).expect("get");
+
+        let row = &listed["rows"][0];
+        assert_eq!(
+            (
+                row["id"].clone(),
+                row["document"].clone(),
+                row["document_authority"].clone(),
+                row["document_refusal"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("skill content")),
+                fetched["row"]["document"].clone(),
+            ),
+            (
+                json!("big"),
+                Value::Null,
+                json!("refused"),
+                true,
+                Value::Null
+            )
+        );
+    }
+
+    /// `meta/mobpacks/deploy_command` refuses a document past the skill
+    /// content cap before it parses or clones it.
+    #[test]
+    fn deploy_command_refuses_documents_past_the_content_cap() {
+        let mut document = serde_json::to_value(valid_document()).expect("document json");
+        document["skill_realms"] = json!([{
+            "id": "local/big",
+            "source": "filesystem",
+            "skills": [{ "id": "big", "source": "inline", "content": "x".repeat(17 << 20) }]
+        }]);
+
+        let preview = deploy_command_preview(&json!({ "document": document }));
+
+        assert_eq!(
+            preview
+                .map(|result| result.command)
+                .map_err(|error| error.contains("skill content")),
+            Err(true)
+        );
+    }
+
+    /// Each distinct expected schema path holds its own copy of a profile's
+    /// output schema, so the copies count against the render cap: twenty
+    /// paths to one 1 MiB schema are refused.
+    #[test]
+    fn expected_schema_files_stop_at_the_render_cap() {
+        let mut toml = format!(
+            "[mob]\nid = \"schema-fanout\"\n\n[profiles.reviewer]\nmodel = \"gpt-5.5\"\n\n\
+             [profiles.reviewer.output_schema]\ntype = \"object\"\ndescription = \"{}\"\n\n\
+             [flows.main]\ndescription = \"Fan out\"\n",
+            "d".repeat(1 << 20)
+        );
+        for index in 0..20 {
+            toml.push_str(&format!(
+                "\n[flows.main.steps.s{index}]\nrole = \"reviewer\"\nmessage = \"Review\"\n\
+                 expected_schema_ref = \"schemas/s{index}.json\"\n"
+            ));
+        }
+        let definition = MobDefinition::from_toml(&toml).expect("definition");
+
+        let files = expected_schema_files_from_definition(&definition);
+
+        assert_eq!(
+            files
+                .map(|files| files.len())
+                .map_err(|diagnostics| diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "rendered_output_too_large")),
+            Err(true)
         );
     }
 }

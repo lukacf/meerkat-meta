@@ -154,7 +154,11 @@ Drafts autosave through `meta/mobpacks/save` into a host JSON store with optimis
 reports at most 1000 diagnostics; past that it ends with a
 `diagnostics_truncated` diagnostic. Every method that takes a document
 (and import and draft save) refuses one whose skill content, summed over
-every skill entry, passes 16 MiB. Setting
+every skill entry, passes 16 MiB. A document with more than 1000 members,
+more than 256 branches in one parallel or branch step, or more than 1024
+branches in its flow is refused before it is rendered, and the rendered
+`mob.toml`, `definition.json` and expected schema files are each refused
+past 16 MiB. Setting
 `rkat_validate: true` requests a second, host-mutating phase: after structural
 validation passes, the server writes a rendered archive and spawns
 `rkat mob validate`. Only `meta/mobpacks/validate` has this phase:
