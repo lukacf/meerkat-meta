@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- CI: the `test-integration` jobs no longer set a fake `OPENAI_API_KEY`. The
+  test fixtures give their members and child gateways their own fake key, so
+  the integration tests, like the unit tests since 0.9.1, run without one.
+  `scripts/test_ci_workflow.py` checks that neither job sets it.
+
 ## [0.9.1] - 2026-10-15
 
 ### Breaking
