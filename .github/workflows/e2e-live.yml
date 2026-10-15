@@ -9,6 +9,9 @@ on:
   schedule:
     - cron: "17 3 * * *"
 
+permissions:
+  contents: read
+
 concurrency:
   group: e2e-live
   cancel-in-progress: false
@@ -18,13 +21,17 @@ jobs:
     name: e2e-live (real rpc_gateway, real Anthropic turns)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    env:
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    # The provider secret reaches only the step that makes the real calls;
+    # every other step, and the cache restore, runs without it. The cache is
+    # restore-only and carries no executables, so nothing this job runs
+    # beside the secret was written by a run that held it.
     steps:
       - uses: actions/checkout@v4
       - name: Refuse to run without the provider secret
+        env:
+          HAS_PROVIDER_SECRET: ${{ secrets.ANTHROPIC_API_KEY != '' }}
         run: |
-          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+          if [ "${HAS_PROVIDER_SECRET}" != "true" ]; then
             echo "::error::repository secret ANTHROPIC_API_KEY is not set; the real-API lane cannot run and will not pretend to" >&2
             exit 1
           fi
@@ -33,5 +40,11 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+          cache-bin: false
       - run: python -m pip install 'sdk/python[dev]'
-      - run: make e2e-live
+      - name: Real-API end-to-end lane
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: make e2e-live

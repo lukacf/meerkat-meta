@@ -167,6 +167,32 @@ class PublishedRegistryTests(unittest.TestCase):
         self.assertEqual(calls, 8)
         self.assertEqual(sleeps, [0.25])
 
+    def test_crates_io_must_serve_the_verified_crate_bytes(self):
+        verified = {
+            "meerkat-meta": artifact_digest("https://crates.example/meerkat-meta-0.8.0.crate", "sha256"),
+            "meta-extension-state": artifact_digest(
+                "https://crates.example/meta-extension-state-0.8.0.crate", "sha256"),
+        }
+        registries.verify_once("0.8.0", reader=exact_payload, downloader=ARTIFACTS.__getitem__,
+                               crate_sha256=verified)
+        for crate in verified:
+            with self.subTest(crate=crate):
+                with self.assertRaisesRegex(registries.RegistryVerificationError, "not the verified"):
+                    registries.verify_once("0.8.0", reader=exact_payload, downloader=ARTIFACTS.__getitem__,
+                                           crate_sha256={**verified, crate: "0" * 64})
+
+    def test_only_crates_checks_just_the_named_crates(self):
+        seen = []
+
+        def reader(url):
+            seen.append(url)
+            return exact_payload(url)
+
+        digest = artifact_digest("https://crates.example/meerkat-meta-0.8.0.crate", "sha256")
+        registries.verify_once("0.8.0", reader=reader, downloader=ARTIFACTS.__getitem__,
+                               crate_sha256={"meerkat-meta": digest}, only_crates=True)
+        self.assertEqual(seen, ["https://crates.io/api/v1/crates/meerkat-meta/0.8.0"])
+
     def test_retry_exhaustion_fails_the_release(self):
         def unavailable(url: str) -> dict:
             raise OSError(f"not public: {url}")
