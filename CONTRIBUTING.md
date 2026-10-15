@@ -89,9 +89,12 @@ complete candidate matrix together.
 an explicit selection of accepted, immutable candidate artifacts. `make release`
 still means a local optimized build; it is not a publication command.
 
-Prepare the release-version/dependency changes in a PR, merge it, and wait for
-successful `ci.yml` **push-to-main** CI on the exact merged commit. Candidate
-production must run from that final commit, not a PR head or an earlier build.
+Prepare the release-version/dependency changes in a PR and merge it. Candidate
+production must run from that final merged commit, not a PR head or an earlier
+build. Candidate runs may start as soon as the commit is on main: their build
+legs run beside the commit's `ci.yml` **push-to-main** run, and collection
+refuses (it never waits) unless that run is already green by then. A refused
+candidate binds nothing; dispatch a new one once CI is green.
 
 While the release PR is open, prewarm the candidate's build cache from its head.
 The prewarm builds the same five targets without signing, packaging, attesting or
@@ -110,23 +113,31 @@ compiling it in every job. A dispatch run is never release evidence. It is a
 second full CI run beside the pull request's own, so use it when runners are
 free, not while other workflows queue.
 
+The five targets form two tiers, each built and bound by its own candidate run
+from the same commit. The core tier (Linux x86_64 and aarch64, macOS arm64) is
+what the release waits for; the trailing tier (macOS x86_64 and Windows, the
+slowest legs) is added to the published release afterwards:
+
 ```bash
 # Dispatch from main; refuse if GitHub's dispatch SHA differs from SOURCE_SHA.
-make release-candidate SOURCE_SHA=<full-merged-commit-sha>
+make release-candidate SOURCE_SHA=<full-merged-commit-sha> TIER=core
+make release-candidate SOURCE_SHA=<full-merged-commit-sha> TIER=trailing
 ```
 
-The existing release workflow builds all five targets and all three executables,
-checks Linux portability, signs macOS executables, and packages them once.
-Candidate mode never runs GitHub release or registry publishers.
-Archive versions come from the pinned workspace, not the branch name.
+Each candidate run builds its tier's targets and all three executables, checks
+Linux portability, checks every macOS binary's architecture, signs macOS
+executables, and packages them once. Candidate mode never runs GitHub release or
+registry publishers. Archive versions come from the pinned workspace, not the
+branch name.
 
-The completed candidate run's summary contains a versioned JSON selection.
-Save it unchanged outside the repository, for example as `accepted-candidate.json`.
-It binds the repository, run and attempt, immutable manifest artifact ID and ZIP
-digest, and manifest file hash. The attested manifest binds the exact source,
-version, CI evidence, all five target artifact identities, and all 15 archive
-and inner-executable hashes. The manifest's own artifact identity is outside the
-manifest to avoid a self-referential hash.
+Each completed candidate run's summary contains a versioned JSON selection.
+Save it unchanged outside the repository, for example as
+`accepted-core.json` and `accepted-trailing.json`. It binds the repository, run
+and attempt, tier, immutable manifest artifact ID and ZIP digest, and manifest
+file hash. The attested manifest binds the exact source, version, CI evidence,
+the tier's target artifact identities, and its archive and inner-executable
+hashes. The manifest's own artifact identity is outside the manifest to avoid a
+self-referential hash.
 
 Inner members follow the unchanged producer: Unix archives contain the executable
 basename, and Windows ZIPs contain exactly
@@ -139,11 +150,12 @@ not placeholders). IDs are integers; digests are 64 lowercase hex characters:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "kind": "accepted-candidate",
   "repository": "lukacf/meerkat-meta",
   "run_id": 123,
   "run_attempt": 1,
+  "tier": "core",
   "manifest_artifact": {
     "id": 456,
     "digest": "<artifact ZIP SHA-256>",
@@ -151,6 +163,22 @@ not placeholders). IDs are integers; digests are 64 lowercase hex characters:
   }
 }
 ```
+
+Promotion accepts only the core selection. It publishes the core archives with
+`index.json` and `checksums.sha256` listing them, the receipt, manifest and
+provenance, then the registries. Add the trailing tier to the published release
+with its selection; this is add-only, bound to the published core receipt and
+the same tag and source, and refuses any existing file with different bytes:
+
+```bash
+make release-assets-recover RELEASE_TAG=vX.Y.Z ARTIFACT_SELECTION=accepted-trailing.json
+```
+
+It adds the trailing archives, `index-trailing.json`,
+`checksums-trailing.sha256`, `candidate-selection-trailing.json`,
+`candidate-manifest-trailing.json` and its provenance. Verification and
+registry retry require the core tier only. Schema 1 selections and releases (up
+to v0.9.1) bind all five targets in one candidate and keep verifying as before.
 
 Give consumers the selected artifacts and hashes for acceptance. Acceptance is
 external to this workflow; the workflow does not claim to have performed consumer

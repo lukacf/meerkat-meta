@@ -1,6 +1,14 @@
 name: Release
-# Meta release protocol v1: tags validate only. Publication requires an
-# explicit accepted-artifact selection through `make release-promote`.
+# Meta release protocol: tags validate only. Publication requires an explicit
+# accepted-artifact selection through `make release-promote`.
+#
+# Candidates come in two tiers (scripts/verify-release-assets.py
+# TIER_TARGETS). A candidate run builds one tier from the merged commit:
+# `make release-candidate SOURCE_SHA=... TIER=core` for Linux x86_64 and
+# aarch64 and macOS arm64, `TIER=trailing` for macOS x86_64 and Windows.
+# Promotion publishes the core selection with the registries; the trailing
+# selection is added to the published release later by add-only assets-mode
+# recovery, so the slower legs never hold up the release.
 
 on:
   push:
@@ -36,6 +44,11 @@ on:
         type: boolean
       release_tag:
         description: "Explicit existing tag for promotion or registry/asset recovery"
+        required: false
+        default: ""
+        type: string
+      candidate_tier:
+        description: "Candidate only: core (Linux x86_64/aarch64, macOS arm64) or trailing (macOS x86_64, Windows)"
         required: false
         default: ""
         type: string
@@ -77,6 +90,8 @@ jobs:
       publish_packages: ${{ steps.resolve.outputs.publish_packages }}
       dry_run: ${{ steps.resolve.outputs.dry_run }}
       ci_bypass: ${{ steps.resolve.outputs.ci_bypass }}
+      tier: ${{ steps.resolve.outputs.tier }}
+      build_matrix: ${{ steps.resolve.outputs.build_matrix }}
     steps:
       - name: Checkout immutable workflow tools
         uses: actions/checkout@v4
@@ -94,6 +109,7 @@ jobs:
           ARTIFACT_SELECTION: ${{ inputs.artifact_selection }}
           PUBLISH_RELEASE_PACKAGES: ${{ inputs.publish_release_packages }}
           REGISTRY_DRY_RUN: ${{ inputs.registry_dry_run }}
+          RELEASE_TIER: ${{ inputs.candidate_tier }}
         run: python3 scripts/release-candidate.py resolve
 
   # Meta's release path had no CI gate at all: release_validate had no `needs`,
@@ -105,9 +121,23 @@ jobs:
   # a precondition that should already hold. Waiting would also convert "this
   # commit was never verified" into "this is taking a while", which is the wrong
   # thing to be patient about.
+  #
+  # A candidate's build legs start as soon as the release commit is on main,
+  # beside its exact-main CI run, so the two overlap instead of queueing. The
+  # gate then runs once every leg has succeeded, before anything is
+  # validated, collected or attested as a candidate, and still refuses: a
+  # candidate whose CI is not green by then binds nothing, and a new candidate
+  # run is dispatched once it is. Every other mode checks before its first job.
   require_ci_green:
     name: Require green exact-main CI
-    needs: [resolve_release]
+    needs: [resolve_release, build_binaries]
+    if: >-
+      always() &&
+      needs.resolve_release.result == 'success' &&
+      ((needs.resolve_release.outputs.mode == 'candidate' &&
+        needs.build_binaries.result == 'success') ||
+       (needs.resolve_release.outputs.mode != 'candidate' &&
+        needs.build_binaries.result == 'skipped'))
     runs-on: ubuntu-24.04
     outputs:
       run_id: ${{ steps.ci_run.outputs.run_id }}
@@ -229,7 +259,9 @@ jobs:
 
   build_binaries:
     name: Build gateway binaries (${{ matrix.target }})
-    needs: [resolve_release, release_validate]
+    # No CI or validation gate here: the legs overlap the exact-main CI run,
+    # and require_ci_green and release_validate run before collection.
+    needs: [resolve_release]
     if: >-
       github.event_name == 'workflow_dispatch' &&
       needs.resolve_release.outputs.mode == 'candidate'
@@ -254,35 +286,15 @@ jobs:
     container: ${{ contains(matrix.target, 'unknown-linux-gnu') && 'docker.io/library/buildpack-deps:bullseye' || '' }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runs-on: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            archive_ext: tar.gz
-          - runs-on: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            archive_ext: tar.gz
-          - runs-on: macos-15
-            target: aarch64-apple-darwin
-            archive_ext: tar.gz
-          # x86_64 macOS cross-compiles on the same free arm64 macos-15 label.
-          # The free Intel label (macos-15-intel) was the slowest leg of every
-          # candidate: 176 minutes in run 38529874352 and still building
-          # after 70 in run 38719226636, against 51 for the cold arm64 leg.
-          # The billed macos-15-large label refuses to start when the
-          # account's Actions spending limit is reached, which failed
-          # candidate run 38521788616. Apple's toolchain links both
-          # architectures, the toolchain step adds the x86_64 standard
-          # library, and the cmake and cc crates pass the target
-          # architecture to the bundled C builds (Opus, ring, SQLite).
-          # "Verify macOS binary architecture" reads every produced binary
-          # before anything is signed or packaged.
-          - runs-on: macos-15
-            target: x86_64-apple-darwin
-            archive_ext: tar.gz
-          - runs-on: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive_ext: zip
+      # The candidate tier's legs only (release-candidate.py BUILD_LEGS):
+      # core is x86_64 and aarch64 Linux and arm64 macOS; trailing is x86_64
+      # macOS, cross-compiled on the free arm64 macos-15 label (the free
+      # Intel label took 128 minutes in run 38719226636 against 53 for the
+      # arm64 leg; the billed large label refuses to start once the Actions
+      # spending limit is reached, which failed candidate run 38521788616),
+      # and Windows. "Verify macOS binary architecture" reads every produced
+      # binary before anything is signed or packaged.
+      matrix: ${{ fromJSON(needs.resolve_release.outputs.build_matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -542,7 +554,7 @@ jobs:
 
   collect_candidate:
     name: Bind immutable candidate artifacts
-    needs: [resolve_release, require_ci_green, build_binaries]
+    needs: [resolve_release, require_ci_green, release_validate, build_binaries]
     if: >-
       github.event_name == 'workflow_dispatch' &&
       needs.resolve_release.outputs.mode == 'candidate'
@@ -558,6 +570,7 @@ jobs:
       RELEASE_SHA: ${{ needs.resolve_release.outputs.sha }}
       RELEASE_VERSION: ${{ needs.resolve_release.outputs.version }}
       RELEASE_TAG: ${{ needs.resolve_release.outputs.tag }}
+      RELEASE_TIER: ${{ needs.resolve_release.outputs.tier }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -571,13 +584,15 @@ jobs:
           CI_RUN_ATTEMPT: ${{ needs.require_ci_green.outputs.run_attempt }}
         run: |
           python3 scripts/release-candidate.py collect --output-dir candidate \
-            --ci-run-id "$CI_RUN_ID" --ci-run-attempt "$CI_RUN_ATTEMPT"
+            --ci-run-id "$CI_RUN_ID" --ci-run-attempt "$CI_RUN_ATTEMPT" --tier "$RELEASE_TIER"
 
+      # The core manifest is candidate-manifest.json; the trailing one is
+      # candidate-manifest-trailing.json, its name on the release.
       - name: Attest candidate manifest
         id: provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: candidate/candidate-manifest.json
+          subject-path: candidate/candidate-manifest*.json
 
       - name: Retain manifest provenance bundle
         env:
@@ -599,8 +614,12 @@ jobs:
           ARTIFACT_ID: ${{ steps.manifest.outputs.artifact-id }}
           ARTIFACT_DIGEST: ${{ steps.manifest.outputs.artifact-digest }}
         run: |
+          manifest="candidate/candidate-manifest.json"
+          if [[ "$RELEASE_TIER" != "core" ]]; then
+            manifest="candidate/candidate-manifest-${RELEASE_TIER}.json"
+          fi
           python3 scripts/release-candidate.py selection \
-            --manifest-file candidate/candidate-manifest.json \
+            --manifest-file "$manifest" \
             --artifact-id "$ARTIFACT_ID" --artifact-digest "$ARTIFACT_DIGEST"
 
   verify_release_assets:

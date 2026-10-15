@@ -437,19 +437,23 @@ including applicable dev-dependencies, before running
 `Cargo.lock` resolves the intended coherent upstream family, then run the
 appropriate workspace checks through `./scripts/repo-cargo` or Make.
 
-**Release protocol v1: tags validate only; they no longer build or publish.**
-After merging the final release-version/dependency commit and obtaining green
-push-to-main CI on that exact SHA, use
-`make release-candidate SOURCE_SHA=<full-sha>`. The dispatch must snapshot that
-same main SHA. It builds/signs/packages the complete binary matrix once and emits
-an immutable run/attempt/artifact/digest selection backed by signed provenance
-and outer/inner executable hashes. Save that selection outside the repo and
-obtain consumer acceptance against those bytes.
+**Release protocol: tags validate only; they no longer build or publish.**
+After merging the final release-version/dependency commit, use
+`make release-candidate SOURCE_SHA=<full-sha> TIER=core` and
+`make release-candidate SOURCE_SHA=<full-sha> TIER=trailing`. The dispatch must
+snapshot that same main SHA. Each run builds/signs/packages one tier (core:
+Linux x86_64 and aarch64, macOS arm64; trailing: macOS x86_64, Windows) beside
+the push-to-main CI run of that SHA, refuses at collection unless that CI run is
+already green, and emits an immutable run/attempt/tier/artifact/digest selection
+backed by signed provenance and outer/inner executable hashes. Save the
+selections outside the repo and obtain consumer acceptance against those bytes.
 
 The release owner then tags the same source as `vX.Y.Z` and invokes
-`make release-promote RELEASE_TAG=vX.Y.Z ARTIFACT_SELECTION=<json-file>`.
-Promotion verifies and publishes the original bytes without rebuilding or
-signing again. Assets precede the Python and TypeScript SDKs, then the crates
+`make release-promote RELEASE_TAG=vX.Y.Z ARTIFACT_SELECTION=<core json-file>`.
+Promotion accepts only the core selection and verifies and publishes the
+original bytes without rebuilding or signing again. The trailing tier is added
+afterwards, add-only, with
+`make release-assets-recover RELEASE_TAG=vX.Y.Z ARTIFACT_SELECTION=<trailing json-file>`. Assets precede the Python and TypeScript SDKs, then the crates
 (`meta-extension-state`, then `meerkat-meta`) and an exact registry readback.
 A failed SDK registry upload does not stop the crates; the readback still fails
 the run while any registry lacks the exact version.
