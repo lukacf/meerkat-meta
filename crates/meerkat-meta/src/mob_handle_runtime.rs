@@ -12646,15 +12646,24 @@ impl MobRuntime {
     ) -> Result<(), crate::child_mob_storage::ChildMobStandDownOutcome> {
         use crate::child_mob_storage::{ChildIncarnation, ChildMobStandDownOutcome, ChildShutdown};
         let root_mob_id = self.handle.definition().id.clone();
-        let children = state.mob_handles_snapshot().await.map_err(|error| {
-            ChildMobStandDownOutcome::Retained {
-                unsettled: vec![format!("child mobs could not be enumerated: {error}")],
-            }
-        })?;
-        for (mob_id, handle) in children {
+        let enumeration_failed = |error: MobError| ChildMobStandDownOutcome::Retained {
+            unsettled: vec![format!("child mobs could not be enumerated: {error}")],
+        };
+        // Every managed child, a destroyed one still managed included (the
+        // retry anchor of a destroy whose native part is incomplete): its
+        // actor may still run. Handle snapshots withhold destroyed mobs, so
+        // the list names them and each handle is looked up.
+        let children = state.mob_list().await.map_err(enumeration_failed)?;
+        for (mob_id, _) in children {
             if mob_id == root_mob_id || !stood_down.insert(mob_id.clone()) {
                 continue;
             }
+            let handle = match state.handle_for(&mob_id).await {
+                Ok(handle) => handle,
+                // Removed since the list: its destroy completed.
+                Err(MobError::MobNotFound(_)) => continue,
+                Err(error) => return Err(enumeration_failed(error)),
+            };
             *child_mobs += 1;
             let incarnation = ChildIncarnation::of(&handle);
             if self.child_mob_root.clean_in(mob_id.as_ref(), &incarnation) {
