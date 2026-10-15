@@ -103,6 +103,13 @@ dependencies instead of compiling them after the merge:
 make release-prewarm SOURCE_SHA=<release-pr-head-sha>
 ```
 
+`make ci-prewarm SOURCE_SHA=<release-pr-head-sha>` does the same for `ci.yml`:
+a dispatch on main builds and tests that head and saves main's CI caches, so the
+push-to-main run after the merge restores a bumped Meerkat Core instead of
+compiling it in every job. A dispatch run is never release evidence. It is a
+second full CI run beside the pull request's own, so use it when runners are
+free, not while other workflows queue.
+
 ```bash
 # Dispatch from main; refuse if GitHub's dispatch SHA differs from SOURCE_SHA.
 make release-candidate SOURCE_SHA=<full-merged-commit-sha>

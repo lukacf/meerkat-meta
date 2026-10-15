@@ -15,7 +15,7 @@ NC     := \033[0m
         audit bright-line memory-evals ci ci-smoke check doc doc-open coverage clean \
         install-hooks uninstall-hooks pre-commit-all update outdated \
         verify-version-parity bump-sdk-versions publish-dry-run-python \
-        release-preflight release-prewarm release-candidate release-promote release-registry-retry release-assets-recover help
+        release-preflight ci-prewarm release-prewarm release-candidate release-promote release-registry-retry release-assets-recover help
 
 all: ci
 
@@ -245,6 +245,10 @@ release-dry-run-smoke: release-preflight-smoke publish-dry-run publish-dry-run-p
 	@echo "$(GREEN)Smoke release dry-run passed.$(NC)"
 
 # Protocol v1: tag pushes validate only; these dispatches never create tags.
+ci-prewarm: ## Build a release PR head (SOURCE_SHA) into main's CI caches before it merges
+	@test -n "$(SOURCE_SHA)" || { echo "SOURCE_SHA is required: the release pull request's head commit" >&2; exit 2; }
+	gh workflow run ci.yml --ref main -f cache_source_sha="$(SOURCE_SHA)"
+
 release-prewarm: ## Prewarm main's release build cache from a release PR head (SOURCE_SHA required); builds only
 	@test -n "$(SOURCE_SHA)" || { echo "SOURCE_SHA is required: the release pull request's head commit" >&2; exit 2; }
 	gh workflow run release-prewarm.yml --ref main -f source_sha="$(SOURCE_SHA)"
