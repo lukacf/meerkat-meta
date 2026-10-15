@@ -487,7 +487,7 @@ impl LlmClient for ScriptedProvider {
             .current()
             .expect("final controller entry check");
         check
-            .observe_entry()
+            .observe_entry(meerkat_core::OperationEntryBoundary::ModelRequest)
             .expect("native audit stages actual transport entry");
         check
             .observe_outcome(OperationObservedOutcome::HttpResponse { status: 200 })
