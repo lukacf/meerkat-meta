@@ -14666,33 +14666,28 @@ impl ListedSkillFiles {
             })
     }
 
-    /// Read the listed file that `path` names. The caller's exact string must
-    /// name a listed file first; only then is the path opened, and the opened
-    /// file's identity must be listed, so a path swapped between the listing
-    /// and the read yields no other file.
+    /// Open the listed file that `path` names, with its size from the opened
+    /// handle. The caller's exact string must name a listed file first; only
+    /// then is the path opened, and the opened file's identity must be
+    /// listed, so a path swapped between the listing and the read yields no
+    /// other file.
     #[cfg(unix)]
-    fn read(&self, path: &str) -> Result<Vec<u8>, PathSkillReadError> {
+    fn open(&self, path: &str) -> Result<(std::fs::File, u64), PathSkillReadError> {
         use std::os::unix::fs::MetadataExt;
         if !self.paths.contains(path) {
             return Err(self.unlisted(path));
         }
-        let mut file =
-            open_skill_file(Path::new(path)).map_err(|_| PathSkillReadError::NotListed)?;
-        let listed = file.metadata().is_ok_and(|metadata| {
-            metadata.is_file() && self.identities.contains(&(metadata.dev(), metadata.ino()))
-        });
-        if !listed {
+        let file = open_skill_file(Path::new(path)).map_err(|_| PathSkillReadError::NotListed)?;
+        let metadata = file.metadata().map_err(|_| PathSkillReadError::NotListed)?;
+        if !(metadata.is_file() && self.identities.contains(&(metadata.dev(), metadata.ino()))) {
             return Err(PathSkillReadError::NotListed);
         }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(PathSkillReadError::Unreadable)?;
-        Ok(bytes)
+        Ok((file, metadata.len()))
     }
 
-    /// Read the listed file that `path` names, from the real path checked.
+    /// Open the listed file that `path` names, from the real path checked.
     #[cfg(not(unix))]
-    fn read(&self, path: &str) -> Result<Vec<u8>, PathSkillReadError> {
+    fn open(&self, path: &str) -> Result<(std::fs::File, u64), PathSkillReadError> {
         if !self.paths.contains(path) {
             return Err(self.unlisted(path));
         }
@@ -14703,7 +14698,35 @@ impl ListedSkillFiles {
         if !self.identities.contains(&real) {
             return Err(PathSkillReadError::NotListed);
         }
-        std::fs::read(&real).map_err(PathSkillReadError::Unreadable)
+        let file = std::fs::File::open(&real).map_err(PathSkillReadError::Unreadable)?;
+        let len = file
+            .metadata()
+            .map_err(PathSkillReadError::Unreadable)?
+            .len();
+        Ok((file, len))
+    }
+
+    /// Read the listed file that `path` names, if it holds at most `limit`
+    /// bytes: a larger file is refused by its opened handle's size before
+    /// any of it is read, and a file that grows past `limit` stops there.
+    fn read_within(&self, path: &str, limit: u64) -> Result<Vec<u8>, PathSkillReadError> {
+        let (file, len) = self.open(path)?;
+        if len > limit {
+            return Err(PathSkillReadError::OverBudget);
+        }
+        let mut bytes = Vec::new();
+        file.take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(PathSkillReadError::Unreadable)?;
+        if bytes.len() as u64 > limit {
+            return Err(PathSkillReadError::OverBudget);
+        }
+        Ok(bytes)
+    }
+
+    /// Read the listed file that `path` names.
+    fn read(&self, path: &str) -> Result<Vec<u8>, PathSkillReadError> {
+        self.read_within(path, u64::MAX)
     }
 }
 
@@ -14857,16 +14880,27 @@ fn read_path_skill_file(path: &str) -> Result<Vec<u8>, PathSkillReadError> {
             listed,
             read_budget,
         }) => {
-            let bytes = listed
-                .get_or_init(|| ListedSkillFiles::from_catalog(runtime_skill_paths))
-                .read(path)?;
-            let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            // Once the budget is spent the request resolves no further path
+            // skill: nothing more is opened or read.
             let remaining = read_budget.get();
-            if read > remaining {
+            if remaining == 0 {
                 return Err(PathSkillReadError::OverBudget);
             }
-            read_budget.set(remaining - read);
-            Ok(bytes)
+            match listed
+                .get_or_init(|| ListedSkillFiles::from_catalog(runtime_skill_paths))
+                .read_within(path, remaining)
+            {
+                Ok(bytes) => {
+                    let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                    read_budget.set(remaining.saturating_sub(read));
+                    Ok(bytes)
+                }
+                Err(PathSkillReadError::OverBudget) => {
+                    read_budget.set(0);
+                    Err(PathSkillReadError::OverBudget)
+                }
+                Err(other) => Err(other),
+            }
         }
         // No scope, so no request to count against: each read is bounded by
         // the one listed file it reads. The authoring dispatcher and the Flow
@@ -15010,6 +15044,9 @@ fn hydrate_path_skill_content_from_archive(
     files: &BTreeMap<String, Vec<u8>>,
     budget: &mut ImportBudget,
 ) -> Result<(), String> {
+    // Refuse as soon as the document's skill content passes its cap, before
+    // copying the member that would pass it.
+    let mut total = document_skill_content_bytes(document);
     let Some(realms) = document.skill_realms.as_array_mut() else {
         return Ok(());
     };
@@ -15038,6 +15075,10 @@ fn hydrate_path_skill_content_from_archive(
             }) else {
                 continue;
             };
+            total = total.saturating_add(bytes.len());
+            if total > MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES {
+                return Err(document_skill_content_too_large(total));
+            }
             budget.charge(bytes.len())?;
             let content = String::from_utf8(bytes.clone()).map_err(|err| {
                 format!("packed skill archive member {path} is not valid UTF-8: {err}")
@@ -15048,7 +15089,20 @@ fn hydrate_path_skill_content_from_archive(
     Ok(())
 }
 
+/// The document a request carries (`content_base64`, `document`, or the
+/// params themselves), refused when its skill content passes
+/// [`MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES`]. Import, every document
+/// method and draft save take their document here.
 fn document_from_params(params: &Value) -> Result<MobpackDocument, String> {
+    let document = document_from_params_uncapped(params)?;
+    let total = document_skill_content_bytes(&document);
+    if total > MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES {
+        return Err(document_skill_content_too_large(total));
+    }
+    Ok(document)
+}
+
+fn document_from_params_uncapped(params: &Value) -> Result<MobpackDocument, String> {
     if let Some(encoded) = params.get("content_base64").and_then(Value::as_str) {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
@@ -15097,15 +15151,44 @@ fn manifest_declares_adaptive_section(manifest: &str) -> bool {
 const MOBPACK_ARCHIVE_MAX_EXPANDED_BYTES: u64 = 32 * 1024 * 1024;
 /// The most entries an archive import reads.
 const MOBPACK_ARCHIVE_MAX_ENTRIES: usize = 4096;
-/// The most bytes of `meta/mob.toml` or `manifest.toml` an import parses.
-/// Parsing expands text several times over, so these stay far below the
-/// archive cap.
-const MOBPACK_ARCHIVE_MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
-/// The most bytes of `meta/editor.json` an import parses. A JSON value tree
-/// can be many times its text (each `0,` of an array becomes a 32-byte
-/// value). The largest sample editor document is a few KiB, so an authored
+/// The most bytes of `manifest.toml` an import reads. It is only scanned
+/// line by line (its name, and whether it declares an adaptive layer), never
+/// parsed into a tree.
+const MOBPACK_ARCHIVE_MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+/// The most bytes of `meta/editor.json` or `meta/mob.toml` an import parses.
+/// Parsing builds a tree many times the text: each `0,` of a JSON array
+/// becomes a 32-byte value, and `mob.toml` is parsed twice, once into a TOML
+/// table. The largest sample editor document is a few KiB, so an authored
 /// document with its inline skill text stays far below this.
-const MOBPACK_ARCHIVE_MAX_EDITOR_JSON_BYTES: u64 = 1024 * 1024;
+const MOBPACK_ARCHIVE_MAX_PARSED_MEMBER_BYTES: u64 = 1024 * 1024;
+/// The most skill content one document may carry, summed over every skill
+/// entry in its realms, so a member's bytes filled into many path skills
+/// count once per skill. Every copy made after a document enters (the import
+/// reply, source and export, a saved draft and its history) is a small
+/// constant times this.
+const MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES: usize = 16 * 1024 * 1024;
+
+/// The skill content `document` carries, summed over every skill entry.
+fn document_skill_content_bytes(document: &MobpackDocument) -> usize {
+    document
+        .skill_realms
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|realm| realm.get("skills").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|skill| skill.get("content").and_then(Value::as_str))
+        .map(str::len)
+        .fold(0_usize, usize::saturating_add)
+}
+
+fn document_skill_content_too_large(total: usize) -> String {
+    format!(
+        "mobpack document carries more than {} MiB of skill content ({total} bytes, counted \
+         once per skill); refusing it",
+        MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES >> 20
+    )
+}
 /// The most bytes one archive import materializes, every copy counted: the
 /// archive's members, the parsed members' text, `mob.toml` copied into a
 /// document, and each path skill an archive member is copied into. One
@@ -15143,8 +15226,8 @@ impl ImportBudget {
 /// The cap on an archive member that import parses whole, if it is one.
 fn parsed_archive_member_cap(path: &str) -> Option<u64> {
     match path {
-        "meta/editor.json" => Some(MOBPACK_ARCHIVE_MAX_EDITOR_JSON_BYTES),
-        "meta/mob.toml" | "manifest.toml" => Some(MOBPACK_ARCHIVE_MAX_DOCUMENT_BYTES),
+        "meta/editor.json" | "meta/mob.toml" => Some(MOBPACK_ARCHIVE_MAX_PARSED_MEMBER_BYTES),
+        "manifest.toml" => Some(MOBPACK_ARCHIVE_MAX_MANIFEST_BYTES),
         _ => None,
     }
 }
@@ -18361,6 +18444,7 @@ fn validate_document(document: &MobpackDocument) -> MobpackValidationResult {
             let ok = !diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.severity == "error");
+            let diagnostics = cap_validation_diagnostics(diagnostics);
             MobpackValidationResult {
                 ok,
                 display_rows: validation_display_rows(ok, &diagnostics, MOBPACK_VALIDATION_SOURCE),
@@ -18383,7 +18467,37 @@ fn validate_document(document: &MobpackDocument) -> MobpackValidationResult {
     }
 }
 
+/// The most diagnostics, and so display rows, one validation reports. Past
+/// it the result ends with one `diagnostics_truncated` diagnostic.
+const MOBPACK_MAX_VALIDATION_DIAGNOSTICS: usize = 1000;
+
+fn cap_validation_diagnostics(mut diagnostics: Vec<MobpackDiagnostic>) -> Vec<MobpackDiagnostic> {
+    if diagnostics.len() <= MOBPACK_MAX_VALIDATION_DIAGNOSTICS {
+        return diagnostics;
+    }
+    let dropped = diagnostics.split_off(MOBPACK_MAX_VALIDATION_DIAGNOSTICS);
+    let severity = if dropped
+        .iter()
+        .any(|diagnostic| diagnostic.severity == "error")
+    {
+        "error"
+    } else {
+        "warning"
+    };
+    diagnostics.push(MobpackDiagnostic {
+        severity: severity.to_string(),
+        code: "diagnostics_truncated".to_string(),
+        message: format!(
+            "validation reports at most {MOBPACK_MAX_VALIDATION_DIAGNOSTICS} diagnostics; more \
+             were found and not reported, so fix these and validate again"
+        ),
+        path: None,
+    });
+    diagnostics
+}
+
 fn invalid_validation_result(diagnostics: Vec<MobpackDiagnostic>) -> MobpackValidationResult {
+    let diagnostics = cap_validation_diagnostics(diagnostics);
     MobpackValidationResult {
         ok: false,
         display_rows: validation_display_rows(false, &diagnostics, MOBPACK_VALIDATION_SOURCE),
@@ -21976,7 +22090,14 @@ fn validate_member_catalog_references(document: &MobpackDocument) -> Vec<Mobpack
         .collect::<BTreeSet<_>>();
     let mut diagnostics = Vec::new();
 
+    // Past the report cap more diagnostics are dropped anyway; stop building
+    // them (one per reference in a document of many references).
+    let full =
+        |diagnostics: &[MobpackDiagnostic]| diagnostics.len() > MOBPACK_MAX_VALIDATION_DIAGNOSTICS;
     for (member_index, member) in members.iter().enumerate() {
+        if full(&diagnostics) {
+            break;
+        }
         if let Some(model) = member.get("model").filter(|value| !value.is_null()) {
             match model.as_str().map(str::trim) {
                 Some("") => {}
@@ -22005,6 +22126,9 @@ fn validate_member_catalog_references(document: &MobpackDocument) -> Vec<Mobpack
 
         if let Some(tools) = member.get("tools").and_then(Value::as_array) {
             for (tool_index, tool) in tools.iter().enumerate() {
+                if full(&diagnostics) {
+                    break;
+                }
                 let Some(tool_id) = tool
                     .as_str()
                     .map(str::trim)
@@ -22033,6 +22157,9 @@ fn validate_member_catalog_references(document: &MobpackDocument) -> Vec<Mobpack
 
         if let Some(skills) = member.get("skills").and_then(Value::as_array) {
             for (skill_index, skill) in skills.iter().enumerate() {
+                if full(&diagnostics) {
+                    break;
+                }
                 let Some(skill_id) = skill
                     .as_str()
                     .map(str::trim)
@@ -22450,7 +22577,9 @@ fn validate_selected_skill_sources(document: &MobpackDocument) -> Vec<MobpackDia
 fn validate_selected_path_skill_files(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
     let mut diagnostics = Vec::new();
     // A digest per archive path is enough to find conflicting content, so
-    // validation keeps no copy of any skill's bytes.
+    // validation keeps a digest, not a second copy of each skill's bytes.
+    // (`selected_skill_sources` still clones each selected source once; the
+    // document skill content cap bounds that.)
     let mut archive_paths = BTreeMap::<String, [u8; 32]>::new();
     for (skill_id, source) in selected_skill_sources(document) {
         let source_kind = source
@@ -22499,7 +22628,9 @@ fn validate_selected_path_skill_files(document: &MobpackDocument) -> Vec<Mobpack
                         message: path_skill_reads_over_budget(&skill_id),
                         path: Some(format!("skill_realms.skills[{skill_id}].path")),
                     });
-                    continue;
+                    // The request's read budget is spent: resolve no further
+                    // path skill.
+                    break;
                 }
                 Err(PathSkillReadError::NotListed) => {
                     diagnostics.push(MobpackDiagnostic {
@@ -36623,10 +36754,10 @@ branch = "choice"
     }
 
     /// Security regression: the members an import parses are refused above a
-    /// cap before they are parsed (`meta/editor.json` above 1 MiB,
-    /// `meta/mob.toml` and `manifest.toml` above 4 MiB), so a small upload
-    /// cannot make import build a parsed JSON or TOML tree many times its
-    /// size. A document under the cap still imports.
+    /// cap before they are parsed (`meta/editor.json` and `meta/mob.toml`
+    /// above 1 MiB, `manifest.toml`, which is only scanned line by line, above
+    /// 4 MiB), so a small upload cannot make import build a parsed JSON or
+    /// TOML tree many times its size. A document under the cap still imports.
     #[test]
     fn archive_import_refuses_oversized_document_members() {
         let mut document = document_with_real_launch_modes();
@@ -36645,24 +36776,24 @@ branch = "choice"
             editor["padding"] = json!("x".repeat(padding));
             serde_json::to_vec(&editor).expect("editor json bytes")
         };
-        let padded_toml = |path: &str| {
+        let padded_toml = |path: &str, padding: usize| {
             let mut text = files[path].clone();
             text.extend_from_slice(b"\n# ");
-            text.extend(std::iter::repeat_n(b'x', 4 << 20));
+            text.extend(std::iter::repeat_n(b'x', padding));
             text.push(b'\n');
             text
         };
 
         let under = with_member("meta/editor.json", padded_editor(512 << 10));
         let over = with_member("meta/editor.json", padded_editor(3 << 19));
-        let mob_toml_over = with_member("meta/mob.toml", padded_toml("meta/mob.toml"));
-        let manifest_over = with_member("manifest.toml", padded_toml("manifest.toml"));
+        let mob_toml_over = with_member("meta/mob.toml", padded_toml("meta/mob.toml", 2 << 20));
+        let manifest_over = with_member("manifest.toml", padded_toml("manifest.toml", 4 << 20));
 
         assert!(under.is_ok(), "{under:?}");
         assert_eq!(
             (
                 over.map_err(|error| error.contains("larger than 1 MiB")),
-                mob_toml_over.map_err(|error| error.contains("larger than 4 MiB")),
+                mob_toml_over.map_err(|error| error.contains("larger than 1 MiB")),
                 manifest_over.map_err(|error| error.contains("larger than 4 MiB")),
             ),
             (Err(true), Err(true), Err(true))
@@ -36832,8 +36963,9 @@ branch = "choice"
     }
 
     /// Security regression: filling path skills in from archive members is
-    /// counted against one budget for the whole import. One member named by
-    /// a thousand path skills is not copied a thousand times.
+    /// bounded. One member named by a thousand path skills is not copied a
+    /// thousand times: the document's skill content cap stops the filling as
+    /// soon as it passes 16 MiB, well inside the import's 64 MiB budget.
     #[test]
     fn archive_import_bounds_path_skill_hydration_across_references() {
         let mut document = document_with_real_launch_modes();
@@ -36875,8 +37007,25 @@ branch = "choice"
         let imported = import_archive_files(&files);
 
         assert_eq!(
-            imported.map_err(|error| error.contains("materializes more than 64 MiB")),
+            imported.map_err(|error| error.contains("skill content")),
             Err(true)
+        );
+    }
+
+    /// The import budget counts every materialized byte and refuses the
+    /// first charge past 64 MiB.
+    #[test]
+    fn import_budget_refuses_past_sixty_four_mib() {
+        let mut budget = ImportBudget::new();
+        assert_eq!(
+            (
+                budget.charge(48 << 20),
+                budget.charge(16 << 20),
+                budget
+                    .charge(1)
+                    .map_err(|error| error.contains("materializes more than 64 MiB")),
+            ),
+            (Ok(()), Ok(()), Err(true))
         );
     }
 
@@ -36998,8 +37147,189 @@ branch = "choice"
             .unwrap_or_default();
 
         assert!(
-            (largest as u64) < MOBPACK_ARCHIVE_MAX_EDITOR_JSON_BYTES / 8,
+            (largest as u64) < MOBPACK_ARCHIVE_MAX_PARSED_MEMBER_BYTES / 8,
             "the largest sample editor document is {largest} bytes"
+        );
+    }
+
+    /// An exported archive plus a member `a` holding `member`, named by
+    /// `references` path skills in a realm no member selects.
+    fn archive_naming_one_member_from_many_path_skills(
+        member: Vec<u8>,
+        references: usize,
+    ) -> String {
+        let mut document = document_with_real_launch_modes();
+        document.mob_toml = None;
+        let exported = export_mobpack(&json!({ "document": document })).expect("export");
+        let mut files = exported_archive_files(&exported.content_base64);
+        let mut editor: Value =
+            serde_json::from_slice(&files["meta/editor.json"]).expect("editor json");
+        let skills = (0..references)
+            .map(|index| {
+                json!({
+                    "id": format!("copy.{index}"),
+                    "label": "Copy",
+                    "source": "path",
+                    "path": "a"
+                })
+            })
+            .collect::<Vec<_>>();
+        let realms = editor["document"]["skill_realms"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .chain([json!({
+                "id": "local/copies",
+                "label": "Copies",
+                "source": "filesystem",
+                "skills": skills
+            })])
+            .collect::<Vec<_>>();
+        editor["document"]["skill_realms"] = Value::Array(realms);
+        files.insert(
+            "meta/editor.json".to_string(),
+            serde_json::to_vec(&editor).expect("editor json bytes"),
+        );
+        files.insert("a".to_string(), member);
+        base64::engine::general_purpose::STANDARD
+            .encode(encode_deployable_mobpack_archive(&files).expect("encode"))
+    }
+
+    /// Security regression: a document whose skill content, summed over every
+    /// skill entry, passes 16 MiB is refused wherever a document enters
+    /// (import, the document methods, draft save), so the copies made after
+    /// it enters (the import reply, source and export, a saved draft and its
+    /// history) stay a small constant times that cap. One 1 MiB member of
+    /// control bytes named by 60 path skills in an unselected realm is a
+    /// roughly 10 KiB upload.
+    #[test]
+    fn documents_past_the_skill_content_cap_are_refused_at_every_entry() {
+        let sixty = archive_naming_one_member_from_many_path_skills(vec![1_u8; 1 << 20], 60);
+        let twenty = archive_naming_one_member_from_many_path_skills(vec![b'x'; 1 << 20], 20);
+        let store = tempfile::tempdir().expect("tempdir");
+        let refused = |result: Result<Value, String>| {
+            result
+                .map(|_| ())
+                .map_err(|error| error.contains("skill content"))
+        };
+
+        let imported = refused(import_mobpack(&json!({ "content_base64": sixty })));
+        let source = refused(
+            source_mobpack(&json!({ "content_base64": twenty }))
+                .and_then(|result| serde_json::to_value(result).map_err(|err| err.to_string())),
+        );
+        let exported = refused(
+            export_mobpack(&json!({ "content_base64": twenty }))
+                .and_then(|result| serde_json::to_value(result).map_err(|err| err.to_string())),
+        );
+        let saved = refused(save_mobpack_draft(&json!({
+            "id": "copies",
+            "content_base64": twenty,
+            "store_path": store.path().join("drafts.json"),
+        })));
+
+        assert_eq!(
+            (imported, source, exported, saved),
+            (Err(true), Err(true), Err(true), Err(true))
+        );
+    }
+
+    /// One validation reports at most 1000 diagnostics and display rows; past
+    /// that it ends with a single `diagnostics_truncated` diagnostic.
+    #[test]
+    fn validation_reports_at_most_a_thousand_diagnostics() {
+        let mut document = document_with_expected_schema_ref();
+        document.members.as_array_mut().unwrap()[0]["skills"] = json!(vec![0; 1_500]);
+
+        let validation = validate_document(&document);
+
+        assert_eq!(
+            (
+                validation.ok,
+                validation.diagnostics.len(),
+                validation
+                    .diagnostics
+                    .last()
+                    .map(|diagnostic| diagnostic.code.clone()),
+                validation.display_rows.len(),
+            ),
+            (
+                false,
+                1_001,
+                Some("diagnostics_truncated".to_string()),
+                1_001
+            )
+        );
+    }
+
+    /// Set in the child process of the stop-resolving test, to its scratch
+    /// directory.
+    #[cfg(unix)]
+    const READ_BUDGET_STOP_CHILD: &str = "META_TEST_PATH_SKILL_READ_BUDGET_STOP";
+
+    /// Once a request without host access has spent its skill read budget,
+    /// validation stops resolving further path skills: one diagnostic, not
+    /// one read and one diagnostic per later reference.
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_path_skill_reads_stop_resolving_once_the_budget_is_spent() {
+        if let Some(scratch) = std::env::var_os(READ_BUDGET_STOP_CHILD) {
+            let skill = PathBuf::from(scratch).join("skills/big/SKILL.md");
+            let mut document = document_selecting_path_skill(&skill);
+            let ids = (0..100)
+                .map(|index| format!("big.{index}"))
+                .collect::<Vec<_>>();
+            document.members.as_array_mut().unwrap()[0]["skills"] = json!(ids);
+            document.skill_realms = json!([{
+                "id": "local/big",
+                "label": "Big",
+                "source": "filesystem",
+                "skills": ids
+                    .iter()
+                    .map(|id| json!({
+                        "id": id,
+                        "label": "Big",
+                        "source": "path",
+                        "path": skill
+                    }))
+                    .collect::<Vec<_>>()
+            }]);
+            let validation = with_untrusted_path_skill_reads(None, || validate_document(&document));
+            assert_eq!(
+                validation
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == "selected_skill_reads_over_budget")
+                    .count(),
+                1,
+                "{:#?}",
+                validation.diagnostics
+            );
+            return;
+        }
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let big = scratch.path().join("skills/big");
+        std::fs::create_dir_all(&big).expect("skill dir");
+        std::fs::write(big.join("SKILL.md"), vec![b'x'; 1 << 20]).expect("big skill");
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "mobpack::tests::untrusted_path_skill_reads_stop_resolving_once_the_budget_is_spent",
+                "--exact",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(READ_BUDGET_STOP_CHILD, scratch.path())
+            .env("META_SKILL_DIRS", scratch.path().join("skills"))
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

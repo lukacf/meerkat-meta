@@ -55,19 +55,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `readable_without_host_access`, and with `read_refusal` when a caller
   without host access cannot read it; reading such a skill names that
   reason. One request without host access reads at most 64 MiB of skill
-  files in total, however many skills name a file. Host access is the
-  caller's own per-call `mobpack.deploy` decision, so a deny rule withholds
-  it even beside an allow rule such as `mobpack.*`. Callers with host
-  access, and the SDKs' stdio and in-process RPC, may still name such paths.
+  files in total, however many skills name a file: a file larger than what
+  is left is refused by its opened handle's size before it is read, and once
+  the budget is spent the request resolves no further path skill. Host
+  access is the caller's own per-call `mobpack.deploy` decision, so a deny
+  rule withholds it even beside an allow rule such as `mobpack.*`. Callers
+  with host access, and the SDKs' stdio and in-process RPC, may still name
+  such paths.
 - Importing a mobpack archive (`meta/mobpacks/import`, and the draft methods
   that re-import a stored archive) refuses an archive that expands past
   32 MiB, holds more than 4096 entries, holds a member that is not a regular
-  file, or holds a `meta/editor.json` larger than 1 MiB or a
-  `meta/mob.toml` or `manifest.toml` larger than 4 MiB (parsing expands
-  those many times over). Everything one import materializes, archive
-  members, parsed text and each path skill filled in from a member, counts
-  against one 64 MiB budget, so a member named by many path skills is not
-  copied once per name. A pax global
+  file, or holds a `meta/editor.json` or `meta/mob.toml` larger than 1 MiB
+  (parsing expands those many times over) or a `manifest.toml` larger than
+  4 MiB. Everything one import materializes, archive members, parsed text
+  and each path skill filled in from a member, counts against one 64 MiB
+  budget, so a member named by many path skills is not copied once per name.
+  Import, every document method and draft save refuse a document whose
+  skill content, summed over every skill entry, passes 16 MiB, so the copies
+  made after a document enters (the import reply, source and export, a
+  saved draft) stay a small constant times that. One validation reports at
+  most 1000 diagnostics, ending with `diagnostics_truncated`. A pax global
   header, which `git archive` writes, is skipped, and a contiguous file
   reads as a regular one. Before, a request under the HTTP body limit could
   expand into gigabytes of memory: a member's bytes were read with no
@@ -136,6 +143,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rendering checks against `console_acceptance_fixture`, a
   `UnifiedRuntime::builder()` host with identity-first members whose routers
   carry no call-context provider.
+
+### Known limitations
+
+- The Flow Editor draft store has no total size or draft count limit yet:
+  each draft is bounded (its document's skill content is capped at 16 MiB),
+  but the number of drafts is not. Store-wide limits are planned for 0.9.3.
 
 ## [0.9.1] - 2026-10-15
 
