@@ -7,6 +7,9 @@ can reach; everything else runs every lane:
 
 - docs, top-level markdown and the non-CI workflows (see `skippable`) reach
   no lane;
+- the classifier and its test reach every lane;
+- the other top-level python scripts reach the console lane, whose fixture
+  test greps every script for port reservations;
 - a file under one of the AREAS prefixes reaches exactly that area's lanes;
 - Rust sources and build configuration (RUST_INPUTS) reach every lane but
   console-perf, which bundles only console/ and packages/console-*;
@@ -15,10 +18,14 @@ can reach; everything else runs every lane:
   lane.
 
 An area may list fewer lanes only when no job outside them reads its files.
-scripts/test_ci_changes.py scans the Rust crates and the console, flow
-editor and SDK sources for references into another area and fails when a
-reader's lane would not run, so a new cross-area read cannot silently skip
-the job it affects.
+scripts/test_ci_changes.py scans the repository's sources, manifests and
+configuration for references into a lane-limited or skippable area (paths,
+$ROOT/ paths, bare area names, globs cut at their first wildcard) and fails
+on any reading area it has not audited, or whose lanes the read area would
+not reach, so a new cross-area read cannot silently skip the job it affects.
+
+ci.yml runs the base commit's copy of this script, so a pull request never
+classifies itself with the classifier it changes.
 
 Usage: ci-changes.py --event NAME [--github-output FILE] [PATH ...]
 Paths default to `git diff --no-renames --name-only -z HEAD^1 HEAD`, the
@@ -47,8 +54,7 @@ EVERY_LANE = frozenset(LANES)
 # Files nothing in the Rust, console, SDK or example jobs reads. docs/rct is
 # not here: tests/console_route_auth.rs and the governance_check binary read
 # it. Nor is .claude: src/mobpack.rs reads .claude/skills. Nor is any markdown
-# below the top level: crates embed prompt files with include_str!. The python
-# scripts run only in fmt-lint (which always runs) and in release.yml.
+# below the top level: crates embed prompt files with include_str!.
 SKIPPABLE_FILES = frozenset(
     {
         ".github/CODEOWNERS",
@@ -69,10 +75,11 @@ AREAS = (
     # bundle, crates/meerkat-meta/console-dist.
     ("console/", frozenset({"console", "console_perf", "flow_editor"})),
     # The flow editor app; the crates embed only crates/meerkat-meta/flow-editor-dist.
-    ("flow-editor/", frozenset({"flow_editor"})),
-    # The Python SDK tests, and the Rust integration tests that run its
-    # parity and reference scripts.
-    ("sdk/python/", frozenset({"python", "integration"})),
+    # console/fixture-ready.test.cjs greps it for port reservations.
+    ("flow-editor/", frozenset({"flow_editor", "console"})),
+    # The Python SDK tests, the Rust integration tests that run its parity
+    # and reference scripts, and the console fixture test's grep.
+    ("sdk/python/", frozenset({"python", "integration", "console"})),
     # The Rust integration tests validate the TypeScript SDK, and the console
     # imports its live module. test-typescript runs on every pull request.
     ("sdk/typescript/", frozenset({"integration", "console", "console_perf", "flow_editor"})),
@@ -84,6 +91,13 @@ RUST_INPUTS = ("crates/", ".cargo/")
 RUST_INPUT_FILES = frozenset({"Cargo.toml", "Cargo.lock", "rust-toolchain.toml"})
 RUST_LANES = EVERY_LANE - {"console_perf"}
 
+# The classifier and its contract decide every other path's lanes.
+CLASSIFIER_FILES = frozenset({"scripts/ci-changes.py", "scripts/test_ci_changes.py"})
+
+
+def top_level_script(path: str) -> bool:
+    return path.startswith("scripts/") and path.count("/") == 1 and path.endswith(".py")
+
 
 def skippable(path: str) -> bool:
     if path.startswith("docs/rct/"):
@@ -92,13 +106,16 @@ def skippable(path: str) -> bool:
         return True
     if "/" not in path and (path.endswith(".md") or path.startswith("LICENSE-")):
         return True
-    if path in SKIPPABLE_FILES:
-        return True
-    return path.startswith("scripts/") and path.count("/") == 1 and path.endswith(".py")
+    return path in SKIPPABLE_FILES
 
 
 def path_lanes(path: str) -> frozenset:
     """The lanes a change to this one path can reach."""
+    if path in CLASSIFIER_FILES:
+        return EVERY_LANE
+    if top_level_script(path):
+        # fmt-lint runs them; console/fixture-ready.test.cjs greps them.
+        return frozenset({"console"})
     if skippable(path):
         return frozenset()
     if path in RUST_INPUT_FILES or path.startswith(RUST_INPUTS):

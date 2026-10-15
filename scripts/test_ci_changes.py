@@ -64,30 +64,62 @@ CONSOLE_LANES = {"console", "console_perf", "flow_editor"}
 RUST_LANES = EVERY_LANE - {"console_perf"}
 
 
-# Where a file may name a path in a lane-limited area: a string or comment
-# that is a path below that area, either repository-relative or reached
-# with ../ from elsewhere. Rust comments are skipped: they document, they
-# do not read.
-LIMITED = sorted((prefix.rstrip("/") for prefix, lanes in ci_changes.AREAS if lanes != ci_changes.EVERY_LANE),
-                 key=len, reverse=True)
-_NAMES = "|".join(re.escape(name) for name in LIMITED)
-REFERENCE = re.compile(
-    rf"(?:\.\./)+({_NAMES})(?=[/\"'`\s)]|$)(/[^\s\"'`),;]*)?"
-    rf"|(?<![\w./@-])({_NAMES})(/[^\s\"'`),;]+)"
-    rf"|(?<=[\"'])(sdk/python|sdk/typescript)(?=[\"'])"
+# Where a file may name a path in a lane-limited or skippable area: a path
+# below that area, repository-relative, reached with ../, or under a shell
+# variable ($ROOT/, ${repo_root}/); a glob, cut at its first wildcard; or the
+# bare area name as a quoted string (git grep and similar path arguments).
+# Rust comments are skipped: they document, they do not read. Bare names are
+# not read from Rust, where words like "console" name modes and routes.
+AREA_NAMES = ("sdk/python", "sdk/typescript", "flow-editor", "console", "sdk", "scripts", "docs")
+SKIPPABLE_NAMES = ("README.md", "CHANGELOG.md", "CONTRIBUTING.md", "CLAUDE.md", "LICENSE-MIT",
+                   "LICENSE-APACHE", ".github/CODEOWNERS", ".github/release.yml",
+                   ".github/workflows/release.yml", ".github/workflows/e2e-live.yml",
+                   ".github/workflows/publish-docs.yml")
+_NAMES = "|".join(re.escape(name) for name in sorted(AREA_NAMES, key=len, reverse=True))
+_FILES = "|".join(re.escape(name) for name in SKIPPABLE_NAMES)
+_REST = r"(/[^\s\"'`),;]*)?"
+_ROOTED = r"(?:\.\./)+|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/"
+PATH_REFERENCE = re.compile(
+    # ../console/x, $ROOT/console, ${root}/sdk: a path whatever follows.
+    rf"(?:{_ROOTED})({_NAMES})(?![\w-]){_REST}"
+    # console/x relative to the repository root: needs the slash.
+    rf"|(?<![\w./@$-])({_NAMES})(/[^\s\"'`),;]+)"
+    # A skippable file, rooted or repository-relative.
+    rf"|(?:{_ROOTED}|(?<![\w./@$-]))({_FILES})(?![\w.-])"
 )
-SCANNED_SUFFIXES = {".rs", ".ts", ".tsx", ".js", ".cjs", ".mjs", ".py", ".sh"}
+# A bare area name counts inside a bracketed or parenthesized list of quoted
+# strings that names at least two areas (a git grep pathspec list, say), and
+# a joined path ("scripts", "repo-cargo" or "scripts" / "repo-cargo") counts
+# as the joined path. A quoted name that is an object key or value
+# (id: "docs", "scripts": {...}) is an identifier, not a path.
+QUOTED_LIST = re.compile(r"[\[(]((?:\s*[\"'`][^\"'`\n]*[\"'`]\s*,?)+)\s*[\])]")
+QUOTED = re.compile(r"[\"'`]([^\"'`\n]*)[\"'`]")
+JOINED = re.compile(rf"[\"'`]({_NAMES})[\"'`]\s*[,/]\s*[\"'`]([\w.-]+)[\"'`]")
+COMMENT_LINE = re.compile(r"^\s*(?://|#|/\*|\*|--|<!--)")
+OBJECT_VALUE = re.compile(r"\w+[\"']?\s*:\s*[\"'`]$")
+BLOCKS = (re.compile(r'"""[\s\S]*?"""'), re.compile(r"'''[\s\S]*?'''"), re.compile(r"/\*[\s\S]*?\*/"))
+SCANNED_SUFFIXES = {".rs", ".ts", ".tsx", ".js", ".cjs", ".mjs", ".py", ".sh", ".json", ".toml",
+                    ".yml", ".yaml"}
+SCANNED_NAMES = {"Makefile"}
 UNSCANNED_DIRS = {"node_modules", "dist", ".tmp", "target", ".git", "__pycache__", "console-dist",
-                  "flow-editor-dist", "output", ".venv", "docs", ".claude", ".codemob-mcp"}
+                  "flow-editor-dist", "output", ".venv", "docs", ".claude", ".codemob-mcp", "fixtures"}
+MAX_SCANNED_BYTES = 1 << 20
+WILDCARD = re.compile(r"[*?\[{]")
 
-# Every place one area's files name a lane-limited area's files, and the
-# lanes that must run when the named files change because the naming file
-# runs in them. A pair missing here is a new cross-area read: decide its
-# lanes in ci-changes.py's AREAS and add it.
+# Every place one area's files read files that changes there might not
+# reach, and the lanes that must run when the read files change because
+# the reading file runs in them. A pair missing here is a new cross-area
+# read: decide its lanes in ci-changes.py and add it.
 CROSS_AREA_READS = {
     # The console app imports sdk/typescript/src/live; console-perf bundles
     # the console sources and the flow editor's browser tests load them.
     ("console/", "sdk/typescript/"): CONSOLE_LANES,
+    # console/fixture-ready.test.cjs (the console job) greps the flow
+    # editor, the SDKs and the scripts for port reservations.
+    ("console/", "flow-editor/"): {"console"},
+    ("console/", "sdk/"): {"console"},
+    ("console/", "sdk/python/"): {"console"},
+    ("console/", "scripts/"): {"console"},
     # Rust integration tests run the Python SDK's parity and reference
     # scripts and read its sources.
     ("crates/*/tests/", "sdk/python/"): {"integration"},
@@ -102,10 +134,33 @@ CROSS_AREA_READS = {
     # The console component packages' tests import console sources; the
     # console job runs them.
     ("packages/", "console/"): {"console"},
+    # Workflow files: ci.yml runs console scripts and keys the console lane's
+    # npm cache on console/package-lock.json, keys flow-editor's on its own,
+    # and installs sdk/python in test-python. Its contract scripts run in
+    # fmt-lint and test-typescript runs on every run, so neither needs a
+    # lane; release, docs and live workflows are not CI lanes.
+    (".github/", "console/"): {"console"},
+    (".github/", "flow-editor/"): {"flow_editor"},
+    (".github/", "sdk/python/"): {"python"},
+    (".github/", "sdk/typescript/"): set(),
+    (".github/", "scripts/"): set(),
+    (".github/", "docs/"): set(),
+    # make test-python reads sdk/python; the release targets and local
+    # hooks are not CI lanes.
+    ("Makefile", "sdk/python/"): {"python"},
+    ("Makefile", "sdk/typescript/"): set(),
+    ("Makefile", "scripts/"): set(),
+    ("Makefile", "skippable"): set(),
+    (".pre-commit-config.yaml", "scripts/"): set(),
     # Contract tests and release scripts run in fmt-lint, which always runs.
     ("scripts/", "console/"): set(),
+    ("scripts/", "flow-editor/"): set(),
+    ("scripts/", "sdk/"): set(),
     ("scripts/", "sdk/python/"): set(),
     ("scripts/", "sdk/typescript/"): set(),
+    ("scripts/", "scripts/"): set(),
+    ("scripts/", "docs/"): set(),
+    ("scripts/", "skippable"): set(),
 }
 
 
@@ -117,25 +172,72 @@ def reader_role(path: str) -> str:
     for prefix, _ in ci_changes.AREAS:
         if path.startswith(prefix):
             return prefix
-    return parts[0] + "/"
+    return parts[0] + "/" if len(parts) > 1 else parts[0]
 
 
 def area_of(path: str) -> str:
+    if ci_changes.skippable(path) and not path.startswith("docs/"):
+        return "skippable"
     for prefix, _ in ci_changes.AREAS:
         if path.startswith(prefix):
             return prefix
     return path.split("/", 1)[0] + "/"
 
 
-def names_existing_path(root: Path, target: str) -> bool:
-    """Whether `target` is a file or directory, or the extension-less start
-    of a file name (an import such as ../sdk/typescript/src/live). Plain
-    string comparison: the text may hold glob characters."""
+def tracked_files(root: Path, target: str) -> list[str]:
+    """Files at or below `target`, or named by its extension-less start (an
+    import such as ../sdk/typescript/src/live). Plain string comparison:
+    the text may hold glob characters."""
     candidate = root / target
-    if candidate.exists():
-        return True
+    if candidate.is_file():
+        return [target]
+    if candidate.is_dir():
+        found = []
+        for directory, subdirectories, files in os.walk(candidate):
+            subdirectories[:] = [d for d in subdirectories if d not in {"node_modules", ".git", "dist", ".tmp"}]
+            found += [Path(directory, name).relative_to(root).as_posix() for name in files]
+        return found
     parent = candidate.parent
-    return parent.is_dir() and any(entry.name.startswith(candidate.name + ".") for entry in parent.iterdir())
+    if parent.is_dir():
+        return [(parent / entry.name).relative_to(root).as_posix() for entry in parent.iterdir()
+                if entry.is_file() and entry.name.startswith(candidate.name + ".")]
+    return []
+
+
+def target_lanes(root: Path, target: str) -> frozenset | None:
+    """The lanes a change anywhere under `target` is sure to reach (the
+    intersection over its files), or None when it names nothing."""
+    files = tracked_files(root, target)
+    if not files:
+        return None
+    lanes = ci_changes.EVERY_LANE
+    for name in files:
+        lanes &= ci_changes.path_lanes(name)
+    return lanes
+
+
+def references(text: str, *, bare: bool) -> list[str]:
+    found = []
+    for match in PATH_REFERENCE.finditer(text):
+        if match.group(1):
+            found.append(match.group(1) + (match.group(2) or ""))
+        elif match.group(3):
+            found.append(match.group(3) + match.group(4))
+        elif not OBJECT_VALUE.search(text, max(0, match.start() - 40), match.start()):
+            found.append(match.group(5))
+    if bare:
+        for match in QUOTED_LIST.finditer(text):
+            names = [name for name in QUOTED.findall(match.group(1)) if name in AREA_NAMES]
+            if len(names) >= 2:
+                found += names
+        found += [f"{match.group(1)}/{match.group(2)}" for match in JOINED.finditer(text)]
+    cut = []
+    for target in found:
+        wildcard = WILDCARD.search(target)
+        if wildcard:
+            target = target[:wildcard.start()]
+        cut.append(target.rstrip("./") or target)
+    return cut
 
 
 def cross_area_reads(root: Path) -> dict[tuple[str, str], set[str]]:
@@ -144,32 +246,30 @@ def cross_area_reads(root: Path) -> dict[tuple[str, str], set[str]]:
         subdirectories[:] = [d for d in subdirectories
                              if d not in UNSCANNED_DIRS and not d.startswith(".release-workflow-fixture")]
         for name in files:
-            if Path(name).suffix not in SCANNED_SUFFIXES:
+            if Path(name).suffix not in SCANNED_SUFFIXES and name not in SCANNED_NAMES:
                 continue
             path = Path(directory, name)
             relative = path.relative_to(root).as_posix()
             try:
+                if path.stat().st_size > MAX_SCANNED_BYTES:
+                    continue
                 text = path.read_text(encoding="utf-8")
             except (UnicodeDecodeError, OSError):
                 continue
-            if path.suffix == ".rs":
-                text = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("//"))
-            for match in REFERENCE.finditer(text):
-                if match.group(1):
-                    target = match.group(1) + (match.group(2) or "")
-                elif match.group(3):
-                    target = match.group(3) + match.group(4)
-                else:
-                    target = match.group(5)
-                target = target.rstrip("./")
-                if ci_changes.path_lanes(target + "/") == ci_changes.EVERY_LANE:
+            # Comments and docstrings document; they do not read.
+            for block in BLOCKS:
+                text = block.sub("", text)
+            text = "\n".join(line for line in text.splitlines() if not COMMENT_LINE.match(line))
+            for target in references(text, bare=path.suffix != ".rs"):
+                lanes = target_lanes(root, target)
+                if lanes is None or lanes == ci_changes.EVERY_LANE:
                     continue
-                if not names_existing_path(root, target):
+                reader, read = area_of(relative), area_of(target.rstrip("/") + ("/" if (root / target).is_dir() else ""))
+                if (root / target).is_dir():
+                    read = target.rstrip("/") + "/" if target.rstrip("/") in AREA_NAMES else read
+                if reader == read or (read != "skippable" and relative.startswith(read)):
                     continue
-                if area_of(relative) == area_of(target + "/"):
-                    continue
-                reads.setdefault((reader_role(relative), area_of(target + "/")), set()).add(
-                    f"{relative} -> {target}")
+                reads.setdefault((reader_role(relative), read), set()).add(f"{relative} -> {target}")
     return reads
 
 
@@ -184,11 +284,19 @@ class CiChangesTests(unittest.TestCase):
         self.assertEqual(self.lanes("docs/concepts/events.mdx", "README.md", "CHANGELOG.md"), set())
         self.assertEqual(self.lanes("LICENSE-MIT"), set())
 
-    def test_non_ci_workflows_and_their_python_contracts_skip_the_heavy_jobs(self):
-        # The shape of PR #642: release.yml plus its python contract test.
-        self.assertEqual(self.lanes(".github/workflows/release.yml", "scripts/test_release_workflow.py"), set())
+    def test_non_ci_workflows_skip_the_heavy_jobs_and_python_scripts_run_the_console_lane(self):
         self.assertEqual(self.lanes(".github/workflows/e2e-live.yml", ".github/workflows/publish-docs.yml"), set())
-        self.assertEqual(self.lanes(".github/CODEOWNERS", ".github/release.yml"), set())
+        self.assertEqual(self.lanes(".github/CODEOWNERS", ".github/release.yml", ".github/workflows/release.yml"),
+                         set())
+        # The shape of PR #642: release.yml plus its python contract test.
+        # fmt-lint runs the script; console/fixture-ready.test.cjs greps it.
+        self.assertEqual(self.lanes(".github/workflows/release.yml", "scripts/test_release_workflow.py"),
+                         {"console"})
+
+    def test_the_classifier_and_its_contract_run_every_lane(self):
+        for path in ("scripts/ci-changes.py", "scripts/test_ci_changes.py"):
+            with self.subTest(path=path):
+                self.assertEqual(self.lanes(path), EVERY_LANE)
 
     def test_files_every_lane_reads_run_every_lane(self):
         for path in (
@@ -234,12 +342,12 @@ class CiChangesTests(unittest.TestCase):
     def test_area_changes_run_only_the_lanes_that_read_them(self):
         for paths, lanes in (
             (("console/package.json", "console/src/ConsoleApp.tsx"), CONSOLE_LANES),
-            (("flow-editor/src/main.ts",), {"flow_editor"}),
-            (("sdk/python/meerkat_meta/__init__.py",), {"python", "integration"}),
+            (("flow-editor/src/main.ts",), {"flow_editor", "console"}),
+            (("sdk/python/meerkat_meta/__init__.py",), {"python", "integration", "console"}),
             (("sdk/typescript/src/live.ts",), {"integration"} | CONSOLE_LANES),
             (("sdk/python/meerkat_meta/types.py", "sdk/typescript/src/types.ts"),
              {"python", "integration"} | CONSOLE_LANES),
-            (("flow-editor/src/main.ts", "README.md", "docs/guide.md"), {"flow_editor"}),
+            (("flow-editor/src/main.ts", "README.md", "docs/guide.md"), {"flow_editor", "console"}),
         ):
             with self.subTest(paths=paths):
                 self.assertEqual(self.lanes(*paths), lanes)
@@ -271,16 +379,31 @@ class CiChangesTests(unittest.TestCase):
             root = Path(tmp)
             for relative, text in {
                 "sdk/python/meerkat_meta/types.py": "X = 1\n",
+                "sdk/typescript/src/types.ts": "export {}\n",
                 "console/src/App.tsx": "export {}\n",
+                "docs/guide.md": "# Guide\n",
+                "scripts/tool.py": "\n",
                 "crates/x/src/lib.rs": '// sdk/python/meerkat_meta/types.py is only named here\n'
                                       'const T: &str = include_str!("../../../sdk/python/meerkat_meta/types.py");\n',
                 "flow-editor/src/a.ts": 'import { X } from "../../console/src/App";\n',
-                "flow-editor/src/b.ts": 'const pattern = "../../console/src/**";\n',
+                # A git grep pathspec list of bare area names.
+                "packages/p/grep.cjs": 'run(["grep", "--", "console", "sdk", "scripts"]);\n',
+                # A shell variable root and a glob cut at its first wildcard.
+                "examples/run.sh": 'cat "$ROOT/docs/guide.md"\nls sdk/typescript/src/*.ts\n',
+                # A manifest reader.
+                "tests/Makefile": "check:\n\tcat ../docs/guide.md\n",
+                # Identifiers and docstrings are not reads.
+                "packages/q/ids.ts": 'const a = { id: "docs", profile: "console" };\nconst b = ["code", "docs"];\n',
+                "packages/q/doc.py": '"""See docs/guide.md."""\n',
             }.items():
                 (root / relative).parent.mkdir(parents=True, exist_ok=True)
                 (root / relative).write_text(text)
             reads = cross_area_reads(root)
-        self.assertEqual(set(reads), {("crates/*/src/", "sdk/python/"), ("flow-editor/", "console/")})
+        self.assertEqual(set(reads), {
+            ("crates/*/src/", "sdk/python/"), ("flow-editor/", "console/"),
+            ("packages/", "console/"), ("packages/", "sdk/"), ("packages/", "scripts/"),
+            ("examples/", "docs/"), ("examples/", "sdk/typescript/"), ("tests/", "docs/"),
+        })
         self.assertNotIn(("crates/*/src/", "sdk/python/"), CROSS_AREA_READS)
 
     def test_pushes_dispatches_and_empty_diffs_run_everything(self):
@@ -330,7 +453,7 @@ class CiChangesTests(unittest.TestCase):
             ci_changes.main(["--event", "push", "--github-output", str(out), "docs/a.md"])
             self.assertEqual(
                 out.read_text(),
-                expected_output() + expected_output("flow_editor") + expected_output(*EVERY_LANE),
+                expected_output() + expected_output("flow_editor", "console") + expected_output(*EVERY_LANE),
             )
 
 

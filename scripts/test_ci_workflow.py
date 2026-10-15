@@ -674,19 +674,75 @@ class CiWorkflowTests(unittest.TestCase):
     def test_changes_job_classifies_the_pull_request_and_fails_closed(self):
         block = job_block("changes")
         self.assertIn("fetch-depth: 2", block)
-        self.assertIn(
-            'python3 scripts/ci-changes.py --event "${{ github.event_name }}" --github-output "$GITHUB_OUTPUT"',
-            block,
-        )
-        # Every lane is an output, and a classifier failure turns every lane on.
+        # Every lane is an output.
         outputs = re.findall(r"(?m)^      ([a-z_]+): \$\{\{ steps\.classify\.outputs\.\1 \}\}$", block)
         self.assertEqual(outputs, list(ci_changes.LANES))
-        self.assertIn(f"            for lane in {' '.join(ci_changes.LANES)}; do\n", block)
-        self.assertIn('              echo "${lane}=true" >> "$GITHUB_OUTPUT"\n', block)
+        self.assertIn(f'          lanes="{" ".join(ci_changes.LANES)}"\n', block)
+        self.assertIn("git show HEAD^1:scripts/ci-changes.py", block)
+        self.assertNotIn("python3 scripts/ci-changes.py", block)
         self.assertNotIn("if:", block)
-        self.assertNotIn("outputs.full", CI_WORKFLOW.read_text())
         self.assertIn("- run: python3 scripts/test_ci_changes.py\n", job_block("fmt-lint"))
 
+    def run_classify_step(self, base_classifier: str | None, *, head_classifier: str | None = None,
+                          event: str = "pull_request") -> dict[str, str]:
+        """Run the classify step in a repository whose base commit holds
+        `base_classifier` (None: no classifier at all) and whose head may
+        change it; return the step's GITHUB_OUTPUT as a mapping."""
+        lines = job_block("changes").splitlines()
+        start = lines.index("      - id: classify")
+        run = lines.index("        run: |", start)
+        body = []
+        for line in lines[run + 1:]:
+            if line and not line.startswith("          "):
+                break
+            body.append(line[10:] if line else "")
+        env = {key: value for key, value in os.environ.items() if not key.startswith("GIT")}
+        env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                   GIT_AUTHOR_NAME="ci", GIT_AUTHOR_EMAIL="ci@example.invalid",
+                   GIT_COMMITTER_NAME="ci", GIT_COMMITTER_EMAIL="ci@example.invalid")
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, temp = Path(tmp) / "repo", Path(tmp) / "runner-temp"
+            repo.mkdir()
+            temp.mkdir()
+            output = Path(tmp) / "output"
+
+            def git(*args):
+                subprocess.run(["git", *args], cwd=repo, env=env, check=True, capture_output=True)
+
+            git("init", "-q")
+            (repo / "scripts").mkdir()
+            for index, classifier in enumerate(
+                    (base_classifier, head_classifier if head_classifier is not None else base_classifier)):
+                if classifier is not None:
+                    (repo / "scripts/ci-changes.py").write_text(classifier)
+                (repo / "touched.txt").write_text(f"commit {index}\n")
+                git("add", "-A")
+                git("commit", "-q", "-m", "tree")
+            env.update(EVENT=event, RUNNER_TEMP=str(temp), GITHUB_OUTPUT=str(output))
+            subprocess.run(["bash", "-e", "-c", "\n".join(body)], cwd=repo, env=env, check=True,
+                           capture_output=True, text=True)
+            return dict(line.split("=", 1) for line in output.read_text().splitlines())
+
+    def test_the_base_commits_classifier_decides_and_fails_closed(self):
+        every = {lane: "true" for lane in ci_changes.LANES}
+
+        def printing(values: dict[str, str]) -> str:
+            text = "".join(f"{key}={value}\\n" for key, value in values.items())
+            return ("import sys\nargs = sys.argv\nopen(args[args.index('--github-output') + 1], 'a')"
+                    f".write('{text}')\n")
+
+        console_only = {lane: ("true" if lane == "console" else "false") for lane in ci_changes.LANES}
+        self.assertEqual(self.run_classify_step(printing(console_only)), console_only)
+        # The pull request's own classifier never decides its lanes.
+        nothing = {lane: "false" for lane in ci_changes.LANES}
+        self.assertEqual(self.run_classify_step(printing(console_only), head_classifier=printing(nothing)),
+                         console_only)
+        for case, base in (("predates the lanes", printing({"full": "false"})),
+                           ("misses a lane", printing({k: v for k, v in console_only.items() if k != "python"})),
+                           ("fails", "raise SystemExit(3)\n"),
+                           ("is absent", None)):
+            with self.subTest(base=case):
+                self.assertEqual(self.run_classify_step(base), every)
 
 if __name__ == "__main__":
     unittest.main()
