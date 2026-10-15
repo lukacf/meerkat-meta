@@ -96,23 +96,6 @@ legs run beside the commit's `ci.yml` **push-to-main** run, and collection
 refuses (it never waits) unless that run is already green by then. A refused
 candidate binds nothing; dispatch a new one once CI is green.
 
-While the release PR is open, prewarm the candidate's build cache from its head.
-The prewarm builds the same five targets without signing, packaging, attesting or
-uploading anything; it only lets the candidate restore Meerkat Core and the other
-dependencies instead of compiling them after the merge:
-
-```bash
-# Dispatch on main; SOURCE_SHA must be the head of a branch of this repository.
-make release-prewarm SOURCE_SHA=<release-pr-head-sha>
-```
-
-`make ci-prewarm SOURCE_SHA=<release-pr-head-sha>` does the same for `ci.yml`:
-a dispatch on main builds and tests that head and saves main's CI caches, so the
-push-to-main run after the merge restores a bumped Meerkat Core instead of
-compiling it in every job. A dispatch run is never release evidence. It is a
-second full CI run beside the pull request's own, so use it when runners are
-free, not while other workflows queue.
-
 The five targets form two tiers, each built and bound by its own candidate run
 from the same commit. The core tier (Linux x86_64 and aarch64, macOS arm64) is
 what the release waits for; the trailing tier (macOS x86_64 and Windows, the

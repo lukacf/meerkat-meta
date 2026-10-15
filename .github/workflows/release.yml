@@ -244,6 +244,8 @@ jobs:
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: Install console dependencies
         run: npm --prefix console ci --silent --no-fund --no-audit
@@ -318,11 +320,12 @@ jobs:
           # stale cache because rust-cache saves only on success. macOS and
           # Windows keys are unchanged.
           key: release-${{ contains(matrix.target, 'unknown-linux-gnu') && 'bullseye-' || '' }}${{ matrix.target }}
-          # Save what a failed or cancelled leg compiled too, so re-running
-          # the leg, or the next candidate, resumes from its dependencies
-          # instead of rebuilding Meerkat Core from nothing. Workspace crates
-          # are never cached; meerkat-meta always builds from the source.
-          cache-on-failure: true
+          # Only successful legs of candidate runs, which build merged main,
+          # write these entries: a failed leg must not leave a half-built
+          # target behind as an exact hit. ~/.cargo/bin is never restored, so
+          # no cached executable can shadow a tool the build or the signing
+          # steps run.
+          cache-bin: false
 
       # Meerkat 0.8.40's `openai-live` path pulls `opus` -> `audiopus_sys`,
       # whose build script falls back to compiling bundled Opus with CMake when
@@ -455,6 +458,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
+          shopt -s nullglob
           case "${TARGET}" in
             aarch64-apple-darwin) expected="arm64" ;;
             x86_64-apple-darwin) expected="x86_64" ;;
@@ -463,13 +467,16 @@ jobs:
               exit 1
               ;;
           esac
+          # Absolute paths: no cached or PATH-planted tool decides.
+          lipo=/usr/bin/lipo
+          file=/usr/bin/file
           # file's two spellings: "Mach-O 64-bit executable x86_64" (macOS)
           # and "Mach-O 64-bit x86_64 executable, flags:..." (libmagic 5.4x).
           file_pattern="^Mach-O 64-bit (executable ${expected}|${expected} executable)([^A-Za-z0-9_]|$)"
           for bin in meta_gateway rpc_gateway meta_repair; do
             path="target/${TARGET}/release/${bin}"
-            archs="$(lipo -archs "${path}")"
-            description="$(file -b "${path}")"
+            archs="$("${lipo}" -archs "${path}")"
+            description="$("${file}" -b "${path}")"
             echo "${path}: lipo '${archs}'; file '${description}'"
             if [[ "${archs}" != "${expected}" ]]; then
               echo "::error::${path} contains '${archs}', expected exactly '${expected}'" >&2
@@ -480,6 +487,54 @@ jobs:
               exit 1
             fi
           done
+          # The bundled C libraries the build scripts configured and compiled
+          # (Opus through CMake, ring and SQLite through cc) must target the
+          # same architecture; a host-architecture archive would fail the link
+          # or, worse, be ignored. Record each one's architecture.
+          build="target/${TARGET}/release/build"
+          for library in "audiopus_sys-*/out/lib/libopus.a" "ring-*/out/libring_core_*.a" \
+                         "libsqlite3-sys-*/out/libsqlite3.a"; do
+            matches=(${build}/${library})
+            if [[ "${#matches[@]}" -eq 0 ]]; then
+              echo "::error::no ${library} under ${build}" >&2
+              exit 1
+            fi
+            for archive in "${matches[@]}"; do
+              archs="$("${lipo}" -archs "${archive}")"
+              echo "${archive}: configured for '${archs}'"
+              if [[ "${archs}" != "${expected}" ]]; then
+                echo "::error::${archive} contains '${archs}', expected exactly '${expected}'" >&2
+                exit 1
+              fi
+            done
+          done
+
+      # The cross-compiled x86_64 leg runs its gateways under Rosetta, the
+      # arm64 leg natively: each must load and report this release's version.
+      - name: Smoke-run macOS gateways
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.resolve_release.outputs.version }}
+        run: |
+          set -euo pipefail
+          run=()
+          if [[ "${TARGET}" == "x86_64-apple-darwin" ]]; then
+            if ! /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
+              sudo /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+            fi
+            run=(/usr/bin/arch -x86_64)
+          fi
+          for bin in meta_gateway rpc_gateway; do
+            # ${run[@]+...}: an empty array under set -u, also in bash 3.2.
+            output="$(${run[@]+"${run[@]}"} "target/${TARGET}/release/${bin}" --version)"
+            echo "${bin}: ${output}"
+            if [[ "${output}" != "${bin} ${VERSION} "* ]]; then
+              echo "::error::${bin} --version printed '${output}', expected '${bin} ${VERSION} ...'" >&2
+              exit 1
+            fi
+          done
 
       - name: Ad-hoc codesign macOS binaries
         if: runner.os == 'macOS'
@@ -487,7 +542,7 @@ jobs:
         run: |
           set -euo pipefail
           for bin in meta_gateway rpc_gateway meta_repair; do
-            codesign --force --sign - "target/${{ matrix.target }}/release/${bin}"
+            /usr/bin/codesign --force --sign - "target/${{ matrix.target }}/release/${bin}"
           done
 
       - name: Package artifacts
@@ -793,38 +848,24 @@ jobs:
           fi
 
 
-  publish_registries:
-    name: Publish crate + SDK packages
-    # The crates publish after the SDK job whether it succeeded or failed, so
-    # one refused SDK registry cannot strand them. A skipped or cancelled SDK
-    # job still stops them, and the final all-registry readback still fails
-    # the run while any registry lacks the exact version.
+  # cargo publish's verification is a full dev build of the packaged crates
+  # (27 of promotion run 38568276468's 32 minutes, cold). It runs here, with
+  # the dependency build that main CI saved for the same commit (the
+  # meta-dev-bins entry of test-python and flow-editor; rust-cache hashes
+  # the target directory, debuginfo level and cache-bin setting into the
+  # entry, so they match those jobs) and with no secret at all.
+  # publish_registries then publishes the same checkout with --no-verify,
+  # holding the token but restoring no cache, so no cached file runs beside
+  # the token. This job never saves.
+  verify_crate_packages:
+    name: Verify crate packages
+    needs: [resolve_release, release_validate]
     if: >-
-      always() &&
       github.event_name == 'workflow_dispatch' &&
-      needs.release_validate.result == 'success' &&
       needs.resolve_release.outputs.publish_packages == 'true' &&
-      ((needs.resolve_release.outputs.mode == 'existing' &&
-        (needs.resolve_release.outputs.dry_run == 'true' ||
-         needs.verify_release_assets.result == 'success')) ||
-       (needs.resolve_release.outputs.mode == 'promote' &&
-        needs.verify_release_assets.result == 'success' &&
-        (needs.resolve_release.outputs.dry_run == 'true' ||
-         needs.publish_github_release.result == 'success'))) &&
-      (needs.publish_sdk_packages.result == 'success' ||
-       needs.publish_sdk_packages.result == 'failure')
-    needs: [resolve_release, release_validate, verify_release_assets, publish_github_release, publish_sdk_packages]
+      (needs.resolve_release.outputs.mode == 'existing' ||
+       needs.resolve_release.outputs.mode == 'promote')
     runs-on: ubuntu-24.04
-    # `cargo publish` verifies each crate by building its packaged sources in
-    # the dev profile, and without a usable cache that was a full cold build:
-    # "Publish Rust crate" took 27 of promotion run 38568276468's 32 minutes.
-    # scripts/repo-cargo builds under ~/.cache unless CARGO_TARGET_DIR is set,
-    # so the rust-cache step restored a directory nothing was built in. With
-    # ci.yml's target directory and line tables, this job restores the
-    # meta-dev-bins entry that the exact-main CI run of the same commit saved
-    # (rust-cache hashes these variables into the key, so they must match
-    # test-python and flow-editor), and only the packaged crates compile.
-    # It never saves: promotion adds no cache entry of its own.
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -837,11 +878,53 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.97.0
 
-      - name: Cache cargo registry
+      - name: Restore the exact-main CI dependency build
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: meta-dev-bins
           save-if: false
+          cache-bin: false
+
+      # Packages both crates and builds each from its packaged sources;
+      # meerkat-meta resolves the packaged meta-extension-state, so an
+      # unpublished new version of it verifies too.
+      - name: Verify the packaged crates build
+        run: scripts/repo-cargo package -p meta-extension-state -p meerkat-meta --locked
+
+  publish_registries:
+    name: Publish crate + SDK packages
+    # The crates publish after the SDK job whether it succeeded or failed, so
+    # one refused SDK registry cannot strand them. A skipped or cancelled SDK
+    # job still stops them, and the final all-registry readback still fails
+    # the run while any registry lacks the exact version.
+    if: >-
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      needs.release_validate.result == 'success' &&
+      needs.verify_crate_packages.result == 'success' &&
+      needs.resolve_release.outputs.publish_packages == 'true' &&
+      ((needs.resolve_release.outputs.mode == 'existing' &&
+        (needs.resolve_release.outputs.dry_run == 'true' ||
+         needs.verify_release_assets.result == 'success')) ||
+       (needs.resolve_release.outputs.mode == 'promote' &&
+        needs.verify_release_assets.result == 'success' &&
+        (needs.resolve_release.outputs.dry_run == 'true' ||
+         needs.publish_github_release.result == 'success'))) &&
+      (needs.publish_sdk_packages.result == 'success' ||
+       needs.publish_sdk_packages.result == 'failure')
+    needs: [resolve_release, release_validate, verify_release_assets, publish_github_release, publish_sdk_packages, verify_crate_packages]
+    runs-on: ubuntu-24.04
+    # Holds CARGO_REGISTRY_TOKEN, so it restores no cache: verify_crate_packages
+    # already built the packaged crates, and --no-verify publishes the same
+    # checkout without compiling anything here.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve_release.outputs.sha }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Install Python tooling
         uses: actions/setup-python@v5
@@ -855,10 +938,10 @@ jobs:
           DRY_RUN="${{ needs.resolve_release.outputs.dry_run }}"
           if [[ "$DRY_RUN" == "true" ]]; then
             echo "Running cargo publish in dry-run mode"
-            scripts/repo-cargo publish -p meta-extension-state --locked --dry-run
+            scripts/repo-cargo publish -p meta-extension-state --locked --no-verify --dry-run
           else
             echo "Publishing meta-extension-state to crates.io"
-            output=$(scripts/repo-cargo publish -p meta-extension-state --locked 2>&1) && true
+            output=$(scripts/repo-cargo publish -p meta-extension-state --locked --no-verify 2>&1) && true
             rc=$?
             if [[ $rc -eq 0 ]]; then
               echo "  meta-extension-state: published"
@@ -878,10 +961,10 @@ jobs:
           DRY_RUN="${{ needs.resolve_release.outputs.dry_run }}"
           if [[ "$DRY_RUN" == "true" ]]; then
             echo "Running cargo publish in dry-run mode"
-            scripts/repo-cargo publish -p meerkat-meta --locked --dry-run
+            scripts/repo-cargo publish -p meerkat-meta --locked --no-verify --dry-run
           else
             echo "Publishing meerkat-meta to crates.io"
-            output=$(scripts/repo-cargo publish -p meerkat-meta --locked 2>&1) && true
+            output=$(scripts/repo-cargo publish -p meerkat-meta --locked --no-verify 2>&1) && true
             rc=$?
             if [[ $rc -eq 0 ]]; then
               echo "  meerkat-meta: published"

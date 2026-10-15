@@ -93,7 +93,7 @@ class CiWorkflowTests(unittest.TestCase):
         toolchain = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]
         version = toolchain["channel"]
         self.assertRegex(version, r"^\d+\.\d+\.\d+$")
-        for name in ("ci.yml", "release.yml", "release-prewarm.yml", "e2e-live.yml"):
+        for name in ("ci.yml", "release.yml", "e2e-live.yml"):
             source = (ROOT / ".github/workflows" / name).read_text()
             installs = re.findall(r"uses:\s*dtolnay/rust-toolchain@(\S+)", source)
             self.assertTrue(installs, f"{name} must install its build toolchain")
@@ -656,105 +656,93 @@ class CiWorkflowTests(unittest.TestCase):
                 result = self.run_gate(results, lanes)
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
 
-    def run_source_step(self, event: str, ref: str, sha: str, heads: list[str]):
-        """Run the changes job's source check with a fake `git ls-remote`."""
+    def test_every_job_builds_the_commit_its_event_names(self):
+        """Main's caches are restored by later main runs, whose result is the
+        evidence release.yml accepts, so only main's own code may write them:
+        no dispatch input and no checkout ref can point a job at another
+        commit."""
+        source = CI_WORKFLOW.read_text()
+        triggers = source.split("\npermissions:", 1)[0]
+        self.assertIn("  workflow_dispatch:\n", triggers)
+        self.assertNotIn("inputs:", triggers)
+        checkouts = re.findall(r"(?m)^      - uses: actions/checkout@v4\n((?: {8}.*\n)*)", source)
+        self.assertEqual(len(checkouts), source.count("uses: actions/checkout@v4"))
+        for settings in checkouts:
+            self.assertNotIn("ref:", settings)
+            self.assertNotIn("repository:", settings)
+
+    def test_changes_job_classifies_the_pull_request_and_fails_closed(self):
+        block = job_block("changes")
+        self.assertIn("fetch-depth: 2", block)
+        # Every lane is an output.
+        outputs = re.findall(r"(?m)^      ([a-z_]+): \$\{\{ steps\.classify\.outputs\.\1 \}\}$", block)
+        self.assertEqual(outputs, list(ci_changes.LANES))
+        self.assertIn(f'          lanes="{" ".join(ci_changes.LANES)}"\n', block)
+        self.assertIn("git show HEAD^1:scripts/ci-changes.py", block)
+        self.assertNotIn("python3 scripts/ci-changes.py", block)
+        self.assertNotIn("if:", block)
+        self.assertIn("- run: python3 scripts/test_ci_changes.py\n", job_block("fmt-lint"))
+
+    def run_classify_step(self, base_classifier: str | None, *, head_classifier: str | None = None,
+                          event: str = "pull_request") -> dict[str, str]:
+        """Run the classify step in a repository whose base commit holds
+        `base_classifier` (None: no classifier at all) and whose head may
+        change it; return the step's GITHUB_OUTPUT as a mapping."""
         lines = job_block("changes").splitlines()
-        start = lines.index("      - id: source")
+        start = lines.index("      - id: classify")
         run = lines.index("        run: |", start)
         body = []
         for line in lines[run + 1:]:
             if line and not line.startswith("          "):
                 break
             body.append(line[10:] if line else "")
+        env = {key: value for key, value in os.environ.items() if not key.startswith("GIT")}
+        env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                   GIT_AUTHOR_NAME="ci", GIT_AUTHOR_EMAIL="ci@example.invalid",
+                   GIT_COMMITTER_NAME="ci", GIT_COMMITTER_EMAIL="ci@example.invalid")
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "bin").mkdir()
-            fake = root / "bin/git"
-            fake.write_text(
-                "#!/usr/bin/env bash\n"
-                '[[ "$1 $2" == "ls-remote --heads" ]] || { echo "unexpected git $*" >&2; exit 99; }\n'
-                'printf "%s\\trefs/heads/branch\\n" $FAKE_HEADS\n'
-            )
-            fake.chmod(0o755)
-            output = root / "output"
-            env = {key: value for key, value in os.environ.items() if not key.startswith("GITHUB_")}
-            env.update({
-                "PATH": f"{root / 'bin'}:{env['PATH']}",
-                "GITHUB_EVENT_NAME": event,
-                "GITHUB_REF": ref,
-                "CACHE_SOURCE_SHA": sha,
-                "GITHUB_SERVER_URL": "https://github.com",
-                "GITHUB_REPOSITORY": "example/meta",
-                "GITHUB_OUTPUT": str(output),
-                "FAKE_HEADS": " ".join(heads),
-            })
-            result = subprocess.run(["bash", "-c", "\n".join(body)], env=env, capture_output=True, text=True)
-            written = output.read_text() if output.exists() else ""
-        return result, written
+            repo, temp = Path(tmp) / "repo", Path(tmp) / "runner-temp"
+            repo.mkdir()
+            temp.mkdir()
+            output = Path(tmp) / "output"
 
-    def test_a_dispatch_on_main_can_build_a_branch_head_into_main_caches(self):
-        """The exact-main run after a Core bump restores Core only if main's
-        cache already holds it, and only a run on main writes main's cache.
-        A dispatch on main may name a branch head; every job that builds
-        checks it out, and nothing else changes for pushes and pull requests."""
-        source = CI_WORKFLOW.read_text()
-        self.assertIn(
-            "  workflow_dispatch:\n    inputs:\n      cache_source_sha:\n", source.split("\npermissions:", 1)[0])
-        self.assertIn('        default: ""\n', source.split("\npermissions:", 1)[0])
-        changes = job_block("changes")
-        self.assertIn("      source_sha: ${{ steps.source.outputs.sha }}\n", changes)
-        self.assertLess(changes.index("      - id: source"), changes.index("      - id: classify"))
-        jobs = re.findall(r"(?m)^  ([a-z-]+):$", source.split("\njobs:\n", 1)[1])
-        for name in jobs:
-            block = job_block(name)
-            if name in ("changes", "gate", "drop-superseded-caches", "test-typescript", "audit"):
-                self.assertNotIn("needs.changes.outputs.source_sha", block, name)
-                continue
-            with self.subTest(job=name):
-                self.assertIn("    needs: changes\n", block)
-                checkouts = re.findall(r"(?m)^      - uses: actions/checkout@v4\n((?: {8}.*\n)*)", block + "\n")
-                self.assertEqual(checkouts, ["        with:\n          ref: ${{ needs.changes.outputs.source_sha }}\n"])
-        # Every job that saves a rust cache builds the named source.
-        for name in jobs:
-            if "uses: Swatinem/rust-cache@v2" in job_block(name):
-                self.assertIn("needs.changes.outputs.source_sha", job_block(name), name)
-        self.assertIn('gh workflow run ci.yml --ref main -f cache_source_sha="$(SOURCE_SHA)"',
-                      (ROOT / "Makefile").read_text())
-        # Cleanup stays push-only, and release.yml accepts only push runs.
-        self.assertIn("    if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n",
-                      job_block("drop-superseded-caches"))
+            def git(*args):
+                subprocess.run(["git", *args], cwd=repo, env=env, check=True, capture_output=True)
 
-        sha = "c" * 40
-        for name, event, ref, given, heads, status, written in (
-            ("no source: pushes and pull requests", "push", "refs/heads/main", "", [sha], 0, ""),
-            ("pull request without source", "pull_request", "refs/pull/1/merge", "", [], 0, ""),
-            ("branch head dispatched on main", "workflow_dispatch", "refs/heads/main", sha, ["d" * 40, sha], 0,
-             f"sha={sha}\n"),
-            ("dispatched on another branch", "workflow_dispatch", "refs/heads/feat/x", sha, [sha], 1, ""),
-            ("not a branch head (a fork's)", "workflow_dispatch", "refs/heads/main", sha, ["d" * 40], 1, ""),
-            ("abbreviated", "workflow_dispatch", "refs/heads/main", sha[:7], [sha], 1, ""),
-        ):
-            with self.subTest(case=name):
-                result, output = self.run_source_step(event, ref, given, heads)
-                self.assertEqual(result.returncode, status, result.stderr)
-                self.assertEqual(output, written)
+            git("init", "-q")
+            (repo / "scripts").mkdir()
+            for index, classifier in enumerate(
+                    (base_classifier, head_classifier if head_classifier is not None else base_classifier)):
+                if classifier is not None:
+                    (repo / "scripts/ci-changes.py").write_text(classifier)
+                (repo / "touched.txt").write_text(f"commit {index}\n")
+                git("add", "-A")
+                git("commit", "-q", "-m", "tree")
+            env.update(EVENT=event, RUNNER_TEMP=str(temp), GITHUB_OUTPUT=str(output))
+            subprocess.run(["bash", "-e", "-c", "\n".join(body)], cwd=repo, env=env, check=True,
+                           capture_output=True, text=True)
+            return dict(line.split("=", 1) for line in output.read_text().splitlines())
 
-    def test_changes_job_classifies_the_pull_request_and_fails_closed(self):
-        block = job_block("changes")
-        self.assertIn("fetch-depth: 2", block)
-        self.assertIn(
-            'python3 scripts/ci-changes.py --event "${{ github.event_name }}" --github-output "$GITHUB_OUTPUT"',
-            block,
-        )
-        # Every lane is an output, and a classifier failure turns every lane on.
-        outputs = re.findall(r"(?m)^      ([a-z_]+): \$\{\{ steps\.classify\.outputs\.\1 \}\}$", block)
-        self.assertEqual(outputs, list(ci_changes.LANES))
-        self.assertIn(f"            for lane in {' '.join(ci_changes.LANES)}; do\n", block)
-        self.assertIn('              echo "${lane}=true" >> "$GITHUB_OUTPUT"\n', block)
-        self.assertNotIn("if:", block)
-        self.assertNotIn("outputs.full", CI_WORKFLOW.read_text())
-        self.assertIn("- run: python3 scripts/test_ci_changes.py\n", job_block("fmt-lint"))
+    def test_the_base_commits_classifier_decides_and_fails_closed(self):
+        every = {lane: "true" for lane in ci_changes.LANES}
 
+        def printing(values: dict[str, str]) -> str:
+            text = "".join(f"{key}={value}\\n" for key, value in values.items())
+            return ("import sys\nargs = sys.argv\nopen(args[args.index('--github-output') + 1], 'a')"
+                    f".write('{text}')\n")
+
+        console_only = {lane: ("true" if lane == "console" else "false") for lane in ci_changes.LANES}
+        self.assertEqual(self.run_classify_step(printing(console_only)), console_only)
+        # The pull request's own classifier never decides its lanes.
+        nothing = {lane: "false" for lane in ci_changes.LANES}
+        self.assertEqual(self.run_classify_step(printing(console_only), head_classifier=printing(nothing)),
+                         console_only)
+        for case, base in (("predates the lanes", printing({"full": "false"})),
+                           ("misses a lane", printing({k: v for k, v in console_only.items() if k != "python"})),
+                           ("fails", "raise SystemExit(3)\n"),
+                           ("is absent", None)):
+            with self.subTest(base=case):
+                self.assertEqual(self.run_classify_step(base), every)
 
 if __name__ == "__main__":
     unittest.main()
