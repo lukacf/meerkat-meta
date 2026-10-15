@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- `Cargo.lock` updates quinn-proto from 0.11.16 to 0.11.19, which clears
+  RUSTSEC-2026-0338, RUSTSEC-2026-0339, RUSTSEC-2026-0340, RUSTSEC-2026-0341
+  and RUSTSEC-2026-0342 from `cargo audit`. Meta was not exposed: no build
+  compiles quinn-proto, which the lockfile records only under reqwest's
+  optional HTTP/3 support, and no workspace feature enables it. Only that
+  lockfile entry changes.
+
 ### Added
 
 - `meta_gateway storage-adopt-predecessor --mob-config <file>` checks the mob
