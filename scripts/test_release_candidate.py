@@ -455,6 +455,13 @@ class CandidateProtocolTests(unittest.TestCase):
         self.assertTrue(all(call["args"][1] == "upload" for call in self.writes()))
         self.assertEqual(uploads[0], "candidate-selection-trailing.json")
         self.assertEqual(set(uploads[-2:]), {"index-trailing.json", "checksums-trailing.sha256"})
+        # Each file only after everything that verifies it.
+        position = uploads.index
+        self.assertLess(position("manifest-provenance-trailing.jsonl"), position("candidate-manifest-trailing.json"))
+        bundles = [position(f"target-{t}-provenance.jsonl") for t in helper.assets.TIER_TARGETS["trailing"]]
+        archives = [position(name) for name in helper.assets.expected_archive_names(VERSION, "trailing")]
+        self.assertLess(position("candidate-manifest-trailing.json"), min(bundles))
+        self.assertLess(max(bundles), min(archives))
         index = json.loads(after["index-trailing.json"][1])
         self.assertEqual((index["tier"], index["artifacts"]),
                          ("trailing", helper.assets.expected_archive_names(VERSION, "trailing")))
@@ -567,6 +574,110 @@ class CandidateProtocolTests(unittest.TestCase):
         self.save()
         os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
         self.command("verify-published", success=False)
+
+    def append_release_asset(self, path, *, asset_id):
+        content = path.read_bytes()
+        self.state["release"]["assets"].append({
+            "id": asset_id, "name": path.name, "size": len(content), "state": "uploaded",
+            "digest": "sha256:" + hashlib.sha256(content).hexdigest(), "local_file": str(path)})
+        self.save()
+
+    def test_probe_1_a_trailing_file_on_a_failed_promotion_draft_never_goes_public(self):
+        core, _ = self.tier_candidate("core", RUN, 300)
+        os.environ.update(RELEASE_MODE="promote", SOURCE_SHA="", ARTIFACT_SELECTION=json.dumps(core))
+        self.command("stage", "--output-dir", str(self.root / "release-assets"),
+                     "--proof-dir", str(self.root / "release-proofs"))
+        planted = self.root / f"meta-gateway-{VERSION}-x86_64-pc-windows-msvc.zip"
+        planted.write_bytes(b"planted while the promotion was interrupted")
+        self.seed_release([self.root / "release-proofs" / helper.SELECTION, planted], draft=True)
+        self.state["calls"] = []
+        self.save()
+        _, error = self.publish(success=False)
+        self.assertIn("trailing files on an unpublished release", error)
+        self.assertFalse(self.writes())
+        self.assertTrue(self.state["release"]["draft"])
+
+    def test_probe_2_a_replaced_trailing_archive_fails_verification_even_while_incomplete(self):
+        self.promote_core()
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        self.assets_mode(trailing)
+        self.state["fail_upload"] = f"meta-rpc-gateway-{VERSION}-x86_64-pc-windows-msvc.zip"
+        self.save()
+        self.command("recover", success=False)
+        replaced = next(a for a in self.state["release"]["assets"]
+                        if a["name"] == f"meta-gateway-{VERSION}-x86_64-apple-darwin.tar.gz")
+        # A well-formed archive of the right member, with other bytes.
+        Path(replaced["local_file"]).write_bytes(archive_bytes("meta_gateway", b"replaced after upload", "tar.gz"))
+        replaced["digest"] = "sha256:" + helper.assets.sha256(Path(replaced["local_file"]))
+        replaced["size"] = Path(replaced["local_file"]).stat().st_size
+        self.save()
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        _, error = self.command("verify-published", success=False)
+        self.assertIn("does not match its manifest record", error)
+
+    def test_probe_3_a_planted_trailing_receipt_and_archive_fail_and_block_nothing_silently(self):
+        self.promote_core()
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        planted_receipt = self.root / "candidate-selection-trailing.json"
+        planted_receipt.write_text(json.dumps(dict(trailing, run_id=999)))
+        planted_archive = self.root / f"meta-repair-{VERSION}-x86_64-pc-windows-msvc.zip"
+        planted_archive.write_bytes(b"planted archive")
+        self.append_release_asset(planted_receipt, asset_id=1990)
+        self.append_release_asset(planted_archive, asset_id=1991)
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        _, error = self.command("verify-published", success=False)
+        self.assertIn("without the trailing manifest", error)
+        # The real trailing tier refuses to bind over the planted files
+        # before any write; an operator removes them first.
+        self.state["calls"] = []
+        self.save()
+        self.assets_mode(trailing)
+        _, error = self.command("recover", success=False)
+        self.assertIn("existing release asset conflict", error)
+        self.assertFalse(self.writes())
+
+    def test_a_tampered_trailing_index_fails_verification_while_an_archive_is_missing(self):
+        self.promote_core()
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        self.assets_mode(trailing)
+        self.command("recover")
+        missing = next(a for a in self.state["release"]["assets"]
+                       if a["name"] == f"meta-repair-{VERSION}-x86_64-pc-windows-msvc.zip")
+        self.state["release"]["assets"].remove(missing)
+        index = next(a for a in self.state["release"]["assets"] if a["name"] == "index-trailing.json")
+        Path(index["local_file"]).write_text('{"tampered": true}\n')
+        index["digest"] = "sha256:" + helper.assets.sha256(Path(index["local_file"]))
+        index["size"] = Path(index["local_file"]).stat().st_size
+        self.save()
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        _, error = self.command("verify-published", success=False)
+        self.assertIn("published trailing index-trailing.json hash mismatch", error)
+
+    def test_promotion_rerun_verifies_trailing_files_already_on_the_public_release(self):
+        core, _ = self.promote_core()
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        self.assets_mode(trailing)
+        self.command("recover")
+        replaced = next(a for a in self.state["release"]["assets"]
+                        if a["name"] == f"meta-gateway-{VERSION}-x86_64-apple-darwin.tar.gz")
+        Path(replaced["local_file"]).write_bytes(archive_bytes("meta_gateway", b"swapped", "tar.gz"))
+        replaced["digest"] = "sha256:" + helper.assets.sha256(Path(replaced["local_file"]))
+        replaced["size"] = Path(replaced["local_file"]).stat().st_size
+        self.state["calls"] = []
+        self.save()
+        os.environ.update(RELEASE_MODE="promote", ARTIFACT_SELECTION=json.dumps(core))
+        _, error = self.publish(success=False)
+        self.assertIn("does not match its manifest record", error)
+        self.assertFalse(self.writes())
+
+    def test_promotion_of_a_trailing_selection_fails_at_resolution(self):
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        os.environ.update(RELEASE_MODE="promote", SOURCE_SHA="", RELEASE_TIER="",
+                          ARTIFACT_SELECTION=json.dumps(trailing))
+        _, error = self.command("resolve", success=False)
+        self.assertIn("promotion accepts only a core selection", error)
+        os.environ["RELEASE_MODE"] = "assets"
+        self.command("resolve")
 
     def test_schema_1_documents_keep_verifying_and_schema_2_requires_its_tier(self):
         v1_selection, v1_manifest = self.staged()

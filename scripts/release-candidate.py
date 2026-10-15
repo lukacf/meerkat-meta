@@ -64,6 +64,12 @@ MANIFEST = "candidate-manifest.json"
 SELECTION = "candidate-selection.json"
 PROVENANCE = "provenance.jsonl"
 MANIFEST_PROVENANCE = "manifest-provenance.jsonl"
+RELEASE_NOTES = (
+    "Original accepted Meta candidate; see the attached selections and provenance. "
+    "Linux x86_64 and aarch64 and macOS arm64 archives are listed in index.json and checksums.sha256. "
+    "macOS x86_64 and Windows archives may arrive later, listed in index-trailing.json and "
+    "checksums-trailing.sha256."
+)
 SCHEMAS = (1, 2)
 # Every release build leg. A schema 2 candidate run builds one tier's legs;
 # the resolver emits them as the build_binaries matrix.
@@ -424,7 +430,9 @@ def resolve():
                 require(ref == MAIN, "tagged release dispatch must use main")
                 valid_tag(tag)
             if mode in ("promote", "assets"):
-                selection_env(original=mode == "assets")
+                chosen = selection_env(original=mode == "assets")
+                if mode == "promote":
+                    require_promotable(chosen)
             else:
                 require(not selected, "selection is not valid for existing mode")
                 require(tag or not publish or dry, "untagged real registry publication refused")
@@ -892,25 +900,64 @@ def verify_flat_subset(folder, destination, tag, tier=None):
     verify_prepared(destination, tag, tier)
 
 
-def verify_published_trailing(folder, inventory, work, sha, version, tag):
-    """The trailing tier may still be absent or partly added: registry retry
-    and verification depend on the core tier only. A complete trailing tier
-    is verified like the core; any trailing file needs the trailing receipt."""
+def verify_present_trailing(folder, inventory, sha, version, tag):
+    """Verify every trailing-tier file a public release carries, however
+    many of them there are; only absent files are tolerated.
+
+    Trailing files need the trailing receipt, and the receipt must be a
+    schema 2 trailing selection. A present manifest must match the receipt,
+    the release's source, version and tag, and its retained attestation.
+    Every present archive must match its manifest record and its target's
+    attestation, and every present index or checksums file its manifest
+    hash. An archive or metadata file without its manifest, or an archive
+    without its target's attestation bundle, cannot be verified and refuses.
+    Returns the number of trailing files still absent.
+    """
     files = tier_file_names(version, "trailing")
     present = files & set(inventory)
-    receipt = tier_proof_names("trailing")[0]
+    receipt, manifest_name, manifest_bundle = tier_proof_names("trailing")
     if not present:
-        print("trailing tier not added yet")
-        return
-    require(receipt in inventory, "trailing assets present without the trailing receipt")
+        return len(files)
+    require(receipt in present, "trailing assets present without the trailing receipt")
     selected = validate_selection(read_json(folder / receipt))
     require(selection_tier(selected) == "trailing", "trailing receipt is not a trailing selection")
-    if present != files:
-        print(f"trailing tier incomplete: {len(files - present)} files pending assets-mode recovery")
-        return
-    verify_published_proofs(folder, selected, sha, version, tag)
-    verify_flat_subset(folder, work / "flat-trailing", tag, "trailing")
-    print("verified the trailing tier")
+    dependents = present - {receipt, manifest_bundle} - {f"target-{t}-provenance.jsonl" for t in tier_targets("trailing")}
+    if manifest_name not in present:
+        require(dependents == set(), "trailing assets present without the trailing manifest")
+        return len(files - present)
+    manifest_path = folder / manifest_name
+    manifest = read_json(manifest_path)
+    match_manifest_selection(manifest, selected, manifest_path, sha, version, tag)
+    require(manifest_bundle in present, "trailing manifest present without its attestation bundle")
+    verify_provenance(manifest_path, folder / manifest_bundle, sha, selected["run_id"], selected["run_attempt"])
+    for name, expected_hash in manifest["metadata"].items():
+        if name in present:
+            require(assets.sha256(folder / name) == expected_hash, f"published trailing {name} hash mismatch")
+    for item in manifest["artifacts"]:
+        bundle = f"target-{item['target']}-provenance.jsonl"
+        for record in item["archives"]:
+            if record["name"] not in present:
+                continue
+            require(bundle in present, f"trailing archive {record['name']} present without its attestation bundle")
+            path = folder / record["name"]
+            require(describe_archive(path, version, item["target"]) == record,
+                    f"published trailing archive {record['name']} does not match its manifest record")
+            verify_provenance(path, folder / bundle, sha, selected["run_id"], selected["run_attempt"])
+    return len(files - present)
+
+
+def verify_published_trailing(folder, inventory, work, sha, version, tag):
+    """The trailing tier may still be absent or partly added: registry retry
+    and verification depend on the core tier only, but every trailing file
+    that is present verifies, and a complete tier verifies as a set."""
+    pending = verify_present_trailing(folder, inventory, sha, version, tag)
+    if pending == len(tier_file_names(version, "trailing")):
+        print("trailing tier not added yet")
+    elif pending:
+        print(f"trailing tier incomplete: every present file verified, {pending} pending assets-mode recovery")
+    else:
+        verify_flat_subset(folder, work / "flat-trailing", tag, "trailing")
+        print("verified the trailing tier")
 
 
 def verify_published(_args=None):
@@ -970,15 +1017,23 @@ def validate_staging(args, selected, sha, version, tag, work):
     return {name: combined / name for name in {*local_assets, *local_proofs}}
 
 
-def check_existing(inventory, downloaded, expected, selected, *, version=None):
+def check_existing(inventory, downloaded, expected, selected, *, version=None, draft=None,
+                   sha=None, tag=None):
     if inventory:
         require(SELECTION in inventory, "unbound partial release: acceptance receipt missing; operator cleanup required")
         require(read_json(downloaded / SELECTION) == selected, "existing release receipt mismatch")
-    # A schema 2 core release may already carry the trailing tier, added by
-    # recovery after promotion; those files are the trailing receipt's to bind.
+    # A published schema 2 core release may already carry the trailing tier,
+    # added by recovery after promotion; every such file present must verify
+    # against the trailing receipt. Promotion makes a draft public, and no
+    # trailing file may ride along: the trailing tier is added only to the
+    # published release.
     trailing = tier_file_names(version, "trailing") if selection_tier(selected) == "core" else set()
+    carried = (trailing & set(inventory)) - set(expected)
+    if carried:
+        require(draft is False, "trailing files on an unpublished release; operator cleanup required")
+        verify_present_trailing(downloaded, inventory, sha, version, tag)
     for name in inventory:
-        if name in trailing and name not in expected:
+        if name in carried:
             continue
         require(name in expected, f"unrecognized existing release asset: {name}")
         require(assets.sha256(downloaded / name) == assets.sha256(expected[name]),
@@ -1022,7 +1077,8 @@ def publish(args):
             require(SELECTION in inventory, "unbound partial release: acceptance receipt missing; operator cleanup required")
             downloaded = work / "existing"
             download_release_inventory(inventory, downloaded)
-            check_existing(inventory, downloaded, expected, selected, version=version)
+            check_existing(inventory, downloaded, expected, selected, version=version,
+                           draft=release["draft"], sha=sha, tag=tag)
             original = snapshot_hashes(inventory, downloaded)
             # Trailing files already added stay exactly as they are.
             expected.update({name: downloaded / name for name in inventory if name not in expected})
@@ -1031,7 +1087,7 @@ def publish(args):
             require(release_inventory(release) == inventory, "release changed before write")
         else:
             run(["gh", "release", "create", tag, "--repo", repository(), "--verify-tag",
-                 "--draft", "--title", tag, "--notes", "Original accepted Meta candidate; see attached selection and provenance."])
+                 "--draft", "--title", tag, "--notes", RELEASE_NOTES])
             release = newly_created_release_for_tag(tag)
             require(release is not None and release["draft"] is True, "new draft release missing")
             require(not release_inventory(release), "new draft unexpectedly contains assets")
@@ -1127,12 +1183,16 @@ def trailing_additions(selected, release, inventory, existing, work, sha, versio
 
 
 def trailing_upload_order(names):
-    """Receipt first (binds the tier), proofs, archives, and the tier's index
-    and checksums last, so a listed archive is always already present."""
-    receipt = tier_proof_names("trailing")[0]
+    """Receipt first (binds the tier), then each file only after everything
+    that verifies it: the manifest's attestation bundle, the manifest, the
+    targets' attestation bundles, the archives, and the tier's index and
+    checksums last, so a listed archive is always already present. An
+    interrupted addition therefore never leaves a present file that cannot
+    be verified."""
+    receipt, manifest_name, manifest_bundle = tier_proof_names("trailing")
     metadata = set(assets.metadata_names("trailing"))
-    rank = lambda name: (0 if name == receipt else 3 if name in metadata
-                         else 2 if assets.is_archive(Path(name)) else 1, name)
+    order = {receipt: 0, manifest_bundle: 1, manifest_name: 2}
+    rank = lambda name: (order.get(name, 5 if name in metadata else 4 if assets.is_archive(Path(name)) else 3), name)
     return sorted(names, key=rank)
 
 
@@ -1160,7 +1220,8 @@ def recover(_args=None):
             output, proofs = work / "staged", work / "proofs"
             stage_candidate(selected, output, proofs, stage_work)
             full = {**flat_local_files(output), **flat_local_files(proofs)}
-            check_existing(inventory, existing, full, selected, version=version)
+            check_existing(inventory, existing, full, selected, version=version,
+                           draft=release["draft"], sha=sha, tag=tag)
             require(SELECTION in inventory, "candidate recovery requires the existing selection receipt")
             additions = full
         else:
