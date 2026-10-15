@@ -1151,12 +1151,12 @@ pub(crate) mod tests {
 
     /// meerkat 0.8.47: readiness observes the durable source body-free and
     /// actor-free. With a ~20 MB whole-blob member, 500 polls read the body
-    /// zero times and stay fast: their nearest-rank p99 (the fifth slowest
-    /// poll) stays under 100 ms, so one stalled poll on a loaded machine does
-    /// not decide the verdict, while body-sized work, which slows every poll,
-    /// still does. The positive control reads the member's body straight
-    /// from the counting store, which the session service's verified-body
-    /// cache (meerkat 0.8.49) cannot answer.
+    /// zero times and stay fast: their nearest-rank p99 (the sixth slowest
+    /// poll, leaving out the five slowest) stays under 100 ms, so one stalled
+    /// poll on a loaded machine does not decide the verdict, while body-sized
+    /// work, which slows every poll, still does. The positive control reads
+    /// the member's body straight from the counting store, which the session
+    /// service's verified-body cache (meerkat 0.8.49) cannot answer.
     #[tokio::test]
     async fn readiness_reads_no_body_of_a_large_whole_blob_member_across_five_hundred_polls() {
         const BODY_BYTES: usize = 20 * 1024 * 1024;
