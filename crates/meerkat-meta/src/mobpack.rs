@@ -14705,17 +14705,40 @@ fn manifest_declares_adaptive_section(manifest: &str) -> bool {
         .any(|line| line == "[adaptive]")
 }
 
-fn document_from_archive_bytes(bytes: &[u8]) -> Result<MobpackDocument, String> {
-    let decoder = GzDecoder::new(bytes);
-    let mut archive = tar::Archive::new(decoder);
-    let mut files = BTreeMap::<String, Vec<u8>>::new();
-    let mut editor_json = None;
-    let mut mob_toml = None;
-    let mut manifest_toml = None;
-    for entry in archive
+/// The most bytes an archive import expands to, tar headers included: far
+/// above any authored mobpack, far below what a small upload could inflate
+/// to otherwise.
+const MOBPACK_ARCHIVE_MAX_EXPANDED_BYTES: u64 = 32 * 1024 * 1024;
+/// The most entries an archive import reads.
+const MOBPACK_ARCHIVE_MAX_ENTRIES: usize = 4096;
+
+/// The members of a mobpack archive that import reads.
+struct MobpackArchiveMembers {
+    files: BTreeMap<String, Vec<u8>>,
+    editor_json: Option<String>,
+    mob_toml: Option<String>,
+    manifest_toml: Option<String>,
+}
+
+fn read_mobpack_archive_members(expanded: impl Read) -> Result<MobpackArchiveMembers, String> {
+    let mut archive = tar::Archive::new(expanded);
+    let mut members = MobpackArchiveMembers {
+        files: BTreeMap::new(),
+        editor_json: None,
+        mob_toml: None,
+        manifest_toml: None,
+    };
+    for (index, entry) in archive
         .entries()
         .map_err(|err| format!("invalid mobpack archive: {err}"))?
+        .enumerate()
     {
+        if index == MOBPACK_ARCHIVE_MAX_ENTRIES {
+            return Err(format!(
+                "mobpack archive has more than {MOBPACK_ARCHIVE_MAX_ENTRIES} entries; refusing \
+                 to import it"
+            ));
+        }
         let mut entry = entry.map_err(|err| format!("invalid mobpack archive entry: {err}"))?;
         let path = entry
             .path()
@@ -14733,14 +14756,33 @@ fn document_from_archive_bytes(bytes: &[u8]) -> Result<MobpackDocument, String> 
             let text = String::from_utf8(bytes.clone())
                 .map_err(|err| format!("invalid UTF-8 archive member {path}: {err}"))?;
             match path.as_str() {
-                "meta/editor.json" => editor_json = Some(text),
-                "meta/mob.toml" => mob_toml = Some(text),
-                "manifest.toml" => manifest_toml = Some(text),
+                "meta/editor.json" => members.editor_json = Some(text),
+                "meta/mob.toml" => members.mob_toml = Some(text),
+                "manifest.toml" => members.manifest_toml = Some(text),
                 _ => {}
             }
         }
-        files.insert(path, bytes);
+        members.files.insert(path, bytes);
     }
+    Ok(members)
+}
+
+fn document_from_archive_bytes(bytes: &[u8]) -> Result<MobpackDocument, String> {
+    // One byte over the cap tells an archive at the cap from a larger one.
+    let mut expanded = GzDecoder::new(bytes).take(MOBPACK_ARCHIVE_MAX_EXPANDED_BYTES + 1);
+    let members = read_mobpack_archive_members(&mut expanded);
+    if expanded.limit() == 0 {
+        return Err(format!(
+            "mobpack archive expands past {} MiB; refusing to import it",
+            MOBPACK_ARCHIVE_MAX_EXPANDED_BYTES >> 20
+        ));
+    }
+    let MobpackArchiveMembers {
+        files,
+        editor_json,
+        mob_toml,
+        manifest_toml,
+    } = members?;
     // A predecessor (pre-0.9) export keeps its editor document under the
     // predecessor archive directory. Reading on without it would import an
     // empty or layout-less document, so it refuses and names the move.
@@ -35564,6 +35606,60 @@ branch = "choice"
                 .unwrap()
                 .iter()
                 .any(|branch| branch["condition"] == "params.choice == left")
+        );
+    }
+
+    /// Security regression: importing an archive stops at a fixed expanded
+    /// size and entry count, so a small upload cannot expand into gigabytes
+    /// of memory.
+    #[test]
+    fn archive_import_refuses_archives_past_the_expansion_caps() {
+        let mut document = document_with_real_launch_modes();
+        document.mob_toml = None;
+        let exported = export_mobpack(&json!({ "document": document })).expect("export");
+        let archive = base64::engine::general_purpose::STANDARD
+            .decode(&exported.content_base64)
+            .expect("archive bytes");
+        let mut files = BTreeMap::new();
+        for entry in tar::Archive::new(GzDecoder::new(archive.as_slice()))
+            .entries()
+            .expect("entries")
+        {
+            let mut entry = entry.expect("entry");
+            let path = entry.path().expect("path").to_string_lossy().to_string();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).expect("member");
+            files.insert(path, bytes);
+        }
+        let import_with = |extra: Vec<(String, Vec<u8>)>| {
+            let mut files = files.clone();
+            files.extend(extra);
+            let archive = encode_deployable_mobpack_archive(&files).expect("encode");
+            (
+                archive.len(),
+                import_mobpack(&json!({
+                    "content_base64": base64::engine::general_purpose::STANDARD.encode(&archive)
+                })),
+            )
+        };
+
+        let (_, plain) = import_with(Vec::new());
+        let (bomb_len, bomb) =
+            import_with(vec![("skills/zeros.md".to_string(), vec![0_u8; 64 << 20])]);
+        let (_, crowd) = import_with(
+            (0..5_000)
+                .map(|index| (format!("skills/crowd-{index}.md"), b"x".to_vec()))
+                .collect(),
+        );
+
+        assert!(plain.is_ok(), "{plain:?}");
+        assert!(bomb_len < 1 << 20, "the bomb is {bomb_len} bytes");
+        assert_eq!(
+            (
+                bomb.map_err(|error| error.contains("expands past")),
+                crowd.map_err(|error| error.contains("more than")),
+            ),
+            (Err(true), Err(true))
         );
     }
 }

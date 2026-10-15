@@ -116,7 +116,7 @@ The mobpack-authoring methods:
 | `meta/mobpacks/validate` | Structural (and optional `rkat`) validation |
 | `meta/mobpacks/source` | Rendered source files (`meta/mob.toml`, …) without archive payload |
 | `meta/mobpacks/export` | `.mobpack` archive as base64 download |
-| `meta/mobpacks/import` | Import `.mobpack` / JSON / TOML |
+| `meta/mobpacks/import` | Import `.mobpack` / JSON / TOML (an archive may expand to at most 32 MiB and 4096 entries) |
 | `meta/mobpacks/deploy_command` | Preview the exact `rkat mob run` command |
 | `meta/mobpacks/deploy` | Deploy plan, or host execution when `execute: true` |
 

@@ -43,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `selected_skill_path_not_permitted` validation error. Callers with the
   `mobpack.deploy` grant or the host deploy opt-in, and the SDK's stdio RPC,
   may still name such paths.
+- Importing a mobpack archive (`meta/mobpacks/import`, and the draft methods
+  that re-import a stored archive) refuses an archive that expands past
+  32 MiB or holds more than 4096 entries. Before, a request under the HTTP
+  body limit could expand into gigabytes of memory.
 
 ### Breaking
 
