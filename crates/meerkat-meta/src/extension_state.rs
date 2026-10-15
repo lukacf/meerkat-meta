@@ -200,29 +200,38 @@ impl NativeAuthorityRegistry {
 
     /// The release counterpart of [`Self::before_activation`] for the agent
     /// mob-tool state: it drops a destroyed child's handle before that
-    /// destroy's storage cleanup drains the child's database observer.
+    /// destroy's storage cleanup drains the child's database observer, and
+    /// with it the handle of every other mob destroyed by then.
     pub(crate) fn after_destroy(self: &Arc<Self>) -> meerkat_mob_mcp::MobAfterDestroy {
         let registry = Arc::downgrade(self);
-        Arc::new(move |mob_id: &meerkat_mob::MobId| {
+        Arc::new(move |_destroyed: &meerkat_mob::MobId| {
             if let Some(registry) = registry.upgrade() {
-                registry.forget_destroyed(mob_id.as_str());
+                registry.forget_destroyed();
             }
         })
     }
 
-    /// Drop the handle bound under `id` when it observes a destroyed mob. A
-    /// mob bound under the id since is another mob and stays bound.
-    fn forget_destroyed(&self, id: &str) {
-        let released = {
+    /// Drop every bound handle that observes a destroyed mob. The destroy the
+    /// hook reports is one of them; a mob destroyed through its own handle,
+    /// or by a rollback inside Meerkat, reports none of its own and is
+    /// released here with the next. A mob bound under an id since is another
+    /// mob and stays bound. The handles are dropped after the lock is
+    /// released.
+    fn forget_destroyed(&self) {
+        let released: Vec<MobReadHandle> = {
             let mut handles = self
                 .handles
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if handles.get(id).is_some_and(is_destroyed) {
-                handles.remove(id)
-            } else {
-                None
-            }
+            let destroyed: Vec<String> = handles
+                .iter()
+                .filter(|(_, handle)| is_destroyed(handle))
+                .map(|(id, _)| id.clone())
+                .collect();
+            destroyed
+                .iter()
+                .filter_map(|id| handles.remove(id))
+                .collect()
         };
         drop(released);
     }
@@ -949,6 +958,93 @@ comms = true
         let former_owner = resolver.resolve(&owner_context, None).await.unwrap();
         assert!(!documents::can_create(&former_owner, &child_owner));
         drop(child);
+        handle.stop().await.unwrap();
+    }
+
+    /// The after-destroy hook releases every bound handle that observes a
+    /// destroyed mob, not only the one it reports: a mob destroyed through
+    /// its own handle, or by a rollback inside Meerkat, reports no destroy of
+    /// its own. A live mob stays bound.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_after_destroy_releases_every_destroyed_mob() {
+        let dir = tempfile::tempdir().unwrap();
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            r#"
+[mob]
+id = "destroyed-sweep"
+[profiles.worker]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+[profiles.worker.tools]
+comms = true
+"#,
+        )
+        .unwrap();
+        let spec = crate::MobBootstrapSpec::persistent(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            dir.path().to_path_buf(),
+            4,
+            Arc::new(
+                meerkat_store::SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
+                    .unwrap(),
+            ),
+        )
+        .unwrap()
+        .with_options(crate::MobBootstrapOptions {
+            allow_ephemeral_sessions: false,
+            notify_orchestrator_on_resume: false,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        });
+        let sessions = spec.session_service.clone();
+        let runtime = crate::MobRuntime::bootstrap(spec).await.unwrap();
+        let handle = runtime.handle();
+        let registry = NativeAuthorityRegistry::new(
+            "test".into(),
+            handle.mob_id().to_string(),
+            sessions.clone(),
+            None,
+            None,
+        );
+        registry.before_activation()(handle.read_handle())
+            .await
+            .unwrap();
+        let mut children = Vec::new();
+        for id in ["sweep-own-handle", "sweep-reported"] {
+            let mut child_definition = handle.definition().clone();
+            child_definition.id = id.into();
+            children.push(
+                meerkat_mob::MobBuilder::new(
+                    child_definition,
+                    meerkat_mob::MobStorage::in_memory(),
+                )
+                .with_session_service(sessions.clone())
+                .with_default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+                .before_activation(registry.before_activation())
+                .create()
+                .await
+                .unwrap(),
+            );
+        }
+        let bound =
+            || -> BTreeSet<String> { registry.handles.read().unwrap().keys().cloned().collect() };
+        assert_eq!(
+            bound(),
+            BTreeSet::from([
+                handle.mob_id().to_string(),
+                "sweep-own-handle".to_string(),
+                "sweep-reported".to_string(),
+            ])
+        );
+
+        for child in &children {
+            child.destroy().await.unwrap();
+        }
+        // Only the second destroy is reported, as the mob-tool state reports
+        // the destroys it runs; the first went through the mob's own handle.
+        registry.after_destroy()(children[1].mob_id());
+        assert_eq!(bound(), BTreeSet::from([handle.mob_id().to_string()]));
+        drop(children);
         handle.stop().await.unwrap();
     }
 

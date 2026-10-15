@@ -17,7 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   stayed, and its id could not be reused. The registry now drops a destroyed
   child through the agent mob-tool state's after-destroy hook
   (`MobMcpState::set_after_destroy`) before the destroy's storage cleanup
-  runs, so the destroy completes and removes the child's storage.
+  runs, so the destroy completes and removes the child's storage. The hook
+  also drops every other mob destroyed by then, such as one destroyed
+  through its own handle or by a rollback inside Meerkat, which reports no
+  destroy of its own.
 - A destroyed mob no longer counts as extension authority, also when it was
   destroyed outside the agent mob-tool state: it is no valid document owner
   any more, it leaves its former owner's managed mobs, and a former owner
