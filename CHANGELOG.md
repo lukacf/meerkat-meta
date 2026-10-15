@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- The Flow Editor that a runtime mounts on its reference app router, which
+  `meta_gateway` and `rpc_gateway` serve beside the console, no longer runs
+  `rkat` on the host for a caller that no access controller grants
+  `mobpack.deploy`. Without an access controller, any process that could
+  reach the gateway's listener (loopback by default, so any local user)
+  could send an unauthenticated `meta/mobpacks/deploy` with `execute: true`,
+  which writes an archive and runs `rkat mob run`, or
+  `meta/mobpacks/validate` with `rkat_validate: true`, which runs
+  `rkat mob validate`. Browsers could not send that request across origins.
+  Now the deploy is refused with `-32602` and the validation stays
+  structural, and `meta/capabilities` advertises
+  `deploy_execute_allowed: false` and `host_mutation_allowed: false`. An
+  enforced access controller still decides per caller, as before.
+  `http_flow_editor::protected_flow_editor_router` and
+  `http_flow_editor::flow_editor_rpc_router_with_decisions` take no access
+  controller, so they no longer run host deploys at all.
+
+### Breaking
+
+- Host deploys from the runtime-mounted Flow Editor need an access-controller
+  grant of `mobpack.deploy` or the new host opt-in (see Security and Added).
+
+### Added
+
+- `--allow-flow-editor-host-deploy` on `meta_gateway` and on
+  `rpc_gateway --persistent`, and `allow_flow_editor_host_deploy(bool)` on
+  `UnifiedRuntimeBuilder` and `UnifiedRuntime`, let the runtime-mounted Flow
+  Editor run host deploys for callers that no enforced access controller
+  governs. It allows every caller the route admits, so enable it only where
+  every process that can reach the listener is trusted. `meta_gateway`
+  includes it in the resume fingerprint, and `rpc_gateway` refuses it
+  without `--persistent`.
+
 ## [0.9.1] - 2026-10-15
 
 ### Breaking

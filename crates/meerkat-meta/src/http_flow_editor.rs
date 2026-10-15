@@ -47,19 +47,27 @@ where
     Router::new().route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
 }
 
+/// The Flow Editor behind the console's HTTP authentication, with no access
+/// controller. Nobody holds a `mobpack.deploy` grant here, so it never runs
+/// `rkat` on the host: deploys stay plans and validation stays structural.
 pub fn protected_flow_editor_router(decisions: RuntimeDecisionState) -> Router {
     flow_editor_frontend_router::<()>().merge(flow_editor_rpc_router_with_decisions(decisions))
 }
 
+/// The Flow Editor a runtime mounts on its reference app router.
+/// `host_deploy_without_access_control` is the host's opt-in to host deploys
+/// for callers that no enforced access controller governs.
 pub(crate) fn protected_flow_editor_router_with_runtime_catalog(
     decisions: RuntimeDecisionState,
     runtime_catalog: MobpackRuntimeCatalogState,
     access: Option<AccessController>,
+    host_deploy_without_access_control: bool,
 ) -> Router {
     flow_editor_frontend_router::<()>().merge(flow_editor_rpc_router_with_runtime_catalog(
         decisions,
         Some(runtime_catalog),
         access,
+        host_deploy_without_access_control,
     ))
 }
 
@@ -101,14 +109,17 @@ where
     )
 }
 
+/// The RPC plane of [`protected_flow_editor_router`]: no access controller,
+/// so no host deploys.
 pub fn flow_editor_rpc_router_with_decisions(decisions: RuntimeDecisionState) -> Router {
-    flow_editor_rpc_router_with_runtime_catalog(decisions, None, None)
+    flow_editor_rpc_router_with_runtime_catalog(decisions, None, None, false)
 }
 
 fn flow_editor_rpc_router_with_runtime_catalog(
     decisions: RuntimeDecisionState,
     runtime_catalog: Option<MobpackRuntimeCatalogState>,
     access: Option<AccessController>,
+    host_deploy_without_access_control: bool,
 ) -> Router {
     Router::new()
         .route("/flow-editor/rpc", post(protected_flow_editor_rpc_handler))
@@ -116,6 +127,7 @@ fn flow_editor_rpc_router_with_runtime_catalog(
             decisions,
             runtime_catalog,
             access,
+            host_deploy_without_access_control,
         })
 }
 
@@ -255,7 +267,15 @@ struct FlowEditorRpcState {
     decisions: RuntimeDecisionState,
     runtime_catalog: Option<MobpackRuntimeCatalogState>,
     access: Option<AccessController>,
+    /// Whether host deploys are allowed for callers that no enforced access
+    /// controller governs. Off unless the host opted in: without a
+    /// controller nobody holds a `mobpack.deploy` grant, and the route may
+    /// be anonymous (an open console on loopback).
+    host_deploy_without_access_control: bool,
 }
+
+/// The `auth.mode` the runtime-mounted Flow Editor reports.
+const REFERENCE_APP_AUTH_MODE: &str = "reference_app";
 
 #[derive(Clone, Copy)]
 struct FlowEditorAuthReport {
@@ -316,19 +336,23 @@ async fn protected_flow_editor_rpc_handler(
             })),
         );
     }
-    // Intersect capability advertisements with the caller's ABAC grants so
-    // the editor does not surface deploy affordances the caller can never
-    // use; per-call enforcement above remains authoritative.
-    let deploy_grant = access_view
-        .as_ref()
-        .filter(|view| view.enforced())
-        .is_none_or(|view| view.may_perform_anywhere(ACTION_MOBPACK_DEPLOY));
+    // Host deploys (`execute: true`, and validation with `rkat_validate`) run
+    // `rkat` on this host, so they need a `mobpack.deploy` grant. An enforced
+    // access controller decides per caller: the check above already refused
+    // a caller it does not grant, and the capability advertisement follows
+    // its grants so the editor does not surface deploy affordances the
+    // caller can never use. Without one nobody holds the grant, so only the
+    // host's explicit opt-in admits host deploys.
+    let deploy_grant = match access_view.as_ref().filter(|view| view.enforced()) {
+        Some(view) => view.may_perform_anywhere(ACTION_MOBPACK_DEPLOY),
+        None => state.host_deploy_without_access_control,
+    };
     let response_id = parsed_request.id.clone().unwrap_or(Value::Null);
     let response = dispatch_flow_editor_rpc_blocking(
         parsed_request,
         FlowEditorAuthReport {
             authenticated: true,
-            mode: "reference_app",
+            mode: REFERENCE_APP_AUTH_MODE,
             reason: "reference app Flow Editor authoring server",
             host_mutation_allowed: deploy_grant,
             deploy_execute_allowed: deploy_grant,
@@ -464,16 +488,12 @@ fn handle_flow_editor_rpc_with_auth(
         ),
         "meta/skills/catalog" => response_value(
             response_id,
-            Some(crate::mobpack::mobpack_skills_catalog_response_with_runtime(
-                runtime_catalog,
-            )),
+            Some(crate::mobpack::mobpack_skills_catalog_response_with_runtime(runtime_catalog)),
             None,
         ),
         "meta/agent_definitions/list" => response_value(
             response_id,
-            Some(
-                crate::mobpack::mobpack_agent_definitions_response_with_runtime(runtime_catalog),
-            ),
+            Some(crate::mobpack::mobpack_agent_definitions_response_with_runtime(runtime_catalog)),
             None,
         ),
         "meta/mobpacks/templates" => response_value(
@@ -491,7 +511,7 @@ fn handle_flow_editor_rpc_with_auth(
                 None,
                 Some(JsonRpcError {
                     code: -32602,
-                    message: "standalone Flow Editor RPC cannot execute host deploys; use deploy planning or run rkat mob run manually".to_string(),
+                    message: host_deploy_refusal(&auth).to_string(),
                     data: Some(serde_json::json!({
                         "method": "meta/mobpacks/deploy",
                         "execute": true,
@@ -578,6 +598,19 @@ fn handle_flow_editor_rpc_with_auth(
                 data: None,
             }),
         ),
+    }
+}
+
+/// Why a deploy with `execute: true` was refused, for the surface that
+/// refused it.
+fn host_deploy_refusal(auth: &FlowEditorAuthReport) -> &'static str {
+    if auth.mode == REFERENCE_APP_AUTH_MODE {
+        "this Flow Editor cannot execute host deploys without a mobpack.deploy access grant or \
+         the host's --allow-flow-editor-host-deploy opt-in; use deploy planning or run rkat mob \
+         run manually"
+    } else {
+        "standalone Flow Editor RPC cannot execute host deploys; use deploy planning or run rkat \
+         mob run manually"
     }
 }
 
@@ -702,8 +735,20 @@ mod tests {
     }
 
     async fn protected_rpc_response(access: Option<AccessController>, body: Value) -> Value {
-        let router =
-            super::flow_editor_rpc_router_with_runtime_catalog(open_decision_state(), None, access);
+        protected_rpc_response_with_host_deploy(access, false, body).await
+    }
+
+    async fn protected_rpc_response_with_host_deploy(
+        access: Option<AccessController>,
+        host_deploy_without_access_control: bool,
+        body: Value,
+    ) -> Value {
+        let router = super::flow_editor_rpc_router_with_runtime_catalog(
+            open_decision_state(),
+            None,
+            access,
+            host_deploy_without_access_control,
+        );
         let response = router
             .oneshot(
                 Request::builder()
@@ -1301,5 +1346,329 @@ mod tests {
                         .is_some_and(|text| text.contains("[mob]"))),
             "{response:#?}"
         );
+    }
+
+    /// A runtime with no access controller, as both bundled gateways build
+    /// one by default. Each test names its own mob: lib tests share one
+    /// in-process comms registry, which refuses a second live supervisor
+    /// route for the same mob.
+    async fn runtime_without_access_control(
+        dir: &std::path::Path,
+        mob_id: &str,
+    ) -> crate::UnifiedRuntime {
+        let session_path = dir.join("sessions");
+        std::fs::create_dir_all(&session_path).expect("session path");
+        let session_service: std::sync::Arc<dyn meerkat_mob::MobSessionService> =
+            std::sync::Arc::new(meerkat::build_ephemeral_service(
+                meerkat::AgentFactory::new(&session_path),
+                meerkat::Config::default(),
+                16,
+            ));
+        let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n"
+        ))
+        .expect("mob definition");
+        let mob_spec = crate::MobBootstrapSpec::new(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            session_service,
+        )
+        .with_options(crate::mob_handle_runtime::MobBootstrapOptions {
+            allow_ephemeral_sessions: true,
+            notify_orchestrator_on_resume: true,
+            default_llm_client: Some(std::sync::Arc::new(meerkat_client::TestClient::default())),
+        });
+        let module_config = crate::MetaConfig {
+            modules: vec![],
+            discovery: crate::types::DiscoverySpec {
+                namespace: mob_id.to_string(),
+                modules: vec![],
+            },
+            pre_spawn: vec![],
+        };
+        crate::UnifiedRuntime::bootstrap(mob_spec, module_config, std::time::Duration::from_secs(5))
+            .await
+            .expect("bootstrap runtime")
+    }
+
+    /// POST one anonymous JSON-RPC request to `/flow-editor/rpc`, the way the
+    /// gateway listener receives it from any local process.
+    async fn anonymous_flow_editor_rpc(app: &axum::Router, method: &str, params: Value) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/flow-editor/rpc")
+                    .header("content-type", "application/json")
+                    .body(Body::from(rpc_body(method, params).to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("flow editor rpc response");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    /// An `rkat` that appends one line to `marker` for every run and answers
+    /// like a completed `rkat mob run`.
+    #[cfg(unix)]
+    fn recording_rkat(dir: &std::path::Path, marker: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let rkat = dir.join("rkat");
+        std::fs::write(
+            &rkat,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> '{}'\n\
+                 printf 'run\\tmob=docs\\tflow=main\\trun_id=run-1\\tstatus=completed\\n'\n\
+                 printf 'result\\t{{\"reply\":\"OK\"}}\\n'\n",
+                marker.to_string_lossy()
+            ),
+        )
+        .expect("write recording rkat");
+        let mut permissions = std::fs::metadata(&rkat)
+            .expect("recording rkat metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&rkat, permissions).expect("chmod recording rkat");
+        rkat
+    }
+
+    /// Security regression: the Flow Editor a runtime mounts on its reference
+    /// app router is served by both bundled gateways, with an open console on
+    /// loopback. Loopback is not same-user isolation, so a caller with no
+    /// `mobpack.deploy` grant must not run `rkat` on the host through it. With
+    /// no access controller and no host opt-in nobody holds that grant:
+    /// anonymous `meta/mobpacks/deploy {execute: true}` and
+    /// `meta/mobpacks/validate {rkat_validate: true}` stay plans and
+    /// structural checks, write no archive, and the capability advertisement
+    /// says so.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_flow_editor_deploy_execute_denied_without_host_grant_or_access_controller() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime =
+            runtime_without_access_control(dir.path(), "flow-editor-deploy-default-deny").await;
+        let app = runtime.build_reference_app_router(open_decision_state());
+        let marker = dir.path().join("rkat.runs");
+        let rkat = recording_rkat(dir.path(), &marker);
+        let deploy_dir = dir.path().join("deploy");
+        let validation_pack = dir.path().join("validate.mobpack");
+
+        let catalogs = anonymous_flow_editor_rpc(&app, "meta/mobpacks/catalogs", Value::Null).await;
+        let document = catalogs["result"]["sample_mobpacks"]
+            .as_array()
+            .expect("sample mobpacks")
+            .iter()
+            .find(|sample| sample["id"] == "sample_docs_only")
+            .expect("docs sample")["document"]
+            .clone();
+        let capabilities = anonymous_flow_editor_rpc(&app, "meta/capabilities", Value::Null).await;
+        let deploy = anonymous_flow_editor_rpc(
+            &app,
+            "meta/mobpacks/deploy",
+            json!({
+                "document": document,
+                "prompt": "Reply with exactly OK.",
+                "execute": true,
+                "output_dir": deploy_dir,
+                "rkat_bin": rkat,
+            }),
+        )
+        .await;
+        let validate = anonymous_flow_editor_rpc(
+            &app,
+            "meta/mobpacks/validate",
+            json!({
+                "document": document,
+                "rkat_validate": true,
+                "rkat_bin": rkat,
+                "validation_pack_path": validation_pack,
+            }),
+        )
+        .await;
+        let _shutdown = runtime.shutdown().await;
+
+        assert_eq!(
+            std::fs::read_to_string(&marker).ok(),
+            None,
+            "rkat ran on the host without a deploy grant: deploy {deploy:#?} validate {validate:#?}"
+        );
+        assert!(
+            !deploy_dir.exists(),
+            "deploy wrote an archive without a deploy grant: {deploy:#?}"
+        );
+        assert!(
+            !validation_pack.exists(),
+            "validate wrote an archive without a deploy grant: {validate:#?}"
+        );
+        let advertised = &capabilities["result"]["authoring_capabilities"];
+        assert_eq!(
+            (
+                advertised["deploy_execute_allowed"].clone(),
+                advertised["host_mutation_allowed"].clone(),
+            ),
+            (json!(false), json!(false)),
+            "{capabilities:#?}"
+        );
+        assert_eq!(deploy["error"]["code"], json!(-32602), "{deploy:#?}");
+        assert_eq!(
+            deploy["error"]["data"],
+            json!({
+                "method": "meta/mobpacks/deploy",
+                "execute": true,
+                "deploy_command": "rkat mob run"
+            }),
+            "{deploy:#?}"
+        );
+        assert_eq!(validate["result"]["ok"], json!(true), "{validate:#?}");
+        assert_ne!(
+            validate["result"]["validation_source"],
+            json!("rkat mob validate"),
+            "{validate:#?}"
+        );
+    }
+
+    /// The host's explicit opt-in (`--allow-flow-editor-host-deploy` on the
+    /// gateways) restores host deploys on a runtime without access control.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_flow_editor_deploy_execute_runs_with_the_host_deploy_opt_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut runtime =
+            runtime_without_access_control(dir.path(), "flow-editor-deploy-host-opt-in").await;
+        runtime.allow_flow_editor_host_deploy(true);
+        let app = runtime.build_reference_app_router(open_decision_state());
+        let marker = dir.path().join("rkat.runs");
+        let rkat = recording_rkat(dir.path(), &marker);
+        let deploy_dir = dir.path().join("deploy");
+
+        let catalogs = anonymous_flow_editor_rpc(&app, "meta/mobpacks/catalogs", Value::Null).await;
+        let document = catalogs["result"]["sample_mobpacks"]
+            .as_array()
+            .expect("sample mobpacks")
+            .iter()
+            .find(|sample| sample["id"] == "sample_docs_only")
+            .expect("docs sample")["document"]
+            .clone();
+        let capabilities = anonymous_flow_editor_rpc(&app, "meta/capabilities", Value::Null).await;
+        let deploy = anonymous_flow_editor_rpc(
+            &app,
+            "meta/mobpacks/deploy",
+            json!({
+                "document": document,
+                "prompt": "Reply with exactly OK.",
+                "execute": true,
+                "output_dir": deploy_dir,
+                "rkat_bin": rkat,
+            }),
+        )
+        .await;
+        let _shutdown = runtime.shutdown().await;
+
+        let advertised = &capabilities["result"]["authoring_capabilities"];
+        assert_eq!(
+            (
+                advertised["deploy_execute_allowed"].clone(),
+                advertised["host_mutation_allowed"].clone(),
+            ),
+            (json!(true), json!(true)),
+            "{capabilities:#?}"
+        );
+        assert_eq!(
+            (
+                deploy["result"]["executed"].clone(),
+                deploy["result"]["success"].clone()
+            ),
+            (json!(true), json!(true)),
+            "{deploy:#?}"
+        );
+        let runs = std::fs::read_to_string(&marker).expect("rkat ran");
+        assert_eq!(runs.lines().count(), 1, "{runs}");
+        assert!(runs.starts_with("mob run "), "{runs}");
+    }
+
+    /// Without an access controller and without the opt-in, the protected
+    /// router refuses execute-deploys and names both ways to allow them.
+    #[tokio::test]
+    async fn without_access_control_or_opt_in_the_refusal_names_the_grant_and_the_opt_in() {
+        let response = protected_rpc_response(
+            None,
+            rpc_body("meta/mobpacks/deploy", json!({ "execute": true })),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], json!(-32602), "{response:#?}");
+        assert_eq!(
+            response["error"]["message"],
+            json!(
+                "this Flow Editor cannot execute host deploys without a mobpack.deploy access \
+                 grant or the host's --allow-flow-editor-host-deploy opt-in; use deploy \
+                 planning or run rkat mob run manually"
+            )
+        );
+    }
+
+    /// An enforced access controller decides per caller, with or without the
+    /// opt-in: a `mobpack.deploy` grant admits host deploys without it, and
+    /// the opt-in never admits a caller the controller does not grant.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_enforced_access_controller_decides_host_deploys_with_or_without_the_opt_in() {
+        let catalogs = super::handle_flow_editor_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "meta/mobpacks/catalogs".to_string(),
+            params: Value::Null,
+        });
+        let document = catalogs["result"]["sample_mobpacks"]
+            .as_array()
+            .expect("sample mobpacks")
+            .iter()
+            .find(|sample| sample["id"] == "sample_docs_only")
+            .expect("docs sample")["document"]
+            .clone();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("rkat.runs");
+        let rkat = recording_rkat(dir.path(), &marker);
+        let deploy = |output: &str| {
+            rpc_body(
+                "meta/mobpacks/deploy",
+                json!({
+                    "document": document,
+                    "prompt": "Reply with exactly OK.",
+                    "execute": true,
+                    "output_dir": dir.path().join(output),
+                    "rkat_bin": rkat,
+                }),
+            )
+        };
+
+        let operators = authoring_access_controller(vec![allow_everyone(
+            "operators",
+            &["mobpack.author", "mobpack.deploy"],
+        )]);
+        let granted =
+            protected_rpc_response_with_host_deploy(Some(operators), false, deploy("granted"))
+                .await;
+        assert_eq!(granted["result"]["executed"], json!(true), "{granted:#?}");
+
+        let authors =
+            authoring_access_controller(vec![allow_everyone("authors", &["mobpack.author"])]);
+        let ungranted =
+            protected_rpc_response_with_host_deploy(Some(authors), true, deploy("ungranted")).await;
+        assert_eq!(
+            (
+                ungranted["error"]["code"].clone(),
+                ungranted["error"]["data"]["action"].clone()
+            ),
+            (json!(ACCESS_DENIED_RPC_CODE), json!("mobpack.deploy")),
+            "{ungranted:#?}"
+        );
+        let runs = std::fs::read_to_string(&marker).expect("the granted deploy ran rkat");
+        assert_eq!(runs.lines().count(), 1, "{runs}");
+        assert!(!dir.path().join("ungranted").exists());
     }
 }

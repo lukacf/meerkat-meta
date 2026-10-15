@@ -172,6 +172,7 @@ pub struct UnifiedRuntimeBuilder {
     control_grants: Option<crate::runtime::cross_mob_control::ControlGrantTable>,
     persistent_metadata: Option<Arc<dyn PersistentMetadataStore>>,
     access_controller: Option<crate::access::AccessController>,
+    flow_editor_host_deploy: bool,
     topology_control_policy: crate::topology_control::TopologyControlPolicy,
     live: Option<super::live_compose::LiveOptions>,
     #[cfg(feature = "openai-live")]
@@ -1061,6 +1062,14 @@ impl UnifiedRuntimeBuilder {
         self
     }
 
+    /// Let the Flow Editor on the reference app router run `rkat` on this
+    /// host for callers that no enforced access controller governs. Off by
+    /// default; see [`UnifiedRuntime::allow_flow_editor_host_deploy`].
+    pub fn allow_flow_editor_host_deploy(mut self, allowed: bool) -> Self {
+        self.flow_editor_host_deploy = allowed;
+        self
+    }
+
     /// Enable access control backed by an existing TOML file
     /// (conventionally `config/access.toml`); admin edits from the console
     /// persist back to the same path. A missing path, a directory, or an
@@ -1785,6 +1794,7 @@ impl UnifiedRuntimeBuilder {
         let mut runtime = UnifiedRuntime::from_parts_unchecked(
             super::UnifiedRuntimeCore {
                 access_controller: self.access_controller,
+                flow_editor_host_deploy: self.flow_editor_host_deploy,
                 topology_controller,
                 post_spawn_hook: self.post_spawn_hook,
                 post_reconcile_hook: self.post_reconcile_hook,

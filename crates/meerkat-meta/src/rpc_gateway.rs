@@ -9806,9 +9806,13 @@ const BARE_INVOCATION_USAGE: &str = r#"rpc_gateway: no mode selected.
 
 usage:
   rpc_gateway --persistent [--control-listen <tcp://host:port | uds:///path>]
+              [--allow-flow-editor-host-deploy]
       The long-lived gateway. Reads one `meta/init` request on stdin, then
       serves JSON-RPC over stdin/stdout until the host closes it. Every SDK
       persistent transport and every deployment uses this mode.
+      --allow-flow-editor-host-deploy lets the Flow Editor on its listener
+      run rkat on this host for callers that no enforced access controller
+      governs; without it they get deploy plans and structural validation.
 
   META_RPC_REQUEST='<one JSON-RPC request>' rpc_gateway
       Single-shot module-plane probe: answers exactly one request against a
@@ -13976,10 +13980,14 @@ impl std::fmt::Display for DispatchLoopEnd {
     }
 }
 
-fn run_persistent(control_listen: Option<ControlListenAddr>) {
+fn run_persistent(control_listen: Option<ControlListenAddr>, flow_editor_host_deploy: bool) {
     match crate::gateway_composition::gateway_tokio_runtime() {
         Ok(runtime) => {
-            let result = runtime.block_on(run_persistent_owned(control_listen, None));
+            let result = runtime.block_on(run_persistent_owned(
+                control_listen,
+                None,
+                flow_editor_host_deploy,
+            ));
             // Tokio's stdin adapter retains an uncancellable blocking read when
             // a signal or private control closes admission before stdin EOF.
             // All domain cleanup has settled before this return. Do not let
@@ -14643,7 +14651,9 @@ pub async fn run_persistent_with_host(
     control_listen: Option<ControlListenAddr>,
     host: Arc<dyn GatewayHostComposition>,
 ) -> Result<(), GatewayRunError> {
-    run_persistent_owned(control_listen, Some(host)).await
+    // A native host decides the Flow Editor host-deploy opt-in itself, in
+    // `bind_runtime`; the launch flag belongs to the stock binary.
+    run_persistent_owned(control_listen, Some(host), false).await
 }
 
 /// The caller guard's synchronous `begin_close` outcome, retained for the
@@ -14699,6 +14709,7 @@ impl Drop for GatewayCallerGuard {
 async fn run_persistent_owned(
     control_listen: Option<ControlListenAddr>,
     host: Option<Arc<dyn GatewayHostComposition>>,
+    flow_editor_host_deploy: bool,
 ) -> Result<(), GatewayRunError> {
     let (cancel, mut cancelled) = oneshot::channel();
     let caller_close = GatewayCallerClose::default();
@@ -14716,6 +14727,7 @@ async fn run_persistent_owned(
             run_persistent_inner(
                 control_listen,
                 host.as_ref(),
+                flow_editor_host_deploy,
                 &mut resources,
                 &mut cancelled,
             )
@@ -15277,6 +15289,7 @@ async fn bootstrap_identity_roster_held(
 async fn run_persistent_inner(
     control_listen: Option<ControlListenAddr>,
     host: Option<&Arc<dyn GatewayHostComposition>>,
+    flow_editor_host_deploy: bool,
     resources: &mut GatewayRunResources,
     cancelled: &mut oneshot::Receiver<()>,
 ) -> Result<(), GatewayRunError> {
@@ -17233,6 +17246,15 @@ external_addressable = true
     if let Some(access) = gateway_options.access.take() {
         runtime.set_access_controller(access);
     }
+    // Without an enforced access controller the Flow Editor refuses host
+    // deploys unless the launch opted in.
+    if flow_editor_host_deploy {
+        tracing::warn!(
+            "--allow-flow-editor-host-deploy: the Flow Editor on this gateway's listener lets \
+             every caller that no enforced access controller governs run rkat on this host"
+        );
+        runtime.allow_flow_editor_host_deploy(true);
+    }
 
     // 5b. Wire error hook — forwards ErrorEvents to Python as JSON-RPC notifications
     let gateway_error_hook: crate::ErrorHook = {
@@ -18579,12 +18601,22 @@ pub fn main() {
             std::process::exit(2);
         }
     };
+    let flow_editor_host_deploy = args
+        .iter()
+        .skip(1)
+        .any(|a| a == "--allow-flow-editor-host-deploy");
     if args.iter().any(|a| a == "--persistent") {
-        run_persistent(control_listen);
+        run_persistent(control_listen, flow_editor_host_deploy);
     } else {
         if control_listen.is_some() {
             eprintln!(
                 "--control-listen requires --persistent (the single-shot gateway hosts no long-lived runtime to serve control RPC)"
+            );
+            std::process::exit(2);
+        }
+        if flow_editor_host_deploy {
+            eprintln!(
+                "--allow-flow-editor-host-deploy requires --persistent (only the persistent gateway serves the Flow Editor)"
             );
             std::process::exit(2);
         }

@@ -422,6 +422,10 @@ pub struct UnifiedRuntimeCore {
     // Optional ABAC enforcement shared by the console/SSE surfaces.
     access_controller: Option<crate::access::AccessController>,
 
+    // The host's opt-in to Flow Editor host deploys for callers that no
+    // enforced access controller governs. Off by default.
+    flow_editor_host_deploy: bool,
+
     // Optional product-level topology authority. The controller always
     // exists so query can remain available, but its policy defaults to
     // disabled and mutation methods are then absent/denied.
@@ -892,6 +896,7 @@ impl UnifiedRuntime {
                 session_bridge: None,
                 identity_first_context: None,
                 access_controller: None,
+                flow_editor_host_deploy: false,
                 topology_controller: crate::topology_control::TopologyController::default(),
                 memory_panel_store: std::sync::RwLock::new(None),
                 job_health_projection: Arc::new(std::sync::RwLock::new(None)),
@@ -1938,6 +1943,22 @@ impl UnifiedRuntime {
     /// this call enforce (and live-serve) the ABAC configuration.
     pub fn set_access_controller(&mut self, controller: crate::access::AccessController) {
         self.access_controller = Some(controller);
+    }
+
+    /// Whether the Flow Editor on the reference app router may run `rkat` on
+    /// this host for callers that no enforced access controller governs:
+    /// `meta/mobpacks/deploy` with `execute: true` and
+    /// `meta/mobpacks/validate` with `rkat_validate: true`. Off by default,
+    /// so without an access controller that grants `mobpack.deploy` both are
+    /// refused (deploys stay plans, validation stays structural).
+    ///
+    /// Allowed, every caller the route admits may deploy: on an open console
+    /// that is every process that can reach the listener, whichever user
+    /// runs it. An enforced access controller keeps deciding per caller
+    /// either way. Routers built after this call use it. The bundled
+    /// gateways set it from `--allow-flow-editor-host-deploy`.
+    pub fn allow_flow_editor_host_deploy(&mut self, allowed: bool) {
+        self.flow_editor_host_deploy = allowed;
     }
 
     /// Wire the bundled sqlite memory store into the console Memory panel

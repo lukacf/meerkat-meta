@@ -28,6 +28,26 @@ address instead.
 
 In this mode the authoring catalogs are runtime-backed: tools, skills, agent definitions, and flow registries reflect the live mob definition and loaded modules, and `meta/capabilities` reports `runtime_backed_catalogs: true`.
 
+Host deploys are off by default in this mode. Deploying with `execute: true`
+or validating with `rkat_validate: true` runs `rkat` on the gateway's host, so
+it needs a caller that an enforced access controller grants `mobpack.deploy`.
+A runtime without an enforced access controller refuses both unless the host
+opts in:
+
+| Host | Opt-in |
+|------|--------|
+| `meta_gateway` | `--allow-flow-editor-host-deploy` |
+| `rpc_gateway` | `--persistent --allow-flow-editor-host-deploy`; the SDK builders pass no launch flags, so an SDK host points its gateway path at a wrapper that adds the flag, or uses a transport with extra arguments (`extra_args` / `extraArgs`) |
+| Rust host | `UnifiedRuntimeBuilder::allow_flow_editor_host_deploy(true)` or `UnifiedRuntime::allow_flow_editor_host_deploy(true)` before building the router |
+
+The opt-in allows host deploys for every caller the route admits. On an open
+console bound to loopback that is every process on the host that can reach
+the port, whichever user runs it, so enable it only where every such process
+is trusted. It never overrides an enforced access controller, which keeps
+deciding per caller. `meta_gateway` includes the opt-in in its resume
+fingerprint, so a launch never resumes a runtime started with the other
+setting.
+
 ### Standalone binary
 
 For authoring without a runtime, run the dedicated binary:
@@ -135,8 +155,10 @@ validation passes, the server writes a rendered archive and spawns
 
 That second phase runs only when the surface and caller have host-mutation
 authority. The standalone server without `--allow-host-deploy` strips the
-request flag and returns structural validation only. An ABAC-enabled runtime
-requires `mobpack.deploy`; without it the call is denied with error `-32030`.
+request flag and returns structural validation only, and so does a runtime
+without an enforced access controller unless the host opted in with
+`--allow-flow-editor-host-deploy`. An ABAC-enabled runtime requires
+`mobpack.deploy`; without it the call is denied with error `-32030`.
 After admission, a missing `rkat` executable produces a warning row
 (`rkat mob validate skipped`) instead of failing the structural result.
 
@@ -147,7 +169,7 @@ RPC `input_params` values are forwarded as repeated `--param key=<json>` binding
 HTTP host-mutation gates:
 
 - **Standalone binary** - `rkat_validate: true` and deploy `execute: true` both require `--allow-host-deploy` (or the env flag). Without it, validation stays structural and execute-deploy fails with a pointer to manual deploy.
-- **Runtime-mounted editor** - both host-mutating operations require the caller's `mobpack.deploy` grant when access control is enforced; open otherwise.
+- **Runtime-mounted editor** - both host-mutating operations require the caller's `mobpack.deploy` grant when access control is enforced. Without an enforced access controller they are refused unless the host opted in (`--allow-flow-editor-host-deploy`, or `allow_flow_editor_host_deploy(true)` in Rust); a refused execute-deploy fails with `-32602` and validation stays structural.
 
 ## Access control
 
@@ -163,6 +185,12 @@ For callers without `mobpack.deploy`, `deploy_execute_allowed` and
 `host_mutation_allowed` are `false`, and the editor does not render the related
 host-mutation affordances. Per-call enforcement remains authoritative; denials
 surface as JSON-RPC error `-32030` with `data.kind = "access_denied"`.
+
+Without an enforced access controller there is no grant to evaluate, so a
+runtime-mounted editor treats every caller as lacking `mobpack.deploy`: it
+advertises `deploy_execute_allowed: false` and `host_mutation_allowed: false`
+and refuses host deploys, unless the host opted in with
+`--allow-flow-editor-host-deploy` (see [On a running runtime](#on-a-running-runtime)).
 
 The standalone binary is a token-less local tool: it binds `127.0.0.1` by default, there is no principal to evaluate, and `--allow-host-deploy` is the only deploy gate.
 
