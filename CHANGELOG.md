@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   destroyed outside the agent mob-tool state: it is no valid document owner
   any more, it leaves its former owner's managed mobs, and a former owner
   that is still live can no longer create documents owned by it.
+- A child mob restored with its runtime still could not be destroyed
+  completely: the runtime's agent event forwarder and identity stream
+  health monitor kept the handles of every mob their first reconcile pass
+  enumerated, restored child mobs included, for as long as they ran. Such a
+  child's destroy answered `Incomplete` with the same storage cleanup
+  refusal. Only their state watchers outlive that pass now.
 
 ## [0.9.1] - 2026-10-15
 

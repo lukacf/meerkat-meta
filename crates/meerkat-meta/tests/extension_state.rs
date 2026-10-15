@@ -1698,3 +1698,59 @@ async fn extension_authority_registry_owner_cleanup_destroys_document_mcp_childr
     drop(state);
     runtime.shutdown().await;
 }
+
+/// A child mob restored with its runtime is released on destroy as a fresh
+/// one is: the restored runtime binds the child's extension authority again,
+/// and nothing it composes keeps the child's handle past the destroy, so the
+/// destroy completes and removes the child's storage.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_authority_registry_releases_a_restored_child_mob_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, _) = harness(dir.path(), None).await;
+    let owned = OwnedChild::create(&runtime, &context, dir.path()).await;
+    let child = owned.child.clone();
+    drop(owned);
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(context);
+
+    let (reopened, context, _) = harness(dir.path(), None).await;
+    let state = reopened
+        .mob_runtime()
+        .agent_mob_mcp_state()
+        .expect("the runtime composes the agent mob-tool state");
+    let handle = state
+        .handle_for(&child)
+        .await
+        .expect("the child is restored with its runtime");
+    let member_session = handle
+        .get_member(&AgentIdentity::from("child-worker"))
+        .await
+        .unwrap()
+        .unwrap()
+        .bridge_session_id()
+        .unwrap()
+        .clone();
+    drop(handle);
+    assert!(
+        matches!(
+            caller(&context, &member_session).await.principal(),
+            Principal::Worker { mob_id, .. } if mob_id == child.as_str()
+        ),
+        "the restored child's member resolves its document caller again"
+    );
+    let report = state
+        .mob_destroy(&child)
+        .await
+        .unwrap_or_else(|error| panic!("the restored child's destroy must complete: {error}"));
+    assert!(report.errors.is_empty(), "{report:?}");
+    let remaining = child_mob_storage_files(dir.path());
+    assert!(
+        !remaining
+            .iter()
+            .any(|name| name.starts_with(&format!("mob--{child}.db"))),
+        "the restored child's storage is removed: {remaining:?}"
+    );
+    drop(state);
+    reopened.shutdown().await;
+}
