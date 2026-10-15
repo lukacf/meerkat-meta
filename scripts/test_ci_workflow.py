@@ -389,7 +389,7 @@ class CiWorkflowTests(unittest.TestCase):
                 "scripts/repo-cargo test -p meerkat-meta --locked --features extension-state "
                 "--test extension_state",
                 "scripts/repo-cargo test -p meerkat-meta --locked --features extension-state "
-                "--lib extension_",
+                "--lib -- extension_ document_mcp_child_supply",
             ],
         )
         for name in ("extension-state-lint", "test-extension-state"):
