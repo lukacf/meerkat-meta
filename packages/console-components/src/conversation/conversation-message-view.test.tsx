@@ -56,6 +56,32 @@ describe("ConversationMessageView", () => {
     }
   });
 
+  test("stock and shared operation refusal cards claim no permission cause", () => {
+    const frames = [{ id: "start", event: "run_started", runId: "run", data: {} }, {
+      id: "refused", event: "tool_result_received", runId: "run", data: {
+        id: "refused-call", name: "write_file", is_error: true,
+        content: [{ type: "text", text: JSON.stringify({
+          error: "operation_refused", message: "operation unavailable under current authorization",
+        }) }],
+      },
+    }];
+    for (const map of [mapShared, mapStock]) {
+      const entry = map(null, frames).find(item => item.kind === "message" && item.operationFeedback)!;
+      expect(entry).toBeDefined();
+      const shared = render(<ConversationMessageView entry={entry} />);
+      const stock = render(<ChatPane agent={null} agentLabel="Agent" identity="agent" entries={[entry]} phase="waiting" draft="" sending={false} staged={[]} onDraftChange={() => {}} onStagedChange={() => {}} onSend={() => false} />);
+      for (const view of [shared, stock]) {
+        const feedback = view.container.querySelector('[data-feedback-kind="operation-refused"]');
+        expect(feedback?.getAttribute("role")).toBe("status");
+        expect(feedback?.getAttribute("aria-label")).toBe("Action refused");
+        expect(feedback?.textContent).toContain("refused under the current authorization, so it did not run");
+        expect(feedback?.textContent).not.toMatch(/Permission denied|not permitted|Run failed/);
+        expect(feedback?.querySelector("button, a, [role='button']")).toBeNull();
+      }
+      shared.unmount(); stock.unmount();
+    }
+  });
+
   test("stock and shared local hook feedback names the blocked call without presenting a run failure", () => {
     const frames = [{ id: "start", event: "run_started", runId: "run", data: {} }, {
       id: "refused", event: "hook_launch_refused", runId: "run", data: {

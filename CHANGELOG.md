@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Console: an operation refusal reads "Action refused" instead of
+  "Permission denied". The host refuses an operation for a policy denial, for
+  an authorization that changed after the operation was prepared and for
+  request facts it could not evaluate, and sends all of them alike, as the
+  `operation_refused` runtime notice or tool error without a reason, so the
+  card now names no cause: "This action was refused under the current
+  authorization, so it did not run." Its feedback kind
+  (`operationFeedback.kind`, the card's `data-feedback-kind`) is
+  `operation-refused` instead of `permission-refused`.
+
 ### Changed
 
 - CI: the `test-integration` jobs no longer set a fake `OPENAI_API_KEY`. The

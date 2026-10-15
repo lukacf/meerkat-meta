@@ -917,16 +917,16 @@ test("stock chat renders one approval for a run continued after a user steer", (
 
 test("stock chat retains typed local refusal and separate audit diagnostic cards", () => {
   const entries = [
-    { kind: "permission-refused" as const, title: "Permission denied", detail: "The agent can continue with permitted work." },
+    { kind: "operation-refused" as const, title: "Action refused", detail: "This action was refused under the current authorization, so it did not run." },
     { kind: "audit-unavailable" as const, title: "Audit update unavailable", detail: "Actual result unchanged.", operationId: "op-1" },
   ].map((operationFeedback, index): ConversationTimelineEntry => ({
     id: `feedback-${index}`, kind: "message", variant: "meta", identity: AGENT,
     createdAt: "2026-10-01T12:00:00Z", text: operationFeedback.detail, operationFeedback,
   }));
   const html = renderChat({ entries, phase: null });
-  assert.match(html, /Permission denied/);
+  assert.match(html, /Action refused/);
   assert.match(html, /Audit update unavailable/);
-  assert.match(html, /data-feedback-kind="permission-refused"/);
+  assert.match(html, /data-feedback-kind="operation-refused"/);
   assert.match(html, /data-feedback-kind="audit-unavailable"/);
   assert.doesNotMatch(html, /Event details/);
 });
