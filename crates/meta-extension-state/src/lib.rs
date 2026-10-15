@@ -41,6 +41,20 @@ pub trait ExtensionDocumentStore: Send + Sync {
         request: &RequestIdentity,
         mutation: Mutation,
     ) -> Result<MutationOutcome>;
+    /// Whether any live document of `realm`, in any namespace, names the mob
+    /// `mob_id` as its owner or in an audience entry
+    /// ([`Document::names_mob`]). A host asks before a new mob takes an id:
+    /// the new mob would inherit what those documents grant the id. The
+    /// answer covers the documents committed when the store reads them, and
+    /// reading them costs one pass over every live document of the realm.
+    /// A store that cannot answer returns an error, and the host then
+    /// refuses the create.
+    async fn references_mob(&self, realm: &str, mob_id: &str) -> Result<bool> {
+        let _ = (realm, mob_id);
+        Err(Error::Storage(
+            "this document store cannot report which documents name a mob".into(),
+        ))
+    }
 }
 
 /// Namespace and realm are bound by host composition, never tool input.

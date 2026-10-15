@@ -232,6 +232,28 @@ impl ExtensionDocumentStore for SqliteExtensionDocumentStore {
             Ok(DocumentPage { documents, next })
         }).await
     }
+    async fn references_mob(&self, realm: &str, mob_id: &str) -> Result<bool> {
+        let (realm, mob_id) = (realm.to_owned(), mob_id.to_owned());
+        self.run(move |connection| {
+            // One read transaction: every live document of the realm, in every
+            // namespace, as committed when it starts. A row that does not
+            // decode fails the answer rather than being skipped.
+            let tx = connection.transaction().map_err(storage)?;
+            let mut statement = tx
+                .prepare("SELECT metadata FROM extension_documents WHERE realm=?1 AND deleted=0")
+                .map_err(storage)?;
+            let mut rows = statement.query(params![realm]).map_err(storage)?;
+            while let Some(row) = rows.next().map_err(storage)? {
+                let metadata: String = row.get(0).map_err(storage)?;
+                let document: Document = decode(&metadata)?;
+                if document.names_mob(&mob_id) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .await
+    }
     async fn lookup_receipt(
         &self,
         scope: &DocumentScope,

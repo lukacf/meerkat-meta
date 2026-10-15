@@ -356,6 +356,22 @@ pub struct Document {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
+impl Document {
+    /// Whether this document names the mob `mob_id`: as its owner
+    /// ([`Owner::Mob`]) or in an audience entry ([`Audience::Mob`]), a grant
+    /// or a deny. Ownership and audiences name a mob by its id alone, so a
+    /// new mob under that id would be named the same way.
+    pub fn names_mob(&self, mob_id: &str) -> bool {
+        matches!(&self.owner, Owner::Mob(owner) if owner == mob_id)
+            || self
+                .access
+                .grants
+                .iter()
+                .map(|grant| &grant.audience)
+                .chain(self.access.denies.iter().map(|deny| &deny.audience))
+                .any(|audience| matches!(audience, Audience::Mob(id) if id == mob_id))
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentSummary {
     pub id: DocumentId,
