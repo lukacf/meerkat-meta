@@ -1150,14 +1150,17 @@ pub(crate) mod tests {
     }
 
     /// meerkat 0.8.47: readiness observes the durable source body-free and
-    /// actor-free. With a ~20 MB whole-blob member, 50 polls read the body
-    /// zero times and stay fast. The positive control reads the member's
-    /// body straight from the counting store, which the session service's
-    /// verified-body cache (meerkat 0.8.49) cannot answer.
+    /// actor-free. With a ~20 MB whole-blob member, 500 polls read the body
+    /// zero times and stay fast: their nearest-rank p99 (the fifth slowest
+    /// poll) stays under 100 ms, so one stalled poll on a loaded machine does
+    /// not decide the verdict, while body-sized work, which slows every poll,
+    /// still does. The positive control reads the member's body straight
+    /// from the counting store, which the session service's verified-body
+    /// cache (meerkat 0.8.49) cannot answer.
     #[tokio::test]
-    async fn readiness_reads_no_body_of_a_large_whole_blob_member_across_fifty_polls() {
+    async fn readiness_reads_no_body_of_a_large_whole_blob_member_across_five_hundred_polls() {
         const BODY_BYTES: usize = 20 * 1024 * 1024;
-        const POLLS: usize = 50;
+        const POLLS: usize = 500;
         let _guard = SHARED_HOST_TEST_LOCK.lock().await;
         let fixture = RealRuntime::start("readiness-large-body").await;
         let handle = fixture.runtime.mob_handle();
@@ -1209,7 +1212,17 @@ pub(crate) mod tests {
             "readiness polls must never read the session body"
         );
         samples.sort();
-        let p99 = samples[(POLLS * 99).div_ceil(100) - 1];
+        // Nearest-rank p99. Over 100 samples or fewer that rank is the
+        // slowest poll, which one scheduling stall on a loaded machine
+        // decides; the bound is meant for a poll that does body-sized work,
+        // which slows every poll, not one.
+        let p99_rank = (samples.len() * 99).div_ceil(100);
+        assert!(
+            p99_rank < samples.len(),
+            "p99 over {} polls is the slowest poll, not a percentile",
+            samples.len()
+        );
+        let p99 = samples[p99_rank - 1];
         eprintln!(
             "readiness over a ~20 MB member: p50 {:?}, p99 {p99:?}",
             samples[POLLS / 2]

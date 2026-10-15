@@ -54,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   0.10.2. No Meta build compiles it: the lockfile records it only under
   reqwest's optional HTTP/3 support (rand 0.10 for quinn-proto), which no
   workspace feature enables, so no build or test changes.
+- The console voice readiness latency test takes its p99 over 500 polls
+  instead of 50. Over 50 polls the nearest-rank p99 is the slowest poll, so
+  one stalled poll on a loaded machine decided the verdict; work sized to the
+  member's 20 MB body, which slows every poll, still fails the 100 ms bound.
 
 ## [0.9.1] - 2026-10-15
 
