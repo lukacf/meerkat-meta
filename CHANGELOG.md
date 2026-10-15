@@ -48,7 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   not change; `operation_scope_ref` documents it in full.
 - Meta's mob session wrappers forward Meerkat's `tool_catalog_view` query to
   the session service they wrap, like its tool-scope siblings, instead of
-  answering that no view is available.
+  answering that no view is available. An embedder's own session-service
+  wrapper must forward `tool_catalog_view` as well: Meerkat's default
+  implementation reports no view, so a wrapper that leaves it out hides the
+  wrapped session's catalog view.
 
 ## [0.9.1] - 2026-10-15
 
