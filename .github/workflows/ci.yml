@@ -76,14 +76,23 @@ jobs:
           # parent is the base, so the diff is the pull request's own change.
           fetch-depth: 2
       - id: classify
-        # The base commit's classifier decides, so a pull request never
-        # classifies itself with the classifier it changes. Fails closed:
-        # if it errors, or prints no line for some lane (a base that
-        # predates the lanes), every lane runs.
+        # Pushes and dispatches run every lane whatever any classifier says:
+        # exact-main CI, the evidence release.yml accepts, must never depend
+        # on classifier output. For a pull request, the base commit's
+        # classifier decides, so a pull request never classifies itself with
+        # the classifier it changes. Fails closed: if it errors, or prints no
+        # line for some lane (a base that predates the lanes), every lane runs.
         env:
           EVENT: ${{ github.event_name }}
         run: |
           lanes="rust integration python console console_perf flow_editor"
+          if [[ "${EVENT}" != "pull_request" ]]; then
+            echo "${EVENT}: every lane runs"
+            for lane in ${lanes}; do
+              echo "${lane}=true" >> "${GITHUB_OUTPUT}"
+            done
+            exit 0
+          fi
           result="${RUNNER_TEMP}/lanes"
           classified=false
           if git show HEAD^1:scripts/ci-changes.py > "${RUNNER_TEMP}/ci-changes.py" \
