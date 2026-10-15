@@ -44,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   percent-escaped in the realm and key). A host operation policy maps it to
   its own action, and a targeted grant selects one lineage for exactly that
   scope.
+- Meta's mob session wrappers forward Meerkat's `tool_catalog_view` query to
+  the session service they wrap, like its tool-scope siblings, instead of
+  answering that no view is available.
 
 ## [0.9.1] - 2026-10-15
 
