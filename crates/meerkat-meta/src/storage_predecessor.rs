@@ -108,19 +108,22 @@ pub const PREDECESSOR_METADATA_DB_FILE_NAMES: [&str; 2] =
 /// Predecessor spellings of the console-timeline database, canonical first.
 pub const PREDECESSOR_CONSOLE_DB_FILE_NAMES: [&str; 2] =
     ["mobkit_console.sqlite3", "mobkit_console.sqlite"];
-/// Predecessor schema ledger domains and the domains they become.
-pub const PREDECESSOR_LEDGER_DOMAINS: [(&str, &str); 5] = [
+/// Predecessor schema ledger domains and the domains they become. The
+/// extension document store's domain ([`PREDECESSOR_EXTENSION_LEDGER_DOMAIN`])
+/// is renamed beside them.
+pub const PREDECESSOR_LEDGER_DOMAINS: [(&str, &str); 4] = [
     ("mobkit-continuity", "meta-continuity"),
     ("mobkit-metadata", "meta-metadata"),
     ("mobkit-console", "meta-console"),
     ("mobkit-memory", "meta-memory"),
-    (PREDECESSOR_EXTENSION_LEDGER_DOMAIN, "meta-extension-state"),
 ];
 /// Predecessor ledger domain of the extension document store
 /// ([`crate::storage_layout::EXTENSION_STATE_DB_FILE_NAME`]). The store kept
 /// its file name and its schema; only this domain marks it as predecessor
-/// state.
+/// state. Adoption renames it to `meta-extension-state`.
 pub const PREDECESSOR_EXTENSION_LEDGER_DOMAIN: &str = "mobkit-extension-state";
+/// The extension document store's ledger domain since 0.9.
+const EXTENSION_LEDGER_DOMAIN: &str = "meta-extension-state";
 /// Predecessor spelling of the public marker in a host's document MCP
 /// descriptors (`META_MCP_DOCUMENT_BINDING`). A descriptor a profile
 /// persisted before 0.9 carries it; the document binding resolves it as
@@ -1537,6 +1540,7 @@ fn plan_ledger(database: &Path) -> Result<Option<LedgerPlan>, String> {
     let renames: Vec<(&'static str, &'static str)> = PREDECESSOR_LEDGER_DOMAINS
         .iter()
         .copied()
+        .chain([(PREDECESSOR_EXTENSION_LEDGER_DOMAIN, EXTENSION_LEDGER_DOMAIN)])
         .filter(|(from, _)| domains.iter().any(|domain| domain == from))
         .collect();
     if renames.is_empty() {
@@ -3512,6 +3516,10 @@ CREATE TABLE IF NOT EXISTS extension_receipts (
         )
         .expect("write predecessor fixture");
     }
+
+    // The public domain table keeps the type 0.9.1 released it with: the
+    // extension store's domain is renamed beside it, not added to it.
+    const _: [(&str, &str); 4] = PREDECESSOR_LEDGER_DOMAINS;
 
     fn ledger_domains_of(path: &Path) -> Vec<String> {
         let conn = rusqlite::Connection::open(path).expect("open the store");
