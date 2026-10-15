@@ -118,9 +118,17 @@ pub(crate) fn open_disk_store(
     ))
 }
 
+/// Destroy is terminal: a destroyed mob's handle is no authority.
+fn is_destroyed(handle: &MobReadHandle) -> bool {
+    handle.status_observation_snapshot() == meerkat_mob::MobState::Destroyed
+}
+
 /// Holds runtime query authorities, never copied lineage or document policy.
 /// A handle is installed by Meerkat's pre-activation callback before its first
-/// member can dispatch. Every operation reads current authority afresh.
+/// member can dispatch. Every operation reads current authority afresh. A
+/// destroyed mob grants nothing: lookups and owner scans skip it, and the
+/// mob-tool state's after-destroy hook drops its handle before the destroy's
+/// storage cleanup, which a handle still held here would refuse.
 pub(crate) struct NativeAuthorityRegistry {
     realm: String,
     identity_bridge_mob: String,
@@ -190,11 +198,41 @@ impl NativeAuthorityRegistry {
         })
     }
 
+    /// The release counterpart of [`Self::before_activation`] for the agent
+    /// mob-tool state: it drops a destroyed child's handle before that
+    /// destroy's storage cleanup drains the child's database observer.
+    pub(crate) fn after_destroy(self: &Arc<Self>) -> meerkat_mob_mcp::MobAfterDestroy {
+        let registry = Arc::downgrade(self);
+        Arc::new(move |mob_id: &meerkat_mob::MobId| {
+            if let Some(registry) = registry.upgrade() {
+                registry.forget_destroyed(mob_id.as_str());
+            }
+        })
+    }
+
+    /// Drop the handle bound under `id` when it observes a destroyed mob. A
+    /// mob bound under the id since is another mob and stays bound.
+    fn forget_destroyed(&self, id: &str) {
+        let released = {
+            let mut handles = self
+                .handles
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if handles.get(id).is_some_and(is_destroyed) {
+                handles.remove(id)
+            } else {
+                None
+            }
+        };
+        drop(released);
+    }
+
     fn handle(&self, id: &str) -> documents::Result<MobReadHandle> {
         self.handles
             .read()
             .map_err(|_| documents::Error::AuthorityUnavailable)?
             .get(id)
+            .filter(|handle| !is_destroyed(handle))
             .cloned()
             .ok_or(documents::Error::AuthorityUnavailable)
     }
@@ -554,6 +592,7 @@ impl ToolCallerResolver for NativeCallerResolver {
             .read()
             .map_err(|_| documents::Error::AuthorityUnavailable)?
             .values()
+            .filter(|handle| !is_destroyed(handle))
             .cloned()
             .collect();
         let mut managed_mobs = BTreeSet::new();
@@ -807,6 +846,109 @@ comms = true
         };
         assert!(child_available.resolve(&child_context, None).await.is_ok());
         child.stop().await.unwrap();
+        handle.stop().await.unwrap();
+    }
+
+    /// A child mob destroyed through its own handle, outside the agent
+    /// mob-tool state, keeps no extension authority: it is no valid document
+    /// owner any more, and its owner no longer manages it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_authority_registry_refuses_a_mob_destroyed_outside_the_mob_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            r#"
+[mob]
+id = "destroyed-authority"
+[profiles.worker]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+[profiles.worker.tools]
+comms = true
+"#,
+        )
+        .unwrap();
+        let spec = crate::MobBootstrapSpec::persistent(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            dir.path().to_path_buf(),
+            4,
+            Arc::new(
+                meerkat_store::SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
+                    .unwrap(),
+            ),
+        )
+        .unwrap()
+        .with_options(crate::MobBootstrapOptions {
+            allow_ephemeral_sessions: false,
+            notify_orchestrator_on_resume: false,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        });
+        let sessions = spec.session_service.clone();
+        let runtime = crate::MobRuntime::bootstrap(spec).await.unwrap();
+        let handle = runtime.handle();
+        let owner = meerkat_mob::AgentIdentity::from("owner");
+        handle
+            .spawn_spec(meerkat_mob::SpawnMemberSpec::host_root(
+                "worker",
+                owner.clone(),
+            ))
+            .await
+            .unwrap();
+        let owner_session = handle
+            .get_member(&owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .bridge_session_id()
+            .unwrap()
+            .clone();
+        let registry = NativeAuthorityRegistry::new(
+            "test".into(),
+            handle.mob_id().to_string(),
+            sessions.clone(),
+            None,
+            None,
+        );
+        registry.before_activation()(handle.read_handle())
+            .await
+            .unwrap();
+        let resolver = NativeCallerResolver {
+            registry: Arc::downgrade(&registry),
+            child_availability: None,
+            requirements: ToolBundleRequirements::durable_documents(
+                "durable-documents-test",
+                "documents_read",
+                "documents_apply",
+            ),
+        };
+        let mut child_definition = handle.definition().clone();
+        child_definition.id = "destroyed-authority-child".into();
+        let child =
+            meerkat_mob::MobBuilder::new(child_definition, meerkat_mob::MobStorage::in_memory())
+                .with_session_service(sessions.clone())
+                .with_default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+                .before_activation(registry.before_activation())
+                .with_owner_bridge_session_create_authority(owner_session.clone(), true, false)
+                .create()
+                .await
+                .unwrap();
+        let child_owner = Owner::Mob(child.mob_id().to_string());
+        let owner_context =
+            ToolDispatchContext::default().with_runtime_identity(owner_session, None);
+        let live = resolver
+            .resolve(&owner_context, Some(&child_owner))
+            .await
+            .unwrap();
+        assert!(documents::can_create(&live, &child_owner));
+
+        child.destroy().await.unwrap();
+        assert!(matches!(
+            resolver.resolve(&owner_context, Some(&child_owner)).await,
+            Err(documents::Error::AuthorityUnavailable)
+        ));
+        let former_owner = resolver.resolve(&owner_context, None).await.unwrap();
+        assert!(!documents::can_create(&former_owner, &child_owner));
+        drop(child);
         handle.stop().await.unwrap();
     }
 }

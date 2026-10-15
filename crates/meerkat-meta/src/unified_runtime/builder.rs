@@ -2273,6 +2273,7 @@ impl UnifiedRuntimeBuilder {
         // Bootstrap installs these on the final agent mob-tool state, after
         // composing its child application policy and native tool bundles.
         spec.before_activation = Some(registry.before_activation());
+        spec.after_destroy = Some(registry.after_destroy());
         Ok(Some(registry))
     }
 
@@ -3024,6 +3025,7 @@ mod tests {
             "refusal must precede opening document storage"
         );
         assert!(spec.before_activation.is_none());
+        assert!(spec.after_destroy.is_none());
     }
 
     /// A document bundle's declared read/edit tools; composition never

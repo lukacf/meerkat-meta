@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- With the `extension-state` feature, destroying a child mob whose members
+  resolved extension documents left the extension authority registry holding
+  the child's read handle. The destroy answered `Incomplete` ("storage
+  cleanup outstanding: the observer drain refused: 3 owner handle(s) still
+  observe this mob database"), the child's database, file watch and threads
+  stayed, and its id could not be reused. The registry now drops a destroyed
+  child through the agent mob-tool state's after-destroy hook
+  (`MobMcpState::set_after_destroy`) before the destroy's storage cleanup
+  runs, so the destroy completes and removes the child's storage.
+- A destroyed mob no longer counts as extension authority, also when it was
+  destroyed outside the agent mob-tool state: it is no valid document owner
+  any more, it leaves its former owner's managed mobs, and a former owner
+  that is still live can no longer create documents owned by it.
+
 ## [0.9.1] - 2026-10-15
 
 ### Breaking

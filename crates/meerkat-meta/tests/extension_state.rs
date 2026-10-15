@@ -1197,3 +1197,504 @@ async fn unpublished_late_birth_phase(path: &std::path::Path, phase: &str) {
     ));
     late_birth_step(phase, "shutdown stable host", runtime.shutdown()).await;
 }
+
+/// The mob databases, with their WAL and shared-memory sidecars, in the
+/// durable child root of the runtime composed over `path`.
+fn child_mob_storage_files(path: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let root = meerkat_mob_mcp::MobMcpState::persistent_forked_participant_store_path(path)
+        .parent()
+        .expect("the child root holds the custody database")
+        .to_path_buf();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Default::default();
+    };
+    entries
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| {
+            name.starts_with("mob--")
+                && [".db", ".db-wal", ".db-shm"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+        })
+        .collect()
+}
+
+/// A child mob of an owner member's bridge session, created through the
+/// agent mob-tool state as an agent `mob_create` creates one. The child
+/// supply gives its profile the host's document bundle, the extension
+/// authority registry binds it before it activates, and its member's
+/// document caller resolves through that registry.
+struct OwnedChild {
+    state: Arc<meerkat_mob_mcp::MobMcpState>,
+    owner_session: meerkat_core::SessionId,
+    child: meerkat_mob::MobId,
+}
+
+impl OwnedChild {
+    async fn create(
+        runtime: &UnifiedRuntime,
+        context: &ToolBundleContext,
+        path: &std::path::Path,
+    ) -> Self {
+        let owner = runtime.spawn(worker("owner")).await.unwrap();
+        let owner_session = member_session(runtime, &owner.agent_identity).await;
+        let state = runtime
+            .mob_runtime()
+            .agent_mob_mcp_state()
+            .expect("the runtime composes the agent mob-tool state");
+        let child = state
+            .mob_create_definition_with_owner_bridge_session(
+                MobDefinition::from_toml(&format!(
+                    "[mob]\nid = \"{}-child\"\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+                     runtime_mode = \"turn_driven\"\n[profiles.worker.tools]\ncomms = true\n",
+                    definition(path).id
+                ))
+                .unwrap(),
+                owner_session.clone(),
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            child_mob_storage_files(path).contains(&format!("mob--{child}.db")),
+            "the child keeps a durable mob database"
+        );
+        let handle = state.handle_for(&child).await.unwrap();
+        assert!(
+            handle.definition().profiles[&meerkat_mob::ProfileName::from("worker")]
+                .as_inline()
+                .expect("an inline child profile")
+                .tools
+                .rust_bundles
+                .iter()
+                .any(|bundle| bundle == NAME),
+            "the child supply gives the child the host's document bundle"
+        );
+        let member = AgentIdentity::from("child-worker");
+        handle.spawn_spec(worker("child-worker")).await.unwrap();
+        let member_session = handle
+            .get_member(&member)
+            .await
+            .unwrap()
+            .unwrap()
+            .bridge_session_id()
+            .unwrap()
+            .clone();
+        // The test keeps nothing of the child: only the runtime holds it.
+        drop(handle);
+        assert!(matches!(
+            caller(context, &member_session).await.principal(),
+            Principal::Worker { mob_id, .. } if mob_id == child.as_str()
+        ));
+        Self {
+            state,
+            owner_session,
+            child,
+        }
+    }
+
+    fn child_owner(&self) -> Owner {
+        Owner::Mob(self.child.to_string())
+    }
+
+    /// Destroy the child through the mob-tool state, as an operator or the
+    /// owner's mob tools do, and require its native destroy to complete.
+    /// Whether the destroy's storage cleanup settled too is the subject of
+    /// `extension_authority_registry_releases_destroyed_child_mob_storage`.
+    async fn destroy_natively(&self) {
+        match self.state.mob_destroy(&self.child).await {
+            Ok(_) => {}
+            Err(meerkat_mob_mcp::MobMcpDestroyError::Incomplete { report })
+                if report
+                    .errors
+                    .iter()
+                    .all(|error| error.starts_with("storage cleanup outstanding: ")) => {}
+            Err(error) => panic!("the child's native destroy must complete: {error}"),
+        }
+        assert!(
+            !self
+                .state
+                .mob_list()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id == &self.child),
+            "the destroyed child is no longer managed"
+        );
+    }
+}
+
+/// Destroying a child mob whose documents resolved through the extension
+/// authority registry completes: the registry holds nothing of the destroyed
+/// child, so the destroy's storage cleanup drains the child's database
+/// observer and removes the database and its sidecars.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_authority_registry_releases_destroyed_child_mob_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, _) = harness(dir.path(), None).await;
+    let owned = OwnedChild::create(&runtime, &context, dir.path()).await;
+    let report = owned
+        .state
+        .mob_destroy(&owned.child)
+        .await
+        .unwrap_or_else(|error| panic!("the child's destroy must complete: {error}"));
+    assert!(report.errors.is_empty(), "{report:?}");
+    let remaining = child_mob_storage_files(dir.path());
+    assert!(
+        !remaining
+            .iter()
+            .any(|name| name.starts_with(&format!("mob--{}.db", owned.child))),
+        "the destroyed child's storage is removed: {remaining:?}"
+    );
+    drop(owned);
+    runtime.shutdown().await;
+}
+
+/// A destroyed child mob leaves its owner's managed mobs: the owner, still
+/// live, no longer manages the child as a document owner, nor the documents
+/// the child owns.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_authority_registry_drops_destroyed_mob_from_owner_managed_mobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, _) = harness(dir.path(), None).await;
+    let owned = OwnedChild::create(&runtime, &context, dir.path()).await;
+    let owner = caller(&context, &owned.owner_session).await;
+    assert!(
+        can_create(&owner, &owned.child_owner()),
+        "the owner manages its live child"
+    );
+    let receipt = context
+        .documents
+        .mutate(
+            &owner,
+            &request("child-owned"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: Some(owned.child_owner()),
+                access: DocumentAccess::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .receipt;
+    let document = context
+        .documents
+        .get(&owner, &receipt.document_id)
+        .await
+        .unwrap();
+    assert_eq!(document.owner, owned.child_owner());
+    assert!(authorize(&owner, &document, Operation::Manage));
+
+    owned.destroy_natively().await;
+    let former_owner = caller(&context, &owned.owner_session).await;
+    assert!(
+        !can_create(&former_owner, &owned.child_owner()),
+        "the destroyed child is no longer among the owner's managed mobs"
+    );
+    assert!(!authorize(&former_owner, &document, Operation::Manage));
+    assert!(matches!(
+        context
+            .documents
+            .get(&former_owner, &receipt.document_id)
+            .await,
+        Err(Error::NotFound)
+    ));
+    drop(owned);
+    runtime.shutdown().await;
+}
+
+/// A former owner that is still live cannot create a new document owned by
+/// the child mob it destroyed: the destroyed mob is no valid owner to name,
+/// and the owner's own authority does not create one for it either.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_authority_registry_refuses_new_documents_owned_by_a_destroyed_mob() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, _) = harness(dir.path(), None).await;
+    let owned = OwnedChild::create(&runtime, &context, dir.path()).await;
+    let dispatch =
+        ToolDispatchContext::default().with_runtime_identity(owned.owner_session.clone(), None);
+    assert!(
+        context
+            .caller_resolver
+            .resolve(&dispatch, Some(&owned.child_owner()))
+            .await
+            .is_ok(),
+        "a live child is a valid document owner"
+    );
+
+    owned.destroy_natively().await;
+    assert!(matches!(
+        context
+            .caller_resolver
+            .resolve(&dispatch, Some(&owned.child_owner()))
+            .await,
+        Err(Error::AuthorityUnavailable)
+    ));
+    let former_owner = caller(&context, &owned.owner_session).await;
+    let created = context
+        .documents
+        .mutate(
+            &former_owner,
+            &request("after-destroy"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: Some(owned.child_owner()),
+                access: DocumentAccess::default(),
+            }),
+        )
+        .await;
+    assert!(
+        created.is_err(),
+        "no new document is committed for the destroyed child: {created:?}"
+    );
+    drop(owned);
+    runtime.shutdown().await;
+}
+
+/// The document tools an embedding host serves over MCP. The host serves
+/// the calls; this bundle carries their declaration and the caller context.
+struct HostDocumentTools;
+#[async_trait::async_trait]
+impl AgentToolDispatcher for HostDocumentTools {
+    fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+        ["host_documents_read", "host_documents_apply"]
+            .into_iter()
+            .map(|name| {
+                Arc::new(ToolDef::new(
+                    name,
+                    "Host document service",
+                    serde_json::json!({"type":"object","properties":{}}),
+                ))
+            })
+            .collect::<Vec<_>>()
+            .into()
+    }
+    fn tool_mutation_class(&self, name: &str) -> ToolMutationClass {
+        match name {
+            "host_documents_read" => ToolMutationClass::ReadOnly,
+            "host_documents_apply" => ToolMutationClass::Mutating,
+            _ => ToolMutationClass::Unknown,
+        }
+    }
+    async fn dispatch(
+        &self,
+        _: ToolCallView<'_>,
+    ) -> std::result::Result<ToolDispatchOutcome, ToolError> {
+        panic!("the embedding host serves document calls, not this bundle")
+    }
+}
+
+struct NoDocumentCalls;
+#[async_trait::async_trait]
+impl meerkat_mcp::McpCallContextProvider for NoDocumentCalls {
+    async fn prepare(
+        &self,
+        _: meerkat_mcp::McpCallTarget<'_>,
+        _: ToolCallView<'_>,
+        _: &ToolDispatchContext,
+    ) -> std::result::Result<Option<meerkat_mcp::McpCallContext>, meerkat_mcp::McpCallContextError>
+    {
+        panic!("no member makes a document call in this fixture")
+    }
+}
+
+/// A runtime composed as an embedding host that supplies its document
+/// service to child mobs over MCP only: a public stdio descriptor child
+/// profiles carry, its host-only runtime twin, and the document authority
+/// behind both. Returns the binding's document context and the public
+/// descriptor.
+async fn document_mcp_harness(
+    path: &std::path::Path,
+) -> (
+    UnifiedRuntime,
+    ToolBundleContext,
+    meerkat_core::McpServerConfig,
+) {
+    // No document call reaches this command in these fixtures.
+    let public = meerkat_core::McpServerConfig::stdio(
+        "host-documents",
+        "host-documents-fixture",
+        vec![],
+        std::collections::HashMap::from([("HOST_DOCUMENTS_TOKEN".to_string(), String::new())]),
+    );
+    let mut runtime_config = public.clone();
+    let meerkat_core::mcp_config::McpTransportConfig::Stdio(stdio) = &mut runtime_config.transport
+    else {
+        panic!("the fixture descriptor is stdio");
+    };
+    stdio
+        .env
+        .insert("HOST_DOCUMENTS_TOKEN".into(), "host-secret".into());
+    let captured = Arc::new(Mutex::new(None));
+    let capture = captured.clone();
+    let binding = meerkat_meta::extension_state::HostMcpDocumentBinding::new(
+        public,
+        runtime_config,
+        ToolBundleRequirements::durable_documents(
+            "host-documents",
+            "host_documents_read",
+            "host_documents_apply",
+        ),
+        Arc::new(
+            move |context: ToolBundleContext| -> std::result::Result<
+                Arc<dyn AgentToolDispatcher>,
+                String,
+            > {
+                *capture.lock().unwrap() = Some(context);
+                Ok(Arc::new(HostDocumentTools))
+            },
+        ),
+        Arc::new(NoDocumentCalls),
+        meerkat_meta::extension_state::ChildMcpAvailability::ChildAvailable,
+    )
+    .unwrap();
+    let public = binding.public_config().clone();
+    let (storage, provenance) =
+        meerkat_meta::mob_composition_manifest::persistent_mob_storage(path.join("mob.sqlite3"))
+            .unwrap();
+    let mut definition = definition(path);
+    let meerkat_mob::ProfileBinding::Inline(profile) = definition
+        .profiles
+        .get_mut(&meerkat_mob::ProfileName::from("worker"))
+        .unwrap()
+    else {
+        panic!("fixture declares an inline worker profile");
+    };
+    // This host offers its documents over MCP only.
+    profile.tools.rust_bundles.clear();
+    // A document MCP binding composes the builder's own session services.
+    let runtime = Box::pin(
+        UnifiedRuntime::builder()
+            .definition(definition)
+            .persistent_state(path)
+            .mob_storage(storage, provenance)
+            .default_llm_client(Arc::new(ScriptClient {
+                calls: AtomicUsize::new(0),
+                tool: "host_documents_read",
+            }))
+            .child_application_tool_policy(meerkat_core::ApplicationToolPolicyBinding::Unmanaged)
+            .module_config(meerkat_meta::MetaConfig {
+                modules: vec![],
+                discovery: meerkat_meta::DiscoverySpec {
+                    namespace: "extension-mcp".into(),
+                    modules: vec![],
+                },
+                pre_spawn: vec![],
+            })
+            .timeout(Duration::from_secs(10))
+            .register_mcp_tool_bundle_factory(binding)
+            .build(),
+    )
+    .await
+    .unwrap();
+    let context = captured.lock().unwrap().take().unwrap();
+    (runtime, context, public)
+}
+
+/// The embedding-host flow: an owner member's bridge session gets a delegate
+/// mob and a child it authored, both carrying the host's document MCP
+/// supply, and their members' document callers resolve through the
+/// extension authority registry. Owner cleanup then destroys both children
+/// completely: nothing of them stays held, and their storage is removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_authority_registry_owner_cleanup_destroys_document_mcp_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, public) = document_mcp_harness(dir.path()).await;
+    let owner = runtime.spawn(worker("owner")).await.unwrap();
+    let owner_session = member_session(&runtime, &owner.agent_identity).await;
+    let state = runtime
+        .mob_runtime()
+        .agent_mob_mcp_state()
+        .expect("the runtime composes the agent mob-tool state");
+    let delegate = state
+        .get_or_create_implicit_mob_for_bridge_session(&owner_session.to_string(), "gpt-5.5")
+        .await
+        .unwrap();
+    let authored = state
+        .mob_create_definition_with_owner_bridge_session(
+            MobDefinition::from_toml(&format!(
+                "[mob]\nid = \"{}-authored\"\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+                 runtime_mode = \"turn_driven\"\n[profiles.worker.tools]\ncomms = true\n",
+                definition(dir.path()).id
+            ))
+            .unwrap(),
+            owner_session.clone(),
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+    for (child, profile, member) in [
+        (&delegate, "delegate", "helper"),
+        (&authored, "worker", "author"),
+    ] {
+        let handle = state.handle_for(child).await.unwrap();
+        assert_eq!(
+            handle.definition().profiles[&meerkat_mob::ProfileName::from(profile)]
+                .as_inline()
+                .expect("an inline child profile")
+                .tools
+                .mcp_servers,
+            vec![public.clone()],
+            "the child supply gives {child} the host's public document descriptor"
+        );
+        drop(handle);
+        state
+            .mob_spawn(
+                child,
+                meerkat_mob::ProfileName::from(profile),
+                AgentIdentity::from(member),
+                Some(meerkat_mob::MobRuntimeMode::TurnDriven),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let handle = state.handle_for(child).await.unwrap();
+        let session = handle
+            .get_member(&AgentIdentity::from(member))
+            .await
+            .unwrap()
+            .unwrap()
+            .bridge_session_id()
+            .unwrap()
+            .clone();
+        drop(handle);
+        assert!(
+            matches!(
+                caller(&context, &session).await.principal(),
+                Principal::Worker { mob_id, .. } if mob_id == child.as_str()
+            ),
+            "{child}'s member resolves its document caller"
+        );
+    }
+    let databases = child_mob_storage_files(dir.path());
+    for child in [&delegate, &authored] {
+        assert!(
+            databases.contains(&format!("mob--{child}.db")),
+            "{child} keeps a durable mob database: {databases:?}"
+        );
+    }
+
+    state
+        .destroy_bridge_session_mobs(&owner_session.to_string())
+        .await
+        .unwrap_or_else(|error| panic!("owner cleanup must destroy both children: {error}"));
+    let managed = state.mob_list().await.unwrap();
+    let remaining = child_mob_storage_files(dir.path());
+    for child in [&delegate, &authored] {
+        assert!(
+            !managed.iter().any(|(id, _)| id == child),
+            "{child} is destroyed"
+        );
+        assert!(
+            !remaining
+                .iter()
+                .any(|name| name.starts_with(&format!("mob--{child}.db"))),
+            "{child}'s storage is removed: {remaining:?}"
+        );
+    }
+    drop(state);
+    runtime.shutdown().await;
+}
