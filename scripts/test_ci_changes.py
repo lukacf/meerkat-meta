@@ -188,7 +188,6 @@ class CiChangesTests(unittest.TestCase):
         # The shape of PR #642: release.yml plus its python contract test.
         self.assertEqual(self.lanes(".github/workflows/release.yml", "scripts/test_release_workflow.py"), set())
         self.assertEqual(self.lanes(".github/workflows/e2e-live.yml", ".github/workflows/publish-docs.yml"), set())
-        self.assertEqual(self.lanes(".github/workflows/release-prewarm.yml"), set())
         self.assertEqual(self.lanes(".github/CODEOWNERS", ".github/release.yml"), set())
 
     def test_files_every_lane_reads_run_every_lane(self):

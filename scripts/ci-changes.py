@@ -54,7 +54,6 @@ SKIPPABLE_FILES = frozenset(
         ".github/CODEOWNERS",
         ".github/release.yml",
         ".github/workflows/release.yml",
-        ".github/workflows/release-prewarm.yml",
         ".github/workflows/e2e-live.yml",
         ".github/workflows/publish-docs.yml",
     }

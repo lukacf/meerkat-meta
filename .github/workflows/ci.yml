@@ -5,12 +5,6 @@ on:
     branches: [main, "ci/**", "feat/**"]
   pull_request:
   workflow_dispatch:
-    inputs:
-      cache_source_sha:
-        description: "Main only: build this branch head (a release pull request's) into main's caches before it merges"
-        required: false
-        default: ""
-        type: string
 
 permissions:
   contents: read
@@ -69,7 +63,6 @@ jobs:
     name: changes
     runs-on: ubuntu-24.04
     outputs:
-      source_sha: ${{ steps.source.outputs.sha }}
       rust: ${{ steps.classify.outputs.rust }}
       integration: ${{ steps.classify.outputs.integration }}
       python: ${{ steps.classify.outputs.python }}
@@ -82,37 +75,6 @@ jobs:
           # A pull request checks out GitHub's merge commit; its first
           # parent is the base, so the diff is the pull request's own change.
           fetch-depth: 2
-      # A Meerkat Core bump arrives with the release pull request, and the
-      # exact-main run after its merge then compiled Core in every job
-      # (run 38714502600: 14-19 minutes per job before any Meta code). A
-      # dispatch on main may name that pull request's head: every job below
-      # builds and tests it and saves main's cache under the keys the
-      # merged commit computes, so the run after the merge restores Core.
-      # Only a branch head of this repository may write main's cache; a
-      # dispatch run is never the exact-main evidence release.yml accepts,
-      # which must be a push run of the merged commit.
-      - id: source
-        env:
-          CACHE_SOURCE_SHA: ${{ inputs.cache_source_sha }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${CACHE_SOURCE_SHA}" ]]; then
-            exit 0
-          fi
-          if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" || "${GITHUB_REF}" != "refs/heads/main" ]]; then
-            echo "::error::cache_source_sha needs a dispatch on main; only main's cache reaches main's runs" >&2
-            exit 1
-          fi
-          if [[ ! "${CACHE_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::cache_source_sha must be a full 40-hex commit" >&2
-            exit 1
-          fi
-          heads="$(git ls-remote --heads "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" | awk '{print $1}')"
-          if ! grep -qx "${CACHE_SOURCE_SHA}" <<< "${heads}"; then
-            echo "::error::${CACHE_SOURCE_SHA} is not the head of a branch of ${GITHUB_REPOSITORY}" >&2
-            exit 1
-          fi
-          echo "sha=${CACHE_SOURCE_SHA}" >> "${GITHUB_OUTPUT}"
       - id: classify
         # Fails closed: if the classifier errors, every lane runs. A later
         # line for the same output overrides an earlier one.
@@ -126,12 +88,9 @@ jobs:
 
   fmt-lint:
     name: fmt-lint
-    needs: changes
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.changes.outputs.source_sha }}
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
@@ -205,8 +164,6 @@ jobs:
           sudo docker image prune -af >/dev/null 2>&1 || true
           df -h /
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.changes.outputs.source_sha }}
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -269,8 +226,6 @@ jobs:
           sudo docker image prune -af >/dev/null 2>&1 || true
           df -h /
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.changes.outputs.source_sha }}
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -307,8 +262,6 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.changes.outputs.source_sha }}
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -332,8 +285,6 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.changes.outputs.source_sha }}
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy
@@ -354,8 +305,6 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.changes.outputs.source_sha }}
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -381,8 +330,6 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.changes.outputs.source_sha }}
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy
@@ -400,8 +347,6 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.changes.outputs.source_sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -410,6 +355,9 @@ jobs:
         with:
           shared-key: meta-dev-bins
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # release.yml's verify_crate_packages restores this entry; no
+          # executable from ~/.cargo/bin rides along.
+          cache-bin: false
       - run: python -m pip install 'sdk/python[dev]'
       # Gateway-backed structural tests materialize OpenAI profiles but never
       # issue provider requests. Meerkat resolves auth during construction, so
@@ -455,8 +403,6 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.changes.outputs.source_sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -534,8 +480,6 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.changes.outputs.source_sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -590,8 +534,6 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.changes.outputs.source_sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -620,8 +562,6 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.changes.outputs.source_sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -647,8 +587,6 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.changes.outputs.source_sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -681,8 +619,6 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.changes.outputs.source_sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -693,6 +629,9 @@ jobs:
         with:
           shared-key: meta-dev-bins
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # release.yml's verify_crate_packages restores this entry; no
+          # executable from ~/.cargo/bin rides along.
+          cache-bin: false
       - run: npm --prefix flow-editor ci --silent --no-fund --no-audit
       - run: npm --prefix flow-editor exec -- playwright install --with-deps chromium
       - run: CARGO_INCREMENTAL=0 scripts/repo-cargo build -p meerkat-meta --bin meta_flow_editor

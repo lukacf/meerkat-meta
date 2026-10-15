@@ -93,23 +93,6 @@ Prepare the release-version/dependency changes in a PR, merge it, and wait for
 successful `ci.yml` **push-to-main** CI on the exact merged commit. Candidate
 production must run from that final commit, not a PR head or an earlier build.
 
-While the release PR is open, prewarm the candidate's build cache from its head.
-The prewarm builds the same five targets without signing, packaging, attesting or
-uploading anything; it only lets the candidate restore Meerkat Core and the other
-dependencies instead of compiling them after the merge:
-
-```bash
-# Dispatch on main; SOURCE_SHA must be the head of a branch of this repository.
-make release-prewarm SOURCE_SHA=<release-pr-head-sha>
-```
-
-`make ci-prewarm SOURCE_SHA=<release-pr-head-sha>` does the same for `ci.yml`:
-a dispatch on main builds and tests that head and saves main's CI caches, so the
-push-to-main run after the merge restores a bumped Meerkat Core instead of
-compiling it in every job. A dispatch run is never release evidence. It is a
-second full CI run beside the pull request's own, so use it when runners are
-free, not while other workflows queue.
-
 ```bash
 # Dispatch from main; refuse if GitHub's dispatch SHA differs from SOURCE_SHA.
 make release-candidate SOURCE_SHA=<full-merged-commit-sha>
