@@ -470,9 +470,13 @@ jobs:
       - run: npm --prefix console exec -- playwright install --with-deps chromium
       - name: Build console acceptance backends
         run: |
-          scripts/repo-cargo build -p meerkat-meta --example library_mode_reference --example console_acceptance_fixture --example memory_console_reference --example workgraph_console_reference
+          scripts/repo-cargo build -p meerkat-meta --example library_mode_reference --example console_acceptance_fixture --example memory_console_reference --example workgraph_console_reference --example mcp_apps_gateway_fixture
           target_dir="$(scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')"
           echo "META_EXAMPLE_BIN_DIR=${target_dir}/debug/examples" >> "$GITHUB_ENV"
+      # Both MCP Apps steps run the persistent rpc_gateway composition
+      # (mcp_apps_gateway_fixture): members come from the gateway's own member
+      # factories, whose MCP routers carry the stock connector call-context
+      # provider, so an MCP App resource-read regression there fails here.
       - name: Native MCP Apps rendering and reload
         if: matrix.shard == 1
         timeout-minutes: 5

@@ -224,18 +224,24 @@ member policy or durable replay. `/counts` reports resolve, resource-read and
 action counts. A native end-to-end check must exercise the real gateway and its
 MCP connection separately.
 
-Build the stock Console and native `console_acceptance_fixture` first, then run
-the native browser lane against those artifacts:
+Build the stock Console and the native `mcp_apps_gateway_fixture` example
+first, then run the native browser lane against those artifacts:
 
 ```sh
 META_EXAMPLE_BIN_DIR=/path/to/prebuilt/examples npm --prefix console run e2e:mcp-apps
 ```
 
-That lane starts the real native member runtime and a stdio MCP server, loads
-the stock Console, invokes its app-only action, and checks reload, original
-connection custody, private metadata separation and native request rejection.
-It writes screenshots and wire evidence under `output/playwright/` and never
-contacts a model provider.
+That lane starts the persistent `rpc_gateway` composition with a scripted
+model, drives it over stdin like an SDK, and spawns its members through the
+gateway's own member factories. Their MCP routers carry the stock connector
+call-context provider that every gateway deployment uses, so a regression in
+that provider's resource reads fails the lane. It starts a stdio MCP server,
+loads the stock Console, invokes its app-only action, and checks reload,
+original connection custody, private metadata separation and native request
+rejection. It writes screenshots and wire evidence under `output/playwright/`
+and never contacts a model provider. `META_MCP_APPS_BACKEND=builder` runs the
+same lane against `console_acceptance_fixture`, a `UnifiedRuntime::builder()`
+host whose member routers carry no call-context provider.
 
 To also exercise live polling through a model turn longer than the host's
 request timeout, run the same lane with `META_MCP_APPS_LONG_POLL=1`. This mounts
