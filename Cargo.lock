@@ -2717,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "meerkat-meta"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3158,7 +3158,7 @@ dependencies = [
 
 [[package]]
 name = "meta-extension-state"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "rusqlite",
@@ -3172,7 +3172,7 @@ dependencies = [
 
 [[package]]
 name = "meta-store-conformance"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "base64",
