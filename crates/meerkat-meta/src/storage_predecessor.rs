@@ -1148,6 +1148,12 @@ pub async fn adopt_predecessor_state(request: &PredecessorAdoptRequest) -> Prede
             .push("adoption already complete; nothing to do".into());
         return report;
     }
+    // Reopening a finished adoption for predecessor state found since: no
+    // step of this run has finished yet, so the journal records none, and a
+    // failure names the steps this run still owes.
+    if journal_complete {
+        journal.completed.clear();
+    }
     journal.status = AdoptionStatus::InProgress;
     journal.predecessor_home = scope.predecessor_home.clone();
     journal.gateway_home = scope.gateway_home.clone();
@@ -3605,6 +3611,56 @@ CREATE TABLE IF NOT EXISTS extension_receipts (
             .unwrap();
         assert_eq!(kept, 1);
         resolve_installation(state).expect("the adopted installation resolves");
+    }
+
+    /// A rerun that reopens a finished adoption for predecessor state found
+    /// since records none of the earlier run's steps as finished: when it
+    /// fails, its journal and the unfinished-adoption refusal it carries
+    /// name the steps this run still owes, not an empty list.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reopened_adoption_that_fails_names_its_unfinished_steps() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path();
+        write_adoption_journal(
+            state,
+            &AdoptionJournal {
+                version: ADOPTION_JOURNAL_VERSION,
+                status: AdoptionStatus::Complete,
+                predecessor_home: None,
+                gateway_home: None,
+                completed: AdoptionStep::ALL.into(),
+                realm_id: None,
+            },
+        )
+        .unwrap();
+        let store = state.join("extension_state.sqlite3");
+        write_predecessor_extension_store(&store);
+        // The ledger step cannot write the store, so the reopened run fails
+        // there, after the steps before it finished.
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&store).is_ok() {
+            // A process that may write a read-only file (root) cannot fail
+            // the step this way.
+            return;
+        }
+
+        let apply = adopt_predecessor_state(&request(state, MigrateMode::Apply)).await;
+        assert!(apply.has_errors(), "{apply:?}");
+        assert!(!apply.complete);
+        let journal = read_adoption_journal(state).unwrap().unwrap();
+        assert_eq!(journal.status, AdoptionStatus::InProgress);
+        assert_eq!(
+            journal.completed,
+            BTreeSet::from([AdoptionStep::DatabaseFiles, AdoptionStep::MemoryLedgerFile])
+        );
+        assert_eq!(
+            unfinished_adoption(state).as_deref(),
+            Some("steps not finished: Ledger, StewardSchedule, GatewayHome, DraftStore")
+        );
+        resolve_installation(state).expect_err("the unfinished adoption refuses startup");
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     /// The stage of an interrupted predecessor ledger write is evidence of

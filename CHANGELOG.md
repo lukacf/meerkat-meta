@@ -56,6 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   its pre-build hook, so feature-on compositions that install no document
   binding, such as a runtime bootstrapped from a ready `MobBootstrapSpec`,
   refuse too.
+- Rerunning `meta_gateway storage-adopt-predecessor --apply` over a finished
+  adoption, for predecessor state found since, reopened its journal with
+  every step of the earlier run still recorded as finished. When the rerun
+  then failed, the journal and startup's refusal named no unfinished step.
+  A reopened journal now records no step as finished until the rerun
+  finishes it.
 
 ## [0.9.1] - 2026-10-15
 
