@@ -530,7 +530,10 @@ fn dispatch_flow_editor_rpc(
             Some(JsonRpcError {
                 code: -32601,
                 message: format!("method not found on flow editor rpc: {}", request.method),
-                data: None,
+                data: Some(serde_json::json!({
+                    "kind": "method_not_advertised",
+                    "method": request.method,
+                })),
             }),
         );
     }
@@ -2018,7 +2021,10 @@ mod tests {
             // not just left out of the advertisement: removing that guard
             // serves it and fails this.
             let unadvertised = anonymous_flow_editor_rpc(app, "meta/status", json!({})).await;
-            if unadvertised["error"]["code"] != json!(-32601) {
+            if unadvertised["error"]["code"] != json!(-32601)
+                || unadvertised["error"]["data"]
+                    != json!({ "kind": "method_not_advertised", "method": "meta/status" })
+            {
                 findings.push(format!(
                     "{surface}: served unadvertised meta/status: {unadvertised}"
                 ));

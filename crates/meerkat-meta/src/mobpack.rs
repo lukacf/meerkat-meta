@@ -592,7 +592,8 @@ fn default_schema_version() -> String {
 fn discover_skill_realms(authoring_sources: &Value) -> Value {
     let mut realms = Vec::new();
     for (realm_id, label, dir) in skill_catalog_dirs() {
-        let skills = discover_skills_in_dir(&dir);
+        let mut skills = discover_skills_in_dir(&dir);
+        annotate_untrusted_skill_reads(&mut skills, &dir);
         if !skills.is_empty() {
             realms.push(json!({
                 "id": realm_id,
@@ -608,6 +609,31 @@ fn discover_skill_realms(authoring_sources: &Value) -> Value {
         realms.push(authoring_realm);
     }
     Value::Array(realms)
+}
+
+/// Mark each discovered path skill with whether a caller without host
+/// access may read it (`readable_without_host_access`) and, if not, why
+/// (`read_refusal`), so the editor can say so instead of offering a skill
+/// whose read is then refused.
+fn annotate_untrusted_skill_reads(skills: &mut [Value], dir: &Path) {
+    let root = std::fs::canonicalize(dir).ok();
+    for skill in skills {
+        let Some(path) = skill
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let refusal = match root.as_deref() {
+            Some(root) => listed_skill_identity(&path, Some(root)).err(),
+            None => Some("its skill directory does not resolve"),
+        };
+        skill["readable_without_host_access"] = json!(refusal.is_none());
+        if let Some(reason) = refusal {
+            skill["read_refusal"] = json!(reason);
+        }
+    }
 }
 
 fn authoring_skill_realm(authoring_sources: &Value, default: bool) -> Option<Value> {
@@ -14576,6 +14602,9 @@ struct ListedSkillFiles {
     /// refused without a stat that could reach a caller-named host (a hung
     /// mount, an automounter path, a Windows UNC share).
     paths: BTreeSet<String>,
+    /// Catalog skill paths that are not readable this way, and why, so a
+    /// refusal names the reason instead of calling the file unlisted.
+    refused: BTreeMap<String, &'static str>,
 }
 
 impl ListedSkillFiles {
@@ -14587,6 +14616,7 @@ impl ListedSkillFiles {
         let mut listed = ListedSkillFiles {
             identities: BTreeSet::new(),
             paths: BTreeSet::new(),
+            refused: BTreeMap::new(),
         };
         for (_, _, dir) in skill_catalog_dirs() {
             let Ok(root) = std::fs::canonicalize(&dir) else {
@@ -14604,28 +14634,28 @@ impl ListedSkillFiles {
         listed
     }
 
-    /// Record `path` as readable when it resolves to a regular file (under
-    /// `root`, for a catalog directory). The identity is taken without
-    /// following a final-component symlink swapped in after canonicalize, and
-    /// both the named and the canonical string are kept so a read can match
-    /// the caller's exact string.
+    /// Record `path` as readable when [`listed_skill_identity`] allows it,
+    /// keeping both the named and the canonical string so a read can match
+    /// the caller's exact string; otherwise record why not.
     fn insert_listed(&mut self, path: &str, root: Option<&Path>) {
-        let Ok(real) = std::fs::canonicalize(path) else {
-            return;
-        };
-        if root.is_some_and(|root| !real.starts_with(root)) {
-            return;
+        match listed_skill_identity(path, root) {
+            Ok((real, identity)) => {
+                self.identities.insert(identity);
+                self.paths.insert(path.to_string());
+                self.paths.insert(listed_path_string(&real));
+            }
+            Err(reason) => {
+                self.refused.insert(path.to_string(), reason);
+            }
         }
-        // A catalog directory is writable by the gateway user, so a hard link
-        // in one aliases a file elsewhere: a listed catalog file must have a
-        // single link. A runtime-named skill is the host's own definition.
-        let require_single_link = root.is_some();
-        let Some(identity) = skill_file_identity(&real, require_single_link) else {
-            return;
-        };
-        self.identities.insert(identity);
-        self.paths.insert(path.to_string());
-        self.paths.insert(real.to_string_lossy().into_owned());
+    }
+
+    fn unlisted(&self, path: &str) -> PathSkillReadError {
+        self.refused
+            .get(path)
+            .map_or(PathSkillReadError::NotListed, |reason| {
+                PathSkillReadError::Refused(reason)
+            })
     }
 
     /// Read the listed file that `path` names. The caller's exact string must
@@ -14636,7 +14666,7 @@ impl ListedSkillFiles {
     fn read(&self, path: &str) -> Result<Vec<u8>, PathSkillReadError> {
         use std::os::unix::fs::MetadataExt;
         if !self.paths.contains(path) {
-            return Err(PathSkillReadError::NotListed);
+            return Err(self.unlisted(path));
         }
         let mut file =
             open_skill_file(Path::new(path)).map_err(|_| PathSkillReadError::NotListed)?;
@@ -14655,8 +14685,11 @@ impl ListedSkillFiles {
     /// Read the listed file that `path` names, from the real path checked.
     #[cfg(not(unix))]
     fn read(&self, path: &str) -> Result<Vec<u8>, PathSkillReadError> {
-        if !self.paths.contains(path) || is_refused_windows_path(path) {
+        if is_refused_windows_path(path) {
             return Err(PathSkillReadError::NotListed);
+        }
+        if !self.paths.contains(path) {
+            return Err(self.unlisted(path));
         }
         let real = std::fs::canonicalize(path).map_err(|_| PathSkillReadError::NotListed)?;
         if !self.identities.contains(&real) {
@@ -14666,28 +14699,102 @@ impl ListedSkillFiles {
     }
 }
 
+/// The identity of the skill file `path` names, when a caller without host
+/// access may read it (under `root`, for a catalog directory), or why not.
+fn listed_skill_identity(
+    path: &str,
+    root: Option<&Path>,
+) -> Result<(PathBuf, SkillFileIdentity), &'static str> {
+    let real = std::fs::canonicalize(path).map_err(|_| "it does not resolve")?;
+    if root.is_some_and(|root| !real.starts_with(root)) {
+        return Err("its real path leaves the skill directory it is listed in");
+    }
+    skill_file_identity(&real, root.is_some()).map(|identity| (real, identity))
+}
+
+/// The string a listed file's canonical path is matched by. Windows
+/// `canonicalize` returns an extended-length `\\?\C:\...` path; a local
+/// drive path is listed in the plain `C:\...` form a document names.
+fn listed_path_string(real: &Path) -> String {
+    let text = real.to_string_lossy().into_owned();
+    if cfg!(unix) {
+        text
+    } else {
+        strip_verbatim_drive_prefix(&text).to_string()
+    }
+}
+
+/// `\\?\C:\dir\file` becomes `C:\dir\file`. Anything else is unchanged: a
+/// verbatim UNC or device path stays, and a read refuses it.
+fn strip_verbatim_drive_prefix(path: &str) -> &str {
+    match path.strip_prefix(r"\\?\") {
+        Some(rest)
+            if rest.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                && rest.as_bytes().get(1) == Some(&b':') =>
+        {
+            rest
+        }
+        _ => path,
+    }
+}
+
 #[cfg(unix)]
-fn skill_file_identity(real: &Path, require_single_link: bool) -> Option<SkillFileIdentity> {
+fn skill_file_identity(real: &Path, catalog_file: bool) -> Result<SkillFileIdentity, &'static str> {
     use std::os::unix::fs::MetadataExt;
     // `symlink_metadata` (lstat) so a final-component symlink swapped in after
     // canonicalize is seen as a symlink, not followed a second time to its
     // target.
-    let metadata = std::fs::symlink_metadata(real).ok()?;
+    let metadata = std::fs::symlink_metadata(real).map_err(|_| "it cannot be inspected")?;
     if !metadata.is_file() {
-        return None;
+        return Err("it is not a regular file");
     }
-    if require_single_link && metadata.nlink() != 1 {
-        return None;
+    if catalog_file
+        && metadata.nlink() != 1
+        && let Some(reason) = shared_link_refusal(metadata.uid(), gateway_uid(), metadata.mode())
+    {
+        return Err(reason);
     }
-    Some((metadata.dev(), metadata.ino()))
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// A catalog file with other hard links may alias whatever file its linker
+/// could link. Read it only when it is another user's world-readable file,
+/// which any caller could read anyway: package stores and shared installs
+/// (Nix, pnpm, uv) hard-link their files. Refuse one the gateway's own user
+/// owns, so a link planted in a catalog directory cannot alias the gateway
+/// user's private files, and one that is not world-readable.
+#[cfg(unix)]
+fn shared_link_refusal(owner: u32, gateway: Option<u32>, mode: u32) -> Option<&'static str> {
+    if gateway.is_none_or(|gateway| gateway == owner) {
+        return Some("it has another hard link and the gateway's own user owns it");
+    }
+    if mode & 0o004 == 0 {
+        return Some("it has another hard link and is not world-readable");
+    }
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn gateway_uid() -> Option<u32> {
+    Some(rustix::process::geteuid().as_raw())
+}
+
+/// Without a known gateway user every multi-link catalog file is refused.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn gateway_uid() -> Option<u32> {
+    None
 }
 
 #[cfg(not(unix))]
-fn skill_file_identity(real: &Path, _require_single_link: bool) -> Option<SkillFileIdentity> {
-    std::fs::symlink_metadata(real)
-        .ok()
-        .filter(std::fs::Metadata::is_file)
-        .map(|_| real.to_path_buf())
+fn skill_file_identity(
+    real: &Path,
+    _catalog_file: bool,
+) -> Result<SkillFileIdentity, &'static str> {
+    match std::fs::symlink_metadata(real) {
+        Ok(metadata) if metadata.is_file() => Ok(real.to_path_buf()),
+        Ok(_) => Err("it is not a regular file"),
+        Err(_) => Err("it cannot be inspected"),
+    }
 }
 
 /// A UNC or device path (`\\server\share`, `\\?\`, `\\.\`, or their
@@ -14722,6 +14829,8 @@ enum PathSkillReadError {
     /// Not a file this caller may read. Every reason reads alike, so a
     /// refusal says nothing about which host files exist.
     NotListed,
+    /// A file the skills catalog lists, but not readable this way, and why.
+    Refused(&'static str),
     Unreadable(std::io::Error),
 }
 
@@ -14737,6 +14846,13 @@ fn read_path_skill_file(path: &str) -> Result<Vec<u8>, PathSkillReadError> {
             .read(path),
         None => ListedSkillFiles::from_catalog(&[]).read(path),
     })
+}
+
+fn path_skill_refused(skill_id: &str, path: &str, reason: &str) -> String {
+    format!(
+        "selected path skill '{skill_id}' names {path}, a skill file the skills catalog lists \
+         but this server does not read without host access: {reason}"
+    )
 }
 
 fn path_skill_not_permitted(skill_id: &str, path: &str) -> String {
@@ -14777,6 +14893,9 @@ fn selected_path_skill_files(
                 Ok(bytes) => bytes,
                 Err(PathSkillReadError::NotListed) => {
                     return Err(path_skill_not_permitted(&skill_id, path));
+                }
+                Err(PathSkillReadError::Refused(reason)) => {
+                    return Err(path_skill_refused(&skill_id, path, reason));
                 }
                 Err(PathSkillReadError::Unreadable(err)) => {
                     return Err(format!(
@@ -14892,7 +15011,7 @@ fn document_from_params(params: &Value) -> Result<MobpackDocument, String> {
             .decode(encoded)
             .map_err(|err| format!("invalid content_base64: {err}"))?;
         if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-            return document_from_value(&value);
+            return document_from_owned_value(value);
         }
         return document_from_archive_bytes(&bytes);
     }
@@ -14935,6 +15054,11 @@ fn manifest_declares_adaptive_section(manifest: &str) -> bool {
 const MOBPACK_ARCHIVE_MAX_EXPANDED_BYTES: u64 = 32 * 1024 * 1024;
 /// The most entries an archive import reads.
 const MOBPACK_ARCHIVE_MAX_ENTRIES: usize = 4096;
+/// The most bytes of each member an import parses whole (`meta/editor.json`,
+/// `meta/mob.toml`, `manifest.toml`). Parsing expands text many times over
+/// (each `0,` in a JSON array becomes a 32-byte value), so these stay far
+/// below the archive cap.
+const MOBPACK_ARCHIVE_MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The members of a mobpack archive that import reads.
 struct MobpackArchiveMembers {
@@ -15032,36 +15156,56 @@ fn read_mobpack_archive_members(decoded: impl Read) -> Result<MobpackArchiveMemb
             .map_err(|err| format!("invalid mobpack archive path: {err}"))?
             .to_string_lossy()
             .to_string();
-        // A mobpack holds regular files. A directory member carries no data;
-        // skip it. Anything else - a symlink or hard link naming a host path,
-        // a device or fifo, a GNU sparse map that synthesizes its bytes - is
-        // refused rather than read.
-        if entry_type.is_dir() {
+        // A mobpack holds regular files. A directory member carries no data,
+        // and a pax global header (`git archive` writes one first) applies to
+        // the whole archive; its bytes already passed the stream budget. Skip
+        // both. A contiguous file reads as a regular one. Anything else - a
+        // symlink or hard link naming a host path, a device or fifo, a GNU
+        // sparse map that synthesizes its bytes - is refused before any of its
+        // data is read. The tar reader has already parsed a sparse member's
+        // map by then; that map came through the stream budget (21 entries
+        // per 512-byte block), so it stays bounded. Refusing at the raw header
+        // would mean raw iteration, which also drops GNU long-name and pax
+        // path handling.
+        if entry_type.is_dir() || entry_type.is_pax_global_extensions() {
             continue;
         }
-        if !entry_type.is_file() {
+        if !(entry_type.is_file() || entry_type.is_contiguous()) {
             return Err(format!(
                 "mobpack archive member {path} is not a regular file ({entry_type:?}); refusing \
                  to import it"
             ));
         }
+        let document_member = matches!(
+            path.as_str(),
+            "meta/editor.json" | "meta/mob.toml" | "manifest.toml"
+        );
+        let limit = if document_member {
+            materialized.min(MOBPACK_ARCHIVE_MAX_DOCUMENT_BYTES)
+        } else {
+            materialized
+        };
         let mut bytes = Vec::new();
-        // +1 so a member that exactly fills the remainder is told from one
-        // that overruns it.
+        // +1 so a member that exactly fills its limit is told from one that
+        // overruns it.
         (&mut entry)
-            .take(materialized + 1)
+            .take(limit + 1)
             .read_to_end(&mut bytes)
             .map_err(|err| {
                 map_archive_read_error(&format!("failed to read archive member {path}"), err)
             })?;
-        if bytes.len() as u64 > materialized {
+        let read = bytes.len() as u64;
+        if document_member && read > MOBPACK_ARCHIVE_MAX_DOCUMENT_BYTES {
+            return Err(format!(
+                "mobpack archive member {path} is larger than {} MiB; refusing to import it",
+                MOBPACK_ARCHIVE_MAX_DOCUMENT_BYTES >> 20
+            ));
+        }
+        if read > materialized {
             return Err(mobpack_archive_too_large());
         }
-        materialized -= bytes.len() as u64;
-        if matches!(
-            path.as_str(),
-            "meta/editor.json" | "meta/mob.toml" | "manifest.toml"
-        ) {
+        materialized -= read;
+        if document_member {
             let text = String::from_utf8(bytes.clone())
                 .map_err(|err| format!("invalid UTF-8 archive member {path}: {err}"))?;
             match path.as_str() {
@@ -15100,7 +15244,8 @@ fn document_from_archive_bytes(bytes: &[u8]) -> Result<MobpackDocument, String> 
     if let Some(text) = editor_json {
         let value: Value = serde_json::from_str(&text)
             .map_err(|err| format!("invalid meta/editor.json: {err}"))?;
-        let mut document = document_from_value(&value)?;
+        drop(text);
+        let mut document = document_from_owned_value(value)?;
         if let Some(mob_toml) = mob_toml.as_ref() {
             document.mob_toml = Some(mob_toml.clone());
         }
@@ -15186,16 +15331,30 @@ fn document_from_archive_bytes(bytes: &[u8]) -> Result<MobpackDocument, String> 
 }
 
 fn document_from_value(value: &Value) -> Result<MobpackDocument, String> {
-    if let Some(document) = value.get("document") {
-        return document_from_value(document);
-    }
-    let mut document: MobpackDocument = serde_json::from_value(value.clone())
-        .map_err(|err| format!("invalid mobpack document: {err}"))?;
-    if document.mob_toml.is_none()
-        && let Some(files) = value.get("files").and_then(Value::as_object)
-        && let Some(text) = files.get("mob.toml").and_then(Value::as_str)
+    document_from_owned_value(value.clone())
+}
+
+/// [`document_from_value`] for a value the caller owns: it is moved into the
+/// document, never cloned, so a large parsed document is held once.
+fn document_from_owned_value(mut value: Value) -> Result<MobpackDocument, String> {
+    while let Some(document) = value
+        .as_object_mut()
+        .and_then(|object| object.remove("document"))
     {
-        document.mob_toml = Some(text.to_string());
+        value = document;
+    }
+    let packed_mob_toml = value
+        .get("files")
+        .and_then(Value::as_object)
+        .and_then(|files| files.get("mob.toml"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut document: MobpackDocument =
+        serde_json::from_value(value).map_err(|err| format!("invalid mobpack document: {err}"))?;
+    if document.mob_toml.is_none()
+        && let Some(text) = packed_mob_toml
+    {
+        document.mob_toml = Some(text);
     }
     upgrade_legacy_deploy_command(&mut document);
     Ok(document)
@@ -22246,6 +22405,15 @@ fn validate_selected_path_skill_files(document: &MobpackDocument) -> Vec<Mobpack
                         severity: "error".to_string(),
                         code: "selected_skill_path_not_permitted".to_string(),
                         message: path_skill_not_permitted(&skill_id, path),
+                        path: Some(format!("skill_realms.skills[{skill_id}].path")),
+                    });
+                    continue;
+                }
+                Err(PathSkillReadError::Refused(reason)) => {
+                    diagnostics.push(MobpackDiagnostic {
+                        severity: "error".to_string(),
+                        code: "selected_skill_path_not_permitted".to_string(),
+                        message: path_skill_refused(&skill_id, path, reason),
                         path: Some(format!("skill_realms.skills[{skill_id}].path")),
                     });
                     continue;
@@ -36115,7 +36283,8 @@ branch = "choice"
     /// Security regression: an entry in a skill directory that links outside
     /// that directory does not make its target readable to an untrusted
     /// caller. The allowlist keeps a catalog file only when its real path
-    /// stays under the real path of the skill directory it was found in.
+    /// stays under the real path of the skill directory it was found in, and
+    /// the refusal says so.
     #[cfg(unix)]
     #[test]
     fn untrusted_path_skill_reads_refuse_skill_links_that_leave_the_skill_dir() {
@@ -36127,12 +36296,15 @@ branch = "choice"
                 })
                 .map(|files| files.into_values().collect::<Vec<_>>())
             };
+            let refused_as_escaping = |read: Result<Vec<Vec<u8>>, String>| {
+                read.map_err(|error| error.contains("leaves the skill directory"))
+            };
             assert_eq!(
                 (
                     read(skills.join("inside/SKILL.md")),
                     read(skills.join("linked-inside/SKILL.md")),
-                    refused_as_unlisted(read(skills.join("linked-dir/SKILL.md"))),
-                    refused_as_unlisted(read(skills.join("linked-file/SKILL.md"))),
+                    refused_as_escaping(read(skills.join("linked-dir/SKILL.md"))),
+                    refused_as_escaping(read(skills.join("linked-file/SKILL.md"))),
                 ),
                 (
                     Ok(vec![b"INSIDE-SKILL".to_vec()]),
@@ -36320,6 +36492,240 @@ branch = "choice"
                 sparse.is_err(),
             ),
             (Err(true), Err(true), Err(true), true)
+        );
+    }
+
+    /// The files of an exported mobpack archive, by archive path.
+    fn exported_archive_files(content_base64: &str) -> BTreeMap<String, Vec<u8>> {
+        let archive = base64::engine::general_purpose::STANDARD
+            .decode(content_base64)
+            .expect("archive bytes");
+        let mut files = BTreeMap::new();
+        for entry in tar::Archive::new(GzDecoder::new(archive.as_slice()))
+            .entries()
+            .expect("entries")
+        {
+            let mut entry = entry.expect("entry");
+            let path = entry.path().expect("path").to_string_lossy().to_string();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).expect("member");
+            files.insert(path, bytes);
+        }
+        files
+    }
+
+    fn import_archive_files(files: &BTreeMap<String, Vec<u8>>) -> Result<Value, String> {
+        let archive = encode_deployable_mobpack_archive(files).expect("encode");
+        import_mobpack(&json!({
+            "content_base64": base64::engine::general_purpose::STANDARD.encode(&archive)
+        }))
+    }
+
+    /// Security regression: the members an import parses (`meta/editor.json`,
+    /// `meta/mob.toml`, `manifest.toml`) are refused above 4 MiB before they
+    /// are parsed, so a small upload cannot make import build a parsed JSON or
+    /// TOML tree many times its size. A document under the cap still imports.
+    #[test]
+    fn archive_import_refuses_oversized_document_members() {
+        let mut document = document_with_real_launch_modes();
+        document.mob_toml = None;
+        let exported = export_mobpack(&json!({ "document": document })).expect("export");
+        let files = exported_archive_files(&exported.content_base64);
+        let editor: Value =
+            serde_json::from_slice(&files["meta/editor.json"]).expect("editor json");
+        let with_member = |path: &str, bytes: Vec<u8>| {
+            let mut files = files.clone();
+            files.insert(path.to_string(), bytes);
+            import_archive_files(&files)
+        };
+        let padded_editor = |padding: usize| {
+            let mut editor = editor.clone();
+            editor["padding"] = json!("x".repeat(padding));
+            serde_json::to_vec(&editor).expect("editor json bytes")
+        };
+        let padded_toml = |path: &str| {
+            let mut text = files[path].clone();
+            text.extend_from_slice(b"\n# ");
+            text.extend(std::iter::repeat_n(b'x', 4 << 20));
+            text.push(b'\n');
+            text
+        };
+
+        let under = with_member("meta/editor.json", padded_editor(3 << 20));
+        let over = with_member("meta/editor.json", padded_editor(4 << 20));
+        let mob_toml_over = with_member("meta/mob.toml", padded_toml("meta/mob.toml"));
+        let manifest_over = with_member("manifest.toml", padded_toml("manifest.toml"));
+
+        assert!(under.is_ok(), "{under:?}");
+        assert_eq!(
+            (
+                over.map_err(|error| error.contains("larger than 4 MiB")),
+                mob_toml_over.map_err(|error| error.contains("larger than 4 MiB")),
+                manifest_over.map_err(|error| error.contains("larger than 4 MiB")),
+            ),
+            (Err(true), Err(true), Err(true))
+        );
+    }
+
+    /// `git archive` output starts with a pax global header (typeflag `g`,
+    /// carrying the commit id), and some tars mark files contiguous
+    /// (typeflag `7`). Both import: the global header is skipped and a
+    /// contiguous file reads as a regular one.
+    #[test]
+    fn archive_import_accepts_git_archive_pax_global_headers_and_contiguous_files() {
+        let mut document = document_with_real_launch_modes();
+        document.mob_toml = None;
+        let exported = export_mobpack(&json!({ "document": document })).expect("export");
+        let files = exported_archive_files(&exported.content_base64);
+
+        let mut builder = Builder::new(Vec::new());
+        let comment = b"52 comment=0123456789abcdef0123456789abcdef01234567\n";
+        let mut global = Header::new_ustar();
+        global.set_entry_type(tar::EntryType::XGlobalHeader);
+        global.set_size(comment.len() as u64);
+        global.set_mode(0o666);
+        builder
+            .append_data(&mut global, "pax_global_header", &comment[..])
+            .expect("pax global header");
+        for (index, (path, bytes)) in files.iter().enumerate() {
+            let mut header = Header::new_ustar();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            if index == 0 {
+                header.set_entry_type(tar::EntryType::Continuous);
+            }
+            builder
+                .append_data(&mut header, path, bytes.as_slice())
+                .expect("member");
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder
+            .write_all(&builder.into_inner().expect("finish tar"))
+            .expect("gzip");
+        let imported = import_mobpack(&json!({
+            "content_base64": base64::engine::general_purpose::STANDARD
+                .encode(encoder.finish().expect("finish gzip"))
+        }));
+
+        assert_eq!(
+            imported.map(|imported| imported["document"]["name"].clone()),
+            Ok(json!(document.name))
+        );
+    }
+
+    /// Set in the child process of the catalog read-refusal test, to its
+    /// scratch directory.
+    #[cfg(unix)]
+    const CATALOG_READ_REFUSAL_CHILD: &str = "META_TEST_CATALOG_READ_REFUSAL";
+
+    /// A catalog skill that a caller without host access cannot read says so,
+    /// and why, in the skills catalog and in the read refusal, instead of
+    /// being offered and then refused as unlisted. Here: a skill file with a
+    /// second hard link, owned by the gateway's own user.
+    #[cfg(unix)]
+    #[test]
+    fn catalog_skills_say_why_a_caller_without_host_access_cannot_read_them() {
+        if let Some(scratch) = std::env::var_os(CATALOG_READ_REFUSAL_CHILD) {
+            let skills = PathBuf::from(scratch).join("skills");
+            let catalog = mobpack_skills_catalog_response_with_runtime(None);
+            let skill = |id: &str| {
+                catalog["skill_realms"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|realm| realm["id"] == "env/skills-0")
+                    .flat_map(|realm| realm["skills"].as_array().into_iter().flatten())
+                    .find(|skill| skill["id"] == id)
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            };
+            let (inside, linked) = (skill("inside"), skill("linked-hard"));
+            let read = with_untrusted_path_skill_reads(None, || {
+                selected_path_skill_files(&document_selecting_path_skill(
+                    &skills.join("linked-hard/SKILL.md"),
+                ))
+            });
+            assert_eq!(
+                (
+                    inside["readable_without_host_access"].clone(),
+                    linked["readable_without_host_access"].clone(),
+                    linked["read_refusal"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("hard link")),
+                    read.map_err(|error| error.contains("hard link")),
+                ),
+                (json!(true), json!(false), true, Err(true))
+            );
+            return;
+        }
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let skills = scratch.path().join("skills");
+        std::fs::create_dir_all(skills.join("inside")).expect("inside skill dir");
+        std::fs::write(skills.join("inside/SKILL.md"), "INSIDE-SKILL").expect("inside skill");
+        std::fs::create_dir_all(skills.join("linked-hard")).expect("linked skill dir");
+        let secret = scratch.path().join("id_secret");
+        std::fs::write(&secret, "HARD-LINKED-SECRET-9c41").expect("secret");
+        std::fs::hard_link(&secret, skills.join("linked-hard/SKILL.md")).expect("hard link");
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "mobpack::tests::catalog_skills_say_why_a_caller_without_host_access_cannot_read_them",
+                "--exact",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(CATALOG_READ_REFUSAL_CHILD, scratch.path())
+            .env("META_SKILL_DIRS", &skills)
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A catalog file with other hard links is read only when another user
+    /// owns it and it is world-readable (a package store's file); one the
+    /// gateway's own user owns, one that is not world-readable, and any when
+    /// the gateway user is unknown, are refused with the reason.
+    #[cfg(unix)]
+    #[test]
+    fn multi_link_catalog_files_are_read_only_when_another_user_shares_them_world_readable() {
+        let gateway = Some(1000);
+        assert_eq!(
+            (
+                shared_link_refusal(0, gateway, 0o100_444),
+                shared_link_refusal(1000, gateway, 0o100_444)
+                    .is_some_and(|reason| reason.contains("gateway's own user")),
+                shared_link_refusal(0, gateway, 0o100_440)
+                    .is_some_and(|reason| reason.contains("not world-readable")),
+                shared_link_refusal(0, None, 0o100_444).is_some(),
+            ),
+            (None, true, true, true)
+        );
+    }
+
+    /// Windows `canonicalize` returns `\\?\C:\...`; a local drive path is
+    /// listed in the plain form a document names, while a verbatim UNC or
+    /// device path is left as is (and refused on read).
+    #[test]
+    fn windows_verbatim_drive_paths_list_in_their_plain_form() {
+        assert_eq!(
+            (
+                strip_verbatim_drive_prefix(r"\\?\C:\skills\x\SKILL.md"),
+                strip_verbatim_drive_prefix(r"\\?\UNC\server\share\SKILL.md"),
+                strip_verbatim_drive_prefix(r"\\.\pipe\x"),
+                strip_verbatim_drive_prefix("/home/user/skills/x/SKILL.md"),
+            ),
+            (
+                r"C:\skills\x\SKILL.md",
+                r"\\?\UNC\server\share\SKILL.md",
+                r"\\.\pipe\x",
+                "/home/user/skills/x/SKILL.md",
+            )
         );
     }
 }

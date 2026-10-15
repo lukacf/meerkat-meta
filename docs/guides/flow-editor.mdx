@@ -116,7 +116,7 @@ The mobpack-authoring methods:
 | `meta/mobpacks/validate` | Structural (and optional `rkat`) validation |
 | `meta/mobpacks/source` | Rendered source files (`meta/mob.toml`, …) without archive payload |
 | `meta/mobpacks/export` | `.mobpack` archive as base64 download |
-| `meta/mobpacks/import` | Import `.mobpack` / JSON / TOML (an archive may hold only regular files and may expand to at most 32 MiB and 4096 entries) |
+| `meta/mobpacks/import` | Import `.mobpack` / JSON / TOML (an archive may hold only regular files, may expand to at most 32 MiB and 4096 entries, and its `meta/editor.json`, `meta/mob.toml` and `manifest.toml` may each be at most 4 MiB) |
 | `meta/mobpacks/deploy_command` | Preview the exact `rkat mob run` command |
 | `meta/mobpacks/deploy` | Deploy plan, or host execution when `execute: true` |
 
@@ -215,10 +215,20 @@ host path it names:
   `selected_skill_path_not_permitted` validation error, so source, export and
   deploy refuse the document instead of packing the file.
 - A listed file counts only while its real path stays inside the skill
-  directory it was found in and it has a single hard link: a link from a
-  skill directory to a file outside it lists nothing. The server reads the
-  file it opened, comparing the opened file's device and inode, so a path
-  swapped between the listing and the read reaches no other file.
+  directory it was found in: a link from a skill directory to a file outside
+  it lists nothing. A catalog file with other hard links counts only when
+  another user owns it and it is world-readable, as package stores (Nix,
+  pnpm, uv) link their files; a hard link to a file the gateway's own user
+  owns does not count. The server reads the file it opened, comparing the
+  opened file's device and inode, so a path swapped between the listing and
+  the read reaches no other file.
+- `meta/skills/catalog` marks each filesystem skill with
+  `readable_without_host_access`, and adds `read_refusal` with the reason
+  when a caller without host access cannot read it; selecting such a skill
+  fails validation with that reason.
+- On Windows, UNC and device paths (`\\server\share\...`, `\\?\UNC\...`,
+  `\\.\...`) are refused without host access, so a skills directory on a
+  network share needs host access.
 
 Host access is the caller's own per-call `mobpack.deploy` decision: a deny
 rule withholds it even when an allow rule such as `mobpack.*` also matches.
