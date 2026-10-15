@@ -289,6 +289,18 @@ def prepare_assets(source_dir, output_dir, release_tag, tier=None):
         verify_tier_assets(output_dir, tag, tier)
 
 
+def tiers_present(assets_dir):
+    """The default for `verify` without --tier: schema 1 when index.json has
+    no tier, otherwise every tier whose index is present, core first."""
+    try:
+        index = json.loads((assets_dir / MANIFEST_NAME).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReleaseAssetError(f"cannot read {MANIFEST_NAME}: {error}") from error
+    if not isinstance(index, dict) or "tier" not in index:
+        return None
+    return tuple(tier for tier in TIERS if (assets_dir / metadata_names(tier)[0]).is_file())
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -303,7 +315,8 @@ def parse_args():
     verify.add_argument("--assets-dir", type=Path, required=True)
     verify.add_argument("--release-tag", required=True)
     verify.add_argument("--tier", choices=TIERS, action="append",
-                        help="verify these tiers, core first (schema 2); default schema 1")
+                        help="verify these tiers, core first (schema 2); default: schema 1, or every "
+                             "tier present when index.json names a tier")
 
     return parser.parse_args()
 
@@ -314,7 +327,7 @@ def main():
         if args.command == "prepare":
             prepare_assets(args.source_dir, args.output_dir, args.release_tag, args.tier)
         else:
-            verify_assets(args.assets_dir, args.release_tag, args.tier)
+            verify_assets(args.assets_dir, args.release_tag, args.tier or tiers_present(args.assets_dir))
     except ReleaseAssetError as error:
         print(f"release asset error: {error}", file=sys.stderr)
         return 1

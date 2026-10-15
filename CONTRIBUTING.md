@@ -203,8 +203,15 @@ registry lacks the exact version. Releases do not publish
 documentation: the `Publish docs` workflow asks the docs site to mirror `docs/`
 on every push to `main` that touches `docs/`.
 New releases retain the original candidate manifest, selection, and provenance
-proofs. Existing flat `index.json` and `checksums.sha256` keep their archive-only
-contract.
+proofs of each tier. The core tier's flat `index.json` and `checksums.sha256`
+list only the Linux x86_64 and aarch64 and macOS arm64 archives; the trailing
+tier, which may arrive later, adds `index-trailing.json` and
+`checksums-trailing.sha256` for the macOS x86_64 and Windows archives. Releases
+up to v0.9.1 keep one `index.json` and `checksums.sha256` for all five targets.
+
+Only the candidate manifest's attestation implies green exact-main CI: the
+build legs start beside CI and attest their archives before the gate runs, and
+collection, which attests the manifest, refuses unless CI is green.
 
 ### Recovery without replacing published bytes
 

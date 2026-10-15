@@ -128,6 +128,12 @@ jobs:
   # validated, collected or attested as a candidate, and still refuses: a
   # candidate whose CI is not green by then binds nothing, and a new candidate
   # run is dispatched once it is. Every other mode checks before its first job.
+  #
+  # So only the candidate manifest's attestation implies green exact-main CI.
+  # Each leg attests its archives before this gate runs; a leg attestation
+  # names the source and run, not CI. Promotion and recovery start from the
+  # manifest, whose collection refused unless CI was green, and verify the
+  # leg attestations under it.
   require_ci_green:
     name: Require green exact-main CI
     needs: [resolve_release, build_binaries]

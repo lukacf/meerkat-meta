@@ -164,5 +164,37 @@ class ReleaseAssetContractTests(unittest.TestCase):
         with self.assertRaisesRegex(release_assets.ReleaseAssetError, "does not match"):
             release_assets.verify_assets(core, "v0.9.2", ("core",))
 
+    def run_verify_cli(self, folder, *tiers, tag="v0.9.2"):
+        import subprocess, sys
+        argv = [sys.executable, str(SCRIPT), "verify", "--assets-dir", str(folder), "--release-tag", tag]
+        for tier in tiers:
+            argv += ["--tier", tier]
+        return subprocess.run(argv, capture_output=True, text=True)
+
+    def test_the_verify_cli_defaults_to_every_tier_present(self):
+        self.write_tier_source("core", self.root / "core-src")
+        self.write_tier_source("trailing", self.root / "trailing-src")
+        core, trailing, both = self.root / "core", self.root / "trailing", self.root / "both"
+        release_assets.prepare_assets(self.root / "core-src", core, "v0.9.2", "core")
+        release_assets.prepare_assets(self.root / "trailing-src", trailing, "v0.9.2", "trailing")
+        both.mkdir()
+        for folder in (core, trailing):
+            for path in folder.iterdir():
+                (both / path.name).write_bytes(path.read_bytes())
+        self.assertEqual(self.run_verify_cli(core).returncode, 0)
+        result = self.run_verify_cli(both)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("(core, trailing)", result.stdout)
+        # Without a tier the default still refuses a trailing archive whose
+        # trailing index is absent.
+        (both / "index-trailing.json").unlink()
+        self.assertNotEqual(self.run_verify_cli(both).returncode, 0)
+        # Schema 1 sets keep verifying with no flag at all.
+        self.write_complete_source()
+        release_assets.prepare_assets(self.source, self.output, "v0.8.0")
+        result = self.run_verify_cli(self.output, tag="v0.8.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("verified 15 flat release archives for v0.8.0\n", result.stdout)
+
 if __name__ == "__main__":
     unittest.main()
