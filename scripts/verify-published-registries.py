@@ -66,7 +66,8 @@ def _required_text(value: Any, *, field: str) -> str:
 
 
 def _verify_crates_payload(
-    payload: dict[str, Any], version: str, crate_name: str = CRATE_NAME
+    payload: dict[str, Any], version: str, crate_name: str = CRATE_NAME,
+    verified_sha256: str | None = None,
 ) -> list[PublishedArtifact]:
     published = payload.get("version")
     if not isinstance(published, dict):
@@ -79,6 +80,13 @@ def _verify_crates_payload(
         raise RegistryVerificationError("crates.io release is yanked or lacks yank state")
     download_path = _required_text(published.get("dl_path"), field="crate download path")
     checksum = _required_text(published.get("checksum"), field="crate checksum")
+    # The release verified one exact .crate per crate; crates.io must serve
+    # those bytes, whichever attempt uploaded them.
+    if verified_sha256 is not None and checksum.lower() != verified_sha256.lower():
+        raise RegistryVerificationError(
+            f"crates.io serves {crate_name} {version} with checksum {checksum}, "
+            f"not the verified {verified_sha256}"
+        )
     return [
         PublishedArtifact(
             label="crate archive",
@@ -154,6 +162,7 @@ def _verify_npm_payload(
 
 def _registry_checks(
     version: str,
+    crate_sha256: dict[str, str] | None = None,
 ) -> tuple[
     tuple[
         str,
@@ -167,16 +176,19 @@ def _registry_checks(
     encoded_pypi = quote(PYPI_NAME, safe="")
     encoded_npm = quote(NPM_NAME, safe="")
     encoded_version = quote(version, safe="")
+    crate_sha256 = crate_sha256 or {}
     return (
         (
             "crates.io",
             f"https://crates.io/api/v1/crates/{encoded_crate}/{encoded_version}",
-            _verify_crates_payload,
+            lambda payload, version: _verify_crates_payload(
+                payload, version, CRATE_NAME, crate_sha256.get(CRATE_NAME)),
         ),
         (
             "crates.io extension-state",
             f"https://crates.io/api/v1/crates/{encoded_extension}/{encoded_version}",
-            lambda payload, version: _verify_crates_payload(payload, version, EXTENSION_CRATE_NAME),
+            lambda payload, version: _verify_crates_payload(
+                payload, version, EXTENSION_CRATE_NAME, crate_sha256.get(EXTENSION_CRATE_NAME)),
         ),
         (
             "PyPI",
@@ -191,14 +203,21 @@ def _registry_checks(
     )
 
 
+CRATE_REGISTRIES = {CRATE_NAME: "crates.io", EXTENSION_CRATE_NAME: "crates.io extension-state"}
+
+
 def verify_once(
     version: str,
     *,
     reader: Callable[[str], dict[str, Any]] = _read_json,
     downloader: Callable[[str], bytes] = _download_artifact,
+    crate_sha256: dict[str, str] | None = None,
+    only_crates: bool = False,
 ) -> None:
     failures: list[str] = []
-    for registry, url, validator in _registry_checks(version):
+    for registry, url, validator in _registry_checks(version, crate_sha256):
+        if only_crates and registry not in {CRATE_REGISTRIES[name] for name in (crate_sha256 or {})}:
+            continue
         try:
             artifacts = validator(reader(url), version)
             for artifact in artifacts:
@@ -232,6 +251,8 @@ def verify_with_retries(
     reader: Callable[[str], dict[str, Any]] = _read_json,
     downloader: Callable[[str], bytes] = _download_artifact,
     sleeper: Callable[[float], None] = time.sleep,
+    crate_sha256: dict[str, str] | None = None,
+    only_crates: bool = False,
 ) -> None:
     if attempts < 1:
         raise ValueError("attempts must be at least 1")
@@ -241,7 +262,8 @@ def verify_with_retries(
     last_error: RegistryVerificationError | None = None
     for attempt in range(1, attempts + 1):
         try:
-            verify_once(version, reader=reader, downloader=downloader)
+            verify_once(version, reader=reader, downloader=downloader,
+                        crate_sha256=crate_sha256, only_crates=only_crates)
         except RegistryVerificationError as error:
             last_error = error
             if attempt == attempts:
@@ -269,7 +291,19 @@ def main() -> int:
     parser.add_argument("--version", required=True)
     parser.add_argument("--attempts", type=int, default=30)
     parser.add_argument("--delay-seconds", type=float, default=10.0)
+    parser.add_argument("--crate-sha256", action="append", default=[], metavar="CRATE=SHA256",
+                        help="require crates.io to serve exactly this verified .crate checksum")
+    parser.add_argument("--only-crates", action="store_true",
+                        help="check only the crates named by --crate-sha256")
     args = parser.parse_args()
+    crate_sha256 = {}
+    for item in args.crate_sha256:
+        name, _, digest = item.partition("=")
+        if name not in CRATE_REGISTRIES or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            parser.error(f"--crate-sha256 needs a known crate and a 64-hex checksum: {item!r}")
+        crate_sha256[name] = digest
+    if args.only_crates and not crate_sha256:
+        parser.error("--only-crates needs at least one --crate-sha256")
 
     version = args.version.strip().removeprefix("v")
     if not version:
@@ -279,6 +313,8 @@ def main() -> int:
             version,
             attempts=args.attempts,
             delay_seconds=args.delay_seconds,
+            crate_sha256=crate_sha256,
+            only_crates=args.only_crates,
         )
     except (RegistryVerificationError, ValueError) as error:
         parser.exit(1, f"registry verification failed: {error}\n")

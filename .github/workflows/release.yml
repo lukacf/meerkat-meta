@@ -866,6 +866,9 @@ jobs:
       (needs.resolve_release.outputs.mode == 'existing' ||
        needs.resolve_release.outputs.mode == 'promote')
     runs-on: ubuntu-24.04
+    outputs:
+      extension_sha256: ${{ steps.crates.outputs.extension_sha256 }}
+      meta_sha256: ${{ steps.crates.outputs.meta_sha256 }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -890,6 +893,23 @@ jobs:
       # unpublished new version of it verifies too.
       - name: Verify the packaged crates build
         run: scripts/repo-cargo package -p meta-extension-state -p meerkat-meta --locked
+
+      # cargo package is byte-reproducible for a commit, so these checksums
+      # name the bytes that were just verified. publish_registries packages
+      # again and must match them before it uploads, and the readback
+      # requires crates.io to serve exactly them.
+      - name: Record the verified crate checksums
+        id: crates
+        env:
+          VERSION: ${{ needs.resolve_release.outputs.version }}
+        run: |
+          set -euo pipefail
+          for pair in "extension_sha256:meta-extension-state" "meta_sha256:meerkat-meta"; do
+            output="${pair%%:*}"; crate="${pair##*:}"
+            sum="$(sha256sum "${CARGO_TARGET_DIR}/package/${crate}-${VERSION}.crate" | cut -d' ' -f1)"
+            echo "${crate}-${VERSION}.crate: ${sum}"
+            echo "${output}=${sum}" >> "${GITHUB_OUTPUT}"
+          done
 
   publish_registries:
     name: Publish crate + SDK packages
@@ -916,7 +936,15 @@ jobs:
     runs-on: ubuntu-24.04
     # Holds CARGO_REGISTRY_TOKEN, so it restores no cache: verify_crate_packages
     # already built the packaged crates, and --no-verify publishes the same
-    # checkout without compiling anything here.
+    # checkout without compiling anything here. The crate bytes are bound to
+    # the verified ones: packaged again and compared before any upload, and
+    # compared on crates.io by the readback, also when a version was
+    # already published by an earlier attempt.
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      RELEASE_VERSION: ${{ needs.resolve_release.outputs.version }}
+      VERIFIED_EXTENSION_SHA256: ${{ needs.verify_crate_packages.outputs.extension_sha256 }}
+      VERIFIED_META_SHA256: ${{ needs.verify_crate_packages.outputs.meta_sha256 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -930,6 +958,23 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Bind the crates to the verified bytes
+        run: |
+          set -euo pipefail
+          scripts/repo-cargo package -p meta-extension-state -p meerkat-meta --locked --no-verify
+          for pair in "meta-extension-state:${VERIFIED_EXTENSION_SHA256}" "meerkat-meta:${VERIFIED_META_SHA256}"; do
+            crate="${pair%%:*}"; verified="${pair##*:}"
+            if [[ ! "${verified}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::no verified checksum for ${crate}" >&2
+              exit 1
+            fi
+            actual="$(sha256sum "${CARGO_TARGET_DIR}/package/${crate}-${RELEASE_VERSION}.crate" | cut -d' ' -f1)"
+            if [[ "${actual}" != "${verified}" ]]; then
+              echo "::error::${crate} now packages to ${actual}, not the verified ${verified}" >&2
+              exit 1
+            fi
+            echo "${crate}: ${actual} (verified)"
+          done
       - name: Publish extension document crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -946,7 +991,9 @@ jobs:
             if [[ $rc -eq 0 ]]; then
               echo "  meta-extension-state: published"
             elif echo "$output" | grep -q "already exists\|already uploaded"; then
-              echo "  meta-extension-state: already published, skipping"
+              python scripts/verify-published-registries.py --version "$RELEASE_VERSION" --only-crates \
+                --crate-sha256 "meta-extension-state=${VERIFIED_EXTENSION_SHA256}"
+              echo "  meta-extension-state: already published with the verified bytes, skipping"
             else
               echo "$output" >&2
               exit $rc
@@ -969,7 +1016,9 @@ jobs:
             if [[ $rc -eq 0 ]]; then
               echo "  meerkat-meta: published"
             elif echo "$output" | grep -q "already exists\|already uploaded"; then
-              echo "  meerkat-meta: already published, skipping"
+              python scripts/verify-published-registries.py --version "$RELEASE_VERSION" --only-crates \
+                --crate-sha256 "meerkat-meta=${VERIFIED_META_SHA256}"
+              echo "  meerkat-meta: already published with the verified bytes, skipping"
             else
               echo "$output" >&2
               exit $rc
@@ -981,4 +1030,6 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
-          python scripts/verify-published-registries.py --version "$VERSION"
+          python scripts/verify-published-registries.py --version "$VERSION" \
+            --crate-sha256 "meta-extension-state=${VERIFIED_EXTENSION_SHA256}" \
+            --crate-sha256 "meerkat-meta=${VERIFIED_META_SHA256}"

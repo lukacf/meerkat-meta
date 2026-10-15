@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline behavioral contracts for release protocol v1 and registry publication."""
 
+import hashlib
 import importlib.util
 import itertools
 import json
@@ -626,7 +627,9 @@ class RegistryReadbackWorkflowTests(unittest.TestCase):
 class RegistryPublicationShellTests(unittest.TestCase):
     """No package tooling runs: the workflow shell drives recording stubs."""
 
-    def run_script(self, step, job, *, dry=False, status=0, output="published"):
+    VERIFIED = {"VERIFIED_EXTENSION_SHA256": "e" * 64, "VERIFIED_META_SHA256": "f" * 64}
+
+    def run_script(self, step, job, *, dry=False, status=0, output="published", verify_status=0):
         with fixture_directory() as root:
             bin_dir = root / "bin"
             scripts = root / "scripts"
@@ -640,6 +643,8 @@ class RegistryPublicationShellTests(unittest.TestCase):
                 "    stream.write(json.dumps(sys.argv) + '\\n')\n"
                 "if sys.argv[1:2] == ['-c']:\n"
                 "    print('0.8.31')\n"
+                "elif sys.argv[1:2] == ['scripts/verify-published-registries.py']:\n"
+                "    sys.exit(int(os.environ['VERIFY_STATUS']))\n"
                 "else:\n"
                 "    print(os.environ['COMMAND_OUTPUT'])\n"
                 "    sys.exit(int(os.environ['COMMAND_STATUS']))\n"
@@ -654,7 +659,8 @@ class RegistryPublicationShellTests(unittest.TestCase):
                 ["bash", "-c", script], cwd=root, capture_output=True, text=True,
                 env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
                      "COMMAND_LOG": str(log), "COMMAND_STATUS": str(status),
-                     "COMMAND_OUTPUT": output},
+                     "COMMAND_OUTPUT": output, "VERIFY_STATUS": str(verify_status),
+                     "RELEASE_VERSION": "0.8.31", **self.VERIFIED},
             )
             commands = ([json.loads(line)[1:] for line in log.read_text().splitlines()]
                         if log.exists() else [])
@@ -686,18 +692,79 @@ class RegistryPublicationShellTests(unittest.TestCase):
                     "Publish Rust crate", "publish_registries", status=status, output=output
                 )
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
-                self.assertEqual(commands, [["publish", "-p", "meerkat-meta", "--locked", "--no-verify"]])
+                self.assertEqual(commands[0], ["publish", "-p", "meerkat-meta", "--locked", "--no-verify"])
+                if output.startswith("already"):
+                    # A version already on crates.io must be the verified bytes.
+                    self.assertEqual(commands[1:], [[
+                        "scripts/verify-published-registries.py", "--version", "0.8.31", "--only-crates",
+                        "--crate-sha256", "meerkat-meta=" + "f" * 64]])
+                else:
+                    self.assertEqual(commands[1:], [])
+
+    def test_an_already_published_crate_with_other_bytes_fails_the_step(self):
+        for step, crate in (("Publish Rust crate", "meerkat-meta"),
+                            ("Publish extension document crate", "meta-extension-state")):
+            with self.subTest(step=step):
+                result, commands = self.run_script(step, "publish_registries", status=101,
+                                                   output="crate version already exists", verify_status=1)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--only-crates", commands[-1])
+                self.assertIn(crate, commands[-1][-1])
+
+    def test_publication_packages_again_and_matches_the_verified_bytes_before_upload(self):
+        bind = step_block("Bind the crates to the verified bytes", "publish_registries")
+        block = job_block("publish_registries")
+        self.assertLess(block.index("- name: Bind the crates to the verified bytes"),
+                        block.index("- name: Publish extension document crate"))
+        script = step_script("Bind the crates to the verified bytes", "publish_registries")
+        self.assertIn("scripts/repo-cargo package -p meta-extension-state -p meerkat-meta --locked --no-verify",
+                      script)
+        for variable in ("VERIFIED_EXTENSION_SHA256: ${{ needs.verify_crate_packages.outputs.extension_sha256 }}",
+                         "VERIFIED_META_SHA256: ${{ needs.verify_crate_packages.outputs.meta_sha256 }}"):
+            self.assertIn(variable, block)
+        self.assertNotIn("CARGO_REGISTRY_TOKEN", bind)
+        with fixture_directory() as root:
+            package = root / "target/package"
+            package.mkdir(parents=True)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            (scripts / "repo-cargo").write_text("#!/usr/bin/env bash\nexit 0\n")
+            (scripts / "repo-cargo").chmod(0o755)
+            files = {}
+            for crate in ("meta-extension-state", "meerkat-meta"):
+                files[crate] = package / f"{crate}-0.8.31.crate"
+                files[crate].write_bytes(crate.encode())
+            sums = {crate: hashlib.sha256(path.read_bytes()).hexdigest() for crate, path in files.items()}
+            env = {**os.environ, "CARGO_TARGET_DIR": str(root / "target"), "RELEASE_VERSION": "0.8.31",
+                   "VERIFIED_EXTENSION_SHA256": sums["meta-extension-state"],
+                   "VERIFIED_META_SHA256": sums["meerkat-meta"]}
+            ok = subprocess.run(["bash", "-c", script], cwd=root, env=env, capture_output=True, text=True)
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            for name, value in (("VERIFIED_META_SHA256", "0" * 64), ("VERIFIED_EXTENSION_SHA256", "")):
+                with self.subTest(mismatch=name):
+                    bad = subprocess.run(["bash", "-c", script], cwd=root, env={**env, name: value},
+                                         capture_output=True, text=True)
+                    self.assertNotEqual(bad.returncode, 0)
+
+    def test_crate_verification_records_the_verified_checksums(self):
+        block = job_block("verify_crate_packages")
+        self.assertIn("extension_sha256: ${{ steps.crates.outputs.extension_sha256 }}", block)
+        self.assertIn("meta_sha256: ${{ steps.crates.outputs.meta_sha256 }}", block)
+        verify = block.index("- name: Verify the packaged crates build")
+        self.assertLess(verify, block.index("- name: Record the verified crate checksums"))
 
     def test_registry_readback_uses_workspace_version_and_preserves_refusals(self):
         for status in (0, 23):
             with self.subTest(status=status):
                 result, commands = self.run_script(
                     "Verify exact packages are public on every registry", "publish_registries",
-                    status=status,
+                    status=status, verify_status=status,
                 )
                 self.assertEqual(result.returncode, status, result.stderr)
                 self.assertEqual(commands[-1],
-                                 ["scripts/verify-published-registries.py", "--version", "0.8.31"])
+                                 ["scripts/verify-published-registries.py", "--version", "0.8.31",
+                                  "--crate-sha256", "meta-extension-state=" + "e" * 64,
+                                  "--crate-sha256", "meerkat-meta=" + "f" * 64])
                 self.assertIn('["workspace"]["package"]["version"]', commands[0][-1])
 
 
@@ -1776,25 +1843,52 @@ class ReleaseCacheReuseTests(unittest.TestCase):
         self.assertNotIn("secrets.", verify)
         self.assertNotIn("permissions:", verify)
 
-    def test_no_job_holding_a_secret_restores_a_cache(self):
-        """A cache entry can carry a planted executable or object; a job that
-        holds a registry token or signing grant must start from nothing
-        cached, and publication verifies with --no-verify only what the
-        secret-free verification job already built."""
-        source = RELEASE_WORKFLOW.read_text()
-        jobs = re.findall(r"(?m)^  ([a-z_]+):$", source.split("\njobs:\n", 1)[1])
-        def code(job: str) -> str:
-            return "\n".join(line for line in job_block(job).splitlines()
-                             if not line.strip().startswith("#"))
+    # Jobs that hold a secret or a write grant and still restore a cache, and
+    # why that cache is trusted. build_binaries restores only release.yml's
+    # own entries, which only successful candidate legs of merged main write,
+    # and restores no executables; its tools are named by absolute path.
+    # e2e-live restores without saving and without executables, and its
+    # provider secret reaches only the step that makes the real calls.
+    CACHE_HOLDER_ALLOWLIST = {
+        ("release.yml", "build_binaries"),
+        ("e2e-live.yml", "e2e-live"),
+    }
 
-        holders = [job for job in jobs if "secrets." in code(job)]
-        self.assertEqual(set(holders), {"publish_sdk_packages", "publish_registries"})
-        for job in holders:
-            with self.subTest(job=job):
-                block = code(job)
-                self.assertNotIn("rust-cache", block)
-                self.assertNotIn("actions/cache", block)
-                self.assertNotRegex(block, r"(?m)^\s+cache(-dependency-path)?:")
+    def test_no_job_holding_a_secret_or_write_grant_restores_a_cache(self):
+        """A cache entry can carry a planted executable or object, so no job
+        in any workflow that holds a secret or a write permission (id-token,
+        attestations, contents, actions or any other scope) may restore one,
+        except the allowlisted jobs above. Publication verifies with
+        --no-verify only what the secret-free verification job built."""
+        holders_seen = set()
+        for workflow in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            source = workflow.read_text()
+            code_lines = [line for line in source.splitlines() if not line.strip().startswith("#")]
+            header = "\n".join(code_lines).split("\njobs:\n", 1)[0]
+            jobs_text = "\n".join(code_lines).split("\njobs:\n", 1)[1]
+            names = re.findall(r"(?m)^  ([A-Za-z_][A-Za-z0-9_-]*):$", jobs_text)
+            for name in names:
+                block = jobs_text.split(f"\n  {name}:\n", 1)[1] if not jobs_text.startswith(f"  {name}:") \
+                    else jobs_text[len(f"  {name}:\n"):]
+                block = re.split(r"(?m)^  [A-Za-z_][A-Za-z0-9_-]*:$", block, 1)[0]
+                holds = ("secrets." in block or re.search(r"(?m)^\s+[a-z-]+: write$", block)
+                         or re.search(r"(?m)^  [a-z-]+: write$", header))
+                restores = ("rust-cache" in block or "actions/cache" in block
+                            or re.search(r"(?m)^\s+cache(-dependency-path)?:", block))
+                with self.subTest(workflow=workflow.name, job=name):
+                    if holds and restores:
+                        self.assertIn((workflow.name, name), self.CACHE_HOLDER_ALLOWLIST)
+                    if holds:
+                        holders_seen.add((workflow.name, name))
+        # The scan sees the jobs it must (and the allowlist is no wider).
+        for expected in (("release.yml", "publish_registries"), ("release.yml", "publish_sdk_packages"),
+                         ("release.yml", "collect_candidate"), ("release.yml", "publish_github_release"),
+                         ("ci.yml", "drop-superseded-caches"), ("publish-docs.yml", "dispatch")):
+            self.assertIn(expected, holders_seen)
+        self.assertLessEqual(self.CACHE_HOLDER_ALLOWLIST, holders_seen)
+        e2e = (ROOT / ".github/workflows/e2e-live.yml").read_text()
+        self.assertEqual(e2e.count("${{ secrets.ANTHROPIC_API_KEY }}"), 1)
+        self.assertIn("          save-if: false\n          cache-bin: false\n", e2e)
         self.assertIn("verify_crate_packages", job_needs("publish_registries"))
         self.assertIn("needs.verify_crate_packages.result == 'success'", job_condition("publish_registries"))
         for step in ("Publish extension document crate", "Publish Rust crate"):

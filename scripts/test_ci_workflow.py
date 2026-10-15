@@ -665,11 +665,30 @@ class CiWorkflowTests(unittest.TestCase):
         triggers = source.split("\npermissions:", 1)[0]
         self.assertIn("  workflow_dispatch:\n", triggers)
         self.assertNotIn("inputs:", triggers)
-        checkouts = re.findall(r"(?m)^      - uses: actions/checkout@v4\n((?: {8}.*\n)*)", source)
-        self.assertEqual(len(checkouts), source.count("uses: actions/checkout@v4"))
+        # Any version or pinned SHA of the checkout action.
+        uses = re.findall(r"(?m)^\s*-?\s*uses:\s*actions/checkout@\S+", source)
+        checkouts = re.findall(r"(?m)^ *- uses: actions/checkout@\S+\n((?: {8,}.*\n)*)", source)
+        self.assertTrue(uses)
+        self.assertEqual(len(checkouts), len(uses))
         for settings in checkouts:
             self.assertNotIn("ref:", settings)
             self.assertNotIn("repository:", settings)
+        # Nor may a run step fetch or move to another commit; reading the
+        # base commit's classifier (git show) is the only git use.
+        code = "\n".join(line for line in source.splitlines() if not line.strip().startswith("#"))
+        self.assertEqual(re.findall(r"\bgit\s+(fetch|checkout|switch|reset|pull|clone|worktree|restore)\b", code), [])
+
+    def test_the_no_redirect_check_sees_every_checkout_and_git_use(self):
+        probe = """
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.inputs.sha }}
+      - run: git fetch origin pull/1/head && git checkout FETCH_HEAD
+"""
+        self.assertEqual(len(re.findall(r"(?m)^ *- uses: actions/checkout@\S+\n((?: {8,}.*\n)*)", probe)), 1)
+        self.assertIn("ref:", re.findall(r"(?m)^ *- uses: actions/checkout@\S+\n((?: {8,}.*\n)*)", probe)[0])
+        self.assertEqual(re.findall(r"\bgit\s+(fetch|checkout|switch|reset|pull|clone|worktree|restore)\b", probe),
+                         ["fetch", "checkout"])
 
     def test_changes_job_classifies_the_pull_request_and_fails_closed(self):
         block = job_block("changes")
@@ -725,6 +744,13 @@ class CiWorkflowTests(unittest.TestCase):
 
     def test_the_base_commits_classifier_decides_and_fails_closed(self):
         every = {lane: "true" for lane in ci_changes.LANES}
+        nothing_runs = ("import sys\nargs = sys.argv\nopen(args[args.index('--github-output') + 1], 'a')"
+                        ".write(''.join(f'{lane}=false\\n' for lane in "
+                        f"{list(ci_changes.LANES)!r}))\n")
+        # Pushes and dispatches run every lane even if a classifier says none.
+        for event in ("push", "workflow_dispatch", "schedule"):
+            with self.subTest(event=event):
+                self.assertEqual(self.run_classify_step(nothing_runs, event=event), every)
 
         def printing(values: dict[str, str]) -> str:
             text = "".join(f"{key}={value}\\n" for key, value in values.items())
