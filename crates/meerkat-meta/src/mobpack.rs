@@ -14492,8 +14492,15 @@ enum PathSkillReads {
     Catalog {
         runtime_skill_paths: Vec<String>,
         listed: std::cell::OnceCell<ListedSkillFiles>,
+        /// Skill file bytes this scope may still read. However many skills a
+        /// document names a listed file under, one request reads at most
+        /// [`MOBPACK_REQUEST_MAX_SKILL_READ_BYTES`] in total.
+        read_budget: std::cell::Cell<u64>,
     },
 }
+
+/// The most path skill bytes one request without host access reads.
+const MOBPACK_REQUEST_MAX_SKILL_READ_BYTES: u64 = 64 * 1024 * 1024;
 
 std::thread_local! {
     /// The read policy of the mobpack operation on this thread. Unset reads
@@ -14550,6 +14557,7 @@ pub(crate) fn with_untrusted_path_skill_reads<R>(
         PathSkillReads::Catalog {
             runtime_skill_paths: runtime_path_skill_paths(runtime),
             listed: std::cell::OnceCell::new(),
+            read_budget: std::cell::Cell::new(MOBPACK_REQUEST_MAX_SKILL_READ_BYTES),
         },
         f,
     )
@@ -14685,11 +14693,11 @@ impl ListedSkillFiles {
     /// Read the listed file that `path` names, from the real path checked.
     #[cfg(not(unix))]
     fn read(&self, path: &str) -> Result<Vec<u8>, PathSkillReadError> {
-        if is_refused_windows_path(path) {
-            return Err(PathSkillReadError::NotListed);
-        }
         if !self.paths.contains(path) {
             return Err(self.unlisted(path));
+        }
+        if is_refused_windows_path(path) {
+            return Err(PathSkillReadError::NotListed);
         }
         let real = std::fs::canonicalize(path).map_err(|_| PathSkillReadError::NotListed)?;
         if !self.identities.contains(&real) {
@@ -14705,6 +14713,9 @@ fn listed_skill_identity(
     path: &str,
     root: Option<&Path>,
 ) -> Result<(PathBuf, SkillFileIdentity), &'static str> {
+    if cfg!(not(unix)) && is_refused_windows_path(path) {
+        return Err("it is a UNC or device path, which needs host access");
+    }
     let real = std::fs::canonicalize(path).map_err(|_| "it does not resolve")?;
     if root.is_some_and(|root| !real.starts_with(root)) {
         return Err("its real path leaves the skill directory it is listed in");
@@ -14759,10 +14770,11 @@ fn skill_file_identity(real: &Path, catalog_file: bool) -> Result<SkillFileIdent
 
 /// A catalog file with other hard links may alias whatever file its linker
 /// could link. Read it only when it is another user's world-readable file,
-/// which any caller could read anyway: package stores and shared installs
-/// (Nix, pnpm, uv) hard-link their files. Refuse one the gateway's own user
-/// owns, so a link planted in a catalog directory cannot alias the gateway
-/// user's private files, and one that is not world-readable.
+/// which any caller could read anyway: a Nix store or an install another
+/// user owns hard-links its files. Refuse one the gateway's own user owns
+/// (which also covers a package store the gateway user installed), so a
+/// link planted in a catalog directory cannot alias the gateway user's
+/// private files, and one that is not world-readable.
 #[cfg(unix)]
 fn shared_link_refusal(owner: u32, gateway: Option<u32>, mode: u32) -> Option<&'static str> {
     if gateway.is_none_or(|gateway| gateway == owner) {
@@ -14799,8 +14811,8 @@ fn skill_file_identity(
 
 /// A UNC or device path (`\\server\share`, `\\?\`, `\\.\`, or their
 /// forward-slash forms) reaches a caller-named host or device. A listed skill
-/// path is never one, so refuse it before canonicalize touches it.
-#[cfg(not(unix))]
+/// path is never one, so refuse it before canonicalize touches it. Only
+/// Windows reads paths this way.
 fn is_refused_windows_path(path: &str) -> bool {
     let bytes = path.as_bytes();
     bytes.starts_with(br"\\") || bytes.starts_with(b"//")
@@ -14831,6 +14843,8 @@ enum PathSkillReadError {
     NotListed,
     /// A file the skills catalog lists, but not readable this way, and why.
     Refused(&'static str),
+    /// The request has read its whole skill file budget.
+    OverBudget,
     Unreadable(std::io::Error),
 }
 
@@ -14841,11 +14855,32 @@ fn read_path_skill_file(path: &str) -> Result<Vec<u8>, PathSkillReadError> {
         Some(PathSkillReads::Catalog {
             runtime_skill_paths,
             listed,
-        }) => listed
-            .get_or_init(|| ListedSkillFiles::from_catalog(runtime_skill_paths))
-            .read(path),
+            read_budget,
+        }) => {
+            let bytes = listed
+                .get_or_init(|| ListedSkillFiles::from_catalog(runtime_skill_paths))
+                .read(path)?;
+            let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            let remaining = read_budget.get();
+            if read > remaining {
+                return Err(PathSkillReadError::OverBudget);
+            }
+            read_budget.set(remaining - read);
+            Ok(bytes)
+        }
+        // No scope, so no request to count against: each read is bounded by
+        // the one listed file it reads. The authoring dispatcher and the Flow
+        // Editor always run a request in a scope.
         None => ListedSkillFiles::from_catalog(&[]).read(path),
     })
+}
+
+fn path_skill_reads_over_budget(skill_id: &str) -> String {
+    format!(
+        "selected path skills read more than {} MiB of skill files in one request; refusing \
+         to read '{skill_id}'",
+        MOBPACK_REQUEST_MAX_SKILL_READ_BYTES >> 20
+    )
 }
 
 fn path_skill_refused(skill_id: &str, path: &str, reason: &str) -> String {
@@ -14896,6 +14931,9 @@ fn selected_path_skill_files(
                 }
                 Err(PathSkillReadError::Refused(reason)) => {
                     return Err(path_skill_refused(&skill_id, path, reason));
+                }
+                Err(PathSkillReadError::OverBudget) => {
+                    return Err(path_skill_reads_over_budget(&skill_id));
                 }
                 Err(PathSkillReadError::Unreadable(err)) => {
                     return Err(format!(
@@ -14964,9 +15002,13 @@ fn is_safe_relative_archive_path(path: &str) -> bool {
         .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
+/// Fill each path skill without content in from the archive member it names.
+/// Every copy counts against the import's `budget`: one member may be named
+/// by many skills.
 fn hydrate_path_skill_content_from_archive(
     document: &mut MobpackDocument,
     files: &BTreeMap<String, Vec<u8>>,
+    budget: &mut ImportBudget,
 ) -> Result<(), String> {
     let Some(realms) = document.skill_realms.as_array_mut() else {
         return Ok(());
@@ -14996,6 +15038,7 @@ fn hydrate_path_skill_content_from_archive(
             }) else {
                 continue;
             };
+            budget.charge(bytes.len())?;
             let content = String::from_utf8(bytes.clone()).map_err(|err| {
                 format!("packed skill archive member {path} is not valid UTF-8: {err}")
             })?;
@@ -15054,11 +15097,57 @@ fn manifest_declares_adaptive_section(manifest: &str) -> bool {
 const MOBPACK_ARCHIVE_MAX_EXPANDED_BYTES: u64 = 32 * 1024 * 1024;
 /// The most entries an archive import reads.
 const MOBPACK_ARCHIVE_MAX_ENTRIES: usize = 4096;
-/// The most bytes of each member an import parses whole (`meta/editor.json`,
-/// `meta/mob.toml`, `manifest.toml`). Parsing expands text many times over
-/// (each `0,` in a JSON array becomes a 32-byte value), so these stay far
-/// below the archive cap.
+/// The most bytes of `meta/mob.toml` or `manifest.toml` an import parses.
+/// Parsing expands text several times over, so these stay far below the
+/// archive cap.
 const MOBPACK_ARCHIVE_MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
+/// The most bytes of `meta/editor.json` an import parses. A JSON value tree
+/// can be many times its text (each `0,` of an array becomes a 32-byte
+/// value). The largest sample editor document is a few KiB, so an authored
+/// document with its inline skill text stays far below this.
+const MOBPACK_ARCHIVE_MAX_EDITOR_JSON_BYTES: u64 = 1024 * 1024;
+/// The most bytes one archive import materializes, every copy counted: the
+/// archive's members, the parsed members' text, `mob.toml` copied into a
+/// document, and each path skill an archive member is copied into. One
+/// budget for the whole import, so a member named by many path skills is not
+/// copied once per name.
+const MOBPACK_IMPORT_MAX_MATERIALIZED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The bytes one archive import may still materialize (see
+/// [`MOBPACK_IMPORT_MAX_MATERIALIZED_BYTES`]).
+struct ImportBudget {
+    remaining: u64,
+}
+
+impl ImportBudget {
+    fn new() -> Self {
+        Self {
+            remaining: MOBPACK_IMPORT_MAX_MATERIALIZED_BYTES,
+        }
+    }
+
+    /// Count `bytes` about to be materialized, refusing past the budget.
+    fn charge(&mut self, bytes: usize) -> Result<(), String> {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        if bytes > self.remaining {
+            return Err(format!(
+                "mobpack archive import materializes more than {} MiB; refusing to import it",
+                MOBPACK_IMPORT_MAX_MATERIALIZED_BYTES >> 20
+            ));
+        }
+        self.remaining -= bytes;
+        Ok(())
+    }
+}
+
+/// The cap on an archive member that import parses whole, if it is one.
+fn parsed_archive_member_cap(path: &str) -> Option<u64> {
+    match path {
+        "meta/editor.json" => Some(MOBPACK_ARCHIVE_MAX_EDITOR_JSON_BYTES),
+        "meta/mob.toml" | "manifest.toml" => Some(MOBPACK_ARCHIVE_MAX_DOCUMENT_BYTES),
+        _ => None,
+    }
+}
 
 /// The members of a mobpack archive that import reads.
 struct MobpackArchiveMembers {
@@ -15120,7 +15209,10 @@ fn map_archive_read_error(context: &str, err: std::io::Error) -> String {
     }
 }
 
-fn read_mobpack_archive_members(decoded: impl Read) -> Result<MobpackArchiveMembers, String> {
+fn read_mobpack_archive_members(
+    decoded: impl Read,
+    budget: &mut ImportBudget,
+) -> Result<MobpackArchiveMembers, String> {
     let budgeted = ArchiveBudgetReader {
         inner: decoded,
         remaining: MOBPACK_ARCHIVE_MAX_EXPANDED_BYTES,
@@ -15132,11 +15224,6 @@ fn read_mobpack_archive_members(decoded: impl Read) -> Result<MobpackArchiveMemb
         mob_toml: None,
         manifest_toml: None,
     };
-    // A second budget, over the bytes each member materializes: a member whose
-    // data the tar layer synthesizes (a GNU sparse map's zero gaps) never
-    // passes the stream budget, so every member is read through this shared
-    // remainder too.
-    let mut materialized = MOBPACK_ARCHIVE_MAX_EXPANDED_BYTES;
     for (index, entry) in archive
         .entries()
         .map_err(|err| map_archive_read_error("invalid mobpack archive", err))?
@@ -15156,17 +15243,19 @@ fn read_mobpack_archive_members(decoded: impl Read) -> Result<MobpackArchiveMemb
             .map_err(|err| format!("invalid mobpack archive path: {err}"))?
             .to_string_lossy()
             .to_string();
-        // A mobpack holds regular files. A directory member carries no data,
-        // and a pax global header (`git archive` writes one first) applies to
-        // the whole archive; its bytes already passed the stream budget. Skip
-        // both. A contiguous file reads as a regular one. Anything else - a
-        // symlink or hard link naming a host path, a device or fifo, a GNU
-        // sparse map that synthesizes its bytes - is refused before any of its
-        // data is read. The tar reader has already parsed a sparse member's
-        // map by then; that map came through the stream budget (21 entries
-        // per 512-byte block), so it stays bounded. Refusing at the raw header
-        // would mean raw iteration, which also drops GNU long-name and pax
-        // path handling.
+        // A mobpack holds regular files. A directory member carries no data.
+        // A pax global header (`git archive` writes one first, carrying the
+        // commit id) sets defaults for the members after it, which neither
+        // the tar reader nor import applies; its data is skipped through the
+        // same stream budget when the next member is read. Skip both. A
+        // contiguous file reads as a regular one. Anything else - a symlink
+        // or hard link naming a host path, a device or fifo, a GNU sparse map
+        // that synthesizes its bytes - is refused before any of its data is
+        // read. The tar reader has already parsed a sparse member's block map
+        // by then, from blocks that came through the stream budget, so the
+        // map is bounded (about 1.4 million entries for 32 MiB). Refusing at
+        // the raw header would mean raw iteration, which also drops GNU
+        // long-name and pax path handling.
         if entry_type.is_dir() || entry_type.is_pax_global_extensions() {
             continue;
         }
@@ -15176,36 +15265,30 @@ fn read_mobpack_archive_members(decoded: impl Read) -> Result<MobpackArchiveMemb
                  to import it"
             ));
         }
-        let document_member = matches!(
-            path.as_str(),
-            "meta/editor.json" | "meta/mob.toml" | "manifest.toml"
-        );
-        let limit = if document_member {
-            materialized.min(MOBPACK_ARCHIVE_MAX_DOCUMENT_BYTES)
-        } else {
-            materialized
-        };
+        let parsed_cap = parsed_archive_member_cap(&path);
+        // A member is read up to what the import may still materialize, and a
+        // parsed member up to its cap too; +1 tells a member that fills its
+        // limit from one that overruns it.
+        let limit = parsed_cap.map_or(budget.remaining, |cap| cap.min(budget.remaining));
         let mut bytes = Vec::new();
-        // +1 so a member that exactly fills its limit is told from one that
-        // overruns it.
         (&mut entry)
             .take(limit + 1)
             .read_to_end(&mut bytes)
             .map_err(|err| {
                 map_archive_read_error(&format!("failed to read archive member {path}"), err)
             })?;
-        let read = bytes.len() as u64;
-        if document_member && read > MOBPACK_ARCHIVE_MAX_DOCUMENT_BYTES {
+        if let Some(cap) = parsed_cap
+            && bytes.len() as u64 > cap
+        {
             return Err(format!(
                 "mobpack archive member {path} is larger than {} MiB; refusing to import it",
-                MOBPACK_ARCHIVE_MAX_DOCUMENT_BYTES >> 20
+                cap >> 20
             ));
         }
-        if read > materialized {
-            return Err(mobpack_archive_too_large());
-        }
-        materialized -= read;
-        if document_member {
+        budget.charge(bytes.len())?;
+        if parsed_cap.is_some() {
+            // The parsed member's text is a second copy of its bytes.
+            budget.charge(bytes.len())?;
             let text = String::from_utf8(bytes.clone())
                 .map_err(|err| format!("invalid UTF-8 archive member {path}: {err}"))?;
             match path.as_str() {
@@ -15221,12 +15304,13 @@ fn read_mobpack_archive_members(decoded: impl Read) -> Result<MobpackArchiveMemb
 }
 
 fn document_from_archive_bytes(bytes: &[u8]) -> Result<MobpackDocument, String> {
+    let mut budget = ImportBudget::new();
     let MobpackArchiveMembers {
         files,
         editor_json,
         mob_toml,
         manifest_toml,
-    } = read_mobpack_archive_members(GzDecoder::new(bytes))?;
+    } = read_mobpack_archive_members(GzDecoder::new(bytes), &mut budget)?;
     // A predecessor (pre-0.9) export keeps its editor document under the
     // predecessor archive directory. Reading on without it would import an
     // empty or layout-less document, so it refuses and names the move.
@@ -15247,9 +15331,10 @@ fn document_from_archive_bytes(bytes: &[u8]) -> Result<MobpackDocument, String> 
         drop(text);
         let mut document = document_from_owned_value(value)?;
         if let Some(mob_toml) = mob_toml.as_ref() {
+            budget.charge(mob_toml.len())?;
             document.mob_toml = Some(mob_toml.clone());
         }
-        hydrate_path_skill_content_from_archive(&mut document, &files)?;
+        hydrate_path_skill_content_from_archive(&mut document, &files, &mut budget)?;
         if let Some(mob_toml) = mob_toml.as_ref()
             && archive_editor_projection_should_reproject(&document, mob_toml)
         {
@@ -15257,13 +15342,15 @@ fn document_from_archive_bytes(bytes: &[u8]) -> Result<MobpackDocument, String> 
                 .map_err(|err| format!("failed to parse mob.toml from mobpack archive: {err}"))?;
             let fallback_name = document.name.trim().to_string();
             let deploy = document.deploy.clone();
+            // The projection holds its own copy of `mob.toml`.
+            budget.charge(mob_toml.len())?;
             let mut projected = project_definition_to_editor_document(
                 &definition,
                 mob_toml,
                 (!fallback_name.is_empty()).then_some(fallback_name.as_str()),
                 deploy,
             )?;
-            hydrate_path_skill_content_from_archive(&mut projected, &files)?;
+            hydrate_path_skill_content_from_archive(&mut projected, &files, &mut budget)?;
             // The mob.toml reprojection (member/parallel/branch/repeat steps)
             // cannot reconstruct the adaptive layer step. If the editor.json
             // document carried one, reprojecting would silently gut the
@@ -15302,13 +15389,15 @@ fn document_from_archive_bytes(bytes: &[u8]) -> Result<MobpackDocument, String> 
     if let Some(mob_toml) = mob_toml {
         let definition = MobDefinition::from_toml(&mob_toml)
             .map_err(|err| format!("failed to parse mob.toml from mobpack archive: {err}"))?;
+        // The projection holds its own copy of `mob.toml`.
+        budget.charge(mob_toml.len())?;
         let mut document = project_definition_to_editor_document(
             &definition,
             &mob_toml,
             Some(&name),
             Value::Null,
         )?;
-        hydrate_path_skill_content_from_archive(&mut document, &files)?;
+        hydrate_path_skill_content_from_archive(&mut document, &files, &mut budget)?;
         return Ok(document);
     }
 
@@ -22360,7 +22449,9 @@ fn validate_selected_skill_sources(document: &MobpackDocument) -> Vec<MobpackDia
 
 fn validate_selected_path_skill_files(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
     let mut diagnostics = Vec::new();
-    let mut archive_paths = BTreeMap::<String, Vec<u8>>::new();
+    // A digest per archive path is enough to find conflicting content, so
+    // validation keeps no copy of any skill's bytes.
+    let mut archive_paths = BTreeMap::<String, [u8; 32]>::new();
     for (skill_id, source) in selected_skill_sources(document) {
         let source_kind = source
             .get("source")
@@ -22372,8 +22463,9 @@ fn validate_selected_path_skill_files(document: &MobpackDocument) -> Vec<Mobpack
             continue;
         }
         let archive_path = packed_skill_archive_path(&skill_id, &source);
-        let bytes = if let Some(content) = source.get("content").and_then(Value::as_str) {
-            content.as_bytes().to_vec()
+        let digest: [u8; 32] = if let Some(content) = source.get("content").and_then(Value::as_str)
+        {
+            Sha256::digest(content.as_bytes()).into()
         } else {
             let Some(path) = source
                 .get("path")
@@ -22399,7 +22491,16 @@ fn validate_selected_path_skill_files(document: &MobpackDocument) -> Vec<Mobpack
                 continue;
             }
             match read_path_skill_file(path) {
-                Ok(bytes) => bytes,
+                Ok(bytes) => Sha256::digest(&bytes).into(),
+                Err(PathSkillReadError::OverBudget) => {
+                    diagnostics.push(MobpackDiagnostic {
+                        severity: "error".to_string(),
+                        code: "selected_skill_reads_over_budget".to_string(),
+                        message: path_skill_reads_over_budget(&skill_id),
+                        path: Some(format!("skill_realms.skills[{skill_id}].path")),
+                    });
+                    continue;
+                }
                 Err(PathSkillReadError::NotListed) => {
                     diagnostics.push(MobpackDiagnostic {
                         severity: "error".to_string(),
@@ -22432,7 +22533,7 @@ fn validate_selected_path_skill_files(document: &MobpackDocument) -> Vec<Mobpack
             }
         };
         if let Some(existing) = archive_paths.get(&archive_path) {
-            if existing != &bytes {
+            if existing != &digest {
                 diagnostics.push(MobpackDiagnostic {
                     severity: "error".to_string(),
                     code: "selected_skill_archive_path_conflict".to_string(),
@@ -22443,7 +22544,7 @@ fn validate_selected_path_skill_files(document: &MobpackDocument) -> Vec<Mobpack
                 });
             }
         } else {
-            archive_paths.insert(archive_path, bytes);
+            archive_paths.insert(archive_path, digest);
         }
     }
     diagnostics
@@ -36521,10 +36622,11 @@ branch = "choice"
         }))
     }
 
-    /// Security regression: the members an import parses (`meta/editor.json`,
-    /// `meta/mob.toml`, `manifest.toml`) are refused above 4 MiB before they
-    /// are parsed, so a small upload cannot make import build a parsed JSON or
-    /// TOML tree many times its size. A document under the cap still imports.
+    /// Security regression: the members an import parses are refused above a
+    /// cap before they are parsed (`meta/editor.json` above 1 MiB,
+    /// `meta/mob.toml` and `manifest.toml` above 4 MiB), so a small upload
+    /// cannot make import build a parsed JSON or TOML tree many times its
+    /// size. A document under the cap still imports.
     #[test]
     fn archive_import_refuses_oversized_document_members() {
         let mut document = document_with_real_launch_modes();
@@ -36551,15 +36653,15 @@ branch = "choice"
             text
         };
 
-        let under = with_member("meta/editor.json", padded_editor(3 << 20));
-        let over = with_member("meta/editor.json", padded_editor(4 << 20));
+        let under = with_member("meta/editor.json", padded_editor(512 << 10));
+        let over = with_member("meta/editor.json", padded_editor(3 << 19));
         let mob_toml_over = with_member("meta/mob.toml", padded_toml("meta/mob.toml"));
         let manifest_over = with_member("manifest.toml", padded_toml("manifest.toml"));
 
         assert!(under.is_ok(), "{under:?}");
         assert_eq!(
             (
-                over.map_err(|error| error.contains("larger than 4 MiB")),
+                over.map_err(|error| error.contains("larger than 1 MiB")),
                 mob_toml_over.map_err(|error| error.contains("larger than 4 MiB")),
                 manifest_over.map_err(|error| error.contains("larger than 4 MiB")),
             ),
@@ -36726,6 +36828,178 @@ branch = "choice"
                 r"\\.\pipe\x",
                 "/home/user/skills/x/SKILL.md",
             )
+        );
+    }
+
+    /// Security regression: filling path skills in from archive members is
+    /// counted against one budget for the whole import. One member named by
+    /// a thousand path skills is not copied a thousand times.
+    #[test]
+    fn archive_import_bounds_path_skill_hydration_across_references() {
+        let mut document = document_with_real_launch_modes();
+        document.mob_toml = None;
+        let exported = export_mobpack(&json!({ "document": document })).expect("export");
+        let mut files = exported_archive_files(&exported.content_base64);
+        let mut editor: Value =
+            serde_json::from_slice(&files["meta/editor.json"]).expect("editor json");
+        let skills = (0..1_000)
+            .map(|index| {
+                json!({
+                    "id": format!("copy.{index}"),
+                    "label": "Copy",
+                    "source": "path",
+                    "path": "a"
+                })
+            })
+            .collect::<Vec<_>>();
+        let realms = editor["document"]["skill_realms"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .chain([json!({
+                "id": "local/copies",
+                "label": "Copies",
+                "source": "filesystem",
+                "skills": skills
+            })])
+            .collect::<Vec<_>>();
+        editor["document"]["skill_realms"] = Value::Array(realms);
+        files.insert(
+            "meta/editor.json".to_string(),
+            serde_json::to_vec(&editor).expect("editor json bytes"),
+        );
+        // 128 KiB named a thousand times is 125 MiB of copies.
+        files.insert("a".to_string(), vec![b'a'; 128 << 10]);
+
+        let imported = import_archive_files(&files);
+
+        assert_eq!(
+            imported.map_err(|error| error.contains("materializes more than 64 MiB")),
+            Err(true)
+        );
+    }
+
+    /// Set in the child process of the path skill read budget test, to its
+    /// scratch directory.
+    #[cfg(unix)]
+    const READ_BUDGET_CHILD: &str = "META_TEST_PATH_SKILL_READ_BUDGET";
+
+    /// Security regression: a caller without host access cannot make one
+    /// request read a listed skill file over and over: the skill files one
+    /// request reads count against one budget. Here a 1 MiB listed skill is
+    /// selected under a hundred skill ids.
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_path_skill_reads_stop_at_a_request_budget() {
+        if let Some(scratch) = std::env::var_os(READ_BUDGET_CHILD) {
+            let skill = PathBuf::from(scratch).join("skills/big/SKILL.md");
+            let mut document = document_selecting_path_skill(&skill);
+            let ids = (0..100)
+                .map(|index| format!("big.{index}"))
+                .collect::<Vec<_>>();
+            document.members.as_array_mut().unwrap()[0]["skills"] = json!(ids);
+            document.skill_realms = json!([{
+                "id": "local/big",
+                "label": "Big",
+                "source": "filesystem",
+                "skills": ids
+                    .iter()
+                    .map(|id| json!({
+                        "id": id,
+                        "label": "Big",
+                        "source": "path",
+                        "path": skill
+                    }))
+                    .collect::<Vec<_>>()
+            }]);
+            let read =
+                with_untrusted_path_skill_reads(None, || selected_path_skill_files(&document));
+            assert_eq!(
+                read.map(|files| files.len())
+                    .map_err(|error| error.contains("more than 64 MiB")),
+                Err(true)
+            );
+            return;
+        }
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let big = scratch.path().join("skills/big");
+        std::fs::create_dir_all(&big).expect("skill dir");
+        std::fs::write(big.join("SKILL.md"), vec![b'x'; 1 << 20]).expect("big skill");
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "mobpack::tests::untrusted_path_skill_reads_stop_at_a_request_budget",
+                "--exact",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(READ_BUDGET_CHILD, scratch.path())
+            .env("META_SKILL_DIRS", scratch.path().join("skills"))
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Validation compares a digest per archive path, not a copy of each
+    /// skill's bytes, and still reports two selected skills that pack
+    /// different content to one archive path.
+    #[test]
+    fn validation_reports_different_skill_content_packed_to_one_archive_path() {
+        let mut document = document_with_expected_schema_ref();
+        document.mob_toml = None;
+        document.members.as_array_mut().unwrap()[0]["skills"] = json!(["one", "two"]);
+        document.skill_realms = json!([{
+            "id": "local/clash",
+            "label": "Clash",
+            "source": "filesystem",
+            "skills": [
+                { "id": "one", "label": "One", "source": "path", "path": "skills/same.md", "content": "first" },
+                { "id": "two", "label": "Two", "source": "path", "path": "skills/same.md", "content": "second" }
+            ]
+        }]);
+
+        let validation = validate_document(&document);
+
+        assert!(
+            validation
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "selected_skill_archive_path_conflict"),
+            "{validation:#?}"
+        );
+    }
+
+    /// Every sample and template document is far under the `meta/editor.json`
+    /// cap, so authored documents import with a wide margin.
+    #[test]
+    fn sample_editor_documents_fit_far_under_the_editor_json_cap() {
+        let largest = sample_mobpack_catalog()
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain([&blank_mobpack_template()])
+            .map(|sample| {
+                serde_json::to_vec_pretty(&json!({
+                    "schema_version": MOBPACK_SCHEMA_VERSION,
+                    "media_type": MOBPACK_MEDIA_TYPE,
+                    "document": sample["document"],
+                }))
+                .expect("editor json")
+                .len()
+            })
+            .max()
+            .unwrap_or_default();
+
+        assert!(
+            (largest as u64) < MOBPACK_ARCHIVE_MAX_EDITOR_JSON_BYTES / 8,
+            "the largest sample editor document is {largest} bytes"
         );
     }
 }

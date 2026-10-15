@@ -46,21 +46,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   without a stat that reaches it. A listed file counts only while its real
   path stays inside the skill directory it was found in, and a catalog file
   with other hard links counts only when another user owns it and it is
-  world-readable (package stores such as Nix, pnpm and uv link their files;
-  a link to the gateway user's own files does not count). The server reads
-  the file it opened (comparing the opened file's device and inode), so a
-  link swapped in after listing reaches no other file. `meta/skills/catalog`
-  marks each filesystem skill with `readable_without_host_access`, and with
-  `read_refusal` when a caller without host access cannot read it; reading
-  such a skill names that reason. Host access is the caller's own per-call
-  `mobpack.deploy` decision, so a deny rule withholds it even beside an
-  allow rule such as `mobpack.*`. Callers with host access, and the SDKs'
-  stdio and in-process RPC, may still name such paths.
+  world-readable, as in a Nix store or another user's install (a store the
+  gateway's own user owns, as pnpm and uv stores usually are, does not
+  count, and neither does a link to the gateway user's own files). The
+  server reads the file it opened (comparing the opened file's device and
+  inode), so a link swapped in after listing reaches no other file.
+  `meta/skills/catalog` marks each filesystem skill with
+  `readable_without_host_access`, and with `read_refusal` when a caller
+  without host access cannot read it; reading such a skill names that
+  reason. One request without host access reads at most 64 MiB of skill
+  files in total, however many skills name a file. Host access is the
+  caller's own per-call `mobpack.deploy` decision, so a deny rule withholds
+  it even beside an allow rule such as `mobpack.*`. Callers with host
+  access, and the SDKs' stdio and in-process RPC, may still name such paths.
 - Importing a mobpack archive (`meta/mobpacks/import`, and the draft methods
   that re-import a stored archive) refuses an archive that expands past
   32 MiB, holds more than 4096 entries, holds a member that is not a regular
-  file, or holds a `meta/editor.json`, `meta/mob.toml` or `manifest.toml`
-  larger than 4 MiB (parsing expands those many times over). A pax global
+  file, or holds a `meta/editor.json` larger than 1 MiB or a
+  `meta/mob.toml` or `manifest.toml` larger than 4 MiB (parsing expands
+  those many times over). Everything one import materializes, archive
+  members, parsed text and each path skill filled in from a member, counts
+  against one 64 MiB budget, so a member named by many path skills is not
+  copied once per name. A pax global
   header, which `git archive` writes, is skipped, and a contiguous file
   reads as a regular one. Before, a request under the HTTP body limit could
   expand into gigabytes of memory: a member's bytes were read with no
