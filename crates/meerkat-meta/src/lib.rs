@@ -36,6 +36,7 @@ pub mod decisions;
 pub mod detached_completion;
 #[cfg(test)]
 mod detached_delivery_route_tests;
+pub(crate) mod document_mcp_marker;
 #[cfg(feature = "extension-state")]
 pub mod extension_state;
 pub(crate) mod fallback_wake;

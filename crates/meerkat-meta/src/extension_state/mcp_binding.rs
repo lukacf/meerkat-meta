@@ -13,11 +13,9 @@ use meerkat_mcp::{
 };
 
 use super::{ToolBundleFactory, ToolBundleRequirements};
+pub use crate::document_mcp_marker::DOCUMENT_BINDING_ENV;
+use crate::document_mcp_marker::is_marked as is_document_descriptor;
 use crate::storage_predecessor::PREDECESSOR_DOCUMENT_BINDING_ENV;
-
-/// Public launch marker, not a credential or a caller identity. An unresolved
-/// marked descriptor always refuses instead of launching an unbound service.
-pub const DOCUMENT_BINDING_ENV: &str = "META_MCP_DOCUMENT_BINDING";
 
 pub use meerkat_mob_mcp::ChildToolBundleAvailability as ChildMcpAvailability;
 
@@ -251,12 +249,6 @@ pub(crate) fn pre_build_hook(
             Ok(())
         })
     })
-}
-
-fn is_document_descriptor(config: &McpServerConfig) -> bool {
-    matches!(&config.transport, McpTransportConfig::Stdio(stdio)
-        if stdio.env.contains_key(DOCUMENT_BINDING_ENV)
-            || stdio.env.contains_key(PREDECESSOR_DOCUMENT_BINDING_ENV))
 }
 
 pub(crate) struct DocumentMcpContextProvider {

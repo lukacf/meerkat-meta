@@ -45,6 +45,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   to a binding with the same server name it refused as a mismatch, and
   otherwise it launched without the host's endpoint and credentials. With
   no binding to resolve it, a descriptor in either spelling now refuses.
+- Without the `extension-state` feature, as in the stock gateways, a member
+  whose profile carries a marked document MCP descriptor
+  (`META_MCP_DOCUMENT_BINDING`, or `MOBKIT_MCP_DOCUMENT_BINDING` from before
+  0.9) is refused at its build instead of launching the descriptor's
+  command without the host's binding. Every composition checks this after
+  its pre-build hook, so feature-on compositions that install no document
+  binding, such as a runtime bootstrapped from a ready `MobBootstrapSpec`,
+  refuse too.
 
 ## [0.9.1] - 2026-10-15
 
