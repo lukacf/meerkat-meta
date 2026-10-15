@@ -1022,6 +1022,7 @@ class ImmutableReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('codesign --force --sign - "target/${{ matrix.target }}/release/${bin}"', signing)
         block = job_block("build_binaries")
         order = ("Apply release build profile overrides", "Build gateway binaries",
+                 "Verify macOS binary architecture",
                  "Ad-hoc codesign macOS binaries", "Package artifacts", "Attest build provenance",
                  "Retain original provenance bundle", "Upload artifacts")
         positions = [block.index(f"      - name: {name}") for name in order]
@@ -1397,6 +1398,225 @@ class LinuxReleaseContainerTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertTrue(checked, "the gate was never invoked")
+
+
+def matrix_entries(job: str = "build_binaries") -> list[dict[str, str]]:
+    """The `include:` entries of a job's matrix, as `key: value` maps."""
+    entries: list[dict[str, str]] = []
+    for line in job_block(job).splitlines():
+        start = re.fullmatch(r"          - ([a-z_-]+): (\S+)", line)
+        field = re.fullmatch(r"            ([a-z_-]+): (\S+)", line)
+        if start:
+            entries.append({start.group(1): start.group(2)})
+        elif field and entries:
+            entries[-1][field.group(1)] = field.group(2)
+    return entries
+
+
+MACH_O_FILE_DESCRIPTIONS = {
+    "arm64": "Mach-O 64-bit executable arm64",
+    "x86_64": "Mach-O 64-bit executable x86_64",
+}
+
+
+def run_macos_arch_step(target: str, *, lipo: str, file: str,
+                        overrides: dict[str, tuple[str, str]] | None = None,
+                        ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Execute the `Verify macOS binary architecture` step body under bash.
+
+    Fake `lipo` and `file` print the given readings (per binary name when
+    `overrides` names it) and record which paths were read, so the test
+    observes the step's decisions on the binaries a cross build produced
+    rather than pattern-matching the YAML. No macOS toolchain is needed.
+    """
+    with fixture_directory() as tmp:
+        root = Path(tmp)
+        bin_dir = root / "fake-bin"
+        bin_dir.mkdir()
+        log = root / "lipo.log"
+        readings = {"*": (lipo, file), **(overrides or {})}
+        (root / "readings.json").write_text(json.dumps(readings))
+        for tool, index, flag in (("lipo", 0, "-archs"), ("file", 1, "-b")):
+            record = 'printf "%s\\n" "$2" >> "$FAKE_LIPO_LOG"' if tool == "lipo" else ":"
+            fake = bin_dir / tool
+            fake.write_text(
+                f"""#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == "{flag}" ]] || {{ echo "fake {tool}: unexpected arguments: $*" >&2; exit 99; }}
+{record}
+python3 - "$2" <<'PY'
+import json, os, sys
+readings = json.load(open(os.environ["FAKE_READINGS"]))
+name = os.path.basename(sys.argv[1])
+print(readings.get(name, readings["*"])[{index}])
+PY
+"""
+            )
+            fake.chmod(0o755)
+        env = os.environ.copy()
+        env.update({
+            "TARGET": target,
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "FAKE_LIPO_LOG": str(log),
+            "FAKE_READINGS": str(root / "readings.json"),
+        })
+        result = subprocess.run(
+            ["bash", "-c", step_script("Verify macOS binary architecture")],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        checked = log.read_text().splitlines() if log.exists() else []
+    return result, checked
+
+
+class MacosReleaseLegTests(unittest.TestCase):
+    """Both macOS legs run on the free arm64 macos-15 label: x86_64 is a
+    cross build there, and every produced binary's Mach-O architecture is
+    read back before anything is signed, packaged, attested or uploaded."""
+
+    def test_x86_64_macos_cross_compiles_on_the_free_arm64_label(self):
+        runners = {entry["target"]: entry["runs-on"] for entry in matrix_entries()}
+        self.assertEqual(set(runners), set(matrix_targets()))
+        self.assertEqual(runners["aarch64-apple-darwin"], "macos-15")
+        self.assertEqual(runners["x86_64-apple-darwin"], "macos-15")
+        block = job_block("build_binaries")
+        # Neither the slow Intel label nor a billed larger label comes back.
+        self.assertNotRegex(block, r"(?m)^\s+- runs-on: macos-\S*(intel|large|xlarge)")
+        # The toolchain step installs the cross standard library.
+        toolchain = step_block("Install Rust")
+        self.assertIn("uses: dtolnay/rust-toolchain@", toolchain)
+        self.assertEqual(scalar(toolchain, "targets", "          "), "${{ matrix.target }}")
+        self.assertIn('--release --target "${{ matrix.target }}"', step_script("Build gateway binaries"))
+
+    def test_the_check_runs_on_macos_after_the_build_and_before_anything_ships(self):
+        block = job_block("build_binaries")
+        check = block.index("      - name: Verify macOS binary architecture")
+        self.assertLess(block.index("      - name: Build gateway binaries"), check)
+        for later in ("Ad-hoc codesign macOS binaries", "Package artifacts",
+                      "Attest build provenance", "Upload artifacts"):
+            with self.subTest(step=later):
+                self.assertLess(check, block.index(f"      - name: {later}"))
+        step = step_block("Verify macOS binary architecture")
+        self.assertEqual(scalar(step, "if", "        "), "runner.os == 'macOS'")
+        self.assertIn("          TARGET: ${{ matrix.target }}", step)
+        self.assertNotIn("continue-on-error", step)
+
+    def test_every_binary_the_build_step_produces_is_read_for_each_macos_target(self):
+        built = re.findall(r"--bin (\w+)", step_script("Build gateway binaries"))
+        self.assertTrue(built, "the build step names no --bin; the parser is wrong")
+        for target, arch in (("aarch64-apple-darwin", "arm64"), ("x86_64-apple-darwin", "x86_64")):
+            with self.subTest(target=target):
+                result, checked = run_macos_arch_step(
+                    target, lipo=arch, file=MACH_O_FILE_DESCRIPTIONS[arch])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(sorted(checked),
+                                 sorted(f"target/{target}/release/{name}" for name in built))
+
+    def test_host_architecture_code_from_a_cross_build_is_refused(self):
+        result, _ = run_macos_arch_step(
+            "x86_64-apple-darwin", lipo="arm64", file=MACH_O_FILE_DESCRIPTIONS["arm64"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("expected exactly 'x86_64'", result.stderr)
+
+    def test_a_universal_binary_is_refused(self):
+        result, _ = run_macos_arch_step(
+            "x86_64-apple-darwin", lipo="x86_64 arm64",
+            file="Mach-O universal binary with 2 architectures: [x86_64:Mach-O 64-bit executable x86_64]")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_one_wrong_binary_fails_the_whole_set(self):
+        result, checked = run_macos_arch_step(
+            "x86_64-apple-darwin", lipo="x86_64", file=MACH_O_FILE_DESCRIPTIONS["x86_64"],
+            overrides={"meta_repair": ("arm64", MACH_O_FILE_DESCRIPTIONS["arm64"])})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("target/x86_64-apple-darwin/release/meta_repair", checked)
+
+    def test_file_must_agree_with_lipo(self):
+        for description in (
+            MACH_O_FILE_DESCRIPTIONS["arm64"],
+            "Mach-O 64-bit executable x86_64h",
+            "Mach-O 64-bit dynamically linked shared library x86_64",
+            "ELF 64-bit LSB pie executable, x86-64",
+        ):
+            with self.subTest(description=description):
+                result, _ = run_macos_arch_step("x86_64-apple-darwin", lipo="x86_64", file=description)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_both_spellings_of_file_are_accepted(self):
+        for description in (
+            "Mach-O 64-bit executable x86_64",
+            "Mach-O 64-bit x86_64 executable, flags:<NOUNDEFS|DYLDLINK|TWOLEVEL|PIE>",
+        ):
+            with self.subTest(description=description):
+                result, _ = run_macos_arch_step("x86_64-apple-darwin", lipo="x86_64", file=description)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_target_without_a_known_architecture_is_refused(self):
+        result, checked = run_macos_arch_step(
+            "x86_64-unknown-linux-gnu", lipo="x86_64", file=MACH_O_FILE_DESCRIPTIONS["x86_64"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(checked, [])
+
+
+def hashed_env(block: str, indent: str) -> dict[str, str]:
+    """The variables rust-cache hashes into its key, from one `env:` level.
+
+    rust-cache hashes every variable whose name starts with one of these
+    prefixes, with the Rust version, into the key; the toolchain action sets
+    CARGO_HOME and CARGO_INCREMENTAL the same way in both workflows.
+    """
+    pattern = re.compile(rf"(?m)^{indent}((?:CARGO|CC|CFLAGS|CXX|CMAKE|RUST)\w*): (.*)$")
+    return dict(pattern.findall(block))
+
+
+class ReleaseCacheReuseTests(unittest.TestCase):
+    def test_release_legs_keep_what_a_failed_leg_compiled(self):
+        cache = step_block("Cache cargo registry")
+        self.assertIn("uses: Swatinem/rust-cache@v2", cache)
+        self.assertEqual(scalar(cache, "cache-on-failure", "          "), "true")
+        # Candidate runs dispatch from main, so their entries are main's.
+        self.assertNotIn("save-if", cache)
+
+    def test_crate_publication_restores_the_exact_main_ci_dependency_build(self):
+        """`cargo publish` verification is a full dev build; it must restore
+        the meta-dev-bins entry CI saved for the same commit, and never save.
+
+        rust-cache keys on the shared key, the runner and the hashed
+        environment, so every one of them must equal what test-python and
+        flow-editor use in ci.yml, or the restore silently misses.
+        """
+        ci_workflow = ROOT / ".github/workflows/ci.yml"
+        ci_source = ci_workflow.read_text()
+
+        def ci_job(name: str) -> str:
+            lines = ci_source.splitlines()
+            start = lines.index(f"  {name}:")
+            for offset, line in enumerate(lines[start + 1:], start=start + 1):
+                if re.fullmatch(r"  [A-Za-z_][A-Za-z0-9_-]*:", line):
+                    return "\n".join(lines[start:offset])
+            return "\n".join(lines[start:])
+
+        publish = job_block("publish_registries")
+        cache = step_block("Cache cargo registry", "publish_registries")
+        self.assertEqual(scalar(cache, "shared-key", "          "), "meta-dev-bins")
+        self.assertEqual(scalar(cache, "save-if", "          "), "false")
+        release_header = RELEASE_WORKFLOW.read_text().split("\njobs:\n", 1)[0]
+        ci_header = ci_source.split("\njobs:\n", 1)[0]
+        release_env = {**hashed_env(release_header, "  "), **hashed_env(publish, "      ")}
+        self.assertEqual(release_env["CARGO_TARGET_DIR"], "${{ github.workspace }}/target")
+        for name in ("test-python", "flow-editor"):
+            with self.subTest(ci_job=name):
+                block = ci_job(name)
+                self.assertIn("          shared-key: meta-dev-bins\n", block)
+                self.assertEqual(
+                    {**hashed_env(ci_header, "  "), **hashed_env(block, "      ")}, release_env)
+                self.assertEqual(scalar(block, "runs-on", "    "), scalar(publish, "runs-on", "    "))
+        # The packaged crates build through repo-cargo, which honours the
+        # explicit target directory rust-cache restores.
+        for step in ("Publish extension document crate", "Publish Rust crate"):
+            self.assertIn("scripts/repo-cargo publish -p", step_script(step, "publish_registries"))
 
 
 if __name__ == "__main__":

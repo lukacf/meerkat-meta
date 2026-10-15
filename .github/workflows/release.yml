@@ -265,11 +265,19 @@ jobs:
           - runs-on: macos-15
             target: aarch64-apple-darwin
             archive_ext: tar.gz
-          # x86_64 macOS builds natively on the free standard Intel label, as
-          # Meerkat's release workflow does. The billed macos-15-large label
-          # refuses to start when the account's Actions spending limit is
-          # reached, which failed candidate run 38521788616.
-          - runs-on: macos-15-intel
+          # x86_64 macOS cross-compiles on the same free arm64 macos-15 label.
+          # The free Intel label (macos-15-intel) was the slowest leg of every
+          # candidate: 176 minutes in run 38529874352 and still building
+          # after 70 in run 38719226636, against 51 for the cold arm64 leg.
+          # The billed macos-15-large label refuses to start when the
+          # account's Actions spending limit is reached, which failed
+          # candidate run 38521788616. Apple's toolchain links both
+          # architectures, the toolchain step adds the x86_64 standard
+          # library, and the cmake and cc crates pass the target
+          # architecture to the bundled C builds (Opus, ring, SQLite).
+          # "Verify macOS binary architecture" reads every produced binary
+          # before anything is signed or packaged.
+          - runs-on: macos-15
             target: x86_64-apple-darwin
             archive_ext: tar.gz
           - runs-on: windows-latest
@@ -298,6 +306,11 @@ jobs:
           # stale cache because rust-cache saves only on success. macOS and
           # Windows keys are unchanged.
           key: release-${{ contains(matrix.target, 'unknown-linux-gnu') && 'bullseye-' || '' }}${{ matrix.target }}
+          # Save what a failed or cancelled leg compiled too, so re-running
+          # the leg, or the next candidate, resumes from its dependencies
+          # instead of rebuilding Meerkat Core from nothing. Workspace crates
+          # are never cached; meerkat-meta always builds from the source.
+          cache-on-failure: true
 
       # Meerkat 0.8.40's `openai-live` path pulls `opus` -> `audiopus_sys`,
       # whose build script falls back to compiling bundled Opus with CMake when
@@ -416,6 +429,45 @@ jobs:
             "target/${TARGET}/release/meta_gateway" \
             "target/${TARGET}/release/rpc_gateway" \
             "target/${TARGET}/release/meta_repair"
+
+      # Both macOS legs run on the arm64 macos-15 label, and the x86_64 leg
+      # cross-compiles, so a build that silently produced host (arm64) code
+      # would otherwise be signed and shipped as x86_64. lipo decides; file
+      # must agree. Every binary the build step produces is checked, and
+      # scripts/test_release_workflow.py runs this body against that --bin
+      # list.
+      - name: Verify macOS binary architecture
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "${TARGET}" in
+            aarch64-apple-darwin) expected="arm64" ;;
+            x86_64-apple-darwin) expected="x86_64" ;;
+            *)
+              echo "::error::no expected Mach-O architecture for ${TARGET}" >&2
+              exit 1
+              ;;
+          esac
+          # file's two spellings: "Mach-O 64-bit executable x86_64" (macOS)
+          # and "Mach-O 64-bit x86_64 executable, flags:..." (libmagic 5.4x).
+          file_pattern="^Mach-O 64-bit (executable ${expected}|${expected} executable)([^A-Za-z0-9_]|$)"
+          for bin in meta_gateway rpc_gateway meta_repair; do
+            path="target/${TARGET}/release/${bin}"
+            archs="$(lipo -archs "${path}")"
+            description="$(file -b "${path}")"
+            echo "${path}: lipo '${archs}'; file '${description}'"
+            if [[ "${archs}" != "${expected}" ]]; then
+              echo "::error::${path} contains '${archs}', expected exactly '${expected}'" >&2
+              exit 1
+            fi
+            if [[ ! "${description}" =~ ${file_pattern} ]]; then
+              echo "::error::${path} is '${description}', expected a Mach-O 64-bit ${expected} executable" >&2
+              exit 1
+            fi
+          done
 
       - name: Ad-hoc codesign macOS binaries
         if: runner.os == 'macOS'
@@ -744,6 +796,19 @@ jobs:
        needs.publish_sdk_packages.result == 'failure')
     needs: [resolve_release, release_validate, verify_release_assets, publish_github_release, publish_sdk_packages]
     runs-on: ubuntu-24.04
+    # `cargo publish` verifies each crate by building its packaged sources in
+    # the dev profile, and without a usable cache that was a full cold build:
+    # "Publish Rust crate" took 27 of promotion run 38568276468's 32 minutes.
+    # scripts/repo-cargo builds under ~/.cache unless CARGO_TARGET_DIR is set,
+    # so the rust-cache step restored a directory nothing was built in. With
+    # ci.yml's target directory and line tables, this job restores the
+    # meta-dev-bins entry that the exact-main CI run of the same commit saved
+    # (rust-cache hashes these variables into the key, so they must match
+    # test-python and flow-editor), and only the packaged crates compile.
+    # It never saves: promotion adds no cache entry of its own.
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -755,6 +820,9 @@ jobs:
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: meta-dev-bins
+          save-if: false
 
       - name: Install Python tooling
         uses: actions/setup-python@v5
