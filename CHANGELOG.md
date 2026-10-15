@@ -40,10 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `MemoryScope::operation_scope_ref` and `AGENT_MEMORY_TARGET_OWNER`
   (`meerkat_meta::memory`): the typed reference by which Meta's memory tools
   name a memory scope in operation targets, `MemoryScopeRef::Host` with owner
-  `meta.agent_memory` and scope `<kind>/<realm>/<key>` (`%` and `/`
-  percent-escaped in the realm and key). A host operation policy maps it to
-  its own action, and a targeted grant selects one lineage for exactly that
-  scope.
+  `meta.agent_memory` and scope `<kind>/<realm>/<key>`, where every `%` in
+  the realm and key is written `%25` and every `/` is written `%2F`. A host
+  operation policy maps it to its own action, and a targeted grant selects
+  one lineage for exactly that scope. The format is a stored contract (work
+  associations persist it as the grant target of memory operations) and will
+  not change; `operation_scope_ref` documents it in full.
 - Meta's mob session wrappers forward Meerkat's `tool_catalog_view` query to
   the session service they wrap, like its tool-scope siblings, instead of
   answering that no view is available.
