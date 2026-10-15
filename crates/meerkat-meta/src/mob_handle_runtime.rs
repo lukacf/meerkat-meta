@@ -9329,6 +9329,11 @@ impl MobBootstrapSpec {
     /// constructors. No Meta pre-build hook runs inside it, so the base layer
     /// refuses a marked document MCP descriptor in a member's build
     /// ([`crate::document_mcp_marker`]): no document binding resolved it.
+    ///
+    /// The refusal sits in the spec's outermost layer, which runs before any
+    /// pre-build hook inside the supplied service. A supplied service whose
+    /// own hook would resolve a marked descriptor never gets to: the build is
+    /// refused first.
     pub fn new(
         definition: MobDefinition,
         storage: MobStorage,
