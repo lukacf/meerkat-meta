@@ -127,6 +127,17 @@ def area_of(path: str) -> str:
     return path.split("/", 1)[0] + "/"
 
 
+def names_existing_path(root: Path, target: str) -> bool:
+    """Whether `target` is a file or directory, or the extension-less start
+    of a file name (an import such as ../sdk/typescript/src/live). Plain
+    string comparison: the text may hold glob characters."""
+    candidate = root / target
+    if candidate.exists():
+        return True
+    parent = candidate.parent
+    return parent.is_dir() and any(entry.name.startswith(candidate.name + ".") for entry in parent.iterdir())
+
+
 def cross_area_reads(root: Path) -> dict[tuple[str, str], set[str]]:
     reads: dict[tuple[str, str], set[str]] = {}
     for directory, subdirectories, files in os.walk(root):
@@ -153,8 +164,7 @@ def cross_area_reads(root: Path) -> dict[tuple[str, str], set[str]]:
                 target = target.rstrip("./")
                 if ci_changes.path_lanes(target + "/") == ci_changes.EVERY_LANE:
                     continue
-                candidate = root / target
-                if not (candidate.exists() or any(candidate.parent.glob(candidate.name + "*"))):
+                if not names_existing_path(root, target):
                     continue
                 if area_of(relative) == area_of(target + "/"):
                     continue
@@ -266,6 +276,7 @@ class CiChangesTests(unittest.TestCase):
                 "crates/x/src/lib.rs": '// sdk/python/meerkat_meta/types.py is only named here\n'
                                       'const T: &str = include_str!("../../../sdk/python/meerkat_meta/types.py");\n',
                 "flow-editor/src/a.ts": 'import { X } from "../../console/src/App";\n',
+                "flow-editor/src/b.ts": 'const pattern = "../../console/src/**";\n',
             }.items():
                 (root / relative).parent.mkdir(parents=True, exist_ok=True)
                 (root / relative).write_text(text)
