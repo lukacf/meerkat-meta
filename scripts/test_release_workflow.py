@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline behavioral contracts for release protocol v1 and registry publication."""
 
+import hashlib
 import itertools
 import json
 import os
@@ -160,7 +161,7 @@ def job_runs(name: str, **context) -> bool:
 JOBS = (
     "resolve_release", "require_ci_green", "release_validate", "build_binaries",
     "collect_candidate", "verify_release_assets", "publish_github_release",
-    "publish_sdk_packages", "publish_registries",
+    "publish_sdk_packages", "verify_crate_packages", "publish_registries",
 )
 WORK_JOBS = JOBS[3:]
 
@@ -614,7 +615,9 @@ class RegistryReadbackWorkflowTests(unittest.TestCase):
 class RegistryPublicationShellTests(unittest.TestCase):
     """No package tooling runs: the workflow shell drives recording stubs."""
 
-    def run_script(self, step, job, *, dry=False, status=0, output="published"):
+    VERIFIED = {"VERIFIED_EXTENSION_SHA256": "e" * 64, "VERIFIED_META_SHA256": "f" * 64}
+
+    def run_script(self, step, job, *, dry=False, status=0, output="published", verify_status=0):
         with fixture_directory() as root:
             bin_dir = root / "bin"
             scripts = root / "scripts"
@@ -628,6 +631,8 @@ class RegistryPublicationShellTests(unittest.TestCase):
                 "    stream.write(json.dumps(sys.argv) + '\\n')\n"
                 "if sys.argv[1:2] == ['-c']:\n"
                 "    print('0.8.31')\n"
+                "elif sys.argv[1:2] == ['scripts/verify-published-registries.py']:\n"
+                "    sys.exit(int(os.environ['VERIFY_STATUS']))\n"
                 "else:\n"
                 "    print(os.environ['COMMAND_OUTPUT'])\n"
                 "    sys.exit(int(os.environ['COMMAND_STATUS']))\n"
@@ -642,7 +647,8 @@ class RegistryPublicationShellTests(unittest.TestCase):
                 ["bash", "-c", script], cwd=root, capture_output=True, text=True,
                 env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
                      "COMMAND_LOG": str(log), "COMMAND_STATUS": str(status),
-                     "COMMAND_OUTPUT": output},
+                     "COMMAND_OUTPUT": output, "VERIFY_STATUS": str(verify_status),
+                     "RELEASE_VERSION": "0.8.31", **self.VERIFIED},
             )
             commands = ([json.loads(line)[1:] for line in log.read_text().splitlines()]
                         if log.exists() else [])
@@ -662,7 +668,7 @@ class RegistryPublicationShellTests(unittest.TestCase):
     def test_crate_rehearsal_passes_dry_run_and_locked_to_the_real_step(self):
         result, commands = self.run_script("Publish Rust crate", "publish_registries", dry=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(commands, [["publish", "-p", "meerkat-meta", "--locked", "--dry-run"]])
+        self.assertEqual(commands, [["publish", "-p", "meerkat-meta", "--locked", "--no-verify", "--dry-run"]])
 
     def test_crate_package_exists_is_success_but_other_errors_keep_their_status(self):
         for output, status, expected in (
@@ -674,18 +680,79 @@ class RegistryPublicationShellTests(unittest.TestCase):
                     "Publish Rust crate", "publish_registries", status=status, output=output
                 )
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
-                self.assertEqual(commands, [["publish", "-p", "meerkat-meta", "--locked"]])
+                self.assertEqual(commands[0], ["publish", "-p", "meerkat-meta", "--locked", "--no-verify"])
+                if output.startswith("already"):
+                    # A version already on crates.io must be the verified bytes.
+                    self.assertEqual(commands[1:], [[
+                        "scripts/verify-published-registries.py", "--version", "0.8.31", "--only-crates",
+                        "--crate-sha256", "meerkat-meta=" + "f" * 64]])
+                else:
+                    self.assertEqual(commands[1:], [])
+
+    def test_an_already_published_crate_with_other_bytes_fails_the_step(self):
+        for step, crate in (("Publish Rust crate", "meerkat-meta"),
+                            ("Publish extension document crate", "meta-extension-state")):
+            with self.subTest(step=step):
+                result, commands = self.run_script(step, "publish_registries", status=101,
+                                                   output="crate version already exists", verify_status=1)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--only-crates", commands[-1])
+                self.assertIn(crate, commands[-1][-1])
+
+    def test_publication_packages_again_and_matches_the_verified_bytes_before_upload(self):
+        bind = step_block("Bind the crates to the verified bytes", "publish_registries")
+        block = job_block("publish_registries")
+        self.assertLess(block.index("- name: Bind the crates to the verified bytes"),
+                        block.index("- name: Publish extension document crate"))
+        script = step_script("Bind the crates to the verified bytes", "publish_registries")
+        self.assertIn("scripts/repo-cargo package -p meta-extension-state -p meerkat-meta --locked --no-verify",
+                      script)
+        for variable in ("VERIFIED_EXTENSION_SHA256: ${{ needs.verify_crate_packages.outputs.extension_sha256 }}",
+                         "VERIFIED_META_SHA256: ${{ needs.verify_crate_packages.outputs.meta_sha256 }}"):
+            self.assertIn(variable, block)
+        self.assertNotIn("CARGO_REGISTRY_TOKEN", bind)
+        with fixture_directory() as root:
+            package = root / "target/package"
+            package.mkdir(parents=True)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            (scripts / "repo-cargo").write_text("#!/usr/bin/env bash\nexit 0\n")
+            (scripts / "repo-cargo").chmod(0o755)
+            files = {}
+            for crate in ("meta-extension-state", "meerkat-meta"):
+                files[crate] = package / f"{crate}-0.8.31.crate"
+                files[crate].write_bytes(crate.encode())
+            sums = {crate: hashlib.sha256(path.read_bytes()).hexdigest() for crate, path in files.items()}
+            env = {**os.environ, "CARGO_TARGET_DIR": str(root / "target"), "RELEASE_VERSION": "0.8.31",
+                   "VERIFIED_EXTENSION_SHA256": sums["meta-extension-state"],
+                   "VERIFIED_META_SHA256": sums["meerkat-meta"]}
+            ok = subprocess.run(["bash", "-c", script], cwd=root, env=env, capture_output=True, text=True)
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            for name, value in (("VERIFIED_META_SHA256", "0" * 64), ("VERIFIED_EXTENSION_SHA256", "")):
+                with self.subTest(mismatch=name):
+                    bad = subprocess.run(["bash", "-c", script], cwd=root, env={**env, name: value},
+                                         capture_output=True, text=True)
+                    self.assertNotEqual(bad.returncode, 0)
+
+    def test_crate_verification_records_the_verified_checksums(self):
+        block = job_block("verify_crate_packages")
+        self.assertIn("extension_sha256: ${{ steps.crates.outputs.extension_sha256 }}", block)
+        self.assertIn("meta_sha256: ${{ steps.crates.outputs.meta_sha256 }}", block)
+        verify = block.index("- name: Verify the packaged crates build")
+        self.assertLess(verify, block.index("- name: Record the verified crate checksums"))
 
     def test_registry_readback_uses_workspace_version_and_preserves_refusals(self):
         for status in (0, 23):
             with self.subTest(status=status):
                 result, commands = self.run_script(
                     "Verify exact packages are public on every registry", "publish_registries",
-                    status=status,
+                    status=status, verify_status=status,
                 )
                 self.assertEqual(result.returncode, status, result.stderr)
                 self.assertEqual(commands[-1],
-                                 ["scripts/verify-published-registries.py", "--version", "0.8.31"])
+                                 ["scripts/verify-published-registries.py", "--version", "0.8.31",
+                                  "--crate-sha256", "meta-extension-state=" + "e" * 64,
+                                  "--crate-sha256", "meerkat-meta=" + "f" * 64])
                 self.assertIn('["workspace"]["package"]["version"]', commands[0][-1])
 
 
@@ -750,9 +817,10 @@ class ReleaseProtocolConditionsTests(unittest.TestCase):
                         if not dry:
                             expected.add("publish_github_release")
                         if publish:
-                            expected.update(("publish_sdk_packages", "publish_registries"))
+                            expected.update(("publish_sdk_packages", "verify_crate_packages",
+                                             "publish_registries"))
                     elif mode == "existing" and publish:
-                        expected = {"publish_sdk_packages", "publish_registries"}
+                        expected = {"publish_sdk_packages", "verify_crate_packages", "publish_registries"}
                         if not dry:
                             expected.add("verify_release_assets")
                     elif mode == "assets" and not publish and not dry:
@@ -808,6 +876,7 @@ class ReleaseProtocolConditionsTests(unittest.TestCase):
                                        "publish_registries")),
             ("publish_github_release", ("publish_sdk_packages", "publish_registries")),
             ("publish_sdk_packages", ("publish_registries",)),
+            ("verify_crate_packages", ("publish_registries",)),
         ):
             for status in ("failure", "skipped", "cancelled"):
                 with self.subTest(upstream=upstream, status=status):
@@ -832,13 +901,14 @@ class ReleaseProtocolConditionsTests(unittest.TestCase):
              {"release_validate", "verify_release_assets"}),
             ("publish_sdk_packages", "existing", True, True, {"release_validate"}),
             ("publish_registries", "promote", True, False,
-             {"release_validate", "verify_release_assets", "publish_github_release", "publish_sdk_packages"}),
+             {"release_validate", "verify_release_assets", "publish_github_release", "publish_sdk_packages",
+              "verify_crate_packages"}),
             ("publish_registries", "promote", True, True,
-             {"release_validate", "verify_release_assets", "publish_sdk_packages"}),
+             {"release_validate", "verify_release_assets", "publish_sdk_packages", "verify_crate_packages"}),
             ("publish_registries", "existing", True, False,
-             {"release_validate", "verify_release_assets", "publish_sdk_packages"}),
+             {"release_validate", "verify_release_assets", "publish_sdk_packages", "verify_crate_packages"}),
             ("publish_registries", "existing", True, True,
-             {"release_validate", "publish_sdk_packages"}),
+             {"release_validate", "publish_sdk_packages", "verify_crate_packages"}),
         )
         # publish_registries follows an SDK job that ran, whether it succeeded
         # or failed; a skipped or cancelled SDK job still stops it.
@@ -863,7 +933,7 @@ class ReleaseProtocolConditionsTests(unittest.TestCase):
     def test_ordinary_jobs_require_implicit_success_of_every_declared_need(self):
         for job, mode in (("require_ci_green", "candidate"), ("release_validate", "candidate"),
                           ("build_binaries", "candidate"), ("collect_candidate", "candidate"),
-                          ("verify_release_assets", "promote")):
+                          ("verify_release_assets", "promote"), ("verify_crate_packages", "promote")):
             self.assertNotIn("always()", job_condition(job))
             for statuses in itertools.product(("success", "failure", "skipped", "cancelled"),
                                               repeat=len(job_needs(job))):
@@ -1022,6 +1092,7 @@ class ImmutableReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('codesign --force --sign - "target/${{ matrix.target }}/release/${bin}"', signing)
         block = job_block("build_binaries")
         order = ("Apply release build profile overrides", "Build gateway binaries",
+                 "Verify macOS binary architecture",
                  "Ad-hoc codesign macOS binaries", "Package artifacts", "Attest build provenance",
                  "Retain original provenance bundle", "Upload artifacts")
         positions = [block.index(f"      - name: {name}") for name in order]
@@ -1397,6 +1468,359 @@ class LinuxReleaseContainerTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertTrue(checked, "the gate was never invoked")
+
+
+def matrix_entries(job: str = "build_binaries") -> list[dict[str, str]]:
+    """The `include:` entries of a job's matrix, as `key: value` maps."""
+    entries: list[dict[str, str]] = []
+    for line in job_block(job).splitlines():
+        start = re.fullmatch(r"          - ([a-z_-]+): (\S+)", line)
+        field = re.fullmatch(r"            ([a-z_-]+): (\S+)", line)
+        if start:
+            entries.append({start.group(1): start.group(2)})
+        elif field and entries:
+            entries[-1][field.group(1)] = field.group(2)
+    return entries
+
+
+MACH_O_FILE_DESCRIPTIONS = {
+    "arm64": "Mach-O 64-bit executable arm64",
+    "x86_64": "Mach-O 64-bit executable x86_64",
+}
+
+
+def run_macos_arch_step(target: str, *, lipo: str, file: str,
+                        overrides: dict[str, tuple[str, str]] | None = None,
+                        libraries: dict[str, str] | None = None,
+                        ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Execute the `Verify macOS binary architecture` step body under bash.
+
+    Fake `lipo` and `file` print the given readings (per binary name when
+    `overrides` names it) and record which paths were read, so the test
+    observes the step's decisions on the binaries a cross build produced
+    rather than pattern-matching the YAML. No macOS toolchain is needed.
+    """
+    with fixture_directory() as tmp:
+        root = Path(tmp)
+        bin_dir = root / "fake-bin"
+        bin_dir.mkdir()
+        log = root / "lipo.log"
+        readings = {"*": (lipo, file), **(overrides or {})}
+        (root / "readings.json").write_text(json.dumps(readings))
+        for tool, index, flag in (("lipo", 0, "-archs"), ("file", 1, "-b")):
+            record = 'printf "%s\\n" "$2" >> "$FAKE_LIPO_LOG"' if tool == "lipo" else ":"
+            fake = bin_dir / tool
+            fake.write_text(
+                f"""#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == "{flag}" ]] || {{ echo "fake {tool}: unexpected arguments: $*" >&2; exit 99; }}
+{record}
+python3 - "$2" <<'PY'
+import json, os, sys
+readings = json.load(open(os.environ["FAKE_READINGS"]))
+name = os.path.basename(sys.argv[1])
+print(readings.get(name, readings["*"])[{index}])
+PY
+"""
+            )
+            fake.chmod(0o755)
+        # The bundled C libraries a build leaves under target/<triple>/release/build.
+        arch = {"x86_64-apple-darwin": "x86_64"}.get(target, "arm64")
+        for relative, archs in (libraries if libraries is not None else {
+            "audiopus_sys-1/out/lib/libopus.a": arch,
+            "ring-2/out/libring_core_0_17_14_.a": arch,
+            "libsqlite3-sys-3/out/libsqlite3.a": arch,
+        }).items():
+            library = root / "target" / target / "release" / "build" / relative
+            library.parent.mkdir(parents=True, exist_ok=True)
+            library.write_bytes(b"!<arch>\n")
+            readings[library.name] = (archs, "current ar archive")
+        (root / "readings.json").write_text(json.dumps(readings))
+        env = os.environ.copy()
+        env.update({
+            "TARGET": target,
+            "FAKE_LIPO_LOG": str(log),
+            "FAKE_READINGS": str(root / "readings.json"),
+        })
+        # The step names its tools by absolute path; the fakes stand in.
+        script = (step_script("Verify macOS binary architecture")
+                  .replace("lipo=/usr/bin/lipo", f"lipo={bin_dir / 'lipo'}")
+                  .replace("file=/usr/bin/file", f"file={bin_dir / 'file'}"))
+        result = subprocess.run(
+            ["bash", "-c", script],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        checked = log.read_text().splitlines() if log.exists() else []
+    return result, checked
+
+
+class MacosReleaseLegTests(unittest.TestCase):
+    """Both macOS legs run on the free arm64 macos-15 label: x86_64 is a
+    cross build there, and every produced binary's Mach-O architecture is
+    read back before anything is signed, packaged, attested or uploaded."""
+
+    def test_x86_64_macos_cross_compiles_on_the_free_arm64_label(self):
+        runners = {entry["target"]: entry["runs-on"] for entry in matrix_entries()}
+        self.assertEqual(set(runners), set(matrix_targets()))
+        self.assertEqual(runners["aarch64-apple-darwin"], "macos-15")
+        self.assertEqual(runners["x86_64-apple-darwin"], "macos-15")
+        block = job_block("build_binaries")
+        # Neither the slow Intel label nor a billed larger label comes back.
+        self.assertNotRegex(block, r"(?m)^\s+- runs-on: macos-\S*(intel|large|xlarge)")
+        # The toolchain step installs the cross standard library.
+        toolchain = step_block("Install Rust")
+        self.assertIn("uses: dtolnay/rust-toolchain@", toolchain)
+        self.assertEqual(scalar(toolchain, "targets", "          "), "${{ matrix.target }}")
+        self.assertIn('--release --target "${{ matrix.target }}"', step_script("Build gateway binaries"))
+
+    def test_the_check_runs_on_macos_after_the_build_and_before_anything_ships(self):
+        block = job_block("build_binaries")
+        check = block.index("      - name: Verify macOS binary architecture")
+        self.assertLess(block.index("      - name: Build gateway binaries"), check)
+        for later in ("Ad-hoc codesign macOS binaries", "Package artifacts",
+                      "Attest build provenance", "Upload artifacts"):
+            with self.subTest(step=later):
+                self.assertLess(check, block.index(f"      - name: {later}"))
+        step = step_block("Verify macOS binary architecture")
+        self.assertEqual(scalar(step, "if", "        "), "runner.os == 'macOS'")
+        self.assertIn("          TARGET: ${{ matrix.target }}", step)
+        self.assertNotIn("continue-on-error", step)
+
+    def test_every_binary_the_build_step_produces_is_read_for_each_macos_target(self):
+        built = re.findall(r"--bin (\w+)", step_script("Build gateway binaries"))
+        self.assertTrue(built, "the build step names no --bin; the parser is wrong")
+        for target, arch in (("aarch64-apple-darwin", "arm64"), ("x86_64-apple-darwin", "x86_64")):
+            with self.subTest(target=target):
+                result, checked = run_macos_arch_step(
+                    target, lipo=arch, file=MACH_O_FILE_DESCRIPTIONS[arch])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                binaries = [path for path in checked if "/build/" not in path]
+                self.assertEqual(sorted(binaries),
+                                 sorted(f"target/{target}/release/{name}" for name in built))
+                # Each bundled C library's architecture is read and logged.
+                self.assertEqual(len([path for path in checked if "/build/" in path]), 3)
+                self.assertIn(f"libopus.a: configured for '{arch}'", result.stdout)
+
+    def test_the_tools_are_named_by_absolute_path(self):
+        script = step_script("Verify macOS binary architecture")
+        self.assertIn("lipo=/usr/bin/lipo\n", script)
+        self.assertIn("file=/usr/bin/file\n", script)
+        self.assertNotRegex(script, r"(?m)^\s*(lipo|file) -")
+        self.assertIn("/usr/bin/codesign --force --sign -", step_block("Ad-hoc codesign macOS binaries"))
+        self.assertIn("/usr/bin/arch -x86_64", step_script("Smoke-run macOS gateways"))
+
+    def test_a_host_architecture_c_library_or_a_missing_one_is_refused(self):
+        for name, libraries in (
+            ("host-architecture opus", {"audiopus_sys-1/out/lib/libopus.a": "arm64",
+                                        "ring-2/out/libring_core_0_17_14_.a": "x86_64",
+                                        "libsqlite3-sys-3/out/libsqlite3.a": "x86_64"}),
+            ("missing sqlite", {"audiopus_sys-1/out/lib/libopus.a": "x86_64",
+                                "ring-2/out/libring_core_0_17_14_.a": "x86_64"}),
+        ):
+            with self.subTest(case=name):
+                result, _ = run_macos_arch_step("x86_64-apple-darwin", lipo="x86_64",
+                                                file=MACH_O_FILE_DESCRIPTIONS["x86_64"], libraries=libraries)
+                self.assertNotEqual(result.returncode, 0)
+
+    def run_smoke(self, target: str, outputs: dict[str, str]) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        with fixture_directory() as tmp:
+            root = Path(tmp)
+            log = root / "arch.log"
+            fake_arch = root / "arch"
+            fake_arch.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$FAKE_ARCH_LOG"\n'
+                                 '[[ "$1" == "-x86_64" ]] || exit 98\nshift\nexec "$@"\n')
+            fake_arch.chmod(0o755)
+            for name, output in outputs.items():
+                binary = root / "target" / target / "release" / name
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                binary.write_text(f'#!/usr/bin/env bash\n[[ "$1" == "--version" ]] && echo "{output}"\n')
+                binary.chmod(0o755)
+            script = step_script("Smoke-run macOS gateways").replace("/usr/bin/arch", str(fake_arch)) \
+                .replace("/usr/bin/true", "true")
+            env = {**os.environ, "TARGET": target, "VERSION": "0.9.2", "FAKE_ARCH_LOG": str(log)}
+            result = subprocess.run(["bash", "-c", script], cwd=root, env=env, capture_output=True, text=True)
+            calls = log.read_text().splitlines() if log.exists() else []
+        return result, calls
+
+    def test_gateways_load_and_report_the_release_version_under_rosetta_or_natively(self):
+        good = {"meta_gateway": "meta_gateway 0.9.2 (console)", "rpc_gateway": "rpc_gateway 0.9.2 (rpc)"}
+        result, calls = self.run_smoke("x86_64-apple-darwin", good)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any("release/meta_gateway --version" in call for call in calls), calls)
+        result, calls = self.run_smoke("aarch64-apple-darwin", good)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse([call for call in calls if "--version" in call], "arm64 runs natively")
+        result, _ = self.run_smoke("x86_64-apple-darwin", {**good, "rpc_gateway": "rpc_gateway 0.9.1 (rpc)"})
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_host_architecture_code_from_a_cross_build_is_refused(self):
+        result, _ = run_macos_arch_step(
+            "x86_64-apple-darwin", lipo="arm64", file=MACH_O_FILE_DESCRIPTIONS["arm64"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("expected exactly 'x86_64'", result.stderr)
+
+    def test_a_universal_binary_is_refused(self):
+        result, _ = run_macos_arch_step(
+            "x86_64-apple-darwin", lipo="x86_64 arm64",
+            file="Mach-O universal binary with 2 architectures: [x86_64:Mach-O 64-bit executable x86_64]")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_one_wrong_binary_fails_the_whole_set(self):
+        result, checked = run_macos_arch_step(
+            "x86_64-apple-darwin", lipo="x86_64", file=MACH_O_FILE_DESCRIPTIONS["x86_64"],
+            overrides={"meta_repair": ("arm64", MACH_O_FILE_DESCRIPTIONS["arm64"])})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("target/x86_64-apple-darwin/release/meta_repair", checked)
+
+    def test_file_must_agree_with_lipo(self):
+        for description in (
+            MACH_O_FILE_DESCRIPTIONS["arm64"],
+            "Mach-O 64-bit executable x86_64h",
+            "Mach-O 64-bit dynamically linked shared library x86_64",
+            "ELF 64-bit LSB pie executable, x86-64",
+        ):
+            with self.subTest(description=description):
+                result, _ = run_macos_arch_step("x86_64-apple-darwin", lipo="x86_64", file=description)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_both_spellings_of_file_are_accepted(self):
+        for description in (
+            "Mach-O 64-bit executable x86_64",
+            "Mach-O 64-bit x86_64 executable, flags:<NOUNDEFS|DYLDLINK|TWOLEVEL|PIE>",
+        ):
+            with self.subTest(description=description):
+                result, _ = run_macos_arch_step("x86_64-apple-darwin", lipo="x86_64", file=description)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_target_without_a_known_architecture_is_refused(self):
+        result, checked = run_macos_arch_step(
+            "x86_64-unknown-linux-gnu", lipo="x86_64", file=MACH_O_FILE_DESCRIPTIONS["x86_64"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(checked, [])
+
+
+def hashed_env(block: str, indent: str) -> dict[str, str]:
+    """The variables rust-cache hashes into its key, from one `env:` level.
+
+    rust-cache hashes every variable whose name starts with one of these
+    prefixes, with the Rust version, into the key; the toolchain action sets
+    CARGO_HOME and CARGO_INCREMENTAL the same way in both workflows.
+    """
+    pattern = re.compile(rf"(?m)^{indent}((?:CARGO|CC|CFLAGS|CXX|CMAKE|RUST)\w*): (.*)$")
+    return dict(pattern.findall(block))
+
+
+class ReleaseCacheReuseTests(unittest.TestCase):
+    def test_release_caches_hold_no_failed_builds_and_no_executables(self):
+        """A failed leg must not pin a half-built entry as an exact hit, and
+        no restored ~/.cargo/bin executable may shadow a build or signing tool."""
+        source = RELEASE_WORKFLOW.read_text()
+        self.assertNotIn("cache-on-failure", source)
+        steps = re.findall(r"- (?:name: [^\n]+\n\s+)?uses: Swatinem/rust-cache@v2\n((?: {8}.*\n)*)", source)
+        self.assertEqual(len(steps), source.count("uses: Swatinem/rust-cache@v2"))
+        for settings in steps:
+            self.assertIn("          cache-bin: false\n", settings)
+        cache = step_block("Cache cargo registry")
+        # Candidate runs dispatch from main, so their entries are main's.
+        self.assertNotIn("save-if", cache)
+        self.assertFalse((ROOT / ".github/workflows/release-prewarm.yml").exists())
+
+    def test_crate_verification_restores_the_exact_main_ci_dependency_build(self):
+        """cargo package's verification build restores the meta-dev-bins
+        entry CI saved for the same commit, in a job that holds no secret.
+
+        rust-cache keys on the shared key, the runner and the hashed
+        environment, and the cache paths follow cache-bin, so every one of
+        them must equal what test-python and flow-editor use in ci.yml, or
+        the restore silently misses.
+        """
+        ci_workflow = ROOT / ".github/workflows/ci.yml"
+        ci_source = ci_workflow.read_text()
+
+        def ci_job(name: str) -> str:
+            lines = ci_source.splitlines()
+            start = lines.index(f"  {name}:")
+            for offset, line in enumerate(lines[start + 1:], start=start + 1):
+                if re.fullmatch(r"  [A-Za-z_][A-Za-z0-9_-]*:", line):
+                    return "\n".join(lines[start:offset])
+            return "\n".join(lines[start:])
+
+        verify = job_block("verify_crate_packages")
+        cache = step_block("Restore the exact-main CI dependency build", "verify_crate_packages")
+        self.assertEqual(scalar(cache, "shared-key", "          "), "meta-dev-bins")
+        self.assertEqual(scalar(cache, "save-if", "          "), "false")
+        self.assertEqual(scalar(cache, "cache-bin", "          "), "false")
+        release_header = RELEASE_WORKFLOW.read_text().split("\njobs:\n", 1)[0]
+        ci_header = ci_source.split("\njobs:\n", 1)[0]
+        release_env = {**hashed_env(release_header, "  "), **hashed_env(verify, "      ")}
+        self.assertEqual(release_env["CARGO_TARGET_DIR"], "${{ github.workspace }}/target")
+        for name in ("test-python", "flow-editor"):
+            with self.subTest(ci_job=name):
+                block = ci_job(name)
+                self.assertIn("          shared-key: meta-dev-bins\n", block)
+                self.assertIn("          cache-bin: false\n", block)
+                self.assertEqual(
+                    {**hashed_env(ci_header, "  "), **hashed_env(block, "      ")}, release_env)
+                self.assertEqual(scalar(block, "runs-on", "    "), scalar(verify, "runs-on", "    "))
+        self.assertIn("scripts/repo-cargo package -p meta-extension-state -p meerkat-meta --locked",
+                      step_block("Verify the packaged crates build", "verify_crate_packages"))
+        self.assertNotIn("secrets.", verify)
+        self.assertNotIn("permissions:", verify)
+
+    # Jobs that hold a secret or a write grant and still restore a cache, and
+    # why that cache is trusted. build_binaries restores only release.yml's
+    # own entries, which only successful candidate legs of merged main write,
+    # and restores no executables; its tools are named by absolute path.
+    # e2e-live restores without saving and without executables, and its
+    # provider secret reaches only the step that makes the real calls.
+    CACHE_HOLDER_ALLOWLIST = {
+        ("release.yml", "build_binaries"),
+        ("e2e-live.yml", "e2e-live"),
+    }
+
+    def test_no_job_holding_a_secret_or_write_grant_restores_a_cache(self):
+        """A cache entry can carry a planted executable or object, so no job
+        in any workflow that holds a secret or a write permission (id-token,
+        attestations, contents, actions or any other scope) may restore one,
+        except the allowlisted jobs above. Publication verifies with
+        --no-verify only what the secret-free verification job built."""
+        holders_seen = set()
+        for workflow in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            source = workflow.read_text()
+            code_lines = [line for line in source.splitlines() if not line.strip().startswith("#")]
+            header = "\n".join(code_lines).split("\njobs:\n", 1)[0]
+            jobs_text = "\n".join(code_lines).split("\njobs:\n", 1)[1]
+            names = re.findall(r"(?m)^  ([A-Za-z_][A-Za-z0-9_-]*):$", jobs_text)
+            for name in names:
+                block = jobs_text.split(f"\n  {name}:\n", 1)[1] if not jobs_text.startswith(f"  {name}:") \
+                    else jobs_text[len(f"  {name}:\n"):]
+                block = re.split(r"(?m)^  [A-Za-z_][A-Za-z0-9_-]*:$", block, 1)[0]
+                holds = ("secrets." in block or re.search(r"(?m)^\s+[a-z-]+: write$", block)
+                         or re.search(r"(?m)^  [a-z-]+: write$", header))
+                restores = ("rust-cache" in block or "actions/cache" in block
+                            or re.search(r"(?m)^\s+cache(-dependency-path)?:", block))
+                with self.subTest(workflow=workflow.name, job=name):
+                    if holds and restores:
+                        self.assertIn((workflow.name, name), self.CACHE_HOLDER_ALLOWLIST)
+                    if holds:
+                        holders_seen.add((workflow.name, name))
+        # The scan sees the jobs it must (and the allowlist is no wider).
+        for expected in (("release.yml", "publish_registries"), ("release.yml", "publish_sdk_packages"),
+                         ("release.yml", "collect_candidate"), ("release.yml", "publish_github_release"),
+                         ("ci.yml", "drop-superseded-caches"), ("publish-docs.yml", "dispatch")):
+            self.assertIn(expected, holders_seen)
+        self.assertLessEqual(self.CACHE_HOLDER_ALLOWLIST, holders_seen)
+        e2e = (ROOT / ".github/workflows/e2e-live.yml").read_text()
+        self.assertEqual(e2e.count("${{ secrets.ANTHROPIC_API_KEY }}"), 1)
+        self.assertIn("          save-if: false\n          cache-bin: false\n", e2e)
+        self.assertIn("verify_crate_packages", job_needs("publish_registries"))
+        self.assertIn("needs.verify_crate_packages.result == 'success'", job_condition("publish_registries"))
+        for step in ("Publish extension document crate", "Publish Rust crate"):
+            script = step_script(step, "publish_registries")
+            self.assertEqual(script.count("--locked --no-verify"), 2, step)
 
 
 if __name__ == "__main__":

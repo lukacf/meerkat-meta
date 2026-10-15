@@ -41,17 +41,34 @@ env:
   # family and its saves stop evicting other entries, release.yml's among
   # them. That job alone holds actions: write, and it runs only for pushes
   # to main, never for a pull request.
+  #
+  # No job caps CARGO_BUILD_JOBS. test-voice, voice-clippy,
+  # test-extension-state and extension-state-lint carried a cap of 2 copied
+  # from release.yml's release-profile memory limit, while every other job
+  # builds the same crates in the dev profile at the runner's 4. The cap
+  # throttled the dependency graph: capped, test-voice spent 19m06 on Meerkat
+  # Core alone (run 38714502600); uncapped and with no cache at all, it
+  # compiled all 472 crates, third-party ones included, in 19m42 (run
+  # 38729784563). meerkat-meta itself did not get faster (14m22 capped,
+  # 13m36 uncapped): its test harness is one rustc process.
 
 jobs:
-  # Decides whether this run needs the Rust, console, SDK and example jobs.
-  # A pull request that changes only docs or the non-CI workflows skips them
-  # (scripts/ci-changes.py names the files); pushes and dispatches always run
-  # everything, so main keeps the full green run release.yml requires.
+  # Decides which lanes of Rust, console, SDK and example jobs this run
+  # needs. A pull request runs the lanes its changed files can reach: none
+  # for docs or the non-CI workflows, only the console lanes for console/,
+  # every lane but console-perf for Rust sources (scripts/ci-changes.py maps
+  # the paths). Pushes and dispatches always run every lane, so main keeps
+  # the full green run release.yml requires.
   changes:
     name: changes
     runs-on: ubuntu-24.04
     outputs:
-      full: ${{ steps.classify.outputs.full }}
+      rust: ${{ steps.classify.outputs.rust }}
+      integration: ${{ steps.classify.outputs.integration }}
+      python: ${{ steps.classify.outputs.python }}
+      console: ${{ steps.classify.outputs.console }}
+      console_perf: ${{ steps.classify.outputs.console_perf }}
+      flow_editor: ${{ steps.classify.outputs.flow_editor }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,11 +76,39 @@ jobs:
           # parent is the base, so the diff is the pull request's own change.
           fetch-depth: 2
       - id: classify
-        # Fails closed: if the classifier errors, the run is full.
+        # Pushes and dispatches run every lane whatever any classifier says:
+        # exact-main CI, the evidence release.yml accepts, must never depend
+        # on classifier output. For a pull request, the base commit's
+        # classifier decides, so a pull request never classifies itself with
+        # the classifier it changes. Fails closed: if it errors, or prints no
+        # line for some lane (a base that predates the lanes), every lane runs.
+        env:
+          EVENT: ${{ github.event_name }}
         run: |
-          if ! python3 scripts/ci-changes.py --event "${{ github.event_name }}" --github-output "$GITHUB_OUTPUT"; then
-            echo "classifier failed; running the full matrix"
-            echo "full=true" >> "$GITHUB_OUTPUT"
+          lanes="rust integration python console console_perf flow_editor"
+          if [[ "${EVENT}" != "pull_request" ]]; then
+            echo "${EVENT}: every lane runs"
+            for lane in ${lanes}; do
+              echo "${lane}=true" >> "${GITHUB_OUTPUT}"
+            done
+            exit 0
+          fi
+          result="${RUNNER_TEMP}/lanes"
+          classified=false
+          if git show HEAD^1:scripts/ci-changes.py > "${RUNNER_TEMP}/ci-changes.py" \
+              && python3 "${RUNNER_TEMP}/ci-changes.py" --event "${EVENT}" --github-output "${result}"; then
+            classified=true
+            for lane in ${lanes}; do
+              grep -Eqx "${lane}=(true|false)" "${result}" || classified=false
+            done
+          fi
+          if [[ "${classified}" == true ]]; then
+            grep -Ex "(${lanes// /|})=(true|false)" "${result}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "the base classifier failed or has no lanes; running every lane"
+            for lane in ${lanes}; do
+              echo "${lane}=true" >> "${GITHUB_OUTPUT}"
+            done
           fi
 
   fmt-lint:
@@ -117,7 +162,7 @@ jobs:
   test:
     name: test
     needs: changes
-    if: needs.changes.outputs.full == 'true'
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     env:
       # ~88 debug test binaries each statically link the full meerkat stack.
@@ -163,7 +208,7 @@ jobs:
   test-integration:
     name: test-integration (${{ matrix.tests }})
     needs: changes
-    if: needs.changes.outputs.full == 'true'
+    if: needs.changes.outputs.integration == 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -226,14 +271,19 @@ jobs:
       - if: matrix.examples
         run: scripts/repo-cargo build --workspace --examples
 
+  # The two meerkat-meta test targets are separate compilations of the
+  # library: the integration test links it as a dependency, the --lib run
+  # compiles it again with cfg(test). Run one after the other they built
+  # serially (run 38714502600: 25m52 then 10m20) while rustc's front end
+  # kept one of the 4 CPUs busy, so one `--no-run` invocation builds both
+  # in parallel and the filtered runs below only execute them.
   test-extension-state:
     name: test-extension-state
     needs: changes
-    if: needs.changes.outputs.full == 'true'
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
@@ -242,6 +292,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: scripts/repo-cargo test -p meta-extension-state --locked
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --lib --test extension_state --no-run
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --test extension_state
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --lib -- extension_ document_mcp_child_supply
 
@@ -252,11 +303,10 @@ jobs:
   extension-state-lint:
     name: extension-state-lint
     needs: changes
-    if: needs.changes.outputs.full == 'true'
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
@@ -272,11 +322,10 @@ jobs:
   test-voice:
     name: test-voice
     needs: changes
-    if: needs.changes.outputs.full == 'true'
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_BUILD_JOBS: "2"
       # The feature union triggers the repository's Rust 1.97 incremental ICE.
       CARGO_INCREMENTAL: "0"
     steps:
@@ -298,11 +347,10 @@ jobs:
   voice-clippy:
     name: voice-clippy
     needs: changes
-    if: needs.changes.outputs.full == 'true'
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_BUILD_JOBS: "2"
       # The feature union triggers the repository's Rust 1.97 incremental ICE.
       CARGO_INCREMENTAL: "0"
     steps:
@@ -318,7 +366,7 @@ jobs:
   test-python:
     name: test-python
     needs: changes
-    if: needs.changes.outputs.full == 'true'
+    if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -332,6 +380,9 @@ jobs:
         with:
           shared-key: meta-dev-bins
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # release.yml's verify_crate_packages restores this entry; no
+          # executable from ~/.cargo/bin rides along.
+          cache-bin: false
       - run: python -m pip install 'sdk/python[dev]'
       # Gateway-backed structural tests materialize OpenAI profiles but never
       # issue provider requests. Meerkat resolves auth during construction, so
@@ -369,7 +420,7 @@ jobs:
   console:
     name: console
     needs: changes
-    if: needs.changes.outputs.full == 'true'
+    if: needs.changes.outputs.console == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -442,7 +493,7 @@ jobs:
   console-browser:
     name: console-browser
     needs: changes
-    if: needs.changes.outputs.full == 'true'
+    if: needs.changes.outputs.console == 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -504,7 +555,7 @@ jobs:
   console-perf:
     name: console-perf
     needs: changes
-    if: needs.changes.outputs.full == 'true'
+    if: needs.changes.outputs.console_perf == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -530,7 +581,7 @@ jobs:
   console-fixtures:
     name: console-fixtures
     needs: changes
-    if: needs.changes.outputs.full == 'true'
+    if: needs.changes.outputs.console == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -555,7 +606,7 @@ jobs:
   console-acceptance:
     name: console-acceptance
     needs: changes
-    if: needs.changes.outputs.full == 'true'
+    if: needs.changes.outputs.console == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -587,7 +638,7 @@ jobs:
   flow-editor:
     name: flow-editor
     needs: changes
-    if: needs.changes.outputs.full == 'true'
+    if: needs.changes.outputs.flow_editor == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -603,6 +654,9 @@ jobs:
         with:
           shared-key: meta-dev-bins
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # release.yml's verify_crate_packages restores this entry; no
+          # executable from ~/.cargo/bin rides along.
+          cache-bin: false
       - run: npm --prefix flow-editor ci --silent --no-fund --no-audit
       - run: npm --prefix flow-editor exec -- playwright install --with-deps chromium
       - run: CARGO_INCREMENTAL=0 scripts/repo-cargo build -p meerkat-meta --bin meta_flow_editor
@@ -670,16 +724,27 @@ jobs:
     steps:
       - name: Check job results
         env:
-          FULL: ${{ needs.changes.outputs.full }}
+          LANE_RUST: ${{ needs.changes.outputs.rust }}
+          LANE_INTEGRATION: ${{ needs.changes.outputs.integration }}
+          LANE_PYTHON: ${{ needs.changes.outputs.python }}
+          LANE_CONSOLE: ${{ needs.changes.outputs.console }}
+          LANE_CONSOLE_PERF: ${{ needs.changes.outputs.console_perf }}
+          LANE_FLOW_EDITOR: ${{ needs.changes.outputs.flow_editor }}
         run: |
           status=0
-          # check <job> <result> <required|skippable>: a skippable job may be
-          # skipped only when `changes` classified the run as docs-only.
+          # check <job> <result> <required|lane>: a job in a lane may be
+          # skipped only when `changes` set that lane to exactly "false",
+          # never when the classification is missing or failed.
           check() {
+            local lane_value=""
+            if [[ "$3" != "required" ]]; then
+              local variable="LANE_${3^^}"
+              lane_value="${!variable-}"
+            fi
             if [[ "$2" == "success" ]]; then
               echo "  $1: success"
-            elif [[ "$3" == "skippable" && "$2" == "skipped" && "${FULL}" == "false" ]]; then
-              echo "  $1: skipped (docs or non-CI workflow change only)"
+            elif [[ "$3" != "required" && "$2" == "skipped" && "${lane_value}" == "false" ]]; then
+              echo "  $1: skipped (no change reaches the $3 lane)"
             else
               echo "  $1: $2"
               status=1
@@ -687,22 +752,22 @@ jobs:
           }
           check changes "${{ needs.changes.result }}" required
           check fmt-lint "${{ needs.fmt-lint.result }}" required
-          check test "${{ needs.test.result }}" skippable
-          check test-integration "${{ needs.test-integration.result }}" skippable
-          check test-extension-state "${{ needs.test-extension-state.result }}" skippable
-          check extension-state-lint "${{ needs.extension-state-lint.result }}" skippable
-          check test-voice "${{ needs.test-voice.result }}" skippable
-          check voice-clippy "${{ needs.voice-clippy.result }}" skippable
-          check test-python "${{ needs.test-python.result }}" skippable
+          check test "${{ needs.test.result }}" rust
+          check test-integration "${{ needs.test-integration.result }}" integration
+          check test-extension-state "${{ needs.test-extension-state.result }}" rust
+          check extension-state-lint "${{ needs.extension-state-lint.result }}" rust
+          check test-voice "${{ needs.test-voice.result }}" rust
+          check voice-clippy "${{ needs.voice-clippy.result }}" rust
+          check test-python "${{ needs.test-python.result }}" python
           check test-typescript "${{ needs.test-typescript.result }}" required
-          check console "${{ needs.console.result }}" skippable
-          check console-browser "${{ needs.console-browser.result }}" skippable
-          check console-perf "${{ needs.console-perf.result }}" skippable
-          check console-fixtures "${{ needs.console-fixtures.result }}" skippable
-          check console-acceptance "${{ needs.console-acceptance.result }}" skippable
-          check flow-editor "${{ needs.flow-editor.result }}" skippable
+          check console "${{ needs.console.result }}" console
+          check console-browser "${{ needs.console-browser.result }}" console
+          check console-perf "${{ needs.console-perf.result }}" console_perf
+          check console-fixtures "${{ needs.console-fixtures.result }}" console
+          check console-acceptance "${{ needs.console-acceptance.result }}" console
+          check flow-editor "${{ needs.flow-editor.result }}" flow_editor
           check audit "${{ needs.audit.result }}" required
           if [[ "${status}" != 0 ]]; then
-            echo "One or more jobs failed, were cancelled, or were skipped without a docs-only classification."
+            echo "One or more jobs failed, were cancelled, or were skipped without a classification that excludes their lane."
             exit 1
           fi
