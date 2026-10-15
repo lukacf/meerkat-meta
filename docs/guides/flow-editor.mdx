@@ -43,8 +43,10 @@ opts in:
 The opt-in allows host deploys for every caller the route admits. On an open
 console bound to loopback that is every process on the host that can reach
 the port, whichever user runs it, so enable it only where every such process
-is trusted. It never overrides an enforced access controller, which keeps
-deciding per caller. `meta_gateway` includes the opt-in in its resume
+is trusted. Host access (the opt-in, or a `mobpack.deploy` grant) also lets a
+caller choose the draft store file and pack path skills that the skills
+catalog does not list (see [Host paths](#host-paths)). It never overrides an
+enforced access controller, which keeps deciding per caller. `meta_gateway` includes the opt-in in its resume
 fingerprint, so a launch never resumes a runtime started with the other
 setting.
 
@@ -140,7 +142,7 @@ Authoring is server-authoritative: the client never mutates the document locally
 
 Drafts autosave through `meta/mobpacks/save` into a host JSON store with optimistic revision guards (`expected_revision` / `draft_etag`). A guard conflict means a concurrent autosave already bumped the revision; the editor drops the stale save and re-persists the current draft. The store path resolves in order:
 
-1. `store_path` request parameter
+1. `store_path` request parameter (over the Flow Editor HTTP route only for a caller with host access; see [Host paths](#host-paths))
 2. `META_FLOW_EDITOR_DRAFT_STORE` environment variable
 3. `$XDG_STATE_HOME/meerkat-meta/meerkat-meta-flow-editor-drafts.json`
 4. `~/.local/state/meerkat-meta/meerkat-meta-flow-editor-drafts.json`
@@ -151,7 +153,8 @@ Drafts autosave through `meta/mobpacks/save` into a host JSON store with optimis
 (`meerkat_mob::validate_definition` + `SpecValidator`). Setting
 `rkat_validate: true` requests a second, host-mutating phase: after structural
 validation passes, the server writes a rendered archive and spawns
-`rkat mob validate`.
+`rkat mob validate`. Only `meta/mobpacks/validate` has this phase:
+`meta/mobpacks/apply_operation` ignores `rkat_validate`.
 
 That second phase runs only when the surface and caller have host-mutation
 authority. The standalone server without `--allow-host-deploy` strips the
@@ -193,6 +196,23 @@ and refuses host deploys, unless the host opted in with
 `--allow-flow-editor-host-deploy` (see [On a running runtime](#on-a-running-runtime)).
 
 The standalone binary is a token-less local tool: it binds `127.0.0.1` by default, there is no principal to evaluate, and `--allow-host-deploy` is the only deploy gate.
+
+### Host paths
+
+A request is the caller's input, so over the Flow Editor HTTP routes a caller
+without host access (no `mobpack.deploy` grant, no host deploy opt-in, no
+`--allow-host-deploy` on the standalone binary) cannot make the server touch a
+host path it names:
+
+- `store_path` is refused with `-32602` on every method. The draft store is
+  the host's: `META_FLOW_EDITOR_DRAFT_STORE` or the gateway home.
+- A path skill in a document (`skill_realms` entry with `source: "path"`) is
+  read only when `meta/skills/catalog` lists that file. Any other path is a
+  `selected_skill_path_not_permitted` validation error, so source, export and
+  deploy refuse the document instead of packing the file.
+
+Callers with host access, and the SDK's stdio RPC, which is the host's own
+channel, may name such paths.
 
 ## Embedding
 

@@ -4861,10 +4861,10 @@ pub fn apply_mobpack_authoring_operation_with_runtime(
             ));
         }
     };
-    let mut validation = validate_document(&document);
-    if validate_with_rkat_requested(params) && validation.ok {
-        validation = validate_document_with_rkat(params, &document, validation)?;
-    }
+    // An authoring edit never runs `rkat` or writes an archive, whatever its
+    // params ask: `meta/mobpacks/validate` is the one method with an `rkat`
+    // phase, and the one the host-mutation advertisement names for it.
+    let validation = validate_document(&document);
     Ok(json!({
         "source": "meta/mobpacks/apply_operation",
         "operation": operation_type,
@@ -14451,6 +14451,83 @@ fn append_archive_file<W: Write>(
         .map_err(|err| format!("failed to append {path}: {err}"))
 }
 
+/// The catalog an untrusted Flow Editor request may read path skills from.
+/// The listed files are resolved on the first path skill read, so a request
+/// that reads none scans no skill directory.
+struct UntrustedPathSkillReads {
+    runtime: Option<MobpackRuntimeCatalogState>,
+    listed: std::cell::OnceCell<BTreeSet<PathBuf>>,
+}
+
+std::thread_local! {
+    /// Set while an untrusted Flow Editor request runs on this thread (see
+    /// [`with_untrusted_path_skill_reads`]). `None`, the default for every
+    /// trusted caller (the SDK's stdio RPC, Rust callers), reads the path a
+    /// document names.
+    static UNTRUSTED_PATH_SKILL_READS: std::cell::RefCell<Option<UntrustedPathSkillReads>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` reading path skills only from the skill files the skills catalog
+/// lists (`runtime` included). The Flow Editor HTTP surfaces run a caller
+/// without host access this way: its document is untrusted input, and a path
+/// skill names a host file whose bytes the source preview, the archive and
+/// its digests carry back to the caller.
+pub(crate) fn with_untrusted_path_skill_reads<R>(
+    runtime: Option<&MobpackRuntimeCatalogState>,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<UntrustedPathSkillReads>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            UNTRUSTED_PATH_SKILL_READS.with(|reads| *reads.borrow_mut() = previous);
+        }
+    }
+    let untrusted = UntrustedPathSkillReads {
+        runtime: runtime.cloned(),
+        listed: std::cell::OnceCell::new(),
+    };
+    let _restore =
+        Restore(UNTRUSTED_PATH_SKILL_READS.with(|reads| reads.borrow_mut().replace(untrusted)));
+    f()
+}
+
+/// Every path skill file the skills catalog lists, canonicalized.
+fn listed_path_skill_files(runtime: Option<&MobpackRuntimeCatalogState>) -> BTreeSet<PathBuf> {
+    skill_realms_response_with_runtime_state(runtime)
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|realm| realm.get("skills").and_then(Value::as_array))
+        .flatten()
+        .filter(|skill| skill.get("source").and_then(Value::as_str) == Some("path"))
+        .filter_map(|skill| skill.get("path").and_then(Value::as_str))
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect()
+}
+
+/// Whether this thread may read the path skill file at `path`. A path that
+/// does not resolve is refused like an unlisted one, so the answer says
+/// nothing about which host files exist.
+fn path_skill_read_permitted(path: &str) -> bool {
+    UNTRUSTED_PATH_SKILL_READS.with(|reads| {
+        reads.borrow().as_ref().is_none_or(|untrusted| {
+            let listed = untrusted
+                .listed
+                .get_or_init(|| listed_path_skill_files(untrusted.runtime.as_ref()));
+            std::fs::canonicalize(path).is_ok_and(|canonical| listed.contains(&canonical))
+        })
+    })
+}
+
+fn path_skill_not_permitted(skill_id: &str, path: &str) -> String {
+    format!(
+        "selected path skill '{skill_id}' names {path}, which is not a skill file this server \
+         lists; reading other host files needs the mobpack.deploy grant or the host deploy opt-in"
+    )
+}
+
 fn selected_path_skill_files(
     document: &MobpackDocument,
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
@@ -14477,6 +14554,9 @@ fn selected_path_skill_files(
                 .ok_or_else(|| {
                     format!("selected path skill '{skill_id}' has no filesystem path")
                 })?;
+            if !path_skill_read_permitted(path) {
+                return Err(path_skill_not_permitted(&skill_id, path));
+            }
             std::fs::read(path).map_err(|err| {
                 format!("failed to read selected path skill '{skill_id}' at {path}: {err}")
             })?
@@ -21817,6 +21897,15 @@ fn validate_selected_path_skill_files(document: &MobpackDocument) -> Vec<Mobpack
             {
                 continue;
             }
+            if !path_skill_read_permitted(path) {
+                diagnostics.push(MobpackDiagnostic {
+                    severity: "error".to_string(),
+                    code: "selected_skill_path_not_permitted".to_string(),
+                    message: path_skill_not_permitted(&skill_id, path),
+                    path: Some(format!("skill_realms.skills[{skill_id}].path")),
+                });
+                continue;
+            }
             match std::fs::read(path) {
                 Ok(bytes) => bytes,
                 Err(err) => {
@@ -28143,9 +28232,11 @@ model = "gpt-5.5"
         );
     }
 
+    /// `rkat_validate` belongs to `meta/mobpacks/validate` alone: an edit
+    /// writes no archive and spawns no `rkat`, whatever it asks.
     #[test]
     #[cfg(unix)]
-    fn apply_operation_runs_rkat_validate_when_requested() {
+    fn apply_operation_never_runs_rkat_validate() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -28174,29 +28265,24 @@ model = "gpt-5.5"
             "rkat_bin": rkat_path,
             "validation_output_dir": dir.path()
         }))
-        .expect("rkat-backed apply operation");
+        .expect("apply operation");
 
         assert!(result["ok"].as_bool().unwrap_or(false), "{result:#?}");
-        assert_eq!(
+        assert_ne!(
             result["validation"]["validation_source"],
-            json!("rkat mob validate")
+            json!("rkat mob validate"),
+            "{result:#?}"
         );
-        assert!(
-            result["validation"]["display_rows"]
-                .as_array()
-                .expect("display rows")
-                .iter()
-                .any(|row| row["head"] == "rkat mob validate executed"
-                    && row["sub"].as_str().is_some_and(|sub| sub.contains("valid")))
-        );
-        let args = std::fs::read_to_string(args_path).expect("read fake rkat args");
-        let args = args.lines().collect::<Vec<_>>();
-        assert_eq!(&args[0..2], ["mob", "validate"]);
-        assert!(
-            args.get(2).is_some_and(
-                |path| path.ends_with(".mobpack") && std::path::Path::new(path).exists()
-            ),
-            "{args:?}"
+        assert!(!args_path.exists(), "apply_operation ran rkat");
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .expect("scratch dir")
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".mobpack"))
+                .collect::<Vec<_>>(),
+            Vec::<String>::new(),
+            "apply_operation wrote a validation archive"
         );
     }
 

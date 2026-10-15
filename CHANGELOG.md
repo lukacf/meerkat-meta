@@ -25,11 +25,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `http_flow_editor::protected_flow_editor_router` and
   `http_flow_editor::flow_editor_rpc_router_with_decisions` take no access
   controller, so they no longer run host deploys at all.
+- The Flow Editor HTTP routes no longer touch a host path that a caller
+  without host access names. On a gateway without an access controller,
+  any local process could, without a token:
+  - send `meta/mobpacks/apply_operation` with `rkat_validate: true`, which
+    wrote an archive and ran `rkat mob validate` (only
+    `meta/mobpacks/validate` stripped that flag);
+  - pass `store_path` to the draft methods, which created directories and
+    files at any writable path, replaced JSON files there, and read any JSON
+    object file back through `meta/mobpacks/list`;
+  - put a path skill naming any readable host file into a document, whose
+    bytes `meta/mobpacks/source` and `meta/mobpacks/export` returned.
+
+  Now `apply_operation` never runs `rkat` (on every surface), `store_path` is
+  refused with `-32602` on every Flow Editor method, and a path skill is
+  read only when `meta/skills/catalog` lists that file; any other path is a
+  `selected_skill_path_not_permitted` validation error. Callers with the
+  `mobpack.deploy` grant or the host deploy opt-in, and the SDK's stdio RPC,
+  may still name such paths.
 
 ### Breaking
 
 - Host deploys from the runtime-mounted Flow Editor need an access-controller
   grant of `mobpack.deploy` or the new host opt-in (see Security and Added).
+- `meta/mobpacks/apply_operation` ignores `rkat_validate` on every surface,
+  including the SDK's stdio RPC; run `meta/mobpacks/validate` for `rkat`
+  validation.
+- Without host access, the Flow Editor HTTP routes refuse `store_path` and
+  pack only path skills that `meta/skills/catalog` lists (see Security).
 
 ### Added
 

@@ -437,7 +437,53 @@ pub fn handle_flow_editor_rpc(request: JsonRpcRequest) -> Value {
     )
 }
 
+/// Every Flow Editor HTTP request runs through here. A caller without host
+/// access (no `mobpack.deploy` grant, no host deploy opt-in) names no host
+/// path: the draft store is the host's own, and a path skill is read only
+/// when the server's skills catalog lists that file. Host execution itself
+/// (`execute`, `rkat_validate`) is decided per method below.
 fn handle_flow_editor_rpc_with_auth(
+    request: JsonRpcRequest,
+    auth: FlowEditorAuthReport,
+    runtime_catalog: Option<&MobpackRuntimeCatalogState>,
+) -> Value {
+    if auth.host_mutation_allowed {
+        return dispatch_flow_editor_rpc(request, auth, runtime_catalog);
+    }
+    if let Some(refusal) = caller_store_path_refusal(&request) {
+        return refusal;
+    }
+    crate::mobpack::with_untrusted_path_skill_reads(runtime_catalog, || {
+        dispatch_flow_editor_rpc(request, auth, runtime_catalog)
+    })
+}
+
+/// `store_path` chooses the draft store file on the host. Without host
+/// access a caller cannot: it could create directories and files at any
+/// writable path, replace JSON files there, and read any JSON object file
+/// back through `meta/mobpacks/list`.
+fn caller_store_path_refusal(request: &JsonRpcRequest) -> Option<Value> {
+    request
+        .params
+        .get("store_path")
+        .is_some_and(|path| !path.is_null())
+        .then(|| {
+            response_value(
+                request.id.clone().unwrap_or(Value::Null),
+                None,
+                Some(JsonRpcError {
+                    code: -32602,
+                    message: "store_path names a host file, which this Flow Editor accepts only \
+                              with the mobpack.deploy grant or the host deploy opt-in; omit it to \
+                              use the host's draft store"
+                        .to_string(),
+                    data: Some(serde_json::json!({ "param": "store_path" })),
+                }),
+            )
+        })
+}
+
+fn dispatch_flow_editor_rpc(
     request: JsonRpcRequest,
     auth: FlowEditorAuthReport,
     runtime_catalog: Option<&MobpackRuntimeCatalogState>,
@@ -1670,5 +1716,232 @@ mod tests {
         let runs = std::fs::read_to_string(&marker).expect("the granted deploy ran rkat");
         assert_eq!(runs.lines().count(), 1, "{runs}");
         assert!(!dir.path().join("ungranted").exists());
+    }
+
+    /// The draft-store methods that write the store. The sweeps that must not
+    /// touch the developer's real default draft store skip them; the
+    /// `store_path` sweep covers them, and every other method shares their
+    /// read and validation paths.
+    const DRAFT_STORE_WRITERS: [&str; 5] = [
+        "meta/mobpacks/create",
+        "meta/mobpacks/save",
+        "meta/mobpacks/delete",
+        "meta/mobpacks/undo",
+        "meta/mobpacks/redo",
+    ];
+
+    async fn sample_docs_only_document(app: &axum::Router) -> Value {
+        let catalogs = anonymous_flow_editor_rpc(app, "meta/mobpacks/catalogs", Value::Null).await;
+        catalogs["result"]["sample_mobpacks"]
+            .as_array()
+            .expect("sample mobpacks")
+            .iter()
+            .find(|sample| sample["id"] == "sample_docs_only")
+            .expect("docs sample")["document"]
+            .clone()
+    }
+
+    /// Request params that take `method` as far as it goes with `document`,
+    /// plus `extra`: the host-side-effect knobs under test.
+    fn method_params(method: &str, document: &Value, extra: &Value) -> Value {
+        let mut params = json!({ "document": document, "prompt": "Reply with exactly OK." });
+        if method == "meta/mobpacks/apply_operation" {
+            params["operation"] = json!({
+                "type": "update_deploy_settings",
+                "field": "prompt",
+                "value": "Validate the edited document."
+            });
+        }
+        if let (Some(params), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+            params.extend(extra.clone());
+        }
+        params
+    }
+
+    /// Security regression: no Flow Editor method runs `rkat` or writes a
+    /// validation archive for a caller without host access.
+    /// `meta/mobpacks/apply_operation` honoured `rkat_validate` too, but only
+    /// `meta/mobpacks/validate` stripped it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_flow_editor_no_method_runs_rkat_without_host_access() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_without_access_control(dir.path(), "flow-editor-no-rkat-sweep").await;
+        let app = runtime.build_reference_app_router(open_decision_state());
+        let marker = dir.path().join("rkat.runs");
+        let rkat = recording_rkat(dir.path(), &marker);
+        let outputs = dir.path().join("outputs");
+        let document = sample_docs_only_document(&app).await;
+        let mut ran = Vec::new();
+        for method in crate::rpc::MOBPACK_AUTHORING_METHODS
+            .iter()
+            .filter(|method| !DRAFT_STORE_WRITERS.contains(method))
+        {
+            let params = method_params(
+                method,
+                &document,
+                &json!({
+                    "rkat_validate": true,
+                    "rkatValidate": true,
+                    "execute": true,
+                    "rkat_bin": rkat,
+                    "output_dir": outputs.join("deploy"),
+                    "validation_output_dir": outputs.join("validate"),
+                    "validation_pack_path": outputs.join("validate.mobpack"),
+                }),
+            );
+            let response = anonymous_flow_editor_rpc(&app, method, params).await;
+            if std::fs::read_to_string(&marker).is_ok() || outputs.exists() {
+                ran.push(format!("{method}: {response}"));
+                let _ = std::fs::remove_file(&marker);
+                let _ = std::fs::remove_dir_all(&outputs);
+            }
+        }
+        let _shutdown = runtime.shutdown().await;
+        assert_eq!(
+            ran,
+            Vec::<String>::new(),
+            "methods that ran rkat or wrote a host archive"
+        );
+    }
+
+    /// Security regression: a caller without host access cannot choose the
+    /// draft store file. `store_path` let it create directories and files at
+    /// any writable path, replace JSON files, and read any JSON object file
+    /// back through `meta/mobpacks/list`.
+    #[tokio::test]
+    async fn runtime_flow_editor_refuses_caller_chosen_draft_store_paths_without_host_access() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_without_access_control(dir.path(), "flow-editor-no-store-path").await;
+        let app = runtime.build_reference_app_router(open_decision_state());
+        let document = sample_docs_only_document(&app).await;
+        let chosen = dir.path().join("caller-chosen");
+        let secret = dir.path().join("secret.json");
+        std::fs::write(
+            &secret,
+            r#"{"credential": {"token": "STORE-PATH-SECRET-7f3a"}}"#,
+        )
+        .expect("write secret json");
+        let mut accepted = Vec::new();
+        for method in crate::rpc::MOBPACK_AUTHORING_METHODS {
+            let params = method_params(
+                method,
+                &document,
+                &json!({ "id": "probe", "store_path": chosen.join("drafts.json") }),
+            );
+            let response = anonymous_flow_editor_rpc(&app, method, params).await;
+            if response["error"]["code"] != json!(-32602)
+                || !response["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("store_path"))
+                || chosen.exists()
+            {
+                accepted.push(format!("{method}: {response}"));
+            }
+        }
+        let leaked =
+            anonymous_flow_editor_rpc(&app, "meta/mobpacks/list", json!({ "store_path": secret }))
+                .await;
+        let _shutdown = runtime.shutdown().await;
+        assert_eq!(
+            accepted,
+            Vec::<String>::new(),
+            "methods that accepted a caller-chosen store_path"
+        );
+        assert!(
+            !leaked.to_string().contains("STORE-PATH-SECRET-7f3a"),
+            "list read a caller-chosen JSON file: {leaked}"
+        );
+    }
+
+    /// Security regression: a document is caller input, and a path skill in
+    /// it names a host file whose bytes the source preview and the archive
+    /// carry back. Without host access the Flow Editor reads only the skill
+    /// files its own skills catalog lists, and those still pack.
+    #[tokio::test]
+    async fn runtime_flow_editor_reads_no_unlisted_host_file_without_host_access() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime =
+            runtime_without_access_control(dir.path(), "flow-editor-no-host-file-read").await;
+        let app = runtime.build_reference_app_router(open_decision_state());
+        let secret = dir.path().join("id_secret");
+        std::fs::write(&secret, "HOST-FILE-SECRET-91c2").expect("write secret file");
+        let with_path_skill = |document: &Value, path: &std::path::Path| {
+            let mut document = document.clone();
+            document["mob_toml"] = Value::Null;
+            document["members"][0]["skills"] = json!(["probe.skill"]);
+            document["skill_realms"]
+                .as_array_mut()
+                .expect("sample skill realms")
+                .push(json!({
+                    "id": "local/probe",
+                    "label": "Local probe",
+                    "source": "filesystem",
+                    "skills": [{
+                        "id": "probe.skill",
+                        "label": "Probe",
+                        "source": "path",
+                        "path": path
+                    }]
+                }));
+            document
+        };
+        let sample = sample_docs_only_document(&app).await;
+        let leaking = with_path_skill(&sample, &secret);
+        let mut leaked = Vec::new();
+        for method in crate::rpc::MOBPACK_AUTHORING_METHODS
+            .iter()
+            .filter(|method| !DRAFT_STORE_WRITERS.contains(method))
+        {
+            let response = anonymous_flow_editor_rpc(
+                &app,
+                method,
+                method_params(method, &leaking, &json!({})),
+            )
+            .await;
+            if response.to_string().contains("HOST-FILE-SECRET-91c2") {
+                leaked.push(method.to_string());
+            }
+        }
+        let validation = anonymous_flow_editor_rpc(
+            &app,
+            "meta/mobpacks/validate",
+            json!({ "document": leaking }),
+        )
+        .await;
+        let listed_skill = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.claude/skills/meerkat-meta/SKILL.md");
+        let listed_text = std::fs::read_to_string(&listed_skill).expect("catalog skill file");
+        let listed = anonymous_flow_editor_rpc(
+            &app,
+            "meta/mobpacks/source",
+            json!({ "document": with_path_skill(&sample, &listed_skill) }),
+        )
+        .await;
+        let _shutdown = runtime.shutdown().await;
+        assert_eq!(
+            leaked,
+            Vec::<String>::new(),
+            "methods that returned the secret"
+        );
+        assert!(
+            validation["result"]["diagnostics"]
+                .as_array()
+                .is_some_and(|diagnostics| diagnostics.iter().any(|diagnostic| {
+                    diagnostic["code"] == "selected_skill_path_not_permitted"
+                        && diagnostic["message"].as_str().is_some_and(|message| {
+                            message.contains("not a skill file this server lists")
+                        })
+                })),
+            "{validation:#?}"
+        );
+        assert!(
+            listed["result"]["source_files"]
+                .as_array()
+                .is_some_and(|files| files
+                    .iter()
+                    .any(|file| file["text"].as_str() == Some(listed_text.as_str()))),
+            "a skill the catalog lists must still pack: {listed:#?}"
+        );
     }
 }
