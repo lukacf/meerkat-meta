@@ -40,9 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Now `apply_operation` never runs `rkat` (on every surface), `store_path` is
   refused with `-32602` on every Flow Editor method, and a path skill is
   read only when `meta/skills/catalog` lists that file; any other path is a
-  `selected_skill_path_not_permitted` validation error. Callers with the
-  `mobpack.deploy` grant or the host deploy opt-in, and the SDK's stdio RPC,
-  may still name such paths.
+  `selected_skill_path_not_permitted` validation error. Host access is the
+  caller's own per-call `mobpack.deploy` decision, so a deny rule withholds
+  it even beside an allow rule such as `mobpack.*`. Callers with host
+  access, and the SDK's stdio RPC, may still name such paths.
 - Importing a mobpack archive (`meta/mobpacks/import`, and the draft methods
   that re-import a stored archive) refuses an archive that expands past
   32 MiB or holds more than 4096 entries. Before, a request under the HTTP

@@ -222,6 +222,7 @@ async fn flow_editor_rpc_handler_with_policy(
             } else {
                 "standalone Flow Editor authoring server"
             },
+            host_access: allow_host_deploy,
             host_mutation_allowed: allow_host_deploy,
             deploy_execute_allowed: allow_host_deploy,
         },
@@ -282,6 +283,16 @@ struct FlowEditorAuthReport {
     authenticated: bool,
     mode: &'static str,
     reason: &'static str,
+    /// The caller's host access, decided per call: whether it may run `rkat`
+    /// on this host (deploy `execute`, `rkat_validate`), choose the draft
+    /// store file, and pack path skills the skills catalog does not list.
+    /// Under an enforced access controller it is the caller's own
+    /// `mobpack.deploy` decision, deny rules included.
+    host_access: bool,
+    /// What `meta/capabilities` advertises as `host_mutation_allowed` and
+    /// `deploy_execute_allowed`. Under an enforced access controller this is
+    /// the coarse "allowed somewhere" signal, which can say yes where
+    /// `host_access` says no. It grants nothing.
     host_mutation_allowed: bool,
     deploy_execute_allowed: bool,
 }
@@ -336,17 +347,26 @@ async fn protected_flow_editor_rpc_handler(
             })),
         );
     }
-    // Host deploys (`execute: true`, and validation with `rkat_validate`) run
-    // `rkat` on this host, so they need a `mobpack.deploy` grant. An enforced
-    // access controller decides per caller: the check above already refused
-    // a caller it does not grant, and the capability advertisement follows
-    // its grants so the editor does not surface deploy affordances the
-    // caller can never use. Without one nobody holds the grant, so only the
-    // host's explicit opt-in admits host deploys.
-    let deploy_grant = match access_view.as_ref().filter(|view| view.enforced()) {
-        Some(view) => view.may_perform_anywhere(ACTION_MOBPACK_DEPLOY),
-        None => state.host_deploy_without_access_control,
-    };
+    // Host access (running `rkat` on this host, choosing the draft store
+    // file, packing path skills the skills catalog does not list) needs a
+    // `mobpack.deploy` grant. An enforced access controller decides it per
+    // call, deny rules included; the check above already refused a host
+    // deploy it does not grant. The capability advertisement uses the
+    // coarser "allowed somewhere" signal, so the editor hides deploy
+    // affordances the caller can never use; it grants nothing. Without a
+    // controller nobody holds the grant, so only the host's explicit opt-in
+    // gives host access.
+    let (host_access, advertised_host_deploy) =
+        match access_view.as_ref().filter(|view| view.enforced()) {
+            Some(view) => (
+                view.allows(ACTION_MOBPACK_DEPLOY),
+                view.may_perform_anywhere(ACTION_MOBPACK_DEPLOY),
+            ),
+            None => (
+                state.host_deploy_without_access_control,
+                state.host_deploy_without_access_control,
+            ),
+        };
     let response_id = parsed_request.id.clone().unwrap_or(Value::Null);
     let response = dispatch_flow_editor_rpc_blocking(
         parsed_request,
@@ -354,8 +374,9 @@ async fn protected_flow_editor_rpc_handler(
             authenticated: true,
             mode: REFERENCE_APP_AUTH_MODE,
             reason: "reference app Flow Editor authoring server",
-            host_mutation_allowed: deploy_grant,
-            deploy_execute_allowed: deploy_grant,
+            host_access,
+            host_mutation_allowed: advertised_host_deploy,
+            deploy_execute_allowed: advertised_host_deploy,
         },
         state.runtime_catalog.clone(),
         response_id,
@@ -430,6 +451,7 @@ pub fn handle_flow_editor_rpc(request: JsonRpcRequest) -> Value {
             authenticated: false,
             mode: "none",
             reason: "standalone Flow Editor authoring server",
+            host_access: false,
             host_mutation_allowed: false,
             deploy_execute_allowed: false,
         },
@@ -447,7 +469,7 @@ fn handle_flow_editor_rpc_with_auth(
     auth: FlowEditorAuthReport,
     runtime_catalog: Option<&MobpackRuntimeCatalogState>,
 ) -> Value {
-    if auth.host_mutation_allowed {
+    if auth.host_access {
         return dispatch_flow_editor_rpc(request, auth, runtime_catalog);
     }
     if let Some(refusal) = caller_store_path_refusal(&request) {
@@ -550,7 +572,7 @@ fn dispatch_flow_editor_rpc(
             None,
         ),
         "meta/mobpacks/deploy"
-            if !auth.deploy_execute_allowed && deploy_execute_requested(&request.params) =>
+            if !auth.host_access && deploy_execute_requested(&request.params) =>
         {
             response_value(
                 response_id,
@@ -574,8 +596,7 @@ fn dispatch_flow_editor_rpc(
         // standalone surface (no `--allow-host-deploy`) and any caller lacking
         // `mobpack.deploy` can never reach the file-write/exec sink.
         "meta/mobpacks/validate"
-            if !auth.host_mutation_allowed
-                && validate_rkat_execution_requested(&request.params) =>
+            if !auth.host_access && validate_rkat_execution_requested(&request.params) =>
         {
             let mut params = request.params.clone();
             if let Some(object) = params.as_object_mut() {
@@ -996,6 +1017,7 @@ mod tests {
                 authenticated: true,
                 mode: "reference_app",
                 reason: "reference app Flow Editor authoring server",
+                host_access: true,
                 host_mutation_allowed: true,
                 deploy_execute_allowed: true,
             },
@@ -1083,6 +1105,7 @@ mod tests {
                 authenticated: false,
                 mode: "standalone_host_deploy",
                 reason: "standalone Flow Editor authoring server with explicit host deploy opt-in",
+                host_access: true,
                 host_mutation_allowed: true,
                 deploy_execute_allowed: true,
             },
@@ -1114,6 +1137,7 @@ mod tests {
                 authenticated: false,
                 mode: "standalone_host_deploy",
                 reason: "standalone Flow Editor authoring server with explicit host deploy opt-in",
+                host_access: true,
                 host_mutation_allowed: true,
                 deploy_execute_allowed: true,
             },
@@ -1756,6 +1780,116 @@ mod tests {
             params.extend(extra.clone());
         }
         params
+    }
+
+    /// `document` with a member selecting a path skill that names `path`, in a
+    /// realm of its own beside the document's realms.
+    fn document_with_path_skill(document: &Value, path: &std::path::Path) -> Value {
+        let mut document = document.clone();
+        document["mob_toml"] = Value::Null;
+        document["members"][0]["skills"] = json!(["probe.skill"]);
+        document["skill_realms"]
+            .as_array_mut()
+            .expect("sample skill realms")
+            .push(json!({
+                "id": "local/probe",
+                "label": "Local probe",
+                "source": "filesystem",
+                "skills": [{
+                    "id": "probe.skill",
+                    "label": "Probe",
+                    "source": "path",
+                    "path": path
+                }]
+            }));
+        document
+    }
+
+    /// Allows every mobpack action and denies `mobpack.deploy`: the deny
+    /// decides, so a caller under it has no host access.
+    fn deploy_denying_access_controller() -> AccessController {
+        authoring_access_controller(vec![
+            allow_everyone("authors", &["mobpack.*"]),
+            crate::access::AccessRule {
+                id: "no-host-deploy".to_string(),
+                effect: crate::access::AccessEffect::Deny,
+                actions: vec!["mobpack.deploy".to_string()],
+                ..crate::access::AccessRule::default()
+            },
+        ])
+    }
+
+    /// Security regression: an enforced controller's deny of `mobpack.deploy`
+    /// withholds host access although an allow rule also matches the action.
+    /// Such a caller chooses no draft store file and reads no file that the
+    /// skills catalog does not list.
+    #[tokio::test]
+    async fn a_mobpack_deploy_deny_withholds_host_paths_although_mobpack_star_is_allowed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret_json = dir.path().join("secret.json");
+        std::fs::write(
+            &secret_json,
+            r#"{"credential": {"token": "DEPLOY-DENIED-SECRET-5d1e"}}"#,
+        )
+        .expect("write secret json");
+        let secret_file = dir.path().join("id_secret");
+        std::fs::write(&secret_file, "DEPLOY-DENIED-SECRET-5d1e").expect("write secret file");
+        let catalogs = super::handle_flow_editor_rpc(JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "meta/mobpacks/catalogs".to_string(),
+            params: Value::Null,
+        });
+        let sample = catalogs["result"]["sample_mobpacks"]
+            .as_array()
+            .expect("sample mobpacks")
+            .iter()
+            .find(|sample| sample["id"] == "sample_docs_only")
+            .expect("docs sample")["document"]
+            .clone();
+        let leaking = document_with_path_skill(&sample, &secret_file);
+
+        let listed = protected_rpc_response_with_host_deploy(
+            Some(deploy_denying_access_controller()),
+            false,
+            rpc_body("meta/mobpacks/list", json!({ "store_path": secret_json })),
+        )
+        .await;
+        let source = protected_rpc_response_with_host_deploy(
+            Some(deploy_denying_access_controller()),
+            false,
+            rpc_body("meta/mobpacks/source", json!({ "document": leaking })),
+        )
+        .await;
+        let validation = protected_rpc_response_with_host_deploy(
+            Some(deploy_denying_access_controller()),
+            false,
+            rpc_body("meta/mobpacks/validate", json!({ "document": leaking })),
+        )
+        .await;
+
+        assert_eq!(
+            (
+                listed["error"]["code"].clone(),
+                listed["error"]["data"].clone()
+            ),
+            (json!(-32602), json!({ "param": "store_path" })),
+            "{listed:#?}"
+        );
+        for response in [&listed, &source, &validation] {
+            assert!(
+                !response.to_string().contains("DEPLOY-DENIED-SECRET-5d1e"),
+                "{response:#?}"
+            );
+        }
+        assert!(
+            validation["result"]["diagnostics"]
+                .as_array()
+                .is_some_and(|diagnostics| diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic["code"] == "selected_skill_path_not_permitted")),
+            "{validation:#?}"
+        );
     }
 
     /// Security regression: no Flow Editor method runs `rkat` or writes a

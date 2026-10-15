@@ -186,8 +186,11 @@ both write an archive and spawn a host process.
 its `authoring_capabilities` advertisement intersects with the caller's grants.
 For callers without `mobpack.deploy`, `deploy_execute_allowed` and
 `host_mutation_allowed` are `false`, and the editor does not render the related
-host-mutation affordances. Per-call enforcement remains authoritative; denials
-surface as JSON-RPC error `-32030` with `data.kind = "access_denied"`.
+host-mutation affordances. The advertisement is coarse: it reads `true` when
+any allow rule names `mobpack.deploy` for the caller, even if a deny rule or a
+resource selector refuses every call. Per-call enforcement remains
+authoritative, for host deploys and for host paths alike; denials surface as
+JSON-RPC error `-32030` with `data.kind = "access_denied"`.
 
 Without an enforced access controller there is no grant to evaluate, so a
 runtime-mounted editor treats every caller as lacking `mobpack.deploy`: it
@@ -211,6 +214,8 @@ host path it names:
   `selected_skill_path_not_permitted` validation error, so source, export and
   deploy refuse the document instead of packing the file.
 
+Host access is the caller's own per-call `mobpack.deploy` decision: a deny
+rule withholds it even when an allow rule such as `mobpack.*` also matches.
 Callers with host access, and the SDK's stdio RPC, which is the host's own
 channel, may name such paths.
 
