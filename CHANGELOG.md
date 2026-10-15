@@ -20,19 +20,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `meta_gateway storage-adopt-predecessor --mob-config <file>` checks the mob
   definition an installation boots with (repeat it for each mob) against every
-  persistent mob storage the predecessor created. It names each key that the
-  release which created a store dropped without a diagnostic and Meta 0.9
-  applies: a profile's or `[runtime]`'s `model_fallback` on a store created by
-  MobKit 0.8.33 or earlier, and a profile's `tools.deny` on a store created by
-  0.8.45 or earlier. Adoption refuses before any change until each such key is
-  removed, which keeps the behaviour the store has run with, or acknowledged
-  with `--acknowledge-ignored-keys`. An acknowledgement changes no recorded
-  definition: the keys take effect only once the stored definition is
-  advanced with the one-shot mob definition update, and until then the
-  store's first resume refuses as `divergent`, as in 0.9.1. The JSON report
-  lists them under `ignored_keys`. Without `--mob-config`, a note names each
-  store whose creating release dropped such keys. A `--mob-config` the
-  gateway would refuse is refused before planning. Library callers use
+  persistent mob storage the predecessor created. It reads the definition each
+  store holds now from a private copy of its event log, the store itself not
+  opened, and names each key that the release which created the store ignored,
+  that Meta 0.9 applies and that the held definition does not record: a
+  profile's or `[runtime]`'s `model_fallback` on a store created by MobKit
+  0.8.33 or earlier, and a profile's `tools.deny` on a store created by 0.8.45
+  or earlier. A key a later release's definition update recorded is in force
+  and is not named. Adoption refuses before any change until each named key
+  is removed, which keeps the behaviour the store has run with, or
+  acknowledged with `--acknowledge-ignored-keys`. An acknowledgement changes
+  no definition: the keys take effect only once the stored definition is
+  advanced with the one-shot mob definition update, and until then an
+  authoritative resume that keeps them refuses as `divergent`, as in 0.9.1.
+  The JSON report lists them under `ignored_keys`. Without `--mob-config`, a
+  note names each store whose creating release ignored such keys. A
+  `--mob-config` that does not parse, or a `mob.toml` that declares a
+  `[self_hosted]` or `[realm]` table, is refused before planning; a `.json`
+  file is read as a `definition.json`. Library callers use
   `storage_predecessor::adopt_predecessor_state_with_definitions` with a
   `PredecessorDefinitionCheck`.
 

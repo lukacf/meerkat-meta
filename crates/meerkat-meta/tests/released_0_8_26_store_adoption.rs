@@ -34,11 +34,12 @@
 //! launch, whose released-representation allowance reads the manifest; and
 //! `meta_repair --composition-manifests` detects and repairs its manifest.
 //!
-//! Keys 0.8.26 dropped from the definition without a diagnostic, and Meta
-//! 0.9 applies, never change the store's behaviour silently: adoption given
-//! the definition (`--mob-config`) names them and refuses before any change
-//! until they are removed or acknowledged, and a resume that keeps them
-//! refuses as divergent.
+//! Keys 0.8.26 ignored in the definition, and Meta 0.9 applies, never change
+//! the store's behaviour silently: adoption given the definition
+//! (`--mob-config`) names those the store's current definition does not
+//! record and refuses before any change until they are removed or
+//! acknowledged, and a resume that keeps them refuses as divergent. A key a
+//! later definition update recorded is in force and is not named.
 
 #![allow(
     clippy::expect_used,
@@ -135,10 +136,10 @@ fn mob_config_without_ignored_key() -> String {
     stripped
 }
 
-/// The released definition with three keys 0.8.26 dropped without a
-/// diagnostic and Meta 0.9 applies: a tool deny list, a profile model
-/// fallback and a mob-wide model fallback. A deployment that kept them in its
-/// config ran without any of them on 0.8.26.
+/// The released definition with three keys 0.8.26 ignored and Meta 0.9
+/// applies: a tool deny list, a profile model fallback and a mob-wide model
+/// fallback. A deployment that kept them in its config ran without any of
+/// them on 0.8.26.
 fn mob_config_with_predecessor_ignored_keys() -> String {
     let config = format!(
         "{}deny = [\"shell\"]\n\n[profiles.planner.model_fallback]\nenabled = false\n\n\
@@ -155,6 +156,40 @@ const PREDECESSOR_IGNORED_KEYS: [&str; 3] = [
     "profiles.planner.tools.deny",
     "runtime.model_fallback",
 ];
+
+/// The released definition with only the tool deny list added.
+fn mob_config_with_deny() -> String {
+    let config = format!("{MOB_CONFIG}deny = [\"shell\"]\n");
+    assert!(config.contains("[profiles.planner.tools]\ncomms = true\nmob_tasks = true\ndeny"));
+    config
+}
+
+/// Advance the stored definition of the staged store to `definition`, as a
+/// later release's one-shot definition update does, then wait until its
+/// store has closed.
+fn advance_stored_definition(state: &Path, definition: &str) {
+    let path = state.join("event_log.sqlite3");
+    let definition = meerkat_mob::MobDefinition::from_toml(definition).expect("definition");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let storage = meerkat_mob::MobStorage::persistent(&path).expect("open the staged store");
+        let receipt = storage
+            .update_definition(1, definition)
+            .await
+            .expect("advance the stored definition");
+        assert_eq!(receipt.epoch, 2, "{receipt:?}");
+    });
+    drop(runtime);
+    // The store's connection worker closes on its own thread after the
+    // store is dropped; the exclusive fence waits for it.
+    drop(
+        meerkat_sqlite::ExclusiveFence::acquire(&path, Duration::from_secs(30))
+            .expect("the advanced store closed"),
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Fixture staging
@@ -899,6 +934,7 @@ fn released_0_8_26_store_adoption_names_and_holds_keys_the_release_ignored() {
         for needle in PREDECESSOR_IGNORED_KEYS.into_iter().chain([
             "refused, nothing changed",
             "0.8.26",
+            "an authoritative resume",
             "--acknowledge-ignored-keys",
         ]) {
             assert!(error.contains(needle), "{needle:?} missing from {error}");
@@ -965,6 +1001,100 @@ fn released_0_8_26_store_adoption_names_and_holds_keys_the_release_ignored() {
     assert_released_state_resumed(&mut gateway);
     gateway.shutdown_and_reap();
     assert_released_transcript_survived(&state);
+}
+
+/// A store 0.8.26 created whose definition a later release advanced with a
+/// tool deny list runs with that list, although its creation manifest does
+/// not record it. Adoption compares the definition the store holds, so it
+/// names only the keys that definition lacks (here the model fallbacks),
+/// adopts with the deny list kept, and a boot that keeps the list resumes.
+/// Removing it, as the creation manifest alone would suggest, would drop a
+/// list in force: that boot refuses as divergent.
+#[test]
+fn released_0_8_26_store_with_an_advanced_definition_keeps_the_deny_list_it_holds() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let state = stage_store(temp.path());
+    advance_stored_definition(&state, &mob_config_with_deny());
+    assert_eq!(
+        manifest_text(&state),
+        released_manifest(),
+        "a definition update leaves the creation manifest as it was"
+    );
+
+    let deny_path = temp.path().join("mob.toml");
+    std::fs::write(&deny_path, mob_config_with_deny()).expect("write the definition");
+    let deny = deny_path.to_str().expect("utf-8 config path");
+    // The same keys as a serialized definition, the form of a definition.json.
+    let keyed_path = temp.path().join("definition.json");
+    std::fs::write(
+        &keyed_path,
+        serde_json::to_vec(
+            &meerkat_mob::MobDefinition::from_toml(&mob_config_with_predecessor_ignored_keys())
+                .expect("definition"),
+        )
+        .expect("serialize the definition"),
+    )
+    .expect("write the definition");
+    let keyed = keyed_path.to_str().expect("utf-8 config path");
+
+    // The definition that keeps the deny list the store holds: nothing to
+    // name or refuse.
+    let run = adopt_with(&state, &home, false, &["--mob-config", deny]);
+    assert_eq!(
+        run.code, 0,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+    let report = run.json();
+    assert_eq!(report["ignored_keys"], json!([]), "{report:#}");
+    assert_eq!(report["errors"], json!([]), "{report:#}");
+
+    let run = adopt_with(&state, &home, false, &["--mob-config", keyed]);
+    assert_eq!(
+        run.code, 1,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+    let named = run.json();
+    assert_eq!(
+        named["ignored_keys"][0]["keys"],
+        json!(["profiles.planner.model_fallback", "runtime.model_fallback"]),
+        "{named:#}"
+    );
+    assert_eq!(named["ignored_keys"][0]["source"], keyed, "{named:#}");
+
+    let run = adopt_with(&state, &home, true, &["--mob-config", deny]);
+    assert_eq!(
+        run.code, 0,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+    let report = run.json();
+    assert_eq!(report["ignored_keys"], json!([]), "{report:#}");
+    assert_eq!(report["errors"], json!([]), "{report:#}");
+    assert_eq!(report["complete"], true, "{report:#}");
+
+    let mut gateway = boot(
+        "0.8.26/advanced-deny-kept",
+        &state,
+        &home,
+        &mob_config_with_deny(),
+        Launch::Authoritative,
+    );
+    assert_released_state_resumed(&mut gateway);
+    gateway.shutdown_and_reap();
+    assert_released_transcript_survived(&state);
+
+    let refusal = boot_refused("0.8.26/advanced-deny-removed", &state, &home, MOB_CONFIG);
+    assert_eq!(refusal["code"], -32019, "{refusal}");
+    assert_eq!(refusal["data"]["kind"], "divergent", "{refusal}");
+    assert_eq!(
+        refusal["data"]["fields"],
+        json!(["profiles.planner.tools.deny"]),
+        "{refusal}"
+    );
 }
 
 /// The released store adopted the way an adoption without the manifest step

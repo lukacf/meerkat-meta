@@ -1322,17 +1322,21 @@ const STORAGE_ADOPT_PREDECESSOR_USAGE: &str = "usage: meta_gateway storage-adopt
      startup refusal names it: the persistent_state of rpc_gateway and the \
      SDK builders, or the store_path directory of meta_gateway (the parent \
      of an explicit session database file). Adoption never infers it.\n\
-     --mob-config names the mob definition (mob.toml) the installation boots \
-     with; repeat it for each mob. Planning compares it with the definition \
-     each persistent mob storage recorded when it was created, and names \
-     every key that the predecessor release which created the store dropped \
-     and Meta 0.9 applies (model_fallback before 0.8.34, tools.deny before \
-     0.8.46). Such keys refuse adoption before any change: remove them to \
-     keep the behaviour the store has run with, or pass \
+     --mob-config names the mob definition the installation boots with \
+     (mob.toml, or a definition.json); repeat it for each mob. Planning \
+     reads the definition each persistent mob storage holds now, from a \
+     private copy of its event log (the store itself is never opened \
+     through its owner), and names every key that the predecessor release \
+     which created the store ignored (model_fallback before 0.8.34, \
+     tools.deny before 0.8.46), that Meta 0.9 applies and that the held \
+     definition does not record. A key a later release recorded there is in \
+     force and is not named. Named keys refuse adoption before any change: \
+     remove them to keep the behaviour the store has run with, or pass \
      --acknowledge-ignored-keys and then advance the stored definition once \
      with the one-shot mob definition update to apply them; resuming never \
-     applies them. A file the gateway would refuse is refused before \
-     planning.\n\
+     applies them, and an authoritative resume that keeps them refuses as \
+     divergent. A --mob-config that does not parse, or that declares a \
+     top-level [self_hosted] or [realm] table, is refused before planning.\n\
      Precondition: every process using the installation is stopped; the \
      run refuses while a runtime registry lists a live process, and fences \
      every database it touches. The fence covers SQLite databases only: \
@@ -1428,8 +1432,9 @@ fn run_storage_adopt_predecessor(args: &[String]) -> i32 {
         );
         return 2;
     }
-    // Each definition is read the way the gateways read mob.toml, so a file
-    // the gateway would refuse is refused here, before planning.
+    // Each definition is read the way meta_gateway reads its workspace
+    // definition: a file that does not parse, or a mob.toml that declares a
+    // host-config table, is refused here, before planning.
     let mut definitions = Vec::with_capacity(mob_configs.len());
     for path in &mob_configs {
         match load_adoption_mob_config(path) {
@@ -1530,7 +1535,7 @@ fn run_storage_adopt_predecessor(args: &[String]) -> i32 {
         }
         for ignored in &report.ignored_keys {
             println!(
-                "  IgnoredKeys {} ({}): {} dropped by predecessor release {} ({})",
+                "  IgnoredKeys {} ({}): {} ignored by predecessor release {} ({})",
                 ignored.manifest,
                 ignored.source,
                 ignored.keys.join(", "),
@@ -1552,12 +1557,21 @@ fn run_storage_adopt_predecessor(args: &[String]) -> i32 {
     i32::from(report.has_errors())
 }
 
-/// Read a `--mob-config` definition the way both gateways read `mob.toml`:
-/// Meerkat's definition parser (with the upgrade note a refused profile
-/// prompt key carries), then the refusal of host-config tables the parser
-/// would drop.
+/// Read a `--mob-config` definition the way meta_gateway reads its
+/// workspace definition: a `.json` file as a serialized definition (its
+/// `definition.json`), anything else as `mob.toml` through Meerkat's
+/// definition parser (with the upgrade note a refused profile prompt key
+/// carries), then the refusal of the host-config tables that parser would
+/// drop.
 fn load_adoption_mob_config(path: &Path) -> Result<MobDefinition, String> {
     let text = fs::read_to_string(path).map_err(|error| format!("failed to read: {error}"))?;
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "json")
+    {
+        return serde_json::from_str::<MobDefinition>(&text)
+            .map_err(|error| format!("not a mob definition: {error}"));
+    }
     let definition = MobDefinition::from_toml(&text).map_err(|error| {
         meerkat_meta::gateway_composition::describe_mob_definition_error(&error)
     })?;
