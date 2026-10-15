@@ -7,31 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking
+
+- With the `extension-state` feature, a document store that an embedding
+  host supplies through `MetaStorageProvider::open_extension_state` must
+  implement the new `ExtensionDocumentStore::references_mob`: report
+  whether any live document of the realm, in any namespace, names a mob id
+  as its owner or in an audience grant or deny, failing the answer (never
+  skipping the document) on a document it cannot read or decode. The default
+  implementation answers an error, and every mob create of the agent
+  mob-tool state, except a session's implicit delegation mob, is then
+  refused. The built-in `SqliteExtensionDocumentStore` implements it.
+
 ### Security
 
-- With the `extension-state` feature, a new session-owned mob could take
-  the id of a destroyed one and inherit what extension documents grant that
-  id, since documents name a mob by its id alone, as their owner
-  (`Owner::Mob`) or in an audience entry (`Audience::Mob`). An agent's
-  `mob_create` takes a model-chosen id, so another session could manage a
-  destroyed child's documents through a new mob under its id: at once now
-  that a destroy releases the id, and after a restart before. The agent
-  mob-tool state now refuses a session-owned create (an agent's
-  `mob_create`, the implicit delegation mob, a temporary council) under an
-  id that any live document of the realm still names while no live mob has
-  it, with a typed refusal that names the remedies: choose another mob id,
-  or have a host or operator with access to the extension store transfer
-  each document the id owns and remove or replace each `Audience::Mob` grant
-  or deny naming it. Not checked: a host's own create, a restore, and the
-  implicit delegation mob that its own session's runtime path recreates.
-  Known limitations: ownership is by id, so the destroyed mob's own owner
-  session cannot recreate the same explicit id while documents name it
-  either (per-instance ownership is the long-term model); the check reads
-  every live document of the realm on each such create; and it is not
-  ordered against a document write already in flight, whose caller the
-  embedding host resolved while the destroyed mob was live. A custom
-  `ExtensionDocumentStore` must implement the new `references_mob`, or every
-  session-owned create is refused.
+- With the `extension-state` feature, a new mob could take the id of a
+  destroyed one and inherit what extension documents grant that id, since
+  documents name a mob by its id alone, as their owner (`Owner::Mob`) or in
+  an audience entry (`Audience::Mob`). An agent's `mob_create` takes a
+  model-chosen id, so another session could manage a destroyed child's
+  documents through a new mob under its id: at once now that a destroy
+  releases the id, and after a restart before. The agent mob-tool state now
+  refuses every create (an agent's `mob_create`, a temporary council, a
+  create without an owner session) under an id that any live document of
+  the realm still names, whatever the registry binds under it, with a typed
+  refusal that names the remedies: choose another mob id, or have a host or
+  operator with access to the extension store transfer each document the id
+  owns and remove or replace each `Audience::Mob` grant or deny naming it.
+  The one exemption is the implicit delegation mob that its own session's
+  runtime path creates or recreates. Known limitations:
+  - Ownership is by id, so the destroyed mob's own owner session cannot
+    recreate the same explicit id while documents name it either;
+    per-instance ownership is the long-term model.
+  - Each such create reads every live document of the realm under the
+    extension store's one connection, so document reads and writes of every
+    session wait while it runs, and a caller that repeats creates under a
+    named id keeps them waiting. A refusal also tells the caller that some
+    document names the id, including one it cannot read. An index or a rate
+    limit is planned for 0.9.3.
+  - The check is not ordered against a document write already in flight,
+    whose caller the embedding host resolved while the destroyed mob was
+    live.
+  - Restoring a persisted mob is never re-checked: a takeover made before
+    0.9.2, or a mob created while no extension tool bundle or document
+    binding was composed (the check is installed only with them), keeps what
+    it inherited after a restart.
+
+### Added
+
+- `meta-extension-state`: `ExtensionDocumentStore::references_mob` reports
+  whether any live document of a realm names a mob, and
+  `Document::names_mob` whether one document does, as its owner
+  (`Owner::Mob`) or in an audience grant or deny (`Audience::Mob`).
+  `SqliteExtensionDocumentStore` answers in one read transaction over every
+  live document of the realm.
 
 ### Fixed
 

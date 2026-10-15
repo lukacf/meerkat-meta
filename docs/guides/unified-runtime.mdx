@@ -119,9 +119,9 @@ authority.
 Documents name a mob by its id alone, as their owner (`Owner::Mob`) or in an
 audience grant or deny (`Audience::Mob`), and they outlive the mob. A new mob
 under the id of a destroyed one would inherit what they grant, so the agent
-mob-tool state refuses a session-owned create (an agent's `mob_create`, the
-implicit delegation mob, a temporary council) under an id that any live
-document of the realm still names while no live mob has it. The typed
+mob-tool state refuses every create (an agent's `mob_create`, a temporary
+council, a create without an owner session) under an id that any live
+document of the realm still names, whatever is bound under the id. The typed
 refusal names the remedies: choose another mob id, or have a host or
 operator with access to the extension store transfer each document the id
 owns to another owner and remove or replace each `Audience::Mob` grant or
@@ -129,17 +129,26 @@ deny naming it. An owner transfer alone leaves the audience entries, and the
 document tools alone cannot manage a document whose owning mob was
 destroyed.
 
-A host's own create, restoring a persisted mob, and the implicit delegation
-mob that its own session's runtime path recreates (as for a model change)
-are not checked. Ownership is by id, not by mob instance, so the owner
-session of a destroyed mob cannot recreate the same explicit id while
-documents name it either. The check reads every live document of the realm
-on each such create. It is not ordered against a document write already in
-flight: a write whose caller the embedding host's tool resolved while the
-destroyed mob was live can still commit a reference to the id after the
-check passed. A custom `ExtensionDocumentStore` must implement
-`references_mob`; its default answers an error, and every session-owned
-create is then refused.
+The one exemption is the implicit delegation mob that its own session's
+runtime path creates or recreates (as for a model change). Ownership is by
+id, not by mob instance, so the owner session of a destroyed mob cannot
+recreate the same explicit id while documents name it either. Each checked
+create reads every live document of the realm under the extension store's
+one connection: document reads and writes of every session wait while it
+runs, and a caller that repeats creates under a named id keeps them waiting.
+A refusal also tells the caller that some document names the id, including
+one it cannot read. The check is not ordered against a document write
+already in flight: a write whose caller the embedding host's tool resolved
+while the destroyed mob was live can still commit a reference to the id
+after the check passed. Restoring a persisted mob is never re-checked, so a
+mob that took an id before this check existed, or while no extension tool
+bundle or document binding was composed, keeps what it inherited.
+
+A document store a host supplies through
+`MetaStorageProvider::open_extension_state` must implement
+`ExtensionDocumentStore::references_mob`, failing the answer (never skipping
+the document) on a document it cannot read. The default answers an error,
+and every create except a session's implicit delegation mob is then refused.
 
 The SDK callback-backed `GatewayContinuityStore` currently lacks the required
 retained identity-history capability. Registering this extension on such a
