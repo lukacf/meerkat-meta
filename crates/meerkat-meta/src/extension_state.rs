@@ -254,18 +254,18 @@ impl NativeAuthorityRegistry {
     /// mob-tool state. Documents name a mob by its id alone, as their owner
     /// or in an audience entry, so a new mob under the id of a destroyed one
     /// would inherit what those documents grant it. Before the state creates
-    /// a mob for an owner session (an agent's `mob_create`, the implicit
-    /// delegation mob, a temporary council), this refuses an id that a live
-    /// document of this realm still names while no live mob has it.
+    /// any mob (an agent's `mob_create`, a temporary council, a create with
+    /// no owner session), this refuses an id that a live document of this
+    /// realm still names while no live mob has it.
     ///
-    /// - A host's own create (no owner session) is not checked: the host
-    ///   chose the id.
-    /// - The implicit delegation mob that its own session's runtime path
-    ///   recreates (Meerkat reports it only for that path, under the id it
-    ///   derives from the session) keeps what its predecessor's documents
-    ///   grant: the same session's delegation mob. A mob a caller names is
-    ///   never reported as one, whatever its id.
-    /// - Any explicit id is refused while documents name it, also for the
+    /// - The one exemption is the implicit delegation mob that its own
+    ///   session's runtime path creates or recreates: Meerkat reports that
+    ///   origin only for that path, under the id it derives from the session,
+    ///   and the mob keeps what its predecessor's documents grant, as the
+    ///   same session's delegation mob. A mob a caller names is never
+    ///   reported as one, whatever its id, and a create without an owner
+    ///   session gets no exemption.
+    /// - Any other id is refused while documents name it, also for the
     ///   owner session that created the destroyed mob: ownership is by id,
     ///   not by mob instance.
     /// - A store that cannot answer, a registry that is gone and a failed
@@ -285,7 +285,7 @@ impl NativeAuthorityRegistry {
             let registry = registry.clone();
             let store = Arc::clone(&store);
             Box::pin(async move {
-                if request.owner_bridge_session_id.is_none() || request.implicit_delegation_mob {
+                if request.implicit_delegation_mob {
                     return Ok(());
                 }
                 let mob_id = request.mob_id.as_str();
@@ -295,21 +295,31 @@ impl NativeAuthorityRegistry {
                          documents name mob id '{mob_id}' can run"
                     )
                 })?;
-                if registry.handle(mob_id).is_ok() {
-                    // A live mob has the id: the documents are its own, and
-                    // the create fails as a duplicate.
-                    return Ok(());
-                }
-                match store.references_mob(&registry.realm, mob_id).await {
-                    Ok(false) => Ok(()),
-                    Ok(true) => Err(mob_id_still_named(mob_id)),
-                    Err(error) => Err(format!(
-                        "the extension documents could not be checked for references to \
-                         mob id '{mob_id}' ({error}), so the create is refused"
-                    )),
-                }
+                registry.check_mob_id_unnamed(store.as_ref(), mob_id).await
             })
         })
+    }
+
+    /// The check [`Self::before_create`] runs for a create it does not
+    /// exempt: refuse `mob_id` while a live document of this realm names it.
+    async fn check_mob_id_unnamed(
+        &self,
+        store: &dyn documents::ExtensionDocumentStore,
+        mob_id: &str,
+    ) -> Result<(), String> {
+        if self.handle(mob_id).is_ok() {
+            // A live mob has the id: the documents are its own, and the
+            // create fails as a duplicate.
+            return Ok(());
+        }
+        match store.references_mob(&self.realm, mob_id).await {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(mob_id_still_named(mob_id)),
+            Err(error) => Err(format!(
+                "the extension documents could not be checked for references to mob id \
+                 '{mob_id}' ({error}), so the create is refused"
+            )),
+        }
     }
 
     fn handle(&self, id: &str) -> documents::Result<MobReadHandle> {

@@ -1809,12 +1809,11 @@ fn assert_refused_with_remedy(error: &meerkat_mob::MobError, mob_id: &meerkat_mo
     );
 }
 
-/// Documents keep naming a destroyed child mob by its id. A new
-/// session-owned mob under that id is refused while they do: from another
-/// owner session (the takeover) and from the child's own owner session
-/// alike (ownership is by id, not by mob instance), in the same process and
-/// after the store is reopened. A host's own create of the id is not
-/// checked.
+/// Documents keep naming a destroyed child mob by its id. A new mob under
+/// that id is refused while they do: from another owner session (the
+/// takeover), from the child's own owner session alike (ownership is by id,
+/// not by mob instance), and without any owner session, in the same process
+/// and after the store is reopened.
 #[tokio::test(flavor = "multi_thread")]
 async fn extension_mob_id_reuse_is_refused_while_documents_name_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -1863,10 +1862,14 @@ async fn extension_mob_id_reuse_is_refused_while_documents_name_it() {
         .await
         .expect_err("the documents still name the id after the store is reopened");
     assert_refused_with_remedy(&refused, &child);
-    state
+    // A create without an owner session gets no exemption: the state's
+    // public create, as an embedder's own surface reaches it, is checked
+    // the same way.
+    let refused = state
         .mob_create_definition(child_definition(&child))
         .await
-        .expect("a host's own create of the id is not checked");
+        .expect_err("a create without an owner session is checked too");
+    assert_refused_with_remedy(&refused, &child);
     drop(state);
     reopened.shutdown().await;
 }
