@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-15
+
 ### Breaking
 
 - `meta_gateway storage-adopt-predecessor --predecessor-home <dir>` without
@@ -63,6 +65,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Requires Meerkat 0.9.1: every Meerkat dependency is pinned to
+  `=0.9.1` from crates.io.
 - `meta_gateway storage-adopt-predecessor --state-dir <dir>` adopts that state
   directory only. It no longer moves the invoking user's own gateway home
   (`$XDG_STATE_HOME` or `~/.local/state`, `meerkat-mobkit` to `meerkat-meta`)

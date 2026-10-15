@@ -4,6 +4,8 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+## 0.9.1
+
 - `MetaBuilder.gating("")` and `MetaBuilder.access_control("")` raise a
   `ValueError` that says an empty path no longer switches the feature off and
   names how to keep it off: do not call the method, and keep nothing at

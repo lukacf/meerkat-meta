@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.1
+
 - `MetaBuilder.gating("")` and `MetaBuilder.accessControl("")` throw an error
   that says an empty path no longer switches the feature off and names how to
   keep it off: do not call the method, and keep nothing at
