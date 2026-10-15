@@ -62,16 +62,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     `157fed890922c4c3fe7c9b7a6319455f0604e9c789818f9c38d45bc115a98ad6`
   - `console/src/mcp-apps/sandbox.js`:
     `4e3592ba5b8bf198322126ccb27919a8d4c4c1976a198f9c497c16833f6c3024`
-- The native MCP Apps browser lane (`npm --prefix console run e2e:mcp-apps`,
-  both CI steps) runs against a new example, `mcp_apps_gateway_fixture`,
-  which serves the persistent `rpc_gateway` composition with a scripted
-  model. Its members are built by the gateway's own member factories, whose
-  MCP routers carry the stock connector call-context provider, so a
-  regression in that provider's MCP App resource reads (the failure that
-  Meerkat 0.9.1 fixed) now fails CI. The lane used to run against
-  `console_acceptance_fixture`, whose `UnifiedRuntime::builder()` members
-  carry no call-context provider; `META_MCP_APPS_BACKEND=builder` still runs
-  it that way.
+- The native MCP Apps browser lane (`npm --prefix console run e2e:mcp-apps`)
+  runs by default against a new example, `mcp_apps_gateway_fixture`, which
+  serves the persistent `rpc_gateway` composition with a scripted model. Its
+  members are built by the gateway's own member factories, whose MCP routers
+  carry the stock connector call-context provider, so a regression in that
+  provider's MCP App resource reads (the failure that Meerkat 0.9.1 fixed)
+  now fails CI. The rendering and polling CI steps use it. A third CI step
+  keeps the previous coverage: `META_MCP_APPS_BACKEND=builder` runs the
+  rendering checks against `console_acceptance_fixture`, a
+  `UnifiedRuntime::builder()` host with identity-first members whose routers
+  carry no call-context provider.
 
 ## [0.9.1] - 2026-10-15
 

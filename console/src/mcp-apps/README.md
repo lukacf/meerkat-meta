@@ -239,9 +239,11 @@ that provider's resource reads fails the lane. It starts a stdio MCP server,
 loads the stock Console, invokes its app-only action, and checks reload,
 original connection custody, private metadata separation and native request
 rejection. It writes screenshots and wire evidence under `output/playwright/`
-and never contacts a model provider. `META_MCP_APPS_BACKEND=builder` runs the
-same lane against `console_acceptance_fixture`, a `UnifiedRuntime::builder()`
-host whose member routers carry no call-context provider.
+and never contacts a model provider. The gateway lane spawns classic members.
+`META_MCP_APPS_BACKEND=builder` runs the same lane against
+`console_acceptance_fixture`, a `UnifiedRuntime::builder()` host with
+identity-first members whose routers carry no call-context provider; CI runs
+both.
 
 To also exercise live polling through a model turn longer than the host's
 request timeout, run the same lane with `META_MCP_APPS_LONG_POLL=1`. This mounts
