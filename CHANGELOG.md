@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- With the `extension-state` feature, a new session-owned mob could take
+  the id of a destroyed one and inherit what extension documents grant that
+  id, since documents name a mob by its id alone, as their owner
+  (`Owner::Mob`) or in an audience entry (`Audience::Mob`). An agent's
+  `mob_create` takes a model-chosen id, so another session could manage a
+  destroyed child's documents through a new mob under its id: at once now
+  that a destroy releases the id, and after a restart before. The agent
+  mob-tool state now refuses a session-owned create (an agent's
+  `mob_create`, the implicit delegation mob, a temporary council) under an
+  id that any live document of the realm still names while no live mob has
+  it, with a typed refusal that names the remedies: choose another mob id,
+  or have a host or operator with access to the extension store transfer
+  each document the id owns and remove or replace each `Audience::Mob` grant
+  or deny naming it. Not checked: a host's own create, a restore, and the
+  implicit delegation mob that its own session's runtime path recreates.
+  Known limitations: ownership is by id, so the destroyed mob's own owner
+  session cannot recreate the same explicit id while documents name it
+  either (per-instance ownership is the long-term model); the check reads
+  every live document of the realm on each such create; and it is not
+  ordered against a document write already in flight, whose caller the
+  embedding host resolved while the destroyed mob was live. A custom
+  `ExtensionDocumentStore` must implement the new `references_mob`, or every
+  session-owned create is refused.
+
 ### Fixed
 
 - With the `extension-state` feature and any extension tool bundle or

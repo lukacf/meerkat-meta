@@ -9247,6 +9247,10 @@ pub struct MobBootstrapSpec {
     /// mob-tool state destroys, before that destroy's storage cleanup.
     #[cfg(feature = "extension-state")]
     pub(crate) after_destroy: Option<meerkat_mob_mcp::MobAfterDestroy>,
+    /// Admits or refuses each mob the agent mob-tool state creates, before
+    /// anything of it exists.
+    #[cfg(feature = "extension-state")]
+    pub(crate) before_create: Option<meerkat_mob_mcp::MobBeforeCreate>,
     /// The meerkat-level realm this spec's persistent stores were composed
     /// under (the fresh default or an adopted predecessor's recorded realm),
     /// with the state directory it was resolved from; `None` for a spec not
@@ -9416,6 +9420,8 @@ impl MobBootstrapSpec {
             before_activation: None,
             #[cfg(feature = "extension-state")]
             after_destroy: None,
+            #[cfg(feature = "extension-state")]
+            before_create: None,
             #[cfg(feature = "extension-state")]
             composed_meerkat_realm: None,
             #[cfg(feature = "extension-state")]
@@ -11990,6 +11996,12 @@ impl MobRuntime {
         if let (Some(state), Some(hook)) = (&spec.agent_mob_mcp_state, &spec.after_destroy) {
             state
                 .set_after_destroy(Arc::clone(hook))
+                .map_err(|error| MobRuntimeError::InvalidConfig(error.to_string()))?;
+        }
+        #[cfg(feature = "extension-state")]
+        if let (Some(state), Some(hook)) = (&spec.agent_mob_mcp_state, &spec.before_create) {
+            state
+                .set_before_create(Arc::clone(hook))
                 .map_err(|error| MobRuntimeError::InvalidConfig(error.to_string()))?;
         }
         auto_mark_declared_resume_overrides(&mut spec.definition);

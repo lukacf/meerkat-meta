@@ -116,6 +116,31 @@ storage provenance. Durable document rows or continuity records alone cannot
 reconstruct missing native creation facts; the extension refuses unavailable
 authority.
 
+Documents name a mob by its id alone, as their owner (`Owner::Mob`) or in an
+audience grant or deny (`Audience::Mob`), and they outlive the mob. A new mob
+under the id of a destroyed one would inherit what they grant, so the agent
+mob-tool state refuses a session-owned create (an agent's `mob_create`, the
+implicit delegation mob, a temporary council) under an id that any live
+document of the realm still names while no live mob has it. The typed
+refusal names the remedies: choose another mob id, or have a host or
+operator with access to the extension store transfer each document the id
+owns to another owner and remove or replace each `Audience::Mob` grant or
+deny naming it. An owner transfer alone leaves the audience entries, and the
+document tools alone cannot manage a document whose owning mob was
+destroyed.
+
+A host's own create, restoring a persisted mob, and the implicit delegation
+mob that its own session's runtime path recreates (as for a model change)
+are not checked. Ownership is by id, not by mob instance, so the owner
+session of a destroyed mob cannot recreate the same explicit id while
+documents name it either. The check reads every live document of the realm
+on each such create. It is not ordered against a document write already in
+flight: a write whose caller the embedding host's tool resolved while the
+destroyed mob was live can still commit a reference to the id after the
+check passed. A custom `ExtensionDocumentStore` must implement
+`references_mob`; its default answers an error, and every session-owned
+create is then refused.
+
 The SDK callback-backed `GatewayContinuityStore` currently lacks the required
 retained identity-history capability. Registering this extension on such a
 host fails before activation with typed `ExtensionAuthorityUnavailable`.

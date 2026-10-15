@@ -118,6 +118,20 @@ pub(crate) fn open_disk_store(
     ))
 }
 
+/// The refusal of a create under an id that documents still name, with
+/// every way to clear the references.
+fn mob_id_still_named(mob_id: &str) -> String {
+    format!(
+        "mob id '{mob_id}' is still named by extension documents of this realm, as their \
+         owner (Owner::Mob) or in an audience grant or deny (Audience::Mob), and no live mob \
+         has it: a new mob under it would inherit what they grant. Choose another mob id, or \
+         have a host or operator with access to the extension store clear every reference \
+         first: transfer each document the id owns to another owner, and remove or replace \
+         each Audience::Mob grant or deny naming it (an owner transfer leaves those). The \
+         document tools alone cannot manage a document whose owning mob was destroyed."
+    )
+}
+
 /// Destroy is terminal: a destroyed mob's handle is no authority.
 fn is_destroyed(handle: &MobReadHandle) -> bool {
     handle.status_observation_snapshot() == meerkat_mob::MobState::Destroyed
@@ -234,6 +248,68 @@ impl NativeAuthorityRegistry {
                 .collect()
         };
         drop(released);
+    }
+
+    /// The admission counterpart of [`Self::before_activation`] for the agent
+    /// mob-tool state. Documents name a mob by its id alone, as their owner
+    /// or in an audience entry, so a new mob under the id of a destroyed one
+    /// would inherit what those documents grant it. Before the state creates
+    /// a mob for an owner session (an agent's `mob_create`, the implicit
+    /// delegation mob, a temporary council), this refuses an id that a live
+    /// document of this realm still names while no live mob has it.
+    ///
+    /// - A host's own create (no owner session) is not checked: the host
+    ///   chose the id.
+    /// - The implicit delegation mob that its own session's runtime path
+    ///   recreates (Meerkat reports it only for that path, under the id it
+    ///   derives from the session) keeps what its predecessor's documents
+    ///   grant: the same session's delegation mob. A mob a caller names is
+    ///   never reported as one, whatever its id.
+    /// - Any explicit id is refused while documents name it, also for the
+    ///   owner session that created the destroyed mob: ownership is by id,
+    ///   not by mob instance.
+    /// - A store that cannot answer, a registry that is gone and a failed
+    ///   read all refuse the create.
+    ///
+    /// The check reads every live document of the realm. It is not ordered
+    /// against a document write already in flight: a write whose caller
+    /// authority was resolved while the destroyed mob was live (the
+    /// embedding host's tool resolves the caller, then mutates) can still
+    /// commit a reference to the id after the check passed.
+    pub(crate) fn before_create(
+        self: &Arc<Self>,
+        store: Arc<dyn documents::ExtensionDocumentStore>,
+    ) -> meerkat_mob_mcp::MobBeforeCreate {
+        let registry = Arc::downgrade(self);
+        Arc::new(move |request: meerkat_mob_mcp::MobCreateRequest| {
+            let registry = registry.clone();
+            let store = Arc::clone(&store);
+            Box::pin(async move {
+                if request.owner_bridge_session_id.is_none() || request.implicit_delegation_mob {
+                    return Ok(());
+                }
+                let mob_id = request.mob_id.as_str();
+                let registry = registry.upgrade().ok_or_else(|| {
+                    format!(
+                        "the extension authority registry is gone, so no check that \
+                         documents name mob id '{mob_id}' can run"
+                    )
+                })?;
+                if registry.handle(mob_id).is_ok() {
+                    // A live mob has the id: the documents are its own, and
+                    // the create fails as a duplicate.
+                    return Ok(());
+                }
+                match store.references_mob(&registry.realm, mob_id).await {
+                    Ok(false) => Ok(()),
+                    Ok(true) => Err(mob_id_still_named(mob_id)),
+                    Err(error) => Err(format!(
+                        "the extension documents could not be checked for references to \
+                         mob id '{mob_id}' ({error}), so the create is refused"
+                    )),
+                }
+            })
+        })
     }
 
     fn handle(&self, id: &str) -> documents::Result<MobReadHandle> {
