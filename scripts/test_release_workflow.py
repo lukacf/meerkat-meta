@@ -1619,5 +1619,135 @@ class ReleaseCacheReuseTests(unittest.TestCase):
             self.assertIn("scripts/repo-cargo publish -p", step_script(step, "publish_registries"))
 
 
+PREWARM_WORKFLOW = ROOT / ".github/workflows/release-prewarm.yml"
+
+
+def workflow_job(path: Path, name: str) -> list[str]:
+    lines = path.read_text().splitlines()
+    start = lines.index(f"  {name}:")
+    for offset, line in enumerate(lines[start + 1:], start=start + 1):
+        if re.fullmatch(r"  [A-Za-z_][A-Za-z0-9_-]*:", line):
+            return lines[start:offset]
+    return lines[start:]
+
+
+def build_shape(path: Path) -> dict[str, object]:
+    """What decides a build_binaries leg's rust-cache keys and compiled
+    artifacts: runner, container, matrix, and every step after Checkout up
+    to the build itself, comments and blank lines dropped."""
+    job = [line for line in workflow_job(path, "build_binaries")
+           if line.strip() and not line.strip().startswith("#")]
+    strategy_start = job.index("    strategy:")
+    strategy_end = job.index("    steps:")
+    steps: dict[str, list[str]] = {}
+    current = None
+    for line in job[strategy_end + 1:]:
+        if line.startswith("      - name: "):
+            current = line[len("      - name: "):]
+            steps[current] = []
+        if current is not None:
+            steps[current].append(line)
+    names = list(steps)
+    built = names[: names.index("Build gateway binaries") + 1]
+    return {
+        "runs-on": [line for line in job if line.startswith("    runs-on: ")],
+        "container": [line for line in job if line.startswith("    container: ")],
+        "strategy": job[strategy_start:strategy_end],
+        "step names": built,
+        "steps": {name: steps[name] for name in built if name != "Checkout"},
+    }
+
+
+def run_prewarm_resolve(ref: str, sha: str, heads: list[str]) -> tuple[subprocess.CompletedProcess[str], str]:
+    """Run the prewarm's source check with a fake `git ls-remote`."""
+    lines = workflow_job(PREWARM_WORKFLOW, "resolve_source")
+    run = lines.index("        run: |")
+    body = "\n".join(line[10:] if line else "" for line in lines[run + 1:]
+                     if not line or line.startswith("          "))
+    with fixture_directory() as tmp:
+        root = Path(tmp)
+        (root / "bin").mkdir()
+        fake = root / "bin/git"
+        fake.write_text(
+            "#!/usr/bin/env bash\n"
+            '[[ "$1 $2" == "ls-remote --heads" ]] || { echo "unexpected git $*" >&2; exit 99; }\n'
+            'printf "%s\\trefs/heads/branch\\n" $FAKE_HEADS\n'
+        )
+        fake.chmod(0o755)
+        output = root / "output"
+        env = os.environ.copy()
+        env.update({
+            "PATH": f"{root / 'bin'}:{env['PATH']}",
+            "GITHUB_REF": ref,
+            "SOURCE_SHA": sha,
+            "GITHUB_SERVER_URL": "https://github.com",
+            "GITHUB_REPOSITORY": "example/meta",
+            "GITHUB_OUTPUT": str(output),
+            "FAKE_HEADS": " ".join(heads),
+        })
+        result = subprocess.run(["bash", "-c", body], env=env, capture_output=True, text=True)
+        written = output.read_text() if output.exists() else ""
+    return result, written
+
+
+class ReleasePrewarmTests(unittest.TestCase):
+    """release-prewarm.yml builds a release pull request's binaries on main
+    before it merges, only so the candidate restores its dependencies."""
+
+    def test_the_prewarm_repeats_the_candidate_build_exactly(self):
+        # rust-cache keys on the job id, the key input, the runner and the
+        # environment; the artifacts depend on the toolchain, profile
+        # overrides and build command. Any drift means the candidate misses
+        # the prewarmed entries or restores ones built differently.
+        release, prewarm = build_shape(RELEASE_WORKFLOW), build_shape(PREWARM_WORKFLOW)
+        self.assertEqual(prewarm, release)
+        self.assertEqual(release["step names"][:2], ["Checkout", "Install Rust"])
+        self.assertIn("Cache cargo registry", release["steps"])
+        self.assertIn("Apply release build profile overrides", release["steps"])
+        header = PREWARM_WORKFLOW.read_text().split("\njobs:\n", 1)[0]
+        release_header = RELEASE_WORKFLOW.read_text().split("\njobs:\n", 1)[0]
+        self.assertEqual(hashed_env(header, "  "), hashed_env(release_header, "  "))
+        self.assertEqual(hashed_env("\n".join(workflow_job(PREWARM_WORKFLOW, "build_binaries")), "      "),
+                         hashed_env(job_block("build_binaries"), "      "))
+        checkout = "\n".join(workflow_job(PREWARM_WORKFLOW, "build_binaries"))
+        self.assertIn("          ref: ${{ needs.resolve_source.outputs.sha }}\n", checkout)
+        self.assertIn("    needs: [resolve_source]\n", checkout)
+
+    def test_the_prewarm_can_only_build(self):
+        source = PREWARM_WORKFLOW.read_text()
+        code = "\n".join(line for line in source.splitlines() if not line.strip().startswith("#"))
+        self.assertEqual(re.findall(r"(?m)^on:\n  (\S+):", code), ["workflow_dispatch"])
+        self.assertIn("\npermissions:\n  contents: read\n\n", code)
+        self.assertEqual(re.findall(r"(?m)^ +permissions:", code), [])
+        for forbidden in ("secrets.", "id-token", "attest", "upload-artifact", "codesign",
+                          "gh release", "publish", "Package artifacts"):
+            self.assertNotIn(forbidden, code, forbidden)
+        self.assertEqual(set(re.findall(r"(?m)^  ([a-z_]+):$", code.split("\njobs:\n", 1)[1])),
+                         {"resolve_source", "build_binaries"})
+
+    def test_only_a_branch_head_dispatched_on_main_reaches_the_build(self):
+        sha = "a" * 40
+        for name, ref, source, heads, accepted in (
+            ("branch head on main", "refs/heads/main", sha, ["b" * 40, sha], True),
+            ("dispatched on another ref", "refs/heads/rel/x", sha, [sha], False),
+            ("a fork's pull request head", "refs/heads/main", sha, ["b" * 40], False),
+            ("abbreviated sha", "refs/heads/main", sha[:12], [sha], False),
+            ("uppercase sha", "refs/heads/main", sha.upper(), [sha], False),
+            ("a prefix of a head", "refs/heads/main", sha[:39] + "b", [sha], False),
+        ):
+            with self.subTest(case=name):
+                result, written = run_prewarm_resolve(ref, source, heads)
+                if accepted:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(written, f"sha={sha}\n")
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(written, "")
+
+    def test_make_dispatches_the_prewarm_on_main(self):
+        makefile = (ROOT / "Makefile").read_text()
+        self.assertIn('gh workflow run release-prewarm.yml --ref main -f source_sha="$(SOURCE_SHA)"', makefile)
+
+
 if __name__ == "__main__":
     unittest.main()

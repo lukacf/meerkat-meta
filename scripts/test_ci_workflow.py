@@ -93,7 +93,7 @@ class CiWorkflowTests(unittest.TestCase):
         toolchain = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]
         version = toolchain["channel"]
         self.assertRegex(version, r"^\d+\.\d+\.\d+$")
-        for name in ("ci.yml", "release.yml", "e2e-live.yml"):
+        for name in ("ci.yml", "release.yml", "release-prewarm.yml", "e2e-live.yml"):
             source = (ROOT / ".github/workflows" / name).read_text()
             installs = re.findall(r"uses:\s*dtolnay/rust-toolchain@(\S+)", source)
             self.assertTrue(installs, f"{name} must install its build toolchain")
