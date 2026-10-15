@@ -3786,8 +3786,10 @@ memory = false
 
     /// Governed work writes memory only when its prepared authorization
     /// names exactly the recorder's memory operation. Through a wrapper that
-    /// resolved its own plan without it (which a base grant would cover), or
-    /// with another identity's scope, the recorder refuses before writing;
+    /// resolved its own plan without a memory target (which a base grant
+    /// would cover), the fenced dispatch refuses the plan before any wrapper
+    /// runs; through one whose plan names another identity's scope, the
+    /// recorder refuses at its own check. Either way nothing is written, and
     /// through the recorder's own plan the same governed write runs.
     #[tokio::test]
     async fn governed_memory_writes_require_the_recorders_authorized_target()
