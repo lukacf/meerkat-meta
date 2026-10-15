@@ -140,6 +140,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `tools.mob_tasks`) can be removed from a persistent mob's config safely: the
   key never reaches the composition Meta records and verifies, so removing or
   adding it never makes the store refuse as `divergent`.
+- Console conversations no longer hide part of their history behind an old
+  notice. A conversation opens on its most recent messages, and a background
+  job or other system notice older than all of them used to render directly
+  above those newer messages, with nothing to show that the messages in
+  between were not loaded yet; "Load older history" then filled in messages
+  newer than the notice above them. Such a notice now waits until "Load older
+  history" reaches its time and then appears once, in its place. Display only:
+  no history data was affected.
+- `meta/console/list_identities` and the Python SDK's
+  `MetaRuntime.list_identities()` return each running identity-first agent
+  once again. In 0.9.0 a live identity was listed twice: once with its runtime
+  alias as `runtime_member_id` (`rt:<identity>:<generation>`) and once with
+  the bare identity. The two rows are now one row that keeps the `rt:` runtime
+  alias. Bindings of different generations, or on different sessions, are
+  still listed separately so that a split binding stays visible.
 - Console: the chat transcript keeps your reading position when an earlier
   turn just above it is laid out again after its content grew while it was off
   screen. The view no longer moves down by the difference right after a scroll
