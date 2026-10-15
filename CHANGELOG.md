@@ -33,7 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `model_fallback` and `tools.deny`. MobKit 0.8.33 and earlier ignored
   `model_fallback`, and 0.8.45 and earlier ignored `tools.deny`; later 0.8
   releases applied them, and their stores recorded them.
-
 - Console: an operation refusal reads "Action refused" instead of
   "Permission denied". The host refuses an operation for a policy denial, for
   an authorization that changed after the operation was prepared and for
@@ -43,6 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   authorization, so it did not run." Its feedback kind
   (`operationFeedback.kind`, the card's `data-feedback-kind`) is
   `operation-refused` instead of `permission-refused`.
+- `meta/gating/decide` refusals for a missing or unknown decision list every
+  decision it accepts, `escalate` included (`decision must be one of:
+  approve, reject, escalate`, and `decision '<value>' is unsupported
+  (allowed: approve, reject, escalate)`); they named only approve and reject.
 
 ### Changed
 
