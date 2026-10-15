@@ -2,7 +2,9 @@
 """Focused contracts for the pull-request CI workflow."""
 
 import fnmatch
+import importlib.util
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -13,6 +15,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
+_CI_CHANGES_SPEC = importlib.util.spec_from_file_location("ci_changes", ROOT / "scripts/ci-changes.py")
+ci_changes = importlib.util.module_from_spec(_CI_CHANGES_SPEC)
+_CI_CHANGES_SPEC.loader.exec_module(ci_changes)
 
 # The target kinds `cargo test` tests by default. Examples are only built,
 # and benches and build scripts are left out, unless a manifest sets their
@@ -559,9 +564,10 @@ class CiWorkflowTests(unittest.TestCase):
         below is therefore a floor - every gating job must be present - and the
         correspondence check runs on top of it.
 
-        A job may be skipped only when `changes` classified the pull request as
-        docs-only (FULL is exactly "false"); every skippable job is one the
-        classification gates, and every other job must succeed.
+        A job in a lane may be skipped only when `changes` set that lane to
+        exactly "false"; every such job is one the same lane output gates,
+        the lanes and their jobs are the ones scripts/ci-changes.py
+        classifies, and every other job must succeed.
         """
         block = job_block("gate")
         needs = block.split("needs: [", 1)[1].split("]", 1)[0]
@@ -594,16 +600,61 @@ class CiWorkflowTests(unittest.TestCase):
             f"consistent while silently making it advisory.",
         )
 
-        checks = dict(re.findall(r'(?m)^\s+check ([a-z-]+) "\$\{\{ needs\.\1\.result \}\}" (required|skippable)$', block))
+        checks = dict(re.findall(r'(?m)^\s+check ([a-z-]+) "\$\{\{ needs\.\1\.result \}\}" (required|[a-z_]+)$', block))
         self.assertEqual(set(checks), listed, "every job in `needs` is checked exactly by name")
-        self.assertIn('"$3" == "skippable" && "$2" == "skipped" && "${FULL}" == "false"', block)
-        self.assertIn("FULL: ${{ needs.changes.outputs.full }}", block)
+        self.assertIn('"$3" != "required" && "$2" == "skipped" && "${lane_value}" == "false"', block)
+        self.assertIn('local variable="LANE_${3^^}"', block)
+        for lane in ci_changes.LANES:
+            self.assertIn(f"LANE_{lane.upper()}: ${{{{ needs.changes.outputs.{lane} }}}}\n", block)
+        lanes = {}
         for name, mode in checks.items():
-            gated = "    if: needs.changes.outputs.full == 'true'\n" in job_block(name)
-            self.assertEqual(mode == "skippable", gated, name)
-            if gated:
-                self.assertIn("    needs: changes\n", job_block(name))
+            gate = re.findall(r"(?m)^    if: needs\.changes\.outputs\.([a-z_]+) == 'true'$", job_block(name))
+            if mode == "required":
+                self.assertEqual(gate, [], name)
+                continue
+            self.assertEqual(gate, [mode], name)
+            self.assertIn("    needs: changes\n", job_block(name))
+            lanes.setdefault(mode, set()).add(name)
+        # The workflow's lanes are exactly the classifier's, job for job.
+        self.assertEqual(lanes, {lane: set(jobs) for lane, jobs in ci_changes.LANE_JOBS.items()})
         self.assertEqual(checks["changes"], "required")
+
+    def run_gate(self, results: dict[str, str], lanes: dict[str, str]) -> subprocess.CompletedProcess:
+        """Run the gate step's shell with job results substituted the way
+        GitHub renders them and the lane outputs in its environment."""
+        lines = job_block("gate").splitlines()
+        start = lines.index("        run: |") + 1
+        body = "\n".join(line[10:] for line in lines[start:] if line.startswith("          ") or not line)
+        script = re.sub(
+            r"\$\{\{ needs\.([a-z-]+)\.result \}\}",
+            lambda match: results.get(match.group(1), "success"),
+            body,
+        )
+        env = {key: value for key, value in os.environ.items() if not key.startswith("LANE_")}
+        env.update({f"LANE_{lane.upper()}": value for lane, value in lanes.items()})
+        return subprocess.run(["bash", "-e", "-c", script], env=env, capture_output=True, text=True)
+
+    def test_gate_accepts_a_skip_only_for_a_lane_classified_false(self):
+        every = {lane: "true" for lane in ci_changes.LANES}
+        console_only = {lane: ("true" if lane in ("console", "console_perf", "flow_editor") else "false")
+                        for lane in ci_changes.LANES}
+        rust_jobs = {job: "skipped" for job in ci_changes.LANE_JOBS["rust"]}
+        cases = (
+            ("all green", {}, every, 0),
+            ("rust lane skipped when classified false", rust_jobs | {"test-integration": "skipped",
+                                                                      "test-python": "skipped"}, console_only, 0),
+            ("a skipped job whose lane is true", {"test-voice": "skipped"}, every, 1),
+            ("a skipped job of a running lane", {"console-perf": "skipped"}, console_only, 1),
+            ("a failed job in a skipped lane", {"test": "failure"}, console_only, 1),
+            ("lanes missing: classification failed", rust_jobs, {}, 1),
+            ("lanes empty", rust_jobs, {lane: "" for lane in ci_changes.LANES}, 1),
+            ("a required job skipped", {"fmt-lint": "skipped"}, console_only, 1),
+            ("changes failed", {"changes": "failure"}, every, 1),
+        )
+        for name, results, lanes, status in cases:
+            with self.subTest(case=name):
+                result = self.run_gate(results, lanes)
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
 
     def test_changes_job_classifies_the_pull_request_and_fails_closed(self):
         block = job_block("changes")
@@ -612,8 +663,13 @@ class CiWorkflowTests(unittest.TestCase):
             'python3 scripts/ci-changes.py --event "${{ github.event_name }}" --github-output "$GITHUB_OUTPUT"',
             block,
         )
-        self.assertIn('echo "full=true" >> "$GITHUB_OUTPUT"', block)
+        # Every lane is an output, and a classifier failure turns every lane on.
+        outputs = re.findall(r"(?m)^      ([a-z_]+): \$\{\{ steps\.classify\.outputs\.\1 \}\}$", block)
+        self.assertEqual(outputs, list(ci_changes.LANES))
+        self.assertIn(f"            for lane in {' '.join(ci_changes.LANES)}; do\n", block)
+        self.assertIn('              echo "${lane}=true" >> "$GITHUB_OUTPUT"\n', block)
         self.assertNotIn("if:", block)
+        self.assertNotIn("outputs.full", CI_WORKFLOW.read_text())
         self.assertIn("- run: python3 scripts/test_ci_changes.py\n", job_block("fmt-lint"))
 
 
