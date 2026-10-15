@@ -1,5 +1,6 @@
 //! Host-owned document MCP composition. Only the public descriptor is durable.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
@@ -12,6 +13,7 @@ use meerkat_mcp::{
 };
 
 use super::{ToolBundleFactory, ToolBundleRequirements};
+use crate::storage_predecessor::PREDECESSOR_DOCUMENT_BINDING_ENV;
 
 /// Public launch marker, not a credential or a caller identity. An unresolved
 /// marked descriptor always refuses instead of launching an unbound service.
@@ -82,7 +84,11 @@ impl HostMcpDocumentBinding {
         let McpTransportConfig::Stdio(runtime_stdio) = &mut runtime_shape.transport else {
             return Err("document MCP runtime must use the public stdio transport".into());
         };
-        if runtime_stdio.env.contains_key(DOCUMENT_BINDING_ENV) {
+        if runtime_stdio.env.contains_key(DOCUMENT_BINDING_ENV)
+            || runtime_stdio
+                .env
+                .contains_key(PREDECESSOR_DOCUMENT_BINDING_ENV)
+        {
             return Err(
                 "document MCP runtime environment must not contain the public marker".into(),
             );
@@ -163,21 +169,23 @@ pub(crate) fn resolve_document_mcp_configs(
     bindings: &[Arc<HostMcpDocumentBinding>],
 ) -> Result<(), String> {
     let mut names = BTreeSet::new();
-    for config in configs.iter() {
+    for persisted in configs.iter() {
+        let config = with_current_marker(persisted);
         let selected = bindings
             .iter()
             .find(|binding| binding.public_config.name == config.name);
-        if (selected.is_some() || is_document_descriptor(config)) && !names.insert(&config.name) {
+        if (selected.is_some() || is_document_descriptor(&config)) && !names.insert(&persisted.name)
+        {
             return Err("duplicate MCP server name in member profile".into());
         }
         match selected {
-            Some(binding) if &binding.public_config == config => {}
+            Some(binding) if binding.public_config == *config => {}
             Some(_) => {
                 return Err(
                     "document MCP public descriptor does not match host registration".into(),
                 );
             }
-            None if is_document_descriptor(config) => {
+            None if is_document_descriptor(&config) => {
                 return Err("selected document MCP host binding is unavailable".into());
             }
             None => {}
@@ -185,14 +193,39 @@ pub(crate) fn resolve_document_mcp_configs(
     }
     // Validate the whole selection before installing any runtime secret.
     for config in configs {
-        if let Some(binding) = bindings
+        let resolved = bindings
             .iter()
-            .find(|binding| &binding.public_config == config)
-        {
-            config.clone_from(&binding.runtime_config);
+            .find(|binding| binding.public_config == *with_current_marker(config))
+            .map(|binding| binding.runtime_config.clone());
+        if let Some(runtime) = resolved {
+            *config = runtime;
         }
     }
     Ok(())
+}
+
+/// `config` with a predecessor-spelled marker under its current name, so a
+/// descriptor a profile persisted before 0.9 matches the binding it was
+/// copied from. Every other field is kept. A descriptor that carries both
+/// spellings is left as it is: it matches no binding and refuses.
+fn with_current_marker(config: &McpServerConfig) -> Cow<'_, McpServerConfig> {
+    let McpTransportConfig::Stdio(stdio) = &config.transport else {
+        return Cow::Borrowed(config);
+    };
+    if stdio.env.contains_key(DOCUMENT_BINDING_ENV) {
+        return Cow::Borrowed(config);
+    }
+    let Some(namespace) = stdio.env.get(PREDECESSOR_DOCUMENT_BINDING_ENV) else {
+        return Cow::Borrowed(config);
+    };
+    let mut current = config.clone();
+    if let McpTransportConfig::Stdio(stdio) = &mut current.transport {
+        stdio.env.remove(PREDECESSOR_DOCUMENT_BINDING_ENV);
+        stdio
+            .env
+            .insert(DOCUMENT_BINDING_ENV.to_string(), namespace.clone());
+    }
+    Cow::Owned(current)
 }
 
 pub(crate) fn pre_build_hook(
@@ -222,7 +255,8 @@ pub(crate) fn pre_build_hook(
 
 fn is_document_descriptor(config: &McpServerConfig) -> bool {
     matches!(&config.transport, McpTransportConfig::Stdio(stdio)
-        if stdio.env.contains_key(DOCUMENT_BINDING_ENV))
+        if stdio.env.contains_key(DOCUMENT_BINDING_ENV)
+            || stdio.env.contains_key(PREDECESSOR_DOCUMENT_BINDING_ENV))
 }
 
 pub(crate) struct DocumentMcpContextProvider {
@@ -459,6 +493,36 @@ mod tests {
         runtime: McpServerConfig,
     ) -> HostMcpDocumentBinding {
         binding(public, runtime).unwrap()
+    }
+
+    /// A descriptor persisted before 0.9 carries the predecessor spelling of
+    /// the public marker. It is the same host-attested descriptor: it
+    /// resolves to its binding's runtime twin exactly as the current spelling
+    /// does, and with no binding to resolve it, it refuses instead of
+    /// launching an unbound service.
+    #[test]
+    fn a_predecessor_marked_descriptor_resolves_and_never_launches_unbound() {
+        let (public, runtime) = configs("secret");
+        let binding = Arc::new(binding(public, runtime.clone()).unwrap());
+        let mut persisted = binding.public_config().clone();
+        let McpTransportConfig::Stdio(stdio) = &mut persisted.transport else {
+            unreachable!()
+        };
+        let namespace = stdio
+            .env
+            .remove(DOCUMENT_BINDING_ENV)
+            .expect("the public descriptor carries the marker");
+        stdio
+            .env
+            .insert("MOBKIT_MCP_DOCUMENT_BINDING".into(), namespace);
+
+        let mut request = vec![persisted.clone()];
+        resolve_document_mcp_configs(&mut request, std::slice::from_ref(&binding)).unwrap();
+        assert_eq!(request, vec![runtime]);
+        assert!(
+            resolve_document_mcp_configs(&mut [persisted], &[]).is_err(),
+            "an unresolved predecessor-marked descriptor refuses"
+        );
     }
 
     #[test]

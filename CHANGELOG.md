@@ -28,6 +28,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   enumerated, restored child mobs included, for as long as they ran. Such a
   child's destroy answered `Incomplete` with the same storage cleanup
   refusal. Only their state watchers outlive that pass now.
+- An extension document store written before 0.9 (`extension_state.sqlite3`
+  under the ledger domain `mobkit-extension-state`) failed to open with an
+  unledgered-objects error that no tool resolved, because
+  `meta_gateway storage-adopt-predecessor` did not adopt that domain. It is
+  predecessor state now: startup refuses it with the adoption command, and
+  the adoption renames its ledger domain to `meta-extension-state` and keeps
+  every document. This covers an installation an earlier 0.9 adoption
+  finished too (rerun the command), and builds without the
+  `extension-state` feature, which now fence the store as well. The store's
+  file name and schema did not change.
+- A document MCP descriptor that a mob definition persisted before 0.9
+  carries its public marker as `MOBKIT_MCP_DOCUMENT_BINDING`. It now
+  resolves to the host's document binding like the current
+  `META_MCP_DOCUMENT_BINDING` spelling. It was not recognized before: next
+  to a binding with the same server name it refused as a mismatch, and
+  otherwise it launched without the host's endpoint and credentials. With
+  no binding to resolve it, a descriptor in either spelling now refuses.
 
 ## [0.9.1] - 2026-10-15
 

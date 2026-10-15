@@ -2,10 +2,11 @@
 //!
 //! Before 0.9 this product shipped under a different name, and several
 //! durable names carried it: two database file names, the gateway's memory
-//! ledger file, four schema ledger domains, one SQLite table, the gateway
+//! ledger file, five schema ledger domains, one SQLite table, the gateway
 //! home directory, the flow-editor draft store file, the steward dream
-//! schedule's host runnable and the creator field of the composition
-//! manifest beside each persistent mob storage. 0.9 renames all of them.
+//! schedule's host runnable, the creator field of the composition manifest
+//! beside each persistent mob storage and the public marker in a host's
+//! document MCP descriptors. 0.9 renames all of them.
 //! This module is the only place that knows the predecessor spellings, and
 //! it uses them for exactly three things:
 //!
@@ -15,7 +16,9 @@
 //!    names ([`crate::storage_layout::StorageLayoutError::PredecessorState`],
 //!    [`crate::storage_layout::StorageLayoutError::PredecessorGatewayHome`]).
 //!    Nothing ever reads a predecessor name as a fallback: a renamed default
-//!    never starts empty beside existing state.
+//!    never starts empty beside existing state. The extension document
+//!    store kept its file name, so its predecessor ledger domain is what
+//!    marks it.
 //! 2. **Explicit adoption.** [`adopt_predecessor_state`], behind
 //!    `meta_gateway storage-adopt-predecessor`, carries one stopped
 //!    installation (a state directory and optionally its gateway home) over,
@@ -33,13 +36,19 @@
 //!    store. The run stops at the first failure. Every refusal happens
 //!    before the first change; every failure after it is reported as such,
 //!    never as "unchanged".
-//! 3. **One read alias.** The composition manifest reads its creator field
-//!    under [`PREDECESSOR_MANIFEST_CREATOR_FIELD`] too. That name is a field
-//!    inside a file the store keeps, not a file or table name a renamed
-//!    default could start empty beside, so reading it cannot fork state; it
-//!    keeps a store that was adopted before the manifest step existed
-//!    opening. [`repair_composition_manifest`] (`meta_repair
-//!    --composition-manifests`) renames it on such a store.
+//! 3. **Two read aliases.** The composition manifest reads its creator
+//!    field under [`PREDECESSOR_MANIFEST_CREATOR_FIELD`] too, and a
+//!    document MCP descriptor resolves with its marker spelled
+//!    [`PREDECESSOR_DOCUMENT_BINDING_ENV`] too. Each name is a field inside
+//!    data the store keeps, not a file or table name a renamed default could
+//!    start empty beside, so reading it cannot fork state. The manifest
+//!    alias keeps a store that was adopted before the manifest step existed
+//!    opening; [`repair_composition_manifest`] (`meta_repair
+//!    --composition-manifests`) renames it on such a store. The marker
+//!    alias keeps a descriptor that a mob definition persisted before 0.9
+//!    resolving to its host binding: definitions are event-sourced, so no
+//!    adoption step rewrites them. Unresolved, a descriptor in either
+//!    spelling refuses instead of launching.
 //!
 //! The journal ([`ADOPTION_JOURNAL_FILE_NAME`]) is the completion evidence.
 //! Until it records every step finished, startup refuses
@@ -100,12 +109,23 @@ pub const PREDECESSOR_METADATA_DB_FILE_NAMES: [&str; 2] =
 pub const PREDECESSOR_CONSOLE_DB_FILE_NAMES: [&str; 2] =
     ["mobkit_console.sqlite3", "mobkit_console.sqlite"];
 /// Predecessor schema ledger domains and the domains they become.
-pub const PREDECESSOR_LEDGER_DOMAINS: [(&str, &str); 4] = [
+pub const PREDECESSOR_LEDGER_DOMAINS: [(&str, &str); 5] = [
     ("mobkit-continuity", "meta-continuity"),
     ("mobkit-metadata", "meta-metadata"),
     ("mobkit-console", "meta-console"),
     ("mobkit-memory", "meta-memory"),
+    (PREDECESSOR_EXTENSION_LEDGER_DOMAIN, "meta-extension-state"),
 ];
+/// Predecessor ledger domain of the extension document store
+/// ([`crate::storage_layout::EXTENSION_STATE_DB_FILE_NAME`]). The store kept
+/// its file name and its schema; only this domain marks it as predecessor
+/// state.
+pub const PREDECESSOR_EXTENSION_LEDGER_DOMAIN: &str = "mobkit-extension-state";
+/// Predecessor spelling of the public marker in a host's document MCP
+/// descriptors (`META_MCP_DOCUMENT_BINDING`). A descriptor a profile
+/// persisted before 0.9 carries it; the document binding resolves it as
+/// the current spelling.
+pub const PREDECESSOR_DOCUMENT_BINDING_ENV: &str = "MOBKIT_MCP_DOCUMENT_BINDING";
 /// The predecessor's meerkat-level realm id. An adopted installation keeps
 /// it, recorded in its adoption journal; a fresh installation uses
 /// [`crate::storage_provider::DEFAULT_MEERKAT_LEVEL_REALM_ID`].
@@ -200,10 +220,12 @@ pub fn predecessor_database_files(state_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Every predecessor file present in `state_dir`, sorted: the database
-/// files, and the memory ledger file together with the stage an
-/// interrupted write of it leaves behind. Startup refuses on any of them,
-/// whether or not it enables memory, before a ledger can start empty beside
-/// them.
+/// files, the memory ledger file together with the stage an interrupted
+/// write of it leaves behind, and the extension document store while its
+/// ledger carries the predecessor domain. Startup refuses on any of them,
+/// whether or not it enables memory or extension state, before a ledger can
+/// start empty beside them or a store opens under a domain it does not
+/// carry.
 pub fn predecessor_state_files(state_dir: &Path) -> Vec<PathBuf> {
     let ledger = state_dir.join(PREDECESSOR_MEMORY_LEDGER_FILE_NAME);
     let mut found = predecessor_database_files(state_dir);
@@ -212,8 +234,27 @@ pub fn predecessor_state_files(state_dir: &Path) -> Vec<PathBuf> {
             .into_iter()
             .filter(|path| present(path)),
     );
+    found.extend(predecessor_extension_store(state_dir));
     found.sort();
     found
+}
+
+/// The extension document store, when its ledger still carries the
+/// predecessor domain. Its file name is unchanged, so only its ledger tells
+/// it apart. A store this read-only probe cannot read is left to its own
+/// open, which refuses an unreadable file and never adopts one.
+fn predecessor_extension_store(state_dir: &Path) -> Option<PathBuf> {
+    let path = state_dir.join(crate::storage_layout::EXTENSION_STATE_DB_FILE_NAME);
+    if !path.is_file() {
+        return None;
+    }
+    let conn = meerkat_sqlite::open(&path, meerkat_sqlite::ConnectionProfile::ReadOnly).ok()?;
+    read_ledger_domains(&conn)
+        .ok()
+        .flatten()?
+        .iter()
+        .any(|domain| domain == PREDECESSOR_EXTENSION_LEDGER_DOMAIN)
+        .then_some(path)
 }
 
 /// Whether anything (a file, a directory, a link, even a dangling one) lies
@@ -3446,6 +3487,116 @@ mod tests {
         MetaStorageLayout::with_injected_roots(state.to_path_buf(), None)
             .metadata_db()
             .expect("the adopted installation resolves");
+    }
+
+    /// The extension document store as a pre-0.9 writer left it. Its file
+    /// name and schema are unchanged in 0.9 (the DDL below is the predecessor
+    /// writer's, byte for byte); only its ledger domain was renamed. One
+    /// document row.
+    fn write_predecessor_extension_store(path: &Path) {
+        let conn = rusqlite::Connection::open(path).expect("open predecessor fixture");
+        conn.execute_batch(
+            "CREATE TABLE meerkat_schema (domain TEXT PRIMARY KEY, version INTEGER NOT NULL);
+             INSERT INTO meerkat_schema (domain, version) VALUES ('mobkit-extension-state', 1);
+CREATE TABLE IF NOT EXISTS extension_documents (
+ realm TEXT NOT NULL, namespace TEXT NOT NULL, id TEXT NOT NULL,
+ metadata TEXT NOT NULL, payload BLOB NOT NULL, deleted INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(realm, namespace, id));
+CREATE TABLE IF NOT EXISTS extension_receipts (
+ realm TEXT NOT NULL, namespace TEXT NOT NULL, principal TEXT NOT NULL,
+ request_id TEXT NOT NULL, fingerprint BLOB NOT NULL, receipt TEXT NOT NULL,
+ document_id TEXT NOT NULL, operation TEXT NOT NULL,
+ PRIMARY KEY(realm, namespace, principal, request_id));
+             INSERT INTO extension_documents (realm, namespace, id, metadata, payload)
+                 VALUES ('meta', 'notes', 'kept-document', '{}', X'010203');",
+        )
+        .expect("write predecessor fixture");
+    }
+
+    fn ledger_domains_of(path: &Path) -> Vec<String> {
+        let conn = rusqlite::Connection::open(path).expect("open the store");
+        read_ledger_domains(&conn)
+            .expect("read the ledger")
+            .expect("the store has a ledger")
+    }
+
+    /// A pre-0.9 extension document store is predecessor state: startup
+    /// refuses it typed and names the adoption, also in an installation whose
+    /// adoption finished before this domain was adopted. The adoption renames
+    /// its ledger domain under the fence and keeps every row, and the
+    /// installation then resolves. Without the extension-state feature too:
+    /// the stock gateway runs the adoption and fences the store.
+    #[tokio::test]
+    async fn an_extension_store_under_the_predecessor_domain_is_adopted_before_it_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path();
+        write_adoption_journal(
+            state,
+            &AdoptionJournal {
+                version: ADOPTION_JOURNAL_VERSION,
+                status: AdoptionStatus::Complete,
+                predecessor_home: None,
+                gateway_home: None,
+                completed: [
+                    AdoptionStep::DatabaseFiles,
+                    AdoptionStep::Ledger,
+                    AdoptionStep::StewardSchedule,
+                    AdoptionStep::GatewayHome,
+                    AdoptionStep::DraftStore,
+                ]
+                .into(),
+                realm_id: None,
+            },
+        )
+        .unwrap();
+        let store = state.join("extension_state.sqlite3");
+        write_predecessor_extension_store(&store);
+
+        let error =
+            resolve_installation(state).expect_err("a predecessor extension store refuses startup");
+        assert!(
+            matches!(
+                &error,
+                crate::storage_layout::StorageLayoutError::PredecessorState { paths, .. }
+                    if paths == std::slice::from_ref(&store)
+            ),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("storage-adopt-predecessor"),
+            "{error}"
+        );
+        assert!(
+            crate::storage_migrate::enumerate_state_dir_databases(state).contains(&store),
+            "the maintenance fence covers the store"
+        );
+
+        let dry = adopt_predecessor_state(&request(state, MigrateMode::DryRun)).await;
+        assert!(!dry.has_errors(), "{:?}", dry.errors);
+        assert!(
+            dry.actions.iter().any(|action| {
+                action.item == PredecessorItem::LedgerDomain
+                    && action.outcome == PredecessorOutcome::Planned
+            }),
+            "{:?}",
+            dry.actions
+        );
+        assert_eq!(ledger_domains_of(&store), ["mobkit-extension-state"]);
+
+        let apply = adopt_predecessor_state(&request(state, MigrateMode::Apply)).await;
+        assert!(!apply.has_errors(), "{:?}", apply.errors);
+        assert!(apply.changed_state && apply.complete, "{apply:?}");
+        assert_eq!(ledger_domains_of(&store), ["meta-extension-state"]);
+        let kept: i64 = rusqlite::Connection::open(&store)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM extension_documents WHERE id = 'kept-document'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
+        resolve_installation(state).expect("the adopted installation resolves");
     }
 
     /// The stage of an interrupted predecessor ledger write is evidence of

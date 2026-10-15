@@ -951,4 +951,94 @@ comms = true
         drop(child);
         handle.stop().await.unwrap();
     }
+
+    /// A document store a pre-0.9 writer left opens under 0.9 once the
+    /// installation is adopted, with its documents intact. Its file name and
+    /// schema did not change; only its ledger domain did, so the fixture is
+    /// this build's store with the predecessor writer's domain. Before the
+    /// adoption the store refuses typed and names the adoption.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_predecessor_document_store_opens_after_adoption() {
+        use crate::storage_provider::MetaStorageProvider as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extension_state.sqlite3");
+        let caller = HostAccessContext::new(
+            "meta",
+            documents::Principal::Agent("writer".into()),
+            documents::VerifiedLineage::root(),
+            documents::HostPolicy::ALLOW,
+        )
+        .unwrap();
+        let content = documents::DocumentContent {
+            title: "written before the rename".into(),
+            content_type: "application/test".into(),
+            schema_version: 1,
+            payload: vec![1, 2, 3],
+        };
+        let written = DocumentService::new(
+            "meta",
+            "notes",
+            Arc::new(open_disk_store(path.clone()).unwrap()),
+        )
+        .unwrap()
+        .mutate(
+            &caller,
+            &documents::RequestIdentity::new("written-before", b"written-before").unwrap(),
+            documents::Mutation::Create(documents::NewDocument {
+                content: content.clone(),
+                owner: None,
+                access: documents::DocumentAccess::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .receipt;
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE meerkat_schema SET domain = 'mobkit-extension-state' \
+                 WHERE domain = 'meta-extension-state'",
+                [],
+            )
+            .unwrap();
+
+        let provider = crate::storage_provider::DiskMetaStorageProvider;
+        let Err(refused) = provider
+            .open_extension_state(
+                &crate::storage_provider::MetaRealmOpenContext::for_state_dir(dir.path()),
+            )
+            .await
+        else {
+            panic!("a predecessor document store must not open");
+        };
+        assert!(
+            refused.to_string().contains("storage-adopt-predecessor"),
+            "{refused}"
+        );
+
+        let adopted = crate::storage_predecessor::adopt_predecessor_state(
+            &crate::storage_predecessor::PredecessorAdoptRequest {
+                state_dir: dir.path().to_path_buf(),
+                mode: crate::storage_migrate::MigrateMode::Apply,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(!adopted.has_errors(), "{:?}", adopted.errors);
+        let Ok(opened) = provider
+            .open_extension_state(
+                &crate::storage_provider::MetaRealmOpenContext::for_state_dir(dir.path()),
+            )
+            .await
+        else {
+            panic!("the adopted document store opens");
+        };
+        let document = DocumentService::new("meta", "notes", opened.store)
+            .unwrap()
+            .get(&caller, &written.document_id)
+            .await
+            .unwrap();
+        assert_eq!(document.revision, written.revision);
+        assert_eq!(document.content, content);
+    }
 }
