@@ -507,16 +507,35 @@ fn caller_store_path_refusal(request: &JsonRpcRequest) -> Option<Value> {
         })
 }
 
+/// Every method the Flow Editor RPC serves, as `meta/capabilities`
+/// advertises them. Dispatch refuses any other method before matching, so no
+/// match arm serves a method that the advertisement leaves out.
+fn flow_editor_methods() -> Vec<&'static str> {
+    let mut methods = vec!["meta/capabilities"];
+    methods.extend_from_slice(crate::rpc::MOBPACK_AUTHORING_METHODS);
+    methods
+}
+
 fn dispatch_flow_editor_rpc(
     request: JsonRpcRequest,
     auth: FlowEditorAuthReport,
     runtime_catalog: Option<&MobpackRuntimeCatalogState>,
 ) -> Value {
     let response_id = request.id.clone().unwrap_or(Value::Null);
+    let methods = flow_editor_methods();
+    if !methods.contains(&request.method.as_str()) {
+        return response_value(
+            response_id,
+            None,
+            Some(JsonRpcError {
+                code: -32601,
+                message: format!("method not found on flow editor rpc: {}", request.method),
+                data: None,
+            }),
+        );
+    }
     match request.method.as_str() {
         "meta/capabilities" => {
-            let mut methods = vec!["meta/capabilities"];
-            methods.extend_from_slice(crate::rpc::MOBPACK_AUTHORING_METHODS);
             let mut authoring_capabilities = crate::rpc::mobpack_authoring_capabilities();
             authoring_capabilities["host_mutation_allowed"] =
                 serde_json::json!(auth.host_mutation_allowed);
@@ -1744,18 +1763,6 @@ mod tests {
         assert!(!dir.path().join("ungranted").exists());
     }
 
-    /// The draft-store methods that write the store. The sweeps that must not
-    /// touch the developer's real default draft store skip them; the
-    /// `store_path` sweep covers them, and every other method shares their
-    /// read and validation paths.
-    const DRAFT_STORE_WRITERS: [&str; 5] = [
-        "meta/mobpacks/create",
-        "meta/mobpacks/save",
-        "meta/mobpacks/delete",
-        "meta/mobpacks/undo",
-        "meta/mobpacks/redo",
-    ];
-
     async fn sample_docs_only_document(app: &axum::Router) -> Value {
         let catalogs = anonymous_flow_editor_rpc(app, "meta/mobpacks/catalogs", Value::Null).await;
         catalogs["result"]["sample_mobpacks"]
@@ -1894,29 +1901,125 @@ mod tests {
         );
     }
 
-    /// Security regression: no Flow Editor method runs `rkat` or writes a
-    /// validation archive for a caller without host access.
-    /// `meta/mobpacks/apply_operation` honoured `rkat_validate` too, but only
-    /// `meta/mobpacks/validate` stripped it.
+    /// Set in the child process of the host path sweep, to its scratch
+    /// directory.
+    const HOST_PATH_SWEEP_CHILD: &str = "META_TEST_FLOW_EDITOR_HOST_PATH_SWEEP";
+    const HOST_PATH_SWEEP_TEST: &str = "http_flow_editor::tests::flow_editor_surfaces_without_host_access_touch_no_caller_named_host_path";
+
+    /// Security regression sweep. On every Flow Editor surface that a caller
+    /// without host access reaches (a runtime without an access controller,
+    /// a runtime whose controller denies `mobpack.deploy`, and the standalone
+    /// router), every advertised method, and the advertised list is exactly
+    /// the dispatch surface:
+    /// - runs no `rkat` and writes no archive;
+    /// - refuses a caller-chosen draft store file;
+    /// - returns no bytes, digest or base64 of a file the skills catalog does
+    ///   not list, and leaves none in the draft store, while a listed skill
+    ///   still packs.
+    ///
+    /// The sweep runs in a child process whose draft store
+    /// (`META_FLOW_EDITOR_DRAFT_STORE`) is a scratch file, so it also covers
+    /// the methods that write the store.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn runtime_flow_editor_no_method_runs_rkat_without_host_access() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let runtime = runtime_without_access_control(dir.path(), "flow-editor-no-rkat-sweep").await;
-        let app = runtime.build_reference_app_router(open_decision_state());
-        let marker = dir.path().join("rkat.runs");
-        let rkat = recording_rkat(dir.path(), &marker);
-        let outputs = dir.path().join("outputs");
-        let document = sample_docs_only_document(&app).await;
-        let mut ran = Vec::new();
-        for method in crate::rpc::MOBPACK_AUTHORING_METHODS
-            .iter()
-            .filter(|method| !DRAFT_STORE_WRITERS.contains(method))
-        {
-            let params = method_params(
-                method,
-                &document,
-                &json!({
+    #[test]
+    fn flow_editor_surfaces_without_host_access_touch_no_caller_named_host_path() {
+        if let Some(scratch) = std::env::var_os(HOST_PATH_SWEEP_CHILD) {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("child runtime")
+                .block_on(host_path_sweep(std::path::Path::new(&scratch)));
+            return;
+        }
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                HOST_PATH_SWEEP_TEST,
+                "--exact",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(HOST_PATH_SWEEP_CHILD, scratch.path())
+            .env(
+                "META_FLOW_EDITOR_DRAFT_STORE",
+                scratch.path().join("drafts.json"),
+            )
+            .output()
+            .expect("run the sweep child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "sweep child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    async fn host_path_sweep(scratch: &std::path::Path) {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let store = std::path::PathBuf::from(
+            std::env::var_os("META_FLOW_EDITOR_DRAFT_STORE").expect("child draft store"),
+        );
+        let secret_text = "SWEEP-HOST-FILE-SECRET-4be7";
+        let secret = scratch.join("id_secret");
+        std::fs::write(&secret, secret_text).expect("write secret");
+        let secret_marks = [
+            secret_text.to_string(),
+            format!("{:x}", sha2::Sha256::digest(secret_text.as_bytes())),
+            base64::engine::general_purpose::STANDARD.encode(secret_text),
+        ];
+        let secret_json = scratch.join("secret.json");
+        std::fs::write(
+            &secret_json,
+            format!(r#"{{"credential": {{"token": "{secret_text}"}}}}"#),
+        )
+        .expect("write secret json");
+        let listed_skill = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.claude/skills/meerkat-meta/SKILL.md");
+        let listed_text = std::fs::read_to_string(&listed_skill).expect("catalog skill file");
+        let marker = scratch.join("rkat.runs");
+        let rkat = recording_rkat(scratch, &marker);
+        let outputs = scratch.join("outputs");
+        let mut expected = std::collections::BTreeSet::from(["meta/capabilities".to_string()]);
+        expected.extend(
+            crate::rpc::MOBPACK_AUTHORING_METHODS
+                .iter()
+                .map(ToString::to_string),
+        );
+
+        let mut runtime =
+            runtime_without_access_control(scratch, "flow-editor-host-path-sweep").await;
+        let without_controller = runtime.build_reference_app_router(open_decision_state());
+        runtime.set_access_controller(deploy_denying_access_controller());
+        let denying_deploy = runtime.build_reference_app_router(open_decision_state());
+        let surfaces = [
+            ("runtime without an access controller", without_controller),
+            ("runtime denying mobpack.deploy", denying_deploy),
+            ("standalone router", super::flow_editor_router()),
+        ];
+        let mut findings = Vec::new();
+        for (index, (surface, app)) in surfaces.iter().enumerate() {
+            let chosen = scratch.join(format!("caller-chosen-{index}"));
+            let capabilities =
+                anonymous_flow_editor_rpc(app, "meta/capabilities", Value::Null).await;
+            let advertised = capabilities["result"]["methods"]
+                .as_array()
+                .expect("advertised methods")
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<std::collections::BTreeSet<_>>();
+            if advertised != expected {
+                findings.push(format!("{surface}: advertises {advertised:?}"));
+            }
+            let sample = sample_docs_only_document(app).await;
+            let leaking = document_with_path_skill(&sample, &secret);
+            let mut swept = std::collections::BTreeSet::new();
+            for method in &advertised {
+                swept.insert(method.clone());
+                let host_knobs = json!({
                     "rkat_validate": true,
                     "rkatValidate": true,
                     "execute": true,
@@ -1924,160 +2027,118 @@ mod tests {
                     "output_dir": outputs.join("deploy"),
                     "validation_output_dir": outputs.join("validate"),
                     "validation_pack_path": outputs.join("validate.mobpack"),
-                }),
-            );
-            let response = anonymous_flow_editor_rpc(&app, method, params).await;
-            if std::fs::read_to_string(&marker).is_ok() || outputs.exists() {
-                ran.push(format!("{method}: {response}"));
-                let _ = std::fs::remove_file(&marker);
-                let _ = std::fs::remove_dir_all(&outputs);
-            }
-        }
-        let _shutdown = runtime.shutdown().await;
-        assert_eq!(
-            ran,
-            Vec::<String>::new(),
-            "methods that ran rkat or wrote a host archive"
-        );
-    }
-
-    /// Security regression: a caller without host access cannot choose the
-    /// draft store file. `store_path` let it create directories and files at
-    /// any writable path, replace JSON files, and read any JSON object file
-    /// back through `meta/mobpacks/list`.
-    #[tokio::test]
-    async fn runtime_flow_editor_refuses_caller_chosen_draft_store_paths_without_host_access() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let runtime = runtime_without_access_control(dir.path(), "flow-editor-no-store-path").await;
-        let app = runtime.build_reference_app_router(open_decision_state());
-        let document = sample_docs_only_document(&app).await;
-        let chosen = dir.path().join("caller-chosen");
-        let secret = dir.path().join("secret.json");
-        std::fs::write(
-            &secret,
-            r#"{"credential": {"token": "STORE-PATH-SECRET-7f3a"}}"#,
-        )
-        .expect("write secret json");
-        let mut accepted = Vec::new();
-        for method in crate::rpc::MOBPACK_AUTHORING_METHODS {
-            let params = method_params(
-                method,
-                &document,
-                &json!({ "id": "probe", "store_path": chosen.join("drafts.json") }),
-            );
-            let response = anonymous_flow_editor_rpc(&app, method, params).await;
-            if response["error"]["code"] != json!(-32602)
-                || !response["error"]["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("store_path"))
-                || chosen.exists()
-            {
-                accepted.push(format!("{method}: {response}"));
-            }
-        }
-        let leaked =
-            anonymous_flow_editor_rpc(&app, "meta/mobpacks/list", json!({ "store_path": secret }))
+                });
+                let response = anonymous_flow_editor_rpc(
+                    app,
+                    method,
+                    method_params(method, &sample, &host_knobs),
+                )
                 .await;
-        let _shutdown = runtime.shutdown().await;
-        assert_eq!(
-            accepted,
-            Vec::<String>::new(),
-            "methods that accepted a caller-chosen store_path"
-        );
-        assert!(
-            !leaked.to_string().contains("STORE-PATH-SECRET-7f3a"),
-            "list read a caller-chosen JSON file: {leaked}"
-        );
-    }
-
-    /// Security regression: a document is caller input, and a path skill in
-    /// it names a host file whose bytes the source preview and the archive
-    /// carry back. Without host access the Flow Editor reads only the skill
-    /// files its own skills catalog lists, and those still pack.
-    #[tokio::test]
-    async fn runtime_flow_editor_reads_no_unlisted_host_file_without_host_access() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let runtime =
-            runtime_without_access_control(dir.path(), "flow-editor-no-host-file-read").await;
-        let app = runtime.build_reference_app_router(open_decision_state());
-        let secret = dir.path().join("id_secret");
-        std::fs::write(&secret, "HOST-FILE-SECRET-91c2").expect("write secret file");
-        let with_path_skill = |document: &Value, path: &std::path::Path| {
-            let mut document = document.clone();
-            document["mob_toml"] = Value::Null;
-            document["members"][0]["skills"] = json!(["probe.skill"]);
-            document["skill_realms"]
-                .as_array_mut()
-                .expect("sample skill realms")
-                .push(json!({
-                    "id": "local/probe",
-                    "label": "Local probe",
-                    "source": "filesystem",
-                    "skills": [{
-                        "id": "probe.skill",
-                        "label": "Probe",
-                        "source": "path",
-                        "path": path
-                    }]
-                }));
-            document
-        };
-        let sample = sample_docs_only_document(&app).await;
-        let leaking = with_path_skill(&sample, &secret);
-        let mut leaked = Vec::new();
-        for method in crate::rpc::MOBPACK_AUTHORING_METHODS
-            .iter()
-            .filter(|method| !DRAFT_STORE_WRITERS.contains(method))
-        {
-            let response = anonymous_flow_editor_rpc(
-                &app,
-                method,
-                method_params(method, &leaking, &json!({})),
+                if marker.exists() || outputs.exists() {
+                    findings.push(format!(
+                        "{surface}: {method} ran rkat or wrote an archive: {response}"
+                    ));
+                    let _ = std::fs::remove_file(&marker);
+                    let _ = std::fs::remove_dir_all(&outputs);
+                }
+                let store_path = json!({ "id": "probe", "store_path": chosen.join("drafts.json") });
+                let response = anonymous_flow_editor_rpc(
+                    app,
+                    method,
+                    method_params(method, &sample, &store_path),
+                )
+                .await;
+                if response["error"]["data"] != json!({ "param": "store_path" }) || chosen.exists()
+                {
+                    findings.push(format!(
+                        "{surface}: {method} accepted store_path: {response}"
+                    ));
+                }
+                let draft = json!({ "id": "sweep-draft" });
+                let response =
+                    anonymous_flow_editor_rpc(app, method, method_params(method, &leaking, &draft))
+                        .await
+                        .to_string();
+                if let Some(mark) = secret_marks
+                    .iter()
+                    .find(|mark| response.contains(mark.as_str()))
+                {
+                    findings.push(format!("{surface}: {method} returned the secret ({mark})"));
+                }
+            }
+            if swept != advertised {
+                findings.push(format!("{surface}: swept {swept:?}"));
+            }
+            // The store writers keep exported skill bytes in the draft store,
+            // and get/list re-import them: walk one draft through every writer
+            // with a document that names the secret, including a redo that
+            // rebuilds that document from the draft's history.
+            for (method, document) in [
+                ("meta/mobpacks/save", Some(&sample)),
+                ("meta/mobpacks/save", Some(&leaking)),
+                ("meta/mobpacks/undo", None),
+                ("meta/mobpacks/redo", None),
+                ("meta/mobpacks/get", None),
+                ("meta/mobpacks/list", None),
+                ("meta/mobpacks/create", None),
+                ("meta/mobpacks/delete", None),
+            ] {
+                let mut params = json!({ "id": "sweep-history" });
+                if let Some(document) = document {
+                    params["document"] = document.clone();
+                }
+                let response = anonymous_flow_editor_rpc(app, method, params).await;
+                let stepped = matches!(method, "meta/mobpacks/undo" | "meta/mobpacks/redo");
+                if response["error"] != Value::Null
+                    || (stepped && response["result"]["stepped"] != json!(true))
+                {
+                    findings.push(format!("{surface}: draft {method} did not run: {response}"));
+                }
+                let response = response.to_string();
+                if let Some(mark) = secret_marks
+                    .iter()
+                    .find(|mark| response.contains(mark.as_str()))
+                {
+                    findings.push(format!(
+                        "{surface}: draft {method} returned the secret ({mark})"
+                    ));
+                }
+            }
+            let leaked_store = anonymous_flow_editor_rpc(
+                app,
+                "meta/mobpacks/list",
+                json!({ "store_path": secret_json }),
+            )
+            .await
+            .to_string();
+            if leaked_store.contains(secret_text) {
+                findings.push(format!("{surface}: list read a caller-chosen JSON file"));
+            }
+            let packed = anonymous_flow_editor_rpc(
+                app,
+                "meta/mobpacks/source",
+                json!({ "document": document_with_path_skill(&sample, &listed_skill) }),
             )
             .await;
-            if response.to_string().contains("HOST-FILE-SECRET-91c2") {
-                leaked.push(method.to_string());
+            if !packed["result"]["source_files"]
+                .as_array()
+                .is_some_and(|files| {
+                    files
+                        .iter()
+                        .any(|file| file["text"].as_str() == Some(listed_text.as_str()))
+                })
+            {
+                findings.push(format!("{surface}: a listed skill did not pack: {packed}"));
             }
         }
-        let validation = anonymous_flow_editor_rpc(
-            &app,
-            "meta/mobpacks/validate",
-            json!({ "document": leaking }),
-        )
-        .await;
-        let listed_skill = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.claude/skills/meerkat-meta/SKILL.md");
-        let listed_text = std::fs::read_to_string(&listed_skill).expect("catalog skill file");
-        let listed = anonymous_flow_editor_rpc(
-            &app,
-            "meta/mobpacks/source",
-            json!({ "document": with_path_skill(&sample, &listed_skill) }),
-        )
-        .await;
+        let stored = std::fs::read_to_string(&store).unwrap_or_default();
+        if let Some(mark) = secret_marks
+            .iter()
+            .find(|mark| stored.contains(mark.as_str()))
+        {
+            findings.push(format!("the draft store holds the secret ({mark})"));
+        }
         let _shutdown = runtime.shutdown().await;
-        assert_eq!(
-            leaked,
-            Vec::<String>::new(),
-            "methods that returned the secret"
-        );
-        assert!(
-            validation["result"]["diagnostics"]
-                .as_array()
-                .is_some_and(|diagnostics| diagnostics.iter().any(|diagnostic| {
-                    diagnostic["code"] == "selected_skill_path_not_permitted"
-                        && diagnostic["message"].as_str().is_some_and(|message| {
-                            message.contains("not a skill file this server lists")
-                        })
-                })),
-            "{validation:#?}"
-        );
-        assert!(
-            listed["result"]["source_files"]
-                .as_array()
-                .is_some_and(|files| files
-                    .iter()
-                    .any(|file| file["text"].as_str() == Some(listed_text.as_str()))),
-            "a skill the catalog lists must still pack: {listed:#?}"
-        );
+        assert_eq!(findings, Vec::<String>::new());
     }
 }
