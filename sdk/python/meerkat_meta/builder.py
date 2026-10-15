@@ -225,7 +225,12 @@ class MetaBuilder:
         file type, so a FIFO there blocks startup instead of refusing it.
         """
         if config_path == "":
-            raise ValueError("gating requires a non-empty path; omit it to keep gating off")
+            raise ValueError(
+                "gating requires a non-empty path: since Meta 0.9.0 an empty path no longer "
+                "switches gating off. To keep gating off, do not call gating(), and keep "
+                "nothing at config/gating.toml under the working directory, which the "
+                "builder loads when present"
+            )
         self._config.gating_config_path = config_path
         return self
 
@@ -249,7 +254,10 @@ class MetaBuilder:
         """
         if config_path == "":
             raise ValueError(
-                "access_control requires a non-empty path; omit it to keep access control off"
+                "access_control requires a non-empty path: since Meta 0.9.0 an empty path "
+                "no longer switches access control off. To keep access control off, do not "
+                "call access_control(), and keep nothing at config/access.toml under the "
+                "working directory, which the builder loads when present"
             )
         self._config.access_config_path = config_path
         return self

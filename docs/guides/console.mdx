@@ -123,6 +123,34 @@ Run the sandbox on a separate origin, with the exact Console origin allowed:
 MCP_APPS_HOST_ORIGIN=http://127.0.0.1:5000 MCP_APPS_SANDBOX_PORT=5001 npm --prefix console run mcp-apps:sandbox
 ```
 
+The sandbox proxy is distributed as source only: the gateway binaries, the
+Python package and the npm package do not include it. To run it outside a
+source checkout, copy two files from the release tag that matches your
+gateway into one directory, keeping their relative layout:
+
+| Repository file | Copy to |
+| --- | --- |
+| `console/mcp-apps-sandbox.cjs` | `mcp-apps-sandbox.cjs` |
+| `console/src/mcp-apps/sandbox.js` | `src/mcp-apps/sandbox.js` |
+
+Then start it with Node.js. It uses only the standard library, so it needs no
+`npm install`:
+
+```sh
+MCP_APPS_HOST_ORIGIN=http://127.0.0.1:5000 MCP_APPS_SANDBOX_PORT=5001 node mcp-apps-sandbox.cjs
+```
+
+The proxy loads `src/mcp-apps/sandbox.js` relative to its own file. The two
+files and the Console embedded in the gateway share an internal sandbox
+protocol, so take the files from the same release as the gateway and replace
+them when you upgrade it. Each release's notes list both files' SHA-256
+digests; check your copies against them. For 0.9.0:
+
+| File | SHA-256 |
+| --- | --- |
+| `console/mcp-apps-sandbox.cjs` | `157fed890922c4c3fe7c9b7a6319455f0604e9c789818f9c38d45bc115a98ad6` |
+| `console/src/mcp-apps/sandbox.js` | `4e3592ba5b8bf198322126ccb27919a8d4c4c1976a198f9c497c16833f6c3024` |
+
 The originating member profile selects its MCP servers through
 `tools.mcp_servers`, or uses its existing host tool provider. Global server
 configuration alone does not grant every member access to those tools.

@@ -493,8 +493,25 @@ function orderBySource(nodes: ProjectedFrame[]): ConsoleFrame[] {
   return ordered.length === nodes.length ? ordered : nodes.map(node => node.frame);
 }
 
+/** Where a newest-first window of a longer timeline begins: the time of its
+ * oldest frame, or +Infinity while no loaded frame carries a time. */
+export function loadedTimelineStartMs(frames: readonly ConsoleFrame[]): number {
+  let start = Number.POSITIVE_INFINITY;
+  for (const frame of frames) {
+    if (typeof frame.timestampMs === "number" && frame.timestampMs < start) start = frame.timestampMs;
+  }
+  return start;
+}
+
+export type RuntimeAppendProjectionOptions = {
+  /** Set while older timeline pages are not loaded: `loadedTimelineStartMs`
+   * of the loaded frames. History before it is unloaded. */
+  unloadedBeforeMs?: number;
+};
+
 /** Project exact runtime appends over the caller's existing stable frame order. */
-export function reconcileRuntimeAppendFrames(frames: readonly ConsoleFrame[]): ConsoleFrame[] {
+export function reconcileRuntimeAppendFrames(frames: readonly ConsoleFrame[],
+  options: RuntimeAppendProjectionOptions = {}): ConsoleFrame[] {
   const snapshots = new Map<string, NoticeSnapshot>();
   const positionSnapshots: NoticeSnapshot[] = [];
   for (const frame of frames) {
@@ -576,11 +593,19 @@ export function reconcileRuntimeAppendFrames(frames: readonly ConsoleFrame[]): C
   }
   for (const [scope, snapshot] of snapshots) {
     for (const { offset, message, origin } of snapshot.notices) {
+      const key = logicalKey(snapshot.frame, origin);
       const frame: ConsoleFrame = {
-        ...snapshot.frame, event: "system_notice", id: logicalKey(snapshot.frame, origin),
+        ...snapshot.frame, event: "system_notice", id: key,
         runId: origin.run_id, sourceCursor: `${snapshot.frame.sessionId}:${offset}`,
         timestampMs: Date.parse(String(message.created_at)), data: { message },
       };
+      // A snapshot carries every notice of its session, but a newest-first
+      // page loads only recent history. A notice older than every loaded
+      // frame would sit directly above much newer rows, hiding the unloaded
+      // history between them. It waits until older pages reach its time,
+      // unless its exact live or history twin is already loaded.
+      if (options.unloadedBeforeMs !== undefined && frame.timestampMs! < options.unloadedBeforeMs
+        && !candidates.has(key)) continue;
       // A snapshot projects an authored row, not a row born when the snapshot
       // arrived. Keep its chronological fallback among the caller's rows before
       // applying canonical/source-sequence edges. Appending it at the tail

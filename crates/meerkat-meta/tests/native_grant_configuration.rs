@@ -114,6 +114,24 @@ fn definition(test: &str) -> meerkat_mob::MobDefinition {
     .expect("mob definition")
 }
 
+/// The fake OpenAI key in-process members resolve their provider identity
+/// with: the same value the gateway host process below is given, not a
+/// secret.
+const FIXTURE_OPENAI_KEY: &str = "sk-regression-test";
+
+/// Agent config whose global realm binds OpenAI to [`FIXTURE_OPENAI_KEY`],
+/// so a member built in this process never depends on an ambient
+/// `OPENAI_API_KEY`. The refusing configuration admits no prompt, so the
+/// provider is never called.
+fn fixture_provider_config() -> meerkat::Config {
+    let mut config = meerkat::Config::default();
+    config.realm.insert(
+        meerkat_core::connection::GLOBAL_REALM_SLUG.to_string(),
+        meerkat_core::RealmConfigSection::from_inline_api_keys(&[("openai", FIXTURE_OPENAI_KEY)]),
+    );
+    config
+}
+
 fn runtime_machine(runtime: &UnifiedRuntime) -> Arc<meerkat_runtime::MeerkatMachine> {
     runtime
         .mob_runtime()
@@ -344,7 +362,7 @@ fn the_gateway_host_grant_owner_is_installed_before_bootstrap() {
             .args(["--exact", GATEWAY_TEST, "--nocapture"])
             .env(GATEWAY_HOST_PROCESS, mode)
             .env(GATEWAY_RECORD, &record)
-            .env("OPENAI_API_KEY", "sk-regression-test")
+            .env("OPENAI_API_KEY", FIXTURE_OPENAI_KEY)
             .env("XDG_STATE_HOME", dir.path().join("xdg-state"))
             .current_dir(dir.path())
             .stdin(std::process::Stdio::piped())
@@ -950,6 +968,7 @@ async fn a_hooked_member_registers_on_a_machine_with_the_host_grant_owner() {
     let snapshots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let runtime = UnifiedRuntime::builder()
         .definition(definition("hooked-member"))
+        .meerkat_config(fixture_provider_config())
         .persistent_state(dir.path().join("state"))
         .native_grant_work_configuration(host_configuration())
         .member_runtime_registration_hook(hook.clone())
@@ -1066,6 +1085,7 @@ async fn a_governed_member_attaches_its_first_server_through_its_session_owner()
     let snapshots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let runtime = UnifiedRuntime::builder()
         .definition(definition("member-live-mcp"))
+        .meerkat_config(fixture_provider_config())
         .persistent_state(dir.path().join("state"))
         .native_grant_work_configuration(host_configuration())
         .member_runtime_registration_hook(hook)

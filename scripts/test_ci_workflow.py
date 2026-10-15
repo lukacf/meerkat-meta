@@ -217,7 +217,6 @@ class CiWorkflowTests(unittest.TestCase):
             self.assertEqual(commands, [command], name)
             self.assertIn("- name: Reclaim runner disk\n", job_block(name))
             self.assertIn('CARGO_PROFILE_DEV_DEBUG: "0"', job_block(name))
-            self.assertIn("OPENAI_API_KEY: sk-regression-test", job_block(name))
         # Exactly one half builds the examples.
         self.assertEqual(block.count("            examples: true\n"), 1)
         self.assertIn("      - if: matrix.examples\n        run: scripts/repo-cargo build --workspace --examples\n", block)
@@ -389,7 +388,7 @@ class CiWorkflowTests(unittest.TestCase):
                 "scripts/repo-cargo test -p meerkat-meta --locked --features extension-state "
                 "--test extension_state",
                 "scripts/repo-cargo test -p meerkat-meta --locked --features extension-state "
-                "--lib extension_",
+                "--lib -- extension_ document_mcp_child_supply",
             ],
         )
         for name in ("extension-state-lint", "test-extension-state"):

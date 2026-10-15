@@ -35,6 +35,9 @@ const RUN_B = "01900000-0000-7000-8000-000000000011";
 const INPUT_A = "01900000-0000-7000-8000-000000000020";
 const INPUT_B = "01900000-0000-7000-8000-000000000021";
 const INTERACTION = "01900000-0000-7000-8000-000000000030";
+const TURN_OLD = "01900000-0000-7000-8000-000000000031";
+const TURN_MID = "01900000-0000-7000-8000-000000000032";
+const TURN_NEW = "01900000-0000-7000-8000-000000000033";
 const BODY = "Boundary notice A\u0301 \u{1f680}: preserve both paragraphs.\nSecond paragraph.";
 const MODEL_ONLY = "Compatibility model projection, never a second visible notice.";
 const agent = {
@@ -1019,6 +1022,64 @@ for (const [surface, map, merge, parse, query, subscribe] of [
     const actual = rows([image, live]);
     assert.equal(actual.length, 2);
     assert.notEqual(actual[0].id, actual[1].id);
+  });
+
+  // A conversation opens on its newest timeline page, but the notice snapshot
+  // on that page carries every notice of the session.
+  const exported = { ...notice({ input_id: INPUT_B }, "Nightly export finished."),
+    created_at: new Date(5000).toISOString() };
+  const imageOf = (id: string, message: Notice, settled: Array<{ run_id: string; input_id: string }> = []) =>
+    snapshot(id, [{ offset: 3, message }], settled, {
+      cursor: "console:9200", timestamp_ms: 9200,
+      payload: { ...snapshot("template", [{ offset: 3, message }], settled).payload, observed_through: "console:9150" },
+    });
+  const newestPage = [
+    wire("asked", "user_input", 9000, { content: "Is the export done?" }, { interaction_id: TURN_NEW }),
+    wire("answered", "text_delta", 9100, { delta: "Checking the export." }, { interaction_id: TURN_NEW, run_id: RUN_B }),
+    imageOf("newest-image", exported),
+  ];
+  const olderPage = [
+    wire("started", "user_input", 4000, { content: "Start the nightly export." }, { interaction_id: TURN_OLD }),
+    applied("exported-live", [exported], { cursor: "console:5100", timestamp_ms: 5100 }),
+    wire("nudged", "user_input", 6000, { content: "Tell me when it lands." }, { interaction_id: TURN_MID }),
+  ];
+  const pageTexts = (frames: WireFrame[], hasOlderHistory: boolean) => map(agent, parse(sse(frames)), {
+    renderInteractionStartsAsUser: true, textMode: "markdown", hasOlderHistory,
+  }).map(conversationEntryText);
+
+  test(`${surface}: a snapshot notice older than every loaded frame waits while older history is unloaded`, () => {
+    assert.deepEqual(pageTexts(newestPage, true), ["Is the export done?", "Checking the export."],
+      "an old notice must not sit directly above newer rows with the history between them unloaded");
+    assert.deepEqual(pageTexts(newestPage, false), [exported.body, "Is the export done?", "Checking the export."],
+      "with no older history to load, the notice is the oldest row of the transcript");
+  });
+
+  test(`${surface}: loading older history places the held notice once, in time order`, () => {
+    assert.ok(!pageTexts(newestPage, true).includes(exported.body));
+    const placed = ["Start the nightly export.", exported.body, "Tell me when it lands.",
+      "Is the export done?", "Checking the export."];
+    for (const hasOlderHistory of [true, false]) {
+      for (const frames of [[...olderPage, ...newestPage], [...newestPage, ...olderPage]]) {
+        assert.deepEqual(pageTexts(frames, hasOlderHistory), placed,
+          "the older page reaches the notice's time, so it renders once between its neighbours");
+      }
+    }
+    const withoutLiveTwin = [olderPage[0], olderPage[2], ...newestPage];
+    assert.deepEqual(pageTexts(withoutLiveTwin, true), pageTexts(withoutLiveTwin, false),
+      "a notice inside the loaded range keeps its place whether or not older pages remain");
+  });
+
+  test(`${surface}: a held notice whose own application is loaded still renders once`, () => {
+    const drained = { ...notice({}, "Review queue drained."), created_at: new Date(8500).toISOString() };
+    const page = [
+      applied("drained-live", [drained], { cursor: "console:9050", timestamp_ms: 9050 }),
+      ...newestPage.slice(0, 2),
+      imageOf("settled-image", drained, [{ run_id: RUN_A, input_id: INPUT_A }]),
+    ];
+    for (const hasOlderHistory of [true, false]) {
+      assert.deepEqual(pageTexts(page, hasOlderHistory), [drained.body, "Is the export done?", "Checking the export."],
+        "its application frame is loaded, so the notice is inside the loaded history");
+    }
   });
 }
 

@@ -92,6 +92,13 @@ describe("MetaBuilder chainable methods", () => {
     assert.throws(() => Meta.builder().gating(""), /non-empty/);
   });
 
+  it("gating() names how to keep gating off when given an empty path", () => {
+    assert.throws(
+      () => Meta.builder().gating(""),
+      /an empty path no longer switches gating off\. To keep gating off, do not call gating\(\), and keep nothing at config\/gating\.toml/,
+    );
+  });
+
   it("consoleConfig() sets consoleConfigPath and returns this", () => {
     const builder = Meta.builder();
     const result = builder.consoleConfig("config/console.toml");
@@ -108,6 +115,13 @@ describe("MetaBuilder chainable methods", () => {
 
   it("accessControl() rejects an explicit empty path", () => {
     assert.throws(() => Meta.builder().accessControl(""), /non-empty/);
+  });
+
+  it("accessControl() names how to keep access control off when given an empty path", () => {
+    assert.throws(
+      () => Meta.builder().accessControl(""),
+      /an empty path no longer switches access control off\. To keep access control off, do not call accessControl\(\), and keep nothing at config\/access\.toml/,
+    );
   });
 
   it("meerkatConfig() sets meerkatConfigPath and returns this", () => {

@@ -16,6 +16,7 @@ rust-version.workspace = true
 # which a dependent's build never compiles.
 exclude = [
     "tests/fixtures/ledger_v1_closure/",
+    "tests/fixtures/released_0_8_26_store/",
     "tests/fixtures/security_idempotency/",
     "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
     "tests/fixtures/v0_8_10_released_session.json",
@@ -34,7 +35,7 @@ ignored = ["meerkat-openai"]
 workspace = true
 
 [dependencies]
-meta-extension-state = { version = "=0.9.0", path = "../meta-extension-state", optional = true }
+meta-extension-state = { version = "=0.9.1", path = "../meta-extension-state", optional = true }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
@@ -66,50 +67,50 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 futures = "0.3"
 fs2 = "0.4"
 object_store = { version = "0.13", features = ["fs"] }
-meerkat-core = { version = "=0.9.0" }
-meerkat-client = { version = "=0.9.0" }
+meerkat-core = { version = "=0.9.1" }
+meerkat-client = { version = "=0.9.1" }
 # The raw client wrappers carry the wrapped client's controller surface and
 # prepared (governed) dispatch, whose types meerkat-client does not re-export.
-meerkat-llm-core = { version = "=0.9.0" }
-meerkat-comms = { version = "=0.9.0" }
-meerkat-contracts = { version = "=0.9.0" }
-meerkat-mob = { version = "=0.9.0" }
-meerkat-mob-mcp = { version = "=0.9.0" }
-meerkat-mcp = { version = "=0.9.0" }
-meerkat-models = { version = "=0.9.0" }
+meerkat-llm-core = { version = "=0.9.1" }
+meerkat-comms = { version = "=0.9.1" }
+meerkat-contracts = { version = "=0.9.1" }
+meerkat-mob = { version = "=0.9.1" }
+meerkat-mob-mcp = { version = "=0.9.1" }
+meerkat-mcp = { version = "=0.9.1" }
+meerkat-models = { version = "=0.9.1" }
 # Meerkat split session memory out of `memory-store` (which now only maps
 # to meerkat-store/memory); explicit `memory` enables need `memory-store-session`.
 # `local-authorization`: the realm-scoped MCP credential source the gateway's
 # member factories install and the realm owner's service-secret writes
 # (`GatewayRealmMcpInstallation`). Private 0.9 pair only.
-meerkat = { version = "=0.9.0", features = ["comms", "skills", "mcp", "memory-store", "memory-store-session", "jsonl-store", "session-store", "sqlite-store", "live", "openai-realtime", "local-authorization"] }
-meerkat-openai = { version = "=0.9.0", optional = true }
+meerkat = { version = "=0.9.1", features = ["comms", "skills", "mcp", "memory-store", "memory-store-session", "jsonl-store", "session-store", "sqlite-store", "live", "openai-realtime", "local-authorization"] }
+meerkat-openai = { version = "=0.9.1", optional = true }
 # READ-ONLY host-side access to meerkat's OWN session semantic memory for the
 # Distiller's post-compaction harvest (§8.4: `MemoryStore::search` over the
 # discard range). This reads meerkat's store; the §12 bright line governs the
 # bundled agent-memory store, which stays plain B-tree SQLite.
-meerkat-memory = { version = "=0.9.0" }
+meerkat-memory = { version = "=0.9.1" }
 # Live (realtime) member sessions: `live_wiring` hosts the projection sink,
 # the WS transport state, and the meta/live/* handlers on top of this crate.
-meerkat-live = { version = "=0.9.0" }
+meerkat-live = { version = "=0.9.1" }
 # `local-authorization`: the native grant work configuration an embedder
 # installs through UnifiedRuntimeBuilder::native_grant_work_configuration
 # (D50 S1). Private 0.9 pair only: published 0.8.51 lacks the feature.
-meerkat-runtime = { version = "=0.9.0", features = ["sqlite-store", "live", "local-authorization"] }
+meerkat-runtime = { version = "=0.9.1", features = ["sqlite-store", "live", "local-authorization"] }
 # The local authorization publication the Console access facts join, so a
 # native consent eligibility observed from them is invalidated by their
 # changes (and the host-side grant owner for the native grant tests).
 # Private 0.9 pair only.
-meerkat-authorization = { version = "=0.9.0" }
-meerkat-session = { version = "=0.9.0", features = ["session-store"] }
+meerkat-authorization = { version = "=0.9.1" }
+meerkat-session = { version = "=0.9.1", features = ["session-store"] }
 # Shared SQLite mechanics (storage-unification): named connection profiles,
 # the per-file migration ledger, per-operation maintenance fence guards
 # (every in-crate opener, M3), and the doctor's read-only ledger reads (M1).
-meerkat-sqlite = { version = "=0.9.0" }
+meerkat-sqlite = { version = "=0.9.1" }
 # `memory` is the parked-delta backend for pre-registration incremental
 # writes in the continuity adapter (nothing parked is ever durable).
-meerkat-store = { version = "=0.9.0", features = ["sqlite", "memory"] }
-meerkat-tools = { version = "=0.9.0" }
+meerkat-store = { version = "=0.9.1", features = ["sqlite", "memory"] }
+meerkat-tools = { version = "=0.9.1" }
 tempfile = "3"
 async-trait = "0.1"
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -204,27 +205,27 @@ futures = "0.3"
 tower = { version = "0.5", features = ["util"] }
 jsonwebtoken = "9"
 async-trait = "0.1"
-meerkat-schedule = { version = "=0.9.0" }
+meerkat-schedule = { version = "=0.9.1" }
 # `schema` feature (test-only) exposes `meerkat_mob::adaptive::layer_decision_schema()`
 # so a parity guard can assert the bundled adaptive layer-decision schema stays
 # Value-equal to meerkat's canonical one. Dev-dependency: not enabled in release
 # builds, so the production binary keeps the lean (no-schemars) meerkat-mob.
 # `test-support` (test-only) exposes the deterministic member-session rebind
 # the delivery-scope gates use to move a session under unchanged continuity.
-meerkat-mob = { version = "=0.9.0", features = ["schema", "test-support"] }
+meerkat-mob = { version = "=0.9.1", features = ["schema", "test-support"] }
 # `test-realtime-fixtures` (test-only) exposes meerkat's shared
 # ScriptedRealtimeSessionFactory so the live-open cross-provider regression
 # tests (tests/gateway_live.rs) can observe the exact channel identity handed
 # to the provider lane without a provider socket or credential.
-meerkat = { version = "=0.9.0", features = ["test-realtime-fixtures"] }
+meerkat = { version = "=0.9.1", features = ["test-realtime-fixtures"] }
 # `test-support` (test-only) exposes meerkat-core's per-session WholeBlob
 # decode counter, so decode assertions attribute decodes to the test's own
 # session instead of the process-wide count every parallel test moves.
-meerkat-core = { version = "=0.9.0", features = ["test-support"] }
+meerkat-core = { version = "=0.9.1", features = ["test-support"] }
 # The host-side contract types for the native grant configuration tests
 # (D50 S1). Private 0.9 pair only.
-meerkat-authorization-contracts = { version = "=0.9.0" }
+meerkat-authorization-contracts = { version = "=0.9.1" }
 # `test-support` (test-only) exposes meerkat-runtime's run-start hold read, so
 # the restart test can assert a restored member without its customizer tools
 # is held, and released once they publish.
-meerkat-runtime = { version = "=0.9.0", features = ["sqlite-store", "live", "test-support"] }
+meerkat-runtime = { version = "=0.9.1", features = ["sqlite-store", "live", "test-support"] }

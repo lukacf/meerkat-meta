@@ -312,6 +312,13 @@ interface IdentityLog extends IdentityLogCore {
   olderHistoryLoading?: boolean;
 }
 
+/// The server holds older pages than the log has loaded: the pane offers
+/// "Load older history", and the transcript keeps session notices older than
+/// every loaded frame back until those pages arrive.
+function identityHasOlderHistory(log: IdentityLog): boolean {
+  return log.hasServerLog === true && Boolean(log.oldestTimelineCursor) && log.olderHistoryExhausted !== true;
+}
+
 function normalizeConsoleTheme(value: unknown): ConsoleTheme | null {
   return value === "dark" || value === "light" ? value : null;
 }
@@ -1716,6 +1723,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         conversationEntries: ConversationTimelineEntry[];
         derivation: TimelineDerivation;
         agentKey: string;
+        hasOlderHistory: boolean;
       }
     >
   >({});
@@ -1731,7 +1739,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     // and keep the object the cached derivation was built with.
     const agentKey = agent ? JSON.stringify(agent) : "";
     if (cached && cached.agentKey === agentKey) agent = cached.agent;
-    if (cached && cached.version === log.version && cached.agent === agent) {
+    // Paging metadata can change without a frame (an empty last page).
+    const hasOlderHistory = identityHasOlderHistory(log);
+    if (cached && cached.version === log.version && cached.agent === agent
+      && cached.hasOlderHistory === hasOlderHistory) {
       return cached;
     }
     const sortedFrames = framesVisibleInPanel(getSortedFrames(identity), panelId);
@@ -1741,9 +1752,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       renderInteractionStartsAsUser: true,
       renderTextDeltas: true,
       blobBaseUrl: baseUrl,
+      hasOlderHistory,
     }, cached?.derivation);
     const conversationEntries = derivation.entries;
-    const next = { version: log.version, agent, sortedFrames, conversationEntries, derivation, agentKey };
+    const next = { version: log.version, agent, sortedFrames, conversationEntries, derivation, agentKey, hasOlderHistory };
     derivedTranscriptRef.current[identity] = next;
     return next;
   }
@@ -4936,11 +4948,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         respawnLabel={configuredActionLabels.respawn}
         retireLabel={configuredActionLabels.retire}
         sendLabel={configuredActionLabels.send}
-        hasOlderHistory={
-          identityLog.hasServerLog === true &&
-          Boolean(identityLog.oldestTimelineCursor) &&
-          identityLog.olderHistoryExhausted !== true
-        }
+        hasOlderHistory={identityHasOlderHistory(identityLog)}
         loadingOlderHistory={identityLog.olderHistoryLoading === true}
         onLoadOlder={() => void loadOlderIdentityTimeline(identity)}
         stackSlot={stackSlot}

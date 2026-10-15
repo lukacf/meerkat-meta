@@ -4,6 +4,15 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+## 0.9.1
+
+- `MetaBuilder.gating("")` and `MetaBuilder.access_control("")` raise a
+  `ValueError` that says an empty path no longer switches the feature off and
+  names how to keep it off: do not call the method, and keep nothing at
+  `config/gating.toml` / `config/access.toml` under the working directory.
+
+## 0.9.0
+
 - Breaking (access control): `MetaBuilder.access_control(path)` now needs
   an existing, valid access file. The gateway refuses to start with a
   missing path, a directory, or an unreadable or invalid file instead of

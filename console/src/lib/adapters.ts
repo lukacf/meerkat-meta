@@ -5,7 +5,7 @@ import { userMessageRenderKey } from "../../../packages/console-core/src/user-me
 import { realtimeMessageOrigin, isRealtimeHistoryMessage } from "../../../packages/console-core/src/realtime-message-identity";
 import { assistantMessageKey, assistantMessageRenderKey, hasAssistantMessageIdCarrier } from "../../../packages/console-core/src/assistant-message-identity";
 import { canonicalAssistantToolCounterparts, isCanonicalAssistantMessage, reconcileAssistantMessageFrames } from "../../../packages/console-core/src/assistant-message-projection";
-import { reconcileAssistantHistoryPositions, reconcileRuntimeAppendFrames, runtimeAppendNoticeKey, runtimeSourceScope, runtimeSourceSequence } from "../../../packages/console-core/src/runtime-append-projection";
+import { loadedTimelineStartMs, reconcileAssistantHistoryPositions, reconcileRuntimeAppendFrames, runtimeAppendNoticeKey, runtimeSourceScope, runtimeSourceSequence } from "../../../packages/console-core/src/runtime-append-projection";
 import { toolCompletionFromFrame, unknownToolCompletion, type ToolCompletionEvidence } from "../../../packages/console-core/src/tool-completion";
 import { parseConsoleContextMessage } from "../../../packages/console-core/src/context-record";
 import {
@@ -4886,6 +4886,10 @@ export type TimelineDerivationOptions = {
   suppressEmbeddedRunStartedPrompt?: boolean;
   blobBaseUrl?: string;
   textMode?: ConversationTextMode;
+  /// The frames are the newest pages of a longer timeline whose older pages
+  /// are not loaded yet. Session notices older than every loaded frame then
+  /// wait for those pages instead of rendering above much newer rows.
+  hasOlderHistory?: boolean;
 };
 
 export function mapFramesToTimelineEntries(
@@ -5006,7 +5010,8 @@ function sameTimelineOptions(left: TimelineDerivationOptions, right: TimelineDer
     && (left.renderTextDeltas !== false) === (right.renderTextDeltas !== false)
     && Boolean(left.suppressEmbeddedRunStartedPrompt) === Boolean(right.suppressEmbeddedRunStartedPrompt)
     && left.blobBaseUrl === right.blobBaseUrl
-    && (left.textMode ?? "markdown") === (right.textMode ?? "markdown");
+    && (left.textMode ?? "markdown") === (right.textMode ?? "markdown")
+    && Boolean(left.hasOlderHistory) === Boolean(right.hasOlderHistory);
 }
 
 /// Continue `previous` with appended frames, or null when that could differ
@@ -5041,6 +5046,9 @@ function extendTimelineDerivation(
     // order it last.
     const cursor = cursorSeq(frame.cursor);
     if (cursor === null || cursor <= maxCursor) return null;
+    // reconcileRuntimeAppendFrames holds back notices older than the oldest
+    // loaded frame; an older frame moves that boundary.
+    if (frame.timestampMs < (resume.fold.unloadedBeforeMs ?? Number.NEGATIVE_INFINITY)) return null;
     maxCursor = cursor;
     // reconcileRuntimeAppendFrames orders by source sequence within a scope.
     const scope = runtimeSourceScope(frame);
@@ -5137,6 +5145,8 @@ function structurallyEqual(left: unknown, right: unknown): boolean {
 interface TimelineFold {
   /// Input frames in transcript sort order (before the reconcile passes).
   readonly sortedFrames: ConsoleFrame[];
+  /// Notices before this time wait for older history (`hasOlderHistory`).
+  readonly unloadedBeforeMs: number | undefined;
   orderedLength(): number;
   step(index: number): void;
   finish(): ConversationTimelineEntry[];
@@ -5160,7 +5170,8 @@ function createTimelineFold(
   const sortedFrames = options.renderInteractionStartsAsUser
     ? sortFramesForTranscript(frames)
     : frames.slice();
-  const orderedFrames = reconcileRuntimeAppendFrames(reconcileAssistantMessageFrames(reconcileAssistantHistoryPositions(sortedFrames)));
+  const unloadedBeforeMs = options.hasOlderHistory ? loadedTimelineStartMs(frames) : undefined;
+  const orderedFrames = reconcileRuntimeAppendFrames(reconcileAssistantMessageFrames(reconcileAssistantHistoryPositions(sortedFrames)), { unloadedBeforeMs });
   const canonicalToolCounterparts = canonicalAssistantToolCounterparts(orderedFrames);
   const realtimeHistoryIds = new Set(orderedFrames.filter(isRealtimeHistoryMessage).map(frame => frame.id));
   const entries: ConversationTimelineEntry[] = [];
@@ -5906,6 +5917,7 @@ function createTimelineFold(
 
   return {
     sortedFrames,
+    unloadedBeforeMs,
     orderedLength: () => orderedFrames.length,
     step,
     finish,

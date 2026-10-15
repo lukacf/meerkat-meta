@@ -2513,8 +2513,9 @@ impl UnifiedRuntimeBuilder {
                 })?;
                 MobDefinition::from_toml(&toml_content).map_err(|e| {
                     UnifiedRuntimeBuilderError::DefinitionLoad(format!(
-                        "failed to parse definition TOML at {}: {e}",
-                        path.display()
+                        "failed to parse definition TOML at {}: {}",
+                        path.display(),
+                        crate::gateway_composition::describe_mob_definition_error(&e)
                     ))
                 })?
             }

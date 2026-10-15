@@ -174,7 +174,11 @@ configuration names no admin, enabled or not, can be administered by nobody from
 the console. Name the first admin in the file before starting the runtime, or in
 trusted local setup with `AccessController::new` and `with_persist_path`. A
 configured access file must exist and be valid: a missing path, a directory or
-an invalid file stops startup. Conventional discovery follows the same rule.
+an invalid file stops startup. An empty path stops startup too: it no longer
+switches access control off, as it did when the predecessor SDKs dropped it. To
+keep access control off, omit `runtime_options.access_config_path` (or send
+`null`), and in the SDKs do not call `accessControl` / `access_control`.
+Conventional discovery follows the same rule.
 Access control stays off only when nothing is at `config/access.toml`, which
 includes a missing or dangling parent directory. Any other entry there, even a
 directory or a dangling `access.toml` link, and any other lookup error (such as

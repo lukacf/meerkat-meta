@@ -53,7 +53,10 @@ publish documentation. The mirror is served under `https://docs.rkat.ai/mobkit/`
 ## 0.9 Rename And Upgrade Notes
 
 0.9 renamed the product from MobKit to Meta as a clean break with no aliases;
-historical CHANGELOG entries keep the old name. Current names:
+historical CHANGELOG entries keep the old name. The operator checklist for an
+upgrade (adoption, refused and newly honoured `mob.toml` keys, ignored keys,
+empty access and gating paths, each with its exact error text) is
+`docs/guides/upgrading-from-mobkit.mdx`. Current names:
 
 - crate, Python distribution and repository `meerkat-meta`; Rust library and
   Python import `meerkat_meta`; npm `@rkat/meta-sdk`;
@@ -91,6 +94,28 @@ Other 0.9 contract changes to keep in mind:
   `PublicIdentityFirstContext`, `PublicSessionBridge`) that carry that owner.
 - The memory backend config keeps only `MemoryBackendConfig::LocalJson`
   (`kind = "local_json"`); any other kind is refused, never reinterpreted.
+- `MobDefinition::from_toml` warns about and ignores keys a profile does not
+  define, such as `tools.mob_tasks` in configs written for earlier releases.
+  The typed parse drops them before Meta records the composition on create or
+  compares it on resume, so dropping (or adding) such a key never makes a
+  persistent store `divergent`; a divergence refusal names only accepted
+  fields. Pinned by `dropping_an_ignored_profile_key_resumes_the_store` and its
+  siblings in `tests/mob_storage_persistence.rs`.
+- Meerkat 0.9 refuses a profile `system_prompt`, `prompt` or `instructions`
+  key, which MobKit 0.8.31 and earlier dropped silently. Every Meta mob-TOML
+  ingress (`rpc_gateway` `mob_config`, `meta_gateway` `config/mob.toml`,
+  `UnifiedRuntimeBuilder`'s TOML path) formats parse failures through
+  `gateway_composition::describe_mob_definition_error`, which appends that
+  removing the key keeps the old behaviour and shows the `[skills.<id>]`
+  remedy. The other keys 0.9 newly refuses or newly honours are listed in the
+  upgrade guide.
+- An empty access or gating path no longer switches the feature off (the
+  predecessor SDKs dropped it by truthiness). `rpc_gateway` refuses
+  `runtime_options.access_config_path` or `gating_config_path` set to `""`, and
+  the SDK builders' `accessControl("")` / `access_control("")` / `gating("")`
+  throw. To keep the feature off, omit the key or send `null`; in the SDKs, do
+  not call the builder method and keep nothing at `config/access.toml` /
+  `config/gating.toml` under the working directory (conventional discovery).
 - `AccessController::load_or_default` is gone: `AccessController::load` reads
   and validates an explicitly configured access file, and a missing or invalid
   file is a typed `AccessConfigError`.
@@ -426,6 +451,8 @@ The release owner then tags the same source as `vX.Y.Z` and invokes
 Promotion verifies and publishes the original bytes without rebuilding or
 signing again. Assets precede the Python and TypeScript SDKs, then the crates
 (`meta-extension-state`, then `meerkat-meta`) and an exact registry readback.
+A failed SDK registry upload does not stop the crates; the readback still fails
+the run while any registry lacks the exact version.
 Releases do not publish documentation (see Current Baseline).
 `REGISTRY_DRY_RUN=true` suppresses all publication;
 `PUBLISH_RELEASE_PACKAGES=false` selects asset-only promotion.
