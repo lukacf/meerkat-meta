@@ -4,7 +4,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { build } = require("esbuild");
-const { EMBEDDED_SHARED_FILES } = require("./generated-assets.cjs");
+const { EMBEDDED_SHARED_FILES, EMBEDDED_SOURCE_FILES } = require("./generated-assets.cjs");
 
 const outDir = path.join(__dirname, "dist");
 const embeddedOutDir = path.join(__dirname, "../crates/meerkat-meta/console-dist");
@@ -111,6 +111,14 @@ async function main() {
   await Promise.all(
     EMBEDDED_SHARED_FILES.map((file) => (
       fs.copyFile(path.join(outDir, file), path.join(embeddedOutDir, file))
+    )),
+  );
+
+  // The MCP Apps sandbox proxy ships inside the gateway binaries, which write
+  // it back out with --write-mcp-apps-sandbox <dir>.
+  await Promise.all(
+    EMBEDDED_SOURCE_FILES.map(({ source, embedded }) => (
+      fs.copyFile(path.join(__dirname, source), path.join(embeddedOutDir, embedded))
     )),
   );
 }

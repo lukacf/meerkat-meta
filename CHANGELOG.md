@@ -41,6 +41,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   every process that can reach the listener is trusted. `meta_gateway`
   includes it in the resume fingerprint, and `rpc_gateway` refuses it
   without `--persistent`.
+- `meta_gateway --write-mcp-apps-sandbox <dir>` and
+  `rpc_gateway --write-mcp-apps-sandbox <dir>` write the MCP Apps sandbox
+  proxy that the binary embeds, `mcp-apps-sandbox.cjs` and
+  `src/mcp-apps/sandbox.js`, in the layout `node <dir>/mcp-apps-sandbox.cjs`
+  loads. They create the directory, replace earlier copies, print each
+  file's SHA-256 and path, and exit without starting a gateway. Rust hosts
+  call `meerkat_meta::mcp_apps_sandbox::write_mcp_apps_sandbox`. The console
+  build copies both files into `crates/meerkat-meta/console-dist/`, and
+  `npm --prefix console run embedded:freshness` fails when a copy differs
+  from its console source.
+
+### Changed
+
+- The Console guide and the MCP Apps host README describe writing the
+  sandbox proxy with `--write-mcp-apps-sandbox` instead of copying it from
+  the release tag. Copying stays the way for gateways before 0.9.2; both
+  files are unchanged since 0.9.0:
+  - `console/mcp-apps-sandbox.cjs`:
+    `157fed890922c4c3fe7c9b7a6319455f0604e9c789818f9c38d45bc115a98ad6`
+  - `console/src/mcp-apps/sandbox.js`:
+    `4e3592ba5b8bf198322126ccb27919a8d4c4c1976a198f9c497c16833f6c3024`
 
 ## [0.9.1] - 2026-10-15
 

@@ -1164,6 +1164,49 @@ pub fn parse_control_listen_arg(args: &[String]) -> Result<Option<ControlListenA
         .map_err(|error| format!("--control-listen: {error}"))
 }
 
+/// `--write-mcp-apps-sandbox <dir>`: write the MCP Apps sandbox proxy this
+/// binary embeds ([`crate::mcp_apps_sandbox`]) into `<dir>` and print each
+/// written file as `<sha256>  <path>` on stdout. `None` when the flag is
+/// absent; otherwise the process exit code: `0` after writing, `1` when a
+/// file could not be written, `2` when the directory is missing. Both
+/// gateways handle it before anything else, so it reads no init request and
+/// starts no runtime. Same argv convention as [`parse_control_listen_arg`].
+pub fn write_mcp_apps_sandbox_arg(args: &[String]) -> Option<i32> {
+    use sha2::Digest as _;
+    let position = args
+        .iter()
+        .position(|arg| arg == "--write-mcp-apps-sandbox")?;
+    let Some(dir) = args
+        .get(position + 1)
+        .filter(|value| !value.starts_with("--"))
+    else {
+        eprintln!("--write-mcp-apps-sandbox requires a directory");
+        return Some(2);
+    };
+    let written = match crate::mcp_apps_sandbox::write_mcp_apps_sandbox(Path::new(dir)) {
+        Ok(written) => written,
+        Err(error) => {
+            eprintln!(
+                "--write-mcp-apps-sandbox: cannot write the MCP Apps sandbox to {dir}: {error}"
+            );
+            return Some(1);
+        }
+    };
+    for path in written {
+        match std::fs::read(&path) {
+            Ok(bytes) => println!("{:x}  {}", sha2::Sha256::digest(&bytes), path.display()),
+            Err(error) => {
+                eprintln!(
+                    "--write-mcp-apps-sandbox: cannot read back {}: {error}",
+                    path.display()
+                );
+                return Some(1);
+            }
+        }
+    }
+    Some(0)
+}
+
 // ---------------------------------------------------------------------------
 // Host configuration ingress
 // ---------------------------------------------------------------------------
@@ -2636,6 +2679,22 @@ default_binding = "local"
             Err(HttpExposureParseError::PublicBaseUrlNoHost {
                 value: "https://".to_string()
             })
+        );
+    }
+
+    /// Without the flag the gateways start as usual; the flag without a
+    /// directory (or followed by another flag) is a usage error, exit 2,
+    /// that writes nothing.
+    #[test]
+    fn write_mcp_apps_sandbox_arg_needs_a_directory() {
+        let args = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            [
+                write_mcp_apps_sandbox_arg(&args(&["--persistent"])),
+                write_mcp_apps_sandbox_arg(&args(&["--write-mcp-apps-sandbox"])),
+                write_mcp_apps_sandbox_arg(&args(&["--write-mcp-apps-sandbox", "--persistent"])),
+            ],
+            [None, Some(2), Some(2)]
         );
     }
 

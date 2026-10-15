@@ -1622,6 +1622,11 @@ fn main() {
         );
         return;
     }
+    // Writes the MCP Apps sandbox proxy this binary embeds and exits: no
+    // tracing, no init request, no runtime.
+    if let Some(code) = meerkat_meta::gateway_composition::write_mcp_apps_sandbox_arg(&args) {
+        std::process::exit(code);
+    }
     // Install the tracing subscriber FIRST — before the maintenance verbs,
     // not just before the gateway boot. The storage verbs drive the same
     // migration code whose progress reports through tracing; dispatching

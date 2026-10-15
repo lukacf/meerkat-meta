@@ -34,15 +34,27 @@ serve credentials, sensitive files, or application APIs on the sandbox origin.
 The proxy needs Node's standard library and `src/mcp-apps/sandbox.js`, with no
 npm dependencies.
 
-Released gateway binaries, the Python package and the npm package do not
-include the proxy. Outside a source checkout, copy `console/mcp-apps-sandbox.cjs`
-and `console/src/mcp-apps/sandbox.js` from the release tag that matches the
-gateway. Keep the second file at `src/mcp-apps/sandbox.js` relative to the
-first, and start the proxy with `node mcp-apps-sandbox.cjs` and the same
-environment variables. The proxy and the Console embedded in the gateway
-share an internal sandbox protocol, so upgrade them together. Check the copies
-against the SHA-256 digests in the release notes; `docs/guides/console.mdx`
-lists the 0.9.0 values.
+The gateway binaries embed the proxy. Outside a source checkout, have the
+gateway you run write it out, then start it with Node and the same
+environment variables:
+
+```sh
+meta_gateway --write-mcp-apps-sandbox ./mcp-apps-sandbox   # or rpc_gateway
+MCP_APPS_HOST_ORIGIN=http://127.0.0.1:5000 MCP_APPS_SANDBOX_PORT=5001 node ./mcp-apps-sandbox/mcp-apps-sandbox.cjs
+```
+
+The flag writes `mcp-apps-sandbox.cjs` and `src/mcp-apps/sandbox.js` into the
+directory, creating it and replacing earlier copies, prints each file's
+SHA-256 and path, and exits without starting a gateway. The proxy and the
+Console embedded in the gateway share an internal sandbox protocol, so write
+the proxy again from the new binary whenever you upgrade the gateway. The
+Python and npm packages do not include the proxy.
+
+Gateways before 0.9.2 do not embed it. For those, copy
+`console/mcp-apps-sandbox.cjs` and `console/src/mcp-apps/sandbox.js` from the
+release tag that matches the gateway, keep the second file at
+`src/mcp-apps/sandbox.js` relative to the first, and check both against the
+SHA-256 digests that `docs/guides/console.mdx` lists for 0.9.0 and 0.9.1.
 
 Omitting the URL or setting a realm override to an empty string retains text
 tool results and disables the corresponding HTTP app operations. Native live

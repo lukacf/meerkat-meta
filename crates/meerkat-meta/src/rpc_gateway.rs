@@ -9819,6 +9819,11 @@ usage:
       fixed built-in demo module and exits. It hosts no mob, no session and
       no agent. The SDK per-call transports use this mode.
 
+  rpc_gateway --write-mcp-apps-sandbox <dir>
+      Write the MCP Apps sandbox proxy this binary embeds into <dir>
+      (mcp-apps-sandbox.cjs and src/mcp-apps/sandbox.js), print each file's
+      SHA-256 and path, and exit. Start it with node <dir>/mcp-apps-sandbox.cjs.
+
   rpc_gateway --version"#;
 
 /// Single-shot mode: reads one request from the environment, answers it
@@ -18581,6 +18586,11 @@ pub fn main() {
             env!("CARGO_PKG_VERSION")
         );
         return;
+    }
+    // Writes the MCP Apps sandbox proxy this binary embeds and exits: no init
+    // request, no runtime.
+    if let Some(code) = crate::gateway_composition::write_mcp_apps_sandbox_arg(&args[1..]) {
+        std::process::exit(code);
     }
     // Predecessor environment variables would be silently ignored by this
     // build; refuse instead.
