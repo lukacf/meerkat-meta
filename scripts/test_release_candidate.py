@@ -625,8 +625,18 @@ class CandidateProtocolTests(unittest.TestCase):
         self.append_release_asset(planted_receipt, asset_id=1990)
         self.append_release_asset(planted_archive, asset_id=1991)
         os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        # The planted receipt names a run that does not exist.
         _, error = self.command("verify-published", success=False)
-        self.assertIn("without the trailing manifest", error)
+        self.assertIn("actions/runs/999", error)
+        # Naming the real run with another manifest artifact fails its record.
+        planted_receipt.write_text(json.dumps(dict(trailing, manifest_artifact=dict(
+            trailing["manifest_artifact"], digest="c" * 64))))
+        receipt_asset = next(a for a in self.state["release"]["assets"] if a["id"] == 1990)
+        receipt_asset["digest"] = "sha256:" + helper.assets.sha256(planted_receipt)
+        receipt_asset["size"] = planted_receipt.stat().st_size
+        self.save()
+        _, error = self.command("verify-published", success=False)
+        self.assertIn("selected manifest artifact digest mismatch", error)
         # The real trailing tier refuses to bind over the planted files
         # before any write; an operator removes them first.
         self.state["calls"] = []
@@ -634,6 +644,8 @@ class CandidateProtocolTests(unittest.TestCase):
         self.assets_mode(trailing)
         _, error = self.command("recover", success=False)
         self.assertIn("existing release asset conflict", error)
+        self.assertIn(f"names run {TRAILING_RUN}/{ATTEMPT}", error)
+        self.assertIn("operator cleanup required", error)
         self.assertFalse(self.writes())
 
     def test_a_tampered_trailing_index_fails_verification_while_an_archive_is_missing(self):
@@ -669,6 +681,125 @@ class CandidateProtocolTests(unittest.TestCase):
         _, error = self.publish(success=False)
         self.assertIn("does not match its manifest record", error)
         self.assertFalse(self.writes())
+
+    def partial_trailing(self, stop_before):
+        """Promote the core, then add the trailing tier until `stop_before`
+        fails to upload; returns the trailing selection."""
+        self.promote_core()
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        self.assets_mode(trailing)
+        self.state["fail_upload"] = stop_before
+        self.save()
+        self.command("recover", success=False)
+        self.state.pop("fail_upload")
+        self.save()
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        return trailing
+
+    def replace_release_asset(self, name, content):
+        asset = next(a for a in self.state["release"]["assets"] if a["name"] == name)
+        Path(asset["local_file"]).write_bytes(content)
+        asset["digest"] = "sha256:" + hashlib.sha256(content).hexdigest()
+        asset["size"] = len(content)
+        self.save()
+
+    def test_a_receipt_alone_is_bound_through_its_run_before_it_counts_as_verified(self):
+        self.partial_trailing("manifest-provenance-trailing.jsonl")
+        names = {asset["name"] for asset in self.state["release"]["assets"]}
+        self.assertIn("candidate-selection-trailing.json", names)
+        self.assertNotIn("candidate-manifest-trailing.json", names)
+        self.state["calls"] = []
+        self.save()
+        stdout, _ = self.command("verify-published")
+        self.assertIn("every present file verified", stdout)
+        reads = [call["args"][1] for call in self.state["calls"] if call["args"][0] == "api"]
+        self.assertIn(helper.repo_endpoint("actions/artifacts/301/zip"), reads)
+        self.assertIn(helper.repo_endpoint(f"actions/runs/{TRAILING_RUN}"), reads)
+
+    def test_a_planted_manifest_bundle_beside_a_receipt_fails(self):
+        trailing = self.partial_trailing("candidate-manifest-trailing.json")
+        self.replace_release_asset("manifest-provenance-trailing.jsonl", b'{"planted": true}\n')
+        _, error = self.command("verify-published", success=False)
+        self.assertIn("manifest bundle is not the candidate's", error)
+
+    def test_target_bundles_waiting_for_their_archives_must_be_the_candidates(self):
+        first_archive = helper.trailing_upload_order(helper.tier_file_names(VERSION, "trailing"))[5]
+        self.assertTrue(first_archive.startswith("meta-"), first_archive)
+        self.partial_trailing(first_archive)
+        stdout, _ = self.command("verify-published")
+        self.assertIn("every present file verified", stdout)
+        self.replace_release_asset("target-x86_64-pc-windows-msvc-provenance.jsonl", b'{"planted": true}\n')
+        _, error = self.command("verify-published", success=False)
+        self.assertIn("is not the candidate's", error)
+
+    def test_verification_requires_green_candidate_and_ci_runs(self):
+        self.promote_core()
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        self.assets_mode(trailing)
+        self.command("recover")
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        self.command("verify-published")
+        for endpoint, change, message in (
+            (f"actions/runs/{TRAILING_RUN}", {"conclusion": "failure"}, "not completed-success"),
+            (f"actions/runs/{RUN}", {"conclusion": "cancelled"}, "not completed-success"),
+            (f"actions/runs/{CI}", {"conclusion": "failure"}, "not completed-success"),
+        ):
+            with self.subTest(endpoint=endpoint):
+                original = dict(self.state["api"][helper.repo_endpoint(endpoint)])
+                self.state["api"][helper.repo_endpoint(endpoint)].update(change)
+                self.save()
+                _, error = self.command("verify-published", success=False)
+                self.assertIn(message, error)
+                self.state["api"][helper.repo_endpoint(endpoint)] = original
+                self.save()
+
+    def test_core_verification_requires_the_manifests_ci_run_green(self):
+        self.promote_core()
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        self.command("verify-published")
+        self.state["api"][helper.repo_endpoint(f"actions/runs/{CI}")].update(conclusion="failure")
+        self.save()
+        _, error = self.command("verify-published", success=False)
+        self.assertIn("not completed-success", error)
+
+    def test_assets_outside_the_tier_file_names_fail_verification(self):
+        self.promote_core()
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        for name in ("install.sh", f"meta-gateway-{VERSION}-riscv64gc-unknown-linux-gnu.tar.gz"):
+            with self.subTest(name=name):
+                extra = self.root / name
+                extra.write_bytes(b"planted")
+                self.append_release_asset(extra, asset_id=1980)
+                _, error = self.command("verify-published", success=False)
+                self.assertIn(f"unexpected release assets: {name}", error)
+                self.state["release"]["assets"] = [a for a in self.state["release"]["assets"] if a["id"] != 1980]
+                self.save()
+        self.command("verify-published")
+
+    def test_a_schema_1_release_refuses_extra_assets_too(self):
+        self.staged()
+        self.publish()
+        os.environ.update(RELEASE_MODE="existing", ARTIFACT_SELECTION="")
+        extra = self.root / "install.sh"
+        extra.write_bytes(b"planted")
+        self.append_release_asset(extra, asset_id=1981)
+        _, error = self.command("verify-published", success=False)
+        self.assertIn("unexpected release assets: install.sh", error)
+
+    def test_local_dispatch_refuses_a_trailing_promotion(self):
+        trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
+        selection = self.root / "accepted-trailing.json"
+        selection.write_text(json.dumps(trailing))
+        self.state["calls"] = []
+        self.save()
+        os.environ.update(RELEASE_MODE="", SOURCE_SHA="", RELEASE_TIER="", RELEASE_TAG=TAG,
+                          ARTIFACT_SELECTION_FILE=str(selection), PUBLISH_RELEASE_PACKAGES="true")
+        _, error = self.command("dispatch", "--mode", "promote", success=False)
+        self.assertIn("promotion accepts only a core selection", error)
+        self.assertFalse(self.state["calls"])
+        os.environ.update(PUBLISH_RELEASE_PACKAGES="false")
+        self.command("dispatch", "--mode", "assets")
+        self.assertEqual(json.loads(self.state["calls"][-1]["inputs"]["artifact_selection"]), trailing)
 
     def test_promotion_of_a_trailing_selection_fails_at_resolution(self):
         trailing, _ = self.tier_candidate("trailing", TRAILING_RUN, 301)
@@ -1315,12 +1446,20 @@ class CandidateProtocolTests(unittest.TestCase):
         self.staged()
         self.publish()
         self.state["calls"] = []
-        self.state["fail_endpoints"] = [key for key in self.state["api"] if "/actions/" in key]
+        # Artifacts expire after their retention; the runs and the artifact
+        # records stay readable, and verification needs nothing more.
+        for key, value in self.state["api"].items():
+            if "/actions/artifacts/" in key and isinstance(value, dict) and "expired" in value:
+                value["expired"] = True
+        self.state["fail_endpoints"] = [key for key in self.state["api"] if key.endswith("/zip")]
         self.save()
         self.command("verify-published")
         self.assertFalse(self.writes())
-        self.assertFalse(any("/actions/" in call["args"][1] for call in self.state["calls"]
-                             if call["args"][0] == "api"))
+        reads = [call["args"][1] for call in self.state["calls"] if call["args"][0] == "api"]
+        self.assertFalse([read for read in reads if read.endswith("/zip")])
+        # The receipt's run, its manifest artifact record and the CI run are read.
+        for endpoint in (f"actions/runs/{RUN}", "actions/artifacts/300", f"actions/runs/{CI}"):
+            self.assertIn(helper.repo_endpoint(endpoint), reads)
 
     def test_deleted_receipt_does_not_downgrade_candidate_era_to_legacy(self):
         self.staged()

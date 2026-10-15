@@ -874,13 +874,33 @@ def protocol_source(sha):
     return "scripts/release-candidate.py" in files
 
 
+def verify_selected_run(selected, sha):
+    """The selection's candidate run completed successfully from this source,
+    and the manifest artifact it names is that run's, with that digest. The
+    artifact may have expired; its record must still match."""
+    info = verify_run(selected["run_id"], selected["run_attempt"], sha)
+    artifact_id = integer(selected["manifest_artifact"]["id"], "manifest artifact ID")
+    value = api(repo_endpoint(f"actions/artifacts/{artifact_id}"))
+    require(value["id"] == artifact_id and value["name"] == f"meta-candidate-manifest-{selected['run_attempt']}",
+            "selected manifest artifact identity/name mismatch")
+    require(value["digest"] == "sha256:" + digest(selected["manifest_artifact"]["digest"]),
+            "selected manifest artifact digest mismatch")
+    owner = value["workflow_run"]
+    require(owner["id"] == info["id"] and owner["head_sha"] == info["head_sha"]
+            and owner["repository_id"] == info["repository"]["id"],
+            "selected manifest artifact belongs to another run")
+    return info
+
+
 def verify_published_proofs(folder, selected, sha, version, tag):
     _, manifest_name, manifest_bundle = tier_proof_names(selection_tier(selected))
+    verify_selected_run(selected, sha)
     manifest_path = folder / manifest_name
     manifest = read_json(manifest_path)
     match_manifest_selection(manifest, selected, manifest_path, sha, version, tag)
     verify_provenance(manifest_path, folder / manifest_bundle, sha,
                       selected["run_id"], selected["run_attempt"])
+    verify_run(manifest["ci"]["run_id"], manifest["ci"]["run_attempt"], sha, ci=True)
     check_metadata(manifest, folder)
     for item in manifest["artifacts"]:
         bundle = folder / f"target-{item['target']}-provenance.jsonl"
@@ -900,18 +920,22 @@ def verify_flat_subset(folder, destination, tag, tier=None):
     verify_prepared(destination, tag, tier)
 
 
-def verify_present_trailing(folder, inventory, sha, version, tag):
+def verify_present_trailing(folder, inventory, sha, version, tag, work):
     """Verify every trailing-tier file a public release carries, however
     many of them there are; only absent files are tolerated.
 
-    Trailing files need the trailing receipt, and the receipt must be a
-    schema 2 trailing selection. A present manifest must match the receipt,
-    the release's source, version and tag, and its retained attestation.
-    Every present archive must match its manifest record and its target's
-    attestation, and every present index or checksums file its manifest
-    hash. An archive or metadata file without its manifest, or an archive
-    without its target's attestation bundle, cannot be verified and refuses.
-    Returns the number of trailing files still absent.
+    The receipt must be a schema 2 trailing selection whose candidate run
+    completed successfully from this source and owns the manifest artifact
+    it names. The manifest comes from the release when present, otherwise
+    from that artifact, the way stage_candidate reads it: it must match the
+    receipt and the release's source, version and tag, carry a valid
+    attestation, and name a green CI run. Every present attestation bundle
+    must be the one the candidate retained (the manifest's verifies the
+    manifest; a target's verifies its archives, or equals the target
+    artifact's when none of them is present yet). Every present archive must
+    match its manifest record and its target's attestation, and every
+    present index or checksums file its manifest hash. Returns the number of
+    trailing files still absent.
     """
     files = tier_file_names(version, "trailing")
     present = files & set(inventory)
@@ -921,23 +945,39 @@ def verify_present_trailing(folder, inventory, sha, version, tag):
     require(receipt in present, "trailing assets present without the trailing receipt")
     selected = validate_selection(read_json(folder / receipt))
     require(selection_tier(selected) == "trailing", "trailing receipt is not a trailing selection")
-    dependents = present - {receipt, manifest_bundle} - {f"target-{t}-provenance.jsonl" for t in tier_targets("trailing")}
-    if manifest_name not in present:
-        require(dependents == set(), "trailing assets present without the trailing manifest")
-        return len(files - present)
-    manifest_path = folder / manifest_name
+    info = verify_selected_run(selected, sha)
+    if manifest_name in present:
+        require(manifest_bundle in present, "trailing manifest present without its attestation bundle")
+        source = folder
+    else:
+        dependents = present & (set(assets.expected_archive_names(version, "trailing"))
+                                | set(assets.metadata_names("trailing")))
+        require(not dependents, "trailing assets present without the trailing manifest")
+        identity = {**selected["manifest_artifact"], "name": f"meta-candidate-manifest-{selected['run_attempt']}"}
+        packed = download_artifact(identity, info, work)
+        source = unpack_artifact(packed, work / "trailing-manifest", sorted(manifest_members("trailing")))
+        if manifest_bundle in present:
+            require(assets.sha256(folder / manifest_bundle) == assets.sha256(source / PROVENANCE),
+                    "published trailing manifest bundle is not the candidate's")
+    manifest_path = source / manifest_name
     manifest = read_json(manifest_path)
     match_manifest_selection(manifest, selected, manifest_path, sha, version, tag)
-    require(manifest_bundle in present, "trailing manifest present without its attestation bundle")
-    verify_provenance(manifest_path, folder / manifest_bundle, sha, selected["run_id"], selected["run_attempt"])
+    bundle_path = folder / manifest_bundle if source is folder else source / PROVENANCE
+    verify_provenance(manifest_path, bundle_path, sha, selected["run_id"], selected["run_attempt"])
+    verify_run(manifest["ci"]["run_id"], manifest["ci"]["run_attempt"], sha, ci=True)
     for name, expected_hash in manifest["metadata"].items():
         if name in present:
             require(assets.sha256(folder / name) == expected_hash, f"published trailing {name} hash mismatch")
     for item in manifest["artifacts"]:
         bundle = f"target-{item['target']}-provenance.jsonl"
-        for record in item["archives"]:
-            if record["name"] not in present:
-                continue
+        archives = [record for record in item["archives"] if record["name"] in present]
+        if bundle in present and not archives:
+            packed = download_artifact(item, info, work)
+            names = [record["name"] for record in item["archives"]]
+            unpacked = unpack_artifact(packed, work / f"trailing-{item['target']}", [*names, PROVENANCE])
+            require(assets.sha256(folder / bundle) == assets.sha256(unpacked / PROVENANCE),
+                    f"published {bundle} is not the candidate's")
+        for record in archives:
             require(bundle in present, f"trailing archive {record['name']} present without its attestation bundle")
             path = folder / record["name"]
             require(describe_archive(path, version, item["target"]) == record,
@@ -950,7 +990,7 @@ def verify_published_trailing(folder, inventory, work, sha, version, tag):
     """The trailing tier may still be absent or partly added: registry retry
     and verification depend on the core tier only, but every trailing file
     that is present verifies, and a complete tier verifies as a set."""
-    pending = verify_present_trailing(folder, inventory, sha, version, tag)
+    pending = verify_present_trailing(folder, inventory, sha, version, tag, work)
     if pending == len(tier_file_names(version, "trailing")):
         print("trailing tier not added yet")
     elif pending:
@@ -976,6 +1016,14 @@ def verify_published(_args=None):
             selected = validate_selection(read_json(folder / SELECTION))
             tier = selection_tier(selected)
             require(tier in (None, "core"), "a release's receipt must bind its core tier")
+        if candidate_era:
+            allowed = tier_file_names(version, tier)
+            if tier == "core":
+                allowed |= tier_file_names(version, "trailing")
+        else:
+            allowed = set(assets.expected_archive_names(version)) | set(assets.metadata_names())
+        unexpected = sorted(set(inventory) - allowed)
+        require(not unexpected, f"unexpected release assets: {', '.join(unexpected)}")
         verify_flat_subset(folder, work / "flat", tag, tier)
         if candidate_era:
             verify_published_proofs(folder, selected, sha, version, tag)
@@ -1018,7 +1066,7 @@ def validate_staging(args, selected, sha, version, tag, work):
 
 
 def check_existing(inventory, downloaded, expected, selected, *, version=None, draft=None,
-                   sha=None, tag=None):
+                   sha=None, tag=None, work=None):
     if inventory:
         require(SELECTION in inventory, "unbound partial release: acceptance receipt missing; operator cleanup required")
         require(read_json(downloaded / SELECTION) == selected, "existing release receipt mismatch")
@@ -1031,7 +1079,7 @@ def check_existing(inventory, downloaded, expected, selected, *, version=None, d
     carried = (trailing & set(inventory)) - set(expected)
     if carried:
         require(draft is False, "trailing files on an unpublished release; operator cleanup required")
-        verify_present_trailing(downloaded, inventory, sha, version, tag)
+        verify_present_trailing(downloaded, inventory, sha, version, tag, work)
     for name in inventory:
         if name in carried:
             continue
@@ -1078,7 +1126,7 @@ def publish(args):
             downloaded = work / "existing"
             download_release_inventory(inventory, downloaded)
             check_existing(inventory, downloaded, expected, selected, version=version,
-                           draft=release["draft"], sha=sha, tag=tag)
+                           draft=release["draft"], sha=sha, tag=tag, work=work)
             original = snapshot_hashes(inventory, downloaded)
             # Trailing files already added stay exactly as they are.
             expected.update({name: downloaded / name for name in inventory if name not in expected})
@@ -1173,12 +1221,20 @@ def trailing_additions(selected, release, inventory, existing, work, sha, versio
     full = {**flat_local_files(output), **flat_local_files(proofs)}
     require(set(full) == tier_file_names(version, "trailing"), "staged trailing inventory mismatch")
     core_files = tier_file_names(version, "core")
+    receipt = tier_proof_names("trailing")[0]
+    bound = ""
+    if receipt in inventory:
+        try:
+            other = read_json(existing / receipt)
+            bound = f" (the release's trailing receipt names run {other.get('run_id')}/{other.get('run_attempt')})"
+        except (ProtocolError, ValueError, AttributeError):
+            bound = " (the release's trailing receipt is unreadable)"
     for name in inventory:
         if name in full:
             require(assets.sha256(existing / name) == assets.sha256(full[name]),
-                    f"existing release asset conflict: {name}")
+                    f"existing release asset conflict: {name}{bound}; operator cleanup required")
         else:
-            require(name in core_files, f"unrecognized existing release asset: {name}")
+            require(name in core_files, f"unrecognized existing release asset: {name}; operator cleanup required")
     return full
 
 
@@ -1221,7 +1277,7 @@ def recover(_args=None):
             stage_candidate(selected, output, proofs, stage_work)
             full = {**flat_local_files(output), **flat_local_files(proofs)}
             check_existing(inventory, existing, full, selected, version=version,
-                           draft=release["draft"], sha=sha, tag=tag)
+                           draft=release["draft"], sha=sha, tag=tag, work=work)
             require(SELECTION in inventory, "candidate recovery requires the existing selection receipt")
             additions = full
         else:
@@ -1258,8 +1314,10 @@ def dispatch(args):
         valid_tag(tag)
         if mode in ("promote", "assets"):
             require(path, "ARTIFACT_SELECTION_FILE is required")
-            selected = json.dumps(validate_selection(read_json(Path(path)), original=mode == "assets"),
-                                  separators=(",", ":"), sort_keys=True)
+            chosen = validate_selection(read_json(Path(path)), original=mode == "assets")
+            if mode == "promote":
+                require_promotable(chosen)
+            selected = json.dumps(chosen, separators=(",", ":"), sort_keys=True)
         else:
             require(not path and publish, "registry retry requires publication enabled and no selection")
         if mode == "assets":
