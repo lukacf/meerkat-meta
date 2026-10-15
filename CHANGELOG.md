@@ -40,18 +40,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Now `apply_operation` never runs `rkat` (on every surface), `store_path` is
   refused with `-32602` on every Flow Editor method, and a path skill is
   read only when `meta/skills/catalog` lists that file; any other path is a
-  `selected_skill_path_not_permitted` validation error. A listed file counts
-  only while its real path stays inside the skill directory it was found
-  in, and the server reads the file it checked (it compares the opened
-  file's device and inode), so a link swapped between the check and the
-  read reaches no other file. Host access is the caller's own per-call
-  `mobpack.deploy` decision, so a deny rule withholds it even beside an
-  allow rule such as `mobpack.*`. Callers with host access, and the SDKs'
-  stdio and in-process RPC, may still name such paths.
+  `selected_skill_path_not_permitted` validation error. A read requires the
+  document's path to match a listed string before it opens anything, so an
+  unlisted path (a Windows UNC share, a path on a hung mount) is refused
+  without a stat that reaches it. A listed file counts only while its real
+  path stays inside the skill directory it was found in and it has a single
+  hard link, and the server reads the file it opened (comparing the opened
+  file's device and inode), so a link swapped in after listing reaches no
+  other file. Host access is the caller's own per-call `mobpack.deploy`
+  decision, so a deny rule withholds it even beside an allow rule such as
+  `mobpack.*`. Callers with host access, and the SDKs' stdio and in-process
+  RPC, may still name such paths.
 - Importing a mobpack archive (`meta/mobpacks/import`, and the draft methods
   that re-import a stored archive) refuses an archive that expands past
-  32 MiB or holds more than 4096 entries. Before, a request under the HTTP
-  body limit could expand into gigabytes of memory.
+  32 MiB, holds more than 4096 entries, or holds a member that is not a
+  regular file. Before, a request under the HTTP body limit could expand
+  into gigabytes of memory: a member's bytes were read with no per-member
+  cap, and a GNU sparse member's zero gaps, which the tar reader synthesizes
+  in memory outside the gzip stream, were not covered by the stream cap at
+  all, so a roughly 150-byte upload declaring an 8 GiB sparse file could
+  exhaust memory.
 
 ### Breaking
 

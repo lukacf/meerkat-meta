@@ -2014,6 +2014,15 @@ mod tests {
             if advertised != expected {
                 findings.push(format!("{surface}: advertises {advertised:?}"));
             }
+            // An unadvertised method is refused by the dispatcher's own guard,
+            // not just left out of the advertisement: removing that guard
+            // serves it and fails this.
+            let unadvertised = anonymous_flow_editor_rpc(app, "meta/status", json!({})).await;
+            if unadvertised["error"]["code"] != json!(-32601) {
+                findings.push(format!(
+                    "{surface}: served unadvertised meta/status: {unadvertised}"
+                ));
+            }
             let sample = sample_docs_only_document(app).await;
             let leaking = document_with_path_skill(&sample, &secret);
             let mut swept = std::collections::BTreeSet::new();

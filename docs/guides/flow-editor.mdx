@@ -116,7 +116,7 @@ The mobpack-authoring methods:
 | `meta/mobpacks/validate` | Structural (and optional `rkat`) validation |
 | `meta/mobpacks/source` | Rendered source files (`meta/mob.toml`, …) without archive payload |
 | `meta/mobpacks/export` | `.mobpack` archive as base64 download |
-| `meta/mobpacks/import` | Import `.mobpack` / JSON / TOML (an archive may expand to at most 32 MiB and 4096 entries) |
+| `meta/mobpacks/import` | Import `.mobpack` / JSON / TOML (an archive may hold only regular files and may expand to at most 32 MiB and 4096 entries) |
 | `meta/mobpacks/deploy_command` | Preview the exact `rkat mob run` command |
 | `meta/mobpacks/deploy` | Deploy plan, or host execution when `execute: true` |
 
@@ -210,14 +210,15 @@ host path it names:
 - `store_path` is refused with `-32602` on every method. The draft store is
   the host's: `META_FLOW_EDITOR_DRAFT_STORE` or the gateway home.
 - A path skill in a document (`skill_realms` entry with `source: "path"`) is
-  read only when `meta/skills/catalog` lists that file. Any other path is a
+  read only when `meta/skills/catalog` lists that file and the document names
+  it by the listed path. Any other path is a
   `selected_skill_path_not_permitted` validation error, so source, export and
   deploy refuse the document instead of packing the file.
 - A listed file counts only while its real path stays inside the skill
-  directory it was found in: a link from a skill directory to a file outside
-  it lists nothing. The server reads the file it checked, comparing the
-  opened file's device and inode, so a path swapped between the check and
-  the read reaches no other file.
+  directory it was found in and it has a single hard link: a link from a
+  skill directory to a file outside it lists nothing. The server reads the
+  file it opened, comparing the opened file's device and inode, so a path
+  swapped between the listing and the read reaches no other file.
 
 Host access is the caller's own per-call `mobpack.deploy` decision: a deny
 rule withholds it even when an allow rule such as `mobpack.*` also matches.

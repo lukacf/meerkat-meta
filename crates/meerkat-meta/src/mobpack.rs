@@ -14564,8 +14564,19 @@ type SkillFileIdentity = (u64, u64);
 #[cfg(not(unix))]
 type SkillFileIdentity = PathBuf;
 
-/// The path skill files a caller without host access may read.
-struct ListedSkillFiles(BTreeSet<SkillFileIdentity>);
+/// The path skill files a caller without host access may read: the on-disk
+/// identities it may read, and the exact path strings that name them.
+struct ListedSkillFiles {
+    /// The device+inode (or, off unix, canonical path) of each listed file,
+    /// checked against the file a read actually opens.
+    identities: BTreeSet<SkillFileIdentity>,
+    /// Every string that names a listed file: both the catalog's discovered
+    /// path and its canonical form. A read matches the caller's exact string
+    /// against this set before it touches the path, so an unlisted path is
+    /// refused without a stat that could reach a caller-named host (a hung
+    /// mount, an automounter path, a Windows UNC share).
+    paths: BTreeSet<String>,
+}
 
 impl ListedSkillFiles {
     /// Every `SKILL.md` the skills catalog finds in a catalog directory whose
@@ -14573,46 +14584,66 @@ impl ListedSkillFiles {
     /// directory lists no file outside it), and every path skill the
     /// runtime's own definition names.
     fn from_catalog(runtime_skill_paths: &[String]) -> Self {
-        let mut identities = BTreeSet::new();
+        let mut listed = ListedSkillFiles {
+            identities: BTreeSet::new(),
+            paths: BTreeSet::new(),
+        };
         for (_, _, dir) in skill_catalog_dirs() {
             let Ok(root) = std::fs::canonicalize(&dir) else {
                 continue;
             };
-            identities.extend(
-                discover_skills_in_dir(&dir)
-                    .iter()
-                    .filter_map(|skill| skill.get("path").and_then(Value::as_str))
-                    .filter_map(|path| std::fs::canonicalize(path).ok())
-                    .filter(|real| real.starts_with(&root))
-                    .filter_map(|real| skill_file_identity(&real)),
-            );
+            for skill in discover_skills_in_dir(&dir) {
+                if let Some(path) = skill.get("path").and_then(Value::as_str) {
+                    listed.insert_listed(path, Some(&root));
+                }
+            }
         }
-        identities.extend(
-            runtime_skill_paths
-                .iter()
-                .filter_map(|path| std::fs::canonicalize(path).ok())
-                .filter_map(|real| skill_file_identity(&real)),
-        );
-        Self(identities)
+        for path in runtime_skill_paths {
+            listed.insert_listed(path, None);
+        }
+        listed
     }
 
-    /// Read the listed file that `path` names. The read opens the path once
-    /// and checks the identity of the file it opened, so a path swapped
-    /// between the check and the read yields no other file.
+    /// Record `path` as readable when it resolves to a regular file (under
+    /// `root`, for a catalog directory). The identity is taken without
+    /// following a final-component symlink swapped in after canonicalize, and
+    /// both the named and the canonical string are kept so a read can match
+    /// the caller's exact string.
+    fn insert_listed(&mut self, path: &str, root: Option<&Path>) {
+        let Ok(real) = std::fs::canonicalize(path) else {
+            return;
+        };
+        if root.is_some_and(|root| !real.starts_with(root)) {
+            return;
+        }
+        // A catalog directory is writable by the gateway user, so a hard link
+        // in one aliases a file elsewhere: a listed catalog file must have a
+        // single link. A runtime-named skill is the host's own definition.
+        let require_single_link = root.is_some();
+        let Some(identity) = skill_file_identity(&real, require_single_link) else {
+            return;
+        };
+        self.identities.insert(identity);
+        self.paths.insert(path.to_string());
+        self.paths.insert(real.to_string_lossy().into_owned());
+    }
+
+    /// Read the listed file that `path` names. The caller's exact string must
+    /// name a listed file first; only then is the path opened, and the opened
+    /// file's identity must be listed, so a path swapped between the listing
+    /// and the read yields no other file.
     #[cfg(unix)]
     fn read(&self, path: &str) -> Result<Vec<u8>, PathSkillReadError> {
         use std::os::unix::fs::MetadataExt;
-        let listed = |metadata: &std::fs::Metadata| {
-            metadata.is_file() && self.0.contains(&(metadata.dev(), metadata.ino()))
-        };
-        // Checking the path before opening it keeps the read from opening an
-        // unlisted file (a device, a FIFO) unless the path changes between.
-        if !std::fs::metadata(path).is_ok_and(|metadata| listed(&metadata)) {
+        if !self.paths.contains(path) {
             return Err(PathSkillReadError::NotListed);
         }
         let mut file =
             open_skill_file(Path::new(path)).map_err(|_| PathSkillReadError::NotListed)?;
-        if !file.metadata().is_ok_and(|metadata| listed(&metadata)) {
+        let listed = file.metadata().is_ok_and(|metadata| {
+            metadata.is_file() && self.identities.contains(&(metadata.dev(), metadata.ino()))
+        });
+        if !listed {
             return Err(PathSkillReadError::NotListed);
         }
         let mut bytes = Vec::new();
@@ -14624,8 +14655,11 @@ impl ListedSkillFiles {
     /// Read the listed file that `path` names, from the real path checked.
     #[cfg(not(unix))]
     fn read(&self, path: &str) -> Result<Vec<u8>, PathSkillReadError> {
+        if !self.paths.contains(path) || is_refused_windows_path(path) {
+            return Err(PathSkillReadError::NotListed);
+        }
         let real = std::fs::canonicalize(path).map_err(|_| PathSkillReadError::NotListed)?;
-        if !self.0.contains(&real) {
+        if !self.identities.contains(&real) {
             return Err(PathSkillReadError::NotListed);
         }
         std::fs::read(&real).map_err(PathSkillReadError::Unreadable)
@@ -14633,30 +14667,47 @@ impl ListedSkillFiles {
 }
 
 #[cfg(unix)]
-fn skill_file_identity(real: &Path) -> Option<SkillFileIdentity> {
+fn skill_file_identity(real: &Path, require_single_link: bool) -> Option<SkillFileIdentity> {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(real)
-        .ok()
-        .filter(std::fs::Metadata::is_file)
-        .map(|metadata| (metadata.dev(), metadata.ino()))
+    // `symlink_metadata` (lstat) so a final-component symlink swapped in after
+    // canonicalize is seen as a symlink, not followed a second time to its
+    // target.
+    let metadata = std::fs::symlink_metadata(real).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    if require_single_link && metadata.nlink() != 1 {
+        return None;
+    }
+    Some((metadata.dev(), metadata.ino()))
 }
 
 #[cfg(not(unix))]
-fn skill_file_identity(real: &Path) -> Option<SkillFileIdentity> {
-    std::fs::metadata(real)
+fn skill_file_identity(real: &Path, _require_single_link: bool) -> Option<SkillFileIdentity> {
+    std::fs::symlink_metadata(real)
         .ok()
         .filter(std::fs::Metadata::is_file)
         .map(|_| real.to_path_buf())
 }
 
-/// Open a skill file without blocking, so a path swapped to a FIFO after the
-/// check cannot hang the read.
+/// A UNC or device path (`\\server\share`, `\\?\`, `\\.\`, or their
+/// forward-slash forms) reaches a caller-named host or device. A listed skill
+/// path is never one, so refuse it before canonicalize touches it.
+#[cfg(not(unix))]
+fn is_refused_windows_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.starts_with(br"\\") || bytes.starts_with(b"//")
+}
+
+/// Open a skill file without blocking or taking a controlling terminal, so a
+/// path swapped to a FIFO or terminal device after listing cannot hang the
+/// read. The opened file's identity is checked before any bytes are read.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_skill_file(path: &Path) -> std::io::Result<std::fs::File> {
     use rustix::fs::{Mode, OFlags};
     let fd = rustix::fs::open(
         path,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOCTTY,
         Mode::empty(),
     )?;
     Ok(std::fs::File::from(fd))
@@ -14893,17 +14944,78 @@ struct MobpackArchiveMembers {
     manifest_toml: Option<String>,
 }
 
-fn read_mobpack_archive_members(expanded: impl Read) -> Result<MobpackArchiveMembers, String> {
-    let mut archive = tar::Archive::new(expanded);
+/// A sentinel the archive byte budget raises; mapped back to the size refusal
+/// whatever tar layer surfaces it (an entry read, a long-name/pax read).
+const MOBPACK_ARCHIVE_BUDGET_SENTINEL: &str = "mobpack-archive-byte-budget-exceeded";
+
+/// A reader that refuses once it has yielded `remaining` bytes. Every byte the
+/// tar reader pulls from the decompressed stream - entry headers, GNU long
+/// names, pax extensions and regular file content - passes through it, so a
+/// small upload cannot inflate the stream without bound before a member is
+/// even yielded. (The gzip layer alone does not: the tar crate synthesizes a
+/// GNU sparse member's zero gaps in memory, outside this stream.)
+struct ArchiveBudgetReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: Read> Read for ArchiveBudgetReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                MOBPACK_ARCHIVE_BUDGET_SENTINEL,
+            ));
+        }
+        let cap = usize::try_from(self.remaining)
+            .unwrap_or(usize::MAX)
+            .min(buf.len());
+        let read = self.inner.read(&mut buf[..cap])?;
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
+
+fn mobpack_archive_too_large() -> String {
+    format!(
+        "mobpack archive expands past {} MiB; refusing to import it",
+        MOBPACK_ARCHIVE_MAX_EXPANDED_BYTES >> 20
+    )
+}
+
+/// Normalize a tar read error: the byte-budget sentinel from any layer becomes
+/// the size refusal; anything else keeps `context`.
+fn map_archive_read_error(context: &str, err: std::io::Error) -> String {
+    if err.to_string().contains(MOBPACK_ARCHIVE_BUDGET_SENTINEL) {
+        mobpack_archive_too_large()
+    } else {
+        format!("{context}: {err}")
+    }
+}
+
+fn read_mobpack_archive_members(decoded: impl Read) -> Result<MobpackArchiveMembers, String> {
+    let budgeted = ArchiveBudgetReader {
+        inner: decoded,
+        remaining: MOBPACK_ARCHIVE_MAX_EXPANDED_BYTES,
+    };
+    let mut archive = tar::Archive::new(budgeted);
     let mut members = MobpackArchiveMembers {
         files: BTreeMap::new(),
         editor_json: None,
         mob_toml: None,
         manifest_toml: None,
     };
+    // A second budget, over the bytes each member materializes: a member whose
+    // data the tar layer synthesizes (a GNU sparse map's zero gaps) never
+    // passes the stream budget, so every member is read through this shared
+    // remainder too.
+    let mut materialized = MOBPACK_ARCHIVE_MAX_EXPANDED_BYTES;
     for (index, entry) in archive
         .entries()
-        .map_err(|err| format!("invalid mobpack archive: {err}"))?
+        .map_err(|err| map_archive_read_error("invalid mobpack archive", err))?
         .enumerate()
     {
         if index == MOBPACK_ARCHIVE_MAX_ENTRIES {
@@ -14912,16 +15024,40 @@ fn read_mobpack_archive_members(expanded: impl Read) -> Result<MobpackArchiveMem
                  to import it"
             ));
         }
-        let mut entry = entry.map_err(|err| format!("invalid mobpack archive entry: {err}"))?;
+        let mut entry =
+            entry.map_err(|err| map_archive_read_error("invalid mobpack archive entry", err))?;
+        let entry_type = entry.header().entry_type();
         let path = entry
             .path()
             .map_err(|err| format!("invalid mobpack archive path: {err}"))?
             .to_string_lossy()
             .to_string();
+        // A mobpack holds regular files. A directory member carries no data;
+        // skip it. Anything else - a symlink or hard link naming a host path,
+        // a device or fifo, a GNU sparse map that synthesizes its bytes - is
+        // refused rather than read.
+        if entry_type.is_dir() {
+            continue;
+        }
+        if !entry_type.is_file() {
+            return Err(format!(
+                "mobpack archive member {path} is not a regular file ({entry_type:?}); refusing \
+                 to import it"
+            ));
+        }
         let mut bytes = Vec::new();
-        entry
+        // +1 so a member that exactly fills the remainder is told from one
+        // that overruns it.
+        (&mut entry)
+            .take(materialized + 1)
             .read_to_end(&mut bytes)
-            .map_err(|err| format!("failed to read archive member {path}: {err}"))?;
+            .map_err(|err| {
+                map_archive_read_error(&format!("failed to read archive member {path}"), err)
+            })?;
+        if bytes.len() as u64 > materialized {
+            return Err(mobpack_archive_too_large());
+        }
+        materialized -= bytes.len() as u64;
         if matches!(
             path.as_str(),
             "meta/editor.json" | "meta/mob.toml" | "manifest.toml"
@@ -14941,21 +15077,12 @@ fn read_mobpack_archive_members(expanded: impl Read) -> Result<MobpackArchiveMem
 }
 
 fn document_from_archive_bytes(bytes: &[u8]) -> Result<MobpackDocument, String> {
-    // One byte over the cap tells an archive at the cap from a larger one.
-    let mut expanded = GzDecoder::new(bytes).take(MOBPACK_ARCHIVE_MAX_EXPANDED_BYTES + 1);
-    let members = read_mobpack_archive_members(&mut expanded);
-    if expanded.limit() == 0 {
-        return Err(format!(
-            "mobpack archive expands past {} MiB; refusing to import it",
-            MOBPACK_ARCHIVE_MAX_EXPANDED_BYTES >> 20
-        ));
-    }
     let MobpackArchiveMembers {
         files,
         editor_json,
         mob_toml,
         manifest_toml,
-    } = members?;
+    } = read_mobpack_archive_members(GzDecoder::new(bytes))?;
     // A predecessor (pre-0.9) export keeps its editor document under the
     // predecessor archive directory. Reading on without it would import an
     // empty or layout-less document, so it refuses and names the move.
@@ -35864,59 +35991,68 @@ branch = "choice"
         );
     }
 
-    /// Security regression: the allowlist check and the read see one file.
-    /// A path that resolves through a symlink to an unlisted file is refused,
-    /// and a symlink swapped between a listed file and an unlisted one while
-    /// reads run never yields the unlisted file's bytes.
+    /// Set in the child process of the swapped-symlink test, to its scratch
+    /// directory.
+    #[cfg(unix)]
+    const SWAPPED_LINK_CHILD: &str = "META_TEST_SWAPPED_SKILL_LINK";
+
+    /// Security regression: the allowlist check and the read see one file. A
+    /// listed skill path whose on-disk target is swapped between the listed
+    /// file and a secret, while reads run, never yields the secret's bytes:
+    /// the read opens the path and checks the opened file's identity, so it
+    /// reads the listed file or refuses, never the secret.
     #[cfg(unix)]
     #[test]
     fn untrusted_path_skill_reads_never_follow_a_swapped_symlink_to_an_unlisted_file() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let secret = dir.path().join("id_secret");
-        std::fs::write(&secret, "SWAPPED-LINK-SECRET-27af").expect("write secret");
-        let listed = catalog_listed_skill_file();
-        let listed_bytes = std::fs::read(&listed).expect("listed skill file");
-        let link = dir.path().join("SKILL.md");
-        std::os::unix::fs::symlink(&secret, &link).expect("link to the secret");
-        let document = document_selecting_path_skill(&link);
+        if let Some(scratch) = std::env::var_os(SWAPPED_LINK_CHILD) {
+            let scratch = PathBuf::from(scratch);
+            let listed_file = scratch.join("skills/probe/real.md");
+            let listed_bytes = std::fs::read(&listed_file).expect("listed file");
+            let secret = scratch.join("id_secret");
+            let skill_md = scratch.join("skills/probe/SKILL.md");
+            let skill_md_str = skill_md.to_string_lossy().to_string();
 
-        let through_link =
-            with_untrusted_path_skill_reads(None, || selected_path_skill_files(&document));
-        assert_eq!(refused_as_unlisted(through_link), Err(true));
+            // Build the allowlist once, while SKILL.md names the listed file,
+            // so the listed file's identity and path string are recorded.
+            let listed = ListedSkillFiles::from_catalog(&[]);
+            assert_eq!(
+                listed.read(&skill_md_str).ok(),
+                Some(listed_bytes.clone()),
+                "the listed skill was not readable before the race"
+            );
 
-        let stop = Arc::new(AtomicBool::new(false));
-        let swapper = {
-            let stop = Arc::clone(&stop);
-            let staged = dir.path().join("SKILL.md.next");
-            std::thread::spawn(move || {
-                let mut swaps = 0_u64;
-                while !stop.load(Ordering::Relaxed) {
-                    let target = if swaps.is_multiple_of(2) {
-                        &listed
-                    } else {
-                        &secret
-                    };
-                    let _ = std::fs::remove_file(&staged);
-                    if std::os::unix::fs::symlink(target, &staged).is_ok()
-                        && std::fs::rename(&staged, &link).is_ok()
-                    {
-                        swaps += 1;
+            let stop = Arc::new(AtomicBool::new(false));
+            let swapper = {
+                let stop = Arc::clone(&stop);
+                let staged = scratch.join("skills/probe/SKILL.md.next");
+                // Moved in: none of these is used after the swapper starts.
+                std::thread::spawn(move || {
+                    let mut swaps = 0_u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let target = if swaps.is_multiple_of(2) {
+                            &listed_file
+                        } else {
+                            &secret
+                        };
+                        let _ = std::fs::remove_file(&staged);
+                        if std::os::unix::fs::symlink(target, &staged).is_ok()
+                            && std::fs::rename(&staged, &skill_md).is_ok()
+                        {
+                            swaps += 1;
+                        }
                     }
-                }
-                swaps
-            })
-        };
-        let (mut leaked, mut listed_reads, mut refused) = (0_u32, 0_u32, 0_u32);
-        let started = std::time::Instant::now();
-        with_untrusted_path_skill_reads(None, || {
+                    swaps
+                })
+            };
+
+            let (mut leaked, mut listed_reads, mut refused) = (0_u32, 0_u32, 0_u32);
+            let started = std::time::Instant::now();
             for round in 1_u32.. {
-                match selected_path_skill_files(&document) {
-                    Ok(files) if files.values().any(|bytes| bytes == &listed_bytes) => {
-                        listed_reads += 1;
-                    }
+                match listed.read(&skill_md_str) {
+                    Ok(bytes) if bytes == listed_bytes => listed_reads += 1,
                     Ok(_) => leaked += 1,
                     Err(_) => refused += 1,
                 }
@@ -35927,18 +36063,47 @@ branch = "choice"
                     break;
                 }
             }
-        });
-        stop.store(true, Ordering::Relaxed);
-        let swaps = swapper.join().expect("swapper thread");
+            stop.store(true, Ordering::Relaxed);
+            let swaps = swapper.join().expect("swapper thread");
 
-        assert_eq!(
-            leaked, 0,
-            "an unlisted file was read ({listed_reads} listed reads, {refused} refusals, \
-             {swaps} swaps)"
-        );
+            assert_eq!(
+                leaked, 0,
+                "the secret was read ({listed_reads} listed reads, {refused} refusals, \
+                 {swaps} swaps)"
+            );
+            assert!(
+                listed_reads > 0 && refused > 0,
+                "{listed_reads} listed reads, {refused} refusals, {swaps} swaps"
+            );
+            return;
+        }
+
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let probe = scratch.path().join("skills/probe");
+        std::fs::create_dir_all(&probe).expect("probe skill dir");
+        std::fs::write(probe.join("real.md"), "LISTED-SKILL-ab12").expect("listed file");
+        std::os::unix::fs::symlink(probe.join("real.md"), probe.join("SKILL.md"))
+            .expect("skill link to the listed file");
+        std::fs::write(scratch.path().join("id_secret"), "SWAPPED-LINK-SECRET-27af")
+            .expect("secret");
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "mobpack::tests::untrusted_path_skill_reads_never_follow_a_swapped_symlink_to_an_unlisted_file",
+                "--exact",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(SWAPPED_LINK_CHILD, scratch.path())
+            .env("META_SKILL_DIRS", scratch.path().join("skills"))
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            listed_reads > 0 && refused > 0,
-            "{listed_reads} listed reads, {refused} refusals, {swaps} swaps"
+            output.status.success() && stdout.contains("1 passed"),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
@@ -36018,8 +36183,9 @@ branch = "choice"
     }
 
     /// Security regression: importing an archive stops at a fixed expanded
-    /// size and entry count, so a small upload cannot expand into gigabytes
-    /// of memory.
+    /// size and entry count, refuses a member that is not a regular file, and
+    /// never materializes a GNU sparse member's synthesized gaps, so a small
+    /// upload cannot expand into gigabytes of memory.
     #[test]
     fn archive_import_refuses_archives_past_the_expansion_caps() {
         let mut document = document_with_real_launch_modes();
@@ -36068,6 +36234,92 @@ branch = "choice"
                 crowd.map_err(|error| error.contains("more than")),
             ),
             (Err(true), Err(true))
+        );
+
+        // Build a gzipped tar whose first member is `header`/`data` and whose
+        // remaining members are the valid files, then import it. A member that
+        // is not a regular file must be refused; a GNU sparse member whose map
+        // declares 8 GiB of zeros must never be materialized.
+        let import_leading_member = |header: Header, name: &str, data: &[u8]| {
+            let mut builder = Builder::new(Vec::new());
+            let mut header = header;
+            builder
+                .append_data(&mut header, name, data)
+                .expect("append leading member");
+            for (path, bytes) in &files {
+                let mut file_header = Header::new_gnu();
+                file_header.set_size(bytes.len() as u64);
+                file_header.set_mode(0o644);
+                file_header.set_cksum();
+                builder
+                    .append_data(&mut file_header, path, bytes.as_slice())
+                    .expect("append file");
+            }
+            let tar_bytes = builder.into_inner().expect("finish tar");
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(&tar_bytes).expect("gzip");
+            let gz = encoder.finish().expect("finish gzip");
+            let gz_len = gz.len();
+            (
+                gz_len,
+                import_mobpack(&json!({
+                    "content_base64": base64::engine::general_purpose::STANDARD.encode(&gz)
+                })),
+            )
+        };
+
+        let symlink = {
+            let mut header = Header::new_gnu();
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_link_name("/etc/passwd").expect("symlink target");
+            import_leading_member(header, "skills/link.md", &[]).1
+        };
+        let hard_link = {
+            let mut header = Header::new_gnu();
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::Link);
+            header
+                .set_link_name("/etc/passwd")
+                .expect("hard link target");
+            import_leading_member(header, "skills/hard.md", &[]).1
+        };
+        let device = {
+            let mut header = Header::new_gnu();
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::Char);
+            import_leading_member(header, "skills/device.md", &[]).1
+        };
+        // A GNU sparse member: one block of a single real byte at offset 8 GiB,
+        // so its map declares 8 GiB + 1 bytes the tar reader fills with zeros.
+        let sparse_bytes = 8 * 1024 * 1024 * 1024 + 1;
+        let (sparse_len, sparse) = {
+            let mut header = Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(1);
+            header.set_entry_type(tar::EntryType::GNUSparse);
+            {
+                let gnu = header.as_gnu_mut().expect("gnu header");
+                gnu.sparse[0].set_offset(sparse_bytes - 1);
+                gnu.sparse[0].set_length(1);
+                gnu.isextended[0] = 0;
+                gnu.set_real_size(sparse_bytes);
+            }
+            import_leading_member(header, "skills/sparse.md", &[0])
+        };
+
+        assert!(
+            sparse_len < 1 << 20,
+            "the sparse archive is {sparse_len} bytes"
+        );
+        assert_eq!(
+            (
+                symlink.map_err(|error| error.contains("not a regular file")),
+                hard_link.map_err(|error| error.contains("not a regular file")),
+                device.map_err(|error| error.contains("not a regular file")),
+                sparse.is_err(),
+            ),
+            (Err(true), Err(true), Err(true), true)
         );
     }
 }
