@@ -421,9 +421,9 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(built, ran)
 
     def test_no_job_caps_build_parallelism(self):
-        """A CARGO_BUILD_JOBS cap shrinks rustc's jobserver too, so it halved
-        LLVM codegen on the crates that bound the build. The dev-profile jobs
-        run uncapped, like the rest of the workflow."""
+        """A CARGO_BUILD_JOBS cap throttled the dependency graph of the four
+        jobs that carried it. The dev-profile jobs run uncapped, like the
+        rest of the workflow."""
         code = [line for line in CI_WORKFLOW.read_text().splitlines() if not line.strip().startswith("#")]
         self.assertEqual([line for line in code if "CARGO_BUILD_JOBS" in line], [])
         self.assertEqual([line for line in code if re.search(r"repo-cargo .*(\s-j\s*\d|--jobs)", line)], [])

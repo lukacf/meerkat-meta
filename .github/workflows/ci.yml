@@ -51,11 +51,12 @@ env:
   # No job caps CARGO_BUILD_JOBS. test-voice, voice-clippy,
   # test-extension-state and extension-state-lint carried a cap of 2 copied
   # from release.yml's release-profile memory limit, while every other job
-  # builds the same crates in the dev profile at the runner's 4. Cargo hands
-  # rustc its jobserver, so the cap also halved LLVM's codegen threads on the
-  # crates that bound the build (meerkat-mob, meerkat-meta): in run
-  # 38714502600 test-voice spent 19m06 on Meerkat Core and 14m22 on
-  # meerkat-meta, against 14-18 and 6-7 in the uncapped console jobs.
+  # builds the same crates in the dev profile at the runner's 4. The cap
+  # throttled the dependency graph: capped, test-voice spent 19m06 on Meerkat
+  # Core alone (run 38714502600); uncapped and with no cache at all, it
+  # compiled all 472 crates, third-party ones included, in 19m42 (run
+  # 38729784563). meerkat-meta itself did not get faster (14m22 capped,
+  # 13m36 uncapped): its test harness is one rustc process.
 
 jobs:
   # Decides which lanes of Rust, console, SDK and example jobs this run
