@@ -30,6 +30,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reads path skills only from files the skills catalog lists, unless it runs
   them under the new `meerkat_meta::with_host_path_skill_reads`. The SDKs'
   stdio and in-process JSON-RPC read as the host, as before.
+- Behaviour-only (not measured by the semver gate): the agent-memory
+  recorder's `memory` tool now names the memory operation each call performs,
+  with Meerkat 0.9.2's typed operation targets. Every plan it resolves carries
+  its own witness with `ToolOperationTarget::MemoryOperation`: `remember` and
+  `update` are a `Write`, `forget` a `Delete` and `recall` a `Read` of the
+  member's identity scope, and `propose_to_mob` a `Propose` to its mob scope.
+  The scope is always the one the recorder pinned when the member was built,
+  never one taken from the call's arguments. A host operation policy that
+  mapped the `memory` tool as an operation without a target now receives
+  that target, and under a targeted grant basis the tool uses only the
+  lineage selected for its memory scope, never the base lineage. Stock
+  governed realms keep refusing it, as they did while it had no target.
+- Behaviour-only: under governed work the `memory` tool reads or writes
+  memory only when the dispatch's prepared authorization names exactly the
+  operation the call performs. A wrapper that forwards its
+  `dispatch_with_context` but resolves its own plan without that target, or
+  with another scope's, is refused with `authorization_refused` (malformed
+  facts) before any memory access, and a plan the recorder did not resolve
+  for the call's own operation is refused as `ExecutionOwnerChanged`.
+  Forward `resolve_execution_plan` and `dispatch_resolved_with_context` to
+  the recorder instead. Ungoverned dispatch is unchanged.
+- Behaviour-only: in a session, a `memory` call with an unknown action, or
+  `propose_to_mob` from a member that is not in a mob, now fails at plan
+  resolution with `invalid_arguments` and the same reason, where the tool
+  returned it as an error result.
 
 ### Security
 
@@ -204,6 +229,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   build copies both files into `crates/meerkat-meta/console-dist/`, and
   `npm --prefix console run embedded:freshness` fails when a copy differs
   from its console source.
+- `MemoryScope::operation_scope_ref` and `AGENT_MEMORY_TARGET_OWNER`
+  (`meerkat_meta::memory`): the typed reference by which Meta's memory tools
+  name a memory scope in operation targets, `MemoryScopeRef::Host` with owner
+  `meta.agent_memory` and scope `<kind>/<realm>/<key>`, where every `%` in
+  the realm and key is written `%25` and every `/` is written `%2F`. A host
+  operation policy maps it to its own action, and a targeted grant selects
+  one lineage for exactly that scope. The format is a stored contract (work
+  associations persist it as the grant target of memory operations) and will
+  not change; `operation_scope_ref` documents it in full.
+- Meta's mob session wrappers forward Meerkat's `tool_catalog_view` query to
+  the session service they wrap, like its tool-scope siblings, instead of
+  answering that no view is available. An embedder's own session-service
+  wrapper must forward `tool_catalog_view` as well: Meerkat's default
+  implementation reports no view, so a wrapper that leaves it out hides the
+  wrapped session's catalog view.
 
 ### Changed
 

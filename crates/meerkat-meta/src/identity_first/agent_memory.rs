@@ -1116,6 +1116,34 @@ impl MemoryRecorder {
         }
     }
 
+    fn mob_scope(&self) -> Option<MemoryScope> {
+        self.mob.as_ref().map(|mob| MemoryScope::Mob {
+            realm: self.config.realm.clone(),
+            mob: mob.clone(),
+        })
+    }
+
+    /// The typed memory operation a `memory` call with `action` performs:
+    /// that action on a scope this recorder pinned at build time (the
+    /// member's identity scope, or its mob scope for `propose_to_mob`),
+    /// never a scope named by the call's arguments.
+    fn operation_target(&self, action: &str) -> Result<meerkat_core::ToolOperationTarget, String> {
+        let (scope, operation) = match action {
+            "remember" | "update" => (self.identity_scope(), meerkat_core::MemoryOperation::Write),
+            "forget" => (self.identity_scope(), meerkat_core::MemoryOperation::Delete),
+            "recall" => (self.identity_scope(), meerkat_core::MemoryOperation::Read),
+            "propose_to_mob" => (
+                self.mob_scope().ok_or_else(propose_outside_mob)?,
+                meerkat_core::MemoryOperation::Propose,
+            ),
+            other => return Err(unknown_memory_action(other)),
+        };
+        Ok(meerkat_core::ToolOperationTarget::MemoryOperation {
+            scope: scope.operation_scope_ref(),
+            operation,
+        })
+    }
+
     fn author(&self) -> crate::memory::records::MemoryAuthor {
         crate::memory::records::MemoryAuthor::Agent {
             identity: self.identity.as_str().to_string(),
@@ -1322,15 +1350,8 @@ impl MemoryRecorder {
                 serde_json::to_string_pretty(&rendered).map_err(|err| err.to_string())
             }
             "propose_to_mob" => {
-                let mob = self.mob.as_deref().ok_or_else(|| {
-                    "propose_to_mob is unavailable: this member is not running inside a mob"
-                        .to_string()
-                })?;
+                let scope = self.mob_scope().ok_or_else(propose_outside_mob)?;
                 let record = self.new_record(&args, "propose_to_mob")?;
-                let scope = MemoryScope::Mob {
-                    realm: self.config.realm.clone(),
-                    mob: mob.to_string(),
-                };
                 // §10.1: the store consults the LLM write gate at propose
                 // time and persists the taint fact on the proposal row; a
                 // tainted proposal's steward "accept" downgrades to an
@@ -1345,12 +1366,19 @@ impl MemoryRecorder {
                      and commit it before it becomes shared memory."
                 ))
             }
-            other => Err(format!(
-                "unknown action '{other}' (expected remember, update, forget, recall, or \
-                 propose_to_mob)"
-            )),
+            other => Err(unknown_memory_action(other)),
         }
     }
+}
+
+fn propose_outside_mob() -> String {
+    "propose_to_mob is unavailable: this member is not running inside a mob".to_string()
+}
+
+fn unknown_memory_action(action: &str) -> String {
+    format!(
+        "unknown action '{action}' (expected remember, update, forget, recall, or propose_to_mob)"
+    )
 }
 
 /// Per-build tool dispatcher composing the Recorder over whatever external
@@ -1365,7 +1393,13 @@ pub(crate) struct RecorderToolDispatcher {
     inner: Option<Arc<dyn meerkat_core::agent::AgentToolDispatcher>>,
     tools: Arc<[Arc<meerkat_core::ToolDef>]>,
     recorder: MemoryRecorder,
+    /// The `memory` tool's execution owner: every plan this recorder
+    /// resolves for it carries this key's witness with the call's typed
+    /// memory operation target, and only such a plan dispatches.
+    execution_authority_key: String,
 }
+
+static NEXT_RECORDER_EXECUTION_AUTHORITY_ID: AtomicU64 = AtomicU64::new(1);
 
 impl RecorderToolDispatcher {
     fn wrapped_owner(
@@ -1375,6 +1409,37 @@ impl RecorderToolDispatcher {
         (tool_name != MEMORY_TOOL_NAME)
             .then_some(self.inner.as_ref())
             .flatten()
+    }
+
+    /// The typed memory operation the `memory` call performs, from its
+    /// parsed action and the recorder's pinned scopes.
+    fn memory_operation_target(
+        &self,
+        call: meerkat_core::types::ToolCallView<'_>,
+    ) -> Result<meerkat_core::ToolOperationTarget, String> {
+        let args: MemoryToolArgs = call.parse_args().map_err(|err| err.to_string())?;
+        self.recorder.operation_target(&args.action)
+    }
+
+    /// Whether this recorder resolved `plan` for exactly the `memory` call's
+    /// current operation target and the tool's current binding.
+    fn resolved_here(
+        &self,
+        call: meerkat_core::types::ToolCallView<'_>,
+        plan: &meerkat_core::ResolvedToolExecutionPlan,
+    ) -> bool {
+        let (Ok(target), Ok(binding)) = (
+            self.memory_operation_target(call),
+            meerkat_core::AgentToolDispatcher::execution_binding_fingerprint(self, call.name),
+        ) else {
+            return false;
+        };
+        plan.owner_witness(&self.execution_authority_key)
+            .is_some_and(|witness| {
+                witness.owner_key() == call.name
+                    && witness.binding_fingerprint() == &binding
+                    && witness.operation_target() == Some(&target)
+            })
     }
 
     pub(crate) fn new(
@@ -1400,6 +1465,10 @@ impl RecorderToolDispatcher {
             inner,
             tools: tools.into(),
             recorder,
+            execution_authority_key: format!(
+                "meta:agent-memory-recorder:{}",
+                NEXT_RECORDER_EXECUTION_AUTHORITY_ID.fetch_add(1, Ordering::Relaxed)
+            ),
         }
     }
 }
@@ -1477,6 +1546,10 @@ impl meerkat_core::agent::AgentToolDispatcher for RecorderToolDispatcher {
         ))
     }
 
+    /// A `memory` plan carries this recorder's witness with the call's typed
+    /// memory operation target (`MemoryRecorder::operation_target`). A call
+    /// whose action names no operation of a pinned scope (an unknown action,
+    /// or `propose_to_mob` outside a mob) resolves no plan.
     fn resolve_execution_plan(
         &self,
         call: meerkat_core::types::ToolCallView<'_>,
@@ -1494,10 +1567,22 @@ impl meerkat_core::agent::AgentToolDispatcher for RecorderToolDispatcher {
             .ok_or_else(|| meerkat_core::ToolExecutionResolutionError::NotFound {
                 tool_name: call.name.to_string(),
             })?;
+        let target = self.memory_operation_target(call).map_err(|reason| {
+            meerkat_core::ToolExecutionResolutionError::InvalidArguments {
+                tool_name: call.name.to_string(),
+                reason,
+            }
+        })?;
+        let witness = meerkat_core::ToolExecutionOwnerWitness::new(
+            self.execution_authority_key.clone(),
+            call.name,
+            meerkat_core::ephemeral_tool_catalog_binding_fingerprint(entry),
+        )?
+        .with_operation_target(target);
         entry
             .execution
-            .resolve_default(resolution_context.deadlines().clone())
-            .map_err(Into::into)
+            .resolve_default(resolution_context.deadlines().clone())?
+            .with_owner_witness(witness)
     }
 
     fn validate_resolved_execution_plan(
@@ -1538,6 +1623,14 @@ impl meerkat_core::agent::AgentToolDispatcher for RecorderToolDispatcher {
             return Err(meerkat_core::ToolError::unavailable(
                 call.name,
                 meerkat_core::ToolUnavailableReason::ExecutionModeOwnerUnavailable,
+            ));
+        }
+        // Only a plan this recorder resolved for exactly this call's memory
+        // target: a plan resolved for another action or scope never writes.
+        if call.name == MEMORY_TOOL_NAME && !self.resolved_here(call, plan) {
+            return Err(meerkat_core::ToolError::unavailable(
+                call.name,
+                meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
             ));
         }
         self.dispatch_with_context(call, context).await
@@ -1617,6 +1710,15 @@ impl meerkat_core::agent::AgentToolDispatcher for RecorderToolDispatcher {
                     name: MEMORY_TOOL_NAME.to_string(),
                     reason: err.to_string(),
                 })?;
+        // Governed work reaches memory only when its prepared authorization
+        // names exactly this call's memory operation, so a wrapper that
+        // forwards this dispatch but resolved its own plan never writes.
+        // Ungoverned dispatch is unchanged.
+        context.require_authorized_operation_target(call, || {
+            self.recorder
+                .operation_target(&args.action)
+                .map_err(|reason| meerkat_core::ToolError::invalid_arguments(call.name, reason))
+        })?;
         let (text, is_error) = match self.recorder.handle(args).await {
             Ok(text) => (text, false),
             Err(text) => (text, true),
@@ -3323,6 +3425,441 @@ memory = false
         .await?;
         assert!(is_error);
         assert!(text.contains("unknown action"), "{text}");
+        Ok(())
+    }
+
+    // ---- Recorder typed memory targets ----
+
+    /// A recorder pinned to the test identity, with no wrapped tools.
+    fn pinned_recorder(
+        provider: Arc<dyn AgentMemoryProvider>,
+        mob: Option<&str>,
+    ) -> Result<Arc<dyn AgentToolDispatcher>, Box<dyn Error>> {
+        Ok(Arc::new(RecorderToolDispatcher::new(
+            None,
+            MemoryRecorder::new(
+                provider,
+                AgentMemoryConfig::default(),
+                identity()?,
+                mob.map(str::to_string),
+            ),
+        )))
+    }
+
+    fn own_identity_scope() -> MemoryScope {
+        MemoryScope::Identity {
+            realm: DEFAULT_REALM.to_string(),
+            identity: "identity:luka".to_string(),
+        }
+    }
+
+    fn memory_target(
+        scope: &MemoryScope,
+        operation: meerkat_core::MemoryOperation,
+    ) -> meerkat_core::ToolOperationTarget {
+        meerkat_core::ToolOperationTarget::MemoryOperation {
+            scope: scope.operation_scope_ref(),
+            operation,
+        }
+    }
+
+    fn plan_targets(
+        plan: &meerkat_core::ResolvedToolExecutionPlan,
+    ) -> Vec<meerkat_core::ToolOperationTarget> {
+        plan.owner_witnesses()
+            .iter()
+            .filter_map(|witness| witness.operation_target().cloned())
+            .collect()
+    }
+
+    fn memory_args(
+        args: &serde_json::Value,
+    ) -> Result<Box<serde_json::value::RawValue>, Box<dyn Error>> {
+        Ok(serde_json::value::RawValue::from_string(args.to_string())?)
+    }
+
+    fn memory_call<'a>(
+        id: &'a str,
+        args: &'a serde_json::value::RawValue,
+    ) -> meerkat_core::types::ToolCallView<'a> {
+        meerkat_core::types::ToolCallView {
+            id,
+            name: MEMORY_TOOL_NAME,
+            args,
+        }
+    }
+
+    async fn identity_records(
+        provider: &Arc<dyn AgentMemoryProvider>,
+    ) -> Result<Vec<AgentMemoryRecord>, Box<dyn Error>> {
+        Ok(provider
+            .recall(AgentMemoryRecallRequest {
+                identity: identity()?,
+                realm: DEFAULT_REALM.to_string(),
+                query_text: None,
+                query_terms: Vec::new(),
+                selection: AgentMemorySelection::Always,
+                max_entries: 8,
+            })
+            .await?)
+    }
+
+    /// Every `memory` plan names exactly the memory operation its action
+    /// performs, on the scope the recorder pinned at build time. A call that
+    /// names no operation of a pinned scope resolves no plan, and the
+    /// arguments cannot name a scope.
+    #[tokio::test]
+    async fn recorder_plans_name_the_memory_operation_of_their_pinned_scope()
+    -> Result<(), Box<dyn Error>> {
+        use crate::tool_application_test_support::resolution;
+        use meerkat_core::MemoryOperation;
+
+        let dir = tempfile::tempdir()?;
+        let provider: Arc<dyn AgentMemoryProvider> =
+            Arc::new(SqliteAgentMemoryStore::open(dir.path())?);
+        let in_mob = pinned_recorder(Arc::clone(&provider), Some("team"))?;
+        let identity_scope = own_identity_scope();
+        let mob_scope = MemoryScope::Mob {
+            realm: DEFAULT_REALM.to_string(),
+            mob: "team".to_string(),
+        };
+        let context = meerkat_core::ToolDispatchContext::default();
+        for (args, expected) in [
+            (
+                serde_json::json!({"action": "remember", "title": "t", "body": "b"}),
+                memory_target(&identity_scope, MemoryOperation::Write),
+            ),
+            (
+                serde_json::json!({
+                    "action": "update",
+                    "memory_id": "mem-1",
+                    "title": "t",
+                    "body": "b",
+                }),
+                memory_target(&identity_scope, MemoryOperation::Write),
+            ),
+            (
+                serde_json::json!({"action": "forget", "memory_id": "mem-1"}),
+                memory_target(&identity_scope, MemoryOperation::Delete),
+            ),
+            (
+                serde_json::json!({"action": "recall", "query_text": "anything"}),
+                memory_target(&identity_scope, MemoryOperation::Read),
+            ),
+            (
+                serde_json::json!({"action": "propose_to_mob", "title": "t", "body": "b"}),
+                memory_target(&mob_scope, MemoryOperation::Propose),
+            ),
+        ] {
+            let raw = memory_args(&args)?;
+            let plan = in_mob.resolve_execution_plan(
+                memory_call("call-1", &raw),
+                &context,
+                &resolution(),
+            )?;
+            assert_eq!(plan_targets(&plan), vec![expected], "{args}");
+        }
+
+        let solo = pinned_recorder(provider, None)?;
+        for (dispatcher, args, reason) in [
+            (
+                &solo,
+                serde_json::json!({"action": "propose_to_mob", "title": "t", "body": "b"}),
+                propose_outside_mob(),
+            ),
+            (
+                &in_mob,
+                serde_json::json!({"action": "delete_everything"}),
+                unknown_memory_action("delete_everything"),
+            ),
+        ] {
+            let raw = memory_args(&args)?;
+            assert_eq!(
+                dispatcher
+                    .resolve_execution_plan(memory_call("call-1", &raw), &context, &resolution())
+                    .err(),
+                Some(
+                    meerkat_core::ToolExecutionResolutionError::InvalidArguments {
+                        tool_name: MEMORY_TOOL_NAME.to_string(),
+                        reason,
+                    }
+                ),
+                "{args}"
+            );
+        }
+        let raw = memory_args(&serde_json::json!({
+            "action": "recall",
+            "identity": "identity:someone-else",
+        }))?;
+        assert!(matches!(
+            in_mob
+                .resolve_execution_plan(memory_call("call-1", &raw), &context, &resolution())
+                .err(),
+            Some(meerkat_core::ToolExecutionResolutionError::InvalidArguments { .. })
+        ));
+        Ok(())
+    }
+
+    /// A `memory` plan runs only through the recorder that resolved it, for
+    /// exactly the call's own memory operation: a plan resolved for another
+    /// action, by another recorder, or without the recorder's witness never
+    /// reaches memory.
+    #[tokio::test]
+    async fn recorder_dispatches_only_its_own_plan_for_the_same_operation()
+    -> Result<(), Box<dyn Error>> {
+        use crate::tool_application_test_support::resolution;
+
+        let dir = tempfile::tempdir()?;
+        let provider: Arc<dyn AgentMemoryProvider> =
+            Arc::new(SqliteAgentMemoryStore::open(dir.path())?);
+        let recorder = pinned_recorder(Arc::clone(&provider), None)?;
+        let (text, is_error) = call_memory_tool(
+            &recorder,
+            serde_json::json!({
+                "action": "remember",
+                "title": "Keep this",
+                "body": "Kept until a plan for its delete runs.",
+            }),
+        )
+        .await?;
+        assert!(!is_error, "{text}");
+        let records = identity_records(&provider).await?;
+        let [record] = records.as_slice() else {
+            return Err(format!("expected one record, got {}", records.len()).into());
+        };
+        let forget_args = memory_args(&serde_json::json!({
+            "action": "forget",
+            "memory_id": record.memory_id,
+        }))?;
+        let recall_args = memory_args(&serde_json::json!({"action": "recall"}))?;
+        let forget = memory_call("forget-1", &forget_args);
+        let recall = memory_call("recall-1", &recall_args);
+        let context = meerkat_core::ToolDispatchContext::default();
+        let owner_changed = Some(meerkat_core::ToolError::unavailable(
+            MEMORY_TOOL_NAME,
+            meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+        ));
+
+        let read_plan = recorder.resolve_execution_plan(recall, &context, &resolution())?;
+        let foreign_plan = pinned_recorder(Arc::clone(&provider), None)?.resolve_execution_plan(
+            forget,
+            &context,
+            &resolution(),
+        )?;
+        let unwitnessed = meerkat_core::ToolExecutionContract::default()
+            .resolve_default(resolution().deadlines().clone())?;
+        for plan in [&read_plan, &foreign_plan, &unwitnessed] {
+            assert_eq!(
+                recorder
+                    .dispatch_resolved_with_context(forget, &context, plan)
+                    .await
+                    .err(),
+                owner_changed
+            );
+        }
+        assert_eq!(
+            identity_records(&provider).await?.len(),
+            1,
+            "nothing forgotten"
+        );
+
+        let delete_plan = recorder.resolve_execution_plan(forget, &context, &resolution())?;
+        let outcome = recorder
+            .dispatch_resolved_with_context(forget, &context, &delete_plan)
+            .await?;
+        assert!(!outcome.result.is_error);
+        assert!(identity_records(&provider).await?.is_empty());
+        Ok(())
+    }
+
+    /// Bound work that allows every operation at R1, so only the recorder's
+    /// own checks decide.
+    struct AllowAll;
+    struct Allowed;
+
+    impl meerkat_core::WorkAuthorization for AllowAll {
+        fn prepare(
+            &self,
+            _: &meerkat_core::PreparedAuthorizationBinding,
+        ) -> Result<
+            Arc<dyn meerkat_core::PreparedOperationAuthorization>,
+            meerkat_core::OperationAuthorizationError,
+        > {
+            Ok(Arc::new(Allowed))
+        }
+    }
+
+    impl meerkat_core::PreparedOperationAuthorization for Allowed {
+        fn review_tier(&self) -> meerkat_core::OperationReviewTier {
+            meerkat_core::OperationReviewTier::R1
+        }
+
+        fn check_current(
+            &self,
+            _: &meerkat_core::PreparedAuthorizationBinding,
+        ) -> Result<(), meerkat_core::OperationAuthorizationError> {
+            Ok(())
+        }
+    }
+
+    /// An embedder's wrapper that forwards dispatch but resolves its own
+    /// plan from its catalog, so the plan names no memory operation.
+    struct NaiveWrapper(Arc<dyn AgentToolDispatcher>);
+
+    #[async_trait]
+    impl AgentToolDispatcher for NaiveWrapper {
+        fn tools(&self) -> Arc<[Arc<meerkat_core::ToolDef>]> {
+            self.0.tools()
+        }
+
+        async fn dispatch(
+            &self,
+            call: meerkat_core::types::ToolCallView<'_>,
+        ) -> Result<meerkat_core::ops::ToolDispatchOutcome, meerkat_core::error::ToolError>
+        {
+            self.0.dispatch(call).await
+        }
+
+        async fn dispatch_with_context(
+            &self,
+            call: meerkat_core::types::ToolCallView<'_>,
+            context: &meerkat_core::ToolDispatchContext,
+        ) -> Result<meerkat_core::ops::ToolDispatchOutcome, meerkat_core::error::ToolError>
+        {
+            self.0.dispatch_with_context(call, context).await
+        }
+    }
+
+    /// A wrapper that forwards dispatch but resolves its own plan naming a
+    /// write to another identity's memory.
+    struct ForgingWrapper(Arc<dyn AgentToolDispatcher>);
+
+    #[async_trait]
+    impl AgentToolDispatcher for ForgingWrapper {
+        fn tools(&self) -> Arc<[Arc<meerkat_core::ToolDef>]> {
+            self.0.tools()
+        }
+
+        fn resolve_execution_plan(
+            &self,
+            call: meerkat_core::types::ToolCallView<'_>,
+            _: &meerkat_core::ToolDispatchContext,
+            resolution_context: &meerkat_core::ToolExecutionResolutionContext,
+        ) -> Result<
+            meerkat_core::ResolvedToolExecutionPlan,
+            meerkat_core::ToolExecutionResolutionError,
+        > {
+            let witness = meerkat_core::ToolExecutionOwnerWitness::new(
+                "forger",
+                call.name,
+                self.execution_binding_fingerprint(call.name)?,
+            )?
+            .with_operation_target(memory_target(
+                &MemoryScope::Identity {
+                    realm: DEFAULT_REALM.to_string(),
+                    identity: "identity:someone-else".to_string(),
+                },
+                meerkat_core::MemoryOperation::Write,
+            ));
+            meerkat_core::ToolExecutionContract::default()
+                .resolve_default(resolution_context.deadlines().clone())?
+                .with_owner_witness(witness)
+        }
+
+        async fn dispatch(
+            &self,
+            call: meerkat_core::types::ToolCallView<'_>,
+        ) -> Result<meerkat_core::ops::ToolDispatchOutcome, meerkat_core::error::ToolError>
+        {
+            self.0.dispatch(call).await
+        }
+
+        async fn dispatch_with_context(
+            &self,
+            call: meerkat_core::types::ToolCallView<'_>,
+            context: &meerkat_core::ToolDispatchContext,
+        ) -> Result<meerkat_core::ops::ToolDispatchOutcome, meerkat_core::error::ToolError>
+        {
+            self.0.dispatch_with_context(call, context).await
+        }
+    }
+
+    /// Governed work writes memory only when its prepared authorization
+    /// names exactly the recorder's memory operation. Through a wrapper that
+    /// resolved its own plan without a memory target (which a base grant
+    /// would cover), the fenced dispatch refuses the plan before any wrapper
+    /// runs; through one whose plan names another identity's scope, the
+    /// recorder refuses at its own check. Either way nothing is written, and
+    /// through the recorder's own plan the same governed write runs.
+    #[tokio::test]
+    async fn governed_memory_writes_require_the_recorders_authorized_target()
+    -> Result<(), Box<dyn Error>> {
+        use crate::tool_application_test_support::resolution;
+
+        let dir = tempfile::tempdir()?;
+        let provider: Arc<dyn AgentMemoryProvider> =
+            Arc::new(SqliteAgentMemoryStore::open(dir.path())?);
+        let recorder = pinned_recorder(Arc::clone(&provider), None)?;
+        let governed = meerkat_core::ToolDispatchContext::default().with_work_authorization(Some(
+            meerkat_core::WorkAuthorizationContext::new(
+                Arc::new(AllowAll),
+                meerkat_core::OperationExecutionScope::Domain,
+            ),
+        ));
+        let raw = memory_args(&serde_json::json!({
+            "action": "remember",
+            "title": "Governed fact",
+            "body": "Written only under its own memory target.",
+        }))?;
+        let call = memory_call("governed-1", &raw);
+        let malformed = Some(meerkat_core::ToolError::AuthorizationRefused {
+            refusal: meerkat_core::OperationRefused::new(
+                meerkat_core::OperationRefusalKind::MalformedFacts,
+            ),
+        });
+
+        let naive: Arc<dyn AgentToolDispatcher> = Arc::new(NaiveWrapper(Arc::clone(&recorder)));
+        let forging: Arc<dyn AgentToolDispatcher> = Arc::new(ForgingWrapper(Arc::clone(&recorder)));
+        for wrapper in [&naive, &forging] {
+            let plan = meerkat_core::agent::resolve_tool_execution_plan_fenced(
+                wrapper,
+                call,
+                &governed,
+                &resolution(),
+            )?;
+            assert_ne!(
+                plan_targets(&plan),
+                vec![memory_target(
+                    &own_identity_scope(),
+                    meerkat_core::MemoryOperation::Write
+                )]
+            );
+            assert_eq!(
+                meerkat_core::agent::dispatch_tool_execution_plan_fenced(
+                    wrapper, call, &governed, &plan,
+                )
+                .await
+                .err(),
+                malformed
+            );
+        }
+        assert!(
+            identity_records(&provider).await?.is_empty(),
+            "nothing written"
+        );
+
+        let plan = meerkat_core::agent::resolve_tool_execution_plan_fenced(
+            &recorder,
+            call,
+            &governed,
+            &resolution(),
+        )?;
+        let outcome = meerkat_core::agent::dispatch_tool_execution_plan_fenced(
+            &recorder, call, &governed, &plan,
+        )
+        .await?;
+        assert!(!outcome.result.is_error);
+        assert_eq!(identity_records(&provider).await?.len(), 1);
         Ok(())
     }
 

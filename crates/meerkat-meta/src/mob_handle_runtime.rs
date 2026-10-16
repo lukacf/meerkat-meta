@@ -7779,6 +7779,15 @@ macro_rules! delegate_mob_session_service {
             ) -> Result<Option<meerkat_core::ToolScopeSnapshot>, SessionError> {
                 self.inner.tool_scope_snapshot(session_id).await
             }
+            // Forwarded exactly, like its tool-scope siblings: the trait
+            // default reports no view, so behind this wrapper the inner
+            // service's catalog view would read as unavailable.
+            async fn tool_catalog_view(
+                &self,
+                session_id: &meerkat_core::types::SessionId,
+            ) -> Result<Option<meerkat_core::ToolCatalogView>, SessionError> {
+                self.inner.tool_catalog_view(session_id).await
+            }
             async fn live_visible_tool_defs(
                 &self,
                 session_id: &meerkat_core::types::SessionId,
@@ -8902,6 +8911,14 @@ impl MobSessionService for AfterCreateMobSessionService {
         session_id: &meerkat_core::types::SessionId,
     ) -> Result<Option<meerkat_core::ToolScopeSnapshot>, SessionError> {
         self.inner.tool_scope_snapshot(session_id).await
+    }
+    // Forwarded exactly, like its tool-scope siblings (see the delegating
+    // wrapper above).
+    async fn tool_catalog_view(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<Option<meerkat_core::ToolCatalogView>, SessionError> {
+        self.inner.tool_catalog_view(session_id).await
     }
     async fn live_visible_tool_defs(
         &self,
@@ -18207,6 +18224,14 @@ comms = true
             })
         }
 
+        async fn tool_catalog_view(
+            &self,
+            _session_id: &meerkat_core::SessionId,
+        ) -> Result<Option<meerkat_core::ToolCatalogView>, meerkat_core::SessionError> {
+            self.record("tool_catalog_view");
+            Ok(Some(forwarded_catalog_view()))
+        }
+
         async fn observe_member_status_view(
             &self,
             _session_id: &meerkat_core::SessionId,
@@ -19112,6 +19137,52 @@ comms = true
         assert_eq!(
             probe.calls(),
             vec!["observe_live_durable_source", "observe_live_durable_source"],
+            "each wrapper forwards exactly once and adds no read of its own"
+        );
+    }
+
+    /// What `ForwardingProbe` answers for a catalog view: a shape no default
+    /// or wrapper-level answer produces.
+    fn forwarded_catalog_view() -> meerkat_core::ToolCatalogView {
+        meerkat_core::ToolCatalogView {
+            mode: meerkat_core::ToolCatalogMode::Deferred,
+            exact_catalog: true,
+            pending_sources: vec!["forwarded-source".to_string()],
+            staged_changes_pending: true,
+            entries: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn wrappers_forward_the_tool_catalog_view_exactly() {
+        let probe = Arc::new(ForwardingProbe::default());
+        let inner: Arc<dyn MobSessionService> = probe.clone();
+        let pre_build: Arc<dyn MobSessionService> = Arc::new(PreBuildMobSessionService {
+            inner: Arc::clone(&inner),
+            hook: no_op_pre_build_hook(),
+            dispatch_taint: None,
+            after_create_hook: None,
+            runtime_adapter_override: None,
+            session_read_absorber: None,
+            archived_terminal_authority: None,
+        });
+        let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
+            inner: Arc::clone(&inner),
+            after_hook: Arc::new(|_, _| Box::pin(async {})),
+        });
+        let session_id = meerkat_core::SessionId::new();
+        for wrapper in [pre_build, after_create] {
+            assert_eq!(
+                wrapper
+                    .tool_catalog_view(&session_id)
+                    .await
+                    .expect("the inner view is forwarded"),
+                Some(forwarded_catalog_view())
+            );
+        }
+        assert_eq!(
+            probe.calls(),
+            vec!["tool_catalog_view", "tool_catalog_view"],
             "each wrapper forwards exactly once and adds no read of its own"
         );
     }
