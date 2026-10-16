@@ -8,10 +8,16 @@ function record(value: unknown): Record<string, unknown> | null {
     ? value as Record<string, unknown> : null;
 }
 
+// The host refuses an operation (`operation_refused`) for a policy denial, for
+// an authorization that changed after the operation was prepared and for
+// request facts it could not evaluate, and sends every one of them alike: its
+// runtime notice and tool error name the refusal and never its reason. The
+// card states only what holds for all of them, so it claims no permission
+// cause, and a reason field no host contract defines changes nothing.
 const refused = (): Feedback => ({
-  kind: "permission-refused",
-  title: "Permission denied",
-  detail: "This action is not permitted for this request. The agent can continue with permitted work.",
+  kind: "operation-refused",
+  title: "Action refused",
+  detail: "This action was refused under the current authorization, so it did not run. The agent can continue with other work.",
 });
 
 const confinementDetails = {

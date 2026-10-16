@@ -3324,7 +3324,9 @@ async function runAuthorizationFeedbackProof() {
     await gotoConsole(page, `${server.baseUrl}/console`);
     await openSidebarAgentChat(page, "Identity Luka");
     const pane = page.getByTestId("chat-pane:identity:luka");
-    await pane.getByText("Permission denied", { exact: true }).waitFor();
+    await pane.getByText("Action refused", { exact: true }).waitFor();
+    // The refusal names no reason, so the card claims no permission cause.
+    assert.equal(await pane.getByText("Permission denied").count(), 0);
     await pane.getByText("Audit update unavailable", { exact: true }).waitFor();
     await pane.getByText("I continued with the permitted calendar read.", { exact: true }).first().waitFor();
     const consent = pane.locator('[data-feedback-kind="review-unsatisfied"]').filter({ hasText: "Call consent-call" });

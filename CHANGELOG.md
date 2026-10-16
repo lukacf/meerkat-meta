@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- `Cargo.lock` updates quinn-proto from 0.11.16 to 0.11.19, which clears
+  RUSTSEC-2026-0338, RUSTSEC-2026-0339, RUSTSEC-2026-0340, RUSTSEC-2026-0341
+  and RUSTSEC-2026-0342 from `cargo audit`. Meta was not exposed: no build
+  compiles quinn-proto, which the lockfile records only under reqwest's
+  optional HTTP/3 support, and no workspace feature enables it. Only that
+  lockfile entry changes.
+
+### Added
+
+- `meta_gateway storage-adopt-predecessor --mob-config <file>` checks the mob
+  definition an installation boots with (repeat it for each mob) against every
+  persistent mob storage the predecessor created. It reads the definition each
+  store holds now from a private copy of its event log, the store itself not
+  opened, and names each key that the release which created the store ignored,
+  that Meta 0.9 applies and that the held definition does not record: a
+  profile's or `[runtime]`'s `model_fallback` on a store created by MobKit
+  0.8.33 or earlier, and a profile's `tools.deny` on a store created by 0.8.45
+  or earlier. A key a later release's definition update recorded is in force
+  and is not named. Adoption refuses before any change until each named key
+  is removed, which keeps the behaviour the store has run with, or
+  acknowledged with `--acknowledge-ignored-keys`. An acknowledgement changes
+  no definition: the keys take effect only once the stored definition is
+  advanced with the one-shot mob definition update, and until then an
+  authoritative resume that keeps them refuses as `divergent`, as in 0.9.1.
+  The JSON report lists them under `ignored_keys`. Without `--mob-config`, a
+  note names each store whose creating release ignored such keys. A
+  `--mob-config` that does not parse, or a `mob.toml` that declares a
+  `[self_hosted]` or `[realm]` table, is refused before planning; a `.json`
+  file is read as a `definition.json`. Library callers use
+  `storage_predecessor::adopt_predecessor_state_with_definitions` with a
+  `PredecessorDefinitionCheck`.
+
+### Fixed
+
+- Docs: the upgrading guide and the 0.9.1 notes said MobKit 0.8.x ignored
+  `model_fallback` and `tools.deny`. MobKit 0.8.33 and earlier ignored
+  `model_fallback`, and 0.8.45 and earlier ignored `tools.deny`; later 0.8
+  releases applied them, and their stores recorded them.
+- `meta/gating/decide` refusals for a missing or unknown decision list every
+  decision it accepts, `escalate` included (`decision must be one of:
+  approve, reject, escalate`, and `decision '<value>' is unsupported
+  (allowed: approve, reject, escalate)`); they named only approve and reject.
+
+### Changed
+
+- Console: an operation refusal reads "Action refused" instead of
+  "Permission denied". The host refuses an operation for a policy denial, for
+  an authorization that changed after the operation was prepared and for
+  request facts it could not evaluate, and sends all of them alike, as the
+  `operation_refused` runtime notice or tool error without a reason, so the
+  card now names no cause: "This action was refused under the current
+  authorization, so it did not run." Its feedback kind
+  (`operationFeedback.kind`, the card's `data-feedback-kind`) is
+  `operation-refused` instead of `permission-refused`.
+- CI: the `test-integration` jobs no longer set a fake `OPENAI_API_KEY`. The
+  test fixtures give their members and child gateways their own fake key, so
+  the integration tests, like the unit tests since 0.9.1, run without one.
+  `scripts/test_ci_workflow.py` checks that neither job sets it.
+- `Cargo.lock` updates chacha20 from 0.10.1, which crates.io yanked, to
+  0.10.2. No Meta build compiles it: the lockfile records it only under
+  reqwest's optional HTTP/3 support (rand 0.10 for quinn-proto), which no
+  workspace feature enables, so no build or test changes.
+- The console voice readiness latency test takes its p99 over 500 polls
+  instead of 50. Over 50 polls the nearest-rank p99 is the slowest poll, so
+  one stalled poll on a loaded machine decided the verdict; work sized to the
+  member's 20 MB body, which slows every poll, still fails the 100 ms bound.
+
 ## [0.9.1] - 2026-10-15
 
 ### Breaking

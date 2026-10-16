@@ -359,7 +359,7 @@ can still appear in the same run.
 
 | Card | Meaning |
 |------|---------|
-| Permission denied | The request's operation permission was refused. |
+| Action refused | The action was refused under the current authorization, so it did not run. The host does not say why: a policy denial, an authorization that changed after the action was prepared, and request details the authorization could not evaluate all arrive as the same refusal, so the card names no cause. |
 | Action could not start | Required process confinement was refused before the action ran. The card retains the exact typed cause. |
 | Action blocked by hook | A pre-tool hook explicitly denied this call. Its typed hook reason remains distinct from operation permission. |
 | Hook could not start | A pre-tool hook failed to launch. This is infrastructure feedback, without an invented permission or confinement cause. |

@@ -1300,7 +1300,8 @@ fn print_migrate_report_text(report: &meerkat_meta::MetaMigrateReport) {
 
 const STORAGE_ADOPT_PREDECESSOR_USAGE: &str = "usage: meta_gateway storage-adopt-predecessor \
      --state-dir <dir> [--gateway-home <dir>] [--predecessor-home <dir>] \
-     [--user-gateway-home] [--apply] [--json]\n\
+     [--user-gateway-home] [--mob-config <file>]... [--acknowledge-ignored-keys] \
+     [--apply] [--json]\n\
      One-shot, offline adoption of one predecessor (pre-0.9) installation: \
      renames the metadata and console database files and the gateway's \
      memory ledger file (at its one fixed path in the state directory; no \
@@ -1321,6 +1322,21 @@ const STORAGE_ADOPT_PREDECESSOR_USAGE: &str = "usage: meta_gateway storage-adopt
      startup refusal names it: the persistent_state of rpc_gateway and the \
      SDK builders, or the store_path directory of meta_gateway (the parent \
      of an explicit session database file). Adoption never infers it.\n\
+     --mob-config names the mob definition the installation boots with \
+     (mob.toml, or a definition.json); repeat it for each mob. Planning \
+     reads the definition each persistent mob storage holds now, from a \
+     private copy of its event log (the store itself is never opened \
+     through its owner), and names every key that the predecessor release \
+     which created the store ignored (model_fallback before 0.8.34, \
+     tools.deny before 0.8.46), that Meta 0.9 applies and that the held \
+     definition does not record. A key a later release recorded there is in \
+     force and is not named. Named keys refuse adoption before any change: \
+     remove them to keep the behaviour the store has run with, or pass \
+     --acknowledge-ignored-keys and then advance the stored definition once \
+     with the one-shot mob definition update to apply them; resuming never \
+     applies them, and an authoritative resume that keeps them refuses as \
+     divergent. A --mob-config that does not parse, or that declares a \
+     top-level [self_hosted] or [realm] table, is refused before planning.\n\
      Precondition: every process using the installation is stopped; the \
      run refuses while a runtime registry lists a live process, and fences \
      every database it touches. The fence covers SQLite databases only: \
@@ -1346,6 +1362,8 @@ fn run_storage_adopt_predecessor(args: &[String]) -> i32 {
     let mut gateway_home: Option<PathBuf> = None;
     let mut predecessor_home: Option<PathBuf> = None;
     let mut user_gateway_home = false;
+    let mut mob_configs: Vec<PathBuf> = Vec::new();
+    let mut acknowledge_ignored_keys = false;
     let mut apply = false;
     let mut json = false;
     let mut iter = args.iter();
@@ -1356,6 +1374,18 @@ fn run_storage_adopt_predecessor(args: &[String]) -> i32 {
             "--predecessor-home" => &mut predecessor_home,
             "--user-gateway-home" => {
                 user_gateway_home = true;
+                continue;
+            }
+            "--mob-config" => {
+                let Some(file) = iter.next() else {
+                    eprintln!("--mob-config requires a file\n{STORAGE_ADOPT_PREDECESSOR_USAGE}");
+                    return 2;
+                };
+                mob_configs.push(PathBuf::from(file));
+                continue;
+            }
+            "--acknowledge-ignored-keys" => {
+                acknowledge_ignored_keys = true;
                 continue;
             }
             "--apply" => {
@@ -1394,6 +1424,26 @@ fn run_storage_adopt_predecessor(args: &[String]) -> i32 {
              {STORAGE_ADOPT_PREDECESSOR_USAGE}"
         );
         return 2;
+    }
+    if acknowledge_ignored_keys && mob_configs.is_empty() {
+        eprintln!(
+            "--acknowledge-ignored-keys needs a definition to check: name it with \
+             --mob-config\n{STORAGE_ADOPT_PREDECESSOR_USAGE}"
+        );
+        return 2;
+    }
+    // Each definition is read the way meta_gateway reads its workspace
+    // definition: a file that does not parse, or a mob.toml that declares a
+    // host-config table, is refused here, before planning.
+    let mut definitions = Vec::with_capacity(mob_configs.len());
+    for path in &mob_configs {
+        match load_adoption_mob_config(path) {
+            Ok(definition) => definitions.push((path.display().to_string(), definition)),
+            Err(reason) => {
+                eprintln!("--mob-config {}: {reason}", path.display());
+                return 1;
+            }
+        }
     }
     // Named homes bind; derived ones are defaults that an unfinished
     // adoption replaces with the homes its journal recorded.
@@ -1438,9 +1488,15 @@ fn run_storage_adopt_predecessor(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let report = runtime.block_on(meerkat_meta::storage_predecessor::adopt_predecessor_state(
-        &request,
-    ));
+    let report = runtime.block_on(
+        meerkat_meta::storage_predecessor::adopt_predecessor_state_with_definitions(
+            &request,
+            &meerkat_meta::storage_predecessor::PredecessorDefinitionCheck::new(
+                definitions,
+                acknowledge_ignored_keys,
+            ),
+        ),
+    );
     if json {
         match serde_json::to_string_pretty(&report) {
             Ok(text) => println!("{text}"),
@@ -1477,6 +1533,20 @@ fn run_storage_adopt_predecessor(args: &[String]) -> i32 {
                 action.item, action.subject, action.from, action.to
             );
         }
+        for ignored in &report.ignored_keys {
+            println!(
+                "  IgnoredKeys {} ({}): {} ignored by predecessor release {} ({})",
+                ignored.manifest,
+                ignored.source,
+                ignored.keys.join(", "),
+                ignored.created_by,
+                if ignored.acknowledged {
+                    "acknowledged"
+                } else {
+                    "refused, nothing changed"
+                }
+            );
+        }
         for note in &report.notes {
             println!("  note: {note}");
         }
@@ -1485,6 +1555,29 @@ fn run_storage_adopt_predecessor(args: &[String]) -> i32 {
         }
     }
     i32::from(report.has_errors())
+}
+
+/// Read a `--mob-config` definition the way meta_gateway reads its
+/// workspace definition: a `.json` file as a serialized definition (its
+/// `definition.json`), anything else as `mob.toml` through Meerkat's
+/// definition parser (with the upgrade note a refused profile prompt key
+/// carries), then the refusal of the host-config tables that parser would
+/// drop.
+fn load_adoption_mob_config(path: &Path) -> Result<MobDefinition, String> {
+    let text = fs::read_to_string(path).map_err(|error| format!("failed to read: {error}"))?;
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "json")
+    {
+        return serde_json::from_str::<MobDefinition>(&text)
+            .map_err(|error| format!("not a mob definition: {error}"));
+    }
+    let definition = MobDefinition::from_toml(&text).map_err(|error| {
+        meerkat_meta::gateway_composition::describe_mob_definition_error(&error)
+    })?;
+    meerkat_meta::gateway_composition::refuse_host_config_tables_in_mob_toml(&text)
+        .map_err(|table| table.to_string())?;
+    Ok(definition)
 }
 
 const STORAGE_PRUNE_USAGE: &str = "usage: meta_gateway storage-prune --state-dir <dir> \

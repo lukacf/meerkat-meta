@@ -222,6 +222,9 @@ class CiWorkflowTests(unittest.TestCase):
             self.assertEqual(commands, [command], name)
             self.assertIn("- name: Reclaim runner disk\n", job_block(name))
             self.assertIn('CARGO_PROFILE_DEV_DEBUG: "0"', job_block(name))
+            # The test fixtures give their members and child gateways their
+            # own fake OpenAI key, so neither job sets one for the whole run.
+            self.assertNotIn("OPENAI_API_KEY", job_block(name), name)
         # Exactly one half builds the examples.
         self.assertEqual(block.count("            examples: true\n"), 1)
         self.assertIn("      - if: matrix.examples\n        run: scripts/repo-cargo build --workspace --examples\n", block)

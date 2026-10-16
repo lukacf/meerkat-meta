@@ -22952,9 +22952,9 @@ function record4(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
 var refused = () => ({
-  kind: "permission-refused",
-  title: "Permission denied",
-  detail: "This action is not permitted for this request. The agent can continue with permitted work."
+  kind: "operation-refused",
+  title: "Action refused",
+  detail: "This action was refused under the current authorization, so it did not run. The agent can continue with other work."
 });
 var confinementDetails = {
   invalid_requirement: "The confinement requirement is invalid.",
