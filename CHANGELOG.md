@@ -55,6 +55,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `propose_to_mob` from a member that is not in a mob, now fails at plan
   resolution with `invalid_arguments` and the same reason, where the tool
   returned it as an error result.
+- Behaviour-only: with the `extension-state` feature, the document service
+  in the `ToolBundleContext` that a tool bundle or document MCP binding
+  factory receives refuses, with `AuthorityUnavailable`, every operation of
+  a caller context its caller resolver did not resolve, such as one the
+  embedding host built with `HostAccessContext::new`, and of a caller whose
+  authority names a mob id that changed after it was resolved (see Fixed).
+  Resolve the caller through `ToolBundleContext::caller_resolver` for each
+  call; a host that needs unordered access uses the store its
+  `MetaStorageProvider` opened directly.
 
 ### Security
 
@@ -244,6 +253,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   wrapper must forward `tool_catalog_view` as well: Meerkat's default
   implementation reports no view, so a wrapper that leaves it out hides the
   wrapped session's catalog view.
+- `meta-extension-state`: `HostAccessContext::with_authority_generation` and
+  `HostAccessContext::authority_generation` carry the host's authority
+  generation a caller was resolved at, and
+  `HostAccessContext::authority_mob_ids` lists the mob ids the caller's
+  authority names. Meta's caller resolver stamps every context it resolves,
+  and its document services refuse an operation naming a mob id whose
+  holder changed after the stamp (see Fixed). Stores do not read them.
 
 ### Changed
 
@@ -372,6 +388,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ExtensionDocumentStore::references_mob` documentation now asks a store an
   embedding host supplies to answer in constant time per id too, from an
   index read again whenever another writer may have changed the documents.
+- With the `extension-state` feature, document operations are ordered
+  against the mob id check. A caller resolved while a destroyed child mob
+  lived could still commit a document owned by the child's id, or shared
+  with it, after another session created a new mob under that id, and the
+  new mob inherited the document; the stale caller could also still read and
+  manage what the new mob owns. Now every operation through the document
+  services the runtime builds (tool bundles and document MCP bindings) holds
+  a shared gate through its store call, and the check holds it exclusively,
+  so the check waits for every write in flight and sees what it committed.
+  The caller resolver stamps each caller with the generation it read before
+  any authority (`HostAccessContext::with_authority_generation`). An admitted
+  create under an id, or the release of the destroyed mob that held it,
+  moves that id's generation, and an operation is refused with
+  `AuthorityUnavailable` when a mob id the caller's authority names (its own
+  mob, the mobs it manages, an owner it was validated for), or a write's new
+  owner or access names, changed after the stamp: the tool resolves its
+  caller again. The after-destroy hook moves the generations without
+  waiting for the gate. This resolves the 0.9.2 known limitation that the
+  check was not ordered against a document write already in flight.
+  Residuals: the ordering covers one runtime in one process, so a writer in
+  another process or through the provider's own store is not ordered; and
+  the implicit delegation mob that its own session's runtime path recreates
+  stays exempt from the check and the ordering, so a write naming its id
+  lands on the recreated mob, which keeps what its predecessor's documents
+  grant.
 
 ### Known limitations
 

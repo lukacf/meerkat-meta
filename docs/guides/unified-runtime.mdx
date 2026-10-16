@@ -132,17 +132,33 @@ destroyed.
 The one exemption is the implicit delegation mob that its own session's
 runtime path creates or recreates (as for a model change). Ownership is by
 id, not by mob instance, so the owner session of a destroyed mob cannot
-recreate the same explicit id while documents name it either. Each checked
-create reads every live document of the realm under the extension store's
-one connection: document reads and writes of every session wait while it
-runs, and a caller that repeats creates under a named id keeps them waiting.
-A refusal also tells the caller that some document names the id, including
-one it cannot read. The check is not ordered against a document write
-already in flight: a write whose caller the embedding host's tool resolved
-while the destroyed mob was live can still commit a reference to the id
-after the check passed. Restoring a persisted mob is never re-checked, so a
-mob that took an id before this check existed, or while no extension tool
-bundle or document binding was composed, keeps what it inherited.
+recreate the same explicit id while documents name it either. The built-in
+SQLite store answers the check from an index of the mob ids its live
+documents name: it reads a realm's documents once, at the first check after
+it opens, keeps the index with its own writes, and reads the realm again
+after another connection commits, so a check costs a lookup, not a scan of
+the realm under the store's one connection. A refusal tells the caller that
+some document names the id, including one it cannot read.
+
+The check is ordered against document operations. It waits for every
+operation in flight through the document services the runtime builds (tool
+bundles and document MCP bindings) and sees what they committed. The caller
+resolver stamps each caller with the generation it read before any
+authority (`HostAccessContext::authority_generation`), and an admitted
+create under an id, or the release of the destroyed mob that held it, moves
+that id's generation. An operation is refused with `AuthorityUnavailable`
+when a mob id its caller's authority names
+(`HostAccessContext::authority_mob_ids`), or a write's new owner or access
+names, changed after the stamp, and the tool resolves its caller again. The
+document services refuse a caller context the resolver did not resolve,
+such as one the host built itself; a host that needs unordered access uses
+its provider's store directly. The ordering covers one runtime in one
+process, and the implicit delegation mob's exemption above takes no part in
+it.
+
+Restoring a persisted mob is never re-checked, so a mob that took an id
+before this check existed, or while no extension tool bundle or document
+binding was composed, keeps what it inherited.
 
 A document store a host supplies through
 `MetaStorageProvider::open_extension_state` must implement

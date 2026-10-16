@@ -176,6 +176,7 @@ pub struct HostAccessContext {
     pub(crate) realm_admin: bool,
     pub(crate) policy: HostPolicy,
     pub(crate) valid_owners: BTreeSet<Owner>,
+    pub(crate) authority_generation: Option<u64>,
 }
 impl HostAccessContext {
     pub fn new(
@@ -203,6 +204,7 @@ impl HostAccessContext {
             realm_admin: false,
             policy,
             valid_owners: BTreeSet::new(),
+            authority_generation: None,
         })
     }
     pub fn with_memberships(
@@ -230,6 +232,38 @@ impl HostAccessContext {
     pub fn with_valid_owners(mut self, owners: BTreeSet<Owner>) -> Self {
         self.valid_owners = owners;
         self
+    }
+    /// Stamp the host's authority generation this context was resolved at.
+    /// A host that orders the changes of which mob holds an id (a create
+    /// admitted under it, a destroy) against document writes compares the
+    /// stamp when a write commits, and refuses a write that names a mob id
+    /// changed after its caller was resolved: that caller was resolved
+    /// against the mob that held the id before. Stores do not read it.
+    pub fn with_authority_generation(mut self, generation: u64) -> Self {
+        self.authority_generation = Some(generation);
+        self
+    }
+    /// The generation [`Self::with_authority_generation`] stamped, if any.
+    pub fn authority_generation(&self) -> Option<u64> {
+        self.authority_generation
+    }
+    /// The mob ids this context's authority names: the mobs the caller is a
+    /// member of, the mobs it manages, and the mob of every owner it was
+    /// validated for ([`Self::with_valid_owners`]), a worker's mob included.
+    /// A host that orders changes of which mob holds an id checks each of
+    /// them against [`Self::authority_generation`].
+    pub fn authority_mob_ids(&self) -> BTreeSet<&str> {
+        let owners = self.valid_owners.iter().filter_map(|owner| match owner {
+            Owner::Mob(id) => Some(id.as_str()),
+            Owner::Agent(Principal::Worker { mob_id, .. }) => Some(mob_id.as_str()),
+            Owner::Agent(Principal::Agent(_)) | Owner::Realm => None,
+        });
+        self.member_mobs
+            .iter()
+            .chain(&self.managed_mobs)
+            .map(String::as_str)
+            .chain(owners)
+            .collect()
     }
     pub(crate) fn owner_is_valid(&self, owner: &Owner) -> bool {
         self.valid_owners.contains(owner)

@@ -2127,3 +2127,126 @@ async fn extension_mob_id_reuse_refuses_when_the_documents_cannot_be_read() {
     drop(state);
     runtime.shutdown().await;
 }
+
+/// Document operations are ordered against a create under an id. A caller
+/// resolved while a child mob lived, whose write commits after the child was
+/// destroyed and another session created a mob under its id, is refused, as
+/// owner and as audience alike: the write was authorized for the destroyed
+/// child, not for the new mob. Its reads are refused too, since its
+/// authority still names the id. The steps run one after the other, forcing
+/// that interleaving: resolve, destroy, create, commit. A caller resolved
+/// after the change reads and writes as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_mob_id_reuse_refuses_a_write_resolved_before_the_id_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, _) = harness(dir.path(), None).await;
+    let owned = OwnedChild::create(&runtime, &context, dir.path()).await;
+    let stale = caller(&context, &owned.owner_session).await;
+    assert!(
+        can_create(&stale, &owned.child_owner()),
+        "resolved while the child lives, its owner session manages it"
+    );
+    let before = context
+        .documents
+        .mutate(
+            &stale,
+            &request("before-destroy"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: None,
+                access: DocumentAccess::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .receipt;
+    owned.destroy_natively().await;
+    let other = runtime.spawn(worker("other-owner")).await.unwrap();
+    let other_session = member_session(&runtime, &other.agent_identity).await;
+    create_for_session(&owned.state, &owned.child, other_session)
+        .await
+        .expect("no document names the id yet");
+
+    let as_owner = context
+        .documents
+        .mutate(
+            &stale,
+            &request("stale-owner"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: Some(owned.child_owner()),
+                access: DocumentAccess::default(),
+            }),
+        )
+        .await;
+    assert!(
+        matches!(as_owner, Err(Error::AuthorityUnavailable)),
+        "a write resolved for the destroyed child is refused as owner: {as_owner:?}"
+    );
+    let shared = || DocumentAccess {
+        grants: vec![Grant {
+            audience: Audience::Mob(owned.child.to_string()),
+            role: Role::Editor,
+        }],
+        ..DocumentAccess::default()
+    };
+    let as_audience = context
+        .documents
+        .mutate(
+            &stale,
+            &request("stale-audience"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: None,
+                access: shared(),
+            }),
+        )
+        .await;
+    assert!(
+        matches!(as_audience, Err(Error::AuthorityUnavailable)),
+        "a write resolved for the destroyed child is refused as audience: {as_audience:?}"
+    );
+    for refused in [
+        context
+            .documents
+            .get(&stale, &before.document_id)
+            .await
+            .map(drop),
+        context
+            .documents
+            .list(&stale, ListRequest::default())
+            .await
+            .map(drop),
+        context
+            .documents
+            .lookup_receipt(&stale, &request("before-destroy"))
+            .await
+            .map(drop),
+    ] {
+        assert!(
+            matches!(refused, Err(Error::AuthorityUnavailable)),
+            "a read by a caller resolved before the id changed is refused: {refused:?}"
+        );
+    }
+    let fresh = caller(&context, &owned.owner_session).await;
+    context
+        .documents
+        .get(&fresh, &before.document_id)
+        .await
+        .expect("a caller resolved after the change reads as before");
+    context
+        .documents
+        .mutate(
+            &fresh,
+            &request("fresh-audience"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: None,
+                access: shared(),
+            }),
+        )
+        .await
+        .expect("a caller resolved after the change writes as before");
+    drop(owned);
+    runtime.shutdown().await;
+}

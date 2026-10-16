@@ -137,6 +137,196 @@ fn is_destroyed(handle: &MobReadHandle) -> bool {
     handle.status_observation_snapshot() == meerkat_mob::MobState::Destroyed
 }
 
+/// Orders the changes of which mob holds an id against document operations.
+///
+/// A document operation holds the read side of the gate from its check below
+/// through its store call, and a create's check of the documents naming an
+/// id holds the write side, so the check waits for every write in flight and
+/// sees what it committed. A generation counts the changes: a create admitted
+/// under an id, and a destroyed mob the registry releases, move the id's
+/// generation past every caller resolved before. The resolver stamps the
+/// generation it read before any authority into the caller's context, and an
+/// operation whose caller's authority names, or whose write names, an id that
+/// changed after the stamp is refused: its caller was resolved against the
+/// mob that held the id before. The generations live outside the gate, so the
+/// synchronous after-destroy hook moves them without waiting for it. The
+/// ordering covers one runtime in one process.
+#[derive(Default)]
+pub(crate) struct MobIdOrdering {
+    gate: tokio::sync::RwLock<()>,
+    generations: std::sync::Mutex<MobIdGenerations>,
+}
+
+#[derive(Default)]
+struct MobIdGenerations {
+    current: u64,
+    changed: BTreeMap<String, u64>,
+}
+
+impl MobIdOrdering {
+    fn generations(&self) -> std::sync::MutexGuard<'_, MobIdGenerations> {
+        self.generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The generation a caller resolved from now on is stamped with.
+    fn current(&self) -> u64 {
+        self.generations().current
+    }
+
+    /// Record a change of which mob holds `mob_id`.
+    fn changed(&self, mob_id: &str) {
+        let mut generations = self.generations();
+        generations.current += 1;
+        let current = generations.current;
+        generations.changed.insert(mob_id.to_owned(), current);
+    }
+
+    /// Whether which mob holds `mob_id` changed after `generation`.
+    fn changed_after(&self, mob_id: &str, generation: u64) -> bool {
+        self.generations()
+            .changed
+            .get(mob_id)
+            .is_some_and(|changed| *changed > generation)
+    }
+}
+
+/// The mob ids a mutation's new owner or access names: a create's, an access
+/// change's and a transfer's. A content replace and a delete name none.
+fn mob_ids_named_by(mutation: &documents::Mutation) -> impl Iterator<Item = &str> {
+    use documents::{Audience, Mutation};
+    let (owner, access) = match mutation {
+        Mutation::Create(new) => (new.owner.as_ref(), Some(&new.access)),
+        Mutation::SetAccess { access, .. } => (None, Some(access)),
+        Mutation::Transfer { owner, access, .. } => (Some(owner), access.as_ref()),
+        Mutation::Replace { .. } | Mutation::Delete { .. } => (None, None),
+    };
+    let owner = owner.and_then(|owner| match owner {
+        Owner::Mob(id) => Some(id.as_str()),
+        Owner::Agent(_) | Owner::Realm => None,
+    });
+    let audiences = access
+        .into_iter()
+        .flat_map(|access| {
+            access
+                .grants
+                .iter()
+                .map(|grant| &grant.audience)
+                .chain(access.denies.iter().map(|deny| &deny.audience))
+        })
+        .filter_map(|audience| match audience {
+            Audience::Mob(id) => Some(id.as_str()),
+            Audience::Agent { .. } | Audience::Realm => None,
+        });
+    owner.into_iter().chain(audiences)
+}
+
+/// The document store behind every document service the composition builds,
+/// for tool bundles and document MCP bindings alike. Every operation holds
+/// the read side of the mob id gate through its store call, and is refused
+/// with [`documents::Error::AuthorityUnavailable`], so that the caller
+/// resolves again, when its caller carries no generation stamp (a context the
+/// resolver did not resolve) or when a mob id the caller's authority names,
+/// or a write's new owner or access names, changed after the stamp. A host
+/// that needs unordered access uses its provider's store directly.
+pub(crate) struct OrderedDocumentStore {
+    inner: Arc<dyn documents::ExtensionDocumentStore>,
+    ordering: Arc<MobIdOrdering>,
+}
+
+impl OrderedDocumentStore {
+    /// Admit one operation of `caller`, which names `named` mob ids besides
+    /// those of the caller's authority: the read side of the gate, held until
+    /// the operation's store call returns.
+    async fn admit<'a>(
+        &self,
+        caller: &HostAccessContext,
+        mut named: impl Iterator<Item = &'a str>,
+    ) -> documents::Result<tokio::sync::RwLockReadGuard<'_, ()>> {
+        let gate = self.ordering.gate.read().await;
+        let resolved_at = caller
+            .authority_generation()
+            .ok_or(documents::Error::AuthorityUnavailable)?;
+        let changed = |mob_id: &str| self.ordering.changed_after(mob_id, resolved_at);
+        if caller.authority_mob_ids().into_iter().any(changed) || named.any(changed) {
+            return Err(documents::Error::AuthorityUnavailable);
+        }
+        Ok(gate)
+    }
+}
+
+#[async_trait]
+impl documents::ExtensionDocumentStore for OrderedDocumentStore {
+    async fn get(
+        &self,
+        scope: &documents::DocumentScope,
+        caller: &HostAccessContext,
+        id: &documents::DocumentId,
+    ) -> documents::Result<documents::Document> {
+        let _gate = self.admit(caller, std::iter::empty()).await?;
+        self.inner.get(scope, caller, id).await
+    }
+    async fn list(
+        &self,
+        scope: &documents::DocumentScope,
+        caller: &HostAccessContext,
+        request: documents::ListRequest,
+    ) -> documents::Result<documents::DocumentPage> {
+        let _gate = self.admit(caller, std::iter::empty()).await?;
+        self.inner.list(scope, caller, request).await
+    }
+    async fn lookup_receipt(
+        &self,
+        scope: &documents::DocumentScope,
+        caller: &HostAccessContext,
+        request: &documents::RequestIdentity,
+    ) -> documents::Result<Option<documents::MutationReceipt>> {
+        let _gate = self.admit(caller, std::iter::empty()).await?;
+        self.inner.lookup_receipt(scope, caller, request).await
+    }
+    async fn mutate(
+        &self,
+        scope: &documents::DocumentScope,
+        caller: &HostAccessContext,
+        request: &documents::RequestIdentity,
+        mutation: documents::Mutation,
+    ) -> documents::Result<documents::MutationOutcome> {
+        let _gate = self.admit(caller, mob_ids_named_by(&mutation)).await?;
+        self.inner.mutate(scope, caller, request, mutation).await
+    }
+    async fn references_mob(&self, realm: &str, mob_id: &str) -> documents::Result<bool> {
+        self.inner.references_mob(realm, mob_id).await
+    }
+}
+
+/// The check a create runs under `mob_id`, ordered against document writes:
+/// it waits for every write in flight to commit, refuses the id while a live
+/// document of `realm` names it, and otherwise moves the id's generation, so
+/// a write whose caller was resolved before is refused when it commits.
+async fn admit_mob_id_create(
+    ordering: &MobIdOrdering,
+    store: &dyn documents::ExtensionDocumentStore,
+    realm: &str,
+    mob_id: &str,
+) -> Result<(), String> {
+    let _gate = ordering.gate.write().await;
+    // Whatever the registry binds under the id is no reason to skip the
+    // check: a mob that activates under it may replace a stopped binding,
+    // and would inherit what the documents grant the id.
+    match store.references_mob(realm, mob_id).await {
+        Ok(false) => {
+            ordering.changed(mob_id);
+            Ok(())
+        }
+        Ok(true) => Err(mob_id_still_named(mob_id)),
+        Err(error) => Err(format!(
+            "the extension documents could not be checked for references to mob id \
+             '{mob_id}' ({error}), so the create is refused"
+        )),
+    }
+}
+
 /// Holds runtime query authorities, never copied lineage or document policy.
 /// A handle is installed by Meerkat's pre-activation callback before its first
 /// member can dispatch. Every operation reads current authority afresh. A
@@ -151,6 +341,10 @@ pub(crate) struct NativeAuthorityRegistry {
     continuity: Option<Arc<dyn crate::identity_first::contracts::ContinuityStore>>,
     access: Option<crate::access::AccessController>,
     pub(crate) publications: Arc<identity_publication::IdentityPublications>,
+    /// The composition's document store, unwrapped: the registry's own reads
+    /// of it run under the mob id gate.
+    store: Arc<dyn documents::ExtensionDocumentStore>,
+    ordering: Arc<MobIdOrdering>,
 }
 
 impl NativeAuthorityRegistry {
@@ -160,6 +354,7 @@ impl NativeAuthorityRegistry {
         sessions: Arc<dyn MobSessionService>,
         continuity: Option<Arc<dyn crate::identity_first::contracts::ContinuityStore>>,
         access: Option<crate::access::AccessController>,
+        store: Arc<dyn documents::ExtensionDocumentStore>,
     ) -> Arc<Self> {
         Arc::new(Self {
             realm,
@@ -169,6 +364,18 @@ impl NativeAuthorityRegistry {
             continuity,
             access,
             publications: Arc::new(Default::default()),
+            store,
+            ordering: Arc::default(),
+        })
+    }
+
+    /// The document store every document service of the composition uses:
+    /// the composition's store, with each write ordered against the changes
+    /// of which mob holds an id ([`OrderedDocumentStore`]).
+    pub(crate) fn document_store(&self) -> Arc<dyn documents::ExtensionDocumentStore> {
+        Arc::new(OrderedDocumentStore {
+            inner: Arc::clone(&self.store),
+            ordering: Arc::clone(&self.ordering),
         })
     }
 
@@ -242,6 +449,11 @@ impl NativeAuthorityRegistry {
                 .filter(|(_, handle)| is_destroyed(handle))
                 .map(|(id, _)| id.clone())
                 .collect();
+            // A write whose caller was resolved while a destroyed mob held
+            // its id is refused from now on.
+            for id in &destroyed {
+                self.ordering.changed(id);
+            }
             destroyed
                 .iter()
                 .filter_map(|id| handles.remove(id))
@@ -271,23 +483,16 @@ impl NativeAuthorityRegistry {
     /// - A store that cannot answer, a registry that is gone and a failed
     ///   read all refuse the create.
     ///
-    /// The check reads every live document of the realm under the store's
-    /// one connection, so document reads and writes of every session wait
-    /// for it, and a refusal tells the caller that some document names the
-    /// id, also one it cannot read. It is not ordered against a document
-    /// write already in flight: a write whose caller authority was resolved
-    /// while the destroyed mob was live (the embedding host's tool resolves
-    /// the caller, then mutates) can still commit a reference to the id
-    /// after the check passed. Restoring a persisted mob is no create and is
-    /// never checked.
-    pub(crate) fn before_create(
-        self: &Arc<Self>,
-        store: Arc<dyn documents::ExtensionDocumentStore>,
-    ) -> meerkat_mob_mcp::MobBeforeCreate {
+    /// The check is ordered against document writes ([`MobIdOrdering`]): it
+    /// waits for every write in flight, and a write whose caller was resolved
+    /// before an admitted create under the id is refused when it commits. The
+    /// exemption above takes no part in that ordering. A refusal tells the
+    /// caller that some document names the id, also one it cannot read.
+    /// Restoring a persisted mob is no create and is never checked.
+    pub(crate) fn before_create(self: &Arc<Self>) -> meerkat_mob_mcp::MobBeforeCreate {
         let registry = Arc::downgrade(self);
         Arc::new(move |request: meerkat_mob_mcp::MobCreateRequest| {
             let registry = registry.clone();
-            let store = Arc::clone(&store);
             Box::pin(async move {
                 if request.implicit_delegation_mob {
                     return Ok(());
@@ -299,29 +504,16 @@ impl NativeAuthorityRegistry {
                          documents name mob id '{mob_id}' can run"
                     )
                 })?;
-                registry.check_mob_id_unnamed(store.as_ref(), mob_id).await
+                registry.admit_create(mob_id).await
             })
         })
     }
 
     /// The check [`Self::before_create`] runs for a create it does not
-    /// exempt: refuse `mob_id` while a live document of this realm names it.
-    async fn check_mob_id_unnamed(
-        &self,
-        store: &dyn documents::ExtensionDocumentStore,
-        mob_id: &str,
-    ) -> Result<(), String> {
-        // Whatever the registry binds under the id is no reason to skip
-        // the check: a mob that activates under it may replace a stopped
-        // binding, and would inherit what the documents grant the id.
-        match store.references_mob(&self.realm, mob_id).await {
-            Ok(false) => Ok(()),
-            Ok(true) => Err(mob_id_still_named(mob_id)),
-            Err(error) => Err(format!(
-                "the extension documents could not be checked for references to mob id \
-                 '{mob_id}' ({error}), so the create is refused"
-            )),
-        }
+    /// exempt: refuse `mob_id` while a live document of this realm names it,
+    /// ordered against document writes ([`admit_mob_id_create`]).
+    async fn admit_create(&self, mob_id: &str) -> Result<(), String> {
+        admit_mob_id_create(&self.ordering, self.store.as_ref(), &self.realm, mob_id).await
     }
 
     fn handle(&self, id: &str) -> documents::Result<MobReadHandle> {
@@ -562,6 +754,9 @@ impl ToolCallerResolver for NativeCallerResolver {
             .registry
             .upgrade()
             .ok_or(documents::Error::AuthorityUnavailable)?;
+        // Read before any authority: a write naming a mob id whose holder
+        // changes after this point is refused when it commits.
+        let resolved_at = registry.ordering.current();
         let session_id = runtime_origin_session(context)?;
         let metadata = registry
             .sessions
@@ -703,7 +898,8 @@ impl ToolCallerResolver for NativeCallerResolver {
         }
         let mut caller =
             HostAccessContext::new(registry.realm.clone(), principal, lineage, policy)?
-                .with_memberships(member_mobs, managed_mobs, realm_admin)?;
+                .with_memberships(member_mobs, managed_mobs, realm_admin)?
+                .with_authority_generation(resolved_at);
         if let Some(owner) = requested_owner {
             registry.validate_owner(owner).await?;
             caller = caller.with_valid_owners(BTreeSet::from([owner.clone()]));
@@ -716,6 +912,13 @@ impl ToolCallerResolver for NativeCallerResolver {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The document store of a registry under test.
+    fn test_store(dir: &std::path::Path) -> Arc<dyn documents::ExtensionDocumentStore> {
+        Arc::new(
+            documents::SqliteExtensionDocumentStore::open(dir.join("documents.sqlite3")).unwrap(),
+        )
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn extension_native_retained_source_policy_observes_authoritative_commit() {
@@ -816,6 +1019,7 @@ comms = true
             sessions.clone(),
             None,
             None,
+            test_store(dir.path()),
         );
         let resolver = NativeCallerResolver {
             registry: Arc::downgrade(&registry),
@@ -1005,6 +1209,7 @@ comms = true
             sessions.clone(),
             None,
             None,
+            test_store(dir.path()),
         );
         registry.before_activation()(handle.read_handle())
             .await
@@ -1093,6 +1298,7 @@ comms = true
             sessions.clone(),
             None,
             None,
+            test_store(dir.path()),
         );
         registry.before_activation()(handle.read_handle())
             .await
@@ -1174,12 +1380,14 @@ comms = true
         let sessions = spec.session_service.clone();
         let runtime = crate::MobRuntime::bootstrap(spec).await.unwrap();
         let handle = runtime.handle();
+        let store = test_store(dir.path());
         let registry = NativeAuthorityRegistry::new(
             "test".into(),
             handle.mob_id().to_string(),
             sessions.clone(),
             None,
             None,
+            Arc::clone(&store),
         );
         registry.before_activation()(handle.read_handle())
             .await
@@ -1187,10 +1395,6 @@ comms = true
         let mob_id = handle.mob_id().to_string();
         assert!(registry.handle(&mob_id).is_ok(), "the id is bound and live");
 
-        let store: Arc<dyn documents::ExtensionDocumentStore> = Arc::new(
-            documents::SqliteExtensionDocumentStore::open(dir.path().join("documents.sqlite3"))
-                .unwrap(),
-        );
         let manager = HostAccessContext::new(
             "test",
             Principal::Agent("manager".into()),
@@ -1220,7 +1424,7 @@ comms = true
             .unwrap();
 
         let refused = registry
-            .check_mob_id_unnamed(store.as_ref(), &mob_id)
+            .admit_create(&mob_id)
             .await
             .expect_err("documents name the id, bound or not");
         assert!(refused.contains(&mob_id), "{refused}");
@@ -1315,5 +1519,276 @@ comms = true
             .unwrap();
         assert_eq!(document.revision, written.revision);
         assert_eq!(document.content, content);
+    }
+
+    /// A document store whose writes wait at a gate the test opens.
+    struct PausedWrites {
+        inner: Arc<dyn documents::ExtensionDocumentStore>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl documents::ExtensionDocumentStore for PausedWrites {
+        async fn get(
+            &self,
+            scope: &documents::DocumentScope,
+            caller: &HostAccessContext,
+            id: &documents::DocumentId,
+        ) -> documents::Result<documents::Document> {
+            self.inner.get(scope, caller, id).await
+        }
+        async fn list(
+            &self,
+            scope: &documents::DocumentScope,
+            caller: &HostAccessContext,
+            request: documents::ListRequest,
+        ) -> documents::Result<documents::DocumentPage> {
+            self.inner.list(scope, caller, request).await
+        }
+        async fn lookup_receipt(
+            &self,
+            scope: &documents::DocumentScope,
+            caller: &HostAccessContext,
+            request: &documents::RequestIdentity,
+        ) -> documents::Result<Option<documents::MutationReceipt>> {
+            self.inner.lookup_receipt(scope, caller, request).await
+        }
+        async fn mutate(
+            &self,
+            scope: &documents::DocumentScope,
+            caller: &HostAccessContext,
+            request: &documents::RequestIdentity,
+            mutation: documents::Mutation,
+        ) -> documents::Result<documents::MutationOutcome> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.inner.mutate(scope, caller, request, mutation).await
+        }
+        async fn references_mob(&self, realm: &str, mob_id: &str) -> documents::Result<bool> {
+            self.inner.references_mob(realm, mob_id).await
+        }
+    }
+
+    /// A caller that manages `mob_id`, as the resolver stamps it at
+    /// `generation`.
+    fn manager_of(mob_id: &str, generation: u64) -> HostAccessContext {
+        HostAccessContext::new(
+            "test",
+            Principal::Agent("manager".into()),
+            VerifiedLineage::root(),
+            HostPolicy::ALLOW,
+        )
+        .unwrap()
+        .with_memberships(BTreeSet::new(), BTreeSet::from([mob_id.to_owned()]), false)
+        .unwrap()
+        .with_authority_generation(generation)
+    }
+
+    fn owned_by(mob_id: &str) -> documents::Mutation {
+        documents::Mutation::Create(documents::NewDocument {
+            content: documents::DocumentContent {
+                title: mob_id.into(),
+                content_type: "application/test".into(),
+                schema_version: 1,
+                payload: vec![1],
+            },
+            owner: Some(Owner::Mob(mob_id.into())),
+            access: documents::DocumentAccess::default(),
+        })
+    }
+
+    /// A create's check is ordered against document writes. A write in
+    /// flight (held inside the store, past its own check, before its commit)
+    /// holds the check until it commits, and the check then sees what it
+    /// wrote. A write whose caller was resolved before a create admitted
+    /// under an id is refused when it commits; a caller resolved after
+    /// writes as before. Gates, not timing, force each interleaving.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_create_check_is_ordered_against_document_writes() {
+        use futures::FutureExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let store: Arc<dyn documents::ExtensionDocumentStore> = Arc::new(PausedWrites {
+            inner: test_store(dir.path()),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let ordering = Arc::new(MobIdOrdering::default());
+        let documents = DocumentService::new(
+            "test",
+            "notes",
+            Arc::new(OrderedDocumentStore {
+                inner: Arc::clone(&store),
+                ordering: Arc::clone(&ordering),
+            }),
+        )
+        .unwrap();
+
+        let caller = manager_of("held", ordering.current());
+        let write = tokio::spawn({
+            let documents = documents.clone();
+            async move {
+                documents
+                    .mutate(
+                        &caller,
+                        &documents::RequestIdentity::new("held", b"held").unwrap(),
+                        owned_by("held"),
+                    )
+                    .await
+            }
+        });
+        entered.notified().await;
+        let mut check = Box::pin(admit_mob_id_create(
+            &ordering,
+            store.as_ref(),
+            "test",
+            "held",
+        ));
+        assert!(
+            (&mut check).now_or_never().is_none(),
+            "the check waits for the write in flight"
+        );
+        release.notify_one();
+        write.await.unwrap().unwrap();
+        let refused = check
+            .await
+            .expect_err("the check sees the write that was in flight");
+        assert!(refused.contains("'held'"), "{refused}");
+
+        let stale = manager_of("fresh", ordering.current());
+        admit_mob_id_create(&ordering, store.as_ref(), "test", "fresh")
+            .await
+            .expect("no document names the id");
+        let refused = documents
+            .mutate(
+                &stale,
+                &documents::RequestIdentity::new("stale", b"stale").unwrap(),
+                owned_by("fresh"),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(documents::Error::AuthorityUnavailable)),
+            "a caller resolved before the create is refused: {refused:?}"
+        );
+        // The store holds this write until the gate opens: open it first.
+        release.notify_one();
+        documents
+            .mutate(
+                &manager_of("fresh", ordering.current()),
+                &documents::RequestIdentity::new("fresh", b"fresh").unwrap(),
+                owned_by("fresh"),
+            )
+            .await
+            .expect("a caller resolved after the create writes as before");
+    }
+
+    /// The after-destroy hook is synchronous: it moves the destroyed mob's
+    /// generation without waiting for the gate a write in flight holds, and
+    /// a caller resolved before the destroy is refused from then on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_after_destroy_moves_generations_while_a_write_is_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            r#"
+[mob]
+id = "destroy-in-flight"
+[profiles.worker]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+[profiles.worker.tools]
+comms = true
+"#,
+        )
+        .unwrap();
+        let spec = crate::MobBootstrapSpec::persistent(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            dir.path().to_path_buf(),
+            4,
+            Arc::new(
+                meerkat_store::SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
+                    .unwrap(),
+            ),
+        )
+        .unwrap()
+        .with_options(crate::MobBootstrapOptions {
+            allow_ephemeral_sessions: false,
+            notify_orchestrator_on_resume: false,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        });
+        let sessions = spec.session_service.clone();
+        let runtime = crate::MobRuntime::bootstrap(spec).await.unwrap();
+        let handle = runtime.handle();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let registry = NativeAuthorityRegistry::new(
+            "test".into(),
+            handle.mob_id().to_string(),
+            sessions.clone(),
+            None,
+            None,
+            Arc::new(PausedWrites {
+                inner: test_store(dir.path()),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+        );
+        let mut child_definition = handle.definition().clone();
+        child_definition.id = "destroyed-in-flight".into();
+        let child =
+            meerkat_mob::MobBuilder::new(child_definition, meerkat_mob::MobStorage::in_memory())
+                .with_session_service(sessions.clone())
+                .with_default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+                .before_activation(registry.before_activation())
+                .create()
+                .await
+                .unwrap();
+        let child_id = child.mob_id().to_string();
+        let documents = DocumentService::new("test", "notes", registry.document_store()).unwrap();
+        let stale = manager_of(&child_id, registry.ordering.current());
+
+        let write = tokio::spawn({
+            let documents = documents.clone();
+            let caller = manager_of("unrelated", registry.ordering.current());
+            async move {
+                documents
+                    .mutate(
+                        &caller,
+                        &documents::RequestIdentity::new("in-flight", b"in-flight").unwrap(),
+                        owned_by("unrelated"),
+                    )
+                    .await
+            }
+        });
+        entered.notified().await;
+        child.destroy().await.unwrap();
+        // Runs on this task while the write holds the gate's read side.
+        registry.after_destroy()(child.mob_id());
+        assert!(
+            registry.ordering.changed_after(
+                &child_id,
+                stale
+                    .authority_generation()
+                    .expect("the test stamps its callers")
+            ),
+            "the destroy moved the child's generation while the write was in flight"
+        );
+        release.notify_one();
+        write.await.unwrap().expect("the write in flight commits");
+        let refused = documents
+            .mutate(
+                &stale,
+                &documents::RequestIdentity::new("stale", b"stale").unwrap(),
+                owned_by(&child_id),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(documents::Error::AuthorityUnavailable)),
+            "a caller resolved before the destroy is refused: {refused:?}"
+        );
+        drop(child);
+        handle.stop().await.unwrap();
     }
 }
