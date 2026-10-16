@@ -695,6 +695,11 @@ class CiWorkflowTests(unittest.TestCase):
             ("lanes empty", rust_jobs, {lane: "" for lane in ci_changes.LANES}, 1),
             ("a required job skipped", {"fmt-lint": "skipped"}, console_only, 1),
             ("changes failed", {"changes": "failure"}, every, 1),
+            ("feature lanes skipped when classified false",
+             {job: "skipped" for lane in ("voice", "extension_state") for job in ci_changes.LANE_JOBS[lane]},
+             {**every, "voice": "false", "extension_state": "false"}, 0),
+            ("a voice job skipped while its lane runs", {"voice-clippy": "skipped"},
+             {**every, "extension_state": "false"}, 1),
             ("the workspace lint skipped while rust runs", {"clippy": "skipped"}, every, 1),
         )
         for name, results, lanes, status in cases:
@@ -809,6 +814,11 @@ class CiWorkflowTests(unittest.TestCase):
         nothing = {lane: "false" for lane in ci_changes.LANES}
         self.assertEqual(self.run_classify_step(printing(console_only), head_classifier=printing(nothing)),
                          console_only)
+        # The classifier before the voice and extension-state lanes printed
+        # the other six; a pull request on such a base runs every lane.
+        six = {lane: "false" for lane in ("rust", "integration", "python", "console", "console_perf",
+                                          "flow_editor")}
+        self.assertEqual(self.run_classify_step(printing(six)), every)
         for case, base in (("predates the lanes", printing({"full": "false"})),
                            ("misses a lane", printing({k: v for k, v in console_only.items() if k != "python"})),
                            ("fails", "raise SystemExit(3)\n"),

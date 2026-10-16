@@ -54,17 +54,20 @@ env:
 
 jobs:
   # Decides which lanes of Rust, console, SDK and example jobs this run
-  # needs. A pull request runs the lanes its changed files can reach: none
-  # for docs or the non-CI workflows, only the console lanes for console/,
-  # every lane but console-perf for Rust sources (scripts/ci-changes.py maps
-  # the paths). Pushes and dispatches always run every lane, so main keeps
-  # the full green run release.yml requires.
+  # needs. A pull request runs the lanes its changed files reach: none for
+  # docs or the non-CI workflows, only the console lanes for console/, rust
+  # and integration for a Rust source, plus the lanes whose own inputs it
+  # changes (scripts/ci-changes.py maps the paths and prints what it left to
+  # the push). Pushes and dispatches always run every lane, so main keeps the
+  # full green run release.yml requires before a tag.
   changes:
     name: changes
     runs-on: ubuntu-24.04
     outputs:
       rust: ${{ steps.classify.outputs.rust }}
       integration: ${{ steps.classify.outputs.integration }}
+      voice: ${{ steps.classify.outputs.voice }}
+      extension_state: ${{ steps.classify.outputs.extension_state }}
       python: ${{ steps.classify.outputs.python }}
       console: ${{ steps.classify.outputs.console }}
       console_perf: ${{ steps.classify.outputs.console_perf }}
@@ -85,7 +88,7 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
         run: |
-          lanes="rust integration python console console_perf flow_editor"
+          lanes="rust integration voice extension_state python console console_perf flow_editor"
           if [[ "${EVENT}" != "pull_request" ]]; then
             echo "${EVENT}: every lane runs"
             for lane in ${lanes}; do
@@ -306,7 +309,7 @@ jobs:
   test-extension-state:
     name: test-extension-state
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.extension_state == 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -329,7 +332,7 @@ jobs:
   extension-state-lint:
     name: extension-state-lint
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.extension_state == 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -348,7 +351,7 @@ jobs:
   test-voice:
     name: test-voice
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.voice == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -373,7 +376,7 @@ jobs:
   voice-clippy:
     name: voice-clippy
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.voice == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -755,6 +758,8 @@ jobs:
         env:
           LANE_RUST: ${{ needs.changes.outputs.rust }}
           LANE_INTEGRATION: ${{ needs.changes.outputs.integration }}
+          LANE_VOICE: ${{ needs.changes.outputs.voice }}
+          LANE_EXTENSION_STATE: ${{ needs.changes.outputs.extension_state }}
           LANE_PYTHON: ${{ needs.changes.outputs.python }}
           LANE_CONSOLE: ${{ needs.changes.outputs.console }}
           LANE_CONSOLE_PERF: ${{ needs.changes.outputs.console_perf }}
@@ -784,10 +789,10 @@ jobs:
           check clippy "${{ needs.clippy.result }}" rust
           check test "${{ needs.test.result }}" rust
           check test-integration "${{ needs.test-integration.result }}" integration
-          check test-extension-state "${{ needs.test-extension-state.result }}" rust
-          check extension-state-lint "${{ needs.extension-state-lint.result }}" rust
-          check test-voice "${{ needs.test-voice.result }}" rust
-          check voice-clippy "${{ needs.voice-clippy.result }}" rust
+          check test-extension-state "${{ needs.test-extension-state.result }}" extension_state
+          check extension-state-lint "${{ needs.extension-state-lint.result }}" extension_state
+          check test-voice "${{ needs.test-voice.result }}" voice
+          check voice-clippy "${{ needs.voice-clippy.result }}" voice
           check test-python "${{ needs.test-python.result }}" python
           check test-typescript "${{ needs.test-typescript.result }}" required
           check console "${{ needs.console.result }}" console

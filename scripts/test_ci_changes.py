@@ -2,7 +2,9 @@
 """Contracts for scripts/ci-changes.py, which runs on a pull request only
 the CI lanes its changed files can reach."""
 
+import contextlib
 import importlib.util
+import io
 import os
 import re
 import subprocess
@@ -62,6 +64,14 @@ def expected_output(*lanes: str) -> str:
 EVERY_LANE = set(ci_changes.LANES)
 CONSOLE_LANES = {"console", "console_perf", "flow_editor"}
 RUST_LANES = EVERY_LANE - {"console_perf"}
+# What a pull request runs for a Rust change that is no feature's own input.
+RUST_PR_LANES = {"rust", "integration"}
+FEATURE_LANES = set(ci_changes.FEATURE_GATES)
+
+
+def no_gates(path: str) -> str:
+    """A changed file's text without any feature gate."""
+    return "pub fn changed() {}\n"
 
 
 # Where a file may name a path in a lane-limited or skippable area: a path
@@ -70,11 +80,16 @@ RUST_LANES = EVERY_LANE - {"console_perf"}
 # bare area name as a quoted string (git grep and similar path arguments).
 # Rust comments are skipped: they document, they do not read. Bare names are
 # not read from Rust, where words like "console" name modes and routes.
-AREA_NAMES = ("sdk/python", "sdk/typescript", "flow-editor", "console", "sdk", "scripts", "docs")
+AREA_NAMES = ("sdk/python", "sdk/typescript", "flow-editor", "console", "sdk", "scripts", "docs",
+              "examples", "packages", "tools/bazel")
+# Skippable files, and single files with lanes of their own (AREA_FILES),
+# whose readers the scan audits too.
 SKIPPABLE_NAMES = ("README.md", "CHANGELOG.md", "CONTRIBUTING.md", "CLAUDE.md", "LICENSE-MIT",
                    "LICENSE-APACHE", ".github/CODEOWNERS", ".github/release.yml",
                    ".github/workflows/release.yml", ".github/workflows/e2e-live.yml",
-                   ".github/workflows/publish-docs.yml")
+                   ".github/workflows/publish-docs.yml", ".pre-commit-config.yaml", ".gitignore",
+                   "BUILD.bazel", "MODULE.bazel", ".bazelrc", ".bazelversion", "deny.toml",
+                   "Makefile", ".config/nextest.toml")
 _NAMES = "|".join(re.escape(name) for name in sorted(AREA_NAMES, key=len, reverse=True))
 _FILES = "|".join(re.escape(name) for name in SKIPPABLE_NAMES)
 _REST = r"(/[^\s\"'`),;]*)?"
@@ -131,19 +146,40 @@ CROSS_AREA_READS = {
     ("examples/", "sdk/typescript/"): {"console"},
     # The flow editor's browser tests start console fixtures.
     ("flow-editor/", "console/"): {"flow_editor"},
+    # The flow editor imports its component packages, and its source
+    # contract test (test:controller) reads the Makefile's targets.
+    ("flow-editor/", "packages/"): {"flow_editor"},
+    ("flow-editor/", "Makefile"): {"flow_editor"},
     # The console component packages' tests import console sources; the
     # console job runs them.
     ("packages/", "console/"): {"console"},
+    # The console and console-perf's bundle import the component packages;
+    # the console's own tests read its fixtures; fixture-ready greps
+    # examples/.
+    ("console/", "packages/"): {"console", "console_perf"},
+    ("console/", "console/fixtures/"): {"console"},
+    ("console/", "examples/"): {"console"},
+    # meerkat-meta's manifest declares the out-of-tree examples that clippy,
+    # the integration lane's example build and console-acceptance compile.
+    ("crates/*/Cargo.toml", "examples/"): {"rust", "integration", "console"},
+    # tests/console_customization_fixtures.rs runs in the integration lane
+    # and in console-fixtures.
+    ("crates/*/tests/", "console/fixtures/"): {"integration", "console"},
+    # The memory eval harness tests run scripts/memory-evals.
+    ("crates/*/tests/", "scripts/memory-evals"): {"integration"},
     # Workflow files: ci.yml runs console scripts and keys the console lane's
     # npm cache on console/package-lock.json, keys flow-editor's on its own,
-    # and installs sdk/python in test-python. Its contract scripts run in
-    # fmt-lint and test-typescript runs on every run, so neither needs a
-    # lane; release, docs and live workflows are not CI lanes.
+    # installs sdk/python in test-python and runs examples/001's topology
+    # script in console-acceptance. Its contract scripts run in fmt-lint and
+    # test-typescript runs on every run, so neither needs a lane; release,
+    # docs and live workflows are not CI lanes.
     (".github/", "console/"): {"console"},
     (".github/", "flow-editor/"): {"flow_editor"},
     (".github/", "sdk/python/"): {"python"},
+    (".github/", "examples/"): {"console"},
     (".github/", "sdk/typescript/"): set(),
     (".github/", "scripts/"): set(),
+    (".github/", "scripts/memory-evals"): set(),
     (".github/", "docs/"): set(),
     # make test-python reads sdk/python; the release targets and local
     # hooks are not CI lanes.
@@ -152,15 +188,23 @@ CROSS_AREA_READS = {
     ("Makefile", "scripts/"): set(),
     ("Makefile", "skippable"): set(),
     (".pre-commit-config.yaml", "scripts/"): set(),
-    # Contract tests and release scripts run in fmt-lint, which always runs.
+    # Contract tests, the classifier and release scripts run in fmt-lint,
+    # which always runs.
     ("scripts/", "console/"): set(),
+    ("scripts/", "console/fixtures/"): set(),
     ("scripts/", "flow-editor/"): set(),
     ("scripts/", "sdk/"): set(),
     ("scripts/", "sdk/python/"): set(),
     ("scripts/", "sdk/typescript/"): set(),
     ("scripts/", "scripts/"): set(),
+    ("scripts/", "scripts/memory-evals"): set(),
     ("scripts/", "docs/"): set(),
     ("scripts/", "skippable"): set(),
+    ("scripts/", "Makefile"): set(),
+    ("scripts/", ".config/nextest.toml"): set(),
+    ("scripts/", "examples/"): set(),
+    ("scripts/", "packages/"): set(),
+    ("scripts/", "tools/bazel/"): set(),
 }
 
 
@@ -168,7 +212,7 @@ def reader_role(path: str) -> str:
     """The area a referencing file runs as: crates split by target kind."""
     parts = path.split("/")
     if parts[0] == "crates" and len(parts) > 2:
-        return f"crates/*/{parts[2]}/"
+        return f"crates/*/{parts[2]}" + ("/" if len(parts) > 3 else "")
     for prefix, _ in ci_changes.AREAS:
         if path.startswith(prefix):
             return prefix
@@ -176,6 +220,8 @@ def reader_role(path: str) -> str:
 
 
 def area_of(path: str) -> str:
+    if path in ci_changes.AREA_FILES:
+        return path
     if ci_changes.skippable(path) and not path.startswith("docs/"):
         return "skippable"
     for prefix, _ in ci_changes.AREAS:
@@ -273,12 +319,62 @@ def cross_area_reads(root: Path) -> dict[tuple[str, str], set[str]]:
     return reads
 
 
-class CiChangesTests(unittest.TestCase):
-    def full(self, *paths, event="pull_request"):
-        return ci_changes.needs_full_run(event, list(paths))
+# A file module declaration and the attributes before it, at the start of a
+# line (so a commented-out declaration is not one).
+MODULE_DECLARATION = re.compile(
+    r"(?m)^[ \t]*(?P<attributes>(?:#\[[^\]]*\]\s*)*)(?:pub(?:\([^)]*\))?\s+)?mod\s+(?P<name>\w+)\s*;"
+)
+CFG_ATTRIBUTE = re.compile(r"#\[cfg\(([^\]]*)\)\]")
+PATH_ATTRIBUTE = re.compile(r'#\[path\s*=\s*"([^"]+)"\]')
 
-    def lanes(self, *paths, event="pull_request"):
-        return set(ci_changes.needed_lanes(event, list(paths)))
+
+def module_file(source: Path, declaration: re.Match) -> Path:
+    """The file a `mod name;` declaration in `source` loads."""
+    explicit = PATH_ATTRIBUTE.search(declaration["attributes"])
+    if explicit:
+        candidates = [source.parent / explicit[1]]
+    else:
+        # Children of a crate root or mod.rs live beside it; those of x.rs in x/.
+        root_like = source.name in ("lib.rs", "main.rs", "mod.rs") or source.parent.name == "bin"
+        directory = source.parent if root_like else source.with_suffix("")
+        candidates = [directory / f"{declaration['name']}.rs", directory / declaration["name"] / "mod.rs"]
+    found = [candidate for candidate in candidates if candidate.is_file()]
+    assert found, f"cannot find the file of module {declaration['name']} declared in {source}"
+    return found[0]
+
+
+def gated_modules(root: Path) -> dict[str, set[str]]:
+    """Feature lane -> the files of the modules a crate's sources declare
+    under that feature's cfg, and of every module those declare in turn
+    (which need not repeat the cfg)."""
+    gated = {lane: set() for lane in ci_changes.FEATURE_GATES}
+    pending = []
+    for source in sorted((root / "crates").glob("*/src/**/*.rs")):
+        for declaration in MODULE_DECLARATION.finditer(source.read_text(encoding="utf-8")):
+            cfgs = " ".join(CFG_ATTRIBUTE.findall(declaration["attributes"]))
+            lanes = {lane for lane, gate in ci_changes.FEATURE_GATES.items() if gate.search(cfgs)}
+            if lanes:
+                pending.append((module_file(source, declaration), lanes))
+    while pending:
+        module, lanes = pending.pop()
+        relative = module.relative_to(root).as_posix()
+        if all(relative in gated[lane] for lane in lanes):
+            continue
+        for lane in lanes:
+            gated[lane].add(relative)
+        for declaration in MODULE_DECLARATION.finditer(module.read_text(encoding="utf-8")):
+            pending.append((module_file(module, declaration), lanes))
+    return gated
+
+class CiChangesTests(unittest.TestCase):
+    def full(self, *paths, event="pull_request", read=no_gates):
+        return ci_changes.needs_full_run(event, list(paths), read)
+
+    def lanes(self, *paths, event="pull_request", read=no_gates):
+        return set(ci_changes.needed_lanes(event, list(paths), read))
+
+    def deferred(self, *paths, read=no_gates):
+        return set(ci_changes.classify("pull_request", list(paths), read)[1])
 
     def test_docs_and_top_level_markdown_skip_the_heavy_jobs(self):
         self.assertEqual(self.lanes("docs/concepts/events.mdx", "README.md", "CHANGELOG.md"), set())
@@ -292,6 +388,21 @@ class CiChangesTests(unittest.TestCase):
         # fmt-lint runs the script; console/fixture-ready.test.cjs greps it.
         self.assertEqual(self.lanes(".github/workflows/release.yml", "scripts/test_release_workflow.py"),
                          {"console"})
+
+    def test_files_only_fmt_lint_and_audit_read_skip_every_lane(self):
+        # fmt-lint and audit run on every pull request.
+        for path in (".pre-commit-config.yaml", ".gitignore", "BUILD.bazel", "MODULE.bazel", ".bazelrc",
+                     ".bazelversion", "tools/bazel/platforms/BUILD.bazel", "deny.toml",
+                     # Generated per crate; only fmt-lint's freshness check reads them.
+                     "crates/meerkat-meta/BUILD.bazel"):
+            with self.subTest(path=path):
+                self.assertEqual(self.lanes(path), set())
+        # Every other top-level script reaches the console lane only: its
+        # fixture test greps scripts/ for port reservations.
+        for path in ("scripts/pre-push-clippy.sh", "scripts/pre-push-unit.sh",
+                     "scripts/generate-bazel-rust-builds.mjs", "scripts/check-memory-bright-line"):
+            with self.subTest(path=path):
+                self.assertEqual(self.lanes(path), {"console"})
 
     def test_the_classifier_and_its_contract_run_every_lane(self):
         for path in ("scripts/ci-changes.py", "scripts/test_ci_changes.py"):
@@ -308,21 +419,18 @@ class CiChangesTests(unittest.TestCase):
             "docs/rct/traceability.md",
             # src/mobpack.rs reads .claude/skills.
             ".claude/skills/meerkat-meta/SKILL.md",
-            # tests/console_customization_fixtures.rs reads console fixtures.
-            "console/fixtures/configured-host-shell/config/console.toml",
-            # Shared by the console, its components and the flow editor.
-            "packages/console-core/src/index.ts",
-            "examples/001-incident-command-center-pack/server.rs",
+            # Every Rust job builds through it.
             "scripts/repo-cargo",
             "scripts/nested/helper.py",
-            "Makefile",
-            ".config/nextest.toml",
+            # Unclassified files fail closed.
+            "tests/memory-evals/README.md",
+            "unknown-root-file",
         ):
             with self.subTest(path=path):
                 self.assertTrue(self.full(path))
                 self.assertTrue(self.full("README.md", path), "one such file makes the whole run full")
 
-    def test_rust_sources_run_every_lane_but_console_perf(self):
+    def test_rust_sources_reach_every_lane_but_console_perf(self):
         # console-perf bundles only console/ and packages/console-*; every
         # other lane compiles the crates.
         for path in (
@@ -336,8 +444,110 @@ class CiChangesTests(unittest.TestCase):
             ".cargo/config.toml",
         ):
             with self.subTest(path=path):
-                self.assertEqual(self.lanes(path), RUST_LANES)
-        self.assertEqual(self.lanes("crates/meerkat-meta/src/lib.rs", "console/src/App.tsx"), EVERY_LANE)
+                self.assertEqual(set(ci_changes.path_lanes(path)), RUST_LANES)
+
+    def test_a_pull_request_leaves_other_configurations_of_a_rust_change_to_the_push(self):
+        # The rust and integration lanes compile and test the default
+        # configuration; the push runs the rest, and release.yml requires
+        # the push run to be green before a tag.
+        for path in ("crates/meerkat-meta/src/rpc.rs", "crates/meerkat-meta/tests/list_runs.rs",
+                     "crates/meerkat-meta/src/memory/steward_prompt_v0.md",
+                     "crates/meta-store-conformance/src/lib.rs"):
+            with self.subTest(path=path):
+                self.assertEqual(self.lanes(path), RUST_PR_LANES)
+                self.assertEqual(self.deferred(path), RUST_LANES - RUST_PR_LANES)
+        # A lane whose own input changes beside it still runs.
+        self.assertEqual(self.lanes("crates/meerkat-meta/src/lib.rs", "console/src/App.tsx"),
+                         RUST_PR_LANES | CONSOLE_LANES)
+        self.assertEqual(self.deferred("crates/meerkat-meta/src/lib.rs", "console/src/App.tsx"),
+                         FEATURE_LANES | {"python"})
+        self.assertEqual(self.lanes("crates/meerkat-meta/src/lib.rs", "sdk/python/meerkat_meta/types.py"),
+                         RUST_PR_LANES | {"python", "console"})
+        # Pushes run every lane.
+        self.assertEqual(self.lanes("crates/meerkat-meta/src/rpc.rs", event="push"), EVERY_LANE)
+
+    def test_feature_lanes_run_for_their_own_inputs(self):
+        def text(content):
+            return lambda path: content
+
+        voice = '#[cfg(feature = "openai-live")]\nfn live() {}\n'
+        extension = '#![cfg(feature="extension-state")]\n'
+        both = voice + '#[cfg(all(test, feature = "extension-state"))]\nmod t;\n'
+        for paths, read, lanes in (
+            # Code the feature gates, in the file itself.
+            (("crates/meerkat-meta/src/rpc.rs",), text(voice), RUST_PR_LANES | {"voice"}),
+            (("crates/meerkat-meta/tests/extension_state.rs",), text(extension),
+             RUST_PR_LANES | {"extension_state"}),
+            (("crates/meerkat-meta/src/mob_handle_runtime.rs",), text(both), RUST_PR_LANES | FEATURE_LANES),
+            # A module the feature gates whole: its file need not say so.
+            (("crates/meerkat-meta/src/console_voice/live_host.rs",), no_gates, RUST_PR_LANES | {"voice"}),
+            (("crates/meerkat-meta/src/extension_state.rs",), no_gates, RUST_PR_LANES | {"extension_state"}),
+            (("crates/meerkat-meta/src/extension_state/store.rs",), no_gates,
+             RUST_PR_LANES | {"extension_state"}),
+            # The crate only the extension-state feature builds.
+            (("crates/meta-extension-state/src/lib.rs",), no_gates, RUST_PR_LANES | {"extension_state"}),
+            # Build configuration every configuration reads.
+            (("Cargo.lock",), no_gates, RUST_PR_LANES | FEATURE_LANES),
+            (("Cargo.toml",), no_gates, RUST_PR_LANES | FEATURE_LANES),
+            (("rust-toolchain.toml",), no_gates, RUST_PR_LANES | FEATURE_LANES),
+            ((".cargo/config.toml",), no_gates, RUST_PR_LANES | FEATURE_LANES),
+            (("crates/meerkat-meta/Cargo.toml",), no_gates, RUST_PR_LANES | FEATURE_LANES),
+            # A file that cannot be read runs every feature lane.
+            (("crates/meerkat-meta/src/rpc.rs",), lambda path: None, RUST_PR_LANES | FEATURE_LANES),
+            # Only Rust sources are read for gates.
+            (("crates/meerkat-meta/src/memory/steward_prompt_v0.md",), text(voice), RUST_PR_LANES),
+            # The bundles the backends embed run the browser lanes that serve them.
+            (("crates/meerkat-meta/console-dist/index.html",), no_gates, RUST_PR_LANES | {"console"}),
+            (("crates/meerkat-meta/flow-editor-dist/index.html",), no_gates, RUST_PR_LANES | {"flow_editor"}),
+        ):
+            with self.subTest(paths=paths):
+                self.assertEqual(self.lanes(*paths, read=read), lanes)
+
+    def test_feature_paths_cover_every_module_a_feature_gates(self):
+        """A file declared under a feature's cfg need not repeat the cfg, so
+        the classifier cannot see the gate in its text: FEATURE_PATHS must
+        list it, or a pull request changing it would compile it nowhere."""
+        gated = gated_modules(ROOT)
+        self.assertIn("crates/meerkat-meta/src/console_voice/live_host.rs", gated["voice"])
+        self.assertIn("crates/meerkat-meta/src/extension_state.rs", gated["extension_state"])
+        for lane, files in gated.items():
+            for path in sorted(files):
+                with self.subTest(lane=lane, path=path):
+                    self.assertTrue(path.startswith(ci_changes.FEATURE_PATHS[lane]),
+                                    f"add {path.removesuffix('.rs')} to FEATURE_PATHS[{lane!r}]")
+
+    def test_the_gated_module_scan_resolves_every_declaration_form(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for relative, text in {
+                "crates/c/src/lib.rs": (
+                    '#[cfg(feature = "openai-live")]\npub mod live;\n'
+                    '#[cfg(all(test, feature = "extension-state"))]\n#[allow(dead_code)]\npub(crate) mod ext;\n'
+                    'mod plain;\n'
+                    '#[cfg(feature = "openai-live")]\n#[path = "elsewhere/moved.rs"]\nmod moved;\n'
+                ),
+                "crates/c/src/live.rs": '#[cfg(feature = "openai-live")]\nmod nested;\n',
+                "crates/c/src/live/nested/mod.rs": "",
+                "crates/c/src/ext.rs": "",
+                "crates/c/src/plain.rs": "",
+                "crates/c/src/elsewhere/moved.rs": "",
+                "crates/c/src/bin/tool.rs": '#[cfg(feature = "openai-live")]\nmod helper;\n',
+                "crates/c/src/bin/helper.rs": "",
+            }.items():
+                (root / relative).parent.mkdir(parents=True, exist_ok=True)
+                (root / relative).write_text(text)
+            gated = gated_modules(root)
+        self.assertEqual(gated, {
+            "voice": {"crates/c/src/live.rs", "crates/c/src/live/nested/mod.rs",
+                      "crates/c/src/elsewhere/moved.rs", "crates/c/src/bin/helper.rs"},
+            "extension_state": {"crates/c/src/ext.rs"},
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "crates/c/src").mkdir(parents=True)
+            (root / "crates/c/src/lib.rs").write_text('#[cfg(feature = "openai-live")]\nmod missing;\n')
+            with self.assertRaisesRegex(AssertionError, "missing"):
+                gated_modules(root)
 
     def test_area_changes_run_only_the_lanes_that_read_them(self):
         for paths, lanes in (
@@ -348,6 +558,18 @@ class CiChangesTests(unittest.TestCase):
             (("sdk/python/meerkat_meta/types.py", "sdk/typescript/src/types.ts"),
              {"python", "integration"} | CONSOLE_LANES),
             (("flow-editor/src/main.ts", "README.md", "docs/guide.md"), {"flow_editor", "console"}),
+            # The component packages feed the console, its perf bundle and
+            # the flow editor.
+            (("packages/console-core/src/index.ts",), CONSOLE_LANES),
+            (("packages/flow-editor-core/src/index.ts",), CONSOLE_LANES),
+            # tests/console_customization_fixtures.rs reads console fixtures.
+            (("console/fixtures/configured-host-shell/config/console.toml",), CONSOLE_LANES | {"integration"}),
+            # Out-of-tree examples and the packs console-acceptance runs.
+            (("examples/001-incident-command-center-pack/server.rs",), {"rust", "integration", "console"}),
+            (("examples/console-extensions/preview.cjs",), {"rust", "integration", "console"}),
+            (("Makefile",), {"python", "flow_editor"}),
+            ((".config/nextest.toml",), {"rust", "integration"}),
+            (("scripts/memory-evals",), {"integration", "console"}),
         ):
             with self.subTest(paths=paths):
                 self.assertEqual(self.lanes(*paths), lanes)
@@ -357,6 +579,12 @@ class CiChangesTests(unittest.TestCase):
         self.assertEqual(len(jobs), len(set(jobs)))
         for _, lanes in ci_changes.AREAS:
             self.assertLessEqual(set(lanes), EVERY_LANE)
+        for lanes in ci_changes.AREA_FILES.values():
+            self.assertLessEqual(set(lanes), EVERY_LANE)
+        self.assertLessEqual(ci_changes.RUST_DEFERRED_LANES, ci_changes.RUST_LANES)
+        self.assertEqual(set(ci_changes.FEATURE_PATHS), FEATURE_LANES)
+        self.assertLessEqual(FEATURE_LANES, ci_changes.RUST_DEFERRED_LANES)
+        self.assertLessEqual(set(ci_changes.EMBEDDED_BUNDLES.values()), ci_changes.RUST_DEFERRED_LANES)
 
     def test_every_cross_area_read_has_audited_lanes(self):
         """A file that reads another area's files runs in some lanes, so a
@@ -373,6 +601,9 @@ class CiChangesTests(unittest.TestCase):
         # The scan sees the reads that motivated the lanes.
         self.assertIn(("console/", "sdk/typescript/"), reads)
         self.assertIn(("crates/*/tests/", "sdk/python/"), reads)
+        self.assertIn(("crates/*/tests/", "scripts/memory-evals"), reads)
+        self.assertIn(("flow-editor/", "Makefile"), reads)
+        self.assertIn(("crates/*/Cargo.toml", "examples/"), reads)
 
     def test_the_scan_catches_a_new_cross_area_read(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -412,7 +643,7 @@ class CiChangesTests(unittest.TestCase):
         self.assertEqual(self.lanes("README.md", event="workflow_dispatch"), EVERY_LANE)
         self.assertEqual(self.lanes(), EVERY_LANE)
 
-    def test_a_rename_out_of_a_built_tree_runs_everything(self):
+    def test_a_rename_out_of_a_built_tree_runs_its_lanes(self):
         # Moving a component the console still imports into docs/ takes it
         # out of the console build. git reports the move as one rename, whose
         # destination alone is skippable.
@@ -424,7 +655,13 @@ class CiChangesTests(unittest.TestCase):
         # Moving a crate's file into docs/ runs the Rust lanes the same way.
         base = {"crates/x/src/lib.rs": component}
         head = {"docs/lib.rs": component}
-        self.assertEqual(classify_commit(base, head), expected_output(*RUST_LANES))
+        self.assertEqual(classify_commit(base, head), expected_output(*RUST_PR_LANES))
+        # A deleted source is read from the base commit, so the feature its
+        # code gated still runs.
+        gated = '#[cfg(feature = "openai-live")]\nfn live() {}\n' * 4
+        base = {"crates/x/src/live.rs": gated}
+        head = {"docs/live.rs": gated}
+        self.assertEqual(classify_commit(base, head), expected_output(*RUST_PR_LANES, "voice"))
 
     def test_a_docs_only_commit_read_from_git_skips_the_heavy_jobs(self):
         # Control for the test above: the same path from git to verdict
@@ -438,6 +675,16 @@ class CiChangesTests(unittest.TestCase):
             "crates/x.rs": "fn main() {}\n",
         }
         self.assertEqual(classify_commit(base, head), expected_output())
+
+    def test_a_gated_source_read_from_the_checkout_runs_its_feature(self):
+        # Control for the deleted-source case: an edited source is read from
+        # the checked-out tree, gate or no gate.
+        base = {"crates/x/src/a.rs": "fn a() {}\n", "crates/x/src/b.rs": "fn b() {}\n"}
+        head = {"crates/x/src/a.rs": 'fn a() {}\n#[cfg(feature = "extension-state")]\nfn e() {}\n',
+                "crates/x/src/b.rs": "fn b() {}\n"}
+        self.assertEqual(classify_commit(base, head), expected_output(*RUST_PR_LANES, "extension_state"))
+        head = {"crates/x/src/a.rs": "fn a() { let _ = 1; }\n", "crates/x/src/b.rs": "fn b() {}\n"}
+        self.assertEqual(classify_commit(base, head), expected_output(*RUST_PR_LANES))
 
     def test_names_git_would_quote_are_read_verbatim(self):
         # Without -z, git quotes this name and no rule could match it.
@@ -456,6 +703,15 @@ class CiChangesTests(unittest.TestCase):
                 expected_output() + expected_output("flow_editor", "console") + expected_output(*EVERY_LANE),
             )
 
+    def test_main_names_the_lanes_left_to_the_push(self):
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            ci_changes.main(["--event", "pull_request", "crates/meerkat-meta/src/memory/steward_prompt_v0.md"])
+        self.assertIn("left to the push: voice extension_state python console flow_editor\n", printed.getvalue())
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            ci_changes.main(["--event", "push", "crates/meerkat-meta/src/memory/steward_prompt_v0.md"])
+        self.assertNotIn("left to the push", printed.getvalue())
 
 if __name__ == "__main__":
     unittest.main()
