@@ -661,4 +661,72 @@ mod tests {
             "another connection's delete is seen"
         );
     }
+
+    /// Delete the document `receipt` names, as a caller that manages
+    /// `mob_id`.
+    async fn delete_owned_by(
+        store: &SqliteExtensionDocumentStore,
+        realm: &str,
+        mob_id: &str,
+        receipt: MutationReceipt,
+        request: &str,
+    ) {
+        let caller = writer(realm)
+            .with_memberships(
+                std::collections::BTreeSet::new(),
+                std::collections::BTreeSet::from([mob_id.to_owned()]),
+                false,
+            )
+            .unwrap();
+        store
+            .mutate(
+                &DocumentScope::new(realm, "notes").unwrap(),
+                &caller,
+                &RequestIdentity::new(request, request.as_bytes()).unwrap(),
+                Mutation::Delete {
+                    id: receipt.document_id,
+                    expected_revision: receipt.revision,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Counts follow every write exactly: two documents naming a mob keep it
+    /// named until both are gone, and its count then leaves the index. The
+    /// index is shared by every clone of the store, so a write through one
+    /// clone is seen by a check through another, without reading documents.
+    #[tokio::test]
+    async fn mob_reference_counts_return_to_zero_across_store_clones() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteExtensionDocumentStore::open(dir.path().join("docs.sqlite")).unwrap();
+        let clone = store.clone();
+        assert!(!store.references_mob("realm", "twice").await.unwrap());
+        store.decoded.store(0, Ordering::SeqCst);
+
+        let first = create_owned_by(&clone, "realm", "twice", "first").await;
+        let second = create_owned_by(&clone, "realm", "twice", "second").await;
+        assert!(
+            store.references_mob("realm", "twice").await.unwrap(),
+            "a write through one clone is seen through another"
+        );
+        delete_owned_by(&clone, "realm", "twice", first, "delete-first").await;
+        assert!(
+            store.references_mob("realm", "twice").await.unwrap(),
+            "one document still names the mob"
+        );
+        delete_owned_by(&clone, "realm", "twice", second, "delete-second").await;
+        assert!(!store.references_mob("realm", "twice").await.unwrap());
+        assert_eq!(store.decoded.load(Ordering::SeqCst), 0);
+        let count = store
+            .connected
+            .lock()
+            .unwrap()
+            .references
+            .realms
+            .get("realm")
+            .and_then(|counts| counts.get("twice"))
+            .copied();
+        assert_eq!(count, None, "the count returned to zero and left the index");
+    }
 }
