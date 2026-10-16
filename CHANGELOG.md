@@ -198,6 +198,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   repeated id is one node, and a lane stops at a node another lane already
   took. Prior steps are also read in place instead of cloned, which copied
   each step once for every step enclosing it.
+- The Flow Editor draft store no longer falls back to a fixed file in the OS
+  temp directory when neither `XDG_STATE_HOME` nor `HOME` is set and
+  `META_FLOW_EDITOR_DRAFT_STORE` names no store, as can happen for a
+  standalone `meta_flow_editor` started by a service manager. Another local
+  user could create, link or read that predictable shared path first. The
+  draft methods now refuse with `-32602` and
+  `data: {"kind": "draft_store_unavailable", "reason": "gateway_home_unavailable"}`,
+  and the message names the remedy: set `META_FLOW_EDITOR_DRAFT_STORE` to a
+  file in a directory only the gateway's user can write, or set
+  `XDG_STATE_HOME` or `HOME`. An unadopted predecessor gateway home, which
+  already refused, refuses with the same kind and `reason`
+  `predecessor_gateway_home` or `adoption_incomplete`.
 
 ### Added
 

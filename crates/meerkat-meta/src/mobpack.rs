@@ -3942,7 +3942,7 @@ fn import_media_type(params: &Value, fallback: &str) -> String {
         .to_string()
 }
 
-fn mobpack_draft_store_path(params: &Value) -> Result<PathBuf, String> {
+fn mobpack_draft_store_path(params: &Value) -> Result<PathBuf, DraftStoreRefusal> {
     let explicit = params
         .get("store_path")
         .and_then(Value::as_str)
@@ -3962,22 +3962,115 @@ fn mobpack_draft_store_path(params: &Value) -> Result<PathBuf, String> {
     }
 }
 
-fn default_mobpack_draft_store_path() -> Result<PathBuf, String> {
+fn default_mobpack_draft_store_path() -> Result<PathBuf, DraftStoreRefusal> {
     // The draft store lives under the gateway home; the ambient
     // `$XDG_STATE_HOME`/`$HOME` derivation belongs to `storage_layout`
-    // (M5 gate), never re-read here. The OS temp directory stays the last
-    // resort when neither root exists — drafts are recoverable scratch,
-    // not a durable slot. An unadopted predecessor home is not "neither
-    // root": its drafts exist, so the store refuses instead of starting
-    // empty in the temp directory.
+    // (M5 gate), never re-read here. Without either root the store has no
+    // location and refuses: a file at a predictable path in the shared OS
+    // temp directory could be created, linked or read first by another local
+    // user. An unadopted predecessor home refuses too: its drafts exist, so
+    // the store does not start empty elsewhere.
     match crate::storage_layout::default_gateway_home() {
         Ok(home) => Ok(home.join(MOBPACK_DRAFT_STORE_FILENAME)),
-        Err(
-            error @ (crate::storage_layout::StorageLayoutError::PredecessorGatewayHome { .. }
-            | crate::storage_layout::StorageLayoutError::AdoptionIncomplete { .. }),
-        ) => Err(error.to_string()),
-        Err(_) => Ok(std::env::temp_dir().join(MOBPACK_DRAFT_STORE_FILENAME)),
+        Err(crate::storage_layout::StorageLayoutError::GatewayHomeUnavailable) => {
+            Err(DraftStoreRefusal::NoStateRoot)
+        }
+        Err(error) => Err(DraftStoreRefusal::GatewayHome(error)),
     }
+}
+
+/// Why the Flow Editor draft store refused a call. A JSON-RPC caller gets it
+/// as the error `data` ([`DraftStoreRefusal::data`]): a `kind` and the fields
+/// that kind names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DraftStoreRefusal {
+    /// No `META_FLOW_EDITOR_DRAFT_STORE`, and neither `$XDG_STATE_HOME` nor
+    /// `$HOME` to derive the gateway home from: the store has no location.
+    NoStateRoot,
+    /// The gateway home cannot hold the store yet: its predecessor (pre-0.9)
+    /// home waits for adoption.
+    GatewayHome(crate::storage_layout::StorageLayoutError),
+}
+
+impl DraftStoreRefusal {
+    /// The JSON-RPC error `data`.
+    fn data(&self) -> Value {
+        match self {
+            Self::NoStateRoot => json!({
+                "kind": "draft_store_unavailable",
+                "reason": "gateway_home_unavailable",
+            }),
+            Self::GatewayHome(error) => json!({
+                "kind": "draft_store_unavailable",
+                "reason": match error {
+                    crate::storage_layout::StorageLayoutError::PredecessorGatewayHome { .. } => {
+                        "predecessor_gateway_home"
+                    }
+                    crate::storage_layout::StorageLayoutError::AdoptionIncomplete { .. } => {
+                        "adoption_incomplete"
+                    }
+                    _ => "gateway_home_refused",
+                },
+            }),
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::NoStateRoot => "the Flow Editor draft store has no location: neither \
+                                  XDG_STATE_HOME nor HOME is set, and drafts are never kept in \
+                                  the shared temp directory; set META_FLOW_EDITOR_DRAFT_STORE to \
+                                  a file in a directory only this user can write, or set \
+                                  XDG_STATE_HOME or HOME"
+                .to_string(),
+            Self::GatewayHome(error) => error.to_string(),
+        }
+    }
+}
+
+/// A draft store method's failure, as its JSON-RPC error reports it: the
+/// message, and for a typed refusal the error `data`.
+#[derive(Debug, Clone)]
+pub(crate) struct DraftStoreFailure {
+    pub(crate) message: String,
+    pub(crate) data: Option<Value>,
+}
+
+impl From<String> for DraftStoreFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            data: None,
+        }
+    }
+}
+
+impl From<DraftStoreRefusal> for DraftStoreFailure {
+    fn from(refusal: DraftStoreRefusal) -> Self {
+        Self {
+            message: refusal.message(),
+            data: Some(refusal.data()),
+        }
+    }
+}
+
+/// The draft store methods for the JSON-RPC dispatch, reporting typed
+/// refusals; `None` for any other method.
+pub(crate) fn mobpack_draft_store_method(
+    method: &str,
+    params: &Value,
+    runtime: Option<&MobpackRuntimeCatalogState>,
+) -> Option<Result<Value, DraftStoreFailure>> {
+    Some(match method {
+        "meta/mobpacks/list" => list_drafts(params, runtime),
+        "meta/mobpacks/get" => get_draft(params, runtime),
+        "meta/mobpacks/create" => create_draft(params),
+        "meta/mobpacks/save" => save_draft(params),
+        "meta/mobpacks/delete" => delete_draft(params),
+        "meta/mobpacks/undo" => step_mobpack_draft_history(params, MobpackDraftHistoryStep::Undo),
+        "meta/mobpacks/redo" => step_mobpack_draft_history(params, MobpackDraftHistoryStep::Redo),
+        _ => return None,
+    })
 }
 
 fn read_mobpack_draft_store(path: &Path) -> Result<BTreeMap<String, Value>, String> {
@@ -4126,7 +4219,7 @@ fn enforce_mobpack_draft_expected_revision(params: &Value, source: &str) -> Resu
     let _guard = MOBPACK_DRAFT_STORE_LOCK
         .lock()
         .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
-    let path = mobpack_draft_store_path(params)?;
+    let path = mobpack_draft_store_path(params).map_err(|refusal| refusal.message())?;
     let rows = read_mobpack_draft_store(&path)?;
     let existing = rows.get(&id);
     let current_revision = mobpack_draft_revision_from_row(existing);
@@ -4332,6 +4425,10 @@ fn mobpack_create_draft_id(
 }
 
 pub fn create_mobpack_draft(params: &Value) -> Result<Value, String> {
+    create_draft(params).map_err(|failure| failure.message)
+}
+
+fn create_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
     let template_id = params
         .get("template")
         .and_then(Value::as_str)
@@ -4519,6 +4616,13 @@ pub fn list_mobpack_drafts_with_runtime(
     params: &Value,
     runtime: Option<&MobpackRuntimeCatalogState>,
 ) -> Result<Value, String> {
+    list_drafts(params, runtime).map_err(|failure| failure.message)
+}
+
+fn list_drafts(
+    params: &Value,
+    runtime: Option<&MobpackRuntimeCatalogState>,
+) -> Result<Value, DraftStoreFailure> {
     let _guard = MOBPACK_DRAFT_STORE_LOCK
         .lock()
         .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
@@ -4557,6 +4661,13 @@ pub fn get_mobpack_draft_with_runtime(
     params: &Value,
     runtime: Option<&MobpackRuntimeCatalogState>,
 ) -> Result<Value, String> {
+    get_draft(params, runtime).map_err(|failure| failure.message)
+}
+
+fn get_draft(
+    params: &Value,
+    runtime: Option<&MobpackRuntimeCatalogState>,
+) -> Result<Value, DraftStoreFailure> {
     let id = params
         .get("id")
         .and_then(Value::as_str)
@@ -4593,6 +4704,10 @@ pub fn get_mobpack_draft_with_runtime(
 }
 
 pub fn save_mobpack_draft(params: &Value) -> Result<Value, String> {
+    save_draft(params).map_err(|failure| failure.message)
+}
+
+fn save_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
     let candidate = mobpack_draft_row_from_params(params, 0)?;
     let id = candidate["id"]
         .as_str()
@@ -4610,14 +4725,14 @@ pub fn save_mobpack_draft(params: &Value) -> Result<Value, String> {
     {
         return Err(format!(
             "mobpack draft revision conflict for {id}: expected {expected_revision}, found {current_revision}"
-        ));
+        ).into());
     }
     if let Some(expected_etag) = mobpack_draft_expected_etag(params) {
         let current_etag = mobpack_draft_etag(&id, current_revision);
         if expected_etag != current_etag {
             return Err(format!(
                 "mobpack draft etag conflict for {id}: expected {expected_etag}, found {current_etag}"
-            ));
+            ).into());
         }
     }
     let mut row = mobpack_draft_row_from_params(params, current_revision.saturating_add(1))?;
@@ -4676,10 +4791,12 @@ enum MobpackDraftHistoryStep {
 
 pub fn undo_mobpack_draft(params: &Value) -> Result<Value, String> {
     step_mobpack_draft_history(params, MobpackDraftHistoryStep::Undo)
+        .map_err(|failure| failure.message)
 }
 
 pub fn redo_mobpack_draft(params: &Value) -> Result<Value, String> {
     step_mobpack_draft_history(params, MobpackDraftHistoryStep::Redo)
+        .map_err(|failure| failure.message)
 }
 
 /// Meta-owned undo/redo over the draft store. The history lives with the
@@ -4690,7 +4807,7 @@ pub fn redo_mobpack_draft(params: &Value) -> Result<Value, String> {
 fn step_mobpack_draft_history(
     params: &Value,
     step: MobpackDraftHistoryStep,
-) -> Result<Value, String> {
+) -> Result<Value, DraftStoreFailure> {
     let (source, head) = match step {
         MobpackDraftHistoryStep::Undo => ("meta/mobpacks/undo", "undo"),
         MobpackDraftHistoryStep::Redo => ("meta/mobpacks/redo", "redo"),
@@ -4717,14 +4834,14 @@ fn step_mobpack_draft_history(
     {
         return Err(format!(
             "{source} draft revision conflict for {id}: expected {expected_revision}, found {current_revision}"
-        ));
+        ).into());
     }
     if let Some(expected_etag) = mobpack_draft_expected_etag(params) {
         let current_etag = mobpack_draft_etag(&id, current_revision);
         if expected_etag != current_etag {
             return Err(format!(
                 "{source} draft etag conflict for {id}: expected {expected_etag}, found {current_etag}"
-            ));
+            ).into());
         }
     }
     let mut history = existing
@@ -4796,6 +4913,10 @@ fn step_mobpack_draft_history(
 }
 
 pub fn delete_mobpack_draft(params: &Value) -> Result<Value, String> {
+    delete_draft(params).map_err(|failure| failure.message)
+}
+
+fn delete_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
     let id = params
         .get("id")
         .and_then(Value::as_str)
@@ -4814,14 +4935,14 @@ pub fn delete_mobpack_draft(params: &Value) -> Result<Value, String> {
     {
         return Err(format!(
             "meta/mobpacks/delete draft revision conflict for {id}: expected {expected_revision}, found {current_revision}"
-        ));
+        ).into());
     }
     if let Some(expected_etag) = mobpack_draft_expected_etag(params) {
         let current_etag = mobpack_draft_etag(&id, current_revision);
         if expected_etag != current_etag {
             return Err(format!(
                 "meta/mobpacks/delete draft etag conflict for {id}: expected {expected_etag}, found {current_etag}"
-            ));
+            ).into());
         }
     }
     let deleted = rows.remove(&id).is_some();
@@ -30622,8 +30743,7 @@ model = "gpt-5.5"
     fn mobpack_draft_registry_defaults_to_durable_state_path() {
         // The layered `$XDG_STATE_HOME`/`$HOME` rules are storage_layout's
         // (tested there); mobpack only appends its feature-owned file name
-        // under the gateway home, falling back to the OS temp directory
-        // when neither root exists.
+        // under the gateway home, and refuses when neither root exists.
         let Ok(path) = default_mobpack_draft_store_path() else {
             // Only an unadopted predecessor home in the ambient environment
             // refuses; that refusal is covered by the storage_predecessor
@@ -37921,5 +38041,67 @@ branch = "choice"
         member_step_ids(&flow["steps"], &mut ids);
         ids.sort();
         assert_eq!(ids, ["a0", "a1", "a2", "dup", "t1", "t2"], "{flow:#}");
+    }
+
+    /// One draft store method through the JSON-RPC dispatch that the Flow
+    /// Editor routes and the gateways' RPC reach.
+    fn draft_store_rpc(method: &str, params: Value) -> crate::rpc::JsonRpcResponse {
+        crate::rpc::handle_mobpack_authoring_rpc_with_runtime(method, &params, json!(1), None)
+            .expect("a draft store method")
+    }
+
+    /// A JSON-RPC error's code and data.
+    fn rpc_refusal(response: &crate::rpc::JsonRpcResponse) -> Option<(i64, Option<Value>)> {
+        response
+            .error
+            .as_ref()
+            .map(|error| (error.code, error.data.clone()))
+    }
+
+    /// Set in the child process of a draft store test that needs an ambient
+    /// environment of its own, to the test's scratch directory.
+    #[cfg(unix)]
+    const DRAFT_STORE_CHILD: &str = "META_TEST_DRAFT_STORE_CHILD";
+
+    /// With neither `$XDG_STATE_HOME` nor `$HOME` set (and no
+    /// `META_FLOW_EDITOR_DRAFT_STORE`), the draft store has no location of
+    /// its own. It refuses with a typed `draft_store_unavailable` refusal
+    /// instead of using a predictable file in the shared OS temp directory,
+    /// which another local user could create, link or read first.
+    #[cfg(unix)]
+    #[test]
+    fn draft_store_without_a_state_root_refuses_instead_of_using_the_temp_dir() {
+        let Some(scratch) = std::env::var_os(DRAFT_STORE_CHILD) else {
+            let scratch = tempfile::tempdir().expect("tempdir");
+            run_test_in_child(
+                "mobpack::tests::draft_store_without_a_state_root_refuses_instead_of_using_the_temp_dir",
+                &[
+                    (DRAFT_STORE_CHILD, Some(scratch.path().as_os_str())),
+                    ("TMPDIR", Some(scratch.path().as_os_str())),
+                    ("HOME", None),
+                    ("XDG_STATE_HOME", None),
+                    ("META_FLOW_EDITOR_DRAFT_STORE", None),
+                ],
+            );
+            return;
+        };
+        let created = draft_store_rpc("meta/mobpacks/create", json!({ "name": "No Root" }));
+        let listed = draft_store_rpc("meta/mobpacks/list", json!({}));
+        let written = std::fs::read_dir(&scratch)
+            .expect("scratch directory")
+            .map(|entry| entry.expect("scratch entry").file_name())
+            .collect::<Vec<_>>();
+
+        let unavailable = Some((
+            -32602,
+            Some(json!({
+                "kind": "draft_store_unavailable",
+                "reason": "gateway_home_unavailable"
+            })),
+        ));
+        assert_eq!(
+            (rpc_refusal(&created), rpc_refusal(&listed), written),
+            (unavailable.clone(), unavailable, Vec::new())
+        );
     }
 }

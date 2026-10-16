@@ -147,6 +147,8 @@ Drafts autosave through `meta/mobpacks/save` into a host JSON store with optimis
 3. `$XDG_STATE_HOME/meerkat-meta/meerkat-meta-flow-editor-drafts.json`
 4. `~/.local/state/meerkat-meta/meerkat-meta-flow-editor-drafts.json`
 
+With none of these (no `META_FLOW_EDITOR_DRAFT_STORE`, and neither `XDG_STATE_HOME` nor `HOME` set) the draft methods refuse with `-32602` and `data: {"kind": "draft_store_unavailable", "reason": "gateway_home_unavailable"}`. The store is never kept in the OS temp directory, where another local user could create, link or read a file at a predictable path first. While the host has not adopted its predecessor (pre-0.9) gateway home, the draft methods refuse with the same kind and `reason` `predecessor_gateway_home` or `adoption_incomplete`.
+
 ## Validation and deploy
 
 `meta/mobpacks/validate` always runs Meta structural validation
