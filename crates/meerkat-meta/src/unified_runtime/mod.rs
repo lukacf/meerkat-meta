@@ -7191,12 +7191,17 @@ model = "gpt-5.5"
     }
 
     fn live_only_attachment() -> meerkat_core::mcp_attachment::LiveMcpAttachment {
-        let server = meerkat_core::mcp_config::McpServerConfig::stdio(
+        live_only_attachment_of(meerkat_core::mcp_config::McpServerConfig::stdio(
             "member-attached",
             "/bin/true",
             Vec::new(),
             std::collections::HashMap::new(),
-        );
+        ))
+    }
+
+    fn live_only_attachment_of(
+        server: meerkat_core::mcp_config::McpServerConfig,
+    ) -> meerkat_core::mcp_attachment::LiveMcpAttachment {
         meerkat_core::mcp_attachment::LiveMcpAttachment {
             control: Arc::new(LiveOnlyControl(server.clone())),
             server,
@@ -7535,6 +7540,350 @@ model = "gpt-5.5"
         assert_eq!(answer, McpAttachmentReadiness::Pending);
         let _ = release_tx.send(());
         drop(runtime);
+    }
+
+    fn diagnosed_setup_failure() -> meerkat_core::mcp_attachment::McpStdioSetupFailure {
+        meerkat_core::mcp_attachment::McpStdioSetupFailure::new(
+            "tools",
+            3,
+            meerkat_core::mcp_attachment::McpStdioSetupPhase::Initialize,
+            meerkat_core::mcp_attachment::McpStdioSetupFailureClass::Closed { exit: None },
+            true,
+        )
+    }
+
+    fn diagnosed_stderr_tail() -> meerkat_core::mcp_attachment::McpStdioStderrTail {
+        meerkat_core::mcp_attachment::McpStdioStderrTail::new(
+            "server stderr\n".to_string(),
+            14,
+            false,
+            true,
+        )
+    }
+
+    /// An attempt that failed its stdio setup: always the same typed failure
+    /// and stderr tail. With `leaving`, that identity leaves the identity
+    /// runtime while either diagnostic is read.
+    struct DiagnosedFailure {
+        leaving: Option<(
+            Arc<crate::identity_first::IdentityRuntime>,
+            crate::identity_first::AgentIdentity,
+        )>,
+    }
+
+    impl DiagnosedFailure {
+        fn readiness() -> meerkat_core::mcp_attachment::McpAttachmentReadiness {
+            meerkat_core::mcp_attachment::McpAttachmentReadiness::Failed {
+                detail: "the server closed during setup".to_string(),
+            }
+        }
+
+        async fn read(&self) {
+            if let Some((runtime, identity)) = &self.leaving {
+                let _ = runtime.remove(identity).await;
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::mcp_attachment::McpAttachmentAttemptObserver for DiagnosedFailure {
+        async fn observe(
+            &self,
+            _tool: &str,
+        ) -> meerkat_core::mcp_attachment::McpAttachmentReadiness {
+            Self::readiness()
+        }
+
+        async fn wait(
+            &self,
+            _tool: &str,
+            _timeout: Duration,
+        ) -> meerkat_core::mcp_attachment::McpAttachmentReadiness {
+            Self::readiness()
+        }
+
+        async fn setup_failure(
+            &self,
+        ) -> Option<meerkat_core::mcp_attachment::McpStdioSetupFailure> {
+            self.read().await;
+            Some(diagnosed_setup_failure())
+        }
+
+        async fn stderr_tail(&self) -> Option<meerkat_core::mcp_attachment::McpStdioStderrTail> {
+            self.read().await;
+            Some(diagnosed_stderr_tail())
+        }
+    }
+
+    /// The public entry's attempt forwards its stdio setup diagnostics, the
+    /// typed failure and the host-only stderr tail, only while its identity
+    /// is still on the attached session: another session, an unknown
+    /// identity or a released identity runtime gets `None`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_identity_bound_attempt_forwards_setup_diagnostics_only_for_the_attached_session() {
+        use crate::identity_first::IdentityBoundAttempt;
+        use meerkat_core::mcp_attachment::McpAttachmentAttemptObserver;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (runtime, identity_runtime) = boot_identity_first_persistent(
+            "identity-bound-diagnostics",
+            &temp.path().join("mob.sqlite3"),
+            &temp.path().join("state"),
+        )
+        .await;
+        let session_id = commit_restart_member_turn(&identity_runtime, "attached").await;
+        let member = crate::identity_first::AgentIdentity::parse(RESTART_MEMBER).expect("identity");
+        let bound = |runtime: std::sync::Weak<crate::identity_first::IdentityRuntime>,
+                     identity: crate::identity_first::AgentIdentity,
+                     session: meerkat_core::types::SessionId| {
+            IdentityBoundAttempt::new(
+                runtime,
+                identity,
+                session,
+                Arc::new(DiagnosedFailure { leaving: None }),
+            )
+        };
+        let weak = Arc::downgrade(&identity_runtime);
+
+        let attached = bound(weak.clone(), member.clone(), session_id.clone());
+        assert_eq!(
+            attached.setup_failure().await,
+            Some(diagnosed_setup_failure())
+        );
+        assert_eq!(attached.stderr_tail().await, Some(diagnosed_stderr_tail()));
+
+        let unknown =
+            crate::identity_first::AgentIdentity::parse("unknown:diagnostics").expect("identity");
+        for stale in [
+            bound(
+                weak.clone(),
+                member.clone(),
+                meerkat_core::types::SessionId::new(),
+            ),
+            bound(weak, unknown, session_id.clone()),
+            bound(std::sync::Weak::new(), member, session_id),
+        ] {
+            assert_eq!(stale.setup_failure().await, None);
+            assert_eq!(stale.stderr_tail().await, None);
+        }
+        drop(runtime);
+    }
+
+    /// An identity that leaves its runtime while a diagnostic is read gets
+    /// `None`: the identity check after the read catches it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_identity_leaving_during_a_diagnostic_read_gets_none() {
+        use crate::identity_first::IdentityBoundAttempt;
+        use meerkat_core::mcp_attachment::McpAttachmentAttemptObserver;
+        for read_tail in [false, true] {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let (runtime, identity_runtime) = boot_identity_first_persistent(
+                if read_tail {
+                    "identity-leaves-tail-read"
+                } else {
+                    "identity-leaves-failure-read"
+                },
+                &temp.path().join("mob.sqlite3"),
+                &temp.path().join("state"),
+            )
+            .await;
+            let session_id = commit_restart_member_turn(&identity_runtime, "attached").await;
+            let member =
+                crate::identity_first::AgentIdentity::parse(RESTART_MEMBER).expect("identity");
+            let leaving = IdentityBoundAttempt::new(
+                Arc::downgrade(&identity_runtime),
+                member.clone(),
+                session_id,
+                Arc::new(DiagnosedFailure {
+                    leaving: Some((Arc::clone(&identity_runtime), member.clone())),
+                }),
+            );
+            if read_tail {
+                assert_eq!(leaving.stderr_tail().await, None);
+            } else {
+                assert_eq!(leaving.setup_failure().await, None);
+            }
+            assert!(
+                !identity_runtime.contains(&member).await,
+                "the identity left during the read"
+            );
+            drop(runtime);
+        }
+    }
+
+    /// What the failing stdio server below writes to its stderr: it reaches
+    /// the host in the attempt's tail and nothing else.
+    const STDERR_SENTINEL: &str = "META-STDERR-SENTINEL-4b9d";
+
+    /// A stdio MCP server that writes [`STDERR_SENTINEL`] to its stderr and
+    /// exits before it answers `initialize`.
+    fn exits_during_initialize(name: &str) -> meerkat_core::mcp_config::McpServerConfig {
+        meerkat_core::mcp_config::McpServerConfig::stdio(
+            name,
+            "/bin/sh",
+            vec![
+                "-c".to_string(),
+                format!("printf 'setup failed: %s\\n' '{STDERR_SENTINEL}' >&2\nexit 3\n"),
+            ],
+            std::collections::HashMap::new(),
+        )
+    }
+
+    /// A governed identity's live stdio server that exits during
+    /// `initialize` reports its typed setup failure and its stderr tail to
+    /// the host through the public identity entry's attempt. The tail stays
+    /// with the host: the receipt, the readiness, the failure and the tail's
+    /// own `Debug` never show the server's stderr, nor does any event of the
+    /// member or the mob. A retired identity's attempt forwards neither.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_identity_attempt_reports_its_failed_stdio_setup_to_the_host_only() {
+        use meerkat_core::mcp_attachment::{
+            McpAttachmentReadiness, McpStdioSetupFailureClass, McpStdioSetupPhase,
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime =
+            super::held_identity_test_support::governed_runtime(&dir, "identity-mcp-diagnostics")
+                .await;
+        let identity =
+            crate::identity_first::AgentIdentity::parse("mcp-diagnostics").expect("identity");
+        let roster = vec![super::held_identity_test_support::member(&identity)];
+        let sessions = Arc::clone(
+            runtime
+                .mob_runtime()
+                .session_service()
+                .expect("the governed runtime has a session service"),
+        );
+        // As the gateways wire it: the identity bridge reaches the session
+        // owner's live attachment entry.
+        let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
+            crate::identity_first::IdentityRuntimeConfig {
+                continuity_store: Arc::new(
+                    crate::identity_first::LocalContinuityStore::in_memory()
+                        .expect("continuity store"),
+                ),
+                lease_provider: Arc::new(crate::identity_first::LocalLeaseProvider::new()),
+                runtime_instance_id: "identity-mcp-diagnostics".to_string(),
+                has_runtime_store: true,
+                durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
+                bridge: Some(Arc::new(
+                    crate::identity_first::MobSessionBridge::with_session_service(
+                        crate::gateway_wiring::identity_mob_handle(&runtime),
+                        Arc::clone(&sessions),
+                    )
+                    .with_controller_pin_source(
+                        runtime
+                            .mob_runtime()
+                            .controller_pin_source()
+                            .expect("the governed runtime records its session owner"),
+                    ),
+                )),
+                default_timeout: None,
+            },
+        ));
+        super::held_identity_test_support::install_roster(&mut runtime, identity_runtime, &roster);
+        runtime
+            .bootstrap_installed_identity_first_context(&roster)
+            .await
+            .expect("the governed member is created");
+        let view = runtime.identity_runtime().expect("identity runtime export");
+        let session_id = view
+            .status(&identity)
+            .await
+            .expect("identity status")
+            .session_id
+            .expect("the member's session");
+        let mut mob_events = runtime.subscribe_mob_events();
+
+        let (view_entry, member) = (&view, &identity);
+        let receipt = attach_between_turns(sessions.as_ref(), &session_id, move || {
+            view_entry.attach_live_mcp_server(
+                member,
+                live_only_attachment_of(exits_during_initialize("exits-during-initialize")),
+            )
+        })
+        .await
+        .expect("the governed member attaches");
+        let readiness = receipt.attempt.wait("any", Duration::from_secs(40)).await;
+        assert!(
+            matches!(readiness, McpAttachmentReadiness::Failed { .. }),
+            "{readiness:?}"
+        );
+        let failure = receipt
+            .attempt
+            .setup_failure()
+            .await
+            .expect("the attempt's typed setup failure reaches the host");
+        assert_eq!(failure.server, "exits-during-initialize");
+        assert_eq!(failure.phase, McpStdioSetupPhase::Initialize);
+        assert!(
+            matches!(failure.class, McpStdioSetupFailureClass::Closed { .. }),
+            "{failure:?}"
+        );
+        assert!(failure.stderr_tail_retained, "{failure:?}");
+        // The drain of the server's stderr can trail the attempt's failure.
+        let tail = tokio::time::timeout(crate::test_wait::STRUCTURAL_BACKSTOP, async {
+            loop {
+                if let Some(tail) = receipt.attempt.stderr_tail().await
+                    && tail.text.contains(STDERR_SENTINEL)
+                {
+                    return tail;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the attempt's stderr tail reaches the host");
+
+        let mut rendered = vec![
+            format!("{receipt:?}"),
+            format!("{readiness:?}"),
+            format!("{:?}", receipt.attempt.observe("any").await),
+            format!("{failure:?}"),
+            format!("{tail:?}"),
+        ];
+        let mut member_events = runtime
+            .mob_handle()
+            .subscribe_agent_events_from(
+                &crate::member_comms_id::mob_member_id(identity.as_str()),
+                meerkat_core::comms::SessionEventCursor::Earliest,
+            )
+            .await
+            .expect("the member's retained events")
+            .stream;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(500), member_events.next()).await
+        {
+            rendered.push(serde_json::to_string(&event).expect("member event json"));
+            rendered.push(format!("{event:?}"));
+        }
+        loop {
+            match mob_events.try_recv() {
+                Ok(event) => {
+                    rendered.push(serde_json::to_string(&event).expect("mob event json"));
+                    rendered.push(format!("{event:?}"));
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        for event in runtime
+            .query_mob_events(&EventQuery::default())
+            .await
+            .expect("the mob event ledger")
+        {
+            rendered.push(serde_json::to_string(&event).expect("ledger event json"));
+        }
+        for text in &rendered {
+            assert!(
+                !text.contains(STDERR_SENTINEL),
+                "the server's stderr escaped the host-only tail: {text}"
+            );
+        }
+
+        view.retire(&identity).await.expect("the identity retires");
+        assert_eq!(receipt.attempt.setup_failure().await, None);
+        assert_eq!(receipt.attempt.stderr_tail().await, None);
+        drop(view);
+        let _ = runtime.shutdown().await;
     }
 
     /// A session owner that records each live attachment and answers
