@@ -180,6 +180,12 @@ jobs:
   # 230 s); after it, all integration tests together take 231 s and the
   # examples 38 s. All three jobs build the same dependency graph, so
   # they share the test job's cache.
+  #
+  # The unit build fits the runner's free disk without a reclaim: run
+  # 38776842877 showed 118 GB free after reclaiming about 30 GB, so about
+  # 88 GB before it, and the unit job links about a dozen binaries without
+  # debuginfo, where test-voice links its own with line tables and reclaims
+  # nothing. The foreground reclaim cost the unit job 104 s in that run.
   test:
     name: test
     needs: changes
@@ -195,20 +201,6 @@ jobs:
       # messages but backtraces lose file:line. Local builds are unaffected.
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      # The workspace debug build (meerkat 0.7.25 dep tree + all test
-      # binaries) plus the rust-cache restore no longer fits beside the
-      # runner's preinstalled toolchains - three consecutive runs died to
-      # ENOSPC mid-link. Reclaim ~30GB of images we never use (mirrors
-      # meerkat's release-lane reclaim, meerkat#858).
-      - name: Reclaim runner disk
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
-            /usr/share/swift /usr/local/julia* /opt/microsoft \
-            /usr/local/share/powershell /usr/share/miniconda \
-            /usr/local/share/chromium /usr/local/share/vcpkg
-          sudo docker image prune -af >/dev/null 2>&1 || true
-          df -h /
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
@@ -225,6 +217,9 @@ jobs:
       # The live-event burst test remains CPU-speed-sensitive. History backfill
       # saturation uses a deterministic read barrier and runs in this gate.
       - run: scripts/repo-cargo nextest run --workspace --lib --bins -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)' --no-fail-fast
+      - name: Report runner disk
+        if: always()
+        run: df -h /
 
   test-integration:
     name: test-integration (${{ matrix.tests }})
@@ -234,13 +229,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Integration test targets by first letter: [a-i] holds about 60% of
-        # their build time and two thirds of their run time, so the other
-        # half also builds the examples. scripts/test_ci_workflow.py checks
-        # that every integration test target matches exactly one pattern.
+        # Integration test targets by first letter, balanced on run
+        # 38776842877's measured build and run times: split [a-i] / [j-z]
+        # they took 524 s / 412 s to build and 102 s / 45 s to run, because
+        # the identity_first_* targets are a third of the work. On those
+        # numbers each class below holds about 334 s of test builds and
+        # runs, counting the example build (51 s) in the second. Together
+        # the classes cover every letter, and scripts/test_ci_workflow.py
+        # checks that every integration test target matches exactly one.
         include:
-          - tests: "[a-i]*"
-          - tests: "[j-z]*"
+          - tests: "[a-hj-mstv-z]*"
+          - tests: "[inopqru]*"
             examples: true
     env:
       # ~88 debug test binaries each statically link the full meerkat stack.
@@ -261,15 +260,18 @@ jobs:
       # binaries) plus the rust-cache restore no longer fits beside the
       # runner's preinstalled toolchains - three consecutive runs died to
       # ENOSPC mid-link. Reclaim ~30GB of images we never use (mirrors
-      # meerkat's release-lane reclaim, meerkat#858).
-      - name: Reclaim runner disk
+      # meerkat's release-lane reclaim, meerkat#858). The deletion took
+      # 100-308 s in the foreground (run 38776842877) while the job needs the
+      # space only when the test binaries link, minutes later, so it runs in
+      # the background at the lowest best-effort I/O priority (the idle class
+      # could starve it while the build reads and writes). The last step
+      # reports the disk.
+      - name: Reclaim runner disk in the background
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
-            /usr/share/swift /usr/local/julia* /opt/microsoft \
-            /usr/local/share/powershell /usr/share/miniconda \
-            /usr/local/share/chromium /usr/local/share/vcpkg
-          sudo docker image prune -af >/dev/null 2>&1 || true
+          sudo -n nohup ionice -c2 -n7 bash -c 'rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/share/swift /usr/local/julia* \
+            /opt/microsoft /usr/local/share/powershell /usr/share/miniconda \
+            /usr/local/share/chromium /usr/local/share/vcpkg; docker image prune -af' >/dev/null 2>&1 &
           df -h /
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -291,6 +293,9 @@ jobs:
       # it compiles and links; one integration half does that here.
       - if: matrix.examples
         run: scripts/repo-cargo build --workspace --examples
+      - name: Report runner disk
+        if: always()
+        run: df -h /
 
   # The two meerkat-meta test targets are separate compilations of the
   # library: the integration test links it as a dependency, the --lib run

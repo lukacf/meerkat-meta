@@ -222,8 +222,24 @@ class CiWorkflowTests(unittest.TestCase):
                 if line.strip().startswith("- run: scripts/repo-cargo nextest run")
             ]
             self.assertEqual(commands, [command], name)
-            self.assertIn("- name: Reclaim runner disk\n", job_block(name))
             self.assertIn('CARGO_PROFILE_DEV_DEBUG: "0"', job_block(name))
+            # Every disk report runs last, whatever failed before it. The
+            # block ends at the next job, after the comments that precede it.
+            lines = job_block(name).splitlines()
+            while lines and (not lines[-1].strip() or lines[-1].lstrip().startswith("#")):
+                lines.pop()
+            self.assertEqual(lines[-3:], ["      - name: Report runner disk", "        if: always()",
+                                          "        run: df -h /"], name)
+        # The unit build fits the runner's free disk and reclaims nothing;
+        # the integration halves reclaim in the background, never on the
+        # critical path.
+        self.assertNotIn("rm -rf", job_block("test"))
+        reclaim = re.search(r"(?m)^      - name: Reclaim runner disk in the background\n        run: \|\n"
+                            r"((?:          .*\n)+)", block + "\n")
+        self.assertIsNotNone(reclaim)
+        self.assertRegex(reclaim.group(1), r"^          sudo -n nohup ionice -c2 -n7 bash -c 'rm -rf ")
+        self.assertRegex(reclaim.group(1), r"docker image prune -af' >/dev/null 2>&1 &\n          df -h /\n$")
+        self.assertLess(block.index("Reclaim runner disk in the background"), block.index("actions/checkout"))
         # Exactly one half builds the examples.
         self.assertEqual(block.count("            examples: true\n"), 1)
         self.assertIn("      - if: matrix.examples\n        run: scripts/repo-cargo build --workspace --examples\n", block)
