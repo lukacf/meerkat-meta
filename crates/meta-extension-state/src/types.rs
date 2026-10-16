@@ -371,6 +371,25 @@ impl Document {
                 .chain(self.access.denies.iter().map(|deny| &deny.audience))
                 .any(|audience| matches!(audience, Audience::Mob(id) if id == mob_id))
     }
+    /// Every mob id this document names, as its owner or in an audience
+    /// grant or deny ([`Self::names_mob`]).
+    pub(crate) fn named_mobs(&self) -> BTreeSet<&str> {
+        let owner = match &self.owner {
+            Owner::Mob(id) => Some(id.as_str()),
+            Owner::Agent(_) | Owner::Realm => None,
+        };
+        let audiences = self
+            .access
+            .grants
+            .iter()
+            .map(|grant| &grant.audience)
+            .chain(self.access.denies.iter().map(|deny| &deny.audience))
+            .filter_map(|audience| match audience {
+                Audience::Mob(id) => Some(id.as_str()),
+                Audience::Agent { .. } | Audience::Realm => None,
+            });
+        owner.into_iter().chain(audiences).collect()
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentSummary {

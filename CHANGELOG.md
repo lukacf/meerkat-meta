@@ -353,6 +353,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   then failed, the journal and startup's refusal named no unfinished step.
   A reopened journal now records no step as finished until the rerun
   finishes it.
+- With the `extension-state` feature, the check that refuses a mob create
+  under an id that extension documents still name no longer reads every live
+  document of the realm on each create. `SqliteExtensionDocumentStore` now
+  counts, per realm, the live documents naming each mob id: it reads a
+  realm's documents once, at the first check after the store opens, keeps
+  the counts with its own writes, and reads the realm again only after
+  another connection committed to the database (SQLite's `data_version`
+  changed: another process, an out-of-band edit). A check is a lookup after
+  that, so a caller that repeats creates under a named id no longer holds the
+  store's one connection, and with it the document reads and writes of every
+  session, for a scan of the realm each time. As before, a live document
+  that does not decode fails the check, now from the next read of its realm
+  on. This resolves the cost half of the 0.9.2 known limitation that each
+  checked create reads every live document of the realm under the store's
+  one connection; the index replaces the rate limit 0.9.2 named. A refusal
+  still tells the caller that some document names the id. The
+  `ExtensionDocumentStore::references_mob` documentation now asks a store an
+  embedding host supplies to answer in constant time per id too, from an
+  index read again whenever another writer may have changed the documents.
 
 ### Known limitations
 

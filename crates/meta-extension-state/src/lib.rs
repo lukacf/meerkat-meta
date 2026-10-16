@@ -54,6 +54,14 @@ pub trait ExtensionDocumentStore: Send + Sync {
     /// cannot answer and returns an error, which a host treats as a refusal,
     /// so a store a host supplies must implement this for mobs to be
     /// created.
+    ///
+    /// A host asks on every such create, so an implementation should answer
+    /// in constant time per id rather than read the realm, as
+    /// [`SqliteExtensionDocumentStore`] does from an index its own writes
+    /// keep. Such an index must be read from the documents before its first
+    /// answer after the store opens, and read again whenever another writer
+    /// may have changed them, so that it never answers past a write it did
+    /// not see.
     async fn references_mob(&self, realm: &str, mob_id: &str) -> Result<bool> {
         let _ = (realm, mob_id);
         Err(Error::Storage(
