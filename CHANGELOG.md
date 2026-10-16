@@ -262,6 +262,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rendering (export and deploy) refuse the document with `-32602` before
   reading its graph. A graph operation that grows a graph past them is
   refused too.
+- Importing a mob definition into the Flow Editor (`meta/mobpacks/import`,
+  and the draft methods that re-import a stored archive) groups each frame's
+  steps in one pass over the frame. Every step searched the whole frame for
+  its parallel siblings, and every branched step for the rest of its branch,
+  so a definition of many steps took work quadratic in their number.
 ### Added
 
 - `meta_gateway storage-adopt-predecessor --mob-config <file>` checks the mob
@@ -438,6 +443,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   A reopened journal now records no step as finished until the rerun
   finishes it.
 
+- Importing a mob definition into the Flow Editor shows each of its steps
+  once. A step with a condition but no branch that shares its dependencies
+  with two or more steps without one was dropped, and the parallel step of
+  those steps was shown again for each such step, so such an import also
+  grew with the product of the two counts.
 ### Known limitations
 
 - The Flow Editor draft store has no total size or draft count limit yet:

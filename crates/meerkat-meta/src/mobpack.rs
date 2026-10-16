@@ -16947,69 +16947,59 @@ fn input_param_summary(params: &[Value]) -> String {
         .join(", ")
 }
 
+/// A frame's nodes in order, each visit counted as one unit of work.
+fn frame_nodes(
+    frame: &FrameSpec,
+) -> impl Iterator<Item = (&meerkat_mob::FlowNodeId, &FlowNodeSpec)> {
+    frame.nodes.iter().inspect(|_| count_mobpack_work())
+}
+
 fn visual_steps_from_frame(frame: &FrameSpec, flow: &FlowSpec) -> Vec<Value> {
+    let groups = FrameStepGroups::of(frame, flow);
     let mut out = Vec::new();
     let mut consumed = BTreeSet::new();
-    for (node_id, node) in &frame.nodes {
+    for (node_id, node) in frame_nodes(frame) {
         if consumed.contains(node_id) {
             continue;
         }
         match node {
             FlowNodeSpec::Step(frame_step) => {
                 if let Some(step) = flow.steps.get(&frame_step.step_id) {
-                    if step.branch.is_none() {
-                        let parallel_nodes = parallel_sibling_nodes(frame, flow, frame_step);
-                        if parallel_nodes.len() > 1 {
-                            for (candidate_node_id, _, _) in &parallel_nodes {
-                                consumed.insert((*candidate_node_id).clone());
-                            }
-                            let id = parallel_nodes
-                                .iter()
-                                .map(|(_, candidate_frame_step, _)| {
-                                    sanitize_identifier(candidate_frame_step.step_id.as_ref())
-                                })
-                                .collect::<Vec<_>>()
-                                .join("_");
-                            out.push(json!({
-                                "id": format!("parallel_{id}"),
-                                "type": "parallel",
-                                "dispatch": "fan_out",
-                                "collection": "all",
-                                "dependsMode": dependency_mode_string(&frame_step.depends_on_mode),
-                                "branches": parallel_nodes.iter().enumerate().map(|(index, (_, candidate_frame_step, candidate_step))| json!({
-                                    "id": format!("br_{}", sanitize_identifier(candidate_frame_step.step_id.as_ref())),
-                                    "label": candidate_frame_step.step_id.to_string(),
-                                    "steps": [visual_step_from_step(candidate_frame_step.step_id.as_ref(), candidate_step)],
-                                    "order": index,
-                                })).collect::<Vec<_>>(),
-                            }));
-                            continue;
+                    let parallel_nodes = groups.parallel_siblings(frame_step, step);
+                    if parallel_nodes.len() > 1 {
+                        for (candidate_node_id, _, _) in parallel_nodes {
+                            consumed.insert((*candidate_node_id).clone());
                         }
+                        let id = parallel_nodes
+                            .iter()
+                            .map(|(_, candidate_frame_step, _)| {
+                                sanitize_identifier(candidate_frame_step.step_id.as_ref())
+                            })
+                            .collect::<Vec<_>>()
+                            .join("_");
+                        out.push(json!({
+                            "id": format!("parallel_{id}"),
+                            "type": "parallel",
+                            "dispatch": "fan_out",
+                            "collection": "all",
+                            "dependsMode": dependency_mode_string(&frame_step.depends_on_mode),
+                            "branches": parallel_nodes.iter().enumerate().map(|(index, (_, candidate_frame_step, candidate_step))| json!({
+                                "id": format!("br_{}", sanitize_identifier(candidate_frame_step.step_id.as_ref())),
+                                "label": candidate_frame_step.step_id.to_string(),
+                                "steps": [visual_step_from_step(candidate_frame_step.step_id.as_ref(), candidate_step)],
+                                "order": index,
+                            })).collect::<Vec<_>>(),
+                        }));
+                        continue;
                     }
                     if let Some(branch_id) = &step.branch {
-                        let branch_nodes = frame
-                            .nodes
-                            .iter()
-                            .filter_map(|(candidate_node_id, candidate_node)| {
-                                let FlowNodeSpec::Step(candidate_frame_step) = candidate_node
-                                else {
-                                    return None;
-                                };
-                                let candidate_step =
-                                    flow.steps.get(&candidate_frame_step.step_id)?;
-                                (candidate_step.branch.as_ref() == Some(branch_id)).then_some((
-                                    candidate_node_id,
-                                    candidate_frame_step,
-                                    candidate_step,
-                                ))
-                            })
-                            .collect::<Vec<_>>();
+                        let branch_nodes = groups.branch(branch_id);
                         if branch_nodes.len() > 1 {
-                            for (candidate_node_id, _, _) in &branch_nodes {
+                            for (candidate_node_id, _, _) in branch_nodes {
                                 consumed.insert((*candidate_node_id).clone());
                             }
                             let controller_role =
-                                branch_controller_role_from_depends_on(frame, flow, &branch_nodes);
+                                branch_controller_role_from_depends_on(frame, flow, branch_nodes);
                             out.push(json!({
                                 "id": format!("branch_{}", sanitize_identifier(branch_id.as_ref())),
                                 "type": "branch",
@@ -17072,35 +17062,92 @@ fn branch_controller_role_from_depends_on(
     None
 }
 
-fn parallel_sibling_nodes<'a>(
-    frame: &'a FrameSpec,
-    flow: &'a FlowSpec,
-    frame_step: &meerkat_mob::definition::FrameStepSpec,
-) -> Vec<(
+/// A step node of a frame: its id, its frame step and the flow step it runs.
+type FrameStepNode<'a> = (
     &'a meerkat_mob::FlowNodeId,
     &'a meerkat_mob::definition::FrameStepSpec,
     &'a FlowStepSpec,
-)> {
-    frame
-        .nodes
-        .iter()
-        .filter_map(|(candidate_node_id, candidate_node)| {
-            let FlowNodeSpec::Step(candidate_frame_step) = candidate_node else {
-                return None;
+);
+
+/// The steps of a frame that import shows together, found in one pass over
+/// the frame: each set of parallel siblings and each branch's steps, in frame
+/// order. Every step used to search the whole frame for them.
+struct FrameStepGroups<'a> {
+    parallel: BTreeMap<(&'a [meerkat_mob::FlowNodeId], &'static str), Vec<FrameStepNode<'a>>>,
+    branches: BTreeMap<&'a meerkat_mob::BranchId, Vec<FrameStepNode<'a>>>,
+}
+
+impl<'a> FrameStepGroups<'a> {
+    fn of(frame: &'a FrameSpec, flow: &'a FlowSpec) -> Self {
+        let mut groups = Self {
+            parallel: BTreeMap::new(),
+            branches: BTreeMap::new(),
+        };
+        for (node_id, node) in frame_nodes(frame) {
+            let FlowNodeSpec::Step(frame_step) = node else {
+                continue;
             };
-            if candidate_frame_step.depends_on != frame_step.depends_on
-                || candidate_frame_step.depends_on_mode != frame_step.depends_on_mode
-                || candidate_frame_step.branch.is_some()
-            {
-                return None;
+            let Some(step) = flow.steps.get(&frame_step.step_id) else {
+                continue;
+            };
+            if let Some(key) = parallel_sibling_key(frame_step, step) {
+                groups
+                    .parallel
+                    .entry(key)
+                    .or_default()
+                    .push((node_id, frame_step, step));
             }
-            let candidate_step = flow.steps.get(&candidate_frame_step.step_id)?;
-            if candidate_step.branch.is_some() || candidate_step.condition.is_some() {
-                return None;
+            if let Some(branch_id) = &step.branch {
+                groups
+                    .branches
+                    .entry(branch_id)
+                    .or_default()
+                    .push((node_id, frame_step, step));
             }
-            Some((candidate_node_id, candidate_frame_step, candidate_step))
-        })
-        .collect()
+        }
+        groups
+    }
+
+    /// The parallel siblings of a step, itself included. A step with a
+    /// branch or a condition has none.
+    fn parallel_siblings(
+        &self,
+        frame_step: &'a meerkat_mob::definition::FrameStepSpec,
+        step: &FlowStepSpec,
+    ) -> &[FrameStepNode<'a>] {
+        count_mobpack_work();
+        parallel_sibling_key(frame_step, step)
+            .and_then(|key| self.parallel.get(&key))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// The steps of a branch.
+    fn branch(&self, branch_id: &meerkat_mob::BranchId) -> &[FrameStepNode<'a>] {
+        count_mobpack_work();
+        self.branches
+            .get(branch_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+/// The steps that run in parallel with a step: those with its dependencies
+/// and their mode. A step with a branch, in the frame or the flow, or a
+/// condition runs with none. Such a step used to take the parallel siblings
+/// of its dependencies anyway, which dropped it from the import and showed
+/// their parallel step once more.
+fn parallel_sibling_key<'a>(
+    frame_step: &'a meerkat_mob::definition::FrameStepSpec,
+    step: &FlowStepSpec,
+) -> Option<(&'a [meerkat_mob::FlowNodeId], &'static str)> {
+    if frame_step.branch.is_some() || step.branch.is_some() || step.condition.is_some() {
+        return None;
+    }
+    Some((
+        frame_step.depends_on.as_slice(),
+        dependency_mode_string(&frame_step.depends_on_mode),
+    ))
 }
 
 fn visual_step_from_step(id: &str, step: &FlowStepSpec) -> Value {
@@ -39296,5 +39343,125 @@ branch = "choice"
         }))
         .expect_err("an operation on a document past the graph caps is refused");
         assert!(refusal.contains("refusing the document"), "{refusal}");
+    }
+
+    /// A mob definition whose one flow runs `length` steps, each after the
+    /// one before.
+    fn chained_flow_definition(length: usize) -> MobDefinition {
+        let mut toml = String::from(
+            "[mob]\nid = \"chain\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+             peer_description = \"Worker\"\n\n[flows.main]\ndescription = \"Chain\"\n",
+        );
+        for step in 0..length {
+            toml.push_str(&format!(
+                "\n[flows.main.steps.s{step}]\nrole = \"worker\"\nmessage = \"Step {step}.\"\n"
+            ));
+            if step > 0 {
+                toml.push_str(&format!("depends_on = [\"s{}\"]\n", step - 1));
+            }
+        }
+        MobDefinition::from_toml(&toml).expect("a chained flow")
+    }
+
+    /// A mob definition whose one flow routes, then runs `count` branches of
+    /// two conditional steps each.
+    fn branched_flow_definition(count: usize) -> MobDefinition {
+        let mut toml = String::from(
+            "[mob]\nid = \"branches\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+             peer_description = \"Worker\"\n\n[flows.main]\ndescription = \"Branches\"\n\n\
+             [flows.main.steps.route]\nrole = \"worker\"\nmessage = \"Route.\"\n",
+        );
+        for branch in 0..count {
+            for kind in ["x", "y"] {
+                toml.push_str(&format!(
+                    "\n[flows.main.steps.b{branch}_{kind}]\nrole = \"worker\"\n\
+                     message = \"Branch {branch}.\"\ndepends_on = [\"route\"]\n\
+                     branch = \"lane{branch}\"\n\
+                     condition = {{ op = \"eq\", path = \"params.kind\", value = \"{kind}\" }}\n"
+                ));
+            }
+        }
+        MobDefinition::from_toml(&toml).expect("a branched flow")
+    }
+
+    /// Importing a definition groups each frame's steps in one pass over the
+    /// frame. Every step searched the whole frame for its parallel siblings,
+    /// and every branched step for the rest of its branch, so importing a
+    /// chain of steps, or many branches, took work quadratic in the steps.
+    #[test]
+    fn import_work_grows_linearly_with_the_steps() {
+        let definition = branched_flow_definition(2);
+        let flow = definition.flows.values().next().expect("the branched flow");
+        let steps = visual_steps_from_frame(&flow.root, flow);
+        let mut types: Vec<_> = steps
+            .iter()
+            .filter_map(|step| step["type"].as_str())
+            .collect();
+        types.sort_unstable();
+        assert_eq!(types, ["branch", "branch", "member"], "{steps:#?}");
+        assert_work_grows_linearly("a chain of n steps", |length| {
+            let definition = chained_flow_definition(length);
+            let flow = definition.flows.values().next().expect("the chained flow");
+            with_mobpack_work(|| visual_steps_from_frame(&flow.root, flow)).1
+        });
+        assert_work_grows_linearly("n branches of two steps", |count| {
+            let definition = branched_flow_definition(count);
+            let flow = definition.flows.values().next().expect("the branched flow");
+            with_mobpack_work(|| visual_steps_from_frame(&flow.root, flow)).1
+        });
+    }
+
+    /// Importing a definition shows each of its steps once. A step with a
+    /// condition but no branch that shares its dependencies with steps
+    /// without one was dropped, and the parallel step of those steps was
+    /// shown again for each such step.
+    #[test]
+    fn import_shows_a_conditioned_step_beside_its_parallel_siblings_once() {
+        let definition = MobDefinition::from_toml(
+            r#"
+[mob]
+id = "siblings"
+
+[profiles.worker]
+model = "gpt-5.5"
+peer_description = "Worker"
+
+[flows.main]
+description = "Siblings"
+
+[flows.main.steps.start]
+role = "worker"
+message = "Start."
+
+[flows.main.steps.a]
+role = "worker"
+message = "A."
+depends_on = ["start"]
+
+[flows.main.steps.b]
+role = "worker"
+message = "B."
+depends_on = ["start"]
+
+[flows.main.steps.c]
+role = "worker"
+message = "C."
+depends_on = ["start"]
+condition = { op = "eq", path = "params.kind", value = "c" }
+
+[flows.main.steps.d]
+role = "worker"
+message = "D."
+depends_on = ["start"]
+condition = { op = "eq", path = "params.kind", value = "d" }
+"#,
+        )
+        .expect("the definition");
+        let flow = definition.flows.values().next().expect("the flow");
+        let steps = Value::Array(visual_steps_from_frame(&flow.root, flow));
+        let mut ids = Vec::new();
+        member_step_ids(&steps, &mut ids);
+        ids.sort();
+        assert_eq!(ids, ["a", "b", "c", "d", "start"], "{steps:#}");
     }
 }
