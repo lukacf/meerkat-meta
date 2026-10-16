@@ -141,7 +141,7 @@ Other 0.9 contract changes to keep in mind:
 | `console/` | React console app source, tests, Vite/build entrypoints, generated `console/dist`. |
 | `packages/console-core/` | Reusable console contracts, conversation/activity/sidebar/dock logic, formatting, rich content. |
 | `packages/console-components/` | Reusable console UI components and CSS tokens/themes. |
-| `crates/meerkat-meta/console-dist/` | Embedded console bundle copied from `console/dist` by `npm run build`. |
+| `crates/meerkat-meta/console-dist/` | Embedded console bundle copied from `console/dist` by `npm run build`, plus the MCP Apps sandbox proxy copied from its console sources (written back out by the gateways' `--write-mcp-apps-sandbox <dir>`). |
 | `flow-editor/` | Flow editor app source. `npm --prefix flow-editor run build` also writes the bundle that `crates/meerkat-meta/flow-editor-dist/` embeds; `flow_editor_router` serves it at `/flow-editor` (the `meta_flow_editor` dev binary). |
 | `sdk/python/` | Python SDK, gateway subprocess transport, identity-first models/providers, tests. |
 | `sdk/typescript/` | TypeScript SDK, fetch/SSE client, runtime builders, tests. |

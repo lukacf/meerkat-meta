@@ -36,6 +36,12 @@ command again finishes it. The gateway homes are separate inputs: a refusal
 that names `the predecessor (pre-0.9) gateway home` carries the exact
 `--predecessor-home` and `--gateway-home` arguments to add.
 
+Since 0.9.2, pass the mob definition the installation boots with as well,
+`--mob-config <mob.toml>` (or its `definition.json`; once per mob), so the dry
+run also checks it for keys that the MobKit release which created a store
+ignored and Meta 0.9 applies. See
+[Keys that now take effect](#4-keys-that-now-take-effect).
+
 In 0.9.1 a bare `--state-dir <dir>` touches only that directory: the
 predecessor database renames, the ledger domains and the metadata table, the
 composition manifests, the memory ledger file, the steward schedule, and the
@@ -93,6 +99,34 @@ manifests on their own, run
 **Do (0.9.0):** in each `*.composition.json`, rename that one key,
 `created_by_mobkit` to `created_by_meta`, and change nothing else in the file.
 The rename is the whole fix.
+
+### The extension document store and document MCP descriptors
+
+Hosts built with the `extension-state` feature keep their documents in
+`<state>/extension_state.sqlite3`. The file name and the schema did not
+change in 0.9; the store's schema ledger domain did, from
+`mobkit-extension-state` to `meta-extension-state`.
+
+**You see (0.9.0, 0.9.1):** the store fails to open with an unledgered
+objects error for the domain `meta-extension-state` (the tables
+`extension_documents` and `extension_receipts`), also after a completed
+adoption, because the adoption did not carry that domain over.
+
+**Do (0.9.2):** the store is predecessor state now. Startup refuses with the
+adoption message above; run `meta_gateway storage-adopt-predecessor` as
+described there. An installation an earlier 0.9 adoption already finished
+lists one more action, the store's ledger domain, and `--apply` renames it.
+Every document is kept. The stock `meta_gateway` adopts the store too: it
+does not need the `extension-state` feature.
+
+A document MCP descriptor that a mob definition persisted before 0.9 (a
+child profile created by an agent `mob_create`, for example) carries the
+public marker under its predecessor name `MOBKIT_MCP_DOCUMENT_BINDING`. 0.9.2
+resolves it to your host's document binding exactly as the current
+`META_MCP_DOCUMENT_BINDING` spelling, so such members keep their documents.
+Nothing needs to change in the stored definitions. A marked descriptor that
+no binding resolves refuses the member's build, in either spelling, with or
+without the `extension-state` feature.
 
 ## 2. Profile prompt keys are refused
 
@@ -177,27 +211,65 @@ Move the table into the Meerkat `config.toml` and point the gateway at it; see
 
 ## 4. Keys that now take effect
 
-MobKit 0.8.x ignored these keys, so a config that carries them did nothing
-before and now changes behaviour. Review them before upgrading.
+Earlier MobKit releases ignored these keys in `mob.toml`, so a config that
+carries them did nothing on those releases and changes behaviour on Meta 0.9.
+Review them before upgrading.
 
 - **`model_fallback`** (on a profile or under `[runtime]`) now configures the
-  model fallback chain. An unknown key inside it, or an invalid chain, refuses
-  the definition with `invalid_model_fallback`.
-- **`tools.deny`** now denies the listed tools to the profile's members. A name
-  outside the known tool vocabularies fails the member build
-  (`DeclaredToolUnknown`), and an empty or whitespace entry refuses the
-  definition:
+  model fallback chain. MobKit 0.8.33 and earlier ignored it. An unknown key
+  inside it, or an invalid chain, refuses the definition with
+  `invalid_model_fallback`.
+- **`tools.deny`** now denies the listed tools to the profile's members.
+  MobKit 0.8.45 and earlier ignored it. A name outside the known tool
+  vocabularies fails the member build (`DeclaredToolUnknown`), and an empty or
+  whitespace entry refuses the definition:
 
   ```text
   malformed_tool_deny: profiles.<name> tools.deny[<i>] "<entry>" is not a tool name
   ```
 
-On an adopted persistent store these keys are also a composition change: the
-store recorded its definition without them, so the first resume refuses as
-`divergent`, naming for example `profiles.<name>.tools.deny` or
-`profiles.<name>.model_fallback`. Remove the keys to keep the MobKit 0.8.x
-behaviour, or keep them and advance the stored definition once with the
-[one-shot mob definition update](/reference/configuration#one-shot-mob-definition-update).
+On an adopted persistent store these keys are also a composition change: a
+store created by a release that ignored them recorded its definition without
+them. Unless a later release's definition update recorded them, the store's
+definition still lacks them, and an authoritative resume (the default) that
+keeps them refuses as `divergent`, naming for example
+`profiles.<name>.tools.deny` or `profiles.<name>.model_fallback`. Resuming
+never applies them.
+
+**Check before adopting.** Give the adoption the definition the installation
+boots with (`mob.toml`, or `definition.json`):
+
+```bash
+meta_gateway storage-adopt-predecessor --state-dir <dir> --mob-config <mob.toml>
+```
+
+Adoption reads the definition each persistent mob storage holds now, from a
+private copy of its event log (the store itself is not opened), and names
+every such key that definition does not record, before it changes anything.
+A key that a later release's definition update recorded is already in effect
+and is not named. The composition manifest only tells which release created
+the store.
+
+```text
+refused, nothing changed: <dir>/event_log.sqlite3.composition.json: the mob
+definition in <mob.toml> sets keys that predecessor release 0.8.26, which
+created this store, ignored and Meta 0.9 applies, and that the definition
+this store holds does not record: profiles.planner.tools.deny. ...
+```
+
+With `--json`, each store's keys are listed under `ignored_keys` (`manifest`,
+`mob_id`, `source`, `created_by`, `keys`, `acknowledged`). A `--mob-config`
+that does not parse, or a `mob.toml` that declares a `[self_hosted]` or
+`[realm]` table, is refused before planning, naming the file.
+
+**Do:** for each named key, choose one:
+
+- Remove it to keep the behaviour the store has run with. The store then
+  resumes unchanged.
+- Keep it: rerun with `--acknowledge-ignored-keys`, which adopts and reports
+  the keys as acknowledged, then advance the stored definition once with the
+  [one-shot mob definition update](/reference/configuration#one-shot-mob-definition-update).
+  Until then an authoritative resume that keeps them refuses as `divergent`.
 
 ## 5. Keys that only warn: safe to remove
 

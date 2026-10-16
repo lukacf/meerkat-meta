@@ -2,10 +2,11 @@
 //!
 //! Before 0.9 this product shipped under a different name, and several
 //! durable names carried it: two database file names, the gateway's memory
-//! ledger file, four schema ledger domains, one SQLite table, the gateway
+//! ledger file, five schema ledger domains, one SQLite table, the gateway
 //! home directory, the flow-editor draft store file, the steward dream
-//! schedule's host runnable and the creator field of the composition
-//! manifest beside each persistent mob storage. 0.9 renames all of them.
+//! schedule's host runnable, the creator field of the composition manifest
+//! beside each persistent mob storage and the public marker in a host's
+//! document MCP descriptors. 0.9 renames all of them.
 //! This module is the only place that knows the predecessor spellings, and
 //! it uses them for exactly three things:
 //!
@@ -15,7 +16,9 @@
 //!    names ([`crate::storage_layout::StorageLayoutError::PredecessorState`],
 //!    [`crate::storage_layout::StorageLayoutError::PredecessorGatewayHome`]).
 //!    Nothing ever reads a predecessor name as a fallback: a renamed default
-//!    never starts empty beside existing state.
+//!    never starts empty beside existing state. The extension document
+//!    store kept its file name, so its predecessor ledger domain is what
+//!    marks it.
 //! 2. **Explicit adoption.** [`adopt_predecessor_state`], behind
 //!    `meta_gateway storage-adopt-predecessor`, carries one stopped
 //!    installation (a state directory and optionally its gateway home) over,
@@ -32,14 +35,28 @@
 //!    established peer key, host pins and control audiences, and the draft
 //!    store. The run stops at the first failure. Every refusal happens
 //!    before the first change; every failure after it is reported as such,
-//!    never as "unchanged".
-//! 3. **One read alias.** The composition manifest reads its creator field
-//!    under [`PREDECESSOR_MANIFEST_CREATOR_FIELD`] too. That name is a field
-//!    inside a file the store keeps, not a file or table name a renamed
-//!    default could start empty beside, so reading it cannot fork state; it
-//!    keeps a store that was adopted before the manifest step existed
-//!    opening. [`repair_composition_manifest`] (`meta_repair
-//!    --composition-manifests`) renames it on such a store.
+//!    never as "unchanged". Given the mob definitions the installation boots
+//!    with ([`PredecessorDefinitionCheck`]), planning also names each key
+//!    that the predecessor release which created a store ignored, that Meta
+//!    0.9 applies and that the definition the store holds does not record,
+//!    and refuses until the operator removes or acknowledges it. To read
+//!    that definition it copies the store's event log from a read-only
+//!    connection into a private temporary directory and opens only the copy
+//!    through Meerkat's mob storage; adoption itself never changes a
+//!    definition.
+//! 3. **Two read aliases.** The composition manifest reads its creator
+//!    field under [`PREDECESSOR_MANIFEST_CREATOR_FIELD`] too, and a
+//!    document MCP descriptor resolves with its marker spelled
+//!    [`PREDECESSOR_DOCUMENT_BINDING_ENV`] too. Each name is a field inside
+//!    data the store keeps, not a file or table name a renamed default could
+//!    start empty beside, so reading it cannot fork state. The manifest
+//!    alias keeps a store that was adopted before the manifest step existed
+//!    opening; [`repair_composition_manifest`] (`meta_repair
+//!    --composition-manifests`) renames it on such a store. The marker
+//!    alias keeps a descriptor that a mob definition persisted before 0.9
+//!    resolving to its host binding: definitions are event-sourced, so no
+//!    adoption step rewrites them. Unresolved, a descriptor in either
+//!    spelling refuses instead of launching.
 //!
 //! The journal ([`ADOPTION_JOURNAL_FILE_NAME`]) is the completion evidence.
 //! Until it records every step finished, startup refuses
@@ -81,9 +98,11 @@ use meerkat::{
     HostRunnableName, HostRunnableTargetBinding, ScheduleService, SqliteScheduleStore,
     TargetBinding, UpdateScheduleRequest,
 };
+use meerkat_mob::MobDefinition;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::mob_composition_manifest::MobCompositionManifest;
 use crate::storage_layout::{
     CANONICAL_CONSOLE_DB_FILE_NAME, CANONICAL_METADATA_DB_FILE_NAME, GATEWAY_HOME_DIR_NAME,
     MetaStorageLayout,
@@ -99,13 +118,27 @@ pub const PREDECESSOR_METADATA_DB_FILE_NAMES: [&str; 2] =
 /// Predecessor spellings of the console-timeline database, canonical first.
 pub const PREDECESSOR_CONSOLE_DB_FILE_NAMES: [&str; 2] =
     ["mobkit_console.sqlite3", "mobkit_console.sqlite"];
-/// Predecessor schema ledger domains and the domains they become.
+/// Predecessor schema ledger domains and the domains they become. The
+/// extension document store's domain ([`PREDECESSOR_EXTENSION_LEDGER_DOMAIN`])
+/// is renamed beside them.
 pub const PREDECESSOR_LEDGER_DOMAINS: [(&str, &str); 4] = [
     ("mobkit-continuity", "meta-continuity"),
     ("mobkit-metadata", "meta-metadata"),
     ("mobkit-console", "meta-console"),
     ("mobkit-memory", "meta-memory"),
 ];
+/// Predecessor ledger domain of the extension document store
+/// ([`crate::storage_layout::EXTENSION_STATE_DB_FILE_NAME`]). The store kept
+/// its file name and its schema; only this domain marks it as predecessor
+/// state. Adoption renames it to `meta-extension-state`.
+pub const PREDECESSOR_EXTENSION_LEDGER_DOMAIN: &str = "mobkit-extension-state";
+/// The extension document store's ledger domain since 0.9.
+const EXTENSION_LEDGER_DOMAIN: &str = "meta-extension-state";
+/// Predecessor spelling of the public marker in a host's document MCP
+/// descriptors (`META_MCP_DOCUMENT_BINDING`). A descriptor a profile
+/// persisted before 0.9 carries it; the document binding resolves it as
+/// the current spelling.
+pub const PREDECESSOR_DOCUMENT_BINDING_ENV: &str = "MOBKIT_MCP_DOCUMENT_BINDING";
 /// The predecessor's meerkat-level realm id. An adopted installation keeps
 /// it, recorded in its adoption journal; a fresh installation uses
 /// [`crate::storage_provider::DEFAULT_MEERKAT_LEVEL_REALM_ID`].
@@ -200,10 +233,12 @@ pub fn predecessor_database_files(state_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Every predecessor file present in `state_dir`, sorted: the database
-/// files, and the memory ledger file together with the stage an
-/// interrupted write of it leaves behind. Startup refuses on any of them,
-/// whether or not it enables memory, before a ledger can start empty beside
-/// them.
+/// files, the memory ledger file together with the stage an interrupted
+/// write of it leaves behind, and the extension document store while its
+/// ledger carries the predecessor domain. Startup refuses on any of them,
+/// whether or not it enables memory or extension state, before a ledger can
+/// start empty beside them or a store opens under a domain it does not
+/// carry.
 pub fn predecessor_state_files(state_dir: &Path) -> Vec<PathBuf> {
     let ledger = state_dir.join(PREDECESSOR_MEMORY_LEDGER_FILE_NAME);
     let mut found = predecessor_database_files(state_dir);
@@ -212,8 +247,27 @@ pub fn predecessor_state_files(state_dir: &Path) -> Vec<PathBuf> {
             .into_iter()
             .filter(|path| present(path)),
     );
+    found.extend(predecessor_extension_store(state_dir));
     found.sort();
     found
+}
+
+/// The extension document store, when its ledger still carries the
+/// predecessor domain. Its file name is unchanged, so only its ledger tells
+/// it apart. A store this read-only probe cannot read is left to its own
+/// open, which refuses an unreadable file and never adopts one.
+fn predecessor_extension_store(state_dir: &Path) -> Option<PathBuf> {
+    let path = state_dir.join(crate::storage_layout::EXTENSION_STATE_DB_FILE_NAME);
+    if !path.is_file() {
+        return None;
+    }
+    let conn = meerkat_sqlite::open(&path, meerkat_sqlite::ConnectionProfile::ReadOnly).ok()?;
+    read_ledger_domains(&conn)
+        .ok()
+        .flatten()?
+        .iter()
+        .any(|domain| domain == PREDECESSOR_EXTENSION_LEDGER_DOMAIN)
+        .then_some(path)
 }
 
 /// Whether anything (a file, a directory, a link, even a dangling one) lies
@@ -788,6 +842,12 @@ pub struct PredecessorAdoptReport {
     pub complete: bool,
     #[serde(default)]
     pub actions: Vec<PredecessorAction>,
+    /// Per persistent mob storage, the keys of a supplied mob definition
+    /// that the predecessor release which created the store ignored, that
+    /// Meta 0.9 applies and that the definition the store holds does not
+    /// record ([`PredecessorDefinitionCheck`]).
+    #[serde(default)]
+    pub ignored_keys: Vec<PredecessorIgnoredKeys>,
     #[serde(default)]
     pub notes: Vec<String>,
     /// Refusals and failures. Non-empty means a nonzero exit.
@@ -844,6 +904,450 @@ impl PredecessorAdoptReport {
             PredecessorOutcome::Refused(reason.into()),
         );
     }
+}
+
+/// The mob definitions an installation boots with, given to adoption to
+/// check against the persistent mob storages the predecessor created.
+///
+/// A predecessor release read its `mob.toml` with Meerkat's definition
+/// parser, which ignored a key that release's definition did not carry: a
+/// config written with the key ran without it, and a store that release
+/// created recorded its definition without it. Meta 0.9 reads the key. While
+/// the definition a store holds still lacks it, an authoritative resume that
+/// keeps it refuses as divergent, and applying it changes what the store's
+/// members do. Adoption names each such key before it changes anything, and
+/// refuses until the operator removes it (keeping the behaviour the store
+/// has run with) or acknowledges it ([`Self::acknowledge_ignored_keys`]). An
+/// acknowledgement changes no definition: the key takes effect only once the
+/// stored definition is advanced through the declared definition-update
+/// ceremony, and resuming never applies it. A key the store's current
+/// definition records is in force, whichever release advanced it there, and
+/// is not named.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct PredecessorDefinitionCheck {
+    /// Each definition with the source a report names it by, such as its
+    /// `mob.toml` path.
+    pub definitions: Vec<(String, MobDefinition)>,
+    /// Report the keys a predecessor release ignored as acknowledged instead
+    /// of refusing.
+    pub acknowledge_ignored_keys: bool,
+}
+
+impl PredecessorDefinitionCheck {
+    pub fn new(definitions: Vec<(String, MobDefinition)>, acknowledge_ignored_keys: bool) -> Self {
+        Self {
+            definitions,
+            acknowledge_ignored_keys,
+        }
+    }
+}
+
+/// The keys a supplied mob definition sets that the predecessor release
+/// which created one persistent mob storage ignored, that Meta 0.9 applies,
+/// and that the definition the store holds now does not record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PredecessorIgnoredKeys {
+    /// The store's composition manifest.
+    pub manifest: String,
+    /// The mob the store and the definition name.
+    pub mob_id: String,
+    /// The source of the supplied definition.
+    pub source: String,
+    /// The release that created the store, as its manifest records it.
+    pub created_by: String,
+    /// Dotted paths of the keys, as a divergence refusal names them.
+    pub keys: Vec<String>,
+    /// The operator acknowledged them; otherwise adoption refused.
+    pub acknowledged: bool,
+}
+
+/// The first predecessor release whose mob definition carried a profile's
+/// or `[runtime]`'s `model_fallback` (with its Meerkat 0.8.37); earlier
+/// releases ignored the key.
+const MODEL_FALLBACK_RECORDED_SINCE: (u64, u64, u64) = (0, 8, 34);
+/// The first predecessor release whose mob definition carried a profile's
+/// `tools.deny` (with its Meerkat 0.8.51); earlier releases ignored the key.
+const TOOLS_DENY_RECORDED_SINCE: (u64, u64, u64) = (0, 8, 46);
+
+/// `major.minor.patch` of a release version, as a composition manifest
+/// records its creator; `None` for anything else.
+fn release_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.').map(|part| part.parse::<u64>().ok());
+    let release = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(release)
+}
+
+/// The keys predecessor release `release` ignored in a mob definition, as a
+/// report names them; `None` when it ignored none of them.
+fn ignored_keys_of(release: (u64, u64, u64)) -> Option<&'static str> {
+    if release < MODEL_FALLBACK_RECORDED_SINCE {
+        Some("model_fallback and tools.deny")
+    } else if release < TOOLS_DENY_RECORDED_SINCE {
+        Some("tools.deny")
+    } else {
+        None
+    }
+}
+
+/// The keys `profile` sets among those `release` ignored, as dotted paths
+/// under `profiles.<name>`.
+fn profile_keys_ignored_by(
+    release: (u64, u64, u64),
+    name: &meerkat_mob::ProfileName,
+    profile: &meerkat_mob::Profile,
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    if release < MODEL_FALLBACK_RECORDED_SINCE && profile.model_fallback.is_some() {
+        keys.push(format!("profiles.{name}.model_fallback"));
+    }
+    if release < TOOLS_DENY_RECORDED_SINCE && !profile.tools.deny.is_empty() {
+        keys.push(format!("profiles.{name}.tools.deny"));
+    }
+    keys
+}
+
+/// The keys `supplied` sets that `held`, the definition a store holds now,
+/// does not record, among the keys `created_by`, the predecessor release
+/// that created the store, ignored: dotted paths, as a divergence refusal
+/// names them, sorted. `None` when `created_by` is not a release version, so
+/// which keys it ignored cannot be told.
+///
+/// A key `held` records is in force, whichever release advanced the
+/// definition to record it, and is not reported. Only a profile both
+/// definitions declare inline is compared; a profile `held` lacks is
+/// reported by [`profiles_not_held`].
+fn predecessor_ignored_keys(
+    created_by: &str,
+    held: &MobDefinition,
+    supplied: &MobDefinition,
+) -> Option<Vec<String>> {
+    let release = release_version(created_by)?;
+    let mut keys = Vec::new();
+    if release < MODEL_FALLBACK_RECORDED_SINCE
+        && supplied.runtime.model_fallback.is_some()
+        && held.runtime.model_fallback.is_none()
+    {
+        keys.push("runtime.model_fallback".to_string());
+    }
+    for (name, binding) in &supplied.profiles {
+        let (Some(profile), Some(stored)) = (
+            binding.as_inline(),
+            held.profiles
+                .get(name)
+                .and_then(|stored| stored.as_inline()),
+        ) else {
+            continue;
+        };
+        if release < MODEL_FALLBACK_RECORDED_SINCE
+            && profile.model_fallback.is_some()
+            && stored.model_fallback.is_none()
+        {
+            keys.push(format!("profiles.{name}.model_fallback"));
+        }
+        if release < TOOLS_DENY_RECORDED_SINCE
+            && !profile.tools.deny.is_empty()
+            && stored.tools.deny.is_empty()
+        {
+            keys.push(format!("profiles.{name}.tools.deny"));
+        }
+    }
+    keys.sort();
+    Some(keys)
+}
+
+/// The inline profiles `supplied` declares that `held` does not, each with
+/// the keys it sets among those `created_by` ignored; profiles that set none
+/// are left out. Adding such a profile is a composition change of its own:
+/// an authoritative resume refuses it as divergent until the stored
+/// definition is advanced, and its keys take effect with it.
+fn profiles_not_held(
+    created_by: &str,
+    held: &MobDefinition,
+    supplied: &MobDefinition,
+) -> Vec<(String, Vec<String>)> {
+    let Some(release) = release_version(created_by) else {
+        return Vec::new();
+    };
+    supplied
+        .profiles
+        .iter()
+        .filter(|(name, _)| !held.profiles.contains_key(*name))
+        .filter_map(|(name, binding)| {
+            let keys = profile_keys_ignored_by(release, name, binding.as_inline()?);
+            (!keys.is_empty()).then(|| (name.to_string(), keys))
+        })
+        .collect()
+}
+
+/// The storage path a composition manifest sits beside.
+fn storage_beside(manifest: &Path) -> Option<PathBuf> {
+    let name = manifest.file_name()?.to_str()?;
+    let storage = name.strip_suffix(crate::mob_composition_manifest::MANIFEST_FILE_SUFFIX)?;
+    Some(manifest.with_file_name(storage))
+}
+
+/// The definition a persistent mob storage holds now, as Meerkat's own
+/// definition authority selects it from the event log (the creation
+/// definition, or the latest one a definition update advanced it to);
+/// `None` when no storage lies there or it holds no mob.
+///
+/// Planning never opens a store through its owner, which migrates the
+/// store's schema as it opens. The storage is copied from a read-only
+/// connection with `VACUUM INTO`, a consistent copy that includes committed
+/// WAL content and leaves the original untouched, into a private temporary
+/// directory, and only that copy is opened through Meerkat's mob storage.
+async fn held_definition(storage: &Path) -> Result<Option<MobDefinition>, String> {
+    if !present(storage) {
+        return Ok(None);
+    }
+    let copy_dir = tempfile::Builder::new()
+        .prefix("meta-adoption-definition-")
+        .tempdir()
+        .map_err(|error| format!("create a private directory for its copy: {error}"))?;
+    let copy = copy_dir.path().join("mob.sqlite3");
+    let copy_name = copy
+        .to_str()
+        .ok_or_else(|| format!("{} is not a UTF-8 path", copy.display()))?;
+    {
+        let conn = meerkat_sqlite::open(storage, meerkat_sqlite::ConnectionProfile::ReadOnly)
+            .map_err(|error| format!("read-only open failed: {error}"))?;
+        conn.execute("VACUUM INTO ?1", [copy_name])
+            .map_err(|error| format!("copying it from a read-only connection failed: {error}"))?;
+    }
+    let copied = meerkat_mob::MobStorage::persistent(&copy)
+        .map_err(|error| format!("opening its copy failed: {error}"))?;
+    let snapshot = copied
+        .created_definition_snapshot()
+        .await
+        .map_err(|error| format!("reading its copy's definition failed: {error}"))?;
+    drop(copied);
+    Ok(snapshot.map(|snapshot| snapshot.definition().clone()))
+}
+
+/// SHA-256 over a storage's database file and its WAL (absent reads as
+/// empty), streamed: the change check for a store whose definition planning
+/// read.
+fn storage_digest(storage: &Path) -> Result<[u8; 32], String> {
+    use std::io::Read as _;
+    let mut wal = storage.as_os_str().to_owned();
+    wal.push("-wal");
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1 << 16];
+    for (path, required) in [(storage.to_path_buf(), true), (PathBuf::from(wal), false)] {
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("read {}: {error}", path.display())),
+        };
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|error| format!("read {}: {error}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// What checking the supplied mob definitions found, by read-only
+/// inspection.
+#[derive(Debug, Default)]
+struct DefinitionCheck {
+    ignored_keys: Vec<PredecessorIgnoredKeys>,
+    /// `(subject, reason)` of each refusal.
+    refusals: Vec<(String, String)>,
+    notes: Vec<String>,
+    /// Each storage whose definition the check read, with its digest then.
+    read: Vec<(PathBuf, [u8; 32])>,
+}
+
+impl DefinitionCheck {
+    fn record(&self, report: &mut PredecessorAdoptReport) {
+        report.ignored_keys.clone_from(&self.ignored_keys);
+        report.notes.extend(self.notes.iter().cloned());
+        report.errors.extend(
+            self.refusals
+                .iter()
+                .map(|(subject, reason)| format!("refused, nothing changed: {subject}: {reason}")),
+        );
+    }
+
+    /// Whether every storage the check read still has the bytes it read.
+    fn storages_unchanged(&self) -> bool {
+        self.read
+            .iter()
+            .all(|(storage, digest)| storage_digest(storage).is_ok_and(|now| now == *digest))
+    }
+}
+
+/// Check `check`'s definitions against every persistent mob storage in
+/// `state_dir` that a predecessor release which ignored keys created: the
+/// release from the store's composition manifest, the definition from the
+/// store itself ([`held_definition`]). Changes nothing.
+async fn check_definitions(
+    state_dir: &Path,
+    check: &PredecessorDefinitionCheck,
+) -> DefinitionCheck {
+    let mut found = DefinitionCheck::default();
+    // A directory or manifest the plan cannot judge is refused by the plan.
+    let Ok(manifests) = composition_manifests_in(state_dir) else {
+        return found;
+    };
+    // Only a store that a release which ignored keys created can lack one.
+    let mut candidates = Vec::new();
+    for path in manifests {
+        let decoded = regular_file_bytes(&path).and_then(|bytes| {
+            serde_json::from_slice::<MobCompositionManifest>(&bytes)
+                .map_err(|error| error.to_string())
+        });
+        let created_by = match decoded {
+            Ok(record) => record.created_by_meta,
+            Err(reason) => {
+                if !check.definitions.is_empty() {
+                    found.refusals.push((
+                        path.display().to_string(),
+                        format!("cannot check the supplied mob definitions against it: {reason}"),
+                    ));
+                }
+                continue;
+            }
+        };
+        match release_version(&created_by) {
+            None => found.notes.push(format!(
+                "{}: its creator {created_by:?} is not a release version, so the keys it \
+                 ignored in the mob definition cannot be told",
+                path.display()
+            )),
+            Some(release) => {
+                if let Some(keys) = ignored_keys_of(release) {
+                    candidates.push((path, created_by, keys));
+                }
+            }
+        }
+    }
+    if check.definitions.is_empty() {
+        for (path, created_by, keys) in &candidates {
+            found.notes.push(format!(
+                "{}: predecessor release {created_by} created this store and ignored {keys} in \
+                 its mob definition; pass the definition the installation boots with \
+                 (--mob-config <mob.toml>) to check it for keys Meta 0.9 applies",
+                path.display()
+            ));
+        }
+        return found;
+    }
+    let mut held = Vec::new();
+    for (path, created_by, _) in candidates {
+        let Some(storage) = storage_beside(&path) else {
+            continue;
+        };
+        match held_definition(&storage).await {
+            Ok(Some(definition)) => match storage_digest(&storage) {
+                Ok(digest) => {
+                    found.read.push((storage, digest));
+                    held.push((path, created_by, definition));
+                }
+                Err(reason) => found.refusals.push((
+                    path.display().to_string(),
+                    format!("cannot read the mob storage beside it: {reason}"),
+                )),
+            },
+            Ok(None) => found.notes.push(format!(
+                "{}: no mob storage beside it holds a mob, so no definition was compared",
+                path.display()
+            )),
+            Err(reason) => found.refusals.push((
+                path.display().to_string(),
+                format!(
+                    "cannot read the mob definition the store at {} holds: {reason}",
+                    storage.display()
+                ),
+            )),
+        }
+    }
+    let mut checked = vec![false; held.len()];
+    for (source, supplied) in &check.definitions {
+        let mut matched = false;
+        for (index, (path, created_by, definition)) in held.iter().enumerate() {
+            if definition.id != supplied.id {
+                continue;
+            }
+            matched = true;
+            checked[index] = true;
+            let manifest = path.display().to_string();
+            for (profile, keys) in profiles_not_held(created_by, definition, supplied) {
+                found.notes.push(format!(
+                    "{manifest}: profile {profile} in {source} sets {}, which predecessor \
+                     release {created_by} ignored, and the definition this store holds has no \
+                     profile {profile}: adding the profile changes the store's composition, so \
+                     an authoritative resume refuses it as divergent until the stored \
+                     definition is advanced, and these keys take effect with it",
+                    keys.join(", ")
+                ));
+            }
+            let keys =
+                predecessor_ignored_keys(created_by, definition, supplied).unwrap_or_default();
+            if keys.is_empty() {
+                continue;
+            }
+            let named = keys.join(", ");
+            if check.acknowledge_ignored_keys {
+                found.notes.push(format!(
+                    "{manifest}: acknowledged keys of the mob definition in {source} that \
+                     predecessor release {created_by}, which created this store, ignored and \
+                     Meta 0.9 applies, and that the definition this store holds does not \
+                     record: {named}. They take effect only once the stored definition is \
+                     advanced with the one-shot mob definition update; until then an \
+                     authoritative resume that keeps them refuses as divergent"
+                ));
+            } else {
+                found.refusals.push((
+                    manifest.clone(),
+                    format!(
+                        "the mob definition in {source} sets keys that predecessor release \
+                         {created_by}, which created this store, ignored and Meta 0.9 applies, \
+                         and that the definition this store holds does not record: {named}. \
+                         The store has run without them, so an authoritative resume that keeps \
+                         them refuses as divergent. Remove them from {source} to keep the \
+                         behaviour this store has run with, or rerun with \
+                         --acknowledge-ignored-keys and then advance the stored definition once \
+                         with the one-shot mob definition update to apply them"
+                    ),
+                ));
+            }
+            found.ignored_keys.push(PredecessorIgnoredKeys {
+                manifest,
+                mob_id: supplied.id.to_string(),
+                source: source.clone(),
+                created_by: created_by.clone(),
+                keys,
+                acknowledged: check.acknowledge_ignored_keys,
+            });
+        }
+        if !matched {
+            found.notes.push(format!(
+                "no persistent mob storage in {} that a release which ignored keys created \
+                 holds mob {} ({source}), so nothing in its definition needs checking",
+                state_dir.display(),
+                supplied.id
+            ));
+        }
+    }
+    for ((path, _, definition), checked) in held.iter().zip(checked) {
+        if !checked {
+            found.notes.push(format!(
+                "{}: no supplied mob definition names mob {}, so it was not checked",
+                path.display(),
+                definition.id
+            ));
+        }
+    }
+    found
 }
 
 /// Planned state-directory work, computed by read-only inspection.
@@ -932,6 +1436,20 @@ struct EstablishedIdentity {
 /// Steps run in order and the run stops at the first failure, so no step
 /// runs after a failed prerequisite.
 pub async fn adopt_predecessor_state(request: &PredecessorAdoptRequest) -> PredecessorAdoptReport {
+    adopt_predecessor_state_with_definitions(request, &PredecessorDefinitionCheck::default()).await
+}
+
+/// [`adopt_predecessor_state`], also checking the mob definitions the
+/// installation boots with ([`PredecessorDefinitionCheck`]). Planning names
+/// each key that the predecessor release which created a store ignored,
+/// that Meta 0.9 applies and that the definition the store holds does not
+/// record ([`PredecessorAdoptReport::ignored_keys`]), and refuses before any
+/// change unless the check acknowledges them. Without definitions it notes
+/// each store whose creating release ignored such keys.
+pub async fn adopt_predecessor_state_with_definitions(
+    request: &PredecessorAdoptRequest,
+    check: &PredecessorDefinitionCheck,
+) -> PredecessorAdoptReport {
     let mut report = PredecessorAdoptReport {
         mode: request.mode,
         state_dir: request.state_dir.clone(),
@@ -1024,6 +1542,8 @@ pub async fn adopt_predecessor_state(request: &PredecessorAdoptRequest) -> Prede
     refuse_live_runtimes(state_dir, &scope, &mut report);
     let state_plan = plan_state(state_dir, &mut report);
     let home_plan = plan_home(&scope, &mut report);
+    let definitions = check_definitions(state_dir, check).await;
+    definitions.record(&mut report);
     if report.has_errors() {
         return report;
     }
@@ -1080,6 +1600,7 @@ pub async fn adopt_predecessor_state(request: &PredecessorAdoptRequest) -> Prede
     if !journal_unchanged
         || revalidated_state.as_ref() != Some(&state_plan)
         || revalidated_home.as_ref() != Some(&home_plan)
+        || !definitions.storages_unchanged()
     {
         report.refuse(
             PredecessorItem::Custody,
@@ -1103,6 +1624,12 @@ pub async fn adopt_predecessor_state(request: &PredecessorAdoptRequest) -> Prede
             .notes
             .push("adoption already complete; nothing to do".into());
         return report;
+    }
+    // Reopening a finished adoption for predecessor state found since: no
+    // step of this run has finished yet, so the journal records none, and a
+    // failure names the steps this run still owes.
+    if journal_complete {
+        journal.completed.clear();
     }
     journal.status = AdoptionStatus::InProgress;
     journal.predecessor_home = scope.predecessor_home.clone();
@@ -1496,6 +2023,7 @@ fn plan_ledger(database: &Path) -> Result<Option<LedgerPlan>, String> {
     let renames: Vec<(&'static str, &'static str)> = PREDECESSOR_LEDGER_DOMAINS
         .iter()
         .copied()
+        .chain([(PREDECESSOR_EXTENSION_LEDGER_DOMAIN, EXTENSION_LEDGER_DOMAIN)])
         .filter(|(from, _)| domains.iter().any(|domain| domain == from))
         .collect();
     if renames.is_empty() {
@@ -3448,6 +3976,170 @@ mod tests {
             .expect("the adopted installation resolves");
     }
 
+    /// The extension document store as a pre-0.9 writer left it. Its file
+    /// name and schema are unchanged in 0.9 (the DDL below is the predecessor
+    /// writer's, byte for byte); only its ledger domain was renamed. One
+    /// document row.
+    fn write_predecessor_extension_store(path: &Path) {
+        let conn = rusqlite::Connection::open(path).expect("open predecessor fixture");
+        conn.execute_batch(
+            "CREATE TABLE meerkat_schema (domain TEXT PRIMARY KEY, version INTEGER NOT NULL);
+             INSERT INTO meerkat_schema (domain, version) VALUES ('mobkit-extension-state', 1);
+CREATE TABLE IF NOT EXISTS extension_documents (
+ realm TEXT NOT NULL, namespace TEXT NOT NULL, id TEXT NOT NULL,
+ metadata TEXT NOT NULL, payload BLOB NOT NULL, deleted INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(realm, namespace, id));
+CREATE TABLE IF NOT EXISTS extension_receipts (
+ realm TEXT NOT NULL, namespace TEXT NOT NULL, principal TEXT NOT NULL,
+ request_id TEXT NOT NULL, fingerprint BLOB NOT NULL, receipt TEXT NOT NULL,
+ document_id TEXT NOT NULL, operation TEXT NOT NULL,
+ PRIMARY KEY(realm, namespace, principal, request_id));
+             INSERT INTO extension_documents (realm, namespace, id, metadata, payload)
+                 VALUES ('meta', 'notes', 'kept-document', '{}', X'010203');",
+        )
+        .expect("write predecessor fixture");
+    }
+
+    // The public domain table keeps the type 0.9.1 released it with: the
+    // extension store's domain is renamed beside it, not added to it.
+    const _: [(&str, &str); 4] = PREDECESSOR_LEDGER_DOMAINS;
+
+    fn ledger_domains_of(path: &Path) -> Vec<String> {
+        let conn = rusqlite::Connection::open(path).expect("open the store");
+        read_ledger_domains(&conn)
+            .expect("read the ledger")
+            .expect("the store has a ledger")
+    }
+
+    /// A pre-0.9 extension document store is predecessor state: startup
+    /// refuses it typed and names the adoption, also in an installation whose
+    /// adoption finished before this domain was adopted. The adoption renames
+    /// its ledger domain under the fence and keeps every row, and the
+    /// installation then resolves. Without the extension-state feature too:
+    /// the stock gateway runs the adoption and fences the store.
+    #[tokio::test]
+    async fn an_extension_store_under_the_predecessor_domain_is_adopted_before_it_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path();
+        write_adoption_journal(
+            state,
+            &AdoptionJournal {
+                version: ADOPTION_JOURNAL_VERSION,
+                status: AdoptionStatus::Complete,
+                predecessor_home: None,
+                gateway_home: None,
+                completed: [
+                    AdoptionStep::DatabaseFiles,
+                    AdoptionStep::Ledger,
+                    AdoptionStep::StewardSchedule,
+                    AdoptionStep::GatewayHome,
+                    AdoptionStep::DraftStore,
+                ]
+                .into(),
+                realm_id: None,
+            },
+        )
+        .unwrap();
+        let store = state.join("extension_state.sqlite3");
+        write_predecessor_extension_store(&store);
+
+        let error =
+            resolve_installation(state).expect_err("a predecessor extension store refuses startup");
+        assert!(
+            matches!(
+                &error,
+                crate::storage_layout::StorageLayoutError::PredecessorState { paths, .. }
+                    if paths == std::slice::from_ref(&store)
+            ),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("storage-adopt-predecessor"),
+            "{error}"
+        );
+        assert!(
+            crate::storage_migrate::enumerate_state_dir_databases(state).contains(&store),
+            "the maintenance fence covers the store"
+        );
+
+        let dry = adopt_predecessor_state(&request(state, MigrateMode::DryRun)).await;
+        assert!(!dry.has_errors(), "{:?}", dry.errors);
+        assert!(
+            dry.actions.iter().any(|action| {
+                action.item == PredecessorItem::LedgerDomain
+                    && action.outcome == PredecessorOutcome::Planned
+            }),
+            "{:?}",
+            dry.actions
+        );
+        assert_eq!(ledger_domains_of(&store), ["mobkit-extension-state"]);
+
+        let apply = adopt_predecessor_state(&request(state, MigrateMode::Apply)).await;
+        assert!(!apply.has_errors(), "{:?}", apply.errors);
+        assert!(apply.changed_state && apply.complete, "{apply:?}");
+        assert_eq!(ledger_domains_of(&store), ["meta-extension-state"]);
+        let kept: i64 = rusqlite::Connection::open(&store)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM extension_documents WHERE id = 'kept-document'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
+        resolve_installation(state).expect("the adopted installation resolves");
+    }
+
+    /// A rerun that reopens a finished adoption for predecessor state found
+    /// since records none of the earlier run's steps as finished: when it
+    /// fails, its journal and the unfinished-adoption refusal it carries
+    /// name the steps this run still owes, not an empty list.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reopened_adoption_that_fails_names_its_unfinished_steps() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path();
+        write_adoption_journal(
+            state,
+            &AdoptionJournal {
+                version: ADOPTION_JOURNAL_VERSION,
+                status: AdoptionStatus::Complete,
+                predecessor_home: None,
+                gateway_home: None,
+                completed: AdoptionStep::ALL.into(),
+                realm_id: None,
+            },
+        )
+        .unwrap();
+        let store = state.join("extension_state.sqlite3");
+        write_predecessor_extension_store(&store);
+        // The ledger step cannot write the store, so the reopened run fails
+        // there, after the steps before it finished.
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&store).is_ok() {
+            // A process that may write a read-only file (root) cannot fail
+            // the step this way.
+            return;
+        }
+
+        let apply = adopt_predecessor_state(&request(state, MigrateMode::Apply)).await;
+        assert!(apply.has_errors(), "{apply:?}");
+        assert!(!apply.complete);
+        let journal = read_adoption_journal(state).unwrap().unwrap();
+        assert_eq!(journal.status, AdoptionStatus::InProgress);
+        assert_eq!(
+            journal.completed,
+            BTreeSet::from([AdoptionStep::DatabaseFiles, AdoptionStep::MemoryLedgerFile])
+        );
+        assert_eq!(
+            unfinished_adoption(state).as_deref(),
+            Some("steps not finished: Ledger, StewardSchedule, GatewayHome, DraftStore")
+        );
+        resolve_installation(state).expect_err("the unfinished adoption refuses startup");
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
     /// The stage of an interrupted predecessor ledger write is evidence of
     /// the ledger's newest state. With or without the committed file beside
     /// it, it blocks startup and adoption refuses it for manual resolution:
@@ -4571,5 +5263,450 @@ mod tests {
                 .expect_err("an ambiguous manifest refuses");
         assert_eq!(refusal.outcome(), "refused", "{refusal:?}");
         assert_eq!(std::fs::read_to_string(&ambiguous).unwrap(), both);
+    }
+
+    /// A mob definition as a predecessor release recorded it: one profile,
+    /// with nothing beyond what every release carried.
+    fn recorded_definition() -> MobDefinition {
+        MobDefinition::from_toml("[mob]\nid = \"m\"\n\n[profiles.lead]\nmodel = \"gpt-5.5\"\n")
+            .unwrap()
+    }
+
+    /// The same definition with the three keys predecessor releases before
+    /// 0.8.34 ignored: a mob-wide and a profile model fallback, and a tool
+    /// deny list.
+    fn definition_with_ignored_keys() -> MobDefinition {
+        MobDefinition::from_toml(
+            "[mob]\nid = \"m\"\n\n[runtime.model_fallback]\nenabled = false\n\n\
+             [profiles.lead]\nmodel = \"gpt-5.5\"\n\n[profiles.lead.model_fallback]\n\
+             enabled = false\n\n[profiles.lead.tools]\ndeny = [\"shell\"]\n",
+        )
+        .unwrap()
+    }
+
+    const IGNORED_KEYS: [&str; 3] = [
+        "profiles.lead.model_fallback",
+        "profiles.lead.tools.deny",
+        "runtime.model_fallback",
+    ];
+
+    fn key_paths(paths: &[&str]) -> Option<Vec<String>> {
+        Some(paths.iter().map(|path| (*path).to_string()).collect())
+    }
+
+    /// The stock composition manifest as predecessor release `release` wrote
+    /// it, recording `definition`, with no mob storage beside it.
+    fn write_recorded_manifest(state: &Path, release: &str, definition: &MobDefinition) {
+        let manifest = serde_json::json!({
+            "manifest_version": 1,
+            "created_by_mobkit": release,
+            "definition": definition,
+            "created_by_authority": "authoritative",
+        });
+        std::fs::write(
+            manifest_file(state),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn definition_check(
+        definition: MobDefinition,
+        acknowledge_ignored_keys: bool,
+    ) -> PredecessorDefinitionCheck {
+        PredecessorDefinitionCheck::new(
+            vec![("mob.toml".to_string(), definition)],
+            acknowledge_ignored_keys,
+        )
+    }
+
+    /// The definition the released MobKit 0.8.26 store was created with (see
+    /// tests/fixtures/README.md): mob `adoption-fixture-planners`, profile
+    /// `planner`.
+    const RELEASED_MOB_CONFIG: &str = "[mob]\nid = \"adoption-fixture-planners\"\n\n\
+        [profiles.planner]\nmodel = \"gpt-5.5\"\nexternal_addressable = true\n\
+        runtime_mode = \"turn_driven\"\n\n[profiles.planner.tools]\ncomms = true\n";
+
+    /// The released definition with a tool deny list, and optionally with
+    /// both model fallbacks: keys 0.8.26 ignored.
+    fn released_definition_with(deny: bool, model_fallbacks: bool) -> MobDefinition {
+        let mut config = RELEASED_MOB_CONFIG.to_string();
+        if deny {
+            config.push_str("deny = [\"shell\"]\n");
+        }
+        if model_fallbacks {
+            config.push_str(
+                "\n[profiles.planner.model_fallback]\nenabled = false\n\n\
+                 [runtime.model_fallback]\nenabled = false\n",
+            );
+        }
+        MobDefinition::from_toml(&config).unwrap()
+    }
+
+    /// The released 0.8.26 store's mob storage and its composition manifest,
+    /// copied byte for byte into `state`: a real predecessor event log that
+    /// holds the released definition. The fixture itself is never opened.
+    fn stage_released_mob_storage(state: &Path) {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/released_0_8_26_store/state");
+        // The released WAL is empty: the database file holds every event.
+        assert_eq!(
+            std::fs::metadata(fixture.join("event_log.sqlite3-wal"))
+                .unwrap()
+                .len(),
+            0
+        );
+        for name in ["event_log.sqlite3", "event_log.sqlite3.composition.json"] {
+            std::fs::copy(fixture.join(name), state.join(name)).unwrap();
+        }
+        assert_eq!(
+            manifest_file(state),
+            state.join("event_log.sqlite3.composition.json")
+        );
+    }
+
+    /// Advance the stored definition of the mob storage in `state` once, as
+    /// a later release's definition update does, and wait for its store to
+    /// close.
+    async fn advance_stored_definition(state: &Path, definition: MobDefinition) {
+        let path = state.join("event_log.sqlite3");
+        let storage = meerkat_mob::MobStorage::persistent(&path).unwrap();
+        let revision = storage.update_definition(1, definition).await.unwrap();
+        assert_eq!(revision.epoch, 2, "{revision:?}");
+        drop(storage);
+        // The store's connection worker closes its connection on its own
+        // thread after the store is dropped; the exclusive fence waits for
+        // it, so planning reads a quiescent file.
+        drop(
+            meerkat_sqlite::ExclusiveFence::acquire(&path, std::time::Duration::from_secs(30))
+                .expect("mob store worker closed"),
+        );
+    }
+
+    /// The keys reported are those the creating release ignored, by the
+    /// first release whose definition carried each (`model_fallback` from
+    /// 0.8.34, `tools.deny` from 0.8.46), that the held definition does not
+    /// record. A key it records, an unchanged definition and a profile it
+    /// lacks are not reported (the profile is noted instead), and a creator
+    /// that is not a release version is not judged.
+    #[test]
+    fn the_reported_keys_are_those_the_creating_release_ignored_and_the_store_lacks() {
+        let held = recorded_definition();
+        let supplied = definition_with_ignored_keys();
+        for (release, expected) in [
+            ("0.8.9", key_paths(&IGNORED_KEYS)),
+            ("0.8.33", key_paths(&IGNORED_KEYS)),
+            ("0.8.34", key_paths(&["profiles.lead.tools.deny"])),
+            ("0.8.45", key_paths(&["profiles.lead.tools.deny"])),
+            ("0.8.46", key_paths(&[])),
+            ("0.8.49", key_paths(&[])),
+            ("0.9.1", key_paths(&[])),
+        ] {
+            assert_eq!(
+                predecessor_ignored_keys(release, &held, &supplied),
+                expected,
+                "{release}"
+            );
+        }
+        assert_eq!(
+            predecessor_ignored_keys("0.8.26", &held, &held),
+            key_paths(&[]),
+            "an unchanged definition"
+        );
+        assert_eq!(
+            predecessor_ignored_keys("0.8.26", &supplied, &supplied),
+            key_paths(&[]),
+            "keys the held definition records, whichever release advanced it"
+        );
+        let new_profile = MobDefinition::from_toml(
+            "[mob]\nid = \"m\"\n\n[profiles.lead]\nmodel = \"gpt-5.5\"\n\n\
+             [profiles.other]\nmodel = \"gpt-5.5\"\n\n[profiles.other.tools]\ndeny = [\"shell\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            predecessor_ignored_keys("0.8.26", &held, &new_profile),
+            key_paths(&[]),
+            "a profile the held definition lacks is not compared"
+        );
+        assert_eq!(
+            profiles_not_held("0.8.26", &held, &new_profile),
+            vec![(
+                "other".to_string(),
+                vec!["profiles.other.tools.deny".to_string()]
+            )]
+        );
+        assert_eq!(profiles_not_held("0.8.46", &held, &new_profile), Vec::new());
+        assert_eq!(
+            profiles_not_held("0.8.26", &new_profile, &new_profile),
+            Vec::new()
+        );
+        for creator in ["0.8", "0.8.26.1", "0.8.26-dev", "mobkit"] {
+            assert_eq!(
+                predecessor_ignored_keys(creator, &held, &supplied),
+                None,
+                "{creator}"
+            );
+        }
+    }
+
+    /// Over the released 0.8.26 store, keys 0.8.26 ignored, that Meta 0.9
+    /// applies and that the store's definition does not record are named and
+    /// refused before any change, by the dry run and by apply, until they
+    /// are acknowledged; adoption then completes and still reports them. The
+    /// released definition reports nothing.
+    #[tokio::test]
+    async fn keys_the_store_does_not_hold_refuse_until_acknowledged() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path();
+        write_predecessor_metadata_db(&state.join(PREDECESSOR_METADATA_DB_FILE_NAMES[0]));
+        stage_released_mob_storage(state);
+        let before = snapshot(state);
+        let manifest = manifest_file(state).display().to_string();
+        let keys = [
+            "profiles.planner.model_fallback",
+            "profiles.planner.tools.deny",
+            "runtime.model_fallback",
+        ];
+        let reported = |acknowledged| {
+            vec![PredecessorIgnoredKeys {
+                manifest: manifest.clone(),
+                mob_id: "adoption-fixture-planners".to_string(),
+                source: "mob.toml".to_string(),
+                created_by: "0.8.26".to_string(),
+                keys: keys.map(String::from).to_vec(),
+                acknowledged,
+            }]
+        };
+
+        let unchanged = adopt_predecessor_state_with_definitions(
+            &request(state, MigrateMode::DryRun),
+            &definition_check(released_definition_with(false, false), false),
+        )
+        .await;
+        assert!(!unchanged.has_errors(), "{:?}", unchanged.errors);
+        assert_eq!(unchanged.ignored_keys, Vec::new());
+
+        for mode in [MigrateMode::DryRun, MigrateMode::Apply] {
+            let report = adopt_predecessor_state_with_definitions(
+                &request(state, mode),
+                &definition_check(released_definition_with(true, true), false),
+            )
+            .await;
+            assert_eq!(report.ignored_keys, reported(false), "{mode:?}");
+            assert!(!report.changed_state, "{mode:?}");
+            assert_eq!(report.errors.len(), 1, "{mode:?}: {:?}", report.errors);
+            let error = &report.errors[0];
+            assert!(
+                error.starts_with(&format!("refused, nothing changed: {manifest}: ")),
+                "{error}"
+            );
+            for needle in keys.into_iter().chain([
+                "predecessor release 0.8.26",
+                "mob.toml",
+                "an authoritative resume",
+                "--acknowledge-ignored-keys",
+            ]) {
+                assert!(error.contains(needle), "{needle:?} missing from {error}");
+            }
+        }
+        assert_eq!(snapshot(state), before, "a refusal changes nothing");
+        assert!(read_adoption_journal(state).unwrap().is_none());
+
+        let applied = adopt_predecessor_state_with_definitions(
+            &request(state, MigrateMode::Apply),
+            &definition_check(released_definition_with(true, true), true),
+        )
+        .await;
+        assert!(!applied.has_errors(), "{:?}", applied.errors);
+        assert!(applied.changed_state && applied.complete, "{applied:?}");
+        assert_eq!(applied.ignored_keys, reported(true));
+        assert!(
+            applied
+                .notes
+                .iter()
+                .any(|note| note.contains("acknowledged")
+                    && note.contains(keys[1])
+                    && note.contains("an authoritative resume")),
+            "{:?}",
+            applied.notes
+        );
+    }
+
+    /// A store 0.8.26 created whose definition a later release advanced with
+    /// a tool deny list runs with it: adoption does not name the deny list
+    /// (removing it would drop a list in force, and make the store's resume
+    /// refuse), and still names the model fallbacks the advanced definition
+    /// does not record.
+    #[tokio::test]
+    async fn a_key_the_advanced_definition_records_is_in_force_and_not_named() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path();
+        stage_released_mob_storage(state);
+        advance_stored_definition(state, released_definition_with(true, false)).await;
+
+        let with_fallbacks = adopt_predecessor_state_with_definitions(
+            &request(state, MigrateMode::DryRun),
+            &definition_check(released_definition_with(true, true), false),
+        )
+        .await;
+        assert_eq!(
+            with_fallbacks
+                .ignored_keys
+                .iter()
+                .map(|ignored| ignored.keys.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![
+                "profiles.planner.model_fallback".to_string(),
+                "runtime.model_fallback".to_string()
+            ]]
+        );
+        assert_eq!(
+            with_fallbacks.errors.len(),
+            1,
+            "{:?}",
+            with_fallbacks.errors
+        );
+
+        for mode in [MigrateMode::DryRun, MigrateMode::Apply] {
+            let deny_in_force = adopt_predecessor_state_with_definitions(
+                &request(state, mode),
+                &definition_check(released_definition_with(true, false), false),
+            )
+            .await;
+            assert!(
+                !deny_in_force.has_errors(),
+                "{mode:?}: {:?}",
+                deny_in_force.errors
+            );
+            assert_eq!(deny_in_force.ignored_keys, Vec::new(), "{mode:?}");
+        }
+    }
+
+    /// Without definitions, a store whose creating release ignored keys is
+    /// noted with the flag that checks it. A definition that names no store,
+    /// a store no definition names, a manifest with no mob storage beside it
+    /// and a profile the store's definition lacks are noted, never refused.
+    /// A manifest that does not decode cannot be checked: refused when
+    /// definitions are given, and adopted as before when none are.
+    #[tokio::test]
+    async fn unchecked_and_unmatched_definitions_are_noted_not_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path();
+        write_predecessor_metadata_db(&state.join(PREDECESSOR_METADATA_DB_FILE_NAMES[0]));
+        write_recorded_manifest(state, "0.8.40", &recorded_definition());
+
+        let unchecked = adopt_predecessor_state(&request(state, MigrateMode::DryRun)).await;
+        assert!(!unchecked.has_errors(), "{:?}", unchecked.errors);
+        assert_eq!(unchecked.ignored_keys, Vec::new());
+        assert!(
+            unchecked
+                .notes
+                .iter()
+                .any(|note| note.contains("--mob-config")
+                    && note.contains("predecessor release 0.8.40")
+                    && note.contains("tools.deny")
+                    && !note.contains("model_fallback")),
+            "{:?}",
+            unchecked.notes
+        );
+
+        let no_storage = adopt_predecessor_state_with_definitions(
+            &request(state, MigrateMode::DryRun),
+            &definition_check(definition_with_ignored_keys(), false),
+        )
+        .await;
+        assert!(!no_storage.has_errors(), "{:?}", no_storage.errors);
+        assert_eq!(no_storage.ignored_keys, Vec::new());
+        assert!(
+            no_storage
+                .notes
+                .iter()
+                .any(|note| note.contains("no mob storage beside it holds a mob")),
+            "{:?}",
+            no_storage.notes
+        );
+
+        write_recorded_manifest(state, "0.8.46", &recorded_definition());
+        let current = adopt_predecessor_state(&request(state, MigrateMode::DryRun)).await;
+        assert!(
+            !current
+                .notes
+                .iter()
+                .any(|note| note.contains("--mob-config")),
+            "a release that ignored nothing is not noted: {:?}",
+            current.notes
+        );
+
+        stage_released_mob_storage(state);
+        let other = MobDefinition::from_toml(
+            "[mob]\nid = \"other\"\n\n[profiles.lead]\nmodel = \"gpt-5.5\"\n\n\
+             [profiles.lead.tools]\ndeny = [\"shell\"]\n",
+        )
+        .unwrap();
+        let unmatched = adopt_predecessor_state_with_definitions(
+            &request(state, MigrateMode::DryRun),
+            &definition_check(other, false),
+        )
+        .await;
+        assert!(!unmatched.has_errors(), "{:?}", unmatched.errors);
+        assert_eq!(unmatched.ignored_keys, Vec::new());
+        for needle in ["holds mob other", "names mob adoption-fixture-planners"] {
+            assert!(
+                unmatched.notes.iter().any(|note| note.contains(needle)),
+                "{needle:?} missing from {:?}",
+                unmatched.notes
+            );
+        }
+
+        let mut added = released_definition_with(false, false);
+        added.profiles.insert(
+            "reviewer".into(),
+            MobDefinition::from_toml(
+                "[mob]\nid = \"x\"\n\n[profiles.reviewer]\nmodel = \"gpt-5.5\"\n\n\
+                 [profiles.reviewer.tools]\ndeny = [\"shell\"]\n",
+            )
+            .unwrap()
+            .profiles
+            .remove("reviewer")
+            .unwrap(),
+        );
+        let new_profile = adopt_predecessor_state_with_definitions(
+            &request(state, MigrateMode::DryRun),
+            &definition_check(added, false),
+        )
+        .await;
+        assert!(!new_profile.has_errors(), "{:?}", new_profile.errors);
+        assert_eq!(new_profile.ignored_keys, Vec::new());
+        assert!(
+            new_profile.notes.iter().any(|note| note
+                .contains("profile reviewer in mob.toml sets profiles.reviewer.tools.deny")),
+            "{:?}",
+            new_profile.notes
+        );
+
+        std::fs::write(
+            manifest_file(state),
+            "{\"manifest_version\": 1, \"created_by_mobkit\": \"0.8.26\", \"definition\": {\"profiles\": 1}}",
+        )
+        .unwrap();
+        let undecodable = adopt_predecessor_state_with_definitions(
+            &request(state, MigrateMode::DryRun),
+            &definition_check(recorded_definition(), false),
+        )
+        .await;
+        assert!(
+            undecodable
+                .errors
+                .iter()
+                .any(|error| error.contains("cannot check the supplied mob definitions")),
+            "{:?}",
+            undecodable.errors
+        );
+        let adopted_as_before = adopt_predecessor_state(&request(state, MigrateMode::DryRun)).await;
+        assert!(
+            !adopted_as_before.has_errors(),
+            "{:?}",
+            adopted_as_before.errors
+        );
     }
 }

@@ -63,6 +63,63 @@ impl MemoryScope {
             Self::Realm { .. } => "",
         }
     }
+
+    /// This scope as the typed memory operation targets of Meta's memory
+    /// tools name it. A host's operation policy maps it to its own action,
+    /// and a targeted grant selects one lineage for exactly this scope.
+    ///
+    /// The format is a stored contract and never changes: work
+    /// associations persist the reference as the grant target of memory
+    /// operations (`GrantTarget::Memory { scope }`), and host policies key on
+    /// it. The reference is `MemoryScopeRef::Host { owner, scope }`, where
+    /// `owner` is [`AGENT_MEMORY_TARGET_OWNER`] (`meta.agent_memory`) and
+    /// `scope` is `<kind>/<realm>/<key>`:
+    ///
+    /// - `<kind>` is [`Self::kind_str`]: `identity`, `mob`, `operator` or
+    ///   `realm`;
+    /// - `<realm>` is the scope's realm, and `<key>` is [`Self::key`]: the
+    ///   identity, mob or operator name, empty for a realm scope (which
+    ///   therefore ends with `/`);
+    /// - in `<realm>` and `<key>`, every `%` is written `%25` and every `/`
+    ///   is written `%2F`, and every other character is kept as it is.
+    ///
+    /// The escaping leaves the two separators as the only `/` in the
+    /// reference, so each reference decodes back to exactly one scope and
+    /// two scopes never share a reference. For example, identity
+    /// `agent:alice` in realm `default` is `identity/default/agent:alice`,
+    /// mob `team/a` in realm `default` is `mob/default/team%2Fa`, and realm
+    /// `default` itself is `realm/default/`.
+    pub fn operation_scope_ref(&self) -> meerkat_core::MemoryScopeRef {
+        meerkat_core::MemoryScopeRef::Host {
+            owner: AGENT_MEMORY_TARGET_OWNER.to_string(),
+            scope: format!(
+                "{}/{}/{}",
+                self.kind_str(),
+                escape_scope_ref_part(self.realm()),
+                escape_scope_ref_part(self.key()),
+            ),
+        }
+    }
+}
+
+/// The stable name Meta's agent memory carries as the owner of every typed
+/// memory operation target its tools produce
+/// ([`MemoryScope::operation_scope_ref`]). Part of that stored contract: it
+/// never changes.
+pub const AGENT_MEMORY_TARGET_OWNER: &str = "meta.agent_memory";
+
+/// Escapes one realm or key for [`MemoryScope::operation_scope_ref`]: `%` as
+/// `%25` and `/` as `%2F`, every other character unchanged.
+fn escape_scope_ref_part(part: &str) -> String {
+    let mut escaped = String::with_capacity(part.len());
+    for ch in part.chars() {
+        match ch {
+            '%' => escaped.push_str("%25"),
+            '/' => escaped.push_str("%2F"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// Closed record taxonomy (§7.1). `OpenLoop` is the prospective-memory kind:
@@ -504,6 +561,193 @@ mod tests {
         assert_eq!(content_hash("a", "b"), content_hash("a", "b"));
         assert_ne!(content_hash("ab", "c"), content_hash("a", "bc"));
         assert_eq!(content_hash("t", "b").len(), 64);
+    }
+
+    /// Typed memory targets name Meta's memory owner and a scope reference
+    /// that keeps every scope distinct: the kind, realm and key never run
+    /// into each other, whatever separators the names contain.
+    #[test]
+    fn operation_scope_refs_are_owned_by_meta_memory_and_never_collide() {
+        let host = |scope: &str| meerkat_core::MemoryScopeRef::Host {
+            owner: AGENT_MEMORY_TARGET_OWNER.to_string(),
+            scope: scope.to_string(),
+        };
+        let identity = |realm: &str, identity: &str| MemoryScope::Identity {
+            realm: realm.to_string(),
+            identity: identity.to_string(),
+        };
+        let cases = [
+            (
+                identity("family", "identity:luka"),
+                "identity/family/identity:luka",
+            ),
+            (
+                MemoryScope::Mob {
+                    realm: "family".to_string(),
+                    mob: "identity:luka".to_string(),
+                },
+                "mob/family/identity:luka",
+            ),
+            (
+                MemoryScope::Operator {
+                    realm: "family".to_string(),
+                    operator: "ops".to_string(),
+                },
+                "operator/family/ops",
+            ),
+            (
+                MemoryScope::Realm {
+                    realm: "family".to_string(),
+                },
+                "realm/family/",
+            ),
+            (identity("a/b", "c"), "identity/a%2Fb/c"),
+            (identity("a", "b/c"), "identity/a/b%2Fc"),
+            (identity("a%2Fb", "c"), "identity/a%252Fb/c"),
+        ];
+        for (scope, expected) in &cases {
+            assert_eq!(scope.operation_scope_ref(), host(expected), "{scope:?}");
+            assert!(scope.operation_scope_ref().is_named());
+        }
+        let refs: std::collections::BTreeSet<String> = cases
+            .iter()
+            .map(|(_, expected)| (*expected).to_string())
+            .collect();
+        assert_eq!(refs.len(), cases.len(), "every scope has its own reference");
+        assert_eq!(AGENT_MEMORY_TARGET_OWNER, "meta.agent_memory");
+    }
+
+    /// Decodes a reference exactly as [`MemoryScope::operation_scope_ref`]
+    /// documents its stored format, refusing anything else.
+    fn decode_operation_scope_ref(reference: &meerkat_core::MemoryScopeRef) -> Option<MemoryScope> {
+        let meerkat_core::MemoryScopeRef::Host { owner, scope } = reference else {
+            return None;
+        };
+        if owner != AGENT_MEMORY_TARGET_OWNER {
+            return None;
+        }
+        let mut parts = scope.split('/');
+        let (Some(kind), Some(realm), Some(key), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        let realm = unescape_scope_ref_part(realm)?;
+        let key = unescape_scope_ref_part(key)?;
+        match kind {
+            "identity" => Some(MemoryScope::Identity {
+                realm,
+                identity: key,
+            }),
+            "mob" => Some(MemoryScope::Mob { realm, mob: key }),
+            "operator" => Some(MemoryScope::Operator {
+                realm,
+                operator: key,
+            }),
+            "realm" if key.is_empty() => Some(MemoryScope::Realm { realm }),
+            _ => None,
+        }
+    }
+
+    fn unescape_scope_ref_part(part: &str) -> Option<String> {
+        let mut unescaped = String::with_capacity(part.len());
+        let mut rest = part;
+        while let Some(index) = rest.find('%') {
+            unescaped.push_str(rest.get(..index)?);
+            unescaped.push(match rest.get(index..index + 3)? {
+                "%25" => '%',
+                "%2F" => '/',
+                _ => return None,
+            });
+            rest = rest.get(index + 3..)?;
+        }
+        unescaped.push_str(rest);
+        Some(unescaped)
+    }
+
+    /// The stored format round-trips: every scope's reference decodes back
+    /// to exactly that scope, so no two scopes share a reference, whatever
+    /// the realm and key contain (separators, the escape character, text
+    /// that already looks escaped, kind names, empty and non-ASCII names).
+    #[test]
+    fn operation_scope_refs_round_trip_and_never_collide() {
+        let names = [
+            "",
+            "default",
+            "identity",
+            "realm",
+            "a/b",
+            "a%b",
+            "a%2Fb",
+            "a%25b",
+            "%2",
+            "%",
+            "/",
+            "%%//",
+            "x/y/z",
+            "agent:alice",
+            "\u{e9}/\u{fc}%",
+        ];
+        let mut scopes = Vec::new();
+        for realm in names {
+            scopes.push(MemoryScope::Realm {
+                realm: realm.to_string(),
+            });
+            for key in names {
+                scopes.push(MemoryScope::Identity {
+                    realm: realm.to_string(),
+                    identity: key.to_string(),
+                });
+                scopes.push(MemoryScope::Mob {
+                    realm: realm.to_string(),
+                    mob: key.to_string(),
+                });
+                scopes.push(MemoryScope::Operator {
+                    realm: realm.to_string(),
+                    operator: key.to_string(),
+                });
+            }
+        }
+        let distinct_scopes: std::collections::BTreeSet<&MemoryScope> = scopes.iter().collect();
+        assert_eq!(distinct_scopes.len(), scopes.len());
+
+        let mut references = std::collections::BTreeSet::new();
+        for scope in &scopes {
+            let reference = scope.operation_scope_ref();
+            assert_eq!(
+                decode_operation_scope_ref(&reference).as_ref(),
+                Some(scope),
+                "{reference:?}"
+            );
+            assert!(reference.is_named(), "{reference:?}");
+            references.insert(reference);
+        }
+        assert_eq!(
+            references.len(),
+            scopes.len(),
+            "two scopes share a reference"
+        );
+
+        // A reference another owner names, or one outside the format, is no
+        // Meta memory scope.
+        for (owner, scope) in [
+            ("another.owner", "identity/default/agent:alice"),
+            (AGENT_MEMORY_TARGET_OWNER, "identity/default"),
+            (AGENT_MEMORY_TARGET_OWNER, "identity/default/a/b"),
+            (AGENT_MEMORY_TARGET_OWNER, "identity/default/a%2fb"),
+            (AGENT_MEMORY_TARGET_OWNER, "realm/default/key"),
+            (AGENT_MEMORY_TARGET_OWNER, "session/default/agent:alice"),
+        ] {
+            let reference = meerkat_core::MemoryScopeRef::Host {
+                owner: owner.to_string(),
+                scope: scope.to_string(),
+            };
+            assert_eq!(
+                decode_operation_scope_ref(&reference),
+                None,
+                "{reference:?}"
+            );
+        }
     }
 
     #[test]

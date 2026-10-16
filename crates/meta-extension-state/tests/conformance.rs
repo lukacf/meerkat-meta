@@ -671,3 +671,119 @@ async fn acl_revocation_and_content_edit_share_one_atomic_revision() {
         result => panic!("atomic order violated: {result:?}"),
     }
 }
+
+/// A host asks the store whether any live document of a realm, in any
+/// namespace, names a mob: as its owner, in a grant or in a deny. A deleted
+/// document, another realm and an unnamed mob do not count. A row that does
+/// not decode fails the answer instead of being skipped; only a reference
+/// already found answers before it.
+#[tokio::test]
+async fn mob_references_cover_every_namespace_owner_and_audience_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("docs.sqlite");
+    let store = Arc::new(SqliteExtensionDocumentStore::open(&path).unwrap());
+    let in_namespace = |namespace: &str| {
+        DocumentService::new(
+            "realm",
+            namespace,
+            Arc::clone(&store) as Arc<dyn ExtensionDocumentStore>,
+        )
+        .unwrap()
+    };
+    let manager = caller("manager")
+        .with_memberships(BTreeSet::new(), BTreeSet::from(["owned".into()]), false)
+        .unwrap();
+    assert!(!store.references_mob("realm", "owned").await.unwrap());
+
+    let create = |owner: Option<Owner>, access: DocumentAccess| {
+        Mutation::Create(NewDocument {
+            content: content(1),
+            owner,
+            access,
+        })
+    };
+    in_namespace("one")
+        .mutate(
+            &manager,
+            &request("owned"),
+            create(Some(Owner::Mob("owned".into())), DocumentAccess::default()),
+        )
+        .await
+        .unwrap();
+    let granted = in_namespace("two")
+        .mutate(
+            &manager,
+            &request("granted"),
+            create(
+                None,
+                DocumentAccess {
+                    grants: vec![Grant {
+                        audience: Audience::Mob("granted".into()),
+                        role: Role::Reader,
+                    }],
+                    ..DocumentAccess::default()
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .receipt;
+    in_namespace("three")
+        .mutate(
+            &manager,
+            &request("denied"),
+            create(
+                None,
+                DocumentAccess {
+                    denies: vec![Deny {
+                        audience: Audience::Mob("denied".into()),
+                        operation: DeniedOperation::Read,
+                    }],
+                    ..DocumentAccess::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    for named in ["owned", "granted", "denied"] {
+        assert!(
+            store.references_mob("realm", named).await.unwrap(),
+            "{named}"
+        );
+    }
+    assert!(!store.references_mob("realm", "unnamed").await.unwrap());
+    assert!(
+        !store
+            .references_mob("another-realm", "owned")
+            .await
+            .unwrap()
+    );
+
+    in_namespace("two")
+        .mutate(
+            &manager,
+            &request("delete-granted"),
+            Mutation::Delete {
+                id: granted.document_id.clone(),
+                expected_revision: granted.revision.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !store.references_mob("realm", "granted").await.unwrap(),
+        "a deleted document names no mob"
+    );
+
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE extension_documents SET metadata = '{' WHERE namespace = 'three'",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.references_mob("realm", "unnamed").await,
+        Err(Error::Storage(_))
+    ));
+}

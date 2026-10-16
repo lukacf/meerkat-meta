@@ -1199,6 +1199,21 @@ fn no_op_pre_build_hook() -> PreBuildHook {
     Arc::new(|_req: &mut CreateSessionRequest| Box::pin(async { Ok(()) }))
 }
 
+/// `hook`, then the refusal of a marked document MCP descriptor it left
+/// unresolved ([`crate::document_mcp_marker`]). A host document binding
+/// resolves its descriptors in the hook, so the refusal runs after it, on
+/// the innermost wrapper: every wrapper outside it has a no-op hook.
+fn refusing_unresolved_document_markers(hook: Option<PreBuildHook>) -> PreBuildHook {
+    let hook = hook.unwrap_or_else(no_op_pre_build_hook);
+    Arc::new(move |request| {
+        let hook = Arc::clone(&hook);
+        Box::pin(async move {
+            hook(request).await?;
+            crate::document_mcp_marker::refuse_unresolved_marked_descriptors(request)
+        })
+    })
+}
+
 /// A spawned member's idle-retirement policy, chosen by the spawning call
 /// (`delegate`, `mob_spawn_member` or `fork_off` with `idle_retire_secs`, or
 /// an RPC/console fork).
@@ -7764,6 +7779,15 @@ macro_rules! delegate_mob_session_service {
             ) -> Result<Option<meerkat_core::ToolScopeSnapshot>, SessionError> {
                 self.inner.tool_scope_snapshot(session_id).await
             }
+            // Forwarded exactly, like its tool-scope siblings: the trait
+            // default reports no view, so behind this wrapper the inner
+            // service's catalog view would read as unavailable.
+            async fn tool_catalog_view(
+                &self,
+                session_id: &meerkat_core::types::SessionId,
+            ) -> Result<Option<meerkat_core::ToolCatalogView>, SessionError> {
+                self.inner.tool_catalog_view(session_id).await
+            }
             async fn live_visible_tool_defs(
                 &self,
                 session_id: &meerkat_core::types::SessionId,
@@ -8888,6 +8912,14 @@ impl MobSessionService for AfterCreateMobSessionService {
     ) -> Result<Option<meerkat_core::ToolScopeSnapshot>, SessionError> {
         self.inner.tool_scope_snapshot(session_id).await
     }
+    // Forwarded exactly, like its tool-scope siblings (see the delegating
+    // wrapper above).
+    async fn tool_catalog_view(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> Result<Option<meerkat_core::ToolCatalogView>, SessionError> {
+        self.inner.tool_catalog_view(session_id).await
+    }
     async fn live_visible_tool_defs(
         &self,
         session_id: &meerkat_core::types::SessionId,
@@ -9228,6 +9260,14 @@ pub struct MobBootstrapSpec {
     pub(crate) member_mcp_custody: Option<Arc<crate::member_mcp_custody::MemberMcpCustody>>,
     #[cfg(feature = "extension-state")]
     pub(crate) before_activation: Option<meerkat_mob::MobBeforeActivation>,
+    /// Releases what `before_activation` bound of a child mob the agent
+    /// mob-tool state destroys, before that destroy's storage cleanup.
+    #[cfg(feature = "extension-state")]
+    pub(crate) after_destroy: Option<meerkat_mob_mcp::MobAfterDestroy>,
+    /// Admits or refuses each mob the agent mob-tool state creates, before
+    /// anything of it exists.
+    #[cfg(feature = "extension-state")]
+    pub(crate) before_create: Option<meerkat_mob_mcp::MobBeforeCreate>,
     /// The meerkat-level realm this spec's persistent stores were composed
     /// under (the fresh default or an adopted predecessor's recorded realm),
     /// with the state directory it was resolved from; `None` for a spec not
@@ -9297,7 +9337,7 @@ pub struct MobBootstrapSpec {
     /// the session service is erased, for governed binding.
     pub controller_pin_source: Option<Arc<dyn crate::identity_first::bridge::ControllerPinSource>>,
     /// Late-bound §10.1 dispatch-time taint slot carried by the base
-    /// session-service wrapper `Self::new` installs; see
+    /// session-service wrapper `Self::with_base_layer` installs; see
     /// [`Self::dispatch_taint_slot`].
     pub(crate) dispatch_taint_slot: crate::memory::dispatch_taint::DispatchTaintSlot,
     /// Holds the ephemeral temp directory alive for the lifetime of the spec.
@@ -9306,20 +9346,47 @@ pub struct MobBootstrapSpec {
 }
 
 impl MobBootstrapSpec {
+    /// A spec over a session service composed outside Meta's stock
+    /// constructors. No Meta pre-build hook runs inside it, so the base layer
+    /// refuses a marked document MCP descriptor in a member's build
+    /// ([`crate::document_mcp_marker`]): no document binding resolved it.
+    ///
+    /// The refusal sits in the spec's outermost layer, which runs before any
+    /// pre-build hook inside the supplied service. A supplied service whose
+    /// own hook would resolve a marked descriptor never gets to: the build is
+    /// refused first.
     pub fn new(
         definition: MobDefinition,
         storage: MobStorage,
         session_service: Arc<dyn MobSessionService>,
     ) -> Self {
+        Self::with_base_layer(
+            definition,
+            storage,
+            session_service,
+            refusing_unresolved_document_markers(None),
+        )
+    }
+
+    /// [`Self::new`] with the base layer's pre-build hook. The stock
+    /// constructors pass a no-op: their inner wrapper already refuses an
+    /// unresolved marker after their own hook, which this outer layer runs
+    /// before.
+    fn with_base_layer(
+        definition: MobDefinition,
+        storage: MobStorage,
+        session_service: Arc<dyn MobSessionService>,
+        hook: PreBuildHook,
+    ) -> Self {
         // Every spec construction path funnels through here (the stock
-        // constructors call `Self::new` with their wrapped service), so this
+        // constructors call it with their wrapped service), so this
         // is the ONE layer that carries the dispatch-time taint slot: each
         // member create passes it exactly once, and later `with_*` re-wraps
         // never double-decorate.
         let dispatch_taint_slot = crate::memory::dispatch_taint::DispatchTaintSlot::default();
         let session_service = Arc::new(PreBuildMobSessionService {
             inner: session_service,
-            hook: no_op_pre_build_hook(),
+            hook,
             dispatch_taint: Some(dispatch_taint_slot.clone()),
             after_create_hook: None,
             runtime_adapter_override: None,
@@ -9368,6 +9435,10 @@ impl MobBootstrapSpec {
             member_mcp_custody: None,
             #[cfg(feature = "extension-state")]
             before_activation: None,
+            #[cfg(feature = "extension-state")]
+            after_destroy: None,
+            #[cfg(feature = "extension-state")]
+            before_create: None,
             #[cfg(feature = "extension-state")]
             composed_meerkat_realm: None,
             #[cfg(feature = "extension-state")]
@@ -10337,7 +10408,7 @@ impl MobBootstrapSpec {
         let controller_pin_source: Arc<dyn crate::identity_first::bridge::ControllerPinSource> =
             concrete_session_service.clone();
         let session_service: Arc<dyn MobSessionService> = concrete_session_service;
-        let hook = hook.unwrap_or_else(no_op_pre_build_hook);
+        let hook = refusing_unresolved_document_markers(hook);
         let session_service = Arc::new(PreBuildMobSessionService {
             inner: session_service,
             hook,
@@ -10351,7 +10422,8 @@ impl MobBootstrapSpec {
         // service: child mobs are built on the tools' session service, so
         // they get every layer member creates get (the gateway's
         // `with_agent_mob_tools` order).
-        let mut spec = Self::new(definition, storage, session_service);
+        let mut spec =
+            Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook());
         // The builder's own default decorator cell, so member taint composes
         // over the default this factory would apply.
         spec.dispatch_taint_slot
@@ -10860,7 +10932,7 @@ impl MobBootstrapSpec {
         let controller_pin_source: Arc<dyn crate::identity_first::bridge::ControllerPinSource> =
             concrete_session_service.clone();
         let session_service: Arc<dyn MobSessionService> = concrete_session_service;
-        let hook = hook.unwrap_or_else(no_op_pre_build_hook);
+        let hook = refusing_unresolved_document_markers(hook);
         let session_service = Arc::new(PreBuildMobSessionService {
             inner: session_service,
             hook,
@@ -10878,7 +10950,8 @@ impl MobBootstrapSpec {
         // service: child mobs are built on the tools' session service, so
         // they get every layer member creates get (the gateway's
         // `with_agent_mob_tools` order).
-        let mut spec = Self::new(definition, storage, session_service);
+        let mut spec =
+            Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook());
         // The builder's own default decorator cell, so member taint composes
         // over the default this factory would apply.
         spec.dispatch_taint_slot
@@ -11228,7 +11301,7 @@ impl MobBootstrapSpec {
             runtime_adapter.clone(),
             after_create_hook,
         ));
-        let hook = hook.unwrap_or_else(no_op_pre_build_hook);
+        let hook = refusing_unresolved_document_markers(hook);
         let session_service = Arc::new(PreBuildMobSessionService {
             inner: session_service,
             hook,
@@ -11242,7 +11315,8 @@ impl MobBootstrapSpec {
         // service: child mobs are built on the tools' session service, so
         // they get every layer member creates get (the gateway's
         // `with_agent_mob_tools` order).
-        let mut spec = Self::new(definition, storage, session_service);
+        let mut spec =
+            Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook());
         // The builder's own default decorator cell, so member taint composes
         // over the default this factory would apply.
         spec.dispatch_taint_slot
@@ -11935,6 +12009,18 @@ impl MobRuntime {
                 .set_before_activation(Arc::clone(callback))
                 .map_err(|error| MobRuntimeError::InvalidConfig(error.to_string()))?;
         }
+        #[cfg(feature = "extension-state")]
+        if let (Some(state), Some(hook)) = (&spec.agent_mob_mcp_state, &spec.after_destroy) {
+            state
+                .set_after_destroy(Arc::clone(hook))
+                .map_err(|error| MobRuntimeError::InvalidConfig(error.to_string()))?;
+        }
+        #[cfg(feature = "extension-state")]
+        if let (Some(state), Some(hook)) = (&spec.agent_mob_mcp_state, &spec.before_create) {
+            state
+                .set_before_create(Arc::clone(hook))
+                .map_err(|error| MobRuntimeError::InvalidConfig(error.to_string()))?;
+        }
         auto_mark_declared_resume_overrides(&mut spec.definition);
         let ephemeral_dir = spec._ephemeral_dir.clone();
         let child_mob_root_claim = spec.child_mob_root_claim.clone();
@@ -12577,15 +12663,24 @@ impl MobRuntime {
     ) -> Result<(), crate::child_mob_storage::ChildMobStandDownOutcome> {
         use crate::child_mob_storage::{ChildIncarnation, ChildMobStandDownOutcome, ChildShutdown};
         let root_mob_id = self.handle.definition().id.clone();
-        let children = state.mob_handles_snapshot().await.map_err(|error| {
-            ChildMobStandDownOutcome::Retained {
-                unsettled: vec![format!("child mobs could not be enumerated: {error}")],
-            }
-        })?;
-        for (mob_id, handle) in children {
+        let enumeration_failed = |error: MobError| ChildMobStandDownOutcome::Retained {
+            unsettled: vec![format!("child mobs could not be enumerated: {error}")],
+        };
+        // Every managed child, a destroyed one still managed included (the
+        // retry anchor of a destroy whose native part is incomplete): its
+        // actor may still run. Handle snapshots withhold destroyed mobs, so
+        // the list names them and each handle is looked up.
+        let children = state.mob_list().await.map_err(enumeration_failed)?;
+        for (mob_id, _) in children {
             if mob_id == root_mob_id || !stood_down.insert(mob_id.clone()) {
                 continue;
             }
+            let handle = match state.handle_for(&mob_id).await {
+                Ok(handle) => handle,
+                // Removed since the list: its destroy completed.
+                Err(MobError::MobNotFound(_)) => continue,
+                Err(error) => return Err(enumeration_failed(error)),
+            };
             *child_mobs += 1;
             let incarnation = ChildIncarnation::of(&handle);
             if self.child_mob_root.clean_in(mob_id.as_ref(), &incarnation) {
@@ -18129,6 +18224,14 @@ comms = true
             })
         }
 
+        async fn tool_catalog_view(
+            &self,
+            _session_id: &meerkat_core::SessionId,
+        ) -> Result<Option<meerkat_core::ToolCatalogView>, meerkat_core::SessionError> {
+            self.record("tool_catalog_view");
+            Ok(Some(forwarded_catalog_view()))
+        }
+
         async fn observe_member_status_view(
             &self,
             _session_id: &meerkat_core::SessionId,
@@ -19034,6 +19137,52 @@ comms = true
         assert_eq!(
             probe.calls(),
             vec!["observe_live_durable_source", "observe_live_durable_source"],
+            "each wrapper forwards exactly once and adds no read of its own"
+        );
+    }
+
+    /// What `ForwardingProbe` answers for a catalog view: a shape no default
+    /// or wrapper-level answer produces.
+    fn forwarded_catalog_view() -> meerkat_core::ToolCatalogView {
+        meerkat_core::ToolCatalogView {
+            mode: meerkat_core::ToolCatalogMode::Deferred,
+            exact_catalog: true,
+            pending_sources: vec!["forwarded-source".to_string()],
+            staged_changes_pending: true,
+            entries: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn wrappers_forward_the_tool_catalog_view_exactly() {
+        let probe = Arc::new(ForwardingProbe::default());
+        let inner: Arc<dyn MobSessionService> = probe.clone();
+        let pre_build: Arc<dyn MobSessionService> = Arc::new(PreBuildMobSessionService {
+            inner: Arc::clone(&inner),
+            hook: no_op_pre_build_hook(),
+            dispatch_taint: None,
+            after_create_hook: None,
+            runtime_adapter_override: None,
+            session_read_absorber: None,
+            archived_terminal_authority: None,
+        });
+        let after_create: Arc<dyn MobSessionService> = Arc::new(AfterCreateMobSessionService {
+            inner: Arc::clone(&inner),
+            after_hook: Arc::new(|_, _| Box::pin(async {})),
+        });
+        let session_id = meerkat_core::SessionId::new();
+        for wrapper in [pre_build, after_create] {
+            assert_eq!(
+                wrapper
+                    .tool_catalog_view(&session_id)
+                    .await
+                    .expect("the inner view is forwarded"),
+                Some(forwarded_catalog_view())
+            );
+        }
+        assert_eq!(
+            probe.calls(),
+            vec!["tool_catalog_view", "tool_catalog_view"],
             "each wrapper forwards exactly once and adds no read of its own"
         );
     }
@@ -24520,6 +24669,128 @@ comms = true
             Err(MobRuntimeError::InvalidConfig(message))
                 if message == "document MCP child delivery requires an agent mob-tool state"
         ));
+    }
+
+    /// A member whose profile carries a marked document MCP descriptor that
+    /// no host document binding resolved is refused at its build, in either
+    /// spelling of the marker and with or without the extension-state
+    /// feature: the descriptor never launches as an unbound service.
+    #[tokio::test]
+    async fn extension_unresolved_document_marker_refuses_member_builds() {
+        for marker in ["META_MCP_DOCUMENT_BINDING", "MOBKIT_MCP_DOCUMENT_BINDING"] {
+            let dir = tempfile::tempdir().expect("temporary store");
+            let mut definition = meerkat_mob::MobDefinition::from_toml(&format!(
+                "[mob]\nid = \"{}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+                 runtime_mode = \"turn_driven\"\n[profiles.worker.tools]\ncomms = true\n",
+                unique_test_mob_id()
+            ))
+            .expect("definition");
+            let Some(meerkat_mob::ProfileBinding::Inline(profile)) = definition
+                .profiles
+                .get_mut(&meerkat_mob::ProfileName::from("worker"))
+            else {
+                panic!("the definition declares an inline worker profile");
+            };
+            profile
+                .tools
+                .mcp_servers
+                .push(meerkat_core::McpServerConfig::stdio(
+                    "documents",
+                    "document-fixture-mcp",
+                    vec![],
+                    std::collections::HashMap::from([(
+                        marker.to_string(),
+                        "documents".to_string(),
+                    )]),
+                ));
+            let mut spec = MobBootstrapSpec::ephemeral_runtime_backed_inner(
+                definition,
+                meerkat_mob::MobStorage::in_memory(),
+                dir.path().to_path_buf(),
+                4,
+                None,
+                "test session store",
+                None,
+                None,
+                None,
+                None,
+                CapabilityFlags::default(),
+                None,
+                None,
+            )
+            .expect("bootstrap spec");
+            spec.options.default_llm_client = Some(Arc::new(
+                meerkat_client::TestClient::for_provider(meerkat_core::Provider::OpenAI),
+            ));
+            let runtime = MobRuntime::bootstrap(spec).await.expect("bootstrap");
+            let refused = Box::pin(runtime.handle().spawn_spec(SpawnMemberSpec::host_root(
+                "worker",
+                meerkat_mob::AgentIdentity::from("reader"),
+            )))
+            .await
+            .map(|_| ())
+            .expect_err("an unresolved marked descriptor refuses the member build");
+            let detail = format!("{refused} {refused:?}");
+            assert!(detail.contains("document MCP"), "{marker}: {detail}");
+            runtime.handle().shutdown().await.expect("shutdown");
+        }
+    }
+
+    /// The same refusal on a spec over a session service composed outside the
+    /// stock constructors, as the stock gateways build theirs: its base layer
+    /// refuses, with or without the extension-state feature.
+    #[tokio::test]
+    async fn extension_unresolved_document_marker_refuses_builds_on_a_supplied_session_service() {
+        for marker in ["META_MCP_DOCUMENT_BINDING", "MOBKIT_MCP_DOCUMENT_BINDING"] {
+            let dir = tempfile::tempdir().expect("temporary store");
+            let mut definition = meerkat_mob::MobDefinition::from_toml(&format!(
+                "[mob]\nid = \"{}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+                 runtime_mode = \"turn_driven\"\n[profiles.worker.tools]\ncomms = true\n",
+                unique_test_mob_id()
+            ))
+            .expect("definition");
+            let Some(meerkat_mob::ProfileBinding::Inline(profile)) = definition
+                .profiles
+                .get_mut(&meerkat_mob::ProfileName::from("worker"))
+            else {
+                panic!("the definition declares an inline worker profile");
+            };
+            profile
+                .tools
+                .mcp_servers
+                .push(meerkat_core::McpServerConfig::stdio(
+                    "documents",
+                    "document-fixture-mcp",
+                    vec![],
+                    std::collections::HashMap::from([(
+                        marker.to_string(),
+                        "documents".to_string(),
+                    )]),
+                ));
+            let factory = AgentFactory::new(dir.path()).builtins(false).comms(true);
+            let builder = FactoryAgentBuilder::new(factory, Config::default());
+            let session_service: Arc<dyn MobSessionService> =
+                Arc::new(meerkat_session::EphemeralSessionService::new(builder, 4));
+            let mut spec = MobBootstrapSpec::new(
+                definition,
+                meerkat_mob::MobStorage::in_memory(),
+                session_service,
+            );
+            spec.options.default_llm_client = Some(Arc::new(
+                meerkat_client::TestClient::for_provider(meerkat_core::Provider::OpenAI),
+            ));
+            let runtime = MobRuntime::bootstrap(spec).await.expect("bootstrap");
+            let refused = Box::pin(runtime.handle().spawn_spec(SpawnMemberSpec::host_root(
+                "worker",
+                meerkat_mob::AgentIdentity::from("reader"),
+            )))
+            .await
+            .map(|_| ())
+            .expect_err("an unresolved marked descriptor refuses the member build");
+            let detail = format!("{refused} {refused:?}");
+            assert!(detail.contains("document MCP"), "{marker}: {detail}");
+            runtime.handle().shutdown().await.expect("shutdown");
+        }
     }
 
     #[tokio::test]

@@ -385,6 +385,7 @@ impl UnifiedRuntime {
         // and tier-3 (`/mob/events`) shipped unauthenticated.
         let flow_editor_decisions = decisions.clone();
         let flow_editor_runtime_catalog = self.mobpack_runtime_catalog_state_snapshot();
+        let flow_editor_host_deploy = self.flow_editor_host_deploy;
         let sse_decisions_a = decisions.clone();
         let sse_decisions_b = decisions.clone();
         let sse_decisions_c = decisions.clone();
@@ -407,6 +408,7 @@ impl UnifiedRuntime {
                 flow_editor_decisions,
                 flow_editor_runtime_catalog,
                 access.clone(),
+                flow_editor_host_deploy,
             ))
             .merge(self.build_console_json_router_with_policy(decisions, visibility_policy))
             .merge(agent_events_sse_router_with_access_and_priming(

@@ -28,6 +28,28 @@ address instead.
 
 In this mode the authoring catalogs are runtime-backed: tools, skills, agent definitions, and flow registries reflect the live mob definition and loaded modules, and `meta/capabilities` reports `runtime_backed_catalogs: true`.
 
+Host deploys are off by default in this mode. Deploying with `execute: true`
+or validating with `rkat_validate: true` runs `rkat` on the gateway's host, so
+it needs a caller that an enforced access controller grants `mobpack.deploy`.
+A runtime without an enforced access controller refuses both unless the host
+opts in:
+
+| Host | Opt-in |
+|------|--------|
+| `meta_gateway` | `--allow-flow-editor-host-deploy` |
+| `rpc_gateway` | `--persistent --allow-flow-editor-host-deploy`; the SDK builders pass no launch flags, so an SDK host points its gateway path at a wrapper that adds the flag, or uses a transport with extra arguments (`extra_args` / `extraArgs`) |
+| Rust host | `UnifiedRuntimeBuilder::allow_flow_editor_host_deploy(true)` or `UnifiedRuntime::allow_flow_editor_host_deploy(true)` before building the router |
+
+The opt-in allows host deploys for every caller the route admits. On an open
+console bound to loopback that is every process on the host that can reach
+the port, whichever user runs it, so enable it only where every such process
+is trusted. Host access (the opt-in, or a `mobpack.deploy` grant) also lets a
+caller choose the draft store file and pack path skills that the skills
+catalog does not list (see [Host paths](#host-paths)). It never overrides an
+enforced access controller, which keeps deciding per caller. `meta_gateway` includes the opt-in in its resume
+fingerprint, so a launch never resumes a runtime started with the other
+setting.
+
 ### Standalone binary
 
 For authoring without a runtime, run the dedicated binary:
@@ -94,7 +116,7 @@ The mobpack-authoring methods:
 | `meta/mobpacks/validate` | Structural (and optional `rkat`) validation |
 | `meta/mobpacks/source` | Rendered source files (`meta/mob.toml`, …) without archive payload |
 | `meta/mobpacks/export` | `.mobpack` archive as base64 download |
-| `meta/mobpacks/import` | Import `.mobpack` / JSON / TOML |
+| `meta/mobpacks/import` | Import `.mobpack` / JSON / TOML (an archive may hold only regular files and may expand to at most 32 MiB and 4096 entries; its `meta/editor.json` and `meta/mob.toml` may each be at most 1 MiB and its `manifest.toml` at most 4 MiB; one import materializes at most 64 MiB, path skills filled in from archive members included) |
 | `meta/mobpacks/deploy_command` | Preview the exact `rkat mob run` command |
 | `meta/mobpacks/deploy` | Deploy plan, or host execution when `execute: true` |
 
@@ -120,7 +142,7 @@ Authoring is server-authoritative: the client never mutates the document locally
 
 Drafts autosave through `meta/mobpacks/save` into a host JSON store with optimistic revision guards (`expected_revision` / `draft_etag`). A guard conflict means a concurrent autosave already bumped the revision; the editor drops the stale save and re-persists the current draft. The store path resolves in order:
 
-1. `store_path` request parameter
+1. `store_path` request parameter (over the Flow Editor HTTP route only for a caller with host access; see [Host paths](#host-paths))
 2. `META_FLOW_EDITOR_DRAFT_STORE` environment variable
 3. `$XDG_STATE_HOME/meerkat-meta/meerkat-meta-flow-editor-drafts.json`
 4. `~/.local/state/meerkat-meta/meerkat-meta-flow-editor-drafts.json`
@@ -128,15 +150,26 @@ Drafts autosave through `meta/mobpacks/save` into a host JSON store with optimis
 ## Validation and deploy
 
 `meta/mobpacks/validate` always runs Meta structural validation
-(`meerkat_mob::validate_definition` + `SpecValidator`). Setting
+(`meerkat_mob::validate_definition` + `SpecValidator`). One validation
+reports at most 1000 diagnostics; past that it ends with a
+`diagnostics_truncated` diagnostic. Every method that takes a document
+(and import and draft save) refuses one whose skill content, summed over
+every skill entry, passes 16 MiB. A document with more than 1000 members,
+more than 256 branches in one parallel or branch step, or more than 1024
+branches in its flow is refused before it is rendered, and the rendered
+`mob.toml`, `definition.json` and expected schema files are each refused
+past 16 MiB. Setting
 `rkat_validate: true` requests a second, host-mutating phase: after structural
 validation passes, the server writes a rendered archive and spawns
-`rkat mob validate`.
+`rkat mob validate`. Only `meta/mobpacks/validate` has this phase:
+`meta/mobpacks/apply_operation` ignores `rkat_validate`.
 
 That second phase runs only when the surface and caller have host-mutation
 authority. The standalone server without `--allow-host-deploy` strips the
-request flag and returns structural validation only. An ABAC-enabled runtime
-requires `mobpack.deploy`; without it the call is denied with error `-32030`.
+request flag and returns structural validation only, and so does a runtime
+without an enforced access controller unless the host opted in with
+`--allow-flow-editor-host-deploy`. An ABAC-enabled runtime requires
+`mobpack.deploy`; without it the call is denied with error `-32030`.
 After admission, a missing `rkat` executable produces a warning row
 (`rkat mob validate skipped`) instead of failing the structural result.
 
@@ -147,7 +180,7 @@ RPC `input_params` values are forwarded as repeated `--param key=<json>` binding
 HTTP host-mutation gates:
 
 - **Standalone binary** - `rkat_validate: true` and deploy `execute: true` both require `--allow-host-deploy` (or the env flag). Without it, validation stays structural and execute-deploy fails with a pointer to manual deploy.
-- **Runtime-mounted editor** - both host-mutating operations require the caller's `mobpack.deploy` grant when access control is enforced; open otherwise.
+- **Runtime-mounted editor** - both host-mutating operations require the caller's `mobpack.deploy` grant when access control is enforced. Without an enforced access controller they are refused unless the host opted in (`--allow-flow-editor-host-deploy`, or `allow_flow_editor_host_deploy(true)` in Rust); a refused execute-deploy fails with `-32602` and validation stays structural.
 
 ## Access control
 
@@ -161,10 +194,61 @@ both write an archive and spawn a host process.
 its `authoring_capabilities` advertisement intersects with the caller's grants.
 For callers without `mobpack.deploy`, `deploy_execute_allowed` and
 `host_mutation_allowed` are `false`, and the editor does not render the related
-host-mutation affordances. Per-call enforcement remains authoritative; denials
-surface as JSON-RPC error `-32030` with `data.kind = "access_denied"`.
+host-mutation affordances. The advertisement is coarse: it reads `true` when
+any allow rule names `mobpack.deploy` for the caller, even if a deny rule or a
+resource selector refuses every call. Per-call enforcement remains
+authoritative, for host deploys and for host paths alike; denials surface as
+JSON-RPC error `-32030` with `data.kind = "access_denied"`.
+
+Without an enforced access controller there is no grant to evaluate, so a
+runtime-mounted editor treats every caller as lacking `mobpack.deploy`: it
+advertises `deploy_execute_allowed: false` and `host_mutation_allowed: false`
+and refuses host deploys, unless the host opted in with
+`--allow-flow-editor-host-deploy` (see [On a running runtime](#on-a-running-runtime)).
 
 The standalone binary is a token-less local tool: it binds `127.0.0.1` by default, there is no principal to evaluate, and `--allow-host-deploy` is the only deploy gate.
+
+### Host paths
+
+A request is the caller's input, so over the Flow Editor HTTP routes a caller
+without host access (no `mobpack.deploy` grant, no host deploy opt-in, no
+`--allow-host-deploy` on the standalone binary) cannot make the server touch a
+host path it names:
+
+- `store_path` is refused with `-32602` on every method. The draft store is
+  the host's: `META_FLOW_EDITOR_DRAFT_STORE` or the gateway home.
+- A path skill in a document (`skill_realms` entry with `source: "path"`) is
+  read only when `meta/skills/catalog` lists that file and the document names
+  it by the listed path. Any other path is a
+  `selected_skill_path_not_permitted` validation error, so source, export and
+  deploy refuse the document instead of packing the file.
+- A listed file counts only while its real path stays inside the skill
+  directory it was found in: a link from a skill directory to a file outside
+  it lists nothing. A catalog file with other hard links counts only when
+  another user owns it and it is world-readable, as in a Nix store or
+  another user's install; a hard link to a file the gateway's own user owns
+  does not count, including a package store that user owns (pnpm and uv
+  stores usually are). The server reads the file it opened, comparing the
+  opened file's device and inode, so a path swapped between the listing and
+  the read reaches no other file.
+- `meta/skills/catalog` marks each filesystem skill with
+  `readable_without_host_access`, and adds `read_refusal` with the reason
+  when a caller without host access cannot read it; selecting such a skill
+  fails validation with that reason.
+- One request without host access reads at most 64 MiB of skill files in
+  total, however many skills name a file. A file larger than what is left
+  is refused before it is read, and once the budget is spent the request
+  resolves no further path skill.
+- On Windows, UNC and device paths (`\\server\share\...`, `\\?\UNC\...`,
+  `\\.\...`) are refused without host access, so a skills directory on a
+  network share needs host access.
+
+Host access is the caller's own per-call `mobpack.deploy` decision: a deny
+rule withholds it even when an allow rule such as `mobpack.*` also matches.
+Callers with host access, and the SDKs' stdio and in-process RPC, which are
+the host's own channels, may name such paths. A Rust host that calls the
+`meerkat_meta::mobpack` functions directly gets the same catalog-only reads
+unless it runs them under `meerkat_meta::with_host_path_skill_reads`.
 
 ## Embedding
 

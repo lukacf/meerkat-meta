@@ -88,6 +88,10 @@ pub const CANONICAL_CONSOLE_DB_FILE_NAME: &str = "meta_console.sqlite3";
 /// Canonical agent-memory root directory name (per-realm files beneath it
 /// stay feature-owned).
 pub const CANONICAL_AGENT_MEMORY_DIR_NAME: &str = "agent-memory";
+/// The extension document store's database file (extension-state feature).
+/// Named in every build: a state directory an extension-state embedder wrote
+/// is fenced and adopted by the stock gateway too.
+pub const EXTENSION_STATE_DB_FILE_NAME: &str = "extension_state.sqlite3";
 /// Reserved event-log database file name. Nothing opens it before the M4
 /// disk factory; the locator exists so the name is decided exactly once.
 pub const EVENT_LOG_DB_FILE_NAME: &str = "event_log.sqlite3";
@@ -151,7 +155,7 @@ impl DatabaseSlot {
             Self::EventLog => EVENT_LOG_DB_FILE_NAME,
             Self::Council => COUNCIL_STORE_FILE,
             #[cfg(feature = "extension-state")]
-            Self::ExtensionState => "extension_state.sqlite3",
+            Self::ExtensionState => EXTENSION_STATE_DB_FILE_NAME,
         }
     }
 

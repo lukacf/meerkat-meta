@@ -64,10 +64,13 @@ impl GatingParamsError {
                 "approver_id must be a non-empty string".to_string()
             }
             GatingParamsError::DecisionRequired => {
-                "decision must be either 'approve' or 'reject'".to_string()
+                format!("decision must be one of: {}", gating_decision_names())
             }
             GatingParamsError::UnknownDecision(decision) => {
-                format!("decision '{decision}' is unsupported (allowed: approve, reject)")
+                format!(
+                    "decision '{decision}' is unsupported (allowed: {})",
+                    gating_decision_names()
+                )
             }
             GatingParamsError::ReasonMustBeString => "reason must be a string".to_string(),
             GatingParamsError::LimitOutOfRange => {
@@ -379,11 +382,69 @@ fn parse_gating_risk_tier(raw: &str) -> Result<GatingRiskTier, GatingParamsError
 
 fn parse_gating_decision(raw: &str) -> Result<GatingDecision, GatingParamsError> {
     let normalized = raw.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "approve" => Ok(GatingDecision::Approve),
-        "reject" => Ok(GatingDecision::Reject),
-        "escalate" => Ok(GatingDecision::Escalate),
-        "" => Err(GatingParamsError::DecisionRequired),
-        _ => Err(GatingParamsError::UnknownDecision(raw.to_string())),
+    if normalized.is_empty() {
+        return Err(GatingParamsError::DecisionRequired);
+    }
+    GATING_DECISIONS
+        .iter()
+        .find(|(name, _)| *name == normalized)
+        .map(|(_, decision)| decision.clone())
+        .ok_or_else(|| GatingParamsError::UnknownDecision(raw.to_string()))
+}
+
+/// Every decision `gating/decide` accepts, by its wire name: the one list
+/// the parser reads and both decision errors name.
+const GATING_DECISIONS: [(&str, GatingDecision); 3] = [
+    ("approve", GatingDecision::Approve),
+    ("reject", GatingDecision::Reject),
+    ("escalate", GatingDecision::Escalate),
+];
+
+/// The accepted decisions as the errors list them.
+fn gating_decision_names() -> String {
+    GATING_DECISIONS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `gating/decide` accepts each decision by its wire name, and both of
+    /// its decision errors list every one of them.
+    #[test]
+    fn every_decision_is_accepted_by_its_wire_name_and_listed_in_the_errors() {
+        for decision in [
+            GatingDecision::Approve,
+            GatingDecision::Reject,
+            GatingDecision::Escalate,
+        ] {
+            // Exhaustive: a new decision fails to compile here until its
+            // wire name is accepted and listed.
+            let wire = match decision {
+                GatingDecision::Approve => "approve",
+                GatingDecision::Reject => "reject",
+                GatingDecision::Escalate => "escalate",
+            };
+            assert_eq!(
+                serde_json::to_value(&decision).ok(),
+                Some(serde_json::json!(wire))
+            );
+            assert_eq!(
+                parse_gating_decision(&format!(" {} ", wire.to_ascii_uppercase())),
+                Ok(decision)
+            );
+        }
+        assert_eq!(
+            parse_gating_decision("defer").map_err(|error| error.message()),
+            Err("decision 'defer' is unsupported (allowed: approve, reject, escalate)".to_string())
+        );
+        assert_eq!(
+            parse_gating_decision(" ").map_err(|error| error.message()),
+            Err("decision must be one of: approve, reject, escalate".to_string())
+        );
     }
 }

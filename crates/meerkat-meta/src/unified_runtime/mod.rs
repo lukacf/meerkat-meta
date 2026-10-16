@@ -422,6 +422,10 @@ pub struct UnifiedRuntimeCore {
     // Optional ABAC enforcement shared by the console/SSE surfaces.
     access_controller: Option<crate::access::AccessController>,
 
+    // The host's opt-in to Flow Editor host deploys for callers that no
+    // enforced access controller governs. Off by default.
+    flow_editor_host_deploy: bool,
+
     // Optional product-level topology authority. The controller always
     // exists so query can remain available, but its policy defaults to
     // disabled and mutation methods are then absent/denied.
@@ -892,6 +896,7 @@ impl UnifiedRuntime {
                 session_bridge: None,
                 identity_first_context: None,
                 access_controller: None,
+                flow_editor_host_deploy: false,
                 topology_controller: crate::topology_control::TopologyController::default(),
                 memory_panel_store: std::sync::RwLock::new(None),
                 job_health_projection: Arc::new(std::sync::RwLock::new(None)),
@@ -1314,22 +1319,26 @@ impl UnifiedRuntime {
                 "meta/cross_mob/send".to_string(),
             ]);
         }
+        let mob_handle = self.mob_handle();
+        let definition = mob_handle.definition();
+        // The runtime projects its own definition, as the host.
+        let (runtime_flow_rows, runtime_agent_definition_sources, runtime_skill_realms) =
+            crate::mobpack::with_host_path_skill_reads(|| {
+                (
+                    crate::mobpack::runtime_flow_registry_rows_from_definition(definition),
+                    crate::mobpack::runtime_agent_definition_sources_from_definition(definition),
+                    crate::mobpack::runtime_skill_realms_from_definition(definition),
+                )
+            });
         crate::mobpack::MobpackRuntimeCatalogState {
             loaded_modules,
             runtime_methods,
             has_contact_directory: self.has_contact_directory(),
             has_peer_mob_handles,
             has_inproc_contacts: self.has_inproc_contacts(),
-            runtime_flow_rows: crate::mobpack::runtime_flow_registry_rows_from_definition(
-                self.mob_handle().definition(),
-            ),
-            runtime_agent_definition_sources:
-                crate::mobpack::runtime_agent_definition_sources_from_definition(
-                    self.mob_handle().definition(),
-                ),
-            runtime_skill_realms: crate::mobpack::runtime_skill_realms_from_definition(
-                self.mob_handle().definition(),
-            ),
+            runtime_flow_rows,
+            runtime_agent_definition_sources,
+            runtime_skill_realms,
         }
     }
 
@@ -1938,6 +1947,22 @@ impl UnifiedRuntime {
     /// this call enforce (and live-serve) the ABAC configuration.
     pub fn set_access_controller(&mut self, controller: crate::access::AccessController) {
         self.access_controller = Some(controller);
+    }
+
+    /// Whether the Flow Editor on the reference app router may run `rkat` on
+    /// this host for callers that no enforced access controller governs:
+    /// `meta/mobpacks/deploy` with `execute: true` and
+    /// `meta/mobpacks/validate` with `rkat_validate: true`. Off by default,
+    /// so without an access controller that grants `mobpack.deploy` both are
+    /// refused (deploys stay plans, validation stays structural).
+    ///
+    /// Allowed, every caller the route admits may deploy: on an open console
+    /// that is every process that can reach the listener, whichever user
+    /// runs it. An enforced access controller keeps deciding per caller
+    /// either way. Routers built after this call use it. The bundled
+    /// gateways set it from `--allow-flow-editor-host-deploy`.
+    pub fn allow_flow_editor_host_deploy(&mut self, allowed: bool) {
+        self.flow_editor_host_deploy = allowed;
     }
 
     /// Wire the bundled sqlite memory store into the console Memory panel
@@ -3386,6 +3411,10 @@ async fn run_resilient_mob_agent_event_forwarder(
     ))
     .await;
     cadence.rebind(&handles);
+    // Only the watchers outlive the pass. A child mob handle kept for the
+    // forwarder's life would keep that child's database observer alive, and
+    // the child's destroy would leave its storage cleanup outstanding.
+    drop(handles);
 
     loop {
         tokio::select! {
@@ -3473,6 +3502,8 @@ async fn run_identity_stream_health_monitor(
     ))
     .await;
     cadence.rebind(&handles);
+    // As in the forwarder: no child mob handle outlives the pass.
+    drop(handles);
 
     loop {
         tokio::select! {

@@ -222,6 +222,9 @@ class CiWorkflowTests(unittest.TestCase):
             self.assertEqual(commands, [command], name)
             self.assertIn("- name: Reclaim runner disk\n", job_block(name))
             self.assertIn('CARGO_PROFILE_DEV_DEBUG: "0"', job_block(name))
+            # The test fixtures give their members and child gateways their
+            # own fake OpenAI key, so neither job sets one for the whole run.
+            self.assertNotIn("OPENAI_API_KEY", job_block(name), name)
         # Exactly one half builds the examples.
         self.assertEqual(block.count("            examples: true\n"), 1)
         self.assertIn("      - if: matrix.examples\n        run: scripts/repo-cargo build --workspace --examples\n", block)
@@ -510,7 +513,7 @@ class CiWorkflowTests(unittest.TestCase):
         for command, count in (
             ("- run: npm --prefix console run perf:typing:browser --silent\n", 1),
             ("node console/browser-e2e.cjs", 1),
-            ("run: npm --prefix console run e2e:mcp-apps --silent\n", 2),
+            ("run: npm --prefix console run e2e:mcp-apps --silent\n", 3),
             ("- run: node console/api-e2e.cjs\n", 1),
         ):
             self.assertEqual(source.count(command), count, command)
@@ -528,6 +531,7 @@ class CiWorkflowTests(unittest.TestCase):
             "- name: Build console acceptance backends\n",
             "- name: Native MCP Apps rendering and reload\n",
             "- name: Native MCP Apps polling during an active model turn\n",
+            "- name: Native MCP Apps on a builder host with identity-first members\n",
             "- run: node console/browser-e2e.cjs --shard=${{ matrix.shard }}/2\n",
             "name: console-browser-${{ github.run_id }}-${{ matrix.shard }}\n",
         ]
@@ -537,7 +541,10 @@ class CiWorkflowTests(unittest.TestCase):
         # the matrix and the shard count must agree. MCP Apps run once.
         self.assertIn("      matrix:\n        shard: [1, 2]\n", browser)
         self.assertIn("      fail-fast: false\n", browser)
-        self.assertEqual(browser.count("        if: matrix.shard == 1\n"), 2)
+        self.assertEqual(browser.count("        if: matrix.shard == 1\n"), 3)
+        # The gateway lanes take the default backend; only the builder lane
+        # selects console_acceptance_fixture.
+        self.assertEqual(browser.count("          META_MCP_APPS_BACKEND: builder\n"), 1)
         self.assertIn("META_EXAMPLE_BIN_DIR=${target_dir}/debug/examples", browser)
 
         console = job_block("console")

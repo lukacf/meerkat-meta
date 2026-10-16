@@ -389,6 +389,81 @@ fn usage_errors_exit_2() {
         &["--state-dir", "/tmp", "--older-than-days", "x"],
     );
     assert_eq!(run.code, 2, "non-numeric threshold must exit 2");
+
+    let run = run_verb(
+        "storage-adopt-predecessor",
+        &["--state-dir", "/tmp", "--acknowledge-ignored-keys"],
+    );
+    assert_eq!(
+        run.code, 2,
+        "--acknowledge-ignored-keys without --mob-config must exit 2"
+    );
+    assert!(
+        run.stderr
+            .contains("--acknowledge-ignored-keys needs a definition to check"),
+        "stderr: {}",
+        run.stderr
+    );
+    let run = run_verb(
+        "storage-adopt-predecessor",
+        &["--state-dir", "/tmp", "--mob-config"],
+    );
+    assert_eq!(run.code, 2, "--mob-config without a file must exit 2");
+    assert!(
+        run.stderr.contains("--mob-config requires a file"),
+        "stderr: {}",
+        run.stderr
+    );
+}
+
+/// A `--mob-config` that does not parse, or a mob.toml that declares a
+/// host-config table, is refused before planning, naming the file, and
+/// nothing is adopted. A `.json` file is read as a serialized definition.
+#[test]
+fn adopt_predecessor_refuses_a_mob_config_that_does_not_parse() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    write_predecessor_metadata_db(&state.join("mobkit_metadata.sqlite3"));
+    for (case, file, text) in [
+        ("not TOML", "mob.toml", "[mob\nid = \"m\"\n"),
+        (
+            "no mob table",
+            "mob.toml",
+            "[profiles.lead]\nmodel = \"gpt-5.5\"\n",
+        ),
+        (
+            "a host config table",
+            "mob.toml",
+            "[mob]\nid = \"m\"\n\n[self_hosted]\nservers = {}\n",
+        ),
+        ("not a definition", "definition.json", "{\"profiles\": 1}"),
+    ] {
+        let config = temp.path().join(file);
+        std::fs::write(&config, text).expect("write mob config");
+        let run = run_verb(
+            "storage-adopt-predecessor",
+            &[
+                "--state-dir",
+                state.to_str().expect("utf-8 state dir"),
+                "--mob-config",
+                config.to_str().expect("utf-8 config path"),
+                "--apply",
+            ],
+        );
+        assert_eq!(run.code, 1, "{case}: stderr: {}", run.stderr);
+        assert!(
+            run.stderr
+                .contains(&format!("--mob-config {}", config.display())),
+            "{case}: stderr: {}",
+            run.stderr
+        );
+        assert!(
+            state.join("mobkit_metadata.sqlite3").exists()
+                && !state.join("meta-adoption.json").exists(),
+            "{case}: nothing is adopted"
+        );
+    }
 }
 
 #[test]

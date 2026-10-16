@@ -404,7 +404,11 @@ mod tests {
     use super::*;
 
     fn adapter() -> Arc<McpRouterAdapter> {
-        Arc::new(McpRouterAdapter::new(meerkat_mcp::McpRouter::new()))
+        Arc::new(McpRouterAdapter::new(
+            meerkat_mcp::McpRouter::new_with_stdio_profile(
+                meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
+            ),
+        ))
     }
 
     #[test]
