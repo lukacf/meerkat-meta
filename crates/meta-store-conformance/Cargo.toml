@@ -34,14 +34,14 @@ workspace = true
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
-meerkat-core = { version = "=0.9.1" }
+meerkat-core = { version = "=0.9.2" }
 # The one-remote-bundle reference provider (M4b) implements both levels of
 # the composite seam: meerkat's RealmStorageProvider (facade storage_provider
 # module + in-memory store implementations) next to Meta's realm store set.
-meerkat = { version = "=0.9.1", features = ["session-store", "memory-store"] }
-meerkat-runtime = { version = "=0.9.1" }
-meerkat-store = { version = "=0.9.1", features = ["memory"] }
-meerkat-store-conformance = { version = "=0.9.1" }
+meerkat = { version = "=0.9.2", features = ["session-store", "memory-store"] }
+meerkat-runtime = { version = "=0.9.2" }
+meerkat-store = { version = "=0.9.2", features = ["memory"] }
+meerkat-store-conformance = { version = "=0.9.2" }
 meerkat-meta = { path = "../meerkat-meta" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde_json = "1"
