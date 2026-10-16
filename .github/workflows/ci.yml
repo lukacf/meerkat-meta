@@ -511,11 +511,14 @@ jobs:
   # scenarios read console/dist and the backends embed
   # crates/meerkat-meta/console-dist, both written by `run build`.
   #
-  # Two shards: browser-e2e's 100 scenarios took 9.5-10.1 minutes in one
+  # Three shards: browser-e2e's 100 scenarios took 9.5-10.1 minutes in one
   # leg (runs 38536518805, 38547674877, 38550484431), and the scenario
   # registry deals each to exactly one --shard=i/n leg
   # (console/scenario-registry.test.cjs). Each leg builds the backends;
-  # MCP Apps run in leg 1.
+  # MCP Apps run in leg 1. With two legs, leg 1 took 14.3 minutes (run
+  # 38776842877: 393 s of backends, 80 s of MCP Apps, 299 s of scenarios).
+  # Dealt three ways, that run's scenario times give 135 s, 217 s and
+  # 222 s, so leg 1's MCP Apps still fit beside its share.
   console-browser:
     name: console-browser
     needs: changes
@@ -524,7 +527,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3]
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # Rust 1.97 incremental compilation can ICE in async identity iteration.
@@ -565,15 +568,15 @@ jobs:
         env:
           META_MCP_APPS_LONG_POLL: "1"
           META_BROWSER_EVIDENCE: ${{ github.workspace }}/output/playwright/console-acceptance/mcp-apps
-      - run: node console/browser-e2e.cjs --shard=${{ matrix.shard }}/2
+      - run: node console/browser-e2e.cjs --shard=${{ matrix.shard }}/3
       - name: Upload console browser evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: console-browser-${{ github.run_id }}-${{ matrix.shard }}
           path: output/playwright/console-acceptance/
-          # Leg 1 always writes MCP Apps evidence; leg 2 writes only what
-          # its scenarios capture.
+          # Leg 1 always writes MCP Apps evidence; the others write only what
+          # their scenarios capture.
           if-no-files-found: ${{ matrix.shard == 1 && 'error' || 'warn' }}
 
   # The composer typing check, split from `console`. It bundles its own
