@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Pre-push unit gate: workspace lib tests, with incremental compilation OFF.
+# Unit gate of the manual hook stage, run on demand before a push
+# (`pre-commit run --hook-stage manual cargo-test --from-ref origin/main
+# --to-ref HEAD`); CI's test job runs every lib and bin test on every pull
+# request that touches Rust. Workspace lib tests, with incremental
+# compilation OFF.
 #
 # Same reasoning as scripts/pre-push-clippy.sh: a stale incremental cache makes
 # rustc abort with an internal compiler error (verify_ich "unstable
