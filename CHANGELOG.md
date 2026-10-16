@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-16
+
 ### Breaking
 
 - With the `extension-state` feature, a document store that an embedding
@@ -247,6 +249,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Requires Meerkat 0.9.2: every Meerkat dependency is pinned to
+  `=0.9.2` from crates.io.
 - Console: an operation refusal reads "Action refused" instead of
   "Permission denied". The host refuses an operation for a policy denial, for
   an authorization that changed after the operation was prepared and for
