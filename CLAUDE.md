@@ -60,6 +60,14 @@ The Make aggregate is not the complete hosted-CI pipeline. Consult
 `.github/workflows/ci.yml` for the required console, voice, TypeScript, and
 other hosted gates.
 
+The pre-push hook runs only fast checks; CI owns clippy and the tests. Run
+the hook's manual stage for them locally (`pre-commit run --hook-stage manual
+cargo-clippy` or `cargo-test`, with `--from-ref origin/main --to-ref HEAD`). A
+pull request runs only the CI lanes its changes reach and leaves the other
+configurations of a Rust change (voice, extension-state, Python SDK, console,
+flow editor) to the push to main, which runs every lane and gates the release.
+CONTRIBUTING.md describes the lanes.
+
 ## Branch conventions
 
 - `main` — stable, PRs merge here
