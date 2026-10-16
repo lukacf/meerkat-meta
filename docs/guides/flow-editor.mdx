@@ -164,7 +164,10 @@ every skill entry, passes 16 MiB. A document with more than 1000 members,
 more than 256 branches in one parallel or branch step, or more than 1024
 branches in its flow is refused before it is rendered, and the rendered
 `mob.toml`, `definition.json` and expected schema files are each refused
-past 16 MiB. Setting
+past 16 MiB. A document whose graph has more than 2048 instances or more
+than 8192 edges is refused before its graph is read: validation fails with
+`too_many_graph_instances` or `too_many_graph_edges`, and `graph_to_flow`,
+`apply_operation`, export and deploy refuse it with `-32602`. Setting
 `rkat_validate: true` requests a second, host-mutating phase: after structural
 validation passes, the server writes a rendered archive and spawns
 `rkat mob validate`. Only `meta/mobpacks/validate` has this phase:

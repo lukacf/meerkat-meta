@@ -56,6 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   resolution with `invalid_arguments` and the same reason, where the tool
   returned it as an error result.
 
+- Behaviour-only: `meta/mobpacks/apply_operation` refuses every operation
+  with `-32602`, not only the graph operations, on a document whose graph
+  has more than 2048 instances or more than 8192 edges: operations that do
+  not edit the graph can still walk it. `meta/mobpacks/graph_to_flow`,
+  export and deploy refuse such a document too, and its validation fails
+  with `too_many_graph_instances` or `too_many_graph_edges` (see Security).
 ### Security
 
 - `Cargo.lock` updates quinn-proto from 0.11.16 to 0.11.19, which clears
@@ -247,6 +253,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   from where each node's lanes lead, worked out once for the whole graph,
   and nodes outside the forks are told apart from the forks' columns by a
   sorted search.
+- A Flow Editor document's graph holds at most 2048 instances and 8192
+  edges. No structure cap counted the graph, and deriving a flow from it
+  still walks nodes that several lanes run through once per lane. Past the
+  caps, validation fails with `too_many_graph_instances` or
+  `too_many_graph_edges` and reads the graph no further, and
+  `meta/mobpacks/graph_to_flow`, every `meta/mobpacks/apply_operation` and
+  rendering (export and deploy) refuse the document with `-32602` before
+  reading its graph. A graph operation that grows a graph past them is
+  refused too.
 ### Added
 
 - `meta_gateway storage-adopt-predecessor --mob-config <file>` checks the mob

@@ -5155,6 +5155,9 @@ pub fn apply_mobpack_authoring_operation_with_runtime(
 ) -> Result<Value, String> {
     enforce_mobpack_draft_expected_revision(params, "meta/mobpacks/apply_operation")?;
     let mut document = document_from_params(params)?;
+    // No operation reads a graph past the structure caps; the graph
+    // operations check again after their edit.
+    refuse_graph_past_structure_caps(&document)?;
     let operation = params
         .get("operation")
         .and_then(Value::as_object)
@@ -5340,7 +5343,7 @@ fn apply_sync_graph_to_flow_operation(
     // the flow is derived from it. Validation accepts the gate-less graph
     // because `validate_graph_projection` proves the equivalence by
     // re-deriving the flow from the graph.
-    document.flow = graph_to_flow_from_document(document);
+    document.flow = graph_to_flow_within_caps(document)?;
     reconcile_flow_step_launch_modes(document);
     Ok(operation_selection_or_clear(operation))
 }
@@ -10353,7 +10356,7 @@ fn apply_insert_graph_node_operation(
         document.edges = Value::Array(edges);
     }
     reject_raw_graph_operation_sections(operation, &["frames"])?;
-    document.flow = graph_to_flow_from_document(document);
+    document.flow = graph_to_flow_within_caps(document)?;
     reconcile_flow_step_launch_modes(document);
     let selected_id = semantic_selection.unwrap_or(selected_id);
     Ok(json!({ "kind": "instance", "id": selected_id, "inserted_ids": inserted_ids }))
@@ -10732,7 +10735,7 @@ fn apply_graph_node_edit_operation(
     )?;
     instances[index] = next_instance;
     document.instances = Value::Array(instances);
-    document.flow = graph_to_flow_from_document(document);
+    document.flow = graph_to_flow_within_caps(document)?;
     reconcile_flow_step_launch_modes(document);
     Ok(json!({ "kind": "instance", "id": instance_id }))
 }
@@ -10799,7 +10802,7 @@ fn apply_move_graph_node_operation(
         }
     }
     document.instances = Value::Array(instances);
-    document.flow = graph_to_flow_from_document(document);
+    document.flow = graph_to_flow_within_caps(document)?;
     reconcile_flow_step_launch_modes(document);
     Ok(json!({ "kind": "instance", "id": instance_id }))
 }
@@ -10896,7 +10899,7 @@ fn apply_delete_graph_node_operation(
     document.instances = Value::Array(instances);
     document.edges = Value::Array(edges);
     reject_raw_graph_operation_sections(operation, &["frames"])?;
-    document.flow = graph_to_flow_from_document(document);
+    document.flow = graph_to_flow_within_caps(document)?;
     reconcile_flow_step_launch_modes(document);
     Ok(json!({ "kind": null, "id": null }))
 }
@@ -10920,7 +10923,7 @@ fn apply_connect_graph_nodes_operation(
     let id = validate_graph_edge(&edge, &edges, &instances, None)?;
     edges.push(edge);
     document.edges = Value::Array(edges);
-    document.flow = graph_to_flow_from_document(document);
+    document.flow = graph_to_flow_within_caps(document)?;
     reconcile_flow_step_launch_modes(document);
     reject_raw_graph_operation_sections(operation, &["frames"])?;
     Ok(json!({ "kind": "edge", "id": id }))
@@ -11288,7 +11291,7 @@ fn apply_graph_edge_edit_operation(
     validate_graph_edge(&next_edge, &edges, &instances, Some(&edge_id))?;
     edges[index] = next_edge;
     document.edges = Value::Array(edges);
-    document.flow = graph_to_flow_from_document(document);
+    document.flow = graph_to_flow_within_caps(document)?;
     reconcile_flow_step_launch_modes(document);
     Ok(json!({ "kind": "edge", "id": edge_id }))
 }
@@ -11311,7 +11314,7 @@ fn apply_delete_graph_edge_operation(
     }
     document.edges = Value::Array(edges);
     reject_raw_graph_operation_sections(operation, &["frames"])?;
-    document.flow = graph_to_flow_from_document(document);
+    document.flow = graph_to_flow_within_caps(document)?;
     reconcile_flow_step_launch_modes(document);
     Ok(json!({ "kind": null, "id": null }))
 }
@@ -12301,7 +12304,7 @@ pub fn graph_projection_mobpack(params: &Value) -> Result<Value, String> {
 pub fn graph_to_flow_mobpack(params: &Value) -> Result<Value, String> {
     enforce_mobpack_draft_expected_revision(params, "meta/mobpacks/graph_to_flow")?;
     let mut document = document_from_params(params)?;
-    let flow = graph_to_flow_from_document(&document);
+    let flow = graph_to_flow_within_caps(&document)?;
     document.flow = flow;
     let validation = validate_document(&document);
     Ok(json!({
@@ -17762,10 +17765,15 @@ const MOBPACK_MAX_STEP_BRANCHES: usize = 256;
 /// after a parallel step without a join each depend on every branch before
 /// them, so the branch counts bound what compiling the flow builds.
 const MOBPACK_MAX_FLOW_BRANCHES: usize = 1024;
+/// The most instances one document's graph may have.
+const MOBPACK_MAX_GRAPH_INSTANCES: usize = 2048;
+/// The most edges one document's graph may have.
+const MOBPACK_MAX_GRAPH_EDGES: usize = 8192;
 
 /// Structure caps checked before a document is rendered: at most
 /// [`MOBPACK_MAX_MEMBERS`] members, [`MOBPACK_MAX_STEP_BRANCHES`] branches in
-/// one step and [`MOBPACK_MAX_FLOW_BRANCHES`] in the flow.
+/// one step and [`MOBPACK_MAX_FLOW_BRANCHES`] in the flow, and the graph caps
+/// of [`graph_structure_refusals`].
 fn validate_document_structure_caps(
     document: &MobpackDocument,
     diagnostics: &mut MobpackDiagnostics,
@@ -17819,6 +17827,57 @@ fn validate_document_structure_caps(
             path: Some("flow.steps".to_string()),
         });
     }
+    diagnostics.extend(graph_structure_refusals(document));
+}
+
+/// The graph structure caps a document does not pass, each as a refusal: at
+/// most [`MOBPACK_MAX_GRAPH_INSTANCES`] instances and
+/// [`MOBPACK_MAX_GRAPH_EDGES`] edges. Deriving a flow indexes the graph once,
+/// but lanes that run through shared nodes still walk them again, so a graph
+/// past the caps is refused before anything derives a flow from it, edits it
+/// or checks it further.
+fn graph_structure_refusals(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+    let mut refusals = Vec::new();
+    let instances = document.instances.as_array().map_or(0, Vec::len);
+    if instances > MOBPACK_MAX_GRAPH_INSTANCES {
+        refusals.push(MobpackDiagnostic {
+            severity: "error".to_string(),
+            code: "too_many_graph_instances".to_string(),
+            message: format!(
+                "mobpack graph has {instances} instances, more than \
+                 {MOBPACK_MAX_GRAPH_INSTANCES}; refusing the document"
+            ),
+            path: Some("instances".to_string()),
+        });
+    }
+    let edges = document.edges.as_array().map_or(0, Vec::len);
+    if edges > MOBPACK_MAX_GRAPH_EDGES {
+        refusals.push(MobpackDiagnostic {
+            severity: "error".to_string(),
+            code: "too_many_graph_edges".to_string(),
+            message: format!(
+                "mobpack graph has {edges} edges, more than {MOBPACK_MAX_GRAPH_EDGES}; \
+                 refusing the document"
+            ),
+            path: Some("edges".to_string()),
+        });
+    }
+    refusals
+}
+
+/// Refuses a document whose graph is past the structure caps.
+fn refuse_graph_past_structure_caps(document: &MobpackDocument) -> Result<(), String> {
+    match graph_structure_refusals(document).into_iter().next() {
+        Some(refusal) => Err(refusal.message),
+        None => Ok(()),
+    }
+}
+
+/// [`graph_to_flow_from_document`], refused for a graph past the structure
+/// caps.
+fn graph_to_flow_within_caps(document: &MobpackDocument) -> Result<Value, String> {
+    refuse_graph_past_structure_caps(document)?;
+    Ok(graph_to_flow_from_document(document))
 }
 
 fn compile_editor_flow(steps: &[Value], members: &[&Value]) -> RenderedFlow {
@@ -21247,6 +21306,11 @@ fn validate_editor_input_params(flow: &Value, diagnostics: &mut MobpackDiagnosti
 
 fn validate_graph_projection(document: &MobpackDocument, diagnostics: &mut MobpackDiagnostics) {
     if document.instances.is_null() && document.edges.is_null() && document.frames.is_null() {
+        return;
+    }
+    // `validate_document_structure_caps` refuses a graph past the caps, and
+    // nothing reads it further.
+    if !graph_structure_refusals(document).is_empty() {
         return;
     }
     // Advanced-mode graphs carry the user's plain nodes and edges without
@@ -39148,5 +39212,89 @@ branch = "choice"
                 );
             }
         }
+    }
+
+    /// A graph with more instances or edges than the structure caps is
+    /// refused before anything derives a flow from it, edits it or checks it
+    /// further: validation reports `too_many_graph_instances` or
+    /// `too_many_graph_edges` and none of the graph's own problems, and
+    /// graph-to-flow, every operation and rendering refuse it.
+    #[test]
+    fn graphs_past_the_structure_caps_are_refused() {
+        let over_caps = |instances: usize, edges: usize| {
+            let mut document = valid_document();
+            document.mob_toml = None;
+            document.flow = json!({ "steps": [] });
+            // Instances without an id and edges without endpoints: problems
+            // that checking the graph reports, one for each.
+            document.instances = Value::Array(vec![json!({}); instances]);
+            document.edges = Value::Array(vec![json!({ "kind": "next" }); edges]);
+            document
+        };
+        for (document, code) in [
+            (
+                over_caps(MOBPACK_MAX_GRAPH_INSTANCES + 1, 0),
+                "too_many_graph_instances",
+            ),
+            (
+                over_caps(1, MOBPACK_MAX_GRAPH_EDGES + 1),
+                "too_many_graph_edges",
+            ),
+        ] {
+            let validation = validate_document(&document);
+            let codes: BTreeSet<&str> = validation
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect();
+            assert!(
+                codes.contains(code)
+                    && !codes.contains("invalid_graph_instance_id")
+                    && !codes.contains("invalid_graph_edge_endpoint"),
+                "{code}: {codes:?}"
+            );
+            let operation = |kind: &str| {
+                apply_mobpack_authoring_operation(&json!({
+                    "document": document,
+                    "operation": { "type": kind },
+                }))
+                .err()
+            };
+            let refusals = [
+                graph_to_flow_mobpack(&json!({ "document": document })).err(),
+                operation("sync_graph_to_flow"),
+                operation("reconcile_members"),
+                render_editor_document_mob_toml(&document).err(),
+            ];
+            assert!(
+                refusals.iter().all(|refusal| {
+                    refusal
+                        .as_deref()
+                        .is_some_and(|message| message.contains("refusing the document"))
+                }),
+                "{code}: {refusals:?}"
+            );
+        }
+    }
+
+    /// Every operation is refused on a document whose graph is past the
+    /// structure caps, an operation that never edits the graph included:
+    /// operations that do not edit it can still walk it (reconciling members
+    /// prunes its instances), so none reads a graph past the caps.
+    #[test]
+    fn an_operation_that_does_not_edit_the_graph_is_refused_past_the_caps() {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.instances = Value::Array(vec![json!({}); MOBPACK_MAX_GRAPH_INSTANCES + 1]);
+        let refusal = apply_mobpack_authoring_operation(&json!({
+            "document": document,
+            "operation": {
+                "type": "update_mob_settings",
+                "field": "orchestrator",
+                "value": "worker",
+            },
+        }))
+        .expect_err("an operation on a document past the graph caps is refused");
+        assert!(refusal.contains("refusing the document"), "{refusal}");
     }
 }
