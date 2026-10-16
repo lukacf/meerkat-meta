@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   deals the console browser scenarios to three legs instead of two. Projected
   from measured step times, a warm pull request that touches only Rust
   finishes in about 11 minutes instead of 17.
+- CI no longer runs on pushes to `ci/**` and `feat/**` branches; those runs
+  ran every lane beside the pull request run of the same commit. A branch
+  gets CI through its pull request, or a dispatch of the CI workflow.
 
 ## [0.9.1] - 2026-10-15
 

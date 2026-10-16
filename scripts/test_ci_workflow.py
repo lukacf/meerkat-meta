@@ -716,6 +716,10 @@ class CiWorkflowTests(unittest.TestCase):
         triggers = source.split("\npermissions:", 1)[0]
         self.assertIn("  workflow_dispatch:\n", triggers)
         self.assertNotIn("inputs:", triggers)
+        # Branches get CI through their pull request (or a dispatch); only
+        # main's pushes run on push, so no branch runs every lane beside its
+        # own pull request run.
+        self.assertIn("  push:\n    branches: [main]\n  pull_request:\n", triggers)
         # Any version or pinned SHA of the checkout action.
         uses = re.findall(r"(?m)^\s*-?\s*uses:\s*actions/checkout@\S+", source)
         checkouts = re.findall(r"(?m)^ *- uses: actions/checkout@\S+\n((?: {8,}.*\n)*)", source)

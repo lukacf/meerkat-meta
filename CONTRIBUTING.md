@@ -97,7 +97,8 @@ the lanes its changed files reach (`scripts/ci-changes.py`):
 Pushes to main and dispatches run every lane, and a release tag requires a
 green run for its exact commit on main, so every lane gates every release. A
 lane a pull request left to the push reports its failures on main, after the
-merge.
+merge. Other branches get CI through their pull request; dispatch the CI
+workflow on a branch for a full run without one.
 
 ## Code Style
 

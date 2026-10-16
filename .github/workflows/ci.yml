@@ -1,8 +1,12 @@
 name: CI
 
 on:
+  # A branch gets CI through its pull request. Push runs on ci/** and feat/**
+  # branches ran every lane beside the pull request run of the same commit
+  # (41 of the last 100 push runs on 2026-10-16), competing for the same
+  # runners; dispatch the workflow for a full run of a branch without one.
   push:
-    branches: [main, "ci/**", "feat/**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
