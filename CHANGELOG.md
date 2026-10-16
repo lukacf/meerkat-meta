@@ -413,6 +413,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   A reopened journal now records no step as finished until the rerun
   finishes it.
 
+### Known limitations
+
+- The Flow Editor draft store has no total size or draft count limit yet:
+  each draft is bounded (its document's skill content is capped at 16 MiB),
+  but the number of drafts is not. Store-wide limits are planned for 0.9.3.
+- The Flow Editor's remaining resource limits continue in 0.9.3: draft store
+  totals, and validation, whose peak memory stays linear in its (capped)
+  input.
+
 ## [0.9.1] - 2026-10-15
 
 ### Breaking
