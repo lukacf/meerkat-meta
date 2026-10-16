@@ -237,6 +237,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   takes writes that leave it no larger. Draft replies also stop copying the
   snapshots they strip from each row.
 
+- Deriving a flow from a Flow Editor graph (`meta/mobpacks/graph_to_flow`,
+  the graph operations of `meta/mobpacks/apply_operation`, and the graph
+  check every validation runs) indexes the graph once. Every lookup of a
+  node, an edge or a lane's member scanned the whole graph, and finding the
+  join that closes a fork walked the graph again, scanning at each step, for
+  every join it tried and every lane, so the work grew quadratically, and
+  for many forks faster, with the graph's size. A fork's join is now read
+  from where each node's lanes lead, worked out once for the whole graph,
+  and nodes outside the forks are told apart from the forks' columns by a
+  sorted search.
 ### Added
 
 - `meta_gateway storage-adopt-predecessor --mob-config <file>` checks the mob

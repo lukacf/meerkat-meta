@@ -17,7 +17,7 @@ use meerkat_mob::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
@@ -12426,7 +12426,7 @@ fn graph_to_flow_with_steps(mut prior: Value, steps: Vec<Value>) -> Value {
 }
 
 /// The graph's instances, each id once: its first instance, the one
-/// [`graph_to_flow_node_by_id`] reads. Instances repeating an id are one node,
+/// [`GraphToFlowGraph::node`] reads. Instances repeating an id are one node,
 /// so they make at most one step (each copy used to become a step of its own,
 /// copying the prior step the id names).
 fn graph_to_flow_unique_instances(instances: &Value) -> Vec<Value> {
@@ -12483,12 +12483,222 @@ fn graph_to_flow_prior_steps_by_id(steps: &[Value]) -> BTreeMap<String, &Value> 
     out
 }
 
+/// The graph that one flow derivation reads, indexed once. Every lookup
+/// scanned all instances, edges or members, and finding a fork's join walked
+/// the graph again, scanning, for each join it tried, so deriving a flow took
+/// work that grew quadratically, and faster, with the graph.
+struct GraphToFlowGraph<'a> {
+    nodes: &'a [Value],
+    /// Each node's position by id. An instance without an id is the node that
+    /// an edge without an endpoint names, as the scans found it.
+    positions: BTreeMap<String, usize>,
+    /// Each node's edges out and in, in document order.
+    outgoing: BTreeMap<String, Vec<&'a Value>>,
+    incoming: BTreeMap<String, Vec<&'a Value>>,
+    /// Each member id's first member.
+    members: BTreeMap<String, &'a Value>,
+    /// The join gates' positions, in node order.
+    joins: Vec<usize>,
+    /// Each node's place in `joins`, when it is a join.
+    join_ranks: Vec<Option<usize>>,
+    /// For each node, the first join (its place in `joins`) that a lane from
+    /// the node reaches.
+    first_joins: Vec<Option<usize>>,
+}
+
+impl<'a> GraphToFlowGraph<'a> {
+    fn new(nodes: &'a [Value], edges: &'a [Value], members: &'a [Value]) -> Self {
+        let mut positions = BTreeMap::new();
+        for (position, node) in nodes.iter().enumerate() {
+            positions
+                .entry(graph_to_flow_string(node, "id"))
+                .or_insert(position);
+        }
+        let mut outgoing = BTreeMap::<String, Vec<&Value>>::new();
+        let mut incoming = BTreeMap::<String, Vec<&Value>>::new();
+        for edge in edges {
+            outgoing
+                .entry(graph_to_flow_string(edge, "from"))
+                .or_default()
+                .push(edge);
+            incoming
+                .entry(graph_to_flow_string(edge, "to"))
+                .or_default()
+                .push(edge);
+        }
+        let mut member_ids = BTreeMap::new();
+        for member in members {
+            member_ids
+                .entry(graph_to_flow_string(member, "id"))
+                .or_insert(member);
+        }
+        let mut joins: Vec<usize> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| graph_to_flow_string(node, "gateKind") == "join")
+            .map(|(position, _)| position)
+            .collect();
+        joins.sort_by(|&a, &b| graph_to_flow_compare_nodes(&nodes[a], &nodes[b]));
+        let mut join_ranks = vec![None; nodes.len()];
+        for (rank, &position) in joins.iter().enumerate() {
+            join_ranks[position] = Some(rank);
+        }
+        let mut graph = Self {
+            nodes,
+            positions,
+            outgoing,
+            incoming,
+            members: member_ids,
+            joins,
+            join_ranks,
+            first_joins: Vec::new(),
+        };
+        graph.first_joins = graph.reach_first_joins();
+        graph
+    }
+
+    /// The node an id names.
+    fn node(&self, id: &str) -> Option<&'a Value> {
+        count_mobpack_work();
+        let nodes = self.nodes;
+        self.positions.get(id).map(|&position| &nodes[position])
+    }
+
+    /// The edges out of the node an id names, in document order.
+    fn outgoing(&self, id: &str) -> &[&'a Value] {
+        count_mobpack_work();
+        self.outgoing.get(id).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    /// The edges into the node an id names, in document order.
+    fn incoming(&self, id: &str) -> &[&'a Value] {
+        count_mobpack_work();
+        self.incoming.get(id).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    /// The first member with an id.
+    fn member(&self, id: &str) -> Option<&'a Value> {
+        count_mobpack_work();
+        self.members.get(id).copied()
+    }
+
+    /// For each node, the first join (its place in `joins`) that a lane from
+    /// the node reaches: the node itself, or a join it reaches through edges
+    /// to nodes that are not terminal. One pass over the graph's strongly
+    /// connected components answers every fork: a component closes after
+    /// every component it reaches, whose answers are then known.
+    fn reach_first_joins(&self) -> Vec<Option<usize>> {
+        const UNVISITED: usize = usize::MAX;
+        let count = self.nodes.len();
+        // The edges a lane follows from each node: to nodes that are not
+        // terminal.
+        let successors: Vec<Vec<usize>> = self
+            .nodes
+            .iter()
+            .map(|node| {
+                self.outgoing(&graph_to_flow_string(node, "id"))
+                    .iter()
+                    .filter_map(|edge| {
+                        self.positions
+                            .get(&graph_to_flow_string(edge, "to"))
+                            .copied()
+                    })
+                    .filter(|&next| !graph_to_flow_bool(&self.nodes[next], "isTerminal"))
+                    .collect()
+            })
+            .collect();
+        let mut order = vec![UNVISITED; count];
+        let mut low = vec![0; count];
+        let mut on_stack = vec![false; count];
+        let mut stack = Vec::new();
+        let mut first_joins = vec![None; count];
+        let mut next_order = 0;
+        for root in 0..count {
+            if order[root] != UNVISITED {
+                continue;
+            }
+            order[root] = next_order;
+            low[root] = next_order;
+            next_order += 1;
+            stack.push(root);
+            on_stack[root] = true;
+            // The depth-first path: each node with how many successors it
+            // has tried.
+            let mut path = vec![(root, 0_usize)];
+            while let Some(&(node, tried)) = path.last() {
+                count_mobpack_work();
+                if let Some(&next) = successors[node].get(tried) {
+                    if let Some(top) = path.last_mut() {
+                        top.1 += 1;
+                    }
+                    if order[next] == UNVISITED {
+                        order[next] = next_order;
+                        low[next] = next_order;
+                        next_order += 1;
+                        stack.push(next);
+                        on_stack[next] = true;
+                        path.push((next, 0));
+                    } else if on_stack[next] {
+                        low[node] = low[node].min(order[next]);
+                    }
+                    continue;
+                }
+                path.pop();
+                if let Some(&(parent, _)) = path.last() {
+                    low[parent] = low[parent].min(low[node]);
+                }
+                if low[node] != order[node] {
+                    continue;
+                }
+                // `node` closes a component: itself and every node above it
+                // on the stack.
+                let Some(start) = stack.iter().rposition(|&member| member == node) else {
+                    continue;
+                };
+                let component = stack.split_off(start);
+                let mut first = None;
+                for &member in &component {
+                    on_stack[member] = false;
+                    first = first.into_iter().chain(self.join_ranks[member]).min();
+                    for &next in &successors[member] {
+                        first = first.into_iter().chain(first_joins[next]).min();
+                    }
+                }
+                for &member in &component {
+                    first_joins[member] = first;
+                }
+            }
+        }
+        first_joins
+    }
+
+    /// The join that closes a fork whose lanes start at `start_ids`: the
+    /// first join, in node order, that a lane start reaches or has an edge
+    /// to. An edge to a terminal join counts, though no lane walks into one.
+    fn find_join(&self, start_ids: &[String]) -> Option<Value> {
+        let mut first = None;
+        for id in start_ids {
+            count_mobpack_work();
+            if let Some(&start) = self.positions.get(id) {
+                first = first.into_iter().chain(self.first_joins[start]).min();
+            }
+            for edge in self.outgoing(id) {
+                if let Some(&next) = self.positions.get(&graph_to_flow_string(edge, "to")) {
+                    first = first.into_iter().chain(self.join_ranks[next]).min();
+                }
+            }
+        }
+        first.map(|rank| self.nodes[self.joins[rank]].clone())
+    }
+}
+
 fn graph_to_flow_segments_to_steps(
     instances: &[Value],
     edges: &[Value],
     members: &[Value],
     prior_by_id: &BTreeMap<String, &Value>,
 ) -> Vec<GraphToFlowSegment> {
+    let graph = GraphToFlowGraph::new(instances, edges, members);
     let mut member_nodes: Vec<Value> = instances
         .iter()
         .filter(|instance| graph_to_flow_is_flow_node(instance))
@@ -12518,25 +12728,22 @@ fn graph_to_flow_segments_to_steps(
         // A node becomes one step: a second edge to it, or a node another
         // lane already took, starts no lane of its own.
         let mut start_ids = BTreeSet::new();
-        let branch_starts: Vec<(Value, Value)> =
-            graph_to_flow_outgoing_edges(edges, &graph_to_flow_string(&gate, "id"))
-                .into_iter()
-                .filter_map(|edge| {
-                    let node =
-                        graph_to_flow_node_by_id(instances, &graph_to_flow_string(&edge, "to"))?;
-                    let id = graph_to_flow_string(&node, "id");
-                    (graph_to_flow_is_flow_node(&node)
-                        && !consumed.contains(&id)
-                        && start_ids.insert(id))
-                    .then_some((edge, node))
-                })
-                .collect();
+        let branch_starts: Vec<(&Value, &Value)> = graph
+            .outgoing(&graph_to_flow_string(&gate, "id"))
+            .iter()
+            .filter_map(|&edge| {
+                let node = graph.node(&graph_to_flow_string(edge, "to"))?;
+                let id = graph_to_flow_string(node, "id");
+                (graph_to_flow_is_flow_node(node)
+                    && !consumed.contains(&id)
+                    && start_ids.insert(id))
+                .then_some((edge, node))
+            })
+            .collect();
         if branch_starts.len() < 2 {
             continue;
         }
-        let join = graph_to_flow_find_join(
-            instances,
-            edges,
+        let join = graph.find_join(
             &branch_starts
                 .iter()
                 .map(|(_, node)| graph_to_flow_string(node, "id"))
@@ -12546,8 +12753,7 @@ fn graph_to_flow_segments_to_steps(
         for (index, (edge, node)) in branch_starts.iter().enumerate() {
             let join_id = join.as_ref().map(|join| graph_to_flow_string(join, "id"));
             let lane_nodes = graph_to_flow_collect_lane_to_join(
-                instances,
-                edges,
+                &graph,
                 &graph_to_flow_string(node, "id"),
                 join_id.as_deref(),
                 &consumed,
@@ -12559,7 +12765,7 @@ fn graph_to_flow_segments_to_steps(
                 gate_kind == "branch" && graph_to_flow_is_fallback_branch_lane(edge, node);
             lanes.push(json!({
                 "id": format!("br_{}", graph_to_flow_string(node, "id")),
-                "label": graph_to_flow_lane_label(node, members, index),
+                "label": graph_to_flow_lane_label(node, &graph, index),
                 "isFallback": is_fallback,
                 "condition": if gate_kind == "branch" { graph_to_flow_condition_text_from_edge(edge, "") } else { String::new() },
                 "cond": if gate_kind == "branch" { graph_to_flow_edge_condition_to_editor_cond(edge).unwrap_or(Value::Null) } else { Value::Null },
@@ -12673,28 +12879,25 @@ fn graph_to_flow_segments_to_steps(
         });
     }
 
+    // The columns the forks span, merged: a node no lane took in one of them
+    // makes no step.
+    let spans = graph_to_flow_merged_spans(&segments);
     let mut groups: BTreeMap<i64, Vec<Value>> = BTreeMap::new();
     for node in member_nodes {
-        let node_id = graph_to_flow_string(&node, "id");
-        if consumed.contains(&node_id)
-            || segments.iter().any(|segment| {
-                graph_to_flow_col(&node) >= segment.col
-                    && graph_to_flow_col(&node) <= segment.span_end
-            })
+        let col = graph_to_flow_col(&node);
+        if consumed.contains(&graph_to_flow_string(&node, "id"))
+            || graph_to_flow_spans_contain(&spans, col)
         {
             continue;
         }
-        groups
-            .entry(graph_to_flow_col(&node))
-            .or_default()
-            .push(node);
+        groups.entry(col).or_default().push(node);
     }
     for (col, mut nodes) in groups {
         nodes.sort_by(graph_to_flow_compare_nodes);
         segments.push(GraphToFlowSegment {
             col,
             span_end: col,
-            step: graph_to_flow_step_for_group(&nodes, edges, members, prior_by_id),
+            step: graph_to_flow_step_for_group(&nodes, &graph, members, prior_by_id),
         });
     }
     segments.sort_by(|a, b| a.col.cmp(&b.col).then(a.span_end.cmp(&b.span_end)));
@@ -12703,7 +12906,7 @@ fn graph_to_flow_segments_to_steps(
 
 fn graph_to_flow_step_for_group(
     nodes: &[Value],
-    edges: &[Value],
+    graph: &GraphToFlowGraph<'_>,
     members: &[Value],
     prior_by_id: &BTreeMap<String, &Value>,
 ) -> Value {
@@ -12711,9 +12914,10 @@ fn graph_to_flow_step_for_group(
         return graph_to_flow_step_from_instance(&nodes[0], members, prior_by_id);
     }
     let has_conditional_fan_in = nodes.iter().any(|node| {
-        graph_to_flow_incoming_edges(edges, &graph_to_flow_string(node, "id"))
+        graph
+            .incoming(&graph_to_flow_string(node, "id"))
             .iter()
-            .any(graph_to_flow_is_condition_edge)
+            .any(|edge| graph_to_flow_is_condition_edge(edge))
     });
     let prefix = if has_conditional_fan_in {
         "branch"
@@ -12735,14 +12939,16 @@ fn graph_to_flow_step_for_group(
             "type": "branch",
             "controllerRole": graph_to_flow_control_role(&Value::Null, None, prior),
             "branches": nodes.iter().enumerate().map(|(index, node)| {
-                let edge = graph_to_flow_incoming_edges(edges, &graph_to_flow_string(node, "id"))
-                    .into_iter()
-                    .find(graph_to_flow_is_condition_edge);
+                let edge = graph
+                    .incoming(&graph_to_flow_string(node, "id"))
+                    .iter()
+                    .copied()
+                    .find(|edge| graph_to_flow_is_condition_edge(edge));
                 json!({
                     "id": format!("br_{}", graph_to_flow_string(node, "id")),
-                    "label": graph_to_flow_lane_label(node, members, index),
-                    "condition": edge.as_ref().map(|edge| graph_to_flow_condition_text_from_edge(edge, "")).unwrap_or_default(),
-                    "cond": edge.as_ref().and_then(graph_to_flow_edge_condition_to_editor_cond).unwrap_or(Value::Null),
+                    "label": graph_to_flow_lane_label(node, graph, index),
+                    "condition": edge.map(|edge| graph_to_flow_condition_text_from_edge(edge, "")).unwrap_or_default(),
+                    "cond": edge.and_then(graph_to_flow_edge_condition_to_editor_cond).unwrap_or(Value::Null),
                     "steps": [graph_to_flow_step_from_instance(node, members, prior_by_id)],
                 })
             }).collect::<Vec<_>>(),
@@ -12764,7 +12970,7 @@ fn graph_to_flow_step_for_group(
             "branches": nodes.iter().enumerate().map(|(index, node)| {
                 json!({
                     "id": format!("br_{}", graph_to_flow_string(node, "id")),
-                    "label": graph_to_flow_lane_label(node, members, index),
+                    "label": graph_to_flow_lane_label(node, graph, index),
                     "steps": [graph_to_flow_step_from_instance(node, members, prior_by_id)],
                 })
             }).collect::<Vec<_>>(),
@@ -13045,92 +13251,38 @@ fn graph_to_flow_normalized_edge_condition(edge: &Value) -> Option<(String, Stri
     None
 }
 
-fn graph_to_flow_find_join(
-    instances: &[Value],
-    edges: &[Value],
-    branch_start_ids: &[String],
-) -> Option<Value> {
-    let mut joins: Vec<Value> = instances
-        .iter()
-        .filter(|instance| graph_to_flow_string(instance, "gateKind") == "join")
-        .cloned()
-        .collect();
-    joins.sort_by(graph_to_flow_compare_nodes);
-    joins.into_iter().find(|join| {
-        let join_id = graph_to_flow_string(join, "id");
-        let incoming: BTreeSet<String> = graph_to_flow_incoming_edges(edges, &join_id)
-            .iter()
-            .map(|edge| graph_to_flow_string(edge, "from"))
-            .collect();
-        branch_start_ids.iter().any(|id| {
-            incoming.contains(id) || graph_to_flow_lane_reaches(instances, edges, id, &join_id)
-        })
-    })
-}
-
 /// The lane from `start_id` up to its join. It stops at a node another lane
 /// already took (`consumed`), so lanes that run into one shared chain without
 /// a join do not each copy the whole chain.
 fn graph_to_flow_collect_lane_to_join(
-    instances: &[Value],
-    edges: &[Value],
+    graph: &GraphToFlowGraph<'_>,
     start_id: &str,
     join_id: Option<&str>,
     consumed: &BTreeSet<String>,
 ) -> Vec<Value> {
     let mut out = Vec::new();
-    let mut current = graph_to_flow_node_by_id(instances, start_id);
+    let mut current = graph.node(start_id);
     let mut seen = BTreeSet::new();
     while let Some(node) = current {
-        let node_id = graph_to_flow_string(&node, "id");
+        let node_id = graph_to_flow_string(node, "id");
         if join_id == Some(node_id.as_str())
             || consumed.contains(&node_id)
             || !seen.insert(node_id.clone())
         {
             break;
         }
-        if graph_to_flow_is_flow_node(&node) {
+        if graph_to_flow_is_flow_node(node) {
             out.push(node.clone());
         }
-        let mut next_nodes: Vec<Value> = graph_to_flow_outgoing_edges(edges, &node_id)
+        current = graph
+            .outgoing(&node_id)
             .iter()
             .filter(|edge| join_id != Some(graph_to_flow_string(edge, "to").as_str()))
-            .filter_map(|edge| {
-                graph_to_flow_node_by_id(instances, &graph_to_flow_string(edge, "to"))
-            })
+            .filter_map(|edge| graph.node(&graph_to_flow_string(edge, "to")))
             .filter(|node| !graph_to_flow_bool(node, "isTerminal"))
-            .collect();
-        next_nodes.sort_by(graph_to_flow_compare_nodes);
-        current = next_nodes.into_iter().next();
+            .min_by(|a, b| graph_to_flow_compare_nodes(a, b));
     }
     out
-}
-
-fn graph_to_flow_lane_reaches(
-    instances: &[Value],
-    edges: &[Value],
-    start_id: &str,
-    target_id: &str,
-) -> bool {
-    let mut queue = VecDeque::from([start_id.to_string()]);
-    let mut seen = BTreeSet::new();
-    while let Some(id) = queue.pop_front() {
-        if id == target_id {
-            return true;
-        }
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-        for edge in graph_to_flow_outgoing_edges(edges, &id) {
-            if let Some(node) =
-                graph_to_flow_node_by_id(instances, &graph_to_flow_string(&edge, "to"))
-                && !graph_to_flow_bool(&node, "isTerminal")
-            {
-                queue.push_back(graph_to_flow_string(&node, "id"));
-            }
-        }
-    }
-    false
 }
 
 fn graph_to_flow_collection_from_join(join: &Value) -> String {
@@ -13174,15 +13326,14 @@ fn graph_to_flow_primitive_id_from_gate(gate: &Value, kind: &str) -> String {
     }
 }
 
-fn graph_to_flow_lane_label(node: &Value, members: &[Value], index: usize) -> String {
+fn graph_to_flow_lane_label(node: &Value, graph: &GraphToFlowGraph<'_>, index: usize) -> String {
     let lane = graph_to_flow_string(node, "lane");
     if !lane.is_empty() {
         return lane;
     }
     let member_id = graph_to_flow_string(node, "memberId");
-    members
-        .iter()
-        .find(|member| graph_to_flow_string(member, "id") == member_id)
+    graph
+        .member(&member_id)
         .map(|member| graph_to_flow_string(member, "name"))
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| {
@@ -13194,27 +13345,46 @@ fn graph_to_flow_lane_label(node: &Value, members: &[Value], index: usize) -> St
         })
 }
 
-fn graph_to_flow_node_by_id(instances: &[Value], id: &str) -> Option<Value> {
-    instances
+/// The columns that `segments` span, as sorted, disjoint ranges.
+fn graph_to_flow_merged_spans(segments: &[GraphToFlowSegment]) -> Vec<(i64, i64)> {
+    let mut spans: Vec<(i64, i64)> = segments
         .iter()
-        .find(|instance| graph_to_flow_string(instance, "id") == id)
-        .cloned()
+        .filter(|segment| segment.col <= segment.span_end)
+        .map(|segment| (segment.col, segment.span_end))
+        .collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
 }
 
-fn graph_to_flow_outgoing_edges(edges: &[Value], id: &str) -> Vec<Value> {
-    edges
-        .iter()
-        .filter(|edge| graph_to_flow_string(edge, "from") == id)
-        .cloned()
-        .collect()
+/// Whether `col` lies in one of `spans`, which are sorted and disjoint.
+fn graph_to_flow_spans_contain(spans: &[(i64, i64)], col: i64) -> bool {
+    count_mobpack_work();
+    let after = spans.partition_point(|&(start, _)| start <= col);
+    after > 0 && col <= spans[after - 1].1
 }
 
-fn graph_to_flow_incoming_edges(edges: &[Value], id: &str) -> Vec<Value> {
-    edges
-        .iter()
-        .filter(|edge| graph_to_flow_string(edge, "to") == id)
-        .cloned()
-        .collect()
+#[cfg(test)]
+std::thread_local! {
+    /// The work the Flow Editor's derivations did on this thread, in
+    /// [`count_mobpack_work`] units: graph fields and index entries read,
+    /// frame nodes visited, realm skills compared. The complexity tests
+    /// compare it across input sizes, so they measure how the work grows, not
+    /// how long it takes.
+    static MOBPACK_WORK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one unit of work for the complexity tests. Outside tests it does
+/// nothing.
+fn count_mobpack_work() {
+    #[cfg(test)]
+    MOBPACK_WORK.with(|work| work.set(work.get().saturating_add(1)));
 }
 
 fn graph_to_flow_compare_nodes(a: &Value, b: &Value) -> std::cmp::Ordering {
@@ -13225,18 +13395,22 @@ fn graph_to_flow_compare_nodes(a: &Value, b: &Value) -> std::cmp::Ordering {
 }
 
 fn graph_to_flow_col(value: &Value) -> i64 {
+    count_mobpack_work();
     value.get("col").and_then(Value::as_i64).unwrap_or(0)
 }
 
 fn graph_to_flow_row(value: &Value) -> i64 {
+    count_mobpack_work();
     value.get("row").and_then(Value::as_i64).unwrap_or(0)
 }
 
 fn graph_to_flow_bool(value: &Value, key: &str) -> bool {
+    count_mobpack_work();
     value.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
 fn graph_to_flow_string(value: &Value, key: &str) -> String {
+    count_mobpack_work();
     value
         .get(key)
         .and_then(Value::as_str)
@@ -38624,5 +38798,355 @@ branch = "choice"
             ),
             (None, Some(json!("drafts")), None, 299)
         );
+    }
+
+    /// Runs `f`, returning its result and the work it did on this thread, in
+    /// [`count_mobpack_work`] units.
+    fn with_mobpack_work<R>(f: impl FnOnce() -> R) -> (R, u64) {
+        let before = MOBPACK_WORK.with(std::cell::Cell::get);
+        let result = f();
+        (result, MOBPACK_WORK.with(std::cell::Cell::get) - before)
+    }
+
+    /// Requires `work(n)` to grow about linearly with `n`. From 100 to 400
+    /// items, linear work grows about 4 times (5 with an n log n sort) and
+    /// quadratic work about 16 times. The units count reads, not time, so the
+    /// check is the same on any machine and under any load.
+    fn assert_work_grows_linearly(what: &str, work: impl Fn(usize) -> u64) {
+        let (small, large) = (work(100), work(400));
+        eprintln!("{what}: {small} units of work for 100 items, {large} for 400");
+        assert!(
+            large < small.saturating_mul(8),
+            "{what}: {small} units of work for 100 items, {large} for 400"
+        );
+    }
+
+    /// A document whose graph is a fork of `lanes` lanes of `length` member
+    /// nodes each, all closed by one join.
+    fn forked_graph_document(lanes: usize, length: usize) -> MobpackDocument {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.members = json!([{ "id": "worker", "name": "Worker" }]);
+        let mut instances =
+            vec![json!({ "id": "fork", "isGate": true, "gateKind": "fork", "col": 0 })];
+        let mut edges = Vec::new();
+        for lane in 0..lanes {
+            let mut previous = "fork".to_string();
+            for step in 0..length {
+                let id = format!("n{lane}_{step}");
+                instances
+                    .push(json!({ "id": id, "memberId": "worker", "col": step + 1, "row": lane }));
+                edges.push(json!({ "from": previous, "to": id, "kind": "next" }));
+                previous = id;
+            }
+            edges.push(json!({ "from": previous, "to": "join", "kind": "next" }));
+        }
+        instances
+            .push(json!({ "id": "join", "isGate": true, "gateKind": "join", "col": length + 1 }));
+        document.instances = Value::Array(instances);
+        document.edges = Value::Array(edges);
+        document
+    }
+
+    /// Deriving a flow from a graph reads each node and edge a bounded number
+    /// of times, so its work grows about linearly with the graph. Each lookup
+    /// scanned every instance or edge, and finding a fork's join walked the
+    /// graph again, scanning, for each join it tried: a fork of two lanes took
+    /// work quadratic in their length.
+    #[test]
+    fn graph_to_flow_work_grows_linearly_with_lane_length() {
+        let flow = graph_to_flow_from_document(&forked_graph_document(2, 3));
+        assert_eq!(
+            (
+                flow["steps"][1]["type"].as_str(),
+                flow["steps"][1]["branches"][1]["steps"]
+                    .as_array()
+                    .map(Vec::len),
+            ),
+            (Some("parallel"), Some(3)),
+            "{flow:#}"
+        );
+        assert_work_grows_linearly("a fork of two lanes of n nodes", |length| {
+            let document = forked_graph_document(2, length);
+            with_mobpack_work(|| graph_to_flow_from_document(&document)).1
+        });
+    }
+
+    /// A document whose graph has `width` members, a fork of `width` one-node
+    /// lanes closed by a join, and after the join a column of `width` nodes,
+    /// each behind a conditional edge.
+    fn wide_graph_document(width: usize) -> MobpackDocument {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.members = Value::Array(
+            (0..width)
+                .map(
+                    |index| json!({ "id": format!("m{index}"), "name": format!("Member {index}") }),
+                )
+                .collect(),
+        );
+        let mut instances = vec![
+            json!({ "id": "fork", "isGate": true, "gateKind": "fork", "col": 0 }),
+            json!({ "id": "join", "isGate": true, "gateKind": "join", "col": 2 }),
+        ];
+        let mut edges = Vec::new();
+        for index in 0..width {
+            let (lane, member, after) = (
+                format!("a{index}"),
+                format!("m{index}"),
+                format!("c{index}"),
+            );
+            instances.push(json!({ "id": lane, "memberId": member, "col": 1, "row": index }));
+            instances.push(json!({ "id": after, "memberId": member, "col": 3, "row": index }));
+            edges.push(json!({ "from": "fork", "to": lane, "kind": "fanout" }));
+            edges.push(json!({ "from": lane, "to": "join", "kind": "next" }));
+            edges.push(json!({
+                "from": "join",
+                "to": after,
+                "kind": "cond",
+                "cond": { "var": "params.lane", "op": "==", "val": index.to_string() },
+            }));
+        }
+        document.instances = Value::Array(instances);
+        document.edges = Value::Array(edges);
+        document
+    }
+
+    /// Lane labels and a column's conditional edges are looked up by id. Each
+    /// lookup scanned every member or edge, so a wide fork and a wide column
+    /// took work quadratic in their width.
+    #[test]
+    fn graph_to_flow_work_grows_linearly_with_fork_width() {
+        let flow = graph_to_flow_from_document(&wide_graph_document(2));
+        assert_eq!(
+            (
+                flow["steps"][1]["branches"][1]["label"].as_str(),
+                flow["steps"][2]["type"].as_str(),
+                flow["steps"][2]["branches"][1]["label"].as_str(),
+            ),
+            (Some("Member 1"), Some("branch"), Some("Member 1")),
+            "{flow:#}"
+        );
+        assert_work_grows_linearly("a fork and a column n nodes wide", |width| {
+            let document = wide_graph_document(width);
+            with_mobpack_work(|| graph_to_flow_from_document(&document)).1
+        });
+    }
+
+    /// A document whose graph has `count` forks of two one-node lanes that
+    /// end at a terminal, a join that no lane reaches, and `count` nodes
+    /// outside every fork.
+    fn many_forks_document(count: usize) -> MobpackDocument {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.members = json!([{ "id": "worker", "name": "Worker" }]);
+        let mut instances = vec![
+            json!({ "id": "join", "isGate": true, "gateKind": "join", "col": 3 * count }),
+            json!({ "id": "end", "isTerminal": true, "kind": "end", "col": 3 * count + 1 }),
+        ];
+        let mut edges = Vec::new();
+        for index in 0..count {
+            let (fork, col) = (format!("f{index}"), 3 * index);
+            instances.push(json!({ "id": fork, "isGate": true, "gateKind": "fork", "col": col }));
+            for (row, lane) in [format!("a{index}"), format!("b{index}")]
+                .into_iter()
+                .enumerate()
+            {
+                instances
+                    .push(json!({ "id": lane, "memberId": "worker", "col": col + 1, "row": row }));
+                edges.push(json!({ "from": fork, "to": lane, "kind": "fanout" }));
+                edges.push(json!({ "from": lane, "to": "end", "kind": "next" }));
+            }
+            instances
+                .push(json!({ "id": format!("c{index}"), "memberId": "worker", "col": col + 2 }));
+        }
+        document.instances = Value::Array(instances);
+        document.edges = Value::Array(edges);
+        document
+    }
+
+    /// A fork's join is read from where each node's lanes lead, worked out
+    /// once for the whole graph, and the nodes outside the forks are told
+    /// apart from the forks' columns by a sorted search. Every fork listed and
+    /// sorted the joins again and walked the graph from each lane start, and
+    /// every node outside the forks was compared with every fork, so a graph
+    /// of many forks took work quadratic in their number.
+    #[test]
+    fn graph_to_flow_work_grows_linearly_with_fork_count() {
+        let flow = graph_to_flow_from_document(&many_forks_document(2));
+        let types: Vec<_> = flow["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|step| step["type"].as_str())
+            .collect();
+        assert_eq!(
+            types,
+            ["input", "parallel", "member", "parallel", "member"],
+            "{flow:#}"
+        );
+        assert_work_grows_linearly("n forks", |count| {
+            let document = many_forks_document(count);
+            with_mobpack_work(|| graph_to_flow_from_document(&document)).1
+        });
+    }
+
+    /// A small deterministic generator (xorshift), so a failing case
+    /// reproduces.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+    }
+
+    /// The join search the derivation ran before it indexed the graph: for
+    /// each join in node order, a scan for an edge from a lane start and a
+    /// breadth-first walk from every lane start, scanning for each step.
+    fn scanned_find_join(
+        instances: &[Value],
+        edges: &[Value],
+        start_ids: &[String],
+    ) -> Option<Value> {
+        let node_by_id = |id: &str| {
+            instances
+                .iter()
+                .find(|instance| graph_to_flow_string(instance, "id") == id)
+                .cloned()
+        };
+        let reaches = |start_id: &str, target_id: &str| {
+            let mut queue = std::collections::VecDeque::from([start_id.to_string()]);
+            let mut seen = BTreeSet::new();
+            while let Some(id) = queue.pop_front() {
+                if id == target_id {
+                    return true;
+                }
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                for edge in edges
+                    .iter()
+                    .filter(|edge| graph_to_flow_string(edge, "from") == id)
+                {
+                    if let Some(node) = node_by_id(&graph_to_flow_string(edge, "to"))
+                        && !graph_to_flow_bool(&node, "isTerminal")
+                    {
+                        queue.push_back(graph_to_flow_string(&node, "id"));
+                    }
+                }
+            }
+            false
+        };
+        let mut joins: Vec<Value> = instances
+            .iter()
+            .filter(|instance| graph_to_flow_string(instance, "gateKind") == "join")
+            .cloned()
+            .collect();
+        joins.sort_by(graph_to_flow_compare_nodes);
+        joins.into_iter().find(|join| {
+            let join_id = graph_to_flow_string(join, "id");
+            start_ids.iter().any(|id| {
+                edges.iter().any(|edge| {
+                    graph_to_flow_string(edge, "from") == id.as_str()
+                        && graph_to_flow_string(edge, "to") == join_id
+                }) || reaches(id, &join_id)
+            })
+        })
+    }
+
+    /// The indexed join search finds the join the scanning one found, on
+    /// graphs with cycles, terminals, terminal joins, a node without an id,
+    /// ids that need trimming, and edges to unknown nodes or without
+    /// endpoints.
+    #[test]
+    fn indexed_join_search_matches_the_scanning_one() {
+        let mut random = Xorshift(0x2545_f491_4f6c_dd1d);
+        let mut found = 0;
+        for case in 0..500 {
+            let count = 2 + random.below(12);
+            let id = |index: usize| {
+                if index == 0 {
+                    String::new()
+                } else {
+                    format!("n{index}")
+                }
+            };
+            let instances: Vec<Value> = (0..count)
+                .map(|index| {
+                    let mut node = json!({
+                        "id": format!(" {} ", id(index)),
+                        "memberId": "worker",
+                        "col": random.below(5),
+                        "row": random.below(3),
+                    });
+                    if random.below(3) == 0 {
+                        node["gateKind"] = json!("join");
+                    }
+                    if random.below(5) == 0 {
+                        node["isTerminal"] = json!(true);
+                    }
+                    node
+                })
+                .collect();
+            let instances = graph_to_flow_unique_instances(&Value::Array(instances));
+            let endpoint = |random: &mut Xorshift| match random.below(count + 2) {
+                pick if pick < count => json!(id(pick)),
+                pick if pick == count => json!("unknown"),
+                _ => Value::Null,
+            };
+            let edges: Vec<Value> = (0..random.below(3 * count))
+                .map(|_| {
+                    let from = endpoint(&mut random);
+                    let to = endpoint(&mut random);
+                    json!({ "from": from, "to": to, "kind": "next" })
+                })
+                .collect();
+            let start_ids: Vec<String> = (0..=random.below(3))
+                .map(|_| graph_to_flow_string(&instances[random.below(instances.len())], "id"))
+                .collect();
+
+            let graph = GraphToFlowGraph::new(&instances, &edges, &[]);
+            let indexed = graph
+                .find_join(&start_ids)
+                .map(|join| graph_to_flow_string(&join, "id"));
+            let scanned = scanned_find_join(&instances, &edges, &start_ids)
+                .map(|join| graph_to_flow_string(&join, "id"));
+            assert_eq!(
+                indexed, scanned,
+                "case {case}: {instances:?} {edges:?} {start_ids:?}"
+            );
+            found += usize::from(indexed.is_some());
+        }
+        assert!(found > 100, "only {found} of 500 cases had a join");
+    }
+
+    /// The merged column ranges hold exactly the columns that some segment
+    /// spans.
+    #[test]
+    fn merged_spans_hold_the_columns_the_segments_span() {
+        let mut random = Xorshift(0x9e37_79b9_7f4a_7c15);
+        for case in 0..500 {
+            let segments: Vec<GraphToFlowSegment> = (0..random.below(6))
+                .map(|_| GraphToFlowSegment {
+                    col: random.below(12) as i64 - 2,
+                    span_end: random.below(12) as i64 - 2,
+                    step: Value::Null,
+                })
+                .collect();
+            let spans = graph_to_flow_merged_spans(&segments);
+            for col in -3..12 {
+                assert_eq!(
+                    graph_to_flow_spans_contain(&spans, col),
+                    segments
+                        .iter()
+                        .any(|segment| col >= segment.col && col <= segment.span_end),
+                    "case {case}, column {col}: {spans:?}"
+                );
+            }
+        }
     }
 }
