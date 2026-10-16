@@ -210,6 +210,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `XDG_STATE_HOME` or `HOME`. An unadopted predecessor gateway home, which
   already refused, refuses with the same kind and `reason`
   `predecessor_gateway_home` or `adoption_incomplete`.
+- Flow Editor draft replies (`meta/mobpacks/create`, `save`, `list`, `get`,
+  `undo`, `redo` and `delete`) name the draft store's host path as
+  `store_path` only to a caller with host access: the host's stdio and
+  in-process RPC, and a Flow Editor caller with the `mobpack.deploy` grant or
+  the host deploy opt-in. Every reply to any other caller, such as an
+  anonymous caller of a loopback Flow Editor route, carried the store's
+  absolute path. Those replies now carry no `store_path` (the SDKs' draft
+  results already read it as optional), and the store's read, parse and
+  write errors and its predecessor-home refusal name no host path to such a
+  caller. A Rust host that calls the `meerkat_meta::mobpack` draft functions
+  itself gets `store_path` when it runs them under
+  `with_host_path_skill_reads`, as it already does to read path skills.
 
 ### Added
 

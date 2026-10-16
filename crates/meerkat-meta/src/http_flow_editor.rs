@@ -1965,6 +1965,9 @@ mod tests {
         let store = std::path::PathBuf::from(
             std::env::var_os("META_FLOW_EDITOR_DRAFT_STORE").expect("child draft store"),
         );
+        // A caller without host access is never told where the host keeps
+        // the draft store.
+        let store_text = store.to_string_lossy().into_owned();
         let secret_text = "SWEEP-HOST-FILE-SECRET-4be7";
         let secret = scratch.join("id_secret");
         std::fs::write(&secret, secret_text).expect("write secret");
@@ -2056,6 +2059,11 @@ mod tests {
                     let _ = std::fs::remove_file(&marker);
                     let _ = std::fs::remove_dir_all(&outputs);
                 }
+                if response.to_string().contains(&store_text) {
+                    findings.push(format!(
+                        "{surface}: {method} named the draft store: {response}"
+                    ));
+                }
                 let store_path = json!({ "id": "probe", "store_path": chosen.join("drafts.json") });
                 let response = anonymous_flow_editor_rpc(
                     app,
@@ -2074,6 +2082,11 @@ mod tests {
                     anonymous_flow_editor_rpc(app, method, method_params(method, &leaking, &draft))
                         .await
                         .to_string();
+                if response.contains(&store_text) {
+                    findings.push(format!(
+                        "{surface}: {method} named the draft store: {response}"
+                    ));
+                }
                 if let Some(mark) = secret_marks
                     .iter()
                     .find(|mark| response.contains(mark.as_str()))
@@ -2110,6 +2123,9 @@ mod tests {
                     findings.push(format!("{surface}: draft {method} did not run: {response}"));
                 }
                 let response = response.to_string();
+                if response.contains(&store_text) {
+                    findings.push(format!("{surface}: draft {method} named the draft store"));
+                }
                 if let Some(mark) = secret_marks
                     .iter()
                     .find(|mark| response.contains(mark.as_str()))

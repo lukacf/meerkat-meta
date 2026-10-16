@@ -221,6 +221,10 @@ host path it names:
 
 - `store_path` is refused with `-32602` on every method. The draft store is
   the host's: `META_FLOW_EDITOR_DRAFT_STORE` or the gateway home.
+- Draft replies (`create`, `save`, `list`, `get`, `undo`, `redo`, `delete`)
+  carry `store_path`, the store's host path, only to a caller with host
+  access, and the draft store's errors and refusals name no host path to any
+  other caller.
 - A path skill in a document (`skill_realms` entry with `source: "path"`) is
   read only when `meta/skills/catalog` lists that file and the document names
   it by the listed path. Any other path is a

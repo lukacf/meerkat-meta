@@ -4023,7 +4023,10 @@ impl DraftStoreRefusal {
                                   a file in a directory only this user can write, or set \
                                   XDG_STATE_HOME or HOME"
                 .to_string(),
-            Self::GatewayHome(error) => error.to_string(),
+            Self::GatewayHome(error) if host_access() => error.to_string(),
+            Self::GatewayHome(_) => "the Flow Editor draft store is unavailable until the host \
+                                   finishes adopting its predecessor (pre-0.9) state"
+                .to_string(),
         }
     }
 }
@@ -4073,51 +4076,55 @@ pub(crate) fn mobpack_draft_store_method(
     })
 }
 
+/// A draft store reply: `reply`, naming the store's host path as `store_path`
+/// only to a caller with host access ([`host_access`]). Any other caller is
+/// not told where the host keeps it.
+fn draft_store_reply(mut reply: Value, path: &Path) -> Value {
+    if host_access() {
+        reply["store_path"] = json!(path);
+    }
+    reply
+}
+
+/// The draft store as a message names it: by its host path for a caller with
+/// host access ([`host_access`]), without one for any other caller.
+fn draft_store_name(path: &Path) -> String {
+    if host_access() {
+        format!("mobpack draft store {}", path.display())
+    } else {
+        "mobpack draft store".to_string()
+    }
+}
+
 fn read_mobpack_draft_store(path: &Path) -> Result<BTreeMap<String, Value>, String> {
     if !path.exists() {
         return Ok(BTreeMap::new());
     }
-    let bytes = std::fs::read(path).map_err(|err| {
-        format!(
-            "failed to read mobpack draft store {}: {err}",
-            path.display()
-        )
-    })?;
+    let bytes = std::fs::read(path)
+        .map_err(|err| format!("failed to read {}: {err}", draft_store_name(path)))?;
     if bytes.is_empty() {
         return Ok(BTreeMap::new());
     }
-    serde_json::from_slice(&bytes).map_err(|err| {
-        format!(
-            "failed to parse mobpack draft store {}: {err}",
-            path.display()
-        )
-    })
+    serde_json::from_slice(&bytes)
+        .map_err(|err| format!("failed to parse {}: {err}", draft_store_name(path)))
 }
 
 fn write_mobpack_draft_store(path: &Path, rows: &BTreeMap<String, Value>) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| {
             format!(
-                "failed to create mobpack draft store directory {}: {err}",
-                parent.display()
+                "failed to create the directory of {}: {err}",
+                draft_store_name(path)
             )
         })?;
     }
     let bytes = serde_json::to_vec_pretty(rows)
         .map_err(|err| format!("failed to encode mobpack draft store: {err}"))?;
     let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, bytes).map_err(|err| {
-        format!(
-            "failed to write mobpack draft store {}: {err}",
-            tmp_path.display()
-        )
-    })?;
-    std::fs::rename(&tmp_path, path).map_err(|err| {
-        format!(
-            "failed to replace mobpack draft store {}: {err}",
-            path.display()
-        )
-    })
+    std::fs::write(&tmp_path, bytes)
+        .map_err(|err| format!("failed to write {}: {err}", draft_store_name(path)))?;
+    std::fs::rename(&tmp_path, path)
+        .map_err(|err| format!("failed to replace {}: {err}", draft_store_name(path)))
 }
 
 fn mobpack_draft_id_from_params(
@@ -4499,12 +4506,14 @@ fn create_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
     // projected to can_undo/can_redo.
     let mut row = row;
     strip_draft_history_fields(&mut row);
-    Ok(json!({
-        "source": "meta/mobpacks/create",
-        "store_path": path,
-        "row": row,
-        "rows": sorted_mobpack_draft_rows(&rows),
-    }))
+    Ok(draft_store_reply(
+        json!({
+            "source": "meta/mobpacks/create",
+            "row": row,
+            "rows": sorted_mobpack_draft_rows(&rows),
+        }),
+        &path,
+    ))
 }
 
 fn sorted_mobpack_draft_rows(rows: &BTreeMap<String, Value>) -> Vec<Value> {
@@ -4645,12 +4654,14 @@ fn list_drafts(
         .into_iter()
         .chain(draft_rows)
         .collect::<Vec<_>>();
-    Ok(json!({
-        "source": "meta/mobpacks/list",
-        "store_path": path,
-        "runtime_backed": runtime.is_some(),
-        "rows": merged_rows,
-    }))
+    Ok(draft_store_reply(
+        json!({
+            "source": "meta/mobpacks/list",
+            "runtime_backed": runtime.is_some(),
+            "rows": merged_rows,
+        }),
+        &path,
+    ))
 }
 
 pub fn get_mobpack_draft(params: &Value) -> Result<Value, String> {
@@ -4695,12 +4706,14 @@ fn get_draft(
         .cloned()
         .ok_or_else(|| format!("mobpack draft not found: {id}"))?;
     let row = normalize_mobpack_draft_row(&row);
-    Ok(json!({
-        "source": "meta/mobpacks/get",
-        "store_path": path,
-        "runtime_backed": runtime.is_some(),
-        "row": row,
-    }))
+    Ok(draft_store_reply(
+        json!({
+            "source": "meta/mobpacks/get",
+            "runtime_backed": runtime.is_some(),
+            "row": row,
+        }),
+        &path,
+    ))
 }
 
 pub fn save_mobpack_draft(params: &Value) -> Result<Value, String> {
@@ -4740,12 +4753,14 @@ fn save_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
     rows.insert(id, row.clone());
     write_mobpack_draft_store(&path, &rows)?;
     let row = normalize_mobpack_draft_row(&row);
-    Ok(json!({
-        "source": "meta/mobpacks/save",
-        "store_path": path,
-        "row": row,
-        "rows": sorted_mobpack_draft_rows(&rows),
-    }))
+    Ok(draft_store_reply(
+        json!({
+            "source": "meta/mobpacks/save",
+            "row": row,
+            "rows": sorted_mobpack_draft_rows(&rows),
+        }),
+        &path,
+    ))
 }
 
 /// Maximum number of undo steps retained per draft in the store.
@@ -4858,28 +4873,32 @@ fn step_mobpack_draft_history(
     let restored = match step {
         MobpackDraftHistoryStep::Undo => {
             let Some(document) = history.pop() else {
-                return Ok(json!({
-                    "source": source,
-                    "store_path": path,
-                    "stepped": false,
-                    "reason": format!("nothing to {head}"),
-                    "row": normalize_mobpack_draft_row(&existing),
-                    "rows": sorted_mobpack_draft_rows(&rows),
-                }));
+                return Ok(draft_store_reply(
+                    json!({
+                        "source": source,
+                        "stepped": false,
+                        "reason": format!("nothing to {head}"),
+                        "row": normalize_mobpack_draft_row(&existing),
+                        "rows": sorted_mobpack_draft_rows(&rows),
+                    }),
+                    &path,
+                ));
             };
             future.push(current_document);
             document
         }
         MobpackDraftHistoryStep::Redo => {
             let Some(document) = future.pop() else {
-                return Ok(json!({
-                    "source": source,
-                    "store_path": path,
-                    "stepped": false,
-                    "reason": format!("nothing to {head}"),
-                    "row": normalize_mobpack_draft_row(&existing),
-                    "rows": sorted_mobpack_draft_rows(&rows),
-                }));
+                return Ok(draft_store_reply(
+                    json!({
+                        "source": source,
+                        "stepped": false,
+                        "reason": format!("nothing to {head}"),
+                        "row": normalize_mobpack_draft_row(&existing),
+                        "rows": sorted_mobpack_draft_rows(&rows),
+                    }),
+                    &path,
+                ));
             };
             history.push(current_document);
             document
@@ -4903,13 +4922,15 @@ fn step_mobpack_draft_history(
     rows.insert(id, row.clone());
     write_mobpack_draft_store(&path, &rows)?;
     let row = normalize_mobpack_draft_row(&row);
-    Ok(json!({
-        "source": source,
-        "store_path": path,
-        "stepped": true,
-        "row": row,
-        "rows": sorted_mobpack_draft_rows(&rows),
-    }))
+    Ok(draft_store_reply(
+        json!({
+            "source": source,
+            "stepped": true,
+            "row": row,
+            "rows": sorted_mobpack_draft_rows(&rows),
+        }),
+        &path,
+    ))
 }
 
 pub fn delete_mobpack_draft(params: &Value) -> Result<Value, String> {
@@ -4947,13 +4968,15 @@ fn delete_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
     }
     let deleted = rows.remove(&id).is_some();
     write_mobpack_draft_store(&path, &rows)?;
-    Ok(json!({
-        "source": "meta/mobpacks/delete",
-        "store_path": path,
-        "id": id,
-        "deleted": deleted,
-        "rows": sorted_mobpack_draft_rows(&rows),
-    }))
+    Ok(draft_store_reply(
+        json!({
+            "source": "meta/mobpacks/delete",
+            "id": id,
+            "deleted": deleted,
+            "rows": sorted_mobpack_draft_rows(&rows),
+        }),
+        &path,
+    ))
 }
 
 pub fn apply_mobpack_authoring_operation(params: &Value) -> Result<Value, String> {
@@ -14734,6 +14757,15 @@ std::thread_local! {
 
 fn path_skill_reads_set() -> bool {
     PATH_SKILL_READS.with(|reads| reads.borrow().is_some())
+}
+
+/// Whether the mobpack operation running on this thread runs for a caller
+/// with host access: [`with_host_path_skill_reads`] set its policy (the
+/// host's own channels, and a Flow Editor caller with the `mobpack.deploy`
+/// grant or the host deploy opt-in). Only such a caller reads any host path a
+/// document names, and only to such a caller do replies name host paths.
+fn host_access() -> bool {
+    PATH_SKILL_READS.with(|reads| matches!(reads.borrow().as_ref(), Some(PathSkillReads::Host)))
 }
 
 fn with_path_skill_reads<R>(reads: PathSkillReads, f: impl FnOnce() -> R) -> R {
@@ -38102,6 +38134,114 @@ branch = "choice"
         assert_eq!(
             (rpc_refusal(&created), rpc_refusal(&listed), written),
             (unavailable.clone(), unavailable, Vec::new())
+        );
+    }
+
+    /// The draft store's host path is named only to a caller with host
+    /// access. Every reply to any other caller (a Flow Editor HTTP caller
+    /// without the deploy grant or opt-in, or a Rust caller that set no host
+    /// read policy) carries no `store_path` and no path of the store.
+    #[test]
+    fn draft_store_replies_name_the_store_path_only_to_host_callers() {
+        let store = tempfile::tempdir().expect("tempdir");
+        let store_path = store.path().join("drafts.json");
+        let store_text = store.path().to_string_lossy().into_owned();
+        let draft = |extra: Value| {
+            let mut params = json!({ "store_path": store_path, "id": "named" });
+            if let (Some(params), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+                params.extend(extra.clone());
+            }
+            params
+        };
+
+        let replies = with_untrusted_path_skill_reads(None, || {
+            [
+                create_mobpack_draft(&draft(json!({ "name": "Named" }))),
+                save_mobpack_draft(&draft(json!({ "document": valid_document() }))),
+                list_mobpack_drafts(&draft(json!({}))),
+                get_mobpack_draft(&draft(json!({}))),
+                undo_mobpack_draft(&draft(json!({}))),
+                redo_mobpack_draft(&draft(json!({}))),
+                delete_mobpack_draft(&draft(json!({}))),
+            ]
+        });
+        let host_list = with_host_path_skill_reads(|| list_mobpack_drafts(&draft(json!({}))));
+
+        let named = replies
+            .iter()
+            .map(|reply| {
+                let reply = reply.as_ref().expect("draft reply");
+                (
+                    reply.get("store_path").is_some(),
+                    reply.to_string().contains(&store_text),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (named, host_list.expect("host list")["store_path"].clone()),
+            (vec![(false, false); 7], json!(store_path))
+        );
+    }
+
+    /// A draft store failure names the store's host path to the host only.
+    #[test]
+    fn draft_store_errors_name_the_store_path_only_to_host_callers() {
+        let store = tempfile::tempdir().expect("tempdir");
+        let store_path = store.path().join("drafts.json");
+        std::fs::write(&store_path, b"{ not json").expect("corrupt store");
+        let store_text = store.path().to_string_lossy().into_owned();
+        let params = json!({ "store_path": store_path });
+
+        let untrusted = with_untrusted_path_skill_reads(None, || list_mobpack_drafts(&params));
+        let host = with_host_path_skill_reads(|| list_mobpack_drafts(&params));
+
+        assert_eq!(
+            (
+                untrusted
+                    .map_err(|error| (error.contains("draft store"), error.contains(&store_text))),
+                host.map_err(|error| error.contains(&store_text)),
+            ),
+            (Err((true, false)), Err(true))
+        );
+    }
+
+    /// While a predecessor gateway home waits for adoption the draft store
+    /// refuses, and names the homes' host paths to the host only.
+    #[cfg(unix)]
+    #[test]
+    fn draft_store_predecessor_refusal_names_host_paths_only_to_the_host() {
+        let Some(scratch) = std::env::var_os(DRAFT_STORE_CHILD) else {
+            let scratch = tempfile::tempdir().expect("tempdir");
+            let state = scratch.path().join("state");
+            std::fs::create_dir_all(
+                state.join(crate::storage_predecessor::PREDECESSOR_GATEWAY_HOME_DIR_NAME),
+            )
+            .expect("predecessor gateway home");
+            run_test_in_child(
+                "mobpack::tests::draft_store_predecessor_refusal_names_host_paths_only_to_the_host",
+                &[
+                    (DRAFT_STORE_CHILD, Some(scratch.path().as_os_str())),
+                    ("XDG_STATE_HOME", Some(state.as_os_str())),
+                    ("META_FLOW_EDITOR_DRAFT_STORE", None),
+                ],
+            );
+            return;
+        };
+        let scratch_text = std::path::PathBuf::from(scratch)
+            .to_string_lossy()
+            .into_owned();
+
+        let untrusted = draft_store_rpc("meta/mobpacks/list", json!({}));
+        let host = with_host_path_skill_reads(|| list_mobpack_drafts(&json!({})));
+
+        assert_eq!(
+            (
+                untrusted
+                    .error
+                    .map(|error| error.message.contains(&scratch_text)),
+                host.map_err(|error| error.contains(&scratch_text)),
+            ),
+            (Some(false), Err(true))
         );
     }
 }
