@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Python SDK: when the gateway's stdout closed while `meta/init` was in
+  flight (the gateway exited, or wrote a fail-closed init refusal and
+  exited), asyncio logged "Future exception was never retrieved" with a
+  `TransportReaderFailedError`. The reader fails the init request and the
+  init's settlement future together, and only the request's failure was
+  raised. Closing the init watch now retires that future on the host loop: a
+  delivered failure is read, and a pending one is cancelled, so a delivery
+  still queued does nothing. The caller's typed error is unchanged
+  (`InitOutcomeUnknownError`, the typed refusal such as
+  `StorageResolutionError`, or `GatewayStartupCleanupError` when the stop
+  then fails). Waiting for the settlement no longer goes through
+  `asyncio.shield`, which after a deadline or a cancelled wait left a later
+  failure unretrieved (Python 3.14 logged it as an exception in a shielded
+  future). The deadline still raises `asyncio.TimeoutError`, and neither it
+  nor a cancelled caller ends the settlement.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

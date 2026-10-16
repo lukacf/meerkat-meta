@@ -4,6 +4,14 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- A gateway whose stdout closes while `meta/init` is in flight (it exits, or
+  writes a fail-closed init refusal and exits) no longer leaves asyncio
+  logging "Future exception was never retrieved" with a
+  `TransportReaderFailedError`. Closing the init watch retires its
+  settlement future on the host loop; the caller's typed error is unchanged.
+
 ## 0.9.2
 
 - No SDK API changes; released with Meta 0.9.2 on Meerkat 0.9.2.

@@ -8,16 +8,20 @@ pin the SDK side of every outcome without a real gateway:
 - once the init request is written, a lost acceptance, a gateway exit, an
   init deadline or a foreign init id is ``InitOutcomeUnknownError``, never a
   refusal;
+- stdout closing during init leaves no unretrieved settlement exception for
+  asyncio to report, and the caller's typed error arrives unchanged;
 - an older gateway's single response still connects.
 The real-gateway counterparts live in ``test_init_protocol_real_gateway.py``.
 """
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import sys
 import textwrap
 import time
+import weakref
 from pathlib import Path
 
 import pytest
@@ -31,11 +35,17 @@ from meerkat_meta import (
     InitOutcomeUnknownError,
     RpcError,
     StorageResolutionError,
+    TransportReaderFailedError,
     TransportTermination,
 )
 from meerkat_meta._transport import PersistentTransport
 from meerkat_meta.builder import Meta
 from meerkat_meta.runtime import MetaRuntime, _rpc_error_from_payload
+
+from .test_transport_robustness import (
+    _assert_settlements_retired,
+    _loop_exception_reports,
+)
 
 # Every stand-in shares this prelude: it reads the init request, records it,
 # and gives the scenario helpers to answer.
@@ -275,6 +285,158 @@ async def test_gateway_exit_after_acceptance_is_outcome_unknown_not_a_refusal(tm
     assert not isinstance(error, RpcError)
     assert error.last_phase == "prewarm"
     assert "closed its stdout" in error.reason
+
+
+class _WatchedTransport(PersistentTransport):
+    """A real transport that keeps a weak reference to each init settlement
+    future it opens, so a test can prove that future was collected."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.settlements: list[weakref.ref] = []
+        self.settled_at_close: list[bool] = []
+
+    def open_init_watch(self, init_id):
+        watch = super().open_init_watch(init_id)
+        self.settlements.append(weakref.ref(watch._settlement))
+        return watch
+
+    def close_init_watch(self, watch):
+        self.settled_at_close.append(watch._settlement.done())
+        super().close_init_watch(watch)
+
+
+class _FirstStopFailsTransport(_WatchedTransport):
+    """Its first stop() stops the child, then reports a failure."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stops = 0
+
+    def stop(self):
+        super().stop()
+        self.stops += 1
+        if self.stops == 1:
+            raise RuntimeError("the first stop failed for the test")
+
+
+class _ReaderFirstTransport(_WatchedTransport):
+    """Returns the init response only after its reader stopped, so the
+    reader's EOF fails the init watch before init closes it."""
+
+    async def send_async(self, request, *, timeout=None):
+        response = await super().send_async(request, timeout=timeout)
+        if request.get("method") == "meta/init":
+            await asyncio.to_thread(self._reader_thread.join, 5)
+        return response
+
+
+@pytest.fixture
+def watched_transports(monkeypatch):
+    """Make runtimes build the given transport class; returns its instances."""
+    made: list[_WatchedTransport] = []
+
+    def use(transport_class):
+        def build(*args, **kwargs):
+            transport = transport_class(*args, **kwargs)
+            made.append(transport)
+            return transport
+
+        monkeypatch.setattr(runtime_module, "PersistentTransport", build)
+        return made
+
+    return use
+
+
+_STOPPED_CLEANLY = TransportTermination("exited", 0, None, "none", "not_negotiated")
+
+
+@pytest.mark.parametrize(
+    "stop_fails", [False, True], ids=["stop_succeeds", "stop_fails"]
+)
+@pytest.mark.asyncio
+async def test_stdout_closing_during_init_leaves_no_unretrieved_settlement(
+    tmp_path, watched_transports, stop_fails
+):
+    """#251: the reader's EOF fails the pending init request and the init
+    watch together. The caller raises the request's typed failure unchanged,
+    and closing the watch retires its settlement, so asyncio never reports
+    "Future exception was never retrieved" (TransportReaderFailedError)."""
+    transports = watched_transports(
+        _FirstStopFailsTransport if stop_fails else _WatchedTransport
+    )
+    script = _gateway(tmp_path, "closes_stdout", """
+        import os
+        os.close(1)  # stdout closes while meta/init is in flight
+        for raw in sys.stdin:  # hold stdin until the SDK closes it
+            pass
+    """)
+    with _loop_exception_reports() as reports:
+        runtime = _runtime(script)
+        if stop_fails:
+            with pytest.raises(GatewayStartupCleanupError) as raised_cleanup:
+                await runtime.connect()
+            failure = raised_cleanup.value
+            error = failure.startup_error
+            assert failure.__cause__ is error
+            assert type(failure.cleanup_error) is RuntimeError
+            assert str(failure.cleanup_error) == "the first stop failed for the test"
+            assert failure.cleanup.last_termination == _STOPPED_CLEANLY
+            await failure.cleanup.shutdown()
+            del raised_cleanup, failure
+        else:
+            with pytest.raises(InitOutcomeUnknownError) as raised:
+                await runtime.connect()
+            error = raised.value
+            del raised
+        assert type(error) is InitOutcomeUnknownError
+        assert error.init_id == _records(script)[0]["init"]["params"]["init_id"]
+        assert error.last_phase is None
+        assert "closed its stdout" in error.reason
+        assert type(error.__cause__) is TransportReaderFailedError
+        del error
+        assert runtime.last_gateway_termination == _STOPPED_CLEANLY
+        assert not runtime.is_running
+        (transport,) = transports
+        await _assert_settlements_retired(transport.settlements, reports)
+
+
+@pytest.mark.asyncio
+async def test_fail_closed_refusal_then_stdout_close_leaves_no_unretrieved_settlement(
+    tmp_path, watched_transports
+):
+    """A fail-closed init refusal is written just before the gateway exits.
+    When the reader's EOF fails the init watch before init closes it, the
+    caller still raises the typed refusal unchanged, and closing the watch
+    retires the failure the reader delivered."""
+    transports = watched_transports(_ReaderFirstTransport)
+    script = _gateway(tmp_path, "refuses_then_closes", """
+        import os
+        emit({"jsonrpc": "2.0", "id": init["id"], "error": {
+            "code": -32014, "message": "storage refused for the test"}})
+        os.close(1)  # the fail-closed exit closes stdout right after
+        for raw in sys.stdin:  # hold stdin until the SDK closes it
+            pass
+    """)
+    with _loop_exception_reports() as reports:
+        runtime = _runtime(script)
+        with pytest.raises(StorageResolutionError) as raised:
+            await runtime.connect()
+        error = raised.value
+        del raised
+        assert type(error) is StorageResolutionError
+        assert error.code == -32014
+        assert str(error) == "storage refused for the test"
+        assert error.method == "meta/init"
+        assert error.__cause__ is None
+        del error
+        assert runtime.last_gateway_termination == _STOPPED_CLEANLY
+        (transport,) = transports
+        assert transport.child_ended.reason == "the gateway closed its stdout"
+        assert transport.settled_at_close == [True], (
+            "EOF did not reach the watch before close"
+        )
+        await _assert_settlements_retired(transport.settlements, reports)
 
 
 @pytest.mark.asyncio
