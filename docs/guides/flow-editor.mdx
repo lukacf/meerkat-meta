@@ -152,7 +152,9 @@ Drafts autosave through `meta/mobpacks/save` into a host JSON store with optimis
 `meta/mobpacks/validate` always runs Meta structural validation
 (`meerkat_mob::validate_definition` + `SpecValidator`). One validation
 reports at most 1000 diagnostics; past that it ends with a
-`diagnostics_truncated` diagnostic. Every method that takes a document
+`diagnostics_truncated` diagnostic. It holds no more than those 1000 while it
+runs, so its memory does not grow with the number of problems a document
+has. Every method that takes a document
 (and import and draft save) refuses one whose skill content, summed over
 every skill entry, passes 16 MiB. A document with more than 1000 members,
 more than 256 branches in one parallel or branch step, or more than 1024

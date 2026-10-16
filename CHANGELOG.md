@@ -177,6 +177,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   synthesizes in memory outside the gzip stream, were not covered by the
   stream cap at all, so a roughly 150-byte upload declaring an 8 GiB sparse
   file could exhaust memory.
+- Flow Editor validation holds at most the 1000 diagnostics it reports while
+  it runs. It built every diagnostic before it truncated the list, so its peak
+  memory grew with the number of problems in a document: a flow of 100000
+  empty steps, about 300 KiB of JSON that any caller reaching a Flow Editor
+  route could send, took about 100 MiB. Every check now passes its
+  diagnostics to one collector that keeps the first 1000 and only notes the
+  rest. A validation still fails on an error past the cap and still ends with
+  `diagnostics_truncated`, whose severity is `error` when a dropped
+  diagnostic was one.
 
 ### Added
 
@@ -359,9 +368,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The Flow Editor draft store has no total size or draft count limit yet:
   each draft is bounded (its document's skill content is capped at 16 MiB),
   but the number of drafts is not. Store-wide limits are planned for 0.9.3.
-- The Flow Editor's remaining resource limits continue in 0.9.3: draft store
-  totals, and validation, whose peak memory stays linear in its (capped)
-  input.
 
 ## [0.9.1] - 2026-10-15
 

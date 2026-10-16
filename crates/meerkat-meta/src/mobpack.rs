@@ -17032,10 +17032,9 @@ struct RenderState<'a> {
 fn render_editor_document_mob_toml(document: &MobpackDocument) -> Result<String, String> {
     // The structure caps bound what compiling the flow builds; the bounded
     // sink bounds what rendering writes, whatever the document's shape.
-    if let Some(refusal) = validate_document_structure_caps(document)
-        .into_iter()
-        .next()
-    {
+    let mut caps = MobpackDiagnostics::default();
+    validate_document_structure_caps(document, &mut caps);
+    if let Some(refusal) = caps.finish().into_iter().next() {
         return Err(refusal.message);
     }
     let mut lines = RenderedLines::new();
@@ -17230,8 +17229,10 @@ const MOBPACK_MAX_FLOW_BRANCHES: usize = 1024;
 /// Structure caps checked before a document is rendered: at most
 /// [`MOBPACK_MAX_MEMBERS`] members, [`MOBPACK_MAX_STEP_BRANCHES`] branches in
 /// one step and [`MOBPACK_MAX_FLOW_BRANCHES`] in the flow.
-fn validate_document_structure_caps(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_document_structure_caps(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let members = document.members.as_array().map_or(0, Vec::len);
     if members > MOBPACK_MAX_MEMBERS {
         diagnostics.push(MobpackDiagnostic {
@@ -17281,7 +17282,6 @@ fn validate_document_structure_caps(document: &MobpackDocument) -> Vec<MobpackDi
             path: Some("flow.steps".to_string()),
         });
     }
-    diagnostics
 }
 
 fn compile_editor_flow(steps: &[Value], members: &[&Value]) -> RenderedFlow {
@@ -18564,7 +18564,7 @@ fn emit_json_toml(lines: &mut RenderedLines, table: &str, value: &Value) {
 }
 
 fn validate_document(document: &MobpackDocument) -> MobpackValidationResult {
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = MobpackDiagnostics::default();
     if document.schema_version.trim() != MOBPACK_SCHEMA_VERSION {
         diagnostics.push(MobpackDiagnostic {
             severity: "warning".to_string(),
@@ -18584,33 +18584,30 @@ fn validate_document(document: &MobpackDocument) -> MobpackValidationResult {
             path: Some("name".to_string()),
         });
     }
-    diagnostics.extend(validate_document_structure_caps(document));
-    diagnostics.extend(validate_removed_budget_split_policies(document));
-    diagnostics.extend(validate_launch_modes(document));
-    diagnostics.extend(validate_deploy_settings(&document.deploy));
-    diagnostics.extend(validate_deploy_runtime_modes(document));
-    diagnostics.extend(validate_editor_schemas(&document.schemas));
-    diagnostics.extend(validate_editor_input_params(&document.flow));
-    diagnostics.extend(validate_editor_flow_step_identities(&document.flow));
-    diagnostics.extend(validate_editor_flow_step_types(&document.flow));
-    diagnostics.extend(validate_editor_flow_step_metadata(&document.flow));
-    diagnostics.extend(validate_editor_adaptive_steps(document));
-    diagnostics.extend(validate_editor_flow_member_roles(document));
-    diagnostics.extend(validate_editor_flow_control_members(document));
-    diagnostics.extend(validate_editor_flow_conditions(&document.flow));
-    diagnostics.extend(validate_graph_projection(document));
-    diagnostics.extend(validate_editor_member_identities(document));
-    diagnostics.extend(validate_member_profile_bindings(document));
-    diagnostics.extend(validate_skill_realms(document));
-    diagnostics.extend(validate_member_catalog_references(document));
-    diagnostics.extend(validate_editor_flow_step_tool_references(document));
-    diagnostics.extend(validate_selected_skill_sources(document));
-    diagnostics.extend(validate_selected_path_skill_files(document));
+    validate_document_structure_caps(document, &mut diagnostics);
+    validate_removed_budget_split_policies(document, &mut diagnostics);
+    validate_launch_modes(document, &mut diagnostics);
+    validate_deploy_settings(&document.deploy, &mut diagnostics);
+    validate_deploy_runtime_modes(document, &mut diagnostics);
+    validate_editor_schemas(&document.schemas, &mut diagnostics);
+    validate_editor_input_params(&document.flow, &mut diagnostics);
+    validate_editor_flow_step_identities(&document.flow, &mut diagnostics);
+    validate_editor_flow_step_types(&document.flow, &mut diagnostics);
+    validate_editor_flow_step_metadata(&document.flow, &mut diagnostics);
+    validate_editor_adaptive_steps(document, &mut diagnostics);
+    validate_editor_flow_member_roles(document, &mut diagnostics);
+    validate_editor_flow_control_members(document, &mut diagnostics);
+    validate_editor_flow_conditions(&document.flow, &mut diagnostics);
+    validate_graph_projection(document, &mut diagnostics);
+    validate_editor_member_identities(document, &mut diagnostics);
+    validate_member_profile_bindings(document, &mut diagnostics);
+    validate_skill_realms(document, &mut diagnostics);
+    validate_member_catalog_references(document, &mut diagnostics);
+    validate_editor_flow_step_tool_references(document, &mut diagnostics);
+    validate_selected_skill_sources(document, &mut diagnostics);
+    validate_selected_path_skill_files(document, &mut diagnostics);
 
-    if diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.severity == "error")
-    {
+    if diagnostics.has_error() {
         return invalid_validation_result(diagnostics);
     }
 
@@ -18640,30 +18637,20 @@ fn validate_document(document: &MobpackDocument) -> MobpackValidationResult {
                         path: diagnostic.location,
                     }),
             );
-            diagnostics.extend(validate_editor_projection_matches_definition(
+            validate_editor_projection_matches_definition(document, &definition, &mut diagnostics);
+            validate_mob_settings_match_definition(document, &definition, &mut diagnostics);
+            validate_editor_flow_members_match_definition(document, &definition, &mut diagnostics);
+            validate_editor_flow_step_metadata_matches_definition(
                 document,
                 &definition,
-            ));
-            diagnostics.extend(validate_mob_settings_match_definition(
-                document,
-                &definition,
-            ));
-            diagnostics.extend(validate_editor_flow_members_match_definition(
-                document,
-                &definition,
-            ));
-            diagnostics.extend(validate_editor_flow_step_metadata_matches_definition(
-                document,
-                &definition,
-            ));
+                &mut diagnostics,
+            );
             if let Err(schema_diagnostics) = expected_schema_files_from_definition(&definition) {
                 diagnostics.extend(schema_diagnostics);
             }
             let flow_ids = definition.flows.keys().map(ToString::to_string).collect();
-            let ok = !diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.severity == "error");
-            let diagnostics = cap_validation_diagnostics(diagnostics);
+            let ok = !diagnostics.has_error();
+            let diagnostics = diagnostics.finish();
             MobpackValidationResult {
                 ok,
                 display_rows: validation_display_rows(ok, &diagnostics, MOBPACK_VALIDATION_SOURCE),
@@ -18690,33 +18677,69 @@ fn validate_document(document: &MobpackDocument) -> MobpackValidationResult {
 /// it the result ends with one `diagnostics_truncated` diagnostic.
 const MOBPACK_MAX_VALIDATION_DIAGNOSTICS: usize = 1000;
 
-fn cap_validation_diagnostics(mut diagnostics: Vec<MobpackDiagnostic>) -> Vec<MobpackDiagnostic> {
-    if diagnostics.len() <= MOBPACK_MAX_VALIDATION_DIAGNOSTICS {
-        return diagnostics;
-    }
-    let dropped = diagnostics.split_off(MOBPACK_MAX_VALIDATION_DIAGNOSTICS);
-    let severity = if dropped
-        .iter()
-        .any(|diagnostic| diagnostic.severity == "error")
-    {
-        "error"
-    } else {
-        "warning"
-    };
-    diagnostics.push(MobpackDiagnostic {
-        severity: severity.to_string(),
-        code: "diagnostics_truncated".to_string(),
-        message: format!(
-            "validation reports at most {MOBPACK_MAX_VALIDATION_DIAGNOSTICS} diagnostics; more \
-             were found and not reported, so fix these and validate again"
-        ),
-        path: None,
-    });
-    diagnostics
+/// The diagnostics of one validation, as its checks find them. It keeps the
+/// first [`MOBPACK_MAX_VALIDATION_DIAGNOSTICS`] and only notes the rest, so a
+/// validation holds at most that many in memory however many problems its
+/// document has. An error past the cap still fails the validation.
+#[derive(Default)]
+struct MobpackDiagnostics {
+    kept: Vec<MobpackDiagnostic>,
+    /// Whether any diagnostic, kept or not, is an error.
+    error: bool,
+    /// Whether a diagnostic past the cap was dropped.
+    truncated: bool,
+    /// Whether a dropped diagnostic was an error.
+    truncated_error: bool,
 }
 
-fn invalid_validation_result(diagnostics: Vec<MobpackDiagnostic>) -> MobpackValidationResult {
-    let diagnostics = cap_validation_diagnostics(diagnostics);
+impl MobpackDiagnostics {
+    fn push(&mut self, diagnostic: MobpackDiagnostic) {
+        let error = diagnostic.severity == "error";
+        self.error |= error;
+        if self.kept.len() < MOBPACK_MAX_VALIDATION_DIAGNOSTICS {
+            self.kept.push(diagnostic);
+        } else {
+            self.truncated = true;
+            self.truncated_error |= error;
+        }
+    }
+
+    fn extend(&mut self, diagnostics: impl IntoIterator<Item = MobpackDiagnostic>) {
+        for diagnostic in diagnostics {
+            self.push(diagnostic);
+        }
+    }
+
+    fn has_error(&self) -> bool {
+        self.error
+    }
+
+    /// The kept diagnostics, ending with one `diagnostics_truncated`
+    /// diagnostic when any were dropped: an error when a dropped one was.
+    fn finish(self) -> Vec<MobpackDiagnostic> {
+        let mut diagnostics = self.kept;
+        if self.truncated {
+            diagnostics.push(MobpackDiagnostic {
+                severity: if self.truncated_error {
+                    "error"
+                } else {
+                    "warning"
+                }
+                .to_string(),
+                code: "diagnostics_truncated".to_string(),
+                message: format!(
+                    "validation reports at most {MOBPACK_MAX_VALIDATION_DIAGNOSTICS} diagnostics; \
+                     more were found and not reported, so fix these and validate again"
+                ),
+                path: None,
+            });
+        }
+        diagnostics
+    }
+}
+
+fn invalid_validation_result(diagnostics: MobpackDiagnostics) -> MobpackValidationResult {
+    let diagnostics = diagnostics.finish();
     MobpackValidationResult {
         ok: false,
         display_rows: validation_display_rows(false, &diagnostics, MOBPACK_VALIDATION_SOURCE),
@@ -18770,7 +18793,10 @@ fn validation_display_rows(
     rows
 }
 
-fn validate_removed_budget_split_policies(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_removed_budget_split_policies(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let mut paths = BTreeSet::new();
     collect_removed_budget_split_policy_paths(
         &document.launch_modes,
@@ -18790,24 +18816,27 @@ fn validate_removed_budget_split_policies(document: &MobpackDocument) -> Vec<Mob
             );
         }
     }
-    paths
-        .into_iter()
-        .map(|path| MobpackDiagnostic {
-            severity: "error".to_string(),
-            code: "unsupported_budget_split_policy".to_string(),
-            message: "budget split policies are no longer supported because Meerkat has no enforceable split-policy runtime seam; use explicit per-member budget limits instead"
-                .to_string(),
-            path: Some(path),
-        })
-        .collect()
+    diagnostics.extend(paths.into_iter().map(|path| MobpackDiagnostic {
+        severity: "error".to_string(),
+        code: "unsupported_budget_split_policy".to_string(),
+        message: "budget split policies are no longer supported because Meerkat has no enforceable split-policy runtime seam; use explicit per-member budget limits instead"
+            .to_string(),
+        path: Some(path),
+    }));
 }
 
+/// Collect the paths of removed budget split policies under `value`. Every
+/// one is an error, so past one more than the diagnostic cap the rest would
+/// only be dropped: collecting stops there.
 fn collect_removed_budget_split_policy_paths(
     value: &Value,
     path: &str,
     accepts_budget_alias: bool,
     paths: &mut BTreeSet<String>,
 ) {
+    if paths.len() > MOBPACK_MAX_VALIDATION_DIAGNOSTICS {
+        return;
+    }
     match value {
         Value::Object(object) => {
             for (key, child) in object {
@@ -18839,17 +18868,18 @@ fn collect_removed_budget_split_policy_paths(
     }
 }
 
-fn validate_launch_modes(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_launch_modes(document: &MobpackDocument, diagnostics: &mut MobpackDiagnostics) {
     if document.launch_modes.is_null() {
-        return Vec::new();
+        return;
     }
     let Some(items) = document.launch_modes.as_array() else {
-        return vec![MobpackDiagnostic {
+        diagnostics.push(MobpackDiagnostic {
             severity: "error".to_string(),
             code: "invalid_launch_modes".to_string(),
             message: "document.launch_modes must be an array".to_string(),
             path: Some("launch_modes".to_string()),
-        }];
+        });
+        return;
     };
     let member_ids = editor_member_ids(document);
     let step_ids = editor_flow_member_step_ids(&document.flow);
@@ -18863,7 +18893,6 @@ fn validate_launch_modes(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
     let profile_by_member = editor_profile_by_member_id(document);
     let flow_launch_modes = editor_flow_member_launch_modes(&document.flow);
     let mut launch_step_ids = BTreeSet::new();
-    let mut diagnostics = Vec::new();
     for (index, item) in items.iter().enumerate() {
         let path = format!("launch_modes[{index}].launch_mode");
         let step_id = item
@@ -19076,23 +19105,20 @@ fn validate_launch_modes(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
             });
         }
     }
-    diagnostics
 }
 
-fn validate_editor_flow_step_types(flow: &Value) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_editor_flow_step_types(flow: &Value, diagnostics: &mut MobpackDiagnostics) {
     collect_editor_flow_step_type_diagnostics(
         flow.get("steps").and_then(Value::as_array),
         "flow.steps",
-        &mut diagnostics,
+        diagnostics,
     );
-    diagnostics
 }
 
 fn collect_editor_flow_step_type_diagnostics(
     steps: Option<&Vec<Value>>,
     path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(steps) = steps else {
         return;
@@ -19140,25 +19166,25 @@ fn collect_editor_flow_step_type_diagnostics(
     }
 }
 
-fn validate_editor_flow_step_metadata(flow: &Value) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_editor_flow_step_metadata(flow: &Value, diagnostics: &mut MobpackDiagnostics) {
     collect_editor_flow_step_metadata_diagnostics(
         flow.get("steps").and_then(Value::as_array),
         "flow.steps",
-        &mut diagnostics,
+        diagnostics,
     );
-    diagnostics
 }
 
 /// Adaptive-layer diagnostics. The "empty" gaps (prompt, objectiveClass,
 /// profileTemplateIds) are draft gates: like a member step without an
 /// instruction they keep the document at stage "draft" until filled in.
-fn validate_editor_adaptive_steps(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_editor_adaptive_steps(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let steps = adaptive_flow_steps(&document.flow);
     if steps.is_empty() {
-        return Vec::new();
+        return;
     }
-    let mut diagnostics = Vec::new();
     let member_ids = editor_member_ids(document);
     let schema_ids = editor_schema_map(&document.schemas);
     for (index, (path, step)) in steps.iter().enumerate() {
@@ -19308,13 +19334,12 @@ fn validate_editor_adaptive_steps(document: &MobpackDocument) -> Vec<MobpackDiag
             }
         }
     }
-    diagnostics
 }
 
 fn collect_editor_flow_step_metadata_diagnostics(
     steps: Option<&Vec<Value>>,
     path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(steps) = steps else {
         return;
@@ -19405,7 +19430,7 @@ fn collect_editor_flow_step_metadata_diagnostics(
 fn validate_required_parallel_dispatch_field(
     step: &Value,
     step_path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(value) = step
         .get("dispatch")
@@ -19446,7 +19471,7 @@ fn validate_required_parallel_dispatch_field(
 fn validate_required_parallel_collection_field(
     step: &Value,
     step_path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     if step
         .get("collection")
@@ -19468,7 +19493,7 @@ fn validate_required_parallel_collection_field(
 fn validate_required_repeat_loop_id_field(
     step: &Value,
     step_path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     if step_string(step, "loopId").is_some() {
         return;
@@ -19484,7 +19509,7 @@ fn validate_required_repeat_loop_id_field(
 fn validate_required_repeat_max_iterations_field(
     step: &Value,
     step_path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(value) = step
         .get("maxIterations")
@@ -19518,7 +19543,7 @@ fn validate_optional_enum_field(
     code: &str,
     label: &str,
     path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(value) = object.get(camel_key).or_else(|| object.get(snake_key)) else {
         return;
@@ -19556,7 +19581,7 @@ fn validate_optional_positive_integer_field(
     code: &str,
     label: &str,
     path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(value) = object.get(camel_key).or_else(|| object.get(snake_key)) else {
         return;
@@ -19578,7 +19603,7 @@ fn validate_optional_positive_integer_field(
 fn validate_collection_policy_field(
     step: &Value,
     step_path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(value) = step
         .get("collection")
@@ -19629,35 +19654,34 @@ fn validate_collection_policy_field(
     }
 }
 
-fn validate_editor_flow_member_roles(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_editor_flow_member_roles(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let member_ids = editor_member_ids(document);
     collect_editor_flow_member_role_diagnostics(
         document.flow.get("steps").and_then(Value::as_array),
         "flow.steps",
         &member_ids,
-        &mut diagnostics,
+        diagnostics,
     );
-    diagnostics
 }
 
-fn validate_editor_flow_step_identities(flow: &Value) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_editor_flow_step_identities(flow: &Value, diagnostics: &mut MobpackDiagnostics) {
     let mut seen = BTreeSet::new();
     collect_editor_flow_step_identity_diagnostics(
         flow.get("steps").and_then(Value::as_array),
         "flow.steps",
         &mut seen,
-        &mut diagnostics,
+        diagnostics,
     );
-    diagnostics
 }
 
 fn collect_editor_flow_step_identity_diagnostics(
     steps: Option<&Vec<Value>>,
     path: &str,
     seen: &mut BTreeSet<String>,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(steps) = steps else {
         return;
@@ -19715,7 +19739,7 @@ fn collect_editor_flow_member_role_diagnostics(
     steps: Option<&Vec<Value>>,
     path: &str,
     member_ids: &BTreeSet<String>,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(steps) = steps else {
         return;
@@ -19784,23 +19808,24 @@ fn collect_editor_flow_member_role_diagnostics(
     }
 }
 
-fn validate_editor_flow_control_members(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_editor_flow_control_members(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let member_ids = editor_member_ids(document);
     collect_editor_flow_control_member_diagnostics(
         document.flow.get("steps").and_then(Value::as_array),
         "flow.steps",
         &member_ids,
-        &mut diagnostics,
+        diagnostics,
     );
-    diagnostics
 }
 
 fn collect_editor_flow_control_member_diagnostics(
     steps: Option<&Vec<Value>>,
     path: &str,
     member_ids: &BTreeSet<String>,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(steps) = steps else {
         return;
@@ -19906,23 +19931,21 @@ fn editor_branch_requires_join_member(step: &Value) -> bool {
     branch_count + usize::from(has_fallback) > 1
 }
 
-fn validate_editor_flow_conditions(flow: &Value) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_editor_flow_conditions(flow: &Value, diagnostics: &mut MobpackDiagnostics) {
     let input_params = editor_input_param_names(flow);
     collect_editor_flow_condition_diagnostics(
         flow.get("steps").and_then(Value::as_array),
         "flow.steps",
         &input_params,
-        &mut diagnostics,
+        diagnostics,
     );
-    diagnostics
 }
 
 fn collect_editor_flow_condition_diagnostics(
     steps: Option<&Vec<Value>>,
     path: &str,
     input_params: &BTreeSet<String>,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(steps) = steps else {
         return;
@@ -20094,7 +20117,7 @@ fn validate_required_repeat_condition_fields(
     step: &Value,
     step_path: &str,
     input_params: &BTreeSet<String>,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(cond) = step.get("cond").and_then(Value::as_object) else {
         diagnostics.push(MobpackDiagnostic {
@@ -20164,7 +20187,7 @@ fn validate_editor_param_ref(
     field: &str,
     input_params: &BTreeSet<String>,
     path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let field = field.trim();
     if field.is_empty() || !input_params.contains(field) {
@@ -20196,19 +20219,19 @@ fn editor_condition_operator_supported(op: &str) -> bool {
     matches!(op, "==" | ">" | "<")
 }
 
-fn validate_deploy_settings(deploy: &Value) -> Vec<MobpackDiagnostic> {
+fn validate_deploy_settings(deploy: &Value, diagnostics: &mut MobpackDiagnostics) {
     if deploy.is_null() {
-        return Vec::new();
+        return;
     }
     let Some(object) = deploy.as_object() else {
-        return vec![MobpackDiagnostic {
+        diagnostics.push(MobpackDiagnostic {
             severity: "error".to_string(),
             code: "invalid_deploy_settings".to_string(),
             message: "document.deploy must be an object".to_string(),
             path: Some("deploy".to_string()),
-        }];
+        });
+        return;
     };
-    let mut diagnostics = Vec::new();
     if let Some(command) = object
         .get("command")
         .and_then(Value::as_str)
@@ -20228,21 +20251,21 @@ fn validate_deploy_settings(deploy: &Value) -> Vec<MobpackDiagnostic> {
         "surface",
         &["cli", "rpc"],
         "invalid_deploy_surface",
-        &mut diagnostics,
+        diagnostics,
     );
     validate_deploy_string_enum(
         object,
         "trust_policy",
         &["permissive", "strict"],
         "invalid_deploy_trust_policy",
-        &mut diagnostics,
+        diagnostics,
     );
     validate_deploy_string_enum(
         object,
         "realm_backend",
         &["jsonl", "sqlite"],
         "invalid_deploy_realm_backend",
-        &mut diagnostics,
+        diagnostics,
     );
     if let Some(model) = object
         .get("model")
@@ -20263,8 +20286,8 @@ fn validate_deploy_settings(deploy: &Value) -> Vec<MobpackDiagnostic> {
             });
         }
     }
-    validate_deploy_non_negative_number(object, "max_total_tokens", &mut diagnostics);
-    validate_deploy_non_negative_number(object, "max_tool_calls", &mut diagnostics);
+    validate_deploy_non_negative_number(object, "max_total_tokens", diagnostics);
+    validate_deploy_non_negative_number(object, "max_tool_calls", diagnostics);
     // `rkat mob run` (meerkat 0.7) carries no model/token/tool-call/surface
     // override flags — runtime budgets and model are pack-policy concerns.
     // Surface an explicit warning instead of silently dropping overrides
@@ -20346,10 +20369,9 @@ fn validate_deploy_settings(deploy: &Value) -> Vec<MobpackDiagnostic> {
             }),
         }
     }
-    diagnostics
 }
 
-fn validate_deploy_runtime_modes(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_deploy_runtime_modes(document: &MobpackDocument, diagnostics: &mut MobpackDiagnostics) {
     let deploy_surface = document
         .deploy
         .get("surface")
@@ -20358,9 +20380,8 @@ fn validate_deploy_runtime_modes(document: &MobpackDocument) -> Vec<MobpackDiagn
         .filter(|value| !value.is_empty())
         .unwrap_or("cli");
     let Some(members) = document.members.as_array() else {
-        return Vec::new();
+        return;
     };
-    let mut diagnostics = Vec::new();
     for (member_index, member) in members.iter().enumerate() {
         let runtime_mode = member
             .get("runtimeMode")
@@ -20402,7 +20423,6 @@ fn validate_deploy_runtime_modes(document: &MobpackDocument) -> Vec<MobpackDiagn
             });
         }
     }
-    diagnostics
 }
 
 fn deploy_runtime_mode_compatibility() -> Value {
@@ -20458,20 +20478,20 @@ fn runtime_mode_labels() -> Value {
     })
 }
 
-fn validate_editor_schemas(schemas: &Value) -> Vec<MobpackDiagnostic> {
+fn validate_editor_schemas(schemas: &Value, diagnostics: &mut MobpackDiagnostics) {
     if schemas.is_null() {
-        return Vec::new();
+        return;
     }
     let Some(items) = schemas.as_array() else {
-        return vec![MobpackDiagnostic {
+        diagnostics.push(MobpackDiagnostic {
             severity: "error".to_string(),
             code: "invalid_editor_schemas".to_string(),
             message: "document.schemas must be an array".to_string(),
             path: Some("schemas".to_string()),
-        }];
+        });
+        return;
     };
 
-    let mut diagnostics = Vec::new();
     let mut schema_ids = BTreeSet::new();
     for (schema_index, schema) in items.iter().enumerate() {
         let schema_path = format!("schemas[{schema_index}]");
@@ -20595,13 +20615,11 @@ fn validate_editor_schemas(schemas: &Value) -> Vec<MobpackDiagnostic> {
             }
         }
     }
-    diagnostics
 }
 
-fn validate_editor_input_params(flow: &Value) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_editor_input_params(flow: &Value, diagnostics: &mut MobpackDiagnostics) {
     let Some(steps) = flow.get("steps").and_then(Value::as_array) else {
-        return diagnostics;
+        return;
     };
     for (step_index, step) in steps.iter().enumerate() {
         if step.get("type").and_then(Value::as_str) != Some("input") {
@@ -20688,12 +20706,11 @@ fn validate_editor_input_params(flow: &Value) -> Vec<MobpackDiagnostic> {
             }
         }
     }
-    diagnostics
 }
 
-fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_graph_projection(document: &MobpackDocument, diagnostics: &mut MobpackDiagnostics) {
     if document.instances.is_null() && document.edges.is_null() && document.frames.is_null() {
-        return Vec::new();
+        return;
     }
     // Advanced-mode graphs carry the user's plain nodes and edges without
     // materialized fan-out/join gates or frames. When re-deriving the flow
@@ -20706,7 +20723,6 @@ fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnosti
     // them.
     let graph_derives_flow =
         document.flow.is_object() && graph_to_flow_from_document(document) == document.flow;
-    let mut diagnostics = Vec::new();
     let Some(instances) = document.instances.as_array() else {
         if !document.instances.is_null() {
             diagnostics.push(MobpackDiagnostic {
@@ -20716,7 +20732,7 @@ fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnosti
                 path: Some("instances".to_string()),
             });
         }
-        return diagnostics;
+        return;
     };
     let edges = match document.edges.as_array() {
         Some(edges) => edges,
@@ -20729,7 +20745,7 @@ fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnosti
                     path: Some("edges".to_string()),
                 });
             }
-            return diagnostics;
+            return;
         }
     };
     let flow_members = editor_flow_member_step_roles(&document.flow);
@@ -20805,12 +20821,12 @@ fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnosti
                 if gate_kind == "fork"
                     && let Some(expected) = graph_controls.fork_controls.get(id)
                 {
-                    validate_graph_fork_control(instance, &path, expected, &mut diagnostics);
+                    validate_graph_fork_control(instance, &path, expected, diagnostics);
                 }
                 if gate_kind == "join"
                     && let Some(expected) = graph_controls.join_controls.get(id)
                 {
-                    validate_graph_join_control(instance, &path, expected, &mut diagnostics);
+                    validate_graph_join_control(instance, &path, expected, diagnostics);
                 }
             }
             continue;
@@ -20893,20 +20909,10 @@ fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnosti
         }
         if !graph_derives_flow {
             if let Some(expected_metadata) = flow_member_metadata.get(id) {
-                validate_graph_member_metadata(
-                    instance,
-                    &path,
-                    expected_metadata,
-                    &mut diagnostics,
-                );
+                validate_graph_member_metadata(instance, &path, expected_metadata, diagnostics);
             }
             if let Some(expected_launch) = flow_launch_modes.get(id) {
-                validate_graph_member_launch_mode(
-                    instance,
-                    &path,
-                    expected_launch,
-                    &mut diagnostics,
-                );
+                validate_graph_member_launch_mode(instance, &path, expected_launch, diagnostics);
             }
         }
     }
@@ -21049,7 +21055,7 @@ fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnosti
                         parts[1],
                         &input_params,
                         &format!("{path}.cond.var"),
-                        &mut diagnostics,
+                        diagnostics,
                     );
                 } else if parts.len() != 3 || parts[0] != "steps" {
                     diagnostics.push(MobpackDiagnostic {
@@ -21108,7 +21114,7 @@ fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnosti
         }
     }
     if !graph_derives_flow {
-        validate_expected_graph_edges(edges, &graph_controls.expected_edges, &mut diagnostics);
+        validate_expected_graph_edges(edges, &graph_controls.expected_edges, diagnostics);
     }
 
     let mut frame_ids = BTreeSet::new();
@@ -21180,8 +21186,6 @@ fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnosti
             }
         }
     }
-
-    diagnostics
 }
 
 #[derive(Debug, Default)]
@@ -21498,7 +21502,7 @@ fn graph_step_id(step: &Value) -> String {
 fn validate_expected_graph_edges(
     edges: &[Value],
     expected_edges: &[EditorGraphExpectedEdge],
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let actual = edges
         .iter()
@@ -21602,7 +21606,7 @@ fn validate_graph_fork_control(
     instance: &Value,
     path: &str,
     expected: &EditorGraphForkControl,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let actual_dispatch = graph_dispatch_mode_from_value(
         instance
@@ -21636,7 +21640,7 @@ fn validate_graph_join_control(
     instance: &Value,
     path: &str,
     expected: &EditorGraphJoinControl,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let actual_collection = graph_join_collection(instance);
     if actual_collection != expected.collection {
@@ -21728,7 +21732,7 @@ fn validate_graph_member_metadata(
     instance: &Value,
     path: &str,
     expected: &EditorGraphMemberMetadata,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let actual = editor_graph_member_metadata(instance);
     if actual.timeout_ms != expected.timeout_ms {
@@ -21829,7 +21833,7 @@ fn validate_graph_member_launch_mode(
     instance: &Value,
     path: &str,
     expected: &EditorGraphLaunchMode,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let actual = editor_graph_launch_mode(
         instance
@@ -21910,7 +21914,7 @@ fn validate_deploy_string_enum(
     key: &str,
     allowed: &[&str],
     code: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     if let Some(value) = object.get(key) {
         let Some(text) = value
@@ -21945,7 +21949,7 @@ fn validate_deploy_string_enum(
 fn validate_deploy_non_negative_number(
     object: &serde_json::Map<String, Value>,
     key: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(value) = object.get(key) else {
         return;
@@ -22287,9 +22291,12 @@ fn collect_editor_flow_member_step_roles(steps: &[Value], roles: &mut BTreeMap<S
     }
 }
 
-fn validate_member_catalog_references(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_member_catalog_references(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let Some(members) = document.members.as_array() else {
-        return Vec::new();
+        return;
     };
     let tool_ids = tool_catalog_response()
         .into_iter()
@@ -22307,16 +22314,8 @@ fn validate_member_catalog_references(document: &MobpackDocument) -> Vec<Mobpack
         .iter()
         .map(|entry| entry.id.to_string())
         .collect::<BTreeSet<_>>();
-    let mut diagnostics = Vec::new();
 
-    // Past the report cap more diagnostics are dropped anyway; stop building
-    // them (one per reference in a document of many references).
-    let full =
-        |diagnostics: &[MobpackDiagnostic]| diagnostics.len() > MOBPACK_MAX_VALIDATION_DIAGNOSTICS;
     for (member_index, member) in members.iter().enumerate() {
-        if full(&diagnostics) {
-            break;
-        }
         if let Some(model) = member.get("model").filter(|value| !value.is_null()) {
             match model.as_str().map(str::trim) {
                 Some("") => {}
@@ -22345,9 +22344,6 @@ fn validate_member_catalog_references(document: &MobpackDocument) -> Vec<Mobpack
 
         if let Some(tools) = member.get("tools").and_then(Value::as_array) {
             for (tool_index, tool) in tools.iter().enumerate() {
-                if full(&diagnostics) {
-                    break;
-                }
                 let Some(tool_id) = tool
                     .as_str()
                     .map(str::trim)
@@ -22376,9 +22372,6 @@ fn validate_member_catalog_references(document: &MobpackDocument) -> Vec<Mobpack
 
         if let Some(skills) = member.get("skills").and_then(Value::as_array) {
             for (skill_index, skill) in skills.iter().enumerate() {
-                if full(&diagnostics) {
-                    break;
-                }
                 let Some(skill_id) = skill
                     .as_str()
                     .map(str::trim)
@@ -22455,15 +22448,15 @@ fn validate_member_catalog_references(document: &MobpackDocument) -> Vec<Mobpack
             }
         }
     }
-
-    diagnostics
 }
 
-fn validate_editor_member_identities(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_editor_member_identities(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let Some(members) = document.members.as_array() else {
-        return Vec::new();
+        return;
     };
-    let mut diagnostics = Vec::new();
     let mut seen = BTreeSet::new();
     for (member_index, member) in members.iter().enumerate() {
         let Some(member_id) = member
@@ -22489,14 +22482,15 @@ fn validate_editor_member_identities(document: &MobpackDocument) -> Vec<MobpackD
             });
         }
     }
-    diagnostics
 }
 
-fn validate_member_profile_bindings(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_member_profile_bindings(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let Some(members) = document.members.as_array() else {
-        return Vec::new();
+        return;
     };
-    let mut diagnostics = Vec::new();
     for (member_index, member) in members.iter().enumerate() {
         let binding_value = member
             .get("profileBinding")
@@ -22596,23 +22590,22 @@ fn validate_member_profile_bindings(document: &MobpackDocument) -> Vec<MobpackDi
             });
         }
     }
-    diagnostics
 }
 
-fn validate_skill_realms(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_skill_realms(document: &MobpackDocument, diagnostics: &mut MobpackDiagnostics) {
     if document.skill_realms.is_null() {
-        return Vec::new();
+        return;
     }
     let Some(realms) = document.skill_realms.as_array() else {
-        return vec![MobpackDiagnostic {
+        diagnostics.push(MobpackDiagnostic {
             severity: "error".to_string(),
             code: "invalid_skill_realms".to_string(),
             message: "document.skill_realms must be an array".to_string(),
             path: Some("skill_realms".to_string()),
-        }];
+        });
+        return;
     };
 
-    let mut diagnostics = Vec::new();
     let mut seen_skill_ids = BTreeMap::<String, String>::new();
     for (realm_index, realm) in realms.iter().enumerate() {
         let realm_path = format!("skill_realms[{realm_index}]");
@@ -22720,7 +22713,6 @@ fn validate_skill_realms(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
             }
         }
     }
-    diagnostics
 }
 
 fn is_starter_skill_marker(value: &str) -> bool {
@@ -22737,8 +22729,10 @@ fn is_starter_provenance_diagnostic(code: &str) -> bool {
     )
 }
 
-fn validate_selected_skill_sources(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_selected_skill_sources(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     for (skill_id, source) in selected_skill_sources(document) {
         let source_path = format!("skill_realms.skills[{skill_id}].source");
         let source_kind = match source.get("source") {
@@ -22790,11 +22784,12 @@ fn validate_selected_skill_sources(document: &MobpackDocument) -> Vec<MobpackDia
             }),
         }
     }
-    diagnostics
 }
 
-fn validate_selected_path_skill_files(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_selected_path_skill_files(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     // A digest per archive path is enough to find conflicting content, so
     // validation keeps a digest, not a second copy of each skill's bytes.
     // (`selected_skill_sources` still clones each selected source once; the
@@ -22897,10 +22892,12 @@ fn validate_selected_path_skill_files(document: &MobpackDocument) -> Vec<Mobpack
             archive_paths.insert(archive_path, digest);
         }
     }
-    diagnostics
 }
 
-fn validate_editor_flow_step_tool_references(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_editor_flow_step_tool_references(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let tool_ids = tool_catalog_response()
         .into_iter()
         .filter_map(|tool| {
@@ -22910,15 +22907,13 @@ fn validate_editor_flow_step_tool_references(document: &MobpackDocument) -> Vec<
         })
         .collect::<BTreeSet<_>>();
     let member_tools = editor_member_tools_by_id(document);
-    let mut diagnostics = Vec::new();
     collect_editor_flow_step_tool_reference_diagnostics(
         document.flow.get("steps").and_then(Value::as_array),
         "flow.steps",
         &tool_ids,
         &member_tools,
-        &mut diagnostics,
+        diagnostics,
     );
-    diagnostics
 }
 
 fn editor_member_tools_by_id(document: &MobpackDocument) -> BTreeMap<String, BTreeSet<String>> {
@@ -22944,7 +22939,7 @@ fn collect_editor_flow_step_tool_reference_diagnostics(
     path: &str,
     tool_ids: &BTreeSet<String>,
     member_tools: &BTreeMap<String, BTreeSet<String>>,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(steps) = steps else {
         return;
@@ -23013,7 +23008,7 @@ fn validate_editor_flow_step_tool_list(
     tool_ids: &BTreeSet<String>,
     member_tools: &BTreeMap<String, BTreeSet<String>>,
     require_member_tool: bool,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     match value {
         Value::Array(items) => {
@@ -23078,7 +23073,7 @@ fn validate_editor_flow_step_tool_ref(
     tool_ids: &BTreeSet<String>,
     member_tools: &BTreeMap<String, BTreeSet<String>>,
     require_member_tool: bool,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     if !tool_ids.contains(tool_id) {
         diagnostics.push(MobpackDiagnostic {
@@ -23148,27 +23143,29 @@ fn editor_max_inline_peer_notifications(member: &Value) -> Option<i32> {
 fn validate_mob_settings_match_definition(
     document: &MobpackDocument,
     definition: &MobDefinition,
-) -> Vec<MobpackDiagnostic> {
+    diagnostics: &mut MobpackDiagnostics,
+) {
     if document.mob_settings.is_null() {
-        return Vec::new();
+        return;
     }
     let Some(settings) = document.mob_settings.as_object() else {
-        return vec![MobpackDiagnostic {
+        diagnostics.push(MobpackDiagnostic {
             severity: "error".to_string(),
             code: "invalid_mob_settings".to_string(),
             message: "mob_settings must be an object".to_string(),
             path: Some("mob_settings".to_string()),
-        }];
+        });
+        return;
     };
-    let mut diagnostics = Vec::new();
     let expected = mob_settings_from_definition(definition);
     let Some(expected) = expected.as_object() else {
-        return vec![MobpackDiagnostic {
+        diagnostics.push(MobpackDiagnostic {
             severity: "error".to_string(),
             code: "invalid_mob_settings".to_string(),
             message: "mob settings derived from mob.toml must be an object".to_string(),
             path: Some("mob_settings".to_string()),
-        }];
+        });
+        return;
     };
 
     compare_mob_setting_string(
@@ -23176,28 +23173,28 @@ fn validate_mob_settings_match_definition(
         expected,
         "orchestrator",
         "editor_mob_orchestrator_mismatch",
-        &mut diagnostics,
+        diagnostics,
     );
     compare_mob_setting_bool(
         settings,
         expected,
         "autoWireOrchestrator",
         "editor_mob_auto_wire_mismatch",
-        &mut diagnostics,
+        diagnostics,
     );
     compare_mob_setting_string(
         settings,
         expected,
         "backendDefault",
         "editor_mob_backend_default_mismatch",
-        &mut diagnostics,
+        diagnostics,
     );
     compare_mob_setting_string(
         settings,
         expected,
         "externalAddressBase",
         "editor_mob_external_address_base_mismatch",
-        &mut diagnostics,
+        diagnostics,
     );
     let editor_wiring = normalized_role_wiring(settings.get("roleWiring"));
     let definition_wiring = normalized_role_wiring(expected.get("roleWiring"));
@@ -23209,14 +23206,13 @@ fn validate_mob_settings_match_definition(
             path: Some("mob_settings.roleWiring".to_string()),
         });
     }
-    compare_advanced_mob_settings(settings, expected, &mut diagnostics);
-    diagnostics
+    compare_advanced_mob_settings(settings, expected, diagnostics);
 }
 
 fn compare_advanced_mob_settings(
     settings: &serde_json::Map<String, Value>,
     expected: &serde_json::Map<String, Value>,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let actual_advanced = match settings.get("advanced").filter(|value| !value.is_null()) {
         Some(value) => match value.as_object() {
@@ -23280,7 +23276,7 @@ fn compare_mob_setting_string(
     expected: &serde_json::Map<String, Value>,
     key: &str,
     code: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(value) = settings.get(key).filter(|value| !value.is_null()) else {
         return;
@@ -23313,7 +23309,7 @@ fn compare_mob_setting_bool(
     expected: &serde_json::Map<String, Value>,
     key: &str,
     code: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(value) = settings.get(key).filter(|value| !value.is_null()) else {
         return;
@@ -23359,9 +23355,10 @@ fn normalized_role_wiring(value: Option<&Value>) -> Option<Vec<(String, String)>
 fn validate_editor_projection_matches_definition(
     document: &MobpackDocument,
     definition: &MobDefinition,
-) -> Vec<MobpackDiagnostic> {
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let Some(members) = document.members.as_array() else {
-        return Vec::new();
+        return;
     };
     let schemas = editor_schema_map(&document.schemas);
     let profiles = definition
@@ -23369,7 +23366,6 @@ fn validate_editor_projection_matches_definition(
         .iter()
         .map(|(name, binding)| (name.to_string(), binding))
         .collect::<BTreeMap<_, _>>();
-    let mut diagnostics = Vec::new();
     let mut seen_profiles = BTreeSet::new();
 
     for (member_index, member) in members.iter().enumerate() {
@@ -23590,14 +23586,13 @@ fn validate_editor_projection_matches_definition(
             (None, None) => {}
         }
     }
-
-    diagnostics
 }
 
 fn validate_editor_flow_members_match_definition(
     document: &MobpackDocument,
     definition: &MobDefinition,
-) -> Vec<MobpackDiagnostic> {
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let profile_by_member = editor_profile_by_member_id(document);
     let mut expected = BTreeMap::<(String, String), usize>::new();
     collect_editor_flow_member_turns(
@@ -23606,11 +23601,10 @@ fn validate_editor_flow_members_match_definition(
         &mut expected,
     );
     if expected.is_empty() {
-        return Vec::new();
+        return;
     }
 
     let actual = definition_flow_step_turns(document, definition);
-    let mut diagnostics = Vec::new();
     for ((profile, message), expected_count) in expected {
         let actual_count = actual
             .get(&(profile.clone(), message.clone()))
@@ -23627,7 +23621,6 @@ fn validate_editor_flow_members_match_definition(
             });
         }
     }
-    diagnostics
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -23645,7 +23638,8 @@ struct FlowStepMetadataKey {
 fn validate_editor_flow_step_metadata_matches_definition(
     document: &MobpackDocument,
     definition: &MobDefinition,
-) -> Vec<MobpackDiagnostic> {
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let profile_by_member = editor_profile_by_member_id(document);
     // meerkat 0.7 parses an omitted step `output_format` as `None` and
     // resolves it schema-aware (`FlowStepSpec::effective_output_format`:
@@ -23662,10 +23656,9 @@ fn validate_editor_flow_step_metadata_matches_definition(
         &mut expected,
     );
     if expected.is_empty() {
-        return Vec::new();
+        return;
     }
     let actual = definition_flow_step_metadata(document, definition);
-    let mut diagnostics = Vec::new();
     for (key, expected_count) in expected {
         let actual_count = actual.get(&key).copied().unwrap_or_default();
         if actual_count < expected_count {
@@ -23680,7 +23673,6 @@ fn validate_editor_flow_step_metadata_matches_definition(
             });
         }
     }
-    diagnostics
 }
 
 fn collect_editor_flow_step_metadata(
@@ -37747,6 +37739,89 @@ branch = "choice"
                     .iter()
                     .any(|diagnostic| diagnostic.code == "rendered_output_too_large")),
             Err(true)
+        );
+    }
+
+    /// Run the test `name` alone in a child process of this test binary with
+    /// `vars` set (`None` removes one), so it runs with an ambient environment
+    /// and a memory high-water mark of its own, and require it to pass.
+    #[cfg(unix)]
+    fn run_test_in_child(name: &str, vars: &[(&str, Option<&std::ffi::OsStr>)]) {
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        child.args([name, "--exact", "--nocapture", "--test-threads", "1"]);
+        for (key, value) in vars {
+            match value {
+                Some(value) => child.env(key, value),
+                None => child.env_remove(key),
+            };
+        }
+        let output = child.output().expect("run the test child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{name} child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Set in the child process of the validation peak memory test.
+    #[cfg(target_os = "linux")]
+    const VALIDATION_PEAK_CHILD: &str = "META_TEST_VALIDATION_PEAK_CHILD";
+
+    /// This process's peak resident set (`VmHWM`), in KiB.
+    #[cfg(target_os = "linux")]
+    fn peak_resident_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("process status")
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok())
+            .expect("VmHWM in the process status")
+    }
+
+    /// Validation holds at most the diagnostic cap while it runs, so its peak
+    /// memory is bounded by the cap, not by how many problems a document has:
+    /// a flow of 100000 steps without an id or a type (two errors each)
+    /// validates within 24 MiB of peak resident memory. It runs in a child
+    /// process, whose high-water mark is its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validation_peak_memory_is_bounded_by_the_diagnostic_cap() {
+        if std::env::var_os(VALIDATION_PEAK_CHILD).is_none() {
+            run_test_in_child(
+                "mobpack::tests::validation_peak_memory_is_bounded_by_the_diagnostic_cap",
+                &[(VALIDATION_PEAK_CHILD, Some(std::ffi::OsStr::new("1")))],
+            );
+            return;
+        }
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.flow = json!({ "steps": vec![json!({}); 100_000] });
+        // Measure validation alone: reset the high-water mark to the resident
+        // set it starts from, where the kernel allows it.
+        let _ = std::fs::write("/proc/self/clear_refs", "5");
+        let before = peak_resident_kib();
+
+        let validation = validate_document(&document);
+
+        let grown_kib = peak_resident_kib().saturating_sub(before);
+        assert_eq!(
+            (
+                validation.ok,
+                validation.diagnostics.len(),
+                validation
+                    .diagnostics
+                    .last()
+                    .map(|diagnostic| diagnostic.code.clone()),
+                grown_kib < 24 << 10,
+            ),
+            (
+                false,
+                MOBPACK_MAX_VALIDATION_DIAGNOSTICS + 1,
+                Some("diagnostics_truncated".to_string()),
+                true
+            ),
+            "validation grew the peak resident set by {grown_kib} KiB"
         );
     }
 }
