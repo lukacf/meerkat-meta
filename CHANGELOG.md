@@ -222,6 +222,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   caller. A Rust host that calls the `meerkat_meta::mobpack` draft functions
   itself gets `store_path` when it runs them under
   `with_host_path_skill_reads`, as it already does to read path skills.
+- The Flow Editor draft store holds at most 256 drafts and 64 MiB. Every
+  draft method reads and rewrites the whole store, and each draft keeps up
+  to 25 undo and 25 redo snapshots of its document, so any caller reaching a
+  Flow Editor route could grow the store, and with it every later call's
+  memory and time, without bound. A new draft past the count, or a write
+  that would grow the store file past 64 MiB, is now refused with `-32602`
+  and `data: {"kind": "draft_store_full", "limit": "drafts", "max_drafts": 256}`
+  or `{"kind": "draft_store_full", "limit": "bytes", "max_bytes": 67108864,
+  "required_bytes": ...}`, and writes nothing. Undo and redo history yields
+  first: before a write is refused, the oldest snapshots go, of the drafts
+  updated longest ago first and of the written draft last, so history alone
+  never blocks a save. Deletes always run, and a store already past a cap
+  takes writes that leave it no larger. Draft replies also stop copying the
+  snapshots they strip from each row.
 
 ### Added
 
@@ -398,12 +412,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   then failed, the journal and startup's refusal named no unfinished step.
   A reopened journal now records no step as finished until the rerun
   finishes it.
-
-### Known limitations
-
-- The Flow Editor draft store has no total size or draft count limit yet:
-  each draft is bounded (its document's skill content is capped at 16 MiB),
-  but the number of drafts is not. Store-wide limits are planned for 0.9.3.
 
 ## [0.9.1] - 2026-10-15
 
