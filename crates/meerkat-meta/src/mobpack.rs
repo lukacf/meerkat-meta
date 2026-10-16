@@ -12019,7 +12019,7 @@ fn graph_to_flow_from_document(document: &MobpackDocument) -> Value {
         .find(|step| step.get("type").and_then(Value::as_str) == Some("input"))
         .cloned()
         .unwrap_or_else(|| editor_input_step_draft_contract()["default_step"].clone());
-    let instances = document.instances.as_array().cloned().unwrap_or_default();
+    let instances = graph_to_flow_unique_instances(&document.instances);
     let edges = document.edges.as_array().cloned().unwrap_or_default();
     let members = document.members.as_array().cloned().unwrap_or_default();
     let prior_by_id = graph_to_flow_prior_steps_by_id(&prior_steps);
@@ -12115,11 +12115,39 @@ fn graph_to_flow_with_steps(mut prior: Value, steps: Vec<Value>) -> Value {
     }
 }
 
-fn graph_to_flow_prior_steps_by_id(steps: &[Value]) -> BTreeMap<String, Value> {
-    fn visit(step: &Value, out: &mut BTreeMap<String, Value>) {
+/// The graph's instances, each id once: its first instance, the one
+/// [`graph_to_flow_node_by_id`] reads. Instances repeating an id are one node,
+/// so they make at most one step (each copy used to become a step of its own,
+/// copying the prior step the id names).
+fn graph_to_flow_unique_instances(instances: &Value) -> Vec<Value> {
+    let mut ids = BTreeSet::new();
+    instances
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|instance| ids.insert(graph_to_flow_string(instance, "id")))
+        .cloned()
+        .collect()
+}
+
+/// No prior step: reads like an empty step.
+static GRAPH_TO_FLOW_NO_PRIOR_STEP: Value = Value::Null;
+
+/// The prior flow step an id names, or [`GRAPH_TO_FLOW_NO_PRIOR_STEP`].
+fn graph_to_flow_prior<'a>(prior_by_id: &BTreeMap<String, &'a Value>, id: &str) -> &'a Value {
+    prior_by_id
+        .get(id)
+        .copied()
+        .unwrap_or(&GRAPH_TO_FLOW_NO_PRIOR_STEP)
+}
+
+/// The prior flow's steps by id, nested steps included. The map borrows them:
+/// a cloned step carried every step nested in it, once per enclosing step.
+fn graph_to_flow_prior_steps_by_id(steps: &[Value]) -> BTreeMap<String, &Value> {
+    fn visit<'a>(step: &'a Value, out: &mut BTreeMap<String, &'a Value>) {
         let id = graph_to_flow_string(step, "id");
         if !id.is_empty() {
-            out.insert(id, step.clone());
+            out.insert(id, step);
         }
         for key in ["steps", "fallback"] {
             if let Some(steps) = step.get(key).and_then(Value::as_array) {
@@ -12149,7 +12177,7 @@ fn graph_to_flow_segments_to_steps(
     instances: &[Value],
     edges: &[Value],
     members: &[Value],
-    prior_by_id: &BTreeMap<String, Value>,
+    prior_by_id: &BTreeMap<String, &Value>,
 ) -> Vec<GraphToFlowSegment> {
     let mut member_nodes: Vec<Value> = instances
         .iter()
@@ -12177,13 +12205,20 @@ fn graph_to_flow_segments_to_steps(
         if gate_kind != "fork" && gate_kind != "branch" {
             continue;
         }
+        // A node becomes one step: a second edge to it, or a node another
+        // lane already took, starts no lane of its own.
+        let mut start_ids = BTreeSet::new();
         let branch_starts: Vec<(Value, Value)> =
             graph_to_flow_outgoing_edges(edges, &graph_to_flow_string(&gate, "id"))
                 .into_iter()
                 .filter_map(|edge| {
                     let node =
                         graph_to_flow_node_by_id(instances, &graph_to_flow_string(&edge, "to"))?;
-                    graph_to_flow_is_flow_node(&node).then_some((edge, node))
+                    let id = graph_to_flow_string(&node, "id");
+                    (graph_to_flow_is_flow_node(&node)
+                        && !consumed.contains(&id)
+                        && start_ids.insert(id))
+                    .then_some((edge, node))
                 })
                 .collect();
         if branch_starts.len() < 2 {
@@ -12205,6 +12240,7 @@ fn graph_to_flow_segments_to_steps(
                 edges,
                 &graph_to_flow_string(node, "id"),
                 join_id.as_deref(),
+                &consumed,
             );
             for lane_node in &lane_nodes {
                 consumed.insert(graph_to_flow_string(lane_node, "id"));
@@ -12228,12 +12264,12 @@ fn graph_to_flow_segments_to_steps(
                 "parallel"
             },
         );
-        let prior = prior_by_id.get(&id).cloned().unwrap_or_else(|| json!({}));
+        let prior = graph_to_flow_prior(prior_by_id, &id);
         let depends_mode = graph_to_flow_first_string(&[
             graph_to_flow_string(&gate, "dependsMode"),
             graph_to_flow_string(&gate, "depends_mode"),
-            graph_to_flow_string(&prior, "dependsMode"),
-            graph_to_flow_string(&prior, "depends_mode"),
+            graph_to_flow_string(prior, "dependsMode"),
+            graph_to_flow_string(prior, "depends_mode"),
         ]);
         let step = if gate_kind == "branch" {
             let branches: Vec<Value> = lanes
@@ -12271,7 +12307,7 @@ fn graph_to_flow_segments_to_steps(
             let mut step = json!({
                 "id": id,
                 "type": "branch",
-                "controllerRole": graph_to_flow_control_role(&gate, join.as_ref(), &prior),
+                "controllerRole": graph_to_flow_control_role(&gate, join.as_ref(), prior),
                 "branches": branches,
                 "fallback": fallback,
             });
@@ -12287,14 +12323,14 @@ fn graph_to_flow_segments_to_steps(
             let mut step = json!({
                 "id": id,
                 "type": "parallel",
-                "controllerRole": graph_to_flow_control_role(&gate, join.as_ref(), &prior),
+                "controllerRole": graph_to_flow_control_role(&gate, join.as_ref(), prior),
                 "dispatch": graph_to_flow_first_string(&[
                     graph_to_flow_string(&gate, "dispatch"),
                     graph_to_flow_string(&gate, "dispatchMode"),
                     graph_to_flow_string(&gate, "dispatch_mode"),
-                    graph_to_flow_string(&prior, "dispatch"),
-                    graph_to_flow_string(&prior, "dispatchMode"),
-                    graph_to_flow_string(&prior, "dispatch_mode"),
+                    graph_to_flow_string(prior, "dispatch"),
+                    graph_to_flow_string(prior, "dispatchMode"),
+                    graph_to_flow_string(prior, "dispatch_mode"),
                     "fan_out".to_string(),
                 ]),
                 "collection": graph_to_flow_first_string(&[
@@ -12359,7 +12395,7 @@ fn graph_to_flow_step_for_group(
     nodes: &[Value],
     edges: &[Value],
     members: &[Value],
-    prior_by_id: &BTreeMap<String, Value>,
+    prior_by_id: &BTreeMap<String, &Value>,
 ) -> Value {
     if nodes.len() == 1 {
         return graph_to_flow_step_from_instance(&nodes[0], members, prior_by_id);
@@ -12382,12 +12418,12 @@ fn graph_to_flow_step_for_group(
             .collect::<Vec<_>>()
             .join("_")
     );
-    let prior = prior_by_id.get(&id).cloned().unwrap_or_else(|| json!({}));
+    let prior = graph_to_flow_prior(prior_by_id, &id);
     if has_conditional_fan_in {
         json!({
             "id": id,
             "type": "branch",
-            "controllerRole": graph_to_flow_control_role(&Value::Null, None, &prior),
+            "controllerRole": graph_to_flow_control_role(&Value::Null, None, prior),
             "branches": nodes.iter().enumerate().map(|(index, node)| {
                 let edge = graph_to_flow_incoming_edges(edges, &graph_to_flow_string(node, "id"))
                     .into_iter()
@@ -12406,13 +12442,13 @@ fn graph_to_flow_step_for_group(
         json!({
             "id": id,
             "type": "parallel",
-            "controllerRole": graph_to_flow_control_role(&Value::Null, None, &prior),
+            "controllerRole": graph_to_flow_control_role(&Value::Null, None, prior),
             "dispatch": graph_to_flow_first_string(&[
-                graph_to_flow_string(&prior, "dispatch"),
+                graph_to_flow_string(prior, "dispatch"),
                 "fan_out".to_string(),
             ]),
             "collection": graph_to_flow_first_string(&[
-                graph_to_flow_string(&prior, "collection"),
+                graph_to_flow_string(prior, "collection"),
                 "all".to_string(),
             ]),
             "branches": nodes.iter().enumerate().map(|(index, node)| {
@@ -12429,20 +12465,20 @@ fn graph_to_flow_step_for_group(
 fn graph_to_flow_member_step_from_instance(
     instance: &Value,
     _members: &[Value],
-    prior_by_id: &BTreeMap<String, Value>,
+    prior_by_id: &BTreeMap<String, &Value>,
 ) -> Value {
     let id = graph_to_flow_string(instance, "id");
-    let prior = prior_by_id.get(&id).cloned().unwrap_or_else(|| json!({}));
+    let prior = graph_to_flow_prior(prior_by_id, &id);
     let mut step = json!({
         "id": id,
         "type": "member",
         "role": graph_to_flow_string(instance, "memberId"),
-        "instruction": graph_to_flow_string(&prior, "instruction"),
-        "launchMode": graph_to_flow_value_with_alias(instance, &prior, &["launchMode", "launch_mode"]).unwrap_or(Value::Null),
-        "quorum": graph_to_flow_value_with_alias(instance, &prior, &["quorum", "collectionQuorum"]).unwrap_or(Value::Null),
-        "timeoutMs": graph_to_flow_value_with_alias(instance, &prior, &["timeoutMs", "timeout_ms"]).unwrap_or(Value::Null),
-        "allowedTools": graph_to_flow_value_with_alias(instance, &prior, &["allowedTools", "allowed_tools"]).unwrap_or_else(|| json!([])),
-        "blockedTools": graph_to_flow_value_with_alias(instance, &prior, &["blockedTools", "blocked_tools"]).unwrap_or_else(|| json!([])),
+        "instruction": graph_to_flow_string(prior, "instruction"),
+        "launchMode": graph_to_flow_value_with_alias(instance, prior, &["launchMode", "launch_mode"]).unwrap_or(Value::Null),
+        "quorum": graph_to_flow_value_with_alias(instance, prior, &["quorum", "collectionQuorum"]).unwrap_or(Value::Null),
+        "timeoutMs": graph_to_flow_value_with_alias(instance, prior, &["timeoutMs", "timeout_ms"]).unwrap_or(Value::Null),
+        "allowedTools": graph_to_flow_value_with_alias(instance, prior, &["allowedTools", "allowed_tools"]).unwrap_or_else(|| json!([])),
+        "blockedTools": graph_to_flow_value_with_alias(instance, prior, &["blockedTools", "blocked_tools"]).unwrap_or_else(|| json!([])),
     });
     for (out_key, keys) in [
         ("dispatchMode", ["dispatchMode", "dispatch_mode", ""]),
@@ -12461,7 +12497,7 @@ fn graph_to_flow_member_step_from_instance(
                 .chain(
                     keys.iter()
                         .filter(|key| !key.is_empty())
-                        .map(|key| graph_to_flow_string(&prior, key)),
+                        .map(|key| graph_to_flow_string(prior, key)),
                 )
                 .collect::<Vec<_>>(),
         );
@@ -12544,7 +12580,7 @@ fn graph_to_flow_is_flow_node(instance: &Value) -> bool {
 fn graph_to_flow_step_from_instance(
     instance: &Value,
     members: &[Value],
-    prior_by_id: &BTreeMap<String, Value>,
+    prior_by_id: &BTreeMap<String, &Value>,
 ) -> Value {
     if graph_to_flow_is_adaptive_node(instance) {
         return graph_to_flow_adaptive_step_from_instance(instance, prior_by_id);
@@ -12554,7 +12590,7 @@ fn graph_to_flow_step_from_instance(
 
 fn graph_to_flow_adaptive_step_from_instance(
     instance: &Value,
-    prior_by_id: &BTreeMap<String, Value>,
+    prior_by_id: &BTreeMap<String, &Value>,
 ) -> Value {
     if let Some(payload) = instance
         .get("adaptive")
@@ -12565,6 +12601,7 @@ fn graph_to_flow_adaptive_step_from_instance(
     let id = graph_to_flow_string(instance, "id");
     if let Some(prior) = prior_by_id
         .get(&id)
+        .copied()
         .filter(|prior| prior.get("type").and_then(Value::as_str) == Some("adaptive"))
     {
         return prior.clone();
@@ -12721,18 +12758,25 @@ fn graph_to_flow_find_join(
     })
 }
 
+/// The lane from `start_id` up to its join. It stops at a node another lane
+/// already took (`consumed`), so lanes that run into one shared chain without
+/// a join do not each copy the whole chain.
 fn graph_to_flow_collect_lane_to_join(
     instances: &[Value],
     edges: &[Value],
     start_id: &str,
     join_id: Option<&str>,
+    consumed: &BTreeSet<String>,
 ) -> Vec<Value> {
     let mut out = Vec::new();
     let mut current = graph_to_flow_node_by_id(instances, start_id);
     let mut seen = BTreeSet::new();
     while let Some(node) = current {
         let node_id = graph_to_flow_string(&node, "id");
-        if join_id == Some(node_id.as_str()) || !seen.insert(node_id.clone()) {
+        if join_id == Some(node_id.as_str())
+            || consumed.contains(&node_id)
+            || !seen.insert(node_id.clone())
+        {
             break;
         }
         if graph_to_flow_is_flow_node(&node) {
@@ -37823,5 +37867,59 @@ branch = "choice"
             ),
             "validation grew the peak resident set by {grown_kib} KiB"
         );
+    }
+
+    /// The member step ids of `steps`, nested steps included.
+    fn member_step_ids(steps: &Value, ids: &mut Vec<String>) {
+        for step in steps.as_array().into_iter().flatten() {
+            if step["type"] == "member" {
+                ids.push(step["id"].as_str().unwrap_or_default().to_string());
+            }
+            member_step_ids(&step["steps"], ids);
+            member_step_ids(&step["fallback"], ids);
+            for branch in step["branches"].as_array().into_iter().flatten() {
+                member_step_ids(&branch["steps"], ids);
+            }
+        }
+    }
+
+    /// Graph-to-flow turns each graph node into at most one step. Lanes of a
+    /// fork that run into one shared chain without a join each copied the
+    /// whole chain (B lanes into a chain of T nodes made B x T steps), and
+    /// instances repeating one id each became a step copying that id's prior
+    /// step: both grew with the references, not with the graph.
+    #[test]
+    fn graph_to_flow_turns_each_graph_node_into_at_most_one_step() {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.members = json!([{ "id": "worker", "name": "Worker" }]);
+        document.flow = json!({ "steps": [{
+            "id": "dup",
+            "type": "member",
+            "role": "worker",
+            "instruction": "i".repeat(4096)
+        }] });
+        let member = |id: String, col: i64, row: i64| json!({ "id": id, "memberId": "worker", "col": col, "row": row });
+        let mut instances =
+            vec![json!({ "id": "g", "isGate": true, "gateKind": "fork", "col": 1 })];
+        let mut edges = Vec::new();
+        for row in 0..3 {
+            instances.push(member(format!("a{row}"), 2, row));
+            edges.push(json!({ "from": "g", "to": format!("a{row}") }));
+            edges.push(json!({ "from": format!("a{row}"), "to": "t1" }));
+        }
+        instances.push(member("t1".to_string(), 3, 0));
+        instances.push(member("t2".to_string(), 4, 0));
+        edges.push(json!({ "from": "t1", "to": "t2" }));
+        instances.extend((0..5).map(|_| member("dup".to_string(), 6, 0)));
+        document.instances = Value::Array(instances);
+        document.edges = Value::Array(edges);
+
+        let flow = graph_to_flow_from_document(&document);
+
+        let mut ids = Vec::new();
+        member_step_ids(&flow["steps"], &mut ids);
+        ids.sort();
+        assert_eq!(ids, ["a0", "a1", "a2", "dup", "t1", "t2"], "{flow:#}");
     }
 }

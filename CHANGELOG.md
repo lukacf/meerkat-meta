@@ -186,6 +186,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rest. A validation still fails on an error past the cap and still ends with
   `diagnostics_truncated`, whose severity is `error` when a dropped
   diagnostic was one.
+- Deriving a flow from a Flow Editor graph (`meta/mobpacks/graph_to_flow`,
+  the graph operations of `meta/mobpacks/apply_operation`, and the graph
+  check every validation runs, import and draft save included) turns each
+  graph node into at most one step. The lanes of a fork that ran into one
+  shared chain without a join each copied the whole chain, B lanes into a
+  chain of T nodes making B x T steps, and instances repeating one id each
+  became a step that copied the prior step of that id. The derived flow grew
+  with those references, not with the graph, which no structure cap counts:
+  a document under the HTTP body limit could expand into gigabytes. Now a
+  repeated id is one node, and a lane stops at a node another lane already
+  took. Prior steps are also read in place instead of cloned, which copied
+  each step once for every step enclosing it.
 
 ### Added
 
