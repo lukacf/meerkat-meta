@@ -18,6 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   implementation answers an error, and every mob create of the agent
   mob-tool state, except a session's implicit delegation mob, is then
   refused. The built-in `SqliteExtensionDocumentStore` implements it.
+- Host deploys from the runtime-mounted Flow Editor need an access-controller
+  grant of `mobpack.deploy` or the new host opt-in (see Security and Added).
+- `meta/mobpacks/apply_operation` ignores `rkat_validate` on every surface,
+  including the SDK's stdio RPC; run `meta/mobpacks/validate` for `rkat`
+  validation.
+- Without host access, the Flow Editor HTTP routes refuse `store_path` and
+  pack only path skills that `meta/skills/catalog` lists (see Security).
+- Rust code that calls the mobpack functions directly (`export_mobpack`,
+  `validate_mobpack`, `import_mobpack` and the rest of `meerkat_meta::mobpack`)
+  reads path skills only from files the skills catalog lists, unless it runs
+  them under the new `meerkat_meta::with_host_path_skill_reads`. The SDKs'
+  stdio and in-process JSON-RPC read as the host, as before.
 
 ### Security
 
@@ -58,6 +70,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     0.9.2, or a mob created while no extension tool bundle or document
     binding was composed (the check is installed only with them), keeps what
     it inherited after a restart.
+- The Flow Editor that a runtime mounts on its reference app router, which
+  `meta_gateway` and `rpc_gateway` serve beside the console, no longer runs
+  `rkat` on the host for a caller that no access controller grants
+  `mobpack.deploy`. Without an access controller, any process that could
+  reach the gateway's listener (loopback by default, so any local user)
+  could send an unauthenticated `meta/mobpacks/deploy` with `execute: true`,
+  which writes an archive and runs `rkat mob run`, or
+  `meta/mobpacks/validate` with `rkat_validate: true`, which runs
+  `rkat mob validate`. Browsers could not send that request across origins.
+  Now the deploy is refused with `-32602` and the validation stays
+  structural, and `meta/capabilities` advertises
+  `deploy_execute_allowed: false` and `host_mutation_allowed: false`. An
+  enforced access controller still decides per caller, as before.
+  `http_flow_editor::protected_flow_editor_router` and
+  `http_flow_editor::flow_editor_rpc_router_with_decisions` take no access
+  controller, so they no longer run host deploys at all.
+- The Flow Editor HTTP routes no longer touch a host path that a caller
+  without host access names. On a gateway without an access controller,
+  any local process could, without a token:
+  - send `meta/mobpacks/apply_operation` with `rkat_validate: true`, which
+    wrote an archive and ran `rkat mob validate` (only
+    `meta/mobpacks/validate` stripped that flag);
+  - pass `store_path` to the draft methods, which created directories and
+    files at any writable path, replaced JSON files there, and read any JSON
+    object file back through `meta/mobpacks/list`;
+  - put a path skill naming any readable host file into a document, whose
+    bytes `meta/mobpacks/source` and `meta/mobpacks/export` returned.
+
+  Now `apply_operation` never runs `rkat` (on every surface), `store_path` is
+  refused with `-32602` on every Flow Editor method, and a path skill is
+  read only when `meta/skills/catalog` lists that file; any other path is a
+  `selected_skill_path_not_permitted` validation error. A read requires the
+  document's path to match a listed string before it opens anything, so an
+  unlisted path (a Windows UNC share, a path on a hung mount) is refused
+  without a stat that reaches it. A listed file counts only while its real
+  path stays inside the skill directory it was found in, and a catalog file
+  with other hard links counts only when another user owns it and it is
+  world-readable, as in a Nix store or another user's install (a store the
+  gateway's own user owns, as pnpm and uv stores usually are, does not
+  count, and neither does a link to the gateway user's own files). The
+  server reads the file it opened (comparing the opened file's device and
+  inode), so a link swapped in after listing reaches no other file.
+  `meta/skills/catalog` marks each filesystem skill with
+  `readable_without_host_access`, and with `read_refusal` when a caller
+  without host access cannot read it; reading such a skill names that
+  reason. One request without host access reads at most 64 MiB of skill
+  files in total, however many skills name a file: a file larger than what
+  is left is refused by its opened handle's size before it is read, and once
+  the budget is spent the request resolves no further path skill. Host
+  access is the caller's own per-call `mobpack.deploy` decision, so a deny
+  rule withholds it even beside an allow rule such as `mobpack.*`. Callers
+  with host access, and the SDKs' stdio and in-process RPC, may still name
+  such paths.
+- Importing a mobpack archive (`meta/mobpacks/import`, and the draft methods
+  that re-import a stored archive) refuses an archive that expands past
+  32 MiB, holds more than 4096 entries, holds a member that is not a regular
+  file, or holds a `meta/editor.json` or `meta/mob.toml` larger than 1 MiB
+  (parsing expands those many times over) or a `manifest.toml` larger than
+  4 MiB. Everything one import materializes, archive members, parsed text
+  and each path skill filled in from a member, counts against one 64 MiB
+  budget, so a member named by many path skills is not copied once per name.
+  Import, every document method and draft save refuse a document whose
+  skill content, summed over every skill entry, passes 16 MiB, so the copies
+  made after a document enters (the import reply, source and export, a
+  saved draft) stay a small constant times that. One validation reports at
+  most 1000 diagnostics, ending with `diagnostics_truncated`. Rendering is
+  bounded too, whatever the document's shape: the rendered `mob.toml`, the
+  `definition.json` parsed from it and the expected schema files beside it
+  are each refused past 16 MiB (a schema shared by many members was copied
+  into every one), and a document with more than 1000 members, more than 256
+  branches in one parallel or branch step, or more than 1024 branches in its
+  flow is refused before it is rendered (branches after a parallel step
+  without a join each depended on every branch before them). A stored draft
+  whose document passes the skill content cap is listed and fetched as a
+  placeholder with the reason. A pax global
+  header, which `git archive` writes, is skipped, and a contiguous file
+  reads as a regular one. Before, a request under the HTTP body limit could
+  expand into gigabytes of memory: a member's bytes were read with no
+  per-member cap, and a GNU sparse member's zero gaps, which the tar reader
+  synthesizes in memory outside the gzip stream, were not covered by the
+  stream cap at all, so a roughly 150-byte upload declaring an 8 GiB sparse
+  file could exhaust memory.
 
 ### Added
 
@@ -89,6 +183,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`Owner::Mob`) or in an audience grant or deny (`Audience::Mob`).
   `SqliteExtensionDocumentStore` answers in one read transaction over every
   live document of the realm.
+- `meerkat_meta::with_host_path_skill_reads(f)` runs mobpack functions as
+  the host, so a path skill reads any file its document names (see
+  Breaking).
+- `--allow-flow-editor-host-deploy` on `meta_gateway` and on
+  `rpc_gateway --persistent`, and `allow_flow_editor_host_deploy(bool)` on
+  `UnifiedRuntimeBuilder` and `UnifiedRuntime`, let the runtime-mounted Flow
+  Editor run host deploys for callers that no enforced access controller
+  governs. It allows every caller the route admits, so enable it only where
+  every process that can reach the listener is trusted. `meta_gateway`
+  includes it in the resume fingerprint, and `rpc_gateway` refuses it
+  without `--persistent`.
+- `meta_gateway --write-mcp-apps-sandbox <dir>` and
+  `rpc_gateway --write-mcp-apps-sandbox <dir>` write the MCP Apps sandbox
+  proxy that the binary embeds, `mcp-apps-sandbox.cjs` and
+  `src/mcp-apps/sandbox.js`, in the layout `node <dir>/mcp-apps-sandbox.cjs`
+  loads. They create the directory, replace earlier copies, print each
+  file's SHA-256 and path, and exit without starting a gateway. Rust hosts
+  call `meerkat_meta::mcp_apps_sandbox::write_mcp_apps_sandbox`. The console
+  build copies both files into `crates/meerkat-meta/console-dist/`, and
+  `npm --prefix console run embedded:freshness` fails when a copy differs
+  from its console source.
 
 ### Changed
 
@@ -113,6 +228,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   instead of 50. Over 50 polls the nearest-rank p99 is the slowest poll, so
   one stalled poll on a loaded machine decided the verdict; work sized to the
   member's 20 MB body, which slows every poll, still fails the 100 ms bound.
+- The Console guide and the MCP Apps host README describe writing the
+  sandbox proxy with `--write-mcp-apps-sandbox` instead of copying it from
+  the release tag. Copying stays the way for gateways before 0.9.2; both
+  files are unchanged since 0.9.0:
+  - `console/mcp-apps-sandbox.cjs`:
+    `157fed890922c4c3fe7c9b7a6319455f0604e9c789818f9c38d45bc115a98ad6`
+  - `console/src/mcp-apps/sandbox.js`:
+    `4e3592ba5b8bf198322126ccb27919a8d4c4c1976a198f9c497c16833f6c3024`
+- The native MCP Apps browser lane (`npm --prefix console run e2e:mcp-apps`)
+  runs by default against a new example, `mcp_apps_gateway_fixture`, which
+  serves the persistent `rpc_gateway` composition with a scripted model. Its
+  members are built by the gateway's own member factories, whose MCP routers
+  carry the stock connector call-context provider, so a regression in that
+  provider's MCP App resource reads (the failure that Meerkat 0.9.1 fixed)
+  now fails CI. The rendering and polling CI steps use it. A third CI step
+  keeps the previous coverage: `META_MCP_APPS_BACKEND=builder` runs the
+  rendering checks against `console_acceptance_fixture`, a
+  `UnifiedRuntime::builder()` host with identity-first members whose routers
+  carry no call-context provider.
 
 ### Fixed
 
@@ -179,6 +313,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   then failed, the journal and startup's refusal named no unfinished step.
   A reopened journal now records no step as finished until the rerun
   finishes it.
+
+### Known limitations
+
+- The Flow Editor draft store has no total size or draft count limit yet:
+  each draft is bounded (its document's skill content is capped at 16 MiB),
+  but the number of drafts is not. Store-wide limits are planned for 0.9.3.
+- The Flow Editor's remaining resource limits continue in 0.9.3: draft store
+  totals, and validation, whose peak memory stays linear in its (capped)
+  input.
 
 ## [0.9.1] - 2026-10-15
 

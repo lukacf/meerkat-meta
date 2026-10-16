@@ -7,12 +7,17 @@ const {
   DIST_GENERATED_FILES,
   EMBEDDED_GENERATED_FILES,
   EMBEDDED_SHARED_FILES,
+  EMBEDDED_SOURCE_FILES,
 } = require("./generated-assets.cjs");
 
 const rootDir = path.resolve(__dirname, "..");
 const distDir = path.join(__dirname, "dist");
 const embeddedDir = path.join(rootDir, "crates", "meerkat-meta", "console-dist");
-const rustConsolePath = path.join(rootDir, "crates", "meerkat-meta", "src", "http_console.rs");
+// The Rust modules that embed console-dist assets with include_str!.
+const rustEmbeddingPaths = [
+  path.join(rootDir, "crates", "meerkat-meta", "src", "http_console.rs"),
+  path.join(rootDir, "crates", "meerkat-meta", "src", "mcp_apps_sandbox.rs"),
+];
 
 function read(filePath) {
   try {
@@ -47,8 +52,10 @@ function assertDirectoryFiles(directory, expectedFiles, label) {
 }
 
 function assertRustEmbeddedAssets() {
-  const source = read(rustConsolePath).toString("utf8");
-  const actual = [...source.matchAll(/include_str!\("\.\.\/console-dist\/([^"]+)"\)/g)]
+  const actual = rustEmbeddingPaths
+    .flatMap((rustPath) => [
+      ...read(rustPath).toString("utf8").matchAll(/include_str!\(\s*"\.\.\/console-dist\/([^"]+)"\s*\)/g),
+    ])
     .map((match) => match[1])
     .sort();
   const expected = [...EMBEDDED_GENERATED_FILES].sort();
@@ -118,6 +125,17 @@ for (const file of EMBEDDED_SHARED_FILES) {
   if (!read(distPath).equals(read(embeddedPath))) {
     process.stderr.write(
       `embedded console asset is stale: ${path.relative(rootDir, embeddedPath)} does not match ${path.relative(rootDir, distPath)}\n`,
+    );
+    process.exit(1);
+  }
+}
+
+for (const { source, embedded } of EMBEDDED_SOURCE_FILES) {
+  const sourcePath = path.join(__dirname, source);
+  const embeddedPath = path.join(embeddedDir, embedded);
+  if (!read(sourcePath).equals(read(embeddedPath))) {
+    process.stderr.write(
+      `embedded console source is stale: ${path.relative(rootDir, embeddedPath)} does not match ${path.relative(rootDir, sourcePath)}\n`,
     );
     process.exit(1);
   }

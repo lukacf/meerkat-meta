@@ -1075,6 +1075,15 @@ of reporting the previous launch's. On `rpc_gateway`, top-level `http_listen`,
 with `-32602` naming their `runtime_options.*` home. See
 [Deployment](/guides/deployment).
 
+Both gateways also take `--allow-flow-editor-host-deploy` (on `rpc_gateway`
+with `--persistent`). Without an enforced access controller, the Flow Editor
+on the gateway's listener refuses deploys with `execute: true` and validation
+with `rkat_validate: true`, because both run `rkat` on the host; the flag
+allows them for every caller the route admits. It is launch-only, and on
+`meta_gateway` it joins the resume fingerprint. Rust hosts use
+`allow_flow_editor_host_deploy(true)` on `UnifiedRuntimeBuilder` or
+`UnifiedRuntime`. See [Flow Editor](/guides/flow-editor).
+
 ### Console auth by surface
 
 `ConsolePolicy::default().require_app_auth` is `true`, and the SDK gateway's

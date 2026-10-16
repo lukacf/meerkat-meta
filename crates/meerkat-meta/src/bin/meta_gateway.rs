@@ -299,6 +299,22 @@ fn collect_recursive_files(root: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+/// The resume key of a launch with `--allow-flow-editor-host-deploy`. Such a
+/// runtime lets callers without an access grant run `rkat` on this host, so
+/// it must never answer a launch that did not ask for that, and a launch that
+/// did must get a runtime that allows it. Keys of launches without the flag
+/// stay as they were, so their live runtimes keep resuming.
+fn resume_key_with_flow_editor_host_deploy(key: String, allowed: bool) -> String {
+    if allowed {
+        format!(
+            "{:x}",
+            Sha256::digest(format!("{key}\nflow-editor-host-deploy"))
+        )
+    } else {
+        key
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn config_fingerprint(
     workspace_root: &Path,
@@ -1684,6 +1700,10 @@ struct GatewayLaunchArgs {
     http_listen: Option<SocketAddr>,
     /// `--allow-remote`.
     allow_remote: bool,
+    /// `--allow-flow-editor-host-deploy`: the runtime-mounted Flow Editor may
+    /// run `rkat` on this host for callers that no enforced access controller
+    /// governs. Launch-only, and part of the resume key.
+    flow_editor_host_deploy: bool,
 }
 
 fn main() {
@@ -1694,6 +1714,11 @@ fn main() {
             env!("CARGO_PKG_VERSION")
         );
         return;
+    }
+    // Writes the MCP Apps sandbox proxy this binary embeds and exits: no
+    // tracing, no init request, no runtime.
+    if let Some(code) = meerkat_meta::gateway_composition::write_mcp_apps_sandbox_arg(&args) {
+        std::process::exit(code);
     }
     // Install the tracing subscriber FIRST — before the maintenance verbs,
     // not just before the gateway boot. The storage verbs drive the same
@@ -1750,6 +1775,9 @@ fn main() {
         }
     };
     let allow_remote = args.iter().any(|arg| arg == "--allow-remote");
+    let flow_editor_host_deploy = args
+        .iter()
+        .any(|arg| arg == "--allow-flow-editor-host-deploy");
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         "meta_gateway starting (console/HTTP gateway)"
@@ -1769,6 +1797,7 @@ fn main() {
         control_listen,
         http_listen,
         allow_remote,
+        flow_editor_host_deploy,
     }))) {
         // A refusal `run()` already answered on the request id must not be
         // followed by a second, id-less reply.
@@ -1821,6 +1850,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         control_listen,
         http_listen: http_listen_flag,
         allow_remote: allow_remote_flag,
+        flow_editor_host_deploy,
     } = launch;
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
@@ -2022,6 +2052,7 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
     } else {
         key
     };
+    let key = resume_key_with_flow_editor_host_deploy(key, flow_editor_host_deploy);
     let registry_file = layout
         .registry_file()
         .ok_or_else(|| anyhow!("gateway storage layout carries no gateway home"))?;
@@ -2422,6 +2453,15 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
         let controller = meerkat_meta::AccessController::load(access_path)
             .map_err(|error| anyhow!("failed to load {}: {error}", access_path.display()))?;
         runtime.set_access_controller(controller);
+    }
+    // Without an enforced access controller the Flow Editor refuses host
+    // deploys unless the launch opted in.
+    if flow_editor_host_deploy {
+        tracing::warn!(
+            "--allow-flow-editor-host-deploy: the Flow Editor on this gateway's listener lets \
+             every caller that no enforced access controller governs run rkat on this host"
+        );
+        runtime.allow_flow_editor_host_deploy(true);
     }
 
     // Load (or mint and persist) the gateway's Ed25519 signing keypair.
@@ -3551,6 +3591,21 @@ mod tests {
             "{error}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn the_flow_editor_host_deploy_opt_in_separates_resume_keys() {
+        let key = "launch-fingerprint".to_string();
+        let opted_in = resume_key_with_flow_editor_host_deploy(key.clone(), true);
+        assert_eq!(
+            (
+                resume_key_with_flow_editor_host_deploy(key.clone(), false),
+                opted_in == key,
+                resume_key_with_flow_editor_host_deploy(key.clone(), true),
+            ),
+            (key, false, opted_in),
+            "without the flag the key is unchanged; with it the key differs, stably"
+        );
     }
 
     #[test]

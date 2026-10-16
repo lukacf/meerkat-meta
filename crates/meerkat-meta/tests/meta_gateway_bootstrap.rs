@@ -423,6 +423,74 @@ fn gateways_report_name_and_version() {
     }
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+/// Both gateway binaries embed the MCP Apps sandbox proxy that the stock
+/// Console needs on an origin of its own, so a released binary is enough to
+/// run it. `--write-mcp-apps-sandbox <dir>` writes the proxy in the layout
+/// `node mcp-apps-sandbox.cjs` loads, byte for byte the console sources the
+/// binary was built from, lists each file with its SHA-256, and exits before
+/// it reads an init request.
+#[test]
+fn gateways_write_the_mcp_apps_sandbox_they_embed_byte_for_byte() {
+    let console = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../console");
+    let files = ["mcp-apps-sandbox.cjs", "src/mcp-apps/sandbox.js"];
+    let sources = files
+        .iter()
+        .map(|file| std::fs::read(console.join(file)).expect("console sandbox source"))
+        .collect::<Vec<_>>();
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    let mut stderr = Vec::new();
+    for (bin, name) in [
+        (env!("CARGO_BIN_EXE_meta_gateway"), "meta_gateway"),
+        (env!("CARGO_BIN_EXE_rpc_gateway"), "rpc_gateway"),
+    ] {
+        let dir = TempDir::new().expect("sandbox tempdir");
+        let target = dir.path().join("mcp-apps-sandbox");
+        let out = Command::new(bin)
+            .arg("--write-mcp-apps-sandbox")
+            .arg(&target)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run --write-mcp-apps-sandbox");
+        actual.push((
+            name,
+            out.status.code(),
+            files
+                .iter()
+                .map(|file| {
+                    std::fs::read(target.join(file))
+                        .ok()
+                        .map(|bytes| sha256_hex(&bytes))
+                })
+                .collect::<Vec<_>>(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        ));
+        expected.push((
+            name,
+            Some(0),
+            sources
+                .iter()
+                .map(|bytes| Some(sha256_hex(bytes)))
+                .collect::<Vec<_>>(),
+            files
+                .iter()
+                .zip(&sources)
+                .map(|(file, bytes)| {
+                    format!("{}  {}\n", sha256_hex(bytes), target.join(file).display())
+                })
+                .collect::<Vec<_>>()
+                .concat(),
+        ));
+        stderr.push(format!("{name}: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    assert_eq!(actual, expected, "gateway stderr:\n{}", stderr.join("\n"));
+}
+
 /// `meta_gateway` is the console/HTTP gateway, not the SDK's stdin-RPC gateway
 /// (that is `rpc_gateway`). If the SDK — which drives a gateway by sending
 /// JSON-RPC over stdin — is misconfigured to spawn `meta_gateway`, init still
