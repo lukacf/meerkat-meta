@@ -3386,6 +3386,10 @@ async fn run_resilient_mob_agent_event_forwarder(
     ))
     .await;
     cadence.rebind(&handles);
+    // Only the watchers outlive the pass. A child mob handle kept for the
+    // forwarder's life would keep that child's database observer alive, and
+    // the child's destroy would leave its storage cleanup outstanding.
+    drop(handles);
 
     loop {
         tokio::select! {
@@ -3473,6 +3477,8 @@ async fn run_identity_stream_health_monitor(
     ))
     .await;
     cadence.rebind(&handles);
+    // As in the forwarder: no child mob handle outlives the pass.
+    drop(handles);
 
     loop {
         tokio::select! {

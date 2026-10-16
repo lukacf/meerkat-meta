@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking
+
+- With the `extension-state` feature, a document store that an embedding
+  host supplies through `MetaStorageProvider::open_extension_state` must
+  implement the new `ExtensionDocumentStore::references_mob`: report
+  whether any live document of the realm, in any namespace, names a mob id
+  as its owner or in an audience grant or deny, failing the answer (never
+  skipping the document) on a document it cannot read or decode. The default
+  implementation answers an error, and every mob create of the agent
+  mob-tool state, except a session's implicit delegation mob, is then
+  refused. The built-in `SqliteExtensionDocumentStore` implements it.
+
 ### Security
 
 - `Cargo.lock` updates quinn-proto from 0.11.16 to 0.11.19, which clears
@@ -15,6 +27,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   compiles quinn-proto, which the lockfile records only under reqwest's
   optional HTTP/3 support, and no workspace feature enables it. Only that
   lockfile entry changes.
+- With the `extension-state` feature, a new mob could take the id of a
+  destroyed one and inherit what extension documents grant that id, since
+  documents name a mob by its id alone, as their owner (`Owner::Mob`) or in
+  an audience entry (`Audience::Mob`). An agent's `mob_create` takes a
+  model-chosen id, so another session could manage a destroyed child's
+  documents through a new mob under its id: at once now that a destroy
+  releases the id, and after a restart before. The agent mob-tool state now
+  refuses every create (an agent's `mob_create`, a temporary council, a
+  create without an owner session) under an id that any live document of
+  the realm still names, whatever the registry binds under it, with a typed
+  refusal that names the remedies: choose another mob id, or have a host or
+  operator with access to the extension store transfer each document the id
+  owns and remove or replace each `Audience::Mob` grant or deny naming it.
+  The one exemption is the implicit delegation mob that its own session's
+  runtime path creates or recreates. Known limitations:
+  - Ownership is by id, so the destroyed mob's own owner session cannot
+    recreate the same explicit id while documents name it either;
+    per-instance ownership is the long-term model.
+  - Each such create reads every live document of the realm under the
+    extension store's one connection, so document reads and writes of every
+    session wait while it runs, and a caller that repeats creates under a
+    named id keeps them waiting. A refusal also tells the caller that some
+    document names the id, including one it cannot read. An index or a rate
+    limit is planned for 0.9.3.
+  - The check is not ordered against a document write already in flight,
+    whose caller the embedding host resolved while the destroyed mob was
+    live.
+  - Restoring a persisted mob is never re-checked: a takeover made before
+    0.9.2, or a mob created while no extension tool bundle or document
+    binding was composed (the check is installed only with them), keeps what
+    it inherited after a restart.
 
 ### Added
 
@@ -40,17 +83,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   file is read as a `definition.json`. Library callers use
   `storage_predecessor::adopt_predecessor_state_with_definitions` with a
   `PredecessorDefinitionCheck`.
-
-### Fixed
-
-- Docs: the upgrading guide and the 0.9.1 notes said MobKit 0.8.x ignored
-  `model_fallback` and `tools.deny`. MobKit 0.8.33 and earlier ignored
-  `model_fallback`, and 0.8.45 and earlier ignored `tools.deny`; later 0.8
-  releases applied them, and their stores recorded them.
-- `meta/gating/decide` refusals for a missing or unknown decision list every
-  decision it accepts, `escalate` included (`decision must be one of:
-  approve, reject, escalate`, and `decision '<value>' is unsupported
-  (allowed: approve, reject, escalate)`); they named only approve and reject.
+- `meta-extension-state`: `ExtensionDocumentStore::references_mob` reports
+  whether any live document of a realm names a mob, and
+  `Document::names_mob` whether one document does, as its owner
+  (`Owner::Mob`) or in an audience grant or deny (`Audience::Mob`).
+  `SqliteExtensionDocumentStore` answers in one read transaction over every
+  live document of the realm.
 
 ### Changed
 
@@ -75,6 +113,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   instead of 50. Over 50 polls the nearest-rank p99 is the slowest poll, so
   one stalled poll on a loaded machine decided the verdict; work sized to the
   member's 20 MB body, which slows every poll, still fails the 100 ms bound.
+
+### Fixed
+
+- Docs: the upgrading guide and the 0.9.1 notes said MobKit 0.8.x ignored
+  `model_fallback` and `tools.deny`. MobKit 0.8.33 and earlier ignored
+  `model_fallback`, and 0.8.45 and earlier ignored `tools.deny`; later 0.8
+  releases applied them, and their stores recorded them.
+- `meta/gating/decide` refusals for a missing or unknown decision list every
+  decision it accepts, `escalate` included (`decision must be one of:
+  approve, reject, escalate`, and `decision '<value>' is unsupported
+  (allowed: approve, reject, escalate)`); they named only approve and reject.
+- With the `extension-state` feature and any extension tool bundle or
+  document MCP binding configured, the extension authority registry kept the
+  read handle of every child mob the agent mob-tool state activated, whether
+  or not its members ever resolved extension documents. Destroying such a
+  child answered `Incomplete` ("storage cleanup outstanding: the observer
+  drain refused: 3 owner handle(s) still observe this mob database"), the
+  child's database, file watch and threads stayed, and its id could not be
+  reused. The registry now drops a destroyed
+  child through the agent mob-tool state's after-destroy hook
+  (`MobMcpState::set_after_destroy`) before the destroy's storage cleanup
+  runs, so the destroy completes and removes the child's storage. The hook
+  also drops every other mob destroyed by then, such as one destroyed
+  through its own handle or by a rollback inside Meerkat, which reports no
+  destroy of its own.
+- A destroyed mob no longer counts as extension authority, also when it was
+  destroyed outside the agent mob-tool state: it is no valid document owner
+  any more, it leaves its former owner's managed mobs, and a former owner
+  that is still live can no longer create documents owned by it.
+- A child mob restored with its runtime still could not be destroyed
+  completely: the runtime's agent event forwarder and identity stream
+  health monitor kept the handles of every mob their first reconcile pass
+  enumerated, restored child mobs included, for as long as they ran. Such a
+  child's destroy answered `Incomplete` with the same storage cleanup
+  refusal. Only their state watchers outlive that pass now.
+- An extension document store written before 0.9 (`extension_state.sqlite3`
+  under the ledger domain `mobkit-extension-state`) failed to open with an
+  unledgered-objects error that no tool resolved, because
+  `meta_gateway storage-adopt-predecessor` did not adopt that domain. It is
+  predecessor state now: startup refuses it with the adoption command, and
+  the adoption renames its ledger domain to `meta-extension-state` and keeps
+  every document. This covers an installation an earlier 0.9 adoption
+  finished too (rerun the command), and builds without the
+  `extension-state` feature, which now fence the store as well. The store's
+  file name and schema did not change.
+- A document MCP descriptor that a mob definition persisted before 0.9
+  carries its public marker as `MOBKIT_MCP_DOCUMENT_BINDING`. It now
+  resolves to the host's document binding like the current
+  `META_MCP_DOCUMENT_BINDING` spelling. It was not recognized before: next
+  to a binding with the same server name it refused as a mismatch, and
+  otherwise it launched without the host's endpoint and credentials. With
+  no binding to resolve it, a descriptor in either spelling now refuses.
+- Without the `extension-state` feature, as in the stock gateways, a member
+  whose profile carries a marked document MCP descriptor
+  (`META_MCP_DOCUMENT_BINDING`, or `MOBKIT_MCP_DOCUMENT_BINDING` from before
+  0.9) is refused at its build instead of launching the descriptor's
+  command without the host's binding. Every composition checks this after
+  its pre-build hook, so feature-on compositions that install no document
+  binding, such as a runtime bootstrapped from a ready `MobBootstrapSpec`,
+  refuse too.
+- Rerunning `meta_gateway storage-adopt-predecessor --apply` over a finished
+  adoption, for predecessor state found since, reopened its journal with
+  every step of the earlier run still recorded as finished. When the rerun
+  then failed, the journal and startup's refusal named no unfinished step.
+  A reopened journal now records no step as finished until the rerun
+  finishes it.
 
 ## [0.9.1] - 2026-10-15
 

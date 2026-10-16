@@ -1197,3 +1197,933 @@ async fn unpublished_late_birth_phase(path: &std::path::Path, phase: &str) {
     ));
     late_birth_step(phase, "shutdown stable host", runtime.shutdown()).await;
 }
+
+/// The mob databases, with their WAL and shared-memory sidecars, in the
+/// durable child root of the runtime composed over `path`.
+fn child_mob_storage_files(path: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let root = meerkat_mob_mcp::MobMcpState::persistent_forked_participant_store_path(path)
+        .parent()
+        .expect("the child root holds the custody database")
+        .to_path_buf();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Default::default();
+    };
+    entries
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| {
+            name.starts_with("mob--")
+                && [".db", ".db-wal", ".db-shm"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+        })
+        .collect()
+}
+
+/// A child mob of an owner member's bridge session, created through the
+/// agent mob-tool state as an agent `mob_create` creates one. The child
+/// supply gives its profile the host's document bundle, the extension
+/// authority registry binds it before it activates, and its member's
+/// document caller resolves through that registry.
+struct OwnedChild {
+    state: Arc<meerkat_mob_mcp::MobMcpState>,
+    owner_session: meerkat_core::SessionId,
+    child: meerkat_mob::MobId,
+}
+
+impl OwnedChild {
+    async fn create(
+        runtime: &UnifiedRuntime,
+        context: &ToolBundleContext,
+        path: &std::path::Path,
+    ) -> Self {
+        let owner = runtime.spawn(worker("owner")).await.unwrap();
+        let owner_session = member_session(runtime, &owner.agent_identity).await;
+        let state = runtime
+            .mob_runtime()
+            .agent_mob_mcp_state()
+            .expect("the runtime composes the agent mob-tool state");
+        let child = state
+            .mob_create_definition_with_owner_bridge_session(
+                MobDefinition::from_toml(&format!(
+                    "[mob]\nid = \"{}-child\"\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+                     runtime_mode = \"turn_driven\"\n[profiles.worker.tools]\ncomms = true\n",
+                    definition(path).id
+                ))
+                .unwrap(),
+                owner_session.clone(),
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            child_mob_storage_files(path).contains(&format!("mob--{child}.db")),
+            "the child keeps a durable mob database"
+        );
+        let handle = state.handle_for(&child).await.unwrap();
+        assert!(
+            handle.definition().profiles[&meerkat_mob::ProfileName::from("worker")]
+                .as_inline()
+                .expect("an inline child profile")
+                .tools
+                .rust_bundles
+                .iter()
+                .any(|bundle| bundle == NAME),
+            "the child supply gives the child the host's document bundle"
+        );
+        let member = AgentIdentity::from("child-worker");
+        handle.spawn_spec(worker("child-worker")).await.unwrap();
+        let member_session = handle
+            .get_member(&member)
+            .await
+            .unwrap()
+            .unwrap()
+            .bridge_session_id()
+            .unwrap()
+            .clone();
+        // The test keeps nothing of the child: only the runtime holds it.
+        drop(handle);
+        assert!(matches!(
+            caller(context, &member_session).await.principal(),
+            Principal::Worker { mob_id, .. } if mob_id == child.as_str()
+        ));
+        Self {
+            state,
+            owner_session,
+            child,
+        }
+    }
+
+    fn child_owner(&self) -> Owner {
+        Owner::Mob(self.child.to_string())
+    }
+
+    /// Destroy the child through the mob-tool state, as an operator or the
+    /// owner's mob tools do, and require its native destroy to complete.
+    /// Whether the destroy's storage cleanup settled too is the subject of
+    /// `extension_authority_registry_releases_destroyed_child_mob_storage`.
+    async fn destroy_natively(&self) {
+        match self.state.mob_destroy(&self.child).await {
+            Ok(_) => {}
+            Err(meerkat_mob_mcp::MobMcpDestroyError::Incomplete { report })
+                if report
+                    .errors
+                    .iter()
+                    .all(|error| error.starts_with("storage cleanup outstanding: ")) => {}
+            Err(error) => panic!("the child's native destroy must complete: {error}"),
+        }
+        assert!(
+            !self
+                .state
+                .mob_list()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id == &self.child),
+            "the destroyed child is no longer managed"
+        );
+    }
+}
+
+/// Destroying a child mob whose documents resolved through the extension
+/// authority registry completes: the registry holds nothing of the destroyed
+/// child, so the destroy's storage cleanup drains the child's database
+/// observer and removes the database and its sidecars.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_authority_registry_releases_destroyed_child_mob_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, _) = harness(dir.path(), None).await;
+    let owned = OwnedChild::create(&runtime, &context, dir.path()).await;
+    let report = owned
+        .state
+        .mob_destroy(&owned.child)
+        .await
+        .unwrap_or_else(|error| panic!("the child's destroy must complete: {error}"));
+    assert!(report.errors.is_empty(), "{report:?}");
+    let remaining = child_mob_storage_files(dir.path());
+    assert!(
+        !remaining
+            .iter()
+            .any(|name| name.starts_with(&format!("mob--{}.db", owned.child))),
+        "the destroyed child's storage is removed: {remaining:?}"
+    );
+    drop(owned);
+    runtime.shutdown().await;
+}
+
+/// A destroyed child mob leaves its owner's managed mobs: the owner, still
+/// live, no longer manages the child as a document owner, nor the documents
+/// the child owns.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_authority_registry_drops_destroyed_mob_from_owner_managed_mobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, _) = harness(dir.path(), None).await;
+    let owned = OwnedChild::create(&runtime, &context, dir.path()).await;
+    let owner = caller(&context, &owned.owner_session).await;
+    assert!(
+        can_create(&owner, &owned.child_owner()),
+        "the owner manages its live child"
+    );
+    let receipt = context
+        .documents
+        .mutate(
+            &owner,
+            &request("child-owned"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: Some(owned.child_owner()),
+                access: DocumentAccess::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .receipt;
+    let document = context
+        .documents
+        .get(&owner, &receipt.document_id)
+        .await
+        .unwrap();
+    assert_eq!(document.owner, owned.child_owner());
+    assert!(authorize(&owner, &document, Operation::Manage));
+
+    owned.destroy_natively().await;
+    let former_owner = caller(&context, &owned.owner_session).await;
+    assert!(
+        !can_create(&former_owner, &owned.child_owner()),
+        "the destroyed child is no longer among the owner's managed mobs"
+    );
+    assert!(!authorize(&former_owner, &document, Operation::Manage));
+    assert!(matches!(
+        context
+            .documents
+            .get(&former_owner, &receipt.document_id)
+            .await,
+        Err(Error::NotFound)
+    ));
+    drop(owned);
+    runtime.shutdown().await;
+}
+
+/// A former owner that is still live cannot create a new document owned by
+/// the child mob it destroyed: the destroyed mob is no valid owner to name,
+/// and the owner's own authority does not create one for it either.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_authority_registry_refuses_new_documents_owned_by_a_destroyed_mob() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, _) = harness(dir.path(), None).await;
+    let owned = OwnedChild::create(&runtime, &context, dir.path()).await;
+    let dispatch =
+        ToolDispatchContext::default().with_runtime_identity(owned.owner_session.clone(), None);
+    assert!(
+        context
+            .caller_resolver
+            .resolve(&dispatch, Some(&owned.child_owner()))
+            .await
+            .is_ok(),
+        "a live child is a valid document owner"
+    );
+
+    owned.destroy_natively().await;
+    assert!(matches!(
+        context
+            .caller_resolver
+            .resolve(&dispatch, Some(&owned.child_owner()))
+            .await,
+        Err(Error::AuthorityUnavailable)
+    ));
+    let former_owner = caller(&context, &owned.owner_session).await;
+    let created = context
+        .documents
+        .mutate(
+            &former_owner,
+            &request("after-destroy"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: Some(owned.child_owner()),
+                access: DocumentAccess::default(),
+            }),
+        )
+        .await;
+    assert!(
+        created.is_err(),
+        "no new document is committed for the destroyed child: {created:?}"
+    );
+    drop(owned);
+    runtime.shutdown().await;
+}
+
+/// The document tools an embedding host serves over MCP. The host serves
+/// the calls; this bundle carries their declaration and the caller context.
+struct HostDocumentTools;
+#[async_trait::async_trait]
+impl AgentToolDispatcher for HostDocumentTools {
+    fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+        ["host_documents_read", "host_documents_apply"]
+            .into_iter()
+            .map(|name| {
+                Arc::new(ToolDef::new(
+                    name,
+                    "Host document service",
+                    serde_json::json!({"type":"object","properties":{}}),
+                ))
+            })
+            .collect::<Vec<_>>()
+            .into()
+    }
+    fn tool_mutation_class(&self, name: &str) -> ToolMutationClass {
+        match name {
+            "host_documents_read" => ToolMutationClass::ReadOnly,
+            "host_documents_apply" => ToolMutationClass::Mutating,
+            _ => ToolMutationClass::Unknown,
+        }
+    }
+    async fn dispatch(
+        &self,
+        _: ToolCallView<'_>,
+    ) -> std::result::Result<ToolDispatchOutcome, ToolError> {
+        panic!("the embedding host serves document calls, not this bundle")
+    }
+}
+
+struct NoDocumentCalls;
+#[async_trait::async_trait]
+impl meerkat_mcp::McpCallContextProvider for NoDocumentCalls {
+    async fn prepare(
+        &self,
+        _: meerkat_mcp::McpCallTarget<'_>,
+        _: ToolCallView<'_>,
+        _: &ToolDispatchContext,
+    ) -> std::result::Result<Option<meerkat_mcp::McpCallContext>, meerkat_mcp::McpCallContextError>
+    {
+        panic!("no member makes a document call in this fixture")
+    }
+}
+
+/// A runtime composed as an embedding host that supplies its document
+/// service to child mobs over MCP only: a public stdio descriptor child
+/// profiles carry, its host-only runtime twin, and the document authority
+/// behind both. Returns the binding's document context and the public
+/// descriptor.
+async fn document_mcp_harness(
+    path: &std::path::Path,
+) -> (
+    UnifiedRuntime,
+    ToolBundleContext,
+    meerkat_core::McpServerConfig,
+) {
+    // No document call reaches this command in these fixtures.
+    let public = meerkat_core::McpServerConfig::stdio(
+        "host-documents",
+        "host-documents-fixture",
+        vec![],
+        std::collections::HashMap::from([("HOST_DOCUMENTS_TOKEN".to_string(), String::new())]),
+    );
+    let mut runtime_config = public.clone();
+    let meerkat_core::mcp_config::McpTransportConfig::Stdio(stdio) = &mut runtime_config.transport
+    else {
+        panic!("the fixture descriptor is stdio");
+    };
+    stdio
+        .env
+        .insert("HOST_DOCUMENTS_TOKEN".into(), "host-secret".into());
+    let captured = Arc::new(Mutex::new(None));
+    let capture = captured.clone();
+    let binding = meerkat_meta::extension_state::HostMcpDocumentBinding::new(
+        public,
+        runtime_config,
+        ToolBundleRequirements::durable_documents(
+            "host-documents",
+            "host_documents_read",
+            "host_documents_apply",
+        ),
+        Arc::new(
+            move |context: ToolBundleContext| -> std::result::Result<
+                Arc<dyn AgentToolDispatcher>,
+                String,
+            > {
+                *capture.lock().unwrap() = Some(context);
+                Ok(Arc::new(HostDocumentTools))
+            },
+        ),
+        Arc::new(NoDocumentCalls),
+        meerkat_meta::extension_state::ChildMcpAvailability::ChildAvailable,
+    )
+    .unwrap();
+    let public = binding.public_config().clone();
+    let (storage, provenance) =
+        meerkat_meta::mob_composition_manifest::persistent_mob_storage(path.join("mob.sqlite3"))
+            .unwrap();
+    let mut definition = definition(path);
+    let meerkat_mob::ProfileBinding::Inline(profile) = definition
+        .profiles
+        .get_mut(&meerkat_mob::ProfileName::from("worker"))
+        .unwrap()
+    else {
+        panic!("fixture declares an inline worker profile");
+    };
+    // This host offers its documents over MCP only.
+    profile.tools.rust_bundles.clear();
+    // A document MCP binding composes the builder's own session services.
+    let runtime = Box::pin(
+        UnifiedRuntime::builder()
+            .definition(definition)
+            .persistent_state(path)
+            .mob_storage(storage, provenance)
+            .default_llm_client(Arc::new(ScriptClient {
+                calls: AtomicUsize::new(0),
+                tool: "host_documents_read",
+            }))
+            .child_application_tool_policy(meerkat_core::ApplicationToolPolicyBinding::Unmanaged)
+            .module_config(meerkat_meta::MetaConfig {
+                modules: vec![],
+                discovery: meerkat_meta::DiscoverySpec {
+                    namespace: "extension-mcp".into(),
+                    modules: vec![],
+                },
+                pre_spawn: vec![],
+            })
+            .timeout(Duration::from_secs(10))
+            .register_mcp_tool_bundle_factory(binding)
+            .build(),
+    )
+    .await
+    .unwrap();
+    let context = captured.lock().unwrap().take().unwrap();
+    (runtime, context, public)
+}
+
+/// The embedding-host flow: an owner member's bridge session gets a delegate
+/// mob and a child it authored, both carrying the host's document MCP
+/// supply, and their members' document callers resolve through the
+/// extension authority registry. Owner cleanup then destroys both children
+/// completely: nothing of them stays held, and their storage is removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_authority_registry_owner_cleanup_destroys_document_mcp_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, public) = document_mcp_harness(dir.path()).await;
+    let owner = runtime.spawn(worker("owner")).await.unwrap();
+    let owner_session = member_session(&runtime, &owner.agent_identity).await;
+    let state = runtime
+        .mob_runtime()
+        .agent_mob_mcp_state()
+        .expect("the runtime composes the agent mob-tool state");
+    let delegate = state
+        .get_or_create_implicit_mob_for_bridge_session(&owner_session.to_string(), "gpt-5.5")
+        .await
+        .unwrap();
+    let authored = state
+        .mob_create_definition_with_owner_bridge_session(
+            MobDefinition::from_toml(&format!(
+                "[mob]\nid = \"{}-authored\"\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+                 runtime_mode = \"turn_driven\"\n[profiles.worker.tools]\ncomms = true\n",
+                definition(dir.path()).id
+            ))
+            .unwrap(),
+            owner_session.clone(),
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+    for (child, profile, member) in [
+        (&delegate, "delegate", "helper"),
+        (&authored, "worker", "author"),
+    ] {
+        let handle = state.handle_for(child).await.unwrap();
+        assert_eq!(
+            handle.definition().profiles[&meerkat_mob::ProfileName::from(profile)]
+                .as_inline()
+                .expect("an inline child profile")
+                .tools
+                .mcp_servers,
+            vec![public.clone()],
+            "the child supply gives {child} the host's public document descriptor"
+        );
+        drop(handle);
+        state
+            .mob_spawn(
+                child,
+                meerkat_mob::ProfileName::from(profile),
+                AgentIdentity::from(member),
+                Some(meerkat_mob::MobRuntimeMode::TurnDriven),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let handle = state.handle_for(child).await.unwrap();
+        let session = handle
+            .get_member(&AgentIdentity::from(member))
+            .await
+            .unwrap()
+            .unwrap()
+            .bridge_session_id()
+            .unwrap()
+            .clone();
+        drop(handle);
+        assert!(
+            matches!(
+                caller(&context, &session).await.principal(),
+                Principal::Worker { mob_id, .. } if mob_id == child.as_str()
+            ),
+            "{child}'s member resolves its document caller"
+        );
+    }
+    let databases = child_mob_storage_files(dir.path());
+    for child in [&delegate, &authored] {
+        assert!(
+            databases.contains(&format!("mob--{child}.db")),
+            "{child} keeps a durable mob database: {databases:?}"
+        );
+    }
+
+    state
+        .destroy_bridge_session_mobs(&owner_session.to_string())
+        .await
+        .unwrap_or_else(|error| panic!("owner cleanup must destroy both children: {error}"));
+    let managed = state.mob_list().await.unwrap();
+    let remaining = child_mob_storage_files(dir.path());
+    for child in [&delegate, &authored] {
+        assert!(
+            !managed.iter().any(|(id, _)| id == child),
+            "{child} is destroyed"
+        );
+        assert!(
+            !remaining
+                .iter()
+                .any(|name| name.starts_with(&format!("mob--{child}.db"))),
+            "{child}'s storage is removed: {remaining:?}"
+        );
+    }
+    drop(state);
+    runtime.shutdown().await;
+}
+
+/// A child mob restored with its runtime is released on destroy as a fresh
+/// one is: the restored runtime binds the child's extension authority again,
+/// and nothing it composes keeps the child's handle past the destroy, so the
+/// destroy completes and removes the child's storage.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_authority_registry_releases_a_restored_child_mob_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, _) = harness(dir.path(), None).await;
+    let owned = OwnedChild::create(&runtime, &context, dir.path()).await;
+    let child = owned.child.clone();
+    drop(owned);
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(context);
+
+    let (reopened, context, _) = harness(dir.path(), None).await;
+    let state = reopened
+        .mob_runtime()
+        .agent_mob_mcp_state()
+        .expect("the runtime composes the agent mob-tool state");
+    let handle = state
+        .handle_for(&child)
+        .await
+        .expect("the child is restored with its runtime");
+    let member_session = handle
+        .get_member(&AgentIdentity::from("child-worker"))
+        .await
+        .unwrap()
+        .unwrap()
+        .bridge_session_id()
+        .unwrap()
+        .clone();
+    drop(handle);
+    assert!(
+        matches!(
+            caller(&context, &member_session).await.principal(),
+            Principal::Worker { mob_id, .. } if mob_id == child.as_str()
+        ),
+        "the restored child's member resolves its document caller again"
+    );
+    let report = state
+        .mob_destroy(&child)
+        .await
+        .unwrap_or_else(|error| panic!("the restored child's destroy must complete: {error}"));
+    assert!(report.errors.is_empty(), "{report:?}");
+    let remaining = child_mob_storage_files(dir.path());
+    assert!(
+        !remaining
+            .iter()
+            .any(|name| name.starts_with(&format!("mob--{child}.db"))),
+        "the restored child's storage is removed: {remaining:?}"
+    );
+    drop(state);
+    reopened.shutdown().await;
+}
+
+/// A child mob definition under `mob_id`, as an agent's `mob_create` passes
+/// one.
+fn child_definition(mob_id: &meerkat_mob::MobId) -> MobDefinition {
+    MobDefinition::from_toml(&format!(
+        "[mob]\nid = \"{mob_id}\"\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+         runtime_mode = \"turn_driven\"\n[profiles.worker.tools]\ncomms = true\n"
+    ))
+    .unwrap()
+}
+
+/// A session-owned create of `mob_id` through the agent mob-tool state, as
+/// an agent's `mob_create` runs it for its session.
+async fn create_for_session(
+    state: &meerkat_mob_mcp::MobMcpState,
+    mob_id: &meerkat_mob::MobId,
+    session: meerkat_core::SessionId,
+) -> std::result::Result<meerkat_mob::MobId, meerkat_mob::MobError> {
+    state
+        .mob_create_definition_with_owner_bridge_session(
+            child_definition(mob_id),
+            session,
+            true,
+            false,
+        )
+        .await
+}
+
+/// The refusal of a create under an id documents still name: recognizable,
+/// and naming every way to clear the references.
+fn assert_refused_with_remedy(error: &meerkat_mob::MobError, mob_id: &meerkat_mob::MobId) {
+    assert!(
+        meerkat_mob_mcp::MobMcpState::is_create_refusal(error),
+        "{error}"
+    );
+    let text = error.to_string();
+    for expected in [
+        mob_id.as_str(),
+        "Choose another mob id",
+        "transfer each document the id owns to another owner",
+        "remove or replace each Audience::Mob grant or deny",
+        "The document tools alone cannot manage",
+    ] {
+        assert!(text.contains(expected), "{expected:?} missing: {text}");
+    }
+    let data = error.structured_data().expect("a structured refusal");
+    assert_eq!(data["kind"], "mob_create_refused");
+    assert!(
+        data["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("Audience::Mob grant or deny")),
+        "{data}"
+    );
+}
+
+/// Documents keep naming a destroyed child mob by its id. A new mob under
+/// that id is refused while they do: from another owner session (the
+/// takeover), from the child's own owner session alike (ownership is by id,
+/// not by mob instance), and without any owner session, in the same process
+/// and after the store is reopened.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_mob_id_reuse_is_refused_while_documents_name_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, _) = harness(dir.path(), None).await;
+    let owned = OwnedChild::create(&runtime, &context, dir.path()).await;
+    let owner = caller(&context, &owned.owner_session).await;
+    context
+        .documents
+        .mutate(
+            &owner,
+            &request("child-owned"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: Some(owned.child_owner()),
+                access: DocumentAccess::default(),
+            }),
+        )
+        .await
+        .unwrap();
+    owned.destroy_natively().await;
+
+    let other = runtime.spawn(worker("other-owner")).await.unwrap();
+    let other_session = member_session(&runtime, &other.agent_identity).await;
+    let refused = create_for_session(&owned.state, &owned.child, other_session)
+        .await
+        .expect_err("another session cannot take the destroyed child's id over");
+    assert_refused_with_remedy(&refused, &owned.child);
+    let refused = create_for_session(&owned.state, &owned.child, owned.owner_session.clone())
+        .await
+        .expect_err("the child's own owner session cannot recreate the explicit id either");
+    assert_refused_with_remedy(&refused, &owned.child);
+    let child = owned.child.clone();
+    drop(owned);
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(context);
+
+    let (reopened, _context, _) = harness(dir.path(), None).await;
+    let state = reopened
+        .mob_runtime()
+        .agent_mob_mcp_state()
+        .expect("the runtime composes the agent mob-tool state");
+    let late = reopened.spawn(worker("late-owner")).await.unwrap();
+    let late_session = member_session(&reopened, &late.agent_identity).await;
+    let refused = create_for_session(&state, &child, late_session)
+        .await
+        .expect_err("the documents still name the id after the store is reopened");
+    assert_refused_with_remedy(&refused, &child);
+    // A create without an owner session gets no exemption: the state's
+    // public create, as an embedder's own surface reaches it, is checked
+    // the same way.
+    let refused = state
+        .mob_create_definition(child_definition(&child))
+        .await
+        .expect_err("a create without an owner session is checked too");
+    assert_refused_with_remedy(&refused, &child);
+    drop(state);
+    reopened.shutdown().await;
+}
+
+/// An audience entry alone keeps a destroyed mob's id named: a document
+/// shared with the mob (Audience::Mob) blocks a new mob under the id after
+/// its owner was transferred away from the mob, until the grant is removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_mob_id_reuse_is_refused_for_an_audience_entry_until_it_is_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, _) = harness(dir.path(), None).await;
+    let owned = OwnedChild::create(&runtime, &context, dir.path()).await;
+    let owner = caller(&context, &owned.owner_session).await;
+    let shared = DocumentAccess {
+        grants: vec![Grant {
+            audience: Audience::Mob(owned.child.to_string()),
+            role: Role::Reader,
+        }],
+        ..DocumentAccess::default()
+    };
+    let created = context
+        .documents
+        .mutate(
+            &owner,
+            &request("shared-with-child"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: Some(owned.child_owner()),
+                access: shared,
+            }),
+        )
+        .await
+        .unwrap()
+        .receipt;
+    // While the child lives, its owner session moves the document to its
+    // own principal; the grant to the child stays.
+    let transferred = context
+        .documents
+        .mutate(
+            &owner,
+            &request("transfer-from-child"),
+            Mutation::Transfer {
+                id: created.document_id.clone(),
+                expected_revision: created.revision.clone(),
+                owner: Owner::Agent(owner.principal().clone()),
+                access: None,
+            },
+        )
+        .await
+        .unwrap()
+        .receipt;
+    owned.destroy_natively().await;
+
+    let other = runtime.spawn(worker("other-owner")).await.unwrap();
+    let other_session = member_session(&runtime, &other.agent_identity).await;
+    let refused = create_for_session(&owned.state, &owned.child, other_session.clone())
+        .await
+        .expect_err("the grant alone still names the id after the owner transfer");
+    assert_refused_with_remedy(&refused, &owned.child);
+
+    let owner = caller(&context, &owned.owner_session).await;
+    context
+        .documents
+        .mutate(
+            &owner,
+            &request("unshare-child"),
+            Mutation::SetAccess {
+                id: created.document_id.clone(),
+                expected_revision: transferred.revision.clone(),
+                access: DocumentAccess::default(),
+            },
+        )
+        .await
+        .unwrap();
+    create_for_session(&owned.state, &owned.child, other_session)
+        .await
+        .expect("with no document naming the id, the create proceeds");
+    drop(owned);
+    runtime.shutdown().await;
+}
+
+/// The implicit delegation mob that a session's own runtime path recreates,
+/// as for a model change, keeps the documents its id owns, also after a
+/// restart restored it with its owner session. A foreign create cannot
+/// claim that id, neither as an explicit mob nor with the implicit flag for
+/// another session, and a temporary council's model-chosen id is checked
+/// like any other.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_mob_id_reuse_keeps_the_sessions_implicit_mob_and_checks_councils() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, _) = harness(dir.path(), None).await;
+    let state = runtime
+        .mob_runtime()
+        .agent_mob_mcp_state()
+        .expect("the runtime composes the agent mob-tool state");
+    let owner = runtime.spawn(worker("owner")).await.unwrap();
+    let session = member_session(&runtime, &owner.agent_identity).await;
+    let (implicit, created) = state
+        .ensure_implicit_mob_for_model(&session.to_string(), "gpt-5.5", None)
+        .await
+        .unwrap();
+    assert!(created);
+    let owner_caller = caller(&context, &session).await;
+    let named = DocumentAccess {
+        grants: vec![Grant {
+            audience: Audience::Mob(implicit.to_string()),
+            role: Role::Reader,
+        }],
+        ..DocumentAccess::default()
+    };
+    context
+        .documents
+        .mutate(
+            &owner_caller,
+            &request("delegation-notes"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: Some(Owner::Mob(implicit.to_string())),
+                access: named,
+            }),
+        )
+        .await
+        .unwrap();
+    let (recreated, created) = state
+        .ensure_implicit_mob_for_model(&session.to_string(), "claude-sonnet-4-5", Some(&implicit))
+        .await
+        .expect("the session's own implicit mob is recreated for a new model");
+    assert!(created);
+    assert_eq!(recreated, implicit);
+    drop(state);
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(context);
+
+    let (reopened, context, _) = harness(dir.path(), None).await;
+    let state = reopened
+        .mob_runtime()
+        .agent_mob_mcp_state()
+        .expect("the runtime composes the agent mob-tool state");
+    assert_eq!(
+        state
+            .find_implicit_mob_for_bridge_session(&session.to_string())
+            .await,
+        Some(implicit.clone()),
+        "the restored implicit mob keeps its owner session"
+    );
+    let (recreated, created) = state
+        .ensure_implicit_mob_for_model(&session.to_string(), "gpt-5.5", Some(&implicit))
+        .await
+        .expect("the restored session recreates its implicit mob again");
+    assert!(created);
+    assert_eq!(recreated, implicit);
+
+    state
+        .destroy_bridge_session_mobs(&session.to_string())
+        .await
+        .unwrap();
+    let foreign = reopened.spawn(worker("foreign")).await.unwrap();
+    let foreign_session = member_session(&reopened, &foreign.agent_identity).await;
+    let refused = create_for_session(&state, &implicit, foreign_session.clone())
+        .await
+        .expect_err("another session cannot claim the implicit mob's id");
+    assert_refused_with_remedy(&refused, &implicit);
+    let refused = state
+        .mob_create_definition_with_owner_bridge_session(
+            child_definition(&implicit),
+            foreign_session.clone(),
+            true,
+            true,
+        )
+        .await
+        .expect_err("the implicit flag counts only for the id of its own session");
+    assert_refused_with_remedy(&refused, &implicit);
+
+    let council = meerkat_mob::temporary_council::TemporaryCouncilId::new("model-chosen")
+        .unwrap()
+        .temporary_mob_id();
+    let foreign_caller = caller(&context, &foreign_session).await;
+    context
+        .documents
+        .mutate(
+            &foreign_caller,
+            &request("shared-with-council"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: None,
+                access: DocumentAccess {
+                    grants: vec![Grant {
+                        audience: Audience::Mob(council.to_string()),
+                        role: Role::Reader,
+                    }],
+                    ..DocumentAccess::default()
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    // A temporary council creates its mob for a session of its own.
+    let refused = state
+        .mob_create_definition_with_owner_bridge_session(
+            child_definition(&council),
+            meerkat_core::SessionId::new(),
+            false,
+            false,
+        )
+        .await
+        .expect_err("a council's model-chosen id is checked");
+    assert_refused_with_remedy(&refused, &council);
+    drop(state);
+    reopened.shutdown().await;
+}
+
+/// The check fails closed: when the documents cannot be read, a
+/// session-owned create is refused rather than let through.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_mob_id_reuse_refuses_when_the_documents_cannot_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, _) = harness(dir.path(), None).await;
+    let owner = runtime.spawn(worker("owner")).await.unwrap();
+    let session = member_session(&runtime, &owner.agent_identity).await;
+    let owner_caller = caller(&context, &session).await;
+    context
+        .documents
+        .mutate(
+            &owner_caller,
+            &request("unreadable"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: None,
+                access: DocumentAccess::default(),
+            }),
+        )
+        .await
+        .unwrap();
+    rusqlite::Connection::open(dir.path().join("extension_state.sqlite3"))
+        .unwrap()
+        .execute("UPDATE extension_documents SET metadata = '{'", [])
+        .unwrap();
+    let state = runtime
+        .mob_runtime()
+        .agent_mob_mcp_state()
+        .expect("the runtime composes the agent mob-tool state");
+    let mob_id = meerkat_mob::MobId::from("never-named");
+    let refused = create_for_session(&state, &mob_id, session)
+        .await
+        .expect_err("an unreadable document store refuses the create");
+    assert!(
+        meerkat_mob_mcp::MobMcpState::is_create_refusal(&refused),
+        "{refused}"
+    );
+    assert!(
+        refused.to_string().contains("could not be checked"),
+        "{refused}"
+    );
+    drop(state);
+    runtime.shutdown().await;
+}

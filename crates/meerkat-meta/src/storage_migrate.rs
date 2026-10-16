@@ -185,6 +185,16 @@ pub fn enumerate_state_dir_databases(state_dir: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    // The extension document store is a slot only with the extension-state
+    // feature, but a state directory an embedder wrote with it can hold one:
+    // every build fences it, and adoption carries it over.
+    #[cfg(not(feature = "extension-state"))]
+    {
+        let path = state_dir.join(crate::storage_layout::EXTENSION_STATE_DB_FILE_NAME);
+        if path.is_file() {
+            files.push(path);
+        }
+    }
     for spelling in MEMORY_ROOT_SPELLINGS {
         let root = state_dir.join(spelling);
         let Ok(entries) = fs::read_dir(&root) else {
