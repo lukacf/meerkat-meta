@@ -77,6 +77,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ExtensionDocumentStoreFactory`, hold a host's own extension document store
   to the mob id contract; a store that keeps the default holder methods
   fails `mob_id_holders`.
+- The attempt in a `PublicIdentityRuntime::attach_live_mcp_server` receipt
+  forwards meerkat's new stdio setup diagnostics,
+  `McpAttachmentAttempt::setup_failure` and `stderr_tail`, under the same
+  identity checks as `observe`: they answer only while the identity is still
+  on the session the server was attached to, checked before and after each
+  read, and `None` otherwise. Without the forwarding the trait's defaults
+  answered `None`, so a host attaching through the identity entry never saw
+  the typed failure or the stderr tail of a stdio server that failed its
+  launch, handshake or tool discovery. The tail stays with the host: Meta
+  does not log it or add it to any event, RPC, SDK or console payload.
 
 ### Fixed
 
