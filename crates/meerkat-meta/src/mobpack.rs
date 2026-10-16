@@ -15586,6 +15586,7 @@ fn selected_path_skill_files(
 }
 
 fn selected_skill_sources(document: &MobpackDocument) -> BTreeMap<String, Value> {
+    let realm_skills = RealmSkills::of(&document.skill_realms);
     let mut selected = BTreeMap::<String, Value>::new();
     if let Some(members) = document.members.as_array() {
         for member in members {
@@ -15600,7 +15601,7 @@ fn selected_skill_sources(document: &MobpackDocument) -> BTreeMap<String, Value>
                 if selected.contains_key(&skill) {
                     continue;
                 }
-                if let Some(source) = skill_source_from_realms(&skill, &document.skill_realms) {
+                if let Some(source) = realm_skills.source(&skill) {
                     selected.insert(skill, source);
                 }
             }
@@ -17680,6 +17681,7 @@ fn render_editor_document_mob_toml(document: &MobpackDocument) -> Result<String,
     emit_rendered_backend(&mut lines, &settings);
     emit_rendered_advanced_mob_settings(&mut lines, &settings);
 
+    let realm_skills = RealmSkills::of(&document.skill_realms);
     let mut selected_skills = BTreeMap::<String, Value>::new();
     for member in &members {
         if lines.full() {
@@ -17689,7 +17691,7 @@ fn render_editor_document_mob_toml(document: &MobpackDocument) -> Result<String,
             if selected_skills.contains_key(&skill) {
                 continue;
             }
-            if let Some(source) = skill_source_from_realms(&skill, &document.skill_realms) {
+            if let Some(source) = realm_skills.source(&skill) {
                 selected_skills.insert(skill, source);
             }
         }
@@ -18911,28 +18913,56 @@ fn string_vec(value: Option<&Value>) -> Vec<String> {
     }
 }
 
-fn skill_source_from_realms(skill_id: &str, realms: &Value) -> Option<Value> {
-    for realm in realms.as_array()? {
-        for skill in realm.get("skills").and_then(Value::as_array)? {
-            if skill.get("id").and_then(Value::as_str).map(str::trim) == Some(skill_id) {
-                let mut source = skill.clone();
-                if let Some(map) = source.as_object_mut() {
-                    if !map.contains_key("realm_id")
-                        && let Some(realm_id) = realm.get("id").and_then(Value::as_str)
-                    {
-                        map.insert("realm_id".to_string(), json!(realm_id));
-                    }
-                    if !map.contains_key("realm_source")
-                        && let Some(realm_source) = realm.get("source").and_then(Value::as_str)
-                    {
-                        map.insert("realm_source".to_string(), json!(realm_source));
-                    }
+/// A realm skill's trimmed id, read as one unit of work.
+fn realm_skill_id(skill: &Value) -> Option<&str> {
+    count_mobpack_work();
+    skill.get("id").and_then(Value::as_str).map(str::trim)
+}
+
+/// The skills of a document's realms by id, indexed once: for each id the
+/// first skill with it, in realm order, with its realm. A realm without a
+/// skills array ends the realms looked in. Each selected skill used to scan
+/// the realms again.
+struct RealmSkills<'a> {
+    skills: BTreeMap<&'a str, (&'a Value, &'a Value)>,
+}
+
+impl<'a> RealmSkills<'a> {
+    fn of(realms: &'a Value) -> Self {
+        let mut skills = BTreeMap::new();
+        for realm in realms.as_array().into_iter().flatten() {
+            let Some(realm_skills) = realm.get("skills").and_then(Value::as_array) else {
+                break;
+            };
+            for skill in realm_skills {
+                if let Some(id) = realm_skill_id(skill) {
+                    skills.entry(id).or_insert((realm, skill));
                 }
-                return Some(source);
             }
         }
+        Self { skills }
     }
-    None
+
+    /// The source of the skill with an id: the skill, naming its realm's id
+    /// and source unless it names its own.
+    fn source(&self, skill_id: &str) -> Option<Value> {
+        count_mobpack_work();
+        let (realm, skill) = self.skills.get(skill_id)?;
+        let mut source = Value::clone(skill);
+        if let Some(map) = source.as_object_mut() {
+            if !map.contains_key("realm_id")
+                && let Some(realm_id) = realm.get("id").and_then(Value::as_str)
+            {
+                map.insert("realm_id".to_string(), json!(realm_id));
+            }
+            if !map.contains_key("realm_source")
+                && let Some(realm_source) = realm.get("source").and_then(Value::as_str)
+            {
+                map.insert("realm_source".to_string(), json!(realm_source));
+            }
+        }
+        Some(source)
+    }
 }
 
 fn editor_tool_config(value: Option<&Value>) -> RenderedToolConfig {
@@ -39463,5 +39493,49 @@ condition = { op = "eq", path = "params.kind", value = "d" }
         member_step_ids(&steps, &mut ids);
         ids.sort();
         assert_eq!(ids, ["a", "b", "c", "d", "start"], "{steps:#}");
+    }
+
+    /// A document with one realm of `count` inline skills, and one member
+    /// that selects each of them and `count` skills no realm defines.
+    fn many_skills_document(count: usize) -> MobpackDocument {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        let skills: Vec<Value> = (0..count)
+            .map(|index| {
+                json!({ "id": format!("skill_{index}"), "source": "inline", "content": "Use it." })
+            })
+            .collect();
+        let selected: Vec<String> = (0..count)
+            .map(|index| format!("skill_{index}"))
+            .chain((0..count).map(|index| format!("missing_{index}")))
+            .collect();
+        document.skill_realms = json!([{ "id": "realm", "skills": skills }]);
+        document.members = json!([{ "id": "worker", "name": "Worker", "skills": selected }]);
+        document
+    }
+
+    /// The skills a document's members select are looked up in an index of
+    /// the realms' skills, built once. Each selection scanned the realms
+    /// again, so selecting many skills, or naming many that no realm defines,
+    /// took work quadratic in their number, when validating, exporting and
+    /// rendering.
+    #[test]
+    fn selected_skill_lookup_work_grows_linearly() {
+        let selected = selected_skill_sources(&many_skills_document(2));
+        assert_eq!(
+            (
+                selected.keys().map(String::as_str).collect::<Vec<_>>(),
+                selected["skill_1"]["realm_id"].as_str(),
+            ),
+            (vec!["skill_0", "skill_1"], Some("realm")),
+        );
+        assert_work_grows_linearly("n selected skills", |count| {
+            let document = many_skills_document(count);
+            with_mobpack_work(|| selected_skill_sources(&document)).1
+        });
+        assert_work_grows_linearly("n rendered skills", |count| {
+            let document = many_skills_document(count);
+            with_mobpack_work(|| render_editor_document_mob_toml(&document)).1
+        });
     }
 }

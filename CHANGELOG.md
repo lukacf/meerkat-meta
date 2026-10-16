@@ -267,6 +267,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   steps in one pass over the frame. Every step searched the whole frame for
   its parallel siblings, and every branched step for the rest of its branch,
   so a definition of many steps took work quadratic in their number.
+- Validating, exporting and rendering a Flow Editor document look up the
+  skills its members select in an index of its realms' skills, built once.
+  Each selection scanned the realms again, so selecting many skills, or
+  naming many that no realm defines, took work quadratic in their number.
 ### Added
 
 - `meta_gateway storage-adopt-predecessor --mob-config <file>` checks the mob
