@@ -41,7 +41,7 @@ import sys
 
 # The lanes, each named by the `changes` output its jobs test in ci.yml.
 LANE_JOBS = {
-    "rust": ("test", "test-extension-state", "extension-state-lint", "test-voice", "voice-clippy"),
+    "rust": ("clippy", "test", "test-extension-state", "extension-state-lint", "test-voice", "voice-clippy"),
     "integration": ("test-integration",),
     "python": ("test-python",),
     "console": ("console", "console-browser", "console-fixtures", "console-acceptance"),

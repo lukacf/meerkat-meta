@@ -123,7 +123,9 @@ class CiWorkflowTests(unittest.TestCase):
         dev-dependency use) share one entry; every other job keeps its own.
         """
         expected = {
-            "fmt-lint": None,
+            # The workspace lint keeps the key it had in fmt-lint, whose
+            # main entry holds its build; fmt-lint itself caches nothing.
+            "clippy": "fmt-lint",
             "test": "test",
             "test-integration": "test",
             "test-extension-state": None,
@@ -345,6 +347,29 @@ class CiWorkflowTests(unittest.TestCase):
             "- run: python3 scripts/verify-decorator-authority.py",
             block,
         )
+
+    def test_the_workspace_lint_runs_in_its_own_rust_lane_job(self):
+        """fmt-lint runs on every pull request and compiles nothing; the
+        workspace clippy runs once, in the clippy job, when a Rust change
+        reaches it, beside fmt-lint instead of after its contract tests."""
+        source = CI_WORKFLOW.read_text()
+        command = "- run: scripts/repo-cargo clippy --workspace --all-targets -- -D warnings\n"
+        self.assertEqual(source.count(command), 1)
+        lint = job_block("clippy")
+        self.assertIn(command, lint)
+        self.assertIn("    needs: changes\n    if: needs.changes.outputs.rust == 'true'\n", lint)
+        self.assertIn("          components: clippy\n", lint)
+        fmt_lint = "\n".join(line for line in job_block("fmt-lint").splitlines()
+                             if not line.strip().startswith("#"))
+        self.assertNotIn("needs:", fmt_lint)
+        self.assertNotIn(" if:", fmt_lint)
+        self.assertNotIn("repo-cargo clippy", fmt_lint)
+        self.assertIn("          components: rustfmt\n", fmt_lint)
+        self.assertNotIn("rust-cache", fmt_lint)
+        for kept in ("- run: scripts/repo-cargo fmt --all -- --check\n",
+                     "- run: node scripts/generate-bazel-rust-builds.mjs --check\n",
+                     "- run: scripts/repo-cargo machete --with-metadata\n"):
+            self.assertIn(kept, fmt_lint)
 
     def test_typescript_sdk_suite_actually_runs_in_ci(self):
         """705 TypeScript tests existed and gated nothing.
@@ -576,6 +601,7 @@ class CiWorkflowTests(unittest.TestCase):
         must_gate = {
             "changes",
             "fmt-lint",
+            "clippy",
             "test",
             "test-integration",
             "test-extension-state",
@@ -650,6 +676,7 @@ class CiWorkflowTests(unittest.TestCase):
             ("lanes empty", rust_jobs, {lane: "" for lane in ci_changes.LANES}, 1),
             ("a required job skipped", {"fmt-lint": "skipped"}, console_only, 1),
             ("changes failed", {"changes": "failure"}, every, 1),
+            ("the workspace lint skipped while rust runs", {"clippy": "skipped"}, every, 1),
         )
         for name, results, lanes, status in cases:
             with self.subTest(case=name):
