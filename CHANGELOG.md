@@ -551,6 +551,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the draft was deleted and created again can overwrite the new draft once
   it reaches the same revision: the etag names the draft's id and revision,
   not which draft of that id it is.
+- A restarted gateway, or a second gateway on the same persistent_state
+  directory and realm, takes over the detached callback jobs of any callback
+  tool its host declares with the same tool name, runner name and runner
+  version, whatever that tool now declares. Its host is offered their running
+  attempts. The gateway also starts their queued and retry-due jobs. Once a
+  running job's lease has expired, it restarts the job if its restart class
+  allows. It uses the original arguments and the credential scope names
+  recorded at submission; the host resolves the credentials as it now
+  registers that runner. Change a detached tool's runner version whenever its
+  declaration, its runner implementation or the profile it runs under changes:
+  a gateway neither offers nor starts jobs of a runner version it does not
+  register. Such jobs stay as they are until a gateway registers that version
+  again, so let a tool's jobs finish, or cancel them, before changing it.
+  Meerkat 0.9.3's own RPC server binds a detached callback job to its tool's
+  declaration; Meta's gateway adopts that binding in a later release.
 
 ### Known issues
 
