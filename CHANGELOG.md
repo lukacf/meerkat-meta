@@ -98,6 +98,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Incomplete { stop_reason }` variant (see Fixed). Code that matches one of
   them exhaustively needs an arm for it.
 
+- `meta/topology/apply` idempotency keys are scoped to the caller. A Console
+  caller (its verified human; else its authenticated principal, with the
+  provider and issuer that verified it; else the open Console's anonymous
+  account), the gateway's JSON-RPC surface, and each principal a host names to
+  `TopologyRuntimeHandle::apply_as` or `SameProcessTopologyCoordinator::apply`
+  have their own keys: the same key from two callers names two operations, and
+  a retry replays only its own caller's apply. An open Console without an
+  access controller never resolves tokens, so every caller there, even one
+  presenting a valid token, is that shared anonymous account; isolating
+  callers needs `require_app_auth` or an access controller. The host's
+  `TopologyRuntimeHandle::apply`, and `apply_as` or the coordinator without a
+  principal, keep their keys as before; such a host key may no longer begin
+  with `apply-scoped:`.
+- Upgrade note: an apply recorded before this version is not matched by any
+  scoped caller, and one recorded under a key that begins with
+  `apply-scoped:` is matched by no caller. A retry across the upgrade with
+  the same key is evaluated as a new apply (refused with
+  `topology_revision_conflict` when its `expected_revision` is stale), and a
+  scoped retry of an apply still pending at the upgrade answers
+  `topology_operation_in_progress` until recovery closes it. A downgrade and
+  re-upgrade drops the keys scoped callers recorded before the downgrade (the
+  earlier version rewrites the state without marking them), so their retries
+  are likewise evaluated as new applies.
+
+- Behaviour-only (not measured by the semver gate): console send records
+  written before this version are not matched by any Console caller, so a
+  send in flight during the upgrade and retried afterwards with the same key
+  is admitted as a new send.
+
 ### Security
 
 - The stock reference app router's documented bound on requests in flight
@@ -301,6 +330,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   launch, handshake or tool discovery. The tail stays with the host: Meta
   does not log it or add it to any event, RPC, SDK or console payload.
 
+- `.github/workflows/warm-deps.yml`, dispatched on a branch whose `Cargo.lock`
+  changed, builds the dependency graph of each Rust CI job from that branch's
+  crates.io dependencies, with no workspace code, and keeps it as a 3-day
+  artifact. The branch's pull request extracts the matching artifact in each
+  Rust job (`scripts/ci-warm-deps.py`), but only from a dispatch on its head
+  commit or an ancestor with the same warm-deps files, so a Meerkat Core bump
+  no longer compiles its dependencies cold in every job. CONTRIBUTING.md has
+  the release-preparation steps.
+- Python SDK: `MobHandle.spawn_helper` and `MobHandle.fork_helper` take
+  `transport_timeout` (seconds), as `activate_member_instruction` already
+  does. Both calls answer only once the helper's turn has finished, so the
+  transport's default request timeout (60 seconds) gave up on longer helpers
+  while they still ran. The value bounds only the client's wait and is not
+  sent to the gateway, which sets no deadline of its own on a helper run.
+  When the wait runs out the helper's outcome is unknown and it may still be
+  running: reconcile it before any retry, since a retry starts another
+  helper rather than cancelling or deduplicating the first.
+
+- `meta/console/recover_send` and its REST twin `POST /console/send/recover`
+  report the caller's own console send by `identity`, `origin` and
+  `idempotency_key`: its acceptance as it is now, and what the runtime holds
+  for it (`native.state`: `admitted` with the input id and, when known, its
+  phase; `absent`; or `unknown`). A send the evidence shows admitted but not
+  yet settled is settled `delivered`, unless this process is still
+  dispatching it, which is left to that dispatch; nothing is dispatched. A key
+  the caller never used and a key another caller used answer the same
+  `send_not_found`. It is gated like `meta/console/send` (`agent.send`,
+  refused on a read-only console).
+- `ConsoleLogStore::unsettled_send_frames` (defaulted to none) and
+  `UnifiedRuntime::reconcile_interrupted_console_sends`, which both gateways
+  run once at startup.
+
 ### Changed
 
 - Flow Editor catalogs give a caller without host access each filesystem
@@ -313,6 +374,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   whose keys change with every `Cargo.lock`, while the entries took 5.4 GB
   of the repository's Actions cache. `verify_crate_packages` still restores
   main CI's `meta-dev-bins` entry read-only.
+
+- The pre-push hook runs only fast local checks. The workspace clippy and the
+  workspace unit gate, which took 712.88 s and 974.16 s of a 28m19s push,
+  moved to the hook's manual stage (`pre-commit run --hook-stage manual
+  cargo-clippy|cargo-test --from-ref origin/main --to-ref HEAD`); CI's clippy
+  and test jobs run both on every pull request that touches Rust. The push
+  stage now takes about 10 seconds warm.
+- A pull request runs only its own CI lanes. For a Rust change it runs
+  clippy, the unit tests and the integration tests, and leaves the voice and
+  extension-state jobs, the Python SDK tests, the console jobs and the flow
+  editor job to the push to main, unless it changes their own inputs: code
+  gated on `openai-live` or `extension-state`, those features' modules and
+  crate, the backend modules a lane drives end to end (the HTTP console and
+  console aggregator, the flow editor binary, its HTTP surface and mobpack,
+  the RPC gateway), the crate files a lane's tests read or its inputs embed
+  (the console and flow editor bundles, contract-checked sources, fixtures),
+  or their own directories. A change to the build configuration
+  (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`,
+  `crates/meerkat-meta/Cargo.toml`) runs every lane that compiles Rust.
+  Console fixtures, the component packages, examples, the
+  Makefile and the nextest configuration reach only the lanes that read them,
+  and the Bazel files, `deny.toml`, `.gitignore` and the hook configuration
+  reach none. Pushes to main and dispatches still run every lane, and a
+  release tag still requires that run to be green for its exact commit.
+- CI runs the workspace clippy in its own job beside `fmt-lint`, which now
+  compiles nothing; balances the two integration halves by measured build and
+  run time (`[a-hj-mstv-z]*` and `[inopqru]*`); drops the unit job's disk
+  reclaim and runs the integration halves' reclaim in the background; and
+  deals the console browser scenarios to three legs instead of two. Projected
+  from measured step times, a warm pull request that touches only Rust
+  finishes in about 11 minutes instead of 17.
+- CI no longer runs on pushes to `ci/**` and `feat/**` branches; those runs
+  ran every lane beside the pull request run of the same commit. A branch
+  gets CI through its pull request, or a dispatch of the CI workflow.
+- The console aggregator's live-event burst test holds its backfill read on
+  a gate and asserts that every live frame reaches the store while the read
+  is held, instead of racing a slow backfill against a deadline. CI's unit
+  test job, which left it out as timing-sensitive, runs it again, without
+  retries; it had run only in the pre-push unit gate, which is now manual.
+- CI's unit test job, now the only automatic run of the lib and bin tests,
+  lists them with its own filter before running them and fails if the
+  filter leaves any out.
+
+- Console sends are deduplicated per caller: the dedupe keys of
+  `meta/console/send` and `/console/send` are scoped to the authenticated
+  principal (a verified human by OIDC issuer and subject, otherwise the
+  console principal with its provider and verified issuer; anonymous
+  callers of an open console share one local account). The same key from
+  two callers names two sends. An open console without an access
+  controller never resolves tokens, so every caller there is that shared
+  account; with `require_app_auth` or an access controller each verified
+  caller has its own scope (on an open console, a caller without a token
+  stays in the shared account).
+- The `dedupe_key` of a console send frame is an opaque digest for every
+  Console caller. The public Rust `MetaConsoleAggregator::send` and
+  `reserve_identity_first_interaction` keep their key shape and behaviour.
 
 ### Fixed
 
@@ -532,6 +649,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   witnesses recorded in their inherited ceiling, so their host callback tools
   stay hidden until they are re-spawned. `fork_off` was not affected: it
   applies no inherited ceiling.
+
+- The identity health monitor logs a member it fails to subscribe to, as
+  the console forwarder does: a warning on the first failure, then debug
+  while the subscription keeps failing, each with `watcher` set to
+  `identity_health_monitor` or `console_forwarder`. The monitor logged
+  neither, so a member whose turns it could not count left no trace until
+  the stream repair (#455).
+
+- Python SDK: a request timeout longer than `threading.TIMEOUT_MAX` (for
+  example `transport_timeout=1e10`) is refused before the request is
+  written. A per-call `transport_timeout`, a server wait's deadline and a
+  transport's own default raise `ValueError`; `connect()` with such a
+  `gateway_init_timeout` raises `TransportError` ("meta/init failed: ...")
+  caused by that `ValueError`, and sends no `meta/init`. The transport used to
+  write the request and only then fail its wait with `OverflowError`, so the
+  gateway ran the call (a helper spawn, for example) with nobody waiting for
+  the reply.
+
+- A replay of a console send the gateway accepted but stopped before it
+  settled now decides from the runtime's admission evidence in the session
+  the send recorded. An admitted input settles it `delivered`. An absent one
+  is dispatched again only for a durable identity's local session, under the
+  send's own delivery identity and pinned to that session (a moved session
+  ends it `delivery_failed`, never retargeted); governed sends and other
+  members' sends are settled from evidence only, so an absent one stays
+  unsettled. A send this process is still dispatching is left to that
+  dispatch. At startup the gateway settles, from evidence only, the unsettled
+  sends among the newest console frames whose input was admitted.
 
 ### Known limitations
 

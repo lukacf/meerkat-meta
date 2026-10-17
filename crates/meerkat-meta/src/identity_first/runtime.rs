@@ -11451,6 +11451,19 @@ impl IdentityRuntime {
             })
     }
 
+    /// Whether a Console human send to `identity` is admitted under its
+    /// delivery identity, pinned to the session the send recorded: a local
+    /// session-backed identity. An externally bound identity takes the
+    /// external delivery, which carries no delivery identity, so a send to it
+    /// must never be dispatched a second time.
+    pub(crate) async fn console_human_delivery_is_keyed(&self, identity: &AgentIdentity) -> bool {
+        self.entries
+            .read()
+            .await
+            .get(identity)
+            .is_some_and(|entry| !durable_spec_uses_external_binding(&entry.spec))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_console_human_input_tracked(
         self: &Arc<Self>,

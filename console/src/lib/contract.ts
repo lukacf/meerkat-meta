@@ -8,6 +8,7 @@ export const CONSOLE_REST_PATHS = {
   timelineStream: "/console/timeline/stream",
   identityTimelineStreamTemplate: "/console/identity/{identity}/stream",
   legacySend: "/console/send",
+  sendRecover: "/console/send/recover",
   mcpAppsResolve: "/console/mcp-apps/resolve",
   mcpAppsReadResource: "/console/mcp-apps/read-resource",
   mcpAppsCallTool: "/console/mcp-apps/call-tool",
@@ -21,6 +22,7 @@ export const CONSOLE_RPC_PATHS = {
 export const CONSOLE_RPC_METHODS = {
   capabilities: "meta/capabilities",
   send: "meta/console/send",
+  recoverSend: "meta/console/recover_send",
   listIdentities: "meta/console/list_identities",
   inspectIdentity: "meta/console/inspect_identity",
   queryTimeline: "meta/console/query_timeline",

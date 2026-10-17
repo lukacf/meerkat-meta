@@ -1218,10 +1218,36 @@ pub(crate) fn resolve_authorized_console_human_from_token(
     decisions: &RuntimeDecisionState,
     token: &str,
 ) -> Option<(ConsoleAccessRequest, Option<AuthenticatedConsoleHuman>)> {
-    let (auth, human) = resolve_console_auth_and_human_from_token(decisions, token).ok()?;
-    crate::decisions::enforce_console_route_access(&decisions.auth, &decisions.console, &auth)
-        .ok()?;
-    Some((auth, human))
+    resolve_authorized_console_caller_from_token(decisions, token)
+        .map(|caller| (caller.auth, caller.human))
+}
+
+/// A caller the Console resolved from a token it verified and authorized.
+pub(crate) struct ResolvedConsoleCaller {
+    /// The access principal and provider classification the Console's
+    /// policy checked.
+    pub(crate) auth: ConsoleAccessRequest,
+    /// The issuer the token verified against: the Console's trusted OIDC
+    /// issuer, as the verification used it.
+    pub(crate) issuer: String,
+    /// The verified human behind the token, when there is one.
+    pub(crate) human: Option<AuthenticatedConsoleHuman>,
+}
+
+/// [`resolve_authorized_console_human_from_token`] that also carries the
+/// issuer the token verified against out of that verification.
+pub(crate) fn resolve_authorized_console_caller_from_token(
+    decisions: &RuntimeDecisionState,
+    token: &str,
+) -> Option<ResolvedConsoleCaller> {
+    let caller = resolve_console_caller_from_token(decisions, token).ok()?;
+    crate::decisions::enforce_console_route_access(
+        &decisions.auth,
+        &decisions.console,
+        &caller.auth,
+    )
+    .ok()?;
+    Some(caller)
 }
 
 /// The trust-domain prefix of a Console human's qualified principal: the
@@ -1402,13 +1428,13 @@ fn resolve_console_auth_from_token(
     decisions: &RuntimeDecisionState,
     token: &str,
 ) -> Result<ConsoleAccessRequest, ConsoleAuthResolutionError> {
-    resolve_console_auth_and_human_from_token(decisions, token).map(|(auth, _)| auth)
+    resolve_console_caller_from_token(decisions, token).map(|caller| caller.auth)
 }
 
-fn resolve_console_auth_and_human_from_token(
+fn resolve_console_caller_from_token(
     decisions: &RuntimeDecisionState,
     token: &str,
-) -> Result<(ConsoleAccessRequest, Option<AuthenticatedConsoleHuman>), ConsoleAuthResolutionError> {
+) -> Result<ResolvedConsoleCaller, ConsoleAuthResolutionError> {
     if decisions.trusted_oidc.audience.trim().is_empty() {
         return Err(ConsoleAuthResolutionError::InvalidTrustedOidcConfig);
     }
@@ -1486,7 +1512,7 @@ fn resolve_console_auth_and_human_from_token(
         _ if discovery.issuer.trim().is_empty() => None,
         (_, Some(subject)) => Some(AuthenticatedConsoleHuman {
             provider: provider.clone(),
-            issuer: discovery.issuer,
+            issuer: discovery.issuer.clone(),
             subject,
             expires_at_epoch_seconds: claims.expires_at_epoch_seconds,
             token_digest: {
@@ -1502,13 +1528,14 @@ fn resolve_console_auth_and_human_from_token(
         }),
     };
 
-    Ok((
-        ConsoleAccessRequest {
+    Ok(ResolvedConsoleCaller {
+        auth: ConsoleAccessRequest {
             provider,
             email: principal,
         },
+        issuer: discovery.issuer,
         human,
-    ))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

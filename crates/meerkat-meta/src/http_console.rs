@@ -52,6 +52,9 @@ use crate::console_aggregator::{
     ConsoleTimelineWindowQuery, ConsoleVisibility, ConsoleVisibilityPolicy,
     HideImplicitDelegateMembersConsoleVisibilityPolicy, MetaConsoleAggregator,
 };
+use crate::console_aggregator::{
+    ConsoleSendRecovery, ConsoleSendScope, NativeSendObservation, ScopedReservation,
+};
 use crate::contact_directory::ContactDirectory;
 use crate::http_sse::{DEFAULT_KEEP_ALIVE_INTERVAL, KEEP_ALIVE_TEXT};
 use crate::mob_handle_runtime::{
@@ -140,10 +143,23 @@ struct ConsoleHttpAuthContext {
     /// Whether the verified token classified the principal as a service
     /// identity rather than a human.
     service_identity: bool,
+    /// The scope this caller's console sends are deduplicated in, fixed
+    /// when the request's token was resolved.
+    send_scope: ConsoleSendScope,
     /// Per-request access snapshot when an [`AccessController`] is wired.
     access_view: Option<AccessView>,
     /// The verified human behind the request's token, when there is one.
     human: Option<crate::runtime::AuthenticatedConsoleHuman>,
+}
+
+impl ConsoleHttpAuthContext {
+    /// The scope this caller's console sends are deduplicated in: the
+    /// verified human (issuer and subject) when there is one, else the
+    /// authenticated principal with its trust source, else the open
+    /// Console's shared local account.
+    fn send_scope(&self) -> ConsoleSendScope {
+        self.send_scope.clone()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -677,6 +693,7 @@ fn console_json_router_with_state(state: ConsoleJsonState) -> Router {
             get(console_identity_timeline_stream_handler),
         )
         .route("/console/send", post(console_send_handler))
+        .route("/console/send/recover", post(console_send_recover_handler))
         .route("/console/rpc", post(console_rpc_handler))
         .route(
             "/console/rpc/multipart",
@@ -902,6 +919,7 @@ pub async fn console_rpc_handler(
             read_only,
             state.access.as_ref(),
             auth_context.access_view.as_ref(),
+            &auth_context.send_scope(),
         ))
         .await;
         return (StatusCode::OK, Json::<Value>(response_value));
@@ -932,6 +950,7 @@ pub async fn console_rpc_handler(
         state.workgraph.as_ref(),
         state.topology.as_ref(),
         &ConsoleSendGovernance::for_request(&state, &auth_context),
+        &console_topology_apply_scope(&auth_context),
     ))
     .await;
     let response_value = decorate_console_job_projection(
@@ -1663,7 +1682,7 @@ async fn console_send_handler(
     if let Err(err) = governance.refuse_ungoverned_delivery(request.identity.as_str()) {
         return console_send_error_response(err);
     }
-    match Box::pin(aggregator.send(request)).await {
+    match Box::pin(aggregator.send_scoped(request, &governance.scope)).await {
         Ok(accepted) => (
             StatusCode::OK,
             Json::<Value>(
@@ -1672,6 +1691,194 @@ async fn console_send_handler(
         )
             .into_response(),
         Err(err) => console_send_error_response(err),
+    }
+}
+
+/// `POST /console/send/recover`: the REST twin of `meta/console/recover_send`.
+/// It runs the same gate as `/console/send`, and the caller is the
+/// authenticated principal, never a parameter.
+async fn console_send_recover_handler(
+    State(state): State<ConsoleJsonState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Json(params): Json<Value>,
+) -> impl IntoResponse {
+    let Some(auth_context) = console_request_auth_context(&state, &headers, &uri) else {
+        return console_json_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "console send recovery requires a valid auth token",
+        );
+    };
+    let identity = params
+        .get("identity")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if let Err(refusal) = console_send_gate(
+        &state.decisions,
+        state.runtime.as_ref(),
+        state.access.as_ref(),
+        auth_context.access_view.as_ref(),
+        identity.as_str(),
+    )
+    .await
+    {
+        return refusal.into_response();
+    }
+    let Some(aggregator) = &state.console_aggregator else {
+        return console_json_error(
+            StatusCode::NOT_FOUND,
+            "unavailable",
+            "console aggregator unavailable",
+        );
+    };
+    let identity_runtime = state
+        .identity_runtime
+        .as_ref()
+        .map(|identity_runtime| Arc::clone(identity_runtime.runtime()));
+    match Box::pin(recover_console_send(
+        aggregator,
+        identity_runtime.as_ref(),
+        &params,
+        &auth_context.send_scope(),
+    ))
+    .await
+    {
+        Ok(recovery) => (
+            StatusCode::OK,
+            Json::<Value>(serde_json::to_value(recovery).unwrap_or(Value::Null)),
+        )
+            .into_response(),
+        Err(RecoverSendFailure::InvalidParams(message)) => {
+            console_json_error(StatusCode::BAD_REQUEST, "invalid_request", &message)
+        }
+        Err(RecoverSendFailure::NotFound) => console_json_error(
+            StatusCode::NOT_FOUND,
+            CONSOLE_SEND_NOT_FOUND_KIND,
+            CONSOLE_SEND_NOT_FOUND_MESSAGE,
+        ),
+        Err(RecoverSendFailure::Send(err)) => console_send_error_response(err),
+    }
+}
+
+/// Typed kind of a recovery that names no send of the caller's. The answer is
+/// the same for a key nobody used and for a key another caller used.
+const CONSOLE_SEND_NOT_FOUND_KIND: &str = "send_not_found";
+const CONSOLE_SEND_NOT_FOUND_MESSAGE: &str = "no console send of yours has this idempotency key";
+
+/// `meta/console/recover_send` parameters: the send's own identity, origin
+/// and idempotency key. Nothing else is accepted, so no interaction or frame
+/// id can be offered as a lookup key.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsoleSendRecoverParams {
+    identity: String,
+    origin: String,
+    idempotency_key: String,
+}
+
+#[derive(Debug)]
+enum RecoverSendFailure {
+    InvalidParams(String),
+    NotFound,
+    Send(ConsoleSendError),
+}
+
+/// Recover the caller's own console send: its acceptance as it is now and
+/// what the runtime holds for it, settling it from admission evidence when
+/// the evidence shows it admitted. Nothing is dispatched. The send is found
+/// only under the caller's `scope`.
+async fn recover_console_send(
+    aggregator: &MetaConsoleAggregator,
+    identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+    params: &Value,
+    scope: &ConsoleSendScope,
+) -> Result<ConsoleSendRecovery, RecoverSendFailure> {
+    let params: ConsoleSendRecoverParams =
+        serde_json::from_value(params.clone()).map_err(|err| {
+            RecoverSendFailure::InvalidParams(format!("invalid recover params: {err}"))
+        })?;
+    for (field, value) in [
+        ("identity", params.identity.as_str()),
+        ("origin", params.origin.as_str()),
+        ("idempotency_key", params.idempotency_key.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(RecoverSendFailure::InvalidParams(format!(
+                "{field} must be non-empty"
+            )));
+        }
+    }
+    let identities = Box::pin(console_send_identity_candidates(
+        aggregator,
+        identity_runtime,
+        &params.identity,
+    ))
+    .await;
+    match Box::pin(aggregator.recover_send(
+        &identities,
+        &params.origin,
+        &params.idempotency_key,
+        scope,
+    ))
+    .await
+    {
+        Ok(Some(recovery)) => Ok(recovery),
+        Ok(None) => Err(RecoverSendFailure::NotFound),
+        Err(err) => Err(RecoverSendFailure::Send(err)),
+    }
+}
+
+/// The identities a console send to `identity` can be recorded under: as
+/// addressed, and the canonical durable identity an alias resolved to (an
+/// identity-first send records the canonical one).
+async fn console_send_identity_candidates(
+    aggregator: &MetaConsoleAggregator,
+    identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+    identity: &str,
+) -> Vec<String> {
+    let mut candidates = vec![identity.to_string()];
+    let Some(identity_runtime) = identity_runtime else {
+        return candidates;
+    };
+    let addressed_directly = match crate::identity_first::AgentIdentity::parse(identity) {
+        Ok(parsed) => identity_runtime.status(&parsed).await.is_ok(),
+        Err(_) => false,
+    };
+    if !addressed_directly
+        && let Some(canonical) =
+            Box::pin(resolve_console_send_identity_alias(aggregator, identity)).await
+        && canonical != identity
+    {
+        candidates.push(canonical);
+    }
+    candidates
+}
+
+fn console_send_recovery_rpc_response(
+    response_id: Value,
+    recovered: Result<ConsoleSendRecovery, RecoverSendFailure>,
+) -> Value {
+    match recovered {
+        Ok(recovery) => response_value(
+            response_id,
+            Some(serde_json::to_value(recovery).unwrap_or(Value::Null)),
+            None,
+        ),
+        Err(RecoverSendFailure::InvalidParams(message)) => invalid_params(response_id, message),
+        Err(RecoverSendFailure::NotFound) => response_value(
+            response_id,
+            None,
+            Some(JsonRpcError {
+                code: -32001,
+                message: CONSOLE_SEND_NOT_FOUND_MESSAGE.to_string(),
+                data: Some(json!({ "kind": CONSOLE_SEND_NOT_FOUND_KIND })),
+            }),
+        ),
+        Err(RecoverSendFailure::Send(err)) => {
+            response_value(response_id, None, Some(console_send_json_rpc_error(err)))
+        }
     }
 }
 
@@ -1824,6 +2031,8 @@ impl ConsoleSendPrecheck {
 pub(crate) struct ConsoleSendGovernance {
     pub(crate) ingress: Option<Arc<dyn crate::console_governed_ingress::ConsoleGovernedIngress>>,
     pub(crate) human: Option<crate::runtime::AuthenticatedConsoleHuman>,
+    /// Whose send this is: the dedupe scope of its idempotency key.
+    pub(crate) scope: ConsoleSendScope,
     /// The runtime's canonical composition: its machine has a host's native
     /// work authorization owner installed, so every member admits only
     /// governed input, whether or not a Console ingress is installed.
@@ -1838,6 +2047,7 @@ impl ConsoleSendGovernance {
         Self {
             ingress: state.governed_ingress.current(),
             human: auth_context.human.clone(),
+            scope: auth_context.send_scope(),
             runtime_governed: state
                 .runtime
                 .as_ref()
@@ -2041,7 +2251,7 @@ async fn console_send_governed_with_identity_first_fallback(
     {
         Err(ConsoleSendError::UnknownIdentity(_)) => {
             governance.refuse_ungoverned_delivery(member_send_request.identity.as_str())?;
-            Box::pin(aggregator.send(member_send_request)).await
+            Box::pin(aggregator.send_scoped(member_send_request, &governance.scope)).await
         }
         result => result,
     }
@@ -2160,18 +2370,48 @@ async fn console_send_identity_first_governed(
         .agent_runtime_id
         .as_ref()
         .map(|id| id.as_str().to_string());
-    let accepted = match Box::pin(
-        aggregator.reserve_identity_first_interaction(request.clone(), session_id.as_deref()),
-    )
+    let (accepted, claim) = match Box::pin(aggregator.reserve_identity_first_interaction_scoped(
+        request.clone(),
+        session_id.as_deref(),
+        &governance.scope,
+    ))
     .await?
     {
-        // An idempotent replay: the original acceptance is the answer, and the
-        // turn it names already ran (or is running). Dispatching again would
-        // run a second turn whose frames land under this interaction id.
-        crate::console_aggregator::IdentityFirstReservation::Existing(accepted) => {
-            return Ok(accepted);
+        // An idempotent replay of a settled send, or of one whose dispatch
+        // runs in this process: the original acceptance is the answer.
+        // Dispatching again would run a second turn under this interaction.
+        ScopedReservation::Replay(accepted) => return Ok(accepted),
+        ScopedReservation::Fresh(accepted, claim) => {
+            crate::console_aggregator::faults::after_console_reserve();
+            (accepted, claim)
         }
-        crate::console_aggregator::IdentityFirstReservation::Fresh(accepted) => accepted,
+        // A replay of a send no live owner settled (the process that
+        // accepted it stopped): the runtime's admission evidence decides.
+        ScopedReservation::Unsettled(accepted, claim, frame) => {
+            match aggregator.observe_native_send(&frame).await {
+                NativeSendObservation::Admitted { .. } => {
+                    return aggregator.settle_admitted_send(&frame, &claim).await;
+                }
+                // Dispatched again only as a host-human send: keyed by the
+                // send's delivery identity and pinned to the session it
+                // recorded, so the runtime keeps one input and a moved session
+                // refuses it (delivery_failed), never retargets it. A governed
+                // send is settled from evidence only.
+                NativeSendObservation::Absent
+                    if governed.is_none()
+                        && accepted.session_id.is_some()
+                        && identity_runtime
+                            .console_human_delivery_is_keyed(&identity)
+                            .await =>
+                {
+                    aggregator.begin_send_redispatch(&frame, &claim)?;
+                    (accepted, Some(claim))
+                }
+                NativeSendObservation::Absent | NativeSendObservation::Unknown { .. } => {
+                    return Ok(accepted);
+                }
+            }
+        }
     };
 
     if let Some(events) = console_events {
@@ -2188,6 +2428,8 @@ async fn console_send_identity_first_governed(
     }
 
     if handling_mode == meerkat_core::types::HandlingMode::Steer {
+        // This request owns the frame's dispatch until the steer settles.
+        let _owner = claim;
         let expected_alias =
             if crate::member_comms_id::is_reserved_generated_alias(&requested_identity) {
                 Some(requested_identity.as_str())
@@ -2207,6 +2449,7 @@ async fn console_send_identity_first_governed(
             .await;
         match send_result {
             Ok(_) => {
+                crate::console_aggregator::faults::after_console_admission();
                 if let Err(err) = aggregator
                     .mark_steer_interaction_delivered(
                         &accepted.input_frame_id,
@@ -2271,7 +2514,10 @@ async fn console_send_identity_first_governed(
     let failed_aggregator = aggregator.clone();
     let failed_frame_id = accepted.input_frame_id.clone();
     let failed_identity = identity.clone();
+    let dispatch_claim = claim;
     let dispatch = tokio::spawn(async move {
+        // The task owns the frame's dispatch until it settles the frame.
+        let _owner = dispatch_claim;
         let send_result = identity_runtime
             .send_console_human_input_tracked(
                 &dispatch_identity,
@@ -2285,6 +2531,7 @@ async fn console_send_identity_first_governed(
             .await;
         match send_result {
             Ok(_) => {
+                crate::console_aggregator::faults::after_console_admission();
                 if let Err(err) = dispatch_aggregator
                     .mark_interaction_delivered(&dispatch_accepted.input_frame_id)
                     .await
@@ -2630,6 +2877,7 @@ fn is_console_mutating_rpc_method(method: &str) -> bool {
         "meta/retire"
             | "meta/reset_all"
             | "meta/console/send"
+            | "meta/console/recover_send"
             | crate::console_voice::VOICE_OPEN_METHOD
             | "meta/blob/upload"
             | "meta/ensure_member"
@@ -3003,7 +3251,9 @@ fn console_rpc_access_requirements(
         | crate::rpc::mob_methods::APPLY_MEMBER_TOOL_DECLARATION => {
             one(ACTION_RUNTIME_ADMIN, None)
         }
-        "meta/console/send" => one(ACTION_AGENT_SEND, identity),
+        // Recovering a send answers only the caller's own sends to the
+        // identity, so it needs exactly what sending there needs.
+        "meta/console/send" | "meta/console/recover_send" => one(ACTION_AGENT_SEND, identity),
         crate::console_voice::VOICE_CONTEXT_STATUS_METHOD
         | crate::console_voice::VOICE_CAPTIONS_METHOD => one(ACTION_AGENT_VIEW, identity),
         crate::console_voice::VOICE_OPEN_METHOD
@@ -4851,6 +5101,7 @@ pub async fn console_rpc_multipart_handler(
             state.decisions.console.read_only,
             state.access.as_ref(),
             auth_context.access_view.as_ref(),
+            &auth_context.send_scope(),
         ))
         .await
     } else {
@@ -4889,6 +5140,7 @@ pub async fn console_rpc_multipart_handler(
             state.workgraph.as_ref(),
             state.topology.as_ref(),
             &ConsoleSendGovernance::for_request(&state, &auth_context),
+            &console_topology_apply_scope(&auth_context),
         ))
         .await
     };
@@ -4971,6 +5223,35 @@ fn console_request_authorized(state: &ConsoleJsonState, headers: &HeaderMap, uri
     console_request_auth_context(state, headers, uri).is_some()
 }
 
+/// The topology apply idempotency scope of a Console caller: the scope its
+/// console sends are deduplicated in, fixed when the request's token was
+/// resolved. That is the verified human (issuer and subject) when there is
+/// one, else the authenticated principal with its trust source (the provider
+/// its token was classified as and the issuer it verified against), else the
+/// open Console's shared anonymous account.
+fn console_topology_apply_scope(
+    auth: &ConsoleHttpAuthContext,
+) -> crate::topology_control::TopologyApplyScope {
+    use crate::topology_control::TopologyApplyScope;
+    match auth.send_scope() {
+        ConsoleSendScope::Human { issuer, subject } => {
+            TopologyApplyScope::Human { issuer, subject }
+        }
+        ConsoleSendScope::Principal {
+            principal,
+            provider,
+            issuer,
+        } => TopologyApplyScope::Principal {
+            principal,
+            provider,
+            issuer,
+        },
+        // A Console request always resolves to a scoped caller; `Unscoped`
+        // belongs to the public Rust send API and never reaches a route.
+        ConsoleSendScope::Anonymous | ConsoleSendScope::Unscoped => TopologyApplyScope::Anonymous,
+    }
+}
+
 fn console_request_auth_context(
     state: &ConsoleJsonState,
     headers: &HeaderMap,
@@ -4990,33 +5271,72 @@ fn console_request_auth_context_for(
     if !decisions.console.require_app_auth {
         // Open console: identify callers that volunteered a valid token so
         // per-user ABAC grants still apply; everyone else is anonymous.
-        let (auth, human) = access
-            .and_then(|_| {
-                let token = console_request_token(headers, uri)?;
-                crate::runtime::resolve_authorized_console_human_from_token(decisions, &token)
-            })
-            .map_or((None, None), |(auth, human)| (Some(auth), human));
-        let service_identity = auth
-            .as_ref()
-            .is_some_and(|auth| auth.provider == crate::AuthProvider::ServiceIdentity);
-        let principal = auth.map(|auth| auth.email);
-        return Some(ConsoleHttpAuthContext {
-            access_view: access.map(|controller| controller.view_for_subject(principal.as_deref())),
-            principal,
-            service_identity,
-            human,
+        let caller = access.and_then(|_| {
+            let token = console_request_token(headers, uri)?;
+            crate::runtime::resolve_authorized_console_caller_from_token(decisions, &token)
         });
+        let Some(caller) = caller else {
+            return Some(ConsoleHttpAuthContext {
+                access_view: access.map(|controller| controller.view_for_subject(None)),
+                principal: None,
+                service_identity: false,
+                send_scope: ConsoleSendScope::Anonymous,
+                human: None,
+            });
+        };
+        return Some(console_caller_auth_context(caller, access));
     }
     let token = console_request_token(headers, uri)?;
-    let (auth, human) =
-        crate::runtime::resolve_authorized_console_human_from_token(decisions, &token)?;
-    Some(ConsoleHttpAuthContext {
+    let caller = crate::runtime::resolve_authorized_console_caller_from_token(decisions, &token)?;
+    Some(console_caller_auth_context(caller, access))
+}
+
+/// The request context of a caller the Console resolved from a verified
+/// token. Its send scope is fixed here, from that verification: the verified
+/// human (issuer and subject) when there is one, else the principal with
+/// the provider its token was classified as and the issuer the token
+/// verified against.
+fn console_caller_auth_context(
+    caller: crate::runtime::ResolvedConsoleCaller,
+    access: Option<&AccessController>,
+) -> ConsoleHttpAuthContext {
+    let crate::runtime::ResolvedConsoleCaller {
+        auth,
+        issuer,
+        human,
+    } = caller;
+    let send_scope = match &human {
+        Some(human) => ConsoleSendScope::Human {
+            issuer: human.issuer().to_string(),
+            subject: human.subject().to_string(),
+        },
+        None => ConsoleSendScope::Principal {
+            principal: auth.email.clone(),
+            provider: console_provider_name(&auth.provider).to_string(),
+            issuer,
+        },
+    };
+    ConsoleHttpAuthContext {
         access_view: access
             .map(|controller| controller.view_for_subject(Some(auth.email.as_str()))),
         service_identity: auth.provider == crate::AuthProvider::ServiceIdentity,
         principal: Some(auth.email),
+        send_scope,
         human,
-    })
+    }
+}
+
+/// The name a principal's send scope records for its provider: the spelling
+/// tokens use, fixed here so a stored dedupe key never depends on how the
+/// provider type serializes.
+fn console_provider_name(provider: &crate::AuthProvider) -> &'static str {
+    match provider {
+        crate::AuthProvider::GoogleOAuth => "google_oauth",
+        crate::AuthProvider::GitHubOAuth => "github_oauth",
+        crate::AuthProvider::GenericOidc => "generic_oidc",
+        crate::AuthProvider::ServiceIdentity => "service_identity",
+        crate::AuthProvider::TestProvider => "test_provider",
+    }
 }
 
 /// The human principal Meta uses for an authenticated Console human when it
@@ -6646,6 +6966,7 @@ async fn handle_console_aggregator_rpc(
     read_only: bool,
     access: Option<&AccessController>,
     access_view: Option<&AccessView>,
+    send_scope: &ConsoleSendScope,
 ) -> Value {
     let response_id = request.id.clone().unwrap_or(Value::Null);
     if let Err(message) =
@@ -6681,7 +7002,11 @@ async fn handle_console_aggregator_rpc(
                 "meta/console/query_timeline",
             ];
             if can_mutate {
-                methods.extend_from_slice(&["meta/retire", "meta/console/send"]);
+                methods.extend_from_slice(&[
+                    "meta/retire",
+                    "meta/console/send",
+                    "meta/console/recover_send",
+                ]);
             }
             if access.is_some() {
                 methods.push("meta/access/status");
@@ -6790,7 +7115,7 @@ async fn handle_console_aggregator_rpc(
             let Some(aggregator) = &console_aggregator else {
                 return console_aggregator_unavailable(response_id);
             };
-            match Box::pin(aggregator.send(send_request)).await {
+            match Box::pin(aggregator.send_scoped(send_request, send_scope)).await {
                 Ok(accepted) => response_value(
                     response_id,
                     Some(serde_json::to_value(accepted).unwrap_or(Value::Null)),
@@ -6800,6 +7125,21 @@ async fn handle_console_aggregator_rpc(
                     response_value(response_id, None, Some(console_send_json_rpc_error(err)))
                 }
             }
+        }
+        "meta/console/recover_send" => {
+            let Some(aggregator) = &console_aggregator else {
+                return console_aggregator_unavailable(response_id);
+            };
+            console_send_recovery_rpc_response(
+                response_id,
+                Box::pin(recover_console_send(
+                    aggregator,
+                    None,
+                    &request.params,
+                    send_scope,
+                ))
+                .await,
+            )
         }
         "meta/retire" => {
             let Some(identity) = request.params.get("identity").and_then(Value::as_str) else {
@@ -6942,6 +7282,7 @@ async fn handle_console_runtime_rpc(
         None,
         None,
         &crate::http_console::ConsoleSendGovernance::default(),
+        &crate::topology_control::TopologyApplyScope::Anonymous,
     )
     .await
 }
@@ -6969,6 +7310,7 @@ async fn handle_console_runtime_rpc_with_visibility(
     workgraph: Option<&meerkat::WorkGraphService>,
     topology: Option<&crate::topology_control::TopologyRuntimeHandle>,
     governance: &ConsoleSendGovernance,
+    topology_apply_scope: &crate::topology_control::TopologyApplyScope,
 ) -> Value {
     let response_id = request.id.clone().unwrap_or(Value::Null);
     if let Err(message) =
@@ -7107,6 +7449,7 @@ async fn handle_console_runtime_rpc_with_visibility(
                     "meta/reset",
                     "meta/reset_all",
                     "meta/console/send",
+                    "meta/console/recover_send",
                     "meta/blob/upload",
                     "meta/ensure_member",
                     "meta/retire_member",
@@ -7319,6 +7662,7 @@ async fn handle_console_runtime_rpc_with_visibility(
                     &request.params,
                     access_view,
                     authenticated_principal,
+                    topology_apply_scope,
                 )
                 .await,
             )
@@ -7790,7 +8134,7 @@ async fn handle_console_runtime_rpc_with_visibility(
             {
                 return response_value(response_id, None, Some(console_send_json_rpc_error(err)));
             }
-            match Box::pin(aggregator.send(send_request)).await {
+            match Box::pin(aggregator.send_scoped(send_request, &governance.scope)).await {
                 Ok(accepted) => response_value(
                     response_id,
                     Some(serde_json::to_value(accepted).unwrap_or(Value::Null)),
@@ -7800,6 +8144,30 @@ async fn handle_console_runtime_rpc_with_visibility(
                     response_value(response_id, None, Some(console_send_json_rpc_error(err)))
                 }
             }
+        })
+        .await,
+        "meta/console/recover_send" => meerkat_runtime::stack_relief::box_in_own_frame(move || async move {
+            let Some(aggregator) = &console_aggregator else {
+                return response_value(
+                    response_id,
+                    None,
+                    Some(JsonRpcError {
+                        code: -32004,
+                        message: "console aggregator unavailable".to_string(),
+                        data: None,
+                    }),
+                );
+            };
+            console_send_recovery_rpc_response(
+                response_id,
+                Box::pin(recover_console_send(
+                    aggregator,
+                    identity_runtime.as_ref(),
+                    &request.params,
+                    &governance.scope,
+                ))
+                .await,
+            )
         })
         .await,
         "meta/blob/get" => meerkat_runtime::stack_relief::box_in_own_frame(move || async move {
@@ -13513,6 +13881,7 @@ comms = true
             true,
             None,
             None,
+            &crate::console_aggregator::ConsoleSendScope::Anonymous,
         )
         .await;
 
@@ -13527,6 +13896,145 @@ comms = true
         assert_eq!(
             response["result"]["runtime_capabilities"]["can_send_messages"],
             json!(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_send_rpc_answers_only_the_callers_own_send_and_takes_no_ids() {
+        use crate::console_aggregator::{ConsoleSendScope, ScopedReservation};
+        let aggregator = MetaConsoleAggregator::in_memory();
+        let owner = ConsoleSendScope::Human {
+            issuer: "https://issuer.example".to_string(),
+            subject: "u1".to_string(),
+        };
+        let other = ConsoleSendScope::Human {
+            issuer: "https://issuer.example".to_string(),
+            subject: "u2".to_string(),
+        };
+        let request = crate::console_aggregator::ConsoleSendRequest {
+            identity: "worker".to_string(),
+            content: json!("hello"),
+            origin: "console".to_string(),
+            idempotency_key: "k1".to_string(),
+            handling_mode: Some("queue".to_string()),
+            origin_kind: None,
+            skill_refs: Vec::new(),
+        };
+        let accepted = match aggregator
+            .reserve_identity_first_interaction_scoped(request, None, &owner)
+            .await
+            .expect("reservation")
+        {
+            ScopedReservation::Fresh(accepted, _claim) => Some(accepted),
+            ScopedReservation::Replay(_) | ScopedReservation::Unsettled(..) => None,
+        }
+        .expect("a fresh reservation");
+        let recover = |params: Value, scope: ConsoleSendScope, read_only: bool| {
+            let aggregator = aggregator.clone();
+            async move {
+                handle_console_aggregator_rpc(
+                    Some(aggregator),
+                    rpc_request_with_params("meta/console/recover_send", params),
+                    true,
+                    read_only,
+                    None,
+                    None,
+                    &scope,
+                )
+                .await
+            }
+        };
+        let key = |idempotency_key: &str| json!({ "identity": "worker", "origin": "console", "idempotency_key": idempotency_key });
+
+        let own = recover(key("k1"), owner.clone(), false).await;
+        assert_eq!(own["error"], Value::Null, "{own}");
+        assert_eq!(
+            own["result"]["input_frame_id"],
+            json!(accepted.input_frame_id)
+        );
+        assert_eq!(
+            own["result"]["interaction_id"],
+            json!(accepted.interaction_id)
+        );
+        assert_eq!(own["result"]["status"], json!("accepted"));
+        assert_eq!(own["result"]["native"]["state"], json!("unknown"));
+
+        // Another principal's key answers exactly as a key nobody used.
+        let foreign = recover(key("k1"), other.clone(), false).await;
+        let missing = recover(key("k-missing"), other.clone(), false).await;
+        assert_eq!(foreign["result"], Value::Null);
+        assert_eq!(foreign["error"], missing["error"]);
+        assert_eq!(foreign["error"]["code"], json!(-32001));
+        assert_eq!(foreign["error"]["data"]["kind"], json!("send_not_found"));
+        let anonymous = recover(key("k1"), ConsoleSendScope::Anonymous, false).await;
+        assert_eq!(anonymous["error"], missing["error"]);
+
+        // The returned ids are not lookup keys: recovery takes the send's
+        // own identity, origin and key, and nothing else.
+        for params in [
+            json!({
+                "identity": "worker",
+                "origin": "console",
+                "idempotency_key": "k1",
+                "interaction_id": accepted.interaction_id,
+            }),
+            json!({
+                "identity": "worker",
+                "origin": "console",
+                "idempotency_key": "k1",
+                "input_frame_id": accepted.input_frame_id,
+            }),
+            json!({
+                "interaction_id": accepted.interaction_id,
+                "input_frame_id": accepted.input_frame_id,
+            }),
+        ] {
+            let by_ids = recover(params, other.clone(), false).await;
+            assert_eq!(by_ids["result"], Value::Null);
+            assert_eq!(by_ids["error"]["code"], json!(-32602), "{by_ids}");
+        }
+        let blank = recover(key(" "), owner.clone(), false).await;
+        assert_eq!(blank["error"]["code"], json!(-32602), "{blank}");
+
+        // Recovery can settle a send, so a read-only console refuses it.
+        let read_only = recover(key("k1"), owner, true).await;
+        assert_eq!(read_only["error"]["code"], json!(-32010));
+        assert_eq!(read_only["error"]["data"]["kind"], json!("read_only"));
+    }
+
+    #[tokio::test]
+    async fn aggregator_capabilities_advertise_recover_send_with_send() {
+        let response = handle_console_aggregator_rpc(
+            None,
+            rpc_request("meta/capabilities"),
+            true,
+            false,
+            None,
+            None,
+            &crate::console_aggregator::ConsoleSendScope::Anonymous,
+        )
+        .await;
+        let methods = response["result"]["methods"]
+            .as_array()
+            .expect("capabilities methods");
+        for method in ["meta/console/send", "meta/console/recover_send"] {
+            assert!(
+                methods.iter().any(|advertised| advertised == method),
+                "{method} missing: {methods:#?}"
+            );
+        }
+        assert!(super::is_console_mutating_rpc_method(
+            "meta/console/recover_send"
+        ));
+        assert_eq!(
+            super::console_rpc_access_requirements(
+                "meta/console/recover_send",
+                &json!({ "identity": "worker" })
+            ),
+            super::console_rpc_access_requirements(
+                "meta/console/send",
+                &json!({ "identity": "worker" })
+            )
         );
     }
 
@@ -13547,6 +14055,7 @@ comms = true
             true,
             None,
             None,
+            &crate::console_aggregator::ConsoleSendScope::Anonymous,
         )
         .await;
 
@@ -13680,6 +14189,7 @@ comms = true
             false,
             None,
             None,
+            &crate::console_aggregator::ConsoleSendScope::Anonymous,
         )
         .await;
 
@@ -13712,6 +14222,7 @@ comms = true
                 false,
                 None,
                 None,
+                &crate::console_aggregator::ConsoleSendScope::Anonymous,
             )
             .await;
             assert_eq!(
@@ -13907,6 +14418,7 @@ comms = true
                 None,
                 None,
                 &crate::http_console::ConsoleSendGovernance::default(),
+                &crate::topology_control::TopologyApplyScope::Anonymous,
             ))
             .await
         }
@@ -15411,6 +15923,7 @@ comms = true
                 None,
                 None,
                 &crate::http_console::ConsoleSendGovernance::default(),
+                &crate::topology_control::TopologyApplyScope::Anonymous,
             ))
             .await;
             assert_ne!(
@@ -15525,6 +16038,7 @@ comms = true
                     None,
                     None,
                     &crate::http_console::ConsoleSendGovernance::default(),
+                    &crate::topology_control::TopologyApplyScope::Anonymous,
                 ))
                 .await;
                 assert_eq!(
@@ -15603,6 +16117,7 @@ comms = true
                 None,
                 None,
                 &crate::http_console::ConsoleSendGovernance::default(),
+                &crate::topology_control::TopologyApplyScope::Anonymous,
             ))
             .await;
             assert_ne!(
@@ -15930,6 +16445,7 @@ comms = true
             None,
             None,
             &governance,
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         );
         // 52,248 bytes with the arms inline (MobKit 0.8.46, debug), 6,256
         // boxed. The bound fails if arms are inlined again, with headroom
@@ -15991,6 +16507,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -16095,6 +16612,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -16651,6 +17169,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -17013,6 +17532,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -17070,6 +17590,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -17111,6 +17632,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -17187,6 +17709,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -17228,6 +17751,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -17271,6 +17795,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -17425,6 +17950,7 @@ comms = true
             false,
             None,
             None,
+            &crate::console_aggregator::ConsoleSendScope::Anonymous,
         ))
         .await;
 
@@ -17446,6 +17972,7 @@ comms = true
             false,
             None,
             None,
+            &crate::console_aggregator::ConsoleSendScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -19204,6 +19731,7 @@ comms = true
             false,
             None,
             None,
+            &crate::console_aggregator::ConsoleSendScope::Anonymous,
         ))
         .await;
 
@@ -21290,6 +21818,141 @@ mod console_viewer_resolver_tests {
         assert_eq!(anonymous.principal, None);
     }
 
+    /// The scope a console send from this request is deduplicated in.
+    fn send_scope_of(state: &ConsoleJsonState, headers: &HeaderMap) -> ConsoleSendScope {
+        let uri: Uri = "/console/send".parse().unwrap();
+        console_request_auth_context(state, headers, &uri)
+            .expect("an admitted request")
+            .send_scope()
+    }
+
+    #[test]
+    fn an_open_console_without_a_controller_sends_every_caller_as_the_shared_local_account() {
+        // No access controller: a volunteered token is never resolved, so
+        // every caller, even one with a valid token, is the one anonymous
+        // local account and shares its send scope.
+        let open = state(decisions(false), None);
+        assert_eq!(
+            send_scope_of(&open, &bearer(BOB)),
+            ConsoleSendScope::Anonymous
+        );
+        assert_eq!(
+            send_scope_of(&open, &bearer(CAROL)),
+            ConsoleSendScope::Anonymous
+        );
+        assert_eq!(
+            send_scope_of(&open, &HeaderMap::new()),
+            ConsoleSendScope::Anonymous
+        );
+
+        // Isolation needs an access controller (or require_app_auth): the
+        // token is resolved and each human is its own scope.
+        let controller = AccessController::new(access(&[BOB, CAROL])).unwrap();
+        let controlled = state(decisions(false), Some(controller));
+        let bob = send_scope_of(&controlled, &bearer(BOB));
+        assert_eq!(
+            bob,
+            ConsoleSendScope::Human {
+                issuer: ISSUER.to_string(),
+                subject: BOB.to_string(),
+            }
+        );
+        assert_ne!(bob, send_scope_of(&controlled, &bearer(CAROL)));
+        assert_eq!(
+            send_scope_of(&controlled, &HeaderMap::new()),
+            ConsoleSendScope::Anonymous
+        );
+
+        let required = state(decisions(true), None);
+        assert_eq!(send_scope_of(&required, &bearer(BOB)), bob);
+    }
+
+    #[test]
+    fn a_principal_without_a_verified_human_is_scoped_by_its_trust_source() {
+        fn signed_bearer(claims: &Value) -> HeaderMap {
+            let mut jwt_header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+            jwt_header.kid = Some("kid-current".to_string());
+            let token = jsonwebtoken::encode(
+                &jwt_header,
+                claims,
+                &jsonwebtoken::EncodingKey::from_secret(b"phase7-trusted-current-secret"),
+            )
+            .expect("signed fixture JWT");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            headers
+        }
+
+        let required = state(decisions(true), None);
+        let robot = send_scope_of(&required, &bearer(ROBOT));
+        assert_eq!(
+            robot,
+            ConsoleSendScope::Principal {
+                principal: ROBOT.to_string(),
+                provider: "service_identity".to_string(),
+                issuer: ISSUER.to_string(),
+            }
+        );
+
+        // A token without a subject is no verified human: its principal is
+        // scoped with the provider the token names, in the token's spelling.
+        let subless = send_scope_of(
+            &required,
+            &signed_bearer(&json!({
+                "iss": ISSUER,
+                "aud": "meerkat-console",
+                "email": BOB,
+                "email_verified": true,
+                "provider": "google_oauth",
+                "exp": chrono::Utc::now().timestamp() + 300,
+            })),
+        );
+        assert_eq!(
+            subless,
+            ConsoleSendScope::Principal {
+                principal: BOB.to_string(),
+                provider: "google_oauth".to_string(),
+                issuer: ISSUER.to_string(),
+            }
+        );
+
+        // The same name verified against another issuer is another caller.
+        const OTHER_ISSUER: &str = "https://other.meta.localhost";
+        let mut other = decisions(true);
+        other.trusted_oidc.discovery_json = json!({
+            "issuer": OTHER_ISSUER,
+            "jwks_uri": format!("{OTHER_ISSUER}/.well-known/jwks.json"),
+        })
+        .to_string();
+        let other_robot = send_scope_of(
+            &state(other, None),
+            &signed_bearer(&json!({
+                "iss": OTHER_ISSUER,
+                "aud": "meerkat-console",
+                "sub": ROBOT,
+                "email": ROBOT,
+                "email_verified": true,
+                "provider": "google_oauth",
+                "exp": chrono::Utc::now().timestamp() + 300,
+            })),
+        );
+        assert_eq!(
+            other_robot,
+            ConsoleSendScope::Principal {
+                principal: ROBOT.to_string(),
+                provider: "service_identity".to_string(),
+                issuer: OTHER_ISSUER.to_string(),
+            }
+        );
+        assert_ne!(
+            robot.dedupe_key("runtime", "agent", "console", "k"),
+            other_robot.dedupe_key("runtime", "agent", "console", "k")
+        );
+    }
+
     #[test]
     fn an_authenticated_human_maps_to_the_console_human_principal() {
         let resolver = ConsoleViewerResolver::new(decisions(true), None);
@@ -21343,6 +22006,59 @@ mod console_viewer_resolver_tests {
                 .unwrap()
                 .allows(crate::access::ACTION_GATING_VIEW),
             "a fresh resolution reflects the replaced policy"
+        );
+    }
+
+    /// The topology apply scope of a Console request.
+    fn topology_apply_scope_of(
+        state: &ConsoleJsonState,
+        headers: &HeaderMap,
+    ) -> crate::topology_control::TopologyApplyScope {
+        let uri: Uri = "/console/rpc".parse().unwrap();
+        console_topology_apply_scope(
+            &console_request_auth_context(state, headers, &uri).expect("an admitted request"),
+        )
+    }
+
+    #[test]
+    fn a_console_callers_topology_apply_scope_follows_its_authentication() {
+        use crate::topology_control::TopologyApplyScope;
+        // An open console without an access controller never resolves a
+        // token: every caller is the shared anonymous account.
+        let open = state(decisions(false), None);
+        for headers in [bearer(BOB), bearer(ROBOT), HeaderMap::new()] {
+            assert_eq!(
+                topology_apply_scope_of(&open, &headers),
+                TopologyApplyScope::Anonymous
+            );
+        }
+
+        // With an access controller, or with sign-in required, the token is
+        // resolved: a verified human by issuer and subject.
+        let bob = TopologyApplyScope::Human {
+            issuer: ISSUER.to_string(),
+            subject: BOB.to_string(),
+        };
+        let controlled = state(
+            decisions(false),
+            Some(AccessController::new(access(&[BOB])).unwrap()),
+        );
+        assert_eq!(topology_apply_scope_of(&controlled, &bearer(BOB)), bob);
+        assert_eq!(
+            topology_apply_scope_of(&controlled, &HeaderMap::new()),
+            TopologyApplyScope::Anonymous
+        );
+        let required = state(decisions(true), None);
+        assert_eq!(topology_apply_scope_of(&required, &bearer(BOB)), bob);
+
+        // A principal without a verified human, by its trust source.
+        assert_eq!(
+            topology_apply_scope_of(&required, &bearer(ROBOT)),
+            TopologyApplyScope::Principal {
+                principal: ROBOT.to_string(),
+                provider: "service_identity".to_string(),
+                issuer: ISSUER.to_string(),
+            }
         );
     }
 }
