@@ -53,8 +53,17 @@ jobs:
       - name: Prepare Linux acceptance isolation
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y bubblewrap libseccomp2 apparmor
-          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          sudo apt-get install --no-install-recommends -y bubblewrap libseccomp2 apparmor apparmor-profiles
+          forge_bwrap_profile=
+          for candidate in /etc/apparmor.d/bwrap /etc/apparmor.d/bwrap-userns-restrict /usr/share/apparmor/extra-profiles/bwrap-userns-restrict; do
+            if test -f "$candidate"; then
+              forge_bwrap_profile=$candidate
+              break
+            fi
+          done
+          test -n "$forge_bwrap_profile"
+          printf 'Loading packaged bubblewrap policy: %s\n' "$forge_bwrap_profile"
+          sudo apparmor_parser -r "$forge_bwrap_profile"
       - name: Verify Linux acceptance isolation
         env:
           PYTHONPATH: installer
