@@ -3872,17 +3872,27 @@ async fn reconcile_agent_event_streams(
                                 next_attempt: Some(now),
                                 consecutive_failures: 0,
                             });
-                    if identity_runtime.is_none() && backoff.consecutive_failures == 0 {
+                    // The identity health monitor runs this pass too: a
+                    // member it cannot watch is logged like one the console
+                    // forwarder cannot.
+                    let watcher = if identity_runtime.is_some() {
+                        "identity_health_monitor"
+                    } else {
+                        "console_forwarder"
+                    };
+                    if backoff.consecutive_failures == 0 {
                         tracing::warn!(
                             mob_id = %mob_id,
                             identity = %identity,
+                            watcher,
                             error = %error,
                             "meta agent event forwarder: failed to subscribe; will retry with backoff"
                         );
-                    } else if identity_runtime.is_none() {
+                    } else {
                         tracing::debug!(
                             mob_id = %mob_id,
                             identity = %identity,
+                            watcher,
                             error = %error,
                             consecutive_failures = backoff.consecutive_failures,
                             "meta agent event forwarder: subscribe still failing; backing off"
@@ -3942,6 +3952,12 @@ async fn observe_bound_session(
     (bound && after.as_ref() == Some(&before)).then_some(before)
 }
 
+/// A mob whose member event subscriptions fail, for the tests of a
+/// subscription that cannot attach.
+#[cfg(test)]
+static FAIL_MEMBER_EVENT_SUBSCRIPTIONS_OF_MOB: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
 async fn subscribe_agent_events_for_console_forwarder(
     handle: &MobHandle,
     identity: &AgentIdentity,
@@ -3955,6 +3971,17 @@ async fn subscribe_agent_events_for_console_forwarder(
     ),
     meerkat_mob::MobError,
 > {
+    #[cfg(test)]
+    if FAIL_MEMBER_EVENT_SUBSCRIPTIONS_OF_MOB
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_deref()
+        == Some(handle.mob_id().as_str())
+    {
+        return Err(meerkat_mob::MobError::Internal(
+            "member event subscription failed (test)".to_string(),
+        ));
+    }
     // Keep the console forwarder on the same authoritative subscription path
     // as `/agents/{id}/events`. The observation shortcut can lag the actor's
     // runtime-member projection in identity-first/runtime-backed packs, which
@@ -7046,6 +7073,54 @@ mod tests {
             .expect("the lease wake attached the monitor, well inside the safety tick");
 
         monitor.abort();
+        runtime.shutdown().await;
+    }
+
+    /// The identity health monitor logs a member it fails to subscribe to,
+    /// as the console forwarder does: a warning on the first failure, then
+    /// debug while it keeps failing. Both were skipped for the monitor, so a
+    /// member it could not watch, and whose turns it then could not count,
+    /// left no trace until the stream repair.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_identity_health_monitor_logs_a_failed_subscription() {
+        let mob_id = "identity-health-subscribe-log";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (runtime, identity_runtime, _ledger, _identity) = health_restart(mob_id, &temp).await;
+        let slot = Arc::new(std::sync::RwLock::new(Some(identity_runtime.clone())));
+        let handle = runtime.mob_handle();
+        let mut tracked = AttachedStreams::default();
+        let mut failures = HashMap::new();
+        let mut streams = SelectAll::new();
+        *FAIL_MEMBER_EVENT_SUBSCRIPTIONS_OF_MOB
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(mob_id.to_string());
+        // A second registered dispatch keeps the capture's interest in the
+        // warning when another thread reached its callsite first.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
+        let (_, log) =
+            crate::test_diagnostics::capture_warnings(Box::pin(reconcile_agent_event_streams(
+                &handle,
+                &None,
+                &mut tracked,
+                &mut failures,
+                &mut streams,
+                Some(&slot),
+            )))
+            .await;
+        *FAIL_MEMBER_EVENT_SUBSCRIPTIONS_OF_MOB
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        assert_eq!(
+            (
+                tracked.current.len(),
+                failures.len(),
+                log.matches("failed to subscribe; will retry with backoff")
+                    .count(),
+                log.contains("identity_health_monitor"),
+            ),
+            (0, 1, 1, true),
+            "{log}"
+        );
         runtime.shutdown().await;
     }
 

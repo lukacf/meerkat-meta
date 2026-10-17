@@ -304,6 +304,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   of the repository's Actions cache. `verify_crate_packages` still restores
   main CI's `meta-dev-bins` entry read-only.
 
+- The pre-push hook runs only fast local checks. The workspace clippy and the
+  workspace unit gate, which took 712.88 s and 974.16 s of a 28m19s push,
+  moved to the hook's manual stage (`pre-commit run --hook-stage manual
+  cargo-clippy|cargo-test --from-ref origin/main --to-ref HEAD`); CI's clippy
+  and test jobs run both on every pull request that touches Rust. The push
+  stage now takes about 10 seconds warm.
+- A pull request runs only its own CI lanes. For a Rust change it runs
+  clippy, the unit tests and the integration tests, and leaves the voice and
+  extension-state jobs, the Python SDK tests, the console jobs and the flow
+  editor job to the push to main, unless it changes their own inputs: code
+  gated on `openai-live` or `extension-state`, those features' modules and
+  crate, the backend modules a lane drives end to end (the HTTP console and
+  console aggregator, the flow editor binary, its HTTP surface and mobpack,
+  the RPC gateway), the crate files a lane's tests read or its inputs embed
+  (the console and flow editor bundles, contract-checked sources, fixtures),
+  or their own directories. A change to the build configuration
+  (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`,
+  `crates/meerkat-meta/Cargo.toml`) runs every lane that compiles Rust.
+  Console fixtures, the component packages, examples, the
+  Makefile and the nextest configuration reach only the lanes that read them,
+  and the Bazel files, `deny.toml`, `.gitignore` and the hook configuration
+  reach none. Pushes to main and dispatches still run every lane, and a
+  release tag still requires that run to be green for its exact commit.
+- CI runs the workspace clippy in its own job beside `fmt-lint`, which now
+  compiles nothing; balances the two integration halves by measured build and
+  run time (`[a-hj-mstv-z]*` and `[inopqru]*`); drops the unit job's disk
+  reclaim and runs the integration halves' reclaim in the background; and
+  deals the console browser scenarios to three legs instead of two. Projected
+  from measured step times, a warm pull request that touches only Rust
+  finishes in about 11 minutes instead of 17.
+- CI no longer runs on pushes to `ci/**` and `feat/**` branches; those runs
+  ran every lane beside the pull request run of the same commit. A branch
+  gets CI through its pull request, or a dispatch of the CI workflow.
+- The console aggregator's live-event burst test holds its backfill read on
+  a gate and asserts that every live frame reaches the store while the read
+  is held, instead of racing a slow backfill against a deadline. CI's unit
+  test job, which left it out as timing-sensitive, runs it again, without
+  retries; it had run only in the pre-push unit gate, which is now manual.
+- CI's unit test job, now the only automatic run of the lib and bin tests,
+  lists them with its own filter before running them and fails if the
+  filter leaves any out.
+
 ### Fixed
 
 - Python SDK: when the gateway's stdout closed while `meta/init` was in
@@ -522,6 +564,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   witnesses recorded in their inherited ceiling, so their host callback tools
   stay hidden until they are re-spawned. `fork_off` was not affected: it
   applies no inherited ceiling.
+
+- The identity health monitor logs a member it fails to subscribe to, as
+  the console forwarder does: a warning on the first failure, then debug
+  while the subscription keeps failing, each with `watcher` set to
+  `identity_health_monitor` or `console_forwarder`. The monitor logged
+  neither, so a member whose turns it could not count left no trace until
+  the stream repair (#455).
 
 ### Known limitations
 

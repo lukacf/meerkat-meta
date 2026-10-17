@@ -59,6 +59,27 @@ async function anchorAt(viewport, row, offset = 100) {
   }, id);
 }
 
+/// Hold a row at the reading position, 10 px above the viewport top, as the
+/// anchor to measure. Through a prepend, a layout change or a return to the
+/// conversation the console keeps the first row the viewport still shows in
+/// place; a row further down moves whenever that row, or one between them,
+/// grows. So the measured row has to be the held one: `row` once placed
+/// there, or else the first later row that can be, since with too little
+/// transcript above `row` the view reaches its top first. The anchor records
+/// the index of its row among the mounted rows and, as `from`, that of `row`;
+/// they differ when a later row is held.
+async function holdReadingRow(viewport, row) {
+  const rows = viewport.locator("[data-conversation-row-id]");
+  const id = await row.getAttribute("data-conversation-row-id");
+  const start = await rows.evaluateAll((items, id) => items.findIndex(item => item.dataset.conversationRowId === id), id);
+  assert(start >= 0, `row ${id} is mounted in this transcript`);
+  for (let index = start; index < start + 10 && index < await rows.count(); index += 1) {
+    const anchor = await anchorAt(viewport, rows.nth(index), -10);
+    if (Math.abs(anchor.offset + 10) <= 2) return { ...anchor, index, from: start };
+  }
+  assert.fail(`no row from ${id} on can be held at the reading position`);
+}
+
 const isOlderHistoryPage = (response) => {
   if (!response.url().endsWith("/console/rpc")) return false;
   const request = response.request().postDataJSON();
@@ -744,7 +765,8 @@ async function readingIntent(host) {
       }
       await page.setViewportSize({ width: 1600, height: 1000 }); await settle(page);
     }
-    const anchor = await anchorAt(viewport, anchorRow, -10);
+    const anchor = await holdReadingRow(viewport, anchorRow);
+    result.anchors = { identity: anchor };
     try {
       result.checks.push(await measureAnchor(viewport, anchor, () => monitor.during("deliberate identity away and return", async () => {
         await retargetReadingPane(page, host, "domain:delivery", firstPane);
@@ -769,9 +791,10 @@ async function readingIntent(host) {
     const secondViewport = secondPane.locator(host === "shared" ? ".cc-conversation-pane__scroll" : ".conv__body");
     await secondViewport.locator("[data-conversation-row-id]").filter({ hasText: result.turns[5].instruction }).last().waitFor();
     // Each pane receives its own explicit scroll intent before background work.
-    const firstReading = await anchorAt(viewport, anchorRow, -10);
+    const firstReading = await holdReadingRow(viewport, anchorRow);
     const secondAnchorRow = secondViewport.locator("[data-conversation-row-id]").filter({ hasText: result.turns[3].instruction }).last();
-    const secondReading = await anchorAt(secondViewport, secondAnchorRow, -10);
+    const secondReading = await holdReadingRow(secondViewport, secondAnchorRow);
+    Object.assign(result.anchors, { firstReading, secondReading });
     assert.notEqual(firstReading.id, secondReading.id, "same-agent panes intentionally read different retained rows");
     result.clearance = [
       await inspectJumpTextClearance(viewport, firstPane.getByRole("button", { name: "Jump to latest", exact: true }), `${host} first split pane 1600`),
@@ -981,13 +1004,14 @@ async function layoutMutations(host) {
     await anchorRow.waitFor();
     // The image belongs to the turn just above the long anchor turn. The
     // windowed stock transcript mounts it once the reader is near it.
-    await anchorAt(viewport, anchorRow, -10);
+    await holdReadingRow(viewport, anchorRow);
     const delayedImage = viewport.locator(`img[src*="${encodeURIComponent(result.image.blobId)}"]`).first();
     await delayedImage.waitFor({ state: "attached" });
     await delayedImage.scrollIntoViewIfNeeded();
     await eventually(() => requestedImage, "browser requests actual delayed blob");
     assert.equal(await delayedImage.evaluate(node => node.complete), false, "blob remains pending until release");
-    const anchor = await anchorAt(viewport, anchorRow, -10);
+    const anchor = await holdReadingRow(viewport, anchorRow);
+    result.anchor = anchor;
     result.checks.push(await measureAnchor(viewport, anchor, async () => {
       releaseImage();
       await eventually(() => delayedImage.evaluate(node => node.complete && node.naturalWidth === 640), "delayed real image decodes");
@@ -1130,8 +1154,12 @@ async function olderHistory(host) {
     // reachable only through prepended history. (Counting rows here would
     // mean reading through the transcript, and reaching its top pages.)
     const recentFrameIds = new Set(recentPages().flatMap((item) => item.response.result.frames.map((frame) => frame.id)));
-    const anchorRow = viewport.locator("[data-conversation-row-id]").nth(2);
-    const anchor = await anchorAt(viewport, anchorRow, -10);
+    // Hold the third row, or a later one when the recent page opens with a
+    // turn so short that the view reaches its top first. What grows here is
+    // the reply of a turn the recent page cut: it gains its "Worked for" line
+    // once the older page brings the run's start.
+    const anchor = await holdReadingRow(viewport, viewport.locator("[data-conversation-row-id]").nth(2));
+    result.anchor = anchor;
     let boundary = seed.response.result.frames[0].cursor;
     let exhausted = seed.response.result.exhausted === true;
     for (let index = 0; !exhausted && index < 16; index += 1) {
