@@ -90,11 +90,17 @@ the lanes its changed files reach (`scripts/ci-changes.py`):
   every lane that compiles Rust.
 - The voice and extension-state jobs, the Python SDK tests, the console jobs
   and the flow editor job compile the same crate in other configurations. A
-  pull request leaves them to the push unless it changes their own inputs:
-  code gated on the `openai-live` or `extension-state` feature, those features'
-  modules and crate, the embedded console and flow editor bundles, or their
-  own directories (`sdk/python/`, `console/`, `flow-editor/`, `packages/`).
-  The `changes` job's log names the lanes a pull request left to the push.
+  pull request leaves them to the push unless it changes one of their own
+  inputs: code gated on the `openai-live` or `extension-state` feature, those
+  features' modules and crate, the backend modules a lane drives end to end
+  (the HTTP console and console aggregator, the flow editor binary, its HTTP
+  surface and mobpack, the RPC gateway), the crate files a lane's tests read
+  or its inputs embed (the console and flow editor bundles, contract-checked
+  sources, fixtures), or their own directories (`sdk/python/`, `console/`,
+  `flow-editor/`, `packages/`). `LANE_INPUTS` in `scripts/ci-changes.py`
+  lists those crate files, and `scripts/test_ci_changes.py` fails on a read
+  or embedded crate file it does not list. The `changes` job's log names the
+  lanes a pull request left to the push.
 - Docs and the files only `fmt-lint` and `audit` read reach no lane.
 
 Pushes to main and dispatches run every lane, and a release tag requires a

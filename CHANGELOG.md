@@ -20,11 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   extension-state jobs, the Python SDK tests, the console jobs and the flow
   editor job to the push to main, unless it changes their own inputs: code
   gated on `openai-live` or `extension-state`, those features' modules and
-  crate, the bundles the backends embed, or their own directories. A change
-  to the build configuration (`Cargo.toml`, `Cargo.lock`,
-  `rust-toolchain.toml`, `.cargo/`, `crates/meerkat-meta/Cargo.toml`) runs
-  every lane that compiles Rust. Console fixtures, the component packages,
-  examples, the
+  crate, the backend modules a lane drives end to end (the HTTP console and
+  console aggregator, the flow editor binary, its HTTP surface and mobpack,
+  the RPC gateway), the crate files a lane's tests read or its inputs embed
+  (the console and flow editor bundles, contract-checked sources, fixtures),
+  or their own directories. A change to the build configuration
+  (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`,
+  `crates/meerkat-meta/Cargo.toml`) runs every lane that compiles Rust.
+  Console fixtures, the component packages, examples, the
   Makefile and the nextest configuration reach only the lanes that read them,
   and the Bazel files, `deny.toml`, `.gitignore` and the hook configuration
   reach none. Pushes to main and dispatches still run every lane, and a

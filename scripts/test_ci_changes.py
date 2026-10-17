@@ -74,14 +74,15 @@ def no_gates(path: str) -> str:
     return "pub fn changed() {}\n"
 
 
-# Where a file may name a path in a lane-limited or skippable area: a path
-# below that area, repository-relative, reached with ../, or under a shell
-# variable ($ROOT/, ${repo_root}/); a glob, cut at its first wildcard; or the
-# bare area name as a quoted string (git grep and similar path arguments).
-# Rust comments are skipped: they document, they do not read. Bare names are
-# not read from Rust, where words like "console" name modes and routes.
+# Where a file may name a path in a lane-limited or skippable area, or in the
+# crates (a pull request can defer lanes past a crate file): a path below
+# that area, repository-relative, reached with ../, or under a shell variable
+# ($ROOT/, ${repo_root}/); a glob, cut at its first wildcard; or the bare area
+# name as a quoted string (git grep and similar path arguments). Rust
+# comments are skipped: they document, they do not read. Bare names are not
+# read from Rust, where words like "console" name modes and routes.
 AREA_NAMES = ("sdk/python", "sdk/typescript", "flow-editor", "console", "sdk", "scripts", "docs",
-              "examples", "packages", "tools/bazel")
+              "examples", "packages", "tools/bazel", "crates")
 # Skippable files, and single files with lanes of their own (AREA_FILES),
 # whose readers the scan audits too.
 SKIPPABLE_NAMES = ("README.md", "CHANGELOG.md", "CONTRIBUTING.md", "CLAUDE.md", "LICENSE-MIT",
@@ -104,12 +105,12 @@ PATH_REFERENCE = re.compile(
 )
 # A bare area name counts inside a bracketed or parenthesized list of quoted
 # strings that names at least two areas (a git grep pathspec list, say), and
-# a joined path ("scripts", "repo-cargo" or "scripts" / "repo-cargo") counts
-# as the joined path. A quoted name that is an object key or value
-# (id: "docs", "scripts": {...}) is an identifier, not a path.
+# a path joined part by part ("scripts", "repo-cargo" or "crates" / "x" /
+# "fixture.json") counts as the joined path. A quoted name that is an object
+# key or value (id: "docs", "scripts": {...}) is an identifier, not a path.
 QUOTED_LIST = re.compile(r"[\[(]((?:\s*[\"'`][^\"'`\n]*[\"'`]\s*,?)+)\s*[\])]")
 QUOTED = re.compile(r"[\"'`]([^\"'`\n]*)[\"'`]")
-JOINED = re.compile(rf"[\"'`]({_NAMES})[\"'`]\s*[,/]\s*[\"'`]([\w.-]+)[\"'`]")
+JOINED = re.compile(rf"[\"'`]({_NAMES})[\"'`]((?:\s*[,/]\s*[\"'`][\w.-]+[\"'`])+)")
 COMMENT_LINE = re.compile(r"^\s*(?://|#|/\*|\*|--|<!--)")
 OBJECT_VALUE = re.compile(r"\w+[\"']?\s*:\s*[\"'`]$")
 BLOCKS = (re.compile(r'"""[\s\S]*?"""'), re.compile(r"'''[\s\S]*?'''"), re.compile(r"/\*[\s\S]*?\*/"))
@@ -205,6 +206,22 @@ CROSS_AREA_READS = {
     ("scripts/", "examples/"): set(),
     ("scripts/", "packages/"): set(),
     ("scripts/", "tools/bazel/"): set(),
+    # Tests outside the crates read crate files: the console's (the embedded
+    # bundle's freshness, the HTTP route and RPC method lists, the voice
+    # transcript fixture), the flow editor's source contract and bundle
+    # build, the Python SDK's wire fixtures, and the example packs' release
+    # targets. A pull request that changes only such a file must still run
+    # the reader's lanes; a test below checks that file by file.
+    ("console/", "crates/"): {"console"},
+    ("flow-editor/", "crates/"): {"flow_editor"},
+    ("sdk/python/", "crates/"): {"python"},
+    ("examples/", "crates/"): {"rust", "integration", "console"},
+    # test-typescript runs on every run, fmt-lint runs the scripts and the
+    # hooks' configuration, and the workspace manifest names its members.
+    ("sdk/typescript/", "crates/"): set(),
+    ("scripts/", "crates/"): set(),
+    (".pre-commit-config.yaml", "crates/"): set(),
+    ("Cargo.toml", "crates/"): set(),
 }
 
 
@@ -276,7 +293,7 @@ def references(text: str, *, bare: bool) -> list[str]:
             names = [name for name in QUOTED.findall(match.group(1)) if name in AREA_NAMES]
             if len(names) >= 2:
                 found += names
-        found += [f"{match.group(1)}/{match.group(2)}" for match in JOINED.finditer(text)]
+        found += ["/".join([match.group(1), *QUOTED.findall(match.group(2))]) for match in JOINED.finditer(text)]
     cut = []
     for target in found:
         wildcard = WILDCARD.search(target)
@@ -366,6 +383,43 @@ def gated_modules(root: Path) -> dict[str, set[str]]:
             pending.append((module_file(module, declaration), lanes))
     return gated
 
+
+def read_from_root(path: str) -> str | None:
+    try:
+        return (ROOT / path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+# What a crate source embeds or loads: include_str!/include_bytes! of a path
+# relative to the file or (through concat! of CARGO_MANIFEST_DIR) to its
+# crate, and path-like joins in a file that names CARGO_MANIFEST_DIR.
+INCLUDE = re.compile(r'include_(?:str|bytes)!\(\s*(concat!\(\s*env!\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*)?"([^"]+)"')
+MANIFEST_JOIN = re.compile(r'\.join\(\s*"([^"]*[/.][^"]*)"\s*\)')
+
+
+def embedded_files(root: Path) -> set[tuple[str, str]]:
+    """(source, data file) for every non-Rust file a crate source embeds or loads."""
+    pairs = set()
+    for source in sorted((root / "crates").glob("*/**/*.rs")):
+        crate = root.joinpath(*source.relative_to(root).parts[:2])
+        text = source.read_text(encoding="utf-8", errors="replace")
+        targets = [(crate if match[1] else source.parent) / match[2].lstrip("/") for match in INCLUDE.finditer(text)]
+        if "CARGO_MANIFEST_DIR" in text:
+            targets += [crate / literal for literal in MANIFEST_JOIN.findall(text)]
+        for target in targets:
+            target = Path(os.path.normpath(target))
+            # Data inside a crate; a join up to the crate or repository root
+            # (tests locating the checkout) is not data.
+            if not target.is_relative_to(root / "crates") or len(target.relative_to(root).parts) < 3:
+                continue
+            files = [target] if target.is_file() else sorted(target.rglob("*")) if target.is_dir() else []
+            for found in files:
+                if found.is_file() and found.suffix != ".rs":
+                    pairs.add((source.relative_to(root).as_posix(), found.relative_to(root).as_posix()))
+    return pairs
+
+
 class CiChangesTests(unittest.TestCase):
     def full(self, *paths, event="pull_request", read=no_gates):
         return ci_changes.needs_full_run(event, list(paths), read)
@@ -450,7 +504,7 @@ class CiChangesTests(unittest.TestCase):
         # The rust and integration lanes compile and test the default
         # configuration; the push runs the rest, and release.yml requires
         # the push run to be green before a tag.
-        for path in ("crates/meerkat-meta/src/rpc.rs", "crates/meerkat-meta/tests/list_runs.rs",
+        for path in ("crates/meerkat-meta/src/governance.rs", "crates/meerkat-meta/tests/list_runs.rs",
                      "crates/meerkat-meta/src/memory/steward_prompt_v0.md",
                      "crates/meta-store-conformance/src/lib.rs"):
             with self.subTest(path=path):
@@ -475,7 +529,7 @@ class CiChangesTests(unittest.TestCase):
         both = voice + '#[cfg(all(test, feature = "extension-state"))]\nmod t;\n'
         for paths, read, lanes in (
             # Code the feature gates, in the file itself.
-            (("crates/meerkat-meta/src/rpc.rs",), text(voice), RUST_PR_LANES | {"voice"}),
+            (("crates/meerkat-meta/src/governance.rs",), text(voice), RUST_PR_LANES | {"voice"}),
             (("crates/meerkat-meta/tests/extension_state.rs",), text(extension),
              RUST_PR_LANES | {"extension_state"}),
             (("crates/meerkat-meta/src/mob_handle_runtime.rs",), text(both), RUST_PR_LANES | FEATURE_LANES),
@@ -494,15 +548,107 @@ class CiChangesTests(unittest.TestCase):
             ((".cargo/config.toml",), no_gates, RUST_LANES),
             (("crates/meerkat-meta/Cargo.toml",), no_gates, RUST_LANES),
             # A file that cannot be read runs every feature lane.
-            (("crates/meerkat-meta/src/rpc.rs",), lambda path: None, RUST_PR_LANES | FEATURE_LANES),
-            # Only Rust sources are read for gates.
+            (("crates/meerkat-meta/src/governance.rs",), lambda path: None, RUST_PR_LANES | FEATURE_LANES),
+            # Only Rust sources are read for gates; other files reach a
+            # deferred lane only when FEATURE_PATHS or LANE_INPUTS lists them.
             (("crates/meerkat-meta/src/memory/steward_prompt_v0.md",), text(voice), RUST_PR_LANES),
+            (("crates/meerkat-meta/tests/fixtures/console_voice_v1.json",), text(""),
+             RUST_PR_LANES | {"voice", "console"}),
             # The bundles the backends embed run the browser lanes that serve them.
             (("crates/meerkat-meta/console-dist/index.html",), no_gates, RUST_PR_LANES | {"console"}),
             (("crates/meerkat-meta/flow-editor-dist/index.html",), no_gates, RUST_PR_LANES | {"flow_editor"}),
         ):
             with self.subTest(paths=paths):
                 self.assertEqual(self.lanes(*paths, read=read), lanes)
+
+    def test_backend_modules_run_the_lanes_that_drive_them_end_to_end(self):
+        # A pull request that can break an end-to-end suite runs it before
+        # the merge: the console backends and HTTP console, the flow editor's
+        # binary and mobpack authoring, and the gateway the Python SDK drives.
+        for path, lanes in (
+            ("crates/meerkat-meta/src/http_console.rs", {"console"}),
+            ("crates/meerkat-meta/src/http_console/routes.rs", {"console"}),
+            ("crates/meerkat-meta/src/console_aggregator/store.rs", {"console"}),
+            ("crates/meerkat-meta/examples/library_mode_reference.rs", {"console"}),
+            ("crates/meerkat-meta/src/bin/meta_flow_editor.rs", {"flow_editor"}),
+            ("crates/meerkat-meta/src/http_flow_editor.rs", {"flow_editor"}),
+            ("crates/meerkat-meta/src/mobpack.rs", {"flow_editor"}),
+            ("crates/meerkat-meta/src/rpc.rs", {"python", "flow_editor"}),
+            ("crates/meerkat-meta/src/rpc/mob_methods.rs", {"python"}),
+            # Sources the console and flow editor contract tests read.
+            ("crates/meerkat-meta/src/rpc/topology_methods.rs", {"python", "console"}),
+            ("crates/meerkat-meta/src/unified_runtime/http.rs", {"flow_editor"}),
+            ("crates/meerkat-meta/src/rpc_gateway.rs", {"python"}),
+            ("crates/meerkat-meta/src/bin/rpc_gateway.rs", {"python"}),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.lanes(path), RUST_PR_LANES | lanes)
+        # Narrow: neighbours of a backend module are not its inputs.
+        for path in ("crates/meerkat-meta/src/http_console_tests/mod.rs", "crates/meerkat-meta/src/rpc_types.rs",
+                     "crates/meerkat-meta/src/bin/meta_gateway.rs", "crates/meerkat-meta/src/mobpack_helpers.rs"):
+            with self.subTest(path=path):
+                self.assertEqual(self.lanes(path), RUST_PR_LANES)
+
+    def test_files_a_deferred_lanes_input_embeds_or_loads_run_that_lane(self):
+        """A deferred lane's own input embeds or loads data: include_str!,
+        include_bytes! and joins onto CARGO_MANIFEST_DIR. A pull request that
+        changes only that data must run the lane too, so FEATURE_PATHS or
+        LANE_INPUTS lists it with the same lanes."""
+        pairs = embedded_files(ROOT)
+        self.assertIn(("crates/meerkat-meta/src/console_voice/captions.rs",
+                       "crates/meerkat-meta/tests/fixtures/console_voice_v1.json"), pairs)
+        for reader, embedded in sorted(pairs):
+            required = self.lanes(reader, read=read_from_root) & ci_changes.RUST_DEFERRED_LANES
+            with self.subTest(reader=reader, embedded=embedded):
+                missing = required - self.lanes(embedded, read=read_from_root)
+                self.assertFalse(missing, f"list {embedded} in LANE_INPUTS with {sorted(missing)}")
+
+    def test_crate_files_read_from_other_areas_run_their_readers_lanes(self):
+        """The console, flow editor and SDK tests read crate files: sources
+        they check for drift, the embedded bundles, wire fixtures. A pull
+        request that changes only such a file must run the reader's lanes,
+        so FEATURE_PATHS or LANE_INPUTS lists it with those lanes."""
+        reads = cross_area_reads(ROOT)
+        self.assertIn("flow-editor/test/source-contract.test.cjs -> crates/meerkat-meta/src/rpc.rs",
+                      reads[("flow-editor/", "crates/")])
+        self.assertIn("console/src/lib/voice-session.test.ts -> "
+                      "crates/meerkat-meta/tests/fixtures/console_voice_v1.json", reads[("console/", "crates/")])
+        self.assertIn("sdk/python/tests/test_role_migrations.py -> "
+                      "crates/meerkat-meta/tests/fixtures/role_migrations_init_params.json",
+                      reads[("sdk/python/", "crates/")])
+        for (reader, area), found in sorted(reads.items()):
+            required = CROSS_AREA_READS.get((reader, area), set())
+            if area != "crates/" or not required:
+                continue
+            for entry in sorted(found):
+                for name in tracked_files(ROOT, entry.split(" -> ")[1]):
+                    with self.subTest(entry=entry, file=name):
+                        missing = required - self.lanes(name, read=read_from_root)
+                        self.assertFalse(missing, f"list {name} in LANE_INPUTS with {sorted(missing)}")
+
+    def test_the_embed_scan_resolves_every_form(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for relative, text in {
+                "crates/c/src/a.rs": 'const A: &str = include_str!("../data/a.json");\n'
+                                     'const B: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/data/b.bin"));\n'
+                                     'fn load() { let _ = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/set"); }\n'
+                                     'fn other() { let _ = dir.join("not-a-path"); }\n',
+                "crates/c/data/a.json": "{}",
+                "crates/c/data/b.bin": "",
+                "crates/c/fixtures/set/one.json": "{}",
+                "crates/c/fixtures/set/two.rs": "",
+                # The checkout root is not data.
+                "crates/c/tests/root.rs": 'fn root() { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."); }\n',
+                "README.md": "",
+            }.items():
+                (root / relative).parent.mkdir(parents=True, exist_ok=True)
+                (root / relative).write_text(text)
+            self.assertEqual(embedded_files(root), {
+                ("crates/c/src/a.rs", "crates/c/data/a.json"),
+                ("crates/c/src/a.rs", "crates/c/data/b.bin"),
+                ("crates/c/src/a.rs", "crates/c/fixtures/set/one.json"),
+            })
 
     def test_feature_paths_cover_every_module_a_feature_gates(self):
         """A file declared under a feature's cfg need not repeat the cfg, so
@@ -585,7 +731,11 @@ class CiChangesTests(unittest.TestCase):
         self.assertLessEqual(ci_changes.RUST_DEFERRED_LANES, ci_changes.RUST_LANES)
         self.assertEqual(set(ci_changes.FEATURE_PATHS), FEATURE_LANES)
         self.assertLessEqual(FEATURE_LANES, ci_changes.RUST_DEFERRED_LANES)
-        self.assertLessEqual(set(ci_changes.EMBEDDED_BUNDLES.values()), ci_changes.RUST_DEFERRED_LANES)
+        for prefix, lanes in ci_changes.LANE_INPUTS:
+            with self.subTest(prefix=prefix):
+                self.assertTrue(prefix.startswith("crates/") and lanes, prefix)
+                self.assertLessEqual(set(lanes), ci_changes.RUST_DEFERRED_LANES)
+                self.assertTrue((ROOT / prefix).exists(), f"{prefix} names nothing")
 
     def test_every_cross_area_read_has_audited_lanes(self):
         """A file that reads another area's files runs in some lanes, so a
@@ -627,6 +777,9 @@ class CiChangesTests(unittest.TestCase):
                 # Identifiers and docstrings are not reads.
                 "packages/q/ids.ts": 'const a = { id: "docs", profile: "console" };\nconst b = ["code", "docs"];\n',
                 "packages/q/doc.py": '"""See docs/guide.md."""\n',
+                # A crate fixture, through a path joined part by part.
+                "crates/x/tests/fixtures/wire.json": "{}\n",
+                "sdk/python/tests/test_wire.py": 'WIRE = (ROOT / "crates" / "x"\n        / "tests" / "fixtures" / "wire.json")\n',
             }.items():
                 (root / relative).parent.mkdir(parents=True, exist_ok=True)
                 (root / relative).write_text(text)
@@ -635,7 +788,10 @@ class CiChangesTests(unittest.TestCase):
             ("crates/*/src/", "sdk/python/"), ("flow-editor/", "console/"),
             ("packages/", "console/"), ("packages/", "sdk/"), ("packages/", "scripts/"),
             ("examples/", "docs/"), ("examples/", "sdk/typescript/"), ("tests/", "docs/"),
+            ("sdk/python/", "crates/"),
         })
+        self.assertEqual(reads[("sdk/python/", "crates/")],
+                         {"sdk/python/tests/test_wire.py -> crates/x/tests/fixtures/wire.json"})
         self.assertNotIn(("crates/*/src/", "sdk/python/"), CROSS_AREA_READS)
 
     def test_pushes_dispatches_and_empty_diffs_run_everything(self):

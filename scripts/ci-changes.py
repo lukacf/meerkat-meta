@@ -24,18 +24,22 @@ leaves the lanes that compile the same crate in another configuration (the
 voice and extension-state features, the Python SDK gateway, the console
 backends, the flow editor binary) to the push, unless the change is one of
 their own inputs (see `deferred_lanes`): code a feature gates, a feature's own
-module or crate, the bundle a backend embeds, or the build configuration,
-which every lane reads. A deferred lane still gates the release, because
-release.yml refuses a tag until the push run of the exact commit on main is
-green. The classifier prints the lanes a pull request deferred.
+module or crate, a backend module the lane drives end to end, a file such an
+input embeds or loads (LANE_INPUTS), or the build configuration, which every
+lane reads. A deferred lane still gates the release, because release.yml
+refuses a tag until the push run of the exact commit on main is green. The
+classifier prints the lanes a pull request deferred.
 
 An area may list fewer lanes only when no job outside them reads its files.
 scripts/test_ci_changes.py scans the repository's sources, manifests and
-configuration for references into a lane-limited or skippable area (paths,
-$ROOT/ paths, bare area names, globs cut at their first wildcard) and fails
-on any reading area it has not audited, or whose lanes the read area would
-not reach, so a new cross-area read cannot silently skip the job it affects.
-It also checks that FEATURE_PATHS covers every module a feature gates.
+configuration for references into a lane-limited or skippable area or into
+the crates (paths, $ROOT/ paths, bare area names, joined path parts, globs
+cut at their first wildcard) and fails on any reading area it has not
+audited, or whose lanes the read area would not reach, or whose lanes a pull
+request changing the read crate file would defer, so a new cross-area read
+cannot silently skip the job it affects. It also checks that FEATURE_PATHS
+covers every module a feature gates, and that a file a lane's own input
+embeds or loads runs that lane.
 
 ci.yml runs the base commit's copy of this script, so a pull request never
 classifies itself with the classifier it changes.
@@ -167,15 +171,50 @@ FEATURE_GATES = {
     "extension_state": re.compile(r'feature\s*=\s*"extension-state"'),
 }
 FEATURE_PATHS = {
-    "voice": ("crates/meerkat-meta/src/console_voice/",),
+    # The transcript fixture the voice modules include_str!.
+    "voice": ("crates/meerkat-meta/src/console_voice/", "crates/meerkat-meta/tests/fixtures/console_voice_v1.json"),
     "extension_state": ("crates/meta-extension-state/", "crates/meerkat-meta/src/extension_state"),
 }
 
-# Bundles a backend embeds -> the lane whose browser tests serve them.
-EMBEDDED_BUNDLES = {
-    "crates/meerkat-meta/console-dist/": "console",
-    "crates/meerkat-meta/flow-editor-dist/": "flow_editor",
-}
+# Rust inputs -> the deferred lanes that drive them end to end or read them,
+# beyond what FEATURE_PATHS lists: a pull request that changes one runs those
+# lanes. Exact files and directories only. scripts/test_ci_changes.py checks
+# that a file one of these (or feature-gated code) embeds or loads, and a
+# crates/ file a console, flow editor or SDK test reads, runs the same lanes.
+LANE_INPUTS = (
+    # The bundles the backends embed and the browser lanes serve.
+    ("crates/meerkat-meta/console-dist/", {"console"}),
+    ("crates/meerkat-meta/flow-editor-dist/", {"flow_editor"}),
+    # The console backends, and the HTTP console and aggregator they serve.
+    ("crates/meerkat-meta/examples/", {"console"}),
+    ("crates/meerkat-meta/src/http_console.rs", {"console"}),
+    ("crates/meerkat-meta/src/http_console/", {"console"}),
+    ("crates/meerkat-meta/src/console_aggregator/", {"console"}),
+    # The flow editor binary, its HTTP surface and the mobpack authoring it drives.
+    ("crates/meerkat-meta/src/bin/meta_flow_editor.rs", {"flow_editor"}),
+    ("crates/meerkat-meta/src/http_flow_editor.rs", {"flow_editor"}),
+    ("crates/meerkat-meta/src/mobpack.rs", {"flow_editor"}),
+    # The RPC gateway the Python SDK tests drive. The flow editor's source
+    # contract test reads rpc.rs too.
+    ("crates/meerkat-meta/src/bin/rpc_gateway.rs", {"python"}),
+    ("crates/meerkat-meta/src/rpc_gateway.rs", {"python"}),
+    ("crates/meerkat-meta/src/rpc.rs", {"python", "flow_editor"}),
+    ("crates/meerkat-meta/src/rpc/", {"python"}),
+    # Other sources the console and flow editor contract tests read.
+    ("crates/meerkat-meta/src/rpc/topology_methods.rs", {"console"}),
+    ("crates/meerkat-meta/src/rpc/workgraph_methods.rs", {"console"}),
+    ("crates/meerkat-meta/src/unified_runtime/http.rs", {"flow_editor"}),
+    # Data the inputs above or feature-gated code embed or load, and the
+    # fixtures the console's voice session tests and the Python SDK tests read.
+    ("crates/meerkat-meta/assets/release-targets.json", {"console"}),
+    ("crates/meerkat-meta/src/adaptive_layer_decision.schema.json", {"flow_editor"}),
+    ("crates/meerkat-meta/tests/fixtures/console_voice_v1.json", {"console"}),
+    ("crates/meerkat-meta/tests/fixtures/application_tool_policies_init_params.json", {"python"}),
+    ("crates/meerkat-meta/tests/fixtures/live_contracts_v1.json", {"python"}),
+    ("crates/meerkat-meta/tests/fixtures/role_migrations_init_params.json", {"extension_state", "python"}),
+    ("crates/meerkat-meta/tests/fixtures/security_idempotency/security-head-evolution.json",
+     {"voice", "extension_state"}),
+)
 
 # The classifier and its contract decide every other path's lanes.
 CLASSIFIER_FILES = frozenset({"scripts/ci-changes.py", "scripts/test_ci_changes.py"})
@@ -245,9 +284,9 @@ def deferred_lanes(path: str, read: Callable[[str], str | None] = read_changed_f
     for lane, prefixes in FEATURE_PATHS.items():
         if path.startswith(prefixes):
             deferred.discard(lane)
-    for prefix, lane in EMBEDDED_BUNDLES.items():
+    for prefix, lanes in LANE_INPUTS:
         if path.startswith(prefix):
-            deferred.discard(lane)
+            deferred -= lanes
     if path.endswith(".rs"):
         text = read(path)
         for lane, gate in FEATURE_GATES.items():
