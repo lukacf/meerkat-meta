@@ -132,13 +132,21 @@ async function exerciseLivePolling({ baseUrl, fixture, page, apps, requests, evi
   assert.equal(await page.locator('iframe[title="Interactive tool result"]').count(), 3,
     'three independent stock App views must be mounted simultaneously');
   const modelBefore = await (await fetch(`${baseUrl}${fixture}/requests`)).json();
+  // Activate the App's buttons as DOM clicks. A coordinate click two iframes
+  // deep can land while the console lays out three Apps that mounted at once,
+  // and never reach the button (main run 39023555191); the rendering and
+  // reload step still clicks Refresh with a real pointer.
   const refreshStartedAt = Date.now();
-  await apps[0].getByRole('button', { name: 'Refresh result', exact: true }).click();
-  await apps[0].getByText('8 matching records', { exact: true }).waitFor({ timeout: 5_000 });
+  await apps[0].getByRole('button', { name: 'Refresh result', exact: true }).dispatchEvent('click');
+  await apps[0].getByText('8 matching records', { exact: true }).waitFor({ timeout: 5_000 }).catch(async (error) => {
+    const [state] = await readStates().catch(() => [undefined]);
+    const calls = requests.filter(request => request.path === '/console/mcp-apps/call-tool').length;
+    throw new Error(`${error.message}\nRefresh handler ran ${state?.refreshActivations ?? 'an unknown number of'} time(s); App errors ${JSON.stringify(state?.errors ?? null)}; ${calls} call-tool request(s)`);
+  });
   const refreshMs = Date.now() - refreshStartedAt;
   assert(refreshMs < 5_000, 'a fresh App action must not wait for the active model turn');
   await assertHeld();
-  for (const app of apps) await app.getByRole('button', { name: 'Start polling', exact: true }).click();
+  for (const app of apps) await app.getByRole('button', { name: 'Start polling', exact: true }).dispatchEvent('click');
   const samples = [];
   // Cross the stock HTTP action timeout while each App independently polls at
   // two-second intervals. Every response has its own bounded request deadline.
@@ -155,7 +163,7 @@ async function exerciseLivePolling({ baseUrl, fixture, page, apps, requests, evi
     samples.push({ atMs: Date.now(), barrier, states });
     await fs.writeFile(path.join(evidence, 'live-polling-progress.json'), JSON.stringify(samples, null, 2));
   }
-  for (const app of apps) await app.getByRole('button', { name: 'Stop polling', exact: true }).click();
+  for (const app of apps) await app.getByRole('button', { name: 'Stop polling', exact: true }).dispatchEvent('click');
   const finalStates = await eventually(async () => {
     const states = await readStates();
     return states.every(state => !state.inFlight) ? states : null;

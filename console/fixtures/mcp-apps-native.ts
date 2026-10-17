@@ -16,11 +16,12 @@ let sequence = 0;
 let timer: ReturnType<typeof setInterval> | undefined;
 let polling = false;
 let inFlight = false;
+let refreshActivations = 0;
 const completions: { requestId: string; startedAt: number; completedAt: number; latencyMs: number }[] = [];
 const errors: string[] = [];
 function publishStatus() {
   status.textContent = `${completions.length} polls completed${errors.length ? `; ${errors.join('; ')}` : ''}`;
-  status.dataset.state = JSON.stringify({ viewId, polling, inFlight, completions, errors });
+  status.dataset.state = JSON.stringify({ viewId, polling, inFlight, completions, errors, refreshActivations });
 }
 function show(value) {
   if (value.isError) throw new Error(`Native App tool failed: ${JSON.stringify(value.content)}`);
@@ -33,6 +34,7 @@ function show(value) {
 }
 app.ontoolresult = show;
 refresh.onclick = async () => {
+  refreshActivations += 1;
   refresh.disabled = true;
   try {
     show(await app.callServerTool({ name: 'refresh', arguments: { viewId, requestId: `${viewId}-refresh` } }, { timeout: 5_000 }));
