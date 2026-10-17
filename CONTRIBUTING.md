@@ -115,15 +115,22 @@ A pull request's CI restores caches saved on main only, so every Rust job of
 a pull request that changes `Cargo.lock` compiles the changed dependencies
 cold. Release preparation therefore runs:
 
-1. Push the pin and lock commit to the release branch.
+1. Push the commit that brings `Cargo.lock` and every `Cargo.toml` to their
+   final state: the Core pins, the lock and the release version stamp. A
+   warm artifact's name binds the exact bytes of all of them, so an artifact
+   built before the version stamp matches no job of the pull request.
 2. Dispatch the warm job on it right away:
    `gh workflow run warm-deps.yml --ref <branch>`.
-3. Do the local stamp, release and full-suite work while it runs.
+3. Do the CHANGELOG stamp, the adoption changes and the full-suite work while
+   it runs. If one of them changes `Cargo.lock` or a `Cargo.toml`, dispatch
+   the warm job again on that commit.
 4. Open the pull request once the warm run has finished, or re-run the pull
    request's CI if it is already open.
 
 Each Rust job's `fetch-warm-deps` step prints one line: the artifact it
-extracted, or why it took none, in which case the job builds as before. It
+extracted, or why it took none, in which case the job builds as before. A
+"no warm-deps-..." line after a finished dispatch means `Cargo.lock`, a
+`Cargo.toml` or the job's build environment changed since it. It
 takes an artifact only from a dispatch on the pull request's head commit or
 one of its ancestors, with the warm workflow, its script and the fetch action
 unchanged since. The
