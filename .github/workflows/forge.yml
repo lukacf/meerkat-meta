@@ -82,7 +82,10 @@ jobs:
               raise SystemExit("Linux acceptance isolation is unavailable; no generated-code checks can run.")
           print("Linux acceptance isolation probe passed.")
           PY
-      - run: npm --prefix console ci --ignore-scripts
+      - name: Prepare private DOM dependencies
+        run: |
+          umask 077
+          npm --prefix console ci --ignore-scripts
       - run: npm --prefix installer/web ci
       - run: npm --prefix installer/web run build
       - name: Prepare protected DOM checks

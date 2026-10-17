@@ -7,6 +7,7 @@ or replacing its transcript with another renderer does not reproduce Forge.
 From the repository root, with Node.js 20+ and npm available:
 
 ```bash
+umask 077
 npm --prefix console ci --ignore-scripts
 npm --prefix installer/web ci
 npm --prefix installer/web run build
@@ -15,6 +16,9 @@ node --test installer/web/build-config.test.mjs
 
 The Console installation supplies development tools such as jsdom. Forge declares
 its own browser dependencies and pins React and ReactDOM to one installation.
+The private umask preserves the reviewed DOM closure's exact file permissions;
+the checker authenticates modes as well as bytes. Install into a fresh checkout
+if an earlier Console dependency installation used different permissions.
 The build graph check bundles the actual application, including the shared chat,
 and rejects browser dependencies resolved from a sibling installation.
 

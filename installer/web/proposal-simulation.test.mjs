@@ -419,10 +419,17 @@ async function mountedAnimationRecovery(verify,{visualReview=false}={}) {
     for(const deadline=performance.now()+5000;performance.now()<deadline && reviewPosts.length<count;)
       await realDelay(1);
   });
+  const waitForAdoption=async count=>settle(async()=>{
+    // Hash verification completes on native crypto workers, independently of
+    // how many setImmediate turns a busy runner can execute.
+    for(const deadline=performance.now()+5000;performance.now()<deadline && adoptionPosts.length<count;)
+      await realDelay(1);
+    assert.equal(adoptionPosts.length,count,'Checked saved-program adoption reaches the actual transport');
+  });
   const visible=()=>instances.filter(instance=>instance.alive && instance.layer.style.visibility==='visible');
   try {
     await mount();
-    await verify({dom,instances,posts,reviewPosts,adoptionPosts,timers,receipts,reads,recoveryReads,mount,generate,settle,waitForTimer,waitForReview,visible,guideRequests,resolveReview:verdict=>resolveReview?.(verdict),
+    await verify({dom,instances,posts,reviewPosts,adoptionPosts,timers,receipts,reads,recoveryReads,mount,generate,settle,waitForTimer,waitForReview,waitForAdoption,visible,guideRequests,resolveReview:verdict=>resolveReview?.(verdict),
       mountRelationships:(selected,model,onInspect)=>settle(()=>root.render(React.createElement(MountedRelationships,{selected,model,onInspect}))),
       resize:(scene,width,height)=>settle(()=>{scene.frame.getBoundingClientRect=()=>({width,height});
         for(const observer of resizeObservers)if(observer.target===scene.frame)observer.callback([{contentRect:{width,height}}]);}),
@@ -495,7 +502,7 @@ test('an explicit saved-source review preserves the choice and leaves the automa
     const saved=await newerSavedFixture([...ui.receipts.values()][0]);ui.setLatest(saved);ui.receipts.set(saved.id,saved);
     const frozen=structuredClone(saved),scope={setup_id:saved.setup_id,stream_id:saved.stream_id};
     await clickRecoveryControl(ui,'Use latest saved animation');
-    await ui.settle(async()=>{for(let turn=0;turn<30;turn++)await new Promise(resolve=>setImmediate(resolve));});
+    await ui.waitForAdoption(1);
     const selected=ui.instances.at(-1);await ui.settle(()=>selected.first());
     const choice=readAnimationSelection(ui.dom.window.sessionStorage,scope);assert.equal(choice.operation_id,saved.id);
     await clickRecoveryControl(ui,'Pause simulation');await ui.resize(selected,720,450);await sampleRecoveryReview(ui,1);
@@ -618,10 +625,13 @@ test('a stale browser explicitly selects the checked latest saved program withou
     });
     assert.equal(button('Use latest saved animation').disabled,true,'Active editing owns its view');
     await ui.settle(()=>button('Refine animation').click());
-    await ui.settle(async()=>{
-      button('Use latest saved animation').click();
-      for(let turn=0;turn<30;turn++)await new Promise(resolve=>setImmediate(resolve));
-    });
+    ui.holdRecoveryValidation(true);
+    await ui.settle(()=>button('Use latest saved animation').click());
+    for(const deadline=performance.now()+5000;performance.now()<deadline && ui.heldRecoveryValidations()<2;){await ui.settle();await realDelay(1);}
+    assert.equal(ui.heldRecoveryValidations(),2,'Both real request hashes finish while their verification is held');
+    assert.equal(ui.adoptionPosts.length,0,'An unfinished verification cannot adopt the publication');
+    ui.releaseRecoveryValidation();
+    await ui.waitForAdoption(1);
     assert.equal(ui.posts.length,1,'Selecting a publication does not call the generation route');
     assert.equal(ui.adoptionPosts.length,1);
     assert.equal(ui.adoptionPosts[0].consumer_intent.intent_revision,ui.posts[0].consumer_intent.intent_revision+1);
@@ -664,10 +674,8 @@ test('an exact selected scene survives remount while its acknowledged visual ref
     };
     await ui.generate();await ui.settle(()=>ui.instances[0].first());
     const saved=await newerSavedFixture([...ui.receipts.values()][0]);ui.setLatest(saved);ui.receipts.set(saved.id,saved);
-    await ui.settle(async()=>{
-      button('Use latest saved animation').click();
-      for(let turn=0;turn<30;turn++)await new Promise(resolve=>setImmediate(resolve));
-    });
+    await ui.settle(()=>button('Use latest saved animation').click());
+    await ui.waitForAdoption(1);
     const selected=ui.instances.at(-1);await ui.settle(()=>selected.first());
     const scope={setup_id:saved.setup_id,stream_id:saved.stream_id};
     assert.equal(readAnimationSelection(ui.dom.window.sessionStorage,scope).operation_id,saved.id);
@@ -707,10 +715,8 @@ test('an exact saved choice is ignored for a changed proposal and a stale select
   await mountedAnimationRecovery(async ui=>{
     await ui.generate();await ui.settle(()=>ui.instances[0].first());
     const saved=await newerSavedFixture([...ui.receipts.values()][0]);ui.setLatest(saved);ui.receipts.set(saved.id,saved);
-    await ui.settle(async()=>{
-      [...ui.dom.window.document.querySelectorAll('button')].find(item=>item.textContent==='Use latest saved animation').click();
-      for(let turn=0;turn<30;turn++)await new Promise(resolve=>setImmediate(resolve));
-    });
+    await ui.settle(()=>[...ui.dom.window.document.querySelectorAll('button')].find(item=>item.textContent==='Use latest saved animation').click());
+    await ui.waitForAdoption(1);
     const selected=ui.instances.at(-1);await ui.settle(()=>selected.first());
     await ui.mount(ownedPlan('changed',2));
     const message=()=>ui.dom.window.document.querySelector('.ps-animation-status > span > span').textContent;
@@ -731,10 +737,11 @@ test('an adopted execution failure discloses only bounded host details and prese
     const button=text=>[...ui.dom.window.document.querySelectorAll('button')].find(item=>item.textContent===text);
     const diagnostic=()=>[...ui.dom.window.document.querySelectorAll('details')]
       .find(item=>item.querySelector('summary')?.textContent==='Animation diagnostics');
-    const adopt=()=>ui.settle(async()=>{
-      button('Use latest saved animation').click();
-      for(let turn=0;turn<30;turn++)await new Promise(resolve=>setImmediate(resolve));
-    });
+    const adopt=async()=>{
+      const count=ui.adoptionPosts.length+1;
+      await ui.settle(()=>button('Use latest saved animation').click());
+      await ui.waitForAdoption(count);
+    };
     await ui.generate();const previous=ui.instances[0];await ui.settle(()=>previous.first());
     assert.equal(diagnostic(),undefined);
     const original=structuredClone([...ui.receipts.values()][0]);
@@ -782,10 +789,8 @@ test('a pending saved candidate failure is sanitized and its diagnostic cannot f
       .find(item=>item.querySelector('summary')?.textContent==='Animation diagnostics');
     await ui.generate();const previous=ui.instances[0];await ui.settle(()=>previous.first());
     const saved=await newerSavedFixture([...ui.receipts.values()][0]);ui.setLatest(saved);
-    await ui.settle(async()=>{
-      [...ui.dom.window.document.querySelectorAll('button')].find(item=>item.textContent==='Use latest saved animation').click();
-      for(let turn=0;turn<30;turn++)await new Promise(resolve=>setImmediate(resolve));
-    });
+    await ui.settle(()=>[...ui.dom.window.document.querySelectorAll('button')].find(item=>item.textContent==='Use latest saved animation').click());
+    await ui.waitForAdoption(1);
     const pending=ui.instances.at(-1),attached=structuredClone(ui.adoptionPosts[0]);
     await ui.settle(()=>pending.fail({kind:'program',phase:'private secret phase',exception:'PrivateError',message:'Private error text'}));
     assert.match(diagnostic().textContent,/Failure: runtime\/worker\./);
@@ -809,7 +814,8 @@ test('saved animation selection refuses another setup or changed code before own
       ui.setLatest(saved,{allowForeign:true});
       await ui.settle(async()=>{
         [...ui.dom.window.document.querySelectorAll('button')].find(item=>item.textContent==='Use latest saved animation').click();
-        for(let turn=0;turn<30;turn++)await realDelay(1);
+        for(const deadline=performance.now()+5000;performance.now()<deadline && !ui.text().includes('does not match this proposal');)
+          await realDelay(1);
       });
       assert.equal(ui.adoptionPosts.length,0);assert.equal(ui.instances.length,1);assert.equal(ui.posts.length,1);
       assert.deepEqual(ui.visible(),[previous]);assert.match(ui.text(),/does not match this proposal/);
