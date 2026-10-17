@@ -5345,10 +5345,11 @@ fn step_mobpack_draft_history(
     }
     // The same revision need not be the same draft: one deleted, created
     // again and saved back to it has it too. Only the draft as read is
-    // overwritten.
+    // overwritten; any other is a revision conflict, which the editor
+    // retries like any other.
     if rows.get(&id) != Some(&existing) {
         return Err(format!(
-            "{source} draft conflict for {id}: the draft changed after it was read at revision {current_revision}"
+            "{source} draft revision conflict for {id}: the draft at revision {current_revision} changed after it was read"
         )
         .into());
     }
@@ -41239,7 +41240,8 @@ condition = { op = "eq", path = "params.kind", value = "c" }
     /// An undo writes only over the draft it read. A draft deleted, created
     /// again and saved back to the revision the undo read, between the
     /// undo's read and its write, is not overwritten by a step built from the
-    /// old draft: the revision alone matched it.
+    /// old draft: the revision alone matched it. The undo fails with a draft
+    /// revision conflict, which the editor retries.
     #[test]
     fn an_undo_does_not_overwrite_a_draft_created_again_at_the_revision_it_read() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -41269,9 +41271,10 @@ condition = { op = "eq", path = "params.kind", value = "c" }
             get_mobpack_draft(&json!({ "store_path": store_path, "id": "aba" })).expect("get");
         assert_eq!(
             (
-                undone
-                    .err()
-                    .is_some_and(|error| error.contains("draft conflict")),
+                undone.err().is_some_and(|error| {
+                    error.contains("draft revision conflict")
+                        && error.contains("changed after it was read")
+                }),
                 fetched["row"]["revision"].clone(),
                 fetched["row"]["name"].clone(),
             ),
