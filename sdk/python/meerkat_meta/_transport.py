@@ -52,7 +52,8 @@ class InitWatch:
     Registered before the init request is written, so a progress or
     settlement notification can never arrive unclaimed. The reader thread
     delivers into an asyncio future on the host loop, so waiting for the
-    settlement is cancellable and holds no thread.
+    settlement is cancellable and holds no thread. Closing the watch retires
+    that future, so a failure nobody awaited is never reported by asyncio.
     """
 
     def __init__(self, init_id: str, loop: asyncio.AbstractEventLoop):
@@ -87,10 +88,48 @@ class InitWatch:
     async def settlement(self, deadline: float | None = None) -> dict[str, Any]:
         """Wait for ``meta/init_settled``. ``deadline`` is the caller's own
         cap in seconds (``None``: wait until the gateway settles, exits, or
-        the reader fails); exceeding it raises ``asyncio.TimeoutError``."""
+        the reader fails); exceeding it raises ``asyncio.TimeoutError``.
+        Neither the deadline nor a cancelled caller ends the settlement."""
+        # asyncio.wait only watches the future. A cancelled shield detaches
+        # from it instead, which left a later failure unretrieved (or, on
+        # Python 3.14, reported as an exception in a shielded future) before
+        # close_init_watch() could retire it.
+        waiting = asyncio.wait((self._settlement,))
         if deadline is None:
-            return await asyncio.shield(self._settlement)
-        return await asyncio.wait_for(asyncio.shield(self._settlement), deadline)
+            await waiting
+        else:
+            await asyncio.wait_for(waiting, deadline)
+        return self._settlement.result()
+
+    def _retire(self) -> None:
+        """Retire the settlement future on its owning loop.
+
+        A failure the reader already delivered is read, so asyncio counts it
+        as retrieved; a pending future is cancelled, so a delivery still
+        queued (the reader's EOF) finds it done and does nothing. Called off
+        the loop, it is queued behind every delivery already queued there.
+        """
+        try:
+            on_loop = asyncio.get_running_loop() is self._loop
+        except RuntimeError:
+            on_loop = False
+        if on_loop:
+            self._drain()
+            return
+        try:
+            self._loop.call_soon_threadsafe(self._drain)
+        except RuntimeError:
+            # The loop is closed: no delivery runs any more, and asyncio never
+            # reports a pending future. Read a failure already delivered.
+            if self._settlement.done() and not self._settlement.cancelled():
+                self._settlement.exception()
+
+    def _drain(self) -> None:
+        settlement = self._settlement
+        if not settlement.done():
+            settlement.cancel()
+        elif not settlement.cancelled():
+            settlement.exception()
 
 
 class _ChildLifetime:
@@ -377,9 +416,16 @@ class PersistentTransport:
         return watch
 
     def close_init_watch(self, watch: InitWatch) -> None:
+        """Stop watching ``watch`` and retire its settlement future.
+
+        The init caller may have stopped waiting first (its request failed,
+        was refused, or timed out) while the reader still failed the watch.
+        That exact watch is retired even if a restart already detached it.
+        """
         with self._pending_lock:
             if self._init_watch is watch:
                 self._init_watch = None
+        watch._retire()
 
     @property
     def request_timeout(self) -> float:
