@@ -5781,4 +5781,351 @@ schedule = true
         );
         governed.shutdown().await;
     }
+
+    /// What one scheduled fire to an identity-first member did on the
+    /// identity lane: the schedule host's identity runtime dispatches it.
+    #[derive(Debug)]
+    struct IdentityFireOutcome {
+        /// The receipt detail of a dispatch, or the schedule domain error.
+        dispatch: Result<Option<String>, String>,
+        terminal_phase: Option<OccurrencePhase>,
+        terminal_reason: Option<meerkat::DeliveryFailureReason>,
+        terminal_detail: Option<String>,
+        /// The identity's lifecycle state, mob member count and session
+        /// before and after the fire.
+        state: (
+            crate::identity_first::IdentityLifecycleState,
+            crate::identity_first::IdentityLifecycleState,
+        ),
+        members: (usize, usize),
+        session: (Option<SessionId>, Option<SessionId>),
+        /// The identity's session after the fire: message count and last
+        /// assistant text.
+        transcript_after: Option<(usize, Option<String>)>,
+        /// The member's agent events after the fire, when it was live before.
+        member_events: Vec<String>,
+        run_failure: Option<meerkat_core::event::AgentErrorReport>,
+        /// Provider calls the fire caused.
+        llm_calls: usize,
+        /// Native ingress checks the governed composition was asked.
+        ingress_checks: usize,
+    }
+
+    /// Fire one due schedule whose target is an identity-first member's mob
+    /// target through [`InternalDeliveryScheduleMobHost`] with the runtime's
+    /// identity runtime, as the gateway composes it, on a runtime built with
+    /// or without `native_grant_work_configuration` (the composition
+    /// [`scheduled_member_fire`] uses). The roster registers lazily, so the
+    /// identity is dormant until something materializes it; `dormant` keeps
+    /// it so up to the fire.
+    async fn scheduled_identity_fire(governed: bool, dormant: bool) -> IdentityFireOutcome {
+        use crate::identity_first::{
+            AgentIdentity, ContinuityStore, IdentityFirstRuntimeContext, LocalContinuityStore,
+        };
+        use crate::unified_runtime::held_identity_test_support as support;
+        use futures::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let llm_calls = Arc::new(AtomicUsize::new(0));
+        let ingress_checks = Arc::new(AtomicUsize::new(0));
+        let mob_id = format!(
+            "schedule-identity-{}-{}",
+            if governed { "on" } else { "off" },
+            uuid::Uuid::new_v4().simple()
+        );
+        let mut builder = crate::UnifiedRuntime::builder()
+            .definition(scheduled_worker_definition(&mob_id))
+            .meerkat_config(scheduled_fire_config())
+            .persistent_state(temp_dir.path().join("state"))
+            .default_llm_client(Arc::new(CountingLlmClient {
+                calls: llm_calls.clone(),
+            }));
+        if governed {
+            builder = builder
+                .native_grant_work_configuration(counting_governed_configuration(
+                    ingress_checks.clone(),
+                ))
+                .member_runtime_registration_hook(Arc::new(support::SelectingHook))
+                .tool_consequence_policy_registry(host_policy_registry());
+        }
+        let mut runtime = builder.build().await.expect("build runtime");
+        let identity = AgentIdentity::parse("scheduled-identity").expect("identity");
+        let roster = vec![support::member(&identity)];
+        let continuity: Arc<dyn ContinuityStore> =
+            Arc::new(LocalContinuityStore::in_memory().expect("continuity store"));
+        let identity_runtime = support::identity_runtime(&runtime, continuity, &mob_id);
+        runtime.install_identity_first_context(Arc::new(
+            IdentityFirstRuntimeContext::new_with_lazy_materialization(
+                Arc::clone(&identity_runtime),
+                Arc::new(support::Roster(roster.clone())),
+                None,
+                None,
+                Some(runtime.mob_handle().definition().clone()),
+                true,
+            ),
+        ));
+        runtime
+            .bootstrap_installed_identity_first_context(&roster)
+            .await
+            .expect("register the roster");
+        if !dormant {
+            identity_runtime
+                .materialize(&identity)
+                .await
+                .expect("materialize the identity");
+        }
+        let handle = runtime.mob_handle();
+        let member = crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
+        let status_before = identity_runtime
+            .status(&identity)
+            .await
+            .expect("identity status");
+        let members_before = handle.list_members().await.len();
+        let mut probe = if dormant {
+            None
+        } else {
+            Some(
+                handle
+                    .subscribe_agent_events(&member)
+                    .await
+                    .expect("probe the member's events"),
+            )
+        };
+        let llm_baseline = llm_calls.load(Ordering::SeqCst);
+        let ingress_baseline = ingress_checks.load(Ordering::SeqCst);
+
+        let binding = MobTargetBinding::Member {
+            mob_id: mob_id.clone(),
+            member_id: member.to_string(),
+            action: ScheduledMobAction::Send {
+                content: meerkat_core::ContentInput::Text("run the scheduled check".to_string()),
+                render_metadata: None,
+            },
+        };
+        let schedule = Schedule::new(CreateScheduleRequest {
+            name: Some("governed-identity-fire".to_string()),
+            description: None,
+            trigger: TriggerSpec::Interval(IntervalTriggerSpec {
+                start_at_utc: chrono::Utc::now(),
+                every_seconds: 60,
+                end_at_utc: None,
+            }),
+            target: TargetBinding::Mob(Box::new(binding.clone())),
+            misfire_policy: meerkat::MisfirePolicy::default(),
+            overlap_policy: meerkat::OverlapPolicy::default(),
+            missing_target_policy: meerkat::MissingTargetPolicy::default(),
+            labels: BTreeMap::new(),
+            planning_horizon_days: None,
+            planning_horizon_occurrences: None,
+        })
+        .expect("schedule");
+        let occurrence = Occurrence::planned_from_schedule(
+            &schedule,
+            meerkat::OccurrenceOrdinal(0),
+            chrono::Utc::now(),
+        )
+        .expect("occurrence");
+        let host = InternalDeliveryScheduleMobHost {
+            inner: Arc::new(NoopScheduleMobHost::new("unused fallback")),
+            handle: handle.clone(),
+            identity_runtime: runtime.identity_runtime_ref().cloned(),
+        };
+        let (dispatch_result, terminal) = match host
+            .deliver_mob_target(
+                &occurrence,
+                &meerkat::ScheduleDeliveryIdentity::for_occurrence(&occurrence),
+                &binding,
+            )
+            .await
+        {
+            Ok(dispatch) => {
+                let detail = dispatch.receipt.detail.clone();
+                let terminal = dispatch.completion.await.expect("delivery terminal");
+                (Ok(detail), Some(terminal))
+            }
+            Err(error) => (Err(error.to_string()), None),
+        };
+        let mut member_events = Vec::new();
+        let mut run_failure = None;
+        match probe.as_mut() {
+            Some(probe) => {
+                let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                    while let Some(event) = probe.next().await {
+                        member_events.push(
+                            meerkat_core::event::agent_event_type(&event.payload).to_string(),
+                        );
+                        match event.payload {
+                            meerkat_core::event::AgentEvent::RunCompleted { .. } => break,
+                            meerkat_core::event::AgentEvent::RunFailed { error_report, .. } => {
+                                run_failure = Some(error_report);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+                .await;
+            }
+            // No member to probe before the fire: give a run it started the
+            // same window to reach the provider.
+            None => tokio::time::sleep(Duration::from_secs(5)).await,
+        }
+        drop(probe);
+        let status_after = identity_runtime
+            .status(&identity)
+            .await
+            .expect("identity status");
+        // The session read can trail a run's events: after a provider call,
+        // wait (bounded) for the reply to reach it.
+        let ran = llm_calls.load(Ordering::SeqCst) > llm_baseline;
+        let mut transcript_after = None;
+        if let (Some(session), Some(sessions)) = (
+            status_after.session_id.as_ref(),
+            runtime.mob_runtime().session_service(),
+        ) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                transcript_after = sessions
+                    .read(session)
+                    .await
+                    .ok()
+                    .map(|view| (view.state.message_count, view.state.last_assistant_text));
+                let settled = transcript_after
+                    .as_ref()
+                    .is_some_and(|(_, reply)| reply.is_some());
+                if !ran || settled || tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        let outcome = IdentityFireOutcome {
+            dispatch: dispatch_result,
+            terminal_phase: terminal.as_ref().map(|terminal| terminal.phase),
+            terminal_reason: terminal
+                .as_ref()
+                .and_then(|terminal| terminal.delivery_failure_reason),
+            terminal_detail: terminal.and_then(|terminal| terminal.detail),
+            state: (status_before.state, status_after.state),
+            members: (members_before, handle.list_members().await.len()),
+            session: (status_before.session_id, status_after.session_id),
+            transcript_after,
+            member_events,
+            run_failure,
+            llm_calls: llm_calls.load(Ordering::SeqCst) - llm_baseline,
+            ingress_checks: ingress_checks.load(Ordering::SeqCst) - ingress_baseline,
+        };
+        drop(host);
+        runtime.shutdown().await;
+        outcome
+    }
+
+    /// The gateway hands the schedule host the runtime's identity runtime,
+    /// so a fire to a durable identity's member takes the identity lane
+    /// (the identity runtime's dispatch, through its session bridge), not
+    /// the plain internal work door. On a runtime built with
+    /// `native_grant_work_configuration` that lane meets the same refusal:
+    /// the occurrence ends `DeliveryFailed` (`RuntimeRejected`) at the fire,
+    /// no run starts and no provider call is made. A dormant identity is
+    /// materialized first: its member and a fresh session are created and
+    /// stay live, the session holding only its system prompt. Without that
+    /// configuration an active and a dormant identity both run the turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_governed_identity_lane_fire_does_not_run_and_materializes_a_dormant_identity_first()
+    {
+        use crate::identity_first::IdentityLifecycleState::{Active, Dormant};
+
+        for dormant in [false, true] {
+            let ungoverned = scheduled_identity_fire(false, dormant).await;
+            assert_eq!(ungoverned.dispatch, Ok(None), "{ungoverned:#?}");
+            assert_eq!(
+                ungoverned.terminal_phase,
+                Some(OccurrencePhase::Completed),
+                "{ungoverned:#?}"
+            );
+            assert_eq!(ungoverned.terminal_reason, None);
+            assert_eq!(ungoverned.terminal_detail, None);
+            assert_eq!(
+                ungoverned.state,
+                (if dormant { Dormant } else { Active }, Active)
+            );
+            assert_eq!(ungoverned.members, (usize::from(!dormant), 1));
+            assert!(ungoverned.session.1.is_some(), "{ungoverned:#?}");
+            if !dormant {
+                assert_eq!(ungoverned.session.0, ungoverned.session.1);
+                assert_eq!(
+                    ungoverned.member_events.first().map(String::as_str),
+                    Some("run_started"),
+                    "{ungoverned:#?}"
+                );
+                assert_eq!(
+                    ungoverned.member_events.last().map(String::as_str),
+                    Some("run_completed"),
+                    "{ungoverned:#?}"
+                );
+            }
+            assert_eq!(
+                ungoverned.transcript_after,
+                Some((3, Some("done".to_string()))),
+                "the ungoverned fire runs one turn: {ungoverned:#?}"
+            );
+            assert!(ungoverned.run_failure.is_none());
+            assert_eq!(ungoverned.llm_calls, 1);
+            assert_eq!(ungoverned.ingress_checks, 0);
+
+            let governed = scheduled_identity_fire(true, dormant).await;
+            let session = governed
+                .session
+                .1
+                .clone()
+                .expect("the identity has a session after the fire");
+            assert_eq!(governed.dispatch, Ok(None), "{governed:#?}");
+            assert_eq!(
+                governed.terminal_phase,
+                Some(OccurrencePhase::DeliveryFailed),
+                "{governed:#?}"
+            );
+            assert_eq!(
+                governed.terminal_reason,
+                Some(meerkat::DeliveryFailureReason::RuntimeRejected)
+            );
+            assert_eq!(
+                governed.terminal_detail,
+                Some(format!(
+                    "identity schedule delivery failed (member scheduled-identity): internal: \
+                     bridge deliver: session bridge mob error: session bridge mob error: member \
+                     session {session} did not admit the input: {NATIVE_ADMISSION_REFUSAL}"
+                ))
+            );
+            if dormant {
+                assert_eq!(
+                    (governed.state, governed.members, governed.session.0.clone()),
+                    ((Dormant, Active), (0, 1), None),
+                    "a dormant identity is materialized before the refusal"
+                );
+            } else {
+                assert_eq!(
+                    (governed.state, governed.members, governed.session.0.clone()),
+                    ((Active, Active), (1, 1), Some(session)),
+                    "an active identity keeps its member and session"
+                );
+            }
+            assert_eq!(
+                governed.transcript_after,
+                Some((1, None)),
+                "the session holds only its system prompt: {governed:#?}"
+            );
+            assert!(
+                governed.member_events.is_empty(),
+                "no run starts: {governed:#?}"
+            );
+            assert!(governed.run_failure.is_none());
+            assert_eq!(governed.llm_calls, 0, "the governed fire runs no turn");
+            assert_eq!(
+                governed.ingress_checks, 0,
+                "refused before the host's ingress check is asked"
+            );
+        }
+    }
 }
