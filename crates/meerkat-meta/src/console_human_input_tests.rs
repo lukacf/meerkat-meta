@@ -1087,6 +1087,101 @@ async fn console_human_reset_refuses_old_prepared_session_and_old_worker_fence()
     h.stop().await;
 }
 
+/// A send accepted in the identity's session whose dispatch never ran (the
+/// gateway stopped in between), and an identity that moved to a new session
+/// before the replay: the replay dispatches it again only into the session
+/// it recorded, which refuses it. It ends `delivery_failed`, and neither
+/// session receives it.
+#[tokio::test(flavor = "multi_thread")]
+async fn console_human_redispatch_into_a_moved_session_fails_and_delivers_nothing() {
+    const MOVED: &str = "MOVED-SESSION a send interrupted before its admission";
+    let h = Harness::new(WAIT).await;
+    let request = h.request("moved-session", MOVED);
+    let accepted = match h
+        .aggregator
+        .reserve_identity_first_interaction_scoped(
+            request.clone(),
+            Some(h.session_id.to_string().as_str()),
+            &crate::console_aggregator::ConsoleSendScope::Anonymous,
+        )
+        .await
+        .unwrap()
+    {
+        // The claim drops here, as it does when the process stops.
+        crate::console_aggregator::ScopedReservation::Fresh(accepted, _claim) => Some(accepted),
+        _ => None,
+    }
+    .expect("a fresh reservation");
+    assert_eq!(
+        accepted.session_id.as_deref(),
+        Some(h.session_id.to_string().as_str())
+    );
+    let successor = h.identity_runtime.reset(&h.identity).await.unwrap();
+    assert_ne!(successor.session_id, h.session_id);
+
+    let replay = h.send(request).await.unwrap();
+    assert_eq!(replay.input_frame_id, accepted.input_frame_id);
+    let settled = tokio::time::timeout(WAIT, async {
+        loop {
+            let page = h
+                .aggregator
+                .query_timeline(ConsoleTimelineQuery {
+                    identity: Some(accepted.identity.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            if let Some(status) = page
+                .frames
+                .iter()
+                .find(|frame| frame.id == accepted.input_frame_id)
+                .map(|frame| frame.status)
+                .filter(|status| {
+                    matches!(
+                        status,
+                        ConsoleFrameStatus::Delivered | ConsoleFrameStatus::DeliveryFailed
+                    )
+                })
+            {
+                break status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the replayed send settles");
+    assert_eq!(
+        settled,
+        ConsoleFrameStatus::DeliveryFailed,
+        "a send recorded in a session the identity left is refused there, never retargeted"
+    );
+    for session in [h.session_id.to_string(), successor.session_id.to_string()] {
+        if let Ok(history) = h
+            .unified
+            .mob_runtime()
+            .read_session_history(&session, 0, None)
+            .await
+        {
+            assert!(
+                !history.messages.iter().any(
+                    |message| matches!(message, Message::User(user) if user.text_content() == MOVED)
+                ),
+                "session {session} received the send"
+            );
+        }
+    }
+    assert!(
+        h.client
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| !format!("{request:?}").contains("MOVED-SESSION")),
+        "the model never saw the send"
+    );
+    h.stop().await;
+}
+
 const SKILL_BODY: &str = "Answer in the chosen house style: numbered, terse, no hedging.";
 const OTHER_SKILL_BODY: &str = "Answer in the other house style: long prose with caveats.";
 
