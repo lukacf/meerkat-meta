@@ -143,9 +143,9 @@ struct ConsoleHttpAuthContext {
     /// Whether the verified token classified the principal as a service
     /// identity rather than a human.
     service_identity: bool,
-    /// The trust source of a resolved principal: the provider the verified
-    /// token was classified as, and the issuer it verified against.
-    principal_source: Option<(crate::AuthProvider, String)>,
+    /// The scope this caller's console sends are deduplicated in, fixed
+    /// when the request's token was resolved.
+    send_scope: ConsoleSendScope,
     /// Per-request access snapshot when an [`AccessController`] is wired.
     access_view: Option<AccessView>,
     /// The verified human behind the request's token, when there is one.
@@ -155,29 +155,10 @@ struct ConsoleHttpAuthContext {
 impl ConsoleHttpAuthContext {
     /// The scope this caller's console sends are deduplicated in: the
     /// verified human (issuer and subject) when there is one, else the
-    /// authenticated principal, else the open Console's shared local account.
+    /// authenticated principal with its trust source, else the open
+    /// Console's shared local account.
     fn send_scope(&self) -> ConsoleSendScope {
-        if let Some(human) = &self.human {
-            return ConsoleSendScope::Human {
-                issuer: human.issuer().to_string(),
-                subject: human.subject().to_string(),
-            };
-        }
-        match &self.principal {
-            Some(principal) => {
-                let (provider, issuer) = self
-                    .principal_source
-                    .as_ref()
-                    .map(|(provider, issuer)| (console_provider_name(provider), issuer.as_str()))
-                    .unwrap_or_default();
-                ConsoleSendScope::Principal {
-                    principal: principal.clone(),
-                    provider: provider.to_string(),
-                    issuer: issuer.to_string(),
-                }
-            }
-            None => ConsoleSendScope::Anonymous,
-        }
+        self.send_scope.clone()
     }
 }
 
@@ -5259,50 +5240,59 @@ fn console_request_auth_context_for(
     if !decisions.console.require_app_auth {
         // Open console: identify callers that volunteered a valid token so
         // per-user ABAC grants still apply; everyone else is anonymous.
-        let (auth, human) = access
-            .and_then(|_| {
-                let token = console_request_token(headers, uri)?;
-                crate::runtime::resolve_authorized_console_human_from_token(decisions, &token)
-            })
-            .map_or((None, None), |(auth, human)| (Some(auth), human));
-        let service_identity = auth
-            .as_ref()
-            .is_some_and(|auth| auth.provider == crate::AuthProvider::ServiceIdentity);
-        let principal_source = auth
-            .as_ref()
-            .and_then(|auth| console_principal_source(decisions, &auth.provider));
-        let principal = auth.map(|auth| auth.email);
-        return Some(ConsoleHttpAuthContext {
-            access_view: access.map(|controller| controller.view_for_subject(principal.as_deref())),
-            principal,
-            service_identity,
-            principal_source,
-            human,
+        let caller = access.and_then(|_| {
+            let token = console_request_token(headers, uri)?;
+            crate::runtime::resolve_authorized_console_caller_from_token(decisions, &token)
         });
+        let Some(caller) = caller else {
+            return Some(ConsoleHttpAuthContext {
+                access_view: access.map(|controller| controller.view_for_subject(None)),
+                principal: None,
+                service_identity: false,
+                send_scope: ConsoleSendScope::Anonymous,
+                human: None,
+            });
+        };
+        return Some(console_caller_auth_context(caller, access));
     }
     let token = console_request_token(headers, uri)?;
-    let (auth, human) =
-        crate::runtime::resolve_authorized_console_human_from_token(decisions, &token)?;
-    Some(ConsoleHttpAuthContext {
+    let caller = crate::runtime::resolve_authorized_console_caller_from_token(decisions, &token)?;
+    Some(console_caller_auth_context(caller, access))
+}
+
+/// The request context of a caller the Console resolved from a verified
+/// token. Its send scope is fixed here, from that verification: the verified
+/// human (issuer and subject) when there is one, else the principal with
+/// the provider its token was classified as and the issuer the token
+/// verified against.
+fn console_caller_auth_context(
+    caller: crate::runtime::ResolvedConsoleCaller,
+    access: Option<&AccessController>,
+) -> ConsoleHttpAuthContext {
+    let crate::runtime::ResolvedConsoleCaller {
+        auth,
+        issuer,
+        human,
+    } = caller;
+    let send_scope = match &human {
+        Some(human) => ConsoleSendScope::Human {
+            issuer: human.issuer().to_string(),
+            subject: human.subject().to_string(),
+        },
+        None => ConsoleSendScope::Principal {
+            principal: auth.email.clone(),
+            provider: console_provider_name(&auth.provider).to_string(),
+            issuer,
+        },
+    };
+    ConsoleHttpAuthContext {
         access_view: access
             .map(|controller| controller.view_for_subject(Some(auth.email.as_str()))),
         service_identity: auth.provider == crate::AuthProvider::ServiceIdentity,
-        principal_source: console_principal_source(decisions, &auth.provider),
         principal: Some(auth.email),
+        send_scope,
         human,
-    })
-}
-
-/// The trust source of a principal the Console resolved from a verified
-/// token: its provider classification and the issuer the token verified
-/// against (the Console's trusted OIDC issuer).
-fn console_principal_source(
-    decisions: &RuntimeDecisionState,
-    provider: &crate::AuthProvider,
-) -> Option<(crate::AuthProvider, String)> {
-    let discovery =
-        crate::auth::parse_oidc_discovery_json(&decisions.trusted_oidc.discovery_json).ok()?;
-    Some((provider.clone(), discovery.issuer))
+    }
 }
 
 /// The name a principal's send scope records for its provider: the spelling

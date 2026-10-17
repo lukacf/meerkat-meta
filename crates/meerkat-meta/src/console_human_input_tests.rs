@@ -1155,20 +1155,37 @@ async fn console_human_redispatch_into_a_moved_session_fails_and_delivers_nothin
         ConsoleFrameStatus::DeliveryFailed,
         "a send recorded in a session the identity left is refused there, never retargeted"
     );
-    for session in [h.session_id.to_string(), successor.session_id.to_string()] {
-        if let Ok(history) = h
-            .unified
-            .mob_runtime()
-            .read_session_history(&session, 0, None)
-            .await
-        {
-            assert!(
-                !history.messages.iter().any(
-                    |message| matches!(message, Message::User(user) if user.text_content() == MOVED)
-                ),
-                "session {session} received the send"
-            );
-        }
+    let holds_the_send = |history: &meerkat_core::service::SessionHistoryPage| {
+        history
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::User(user) if user.text_content() == MOVED))
+    };
+    // A retargeted send would land in the successor: its history must read,
+    // so this cannot pass on a read error.
+    let successor_history = h
+        .unified
+        .mob_runtime()
+        .read_session_history(&successor.session_id.to_string(), 0, None)
+        .await
+        .expect("the successor session's history reads");
+    assert!(
+        !holds_the_send(&successor_history),
+        "the successor session received the send"
+    );
+    // The session the send recorded refused it (delivery_failed above). The
+    // reset retired that session, so its history is checked when it still
+    // reads.
+    if let Ok(history) = h
+        .unified
+        .mob_runtime()
+        .read_session_history(&h.session_id.to_string(), 0, None)
+        .await
+    {
+        assert!(
+            !holds_the_send(&history),
+            "the recorded session received the send"
+        );
     }
     assert!(
         h.client
