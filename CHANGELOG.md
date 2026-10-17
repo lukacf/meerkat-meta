@@ -55,7 +55,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `propose_to_mob` from a member that is not in a mob, now fails at plan
   resolution with `invalid_arguments` and the same reason, where the tool
   returned it as an error result.
-
 - Behaviour-only: `meta/mobpacks/apply_operation` refuses every operation
   but the deletes (`delete_flow_step`, `delete_graph_node`,
   `delete_graph_edge` and `delete_member`) with `-32602`, not only the
@@ -255,7 +254,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   never blocks a save. Deletes always run, and a store already past a cap
   takes writes that leave it no larger. Draft replies also stop copying the
   snapshots they strip from each row.
-
 - Deriving a flow from a Flow Editor graph (`meta/mobpacks/graph_to_flow`,
   the graph operations of `meta/mobpacks/apply_operation`, and the graph
   check every validation runs) indexes the graph once. Every lookup of a
@@ -503,12 +501,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   then failed, the journal and startup's refusal named no unfinished step.
   A reopened journal now records no step as finished until the rerun
   finishes it.
-
 - Importing a mob definition into the Flow Editor shows each of its steps
   once. A step with a condition but no branch that shares its dependencies
   with two or more steps without one was dropped, and the parallel step of
   those steps was shown again for each such step, so such an import also
-  grew with the product of the two counts.
+  grew with the product of the two counts. Such a step is now shown as its
+  own step after that parallel step (see Known limitations).
+
 ### Known limitations
 
 - The Flow Editor draft store has no total size or draft count limit yet:
@@ -521,6 +520,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   route: one caller can fill it to its caps, which refuses new drafts to
   everyone else and drops other drafts' undo history first, and any caller
   can overwrite or delete any draft. Per-caller stores or quotas are planned.
+- The Flow Editor shows a step with a condition but no branch as a plain
+  step, without its condition, so exporting an imported flow writes the
+  step without its condition, after the step before it in the editor's
+  flow: a step that ran beside parallel steps when its condition held then
+  runs after them, always.
 
 ## [0.9.1] - 2026-10-15
 

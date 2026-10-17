@@ -40399,4 +40399,84 @@ condition = { op = "eq", path = "params.kind", value = "d" }
         }
         assert!(taken > 250, "only {taken} nodes taken in 500 cases");
     }
+
+    /// A step with a condition but no branch is imported as a plain step of
+    /// its own, after the parallel step of the steps it shares its
+    /// dependencies with. The editor shows no condition on a member step, so
+    /// exporting the imported flow writes it without its condition, after
+    /// those steps (see the changelog's Known limitations). The step ids sort
+    /// in dependency order: import shows a frame's steps in id order.
+    #[test]
+    fn a_conditioned_step_without_a_branch_exports_as_a_plain_step_after_its_siblings() {
+        let mob_toml = r#"
+[mob]
+id = "siblings"
+
+[profiles.worker]
+model = "gpt-5.5"
+peer_description = "Worker"
+
+[flows.main]
+description = "Siblings"
+
+[flows.main.steps.plan]
+role = "worker"
+message = "Plan."
+
+[flows.main.steps.review_a]
+role = "worker"
+message = "A."
+depends_on = ["plan"]
+
+[flows.main.steps.review_b]
+role = "worker"
+message = "B."
+depends_on = ["plan"]
+
+[flows.main.steps.review_c]
+role = "worker"
+message = "C."
+depends_on = ["plan"]
+condition = { op = "eq", path = "params.kind", value = "c" }
+"#;
+        let imported = import_mobpack(&json!({ "mob_toml": mob_toml })).expect("import");
+        let mut document: MobpackDocument =
+            serde_json::from_value(imported["document"].clone()).expect("document");
+        let shown: Vec<(&str, &str)> = document.flow["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|step| step["type"] != "input")
+            .filter_map(|step| Some((step["type"].as_str()?, step["id"].as_str()?)))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("member", "plan"),
+                ("parallel", "parallel_review_a_review_b"),
+                ("member", "review_c")
+            ]
+        );
+
+        document.mob_toml = None;
+        let exported = render_editor_document_mob_toml(&document).expect("export the import");
+        let definition = MobDefinition::from_toml(&exported).expect("the exported definition");
+        let flow = definition.flows.values().next().expect("the exported flow");
+        let message_of = |id: &str| flow.steps.get(id).map(|step| step.message.text_content());
+        let c = flow
+            .steps
+            .values()
+            .find(|step| step.message.text_content() == "C.")
+            .expect("step C");
+        let mut after: Vec<String> = c
+            .depends_on
+            .iter()
+            .filter_map(|id| message_of(id.as_str()))
+            .collect();
+        after.sort();
+        assert_eq!(
+            (after, c.condition.is_none()),
+            (vec!["A.".to_string(), "B.".to_string()], true)
+        );
+    }
 }
