@@ -867,7 +867,10 @@ jobs:
   # entry, so they match those jobs) and with no secret at all.
   # publish_registries then publishes the same checkout with --no-verify,
   # holding the token but restoring no cache, so no cached file runs beside
-  # the token. This job never saves.
+  # the token. This job never saves. The restore makes its "packages build"
+  # verdict only as trustworthy as main CI's cache, but a poisoned entry
+  # cannot ship: publish_registries packages again from source, refuses bytes
+  # that differ from the sha256 recorded here, and alone holds the secret.
   verify_crate_packages:
     name: Verify crate packages
     needs: [resolve_release, release_validate]
