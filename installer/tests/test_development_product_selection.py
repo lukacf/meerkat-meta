@@ -1,7 +1,9 @@
 """Inert integrity controls for the expressly unqualified development path."""
 from copy import deepcopy
 from dataclasses import replace
+import hashlib
 import json
+from pathlib import Path
 import zipfile
 
 import pytest
@@ -165,9 +167,12 @@ def test_development_distribution_keeps_guide_and_application_owners_separate(
         product, bundle_source, tmp_path, meta_version):
     from launchkit.bootstrap import SelectedGuideRuntime
     from launchkit.connect_installer_caller import ExactFile
-    from launchkit import distribution, product_distribution
+    from launchkit import distribution, product_distribution, guide_sdk
 
     root, _, _ = bundle_source
+    sdk = root / guide_sdk.WHEEL
+    sdk.parent.mkdir(parents=True)
+    sdk.write_bytes((Path(__file__).parents[1] / guide_sdk.WHEEL).read_bytes())
     for name in ("LICENSE-MIT", "LICENSE-APACHE"):
         (root / name).write_text("Inert public license.\n")
     gateway = put(product.root / "guide/rpc_gateway", b"inert guide, never execute\n")
@@ -184,6 +189,11 @@ def test_development_distribution_keeps_guide_and_application_owners_separate(
     assert observed["guide"]["version"] == observed["guide"]["core_version"] == "0.9.0"
     assert observed["product"]["selection"]["meta"]["version"] == meta_version
     assert observed["guide"]["gateway"]["sha256"] == gateway.sha256
+    assert observed["guide"]["sdk"] == guide_sdk.selection()
+    assert (extracted / observed["product"]["paths"]["meta_wheel"]).read_bytes() == target.meta_wheel.path.read_bytes()
+    expected_clients = [guide_sdk.WHEEL, observed["product"]["paths"]["toolkit_wheel"]]
+    assert distribution.sdk_wheels(extracted) == expected_clients
+    assert distribution.bootstrap_inputs(extracted) == ["meta-toolkit", *expected_clients]
     readme = (extracted / "README.md").read_text()
     assert "The Forge guide uses Core 0.9.0 and Meta 0.9.0" in readme
     assert f"application uses the separately selected Meta {meta_version} and Toolkit" in readme
@@ -192,14 +202,32 @@ def test_development_distribution_keeps_guide_and_application_owners_separate(
     manifest = extracted / distribution.MANIFEST
     original = manifest.read_bytes()
     for field, value in (("version", "0.9.1"), ("core_version", "0.9.1"),
-            ("meta_source", "not-a-source-hash"), ("gateway", {**observed["guide"]["gateway"], "sha256": "f" * 64})):
+            ("meta_source", "not-a-source-hash"), ("gateway", {**observed["guide"]["gateway"], "sha256": "f" * 64}),
+            ("sdk", {**observed["guide"]["sdk"], "version": "0.9.0"})):
         changed = deepcopy(observed)
         changed["guide"][field] = value
         manifest.write_bytes(json_bytes(changed))
         with pytest.raises(distribution.DistributionError):
             product_distribution.verify(extracted)
         manifest.write_bytes(original)
+    # A changed client wheel cannot be admitted by rehashing the outer manifest.
+    wheel_copy = extracted / guide_sdk.WHEEL
+    wheel_original = wheel_copy.read_bytes()
+    changed_wheel = wheel_original[:-1] + bytes([wheel_original[-1] ^ 1])
+    wheel_copy.write_bytes(changed_wheel)
+    changed = deepcopy(observed)
+    changed["files"][guide_sdk.WHEEL]["sha256"] = hashlib.sha256(changed_wheel).hexdigest()
+    manifest.write_bytes(json_bytes(changed))
+    with pytest.raises(distribution.DistributionError, match="reviewed wheel"):
+        product_distribution.verify(extracted)
+    wheel_copy.write_bytes(wheel_original)
+    manifest.write_bytes(original)
     gateway_copy = extracted / "vendor/guide/rpc_gateway"
     gateway_copy.write_bytes(b"changed guide bytes\n")
     with pytest.raises(distribution.DistributionError, match="files changed"):
         product_distribution.verify(extracted)
+    sdk.write_bytes(changed_wheel)
+    refused_output = tmp_path / "changed-guide-sdk.zip"
+    with pytest.raises(distribution.DistributionError, match="reviewed wheel"):
+        product_distribution.package(root, target, guide, refused_output)
+    assert not refused_output.exists()

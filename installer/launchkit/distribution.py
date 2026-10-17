@@ -352,12 +352,15 @@ def verify_product(root):
 
 
 def sdk_wheels(root):
-    """Return only SDK paths from the byte-verified standalone selection."""
+    """Return the host's SDK paths from the byte-verified standalone selection.
+
+    A product retains its application SDK separately for the app environment.
+    """
     root = Path(root).absolute()
     data = json.loads(_read(root / MANIFEST), object_pairs_hook=_unique_object)
     if isinstance(data, dict) and data.get("format") == "meta-forge-product-standalone-v1":
         checked = verify_product(root)
-        return [checked["product"]["paths"][name] for name in ("meta_wheel", "toolkit_wheel")]
+        return [checked["guide"]["sdk"]["path"], checked["product"]["paths"]["toolkit_wheel"]]
     return [verify(root)]
 
 
@@ -377,8 +380,8 @@ def bootstrap_inputs(root):
     data = json.loads(_read(root / MANIFEST), object_pairs_hook=_unique_object)
     if isinstance(data, dict) and data.get("format") == "meta-forge-product-standalone-v1":
         checked = verify_product(root)
-        return ["meta-toolkit", *(checked["product"]["paths"][name]
-            for name in ("meta_wheel", "toolkit_wheel"))]
+        return ["meta-toolkit", checked["guide"]["sdk"]["path"],
+            checked["product"]["paths"]["toolkit_wheel"]]
     return ["legacy", verify(root)]
 
 

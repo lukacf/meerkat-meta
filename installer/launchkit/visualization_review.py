@@ -814,7 +814,8 @@ class VisualizationReviewService:
                     raise TimeoutError("The review observation deadline has elapsed.")
                 result = await handle.spawn_helper(receipt["helper_identity"], task,
                     result_label="visual-review-result", max_text_bytes=MAX_RESULT_BYTES,
-                    role=REVIEW_PROFILE, runtime_mode="turn_driven")
+                    role=REVIEW_PROFILE, runtime_mode="turn_driven",
+                    transport_timeout=remaining)
             failure_boundary = "result_fields"
             # HelperResult has only output/tokens_used/session_id. Output prose is
             # not publication authority, and it cannot replace a checked callback.

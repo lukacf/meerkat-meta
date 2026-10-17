@@ -606,6 +606,10 @@ const apply = Reflect.apply, make = Object.create, define = Object.definePropert
 const keys = Object.keys, freeze = Object.freeze, proto = Object.getPrototypeOf, setProto = Object.setPrototypeOf;
 const quote = JSON.stringify, string = String, trim = String.prototype.trim, slice = String.prototype.slice;
 const read = fs.readSync, close = fs.closeSync, write = fs.writeSync;
+// Initialize libuv's lazy output streams while stdin still occupies fd 0.
+// Otherwise the pinned Darwin build can duplicate an output descriptor into
+// the closed stdin slot and abort when authored code first opens stdout.
+void process.stdout; void process.stderr;
 const alloc = Buffer.alloc, fill = Buffer.prototype.fill, byteLength = Buffer.byteLength;
 const secretKey = crypto.createSecretKey, createHmac = crypto.createHmac;
 const selected = make(null);

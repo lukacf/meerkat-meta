@@ -171,6 +171,7 @@ async def test_installed_dispatcher_delivers_actual_image_and_source_bound_advis
     assert result["status"] == "reviewed" and result["report"]["verdict"] == "needs_revision"
     assert runtime.images and len(runtime.calls) == 1
     options = dict(runtime.calls[0][2])
+    assert 0 < options.pop("transport_timeout") <= review.timeout
     assert options == {"result_label": "visual-review-result", "max_text_bytes": 16000, "role": "visual-review", "runtime_mode": "turn_driven"}
     assert result["correction_advisory"]["expected_parent"] == {"operation_id": before["binding"]["id"], **{key: before["binding"][key] for key in ("code_hash", "blueprint_hash", "model_hash", "setup_id", "stream_id")}}
     assert result["correction_advisory"]["eligible_now"] is True and not operations.mutations

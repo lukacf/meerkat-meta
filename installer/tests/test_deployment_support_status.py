@@ -26,7 +26,7 @@ async def test_support_read_keeps_loop_responsive(owned, monkeypatch):
 
     def slow_read(*args):
         entered.set()
-        release.wait(0.15)
+        release.wait(2)
         try:
             return original(*args)
         finally:
@@ -34,10 +34,17 @@ async def test_support_read_keeps_loop_responsive(owned, monkeypatch):
 
     monkeypatch.setattr(refresh, "_ordinary_source", slow_read)
     projection = asyncio.create_task(refresh.support_projection(directory, manager))
-    await asyncio.sleep(0.01)
-    responsive = entered.is_set() and not finished.is_set() and not projection.done()
-    release.set()
-    value = await projection
+    try:
+        # A busy runner need not start the worker within a fixed 10ms window.
+        # Observe its actual entry, then require a loop turn while it is held.
+        async with asyncio.timeout(1):
+            while not entered.is_set():
+                await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        responsive = not finished.is_set() and not projection.done()
+    finally:
+        release.set()
+        value = await projection
     assert responsive, "Support validation blocked the event loop before this heartbeat."
     assert value["stopped_verified"] is True and value["prepare_available"] is True
 

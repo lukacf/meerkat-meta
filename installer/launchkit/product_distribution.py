@@ -12,6 +12,7 @@ import tempfile
 import zipfile
 
 from . import distribution as legacy
+from . import guide_sdk
 from .packaged_runtime import FORMAT, relocate_selection
 from .runtime_candidates import (ArtifactFile, MetaToolkitRuntimeTarget,
     MAX_PRODUCT_ARCHIVE_BYTES)
@@ -92,6 +93,8 @@ configuration files to upload or publish.
 
 - Guide Core: `{guide.core_source}`
 - Guide Meta: `{guide.meta_source}`
+- Guide client SDK: `{guide_sdk.VERSION}` (source `{guide_sdk.SOURCE}`)
+- Guide client SDK wheel: `{guide_sdk.SHA256}`
 - Application Meta SDK wheel: `{target.meta_wheel.sha256}`
 - Toolkit SDK wheel: `{target.toolkit_wheel.sha256}`
 - Native product descriptor: `{target.assembly.sha256}`
@@ -131,7 +134,7 @@ def _ordinary(path, limit, *, allow_empty=False):
 def _public_path(name):
     if name in PUBLIC_EXTRA:
         return True
-    if name.startswith("vendor/product/") or name == "vendor/guide/rpc_gateway":
+    if name.startswith("vendor/product/") or name in {"vendor/guide/rpc_gateway", guide_sdk.WHEEL}:
         from pathlib import PurePosixPath
 
         path = PurePosixPath(name)
@@ -211,6 +214,7 @@ def package(root, target, guide, output):
     paths["dependency_wheels"] = ["vendor/product/" + pin.path.relative_to(target.artifact_root).as_posix()
         for pin in target.dependency_wheels]
     source_files["vendor/guide/rpc_gateway"] = guide.gateway.path
+    source_files[guide_sdk.WHEEL] = root / guide_sdk.WHEEL
     with tempfile.TemporaryDirectory(prefix="forge-product-dom-") as temporary:
         candidate_document = Path(temporary).resolve(strict=True) / "README.md"
         candidate_document.write_text(candidate_readme(guide, target, artifacts.origin))
@@ -241,10 +245,15 @@ def package(root, target, guide, output):
             total += size
         if len(source_files) > MAX_FILES or total > MAX_TOTAL:
             raise legacy.DistributionError("The product distribution exceeds its bounds.")
+        # Bind the bytes observed for this archive, not an earlier SDK read.
+        # The application's wheel remains selected separately for its own env.
+        if file_records[guide_sdk.WHEEL] != {"sha256": guide_sdk.SHA256, "bytes": guide_sdk.SIZE}:
+            raise legacy.DistributionError("The Guide client SDK differs from its reviewed wheel.")
         guide_hash, guide_size = _ordinary(guide.gateway.path, MAX_PRODUCT_ARCHIVE_BYTES)
         data = {"format": FORMAT, "product": {"selection": selection, "paths": paths},
             "guide": {"version": guide.version, "core_version": guide.core_version,
                 "meta_source": guide.meta_source, "core_source": guide.core_source,
+                "sdk": guide_sdk.selection(),
                 "gateway": {"path": "vendor/guide/rpc_gateway", "sha256": guide_hash, "bytes": guide_size}},
             "frontend_source_sha256": legacy._frontend_inputs(root),
             "dom_dependencies_sha256": dom_hash, "files": file_records, "file_modes": modes,
@@ -331,12 +340,18 @@ def verify(root):
     target = relocate_selection(data["product"]["selection"], data["product"]["paths"], root)
     selected_runtime_artifacts(target)
     guide = data["guide"]
-    if (type(guide) is not dict or guide.keys() != {"version", "core_version", "meta_source", "core_source", "gateway"}
+    if (type(guide) is not dict or guide.keys() != {"version", "core_version", "meta_source", "core_source", "gateway", "sdk"}
             or guide["version"] != "0.9.0"
             or guide["core_version"] != "0.9.0"
+            or guide["sdk"] != guide_sdk.selection()
+            or guide_sdk.WHEEL not in data["files"]
             or guide["gateway"] != {"path": "vendor/guide/rpc_gateway",
                 **data["files"]["vendor/guide/rpc_gateway"]}
             or any(type(guide[name]) is not str or not re.fullmatch("[0-9a-f]{40}", guide[name])
                 for name in ("meta_source", "core_source"))):
         raise legacy.DistributionError("The product guide differs from its selected native bytes.")
+    try:
+        guide_sdk.verify(legacy._read(root / guide_sdk.WHEEL))
+    except ValueError as exc:
+        raise legacy.DistributionError(str(exc)) from exc
     return data

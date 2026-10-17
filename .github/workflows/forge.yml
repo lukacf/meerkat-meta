@@ -49,6 +49,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Install the reviewed Guide client SDK
+        run: python -m pip install --no-index --no-deps --require-hashes --find-links installer/vendor/guide -r installer/requirements-guide-sdk.txt
       - run: python -m pip install -e './installer[test]'
       - name: Prepare Linux acceptance isolation
         run: |
@@ -80,8 +82,22 @@ jobs:
               raise SystemExit("Linux acceptance isolation is unavailable; no generated-code checks can run.")
           print("Linux acceptance isolation probe passed.")
           PY
+      - run: npm --prefix console ci --ignore-scripts
       - run: npm --prefix installer/web ci
       - run: npm --prefix installer/web run build
+      - name: Prepare protected DOM checks
+        env:
+          PYTHONPATH: installer
+        run: |
+          python -m launchkit.checker_runtime
+          python - <<'PY'
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+          from launchkit.dom_check import prepare_dependencies
+          with TemporaryDirectory() as folder:
+              prepare_dependencies(Path(folder).resolve())
+          print("Authenticated DOM dependency closure is ready.")
+          PY
       - name: Backend regression tests
         run: python -m pytest -vv installer/tests --maxfail=10 --tb=short --junitxml=forge-pytest.xml
       - name: Retain test results

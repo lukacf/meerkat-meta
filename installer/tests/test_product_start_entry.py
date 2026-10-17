@@ -30,7 +30,7 @@ if args[:3] == ["-B", "-m", "launchkit.distribution"]:
     if failure == "verification":
         sys.exit(31)
     if args[3:] == ["--bootstrap-inputs", "."]:
-        print("meta-toolkit\\nvendor/product/Meta runtime.whl\\nvendor/product/Toolkit runtime.whl")
+        print("meta-toolkit\\nvendor/guide/Meta client.whl\\nvendor/product/Toolkit runtime.whl")
         sys.exit(0)
     if args[3:] == ["--verify", "."]:
         print("legacy-single.whl")
@@ -76,7 +76,7 @@ def test_product_entry_keeps_both_sdks_and_uses_the_selected_runtime(product_ent
     assert result.returncode == 0, result.stderr
     assert ["-B", "-m", "launchkit.distribution", "--bootstrap-inputs", "."] in calls
     assert ["-m", "pip", "install", "--quiet", "--force-reinstall", "--no-deps",
-        "vendor/product/Meta runtime.whl", "vendor/product/Toolkit runtime.whl"] in calls
+        "vendor/guide/Meta client.whl", "vendor/product/Toolkit runtime.whl"] in calls
     assert ["-B", "-c", "from launchkit.packaged_runtime import open_selection; open_selection()"] in calls
     assert not any("launchkit.bootstrap" in args or any("meerkat_mobkit" in part for part in args) for args in calls)
     serving = [args for args in calls if args[:2] == ["-m", "uvicorn"]]
