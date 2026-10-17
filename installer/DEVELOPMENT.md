@@ -36,6 +36,12 @@ python3.12 -m venv installer/.venv
 installer/.venv/bin/python -m pip install -e './installer[test]'
 ```
 
+On Linux, protected acceptance execution also requires `bubblewrap`,
+`libseccomp2` and working user, PID, mount and network namespace isolation. The
+Forge workflow installs those packages and runs the actual isolation probe
+before the suite. A missing or failed sandbox cannot qualify generated-code
+execution; keep that failure visible instead of using an unsandboxed fallback.
+
 Build the frontend with the commands above before running the complete backend
 suite. Some backend cases inspect or package those built browser files. Use the
 same commands as the Forge workflow:
