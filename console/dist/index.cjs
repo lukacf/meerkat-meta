@@ -24444,6 +24444,7 @@ function latestRoutableFrameIsTerminal(frames) {
 var CONSOLE_RPC_METHODS = {
   capabilities: "meta/capabilities",
   send: "meta/console/send",
+  recoverSend: "meta/console/recover_send",
   listIdentities: "meta/console/list_identities",
   inspectIdentity: "meta/console/inspect_identity",
   queryTimeline: "meta/console/query_timeline",
