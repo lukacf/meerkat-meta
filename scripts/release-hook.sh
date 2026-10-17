@@ -10,11 +10,20 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # cargo-release runs this hook in its dry run too, with DRY_RUN=true (and
 # DRY_RUN=false on --execute). A dry run must leave the worktree as it found
-# it, so the hook only reports what an execute would do.
-if [ "${DRY_RUN:-false}" = "true" ]; then
-  echo "release-hook: dry run: would bump the SDK, Bazel and install-doc versions to $VERSION and stage them"
-  exit 0
-fi
+# it, so the hook only reports what an execute would do. Any other value, or
+# none, is refused before anything is written: the hook runs under
+# cargo-release, which always says which.
+case "${DRY_RUN:-}" in
+  true)
+    echo "release-hook: dry run: would bump the SDK, Bazel and install-doc versions to $VERSION and stage them"
+    exit 0
+    ;;
+  false) ;;
+  *)
+    echo "release-hook: DRY_RUN must be true or false (got '${DRY_RUN:-unset}')" >&2
+    exit 2
+    ;;
+esac
 
 # Prevent duplicate execution within the same release
 SENTINEL="$ROOT/.release-hook-done"

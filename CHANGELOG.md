@@ -22,7 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `DRY_RUN=true`, and the hook (`scripts/release-hook.sh`) bumped the SDK,
   Bazel and install-doc versions anyway, then failed its parity check against
   the unbumped Cargo version, so the dry run stopped with the version files
-  modified. The hook now only reports what an execute would bump and stage.
+  modified. The hook now only reports what an execute would bump and stage,
+  and refuses, writing nothing, a `DRY_RUN` other than `true` or `false`.
 
 ## [0.9.2] - 2026-10-16
 

@@ -95,7 +95,12 @@ class ReleaseVersionScriptsTests(unittest.TestCase):
     def run_command(self, *args, check=True, extra_env=None):
         env = os.environ.copy()
         env["CARGO_TARGET_DIR"] = str(self.root / "target")
-        env.update(extra_env or {})
+        # A None value removes the variable.
+        for key, value in (extra_env or {}).items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
         result = subprocess.run(
             args,
             cwd=self.root,
@@ -111,7 +116,9 @@ class ReleaseVersionScriptsTests(unittest.TestCase):
         return result
 
     def test_release_hook_bumps_and_stages_bazel_module_version(self):
-        self.run_command("scripts/release-hook.sh", "0.8.1")
+        self.run_command(
+            "scripts/release-hook.sh", "0.8.1", extra_env={"DRY_RUN": "false"}
+        )
 
         module = (self.root / "MODULE.bazel").read_text()
         self.assertIn('version = "0.8.1"', module)
@@ -180,6 +187,28 @@ class ReleaseVersionScriptsTests(unittest.TestCase):
             "MODULE.bazel",
             self.run_command("git", "diff", "--cached", "--name-only").stdout.split(),
         )
+
+    def test_release_hook_refuses_an_unset_or_unknown_dry_run(self):
+        # cargo-release always passes DRY_RUN=true or DRY_RUN=false; anything
+        # else (an unpinned tool, a direct run) is refused before any write.
+        def worktree():
+            return self.run_command(
+                "git", "status", "--porcelain", "--ignored", "--untracked-files=all"
+            ).stdout
+
+        before = worktree()
+        for value in (None, "", "yes", "TRUE", "1"):
+            with self.subTest(dry_run=value):
+                result = self.run_command(
+                    "scripts/release-hook.sh",
+                    "0.8.1",
+                    check=False,
+                    extra_env={"DRY_RUN": value},
+                )
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("DRY_RUN must be true or false", result.stderr)
+                self.assertEqual(worktree(), before)
+                self.assertFalse((self.root / ".release-hook-done").exists())
 
     def test_version_parity_rejects_unparsable_bazel_module_version(self):
         self.run_command("scripts/bump-sdk-versions.sh", "0.8.1")
