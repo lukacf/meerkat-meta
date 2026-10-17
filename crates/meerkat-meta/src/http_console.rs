@@ -5858,7 +5858,15 @@ async fn attached_session_access_violation(
         .await
         .unwrap_or_default();
     if owners.is_empty() {
-        return (!view.is_admin()).then(|| member_access_denied(ACTION_AGENT_VIEW, None));
+        return (!view.is_admin()).then(|| JsonRpcError {
+            code: ACCESS_DENIED_RPC_CODE,
+            message: "access denied: the session has no established owner".to_string(),
+            data: Some(json!({
+                "kind": "access_denied",
+                "reason": "session_owner_unknown",
+                "session_id": session_id.to_string(),
+            })),
+        });
     }
     [ACTION_AGENT_VIEW, ACTION_AGENT_SEND]
         .into_iter()
