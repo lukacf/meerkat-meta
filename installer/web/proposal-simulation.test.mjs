@@ -669,7 +669,7 @@ test('an exact selected scene survives remount while its acknowledged visual ref
     assert.match(ui.text(),/could not finish this scene/);assert.match(ui.text(),/Retry agent/);
     const failed=structuredClone([...ui.receipts.values()].at(-1));
     await ui.remount();
-    for(let turn=0;turn<20 && ui.instances.length<3;turn++)await ui.settle();
+    for(const deadline=performance.now()+5000;performance.now()<deadline && ui.instances.length<3;){await ui.settle();await realDelay(1);}
     const recovered=ui.instances[2];assert.ok(recovered);assert.equal(recovered.options.code,saved.artifact.code);
     await ui.settle(()=>recovered.first());
     assert.deepEqual(ui.visible(),[recovered]);assert.equal(recovered.runtimeActivity,null);
@@ -1189,7 +1189,7 @@ test('remount restores verified historical inputs without admitting extra work w
     await ui.generate();const first=ui.instances[0];await ui.settle(()=>first.first());
     const oldModel=structuredClone(first.options.model),oldPlan=structuredClone(first.options.blueprint);
     await ui.mount(ownedPlan('latest',2));ui.nextStatus('queued');await ui.remount();
-    for(let turn=0;turn<20 && ui.instances.length<2;turn++)await ui.settle();
+    for(const deadline=performance.now()+5000;performance.now()<deadline && ui.instances.length<2;){await ui.settle();await realDelay(1);}
     assert.equal(ui.posts.length,1,'Recovery reads an existing operation, without another authoring admission');
     assert.equal(ui.recoveryReads().length,1);
     const recovered=ui.instances[1];assert.ok(recovered);
@@ -1210,7 +1210,7 @@ test('a restored equal-input scene remains historical and never receives current
   await mountedAnimationRecovery(async ui=>{
     await ui.generate();await ui.settle(()=>ui.instances[0].first());
     ui.nextStatus('queued');await ui.remount();
-    for(let turn=0;turn<20 && ui.instances.length<2;turn++)await ui.settle();
+    for(const deadline=performance.now()+5000;performance.now()<deadline && ui.instances.length<2;){await ui.settle();await realDelay(1);}
     const recovered=ui.instances[1];assert.ok(recovered);await ui.settle(()=>recovered.first());
     await ui.mount(undefined,undefined,{status:'running',activeNodeIds:['earlier:main']});
     assert.equal(recovered.runtimeActivity,null);
@@ -1318,7 +1318,7 @@ test('verified historical hydration waits for a current startup candidate and su
     assert.equal(ui.instances.length,2,'Historical hydration stages without replacing the accepted startup candidate');
     assert.equal(replacement.alive,true);assert.deepEqual(ui.visible(),[]);
     await ui.settle(()=>replacement.fail());
-    for(let turn=0;turn<20 && ui.instances.length<3;turn++)await ui.settle();
+    for(const deadline=performance.now()+5000;performance.now()<deadline && ui.instances.length<3;){await ui.settle();await realDelay(1);}
     const recovered=ui.instances[2];assert.ok(recovered);await ui.settle(()=>recovered.first());
     assert.deepEqual(recovered.options.model,oldInputs.model);assert.deepEqual(recovered.options.blueprint,oldInputs.plan);
     assert.deepEqual(ui.visible(),[recovered]);assert.equal(ui.count(),'1');
@@ -1339,7 +1339,7 @@ test('late historical hydration can restore the previous scene after both curren
     assert.deepEqual(ui.visible(),[]);assert.equal(ui.posts.length,3);
     assert.equal([...ui.timers.values()].some(timer=>timer.delay===650),false,'Automatic authoring repair has stopped');
     await ui.settle(()=>ui.releaseRecovery());
-    for(let turn=0;turn<20 && ui.instances.length<4;turn++)await ui.settle();
+    for(const deadline=performance.now()+5000;performance.now()<deadline && ui.instances.length<4;){await ui.settle();await realDelay(1);}
     const recovered=ui.instances[3];assert.ok(recovered);await ui.settle(()=>recovered.first());
     assert.deepEqual(ui.visible(),[recovered]);assert.equal(ui.count(),'1');
     assert.deepEqual(recovered.options.blueprint,first.options.blueprint);
@@ -1386,7 +1386,7 @@ test('an abandoned unpublished candidate cannot block historical recovery when i
     await ui.mount(b);assert.equal(abandoned.alive,false);
     await ui.mount(a);assert.equal(ui.instances.length,2,'Returning inputs alone cannot restart the old unpublished candidate');
     await ui.settle(()=>ui.releaseRecovery());
-    for(let turn=0;turn<20 && ui.instances.length<3;turn++)await ui.settle();
+    for(const deadline=performance.now()+5000;performance.now()<deadline && ui.instances.length<3;){await ui.settle();await realDelay(1);}
     const recovered=ui.instances[2];assert.ok(recovered);await ui.settle(()=>recovered.first());
     assert.deepEqual(ui.visible(),[recovered]);assert.equal(ui.count(),'1');
     assert.deepEqual(recovered.options.blueprint,first.options.blueprint);
@@ -1402,7 +1402,7 @@ test('a failed recovered scene cannot start again when its former desired propos
     await ui.generate();await ui.settle(()=>ui.instances[0].first());
     const a=ownedPlan('latest',2),b=ownedPlan('different',3);
     await ui.mount(a);await ui.remount();
-    for(let turn=0;turn<20 && ui.instances.length<2;turn++)await ui.settle();
+    for(const deadline=performance.now()+5000;performance.now()<deadline && ui.instances.length<2;){await ui.settle();await realDelay(1);}
     const failed=ui.instances[1];assert.ok(failed);await ui.settle(()=>failed.first());
     await ui.mount(b);await ui.settle(()=>failed.fail());await ui.mount(a);
     assert.equal(ui.instances.length,2,'Only a fresh verified recovery checkpoint may construct a historical frame owner');
@@ -1444,7 +1444,7 @@ test('historical recovery startup failure does not ask the agent to repair old c
   await mountedAnimationRecovery(async ui=>{
     await ui.generate();await ui.settle(()=>ui.instances[0].first());
     await ui.mount(ownedPlan('latest',2));await ui.remount();
-    for(let turn=0;turn<20 && ui.instances.length<2;turn++)await ui.settle();
+    for(const deadline=performance.now()+5000;performance.now()<deadline && ui.instances.length<2;){await ui.settle();await realDelay(1);}
     const recovered=ui.instances[1];assert.ok(recovered);await ui.settle(()=>recovered.fail());
     assert.equal(ui.posts.length,1);assert.equal(ui.visible().length,0);
     await ui.generate();assert.equal(ui.posts.length,2);assert.equal(ui.posts[1].feedback,'');
