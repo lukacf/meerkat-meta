@@ -1605,18 +1605,6 @@ class LinuxReleaseContainerTests(unittest.TestCase):
         self.assertIsNotNone(declared, "the gate must declare an overridable default floor")
         self.assertEqual(declared.group(1), CONTAINER_GLIBC[codename])
 
-    def test_the_linux_cache_key_names_the_container(self):
-        # rust-cache keys on rustc, the lock and the env; none changed when the
-        # Linux legs moved into the container, so the host-built target dir
-        # would be restored into it and the gate would refuse the same stale
-        # cache on every retry. The other legs keep their existing keys.
-        key = scalar(step_block("Cache cargo registry"), "key", "          ")
-        linux = render_template(key, matrix_target="x86_64-unknown-linux-gnu")
-        mac = render_template(key, matrix_target="aarch64-apple-darwin")
-
-        self.assertIn(self.linux_image().rsplit(":", 1)[1], linux)
-        self.assertEqual(mac, "release-aarch64-apple-darwin")
-
     def test_the_gate_runs_on_linux_after_the_build_and_before_anything_ships(self):
         block = job_block("build_binaries")
         gate = block.index("      - name: Check Linux binary portability")
@@ -1896,18 +1884,21 @@ def hashed_env(block: str, indent: str) -> dict[str, str]:
 
 
 class ReleaseCacheReuseTests(unittest.TestCase):
-    def test_release_caches_hold_no_failed_builds_and_no_executables(self):
-        """A failed leg must not pin a half-built entry as an exact hit, and
-        no restored ~/.cargo/bin executable may shadow a build or signing tool."""
+    def test_release_runs_save_no_rust_cache(self):
+        """Release jobs saved entries keyed on Cargo.lock that no later
+        release restored (every v0.9.2 leg found "No cache found") while they
+        took a third of the repository's cache budget. The only rust cache
+        left is verify_crate_packages' read-only restore of main CI's entry,
+        and it restores no ~/.cargo/bin executable."""
         source = RELEASE_WORKFLOW.read_text()
         self.assertNotIn("cache-on-failure", source)
         steps = re.findall(r"- (?:name: [^\n]+\n\s+)?uses: Swatinem/rust-cache@v2\n((?: {8}.*\n)*)", source)
         self.assertEqual(len(steps), source.count("uses: Swatinem/rust-cache@v2"))
-        for settings in steps:
-            self.assertIn("          cache-bin: false\n", settings)
-        cache = step_block("Cache cargo registry")
-        # Candidate runs dispatch from main, so their entries are main's.
-        self.assertNotIn("save-if", cache)
+        self.assertEqual(len(steps), 1)
+        self.assertIn("          save-if: false\n          cache-bin: false\n", steps[0])
+        for job in ("build_binaries", "release_validate", "publish_registries"):
+            with self.subTest(job=job):
+                self.assertNotIn("rust-cache", job_block(job))
         self.assertFalse((ROOT / ".github/workflows/release-prewarm.yml").exists())
 
     def test_crate_verification_restores_the_exact_main_ci_dependency_build(self):
@@ -1953,13 +1944,10 @@ class ReleaseCacheReuseTests(unittest.TestCase):
         self.assertNotIn("permissions:", verify)
 
     # Jobs that hold a secret or a write grant and still restore a cache, and
-    # why that cache is trusted. build_binaries restores only release.yml's
-    # own entries, which only successful candidate legs of merged main write,
-    # and restores no executables; its tools are named by absolute path.
-    # e2e-live restores without saving and without executables, and its
-    # provider secret reaches only the step that makes the real calls.
+    # why that cache is trusted. e2e-live restores without saving and without
+    # executables, and its provider secret reaches only the step that makes
+    # the real calls.
     CACHE_HOLDER_ALLOWLIST = {
-        ("release.yml", "build_binaries"),
         ("e2e-live.yml", "e2e-live"),
     }
 
