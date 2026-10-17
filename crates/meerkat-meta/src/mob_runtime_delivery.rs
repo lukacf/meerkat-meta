@@ -307,7 +307,7 @@ impl RunningMobRuntimeDelivery {
         drop(handle);
     }
 
-    fn is_stopped(&self) -> bool {
+    pub(super) fn is_stopped(&self) -> bool {
         self.handle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -12559,7 +12559,10 @@ impl MobRuntime {
     /// Stand down every durable child mob this runtime manages.
     ///
     /// Call it after the root mob has stopped; [`crate::UnifiedRuntime`]
-    /// shutdown does. It first closes the agent mob-tool state's admission
+    /// shutdown does. It is terminal: first it stops the runtime's delivery
+    /// owner ([`Self::stop_runtime_delivery`]) and empties the composition
+    /// slots that point back at this runtime, as that shutdown does once the
+    /// mob stops. It then closes the agent mob-tool state's admission
     /// (Meerkat's `MobMcpState::close_admission`) and waits for the creates,
     /// inserts, restores and council admissions already past their check, so
     /// the child snapshot it takes next is final. Each child then gets a
@@ -12584,6 +12587,15 @@ impl MobRuntime {
         &self,
         deadline: std::time::Instant,
     ) -> crate::child_mob_storage::ChildMobStandDownOutcome {
+        // A stand-down is terminal, as `UnifiedRuntime`'s shutdown is: the
+        // delivery owner stops and the composition slots that point back at
+        // this runtime empty before the child root can be released. A runtime
+        // torn down without `UnifiedRuntime` has nothing else that stops
+        // them, and its owner kept reconciling over the runtime store of a
+        // released root. Both are idempotent; `UnifiedRuntime` did them
+        // already.
+        self.stop_runtime_delivery();
+        self.release_composition_slots();
         // A root already released (or never claimed) answers at once.
         if let Some(unclaimed) = self.child_mob_root.unclaimed_outcome() {
             return unclaimed;

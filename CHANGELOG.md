@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A `MobRuntime` torn down without `UnifiedRuntime` (its root mob shut down,
+  then `stand_down_child_mobs`) stops its runtime delivery owner and empties
+  the composition slots that point back at it before it releases the durable
+  child root, as `UnifiedRuntime`'s shutdown does. Nothing stopped the owner
+  there: it kept reconciling over the runtime store after the root was
+  released, held by the composition the dropped runtime left behind, and
+  recreated a state directory that had been removed.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
