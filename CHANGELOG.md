@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Release builds no longer restore or save Rust caches in `build_binaries`
+  and `release_validate`. No v0.9.2 release job restored one of their entries,
+  whose keys change with every `Cargo.lock`, while the entries took 5.4 GB
+  of the repository's Actions cache. `verify_crate_packages` still restores
+  main CI's `meta-dev-bins` entry read-only.
 - The pre-push hook runs only fast local checks. The workspace clippy and the
   workspace unit gate, which took 712.88 s and 974.16 s of a 28m19s push,
   moved to the hook's manual stage (`pre-commit run --hook-stage manual
