@@ -6096,11 +6096,10 @@ schedule = true
     /// so the evidence that no run started is its system-only transcript
     /// and the absence of any provider call.
     ///
-    /// Without that configuration the fire materializes the session and
-    /// runs its turn, but the occurrence is still `Dispatching` after the
-    /// turn ran: the Meerkat 0.9.2 defect where the first fire of a
-    /// materialize-on-demand target never completes. Meerkat 0.9.3 fixes
-    /// it, so adopting 0.9.3 flips the ungoverned `Dispatching` pin below.
+    /// Without that configuration the fire materializes the session, runs
+    /// its turn and completes. Before Meerkat 0.9.3 the occurrence stayed
+    /// `Dispatching` after the turn ran: the first fire of a
+    /// materialize-on-demand target never completed.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_governed_materialized_session_fire_materializes_then_fails_without_running() {
         let ungoverned = HostedScheduleFixture::new(false).await;
@@ -6111,10 +6110,10 @@ schedule = true
             .occurrence_session
             .clone()
             .expect("the fire's occurrence");
-        // Meerkat 0.9.2: the first materialize-on-demand fire never completes.
+        // Meerkat 0.9.3: the first materialize-on-demand fire completes.
         assert_eq!(
             outcome.phase,
-            Some(OccurrencePhase::Dispatching),
+            Some(OccurrencePhase::Completed),
             "{outcome:#?}"
         );
         assert_eq!(outcome.failure_class, None);
