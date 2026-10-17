@@ -77,6 +77,7 @@ use crate::identity_first::agent_memory::{
 use crate::memory::capabilities::{
     EvidenceRefResolver, PendingHarvest, PendingPromotion, PendingProposal, StewardStore,
 };
+use crate::memory::completion::{CompletionStop, completion_stop};
 use crate::memory::coordinator::DEFAULT_INSTRUCTION_HEADER;
 use crate::memory::distiller::TranscriptSource;
 use crate::memory::events::{MemoryEventSink, MemoryTimelineEvent};
@@ -184,6 +185,13 @@ pub enum StewardError {
     Truncated {
         max_output_tokens: u32,
     },
+    /// The model stopped before a complete answer for a reason other than
+    /// the output ceiling: a content filter, a cancelled response, a tool
+    /// call the stage never offers, or a stop reason Meerkat adds later.
+    /// Nothing is written from the partial body, however well it parses.
+    Incomplete {
+        stop_reason: meerkat_core::StopReason,
+    },
     Parse(String),
     Store(String),
 }
@@ -200,6 +208,11 @@ impl std::fmt::Display for StewardError {
                 "steward response hit the output ceiling of {max_output_tokens} tokens and was \
                  truncated; raise it via the steward config's max_output_tokens (models spend this \
                  same budget on thinking/reasoning tokens as well as the answer)"
+            ),
+            Self::Incomplete { stop_reason } => write!(
+                f,
+                "steward response stopped with {stop_reason:?} before a complete answer; \
+                 nothing is written from it"
             ),
             Self::Parse(msg) => write!(f, "steward parse error: {msg}"),
             Self::Store(msg) => write!(f, "steward store error: {msg}"),
@@ -3972,17 +3985,17 @@ pub async fn complete_text(
             }
             LlmEvent::TextDelta { delta, meta } => assembler.on_text_delta(&delta, meta),
             LlmEvent::Done { outcome } => match outcome {
-                LlmDoneOutcome::Success { stop_reason } => {
+                LlmDoneOutcome::Success { stop_reason } => match completion_stop(stop_reason) {
+                    CompletionStop::Answered => break,
                     // Do NOT discard stop_reason. A MaxTokens stop arrives with a
                     // partial or empty body; returning it as a short answer sends a
                     // truncation into a strict parse, which then blames the model.
-                    if matches!(stop_reason, meerkat_core::StopReason::MaxTokens) {
+                    CompletionStop::Truncated => {
                         return Err(StewardError::Truncated {
                             max_output_tokens: profile.params.max_output_tokens,
                         });
                     }
-                    break;
-                }
+                },
                 LlmDoneOutcome::Error { error } => return Err(classify_llm_error(error)),
             },
             LlmEvent::OperationObservationFailed {

@@ -69,6 +69,7 @@ use crate::identity_first::agent_memory::{
     AgentMemoryError, AgentMemoryProvider, MEMORY_TOOL_NAME, compact_whitespace,
     truncate_utf8_boundary,
 };
+use crate::memory::completion::{CompletionStop, completion_stop};
 use crate::memory::factory_handle::FactoryModelClientHandle;
 use crate::memory::guards::{BackgroundBudget, BackgroundBudgetConfig};
 use crate::memory::records::{
@@ -133,6 +134,13 @@ pub enum DistillerError {
     Truncated {
         max_output_tokens: u32,
     },
+    /// The model stopped before a complete answer for a reason other than
+    /// the output ceiling: a content filter, a cancelled response, a tool
+    /// call the stage never offers, or a stop reason Meerkat adds later.
+    /// Nothing is distilled from the partial body, however well it parses.
+    Incomplete {
+        stop_reason: meerkat_core::StopReason,
+    },
     Parse(String),
     Store(String),
     Transcript(String),
@@ -149,6 +157,11 @@ impl std::fmt::Display for DistillerError {
                 "distiller response hit the output ceiling of {max_output_tokens} tokens and was \
                  truncated; raise it via the distiller config's max_output_tokens (models spend this \
                  same budget on thinking/reasoning tokens as well as the answer)"
+            ),
+            Self::Incomplete { stop_reason } => write!(
+                f,
+                "distiller response stopped with {stop_reason:?} before a complete answer; \
+                 nothing is distilled from it"
             ),
             Self::Parse(msg) => write!(f, "distiller parse error: {msg}"),
             Self::Store(msg) => write!(f, "distiller store error: {msg}"),
@@ -1038,17 +1051,17 @@ async fn complete_text(
             }
             LlmEvent::TextDelta { delta, meta } => assembler.on_text_delta(&delta, meta),
             LlmEvent::Done { outcome } => match outcome {
-                LlmDoneOutcome::Success { stop_reason } => {
+                LlmDoneOutcome::Success { stop_reason } => match completion_stop(stop_reason) {
+                    CompletionStop::Answered => break,
                     // Do NOT discard stop_reason. A MaxTokens stop arrives with a
                     // partial or empty body; returning it as a short answer sends a
                     // truncation into a strict parse, which then blames the model.
-                    if matches!(stop_reason, meerkat_core::StopReason::MaxTokens) {
+                    CompletionStop::Truncated => {
                         return Err(DistillerError::Truncated {
                             max_output_tokens: profile.params.max_output_tokens,
                         });
                     }
-                    break;
-                }
+                },
                 LlmDoneOutcome::Error { error } => return Err(classify_llm_error(error)),
             },
             LlmEvent::OperationObservationFailed {

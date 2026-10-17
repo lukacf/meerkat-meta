@@ -44,6 +44,7 @@ use meerkat_core::{Message, Provider, SystemNoticeKind, SystemNoticeMessage, Use
 
 use crate::identity_first::agent_memory::{compact_whitespace, truncate_utf8_boundary};
 use crate::memory::capabilities::StewardStore;
+use crate::memory::completion::{CompletionStop, completion_stop};
 use crate::memory::distiller::{CompactionFollowUp, DistillOutcome, DistillerEngine};
 use crate::memory::events::{MemoryEventSink, MemoryTimelineEvent};
 use crate::memory::factory_handle::FactoryModelClientHandle;
@@ -103,6 +104,13 @@ pub enum HygienistError {
     Truncated {
         max_output_tokens: u32,
     },
+    /// The model stopped before a complete answer for a reason other than
+    /// the output ceiling: a content filter, a cancelled response, a tool
+    /// call the stage never offers, or a stop reason Meerkat adds later.
+    /// No revision is applied from the partial body, however well it parses.
+    Incomplete {
+        stop_reason: meerkat_core::StopReason,
+    },
     Parse(String),
     Seam(String),
     Spans(String),
@@ -119,6 +127,11 @@ impl std::fmt::Display for HygienistError {
                 "hygienist response hit the output ceiling of {max_output_tokens} tokens and was \
                  truncated; raise it via the hygienist config's max_output_tokens (models spend this \
                  same budget on thinking/reasoning tokens as well as the answer)"
+            ),
+            Self::Incomplete { stop_reason } => write!(
+                f,
+                "hygienist response stopped with {stop_reason:?} before a complete answer; \
+                 no revision is applied from it"
             ),
             Self::Parse(msg) => write!(f, "hygienist parse error: {msg}"),
             Self::Seam(msg) => write!(f, "hygienist revision seam error: {msg}"),
@@ -1634,17 +1647,17 @@ pub async fn complete_text(
             }
             LlmEvent::TextDelta { delta, meta } => assembler.on_text_delta(&delta, meta),
             LlmEvent::Done { outcome } => match outcome {
-                LlmDoneOutcome::Success { stop_reason } => {
+                LlmDoneOutcome::Success { stop_reason } => match completion_stop(stop_reason) {
+                    CompletionStop::Answered => break,
                     // Do NOT discard stop_reason. A MaxTokens stop arrives with a
                     // partial or empty body; returning it as a short answer sends a
                     // truncation into a strict parse, which then blames the model.
-                    if matches!(stop_reason, meerkat_core::StopReason::MaxTokens) {
+                    CompletionStop::Truncated => {
                         return Err(HygienistError::Truncated {
                             max_output_tokens: profile.params.max_output_tokens,
                         });
                     }
-                    break;
-                }
+                },
                 LlmDoneOutcome::Error { error } => return Err(classify_llm_error(error)),
             },
             LlmEvent::OperationObservationFailed {
