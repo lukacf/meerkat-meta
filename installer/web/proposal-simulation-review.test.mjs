@@ -1,3 +1,4 @@
+import { setTimeout as realDelay } from 'node:timers/promises';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -156,7 +157,7 @@ async function mounted(verify,{reduced=true,verdict='acceptable',deferReview=fal
       React.createElement('input',{'aria-label':'Guide draft',defaultValue:'I am still typing'}),
       React.createElement(ProposalSimulation,{plan,setupId:setup,onRequestChange:message=>guideRequests.push(message)})));
   });
-  const until=async(check)=>{for(let count=0;count<100&&!check();count++)await settle();assert.ok(check(),'Mounted work reached expected boundary');};
+  const until=async(check)=>{for(const deadline=performance.now()+5000;performance.now()<deadline&&!check();){await settle();await realDelay(1);}assert.ok(check(),'Mounted work reached expected boundary');};
   const tick=delay=>settle(async()=>{
     const entry=[...timers].find(([,value])=>value.delay===delay);assert.ok(entry,`One ${delay}ms timer`);timers.delete(entry[0]);
     if(delay===12000)for(const instance of instances)if(instance.alive && !instance.paused)instance.time=(instance.time+12)%instance.duration;
@@ -614,7 +615,7 @@ test('an expired consumer intent cannot start or resurrect a pending presentatio
 
 test('mounted inconclusive capability or result preserves working scene without generation loops',async()=>{
   for(const config of [{capability:false},{verdict:'inconclusive'}])await mounted(async ui=>{
-    await ui.generate();const scene=ui.instances[0];await ui.first(scene);await ui.until(()=>ui.text().includes(config.capability===false?'Visual review is unavailable':'visual check was inconclusive'));
+    await ui.generate();const scene=ui.instances[0];await ui.first(scene);await ui.until(()=>ui.text().includes(config.capability===false?'Automatic animation check unavailable':'Animation quality not confirmed'));
     assert.deepEqual(ui.visible(),[scene]);assert.equal(ui.posts.length,1);assert.equal([...ui.timers.values()].some(timer=>timer.delay===650),false);
     assert.deepEqual(ui.guideRequests,[]);
   },config);

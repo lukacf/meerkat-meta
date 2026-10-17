@@ -223,7 +223,7 @@ async function mountedPanel(t, fixture, verify) {
 const useView = document => document.querySelector('.deployment-use');
 const taskField = document => useView(document)?.querySelector('.deployment-use-field textarea');
 const reportField = document => useView(document)?.querySelector('.deployment-use-feedback textarea');
-const appLink = document => useView(document)?.querySelector('.deployment-use-interfaces a');
+const appLink = document => [...(useView(document)?.querySelectorAll('.deployment-use-interfaces a') || [])].find(link => !new URL(link.href).hash.startsWith('#mobkit-task=')) || null;
 const taskLink = document => [...(useView(document)?.querySelectorAll('a') || [])]
   .find(link => link.textContent === 'Continue with this task');
 function button(document, label) {

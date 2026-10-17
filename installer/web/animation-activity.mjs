@@ -1,7 +1,7 @@
 import { animationRequestMatches } from './animation-publication.mjs';
 import { createGuideFrameLog, ingestGuideTimeline } from './native-guide-chat.mjs';
 import { buildConversationViewState, mapFramesToTimelineEntries,
-  sortConversationTimelineEntries, parseConversationRichBlocks } from '../../packages/console-core/src/index.ts';
+  sortConversationTimelineEntries, parseConversationRichBlocks, hasAssistantMessageIdCarrier } from '../../packages/console-core/src/index.ts';
 
 const digest = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const identifier = value => typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value);
@@ -95,11 +95,13 @@ export function animationSummaryFrame(frame) {
   }
   const summary = frame.payload?.summary;
   if (typeof summary !== 'string' || !summary) return frame.kind?.startsWith('reasoning') ? null : frame;
+  const assistant = Object.hasOwn(frame.payload, 'assistant_message_id')
+    ? { assistant_message_id: frame.payload.assistant_message_id } : {};
   if (['reasoning_summary_delta', 'reasoning_delta'].includes(frame.kind)) return {
-    ...frame, kind: 'reasoning_delta', payload: { delta: summary },
+    ...frame, kind: 'reasoning_delta', payload: { delta: summary, ...assistant },
   };
   if (['reasoning_summary', 'reasoning_summary_complete', 'reasoning_complete'].includes(frame.kind)) return {
-    ...frame, kind: 'reasoning_complete', payload: { text: summary },
+    ...frame, kind: 'reasoning_complete', payload: { text: summary, ...assistant },
   };
   return frame;
 }
@@ -163,6 +165,14 @@ export function animationActivityConversation(scope, frames = [], native = null)
       }
       continue;
     }
+    // Native assistant identity and canonical history belong to the Console.
+    // Keep its exact carrier, including malformed IDs that must not fall back
+    // to legacy matching. Only unkeyed predecessor text uses the segment shim.
+    if(hasAssistantMessageIdCarrier(frame)){
+      openText=null;
+      activity.push(frame);
+      continue;
+    }
     if(context && ['text_delta','text_complete'].includes(frame.event)){
       if(frame.event==='text_delta'){
         const text=frame.data?.delta ?? frame.data?.text;
@@ -205,8 +215,8 @@ export function animationActivityConversation(scope, frames = [], native = null)
         {type:'thinking',label:'Context summary',text,final:true,persisted:true}]});
   }
   const entries = sortConversationTimelineEntries([...mapFramesToTimelineEntries(agent, activity, {
-    renderInteractionStartsAsUser: true, renderTextDeltas: true, suppressEmbeddedRunStartedPrompt: true,
-  }).filter(entry => entry.identity?.role !== 'user' && ![...replaced,...contextMarkers].some(id=>entry.id.startsWith(`${id}:`))).map(entry => ({ ...entry,
+    renderInteractionStartsAsUser: true, renderTextDeltas: true, suppressEmbeddedRunStartedPrompt: true, textMode: 'markdown',
+  }).filter(entry => entry.identity?.role !== 'user' && ![...replaced,...contextMarkers].some(id=>entry.id===id || entry.id.startsWith(`${id}:`))).map(entry => ({ ...entry,
     ...(entry.blocks ? { blocks: entry.blocks.map(block => block.type === 'thinking'
       ? { ...block, label: 'Reasoning summary' } : block) } : {}),
   })),...completed]);

@@ -1,15 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { build } from 'esbuild';
+import { loadTestModule as load } from './test-support/bundle.mjs';
 import { fileURLToPath } from 'node:url';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
-async function load(path, options = {}) {
-  const result = await build({ entryPoints: [fileURLToPath(new URL(path, import.meta.url))], bundle: true,
-    write: false, format: 'esm', platform: 'node', jsx: 'automatic', logLevel: 'silent', ...options });
-  return import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
-}
 const { animationActivityScope, animationActivityKey, animationActivityUrl, animationActivityPageMatches,
   createAnimationActivityLog, readAnimationActivity, animationActivityPresentation, animationActivityConversation,
   animationSummaryFrame } = await load('animation-activity.mjs');
@@ -162,7 +157,7 @@ test('native compaction markers keep public context text collapsed across pages 
   const waiting = log.accept(page({ frames: [], next_cursor: 'console:12' }));
   assert.equal(animationActivityPresentation(waiting.page).label, 'Preserving context');
   const final = log.accept(page({ frames: [
-    frame(13, 'reasoning_summary_complete', { summary: 'Regular public reasoning summary.' }),
+    frame(13, 'reasoning_summary_complete', { summary: 'Regular public reasoning summary.', assistant_message_id: 'public-author-summary' }),
     frame(14, 'tool_call_requested', { name: 'inspect_visualization', tool_call_id: 'inspection' }),
     frame(15, 'tool_execution_completed', { name: 'inspect_visualization', tool_call_id: 'inspection' }),
     frame(16, 'text_complete', { text: 'Exact public context summary.' }),
@@ -257,6 +252,41 @@ test('a complete public output replaces only its open text segment, preserving e
   assert.equal(entries.filter(entry=>entry.id.startsWith('animation-output:')).length,2);
   assert.equal(entries.filter(entry=>JSON.stringify(entry).includes('Exact final public result')).length,1);
   assert.equal(entries.some(entry=>entry.blocks?.some(block=>block.type==='code' && block.body==='{}')),false);
+});
+
+test('public summary retains its exact native assistant carrier without exposing other payload fields', () => {
+  const input = frame(10, 'reasoning_summary_complete', { summary: 'Public summary.',
+    assistant_message_id: ' native occurrence ', text: 'PRIVATE_RAW_REASONING' });
+  const before = structuredClone(input), projected = animationSummaryFrame(input);
+  assert.deepEqual(projected.payload, { text: 'Public summary.', assistant_message_id: ' native occurrence ' });
+  assert.deepEqual(input, before);
+  for (const value of ['', 23, null]) {
+    const projected = animationSummaryFrame(frame(10, 'reasoning_summary_complete', {
+      summary: 'Public summary.', assistant_message_id: value }));
+    assert.equal(projected.payload.assistant_message_id, value, 'Malformed explicit identity cannot silently become legacy text');
+  }
+});
+
+test('native assistant source replaces provisional animation text once and preserves equal independent replies', () => {
+  const canonicalText = '  Exact canonical answer\r\nKeep its source bytes.  \n';
+  const history = (number, identity, text) => ({ ...frame(number, 'text_complete', {
+    assistant_message_id: identity, text,
+    message: { role: 'block_assistant', assistant_message_id: identity,
+      blocks: [{ block_type: 'text', data: { text } }] },
+  }), source: { kind: 'session_history' } });
+  const result = createAnimationActivityLog(scope).accept(page({ frames: [
+    frame(10, 'text_delta', { assistant_message_id: 'native-one', delta: 'Discard this draft.' }),
+    frame(11, 'text_complete', { assistant_message_id: 'native-one', text: 'Discard this provisional result.' }),
+    history(12, 'native-one', canonicalText),
+    frame(13, 'interaction_complete', { assistant_message_id: 'native-one', text: 'Do not render this result reference.' }),
+    history(14, 'native-two', canonicalText),
+  ], next_cursor: 'console:14' }));
+  const { entries, viewState } = animationActivityConversation(scope, result.frames);
+  assert.deepEqual(entries.map(entry => entry.id), ['unit-frame-12', 'unit-frame-14']);
+  assert.deepEqual(entries.map(entry => entry.copyText), [canonicalText, canonicalText]);
+  assert.doesNotMatch(JSON.stringify(viewState), /Discard this|Do not render this/);
+  assert.equal(entries.some(entry => entry.id.startsWith('animation-output:')), false,
+    'The native Console owns canonical assistant messages');
 });
 
 test('production refinement form stays editable while awaiting host admission and passes raw text only on explicit controls', () => {

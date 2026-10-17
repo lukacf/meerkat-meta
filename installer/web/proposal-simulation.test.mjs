@@ -1,3 +1,4 @@
+import { setTimeout as realDelay } from 'node:timers/promises';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { build } from 'esbuild';
@@ -389,10 +390,10 @@ async function mountedAnimationRecovery(verify,{visualReview=false}={}) {
     await settle(async()=>{
       // Node's crypto completion can take more than one event-loop turn. Wait
       // for the actual scheduled sample, without firing or inventing a timer.
-      for(let turn=0;turn<20;turn++){
+      for(const deadline=performance.now()+5000;performance.now()<deadline;){
         entry=[...timers].find(([,value])=>value.delay===delay);
         if(entry)return;
-        await new Promise(resolve=>setImmediate(resolve));
+        await realDelay(1);
       }
     });
     return entry;
@@ -400,8 +401,8 @@ async function mountedAnimationRecovery(verify,{visualReview=false}={}) {
   const waitForReview=async count=>settle(async()=>{
     // Wait for the final frame hash to reach the actual POST transport, using
     // the same bounded event-loop wait as sample readiness above.
-    for(let turn=0;turn<20 && reviewPosts.length<count;turn++)
-      await new Promise(resolve=>setImmediate(resolve));
+    for(const deadline=performance.now()+5000;performance.now()<deadline && reviewPosts.length<count;)
+      await realDelay(1);
   });
   const visible=()=>instances.filter(instance=>instance.alive && instance.layer.style.visibility==='visible');
   try {
@@ -792,7 +793,7 @@ test('saved animation selection refuses another setup or changed code before own
       ui.setLatest(saved,{allowForeign:true});
       await ui.settle(async()=>{
         [...ui.dom.window.document.querySelectorAll('button')].find(item=>item.textContent==='Use latest saved animation').click();
-        for(let turn=0;turn<30;turn++)await new Promise(resolve=>setImmediate(resolve));
+        for(let turn=0;turn<30;turn++)await realDelay(1);
       });
       assert.equal(ui.adoptionPosts.length,0);assert.equal(ui.instances.length,1);assert.equal(ui.posts.length,1);
       assert.deepEqual(ui.visible(),[previous]);assert.match(ui.text(),/does not match this proposal/);

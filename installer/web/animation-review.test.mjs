@@ -1,3 +1,4 @@
+import { setTimeout as realDelay } from 'node:timers/promises';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
@@ -41,7 +42,7 @@ function controllerFixture({owner=fixture().owner,playing=false,reduced=false,ve
   const review=createAnimationReview({owner,animation,isCurrent:()=>current && (isCurrent?.() ?? true),rendererHash,fetcher,budget,
     setTimer:(callback,delay)=>{const id=++next;timers.set(id,{callback,delay});onTimer?.(delay);return id;},clearTimer:id=>timers.delete(id),
     onStatus:value=>statuses.push(value),onCorrection:value=>{corrections.push(value);return true;},sampleDelay});
-  const tick=async(delay=100)=>{let entry;for(let attempt=0;attempt<100&&!entry;attempt++){entry=[...timers].find(([,value])=>value.delay===delay);if(!entry)await settle();}assert.ok(entry,`One ${delay}ms timer`);
+  const tick=async(delay=100)=>{let entry;for(const deadline=performance.now()+5000;performance.now()<deadline&&!entry;){entry=[...timers].find(([,value])=>value.delay===delay);if(!entry)await realDelay(1);}assert.ok(entry,`One ${delay}ms timer`);
     timers.delete(entry[0]);entry[1].callback();await settle();};
   return {owner,animation,review,timers,calls,statuses,corrections,captures,tick,stale:()=>{current=false;}};
 }

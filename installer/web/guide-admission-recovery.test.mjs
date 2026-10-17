@@ -291,8 +291,10 @@ test('guide admission recovery: checking disables new draft and retires captured
     assert.equal(state.session.getItem(GUIDE_CREATION_KEY), token);
     await act(async () => { reading.resolve(reading.value); await settle(); });
     assert.equal(named(document, 'Open a new draft').disabled, false);
+    const afterRead = state.calls.length;
     await invoke(oldHandler, button);
-    assert.equal(state.calls.length, before, 'A finished check still changed the original read token.');
+    assert.equal(state.calls.length, afterRead, 'A retired callback cannot navigate or start another request after the check settles.');
+    assert.equal(state.session.getItem(GUIDE_CREATION_KEY), token);
     await click(named(document, 'Open a new draft'));
     assert.equal(state.session.getItem(GUIDE_CREATION_KEY), null);
     assert.equal(state.posts().length, 1);

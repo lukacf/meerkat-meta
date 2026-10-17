@@ -372,10 +372,13 @@ test('the anonymous opening keeps a starting-point preview unsent until explicit
         {frames:[],bindings:[],next_cursor:null,latest_cursor:null,exhausted:true}:null;
   };
   await mountedGuide({value:durable},async(document,calls)=>{
-    const preview=[...document.querySelectorAll('button')].find(button=>button.textContent.includes('Find a starting point together'));
+    const preview=[...document.querySelectorAll('button')].find(button=>button.textContent.includes('Answer two questions'));
     assert.ok(preview);
     await act(async()=>preview.click());
     assert.equal(calls.filter(call=>call.method==='POST').length,0,'Preview never creates a setup or sends the existing idea');
+    assert.equal(document.querySelector('#setup-message').value,input.draft);
+    const back=[...document.querySelectorAll('button')].find(button=>button.textContent==='Back to my words');
+    assert.ok(back); await act(async()=>back.click());
     assert.equal(document.querySelector('#setup-message').value,input.draft);
     await act(async()=>document.querySelector('#setup-send').click());
     assert.equal(calls.filter(call=>call.url==='/api/guide/start'&&call.method==='POST').length,1);
@@ -406,6 +409,7 @@ test('a lost setup creation reply and page reload reuse one saved setup before s
       if(lost){lost=false;throw new TypeError('Connection lost after creation committed');}
       return structuredClone(created.get(request));
     }
+    if(url.startsWith('/api/guide/creation/'))return structuredClone(created.get(url.split('/').at(-1)));
     if(url===respondUrl && options.method==='POST')return {...structuredClone(opening),id:'owned-recovered-creation',version:2,
       operation:{status:'completed',request_id:'c'.repeat(64),version:1,request:JSON.parse(options.body)}};
     return url==='/api/guide/new'?structuredClone(opening):url==='/api/guide/list'?{setups:[]}:
@@ -424,8 +428,12 @@ test('a lost setup creation reply and page reload reuse one saved setup before s
   await mountedGuide({value:durable},async(document,calls)=>{
     assert.equal(calls.filter(call=>call.method==='POST').length,0,'Reload observes without automatically replaying work');
     assert.equal(document.querySelector('#setup-message').value,input.draft);
+    const check=[...document.querySelectorAll('button')].find(button=>button.textContent==='Check saved conversation');
+    assert.ok(check); await act(async()=>check.click());
+    assert.ok(calls.some(call=>call.url===`/api/guide/creation/${firstRequest}`&&call.method==='GET'));
+    assert.equal(calls.filter(call=>call.url==='/api/guide/start').length,0,'Creation recovery observes the original request without posting it again');
+    assert.equal(calls.filter(call=>call.url===respondUrl).length,0,'Checking alone never sends the retained idea');
     await act(async()=>document.querySelector('#setup-send').click());
-    assert.equal(calls.find(call=>call.url==='/api/guide/start').body.start_request_id,firstRequest);
     assert.equal(created.size,1);
     const replies=calls.filter(call=>call.url===respondUrl);
     assert.equal(replies.length,1);assert.equal(replies[0].body.text,input.draft);
@@ -465,8 +473,9 @@ test('delayed real guide navigation never copies an anonymous or another saved s
       await act(async()=>button.click());
     };
     assert.equal(composer().value,anonymousDraft.draft);
-    await click('Coordinate team requests');
+    await click('Answer two questions');
     assert.equal(composer().value,anonymousDraft.draft);
+    await click('Back to my words');
     await click('Your setups');
     await click('Smart telescope companion');
     assert.equal(composer().value,anonymousDraft.draft,'the current setup keeps its draft during a pending read');
@@ -579,13 +588,16 @@ test('reload consumes a newly completed ambiguous send without erasing a later r
     assert.equal(composer().value,text);
     await act(async()=>document.querySelector('#setup-send').click());
     assert.equal(composer().value,text,'an ambiguous response preserves input until actual admission evidence returns');
-    await click('Reload saved conversation');
+    await click('Check saved conversation');
     assert.match(document.body.textContent,/Who is the system for\?/);
     assert.equal(composer().value,'','the newly acknowledged send is not resurrected by live-input migration');
     assert.equal(JSON.parse(values.get(inputKey(completed))).draft,'');
     assert.equal(values.get(`mobkit-setup-completed-v1:${before.id}`),completed.operation.request_id);
-    await click('Coordinate team requests');
-    assert.equal(composer().value,text,'the user deliberately starts a later draft with the same text');
+    await act(async()=>{
+      const setter=Object.getOwnPropertyDescriptor(document.defaultView.HTMLTextAreaElement.prototype,'value').set;
+      setter.call(composer(),text); composer().dispatchEvent(new document.defaultView.Event('input',{bubbles:true}));
+    });
+    assert.equal(composer().value,text,'the user deliberately writes a later draft with the same text');
     await click('Your setups');
     await click('Office setup');
     assert.equal(composer().value,text,'a historical completed operation cannot consume that new draft');

@@ -135,7 +135,9 @@ function fixture({ running = true, action = 'chat', pending = null, savedDraft =
     const method = options.method || 'GET', body = options.body ? JSON.parse(options.body) : undefined;
     calls.push({ url, method, ...(body === undefined ? {} : { body }) });
     if (method === 'POST' && url === '/api/guide/start' && anonymous && !guideStarted) {
-      assert.deepEqual(body, {}, 'Ordinary manual startup does not replace or pre-submit the human draft');
+      assert.deepEqual(Object.keys(body), ['start_request_id'],
+        'Ordinary manual startup carries only its durable creation identity, never the human draft');
+      assert.match(body.start_request_id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
       guideStarted = true;
       server = { ...structuredClone(server), id: startedId, version: 1 };
       return structuredClone(server);
@@ -712,7 +714,9 @@ test('a lost newClass response recovers current server context and retains exact
     const reviews = () => state.calls.filter(call => call.url === state.respondUrl);
     assert.equal(reviews().length, 1);
     assert.deepEqual(reviews()[0].body.blueprint, edited, 'The initial ordinary manual admission contains the actual human draft');
-    assert.match(document.querySelector('.setup-error').textContent, /Synthetic manual response lost/);
+    const recovery = document.querySelector('.setup-delivery-recovery');
+    assert.ok(!!recovery, 'An uncertain response exposes the existing read-only recovery control');
+    assert.match(recovery.textContent, /Message delivery is not confirmed/);
     assert.equal(state.server().operation.status, 'running', 'The server retained admission before its response was lost');
     assert.notDeepEqual(state.server().operation.request.blueprint, edited,
       'The lost receipt contains genuine server normalization, so exact raw blueprint comparison cannot acknowledge it');
@@ -725,7 +729,7 @@ test('a lost newClass response recovers current server context and retains exact
     current.agent_classes[0].description = 'SERVER-ONLY-CORRECTION: preserve the updated evidence boundary.';
     state.setServer({ ...structuredClone(admitted), version: admitted.version + 1, proposal: current,
       operation: { ...admitted.operation, status: 'completed' } });
-    await click(document.querySelector('.setup-error'), 'Reload saved conversation');
+    await click(recovery, 'Check saved conversation');
     assert.equal(reviews().length, 1, 'Recovering the retained completed receipt never resends the old full blueprint');
     assert.deepEqual(state.manual().blueprint, edited, 'The unbound human adjustment stays recoverable');
     assert.deepEqual(state.manual().manual_intent, { base: state.original, draft: edited });

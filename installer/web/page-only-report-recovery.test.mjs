@@ -489,7 +489,7 @@ for (const kind of ['local', 'remote']) {
       const { request_id: firstId, ...first } = posts[0].body;
       const { request_id: secondId, ...second } = posts[1].body;
       assert.deepEqual(second, first); assert.equal(first.task, draft.task.trim());
-      assert.match(document.querySelector('.deployment-use-success').textContent, /Your success report is saved/);
+      assert.match(document.querySelector('.deployment-use-success').textContent, /An earlier success report is saved for this job/);
       assert.match(document.body.textContent, /Browser draft storage is unavailable/);
       assertDrafts(document); assert.deepEqual(publications, []);
       assert.equal(postsFor(calls, kind, 'feedback').length, 0);

@@ -8,8 +8,8 @@ import { mountConsoleShell } from '../launchkit/templates_v2/console_shell.mjs';
 import { mountConsoleSetup, createConsoleSetupPort } from '../launchkit/templates_v2/console_setup.mjs';
 
 const { JSDOM } = createRequire(new URL('../../console/package.json', import.meta.url))('jsdom');
-const nativeHTML = await readFile(new URL('../.artifacts/forge-console-scope-retirement-20261008/toolkit-shell/native-console.html', import.meta.url), 'utf8');
-const toolkit = new URL('../.artifacts/forge-toolkit-ui-intake-20261008/extracted/toolkit-ui/index.js', import.meta.url);
+const nativeHTML = await readFile(new URL('../tests/fixtures/console_shell/native-console.html', import.meta.url), 'utf8');
+const toolkit = new URL('../launchkit/templates_v2/toolkit-ui/index.js', import.meta.url);
 const bundled = await build({ entryPoints: [toolkit.pathname], bundle: true, write: false, format: 'esm', platform: 'browser', logLevel: 'silent' });
 const { mountSetupConversation } = await import(`data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].contents).toString('base64')}`);
 const flush = async () => { for (let i = 0; i < 15; i++) await new Promise(resolve => setImmediate(resolve)); };

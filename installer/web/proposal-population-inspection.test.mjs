@@ -61,7 +61,8 @@ async function mountedPopulation(verify) {
       builder.onResolve({filter: /(?:freeform-animation|mob-sim-renderer)\.mjs$/}, args => ({path: args.path, namespace: 'inert-preview'}));
       builder.onLoad({filter: /.*/, namespace: 'inert-preview'}, args => ({contents: args.path.includes('mob-sim-renderer')
         ? 'export class MobSim {setScene(){}seek(){}destroy(){}}'
-        : `export class FreeformAnimation {
+        : `export function animationFailureDetail(){throw Error('Unexpected renderer failure in the population fixture');}
+          export class FreeformAnimation {
           constructor(layer,options){this.layer=layer;this.options=options;this.alive=true;this.duration=30;this.time=0;
             this.frame=document.createElement('iframe');layer.append(this.frame);
             globalThis.__populationAnimationInstances.push(this);}

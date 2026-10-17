@@ -225,6 +225,7 @@ for (const kind of ["local", "remote"]) {
 async function mounted(kind, verify, { post, initialMetadata, initialStorage } = {}) {
   const dom = new JSDOM('<div id="root"></div>', { url: "http://localhost/", pretendToBeVisual: true });
   const calls = [], builds = [], storage = initialStorage || dom.window.sessionStorage;
+  if (initialStorage) Object.defineProperty(dom.window, "sessionStorage", { configurable: true, value: initialStorage });
   let metadataPatch = initialMetadata || {}, current = { state, receipt: kind === "local" ? local : remote, build,
     blocked: true, onRepairReceipt: (value) => builds.push(value), Icon: () => null };
   const metadataForCurrent = () => metadata(kind, current.receipt, current.state, metadataPatch);
@@ -496,15 +497,16 @@ for (const kind of ["local", "remote"]) {
 
   test(`${kind} failed retry-record removal blocks new confirmations and clear retries never POST`, async () => {
     const storage = memoryStorage(), remove = storage.removeItem;
-    let failRemoval = true;
+    let failRemoval = true, failedRemovals = 0;
     storage.removeItem = (key) => {
-      if (failRemoval && key.includes("mobkit-installed-use-success-v1:")) throw new Error("PRIVATE_BROWSER_STORAGE");
+      if (failRemoval && key.includes("mobkit-installed-use-success-v1:")) { failedRemovals++; throw new Error("PRIVATE_BROWSER_STORAGE"); }
       remove(key);
     };
     await mounted(kind, async ({ document, edit, click, reload, calls, builds, uuidCount, button }) => {
       await edit("Task A"); await edit("Unsent improvement", ".deployment-use-feedback textarea"); await click("It worked");
       await reload({ state: { ...state, version: 5 } }); await click("Retry success confirmation");
       const original = calls.find((call) => call.method === "POST").body;
+      assert.ok(failedRemovals > 0, "The actual browser store exercised the injected removal failure");
       assert.match(document.querySelector(".deployment-use-success").textContent, /browser retry record could not be cleared/);
       assert.equal(button("Retry success confirmation").disabled, true);
       await click("Clear unsaved confirmation");

@@ -49,7 +49,7 @@ jobs:
       - run: npm --prefix installer/web ci
       - run: npm --prefix installer/web run build
       - name: Backend regression tests
-        run: python -m pytest -q installer/tests --tb=short --junitxml=forge-pytest.xml
+        run: python -m pytest -vv installer/tests --maxfail=10 --tb=short --junitxml=forge-pytest.xml
       - name: Retain test results
         if: always()
         uses: actions/upload-artifact@v4

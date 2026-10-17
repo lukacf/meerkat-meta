@@ -174,7 +174,7 @@ async function mounted(initial, verify, { manual, available = false, providerRea
         await act(async () => {
           const index = savedGuides.findIndex(guide => guide.id === guideId);
           assert.ok(index >= 0, 'The fixture exposes the selected saved setup.');
-          const choice = [...dom.window.document.querySelectorAll('.setup-history-menu > button')][index];
+          const choice = [...dom.window.document.querySelectorAll('.setup-history-menu .setup-history-conversation')][index];
           assert.ok(choice, 'The selected setup has its ordinary history control.');
           choice.click(); await settle();
         });
@@ -565,7 +565,7 @@ test('optional starting context stays separate from writing and is consumed only
     assert.deepEqual(writes(), [], 'Local choices never send guide work or settings.');
     assert.equal(document.querySelector('#setup-send').disabled, false, 'A novice can start with only the two choices.');
     assert.equal(document.querySelector('#setup-send').textContent.trim(), 'Send to guide');
-    assert.equal(document.querySelector('#setup-after-send p').textContent, 'Your guide will start from these two answers. Add a task if you have one, or send them as they are.');
+    assert.equal(document.querySelector('#setup-after-send p').textContent, 'Your two answers stay here until you send.');
     await act(async () => { document.querySelector('#setup-send').click(); await settle(); });
     assert.deepEqual(writes().map(call => call.url), ['/api/guide/start', `/api/guide/${id}/respond`]);
     assert.deepEqual(writes()[1].body, { version: 1, action: 'answer', selected: [], text: 'For a team, I would like help with repetitive work.' });
@@ -585,7 +585,7 @@ test('first-minute mobile choices-only completion focuses Send while explicit Wr
     assert.equal(send.disabled, false); assert.equal(send.textContent.trim(), 'Send to guide');
     assert.equal(editor.value, ''); assert.equal(document.querySelectorAll('textarea').length, 1);
     assert.equal(helper.dataset.open, 'false'); assert.equal(helper.dataset.route, 'choose');
-    assert.equal(startingContextButton(document, 'Your starting point').getAttribute('aria-pressed'), 'true');
+    assert.equal(startingContextButton(document, 'Your two answers').getAttribute('aria-pressed'), 'true');
     assert.equal(document.getElementById('setup-idea-shortcuts'), null, 'Mobile retains ordinary multiline writing rather than desktop Enter guidance.');
     assert.deepEqual(saved.starting_help, { version: 2, audience_id: 'household', kind_id: 'organizing' });
     await clickStarting(document, 'In my own words');
@@ -680,9 +680,9 @@ test('the native editor and optional thinking helper never replace or send the e
     assert.equal(writeRoute.getAttribute('aria-pressed'), 'false');
     assert.equal(chooseRoute.getAttribute('aria-pressed'), 'true');
     assert.equal(chooseRoute.closest('[hidden]'), null);
-    assert.equal(chooseRoute.querySelector('strong').textContent, 'Your starting point');
-    assert.equal(chooseRoute.querySelector('small').textContent, 'Review or change your answers');
-    await clickStarting(document, 'Your starting point');
+    assert.equal(chooseRoute.querySelector('strong').textContent, 'Your two answers');
+    assert.equal(chooseRoute.querySelector('small').textContent, 'A team / Repetitive work');
+    await clickStarting(document, 'Your two answers');
     assert.equal(helper.dataset.open, 'false', 'The answered Choose route keeps the committed review visible.');
     const field = startingContextButton(document, 'Change who this helps: A team'); field.focus();
     await clickStarting(document, 'Change who this helps: A team');
@@ -920,7 +920,7 @@ test('starting context field edit: answered review stays closed while individual
     assert.equal(document.activeElement, audienceTrigger, 'An audience-only commit returns to its original review field.');
     assert.equal(editor.value, written);
     assert.match(helper().querySelector('[role="status"]').textContent, /Starting point updated/);
-    await clickStarting(document, 'Your starting point');
+    await clickStarting(document, 'Your two answers');
     assert.equal(helper().dataset.open, 'false', 'The answered route is review, not a restart of both questions.');
     assert.deepEqual(stored(), { version: 2, audience_id: 'household', kind_id: 'repetitive' });
     await clickStarting(document, 'Change who this helps: My household'); await clickStarting(document, 'Just me');
@@ -1079,7 +1079,7 @@ test('starting context: removing an applied starting point also dismisses its un
     assert.equal(JSON.parse(values.get(inputKey(guide))).starting_help, undefined);
     await clickStarting(document, 'Answer two questions');
     assert.equal(startingContextButton(document, 'Many people').getAttribute('aria-pressed'), 'false', 'Removed choices do not reappear in a new helper.');
-    await clickStarting(document, 'Back to my idea');
+    await clickStarting(document, 'Back to my words');
     assert.deepEqual(calls.filter(call => call.method !== 'GET'), []);
   }, { available: true, runAnimationFrames: true });
 });
@@ -1438,7 +1438,7 @@ test('first-minute editor descriptions follow context, provider visibility and m
     assert.match(descriptions(['setup-after-send', 'setup-idea-shortcuts']), /Nothing is sent until.*Enter to send.*Shift \+ Enter/);
     await clickStarting(document, 'Answer two questions'); await clickStarting(document, 'A team'); await clickStarting(document, 'Keeping track of things');
     assert.match(descriptions(['setup-idea-optional', 'setup-message-starting-example', 'setup-after-send', 'setup-idea-shortcuts']),
-      /Optional.*Keep track of decisions and deadlines.*Your guide will start from these two answers/s);
+      /Optional.*Keep track of decisions and deadlines.*Your two answers stay here until you send/s);
     assert.equal(document.activeElement, document.querySelector('#setup-send'));
     assert.equal(editor.placeholder, 'For example: Keep track of decisions and deadlines for a project.');
     await clickStarting(document, 'Change the kind of work: Keeping track of things'); await clickStarting(document, 'Repetitive work');
@@ -1538,9 +1538,9 @@ for (const scenario of ['ordinary handoff', 'hidden cancel body fallback', 'focu
       const helper = document.querySelector('.forge-starting-conversation');
       assert.equal(helper.dataset.open, 'true');
       assert.equal(helper.querySelector('h3').textContent, 'What would help most?');
-      const cancel = startingContextButton(document, 'Back to my idea');
+      const cancel = startingContextButton(document, 'Back to my words');
       cancel.focus();
-      await clickStarting(document, 'Back to my idea');
+      await clickStarting(document, 'Back to my words');
       assert.equal(helper.dataset.open, 'false', 'Cancellation commits the closed helper before the focus frame.');
       assert.equal(cancel.closest('[hidden]')?.hidden, true, 'The old Back action is now inside the hidden question region.');
       assert.equal(document.querySelector('#setup-message'), editor, 'The exact native editor remains mounted through cancellation.');

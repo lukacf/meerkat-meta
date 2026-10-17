@@ -74,7 +74,7 @@ test("wait status retains a confirmed tool label without claiming proposal compl
   frames: [{id: "tool", event: "tool_call_requested", interactionId: "native-turn", timestampMs: 1000,
     data: {id: "call", name: "read_design_reference", args: {secret: "PRIVATE_ARGUMENT"}}},
   {id: "result", event: "tool_result_received", interactionId: "native-turn", timestampMs: 1001,
-    data: {id: "call", name: "read_design_reference", result: "PRIVATE_RESULT"}}]};
+    data: {id: "call", name: "read_design_reference", is_error: false, result: "PRIVATE_RESULT"}}]};
   const render = (changed = snapshot) => renderToStaticMarkup(React.createElement(GuideWaitStatus, {state, snapshot: changed}));
   assert.match(render(), /Last tool: read design reference - completed/);
   assert.match(render(), /Guide request running/);

@@ -259,7 +259,7 @@ test("optional examples seed an empty message for editing and never send guide w
   await mountedStartingPoints("", async (document, choices, render) => {
     await act(async () => document.querySelector(".setup-starting-points > button").click());
     assert.equal(choices.length, 1);
-    assert.match(choices[0], /who needs support/);
+    assert.match(choices[0], /which information it needs/);
     assert.equal(document.querySelector("details"), null);
     await render("", true);
     await act(async () => document.querySelector(".setup-starting-points > button").click());
@@ -275,13 +275,13 @@ test("exploring several starting points previews examples while preserving every
       assert.deepEqual(choices, []);
       assert.equal(document.querySelector("#owned-description").value, draft);
       assert.equal(document.querySelector("details").open, true);
-      assert.match(document.querySelector("details").textContent, /Example: Coordinate team requests/);
+      assert.match(document.querySelector("details").textContent, /Example: Stay on top of my projects/);
       assert.match(document.querySelector("details").textContent, /Your description is still in the message box/);
       await act(async () => buttons[1].click());
       assert.deepEqual(choices, []);
       assert.equal(document.querySelector("#owned-description").value, draft);
-      assert.match(document.querySelector("details").textContent, /Example: A research observatory/);
-      assert.doesNotMatch(document.querySelector("details").textContent, /Example: Coordinate team requests/);
+      assert.match(document.querySelector("details").textContent, /Example: Keep our household in sync/);
+      assert.doesNotMatch(document.querySelector("details").textContent, /Example: Stay on top of my projects/);
     });
   }
 });

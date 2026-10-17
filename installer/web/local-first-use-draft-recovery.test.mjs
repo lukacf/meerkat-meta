@@ -367,7 +367,7 @@ function assertUnchecked(document, draft) {
   assert.doesNotMatch(view.textContent, /UNCHECKED NAME|UNCHECKED IDEA/);
 }
 function assertLinks(document, id, task = taskFor(id), handoffAllowed = true) {
-  const view = useView(document), link = view?.querySelector('.deployment-use-interfaces a');
+  const view = useView(document), link = view?.querySelector('.deployment-use-interfaces ul a');
   assert.equal(view?.querySelector('h3')?.textContent, `Use ${planFor(id).project.name}`);
   assert.equal(link?.getAttribute('href'), handoffAllowed ? entryUrl(id) : null);
   assert.equal(link?.textContent.trim(), `Open ${entryLabel(id)}`);
@@ -406,8 +406,8 @@ for (const focusedEditor of ['task', 'report']) {
         disclosure: useView(document).querySelector('.deployment-use-feedback-disclosure'),
         help: useView(document).querySelector('.deployment-use-job-help'),
         outcome: useView(document).querySelector('input[value="partly"]') };
-      assert.equal(original.help.open, true, 'Authored job help starts beside the editable draft');
-      original.help.open = false;
+      assert.equal(original.help.open, false, 'Optional authored job help starts closed beside the editable draft');
+      original.help.open = true; original.help.open = false;
       const focused = original[focusedEditor];
       focused.focus(); focused.setSelectionRange(9, 22, 'backward');
       function assertEditors(phase) {
@@ -649,7 +649,7 @@ test('parent receipt storage recovery denied Window getter never borrows a globa
 
 function cachedEntryLinks(document) {
   return [...document.querySelectorAll('.deployment-use-interfaces a, .deployment-use-admin a, ' +
-    '.deployment-use-console-handoff a, .deployment-use > a, .deployment-interface-scope a')];
+    '.deployment-use-console-handoff a, .deployment-use > a, .deployment-interface-scope a')].filter(link => !link.closest('.deployment-use-entry-handoff'));
 }
 function assertCachedEntriesPaused(document, originalLabels) {
   const links = cachedEntryLinks(document);

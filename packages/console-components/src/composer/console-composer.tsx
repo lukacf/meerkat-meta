@@ -34,6 +34,7 @@ export type ConsoleComposerProps = {
   shellClassName?: string;
   footerClassName?: string;
   inputId?: string;
+  inputDescriptionId?: string;
   inputRef?: Ref<HTMLTextAreaElement>;
   shellId?: string;
   submitButtonId?: string;
@@ -99,6 +100,7 @@ export function ConsoleComposer({
   shellClassName,
   footerClassName,
   inputId,
+  inputDescriptionId,
   inputRef,
   shellId,
   submitButtonId,
@@ -160,6 +162,7 @@ export function ConsoleComposer({
         disabled={submitDisabled}
         id={submitButtonId}
         title={submitLabel}
+        aria-label={submitLabel}
         type="button"
         onClick={onSubmit}
       >
@@ -201,6 +204,7 @@ export function ConsoleComposer({
           className="cc-composer__textarea"
           disabled={disabled}
           id={inputId}
+          aria-describedby={inputDescriptionId}
           placeholder={placeholder}
           value={value}
           onChange={(event) => onChange(event.currentTarget.value)}
