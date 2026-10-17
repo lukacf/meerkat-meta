@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The per-agent event stream (`/agents/{id}/events`) evaluates the console
+  visibility policy for a member named by its runtime alias against that
+  identity's member, as it does for the durable identity, and answers
+  `member_not_found` for a runtime alias that names no live member. Its
+  access rules judge that member too, with the member's own labels.
 - `meta/identity/resolved_tools`, and `resolved_tools_for_member` in Rust,
   resolve the supplied id through `roster_member_id_for_supplied_id`, as
   `meta/identity/routing_status` does (#366). A member named by its current

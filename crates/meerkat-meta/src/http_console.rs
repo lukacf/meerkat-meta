@@ -5842,6 +5842,26 @@ pub(crate) async fn sse_member_identity_visibility(
     Some((identity, visible))
 }
 
+/// Resolve the member a per-agent event stream names and evaluate the
+/// console visibility policy against it. A runtime alias names its
+/// identity's durable roster row (a read under the member-id alias rule),
+/// so the policy sees the member the stream serves. `None` means no live
+/// member answers to the request.
+pub(crate) async fn sse_agent_stream_identity_visibility(
+    handle: &MobHandle,
+    visibility_policy: &dyn ConsoleVisibilityPolicy,
+    requested_identity: &str,
+) -> Option<(String, bool)> {
+    if let Some(found) =
+        sse_member_identity_visibility(handle, visibility_policy, requested_identity).await
+    {
+        return Some(found);
+    }
+    let decoded = crate::member_comms_id::runtime_alias_str(requested_identity);
+    let durable = crate::member_comms_id::durable_identity_from_runtime_alias(&decoded)?;
+    sse_member_identity_visibility(handle, visibility_policy, &durable).await
+}
+
 /// Resolve an attributed event to the exact live roster binding that emitted
 /// it, then snapshot both ABAC attributes and console visibility from that
 /// entry. `None` means the authority can no longer be proven and protected
@@ -17905,6 +17925,229 @@ comms = true
                 "(error, durable row wired) after {method} through {current_alias}"
             );
         }
+        Ok(())
+    }
+
+    /// The per-agent event stream applies the console visibility policy to
+    /// the member a request names, in every spelling: a durable identity, or
+    /// a runtime alias, which names its identity's durable roster row. A
+    /// runtime alias that names no live member is refused, and only a
+    /// visible member's stream is opened.
+    #[tokio::test]
+    async fn agent_events_stream_applies_console_visibility_to_every_member_spelling()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        struct HideOtherTenant;
+        impl crate::console_aggregator::ConsoleVisibilityPolicy for HideOtherTenant {
+            fn member_visible(&self, member: &crate::runtime::ConsoleMember) -> bool {
+                member.labels.get("tenant").map(String::as_str) != Some("other")
+            }
+        }
+
+        const HIDDEN: &str = "review:stream-hidden";
+        const VISIBLE: &str = "review:stream-visible";
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("agent-events-stream-visibility").await?;
+        for (durable, labels) in [
+            (
+                HIDDEN,
+                BTreeMap::from([("tenant".to_string(), "other".to_string())]),
+            ),
+            (VISIBLE, BTreeMap::new()),
+        ] {
+            runtime
+                .handle()
+                .spawn_spec(
+                    SpawnMemberSpec::from_wire(
+                        "worker".to_string(),
+                        crate::member_comms_id::mob_member_id_str(durable).into_owned(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .with_labels(labels),
+                )
+                .await?;
+        }
+        let subscribed: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let recorded = Arc::clone(&subscribed);
+        let subscribe: crate::http_sse::AgentEventReplaySubscribeFn =
+            Arc::new(move |agent_id, _cursor| {
+                recorded
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(agent_id);
+                Box::pin(async move {
+                    Ok(crate::http_sse::AgentEventReplay {
+                        epoch: None,
+                        stream: Box::pin(futures::stream::iter(vec![
+                            meerkat_core::event::EventEnvelope::new(
+                                "stream-visibility",
+                                1,
+                                None,
+                                meerkat_core::AgentEvent::TextDelta {
+                                    delta: "stream-visibility-delta".to_string(),
+                                    assistant_message_id: None,
+                                },
+                            ),
+                        ])),
+                    })
+                })
+            });
+        let app = crate::http_sse::agent_events_sse_router_with_access_and_priming(
+            subscribe,
+            None,
+            None,
+            Some(runtime.clone()),
+            Arc::new(HideOtherTenant),
+        );
+        let status =
+            async |agent_id: &str| -> Result<StatusCode, Box<dyn std::error::Error + Send + Sync>> {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/agents/{agent_id}/events"))
+                            .body(Body::empty())?,
+                    )
+                    .await?;
+                Ok(response.status())
+            };
+
+        let statuses = (
+            status(HIDDEN).await?,
+            status(&format!("rt:{HIDDEN}:1")).await?,
+            status(&format!("rt:{VISIBLE}:1")).await?,
+            status("rt:review:stream-nobody:0").await?,
+        );
+        let opened = subscribed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            (statuses, opened),
+            (
+                (
+                    StatusCode::NOT_FOUND,
+                    StatusCode::NOT_FOUND,
+                    StatusCode::OK,
+                    StatusCode::NOT_FOUND,
+                ),
+                vec![format!("rt:{VISIBLE}:1")],
+            ),
+            "((hidden durable, hidden alias, visible alias, unknown alias), streams opened)"
+        );
+        Ok(())
+    }
+
+    /// The per-agent event stream applies the access rules to the member a
+    /// request names, in every spelling: a runtime alias is judged as the
+    /// member it names, with that member's labels, as the durable identity
+    /// is.
+    #[tokio::test]
+    async fn agent_events_stream_applies_access_rules_to_every_member_spelling()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        const RESTRICTED: &str = "review:stream-restricted";
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("agent-events-stream-access").await?;
+        runtime
+            .handle()
+            .spawn_spec(
+                SpawnMemberSpec::from_wire(
+                    "worker".to_string(),
+                    crate::member_comms_id::mob_member_id_str(RESTRICTED).into_owned(),
+                    None,
+                    None,
+                    None,
+                )
+                .with_labels(BTreeMap::from([(
+                    "org".to_string(),
+                    "restricted".to_string(),
+                )])),
+            )
+            .await?;
+        let controller =
+            crate::access::AccessController::new(crate::access::AccessControlConfig {
+                enabled: true,
+                admins: vec!["root@example.test".to_string()],
+                rules: vec![
+                    crate::access::AccessRule {
+                        id: "view-all".to_string(),
+                        actions: vec![crate::access::ACTION_AGENT_VIEW.to_string()],
+                        agents: vec!["*".to_string()],
+                        ..crate::access::AccessRule::default()
+                    },
+                    crate::access::AccessRule {
+                        id: "deny-restricted".to_string(),
+                        effect: crate::access::AccessEffect::Deny,
+                        actions: vec![crate::access::ACTION_AGENT_VIEW.to_string()],
+                        match_labels: BTreeMap::from([(
+                            "org".to_string(),
+                            "restricted".to_string(),
+                        )]),
+                        ..crate::access::AccessRule::default()
+                    },
+                ],
+                ..crate::access::AccessControlConfig::default()
+            })?;
+        let subscribed: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let recorded = Arc::clone(&subscribed);
+        let subscribe: crate::http_sse::AgentEventReplaySubscribeFn =
+            Arc::new(move |agent_id, _cursor| {
+                recorded
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(agent_id);
+                Box::pin(async move {
+                    Ok(crate::http_sse::AgentEventReplay {
+                        epoch: None,
+                        stream: Box::pin(futures::stream::iter(Vec::new())),
+                    })
+                })
+            });
+        let app = crate::http_sse::agent_events_sse_router_with_access_and_priming(
+            subscribe,
+            None,
+            Some(controller),
+            Some(runtime.clone()),
+            Arc::new(crate::console_aggregator::AllowAllConsoleVisibilityPolicy),
+        );
+        let status =
+            async |agent_id: &str| -> Result<StatusCode, Box<dyn std::error::Error + Send + Sync>> {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/agents/{agent_id}/events"))
+                            .body(Body::empty())?,
+                    )
+                    .await?;
+                Ok(response.status())
+            };
+
+        let statuses = (
+            status(RESTRICTED).await?,
+            status(&format!("rt:{RESTRICTED}:1")).await?,
+        );
+        let opened = subscribed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            (statuses, opened),
+            (
+                (StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+                Vec::<String>::new()
+            ),
+            "((durable, runtime alias), streams opened)"
+        );
         Ok(())
     }
 
