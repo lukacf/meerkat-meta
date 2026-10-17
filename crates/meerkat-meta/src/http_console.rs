@@ -21739,6 +21739,55 @@ mod console_viewer_resolver_tests {
         assert_eq!(anonymous.principal, None);
     }
 
+    /// The scope a console send from this request is deduplicated in.
+    fn send_scope_of(state: &ConsoleJsonState, headers: &HeaderMap) -> ConsoleSendScope {
+        let uri: Uri = "/console/send".parse().unwrap();
+        console_request_auth_context(state, headers, &uri)
+            .expect("an admitted request")
+            .send_scope()
+    }
+
+    #[test]
+    fn an_open_console_without_a_controller_sends_every_caller_as_the_shared_local_account() {
+        // No access controller: a volunteered token is never resolved, so
+        // every caller, even one with a valid token, is the one anonymous
+        // local account and shares its send scope.
+        let open = state(decisions(false), None);
+        assert_eq!(
+            send_scope_of(&open, &bearer(BOB)),
+            ConsoleSendScope::Anonymous
+        );
+        assert_eq!(
+            send_scope_of(&open, &bearer(CAROL)),
+            ConsoleSendScope::Anonymous
+        );
+        assert_eq!(
+            send_scope_of(&open, &HeaderMap::new()),
+            ConsoleSendScope::Anonymous
+        );
+
+        // Isolation needs an access controller (or require_app_auth): the
+        // token is resolved and each human is its own scope.
+        let controller = AccessController::new(access(&[BOB, CAROL])).unwrap();
+        let controlled = state(decisions(false), Some(controller));
+        let bob = send_scope_of(&controlled, &bearer(BOB));
+        assert_eq!(
+            bob,
+            ConsoleSendScope::Human {
+                issuer: ISSUER.to_string(),
+                subject: BOB.to_string(),
+            }
+        );
+        assert_ne!(bob, send_scope_of(&controlled, &bearer(CAROL)));
+        assert_eq!(
+            send_scope_of(&controlled, &HeaderMap::new()),
+            ConsoleSendScope::Anonymous
+        );
+
+        let required = state(decisions(true), None);
+        assert_eq!(send_scope_of(&required, &bearer(BOB)), bob);
+    }
+
     #[test]
     fn an_authenticated_human_maps_to_the_console_human_principal() {
         let resolver = ConsoleViewerResolver::new(decisions(true), None);

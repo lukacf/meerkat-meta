@@ -758,8 +758,11 @@ idempotency_key)`. The caller is the authenticated console principal, taken
 from the request's auth and never from a parameter: a verified human by OIDC
 issuer and subject, otherwise the authenticated principal (a service identity,
 or a token without a subject). Anonymous callers of an open console share one
-local account. The same key from two callers names two different sends:
-neither replays nor observes the other's.
+local account. An open console without an access controller never resolves
+tokens, so there every caller, even one presenting a valid token, is that
+shared account; per-principal isolation needs `require_app_auth` or an access
+controller. The same key from two callers names two different sends: neither
+replays nor observes the other's.
 Mint a new key for a new send; to replay an ambiguous send, retain the same
 scope, content, and effective `handling_mode` (omission means `queue`).
 A matching replay returns the earlier interaction's acceptance whether or not
