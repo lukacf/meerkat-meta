@@ -244,6 +244,25 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(source.count("scripts/repo-cargo build --workspace --examples"), 1)
         self.assertEqual(source.count("scripts/repo-cargo nextest run --workspace"), 2)
 
+    def test_the_unit_job_proves_its_filter_leaves_out_no_lib_or_bin_test(self):
+        """`test` is the only automatic run of the lib and bin tests, since
+        the pre-push unit gate is manual: a lib test its filter dropped once
+        ran in no CI job at all. Before the run it lists those tests with
+        the run's own filter, and scripts/verify-unit-test-filter.py fails
+        the job on any the filter leaves out."""
+        steps = [line.strip()[len("- run: "):] for line in job_block("test").splitlines()
+                 if line.strip().startswith("- run: ")]
+        run = [step for step in steps if step.startswith("scripts/repo-cargo nextest run")]
+        self.assertEqual(len(run), 1, steps)
+        filter_ = re.search(r"-E '[^']*'", run[0]).group(0)
+        listing = '"${RUNNER_TEMP}/unit-tests.json"'
+        self.assertEqual(steps, [
+            f"scripts/repo-cargo nextest list --workspace --lib --bins {filter_} --message-format json > {listing}",
+            f"python3 scripts/verify-unit-test-filter.py {listing}",
+            run[0],
+        ])
+        self.assertIn("- run: python3 scripts/test_verify_unit_test_filter.py\n", job_block("fmt-lint"))
+
     def test_the_split_coverage_guard_reads_targets_as_cargo_does(self):
         """Targets, test flags and autotests in any valid TOML spelling, and
         glob or implicit path members, all reach the guard: it reads `cargo

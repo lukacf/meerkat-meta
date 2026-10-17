@@ -41,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   is held, instead of racing a slow backfill against a deadline. CI's unit
   test job, which left it out as timing-sensitive, runs it again, without
   retries; it had run only in the pre-push unit gate, which is now manual.
+- CI's unit test job, now the only automatic run of the lib and bin tests,
+  lists them with its own filter before running them and fails if the
+  filter leaves any out.
 
 ## [0.9.1] - 2026-10-15
 

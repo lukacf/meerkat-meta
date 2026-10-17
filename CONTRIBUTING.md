@@ -83,6 +83,8 @@ on every pull request. Its other jobs form lanes, and a pull request runs only
 the lanes its changed files reach (`scripts/ci-changes.py`):
 
 - A Rust change runs `clippy`, `test` and the two `test-integration` halves.
+  `test` is the only automatic run of the lib and bin tests: it lists them
+  first and fails if its filter leaves any out.
 - The voice and extension-state jobs, the Python SDK tests, the console jobs
   and the flow editor job compile the same crate in other configurations. A
   pull request leaves them to the push unless it changes their own inputs:
