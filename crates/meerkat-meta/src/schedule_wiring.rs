@@ -24,7 +24,8 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -322,28 +323,77 @@ pub async fn ensure_steward_dream_schedule(
 
 #[derive(Clone, Default)]
 pub struct ScheduleMobTargetRegistry {
-    state: Arc<RwLock<Option<Arc<MobMcpState>>>>,
+    state: Arc<RwLock<AdoptedMobState>>,
+}
+
+/// The mob state a registry resolves bridge sessions against, held weakly:
+/// the runtime's mob runtime owns it, and the schedule tools a session
+/// service keeps must not keep a stopped host's mob state alive.
+#[derive(Default)]
+enum AdoptedMobState {
+    /// No mob state was adopted: the runtime has no mobs.
+    #[default]
+    Unset,
+    /// The adopted mob state. It no longer upgrades once its owner dropped
+    /// it, when its host stopped.
+    Adopted(Weak<MobMcpState>),
+}
+
+/// What a registry resolved a bridge session to.
+enum MobSessionResolution {
+    /// The session's mob and member, or none: no mob state was adopted, or
+    /// none of its mobs has the session.
+    Resolved(Option<(String, String)>),
+    /// The adopted mob state is gone: its host stopped.
+    Stopped,
 }
 
 impl ScheduleMobTargetRegistry {
+    /// Adopt the mob state bridge sessions resolve against, or forget it
+    /// with `None`. The registry keeps only a weak reference to it.
     pub fn set_mob_state(&self, state: Option<Arc<MobMcpState>>) {
         if let Ok(mut guard) = self.state.write() {
-            *guard = state;
+            *guard = match state {
+                Some(state) => AdoptedMobState::Adopted(Arc::downgrade(&state)),
+                None => AdoptedMobState::Unset,
+            };
         }
     }
 
     async fn resolve_bridge_session(&self, session_id: &str) -> Option<(String, String)> {
-        let state = self.state.read().ok().and_then(|guard| guard.clone())?;
-        let parsed_session_id = meerkat::SessionId::parse(session_id).ok()?;
-        let handles = state.mob_handles_snapshot().await.ok()?;
-        for (mob_id, handle) in handles {
-            let roster = handle.roster().await;
-            if let Some(entry) = roster.find_by_bridge_session_id(&parsed_session_id) {
-                return Some((mob_id.to_string(), entry.agent_identity.to_string()));
-            }
+        match self.resolve_mob_session(session_id).await {
+            MobSessionResolution::Resolved(found) => found,
+            MobSessionResolution::Stopped => None,
         }
-        None
     }
+
+    /// Resolve a bridge session against the adopted mob state, holding the
+    /// state only for this call's roster walk.
+    async fn resolve_mob_session(&self, session_id: &str) -> MobSessionResolution {
+        let adopted = match self.state.read().as_deref() {
+            Ok(AdoptedMobState::Adopted(state)) => Some(state.upgrade()),
+            Ok(AdoptedMobState::Unset) | Err(_) => None,
+        };
+        let state = match adopted {
+            None => return MobSessionResolution::Resolved(None),
+            Some(None) => return MobSessionResolution::Stopped,
+            Some(Some(state)) => state,
+        };
+        MobSessionResolution::Resolved(bridge_session_member(&state, session_id).await)
+    }
+}
+
+/// The mob and member a bridge session belongs to in `state`'s mobs.
+async fn bridge_session_member(state: &MobMcpState, session_id: &str) -> Option<(String, String)> {
+    let parsed_session_id = meerkat::SessionId::parse(session_id).ok()?;
+    let handles = state.mob_handles_snapshot().await.ok()?;
+    for (mob_id, handle) in handles {
+        let roster = handle.roster().await;
+        if let Some(entry) = roster.find_by_bridge_session_id(&parsed_session_id) {
+            return Some((mob_id.to_string(), entry.agent_identity.to_string()));
+        }
+    }
+    None
 }
 
 pub struct AttachedScheduleTools {
@@ -465,9 +515,11 @@ impl meerkat_core::AgentToolDispatcher for FiringHostGatedScheduleTools {
     }
 }
 
-type MobSessionResolver = Arc<
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<(String, String)>> + Send>> + Send + Sync,
->;
+type MobSessionResolver =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = MobSessionResolution> + Send>> + Send + Sync>;
+
+/// A rewrite candidate met a stopped mob state.
+struct MobStateStopped;
 
 struct MobIdentityScheduleToolDispatcher {
     inner: Arc<dyn meerkat_core::AgentToolDispatcher>,
@@ -481,11 +533,8 @@ impl MobIdentityScheduleToolDispatcher {
     ) -> Self {
         let resolve_mob_session = Arc::new(move |session_id: String| {
             let mob_target_registry = mob_target_registry.clone();
-            Box::pin(async move {
-                mob_target_registry
-                    .resolve_bridge_session(&session_id)
-                    .await
-            }) as Pin<Box<dyn Future<Output = Option<(String, String)>> + Send>>
+            Box::pin(async move { mob_target_registry.resolve_mob_session(&session_id).await })
+                as Pin<Box<dyn Future<Output = MobSessionResolution> + Send>>
         });
         Self {
             inner,
@@ -502,8 +551,8 @@ impl MobIdentityScheduleToolDispatcher {
         let resolve = Arc::new(resolve);
         let resolve_mob_session = Arc::new(move |session_id: String| {
             let resolve = resolve.clone();
-            Box::pin(async move { resolve(session_id).await })
-                as Pin<Box<dyn Future<Output = Option<(String, String)>> + Send>>
+            Box::pin(async move { MobSessionResolution::Resolved(resolve(session_id).await) })
+                as Pin<Box<dyn Future<Output = MobSessionResolution> + Send>>
         });
         Self {
             inner,
@@ -511,14 +560,32 @@ impl MobIdentityScheduleToolDispatcher {
         }
     }
 
-    async fn rewrite_args(&self, call_name: &str, args: Value) -> Value {
+    /// Rewrite a create or update whose resumable-session target is a mob
+    /// member's bridge session to that member. A rewrite candidate whose mob
+    /// state is gone is refused: it is neither judged by the dead state nor
+    /// let through unrewritten.
+    async fn rewrite_args(&self, call_name: &str, args: Value) -> Result<Value, MobStateStopped> {
         if call_name != "meerkat_schedule_create" && call_name != "meerkat_schedule_update" {
-            return args;
+            return Ok(args);
         }
-        rewrite_resumable_session_target_to_mob_member(args, |session_id| async move {
-            (self.resolve_mob_session)(session_id).await
+        let stopped = AtomicBool::new(false);
+        let rewritten = rewrite_resumable_session_target_to_mob_member(args, |session_id| {
+            let stopped = &stopped;
+            async move {
+                match (self.resolve_mob_session)(session_id).await {
+                    MobSessionResolution::Resolved(found) => found,
+                    MobSessionResolution::Stopped => {
+                        stopped.store(true, Ordering::Relaxed);
+                        None
+                    }
+                }
+            }
         })
-        .await
+        .await;
+        if stopped.load(Ordering::Relaxed) {
+            return Err(MobStateStopped);
+        }
+        Ok(rewritten)
     }
 }
 
@@ -552,7 +619,17 @@ impl meerkat_core::AgentToolDispatcher for MobIdentityScheduleToolDispatcher {
                 format!("invalid schedule tool-call arguments JSON: {error}"),
             )
         })?;
-        let rewritten = self.rewrite_args(call.name, args).await;
+        // A stopped mob state is Meta's stopped driver: refused as
+        // temporarily unavailable, as Core refuses a stopped driver.
+        let rewritten = self
+            .rewrite_args(call.name, args)
+            .await
+            .map_err(|MobStateStopped| {
+                meerkat_core::ToolError::unavailable(
+                    call.name,
+                    meerkat_core::ToolUnavailableReason::TemporarilyUnavailable,
+                )
+            })?;
         let rewritten_raw = serde_json::value::RawValue::from_string(rewritten.to_string())
             .map_err(|error| {
                 meerkat_core::ToolError::invalid_arguments(
@@ -4687,6 +4764,298 @@ schedule = true
             "domain:security",
             "Send the morning digest.",
             "external_event",
+        );
+    }
+
+    /// A mob state with no mobs, over an ephemeral session service, and the
+    /// directory its agent factory uses.
+    fn mob_state_without_mobs() -> (tempfile::TempDir, Arc<MobMcpState>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let factory = AgentFactory::new(dir.path());
+        let builder = FactoryAgentBuilder::new(factory, Config::default());
+        let service = Arc::new(meerkat_session::EphemeralSessionService::new(builder, 4));
+        let state =
+            MobMcpState::new(service, meerkat_mob::MobControlPrincipal::Owner).expect("mob state");
+        (dir, Arc::new(state))
+    }
+
+    /// Schedule tools attached over an in-memory store, and the dispatcher
+    /// they install in the builder's schedule-tools slot.
+    fn schedule_tools_over_a_memory_store() -> (
+        tempfile::TempDir,
+        AttachedScheduleTools,
+        Arc<dyn meerkat_core::AgentToolDispatcher>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let builder = FactoryAgentBuilder::new(AgentFactory::new(dir.path()), Config::default());
+        let attached =
+            attach_schedule_tools_with_store(&builder, Arc::new(MemoryScheduleStore::default()));
+        let installed = builder
+            .default_schedule_tools
+            .read()
+            .expect("schedule tools slot")
+            .clone()
+            .expect("installed schedule tools");
+        (dir, attached, installed)
+    }
+
+    /// Waits up to five seconds for `state` to be dropped.
+    async fn dropped_within_bound(state: &std::sync::Weak<MobMcpState>) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.upgrade().is_some() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        state.upgrade().is_none()
+    }
+
+    /// Runs one schedule tool call through `tools`.
+    async fn schedule_call(
+        tools: &Arc<dyn meerkat_core::AgentToolDispatcher>,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+        let args = RawValue::from_string(args.to_string()).expect("tool arguments");
+        tools
+            .dispatch(ToolCallView {
+                id: "registry-call",
+                name,
+                args: &args,
+            })
+            .await
+    }
+
+    /// Create arguments with a resumable-session prompt target: a candidate
+    /// for the rewrite to a mob member.
+    fn resumable_session_create_args(name: &str) -> serde_json::Value {
+        json!({
+            "name": name,
+            "trigger": {
+                "type": "interval",
+                "start_at_utc": "2026-07-01T05:00:00Z",
+                "every_seconds": 3600
+            },
+            "target": {
+                "target_kind": "session",
+                "type": "resumable_session",
+                "session_id": "019ee0a7-a594-7670-b530-97e7c9e263b7",
+                "action": { "type": "prompt", "prompt": "Check in." }
+            }
+        })
+    }
+
+    /// The installed schedule tools keep no mob state alive: once its owner
+    /// drops the adopted state, it is gone. The registry held it, so a
+    /// stopped host's mob state lived on in every session service's schedule
+    /// tools.
+    #[tokio::test]
+    async fn installed_schedule_tools_keep_no_mob_state_alive() {
+        let (_state_dir, state) = mob_state_without_mobs();
+        let (_dir, attached, _installed) = schedule_tools_over_a_memory_store();
+        attached
+            .mob_target_registry
+            .set_mob_state(Some(Arc::clone(&state)));
+        let adopted = Arc::downgrade(&state);
+        drop(state);
+        assert!(
+            dropped_within_bound(&adopted).await,
+            "the schedule tools kept the dropped mob state alive"
+        );
+    }
+
+    /// A create whose resumable-session target the registry would rewrite to
+    /// a mob member is refused as temporarily unavailable once the adopted
+    /// mob state is gone, as Core refuses a stopped driver; schedule calls
+    /// that are no rewrite candidates still run.
+    #[tokio::test]
+    async fn a_rewrite_candidate_after_the_mob_state_is_gone_is_unavailable() {
+        let (_state_dir, state) = mob_state_without_mobs();
+        let (_dir, attached, installed) = schedule_tools_over_a_memory_store();
+        attached
+            .mob_target_registry
+            .set_mob_state(Some(Arc::clone(&state)));
+        let adopted = Arc::downgrade(&state);
+        drop(state);
+        let gone = dropped_within_bound(&adopted).await;
+
+        let refused = schedule_call(
+            &installed,
+            "meerkat_schedule_create",
+            resumable_session_create_args("after-the-host-stopped"),
+        )
+        .await
+        .err();
+        assert!(
+            matches!(
+                &refused,
+                Some(meerkat_core::ToolError::Unavailable {
+                    reason: meerkat_core::ToolUnavailableReason::TemporarilyUnavailable,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        assert!(gone, "the mob state is gone");
+        assert!(attached.service.list().await.expect("list").is_empty());
+
+        let current_session = json!({
+            "name": "a-session-target",
+            "trigger": {
+                "type": "interval",
+                "start_at_utc": "2026-07-01T05:00:00Z",
+                "every_seconds": 3600
+            },
+            "target": {
+                "target_kind": "session",
+                "type": "resumable_session",
+                "session_id": "019ee0a7-a594-7670-b530-97e7c9e263b7",
+                "action": {
+                    "type": "prompt",
+                    "prompt": "Pinned to the session.",
+                    "system_prompt": "Not a member prompt."
+                }
+            }
+        });
+        schedule_call(&installed, "meerkat_schedule_create", current_session)
+            .await
+            .expect("a target that is no rewrite candidate is created");
+        let schedules = attached.service.list().await.expect("list");
+        assert_eq!(schedules.len(), 1);
+        let schedule_id = schedules[0].schedule_id.to_string();
+        for (name, args) in [
+            ("meerkat_schedule_list", json!({})),
+            (
+                "meerkat_schedule_get",
+                json!({ "schedule_id": schedule_id }),
+            ),
+            (
+                "meerkat_schedule_pause",
+                json!({ "schedule_id": schedule_id }),
+            ),
+        ] {
+            schedule_call(&installed, name, args)
+                .await
+                .unwrap_or_else(|error| panic!("{name} still answers: {error:?}"));
+        }
+    }
+
+    /// A registry that never adopted a mob state passes a rewrite candidate
+    /// through unchanged.
+    #[tokio::test]
+    async fn a_registry_without_a_mob_state_passes_the_target_through() {
+        let (_dir, attached, installed) = schedule_tools_over_a_memory_store();
+        schedule_call(
+            &installed,
+            "meerkat_schedule_create",
+            resumable_session_create_args("no-mob-runtime"),
+        )
+        .await
+        .expect("created");
+        let schedules = attached.service.list().await.expect("list");
+        assert!(
+            matches!(
+                schedules.first().map(|schedule| &schedule.target),
+                Some(TargetBinding::Session(_))
+            ),
+            "{schedules:?}"
+        );
+    }
+
+    /// A torn-down runtime leaves its mob state to no schedule tools: once
+    /// the runtime that owns it shuts down and is dropped, the mob state its
+    /// schedule tools' registry adopted is gone. The registry kept it alive
+    /// for as long as anything held the registry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_torn_down_runtime_leaves_its_mob_state_to_no_schedule_tools() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let state = temp_dir.path().join("state");
+        std::fs::create_dir_all(&state).expect("state dir");
+        let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
+            meerkat_store::SqliteSessionStore::open(state.join("sessions.db"))
+                .expect("session store"),
+        );
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new(state.join("runtime.sqlite"))
+                .expect("runtime store"),
+        );
+        let blob_store: Arc<dyn meerkat_core::BlobStore> =
+            Arc::new(meerkat_store::MemoryBlobStore::new());
+        let factory = AgentFactory::new(&state).comms(true);
+        let mut builder = FactoryAgentBuilder::new(factory, Config::default());
+        builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(
+            session_store.clone(),
+        )));
+        builder.default_blob_store = Some(blob_store.clone());
+        let jobs: Arc<dyn meerkat::DetachedJobStore> =
+            Arc::new(meerkat::MemoryDetachedJobStore::new());
+        builder.default_detached_job_store = Some(Arc::clone(&jobs));
+        let delivery =
+            crate::mob_handle_runtime::MobRuntimeDelivery::new(Arc::clone(&runtime_store), jobs);
+        let attached =
+            attach_schedule_tools_with_store(&builder, Arc::new(MemoryScheduleStore::default()));
+        let mob_tools_slot = Arc::clone(&builder.default_mob_tools);
+        let adapter = Arc::new(
+            meerkat_runtime::MeerkatMachine::persistent(
+                Arc::clone(&runtime_store),
+                Arc::clone(&blob_store),
+            )
+            .expect("runtime machine"),
+        );
+        let session_service = Arc::new(PersistentSessionService::new(
+            builder,
+            16,
+            session_store,
+            runtime_store,
+            blob_store,
+        ));
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            "[mob]\nid = \"registry-teardown\"\n\n[profiles.general]\nmodel = \"gpt-5.5\"\n",
+        )
+        .expect("definition");
+        let mob_spec = crate::mob_handle_runtime::MobBootstrapSpec::new(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            session_service,
+        )
+        .with_session_runtime_adapter(adapter)
+        .expect("the session runtime owner")
+        .with_runtime_delivery(delivery)
+        .with_agent_mob_tools(mob_tools_slot)
+        .expect("install the agent mob tools")
+        .with_options(crate::mob_handle_runtime::MobBootstrapOptions {
+            allow_ephemeral_sessions: true,
+            notify_orchestrator_on_resume: true,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::for_provider(
+                meerkat_core::Provider::OpenAI,
+            ))),
+        });
+        let runtime = crate::UnifiedRuntime::bootstrap(
+            mob_spec,
+            crate::MetaConfig {
+                modules: vec![],
+                discovery: crate::DiscoverySpec {
+                    namespace: "registry-teardown".to_string(),
+                    modules: vec![],
+                },
+                pre_spawn: vec![],
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("bootstrap");
+        let adopted = crate::gateway_composition::adopt_schedule_mob_targets(
+            &runtime,
+            &attached.service,
+            &attached.mob_target_registry,
+        )
+        .await
+        .expect("the runtime has a mob state");
+        let adopted_state = Arc::downgrade(&adopted);
+        drop(adopted);
+        runtime.shutdown().await;
+        drop(runtime);
+        assert!(
+            dropped_within_bound(&adopted_state).await,
+            "the schedule tools kept the torn-down runtime's mob state alive"
         );
     }
 }
