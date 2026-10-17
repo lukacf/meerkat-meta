@@ -315,6 +315,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   to the mob id contract; a store that keeps the default holder methods
   fails `mob_id_holders`.
 
+- `.github/workflows/warm-deps.yml`, dispatched on a branch whose `Cargo.lock`
+  changed, builds the dependency graph of each Rust CI job from that branch's
+  crates.io dependencies, with no workspace code, and keeps it as a 3-day
+  artifact. The branch's pull request extracts the matching artifact in each
+  Rust job (`scripts/ci-warm-deps.py`), but only from a dispatch on its head
+  commit or an ancestor with the same warm-deps files, so a Meerkat Core bump
+  no longer compiles its dependencies cold in every job. CONTRIBUTING.md has
+  the release-preparation steps.
+- Python SDK: `MobHandle.spawn_helper` and `MobHandle.fork_helper` take
+  `transport_timeout` (seconds), as `activate_member_instruction` already
+  does. Both calls answer only once the helper's turn has finished, so the
+  transport's default request timeout (60 seconds) gave up on longer helpers
+  while they still ran. The value bounds only the client's wait and is not
+  sent to the gateway, which sets no deadline of its own on a helper run.
+  When the wait runs out the helper's outcome is unknown and it may still be
+  running: reconcile it before any retry, since a retry starts another
+  helper rather than cancelling or deduplicating the first.
+
 ### Changed
 
 - Flow Editor catalogs give a caller without host access each filesystem
@@ -595,6 +613,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `identity_health_monitor` or `console_forwarder`. The monitor logged
   neither, so a member whose turns it could not count left no trace until
   the stream repair (#455).
+
+- Python SDK: a request timeout longer than `threading.TIMEOUT_MAX` (for
+  example `transport_timeout=1e10`) is refused before the request is
+  written. A per-call `transport_timeout`, a server wait's deadline and a
+  transport's own default raise `ValueError`; `connect()` with such a
+  `gateway_init_timeout` raises `TransportError` ("meta/init failed: ...")
+  caused by that `ValueError`, and sends no `meta/init`. The transport used to
+  write the request and only then fail its wait with `OverflowError`, so the
+  gateway ran the call (a helper spawn, for example) with nobody waiting for
+  the reply.
 
 ### Known limitations
 

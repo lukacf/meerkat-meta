@@ -4736,12 +4736,32 @@ class MobHandle:
         role: str | None = None,
         runtime_mode: str | None = None,
         backend: str | None = None,
+        transport_timeout: float | None = None,
     ) -> HelperResult:
         """Spawn a short-lived helper member and return its bounded result.
 
         ``result_label`` and ``max_text_bytes`` are required by meerkat
         0.8.22's exact helper contract; the byte bound is validated
         upstream before admission.
+
+        The gateway replies only after it has provisioned the helper, the
+        helper's turn has finished and its retirement has been attempted, and
+        it sets no deadline of its own on any of that. ``transport_timeout``
+        (seconds) sets how long this call waits for the reply; it defaults to
+        the transport's request timeout (60 seconds for the stock transport).
+        Size it for all three steps, with margin. It bounds only this client's
+        wait: it is not sent to the gateway, and the helper is not stopped
+        when the wait runs out.
+
+        When the wait runs out, the stock transport raises
+        ``RuntimeError("persistent transport: timeout after <n>s waiting for
+        response")`` and the helper's outcome is unknown: it may still be
+        running and may still finish, and its reply is dropped. Do not retry
+        blindly; reconcile the original helper's status and effects first. A
+        retry under a fresh ``agent_identity`` is a new operation that starts
+        another helper: it neither cancels nor deduplicates the first. A retry
+        under the same ``agent_identity`` queues behind the first helper on
+        identity-first gateways.
         """
         from .types import HelperResult
         params: dict[str, Any] = {
@@ -4759,7 +4779,11 @@ class MobHandle:
             options["backend"] = backend
         if options:
             params["options"] = options
-        raw = await self._runtime._rpc("meta/spawn_helper", params)
+        raw = await self._runtime._rpc(
+            "meta/spawn_helper",
+            params,
+            transport_timeout=transport_timeout,
+        )
         return HelperResult.from_dict(raw)
 
     async def fork_helper(
@@ -4774,12 +4798,18 @@ class MobHandle:
         role: str | None = None,
         runtime_mode: str | None = None,
         backend: str | None = None,
+        transport_timeout: float | None = None,
     ) -> HelperResult:
         """Fork a helper from an existing member's context.
 
         ``result_label`` and ``max_text_bytes`` are required by meerkat
         0.8.22's exact helper contract; the byte bound is validated
         upstream before admission.
+
+        ``transport_timeout`` works as in :meth:`spawn_helper`: it bounds only
+        this client's wait for the forked helper's result, and the same sizing
+        applies. When it runs out the forked helper's outcome is unknown and it
+        may still be running; the retry advice of :meth:`spawn_helper` applies.
         """
         from .types import HelperResult
         params: dict[str, Any] = {
@@ -4800,7 +4830,11 @@ class MobHandle:
             options["backend"] = backend
         if options:
             params["options"] = options
-        raw = await self._runtime._rpc("meta/fork_helper", params)
+        raw = await self._runtime._rpc(
+            "meta/fork_helper",
+            params,
+            transport_timeout=transport_timeout,
+        )
         return HelperResult.from_dict(raw)
 
     # -----------------------------------------------------------------
