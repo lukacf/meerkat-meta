@@ -221,9 +221,7 @@ jobs:
       # runner class is not a valid measurement environment for the assertion.
       # The gate stays armed in local full-suite runs (exclusively scheduled
       # via .config/nextest.toml) and in the release-gate protocol.
-      # The live-event burst test remains CPU-speed-sensitive. History backfill
-      # saturation uses a deterministic read barrier and runs in this gate.
-      - run: scripts/repo-cargo nextest run --workspace --lib --bins -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)' --no-fail-fast
+      - run: scripts/repo-cargo nextest run --workspace --lib --bins -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu)' --no-fail-fast
       - name: Report runner disk
         if: always()
         run: df -h /
@@ -293,9 +291,7 @@ jobs:
       # runner class is not a valid measurement environment for the assertion.
       # The gate stays armed in local full-suite runs (exclusively scheduled
       # via .config/nextest.toml) and in the release-gate protocol.
-      # The live-event burst test remains CPU-speed-sensitive. History backfill
-      # saturation uses a deterministic read barrier and runs in this gate.
-      - run: scripts/repo-cargo nextest run --workspace --test '${{ matrix.tests }}' -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)' --no-fail-fast
+      - run: scripts/repo-cargo nextest run --workspace --test '${{ matrix.tests }}' -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu)' --no-fail-fast
       # cargo's default test selection also builds every example, to prove
       # it compiles and links; one integration half does that here.
       - if: matrix.examples

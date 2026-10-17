@@ -36,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - CI no longer runs on pushes to `ci/**` and `feat/**` branches; those runs
   ran every lane beside the pull request run of the same commit. A branch
   gets CI through its pull request, or a dispatch of the CI workflow.
+- The console aggregator's live-event burst test holds its backfill read on
+  a gate and asserts that every live frame reaches the store while the read
+  is held, instead of racing a slow backfill against a deadline. CI's unit
+  test job, which left it out as timing-sensitive, runs it again, without
+  retries; it had run only in the pre-push unit gate, which is now manual.
 
 ## [0.9.1] - 2026-10-15
 

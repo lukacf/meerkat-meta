@@ -95,10 +95,6 @@ repos:
   #
   #   pre-commit run --hook-stage manual cargo-clippy --from-ref origin/main --to-ref HEAD
   #   pre-commit run --hook-stage manual cargo-test --from-ref origin/main --to-ref HEAD
-  #
-  # The unit gate runs every lib test, while CI's test job leaves out the
-  # CPU-speed-sensitive live_event_burst_reaches_store_while_slow_backfill_is_running;
-  # `make test` (the local full suite) still runs it.
 
   # Clippy on changed crates only (falls back to workspace for root manifest changes)
   - repo: local
