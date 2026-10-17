@@ -94,6 +94,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `MobpackDraftSummary`, and the TypeScript SDK's as `MobpackDraftSummary`.
   A draft id longer than 256 characters is refused.
 
+- `DistillerError`, `HygienistError` and `StewardError` gain an
+  `Incomplete { stop_reason }` variant (see Fixed). Code that matches one of
+  them exhaustively needs an arm for it.
+
 ### Security
 
 - The stock reference app router's documented bound on requests in flight
@@ -470,6 +474,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the unbumped Cargo version, so the dry run stopped with the version files
   modified. The hook now only reports what an execute would bump and stage,
   and refuses, writing nothing, a `DRY_RUN` other than `true` or `false`.
+
+- **Agent-memory stages write nothing from an answer the model did not
+  finish.** The distiller, the hygienist and the steward refused only an
+  output-ceiling stop, so a reply that a provider's content filter cut off,
+  a cancelled response or a tool-call stop was parsed like an answer and
+  could be written as memory or applied as a transcript revision. A
+  completion is now an answer only when the model ended its turn or matched
+  a stop sequence. Any other stop fails the call as
+  `Incomplete { stop_reason }`, and the run, or that harvest, is skipped with
+  the stop named in its skip reason, as an output-ceiling stop already was
+  with `Truncated`. A completion stream that ends before its terminal event is
+  refused too. A stop reason that a later Meerkat adds is refused the same
+  way. Meerkat 0.9.2 itself reports an Anthropic refusal as an ended turn, so
+  against it a refused reply still reads as an answer; it is refused once
+  Meerkat reports refusals as their own stop.
 
 ### Known limitations
 

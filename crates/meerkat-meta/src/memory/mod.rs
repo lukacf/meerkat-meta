@@ -7,6 +7,7 @@
 //! never grow retrieval-index machinery; that is hub material.
 
 pub mod capabilities;
+pub(crate) mod completion;
 pub mod coordinator;
 pub mod dispatch_taint;
 pub mod distiller;
