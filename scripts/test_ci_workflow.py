@@ -123,7 +123,9 @@ class CiWorkflowTests(unittest.TestCase):
         dev-dependency use) share one entry; every other job keeps its own.
         """
         expected = {
-            "fmt-lint": None,
+            # The workspace lint keeps the key it had in fmt-lint, whose
+            # main entry holds its build; fmt-lint itself caches nothing.
+            "clippy": "fmt-lint",
             "test": "test",
             "test-integration": "test",
             "test-extension-state": None,
@@ -166,7 +168,8 @@ class CiWorkflowTests(unittest.TestCase):
         # Jobs that run pull request code stay read-only. Only the cleanup
         # job may delete caches: it runs for pushes to main alone, after every
         # job that saves a rust cache, and drops exactly their families.
-        self.assertEqual(re.findall(r"(?m)^ +permissions:$", source), ["    permissions:"])
+        # The Rust jobs only read actions, to fetch warmed dependency builds
+        # (scripts/test_ci_warm_deps.py pins those grants).
         self.assertEqual(re.findall(r"(?m)^ +actions: write$", source), ["      actions: write"])
         drop = job_block("drop-superseded-caches")
         self.assertIn("    if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n", drop)
@@ -203,10 +206,7 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertGreater(len(integration_tests), 100)
         self.assertEqual(split_coverage_problems(members, patterns), [])
         self.assertIn("    strategy:\n      fail-fast: false\n", block)
-        filter_ = (
-            "-E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) "
-            "and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)'"
-        )
+        filter_ = "-E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu)'"
         expected = {
             "test": f"scripts/repo-cargo nextest run --workspace --lib --bins {filter_} --no-fail-fast",
             "test-integration": (
@@ -220,17 +220,52 @@ class CiWorkflowTests(unittest.TestCase):
                 if line.strip().startswith("- run: scripts/repo-cargo nextest run")
             ]
             self.assertEqual(commands, [command], name)
-            self.assertIn("- name: Reclaim runner disk\n", job_block(name))
             self.assertIn('CARGO_PROFILE_DEV_DEBUG: "0"', job_block(name))
             # The test fixtures give their members and child gateways their
             # own fake OpenAI key, so neither job sets one for the whole run.
             self.assertNotIn("OPENAI_API_KEY", job_block(name), name)
+            # Every disk report runs last, whatever failed before it. The
+            # block ends at the next job, after the comments that precede it.
+            lines = job_block(name).splitlines()
+            while lines and (not lines[-1].strip() or lines[-1].lstrip().startswith("#")):
+                lines.pop()
+            self.assertEqual(lines[-3:], ["      - name: Report runner disk", "        if: always()",
+                                          "        run: df -h /"], name)
+        # The unit build fits the runner's free disk and reclaims nothing;
+        # the integration halves reclaim in the background, never on the
+        # critical path.
+        self.assertNotIn("rm -rf", job_block("test"))
+        reclaim = re.search(r"(?m)^      - name: Reclaim runner disk in the background\n        run: \|\n"
+                            r"((?:          .*\n)+)", block + "\n")
+        self.assertIsNotNone(reclaim)
+        self.assertRegex(reclaim.group(1), r"^          sudo -n nohup ionice -c2 -n7 bash -c 'rm -rf ")
+        self.assertRegex(reclaim.group(1), r"docker image prune -af' >/dev/null 2>&1 &\n          df -h /\n$")
+        self.assertLess(block.index("Reclaim runner disk in the background"), block.index("actions/checkout"))
         # Exactly one half builds the examples.
         self.assertEqual(block.count("            examples: true\n"), 1)
         self.assertIn("      - if: matrix.examples\n        run: scripts/repo-cargo build --workspace --examples\n", block)
         source = CI_WORKFLOW.read_text()
         self.assertEqual(source.count("scripts/repo-cargo build --workspace --examples"), 1)
         self.assertEqual(source.count("scripts/repo-cargo nextest run --workspace"), 2)
+
+    def test_the_unit_job_proves_its_filter_leaves_out_no_lib_or_bin_test(self):
+        """`test` is the only automatic run of the lib and bin tests, since
+        the pre-push unit gate is manual: a lib test its filter dropped once
+        ran in no CI job at all. Before the run it lists those tests with
+        the run's own filter, and scripts/verify-unit-test-filter.py fails
+        the job on any the filter leaves out."""
+        steps = [line.strip()[len("- run: "):] for line in job_block("test").splitlines()
+                 if line.strip().startswith("- run: ")]
+        run = [step for step in steps if step.startswith("scripts/repo-cargo nextest run")]
+        self.assertEqual(len(run), 1, steps)
+        filter_ = re.search(r"-E '[^']*'", run[0]).group(0)
+        listing = '"${RUNNER_TEMP}/unit-tests.json"'
+        self.assertEqual(steps, [
+            f"scripts/repo-cargo nextest list --workspace --lib --bins {filter_} --message-format json > {listing}",
+            f"python3 scripts/verify-unit-test-filter.py {listing}",
+            run[0],
+        ])
+        self.assertIn("- run: python3 scripts/test_verify_unit_test_filter.py\n", job_block("fmt-lint"))
 
     def test_the_split_coverage_guard_reads_targets_as_cargo_does(self):
         """Targets, test flags and autotests in any valid TOML spelling, and
@@ -348,6 +383,29 @@ class CiWorkflowTests(unittest.TestCase):
             "- run: python3 scripts/verify-decorator-authority.py",
             block,
         )
+
+    def test_the_workspace_lint_runs_in_its_own_rust_lane_job(self):
+        """fmt-lint runs on every pull request and compiles nothing; the
+        workspace clippy runs once, in the clippy job, when a Rust change
+        reaches it, beside fmt-lint instead of after its contract tests."""
+        source = CI_WORKFLOW.read_text()
+        command = "- run: scripts/repo-cargo clippy --workspace --all-targets -- -D warnings\n"
+        self.assertEqual(source.count(command), 1)
+        lint = job_block("clippy")
+        self.assertIn(command, lint)
+        self.assertIn("    needs: changes\n    if: needs.changes.outputs.rust == 'true'\n", lint)
+        self.assertIn("          components: clippy\n", lint)
+        fmt_lint = "\n".join(line for line in job_block("fmt-lint").splitlines()
+                             if not line.strip().startswith("#"))
+        self.assertNotIn("needs:", fmt_lint)
+        self.assertNotIn(" if:", fmt_lint)
+        self.assertNotIn("repo-cargo clippy", fmt_lint)
+        self.assertIn("          components: rustfmt\n", fmt_lint)
+        self.assertNotIn("rust-cache", fmt_lint)
+        for kept in ("- run: scripts/repo-cargo fmt --all -- --check\n",
+                     "- run: node scripts/generate-bazel-rust-builds.mjs --check\n",
+                     "- run: scripts/repo-cargo machete --with-metadata\n"):
+            self.assertIn(kept, fmt_lint)
 
     def test_typescript_sdk_suite_actually_runs_in_ci(self):
         """705 TypeScript tests existed and gated nothing.
@@ -539,14 +597,17 @@ class CiWorkflowTests(unittest.TestCase):
             "- name: Native MCP Apps rendering and reload\n",
             "- name: Native MCP Apps polling during an active model turn\n",
             "- name: Native MCP Apps on a builder host with identity-first members\n",
-            "- run: node console/browser-e2e.cjs --shard=${{ matrix.shard }}/2\n",
+            "- run: node console/browser-e2e.cjs --shard=${{ matrix.shard }}/3\n",
             "name: console-browser-${{ github.run_id }}-${{ matrix.shard }}\n",
         ]
         positions = [browser.index(marker) for marker in order]
         self.assertEqual(positions, sorted(positions))
-        # Two legs, each dealt its own scenarios by the registry's --shard=i/2;
-        # the matrix and the shard count must agree. MCP Apps run once.
-        self.assertIn("      matrix:\n        shard: [1, 2]\n", browser)
+        # Three legs, each dealt its own scenarios by the registry's
+        # --shard=i/3; the matrix and the shard count must agree. MCP Apps
+        # run once.
+        legs = re.search(r"(?m)^        shard: \[([0-9, ]+)\]$", browser).group(1).split(", ")
+        self.assertEqual(legs, [str(index) for index in range(1, 4)])
+        self.assertIn(f"--shard=${{{{ matrix.shard }}}}/{len(legs)}\n", browser)
         self.assertIn("      fail-fast: false\n", browser)
         self.assertEqual(browser.count("        if: matrix.shard == 1\n"), 3)
         # The gateway lanes take the default backend; only the builder lane
@@ -590,6 +651,7 @@ class CiWorkflowTests(unittest.TestCase):
         must_gate = {
             "changes",
             "fmt-lint",
+            "clippy",
             "test",
             "test-integration",
             "test-extension-state",
@@ -664,6 +726,12 @@ class CiWorkflowTests(unittest.TestCase):
             ("lanes empty", rust_jobs, {lane: "" for lane in ci_changes.LANES}, 1),
             ("a required job skipped", {"fmt-lint": "skipped"}, console_only, 1),
             ("changes failed", {"changes": "failure"}, every, 1),
+            ("feature lanes skipped when classified false",
+             {job: "skipped" for lane in ("voice", "extension_state") for job in ci_changes.LANE_JOBS[lane]},
+             {**every, "voice": "false", "extension_state": "false"}, 0),
+            ("a voice job skipped while its lane runs", {"voice-clippy": "skipped"},
+             {**every, "extension_state": "false"}, 1),
+            ("the workspace lint skipped while rust runs", {"clippy": "skipped"}, every, 1),
         )
         for name, results, lanes, status in cases:
             with self.subTest(case=name):
@@ -679,6 +747,10 @@ class CiWorkflowTests(unittest.TestCase):
         triggers = source.split("\npermissions:", 1)[0]
         self.assertIn("  workflow_dispatch:\n", triggers)
         self.assertNotIn("inputs:", triggers)
+        # Branches get CI through their pull request (or a dispatch); only
+        # main's pushes run on push, so no branch runs every lane beside its
+        # own pull request run.
+        self.assertIn("  push:\n    branches: [main]\n  pull_request:\n", triggers)
         # Any version or pinned SHA of the checkout action.
         uses = re.findall(r"(?m)^\s*-?\s*uses:\s*actions/checkout@\S+", source)
         checkouts = re.findall(r"(?m)^ *- uses: actions/checkout@\S+\n((?: {8,}.*\n)*)", source)
@@ -777,6 +849,11 @@ class CiWorkflowTests(unittest.TestCase):
         nothing = {lane: "false" for lane in ci_changes.LANES}
         self.assertEqual(self.run_classify_step(printing(console_only), head_classifier=printing(nothing)),
                          console_only)
+        # The classifier before the voice and extension-state lanes printed
+        # the other six; a pull request on such a base runs every lane.
+        six = {lane: "false" for lane in ("rust", "integration", "python", "console", "console_perf",
+                                          "flow_editor")}
+        self.assertEqual(self.run_classify_step(printing(six)), every)
         for case, base in (("predates the lanes", printing({"full": "false"})),
                            ("misses a lane", printing({k: v for k, v in console_only.items() if k != "python"})),
                            ("fails", "raise SystemExit(3)\n"),

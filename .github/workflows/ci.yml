@@ -1,11 +1,18 @@
 name: CI
 
 on:
+  # A branch gets CI through its pull request. Push runs on ci/** and feat/**
+  # branches ran every lane beside the pull request run of the same commit
+  # (41 of the last 100 push runs on 2026-10-16), competing for the same
+  # runners; dispatch the workflow for a full run of a branch without one.
   push:
-    branches: [main, "ci/**", "feat/**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
+# Jobs that build Rust also read actions, to fetch the dependency builds
+# warm-deps.yml warmed for a pull request's branch (scripts/ci-warm-deps.py);
+# their checkouts keep no credentials, since nothing after them uses git.
 permissions:
   contents: read
 
@@ -54,17 +61,20 @@ env:
 
 jobs:
   # Decides which lanes of Rust, console, SDK and example jobs this run
-  # needs. A pull request runs the lanes its changed files can reach: none
-  # for docs or the non-CI workflows, only the console lanes for console/,
-  # every lane but console-perf for Rust sources (scripts/ci-changes.py maps
-  # the paths). Pushes and dispatches always run every lane, so main keeps
-  # the full green run release.yml requires.
+  # needs. A pull request runs the lanes its changed files reach: none for
+  # docs or the non-CI workflows, only the console lanes for console/, rust
+  # and integration for a Rust source, plus the lanes whose own inputs it
+  # changes (scripts/ci-changes.py maps the paths and prints what it left to
+  # the push). Pushes and dispatches always run every lane, so main keeps the
+  # full green run release.yml requires before a tag.
   changes:
     name: changes
     runs-on: ubuntu-24.04
     outputs:
       rust: ${{ steps.classify.outputs.rust }}
       integration: ${{ steps.classify.outputs.integration }}
+      voice: ${{ steps.classify.outputs.voice }}
+      extension_state: ${{ steps.classify.outputs.extension_state }}
       python: ${{ steps.classify.outputs.python }}
       console: ${{ steps.classify.outputs.console }}
       console_perf: ${{ steps.classify.outputs.console_perf }}
@@ -85,7 +95,7 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
         run: |
-          lanes="rust integration python console console_perf flow_editor"
+          lanes="rust integration voice extension_state python console console_perf flow_editor"
           if [[ "${EVENT}" != "pull_request" ]]; then
             echo "${EVENT}: every lane runs"
             for lane in ${lanes}; do
@@ -111,6 +121,10 @@ jobs:
             done
           fi
 
+  # The checks every run needs and no compile: formatting, the repository
+  # contract tests, the generated Bazel files and unused dependencies. The
+  # cargo metadata they read downloads the dependency sources; no build
+  # output is worth a cache entry here.
   fmt-lint:
     name: fmt-lint
     runs-on: ubuntu-24.04
@@ -118,10 +132,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          components: rustfmt
       - run: scripts/repo-cargo fmt --all -- --check
       - run: python3 scripts/check-conflict-markers
       - run: python3 scripts/test_check_conflict_markers.py
@@ -145,12 +156,40 @@ jobs:
       - run: python3 scripts/verify-crate-package-files.py
       - run: python3 scripts/test_verify_crate_package_files.py
       - run: python3 scripts/test_memory_evals.py
+      - run: python3 scripts/test_verify_unit_test_filter.py
+      - run: python3 scripts/test_ci_warm_deps.py
       - run: scripts/check-memory-bright-line
       - run: scripts/memory-evals --check
       - run: node scripts/generate-bazel-rust-builds.mjs --check
       - uses: taiki-e/install-action@cargo-machete
-      - run: scripts/repo-cargo clippy --workspace --all-targets -- -D warnings
       - run: scripts/repo-cargo machete --with-metadata
+
+  # The workspace lint, split from fmt-lint: it ran after fmt-lint's
+  # contract tests and was the run's critical path (run 38776842877: clippy
+  # 610 s after 336 s of test_release_candidate.py, 17.1 minutes in all).
+  # In its own job it runs only when a Rust change reaches it. Its cache
+  # keeps the fmt-lint key, whose main entry holds this lint's build.
+  clippy:
+    name: clippy
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fmt-lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
+      - run: scripts/repo-cargo clippy --workspace --all-targets -- -D warnings
 
   # Unit tests run in one job and integration tests in two halves. As one
   # job, the build took 12.8-16.4 minutes and the run 5.1-6.2 (October
@@ -159,6 +198,12 @@ jobs:
   # 230 s); after it, all integration tests together take 231 s and the
   # examples 38 s. All three jobs build the same dependency graph, so
   # they share the test job's cache.
+  #
+  # The unit build fits the runner's free disk without a reclaim: run
+  # 38776842877 showed 118 GB free after reclaiming about 30 GB, so about
+  # 88 GB before it, and the unit job links about a dozen binaries without
+  # debuginfo, where test-voice links its own with line tables and reclaims
+  # nothing. The foreground reclaim cost the unit job 104 s in that run.
   test:
     name: test
     needs: changes
@@ -173,27 +218,19 @@ jobs:
       # CI test binaries therefore carry no debuginfo; panics keep their
       # messages but backtraces lose file:line. Local builds are unaffected.
       CARGO_PROFILE_DEV_DEBUG: "0"
+    permissions:
+      actions: read
+      contents: read
     steps:
-      # The workspace debug build (meerkat 0.7.25 dep tree + all test
-      # binaries) plus the rust-cache restore no longer fits beside the
-      # runner's preinstalled toolchains - three consecutive runs died to
-      # ENOSPC mid-link. Reclaim ~30GB of images we never use (mirrors
-      # meerkat's release-lane reclaim, meerkat#858).
-      - name: Reclaim runner disk
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
-            /usr/share/swift /usr/local/julia* /opt/microsoft \
-            /usr/local/share/powershell /usr/share/miniconda \
-            /usr/local/share/chromium /usr/local/share/vcpkg
-          sudo docker image prune -af >/dev/null 2>&1 || true
-          df -h /
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - uses: taiki-e/install-action@nextest
       # The idle CPU gate asserts an absolute per-30s CPU budget calibrated on
       # real hardware; GitHub's shared 2-vCPU runners read ~3-4s where real
@@ -201,9 +238,16 @@ jobs:
       # runner class is not a valid measurement environment for the assertion.
       # The gate stays armed in local full-suite runs (exclusively scheduled
       # via .config/nextest.toml) and in the release-gate protocol.
-      # The live-event burst test remains CPU-speed-sensitive. History backfill
-      # saturation uses a deterministic read barrier and runs in this gate.
-      - run: scripts/repo-cargo nextest run --workspace --lib --bins -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)' --no-fail-fast
+      # Both of the filter's tests are integration tests. This job is the only
+      # automatic run of the lib and bin tests (the pre-push unit gate is
+      # manual), so its filter may leave none of those out: the listing
+      # builds what the run reuses, and the check fails on any it drops.
+      - run: scripts/repo-cargo nextest list --workspace --lib --bins -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu)' --message-format json > "${RUNNER_TEMP}/unit-tests.json"
+      - run: python3 scripts/verify-unit-test-filter.py "${RUNNER_TEMP}/unit-tests.json"
+      - run: scripts/repo-cargo nextest run --workspace --lib --bins -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu)' --no-fail-fast
+      - name: Report runner disk
+        if: always()
+        run: df -h /
 
   test-integration:
     name: test-integration (${{ matrix.tests }})
@@ -213,13 +257,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Integration test targets by first letter: [a-i] holds about 60% of
-        # their build time and two thirds of their run time, so the other
-        # half also builds the examples. scripts/test_ci_workflow.py checks
-        # that every integration test target matches exactly one pattern.
+        # Integration test targets by first letter, balanced on run
+        # 38776842877's measured build and run times: split [a-i] / [j-z]
+        # they took 524 s / 412 s to build and 102 s / 45 s to run, because
+        # the identity_first_* targets are a third of the work. On those
+        # numbers each class below holds about 334 s of test builds and
+        # runs, counting the example build (51 s) in the second. Together
+        # the classes cover every letter, and scripts/test_ci_workflow.py
+        # checks that every integration test target matches exactly one.
         include:
-          - tests: "[a-i]*"
-          - tests: "[j-z]*"
+          - tests: "[a-hj-mstv-z]*"
+          - tests: "[inopqru]*"
             examples: true
     env:
       # ~88 debug test binaries each statically link the full meerkat stack.
@@ -230,27 +278,36 @@ jobs:
       # CI test binaries therefore carry no debuginfo; panics keep their
       # messages but backtraces lose file:line. Local builds are unaffected.
       CARGO_PROFILE_DEV_DEBUG: "0"
+    permissions:
+      actions: read
+      contents: read
     steps:
       # The workspace debug build (meerkat 0.7.25 dep tree + all test
       # binaries) plus the rust-cache restore no longer fits beside the
       # runner's preinstalled toolchains - three consecutive runs died to
       # ENOSPC mid-link. Reclaim ~30GB of images we never use (mirrors
-      # meerkat's release-lane reclaim, meerkat#858).
-      - name: Reclaim runner disk
+      # meerkat's release-lane reclaim, meerkat#858). The deletion took
+      # 100-308 s in the foreground (run 38776842877) while the job needs the
+      # space only when the test binaries link, minutes later, so it runs in
+      # the background at the lowest best-effort I/O priority (the idle class
+      # could starve it while the build reads and writes). The last step
+      # reports the disk.
+      - name: Reclaim runner disk in the background
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
-            /usr/share/swift /usr/local/julia* /opt/microsoft \
-            /usr/local/share/powershell /usr/share/miniconda \
-            /usr/local/share/chromium /usr/local/share/vcpkg
-          sudo docker image prune -af >/dev/null 2>&1 || true
+          sudo -n nohup ionice -c2 -n7 bash -c 'rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/share/swift /usr/local/julia* \
+            /opt/microsoft /usr/local/share/powershell /usr/share/miniconda \
+            /usr/local/share/chromium /usr/local/share/vcpkg; docker image prune -af' >/dev/null 2>&1 &
           df -h /
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - uses: taiki-e/install-action@nextest
       # The idle CPU gate asserts an absolute per-30s CPU budget calibrated on
       # real hardware; GitHub's shared 2-vCPU runners read ~3-4s where real
@@ -258,13 +315,14 @@ jobs:
       # runner class is not a valid measurement environment for the assertion.
       # The gate stays armed in local full-suite runs (exclusively scheduled
       # via .config/nextest.toml) and in the release-gate protocol.
-      # The live-event burst test remains CPU-speed-sensitive. History backfill
-      # saturation uses a deterministic read barrier and runs in this gate.
-      - run: scripts/repo-cargo nextest run --workspace --test '${{ matrix.tests }}' -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu) and not test(live_event_burst_reaches_store_while_slow_backfill_is_running)' --no-fail-fast
+      - run: scripts/repo-cargo nextest run --workspace --test '${{ matrix.tests }}' -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu)' --no-fail-fast
       # cargo's default test selection also builds every example, to prove
       # it compiles and links; one integration half does that here.
       - if: matrix.examples
         run: scripts/repo-cargo build --workspace --examples
+      - name: Report runner disk
+        if: always()
+        run: df -h /
 
   # The two meerkat-meta test targets are separate compilations of the
   # library: the integration test links it as a dependency, the --lib run
@@ -275,17 +333,23 @@ jobs:
   test-extension-state:
     name: test-extension-state
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.extension_state == 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_INCREMENTAL: "0"
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - run: scripts/repo-cargo test -p meta-extension-state --locked
       # console-test-faults only adds the console send process test's abort
       # points, so it shares the extension-state build.
@@ -301,37 +365,49 @@ jobs:
   extension-state-lint:
     name: extension-state-lint
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.extension_state == 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_INCREMENTAL: "0"
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - run: scripts/repo-cargo check -p meerkat-meta --locked --no-default-features
       - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features extension-state,console-test-faults --lib --test extension_state --test console_send_recovery_process -- -D warnings
 
   test-voice:
     name: test-voice
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.voice == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # The feature union triggers the repository's Rust 1.97 incremental ICE.
       CARGO_INCREMENTAL: "0"
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       # The shared host uses a loopback provider, never paid credentials.
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --lib --bin rpc_gateway --bin meta_gateway --test console_route_auth --test console_experience --test never_executed_persistence --test swarm_integration console_voice
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --lib gateway_openai_live_registration
@@ -345,20 +421,26 @@ jobs:
   voice-clippy:
     name: voice-clippy
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.voice == 'true'
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # The feature union triggers the repository's Rust 1.97 incremental ICE.
       CARGO_INCREMENTAL: "0"
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features openai-live --lib --bin rpc_gateway --bin meta_gateway -- -D warnings
 
   test-python:
@@ -368,8 +450,13 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -381,6 +468,7 @@ jobs:
           # release.yml's verify_crate_packages restores this entry; no
           # executable from ~/.cargo/bin rides along.
           cache-bin: false
+      - uses: ./.github/actions/fetch-warm-deps
       - run: python -m pip install 'sdk/python[dev]'
       # Gateway-backed structural tests materialize OpenAI profiles but never
       # issue provider requests. Meerkat resolves auth during construction, so
@@ -424,8 +512,13 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # Rust 1.97 incremental compilation can ICE in async identity iteration.
       CARGO_INCREMENTAL: "0"
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -436,6 +529,7 @@ jobs:
         with:
           shared-key: meta-dev-examples
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - run: npm --prefix console ci --silent --no-fund --no-audit
       - run: npm --prefix console run phase0:types --silent
       - run: npm --prefix console run contracts:console --silent
@@ -483,11 +577,14 @@ jobs:
   # scenarios read console/dist and the backends embed
   # crates/meerkat-meta/console-dist, both written by `run build`.
   #
-  # Two shards: browser-e2e's 100 scenarios took 9.5-10.1 minutes in one
+  # Three shards: browser-e2e's 100 scenarios took 9.5-10.1 minutes in one
   # leg (runs 38536518805, 38547674877, 38550484431), and the scenario
   # registry deals each to exactly one --shard=i/n leg
   # (console/scenario-registry.test.cjs). Each leg builds the backends;
-  # MCP Apps run in leg 1.
+  # MCP Apps run in leg 1. With two legs, leg 1 took 14.3 minutes (run
+  # 38776842877: 393 s of backends, 80 s of MCP Apps, 299 s of scenarios).
+  # Dealt three ways, that run's scenario times give 135 s, 217 s and
+  # 222 s, so leg 1's MCP Apps still fit beside its share.
   console-browser:
     name: console-browser
     needs: changes
@@ -496,13 +593,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3]
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # Rust 1.97 incremental compilation can ICE in async identity iteration.
       CARGO_INCREMENTAL: "0"
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -513,6 +615,7 @@ jobs:
         with:
           shared-key: meta-dev-examples
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - run: npm --prefix console ci --silent --no-fund --no-audit
       - run: npm --prefix console run build --silent
       - run: npm --prefix console run build:acceptance --silent
@@ -551,15 +654,15 @@ jobs:
         env:
           META_MCP_APPS_BACKEND: builder
           META_BROWSER_EVIDENCE: ${{ github.workspace }}/output/playwright/console-acceptance/mcp-apps
-      - run: node console/browser-e2e.cjs --shard=${{ matrix.shard }}/2
+      - run: node console/browser-e2e.cjs --shard=${{ matrix.shard }}/3
       - name: Upload console browser evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: console-browser-${{ github.run_id }}-${{ matrix.shard }}
           path: output/playwright/console-acceptance/
-          # Leg 1 always writes MCP Apps evidence; leg 2 writes only what
-          # its scenarios capture.
+          # Leg 1 always writes MCP Apps evidence; the others write only what
+          # their scenarios capture.
           if-no-files-found: ${{ matrix.shard == 1 && 'error' || 'warn' }}
 
   # The composer typing check, split from `console`. It bundles its own
@@ -597,8 +700,13 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -609,6 +717,7 @@ jobs:
         with:
           shared-key: meta-dev-examples
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - run: npm --prefix console ci --silent --no-fund --no-audit
       - run: npm --prefix console run fixtures:console-customization --silent
 
@@ -622,8 +731,13 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -634,6 +748,7 @@ jobs:
         with:
           shared-key: meta-dev-examples
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - run: npm --prefix console ci --silent --no-fund --no-audit
       - run: npm --prefix console exec -- playwright install --with-deps chromium
       - name: Stock incident topology acceptance
@@ -654,8 +769,13 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -669,6 +789,7 @@ jobs:
           # release.yml's verify_crate_packages restores this entry; no
           # executable from ~/.cargo/bin rides along.
           cache-bin: false
+      - uses: ./.github/actions/fetch-warm-deps
       - run: npm --prefix flow-editor ci --silent --no-fund --no-audit
       - run: npm --prefix flow-editor exec -- playwright install --with-deps chromium
       - run: CARGO_INCREMENTAL=0 scripts/repo-cargo build -p meerkat-meta --bin meta_flow_editor
@@ -715,7 +836,7 @@ jobs:
   drop-superseded-caches:
     name: drop-superseded-caches
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [fmt-lint, test, test-integration, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, console, console-browser, console-fixtures, console-acceptance, flow-editor]
+    needs: [clippy, test, test-integration, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, console, console-browser, console-fixtures, console-acceptance, flow-editor]
     runs-on: ubuntu-24.04
     continue-on-error: true
     permissions:
@@ -731,13 +852,15 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [changes, fmt-lint, test, test-integration, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, test-typescript, console, console-browser, console-perf, console-fixtures, console-acceptance, flow-editor, audit]
+    needs: [changes, fmt-lint, clippy, test, test-integration, test-extension-state, extension-state-lint, test-voice, voice-clippy, test-python, test-typescript, console, console-browser, console-perf, console-fixtures, console-acceptance, flow-editor, audit]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results
         env:
           LANE_RUST: ${{ needs.changes.outputs.rust }}
           LANE_INTEGRATION: ${{ needs.changes.outputs.integration }}
+          LANE_VOICE: ${{ needs.changes.outputs.voice }}
+          LANE_EXTENSION_STATE: ${{ needs.changes.outputs.extension_state }}
           LANE_PYTHON: ${{ needs.changes.outputs.python }}
           LANE_CONSOLE: ${{ needs.changes.outputs.console }}
           LANE_CONSOLE_PERF: ${{ needs.changes.outputs.console_perf }}
@@ -764,12 +887,13 @@ jobs:
           }
           check changes "${{ needs.changes.result }}" required
           check fmt-lint "${{ needs.fmt-lint.result }}" required
+          check clippy "${{ needs.clippy.result }}" rust
           check test "${{ needs.test.result }}" rust
           check test-integration "${{ needs.test-integration.result }}" integration
-          check test-extension-state "${{ needs.test-extension-state.result }}" rust
-          check extension-state-lint "${{ needs.extension-state-lint.result }}" rust
-          check test-voice "${{ needs.test-voice.result }}" rust
-          check voice-clippy "${{ needs.voice-clippy.result }}" rust
+          check test-extension-state "${{ needs.test-extension-state.result }}" extension_state
+          check extension-state-lint "${{ needs.extension-state-lint.result }}" extension_state
+          check test-voice "${{ needs.test-voice.result }}" voice
+          check voice-clippy "${{ needs.voice-clippy.result }}" voice
           check test-python "${{ needs.test-python.result }}" python
           check test-typescript "${{ needs.test-typescript.result }}" required
           check console "${{ needs.console.result }}" console

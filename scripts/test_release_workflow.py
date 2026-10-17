@@ -90,22 +90,27 @@ def job_condition(name: str) -> str:
     return " ".join(body)
 
 
-def evaluate_condition(expression: str, *, statuses=(), **context) -> bool:
+def evaluate_condition(expression: str, *, statuses=(), run_cancelled=False, **context) -> bool:
     """Evaluate a GitHub `if:` expression under an explicit context.
 
     String assertions cannot tell a conjunction from a disjunction, which is the
     entire defect class here, so the gate is exercised rather than pattern
     matched. Any name the expression uses that the caller did not supply raises,
     so a renamed input fails loudly instead of silently reading as falsey.
+    `run_cancelled` models a run cancelled before the job starts. GitHub's
+    cancelled() reads the run, not the needs ("Returns true if the workflow
+    was canceled"), so a need cancelled on its own, by a timeout, does not
+    make it true. A cancelled run makes success() false too; always() stays
+    true.
     """
     expression = expression.strip()
     if expression.startswith("${{") and expression.endswith("}}"):
         expression = expression[3:-2].strip()
     functions = {
         "always": lambda: True,
-        "success": lambda: all(status == "success" for status in statuses),
+        "success": lambda: not run_cancelled and all(status == "success" for status in statuses),
         "failure": lambda: "failure" in statuses,
-        "cancelled": lambda: "cancelled" in statuses,
+        "cancelled": lambda: run_cancelled,
         "startsWith": lambda value, prefix: value.startswith(prefix),
         "contains": lambda value, part: part in value,
     }
@@ -166,7 +171,7 @@ def job_ancestors(name: str) -> list[str]:
     return sorted(seen, key=lambda job: (JOBS.index(job) if job in JOBS else len(JOBS), job))
 
 
-def job_runs(name: str, **context) -> bool:
+def job_runs(name: str, *, run_cancelled=False, **context) -> bool:
     """Apply GitHub's status semantics: status functions, explicit or the
     implicit success() of a condition without one, read every ancestor."""
     expression = job_condition(name)
@@ -182,9 +187,10 @@ def job_runs(name: str, **context) -> bool:
         statuses.append(context[key])
     # Evaluate first even if implicit success is false: missing contexts must
     # never disappear behind a skipped dependency or short-circuited branch.
-    condition = evaluate_condition(expression, statuses=statuses, **context)
+    condition = evaluate_condition(expression, statuses=statuses, run_cancelled=run_cancelled, **context)
     explicit_status = re.search(r"\b(?:always|success|failure|cancelled)\s*\(", expression)
-    return condition and (bool(explicit_status) or all(s == "success" for s in statuses))
+    return condition and (bool(explicit_status)
+                          or (not run_cancelled and all(s == "success" for s in statuses)))
 
 
 # Dependency order: a candidate's build legs overlap exact-main CI, so they
@@ -928,7 +934,7 @@ class ReleaseProtocolConditionsTests(unittest.TestCase):
         self.assertEqual((results["require_ci_green"], results["collect_candidate"]), ("skipped", "skipped"))
 
     def test_the_ci_gate_runs_after_candidate_builds_and_first_in_every_other_mode(self):
-        self.assertIn("always()", job_condition("require_ci_green"))
+        self.assertIn("!cancelled()", job_condition("require_ci_green"))
         for mode in ("candidate", "promote", "existing", "assets", "tag"):
             for resolved, built in itertools.product(("success", "failure", "skipped", "cancelled"), repeat=2):
                 context = protocol_context(mode, event="push" if mode == "tag" else "workflow_dispatch")
@@ -981,7 +987,7 @@ class ReleaseProtocolConditionsTests(unittest.TestCase):
         # or failed; a skipped or cancelled SDK job still stops it.
         accepted = {("publish_registries", "publish_sdk_packages"): ("success", "failure")}
         for job, mode, publish, dry, required in scenarios:
-            self.assertIn("always()", job_condition(job))
+            self.assertIn("!cancelled()", job_condition(job))
             # resolve_release is already required by validation (and by the
             # registry DAG for docs). Its failure cascade is tested above.
             dependencies = [need for need in job_needs(job) if need != "resolve_release"]
@@ -1000,13 +1006,13 @@ class ReleaseProtocolConditionsTests(unittest.TestCase):
     def test_jobs_run_only_when_every_declared_need_succeeded(self):
         # build_binaries keeps the implicit success(): its only ancestor is the
         # resolver. Every other job has an ancestor that some mode skips, so it
-        # states each need's result under always() (GitHubSkipPropagationTests).
+        # states each need's result under !cancelled() (GitHubSkipPropagationTests).
         self.assertNotIn("always()", job_condition("build_binaries"))
         for job, mode in (("release_validate", "candidate"), ("release_validate", "promote"),
                           ("build_binaries", "candidate"), ("collect_candidate", "candidate"),
                           ("verify_release_assets", "promote"), ("verify_crate_packages", "promote")):
             if job != "build_binaries":
-                self.assertIn("always()", job_condition(job))
+                self.assertIn("!cancelled()", job_condition(job))
             for statuses in itertools.product(("success", "failure", "skipped", "cancelled"),
                                               repeat=len(job_needs(job))):
                 context = protocol_context(mode)
@@ -1121,6 +1127,26 @@ class GitHubSkipPropagationTests(unittest.TestCase):
                 for need in job_needs(job):
                     self.assertIn(f"needs.{need}.result", condition)
 
+    def test_a_cancelled_run_starts_no_job_after_its_cancellation(self):
+        # always() starts a job whose needs succeeded even after the run was
+        # cancelled, so a cancelled promotion could still publish. Every job
+        # condition uses !cancelled() as its status function instead.
+        for job in JOBS:
+            with self.subTest(job=job):
+                self.assertNotRegex(job_condition(job), r"\balways\s*\(")
+        for label, mode, publish, dry, event, expected in self.MODES:
+            context = protocol_context(mode, publish, dry, event=event)
+            results = release_results(context)
+            context.update({f"needs_{job}_result": result for job, result in results.items()})
+            for job in sorted((self.BASE | expected) - {"resolve_release"}):
+                with self.subTest(mode=label, job=job):
+                    self.assertTrue(job_runs(job, **context))
+                    self.assertFalse(job_runs(job, run_cancelled=True, **context))
+        # The model is exercised, not assumed: always() ignores the cancel.
+        context = protocol_context("promote")
+        self.assertTrue(evaluate_condition("always() && true", run_cancelled=True, **context))
+        self.assertFalse(evaluate_condition("!cancelled() && true", run_cancelled=True, **context))
+
 
 class WorkflowExtractorTests(unittest.TestCase):
     def test_bounded_jobs_and_steps_cannot_borrow_guards_from_their_neighbors(self):
@@ -1148,7 +1174,9 @@ class WorkflowExtractorTests(unittest.TestCase):
         self.assertTrue(evaluate_condition("!false && true != false && always()"))
         self.assertFalse(evaluate_condition("success()", statuses=("skipped",)))
         self.assertTrue(evaluate_condition("failure()", statuses=("failure",)))
-        self.assertTrue(evaluate_condition("cancelled()", statuses=("cancelled",)))
+        self.assertTrue(evaluate_condition("cancelled()", run_cancelled=True))
+        self.assertFalse(evaluate_condition("cancelled()", statuses=("cancelled",)))
+        self.assertFalse(evaluate_condition("success()", statuses=("success",), run_cancelled=True))
         with self.assertRaisesRegex(AssertionError, "unsupported"):
             evaluate_condition("unknownFunction()")
         with self.assertRaisesRegex(AssertionError, "unsupported"):
@@ -1605,18 +1633,6 @@ class LinuxReleaseContainerTests(unittest.TestCase):
         self.assertIsNotNone(declared, "the gate must declare an overridable default floor")
         self.assertEqual(declared.group(1), CONTAINER_GLIBC[codename])
 
-    def test_the_linux_cache_key_names_the_container(self):
-        # rust-cache keys on rustc, the lock and the env; none changed when the
-        # Linux legs moved into the container, so the host-built target dir
-        # would be restored into it and the gate would refuse the same stale
-        # cache on every retry. The other legs keep their existing keys.
-        key = scalar(step_block("Cache cargo registry"), "key", "          ")
-        linux = render_template(key, matrix_target="x86_64-unknown-linux-gnu")
-        mac = render_template(key, matrix_target="aarch64-apple-darwin")
-
-        self.assertIn(self.linux_image().rsplit(":", 1)[1], linux)
-        self.assertEqual(mac, "release-aarch64-apple-darwin")
-
     def test_the_gate_runs_on_linux_after_the_build_and_before_anything_ships(self):
         block = job_block("build_binaries")
         gate = block.index("      - name: Check Linux binary portability")
@@ -1896,18 +1912,21 @@ def hashed_env(block: str, indent: str) -> dict[str, str]:
 
 
 class ReleaseCacheReuseTests(unittest.TestCase):
-    def test_release_caches_hold_no_failed_builds_and_no_executables(self):
-        """A failed leg must not pin a half-built entry as an exact hit, and
-        no restored ~/.cargo/bin executable may shadow a build or signing tool."""
+    def test_release_runs_save_no_rust_cache(self):
+        """Release jobs saved entries keyed on Cargo.lock that no later
+        release restored (every v0.9.2 leg found "No cache found") while they
+        took a third of the repository's cache budget. The only rust cache
+        left is verify_crate_packages' read-only restore of main CI's entry,
+        and it restores no ~/.cargo/bin executable."""
         source = RELEASE_WORKFLOW.read_text()
         self.assertNotIn("cache-on-failure", source)
         steps = re.findall(r"- (?:name: [^\n]+\n\s+)?uses: Swatinem/rust-cache@v2\n((?: {8}.*\n)*)", source)
         self.assertEqual(len(steps), source.count("uses: Swatinem/rust-cache@v2"))
-        for settings in steps:
-            self.assertIn("          cache-bin: false\n", settings)
-        cache = step_block("Cache cargo registry")
-        # Candidate runs dispatch from main, so their entries are main's.
-        self.assertNotIn("save-if", cache)
+        self.assertEqual(len(steps), 1)
+        self.assertIn("          save-if: false\n          cache-bin: false\n", steps[0])
+        for job in ("build_binaries", "release_validate", "publish_registries"):
+            with self.subTest(job=job):
+                self.assertNotIn("rust-cache", job_block(job))
         self.assertFalse((ROOT / ".github/workflows/release-prewarm.yml").exists())
 
     def test_crate_verification_restores_the_exact_main_ci_dependency_build(self):
@@ -1953,13 +1972,10 @@ class ReleaseCacheReuseTests(unittest.TestCase):
         self.assertNotIn("permissions:", verify)
 
     # Jobs that hold a secret or a write grant and still restore a cache, and
-    # why that cache is trusted. build_binaries restores only release.yml's
-    # own entries, which only successful candidate legs of merged main write,
-    # and restores no executables; its tools are named by absolute path.
-    # e2e-live restores without saving and without executables, and its
-    # provider secret reaches only the step that makes the real calls.
+    # why that cache is trusted. e2e-live restores without saving and without
+    # executables, and its provider secret reaches only the step that makes
+    # the real calls.
     CACHE_HOLDER_ALLOWLIST = {
-        ("release.yml", "build_binaries"),
         ("e2e-live.yml", "e2e-live"),
     }
 
