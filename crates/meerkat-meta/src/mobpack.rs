@@ -5323,9 +5323,6 @@ pub fn apply_mobpack_authoring_operation_with_runtime(
 ) -> Result<Value, String> {
     enforce_mobpack_draft_expected_revision(params, "meta/mobpacks/apply_operation")?;
     let mut document = document_from_params(params)?;
-    // No operation reads a graph past the structure caps; the graph
-    // operations check again after their edit.
-    refuse_graph_past_structure_caps(&document)?;
     let operation = params
         .get("operation")
         .and_then(Value::as_object)
@@ -5337,6 +5334,13 @@ pub fn apply_mobpack_authoring_operation_with_runtime(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "meta/mobpacks/apply_operation requires operation.type".to_string())?;
+    // No operation but a delete reads a graph past the structure caps, so a
+    // document past them can be brought back under them; every operation is
+    // checked again after its edit.
+    let graph_before = graph_structure_sizes(&document);
+    if !operation_only_removes(operation_type) {
+        refuse_graph_past_structure_caps(&document)?;
+    }
     if operation.get("document").is_some() {
         return Err(format!(
             "{operation_type} does not accept operation.document; use meta/mobpacks/import or create/save for document replacement"
@@ -5403,6 +5407,7 @@ pub fn apply_mobpack_authoring_operation_with_runtime(
             ));
         }
     };
+    refuse_graph_grown_past_structure_caps(&document, graph_before)?;
     // An authoring edit never runs `rkat` or writes an archive, whatever its
     // params ask: `meta/mobpacks/validate` is the one method with an `rkat`
     // phase, and the one the host-mutation advertisement names for it.
@@ -11067,8 +11072,7 @@ fn apply_delete_graph_node_operation(
     document.instances = Value::Array(instances);
     document.edges = Value::Array(edges);
     reject_raw_graph_operation_sections(operation, &["frames"])?;
-    document.flow = graph_to_flow_within_caps(document)?;
-    reconcile_flow_step_launch_modes(document);
+    derive_flow_from_shrunk_graph(document);
     Ok(json!({ "kind": null, "id": null }))
 }
 
@@ -11482,8 +11486,7 @@ fn apply_delete_graph_edge_operation(
     }
     document.edges = Value::Array(edges);
     reject_raw_graph_operation_sections(operation, &["frames"])?;
-    document.flow = graph_to_flow_within_caps(document)?;
-    reconcile_flow_step_launch_modes(document);
+    derive_flow_from_shrunk_graph(document);
     Ok(json!({ "kind": null, "id": null }))
 }
 
@@ -18127,11 +18130,11 @@ fn member_tool_count(member: &Value) -> usize {
 /// most [`MOBPACK_MAX_GRAPH_INSTANCES`] instances and
 /// [`MOBPACK_MAX_GRAPH_EDGES`] edges. Deriving a flow indexes the graph once,
 /// but lanes that run through shared nodes still walk them again, so a graph
-/// past the caps is refused before anything derives a flow from it, edits it
-/// or checks it further.
+/// past the caps is refused before anything derives a flow from it or checks
+/// it further, and only a delete edits it.
 fn graph_structure_refusals(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
     let mut refusals = Vec::new();
-    let instances = document.instances.as_array().map_or(0, Vec::len);
+    let (instances, edges) = graph_structure_sizes(document);
     if instances > MOBPACK_MAX_GRAPH_INSTANCES {
         refusals.push(MobpackDiagnostic {
             severity: "error".to_string(),
@@ -18143,7 +18146,6 @@ fn graph_structure_refusals(document: &MobpackDocument) -> Vec<MobpackDiagnostic
             path: Some("instances".to_string()),
         });
     }
-    let edges = document.edges.as_array().map_or(0, Vec::len);
     if edges > MOBPACK_MAX_GRAPH_EDGES {
         refusals.push(MobpackDiagnostic {
             severity: "error".to_string(),
@@ -18163,6 +18165,56 @@ fn refuse_graph_past_structure_caps(document: &MobpackDocument) -> Result<(), St
     match graph_structure_refusals(document).into_iter().next() {
         Some(refusal) => Err(refusal.message),
         None => Ok(()),
+    }
+}
+
+/// The sizes of a document's graph that the structure caps bound: its
+/// instances and its edges.
+fn graph_structure_sizes(document: &MobpackDocument) -> (usize, usize) {
+    (
+        document.instances.as_array().map_or(0, Vec::len),
+        document.edges.as_array().map_or(0, Vec::len),
+    )
+}
+
+/// Whether graph sizes are past the structure caps.
+fn graph_sizes_past_caps((instances, edges): (usize, usize)) -> bool {
+    instances > MOBPACK_MAX_GRAPH_INSTANCES || edges > MOBPACK_MAX_GRAPH_EDGES
+}
+
+/// Refuses an operation that left the graph past the structure caps, unless
+/// the graph was past them before and the operation grew neither its
+/// instances nor its edges: no edit pushes a graph past the caps, and on a
+/// graph past them an edit may only shrink it.
+fn refuse_graph_grown_past_structure_caps(
+    document: &MobpackDocument,
+    before: (usize, usize),
+) -> Result<(), String> {
+    let after = graph_structure_sizes(document);
+    if graph_sizes_past_caps(before) && after.0 <= before.0 && after.1 <= before.1 {
+        return Ok(());
+    }
+    refuse_graph_past_structure_caps(document)
+}
+
+/// The operations that only remove: a flow step, a graph node or edge, or a
+/// member, with what refers to it. They are the operations let through on a
+/// document whose graph is past the structure caps, so it can always be
+/// brought back under them.
+fn operation_only_removes(operation_type: &str) -> bool {
+    matches!(
+        operation_type,
+        "delete_flow_step" | "delete_graph_node" | "delete_graph_edge" | "delete_member"
+    )
+}
+
+/// Derives the flow from a graph a delete shrank. A graph still past the
+/// structure caps keeps the flow it had: nothing derives a flow from a graph
+/// past the caps, and the delete that brings it under them derives the flow.
+fn derive_flow_from_shrunk_graph(document: &mut MobpackDocument) {
+    if !graph_sizes_past_caps(graph_structure_sizes(document)) {
+        document.flow = graph_to_flow_from_document(document);
+        reconcile_flow_step_launch_modes(document);
     }
 }
 
@@ -39551,7 +39603,8 @@ branch = "choice"
     /// refused before anything derives a flow from it, edits it or checks it
     /// further: validation reports `too_many_graph_instances` or
     /// `too_many_graph_edges` and none of the graph's own problems, and
-    /// graph-to-flow, every operation and rendering refuse it.
+    /// graph-to-flow, every operation but the deletes, and rendering refuse
+    /// it.
     #[test]
     fn graphs_past_the_structure_caps_are_refused() {
         let over_caps = |instances: usize, edges: usize| {
@@ -39610,10 +39663,11 @@ branch = "choice"
         }
     }
 
-    /// Every operation is refused on a document whose graph is past the
-    /// structure caps, an operation that never edits the graph included:
-    /// operations that do not edit it can still walk it (reconciling members
-    /// prunes its instances), so none reads a graph past the caps.
+    /// Every operation but the deletes is refused on a document whose graph
+    /// is past the structure caps, an operation that never edits the graph
+    /// included: operations that do not edit it can still walk it
+    /// (reconciling members prunes its instances), so none reads a graph past
+    /// the caps.
     #[test]
     fn an_operation_that_does_not_edit_the_graph_is_refused_past_the_caps() {
         let mut document = valid_document();
@@ -40069,5 +40123,116 @@ condition = { op = "eq", path = "params.kind", value = "d" }
             .expect_err("rendering a member past the tool cap is refused");
         assert!(refusal.contains("refusing to render it"), "{refusal}");
         assert!(!codes(&with_tools(MOBPACK_MAX_MEMBER_TOOLS)).contains("too_many_member_tools"));
+    }
+
+    /// A document whose flow runs `count` member steps, one after another,
+    /// with the graph they project to: `count` instances and `count - 1`
+    /// edges.
+    fn chained_member_steps_document(count: usize) -> MobpackDocument {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.members = json!([{ "id": "worker", "name": "Worker" }]);
+        let steps: Vec<Value> = (0..count)
+            .map(|index| json!({ "id": format!("s{index}"), "type": "member", "role": "worker" }))
+            .collect();
+        let (instances, edges, frames) = graph_projection_from_visual_steps(&steps);
+        document.flow = json!({ "steps": steps });
+        document.instances = Value::Array(instances);
+        document.edges = Value::Array(edges);
+        document.frames = Value::Array(frames);
+        document
+    }
+
+    /// Runs one authoring operation on a document.
+    fn apply_operation_to(document: &Value, operation: Value) -> Result<Value, String> {
+        apply_mobpack_authoring_operation(&json!({
+            "document": document,
+            "operation": operation,
+        }))
+    }
+
+    /// A flow operation derives the graph again from the flow, and is refused
+    /// when that graph would be past the structure caps, as a graph operation
+    /// is.
+    #[test]
+    fn a_flow_operation_cannot_push_the_graph_past_the_caps() {
+        let insert = json!({
+            "type": "insert_flow_step",
+            "step": { "id": "extra", "type": "member", "role": "worker" },
+            "lane_ref": { "lane": "main", "index": 0 },
+        });
+        let at_caps = json!(chained_member_steps_document(MOBPACK_MAX_GRAPH_INSTANCES));
+        let refusal = apply_operation_to(&at_caps, insert.clone())
+            .expect_err("a step that pushes the graph past the caps is refused");
+        assert!(refusal.contains("refusing the document"), "{refusal}");
+        let under_caps = json!(chained_member_steps_document(
+            MOBPACK_MAX_GRAPH_INSTANCES - 1
+        ));
+        let inserted = apply_operation_to(&under_caps, insert)
+            .expect("a step that keeps the graph within the caps");
+        assert_eq!(
+            inserted["document"]["instances"].as_array().map(Vec::len),
+            Some(MOBPACK_MAX_GRAPH_INSTANCES)
+        );
+    }
+
+    /// On a document whose graph is past the structure caps the deletes are
+    /// let through, so it can be brought back under the caps. A node delete
+    /// that leaves the graph past them keeps the document's flow, and the one
+    /// that brings it under them derives the flow again. Every other
+    /// operation is still refused.
+    #[test]
+    fn deletes_bring_a_graph_past_the_caps_back_under_them() {
+        let past = json!(chained_member_steps_document(
+            MOBPACK_MAX_GRAPH_INSTANCES + 2
+        ));
+        let refusal = apply_operation_to(
+            &past,
+            json!({
+                "type": "insert_flow_step",
+                "step": { "id": "extra", "type": "member", "role": "worker" },
+                "lane_ref": { "lane": "main" },
+            }),
+        )
+        .expect_err("an insert on a graph past the caps is refused");
+        assert!(refusal.contains("refusing the document"), "{refusal}");
+
+        let step_deleted = |document: &Value, id: &str| {
+            apply_operation_to(
+                document,
+                json!({ "type": "delete_flow_step", "step_id": id }),
+            )
+            .expect("a step delete on a graph past the caps is let through")["document"]
+                .clone()
+        };
+        let under = step_deleted(&step_deleted(&past, "s0"), "s1");
+        assert_eq!(
+            under["instances"].as_array().map(Vec::len),
+            Some(MOBPACK_MAX_GRAPH_INSTANCES)
+        );
+
+        let node_deleted = |document: &Value, id: &str| {
+            apply_operation_to(
+                document,
+                json!({ "type": "delete_graph_node", "instance_id": id }),
+            )
+            .expect("a node delete on a graph past the caps is let through")["document"]
+                .clone()
+        };
+        let still_past = node_deleted(&past, "s0");
+        assert_eq!(still_past["flow"], past["flow"]);
+        let under = node_deleted(&still_past, "s1");
+        let derived: Vec<&str> = under["flow"]["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|step| step["type"] == "member")
+            .filter_map(|step| step["id"].as_str())
+            .collect();
+        assert_eq!(derived.len(), MOBPACK_MAX_GRAPH_INSTANCES);
+        assert!(
+            !derived.contains(&"s0") && !derived.contains(&"s1"),
+            "{derived:?}"
+        );
     }
 }

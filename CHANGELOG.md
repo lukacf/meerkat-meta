@@ -57,11 +57,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   returned it as an error result.
 
 - Behaviour-only: `meta/mobpacks/apply_operation` refuses every operation
-  with `-32602`, not only the graph operations, on a document whose graph
-  has more than 2048 instances or more than 8192 edges: operations that do
-  not edit the graph can still walk it. `meta/mobpacks/graph_to_flow`,
-  export and deploy refuse such a document too, and its validation fails
-  with `too_many_graph_instances` or `too_many_graph_edges` (see Security).
+  but the deletes (`delete_flow_step`, `delete_graph_node`,
+  `delete_graph_edge` and `delete_member`) with `-32602`, not only the
+  graph operations, on a document whose graph has more than 2048 instances
+  or more than 8192 edges: operations that do not edit the graph can still
+  walk it. The deletes are let through so such a document can be brought
+  back under the caps. An operation that would push the graph past the
+  caps, a flow operation that derives the graph again from the flow
+  included, is refused too. `meta/mobpacks/graph_to_flow`, export and
+  deploy refuse such a document, and its validation fails with
+  `too_many_graph_instances` or `too_many_graph_edges` (see Security).
 - Behaviour-only: Flow Editor draft replies other than `meta/mobpacks/get`
   (`create`, `save`, `list`, `undo`, `redo` and `delete`) carry each draft as
   stored, with the editor document it was saved with. They no longer
@@ -265,11 +270,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   edges. No structure cap counted the graph, and deriving a flow from it
   still walks nodes that several lanes run through once per lane. Past the
   caps, validation fails with `too_many_graph_instances` or
-  `too_many_graph_edges` and reads the graph no further, and
-  `meta/mobpacks/graph_to_flow`, every `meta/mobpacks/apply_operation` and
-  rendering (export and deploy) refuse the document with `-32602` before
-  reading its graph. A graph operation that grows a graph past them is
-  refused too.
+  `too_many_graph_edges` and checks nothing after the caps, and
+  `meta/mobpacks/graph_to_flow`, rendering (export and deploy) and every
+  `meta/mobpacks/apply_operation` but the deletes refuse the document with
+  `-32602` before deriving anything from its graph. The deletes are let
+  through so the document can be brought back under the caps; while its
+  graph stays past them, a deleted node or edge leaves the flow as it was.
+  An operation that would push a graph past the caps, a flow operation
+  that derives the graph again from the flow included, is refused.
 - Importing a mob definition into the Flow Editor (`meta/mobpacks/import`,
   and the draft methods that re-import a stored archive) groups each frame's
   steps in one pass over the frame. Every step searched the whole frame for
