@@ -378,8 +378,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   exempt create included) records its holder and binds when its mob
   activates. Activations under an id are decided one at a time: one that
   finds a live mob bound under the id is refused, records nothing and drops
-  its admission. A restore, or a held child's resume, binds when the store
-  records the mob's own holder for the id, or when no live document names the
+  whatever admission is pending under the id. A restore, or a held child's
+  resume, binds when the store records the mob's own holder for the id, or
+  when no live document names the
   id. When live documents name the id and the store records another holder,
   the documents were written while that holder's mob held the id, and the
   restored mob is quarantined: it is bound, but its members resolve no
