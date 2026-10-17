@@ -10,6 +10,10 @@ All notable changes to the Python SDK are documented here.
   `updated_at_unix_ms`, `can_undo` and `can_redo`): Meta lists drafts
   without their documents. A write's `row` is still a whole
   `MobpackDraftRow`; `meta/mobpacks/get` returns a draft's document.
+- `MobpackDraftSaveResult`, `MobpackDraftHistoryResult` and
+  `MobpackDraftDeleteResult` carry `durability_warning`, set when Meta wrote
+  the draft store but could not sync its directory: the write took effect
+  and may not survive a crash.
 
 ## 0.9.2
 

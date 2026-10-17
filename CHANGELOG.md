@@ -20,13 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   included, is refused too. `meta/mobpacks/graph_to_flow`, export and
   deploy refuse such a document, and its validation fails with
   `too_many_graph_instances` or `too_many_graph_edges` (see Security).
-- Behaviour-only: Flow Editor draft replies other than `meta/mobpacks/get`
-  (`create`, `save`, `list`, `undo`, `redo` and `delete`) carry each draft as
-  stored, with the editor document it was saved with. They no longer
-  re-import each valid draft's archive and carry its document with
-  `document_source: "mobpack_archive"` and `document_authority: "artifact"`;
-  `get` still does, for the draft it returns. A document past a structure
-  cap now fails validation with the cap's diagnostic alone.
+- Behaviour-only: the `row` of a Flow Editor draft write
+  (`meta/mobpacks/create`, `save`, `undo` and `redo`) is the draft as
+  stored, with the editor document it was saved with. Draft replies other
+  than `meta/mobpacks/get` no longer re-import each valid draft's archive
+  and carry its document with `document_source: "mobpack_archive"` and
+  `document_authority: "artifact"`; `get` still does, for the draft it
+  returns. A document past a structure cap now fails validation with the
+  cap's diagnostic alone.
 - Behaviour and SDK types: Flow Editor draft replies list the drafts as
   summaries. The `rows` of `meta/mobpacks/create`, `save`, `list`, `undo`,
   `redo` and `delete` hold each draft's `id`, `name`, `version`, `stage`,
@@ -154,7 +155,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   method read and parsed such a file whole, the store took the default file
   mode, and writers sharing a store raced on one fixed `.json.tmp` file.
   The new file is synced to disk before the rename and its directory after
-  it, so a crash leaves either the old store or the new one whole.
+  it, so a crash leaves either the old store or the new one whole. A write
+  whose directory then cannot be synced has taken effect: it is reported
+  done, with the written draft and a `durability_warning` in its reply,
+  not as a failure that a client would retry.
 - The standalone Flow Editor server (`meta_flow_editor`) handles at most 16
   requests at once, and the rest wait for a slot. Any local process can call
   it, and every request it handled ran on the blocking pool, so it took any
@@ -242,6 +246,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   share one store each read it, change it and rename their copy over it, so
   of their concurrent writes only the last one renamed survives: run one
   process per store.
+- A Flow Editor client that holds a draft's etag or revision from before
+  the draft was deleted and created again can overwrite the new draft once
+  it reaches the same revision: the etag names the draft's id and revision,
+  not which draft of that id it is.
 
 ## [0.9.2] - 2026-10-16
 

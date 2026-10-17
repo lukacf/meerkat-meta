@@ -1815,6 +1815,9 @@ class MobpackDraftSaveResult:
     store_path: str | None
     row: MobpackDraftRow
     rows: list[MobpackDraftSummary]
+    durability_warning: str | None = None
+    """Set when Meta wrote the draft but could not sync the draft store's
+    directory: the write took effect and may not survive a crash."""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MobpackDraftSaveResult:
@@ -1823,6 +1826,7 @@ class MobpackDraftSaveResult:
             store_path=data.get("store_path"),
             row=MobpackDraftRow.from_dict(data.get("row", {})),
             rows=[MobpackDraftSummary.from_dict(r) for r in data.get("rows", [])],
+            durability_warning=data.get("durability_warning"),
         )
 
 
@@ -1839,6 +1843,9 @@ class MobpackDraftHistoryResult:
     row: MobpackDraftRow
     rows: list[MobpackDraftSummary]
     reason: str | None = None
+    durability_warning: str | None = None
+    """Set when Meta stepped the draft but could not sync the draft store's
+    directory: the step took effect and may not survive a crash."""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MobpackDraftHistoryResult:
@@ -1849,6 +1856,7 @@ class MobpackDraftHistoryResult:
             row=MobpackDraftRow.from_dict(data.get("row", {})),
             rows=[MobpackDraftSummary.from_dict(r) for r in data.get("rows", [])],
             reason=data.get("reason"),
+            durability_warning=data.get("durability_warning"),
         )
 
 
@@ -1860,6 +1868,9 @@ class MobpackDraftDeleteResult:
     id: str
     deleted: bool
     rows: list[MobpackDraftSummary]
+    durability_warning: str | None = None
+    """Set when Meta deleted the draft but could not sync the draft store's
+    directory: the delete took effect and may not survive a crash."""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MobpackDraftDeleteResult:
@@ -1869,6 +1880,7 @@ class MobpackDraftDeleteResult:
             id=str(data.get("id", "")),
             deleted=bool(data.get("deleted", False)),
             rows=[MobpackDraftSummary.from_dict(r) for r in data.get("rows", [])],
+            durability_warning=data.get("durability_warning"),
         )
 
 

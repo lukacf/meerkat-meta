@@ -2131,6 +2131,11 @@ export interface MobpackDraftSaveResult {
   readonly storePath: string | null;
   readonly row: MobpackDraftRow;
   readonly rows: readonly MobpackDraftSummary[];
+  /**
+   * Set when Meta wrote the draft store but could not sync its directory:
+   * the write took effect and may not survive a crash.
+   */
+  readonly durabilityWarning: string | null;
 }
 
 export function parseMobpackDraftSaveResult(
@@ -2142,6 +2147,7 @@ export function parseMobpackDraftSaveResult(
     storePath: d.store_path == null ? null : String(d.store_path),
     row: parseMobpackDraftRow(d.row),
     rows: asRecordArray(d.rows).map(parseMobpackDraftSummary),
+    durabilityWarning: d.durability_warning == null ? null : String(d.durability_warning),
   };
 }
 
@@ -2157,6 +2163,11 @@ export interface MobpackDraftHistoryResult {
   readonly reason: string | null;
   readonly row: MobpackDraftRow;
   readonly rows: readonly MobpackDraftSummary[];
+  /**
+   * Set when Meta wrote the draft store but could not sync its directory:
+   * the write took effect and may not survive a crash.
+   */
+  readonly durabilityWarning: string | null;
 }
 
 export function parseMobpackDraftHistoryResult(
@@ -2170,6 +2181,7 @@ export function parseMobpackDraftHistoryResult(
     reason: d.reason == null ? null : String(d.reason),
     row: parseMobpackDraftRow(d.row),
     rows: asRecordArray(d.rows).map(parseMobpackDraftSummary),
+    durabilityWarning: d.durability_warning == null ? null : String(d.durability_warning),
   };
 }
 
@@ -2179,6 +2191,11 @@ export interface MobpackDraftDeleteResult {
   readonly id: string;
   readonly deleted: boolean;
   readonly rows: readonly MobpackDraftSummary[];
+  /**
+   * Set when Meta wrote the draft store but could not sync its directory:
+   * the write took effect and may not survive a crash.
+   */
+  readonly durabilityWarning: string | null;
 }
 
 export function parseMobpackDraftDeleteResult(
@@ -2191,6 +2208,7 @@ export function parseMobpackDraftDeleteResult(
     id: String(d.id ?? ""),
     deleted: Boolean(d.deleted),
     rows: asRecordArray(d.rows).map(parseMobpackDraftSummary),
+    durabilityWarning: d.durability_warning == null ? null : String(d.durability_warning),
   };
 }
 

@@ -4219,6 +4219,18 @@ fn draft_store_reply(mut reply: Value, path: &Path) -> Value {
     reply
 }
 
+/// The reply of a draft store write ([`draft_store_reply`]). A write that
+/// replaced the store but could not sync its directory has taken effect, so
+/// its reply carries the written draft as any other does, with the warning
+/// as `durability_warning`.
+fn draft_store_write_reply(reply: Value, path: &Path, durability_warning: Option<String>) -> Value {
+    let mut reply = draft_store_reply(reply, path);
+    if let Some(warning) = durability_warning {
+        reply["durability_warning"] = json!(warning);
+    }
+    reply
+}
+
 /// The draft store as a message names it: by its host path for a caller with
 /// host access ([`host_access`]), without one for any other caller.
 fn draft_store_name(path: &Path) -> String {
@@ -4309,7 +4321,16 @@ fn read_draft_store(
 /// new one whole. Each write gets a file of its own, so writers that share a
 /// store never write into one temporary file, and the store is never encoded
 /// into memory first.
-fn write_mobpack_draft_store(path: &Path, rows: &BTreeMap<String, Value>) -> Result<(), String> {
+///
+/// Once renamed, the store holds the write: a directory that cannot be
+/// synced then is returned as a durability warning for the write's reply
+/// ([`draft_store_write_reply`]), never as its failure. Undo and redo are
+/// not idempotent, so a client that retried a write reported failed would
+/// step the draft twice.
+fn write_mobpack_draft_store(
+    path: &Path,
+    rows: &BTreeMap<String, Value>,
+) -> Result<Option<String>, String> {
     let dir = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -4340,13 +4361,24 @@ fn write_mobpack_draft_store(path: &Path, rows: &BTreeMap<String, Value>) -> Res
             err.error
         )
     })?;
-    sync_dir(dir).map_err(|err| {
+    Ok(sync_dir(dir).err().map(|err| {
+        tracing::warn!(
+            store = %path.display(),
+            error = %err,
+            "the Flow Editor draft store was replaced, but its directory could not be synced"
+        );
         format!(
             "{} was replaced, but its directory could not be synced, so the write may not survive a crash: {err}",
             draft_store_name(path)
         )
-    })?;
-    Ok(())
+    }))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Fails the next directory sync on this thread, for the tests of a
+    /// store write whose directory cannot be synced.
+    static FAIL_NEXT_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Sync a directory's entries to disk, so a rename into it survives a crash.
@@ -4355,6 +4387,10 @@ fn write_mobpack_draft_store(path: &Path, rows: &BTreeMap<String, Value>) -> Res
 #[cfg(unix)]
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     use std::io::ErrorKind;
+    #[cfg(test)]
+    if FAIL_NEXT_DIR_SYNC.with(std::cell::Cell::take) {
+        return Err(std::io::Error::other("injected directory sync failure"));
+    }
     match std::fs::File::open(dir).and_then(|dir| dir.sync_all()) {
         Err(err)
             if !matches!(
@@ -4889,19 +4925,20 @@ fn create_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
     });
     rows.insert(id.clone(), row.clone());
     admit_draft_store_write(&mut rows, &id, before)?;
-    write_mobpack_draft_store(&path, &rows)?;
+    let durability_warning = write_mobpack_draft_store(&path, &rows)?;
     drop(lock);
     // The create response keeps the freshly cloned editor document (no
     // artifact re-import); only the store-internal history fields are
     // projected to can_undo/can_redo.
     let row = draft_row_without_history(&row);
-    Ok(draft_store_reply(
+    Ok(draft_store_write_reply(
         json!({
             "source": "meta/mobpacks/create",
             "row": row,
             "rows": draft_summaries(&rows),
         }),
         &path,
+        durability_warning,
     ))
 }
 
@@ -5250,16 +5287,17 @@ fn save_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
     attach_draft_history_on_save(existing, &mut row);
     rows.insert(id.clone(), row);
     admit_draft_store_write(&mut rows, &id, before)?;
-    write_mobpack_draft_store(&path, &rows)?;
+    let durability_warning = write_mobpack_draft_store(&path, &rows)?;
     drop(lock);
     let row = rows.get(&id).map(stored_draft_row).unwrap_or_default();
-    Ok(draft_store_reply(
+    Ok(draft_store_write_reply(
         json!({
             "source": "meta/mobpacks/save",
             "row": row,
             "rows": draft_summaries(&rows),
         }),
         &path,
+        durability_warning,
     ))
 }
 
@@ -5463,10 +5501,10 @@ fn step_mobpack_draft_history(
     }
     rows.insert(id.clone(), row);
     admit_draft_store_write(&mut rows, &id, before)?;
-    write_mobpack_draft_store(&path, &rows)?;
+    let durability_warning = write_mobpack_draft_store(&path, &rows)?;
     drop(lock);
     let row = rows.get(&id).map(stored_draft_row).unwrap_or_default();
-    Ok(draft_store_reply(
+    Ok(draft_store_write_reply(
         json!({
             "source": source,
             "stepped": true,
@@ -5474,6 +5512,7 @@ fn step_mobpack_draft_history(
             "rows": draft_summaries(&rows),
         }),
         &path,
+        durability_warning,
     ))
 }
 
@@ -5509,9 +5548,9 @@ fn delete_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
         }
     }
     let deleted = rows.remove(&id).is_some();
-    write_mobpack_draft_store(&path, &rows)?;
+    let durability_warning = write_mobpack_draft_store(&path, &rows)?;
     drop(lock);
-    Ok(draft_store_reply(
+    Ok(draft_store_write_reply(
         json!({
             "source": "meta/mobpacks/delete",
             "id": id,
@@ -5519,6 +5558,7 @@ fn delete_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
             "rows": draft_summaries(&rows),
         }),
         &path,
+        durability_warning,
     ))
 }
 
@@ -41466,5 +41506,53 @@ condition = { op = "eq", path = "params.kind", value = "c" }
             .expect_err("an id past the cap is refused");
         assert!(refusal.contains("more than 256"), "{refusal}");
         assert!(save("d".repeat(MOBPACK_DRAFT_MAX_ID_CHARS)).is_ok());
+    }
+
+    /// A store write that replaced the store but could not sync its directory
+    /// has taken effect, so it is reported done, with a `durability_warning`
+    /// and the written draft, not as a failure: undo and redo are not
+    /// idempotent, and a client that retried a failed undo stepped twice.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_whose_directory_cannot_be_synced_is_reported_done_with_a_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("drafts.json");
+        let save = |name: &str| {
+            let mut document = valid_document();
+            document.name = name.to_string();
+            save_mobpack_draft(&json!({
+                "store_path": store_path,
+                "id": "synced",
+                "document": document,
+            }))
+        };
+        save("First").expect("save");
+        save("Second").expect("save");
+        let warned = |reply: &Result<Value, String>| {
+            reply
+                .as_ref()
+                .ok()
+                .and_then(|reply| reply["durability_warning"].as_str())
+                .is_some_and(|warning| warning.contains("could not be synced"))
+        };
+        FAIL_NEXT_DIR_SYNC.with(|fail| fail.set(true));
+        let undone = undo_mobpack_draft(&json!({ "store_path": store_path, "id": "synced" }));
+        FAIL_NEXT_DIR_SYNC.with(|fail| fail.set(true));
+        let saved = save("Third");
+        let fetched =
+            get_mobpack_draft(&json!({ "store_path": store_path, "id": "synced" })).expect("get");
+        assert_eq!(
+            (
+                warned(&undone),
+                undone
+                    .as_ref()
+                    .ok()
+                    .map(|reply| reply["row"]["revision"].clone()),
+                warned(&saved),
+                fetched["row"]["revision"].clone(),
+                fetched["row"]["name"].clone(),
+            ),
+            (true, Some(json!(3)), true, json!(4), json!("Third"))
+        );
     }
 }

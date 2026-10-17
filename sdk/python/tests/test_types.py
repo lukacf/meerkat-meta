@@ -403,6 +403,16 @@ class TestMobpackAuthoringResults:
         })
         assert saved.row.id == "f_demo"
         assert len(saved.rows) == 1
+        assert saved.durability_warning is None
+        warned = MobpackDraftSaveResult.from_dict({
+            "source": "meta/mobpacks/save",
+            "row": row_payload,
+            "rows": [],
+            "durability_warning": "mobpack draft store was replaced, but its directory could not be synced",
+        })
+        assert warned.durability_warning == (
+            "mobpack draft store was replaced, but its directory could not be synced"
+        )
 
         deleted = MobpackDraftDeleteResult.from_dict({
             "source": "meta/mobpacks/delete",
@@ -454,6 +464,20 @@ class TestMobpackAuthoringResults:
         assert blocked.stepped is False
         assert blocked.reason == "nothing to redo"
         assert blocked.row.etag == "f_demo:4"
+        assert blocked.durability_warning is None
+        warned = MobpackDraftHistoryResult.from_dict({
+            "source": "meta/mobpacks/undo",
+            "stepped": True,
+            "row": row_payload,
+            "rows": [],
+            "durability_warning": "not synced",
+        })
+        assert warned.durability_warning == "not synced"
+        assert MobpackDraftDeleteResult.from_dict({
+            "id": "f_demo",
+            "deleted": True,
+            "durability_warning": "not synced",
+        }).durability_warning == "not synced"
 
     def test_apply_operation_result_from_dict(self):
         applied = MobpackApplyOperationResult.from_dict({

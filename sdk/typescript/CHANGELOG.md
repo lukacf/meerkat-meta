@@ -7,6 +7,10 @@
   (parsed by `parseMobpackDraftSummary`): Meta lists drafts without their
   documents. A write's `row` is still a whole `MobpackDraftRow`;
   `meta/mobpacks/get` returns a draft's document.
+- `MobpackDraftSaveResult`, `MobpackDraftHistoryResult` and
+  `MobpackDraftDeleteResult` carry `durabilityWarning`, set when Meta wrote
+  the draft store but could not sync its directory: the write took effect
+  and may not survive a crash.
 
 ## 0.9.2
 
