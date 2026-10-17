@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The identity health monitor logs a member it fails to subscribe to, as
+  the console forwarder does: a warning on the first failure, then debug
+  while the subscription keeps failing, each with `watcher` set to
+  `identity_health_monitor` or `console_forwarder`. The monitor logged
+  neither, so a member whose turns it could not count left no trace until
+  the stream repair (#455).
+
 ### Changed
 
 - Release builds no longer restore or save Rust caches in `build_binaries`
