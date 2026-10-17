@@ -6028,9 +6028,13 @@ schedule = true
     /// `native_grant_work_configuration` that lane meets the same refusal:
     /// the occurrence ends `DeliveryFailed` (`RuntimeRejected`) at the fire,
     /// no run starts and no provider call is made. A dormant identity is
-    /// materialized first: its member and a fresh session are created and
-    /// stay live, the session holding only its system prompt. Without that
-    /// configuration an active and a dormant identity both run the turn.
+    /// materialized first: its member is created and its session is created
+    /// or resumed, and both stay live. The identity here was never embodied,
+    /// so its session is fresh and holds only its system prompt; no probe
+    /// watches a member that does not exist before the fire, so its no-run
+    /// evidence is that system-only transcript and the absence of provider
+    /// calls. Without that configuration an active and a dormant identity
+    /// both run the turn.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_governed_identity_lane_fire_does_not_run_and_materializes_a_dormant_identity_first()
     {
@@ -6116,10 +6120,12 @@ schedule = true
                 Some((1, None)),
                 "the session holds only its system prompt: {governed:#?}"
             );
-            assert!(
-                governed.member_events.is_empty(),
-                "no run starts: {governed:#?}"
-            );
+            if !dormant {
+                assert!(
+                    governed.member_events.is_empty(),
+                    "no run starts: {governed:#?}"
+                );
+            }
             assert!(governed.run_failure.is_none());
             assert_eq!(governed.llm_calls, 0, "the governed fire runs no turn");
             assert_eq!(
