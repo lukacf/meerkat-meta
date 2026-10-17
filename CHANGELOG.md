@@ -24,7 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     (the target a member's own current-session schedule carries): the
     member's session refuses the internal work Meta submits, the occurrence
     ends `DeliveryFailed` with `RuntimeRejected`, and the member's session
-    and transcript are unchanged.
+    and transcript are unchanged. A scheduled fire whose target member is a
+    durable identity goes through Meta's identity runtime and is refused the
+    same way; if that identity is dormant, it is first materialized (its
+    member and a fresh session are created and stay live), and the fire is
+    then refused.
   - A session target naming an existing session: the schedule host's
     session host submits the prompt as runtime input, which is refused, and
     refused again on its exact redrive, so the occurrence ends
