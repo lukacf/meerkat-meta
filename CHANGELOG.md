@@ -9,15 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Known issues
 
-- A runtime built with `UnifiedRuntimeBuilder::native_grant_work_configuration`
-  does not run scheduled agent work sent to a mob member, and each such fire
-  fails late: the schedule is accepted, and at every fire the member's
-  session refuses the input at native admission ("native work authority
-  association is unavailable or mismatched"), because the schedule host
-  submits plain internal work that carries no input authority association.
-  The occurrence ends `DeliveryFailed` with `RuntimeRejected`; no run starts,
-  no provider call is made and the member's session is unchanged. The same
-  fire on a runtime without that configuration runs as before.
+- A runtime whose machine carries a native grant owner (built with
+  `UnifiedRuntimeBuilder::native_grant_work_configuration`, or an
+  `rpc_gateway` whose host supplies one through
+  `GatewayHostComposition::native_grant_work_configuration`) does not run
+  scheduled work sent to its mob members or to its sessions, and each such
+  fire fails late: the schedule is accepted, and at every fire the input is
+  refused at native admission ("native work authority association is
+  unavailable or mismatched"), because the schedule host submits it without
+  an input authority association. No run starts and no provider call is
+  made; the same fires on a runtime without a native grant owner run. How
+  the occurrence ends depends on the target:
+  - A mob target naming a member, or the member's `mob_member:` identity
+    (the target a member's own current-session schedule carries): the
+    member's session refuses the internal work Meta submits, the occurrence
+    ends `DeliveryFailed` with `RuntimeRejected`, and the member's session
+    and transcript are unchanged.
+  - A session target naming an existing session: the schedule host's
+    session host submits the prompt as runtime input, which is refused, and
+    refused again on its exact redrive, so the occurrence ends
+    `DeliveryFailed` with `TransportError`.
+  - A session target materialized on demand: the session host first
+    materializes the session and binds it to the schedule; the prompt is
+    then refused as above (`DeliveryFailed` with `TransportError`), and the
+    new session is left holding only its system prompt.
 
 ## [0.9.2] - 2026-10-16
 
