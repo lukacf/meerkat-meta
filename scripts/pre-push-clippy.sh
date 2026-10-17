@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Pre-push clippy gate: lint only changed crates instead of the full workspace.
-# Falls back to workspace clippy for root build inputs or unowned Rust files.
+# Clippy gate of the manual hook stage, run on demand before a push
+# (`pre-commit run --hook-stage manual cargo-clippy --from-ref origin/main
+# --to-ref HEAD`); CI's clippy job lints the whole workspace on every pull
+# request that touches Rust. Lints only changed crates instead of the full
+# workspace, and falls back to workspace clippy for root build inputs or
+# unowned Rust files.
 set -euo pipefail
 
 # Incremental compilation is OFF for the push gates.

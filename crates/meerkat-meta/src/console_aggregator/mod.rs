@@ -9345,6 +9345,7 @@ mod tests {
         active_reads: Arc<AtomicUsize>,
         max_active_reads: Arc<AtomicUsize>,
         first_read_wave: Arc<std::sync::Mutex<Option<HistoryReadWave>>>,
+        held_first_read: Arc<std::sync::Mutex<Option<Arc<HistoryReadGate>>>>,
         scripted_reads: Arc<std::sync::Mutex<std::collections::VecDeque<ScriptedHistoryRead>>>,
         scripted_application_reads:
             Arc<std::sync::Mutex<std::collections::VecDeque<ScriptedApplicationRead>>>,
@@ -9402,6 +9403,7 @@ mod tests {
                 active_reads: Arc::new(AtomicUsize::new(0)),
                 max_active_reads: Arc::new(AtomicUsize::new(0)),
                 first_read_wave: Arc::new(std::sync::Mutex::new(None)),
+                held_first_read: Arc::new(std::sync::Mutex::new(None)),
                 scripted_reads: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
                 scripted_application_reads: Arc::new(std::sync::Mutex::new(
                     std::collections::VecDeque::new(),
@@ -9441,6 +9443,19 @@ mod tests {
                 count,
                 barrier: Arc::new(tokio::sync::Barrier::new(count)),
             });
+        }
+
+        /// Hold the first history read open until the returned gate is
+        /// released; it then reads the real page like every other read.
+        fn hold_first_history_read(&self) -> Arc<HistoryReadGate> {
+            assert_eq!(self.read_calls(), 0, "configure before any history reads");
+            let gate = HistoryReadGate::new();
+            *self.held_first_read.lock().expect("held first read lock") = Some(gate.clone());
+            gate
+        }
+
+        fn active_reads(&self) -> usize {
+            self.active_reads.load(Ordering::SeqCst)
         }
     }
 
@@ -9689,6 +9704,19 @@ mod tests {
                 .clone();
             if let Some(wave) = first_wave.filter(|wave| read_index < wave.count) {
                 wave.barrier.wait().await;
+            }
+            let held = self
+                .held_first_read
+                .lock()
+                .expect("held first read lock")
+                .clone();
+            if let Some(gate) = held.filter(|_| read_index == 0) {
+                gate.entered.add_permits(1);
+                gate.release
+                    .acquire()
+                    .await
+                    .expect("release gate open")
+                    .forget();
             }
             let scripted = self
                 .scripted_reads
@@ -16241,12 +16269,18 @@ comms = true
         let _ = runtime.mob_handle().stop().await;
     }
 
+    /// The live pump must keep projecting while a session-history backfill
+    /// is in flight. The backfill's first history read is held open on a
+    /// gate for the whole burst, so every live frame provably lands while a
+    /// backfill read is still running, however fast or slow the machine is.
+    /// Only a hang is bounded by time; no pass condition is.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn live_event_burst_reaches_store_while_slow_backfill_is_running() {
         const MEMBER_COUNT: usize = 24;
         const LIVE_EVENT_COUNT: usize = 2_048;
-        let (_temp, runtime, _delayed_service) =
-            build_stress_runtime(MEMBER_COUNT, Duration::from_millis(200)).await;
+        let (_temp, runtime, delayed_service) =
+            build_stress_runtime(MEMBER_COUNT, Duration::ZERO).await;
+        let held_read = delayed_service.hold_first_history_read();
         let aggregator = MetaConsoleAggregator::in_memory();
         aggregator.register_runtime(ConsoleRuntimeRegistration {
             runtime_key: "runtime-burst".to_string(),
@@ -16254,6 +16288,10 @@ comms = true
             identity_namespace: "stress".to_string(),
             visibility_policy: Arc::new(AllowAllConsoleVisibilityPolicy),
         });
+        // Registration replays the (empty) event log, then backfills every
+        // member's session history; its first read now waits on the gate.
+        held_read.wait_until_entered().await;
+
         let console_events = runtime.console_events();
         for idx in 0..LIVE_EVENT_COUNT {
             console_events
@@ -16266,23 +16304,39 @@ comms = true
                 .await;
         }
 
-        // Generous deadline: the loop breaks the instant all live frames land,
-        // so a large ceiling is free in the normal case and only prevents a
-        // false drop-detection when the live pump is CPU-starved under full
-        // parallel CI load (the old 5s deadline flaked the suite).
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // A pump blocked behind the backfill never stores these frames while
+        // the read is held, so this bound only turns that hang into a
+        // failure; it is far above any machine's projection time.
+        let hang_guard = Instant::now() + Duration::from_mins(2);
         let mut observed = 0;
-        while Instant::now() < deadline {
-            observed = count_console_event_frames(&aggregator, "stress/agent-0").await;
-            if observed >= LIVE_EVENT_COUNT {
-                break;
-            }
+        while observed < LIVE_EVENT_COUNT && Instant::now() < hang_guard {
             tokio::time::sleep(Duration::from_millis(25)).await;
+            observed = count_console_event_frames(&aggregator, "stress/agent-0").await;
         }
-
         assert_eq!(
             observed, LIVE_EVENT_COUNT,
-            "live pump should not drop frames while slow background backfill is running"
+            "every live frame must reach the store while the backfill read is held"
+        );
+        assert!(
+            delayed_service.active_reads() >= 1,
+            "the held backfill read must still be in flight when the burst is stored"
+        );
+
+        // Once the backfill read finishes, the stored burst is unchanged:
+        // the backfill neither drops nor duplicates live frames.
+        held_read.release();
+        let settled = Instant::now() + Duration::from_mins(2);
+        while delayed_service.active_reads() > 0 && Instant::now() < settled {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            delayed_service.active_reads(),
+            0,
+            "the released read finishes"
+        );
+        assert_eq!(
+            count_console_event_frames(&aggregator, "stress/agent-0").await,
+            LIVE_EVENT_COUNT
         );
         let _ = runtime.mob_handle().stop().await;
     }

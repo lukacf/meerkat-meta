@@ -21,7 +21,7 @@ class PrePushClippyDispatchTests(unittest.TestCase):
         self.assertIsNotNone(hook, "cargo-clippy hook is missing")
         fields = dict(line.strip().split(": ", 1) for line in hook["fields"].splitlines())
         self.assertEqual(fields["entry"], "scripts/pre-push-clippy.sh")
-        self.assertEqual(fields["stages"], "[pre-push]")
+        self.assertEqual(fields["stages"], "[manual]")
         # pre-commit combines files and type filters, so a Rust-only type
         # filter would still prevent manifests and lockfiles from dispatching.
         for key in ("types", "types_or", "exclude_types", "exclude"):
@@ -41,6 +41,53 @@ class PrePushClippyDispatchTests(unittest.TestCase):
         ):
             with self.subTest(excluded=path):
                 self.assertIsNone(selector.search(path))
+
+
+
+def hook_stages(config: str) -> dict[str, str]:
+    """Every hook id in .pre-commit-config.yaml and its stages field."""
+    hooks = {}
+    for match in re.finditer(r"(?m)^      - id: (\S+)\n((?:^        [^\n]*\n)*)", config):
+        fields = dict(line.strip().split(": ", 1) for line in match[2].splitlines() if ": " in line)
+        hooks[match[1]] = fields
+    return hooks
+
+
+class PushStageTests(unittest.TestCase):
+    """A push runs only fast local checks. The workspace clippy and unit gate
+    took 712.88 s and 974.16 s of a 28m19s push (2026-10-16); CI's clippy
+    and test jobs run them on every pull request that touches Rust, so the
+    hook keeps them only on demand (`pre-commit run --hook-stage manual`)."""
+
+    def setUp(self):
+        self.config = (Path(__file__).resolve().parents[1] / ".pre-commit-config.yaml").read_text()
+        self.hooks = hook_stages(self.config)
+
+    def test_the_push_stage_compiles_nothing(self):
+        pushed = {name for name, fields in self.hooks.items() if "pre-push" in fields.get("stages", "")}
+        self.assertEqual(pushed, {
+            "gitleaks", "trailing-whitespace", "end-of-file-fixer", "check-yaml", "check-toml",
+            "check-merge-conflict", "check-added-large-files", "cargo-fmt", "bazel-builds-fresh",
+            "decorator-authority",
+        })
+        for name in pushed:
+            entry = self.hooks[name].get("entry", "")
+            with self.subTest(hook=name):
+                self.assertNotRegex(entry, r"clippy|nextest|cargo (build|check|test)|pre-push-unit")
+
+    def test_the_cargo_gates_stay_runnable_on_demand(self):
+        for name, entry in (("cargo-clippy", "scripts/pre-push-clippy.sh"),
+                            ("cargo-test", "scripts/pre-push-unit.sh")):
+            with self.subTest(hook=name):
+                self.assertEqual(self.hooks[name]["entry"], entry)
+                self.assertEqual(self.hooks[name]["stages"], "[manual]")
+        self.assertIn("pre-commit run --hook-stage manual", self.config)
+
+    def test_the_stage_parser_reads_every_hook(self):
+        # Control: the parser sees both the local and the third-party hooks.
+        self.assertGreaterEqual(len(self.hooks), 13)
+        self.assertEqual(self.hooks["gitleaks"]["stages"], "[pre-push]")
+        self.assertNotIn("stages", self.hooks["cargo-fmt-fix"])
 
 
 class PrePushClippyTests(unittest.TestCase):
