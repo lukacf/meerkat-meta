@@ -486,12 +486,13 @@ class CiChangesTests(unittest.TestCase):
              RUST_PR_LANES | {"extension_state"}),
             # The crate only the extension-state feature builds.
             (("crates/meta-extension-state/src/lib.rs",), no_gates, RUST_PR_LANES | {"extension_state"}),
-            # Build configuration every configuration reads.
-            (("Cargo.lock",), no_gates, RUST_PR_LANES | FEATURE_LANES),
-            (("Cargo.toml",), no_gates, RUST_PR_LANES | FEATURE_LANES),
-            (("rust-toolchain.toml",), no_gates, RUST_PR_LANES | FEATURE_LANES),
-            ((".cargo/config.toml",), no_gates, RUST_PR_LANES | FEATURE_LANES),
-            (("crates/meerkat-meta/Cargo.toml",), no_gates, RUST_PR_LANES | FEATURE_LANES),
+            # Build configuration every lane's build reads: a dependency or
+            # toolchain change runs every lane that compiles Rust.
+            (("Cargo.lock",), no_gates, RUST_LANES),
+            (("Cargo.toml",), no_gates, RUST_LANES),
+            (("rust-toolchain.toml",), no_gates, RUST_LANES),
+            ((".cargo/config.toml",), no_gates, RUST_LANES),
+            (("crates/meerkat-meta/Cargo.toml",), no_gates, RUST_LANES),
             # A file that cannot be read runs every feature lane.
             (("crates/meerkat-meta/src/rpc.rs",), lambda path: None, RUST_PR_LANES | FEATURE_LANES),
             # Only Rust sources are read for gates.

@@ -85,15 +85,16 @@ the lanes its changed files reach (`scripts/ci-changes.py`):
 - A Rust change runs `clippy`, `test` and the two `test-integration` halves.
   `test` is the only automatic run of the lib and bin tests: it lists them
   first and fails if its filter leaves any out.
+- A change to the build configuration (`Cargo.toml`, `Cargo.lock`,
+  `rust-toolchain.toml`, `.cargo/`, `crates/meerkat-meta/Cargo.toml`) runs
+  every lane that compiles Rust.
 - The voice and extension-state jobs, the Python SDK tests, the console jobs
   and the flow editor job compile the same crate in other configurations. A
   pull request leaves them to the push unless it changes their own inputs:
   code gated on the `openai-live` or `extension-state` feature, those features'
-  modules and crate, the build configuration (`Cargo.toml`, `Cargo.lock`,
-  `rust-toolchain.toml`, `.cargo/`), the embedded console and flow editor
-  bundles, or their own directories (`sdk/python/`, `console/`,
-  `flow-editor/`, `packages/`). The `changes` job's log names the lanes a pull
-  request left to the push.
+  modules and crate, the embedded console and flow editor bundles, or their
+  own directories (`sdk/python/`, `console/`, `flow-editor/`, `packages/`).
+  The `changes` job's log names the lanes a pull request left to the push.
 - Docs and the files only `fmt-lint` and `audit` read reach no lane.
 
 Pushes to main and dispatches run every lane, and a release tag requires a

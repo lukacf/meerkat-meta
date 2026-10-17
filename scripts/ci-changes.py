@@ -24,8 +24,8 @@ leaves the lanes that compile the same crate in another configuration (the
 voice and extension-state features, the Python SDK gateway, the console
 backends, the flow editor binary) to the push, unless the change is one of
 their own inputs (see `deferred_lanes`): code a feature gates, a feature's own
-module or crate, the build configuration every configuration reads, or the
-bundle a backend embeds. A deferred lane still gates the release, because
+module or crate, the bundle a backend embeds, or the build configuration,
+which every lane reads. A deferred lane still gates the release, because
 release.yml refuses a tag until the push run of the exact commit on main is
 green. The classifier prints the lanes a pull request deferred.
 
@@ -151,9 +151,9 @@ RUST_LANES = EVERY_LANE - {"console_perf"}
 # rust and integration lanes have compiled and tested the default one.
 RUST_DEFERRED_LANES = frozenset({"voice", "extension_state", "python", "console", "flow_editor"})
 
-# Build configuration every configuration of the crates reads: the lockfile
-# does not record which feature activates an entry, so a pull request that
-# changes any of these runs the feature lanes too.
+# Build configuration every lane's build reads: a dependency or toolchain
+# change (a Meerkat Core bump, say) can break any end-to-end suite, so a pull
+# request that changes one runs every lane.
 BUILD_CONFIGURATION_FILES = RUST_INPUT_FILES | {"crates/meerkat-meta/Cargo.toml"}
 BUILD_CONFIGURATION_PREFIXES = (".cargo/",)
 
@@ -239,9 +239,9 @@ def deferred_lanes(path: str, read: Callable[[str], str | None] = read_changed_f
     """The lanes this path reaches that a pull request leaves to the push."""
     if not rust_input(path):
         return frozenset()
-    deferred = set(RUST_DEFERRED_LANES)
     if path in BUILD_CONFIGURATION_FILES or path.startswith(BUILD_CONFIGURATION_PREFIXES):
-        deferred -= set(FEATURE_GATES)
+        return frozenset()
+    deferred = set(RUST_DEFERRED_LANES)
     for lane, prefixes in FEATURE_PATHS.items():
         if path.startswith(prefixes):
             deferred.discard(lane)
