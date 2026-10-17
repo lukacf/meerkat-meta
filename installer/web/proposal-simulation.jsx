@@ -446,8 +446,10 @@ export function ProposalSimulation({plan,interfaceFact,designBrief,visualization
     if(!snapshot && !selection)return;
     let cancelled=false;
     const controller=new AbortController(),epoch=presentationEpochRef.current;
+    // Historical verification belongs to this proposal, across repair attempts.
     const isCurrent=()=>!cancelled && epoch===presentationEpochRef.current
-      && !activeAnimationRef.current && animationRequestMatches(request,currentRequestRef.current);
+      && !activeAnimationRef.current && currentRequestRef.current.streamId===streamId
+      && currentRequestRef.current.proposalKey===key;
     (async()=>{
       try {
         const response=await fetch(`/api/visualizations/${(snapshot || selection).operation_id}`,{signal:controller.signal});
@@ -464,7 +466,10 @@ export function ProposalSimulation({plan,interfaceFact,designBrief,visualization
       } catch { /* Recovery is optional; the current generation remains independent. */ }
     })();
     return()=>{cancelled=true;controller.abort();};
-  },[key,streamId,retry,setupId]);
+  },[key,streamId,setupId]);
+  // A repair changes the current candidate, not the saved scene's source.
+  // Keep its original fetch/hash verification alive until this scope changes.
+  useEffect(()=>{showPendingRecovery();},[key,streamId,retry,setupId]);
   useEffect(()=>{
     if(!candidate || candidate.streamId!==streamId || candidate.key!==key && !candidate.recovered
       || !animationRequestMatches(candidate.request,currentRequestRef.current) || !authoredHostRef.current)return;

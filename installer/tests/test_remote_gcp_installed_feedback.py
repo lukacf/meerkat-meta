@@ -26,10 +26,10 @@ PRIVATE = "OFFLINE_GCP_PRIVATE_FIXTURE_CANARY"
 
 class CheckedCloudPackage(CloudPackage):
     async def status(self, identity, *, state=None):
-        return {**await super().status(identity), "source_verified": True}
+        return {**await super().status(identity, state=state), "source_verified": True}
 
-    async def package(self, identity, build_id):
-        payload, slug = await super().package(identity, build_id)
+    async def package(self, identity, build_id, *, state=None):
+        payload, slug = await super().package(identity, build_id, state=state)
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
             files = {name: archive.read(name) for name in archive.namelist()}
         definition = json.loads(files["deployment.json"])

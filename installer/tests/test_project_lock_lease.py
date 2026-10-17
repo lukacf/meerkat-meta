@@ -208,7 +208,8 @@ def test_preexisting_symlinks_are_refused_without_writing_to_their_targets(tmp_p
 @pytest.mark.parametrize("target", ["directory", "lock", "hardlink", "fifo"])
 def test_unsafe_existing_lock_location_is_not_modified(tmp_path, storage, target):
     directory = tmp_path / ".mobkit"
-    directory.mkdir(mode=0o755 if target == "directory" else 0o700)
+    directory.mkdir(mode=0o700)
+    directory.chmod(0o755 if target == "directory" else 0o700)
     lock = directory / "launch.lock"
     if target == "fifo":
         os.mkfifo(lock, 0o600)

@@ -16,6 +16,8 @@ from launchkit.templates import storage_setup
 from test_provider_settings import native_spec
 from test_architect_startup_recovery import FakeRuntime, startup
 
+from test_meta_guide_runtime import selected as selected_guide_runtime
+
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
@@ -192,7 +194,10 @@ def test_saved_canonical_provider_wins_public_selection_over_environment_priorit
     architect.start.assert_not_awaited()
 
 
-def test_missing_canonical_key_is_not_claimed_configured_or_started(api, monkeypatch):
+def test_missing_canonical_key_is_not_claimed_configured_or_started(api, monkeypatch, selected_guide_runtime):
+    from dataclasses import replace
+    from launchkit import bootstrap
+    monkeypatch.setattr(bootstrap, "_selected_guide_runtime", replace(selected_guide_runtime, _model_route=None))
     client, settings, architect, root = api
     settings.environ['OPENAI_API_KEY'] = 'fictional-other-provider-key'
     native_spec(setup_runtime_root(root), provider='anthropic')

@@ -273,12 +273,27 @@ async function mountedAnimationRecovery(verify,{visualReview=false}={}) {
   let timerId=0,receiptId=0,latestPlan=ownedPlan(),latestSetup='owned-recovery',latestBrief,latestFeedback,resolveReview;
   let nextStatus='completed',holdRecovery=false;
   const recoveryResponses=[];
+  const nativeCrypto=globalThis.crypto,recoveryDigests=[];
+  let holdRecoveryValidation=false;
+  const releaseRecoveryValidation=()=>{holdRecoveryValidation=false;recoveryDigests.splice(0).forEach(resolve=>resolve());};
+  const observedSubtle=new Proxy(nativeCrypto.subtle,{get(target,name){
+    if(name==='digest')return async(...args)=>{
+      const bytes=await nativeCrypto.subtle.digest(...args);
+      if(holdRecoveryValidation)await new Promise(resolve=>recoveryDigests.push(resolve));
+      return bytes;
+    };
+    const value=Reflect.get(target,name,target);return typeof value==='function'?value.bind(target):value;
+  }});
+  const observedCrypto=new Proxy(nativeCrypto,{get(target,name){
+    if(name==='subtle')return observedSubtle;
+    const value=Reflect.get(target,name,target);return typeof value==='function'?value.bind(target):value;
+  }});
   const recoveryReads=()=>reads.filter(target=>/^\/api\/visualizations\/[a-f0-9]{64}$/.test(target));
   const reviewPosts=[];
   const adoptionPosts=[];
   let latestSaved=null,latestReadStatus=null,allowForeignLatest=false;
   const rendererHash=(await import('./animation-review-renderer-hash.mjs')).ANIMATION_RENDERER_HASH;
-  const replacements={window:dom.window,document:dom.window.document,navigator:dom.window.navigator,sessionStorage:dom.window.sessionStorage,
+  const replacements={window:dom.window,document:dom.window.document,navigator:dom.window.navigator,sessionStorage:dom.window.sessionStorage,crypto:observedCrypto,
     HTMLElement:dom.window.HTMLElement,IS_REACT_ACT_ENVIRONMENT:true,__ownedAnimationInstances:instances,
     matchMedia:()=>({matches:false,addEventListener(){},removeEventListener(){}}),
     ResizeObserver:class {
@@ -412,13 +427,14 @@ async function mountedAnimationRecovery(verify,{visualReview=false}={}) {
       resize:(scene,width,height)=>settle(()=>{scene.frame.getBoundingClientRect=()=>({width,height});
         for(const observer of resizeObservers)if(observer.target===scene.frame)observer.callback([{contentRect:{width,height}}]);}),
       setLatest:(saved,{allowForeign=false}={})=>{latestSaved=structuredClone(saved);allowForeignLatest=allowForeign;},
+      holdRecoveryValidation:value=>{holdRecoveryValidation=value;},heldRecoveryValidations:()=>recoveryDigests.length,releaseRecoveryValidation,
       latestReadStatus:value=>{latestReadStatus=value;},
       nextStatus:value=>{nextStatus=value;},holdRecovery:value=>{holdRecovery=value;},releaseRecovery:()=>recoveryResponses.splice(0).forEach(resolve=>resolve()),
       remount:async()=>{await settle(()=>root.unmount());root=createRoot(dom.window.document.getElementById('root'));await mount();},
       text:()=>dom.window.document.body.textContent,
       count:()=>dom.window.document.querySelector('.proposal-simulation').dataset.nodeCount});
   }finally{
-    await settle(()=>root.unmount());dom.window.close();
+    await settle(()=>{releaseRecoveryValidation();root.unmount();});dom.window.close();
     assert.ok(instances.every(instance=>!instance.alive),'Unmount releases active, retained and failed scene owners');
     for(const [key,descriptor] of previous){if(descriptor)Object.defineProperty(globalThis,key,descriptor);else delete globalThis[key];}
   }
@@ -1307,17 +1323,21 @@ test('delayed historical hydration cannot replace a newly published current firs
   });
 });
 
-test('verified historical hydration waits for a current startup candidate and survives its failure before first frame',async()=>{
+test('historical verification in flight survives a current startup failure before first frame',async()=>{
   await mountedAnimationRecovery(async ui=>{
     await ui.generate();const first=ui.instances[0];await ui.settle(()=>first.first());
     const oldInputs=structuredClone({model:first.options.model,plan:first.options.blueprint});
     await ui.mount(ownedPlan('latest',2));ui.holdRecovery(true);await ui.remount();
     await ui.generate();const replacement=ui.instances[1];
+    ui.holdRecoveryValidation(true);
     await ui.settle(()=>ui.releaseRecovery());
-    for(let turn=0;turn<20;turn++)await ui.settle();
+    for(const deadline=performance.now()+5000;performance.now()<deadline && ui.heldRecoveryValidations()<3;){await ui.settle();await realDelay(1);}
+    assert.equal(ui.heldRecoveryValidations(),3,'All three real native hashes finished, but their verification remains in flight');
     assert.equal(ui.instances.length,2,'Historical hydration stages without replacing the accepted startup candidate');
     assert.equal(replacement.alive,true);assert.deepEqual(ui.visible(),[]);
     await ui.settle(()=>replacement.fail());
+    assert.equal(ui.recoveryReads().length,1,'A repair retry retains the original verification instead of fetching it again');
+    await ui.settle(()=>ui.releaseRecoveryValidation());
     for(const deadline=performance.now()+5000;performance.now()<deadline && ui.instances.length<3;){await ui.settle();await realDelay(1);}
     const recovered=ui.instances[2];assert.ok(recovered);await ui.settle(()=>recovered.first());
     assert.deepEqual(recovered.options.model,oldInputs.model);assert.deepEqual(recovered.options.blueprint,oldInputs.plan);

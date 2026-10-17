@@ -12,6 +12,8 @@ from launchkit.compiler import application_profiles, generate_files, mob_toml
 from launchkit.design_knowledge import design_findings
 from launchkit.rehearsal_worker import rehearsal_mob_toml
 
+from test_meta_guide_runtime import selected as selected_guide_runtime
+
 
 @pytest.fixture(autouse=True)
 def candidate_origin():
@@ -76,7 +78,7 @@ def test_native_fixed_and_reusable_profiles_receive_same_policy_without_rewiring
     assert spec.resolved_edges() == unrestricted.resolved_edges()
 
 
-def test_package_and_rehearsal_keep_policy_in_every_configuration_surface():
+def test_package_and_rehearsal_keep_policy_in_every_configuration_surface(selected_guide_runtime):
     spec = configured()
     files = generate_files(spec)
     assert Blueprint.model_validate_json(files["blueprint.json"]) == spec
