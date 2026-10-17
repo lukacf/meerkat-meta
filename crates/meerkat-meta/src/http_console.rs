@@ -5827,7 +5827,15 @@ async fn session_member_owners(
         {
             Ok(Some(owner)) => owners.push(owner.as_str().to_string()),
             Ok(None) => {}
-            Err(_) => return None,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %error,
+                    "the continuity store could not read a session's owner; the console \
+                     attach treats the session as having no established owner"
+                );
+                return None;
+            }
         }
     }
     for member in handle.list_members_including_retiring().await {
@@ -5847,6 +5855,8 @@ async fn session_member_owners(
 /// session's conversation, so under enforced access rules every member the
 /// session belongs to is judged for read and send access. A session whose
 /// owner cannot be established is refused unless the caller is an admin.
+/// A refusal names only the session the caller supplied: neither the owner
+/// nor the access the caller lacked.
 async fn attached_session_access_violation(
     view: Option<&AccessView>,
     handle: &MobHandle,
@@ -5868,14 +5878,17 @@ async fn attached_session_access_violation(
             })),
         });
     }
-    [ACTION_AGENT_VIEW, ACTION_AGENT_SEND]
+    let refused = [ACTION_AGENT_VIEW, ACTION_AGENT_SEND]
         .into_iter()
-        .find_map(|action| {
-            owners
-                .iter()
-                .find(|owner| !view.allows_agent(action, owner))
-                .map(|owner| member_access_denied(action, Some(owner.clone())))
-        })
+        .any(|action| owners.iter().any(|owner| !view.allows_agent(action, owner)));
+    refused.then(|| JsonRpcError {
+        code: ACCESS_DENIED_RPC_CODE,
+        message: "access denied: the caller may not attach this session".to_string(),
+        data: Some(json!({
+            "kind": "access_denied",
+            "session_id": session_id.to_string(),
+        })),
+    })
 }
 
 fn durable_identity_for_member(member: &meerkat_mob::runtime::MobMemberListEntry) -> String {
@@ -19199,6 +19212,179 @@ comms = true
             json!("access_denied"),
             "an admin passes the owner check: {admitted}"
         );
+        Ok(())
+    }
+
+    /// A refusal to attach a session whose owner the caller may not access
+    /// names only the session the caller supplied. Neither the owner nor the
+    /// access the caller lacked appears in its message or data.
+    #[tokio::test]
+    async fn console_attach_refusal_does_not_name_the_session_owner()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const OWNER: &str = "review:session-owner";
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-attach-owner-private").await?;
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "console-attach-owner-private".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        runtime
+            .handle()
+            .spawn_spec(
+                SpawnMemberSpec::from_wire(
+                    "worker".to_string(),
+                    crate::member_comms_id::mob_member_id_str(OWNER).into_owned(),
+                    None,
+                    Some(meerkat_mob::MobRuntimeMode::TurnDriven),
+                    None,
+                )
+                .with_labels(BTreeMap::from([
+                    ("agent_identity".to_string(), OWNER.to_string()),
+                    ("org".to_string(), "restricted".to_string()),
+                ])),
+            )
+            .await?;
+        let bridge_session_id = runtime
+            .handle()
+            .resolve_bridge_session_id(&crate::member_comms_id::mob_member_id(OWNER))
+            .await
+            .ok_or("the spawned member must have a bridge session")?;
+        let identity = AgentIdentity::parse(OWNER)?;
+        let spec = DurableAgentSpec {
+            identity: identity.clone(),
+            profile: ProfileName::from("worker"),
+            addressability: AgentAddressability::Addressable,
+            display_name: None,
+            labels: BTreeMap::new(),
+            context: None,
+            additional_instructions: Vec::new(),
+            initial_message: None,
+            runtime_mode_override: None,
+            backend: None,
+            binding: None,
+            placement: None,
+        };
+        identity_runtime
+            .register(
+                spec.clone(),
+                IdentityLifecycleState::Active,
+                Some(ContinuityRecord {
+                    identity: identity.clone(),
+                    agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{OWNER}:1"))?,
+                    session_id: bridge_session_id.clone(),
+                    generation: ContinuityGeneration::new(1),
+                    checkpoint_version: CheckpointVersion::new(0),
+                }),
+                Some(LeaseGrant {
+                    identity,
+                    fencing_token: FencingToken::new(1),
+                    ttl: Duration::from_mins(1),
+                }),
+            )
+            .await;
+        let roster = Arc::new(crate::identity_first::MutableRosterProvider::new(vec![
+            spec,
+        ]));
+        let controller =
+            crate::access::AccessController::new(crate::access::AccessControlConfig {
+                enabled: true,
+                admins: vec!["root@example.test".to_string()],
+                rules: vec![
+                    crate::access::AccessRule {
+                        id: "allow-all".to_string(),
+                        actions: vec![
+                            crate::access::ACTION_AGENT_VIEW.to_string(),
+                            crate::access::ACTION_AGENT_SEND.to_string(),
+                            crate::access::ACTION_AGENT_SPAWN.to_string(),
+                        ],
+                        agents: vec!["*".to_string()],
+                        ..crate::access::AccessRule::default()
+                    },
+                    crate::access::AccessRule {
+                        id: "deny-restricted".to_string(),
+                        effect: crate::access::AccessEffect::Deny,
+                        actions: vec![crate::access::ACTION_AGENT_VIEW.to_string()],
+                        match_labels: BTreeMap::from([(
+                            "org".to_string(),
+                            "restricted".to_string(),
+                        )]),
+                        ..crate::access::AccessRule::default()
+                    },
+                ],
+                ..crate::access::AccessControlConfig::default()
+            })?;
+        let anonymous = controller.view_for_subject(None);
+        let session_id = bridge_session_id.to_string();
+        let call = async |method: &str, params: Value| {
+            Box::pin(handle_console_runtime_rpc_with_visibility(
+                &runtime,
+                None,
+                None,
+                None,
+                Some(ConsoleEventStore::new()),
+                None,
+                Some(identity_runtime.clone()),
+                None,
+                None,
+                &crate::console_aggregator::AllowAllConsoleVisibilityPolicy,
+                rpc_request_with_params(method, params),
+                true,
+                false,
+                None,
+                Some(&controller),
+                Some(&anonymous),
+                None,
+                Some(roster.clone()),
+                None,
+                None,
+                &crate::http_console::ConsoleSendGovernance::default(),
+            ))
+            .await
+        };
+        let attach = call(
+            "meta/attach_existing_session",
+            json!({
+                "role": "worker",
+                "agent_identity": "attach-owner-private",
+                "session_id": session_id,
+            }),
+        )
+        .await;
+        let resume = call(
+            "meta/ensure_member",
+            json!({
+                "role": "worker",
+                "agent_identity": "ensure-owner-private",
+                "plane": "worker",
+                "resume_session_id": session_id,
+            }),
+        )
+        .await;
+
+        let expected = json!({
+            "code": crate::http_console::ACCESS_DENIED_RPC_CODE,
+            "message": "access denied: the caller may not attach this session",
+            "data": { "kind": "access_denied", "session_id": session_id },
+        });
+        assert_eq!(
+            (&attach["error"], &resume["error"]),
+            (&expected, &expected),
+            "an attach or a resume of the session is refused naming only that session"
+        );
+        let encoded_owner = crate::member_comms_id::mob_member_id_str(OWNER);
+        for refusal in [&attach["error"], &resume["error"]] {
+            let text = refusal.to_string();
+            assert!(!text.contains(OWNER), "the refusal names no owner: {text}");
+            assert!(
+                !text.contains(&*encoded_owner),
+                "the refusal names no encoded owner: {text}"
+            );
+        }
         Ok(())
     }
 
