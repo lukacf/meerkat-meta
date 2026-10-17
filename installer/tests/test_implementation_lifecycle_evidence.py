@@ -148,7 +148,7 @@ async def test_restart_custody_loss_overrides_persisted_cleanup_progress_and_for
     assert not any(lifecycle[name] for name in GATES)
     with pytest.raises(DraftConflict, match="no longer owns"):
         await service.request_stop(state["id"], 4, directory.name)
-    with pytest.raises(DraftConflict, match="cleanup is not confirmed"):
+    with pytest.raises(DraftConflict, match="cleanup cannot be confirmed"):
         await service.submit(state["id"], 4, expected_selected_build_id=directory.name)
     assert "sentinel" not in json.dumps(lifecycle)
 

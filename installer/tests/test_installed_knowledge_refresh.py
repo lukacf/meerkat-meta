@@ -38,7 +38,7 @@ async def installed(tmp_path, monkeypatch, request):
         "secret": True, "required": True})
     implementation.extra_files = generate_elephant_files(knowledge, "test-team", "anthropic")
     if getattr(request, "param", None) == "old-helper":
-        source = Path(__file__).parents[1] / ".artifacts/forge-knowledge-key-recovery-20261010/manage.py.before"
+        source = Path(__file__).parent / "fixtures/knowledge_key_recovery/manage.py.before"
         assert hashlib.sha256(source.read_bytes()).hexdigest() == "01b42737cdf1c91a7b35e426ddd6ddf94a93f68e16e177f25d8e90d4e05b8918"
         implementation.extra_files["knowledge/manage.py"] = source.read_text()
     service = Service(tmp_path / "server", guide, implementation)
@@ -59,7 +59,10 @@ async def installed(tmp_path, monkeypatch, request):
         local["PRIVATE_EXTRA"] = "retained-knowledge-extra-canary"
         manager.write_env(destination / "knowledge/.env", local)
     retained = []
-    for name in ("data/records.bin", ".mobkit/state/history.bin", "knowledge/.source/retained.bin"):
+    retained_names = ["data/records.bin", ".mobkit/state/history.bin"]
+    if not first_setup:
+        retained_names.append("knowledge/.source/retained.bin")
+    for name in retained_names:
         path = destination / name
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         path.write_bytes(b"Private synthetic state must remain unchanged.\n")
@@ -430,7 +433,7 @@ async def test_update_checked_start_reaches_same_owned_preparation(installed, mo
     updates = SimpleNamespace(checkpoint=lambda *args, **kwargs: None,
         _require_runtime_framework_configuration=lambda *args: None)
     scope = {**worker.__dict__, "supervisor": installed.supervisor, "directory": installed.directory,
-        "recover_current": False, "current_transaction": lambda: (read_receipt(installed.directory), installed.directory, {}),
+        "recover_current": False, "product_update": False, "current_transaction": lambda: (read_receipt(installed.directory), installed.directory, {}),
         "updates": updates, "expected_binding": None, "expected_installation": None, "dependency_update": None,
         "native_update": False, "replacement": None, "command": command, "publish": lambda *args: pytest.fail("No native readiness is fabricated.")}
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), scope)

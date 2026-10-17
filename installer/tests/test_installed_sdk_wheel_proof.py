@@ -100,13 +100,23 @@ def compare(files, *, facts=None, **options):
 
 
 @pytest.mark.parametrize("sdk_files", ["0.9.0", "0.9.1"], indirect=True)
-def test_exact_installed_pair_returns_original_facts_and_no_receipt_or_process(sdk_files):
+def test_exact_installed_pair_returns_original_facts_and_no_receipt_or_process(sdk_files, monkeypatch):
     original = {path: path.read_bytes() for path in sdk_files.site.rglob("*") if path.is_file()}
+    import builtins
+    modules = {name: module for name, module in sys.modules.items()
+               if name.split(".")[0] in {"meerkat_meta", "meerkat_toolkit"}}
+    original_import = builtins.__import__
+    def no_sdk_import(name, *args, **kwargs):
+        if name.split(".")[0] in {"meerkat_meta", "meerkat_toolkit"}:
+            pytest.fail("Installed byte readback must not import an SDK.")
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", no_sdk_import)
     result = compare(sdk_files)
     assert result[0] is sdk_files.facts[0] and result[1] is sdk_files.facts[1]
     assert {path: path.read_bytes() for path in sdk_files.site.rglob("*") if path.is_file()} == original
     assert not (sdk_files.root / ".venv/forge-sdk.receipt.json").exists()
-    assert not any(name in sys.modules for name in ("meerkat_meta", "meerkat_toolkit"))
+    assert {name: module for name, module in sys.modules.items()
+            if name.split(".")[0] in {"meerkat_meta", "meerkat_toolkit"}} == modules
     assert sdk_files.calls == []
 
 

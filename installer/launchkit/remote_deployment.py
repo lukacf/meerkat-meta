@@ -584,7 +584,7 @@ class RemoteDeploymentService:
                     return None
                 return latest
             return selected["state"]
-        except (ValueError, LookupError):
+        except (ValueError, LookupError, OSError):
             return None
 
     async def current(self, receipt, *, state=None):

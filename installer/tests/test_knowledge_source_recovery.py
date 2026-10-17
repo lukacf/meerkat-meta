@@ -29,7 +29,8 @@ def checkout(manager, monkeypatch):
         exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), manager.__dict__)
     private = [manager.ROOT / ".env", manager.ROOT.parent / ".env", manager.ROOT.parent / "saved-history.bin"]
     for path in private:
-        path.write_bytes(b"Retained synthetic private input.\n")
+        path.write_bytes(b"JWT_SECRET=retained-inert-signing-value\nSURREALDB_PASS=retained-inert-database-value\n"
+                         if path.name == ".env" else b"Retained synthetic private input.\n")
         path.chmod(0o600)
     before = {path: (path.read_bytes(), path.stat().st_ino) for path in private}
     observation = SimpleNamespace(manager=manager, calls=[], before=before, failure=None,
@@ -270,7 +271,8 @@ def test_replaced_stage_is_neither_published_nor_removed(checkout, when):
 def test_up_fetch_retry_reaches_compose_only_after_valid_checkout(checkout, monkeypatch):
     manager = checkout.manager
     events = []
-    monkeypatch.setattr(manager, "load_settings", lambda: SETTINGS)
+    expected_settings = {**SETTINGS, "token_env": "ELEPHANT_TOKEN", "space_env": "ELEPHANT_SPACE_ID"}
+    monkeypatch.setattr(manager, "load_settings", lambda: expected_settings)
     monkeypatch.setattr(manager, "local_preflight", lambda: events.append("preflight"))
     monkeypatch.setattr(manager, "setup", lambda *_: pytest.fail("Existing private credentials must remain."))
 
@@ -279,7 +281,7 @@ def test_up_fetch_retry_reaches_compose_only_after_valid_checkout(checkout, monk
         events.append(("compose", args))
 
     async def verify(settings, operation):
-        assert settings is SETTINGS and operation == "verify"
+        assert settings is expected_settings and operation == "verify"
         events.append("verify")
         return {"fixture_verified": True}
 

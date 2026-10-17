@@ -16,7 +16,7 @@ from launchkit.connect_installer_caller import CustodyError, ExactFile
 from launchkit.deployment_worker import Supervisor
 from launchkit.forge_application_host import ForgeApplicationHost
 from launchkit.projects import DraftConflict
-from launchkit.runtime_selection import selected_runtime_artifacts
+from launchkit.runtime_selection import selected_runtime_artifacts, selected_runtime_platform
 from launchkit.templates import install_candidate as adapter
 from launchkit.templates.storage_setup import project_lock
 from test_candidate_implementation import service as implementation_service, accepted_fixture
@@ -29,6 +29,9 @@ from test_meta_toolkit_runtime_selection import product, no_product_execution
 @pytest.fixture
 async def prepared(tmp_path, selected, implementation_service, monkeypatch):
     f = selected
+    # This inert package declares its own target; no native artifact executes.
+    monkeypatch.setattr("launchkit.runtime_dependencies.platform_target",
+        lambda: selected_runtime_platform(f.target))
     f.guide_id = implementation_service.guide.identity
     f.protected["application/configuration.json"] = put(f.root / "application/configuration.json", {"fields": [
         {"key": "CONSOLE_USER_ID", "label": "User ID", "required": True, "secret": False},

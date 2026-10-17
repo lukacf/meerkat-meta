@@ -131,7 +131,7 @@ def test_inspection_dict_order_is_not_a_distinct_fact_and_existing_metadata_is_r
 @pytest.mark.asyncio
 async def test_registered_inspection_full_access_preserves_persisted_input_source_and_feedback(team):
     from jsonschema import validate
-    from meerkat_mobkit.models import SessionBuildOptions
+    from meerkat_meta.models import SessionBuildOptions
 
     tools, _ = team
     extra = continuation_context()
@@ -172,7 +172,7 @@ async def test_registered_inspection_full_access_preserves_persisted_input_sourc
 @pytest.mark.asyncio
 async def test_registered_exact_edit_uses_read_hash_and_invalidates_only_successful_source_changes(team):
     from jsonschema import ValidationError, validate
-    from meerkat_mobkit.models import SessionBuildOptions
+    from meerkat_meta.models import SessionBuildOptions
 
     tools, _ = team
     draft = SessionBuildOptions()
@@ -221,11 +221,11 @@ async def test_inspection_rejects_unsupported_views_without_echoing_arguments(te
 @pytest.mark.asyncio
 @pytest.mark.parametrize("agent_index", (0, 1))
 async def test_messaging_reference_exposes_exact_installed_admission_and_observation_contract(team, agent_index):
-    from meerkat_mobkit.errors import RpcError
-    from meerkat_mobkit.identity_first_models import (CompletionCursor, CompletionProgress,
+    from meerkat_meta.errors import RpcError
+    from meerkat_meta.identity_first_models import (CompletionCursor, CompletionProgress,
                                                      DispatchInput, DispatchResult,
                                                      IdentityInspection, SendResult)
-    from meerkat_mobkit.runtime import IdentityAgentHandle, MobKitRuntime
+    from meerkat_meta.runtime import IdentityAgentHandle, MetaRuntime
 
     agent = team[agent_index]
     offset = 0
@@ -245,8 +245,8 @@ async def test_messaging_reference_exposes_exact_installed_admission_and_observa
     reference = "\n".join(lines)
     for contract in (DispatchInput, DispatchResult, SendResult, CompletionCursor,
                      CompletionProgress, IdentityInspection, RpcError,
-                     MobKitRuntime.dispatch, MobKitRuntime.dispatch_text,
-                     MobKitRuntime.inspect_identity, IdentityAgentHandle.inspect,
+                     MetaRuntime.dispatch, MetaRuntime.dispatch_text,
+                     MetaRuntime.inspect_identity, IdentityAgentHandle.inspect,
                      IdentityAgentHandle.dispatch_and_wait,
                      IdentityAgentHandle.dispatch_text_and_wait,
                      IdentityAgentHandle._wait_for_admission,
@@ -258,15 +258,15 @@ async def test_messaging_reference_exposes_exact_installed_admission_and_observa
 @pytest.mark.parametrize("agent_index", (0, 1))
 async def test_roster_reference_is_registered_and_pages_exact_installed_provider_contracts(team, agent_index):
     from jsonschema import validate
-    from meerkat_mobkit.builder import MobKitBuilder
-    from meerkat_mobkit.identity_first_models import (AgentBuildContext, AgentBuildDraft,
+    from meerkat_meta.builder import MetaBuilder
+    from meerkat_meta.identity_first_models import (AgentBuildContext, AgentBuildDraft,
                                                      DurableAgentSpec, ManagedPeerEdge,
                                                      RosterContext)
-    from meerkat_mobkit.identity_first_providers import (AgentCustomizerProtocol,
+    from meerkat_meta.identity_first_providers import (AgentCustomizerProtocol,
                                                         RosterProviderProtocol,
                                                         TopologyProviderProtocol)
-    from meerkat_mobkit.models import SessionBuildOptions
-    from meerkat_mobkit.runtime import MobKitRuntime
+    from meerkat_meta.models import SessionBuildOptions
+    from meerkat_meta.runtime import MetaRuntime
 
     agent = team[agent_index]
     draft = SessionBuildOptions()
@@ -295,16 +295,17 @@ async def test_roster_reference_is_registered_and_pages_exact_installed_provider
     for contract in (RosterProviderProtocol, TopologyProviderProtocol,
                      AgentCustomizerProtocol, DurableAgentSpec, ManagedPeerEdge,
                      RosterContext, AgentBuildContext, AgentBuildDraft,
-                     MobKitBuilder.roster, MobKitBuilder.topology_provider,
-                     MobKitBuilder.agent_customizer, MobKitRuntime.reconcile):
+                     MetaBuilder.roster, MetaBuilder.topology_provider,
+                     MetaBuilder.agent_customizer, MetaRuntime.reconcile):
         assert inspect.getsource(contract).rstrip() in reference
 
 
 @pytest.mark.asyncio
-async def test_both_native_agents_receive_pinned_schedule_wire_contract_and_installed_callbacks(team):
-    from meerkat_mobkit.builder import MobKitBuilder
-    from meerkat_mobkit.runtime import MobKitRuntime
-    from launchkit.native_schedule_reference import schedule_reference
+async def test_both_native_agents_receive_selected_recurrence_guidance_and_installed_callbacks(team):
+    from importlib import metadata
+    from meerkat_meta.builder import MetaBuilder
+    from meerkat_meta.runtime import MetaRuntime
+    from launchkit.native_schedule_reference import selected_recurrence_guidance
 
     tools, reviewer = team
     results = []
@@ -312,10 +313,11 @@ async def test_both_native_agents_receive_pinned_schedule_wire_contract_and_inst
         offset, lines = 0, []
         while True:
             page = await agent.reference({"name": "schedule", "offset": offset, "limit": 47})
-            assert page["ok"]
-            assert page["installed_sdk_version"] == page["reference_version"] == "0.8.42"
-            assert page["version_matches"] and not page["observed_destination"]
-            assert page["reference_kind"] == "static_pinned_primary_source"
+            assert page.get("ok") is not False
+            assert page["installed_sdk_version"] == metadata.version("meerkat-meta")
+            assert page["native_authoring_schema"] == "Not supplied by selected SDK source; inspect the actual granted native tools."
+            assert "reference_version" not in page and "version_matches" not in page
+            assert {item["path"] for item in page["source_files"]} == {"meerkat_meta/runtime.py", "meerkat_meta/builder.py"}
             numbered = page["content"].splitlines()
             assert len(numbered) <= 47
             for index, line in enumerate(numbered, offset + 1):
@@ -327,8 +329,9 @@ async def test_both_native_agents_receive_pinned_schedule_wire_contract_and_inst
                 break
             offset = page["next_offset"]
         content = "\n".join(lines)
-        assert schedule_reference("0.8.42")["content"] in content
-        for contract in (MobKitRuntime.on_schedule_fire, MobKitBuilder.host_runnables):
+        assert selected_recurrence_guidance() in content
+        assert "Pinned native input schemas:" not in content
+        for contract in (MetaRuntime.on_schedule_fire, MetaBuilder.host_runnables):
             assert inspect.getsource(contract).rstrip() in content
         assert len(content.encode()) < 64 * 1024
         results.append(content)
@@ -336,30 +339,38 @@ async def test_both_native_agents_receive_pinned_schedule_wire_contract_and_inst
 
 
 @pytest.mark.asyncio
-async def test_builder_and_reviewer_schedule_version_guard_uses_host_metadata_not_arguments(team, monkeypatch):
+async def test_schedule_reference_uses_host_metadata_and_never_borrows_legacy_schema(team, monkeypatch):
     import builtins
 
     tools, reviewer = team
     original_import = builtins.__import__
-    def require_guard_before_sdk_import(name, *args, **kwargs):
-        if name == "meerkat_mobkit":
-            raise AssertionError("A missing or mismatched SDK must be rejected before loading it.")
+    def no_legacy_import(name, *args, **kwargs):
+        if name.split(".")[0] == "meerkat_mobkit":
+            raise AssertionError("Current Meta references must not import the predecessor SDK.")
         return original_import(name, *args, **kwargs)
-    monkeypatch.setattr(builtins, "__import__", require_guard_before_sdk_import)
-    monkeypatch.setattr(worker.metadata, "version", lambda name: "0.8.43")
+    monkeypatch.setattr(builtins, "__import__", no_legacy_import)
+    def host_version(name):
+        assert name == "meerkat-meta"
+        return "0.9.43"
+    monkeypatch.setattr(worker.metadata, "version", host_version)
     for agent in (tools, reviewer):
-        result = await agent.reference({"name": "schedule", "installed_sdk_version": "0.8.42"})
-        assert result["ok"] is False
-        assert result["installed_sdk_version"] == "0.8.43"
-        assert not result["version_matches"] and not result["observed_destination"]
-        assert "content" not in result
-        lookup = await agent.reference({"name": "schedule", "query": "create"})
-        assert lookup["installed_sdk_version"] == "0.8.43"
-        assert lookup["unavailable_references"] == ["schedule"] and lookup["matches"] == []
+        result = await agent.reference({"name": "schedule", "installed_sdk_version": "0.8.42", "limit": 250})
+        assert result.get("ok") is not False
+        assert result["installed_sdk_version"] == "0.9.43"
+        assert "MetaRuntime.on_schedule_fire" in result["content"]
+        assert "Pinned native input schemas:" not in result["content"]
+        assert "reference_version" not in result and "version_matches" not in result
+        lookup = await agent.reference({"name": "schedule", "query": "native authoring schema"})
+        assert lookup["installed_sdk_version"] == "0.9.43"
+        assert lookup["unavailable_references"] == []
+        assert lookup["matches"][0]["source_file"] == "launchkit/native_schedule_reference.py#selected_recurrence_guidance"
     def missing(name):
         raise worker.metadata.PackageNotFoundError(name)
     monkeypatch.setattr(worker.metadata, "version", missing)
-    assert (await reviewer.reference({"name": "schedule"}))["installed_sdk_version"] is None
+    result = await reviewer.reference({"name": "schedule", "limit": 250})
+    assert result["installed_sdk_version"] is None
+    assert "MetaRuntime.on_schedule_fire" in result["content"]
+    assert "Pinned native input schemas:" not in result["content"]
 
 
 @pytest.fixture
@@ -445,7 +456,7 @@ async def test_selected_runtime_references_use_original_wheels_not_forge_sdk(
         for name in ("runtime", "builder", "identity", "types", "roster", "messaging", "flows", "schedule"):
             page = await agent.reference({"name": name, "limit": 250})
             assert page.get("ok") is not False
-            assert page["selected_sdk_versions"] == {"meerkat-meta": "0.9.0", "meerkat-toolkit": "0.1.0"}
+            assert page["selected_sdk_versions"] == {"meerkat-meta": "0.9.0", "meerkat-toolkit": "0.9.0"}
             assert page["installed_sdk_version"] is None and not page["observed_destination"]
             assert "0.8.42" not in page["content"] and "MobKitRuntime" not in page["content"].replace("ToolkitMobKitRuntime", "")
             for source in page["source_files"]:
@@ -606,17 +617,17 @@ async def test_runtime_reference_query_finds_exact_public_result_type(team, agen
     import hashlib
     from importlib import metadata
     from jsonschema import validate
-    from meerkat_mobkit.models import SessionBuildOptions
-    from meerkat_mobkit.types import MemberSnapshot
+    from meerkat_meta.models import SessionBuildOptions
+    from meerkat_meta.types import MemberSnapshot
 
     agent = team[agent_index]
     args = {"query": "class membersnapshot:", "limit": 8}
     result = await agent.reference(args)
     hit = next(item for item in result["matches"]
-               if item["source_file"] == "meerkat_mobkit/types.py")
+               if item["source_file"] == "meerkat_meta/types.py")
     source_path = Path(inspect.getfile(MemberSnapshot))
     source = source_path.read_text()
-    assert result["installed_sdk_version"] == metadata.version("meerkat-mobkit")
+    assert result["installed_sdk_version"] == metadata.version("meerkat-meta")
     assert hit["name"] == "types"
     assert hit["source_line"] == hit["line"] == hit["offset"] + 1
     assert source.splitlines()[hit["source_line"] - 1] == hit["snippet"]
@@ -653,12 +664,12 @@ async def test_runtime_reference_query_is_literal_bounded_and_paged(team):
 
 @pytest.mark.asyncio
 async def test_runtime_reference_query_preserves_focused_source_locations(team):
-    from meerkat_mobkit.identity_first_providers import TopologyProviderProtocol
+    from meerkat_meta.identity_first_providers import TopologyProviderProtocol
 
     result = await team[0].reference({"name": "roster", "query": "class TopologyProviderProtocol"})
     hit, = result["matches"]
     source = Path(inspect.getfile(TopologyProviderProtocol)).read_text().splitlines()
-    assert hit["source_file"] == "meerkat_mobkit/identity_first_providers.py"
+    assert hit["source_file"] == "meerkat_meta/identity_first_providers.py"
     assert source[hit["source_line"] - 1] == hit["snippet"]
     page = await team[0].reference({"name": "roster", "offset": hit["offset"], "limit": 1})
     assert page["content"] == f"{hit['line']}: {hit['snippet']}"
@@ -676,11 +687,11 @@ async def test_runtime_reference_rejects_invalid_query_before_sdk_reads(team, mo
 
 @pytest.mark.asyncio
 async def test_runtime_reference_lookup_cannot_read_private_modules_or_arbitrary_paths(team, tmp_path, monkeypatch):
-    import meerkat_mobkit
+    import meerkat_meta
     from jsonschema import ValidationError, validate
-    from meerkat_mobkit.models import SessionBuildOptions
+    from meerkat_meta.models import SessionBuildOptions
 
-    installed = Path(inspect.getfile(meerkat_mobkit)).parent
+    installed = Path(inspect.getfile(meerkat_meta)).parent
     admitted = ("runtime.py", "builder.py", "identity_first_models.py", "types.py",
                 "identity_first_providers.py", "errors.py")
     sdk = tmp_path / "reference-sdk"

@@ -32,7 +32,7 @@ async def test_launch_validates_saved_application_settings_before_resources(
     (application / "configuration.json").write_text(json.dumps({"fields": fields}))
     environment = [{"key": "OPENAI_API_KEY", "label": "Provider key",
                     "secret": True, "required": True}]
-    spec = {"environment": environment, "port": 8788}
+    spec = {"environment": environment, "port": 8788, "classes": []}
     values = {"OPENAI_API_KEY": "inert-provider-canary",
               "LAUNCH_SITE_NAME": "  exact chosen site  ",
               "LAUNCH_ACCESS_SECRET": " \tvalid-private-canary-token\t ",
@@ -90,9 +90,9 @@ async def test_launch_validates_saved_application_settings_before_resources(
         assert "valid-private-canary-token" not in diagnostic
         assert milestones == []
     else:
-        with pytest.raises(ResourceReached, match="connector-tools"):
+        with pytest.raises(ResourceReached, match="application"):
             await host.run(spec, SimpleNamespace())
-        assert milestones == ["connector-tools"]
+        assert milestones == ["application"]
     assert saved.read_bytes() == saved_bytes
     assert not (tmp_path / "data").exists()
     assert not (tmp_path / ".mobkit").exists()
