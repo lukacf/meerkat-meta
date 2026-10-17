@@ -9,9 +9,10 @@ from launchkit.blueprint import Blueprint, ToolGrants, starter_blueprint
 from launchkit.compiler import application_profiles, generate_package, mob_toml, package_availability, package_preview
 from launchkit.rehearsal import masked_capabilities
 from launchkit.rehearsal_worker import rehearsal_mob_toml
+from test_meta_guide_runtime import selected as selected_guide_runtime
 
 
-def test_explicit_bundle_survives_selected_profiles_but_not_ordinary_install_or_trial():
+def test_explicit_bundle_survives_selected_profiles_but_not_ordinary_install_or_trial(selected_guide_runtime):
     original = starter_blueprint().model_dump(mode="json")
     data = deepcopy(original)
     selected = data["agent_classes"][1]

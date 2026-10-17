@@ -14,6 +14,7 @@ from launchkit.generator import generate_files as generate_v1_files
 from launchkit.planner import DEFAULT_MODELS as PLANNER_MODELS
 from launchkit.rehearsal_worker import rehearsal_mob_toml
 from launchkit.schema import DEFAULT_MODELS, DeploymentSpec, DesignRequest
+from test_meta_guide_runtime import selected as selected_guide_runtime
 
 
 def project():
@@ -119,7 +120,7 @@ def test_explicit_invalid_openai_model_is_rejected_not_replaced(model):
         AgentClass.model_validate(role(model=model))
 
 
-def test_new_default_package_and_trial_use_builtin_model_without_custom_collision():
+def test_new_default_package_and_trial_use_builtin_model_without_custom_collision(selected_guide_runtime):
     spec = Blueprint.model_validate(blueprint())
     files = generate_files(spec)
     native = tomllib.loads(files["config/mob.toml"])

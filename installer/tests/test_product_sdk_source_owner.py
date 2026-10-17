@@ -18,6 +18,30 @@ from test_selected_sdk_supervisor import (
 )
 
 
+@pytest.fixture(autouse=True)
+def no_selected_sdk_import(monkeypatch):
+    import builtins
+    import importlib
+
+    roots = {"meerkat_meta", "meerkat_toolkit", "fixture_sequence"}
+    before = {name: module for name, module in sys.modules.items()
+              if name.split(".")[0] in roots}
+    original_import, original_module = builtins.__import__, importlib.import_module
+    def guarded_import(name, *args, **kwargs):
+        if name.split(".")[0] in roots:
+            pytest.fail("Selected SDK byte installation must not import SDK source.")
+        return original_import(name, *args, **kwargs)
+    def guarded_module(name, *args, **kwargs):
+        if name.split(".")[0] in roots:
+            pytest.fail("Selected SDK byte installation must not load an SDK module.")
+        return original_module(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setattr(importlib, "import_module", guarded_module)
+    yield
+    assert {name: module for name, module in sys.modules.items()
+            if name.split(".")[0] in roots} == before
+
+
 def _install_owned(files, require_owner_current):
     return files.owner.install_selected_sdk_pair(files.meta_path, files.toolkit_path,
         meta=files.meta[1], toolkit=files.toolkit[1], site_packages=files.site,
@@ -60,8 +84,7 @@ async def test_selected_sdk_owner_callback_stays_on_original_task_through_real_r
     assert not list((files.root / ".venv").glob(".forge-selected-*"))
     assert (files.root / "retained.txt").read_bytes() == b"application state stays owned\n"
     assert not (files.root / ".venv/forge-sdk.receipt.json").exists()
-    assert not any(name in sys.modules for name in
-        ("meerkat_meta", "meerkat_toolkit", "fixture_sequence"))
+    assert "fixture_sequence" not in sys.modules
     for child in files.children:
         assert_reaped(child)
 
@@ -175,6 +198,5 @@ async def test_sdk_parent_owner_interruption_stops_and_joins_same_child_worker(s
     assert not list((files.root / ".venv").glob(".forge-selected-*"))
     assert (files.root / "retained.txt").read_bytes() == b"application state stays owned\n"
     assert not (files.root / ".venv/forge-sdk.receipt.json").exists()
-    assert not any(name in sys.modules for name in
-        ("meerkat_meta", "meerkat_toolkit", "fixture_sequence"))
+    assert "fixture_sequence" not in sys.modules
     assert_reaped(files.children[0])

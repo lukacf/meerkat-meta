@@ -16,6 +16,7 @@ from launchkit import native_definition_continuity, native_models
 from launchkit.native_models import (is_legacy_registry_removal, legacy_registry_successor,
     model_catalog_context, model_registry_lines, supplemental_model_metadata)
 from test_architect_startup_recovery import FakeRuntime, startup
+from test_meta_guide_runtime import selected as selected_guide_runtime
 
 
 def old_metadata():
@@ -408,7 +409,7 @@ def test_unknown_or_unrepresentable_definition_is_never_dropped(registry, mutate
     assert not registry.receipt.exists()
 
 
-def test_builder_visual_reviewer_and_application_use_same_collision_free_builtin():
+def test_builder_visual_reviewer_and_application_use_same_collision_free_builtin(selected_guide_runtime):
     from launchkit.implementation_worker import implementation_mob_toml
     from launchkit.visual_review_runtime import visual_review_mob_toml
     from launchkit.blueprint import starter_blueprint
@@ -516,61 +517,62 @@ async def test_active_member_must_belong_to_current_identity_session(startup):
 
 
 @pytest.mark.asyncio
-async def test_saved_setup_removes_only_legacy_model_via_native_cas_with_unchanged_tuning(startup):
+async def test_current_meta_guide_leaves_legacy_fixture_and_model_cas_to_native_owner(startup):
     service, controller = startup
     root = module.setup_runtime_root(service.root)
-    original = definition()
-    previous = write_spec(root, original, revision=7, blob=True)
-    from launchkit.templates.storage_setup import write_private
-    write_private(root / "deployment.json", {"slug": "launch-architect", "mobkitVersion": "0.8.47"})
-    write_private(root / ".mobkit/launch-storage.json", {
-        "format": 1, "project": "launch-architect", "version": "0.8.47", "phase": "ready"})
-    state_inode = (root / ".mobkit/state").stat().st_ino
-    async def native_cas(builder):
-        assert controller.lock_events == ["acquired"]
-        assert controller.spec_updates == [7]
-        # This fixture represents the supported native CAS at SDK build, not
-        # production host code writing a canonical native table.
-        write_spec(root, legacy_registry_successor(original), revision=8)
-    controller.callback_runner = native_cas
-    runtime = FakeRuntime()
-    controller.outcomes = [runtime]
-    assert (await service.start())["status"] == "ready"
-    receipt = json.loads((root / ".mobkit" / module.SETUP_REGISTRY_RECEIPT).read_text())
-    assert base64.b64decode(receipt["previous_spec"]) == previous
-    assert receipt["successor_definition"]["profiles"] == original["profiles"]
-    native = tomllib.loads(controller.mob_configs[0])
-    assert native["models"] == {}
-    assert native["profiles"]["architect"]["auto_compact_threshold"] == 321987
-    assert native["profiles"]["visualizer"]["auto_compact_threshold"] == 321987
-    assert "auto_compact_threshold" not in native["profiles"]["connectors"]
-    assert native["profiles"]["visualizer"]["provider_params"] == original["profiles"]["visualizer"]["provider_params"]
-    assert (root / ".mobkit/state").stat().st_ino == state_inode
-    await service.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_native_build_without_exact_successor_never_advertises_ready(startup):
-    service, controller = startup
-    root = module.setup_runtime_root(service.root)
-    previous = write_spec(root, definition(), revision=7)
-    from launchkit.templates.storage_setup import write_private
-    write_private(root / "deployment.json", {"slug": "launch-architect", "mobkitVersion": "0.8.47"})
-    write_private(root / ".mobkit/launch-storage.json", {
-        "format": 1, "project": "launch-architect", "version": "0.8.47", "phase": "ready"})
+    write_spec(root, definition(), revision=7, blob=True)
     database = root / ".mobkit/state/event_log.sqlite3"
     before = database.read_bytes(), database.stat().st_ino
     runtime = FakeRuntime()
     controller.outcomes = [runtime]
-    with pytest.raises(RuntimeError, match="did not publish the exact"):
-        await service.start()
-    receipt = json.loads((root / ".mobkit" / module.SETUP_REGISTRY_RECEIPT).read_text())
-    assert base64.b64decode(receipt["previous_spec"]) == previous
-    assert controller.spec_updates == [7]
+    assert (await service.start())["status"] == "ready"
+    # The inert native owner accepts startup. Host code neither interprets nor
+    # rewrites this predecessor-format store and cannot qualify its migration.
+    assert controller.spec_updates == []
     assert before == (database.read_bytes(), database.stat().st_ino)
-    assert runtime.wait_calls == [] and runtime.member_calls == []
-    assert runtime.shutdown_calls == 1 and controller.lock_events == ["acquired", "released"]
-    assert service.runtime is None and service.state == "failed"
+    assert not (root / ".mobkit" / module.SETUP_REGISTRY_RECEIPT).exists()
+    assert not (root / ".mobkit" / module.SETUP_REGISTRY_COMPLETED).exists()
+    assert runtime.wait_calls
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_current_meta_explicit_revision_uses_native_cas_without_legacy_host_repair(startup):
+    service, controller = startup
+    root = module.setup_runtime_root(service.root)
+    write_spec(root, definition(), revision=7)
+    database = root / ".mobkit/state/event_log.sqlite3"
+    before = database.read_bytes(), database.stat().st_ino
+    async def original_revision(builder):
+        assert controller.lock_events == ["acquired"]
+        assert controller.spec_updates == [7]
+        assert before == (database.read_bytes(), database.stat().st_ino)
+    controller.callback_runner = original_revision
+    runtime = FakeRuntime()
+    controller.outcomes = [runtime]
+    assert (await service.start(expected_revision=7))["status"] == "ready"
+    assert controller.spec_updates == [7] and controller.builds == 1
+    assert before == (database.read_bytes(), database.stat().st_ino)
+    assert not (root / ".mobkit" / module.SETUP_REGISTRY_RECEIPT).exists()
+    assert runtime.wait_calls
+    await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_native_rejection_keeps_legacy_fixture_without_claiming_ready(startup):
+    service, controller = startup
+    root = module.setup_runtime_root(service.root)
+    write_spec(root, definition(), revision=7)
+    database = root / ".mobkit/state/event_log.sqlite3"
+    before = database.read_bytes(), database.stat().st_ino
+    runtime = FakeRuntime(ready=False, broken=1)
+    controller.outcomes = [runtime]
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        await service.start()
+    assert controller.spec_updates == []
+    assert before == (database.read_bytes(), database.stat().st_ino)
+    assert runtime.shutdown_calls == 1 and service.runtime is None
+    assert service.state == "failed"
     assert not (root / ".mobkit" / module.SETUP_REGISTRY_COMPLETED).exists()
 
 

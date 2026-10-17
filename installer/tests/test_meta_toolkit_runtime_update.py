@@ -103,7 +103,7 @@ def test_product_compiler_preserves_design_and_refuses_manual_or_unknown_model(p
         assert "Shell entrypoints cannot select its native setup inputs" in text
         assert "pip install" not in text and "--doctor" not in text
     assert b"meerkat-meta==0.9.0 --hash=sha256:" in candidate["requirements.txt"][0]
-    assert b"meerkat-toolkit==0.1.0 --hash=sha256:" in candidate["requirements.txt"][0]
+    assert b"meerkat-toolkit==0.9.0 --hash=sha256:" in candidate["requirements.txt"][0]
     assert b"complete native product prefix" in candidate["README.md"][0]
     spec = json.loads(candidate["blueprint.json"][0])
     spec["agent_classes"][0]["model"] = "gpt-6.1-sol"

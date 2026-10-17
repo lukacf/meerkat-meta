@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -23,10 +24,11 @@ def test_starters_are_valid_for_all_templates(template):
 def test_no_configuration_is_truthfully_reported(monkeypatch):
     for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"]:
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(bootstrap, "_selected_guide_runtime", None)
     capability = planner_capability()
     assert capability["available"] is False
     assert capability["providers"] == []
-    assert "key" in capability["reason"]
+    assert "provider" in capability["reason"]
 
 
 def test_model_output_cannot_smuggle_deployment_fields():
@@ -52,11 +54,14 @@ def test_model_output_must_have_unique_safe_ids():
 
 
 def test_package_selection_does_not_fall_back_to_retained_legacy_cache(tmp_path, monkeypatch):
+    from launchkit.connect_installer_caller import ExactFile
+
     package = tmp_path / "same-checkout"
     legacy = package / ".tools/rpc_gateway"
     legacy.parent.mkdir(parents=True)
     legacy.write_bytes(b"Retained legacy runtime, never executed.")
     legacy.chmod(0o700)
+    monkeypatch.setattr(bootstrap, "_selected_guide_runtime", None)
     monkeypatch.setattr(planner, "__file__", str(package / "launchkit/planner.py"))
     monkeypatch.setattr(planner.shutil, "which", lambda name: None)
     monkeypatch.delenv("MOBKIT_GATEWAY_BIN", raising=False)
@@ -65,5 +70,10 @@ def test_package_selection_does_not_fall_back_to_retained_legacy_cache(tmp_path,
     current.parent.mkdir(parents=True)
     current.write_bytes(b"Current runtime, never executed.")
     current.chmod(0o700)
+    assert planner.gateway_path() is None, "A cached executable is not a selected Meta runtime."
+    selected = bootstrap.SelectedGuideRuntime(
+        ExactFile(current, hashlib.sha256(current.read_bytes()).hexdigest()),
+        "0.9.0", "0.9.0", "a" * 40, "b" * 40)
+    monkeypatch.setattr(bootstrap, "_selected_guide_runtime", selected)
     assert planner.gateway_path() == current
     assert legacy.read_bytes() == b"Retained legacy runtime, never executed."
