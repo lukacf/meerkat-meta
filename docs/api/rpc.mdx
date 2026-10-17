@@ -766,7 +766,17 @@ turn from typed data.
 The response includes `interaction_id` and `identity`. The multipart JSON-RPC endpoint also accepts this method when `content` contains `image_upload` placeholders.
 
 `origin` and `idempotency_key` are required, non-empty strings after trimming.
-Deduplication is scoped by `(runtime, identity, origin, idempotency_key)`.
+Deduplication is scoped by `(caller, runtime, identity, origin,
+idempotency_key)`. The caller is the authenticated console principal, taken
+from the request's auth and never from a parameter: a verified human by OIDC
+issuer and subject, otherwise the authenticated principal (a service identity,
+or a token without a subject) together with its provider and the issuer its
+token verified against. Anonymous callers of an open console share one local
+account. An open console without an access controller never resolves tokens,
+so there every caller, even one presenting a valid token, is that shared
+account; per-principal isolation needs `require_app_auth` or an access
+controller. The same key from two callers names two different sends: neither
+replays nor observes the other's.
 Mint a new key for a new send; to replay an ambiguous send, retain the same
 scope, content, and effective `handling_mode` (omission means `queue`).
 A matching replay returns the earlier interaction's acceptance whether or not
@@ -775,6 +785,58 @@ the turn has finished. Changed content or mode (for example `queue` to
 HTTP 409 on the REST form). Changing the target or origin can create a
 distinct send. Member respawn does not clear the key, but this does not
 promise replay after the deduplication records or runtime are lost.
+
+A send is accepted (its `user_input` frame) before it is submitted for native
+admission, and settled (`delivered` or `delivery_failed`) after. When the
+gateway stops in between, a replay of the same send decides from the
+runtime's admission evidence in the session the send recorded. An admitted
+input settles the send `delivered`. For a send to a durable identity's local
+session, an absent one is dispatched again under the send's own delivery
+identity and pinned to that session, so the runtime keeps one input; if the
+session has moved, the send ends `delivery_failed` and is never retargeted.
+A governed send, or any other member's, is settled from evidence only and
+never dispatched again. At
+startup the gateway settles, from evidence only, the unsettled sends among
+the newest console frames whose input was admitted.
+
+### `meta/console/recover_send`
+
+Recover the caller's own console send: its acceptance as it is now and what
+the runtime holds for it. Mutating (it can settle a send) and gated like
+`meta/console/send` (ABAC action `agent.send` on the identity).
+
+```json
+{
+  "identity": "identity:alice",
+  "origin": "console:panel-1",
+  "idempotency_key": "panel-1:turn-1"
+}
+```
+
+The three fields are required and nothing else is accepted: interaction and
+frame ids are not lookup keys. The result is the send's acceptance plus
+`native`:
+
+```json
+{
+  "interaction_id": "...",
+  "identity": "identity:alice",
+  "session_id": "...",
+  "input_frame_id": "console-frame-...",
+  "cursor": "console:241",
+  "status": "delivered",
+  "native": { "state": "admitted", "input_id": "...", "phase": "consumed" }
+}
+```
+
+`native.state` is `admitted` (with the input id and its lifecycle `phase`),
+`absent` (no input under the send's delivery keys in its recorded session; a
+member reached through an external binding carries no delivery key, so for it
+this is not evidence that nothing was delivered), or `unknown` (with a
+`cause`). A send the evidence shows admitted but not yet settled is settled
+`delivered`; nothing is ever dispatched. A key the caller never used, and a
+key another caller used, both answer `-32001` with `data.kind =
+"send_not_found"`. The REST twin is `POST /console/send/recover`.
 
 `skill_refs` is optional: typed, source-pinned skills selected for this exact
 turn, in the same shape as meerkat `turn/start`:

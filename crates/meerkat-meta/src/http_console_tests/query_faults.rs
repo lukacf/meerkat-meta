@@ -231,6 +231,7 @@ async fn timeline_faults_preserve_class_across_rest_sse_and_both_rpc_paths()
                     false,
                     None,
                     None,
+                    &crate::console_aggregator::ConsoleSendScope::Anonymous,
                 )
                 .await
             };

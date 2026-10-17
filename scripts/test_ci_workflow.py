@@ -443,20 +443,24 @@ class CiWorkflowTests(unittest.TestCase):
             runs("extension-state-lint"),
             [
                 "scripts/repo-cargo check -p meerkat-meta --locked --no-default-features",
-                "scripts/repo-cargo clippy -p meerkat-meta --locked --features extension-state "
-                "--lib --test extension_state -- -D warnings",
+                "scripts/repo-cargo clippy -p meerkat-meta --locked --features "
+                "extension-state,console-test-faults --lib --test extension_state "
+                "--test console_send_recovery_process -- -D warnings",
             ],
         )
         self.assertEqual(
             runs("test-extension-state"),
             [
                 "scripts/repo-cargo test -p meta-extension-state --locked",
-                "scripts/repo-cargo test -p meerkat-meta --locked --features extension-state "
-                "--lib --test extension_state --no-run",
-                "scripts/repo-cargo test -p meerkat-meta --locked --features extension-state "
-                "--test extension_state",
-                "scripts/repo-cargo test -p meerkat-meta --locked --features extension-state "
-                "--lib -- extension_ document_mcp_child_supply",
+                "scripts/repo-cargo test -p meerkat-meta --locked --features "
+                "extension-state,console-test-faults --lib --test extension_state "
+                "--test console_send_recovery_process --no-run",
+                "scripts/repo-cargo test -p meerkat-meta --locked --features "
+                "extension-state,console-test-faults --test extension_state",
+                "scripts/repo-cargo test -p meerkat-meta --locked --features "
+                "extension-state,console-test-faults --test console_send_recovery_process",
+                "scripts/repo-cargo test -p meerkat-meta --locked --features "
+                "extension-state,console-test-faults --lib -- extension_ document_mcp_child_supply",
             ],
         )
         for name in ("extension-state-lint", "test-extension-state"):
@@ -475,7 +479,10 @@ class CiWorkflowTests(unittest.TestCase):
         ]
         build, *runs = steps
         self.assertTrue(build.endswith(" --no-run"), build)
-        prefix = "scripts/repo-cargo test -p meerkat-meta --locked --features extension-state "
+        prefix = (
+            "scripts/repo-cargo test -p meerkat-meta --locked --features "
+            "extension-state,console-test-faults "
+        )
         self.assertTrue(all(step.startswith(prefix) for step in steps), steps)
         built = set(re.findall(r"--(lib|test \S+)", build.split(" -- ")[0]))
         ran = {target for step in runs for target in re.findall(r"--(lib|test \S+)", step.split(" -- ")[0])}

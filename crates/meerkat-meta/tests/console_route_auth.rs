@@ -365,6 +365,69 @@ async fn console_voice_http_read_only_blocks_open_but_not_owned_cancel_fencing()
     assert_eq!(close["result"], json!({"phase":"closed"}));
 }
 
+/// The ids a console send returns (`interaction_id`, `input_frame_id`) are
+/// correlation handles, not capabilities: no console route or RPC method in
+/// the contract accepts one as a request field, so a principal holding
+/// another's ids can neither read nor act through them. A method that ever
+/// resolves one must check that the caller owns it, and update this pin.
+#[test]
+fn console_contract_requests_take_no_interaction_or_frame_ids() {
+    let artifact: Value = serde_json::from_str(include_str!(
+        "../../../docs/rct/console-rest-sse-contract-v0.5.0.json"
+    ))
+    .expect("contract artifact json should parse");
+    const REQUEST_FIELD_LISTS: &[&str] = &[
+        "required_fields",
+        "optional_fields",
+        "query_optional_fields",
+        "required_path_params",
+    ];
+    const ID_FIELDS: &[&str] = &["interaction_id", "input_frame_id", "frame_id"];
+    fn walk(value: &Value, path: &mut Vec<String>, offenders: &mut Vec<String>, lists: &mut usize) {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object {
+                    if REQUEST_FIELD_LISTS.contains(&key.as_str())
+                        && let Some(fields) = child.as_array()
+                    {
+                        *lists += 1;
+                        for field in fields.iter().filter_map(Value::as_str) {
+                            if ID_FIELDS.contains(&field) {
+                                offenders.push(format!("{}/{key}: {field}", path.join("/")));
+                            }
+                        }
+                    }
+                    path.push(key.clone());
+                    walk(child, path, offenders, lists);
+                    path.pop();
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, path, offenders, lists);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut offenders = Vec::new();
+    let mut lists = 0;
+    walk(
+        &artifact["surfaces"],
+        &mut Vec::new(),
+        &mut offenders,
+        &mut lists,
+    );
+    assert!(
+        lists > 20,
+        "the walk must see the contract's request lists ({lists})"
+    );
+    assert!(
+        offenders.is_empty(),
+        "console requests that take an interaction or frame id: {offenders:?}"
+    );
+}
+
 #[test]
 fn phase0_contract_004_console_rest_sse_contract_version_is_pinned_and_enforced() {
     let artifact: Value = serde_json::from_str(include_str!(

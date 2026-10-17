@@ -287,6 +287,26 @@ impl UnifiedRuntime {
         aggregator
     }
 
+    /// Settle, from native admission evidence, the console sends a previous
+    /// process accepted but did not see settle. Bounded and evidence only: a
+    /// send whose input the runtime admitted is settled delivered; nothing
+    /// is dispatched or failed. Gateways run it once at startup, after
+    /// building the console router and before serving it. A runtime whose
+    /// console projection was never built has nothing to settle.
+    pub async fn reconcile_interrupted_console_sends(&self) {
+        let Some(projection) = self.console_projection.get() else {
+            return;
+        };
+        let outcome = projection.reconcile_interrupted_sends().await;
+        if outcome.examined > 0 {
+            tracing::info!(
+                examined = outcome.examined,
+                delivered = outcome.delivered,
+                "reconciled interrupted console sends"
+            );
+        }
+    }
+
     pub fn build_console_json_router(&self, decisions: RuntimeDecisionState) -> Router {
         self.build_console_json_router_with_policy(
             decisions,

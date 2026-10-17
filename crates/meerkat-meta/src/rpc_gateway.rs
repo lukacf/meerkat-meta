@@ -18127,6 +18127,10 @@ external_addressable = true
             format!("host app routes refused: {error}"),
         )
     })?;
+    // Before anything is served: console sends a previous process accepted
+    // and did not see settle are settled from the runtime's evidence. The
+    // router built above created the console projection this reads.
+    runtime.reconcile_interrupted_console_sends().await;
     // Live (realtime) transport: ONE live context per gateway (one adapter
     // host, one WS state, one provider registration) serves every live door.
     // Console voice and the external `meta/live/*` surface share it and

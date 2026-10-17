@@ -122,6 +122,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   earlier version rewrites the state without marking them), so their retries
   are likewise evaluated as new applies.
 
+- Behaviour-only (not measured by the semver gate): console send records
+  written before this version are not matched by any Console caller, so a
+  send in flight during the upgrade and retried afterwards with the same key
+  is admitted as a new send.
+
 ### Security
 
 - The stock reference app router's documented bound on requests in flight
@@ -333,6 +338,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   running: reconcile it before any retry, since a retry starts another
   helper rather than cancelling or deduplicating the first.
 
+- `meta/console/recover_send` and its REST twin `POST /console/send/recover`
+  report the caller's own console send by `identity`, `origin` and
+  `idempotency_key`: its acceptance as it is now, and what the runtime holds
+  for it (`native.state`: `admitted` with the input id and, when known, its
+  phase; `absent`; or `unknown`). A send the evidence shows admitted but not
+  yet settled is settled `delivered`, unless this process is still
+  dispatching it, which is left to that dispatch; nothing is dispatched. A key
+  the caller never used and a key another caller used answer the same
+  `send_not_found`. It is gated like `meta/console/send` (`agent.send`,
+  refused on a read-only console).
+- `ConsoleLogStore::unsettled_send_frames` (defaulted to none) and
+  `UnifiedRuntime::reconcile_interrupted_console_sends`, which both gateways
+  run once at startup.
+
 ### Changed
 
 - Flow Editor catalogs give a caller without host access each filesystem
@@ -387,6 +406,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - CI's unit test job, now the only automatic run of the lib and bin tests,
   lists them with its own filter before running them and fails if the
   filter leaves any out.
+
+- Console sends are deduplicated per caller: the dedupe keys of
+  `meta/console/send` and `/console/send` are scoped to the authenticated
+  principal (a verified human by OIDC issuer and subject, otherwise the
+  console principal with its provider and verified issuer; anonymous
+  callers of an open console share one local account). The same key from
+  two callers names two sends. An open console without an access
+  controller never resolves tokens, so every caller there is that shared
+  account; with `require_app_auth` or an access controller each verified
+  caller has its own scope (on an open console, a caller without a token
+  stays in the shared account).
+- The `dedupe_key` of a console send frame is an opaque digest for every
+  Console caller. The public Rust `MetaConsoleAggregator::send` and
+  `reserve_identity_first_interaction` keep their key shape and behaviour.
 
 ### Fixed
 
@@ -623,6 +656,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   write the request and only then fail its wait with `OverflowError`, so the
   gateway ran the call (a helper spawn, for example) with nobody waiting for
   the reply.
+
+- A replay of a console send the gateway accepted but stopped before it
+  settled now decides from the runtime's admission evidence in the session
+  the send recorded. An admitted input settles it `delivered`. An absent one
+  is dispatched again only for a durable identity's local session, under the
+  send's own delivery identity and pinned to that session (a moved session
+  ends it `delivery_failed`, never retargeted); governed sends and other
+  members' sends are settled from evidence only, so an absent one stays
+  unsettled. A send this process is still dispatching is left to that
+  dispatch. At startup the gateway settles, from evidence only, the unsettled
+  sends among the newest console frames whose input was admitted.
 
 ### Known limitations
 
