@@ -13662,6 +13662,9 @@ pub async fn model_routing_status_for_member(
     model_routing_status_for_session(session_service, member_id, session_id).await
 }
 
+/// Resolve a supplied member id to its current session through the mob
+/// handle, then read that session's visible tools. Mirrors
+/// `model_routing_status_for_member`.
 pub async fn resolved_tools_for_member(
     handle: &MobHandle,
     session_service: Option<&Arc<dyn MobSessionService>>,
@@ -13670,7 +13673,14 @@ pub async fn resolved_tools_for_member(
     if member_id.trim().is_empty() {
         return Err(MobRuntimeError::InvalidInput("identity must not be empty"));
     }
-    let mid = crate::member_comms_id::mob_member_id(member_id);
+    // `roster_member_id_for_supplied_id`, NOT `mob_member_id`, for the same
+    // reason as the routing-status lookup (#366): the roster is keyed by the
+    // encoded DURABLE identity, so a current runtime alias
+    // (`rt:{identity}:{generation}`) handed straight to `mob_member_id` names
+    // a roster row nobody owns, and a healthy member reads as having no
+    // session. The SUPPLIED identity is still what the snapshot echoes. A
+    // stale alias is refused by the surfaces before this lookup.
+    let mid = crate::member_comms_id::roster_member_id_for_supplied_id(member_id);
     let status = handle.member_status(&mid).await?;
     let Some(session_id) = status.current_session_id else {
         return Err(MobRuntimeError::InvalidInput(
@@ -15306,6 +15316,48 @@ mod tests {
             .resolve_bridge_session_id(&meerkat_mob::AgentIdentity::from(member))
             .await
             .expect("member session")
+    }
+
+    /// #366: every spelling of one member reaches the same resolved tools.
+    /// The roster is keyed by the encoded durable identity, so the lookup has
+    /// to decode a supplied id the way `model_routing_status_for_member` does.
+    /// A current runtime alias (`rt:{identity}:{generation}`) handed straight
+    /// to `mob_member_id` names a roster row nobody owns, and the healthy
+    /// member reads as having no current session. Each snapshot echoes the
+    /// spelling it was asked with.
+    #[tokio::test]
+    async fn resolved_tools_for_member_resolves_every_spelling_of_one_member() {
+        const DURABLE: &str = "review:singleton";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = bootstrap_opt_in_runtime("resolved-tools-member-alias", dir.path()).await;
+        let handle = runtime.handle();
+        let roster_id = crate::member_comms_id::mob_member_id_str(DURABLE).into_owned();
+        let session_id = seat_worker(&handle, &roster_id).await;
+
+        let durable = resolved_tools_for_member(&handle, runtime.session_service(), DURABLE)
+            .await
+            .expect("the durable identity resolves its seated member");
+        assert_eq!(durable.session_id, session_id.to_string());
+        assert!(
+            !durable.tools.is_empty(),
+            "the seated member exposes tools: {durable:?}"
+        );
+
+        for supplied in [format!("rt:{DURABLE}:0"), roster_id.clone()] {
+            let resolved = resolved_tools_for_member(&handle, runtime.session_service(), &supplied)
+                .await
+                .map_err(|error| error.to_string());
+            assert_eq!(
+                resolved,
+                Ok(ResolvedToolsSnapshot {
+                    identity: supplied.clone(),
+                    session_id: durable.session_id.clone(),
+                    tools: durable.tools.clone(),
+                }),
+                "{supplied} must resolve the member {DURABLE} names, with the same session and tools"
+            );
+        }
+        let _ = handle.shutdown().await;
     }
 
     /// Review of #442 (hardening): a forker respawning its own child with the

@@ -11828,6 +11828,30 @@ comms = true
             "{get:#?}"
         );
 
+        // #366: resolved tools decode a supplied runtime alias to its durable
+        // member, so the stale-alias refusal must still come first here too.
+        let resolved_tools: Value = serde_json::from_str(
+            &super::handle_unified_rpc_json_arc(
+                &runtime,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "meta/identity/resolved_tools",
+                    "params": {"identity": stale_alias},
+                })
+                .to_string(),
+                Duration::from_secs(5),
+                None,
+                None,
+            )
+            .await,
+        )?;
+        assert_eq!(
+            resolved_tools["error"]["data"]["kind"],
+            json!("stale_identity_runtime_binding"),
+            "{resolved_tools:#?}"
+        );
+
         runtime.shutdown().await;
         Ok(())
     }

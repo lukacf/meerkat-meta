@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `meta/identity/resolved_tools`, and `resolved_tools_for_member` in Rust,
+  resolve the supplied id through `roster_member_id_for_supplied_id`, as
+  `meta/identity/routing_status` does (#366). A member named by its current
+  runtime alias (`rt:{identity}:{generation}`) or by its encoded roster id
+  now returns the same session and tools as its durable identity; it used
+  to fail with "identity has no current session". The response still echoes
+  the spelling the caller supplied, and a stale runtime alias is still
+  refused with `stale_identity_runtime_binding`.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

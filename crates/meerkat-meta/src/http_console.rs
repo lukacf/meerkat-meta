@@ -17765,6 +17765,35 @@ comms = true
             }
         }
 
+        // #366: resolved tools decode a supplied runtime alias to its durable
+        // member, so the stale-alias refusal must still come first.
+        let resolved_tools = Box::pin(handle_console_runtime_rpc(
+            &runtime,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(identity_runtime.clone()),
+            None,
+            None,
+            rpc_request_with_params(
+                "meta/identity/resolved_tools",
+                json!({ "identity": "rt:review:singleton:0" }),
+            ),
+            true,
+        ))
+        .await;
+        assert_eq!(
+            resolved_tools["error"]["data"]["kind"],
+            json!("stale_identity_runtime_binding"),
+            "resolved_tools must refuse a stale runtime alias: {resolved_tools:#?}"
+        );
+        assert_eq!(
+            resolved_tools["error"]["data"]["registered_runtime_member_id"],
+            json!("rt:review:singleton:1")
+        );
+
         let list_response = Box::pin(handle_console_runtime_rpc(
             &runtime,
             None,
