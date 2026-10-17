@@ -291,6 +291,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   draft it returns, outside the lock. Validation also stops at a document's
   structure caps, before the checks whose work they bound, and a new draft
   is refused as soon as the store is read when it already holds 256.
+- The Flow Editor draft store is written through a new, uniquely named file
+  readable only by its user, in directories created readable only by that
+  user, then renamed over the store. Each write streams the store to that
+  file, and the byte cap is checked by counting, so no write builds a copy
+  of the store in memory. A store file past 128 MiB (written before the
+  caps) is refused before it is read, with `-32602` and
+  `data: {"kind": "draft_store_unavailable", "reason": "store_too_large",
+  "max_read_bytes": 134217728, "store_bytes": ...}`. Before, every draft
+  method read and parsed such a file whole, the store took the default file
+  mode, and writers sharing a store raced on one fixed `.json.tmp` file.
 
 ### Added
 
@@ -481,6 +491,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The Flow Editor's remaining resource limits continue in 0.9.3: draft store
   totals, and validation, whose peak memory stays linear in its (capped)
   input.
+- The Flow Editor draft store is shared by every caller of a Flow Editor
+  route: one caller can fill it to its caps, which refuses new drafts to
+  everyone else and drops other drafts' undo history first, and any caller
+  can overwrite or delete any draft. Per-caller stores or quotas are planned.
 
 ## [0.9.1] - 2026-10-15
 

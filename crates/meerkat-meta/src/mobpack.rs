@@ -4039,6 +4039,10 @@ pub(crate) enum DraftStoreRefusal {
     /// The store file would pass [`MOBPACK_DRAFT_STORE_MAX_BYTES`] even with
     /// every undo and redo snapshot dropped: it would take `required_bytes`.
     TooLarge { required_bytes: usize },
+    /// The store file holds `bytes`, past
+    /// [`MOBPACK_DRAFT_STORE_MAX_READ_BYTES`] (a store written before the
+    /// caps): it is refused before it is read.
+    Oversized { bytes: u64, path: PathBuf },
 }
 
 impl DraftStoreRefusal {
@@ -4072,6 +4076,12 @@ impl DraftStoreRefusal {
                 "max_bytes": MOBPACK_DRAFT_STORE_MAX_BYTES,
                 "required_bytes": required_bytes,
             }),
+            Self::Oversized { bytes, .. } => json!({
+                "kind": "draft_store_unavailable",
+                "reason": "store_too_large",
+                "max_read_bytes": MOBPACK_DRAFT_STORE_MAX_READ_BYTES,
+                "store_bytes": bytes,
+            }),
         }
     }
 
@@ -4095,6 +4105,12 @@ impl DraftStoreRefusal {
                 "the Flow Editor draft store holds at most {} MiB, and this save needs \
                  {required_bytes} bytes even without undo history; delete drafts to make room",
                 MOBPACK_DRAFT_STORE_MAX_BYTES >> 20
+            ),
+            Self::Oversized { bytes, path } => format!(
+                "the {} holds {bytes} bytes, more than {} MiB, and is not read; move it aside \
+                 to start a new draft store",
+                draft_store_name(path),
+                MOBPACK_DRAFT_STORE_MAX_READ_BYTES >> 20
             ),
         }
     }
@@ -4173,6 +4189,12 @@ const MOBPACK_DRAFT_STORE_MAX_DRAFTS: usize = 256;
 /// well as the disk the store takes.
 const MOBPACK_DRAFT_STORE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// The most bytes of a draft store file the draft methods read: twice
+/// [`MOBPACK_DRAFT_STORE_MAX_BYTES`]. A store written before the caps can be
+/// past the cap and still works, but one past this is refused before it is
+/// read, since every draft method reads and parses the whole file.
+const MOBPACK_DRAFT_STORE_MAX_READ_BYTES: u64 = 2 * MOBPACK_DRAFT_STORE_MAX_BYTES as u64;
+
 /// How many drafts and bytes the draft store file held when it was read.
 #[derive(Clone, Copy)]
 struct DraftStoreSize {
@@ -4181,20 +4203,46 @@ struct DraftStoreSize {
 }
 
 fn read_mobpack_draft_store(path: &Path) -> Result<BTreeMap<String, Value>, String> {
-    read_draft_store(path).map(|(rows, _)| rows)
+    read_draft_store(path)
+        .map(|(rows, _)| rows)
+        .map_err(|failure| failure.message)
 }
 
-/// The draft store's rows, and its size as read.
-fn read_draft_store(path: &Path) -> Result<(BTreeMap<String, Value>, DraftStoreSize), String> {
+/// The draft store's rows, and its size as read. A missing or empty file is an
+/// empty store; a file past [`MOBPACK_DRAFT_STORE_MAX_READ_BYTES`] is refused
+/// before any of it is read.
+fn read_draft_store(
+    path: &Path,
+) -> Result<(BTreeMap<String, Value>, DraftStoreSize), DraftStoreFailure> {
     let empty = DraftStoreSize {
         drafts: 0,
         bytes: 0,
     };
-    if !path.exists() {
-        return Ok((BTreeMap::new(), empty));
+    let unreadable =
+        |err: std::io::Error| format!("failed to read {}: {err}", draft_store_name(path));
+    let oversized = |bytes: u64| DraftStoreRefusal::Oversized {
+        bytes,
+        path: path.to_path_buf(),
+    };
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((BTreeMap::new(), empty));
+        }
+        Err(err) => return Err(unreadable(err).into()),
+    };
+    let len = file.metadata().map_err(unreadable)?.len();
+    if len > MOBPACK_DRAFT_STORE_MAX_READ_BYTES {
+        return Err(oversized(len).into());
     }
-    let bytes = std::fs::read(path)
-        .map_err(|err| format!("failed to read {}: {err}", draft_store_name(path)))?;
+    let mut bytes = Vec::new();
+    file.take(MOBPACK_DRAFT_STORE_MAX_READ_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if read > MOBPACK_DRAFT_STORE_MAX_READ_BYTES {
+        return Err(oversized(read).into());
+    }
     if bytes.is_empty() {
         return Ok((BTreeMap::new(), empty));
     }
@@ -4207,17 +4255,62 @@ fn read_draft_store(path: &Path) -> Result<(BTreeMap<String, Value>, DraftStoreS
     Ok((rows, size))
 }
 
+/// Write the draft store: streamed into a new file beside it, readable only
+/// by its user, then renamed over it. Each write gets a file of its own, so
+/// writers that share a store never write into one temporary file, and the
+/// store is never encoded into memory first.
 fn write_mobpack_draft_store(path: &Path, rows: &BTreeMap<String, Value>) -> Result<(), String> {
-    write_draft_store_bytes(path, &encode_draft_store(rows)?)
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    create_private_dir_all(dir).map_err(|err| {
+        format!(
+            "failed to create the directory of {}: {err}",
+            draft_store_name(path)
+        )
+    })?;
+    let unwritable =
+        |err: std::io::Error| format!("failed to write {}: {err}", draft_store_name(path));
+    let mut file = tempfile::Builder::new()
+        .prefix(".flow-editor-drafts-")
+        .suffix(".tmp")
+        .tempfile_in(dir)
+        .map_err(unwritable)?;
+    let mut writer = std::io::BufWriter::new(file.as_file_mut());
+    serde_json::to_writer_pretty(&mut writer, rows)
+        .map_err(|err| format!("failed to encode {}: {err}", draft_store_name(path)))?;
+    writer.flush().map_err(unwritable)?;
+    drop(writer);
+    file.persist(path).map_err(|err| {
+        format!(
+            "failed to replace {}: {}",
+            draft_store_name(path),
+            err.error
+        )
+    })?;
+    Ok(())
 }
 
-fn encode_draft_store(rows: &BTreeMap<String, Value>) -> Result<Vec<u8>, String> {
-    serde_json::to_vec_pretty(rows)
-        .map_err(|err| format!("failed to encode mobpack draft store: {err}"))
+/// Create `dir` and any missing parent, readable only by this user; a
+/// directory that exists keeps its mode.
+#[cfg(unix)]
+fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
 }
 
-/// Encode `rows`, the store after a write to the draft `id`, within the store
-/// caps; `before` is the store as that write read it.
+#[cfg(not(unix))]
+fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
+/// Check `rows`, the store after a write to the draft `id`, against the store
+/// caps; `before` is the store as that write read it. Sizes are counted, not
+/// encoded, so checking a store near the byte cap builds no copy of it.
 ///
 /// A write that adds a draft past [`MOBPACK_DRAFT_STORE_MAX_DRAFTS`] is
 /// refused. Past [`MOBPACK_DRAFT_STORE_MAX_BYTES`] undo and redo history yields
@@ -4229,20 +4322,19 @@ fn admit_draft_store_write(
     rows: &mut BTreeMap<String, Value>,
     id: &str,
     before: DraftStoreSize,
-) -> Result<Vec<u8>, DraftStoreFailure> {
+) -> Result<(), DraftStoreFailure> {
     if rows.len() > MOBPACK_DRAFT_STORE_MAX_DRAFTS && rows.len() > before.drafts {
         return Err(DraftStoreRefusal::TooManyDrafts.into());
     }
     let limit = MOBPACK_DRAFT_STORE_MAX_BYTES.max(before.bytes);
-    let encoded = encode_draft_store(rows)?;
-    if encoded.len() <= limit {
-        return Ok(encoded);
+    let size = draft_store_len(rows);
+    if size <= limit {
+        return Ok(());
     }
     // A snapshot's pretty-printed bytes are at least its compact JSON, so
     // dropping snapshots whose compact JSON covers the excess shrinks the file
     // to the limit.
-    let mut excess = encoded.len() - limit;
-    drop(encoded);
+    let mut excess = size - limit;
     for draft in draft_history_yield_order(rows, id) {
         let Some(row) = rows.get_mut(&draft).and_then(Value::as_object_mut) else {
             continue;
@@ -4259,12 +4351,12 @@ fn admit_draft_store_write(
             break;
         }
     }
-    let encoded = encode_draft_store(rows)?;
-    if encoded.len() <= limit {
-        Ok(encoded)
+    let size = draft_store_len(rows);
+    if size <= limit {
+        Ok(())
     } else {
         Err(DraftStoreRefusal::TooLarge {
-            required_bytes: encoded.len(),
+            required_bytes: size,
         }
         .into())
     }
@@ -4293,37 +4385,32 @@ fn draft_history_yield_order(rows: &BTreeMap<String, Value>, id: &str) -> Vec<St
         .collect()
 }
 
+/// Counts the bytes written to it, so an encoding's size is known without
+/// building it.
+struct JsonByteCounter(usize);
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// How many bytes `value` takes as compact JSON, counted without building it.
 fn compact_json_len(value: &Value) -> usize {
-    struct Counter(usize);
-    impl std::io::Write for Counter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.saturating_add(bytes.len());
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter(0);
+    let mut counter = JsonByteCounter(0);
     serde_json::to_writer(&mut counter, value).map_or(0, |()| counter.0)
 }
 
-fn write_draft_store_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            format!(
-                "failed to create the directory of {}: {err}",
-                draft_store_name(path)
-            )
-        })?;
-    }
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, bytes)
-        .map_err(|err| format!("failed to write {}: {err}", draft_store_name(path)))?;
-    std::fs::rename(&tmp_path, path)
-        .map_err(|err| format!("failed to replace {}: {err}", draft_store_name(path)))
+/// How many bytes the draft store takes as it is written (pretty JSON),
+/// counted without building it.
+fn draft_store_len(rows: &BTreeMap<String, Value>) -> usize {
+    let mut counter = JsonByteCounter(0);
+    serde_json::to_writer_pretty(&mut counter, rows).map_or(0, |()| counter.0)
 }
 
 fn mobpack_draft_id_from_params(
@@ -4710,8 +4797,8 @@ fn create_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
         "draft_etag": draft_etag
     });
     rows.insert(id.clone(), row.clone());
-    let encoded = admit_draft_store_write(&mut rows, &id, before)?;
-    write_draft_store_bytes(&path, &encoded)?;
+    admit_draft_store_write(&mut rows, &id, before)?;
+    write_mobpack_draft_store(&path, &rows)?;
     drop(lock);
     // The create response keeps the freshly cloned editor document (no
     // artifact re-import); only the store-internal history fields are
@@ -4974,8 +5061,8 @@ fn save_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
     set_draft_row_revision(&mut row, &id, current_revision.saturating_add(1));
     attach_draft_history_on_save(existing, &mut row);
     rows.insert(id.clone(), row);
-    let encoded = admit_draft_store_write(&mut rows, &id, before)?;
-    write_draft_store_bytes(&path, &encoded)?;
+    admit_draft_store_write(&mut rows, &id, before)?;
+    write_mobpack_draft_store(&path, &rows)?;
     drop(lock);
     let row = rows.get(&id).map(stored_draft_row).unwrap_or_default();
     Ok(draft_store_reply(
@@ -5157,8 +5244,8 @@ fn step_mobpack_draft_history(
         .into());
     }
     rows.insert(id.clone(), row);
-    let encoded = admit_draft_store_write(&mut rows, &id, before)?;
-    write_draft_store_bytes(&path, &encoded)?;
+    admit_draft_store_write(&mut rows, &id, before)?;
+    write_mobpack_draft_store(&path, &rows)?;
     drop(lock);
     let row = rows.get(&id).map(stored_draft_row).unwrap_or_default();
     Ok(draft_store_reply(
@@ -39757,5 +39844,53 @@ condition = { op = "eq", path = "params.kind", value = "d" }
             .map(|diagnostic| diagnostic.code)
             .collect();
         assert_eq!(errors, BTreeSet::from(["too_many_members".to_string()]));
+    }
+
+    /// A draft store file far past the byte cap (one written before the caps)
+    /// is refused, typed, before any of it is read: every draft method read
+    /// and parsed the whole file.
+    #[test]
+    fn a_draft_store_far_past_the_byte_cap_is_refused_unread() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("drafts.json");
+        std::fs::File::create(&store_path)
+            .and_then(|file| file.set_len(MOBPACK_DRAFT_STORE_MAX_READ_BYTES + 1))
+            .expect("a sparse store file past the read cap");
+        let listed = draft_store_rpc("meta/mobpacks/list", json!({ "store_path": store_path }));
+        assert_eq!(
+            rpc_refusal(&listed).and_then(|(_, data)| data),
+            Some(json!({
+                "kind": "draft_store_unavailable",
+                "reason": "store_too_large",
+                "max_read_bytes": MOBPACK_DRAFT_STORE_MAX_READ_BYTES,
+                "store_bytes": MOBPACK_DRAFT_STORE_MAX_READ_BYTES + 1,
+            }))
+        );
+    }
+
+    /// The draft store is written readable only by its user, into directories
+    /// created readable only by that user: wherever the state directory can
+    /// be traversed, other local users could read every draft.
+    #[cfg(unix)]
+    #[test]
+    fn the_draft_store_is_private_to_its_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        let store_path = state.join("drafts.json");
+        save_mobpack_draft(&json!({
+            "store_path": store_path,
+            "id": "private",
+            "document": valid_document(),
+        }))
+        .expect("save a draft");
+        let mode = |path: &Path| {
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!((mode(&state), mode(&store_path)), (0o700, 0o600));
     }
 }
