@@ -449,6 +449,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   step of one lane, which an export writes back with the condition, and a
   graph with a one-lane branch derives that branch step again.
 
+- The schedule tools a session service keeps no longer keep a stopped
+  host's mob state alive: Meta's schedule mob target registry holds it
+  weakly, so the runtime's mob runtime stays its only owner. Once that state
+  is gone, a `meerkat_schedule_create` or `meerkat_schedule_update` whose
+  resumable-session target Meta would rewrite to a mob member is refused as
+  temporarily unavailable (`ToolError::Unavailable`), as Core refuses a
+  stopped driver; other targets and the store-only calls are unchanged.
+
 ### Known limitations
 
 - The Flow Editor draft store is shared by every caller of a Flow Editor
