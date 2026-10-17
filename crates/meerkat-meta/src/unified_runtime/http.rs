@@ -72,12 +72,20 @@ async fn healthz_response(
 
 /// Default cap on the requests the stock reference app router serves at once.
 ///
-/// The cap is app-wide: one set of permits for every route and every
-/// connection, including the routes the gateways merge in after the
-/// reference router (the host's routes and the live WebSocket door). A
-/// request holds its permit until its response is produced, so an SSE stream
-/// runs without one once its headers are sent, and a WebSocket upgrade holds
-/// one only until its 101 response. Hosts that wrap Meta in their own axum
+/// The cap counts handlers in flight. A request holds its permit until its
+/// response is produced, so an SSE stream runs without one once its headers
+/// are sent, and a WebSocket upgrade holds one only until its 101 response. A
+/// request over the cap waits for a permit, and nothing bounds how many
+/// requests wait. The cap limits neither connections nor open SSE or
+/// WebSocket streams, so a flood of connections still needs an outer limit or
+/// timeout.
+///
+/// One set of permits covers every route and connection of a router the
+/// public builders return, including the live WebSocket door that
+/// `build_reference_app_router_with_live` mounts. The stock `rpc_gateway` puts
+/// the host's routes and its live door under the same permits. Each built
+/// router has its own permits, and routes an embedding host merges into a
+/// returned router are outside them. Hosts that wrap Meta in their own axum
 /// service may still choose a different outer limit, but the reference router
 /// itself defaults to a ceiling high enough for real console usage.
 pub const DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS: usize = 1024;
