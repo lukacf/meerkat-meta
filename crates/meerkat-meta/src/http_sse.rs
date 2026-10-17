@@ -254,6 +254,9 @@ struct AgentSseState {
     /// label/role/lineage rules resolve without a prior
     /// `/console/experience` call. `None` keeps the route behaviour unchanged.
     prime_runtime: Option<MobRuntime>,
+    /// Identity authority whose current runtime aliases the access rules
+    /// need to judge an alias as the member it names.
+    prime_identity_runtime: Option<Arc<crate::identity_first::IdentityRuntime>>,
 }
 
 pub fn agent_events_sse_router(
@@ -273,6 +276,7 @@ pub fn agent_events_sse_router_with_access(
         decisions,
         access,
         None,
+        None,
         Arc::new(AllowAllConsoleVisibilityPolicy),
     )
 }
@@ -282,6 +286,7 @@ pub(crate) fn agent_events_sse_router_with_access_and_priming(
     decisions: Option<RuntimeDecisionState>,
     access: Option<AccessController>,
     prime_runtime: Option<MobRuntime>,
+    prime_identity_runtime: Option<Arc<crate::identity_first::IdentityRuntime>>,
     visibility_policy: Arc<dyn ConsoleVisibilityPolicy>,
 ) -> Router {
     Router::new()
@@ -292,6 +297,7 @@ pub(crate) fn agent_events_sse_router_with_access_and_priming(
             access,
             visibility_policy,
             prime_runtime,
+            prime_identity_runtime,
         })
 }
 
@@ -343,6 +349,11 @@ async fn agent_events_sse_handler(
         agent_id.clone()
     };
     prime_sse_access_cache(state.prime_runtime.as_ref(), state.access.as_ref()).await;
+    if let (Some(identity_runtime), Some(controller)) =
+        (state.prime_identity_runtime.as_ref(), state.access.as_ref())
+    {
+        crate::http_console::prime_current_runtime_aliases(identity_runtime, controller).await;
+    }
     // The access rules judge the member the request resolved to as well
     // as the spelling it used: a runtime alias is not a name the rules
     // describe, the member it names is.
@@ -754,6 +765,7 @@ mod tests {
         });
         let app = agent_events_sse_router_with_access_and_priming(
             subscribe,
+            None,
             None,
             None,
             None,

@@ -7007,6 +7007,9 @@ async fn handle_console_runtime_rpc_with_visibility(
     // experience endpoint first.
     if let Some(controller) = access.filter(|controller| controller.enabled()) {
         prime_access_cache_from_runtime(runtime, controller).await;
+        if let Some(identity_runtime) = identity_runtime.as_ref() {
+            prime_current_runtime_aliases(identity_runtime, controller).await;
+        }
     }
     if let Some(response) = handle_access_admin_rpc(access, access_view, &request) {
         return response;
@@ -12298,6 +12301,29 @@ pub(crate) async fn prime_access_cache_from_runtime(
     }
     let registered = runtime.console_identity_labels().await;
     prime_access_cache_from_handle_with_registry(&runtime.handle(), access, &registered).await;
+    if let Some(identity_runtime) = runtime.installed_identity_runtime() {
+        prime_current_runtime_aliases(&identity_runtime, access).await;
+    }
+}
+
+/// Record each identity's current runtime alias, so the access rules judge
+/// an alias as the member it names.
+pub(crate) async fn prime_current_runtime_aliases(
+    identity_runtime: &crate::identity_first::IdentityRuntime,
+    access: &AccessController,
+) {
+    if !access.enabled() {
+        return;
+    }
+    let statuses = identity_runtime.statuses().await;
+    access.record_current_runtime_aliases(statuses.into_iter().map(|status| {
+        (
+            status.identity.as_str().to_string(),
+            status
+                .agent_runtime_id
+                .map(|alias| alias.as_str().to_string()),
+        )
+    }));
 }
 
 pub(crate) async fn prime_access_cache_from_handle(handle: &MobHandle, access: &AccessController) {
@@ -18002,6 +18028,7 @@ comms = true
             None,
             None,
             Some(runtime.clone()),
+            None,
             Arc::new(HideOtherTenant),
         );
         let status =
@@ -18046,7 +18073,8 @@ comms = true
     /// The per-agent event stream applies the access rules to the member a
     /// request names, in every spelling: a runtime alias is judged as the
     /// member it names, with that member's labels, as the durable identity
-    /// is.
+    /// is, and a member the rules allow stays reachable through both
+    /// spellings.
     #[tokio::test]
     async fn agent_events_stream_applies_access_rules_to_every_member_spelling()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -18055,24 +18083,76 @@ comms = true
         use tower::ServiceExt;
 
         const RESTRICTED: &str = "review:stream-restricted";
+        const OPEN: &str = "review:stream-open";
         let (_temp_dir, runtime) =
             build_empty_console_test_runtime("agent-events-stream-access").await?;
-        runtime
-            .handle()
-            .spawn_spec(
-                SpawnMemberSpec::from_wire(
-                    "worker".to_string(),
-                    crate::member_comms_id::mob_member_id_str(RESTRICTED).into_owned(),
-                    None,
-                    None,
-                    None,
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "agent-events-stream-access".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        for (durable, labels) in [
+            (
+                RESTRICTED,
+                BTreeMap::from([("org".to_string(), "restricted".to_string())]),
+            ),
+            (OPEN, BTreeMap::new()),
+        ] {
+            runtime
+                .handle()
+                .spawn_spec(
+                    SpawnMemberSpec::from_wire(
+                        "worker".to_string(),
+                        crate::member_comms_id::mob_member_id_str(durable).into_owned(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .with_labels(labels),
                 )
-                .with_labels(BTreeMap::from([(
-                    "org".to_string(),
-                    "restricted".to_string(),
-                )])),
-            )
-            .await?;
+                .await?;
+            let session_id = runtime
+                .handle()
+                .resolve_bridge_session_id(&crate::member_comms_id::mob_member_id(durable))
+                .await
+                .ok_or("the spawned member must have a bridge session")?;
+            let identity = AgentIdentity::parse(durable)?;
+            identity_runtime
+                .register(
+                    DurableAgentSpec {
+                        identity: identity.clone(),
+                        profile: ProfileName::from("worker"),
+                        addressability: AgentAddressability::Addressable,
+                        display_name: None,
+                        labels: BTreeMap::new(),
+                        context: None,
+                        additional_instructions: Vec::new(),
+                        initial_message: None,
+                        runtime_mode_override: None,
+                        backend: None,
+                        binding: None,
+                        placement: None,
+                    },
+                    IdentityLifecycleState::Active,
+                    Some(ContinuityRecord {
+                        identity: identity.clone(),
+                        agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{durable}:1"))?,
+                        session_id,
+                        generation: ContinuityGeneration::new(1),
+                        checkpoint_version: CheckpointVersion::new(0),
+                    }),
+                    Some(LeaseGrant {
+                        identity,
+                        fencing_token: FencingToken::new(1),
+                        ttl: Duration::from_mins(1),
+                    }),
+                )
+                .await;
+        }
         let controller =
             crate::access::AccessController::new(crate::access::AccessControlConfig {
                 enabled: true,
@@ -18117,6 +18197,7 @@ comms = true
             None,
             Some(controller),
             Some(runtime.clone()),
+            Some(identity_runtime.clone()),
             Arc::new(crate::console_aggregator::AllowAllConsoleVisibilityPolicy),
         );
         let status =
@@ -18135,6 +18216,8 @@ comms = true
         let statuses = (
             status(RESTRICTED).await?,
             status(&format!("rt:{RESTRICTED}:1")).await?,
+            status(OPEN).await?,
+            status(&format!("rt:{OPEN}:1")).await?,
         );
         let opened = subscribed
             .lock()
@@ -18143,10 +18226,188 @@ comms = true
         assert_eq!(
             (statuses, opened),
             (
-                (StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
-                Vec::<String>::new()
+                (
+                    StatusCode::FORBIDDEN,
+                    StatusCode::FORBIDDEN,
+                    StatusCode::OK,
+                    StatusCode::OK,
+                ),
+                vec![OPEN.to_string(), format!("rt:{OPEN}:1")],
             ),
-            "((durable, runtime alias), streams opened)"
+            "((restricted durable, restricted alias, open durable, open alias), streams opened)"
+        );
+        Ok(())
+    }
+
+    /// The console access rules judge a member named by its runtime alias as
+    /// the member it names, with that member's labels, as they judge its
+    /// durable identity: a label-scoped deny holds for a member read and for a
+    /// destructive member action through every spelling, and a member the
+    /// rules allow stays reachable through both spellings.
+    #[tokio::test]
+    async fn console_access_rules_judge_every_member_spelling()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const GUARDED: &str = "review:access-guarded";
+        const OPEN: &str = "review:access-open";
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-access-every-spelling").await?;
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "console-access-every-spelling".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        let mut specs = Vec::new();
+        for (durable, restricted) in [(GUARDED, true), (OPEN, false)] {
+            let mut labels = BTreeMap::from([("agent_identity".to_string(), durable.to_string())]);
+            if restricted {
+                labels.insert("org".to_string(), "restricted".to_string());
+            }
+            runtime
+                .handle()
+                .spawn_spec(
+                    SpawnMemberSpec::from_wire(
+                        "worker".to_string(),
+                        crate::member_comms_id::mob_member_id_str(durable).into_owned(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .with_labels(labels),
+                )
+                .await?;
+            let session_id = runtime
+                .handle()
+                .resolve_bridge_session_id(&crate::member_comms_id::mob_member_id(durable))
+                .await
+                .ok_or("the spawned member must have a bridge session")?;
+            let identity = AgentIdentity::parse(durable)?;
+            let spec = DurableAgentSpec {
+                identity: identity.clone(),
+                profile: ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            };
+            identity_runtime
+                .register(
+                    spec.clone(),
+                    IdentityLifecycleState::Active,
+                    Some(ContinuityRecord {
+                        identity: identity.clone(),
+                        agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{durable}:1"))?,
+                        session_id,
+                        generation: ContinuityGeneration::new(1),
+                        checkpoint_version: CheckpointVersion::new(0),
+                    }),
+                    Some(LeaseGrant {
+                        identity,
+                        fencing_token: FencingToken::new(1),
+                        ttl: Duration::from_mins(1),
+                    }),
+                )
+                .await;
+            specs.push(spec);
+        }
+        let roster = Arc::new(crate::identity_first::MutableRosterProvider::new(specs));
+        let controller =
+            crate::access::AccessController::new(crate::access::AccessControlConfig {
+                enabled: true,
+                admins: vec!["root@example.test".to_string()],
+                rules: vec![
+                    crate::access::AccessRule {
+                        id: "allow-all".to_string(),
+                        actions: vec![
+                            crate::access::ACTION_AGENT_VIEW.to_string(),
+                            crate::access::ACTION_AGENT_RETIRE.to_string(),
+                        ],
+                        agents: vec!["*".to_string()],
+                        ..crate::access::AccessRule::default()
+                    },
+                    crate::access::AccessRule {
+                        id: "deny-restricted".to_string(),
+                        effect: crate::access::AccessEffect::Deny,
+                        actions: vec![
+                            crate::access::ACTION_AGENT_VIEW.to_string(),
+                            crate::access::ACTION_AGENT_RETIRE.to_string(),
+                        ],
+                        match_labels: BTreeMap::from([(
+                            "org".to_string(),
+                            "restricted".to_string(),
+                        )]),
+                        ..crate::access::AccessRule::default()
+                    },
+                ],
+                ..crate::access::AccessControlConfig::default()
+            })?;
+        let view = controller.view_for_subject(None);
+        let call = async |method: &str, member_id: String| -> &'static str {
+            let response = Box::pin(handle_console_runtime_rpc_with_visibility(
+                &runtime,
+                None,
+                None,
+                None,
+                Some(ConsoleEventStore::new()),
+                None,
+                Some(identity_runtime.clone()),
+                None,
+                None,
+                &crate::console_aggregator::AllowAllConsoleVisibilityPolicy,
+                rpc_request_with_params(method, json!({ "member_id": member_id })),
+                true,
+                false,
+                None,
+                Some(&controller),
+                Some(&view),
+                None,
+                Some(roster.clone()),
+                None,
+                None,
+                &crate::http_console::ConsoleSendGovernance::default(),
+            ))
+            .await;
+            if response["error"]["data"]["kind"] == json!("access_denied") {
+                "denied"
+            } else if response["error"].is_null() {
+                "ok"
+            } else {
+                "other error"
+            }
+        };
+
+        let reads = (
+            call("meta/get_member", GUARDED.to_string()).await,
+            call("meta/get_member", format!("rt:{GUARDED}:1")).await,
+            call("meta/get_member", OPEN.to_string()).await,
+            call("meta/get_member", format!("rt:{OPEN}:1")).await,
+        );
+        let retires = (
+            call("meta/retire_member", format!("rt:{GUARDED}:1")).await,
+            call("meta/retire_member", format!("rt:{OPEN}:1")).await,
+        );
+        let guarded_state = identity_runtime
+            .status(&AgentIdentity::parse(GUARDED)?)
+            .await?
+            .state;
+        assert_eq!(
+            (reads, retires, guarded_state),
+            (
+                ("denied", "denied", "ok", "ok"),
+                ("denied", "ok"),
+                IdentityLifecycleState::Active,
+            ),
+            "((read guarded durable, guarded alias, open durable, open alias), \
+             (retire guarded alias, open alias), guarded identity state)"
         );
         Ok(())
     }

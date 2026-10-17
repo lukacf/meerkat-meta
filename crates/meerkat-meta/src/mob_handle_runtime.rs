@@ -12838,6 +12838,17 @@ impl MobRuntime {
         }
     }
 
+    /// The installed identity authority, if any.
+    pub(crate) fn installed_identity_runtime(
+        &self,
+    ) -> Option<Arc<crate::identity_first::IdentityRuntime>> {
+        self.identity_runtime_slot.as_ref().and_then(|slot| {
+            slot.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+    }
+
     /// Remove the late-bound identity authority after the mob has fully
     /// quiesced. IdentityRuntime owns a MobHandle in its runtime services, so
     /// retaining the reverse Arc here would form a shutdown cycle and keep

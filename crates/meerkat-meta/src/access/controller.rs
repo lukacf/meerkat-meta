@@ -116,6 +116,9 @@ struct AccessControllerInner {
     state: RwLock<AccessState>,
     persist_path: RwLock<Option<PathBuf>>,
     attributes: RwLock<BTreeMap<String, Arc<AgentResourceAttributes>>>,
+    /// The runtime alias of each durable identity's current incarnation,
+    /// keyed like `attributes` (console namespace included).
+    current_runtime_aliases: RwLock<BTreeMap<String, String>>,
     /// Serializes the read-modify-write of every config mutation so two
     /// concurrent admin edits can't lose an update (clone-under-read then
     /// unconditional swap would otherwise drop one writer's delta) and so
@@ -186,6 +189,7 @@ impl AccessController {
                 }),
                 persist_path: RwLock::new(None),
                 attributes: RwLock::new(BTreeMap::new()),
+                current_runtime_aliases: RwLock::new(BTreeMap::new()),
                 mutation: Mutex::new(()),
                 publication: OnceLock::new(),
             }),
@@ -511,6 +515,46 @@ impl AccessController {
         cache.insert(attributes.identity.clone(), Arc::new(attributes));
     }
 
+    /// Record which runtime alias is each durable identity's current
+    /// incarnation: `(identity, Some(alias))` sets it, `(identity, None)`
+    /// forgets it. Keys and aliases use the cached attributes' console
+    /// namespace.
+    pub(crate) fn record_current_runtime_aliases<I>(&self, aliases: I)
+    where
+        I: IntoIterator<Item = (String, Option<String>)>,
+    {
+        let aliases = aliases.into_iter().collect::<Vec<_>>();
+        let unchanged = {
+            let current = self
+                .inner
+                .current_runtime_aliases
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            aliases
+                .iter()
+                .all(|(identity, alias)| current.get(identity) == alias.as_ref())
+        };
+        if unchanged {
+            return;
+        }
+        let _published = self.publish_owner_change();
+        let mut current = self
+            .inner
+            .current_runtime_aliases
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (identity, alias) in aliases {
+            match alias {
+                Some(alias) => {
+                    current.insert(identity, alias);
+                }
+                None => {
+                    current.remove(&identity);
+                }
+            }
+        }
+    }
+
     /// Whether the cache already holds exactly these attributes, so that
     /// recording them again changes no fact and publishes nothing.
     fn records_attributes(&self, attributes: &AgentResourceAttributes) -> bool {
@@ -622,6 +666,17 @@ impl AccessDecisionFence<'_> {
         if !self.view.config.enabled {
             return true;
         }
+        // A runtime alias is judged as the member it names, as in
+        // `AccessView::decide_agent`.
+        let member;
+        let identity = match self.view.runtime_alias_member(identity) {
+            RuntimeAliasMember::NotAnAlias => identity,
+            RuntimeAliasMember::Current(member_key) => {
+                member = member_key;
+                member.as_str()
+            }
+            RuntimeAliasMember::NotCurrent => return self.view.is_admin,
+        };
         let lineage = AccessView::lineage_in(&self.attributes, identity);
         if lineage.is_empty() {
             return self
@@ -633,6 +688,14 @@ impl AccessDecisionFence<'_> {
             .decide_agent_lineage(ACTION_AGENT_VIEW, identity, &lineage)
             .is_allow()
     }
+}
+
+/// How an agent spelling relates to the runtime alias namespace.
+enum RuntimeAliasMember {
+    NotAnAlias,
+    /// The current incarnation of a known identity: its member cache key.
+    Current(String),
+    NotCurrent,
 }
 
 /// An immutable per-request snapshot of one principal's access.
@@ -724,6 +787,27 @@ impl AccessView {
         if !self.config.enabled {
             return AccessDecision::Allow;
         }
+        // A runtime alias names one incarnation of a durable identity. It is
+        // judged as that member while it is the identity's current
+        // incarnation; a stale or unknown generation is refused rather than
+        // judged as a name no rule describes. An admin passes, as for any
+        // resource.
+        let member;
+        let identity = match self.runtime_alias_member(identity) {
+            RuntimeAliasMember::NotAnAlias => identity,
+            RuntimeAliasMember::Current(member_key) => {
+                member = member_key;
+                member.as_str()
+            }
+            RuntimeAliasMember::NotCurrent if self.is_admin => return AccessDecision::Allow,
+            RuntimeAliasMember::NotCurrent => {
+                return AccessDecision::Deny {
+                    reason: format!(
+                        "{identity} does not name the current incarnation of a known member"
+                    ),
+                };
+            }
+        };
         let lineage = self.lineage_for(identity);
         if lineage.is_empty() {
             return self.decide(action, &AccessResource::for_identity(identity));
@@ -781,6 +865,43 @@ impl AccessView {
     /// (`spawned_by` chain). Bounded and cycle-safe. An ancestor without
     /// cached attributes still contributes an identity-only resource so
     /// identity-selector rules naming the parent apply to its descendants.
+    /// Classify an agent spelling: not a runtime alias, the current alias of
+    /// a known identity (with that member's cache key), or a runtime alias
+    /// that is stale, unknown, or malformed.
+    fn runtime_alias_member(&self, key: &str) -> RuntimeAliasMember {
+        let (namespace, alias) = match key.rfind("/rt:") {
+            Some(at) => (Some(&key[..at]), &key[at + 1..]),
+            None => (None, key),
+        };
+        let alias = crate::member_comms_id::runtime_alias_str(alias);
+        if !crate::member_comms_id::is_reserved_generated_alias(&alias) {
+            return RuntimeAliasMember::NotAnAlias;
+        }
+        let Some(durable) = crate::member_comms_id::durable_identity_from_runtime_alias(&alias)
+        else {
+            return RuntimeAliasMember::NotCurrent;
+        };
+        let (member_key, alias_key) = match namespace {
+            Some(namespace) => (
+                format!("{namespace}/{durable}"),
+                format!("{namespace}/{alias}"),
+            ),
+            None => (durable, alias.into_owned()),
+        };
+        let current = self
+            .inner
+            .current_runtime_aliases
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&member_key)
+            .is_some_and(|current| *current == alias_key);
+        if current {
+            RuntimeAliasMember::Current(member_key)
+        } else {
+            RuntimeAliasMember::NotCurrent
+        }
+    }
+
     fn lineage_for(&self, identity: &str) -> Vec<LineageLink> {
         let cache = self
             .inner
@@ -945,6 +1066,99 @@ mod tests {
                 ..AccessRule::default()
             }],
         }
+    }
+
+    /// A runtime alias is judged as the member it names while it is that
+    /// identity's current incarnation, with the member's cached attributes,
+    /// exactly as the durable identity is. A stale or unknown generation is
+    /// refused rather than judged as a name no rule describes; an admin passes
+    /// as for any resource.
+    #[test]
+    fn a_runtime_alias_is_judged_as_the_member_it_names() {
+        let retire = crate::access::ACTION_AGENT_RETIRE;
+        let controller = AccessController::new(AccessControlConfig {
+            enabled: true,
+            admins: vec!["root@example.test".to_string()],
+            rules: vec![
+                AccessRule {
+                    id: "retire-all".to_string(),
+                    actions: vec![retire.to_string()],
+                    agents: vec!["*".to_string()],
+                    ..AccessRule::default()
+                },
+                AccessRule {
+                    id: "deny-restricted".to_string(),
+                    effect: AccessEffect::Deny,
+                    actions: vec![retire.to_string()],
+                    match_labels: BTreeMap::from([("org".to_string(), "restricted".to_string())]),
+                    ..AccessRule::default()
+                },
+                AccessRule {
+                    id: "deny-named".to_string(),
+                    effect: AccessEffect::Deny,
+                    actions: vec![retire.to_string()],
+                    agents: vec!["review:named".to_string()],
+                    ..AccessRule::default()
+                },
+            ],
+            ..AccessControlConfig::default()
+        })
+        .expect("controller");
+        for (identity, labels) in [
+            (
+                "review:labelled",
+                BTreeMap::from([("org".to_string(), "restricted".to_string())]),
+            ),
+            ("review:named", BTreeMap::new()),
+            ("review:open", BTreeMap::new()),
+        ] {
+            controller.record_agent_attributes(AgentResourceAttributes {
+                identity: identity.to_string(),
+                agent_id: Some(identity.to_string()),
+                role: Some("worker".to_string()),
+                labels,
+            });
+        }
+        controller.record_current_runtime_aliases(
+            ["review:labelled", "review:named", "review:open"]
+                .map(|identity| (identity.to_string(), Some(format!("rt:{identity}:1")))),
+        );
+        let anonymous = controller.view_for_subject(None);
+        let admin = controller.view_for_subject(Some("root@example.test"));
+        let allowed = |view: &AccessView, spelling: &str| view.allows_agent(retire, spelling);
+        assert_eq!(
+            [
+                [
+                    allowed(&anonymous, "review:labelled"),
+                    allowed(&anonymous, "rt:review:labelled:1"),
+                ],
+                [
+                    allowed(&anonymous, "review:named"),
+                    allowed(&anonymous, "rt:review:named:1"),
+                ],
+                [
+                    allowed(&anonymous, "review:open"),
+                    allowed(&anonymous, "rt:review:open:1"),
+                ],
+                [
+                    allowed(&anonymous, "rt:review:open:0"),
+                    allowed(&anonymous, "rt:review:unknown:0"),
+                ],
+                [
+                    allowed(&admin, "rt:review:labelled:1"),
+                    allowed(&admin, "rt:review:open:0"),
+                ],
+            ],
+            [
+                [false, false],
+                [false, false],
+                [true, true],
+                [false, false],
+                [true, true],
+            ],
+            "rows: labelled, named, open (durable, current alias); open stale alias, \
+             unknown alias; admin current alias, admin stale alias"
+        );
     }
 
     #[test]

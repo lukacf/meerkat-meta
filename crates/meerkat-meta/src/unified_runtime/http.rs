@@ -504,6 +504,7 @@ impl UnifiedRuntime {
                 Some(sse_decisions_a),
                 access.clone(),
                 Some(self.mob_runtime().clone()),
+                self.identity_runtime_ref().cloned(),
                 agent_sse_visibility_policy,
             ))
             .merge(mob_events_sse_router_with_access_and_priming(
