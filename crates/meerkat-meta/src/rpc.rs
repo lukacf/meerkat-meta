@@ -2330,6 +2330,7 @@ async fn handle_unified_rpc_json_inner(
                 &request.params,
                 None,
                 Some("local-host"),
+                &crate::topology_control::TopologyApplyScope::LocalHost,
             )
             .await
         }

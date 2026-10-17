@@ -326,7 +326,15 @@ Validate a side-effect-free, revision-pinned set of explicit operations.
 ### `meta/topology/apply`
 
 Apply a previously valid shape of request. `expected_revision` provides
-compare-and-swap protection and `idempotency_key` is mandatory. Exact replay
+compare-and-swap protection and `idempotency_key` is mandatory. Keys are
+scoped to the caller: a Console caller (its verified human; else its
+authenticated principal, with the provider and issuer that verified it; else
+the open Console's anonymous account) and the gateway's JSON-RPC surface each
+have their own keys, so the same key from two callers names two operations
+and a retry replays only its own caller's apply. An open Console without an
+access controller never resolves tokens, so there every caller, even one
+presenting a valid token, is that shared anonymous account; isolating callers
+needs `require_app_auth` or an access controller. Exact replay
 is durable only across the configured retention horizon: `receipt_limit`
 keeps full operation receipts, then `idempotency_history_limit` keeps bounded
 key fingerprints that reject ambiguous reuse after a receipt ages out.

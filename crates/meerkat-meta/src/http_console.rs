@@ -140,6 +140,9 @@ struct ConsoleHttpAuthContext {
     /// Whether the verified token classified the principal as a service
     /// identity rather than a human.
     service_identity: bool,
+    /// The trust source of a resolved principal: the provider the verified
+    /// token was classified as, and the issuer it verified against.
+    principal_source: Option<(crate::AuthProvider, String)>,
     /// Per-request access snapshot when an [`AccessController`] is wired.
     access_view: Option<AccessView>,
     /// The verified human behind the request's token, when there is one.
@@ -932,6 +935,7 @@ pub async fn console_rpc_handler(
         state.workgraph.as_ref(),
         state.topology.as_ref(),
         &ConsoleSendGovernance::for_request(&state, &auth_context),
+        &console_topology_apply_scope(&auth_context),
     ))
     .await;
     let response_value = decorate_console_job_projection(
@@ -4889,6 +4893,7 @@ pub async fn console_rpc_multipart_handler(
             state.workgraph.as_ref(),
             state.topology.as_ref(),
             &ConsoleSendGovernance::for_request(&state, &auth_context),
+            &console_topology_apply_scope(&auth_context),
         ))
         .await
     };
@@ -4971,6 +4976,37 @@ fn console_request_authorized(state: &ConsoleJsonState, headers: &HeaderMap, uri
     console_request_auth_context(state, headers, uri).is_some()
 }
 
+/// The topology apply idempotency scope of a Console caller: the verified
+/// human (issuer and subject) when there is one, else the authenticated
+/// principal with its trust source (the provider and issuer that verified
+/// it), else the open Console's shared anonymous account.
+fn console_topology_apply_scope(
+    auth: &ConsoleHttpAuthContext,
+) -> crate::topology_control::TopologyApplyScope {
+    use crate::topology_control::TopologyApplyScope;
+    if let Some(human) = &auth.human {
+        return TopologyApplyScope::Human {
+            issuer: human.issuer().to_string(),
+            subject: human.subject().to_string(),
+        };
+    }
+    match &auth.principal {
+        Some(principal) => {
+            let (provider, issuer) = auth
+                .principal_source
+                .as_ref()
+                .map(|(provider, issuer)| (console_provider_name(provider), issuer.as_str()))
+                .unwrap_or_default();
+            TopologyApplyScope::Principal {
+                principal: principal.clone(),
+                provider: provider.to_string(),
+                issuer: issuer.to_string(),
+            }
+        }
+        None => TopologyApplyScope::Anonymous,
+    }
+}
+
 fn console_request_auth_context(
     state: &ConsoleJsonState,
     headers: &HeaderMap,
@@ -4999,11 +5035,15 @@ fn console_request_auth_context_for(
         let service_identity = auth
             .as_ref()
             .is_some_and(|auth| auth.provider == crate::AuthProvider::ServiceIdentity);
+        let principal_source = auth
+            .as_ref()
+            .and_then(|auth| console_principal_source(decisions, &auth.provider));
         let principal = auth.map(|auth| auth.email);
         return Some(ConsoleHttpAuthContext {
             access_view: access.map(|controller| controller.view_for_subject(principal.as_deref())),
             principal,
             service_identity,
+            principal_source,
             human,
         });
     }
@@ -5014,9 +5054,35 @@ fn console_request_auth_context_for(
         access_view: access
             .map(|controller| controller.view_for_subject(Some(auth.email.as_str()))),
         service_identity: auth.provider == crate::AuthProvider::ServiceIdentity,
+        principal_source: console_principal_source(decisions, &auth.provider),
         principal: Some(auth.email),
         human,
     })
+}
+
+/// The trust source of a principal the Console resolved from a verified
+/// token: its provider classification and the issuer the token verified
+/// against (the Console's trusted OIDC issuer).
+fn console_principal_source(
+    decisions: &RuntimeDecisionState,
+    provider: &crate::AuthProvider,
+) -> Option<(crate::AuthProvider, String)> {
+    let discovery =
+        crate::auth::parse_oidc_discovery_json(&decisions.trusted_oidc.discovery_json).ok()?;
+    Some((provider.clone(), discovery.issuer))
+}
+
+/// The name a principal's send scope records for its provider: the spelling
+/// tokens use, fixed here so a stored dedupe key never depends on how the
+/// provider type serializes.
+fn console_provider_name(provider: &crate::AuthProvider) -> &'static str {
+    match provider {
+        crate::AuthProvider::GoogleOAuth => "google_oauth",
+        crate::AuthProvider::GitHubOAuth => "github_oauth",
+        crate::AuthProvider::GenericOidc => "generic_oidc",
+        crate::AuthProvider::ServiceIdentity => "service_identity",
+        crate::AuthProvider::TestProvider => "test_provider",
+    }
 }
 
 /// The human principal Meta uses for an authenticated Console human when it
@@ -6942,6 +7008,7 @@ async fn handle_console_runtime_rpc(
         None,
         None,
         &crate::http_console::ConsoleSendGovernance::default(),
+        &crate::topology_control::TopologyApplyScope::Anonymous,
     )
     .await
 }
@@ -6969,6 +7036,7 @@ async fn handle_console_runtime_rpc_with_visibility(
     workgraph: Option<&meerkat::WorkGraphService>,
     topology: Option<&crate::topology_control::TopologyRuntimeHandle>,
     governance: &ConsoleSendGovernance,
+    topology_apply_scope: &crate::topology_control::TopologyApplyScope,
 ) -> Value {
     let response_id = request.id.clone().unwrap_or(Value::Null);
     if let Err(message) =
@@ -7319,6 +7387,7 @@ async fn handle_console_runtime_rpc_with_visibility(
                     &request.params,
                     access_view,
                     authenticated_principal,
+                    topology_apply_scope,
                 )
                 .await,
             )
@@ -13907,6 +13976,7 @@ comms = true
                 None,
                 None,
                 &crate::http_console::ConsoleSendGovernance::default(),
+                &crate::topology_control::TopologyApplyScope::Anonymous,
             ))
             .await
         }
@@ -15411,6 +15481,7 @@ comms = true
                 None,
                 None,
                 &crate::http_console::ConsoleSendGovernance::default(),
+                &crate::topology_control::TopologyApplyScope::Anonymous,
             ))
             .await;
             assert_ne!(
@@ -15525,6 +15596,7 @@ comms = true
                     None,
                     None,
                     &crate::http_console::ConsoleSendGovernance::default(),
+                    &crate::topology_control::TopologyApplyScope::Anonymous,
                 ))
                 .await;
                 assert_eq!(
@@ -15603,6 +15675,7 @@ comms = true
                 None,
                 None,
                 &crate::http_console::ConsoleSendGovernance::default(),
+                &crate::topology_control::TopologyApplyScope::Anonymous,
             ))
             .await;
             assert_ne!(
@@ -15930,6 +16003,7 @@ comms = true
             None,
             None,
             &governance,
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         );
         // 52,248 bytes with the arms inline (MobKit 0.8.46, debug), 6,256
         // boxed. The bound fails if arms are inlined again, with headroom
@@ -15991,6 +16065,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -16095,6 +16170,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -16651,6 +16727,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -17013,6 +17090,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -17070,6 +17148,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -17111,6 +17190,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -17187,6 +17267,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -17228,6 +17309,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -17271,6 +17353,7 @@ comms = true
             None,
             None,
             &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
         ))
         .await;
         assert_eq!(
@@ -21343,6 +21426,59 @@ mod console_viewer_resolver_tests {
                 .unwrap()
                 .allows(crate::access::ACTION_GATING_VIEW),
             "a fresh resolution reflects the replaced policy"
+        );
+    }
+
+    /// The topology apply scope of a Console request.
+    fn topology_apply_scope_of(
+        state: &ConsoleJsonState,
+        headers: &HeaderMap,
+    ) -> crate::topology_control::TopologyApplyScope {
+        let uri: Uri = "/console/rpc".parse().unwrap();
+        console_topology_apply_scope(
+            &console_request_auth_context(state, headers, &uri).expect("an admitted request"),
+        )
+    }
+
+    #[test]
+    fn a_console_callers_topology_apply_scope_follows_its_authentication() {
+        use crate::topology_control::TopologyApplyScope;
+        // An open console without an access controller never resolves a
+        // token: every caller is the shared anonymous account.
+        let open = state(decisions(false), None);
+        for headers in [bearer(BOB), bearer(ROBOT), HeaderMap::new()] {
+            assert_eq!(
+                topology_apply_scope_of(&open, &headers),
+                TopologyApplyScope::Anonymous
+            );
+        }
+
+        // With an access controller, or with sign-in required, the token is
+        // resolved: a verified human by issuer and subject.
+        let bob = TopologyApplyScope::Human {
+            issuer: ISSUER.to_string(),
+            subject: BOB.to_string(),
+        };
+        let controlled = state(
+            decisions(false),
+            Some(AccessController::new(access(&[BOB])).unwrap()),
+        );
+        assert_eq!(topology_apply_scope_of(&controlled, &bearer(BOB)), bob);
+        assert_eq!(
+            topology_apply_scope_of(&controlled, &HeaderMap::new()),
+            TopologyApplyScope::Anonymous
+        );
+        let required = state(decisions(true), None);
+        assert_eq!(topology_apply_scope_of(&required, &bearer(BOB)), bob);
+
+        // A principal without a verified human, by its trust source.
+        assert_eq!(
+            topology_apply_scope_of(&required, &bearer(ROBOT)),
+            TopologyApplyScope::Principal {
+                principal: ROBOT.to_string(),
+                provider: "service_identity".to_string(),
+                issuer: ISSUER.to_string(),
+            }
         );
     }
 }

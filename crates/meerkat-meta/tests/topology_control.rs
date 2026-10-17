@@ -1913,3 +1913,649 @@ async fn expensive_topology_query_does_not_block_apply() {
 
     shutdown(&runtime).await;
 }
+
+/// The issuer the test Console trusts, and a second development issuer for a
+/// second Console over the same runtime.
+const TRUSTED_ISSUER: &str = "https://trusted.meta.localhost";
+const OTHER_ISSUER: &str = "https://other.meta.localhost";
+
+/// Console decisions that verify HS256 test tokens from `issuer`, with two
+/// people and two service identities allowlisted.
+fn console_decisions(issuer: &str, require_app_auth: bool) -> meerkat_meta::RuntimeDecisionState {
+    meerkat_meta::build_runtime_decision_state(meerkat_meta::RuntimeDecisionInputs {
+        bigquery: meerkat_meta::BigQueryNaming {
+            dataset: "topology_scope_dataset".to_string(),
+            table: "topology_scope_table".to_string(),
+        },
+        trusted_meta_toml: r#"
+[[modules]]
+id = "router"
+command = "router-bin"
+args = ["--mode", "fast"]
+restart_policy = "always"
+"#
+        .to_string(),
+        auth: meerkat_meta::AuthPolicy {
+            default_provider: meerkat_meta::AuthProvider::GoogleOAuth,
+            email_allowlist: vec![
+                "alice@example.com".to_string(),
+                "bob@example.com".to_string(),
+                "svc:robot".to_string(),
+                "svc:other".to_string(),
+            ],
+        },
+        trusted_oidc: meerkat_meta::TrustedOidcRuntimeConfig {
+            discovery_json: serde_json::json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/.well-known/jwks.json")
+            })
+            .to_string(),
+            jwks_json: r#"{"keys":[{"kid":"kid-current","kty":"oct","alg":"HS256","k":"cGhhc2U4LXRydXN0ZWQtY3VycmVudC1zZWNyZXQ"}]}"#
+                .to_string(),
+            audience: "meerkat-console".to_string(),
+            require_verified_email: false,
+        },
+        console: meerkat_meta::ConsolePolicy {
+            require_app_auth,
+            ..meerkat_meta::ConsolePolicy::default()
+        },
+        ops: meerkat_meta::RuntimeOpsPolicy::default(),
+        release_metadata_json: include_str!("../assets/release-targets.json").to_string(),
+    })
+    .expect("console decisions")
+}
+
+/// Console decisions that require sign-in with a token from the trusted
+/// issuer.
+fn authenticated_console_decisions() -> meerkat_meta::RuntimeDecisionState {
+    console_decisions(TRUSTED_ISSUER, true)
+}
+
+/// A test token from `issuer` with `claims`, valid for five minutes.
+fn signed_console_token(issuer: &str, mut claims: serde_json::Value) -> String {
+    claims["iss"] = issuer.into();
+    claims["aud"] = "meerkat-console".into();
+    claims["exp"] = (chrono::Utc::now().timestamp() + 300).into();
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+    header.kid = Some("kid-current".to_string());
+    jsonwebtoken::encode(
+        &header,
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(b"phase8-trusted-current-secret"),
+    )
+    .expect("console token")
+}
+
+/// A token from the trusted issuer for `subject`: a verified human, or a
+/// service identity for an `svc:` name.
+fn console_token(subject: &str) -> String {
+    signed_console_token(
+        TRUSTED_ISSUER,
+        serde_json::json!({
+            "sub": subject,
+            "email": subject,
+            "provider": "google_oauth",
+        }),
+    )
+}
+
+/// `meta/topology/apply` through the Console JSON-RPC route, signed in as
+/// `subject`.
+async fn console_apply(
+    app: &axum::Router,
+    subject: &str,
+    request: &TopologyApplyRequest,
+) -> serde_json::Value {
+    console_apply_bearing(app, Some(&console_token(subject)), request).await
+}
+
+/// `meta/topology/apply` through the Console JSON-RPC route, bearing `token`
+/// when there is one.
+async fn console_apply_bearing(
+    app: &axum::Router,
+    token: Option<&str>,
+    request: &TopologyApplyRequest,
+) -> serde_json::Value {
+    use tower::ServiceExt;
+
+    let mut builder = axum::http::Request::builder()
+        .method("POST")
+        .uri("/console/rpc")
+        .header("content-type", "application/json");
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            builder
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "meta/topology/apply",
+                        "params": request,
+                    })
+                    .to_string(),
+                ))
+                .expect("console request"),
+        )
+        .await
+        .expect("console response");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("console body");
+    serde_json::from_slice(&body).expect("console json")
+}
+
+/// `meta/topology/apply` through the gateway's JSON-RPC surface.
+async fn gateway_apply(
+    runtime: &UnifiedRuntime,
+    request: &TopologyApplyRequest,
+) -> serde_json::Value {
+    let response = meerkat_meta::handle_unified_rpc_json(
+        runtime,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "meta/topology/apply",
+            "params": request,
+        })
+        .to_string(),
+        Duration::from_secs(5),
+        None,
+        None,
+    )
+    .await;
+    serde_json::from_str(&response).expect("gateway json")
+}
+
+/// A disconnect of alice and bob under `idempotency_key`.
+fn disconnect_alice_bob(expected_revision: u64, idempotency_key: &str) -> TopologyApplyRequest {
+    let mut request = connect_alice_bob(expected_revision, idempotency_key);
+    request.operations[0].action = TopologyAction::Disconnect;
+    request
+}
+
+/// The same key from two Console callers names two operations: the second
+/// caller's identical request is evaluated as its own apply (here a revision
+/// conflict, since the first apply advanced the revision), and the first
+/// caller's retry still replays its own apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_same_key_from_two_console_callers_names_two_operations() {
+    let _serial = TOPOLOGY_TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime = build_runtime(temp.path(), "topology-scope-replay", "alice").await;
+    spawn_bob(&runtime).await;
+    let app = runtime.build_console_json_router(authenticated_console_decisions());
+    let revision = runtime
+        .topology_runtime_handle()
+        .controller()
+        .revision()
+        .await;
+    let request = connect_alice_bob(revision, "shared-key");
+
+    let first = console_apply(&app, "alice@example.com", &request).await;
+    let receipt = first["result"].clone();
+    assert_eq!(receipt["status"], "applied", "{first}");
+
+    let other = console_apply(&app, "bob@example.com", &request).await;
+    assert!(
+        other.get("result").is_none(),
+        "the second caller's apply is its own: {other}"
+    );
+    assert_eq!(
+        other["error"]["data"]["kind"], "topology_revision_conflict",
+        "{other}"
+    );
+
+    let replay = console_apply(&app, "alice@example.com", &request).await;
+    assert_eq!(replay["result"], receipt, "{replay}");
+    shutdown(&runtime).await;
+}
+
+/// A second Console caller's different request under a key the first caller
+/// used is evaluated as its own apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_console_caller_reusing_a_key_applies_its_own_request() {
+    let _serial = TOPOLOGY_TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime = build_runtime(temp.path(), "topology-scope-reuse", "alice").await;
+    spawn_bob(&runtime).await;
+    let app = runtime.build_console_json_router(authenticated_console_decisions());
+    let revision = runtime
+        .topology_runtime_handle()
+        .controller()
+        .revision()
+        .await;
+
+    let first = console_apply(
+        &app,
+        "alice@example.com",
+        &connect_alice_bob(revision, "taken-key"),
+    )
+    .await;
+    assert_eq!(first["result"]["status"], "applied", "{first}");
+
+    let mut different = connect_alice_bob(revision + 1, "taken-key");
+    different.reason = Some("a different caller's own request".to_string());
+    let other = console_apply(&app, "bob@example.com", &different).await;
+    assert!(
+        other.get("error").is_none(),
+        "the second caller's request is applied as its own: {other}"
+    );
+    assert_eq!(other["result"]["status"], "noop", "{other}");
+    shutdown(&runtime).await;
+}
+
+/// The gateway's JSON-RPC surface and a Console caller do not share apply
+/// keys: the Console caller's identical request under the key the gateway
+/// applied is evaluated as its own apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_gateway_and_a_console_caller_do_not_share_apply_keys() {
+    let _serial = TOPOLOGY_TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime = build_runtime(temp.path(), "topology-scope-surfaces", "alice").await;
+    spawn_bob(&runtime).await;
+    let app = runtime.build_console_json_router(authenticated_console_decisions());
+    let revision = runtime
+        .topology_runtime_handle()
+        .controller()
+        .revision()
+        .await;
+    let request = connect_alice_bob(revision, "gateway-key");
+
+    let gateway = gateway_apply(&runtime, &request).await;
+    assert_eq!(gateway["result"]["status"], "applied", "{gateway}");
+
+    let console = console_apply(&app, "alice@example.com", &request).await;
+    assert!(
+        console.get("result").is_none(),
+        "the Console caller's apply is its own: {console}"
+    );
+    assert_eq!(
+        console["error"]["data"]["kind"], "topology_revision_conflict",
+        "{console}"
+    );
+    shutdown(&runtime).await;
+}
+
+/// The bilateral coordinator's apply keys are the naming principal's own: a
+/// second principal's identical request under the same key is evaluated as
+/// its own apply, while the first principal's retry still replays its apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bilateral_apply_keys_are_the_naming_principals_own() {
+    let _serial = TOPOLOGY_TEST_LOCK.lock().await;
+    let root = tempfile::tempdir().expect("root");
+    let right = build_runtime(root.path(), "topology-scope-pair-b", "bob").await;
+    let left = build_runtime(root.path(), "topology-scope-pair-a", "alice").await;
+    let coordinator =
+        SameProcessTopologyCoordinator::open(root.path().join("pair.json")).expect("coordinator");
+    let initial = coordinator
+        .query(&left, &right, None)
+        .await
+        .expect("initial query");
+    let request = TopologyBilateralApplyRequest {
+        expected_revisions: initial.authority_revisions,
+        idempotency_key: "pair-key".to_string(),
+        operations: vec![mutation(
+            TopologyAction::Connect,
+            &edge(
+                "topology-scope-pair-a",
+                "alice",
+                "topology-scope-pair-b",
+                "bob",
+            ),
+        )],
+        reason: Some("scoped bilateral apply".to_string()),
+        risk_tier: None,
+    };
+
+    let applied = coordinator
+        .apply(
+            &left,
+            &right,
+            request.clone(),
+            Some("alice@example.com"),
+            "alice@example.com",
+        )
+        .await
+        .expect("the first principal applies");
+    assert_eq!(applied.status, TopologyOperationStatus::Applied);
+
+    let other = coordinator
+        .apply(
+            &left,
+            &right,
+            request.clone(),
+            Some("bob@example.com"),
+            "bob@example.com",
+        )
+        .await;
+    assert!(
+        matches!(
+            other,
+            Err(meerkat_meta::TopologyControlError::RevisionConflict { .. })
+        ),
+        "the second principal's apply is its own: {other:?}"
+    );
+
+    let replay = coordinator
+        .apply(
+            &left,
+            &right,
+            request,
+            Some("alice@example.com"),
+            "alice@example.com",
+        )
+        .await
+        .expect("the first principal replays");
+    assert_eq!(replay, applied);
+    shutdown(&left).await;
+    shutdown(&right).await;
+}
+
+/// A Console caller's own apply key keeps its semantics: its retry replays
+/// its apply across a restart, and its reuse of the key for a different
+/// request is still refused, while another caller's identical request after
+/// the restart is still evaluated as its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_console_callers_own_apply_key_replays_after_restart_and_refuses_reuse() {
+    let _serial = TOPOLOGY_TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let authority = "topology-scope-restart";
+    let runtime = build_runtime(temp.path(), authority, "alice").await;
+    spawn_bob(&runtime).await;
+    let app = runtime.build_console_json_router(authenticated_console_decisions());
+    let revision = runtime
+        .topology_runtime_handle()
+        .controller()
+        .revision()
+        .await;
+    let request = connect_alice_bob(revision, "restart-key");
+    let first = console_apply(&app, "alice@example.com", &request).await;
+    let receipt = first["result"].clone();
+    assert_eq!(receipt["status"], "applied", "{first}");
+    drop(app);
+    shutdown(&runtime).await;
+    drop(runtime);
+
+    let runtime = build_runtime(temp.path(), authority, "alice").await;
+    spawn_bob(&runtime).await;
+    let app = runtime.build_console_json_router(authenticated_console_decisions());
+    let replay = console_apply(&app, "alice@example.com", &request).await;
+    assert_eq!(replay["result"], receipt, "{replay}");
+
+    let mut reused = request.clone();
+    reused.reason = Some("the same caller's different request".to_string());
+    let conflict = console_apply(&app, "alice@example.com", &reused).await;
+    assert_eq!(
+        conflict["error"]["data"]["kind"], "topology_idempotency_conflict",
+        "{conflict}"
+    );
+
+    let other = console_apply(&app, "bob@example.com", &request).await;
+    assert!(other.get("result").is_none(), "{other}");
+    assert_eq!(
+        other["error"]["data"]["kind"], "topology_revision_conflict",
+        "{other}"
+    );
+    shutdown(&runtime).await;
+}
+
+/// The host's Rust API without a principal keeps its key shape: a host apply
+/// replays to the host, and a Console caller never matches the host's key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_hosts_unscoped_apply_key_is_not_matched_by_a_console_caller() {
+    let _serial = TOPOLOGY_TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime = build_runtime(temp.path(), "topology-scope-host", "alice").await;
+    spawn_bob(&runtime).await;
+    let app = runtime.build_console_json_router(authenticated_console_decisions());
+    let topology = runtime.topology_runtime_handle();
+    let revision = topology.controller().revision().await;
+    let request = connect_alice_bob(revision, "host-key");
+    let applied = topology
+        .apply(request.clone(), "host")
+        .await
+        .expect("the host applies");
+    assert_eq!(applied.status, TopologyOperationStatus::Applied);
+    assert_eq!(
+        topology
+            .apply(request.clone(), "host")
+            .await
+            .expect("the host replays"),
+        applied
+    );
+
+    let console = console_apply(&app, "alice@example.com", &request).await;
+    assert!(console.get("result").is_none(), "{console}");
+    assert_eq!(
+        console["error"]["data"]["kind"], "topology_revision_conflict",
+        "{console}"
+    );
+    shutdown(&runtime).await;
+}
+
+/// A Console principal without a verified human (here a service identity)
+/// has its own apply keys, scoped by the trust source that verified it: its
+/// retry replays its apply, while another service identity, a verified
+/// human, and the same service identity verified by another issuer each
+/// apply their own request under the same key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_console_principal_without_a_verified_human_has_its_own_apply_keys() {
+    let _serial = TOPOLOGY_TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime = build_runtime(temp.path(), "topology-scope-principal", "alice").await;
+    spawn_bob(&runtime).await;
+    let trusted = runtime.build_console_json_router(console_decisions(TRUSTED_ISSUER, true));
+    let other_issuer = runtime.build_console_json_router(console_decisions(OTHER_ISSUER, true));
+    let revision = runtime
+        .topology_runtime_handle()
+        .controller()
+        .revision()
+        .await;
+    let request = connect_alice_bob(revision, "principal-key");
+    let robot = console_token("svc:robot");
+
+    let first = console_apply_bearing(&trusted, Some(&robot), &request).await;
+    let receipt = first["result"].clone();
+    assert_eq!(receipt["status"], "applied", "{first}");
+    let replay = console_apply_bearing(&trusted, Some(&robot), &request).await;
+    assert_eq!(replay["result"], receipt, "{replay}");
+
+    let robot_from_other_issuer = signed_console_token(
+        OTHER_ISSUER,
+        serde_json::json!({
+            "sub": "svc:robot",
+            "email": "svc:robot",
+            "provider": "google_oauth",
+        }),
+    );
+    for (caller, app, token) in [
+        (
+            "another service identity",
+            &trusted,
+            console_token("svc:other"),
+        ),
+        (
+            "a verified human",
+            &trusted,
+            console_token("alice@example.com"),
+        ),
+        (
+            "the same service identity verified by another issuer",
+            &other_issuer,
+            robot_from_other_issuer,
+        ),
+    ] {
+        let own = console_apply_bearing(app, Some(&token), &request).await;
+        assert!(own.get("result").is_none(), "{caller}: {own}");
+        assert_eq!(
+            own["error"]["data"]["kind"], "topology_revision_conflict",
+            "{caller}: {own}"
+        );
+    }
+    shutdown(&runtime).await;
+}
+
+/// A principal the host names on its Rust API has its own apply keys, apart
+/// from a Console principal of the same name: the Console principal's
+/// identical request under the key the host applied is evaluated as its own
+/// apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_principal_the_host_names_is_not_a_console_principal_of_that_name() {
+    let _serial = TOPOLOGY_TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime = build_runtime(temp.path(), "topology-scope-named", "alice").await;
+    spawn_bob(&runtime).await;
+    let app = runtime.build_console_json_router(authenticated_console_decisions());
+    let topology = runtime.topology_runtime_handle();
+    let revision = topology.controller().revision().await;
+    let request = connect_alice_bob(revision, "named-key");
+    let applied = topology
+        .apply_as(request.clone(), Some("bob@example.com"), "bob@example.com")
+        .await
+        .expect("the host applies for bob");
+    assert_eq!(applied.status, TopologyOperationStatus::Applied);
+
+    // A token without a subject: an authenticated principal, no verified
+    // human.
+    let principal = signed_console_token(
+        TRUSTED_ISSUER,
+        serde_json::json!({
+            "email": "bob@example.com",
+            "provider": "google_oauth",
+        }),
+    );
+    let console = console_apply_bearing(&app, Some(&principal), &request).await;
+    assert!(console.get("result").is_none(), "{console}");
+    assert_eq!(
+        console["error"]["data"]["kind"], "topology_revision_conflict",
+        "{console}"
+    );
+    shutdown(&runtime).await;
+}
+
+/// An open Console without an access controller never resolves tokens: every
+/// caller there, with a valid token or none, is the shared anonymous account
+/// and shares its apply keys, while the gateway's surface keeps its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_consoles_callers_share_the_anonymous_apply_keys() {
+    let _serial = TOPOLOGY_TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime = build_runtime(temp.path(), "topology-scope-open", "alice").await;
+    spawn_bob(&runtime).await;
+    let app = runtime.build_console_json_router(console_decisions(TRUSTED_ISSUER, false));
+    let revision = runtime
+        .topology_runtime_handle()
+        .controller()
+        .revision()
+        .await;
+    let request = connect_alice_bob(revision, "open-key");
+
+    let first =
+        console_apply_bearing(&app, Some(&console_token("alice@example.com")), &request).await;
+    let receipt = first["result"].clone();
+    assert_eq!(receipt["status"], "applied", "{first}");
+    for token in [Some(console_token("bob@example.com")), None] {
+        let shared = console_apply_bearing(&app, token.as_deref(), &request).await;
+        assert_eq!(shared["result"], receipt, "{shared}");
+    }
+
+    let gateway = gateway_apply(&runtime, &request).await;
+    assert!(gateway.get("result").is_none(), "{gateway}");
+    assert_eq!(
+        gateway["error"]["data"]["kind"], "topology_revision_conflict",
+        "{gateway}"
+    );
+    shutdown(&runtime).await;
+}
+
+/// Compacted history is per caller: once a Console caller's apply has aged
+/// out of the retained receipts, its retry with that key is refused as
+/// compacted history, while another caller's and the host's identical
+/// requests under the same key are evaluated as their own applies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_console_callers_compacted_apply_key_is_its_own() {
+    let _serial = TOPOLOGY_TEST_LOCK.lock().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let runtime = build_runtime_with_client_and_policy(
+        temp.path(),
+        "topology-scope-compacted",
+        "alice",
+        Arc::new(TestClient::for_provider(Provider::OpenAI)),
+        TopologyControlPolicy {
+            receipt_limit: 1,
+            ..editable_policy()
+        },
+    )
+    .await;
+    spawn_bob(&runtime).await;
+    let app = runtime.build_console_json_router(authenticated_console_decisions());
+    let topology = runtime.topology_runtime_handle();
+    let revision = topology.controller().revision().await;
+    let request = connect_alice_bob(revision, "aged-key");
+
+    let first = console_apply(&app, "alice@example.com", &request).await;
+    assert_eq!(first["result"]["status"], "applied", "{first}");
+    // The one retained receipt is now the second apply's.
+    let second = console_apply(
+        &app,
+        "alice@example.com",
+        &disconnect_alice_bob(revision + 1, "newer-key"),
+    )
+    .await;
+    assert_eq!(second["result"]["status"], "applied", "{second}");
+
+    let retry = console_apply(&app, "alice@example.com", &request).await;
+    assert_eq!(
+        retry["error"]["data"]["kind"], "topology_idempotency_history_compacted",
+        "{retry}"
+    );
+    let other = console_apply(&app, "bob@example.com", &request).await;
+    assert_eq!(
+        other["error"]["data"]["kind"], "topology_revision_conflict",
+        "{other}"
+    );
+    let host = topology
+        .apply(request, "host")
+        .await
+        .expect_err("the host's identical request is its own apply");
+    assert_eq!(host.kind(), "topology_revision_conflict");
+    shutdown(&runtime).await;
+}
+
+/// A bilateral journal entry filed before keys were scoped, under a key that
+/// begins with the reserved prefix, names no caller's apply: opening the
+/// journal drops it and keeps every other entry.
+#[test]
+fn opening_a_journal_drops_reserved_prefix_entries_from_before_keys_were_scoped() {
+    let root = tempfile::tempdir().expect("root");
+    let journal = root.path().join("earlier-pair.json");
+    std::fs::write(
+        &journal,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "idempotency": {
+                "apply-scoped:earlier": {"fingerprint": "f1", "operation_id": "o1"},
+                "host-key": {"fingerprint": "f2", "operation_id": "o2"},
+                "apply-scoped:filed": {"fingerprint": "f3", "operation_id": "o3", "scoped": true},
+            }
+        }))
+        .expect("journal json"),
+    )
+    .expect("write journal");
+    drop(SameProcessTopologyCoordinator::open(&journal).expect("open the journal"));
+
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal).expect("read journal"))
+            .expect("journal json");
+    let keys = persisted["idempotency"]
+        .as_object()
+        .expect("idempotency entries")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(keys, vec!["apply-scoped:filed", "host-key"], "{persisted}");
+}

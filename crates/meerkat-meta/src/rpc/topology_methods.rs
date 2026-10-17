@@ -7,8 +7,9 @@ use crate::access::{
     ACTION_TOPOLOGY_VIEW, AccessView,
 };
 use crate::topology_control::{
-    TopologyApplyRequest, TopologyAuditPage, TopologyControlError, TopologyControlMode,
-    TopologyMutation, TopologyNodeAffordances, TopologyPlanRequest, TopologyRuntimeHandle,
+    TopologyApplyRequest, TopologyApplyScope, TopologyAuditPage, TopologyControlError,
+    TopologyControlMode, TopologyMutation, TopologyNodeAffordances, TopologyPlanRequest,
+    TopologyRuntimeHandle,
 };
 
 use super::{JSONRPC_VERSION, JsonRpcError, JsonRpcResponse};
@@ -158,12 +159,15 @@ pub(crate) async fn handle_plan(
     }
 }
 
+/// `meta/topology/apply` for a caller of `scope`: its idempotency keys are
+/// its own, so the same key from another caller names another operation.
 pub(crate) async fn handle_apply(
     topology: &TopologyRuntimeHandle,
     response_id: Value,
     params: &Value,
     view: Option<&AccessView>,
     actor: Option<&str>,
+    scope: &TopologyApplyScope,
 ) -> JsonRpcResponse {
     let mut request: TopologyApplyRequest = match serde_json::from_value(params.clone()) {
         Ok(request) => request,
@@ -185,7 +189,13 @@ pub(crate) async fn handle_apply(
                 .unwrap_or_else(|| "<redacted>".to_string()),
         };
         if let Err(audit_error) = topology
-            .record_denied_apply(&request, actor, actor.unwrap_or("local-host"), &denied)
+            .record_denied_apply(
+                &request,
+                scope,
+                actor,
+                actor.unwrap_or("local-host"),
+                &denied,
+            )
             .await
         {
             return failure(response_id, audit_error);
@@ -194,7 +204,7 @@ pub(crate) async fn handle_apply(
     }
     let expose_attribution = attribution_allowed_for_operations(view, &request.operations);
     match topology
-        .apply_as(request, actor, actor.unwrap_or("local-host"))
+        .apply_in_scope(request, scope, actor, actor.unwrap_or("local-host"))
         .await
     {
         Ok(mut receipt) => {

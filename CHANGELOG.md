@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking
+
+- `meta/topology/apply` idempotency keys are scoped to the caller. A Console
+  caller (its verified human; else its authenticated principal, with the
+  provider and issuer that verified it; else the open Console's anonymous
+  account), the gateway's JSON-RPC surface, and each principal a host names to
+  `TopologyRuntimeHandle::apply_as` or `SameProcessTopologyCoordinator::apply`
+  have their own keys: the same key from two callers names two operations, and
+  a retry replays only its own caller's apply. An open Console without an
+  access controller never resolves tokens, so every caller there, even one
+  presenting a valid token, is that shared anonymous account; isolating
+  callers needs `require_app_auth` or an access controller. The host's
+  `TopologyRuntimeHandle::apply`, and `apply_as` or the coordinator without a
+  principal, keep their keys as before; such a host key may no longer begin
+  with `apply-scoped:`.
+- Upgrade note: an apply recorded before this version is not matched by any
+  scoped caller, and one recorded under a key that begins with
+  `apply-scoped:` is matched by no caller. A retry across the upgrade with
+  the same key is evaluated as a new apply (refused with
+  `topology_revision_conflict` when its `expected_revision` is stale), and a
+  scoped retry of an apply still pending at the upgrade answers
+  `topology_operation_in_progress` until recovery closes it.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
