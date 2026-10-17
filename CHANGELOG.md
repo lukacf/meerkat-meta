@@ -301,6 +301,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   "max_read_bytes": 134217728, "store_bytes": ...}`. Before, every draft
   method read and parsed such a file whole, the store took the default file
   mode, and writers sharing a store raced on one fixed `.json.tmp` file.
+- The standalone Flow Editor server (`meta_flow_editor`) handles at most 16
+  requests at once, and the rest wait for a slot. Any local process can call
+  it, and every request it handled ran on the blocking pool, so it took any
+  number of requests at once.
 
 ### Added
 

@@ -6,6 +6,7 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::Value;
+use tower::limit::GlobalConcurrencyLimitLayer;
 
 use crate::access::{ACTION_MOBPACK_AUTHOR, ACTION_MOBPACK_DEPLOY, AccessController, AccessView};
 use crate::http_console::ACCESS_DENIED_RPC_CODE;
@@ -28,12 +29,28 @@ pub fn flow_editor_router() -> Router {
     standalone_favicon_router::<()>()
         .merge(flow_editor_frontend_router::<()>())
         .merge(flow_editor_rpc_router::<()>())
+        .layer(standalone_concurrency_limit())
 }
 
 pub fn flow_editor_router_with_host_deploy() -> Router {
     standalone_favicon_router::<()>()
         .merge(flow_editor_frontend_router::<()>())
         .merge(flow_editor_rpc_router_allowing_host_deploy::<()>())
+        .layer(standalone_concurrency_limit())
+}
+
+/// The most requests the standalone Flow Editor server handles at once; the
+/// rest wait for a slot. Any local process can call it, and every request it
+/// handles runs on the blocking pool, which it could otherwise fill.
+const STANDALONE_FLOW_EDITOR_MAX_CONCURRENT_REQUESTS: usize = 16;
+
+/// One limit for every request to a standalone router: one semaphore,
+/// however often the layer is applied. axum applies a router's layer to
+/// each route, and to a handler's route again for each connection it
+/// serves, so a per-service limit (`ConcurrencyLimitLayer`) would bound one
+/// route on one connection.
+fn standalone_concurrency_limit() -> GlobalConcurrencyLimitLayer {
+    GlobalConcurrencyLimitLayer::new(STANDALONE_FLOW_EDITOR_MAX_CONCURRENT_REQUESTS)
 }
 
 /// Quiet-favicon route for the standalone Flow Editor server only. It must
@@ -190,10 +207,18 @@ pub async fn flow_editor_rpc_handler_allowing_host_deploy(
     flow_editor_rpc_handler_with_policy(request, true).await
 }
 
+/// Requests the standalone Flow Editor RPC handler has started, for the test
+/// of how many it handles at once.
+#[cfg(test)]
+static STANDALONE_RPC_REQUESTS_STARTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 async fn flow_editor_rpc_handler_with_policy(
     request: Value,
     allow_host_deploy: bool,
 ) -> impl IntoResponse {
+    #[cfg(test)]
+    STANDALONE_RPC_REQUESTS_STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let parsed_request = match serde_json::from_value::<JsonRpcRequest>(request) {
         Ok(req) => req,
         Err(_) => {
@@ -2171,5 +2196,61 @@ mod tests {
         }
         let _shutdown = runtime.shutdown().await;
         assert_eq!(findings, Vec::<String>::new());
+    }
+
+    /// The standalone Flow Editor server handles at most 16 requests at once;
+    /// the rest wait for a slot. Any local process can call it, and every
+    /// request it handles waits on the blocking pool, which it could fill.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_standalone_server_handles_at_most_sixteen_requests_at_once() {
+        use std::sync::atomic::Ordering;
+        let store = tempfile::tempdir().expect("tempdir");
+        let store_path = store.path().join("drafts.json");
+        // Every draft method waits for the draft store lock this thread holds.
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _held = crate::mobpack::hold_draft_store_lock_for_test();
+            held_tx.send(()).expect("held");
+            release_rx.recv().ok();
+        });
+        held_rx.recv().expect("the draft store lock is held");
+        let app = super::flow_editor_router_with_host_deploy();
+        let requests = (0..20)
+            .map(|index| {
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "method": "meta/mobpacks/list",
+                    "params": { "store_path": store_path },
+                })
+                .to_string();
+                let app = app.clone();
+                tokio::spawn(async move {
+                    app.oneshot(
+                        Request::post("/flow-editor/rpc")
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .expect("request"),
+                    )
+                    .await
+                })
+            })
+            .collect::<Vec<_>>();
+        let started = || super::STANDALONE_RPC_REQUESTS_STARTED.load(Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while started() < 16 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Long enough for any request past the limit to start, were it let in.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let at_once = started();
+        release_tx.send(()).expect("release the lock");
+        holder.join().expect("the lock holder");
+        for request in requests {
+            let response = request.await.expect("request task").expect("response");
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+        }
+        assert_eq!(at_once, 16, "requests the server handled at once");
     }
 }

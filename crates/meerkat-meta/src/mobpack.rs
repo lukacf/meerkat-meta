@@ -157,6 +157,15 @@ const EDITOR_SCHEMA_FIELD_TYPES: &[&str] = &[
 
 static MOBPACK_DRAFT_STORE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Hold the draft store lock, so draft methods wait for the test that holds
+/// it.
+#[cfg(test)]
+pub(crate) fn hold_draft_store_lock_for_test() -> std::sync::MutexGuard<'static, ()> {
+    MOBPACK_DRAFT_STORE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Hold the draft store lock for one read, check and write of the store.
 /// Every draft call from every caller waits for it.
 fn lock_draft_store() -> Result<DraftStoreLock, String> {

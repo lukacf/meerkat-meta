@@ -68,7 +68,8 @@ Without `--allow-host-deploy`, the standalone server refuses
 `meta/mobpacks/deploy` with `execute: true` and points you at deploy planning
 or running `rkat mob run` manually. A validate request with
 `rkat_validate: true` is reduced to structural validation, so it cannot write
-an archive or spawn `rkat`.
+an archive or spawn `rkat`. The standalone server handles at most 16 requests
+at once; the rest wait for a slot.
 
 ### Library routers
 
