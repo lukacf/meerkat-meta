@@ -4689,4 +4689,282 @@ schedule = true
             "external_event",
         );
     }
+
+    /// What one scheduled fire to a mob member did, observed from the
+    /// schedule host, the member's event stream and the provider.
+    #[derive(Debug)]
+    struct ScheduledFireOutcome {
+        /// The receipt detail of a dispatch, or the schedule domain error.
+        dispatch: Result<Option<String>, String>,
+        terminal_phase: Option<OccurrencePhase>,
+        terminal_reason: Option<meerkat::DeliveryFailureReason>,
+        terminal_detail: Option<String>,
+        /// The member's agent events after the fire, by type.
+        member_events: Vec<String>,
+        /// The typed failure of a run the fire started, if one failed.
+        run_failure: Option<meerkat_core::event::AgentErrorReport>,
+        /// Provider calls the fire caused.
+        llm_calls: usize,
+        /// Native ingress checks the governed composition was asked.
+        ingress_checks: usize,
+        member_session_before: Option<SessionId>,
+        member_session_after: Option<SessionId>,
+    }
+
+    /// Fire one due schedule whose target is a mob member through
+    /// [`InternalDeliveryScheduleMobHost`], on a runtime built with or
+    /// without `native_grant_work_configuration`. The governed composition
+    /// is the held-identity fixture's (its grant owner, a destination hook,
+    /// a host tool policy), with a native ingress check that admits and
+    /// counts, so a refusal is not that check's.
+    async fn scheduled_member_fire(governed: bool) -> ScheduledFireOutcome {
+        use crate::unified_runtime::held_identity_test_support as governance;
+        use futures::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let llm_calls = Arc::new(AtomicUsize::new(0));
+        let ingress_checks = Arc::new(AtomicUsize::new(0));
+        let mob_id = format!(
+            "schedule-governed-{}-{}",
+            if governed { "on" } else { "off" },
+            uuid::Uuid::new_v4().simple()
+        );
+        let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"{mob_id}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+             runtime_mode = \"turn_driven\"\n\n[profiles.worker.tools]\ncomms = true\n"
+        ))
+        .expect("mob definition");
+        let mut config = Config::default();
+        config.realm.insert(
+            meerkat_core::connection::GLOBAL_REALM_SLUG.to_string(),
+            meerkat_core::RealmConfigSection::from_inline_api_keys(&[(
+                "openai",
+                "sk-regression-test",
+            )]),
+        );
+        let mut builder = crate::UnifiedRuntime::builder()
+            .definition(definition)
+            .meerkat_config(config)
+            .persistent_state(temp_dir.path().join("state"))
+            .default_llm_client(Arc::new(CountingLlmClient {
+                calls: llm_calls.clone(),
+            }));
+        if governed {
+            let mut configuration = governance::host_configuration();
+            let checks = ingress_checks.clone();
+            configuration.ingress = Arc::new(
+                move |_, _, _, _| -> Result<(), meerkat_runtime::input_authority::NativeAdmissionError> {
+                    checks.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            );
+            builder = builder
+                .native_grant_work_configuration(configuration)
+                .member_runtime_registration_hook(Arc::new(governance::SelectingHook))
+                .tool_consequence_policy_registry(Arc::new(
+                    meerkat_core::ToolConsequencePolicyRegistry::new(
+                        vec![Arc::new(governance::HostPolicy(
+                            meerkat_core::PolicyProviderId::new("host").expect("provider id"),
+                        ))],
+                        meerkat_core::PolicyEvaluationSupervisorConfig::default(),
+                        None,
+                    )
+                    .expect("host policy registry"),
+                ));
+        }
+        let runtime = builder.build().await.expect("build runtime");
+        let handle = runtime.mob_handle();
+        let member = meerkat_mob::ids::AgentIdentity::from("scheduled-worker");
+        runtime
+            .spawn_many(vec![meerkat_mob::SpawnMemberSpec::new(
+                meerkat_mob::ProfileName::from("worker"),
+                member.clone(),
+            )])
+            .await
+            .expect("spawn the member");
+        let member_session_before = handle.resolve_bridge_session_id(&member).await;
+        let mut probe = handle
+            .subscribe_agent_events(&member)
+            .await
+            .expect("probe the member's events");
+        let llm_baseline = llm_calls.load(Ordering::SeqCst);
+        let ingress_baseline = ingress_checks.load(Ordering::SeqCst);
+
+        let member_id = crate::member_comms_id::mob_member_id("scheduled-worker").to_string();
+        let content = meerkat_core::ContentInput::Text("run the scheduled check".to_string());
+        let binding = MobTargetBinding::Member {
+            mob_id: mob_id.clone(),
+            member_id,
+            action: ScheduledMobAction::Send {
+                content,
+                render_metadata: None,
+            },
+        };
+        let schedule = Schedule::new(CreateScheduleRequest {
+            name: Some("governed-member-fire".to_string()),
+            description: None,
+            trigger: TriggerSpec::Interval(IntervalTriggerSpec {
+                start_at_utc: chrono::Utc::now(),
+                every_seconds: 60,
+                end_at_utc: None,
+            }),
+            target: TargetBinding::Mob(Box::new(binding.clone())),
+            misfire_policy: meerkat::MisfirePolicy::default(),
+            overlap_policy: meerkat::OverlapPolicy::default(),
+            missing_target_policy: meerkat::MissingTargetPolicy::default(),
+            labels: BTreeMap::new(),
+            planning_horizon_days: None,
+            planning_horizon_occurrences: None,
+        })
+        .expect("schedule");
+        let occurrence = Occurrence::planned_from_schedule(
+            &schedule,
+            meerkat::OccurrenceOrdinal(0),
+            chrono::Utc::now(),
+        )
+        .expect("occurrence");
+        let host = InternalDeliveryScheduleMobHost {
+            inner: Arc::new(NoopScheduleMobHost::new("unused fallback")),
+            handle: handle.clone(),
+            identity_runtime: None,
+        };
+
+        let mut outcome = ScheduledFireOutcome {
+            dispatch: Ok(None),
+            terminal_phase: None,
+            terminal_reason: None,
+            terminal_detail: None,
+            member_events: Vec::new(),
+            run_failure: None,
+            llm_calls: 0,
+            ingress_checks: 0,
+            member_session_before,
+            member_session_after: None,
+        };
+        match host
+            .deliver_mob_target(
+                &occurrence,
+                &meerkat::ScheduleDeliveryIdentity::for_occurrence(&occurrence),
+                &binding,
+            )
+            .await
+        {
+            Ok(dispatch) => {
+                outcome.dispatch = Ok(dispatch.receipt.detail.clone());
+                let terminal = dispatch.completion.await.expect("delivery terminal");
+                outcome.terminal_phase = Some(terminal.phase);
+                outcome.terminal_reason = terminal.delivery_failure_reason;
+                outcome.terminal_detail = terminal.detail;
+            }
+            Err(error) => outcome.dispatch = Err(error.to_string()),
+        }
+        // Whatever the schedule recorded, follow the member until a run it
+        // started ends, or a bounded window shows none started.
+        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = probe.next().await {
+                outcome
+                    .member_events
+                    .push(meerkat_core::event::agent_event_type(&event.payload).to_string());
+                match event.payload {
+                    meerkat_core::event::AgentEvent::RunCompleted { .. } => break,
+                    meerkat_core::event::AgentEvent::RunFailed { error_report, .. } => {
+                        outcome.run_failure = Some(error_report);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        outcome.llm_calls = llm_calls.load(Ordering::SeqCst) - llm_baseline;
+        outcome.ingress_checks = ingress_checks.load(Ordering::SeqCst) - ingress_baseline;
+        outcome.member_session_after = handle.resolve_bridge_session_id(&member).await;
+        drop(probe);
+        runtime.shutdown().await;
+        outcome
+    }
+
+    /// A runtime built with `native_grant_work_configuration` does not run a
+    /// scheduled fire to a mob member. The schedule host submits the fire as
+    /// plain internal work, which carries no input authority association,
+    /// and the member's session refuses it at native admission before the
+    /// host's ingress check is asked: the occurrence ends `DeliveryFailed`
+    /// (`RuntimeRejected`) at the fire, no run starts, no provider call is
+    /// made and the member's session is unchanged. The same fire on a
+    /// runtime without that configuration runs the member's turn and
+    /// completes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_governed_members_scheduled_fire_does_not_run_and_an_ungoverned_one_does() {
+        let ungoverned = scheduled_member_fire(false).await;
+        assert!(
+            matches!(&ungoverned.dispatch, Ok(Some(detail)) if detail.starts_with("work_ref=")),
+            "{ungoverned:#?}"
+        );
+        assert_eq!(ungoverned.terminal_phase, Some(OccurrencePhase::Completed));
+        assert_eq!(ungoverned.terminal_reason, None);
+        assert_eq!(ungoverned.terminal_detail, None);
+        assert_eq!(
+            ungoverned.member_events.first().map(String::as_str),
+            Some("run_started"),
+            "{ungoverned:#?}"
+        );
+        assert_eq!(
+            ungoverned.member_events.last().map(String::as_str),
+            Some("run_completed"),
+            "{ungoverned:#?}"
+        );
+        assert!(ungoverned.run_failure.is_none(), "{ungoverned:#?}");
+        assert_eq!(ungoverned.llm_calls, 1, "the ungoverned fire runs one turn");
+        assert_eq!(ungoverned.ingress_checks, 0);
+        assert!(ungoverned.member_session_before.is_some());
+        assert_eq!(
+            ungoverned.member_session_after, ungoverned.member_session_before,
+            "the fire runs in the member's own session"
+        );
+
+        let governed = scheduled_member_fire(true).await;
+        let session = governed
+            .member_session_before
+            .clone()
+            .expect("the governed member has a session");
+        assert!(
+            matches!(governed.dispatch, Ok(None)),
+            "no work receipt: {governed:#?}"
+        );
+        assert_eq!(
+            governed.terminal_phase,
+            Some(OccurrencePhase::DeliveryFailed)
+        );
+        assert_eq!(
+            governed.terminal_reason,
+            Some(meerkat::DeliveryFailureReason::RuntimeRejected)
+        );
+        assert_eq!(
+            governed.terminal_detail.as_deref(),
+            Some(
+                format!(
+                    "internal schedule delivery failed (member scheduled-worker): member \
+                     session {session} did not admit the input: Input validation failed: \
+                     native work authority association is unavailable or mismatched"
+                )
+                .as_str()
+            )
+        );
+        assert!(
+            governed.member_events.is_empty(),
+            "no run starts: {governed:#?}"
+        );
+        assert!(governed.run_failure.is_none());
+        assert_eq!(governed.llm_calls, 0, "the governed fire runs no turn");
+        assert_eq!(
+            governed.ingress_checks, 0,
+            "refused before the host's ingress check is asked"
+        );
+        assert_eq!(
+            governed.member_session_after,
+            Some(session),
+            "the member's session is unchanged"
+        );
+    }
 }

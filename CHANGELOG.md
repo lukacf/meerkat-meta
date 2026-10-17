@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Known issues
+
+- A runtime built with `UnifiedRuntimeBuilder::native_grant_work_configuration`
+  does not run scheduled agent work sent to a mob member, and each such fire
+  fails late: the schedule is accepted, and at every fire the member's
+  session refuses the input at native admission ("native work authority
+  association is unavailable or mismatched"), because the schedule host
+  submits plain internal work that carries no input authority association.
+  The occurrence ends `DeliveryFailed` with `RuntimeRejected`; no run starts,
+  no provider call is made and the member's session is unchanged. The same
+  fire on a runtime without that configuration runs as before.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
