@@ -372,7 +372,11 @@ impl ScheduleMobTargetRegistry {
     async fn resolve_mob_session(&self, session_id: &str) -> MobSessionResolution {
         let adopted = match self.state.read().as_deref() {
             Ok(AdoptedMobState::Adopted(state)) => Some(state.upgrade()),
-            Ok(AdoptedMobState::Unset) | Err(_) => None,
+            Ok(AdoptedMobState::Unset) => None,
+            // A writer panicked while it adopted a mob state, so which state
+            // it adopted is unknown: refuse as for a stopped host rather
+            // than let a rewrite candidate through unrewritten.
+            Err(_) => return MobSessionResolution::Stopped,
         };
         let state = match adopted {
             None => return MobSessionResolution::Resolved(None),
@@ -4936,6 +4940,41 @@ schedule = true
                 .await
                 .unwrap_or_else(|error| panic!("{name} still answers: {error:?}"));
         }
+    }
+
+    /// A registry whose lock a writer poisoned by panicking no longer knows
+    /// which mob state it adopted, so a rewrite candidate is refused as
+    /// temporarily unavailable, as for a stopped host, not let through
+    /// unrewritten.
+    #[tokio::test]
+    async fn a_poisoned_registry_refuses_a_rewrite_candidate() {
+        let (_dir, attached, installed) = schedule_tools_over_a_memory_store();
+        let lock = Arc::clone(&attached.mob_target_registry.state);
+        let poisoner = std::thread::spawn(move || {
+            let _held = lock.write().expect("the registry lock");
+            panic!("a writer panics while it holds the registry lock");
+        });
+        assert!(poisoner.join().is_err(), "the writer panicked");
+        assert!(attached.mob_target_registry.state.is_poisoned());
+
+        let refused = schedule_call(
+            &installed,
+            "meerkat_schedule_create",
+            resumable_session_create_args("after-a-writer-panicked"),
+        )
+        .await
+        .err();
+        assert!(
+            matches!(
+                &refused,
+                Some(meerkat_core::ToolError::Unavailable {
+                    reason: meerkat_core::ToolUnavailableReason::TemporarilyUnavailable,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        assert!(attached.service.list().await.expect("list").is_empty());
     }
 
     /// A registry that never adopted a mob state passes a rewrite candidate
