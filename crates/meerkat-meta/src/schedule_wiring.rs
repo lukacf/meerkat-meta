@@ -5688,6 +5688,8 @@ schedule = true
     /// is made. Without that configuration the fire materializes the
     /// session and runs its turn, but Meerkat 0.9.2 does not record the
     /// occurrence complete: it is still `Dispatching` after the turn ran.
+    /// That is a Meerkat defect fixed in 0.9.3, so adopting 0.9.3 flips the
+    /// ungoverned pin below.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_governed_materialized_session_fire_materializes_then_fails_without_running() {
         let ungoverned = HostedScheduleFixture::new(false).await;
