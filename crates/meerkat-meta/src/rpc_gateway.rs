@@ -14028,26 +14028,29 @@ pub use crate::gateway_mcp_composition::{
 /// served.
 pub const HOST_APP_ROUTES_PREFIX: &str = "/host";
 
-/// Nest the host's read-only routes, if any, under [`HOST_APP_ROUTES_PREFIX`].
+/// Nest the host's read-only routes, if any, under [`HOST_APP_ROUTES_PREFIX`],
+/// under the app's `request_bound`.
 fn mount_host_app_routes(
     app: axum::Router,
     host: Option<&Arc<dyn GatewayHostComposition>>,
     viewer: crate::http_console::ConsoleViewerResolver,
     send_precheck: crate::http_console::ConsoleSendPrecheck,
+    request_bound: &crate::unified_runtime::http::ReferenceAppRequestBound,
 ) -> Result<axum::Router, GatewayHostError> {
     let Some(host) = host else {
         return Ok(app);
     };
     Ok(
         match host.host_app_routes_with_send_precheck(viewer, send_precheck)? {
-            Some(routes) => app.nest(HOST_APP_ROUTES_PREFIX, routes),
+            Some(routes) => app.nest(HOST_APP_ROUTES_PREFIX, request_bound.apply(routes)),
             None => app,
         },
     )
 }
 
 /// The console app this gateway serves: the runtime's reference router and
-/// the host's routes, if any, under [`HOST_APP_ROUTES_PREFIX`].
+/// the host's routes, if any, under [`HOST_APP_ROUTES_PREFIX`], all under one
+/// `request_bound`.
 fn gateway_console_app(
     runtime: &UnifiedRuntime,
     decisions: RuntimeDecisionState,
@@ -14061,6 +14064,7 @@ fn gateway_console_app(
         host,
         viewer,
         send_precheck,
+        request_bound,
     )
 }
 
@@ -18218,7 +18222,12 @@ external_addressable = true
             #[cfg(not(feature = "openai-live"))]
             let _ = &live_agent_factory;
             let app = if matches!(gateway_options.live, GatewayLiveOption::Enabled { .. }) {
-                app.merge(meerkat_live::live_ws_router(Arc::clone(&live_ctx.ws_state)))
+                // The live door shares the console's request bound: an upgrade
+                // holds a permit only until its 101 response.
+                app.merge(
+                    request_bound
+                        .apply(meerkat_live::live_ws_router(Arc::clone(&live_ctx.ws_state))),
+                )
             } else {
                 app
             };
@@ -20491,6 +20500,11 @@ mod host_app_routes_tests {
         crate::http_console::ConsoleSendPrecheck::new(minimal_decision_state(), None, None)
     }
 
+    /// One request bound per mounted app, as the gateway composes it.
+    fn request_bound() -> crate::unified_runtime::http::ReferenceAppRequestBound {
+        crate::unified_runtime::http::ReferenceAppRequestBound::default()
+    }
+
     /// A host whose route runs the Console's send precheck for the viewer it
     /// resolves.
     struct PrecheckHost;
@@ -20563,8 +20577,14 @@ mod host_app_routes_tests {
     #[tokio::test]
     async fn a_host_route_runs_the_consoles_send_precheck() {
         let host: Arc<dyn GatewayHostComposition> = Arc::new(PrecheckHost);
-        let app = mount_host_app_routes(console_app(), Some(&host), resolver(), precheck())
-            .expect("the host's routes mount");
+        let app = mount_host_app_routes(
+            console_app(),
+            Some(&host),
+            resolver(),
+            precheck(),
+            &request_bound(),
+        )
+        .expect("the host's routes mount");
         assert_eq!(
             get(&app, "/host/precheck").await,
             (StatusCode::OK, "pass".to_string())
@@ -20577,6 +20597,7 @@ mod host_app_routes_tests {
             Some(&host),
             resolver(),
             crate::http_console::ConsoleSendPrecheck::new(read_only, None, None),
+            &request_bound(),
         )
         .expect("the host's routes mount");
         assert_eq!(
@@ -20589,8 +20610,14 @@ mod host_app_routes_tests {
     #[tokio::test]
     async fn host_routes_are_served_beside_the_console_under_the_host_prefix() {
         let host: Arc<dyn GatewayHostComposition> = Arc::new(RouteHost { routes: Ok(true) });
-        let app = mount_host_app_routes(console_app(), Some(&host), resolver(), precheck())
-            .expect("the host's routes mount");
+        let app = mount_host_app_routes(
+            console_app(),
+            Some(&host),
+            resolver(),
+            precheck(),
+            &request_bound(),
+        )
+        .expect("the host's routes mount");
 
         let (status, body) = get(&app, "/host/status").await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -20618,6 +20645,7 @@ mod host_app_routes_tests {
             Some(&host),
             crate::http_console::ConsoleViewerResolver::new(decisions, None),
             precheck(),
+            &request_bound(),
         )
         .expect("the host's routes mount");
         assert_eq!(get(&app, "/host/status").await.0, StatusCode::UNAUTHORIZED);
@@ -20625,21 +20653,168 @@ mod host_app_routes_tests {
 
     #[tokio::test]
     async fn no_host_or_no_routes_leaves_the_app_unchanged_and_a_refusal_fails_init() {
-        let app = mount_host_app_routes(console_app(), None, resolver(), precheck()).unwrap();
+        let app = mount_host_app_routes(
+            console_app(),
+            None,
+            resolver(),
+            precheck(),
+            &request_bound(),
+        )
+        .unwrap();
         assert_eq!(get(&app, "/host/status").await.0, StatusCode::NOT_FOUND);
 
         let host: Arc<dyn GatewayHostComposition> = Arc::new(RouteHost { routes: Ok(false) });
-        let app =
-            mount_host_app_routes(console_app(), Some(&host), resolver(), precheck()).unwrap();
+        let app = mount_host_app_routes(
+            console_app(),
+            Some(&host),
+            resolver(),
+            precheck(),
+            &request_bound(),
+        )
+        .unwrap();
         assert_eq!(get(&app, "/host/status").await.0, StatusCode::NOT_FOUND);
 
         let host: Arc<dyn GatewayHostComposition> = Arc::new(RouteHost {
             routes: Err(GatewayHostError::Denied),
         });
         assert_eq!(
-            mount_host_app_routes(console_app(), Some(&host), resolver(), precheck()).err(),
+            mount_host_app_routes(
+                console_app(),
+                Some(&host),
+                resolver(),
+                precheck(),
+                &request_bound()
+            )
+            .err(),
             Some(GatewayHostError::Denied)
         );
+    }
+
+    /// A host whose routes stay in flight until the test releases them.
+    struct HeldRouteHost {
+        held: crate::unified_runtime::http::request_bound_test_support::HeldRequests,
+    }
+
+    #[async_trait]
+    impl GatewayHostComposition for HeldRouteHost {
+        async fn prepare_bootstrap(
+            &self,
+            spec: MobBootstrapSpec,
+        ) -> Result<MobBootstrapSpec, GatewayHostError> {
+            Ok(spec)
+        }
+        fn native_grant_work_configuration(
+            &self,
+        ) -> Result<
+            Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
+            GatewayHostError,
+        > {
+            Ok(None)
+        }
+        async fn bind_runtime(
+            &self,
+            _runtime: &mut UnifiedRuntime,
+        ) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        fn publish_bootstrap_ready(
+            &self,
+            publication: GatewayBootstrapReady<'_>,
+        ) -> Result<(), GatewayHostError> {
+            publication.publish();
+            Ok(())
+        }
+        fn begin_close(&self, _reason: GatewayHostCloseReason) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        async fn join_close(&self) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        async fn wait_closed(&self) {
+            std::future::pending::<()>().await;
+        }
+        fn host_app_routes(
+            &self,
+            _viewer: crate::http_console::ConsoleViewerResolver,
+        ) -> Result<Option<axum::Router>, GatewayHostError> {
+            Ok(Some(self.held.routes("/held/plain", "/held/with-state")))
+        }
+    }
+
+    /// The host's routes share the gateway's request bound with the Console:
+    /// no more of their handlers run at once than it allows, across
+    /// connections, and a Console route waits while they hold every permit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::expect_used)]
+    async fn host_app_routes_share_the_gateway_request_bound() {
+        use crate::unified_runtime::http::ReferenceAppRequestBound;
+        use crate::unified_runtime::http::request_bound_test_support::{
+            HeldRequests, get_on_own_connection, serve,
+        };
+
+        const LIMIT: usize = 2;
+        let definition = MobDefinition::from_toml(
+            "[mob]\nid = \"gateway-request-bound\"\n[profiles.worker]\nmodel = \"gpt-5.5\"\n",
+        )
+        .expect("definition");
+        let runtime = crate::unified_runtime::UnifiedRuntimeBuilder::default()
+            .definition(definition)
+            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .build()
+            .await
+            .expect("runtime");
+        let decisions = RuntimeDecisionState::local_console(
+            ConsolePolicy {
+                require_app_auth: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let held = HeldRequests::new();
+        let host: Arc<dyn GatewayHostComposition> = Arc::new(HeldRouteHost { held: held.clone() });
+        let app = gateway_console_app(
+            &runtime,
+            decisions.clone(),
+            Some(&host),
+            runtime.console_viewer_resolver(&decisions),
+            runtime.console_send_precheck(&decisions),
+            &ReferenceAppRequestBound::new(LIMIT),
+        )
+        .expect("console app");
+        let (address, server) = serve(app).await;
+
+        let requests = (0..4)
+            .map(|index| {
+                let path = if index % 2 == 0 {
+                    "/host/held/plain"
+                } else {
+                    "/host/held/with-state"
+                };
+                tokio::spawn(get_on_own_connection(address, path.to_string()))
+            })
+            .collect::<Vec<_>>();
+        held.wait_in_flight(LIMIT).await;
+        let healthz = tokio::spawn(get_on_own_connection(address, "/healthz".to_string()));
+        // Time for every outstanding request to start, if the bound let it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            held.peak(),
+            LIMIT,
+            "host routes ran beyond the gateway's bound"
+        );
+        assert!(
+            !healthz.is_finished(),
+            "/healthz was served while host routes held every permit"
+        );
+
+        held.release();
+        for request in requests {
+            assert_eq!(request.await.expect("held request"), 200);
+        }
+        assert_eq!(healthz.await.expect("healthz request"), 200);
+        assert_eq!(held.peak(), LIMIT);
+        server.abort();
+        runtime.shutdown().await;
     }
 }
 

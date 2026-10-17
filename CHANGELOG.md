@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- The stock reference app router's documented bound on requests in flight
+  (`DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS`) was not enforced across
+  routes and connections: a client could run more handlers at once by
+  spreading requests over routes and connections, and the routes the gateway
+  adds after the reference router (the host's routes and the live WebSocket
+  door) had no bound at all. The bound now holds app-wide (see Fixed).
+
+### Fixed
+
+- The reference app router's request bound is one set of permits for the
+  whole app. axum applies a `Router::layer` to every route on its own, and
+  again for every connection a handler route is served on, and tower's
+  `ConcurrencyLimitLayer` made new permits each time, so the bound held per
+  route and, for routes such as `/healthz`, per connection. It now uses one
+  shared semaphore (`GlobalConcurrencyLimitLayer`), which `rpc_gateway`'s host
+  routes and live WebSocket door, and the live door
+  `UnifiedRuntime::build_reference_app_router_with_live` mounts, share. A
+  request holds its permit until its response is produced: an SSE stream runs
+  without one once its headers are sent, and a WebSocket upgrade holds one
+  only until its 101 response.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
