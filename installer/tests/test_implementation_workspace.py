@@ -19,6 +19,23 @@ from launchkit.implementation_workspace import ImplementationWorkspace, Workspac
 import launchkit.implementation_workspace as implementation
 
 
+def test_linux_runtime_keeps_shared_library_loader_name_without_exposing_its_directory(tmp_path, monkeypatch):
+    from launchkit import linux_sandbox
+    library_directory = tmp_path / "private-runtime" / "lib"
+    library_directory.mkdir(parents=True)
+    actual = library_directory / "libpython3.12.so.1.0"
+    actual.write_bytes(b"inert shared-library fixture, never executed")
+    alias = library_directory / "libpython3.12.so"
+    alias.symlink_to(actual.name)
+    (library_directory / "private-config").write_bytes(b"must not be mounted")
+    values = {"LDLIBRARY": alias.name, "LIBDIR": str(library_directory), "MULTIARCH": None}
+    monkeypatch.setattr(linux_sandbox.sysconfig, "get_config_var", values.get)
+    reads = set(linux_sandbox._runtime_reads())
+    assert str(alias) in reads
+    assert str(actual) in reads, "The ELF loader uses the resolved library's versioned filename."
+    assert str(library_directory) not in reads
+
+
 @pytest.fixture
 def workspace(tmp_path):
     result = ImplementationWorkspace(tmp_path / "implementation", starter_blueprint())

@@ -128,7 +128,10 @@ def _runtime_reads():
     paths.extend(["/lib/ld-linux-aarch64.so.1", "/lib64/ld-linux-x86-64.so.2"])
     library, directory = sysconfig.get_config_var("LDLIBRARY"), sysconfig.get_config_var("LIBDIR")
     if library and directory:
-        paths.append(str(Path(directory) / library))
+        path = Path(directory) / library
+        # The ELF loader may request the versioned SONAME behind this alias.
+        # Bind both exact names, never the surrounding library directory.
+        paths.extend([str(path), str(path.resolve())])
     return paths
 
 
