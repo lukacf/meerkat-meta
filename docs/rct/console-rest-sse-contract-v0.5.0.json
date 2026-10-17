@@ -283,7 +283,7 @@
             "absent",
             "unknown"
           ],
-          "note": "The send's acceptance as meta/console/send answers it (TYPE-023), with its status as it is now, plus native: what the runtime holds for the send in the session it recorded ({state: admitted, input_id, phase?}, {state: absent} or {state: unknown, cause}). A send the evidence shows admitted but not yet settled is settled delivered first. Nothing is dispatched."
+          "note": "The send's acceptance as meta/console/send answers it (TYPE-023), with its status as it is now, plus native: what the runtime holds for the send in the session it recorded ({state: admitted, input_id, and phase when known}, {state: absent} or {state: unknown, cause}). A send the evidence shows admitted but not yet settled is settled delivered first, unless this process is still dispatching it, which is left to that dispatch. Nothing is dispatched."
         },
         "errors": [
           {
@@ -634,7 +634,7 @@
               "absent",
               "unknown"
             ],
-            "note": "The send's acceptance as meta/console/send answers it (TYPE-023), with its status as it is now, plus native: what the runtime holds for the send in the session it recorded ({state: admitted, input_id, phase?}, {state: absent} or {state: unknown, cause}). A send the evidence shows admitted but not yet settled is settled delivered first. Nothing is dispatched."
+            "note": "The send's acceptance as meta/console/send answers it (TYPE-023), with its status as it is now, plus native: what the runtime holds for the send in the session it recorded ({state: admitted, input_id, and phase when known}, {state: absent} or {state: unknown, cause}). A send the evidence shows admitted but not yet settled is settled delivered first, unless this process is still dispatching it, which is left to that dispatch. Nothing is dispatched."
           },
           "errors": [
             {
