@@ -58,8 +58,14 @@ jobs:
         env:
           PYTHONPATH: installer
         run: |
+          bwrap --version
+          bwrap --unshare-user --unshare-pid --unshare-net --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 -- /usr/bin/true
           python - <<'PY'
+          import pathlib
+          import sysconfig
           from launchkit.implementation_workspace import _sandbox_executable
+          library = pathlib.Path(sysconfig.get_config_var("LIBDIR")) / sysconfig.get_config_var("LDLIBRARY")
+          print("Selected Python shared library:", library, "->", library.resolve(), flush=True)
           if not _sandbox_executable():
               raise SystemExit("Linux acceptance isolation is unavailable; no generated-code checks can run.")
           print("Linux acceptance isolation probe passed.")
