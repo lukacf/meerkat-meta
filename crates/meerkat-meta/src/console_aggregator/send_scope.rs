@@ -117,7 +117,11 @@ mod tests {
         let alice = human("alice-sub");
         assert_eq!(key(&alice), key(&alice));
         assert!(key(&alice).starts_with("send-scoped:"));
-        let others = [
+        // Each scope differs from some other in exactly one component (the
+        // kind, a subject, a principal name, a provider or an issuer); no
+        // two share a key.
+        let scopes = [
+            alice.clone(),
             human("bob-sub"),
             ConsoleSendScope::Human {
                 issuer: "https://other.example".to_string(),
@@ -125,11 +129,15 @@ mod tests {
             },
             ConsoleSendScope::Anonymous,
             principal("alice-sub", "generic_oidc", "https://issuer.example"),
+            principal("bob-sub", "generic_oidc", "https://issuer.example"),
+            principal("alice-sub", "google_oauth", "https://issuer.example"),
             principal("alice-sub", "service_identity", "https://issuer.example"),
             principal("alice-sub", "generic_oidc", "https://other.example"),
         ];
-        for other in &others {
-            assert_ne!(key(&alice), key(other), "{other:?}");
+        for (index, scope) in scopes.iter().enumerate() {
+            for other in &scopes[index + 1..] {
+                assert_ne!(key(scope), key(other), "{scope:?} and {other:?}");
+            }
         }
         for (runtime, identity, origin, idempotency) in [
             ("runtime-b", "agent", "console", "k1"),

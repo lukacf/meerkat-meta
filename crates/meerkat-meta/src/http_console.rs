@@ -168,20 +168,12 @@ impl ConsoleHttpAuthContext {
                 let (provider, issuer) = self
                     .principal_source
                     .as_ref()
-                    .map(|(provider, issuer)| {
-                        (
-                            serde_json::to_value(provider)
-                                .ok()
-                                .and_then(|value| value.as_str().map(ToString::to_string))
-                                .unwrap_or_default(),
-                            issuer.clone(),
-                        )
-                    })
+                    .map(|(provider, issuer)| (console_provider_name(provider), issuer.as_str()))
                     .unwrap_or_default();
                 ConsoleSendScope::Principal {
                     principal: principal.clone(),
-                    provider,
-                    issuer,
+                    provider: provider.to_string(),
+                    issuer: issuer.to_string(),
                 }
             }
             None => ConsoleSendScope::Anonymous,
@@ -5311,6 +5303,19 @@ fn console_principal_source(
     let discovery =
         crate::auth::parse_oidc_discovery_json(&decisions.trusted_oidc.discovery_json).ok()?;
     Some((provider.clone(), discovery.issuer))
+}
+
+/// The name a principal's send scope records for its provider: the spelling
+/// tokens use, fixed here so a stored dedupe key never depends on how the
+/// provider type serializes.
+fn console_provider_name(provider: &crate::AuthProvider) -> &'static str {
+    match provider {
+        crate::AuthProvider::GoogleOAuth => "google_oauth",
+        crate::AuthProvider::GitHubOAuth => "github_oauth",
+        crate::AuthProvider::GenericOidc => "generic_oidc",
+        crate::AuthProvider::ServiceIdentity => "service_identity",
+        crate::AuthProvider::TestProvider => "test_provider",
+    }
 }
 
 /// The human principal Meta uses for an authenticated Console human when it
@@ -21826,6 +21831,23 @@ mod console_viewer_resolver_tests {
 
     #[test]
     fn a_principal_without_a_verified_human_is_scoped_by_its_trust_source() {
+        fn signed_bearer(claims: &Value) -> HeaderMap {
+            let mut jwt_header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+            jwt_header.kid = Some("kid-current".to_string());
+            let token = jsonwebtoken::encode(
+                &jwt_header,
+                claims,
+                &jsonwebtoken::EncodingKey::from_secret(b"phase7-trusted-current-secret"),
+            )
+            .expect("signed fixture JWT");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            headers
+        }
+
         let required = state(decisions(true), None);
         let robot = send_scope_of(&required, &bearer(ROBOT));
         assert_eq!(
@@ -21833,6 +21855,28 @@ mod console_viewer_resolver_tests {
             ConsoleSendScope::Principal {
                 principal: ROBOT.to_string(),
                 provider: "service_identity".to_string(),
+                issuer: ISSUER.to_string(),
+            }
+        );
+
+        // A token without a subject is no verified human: its principal is
+        // scoped with the provider the token names, in the token's spelling.
+        let subless = send_scope_of(
+            &required,
+            &signed_bearer(&json!({
+                "iss": ISSUER,
+                "aud": "meerkat-console",
+                "email": BOB,
+                "email_verified": true,
+                "provider": "google_oauth",
+                "exp": chrono::Utc::now().timestamp() + 300,
+            })),
+        );
+        assert_eq!(
+            subless,
+            ConsoleSendScope::Principal {
+                principal: BOB.to_string(),
+                provider: "google_oauth".to_string(),
                 issuer: ISSUER.to_string(),
             }
         );
@@ -21845,11 +21889,9 @@ mod console_viewer_resolver_tests {
             "jwks_uri": format!("{OTHER_ISSUER}/.well-known/jwks.json"),
         })
         .to_string();
-        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
-        header.kid = Some("kid-current".to_string());
-        let other_token = jsonwebtoken::encode(
-            &header,
-            &json!({
+        let other_robot = send_scope_of(
+            &state(other, None),
+            &signed_bearer(&json!({
                 "iss": OTHER_ISSUER,
                 "aud": "meerkat-console",
                 "sub": ROBOT,
@@ -21857,16 +21899,8 @@ mod console_viewer_resolver_tests {
                 "email_verified": true,
                 "provider": "google_oauth",
                 "exp": chrono::Utc::now().timestamp() + 300,
-            }),
-            &jsonwebtoken::EncodingKey::from_secret(b"phase7-trusted-current-secret"),
-        )
-        .expect("signed fixture JWT");
-        let mut other_bearer = HeaderMap::new();
-        other_bearer.insert(
-            header::AUTHORIZATION,
-            format!("Bearer {other_token}").parse().unwrap(),
+            })),
         );
-        let other_robot = send_scope_of(&state(other, None), &other_bearer);
         assert_eq!(
             other_robot,
             ConsoleSendScope::Principal {
