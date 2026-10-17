@@ -4751,13 +4751,17 @@ class MobHandle:
         the transport's request timeout (60 seconds for the stock transport).
         Size it for all three steps, with margin. It bounds only this client's
         wait: it is not sent to the gateway, and the helper is not stopped
-        when the wait runs out. The stock transport then raises
+        when the wait runs out.
+
+        When the wait runs out, the stock transport raises
         ``RuntimeError("persistent transport: timeout after <n>s waiting for
-        response")`` and the outcome is unknown: the helper may still finish,
-        and its reply is dropped. Do not retry blindly, since every call spawns
-        a new helper. A retry with the same ``agent_identity`` also queues
-        behind the first helper on that identity's lock, so use a fresh
-        identity.
+        response")`` and the helper's outcome is unknown: it may still be
+        running and may still finish, and its reply is dropped. Do not retry
+        blindly; reconcile the original helper's status and effects first. A
+        retry under a fresh ``agent_identity`` is a new operation that starts
+        another helper: it neither cancels nor deduplicates the first. A retry
+        under the same ``agent_identity`` queues behind the first helper on
+        identity-first gateways.
         """
         from .types import HelperResult
         params: dict[str, Any] = {
@@ -4803,8 +4807,9 @@ class MobHandle:
         upstream before admission.
 
         ``transport_timeout`` works as in :meth:`spawn_helper`: it bounds only
-        this client's wait for the forked helper's result, the same sizing and
-        retry advice applies, and when it runs out the outcome is unknown.
+        this client's wait for the forked helper's result, and the same sizing
+        applies. When it runs out the forked helper's outcome is unknown and it
+        may still be running; the retry advice of :meth:`spawn_helper` applies.
         """
         from .types import HelperResult
         params: dict[str, Any] = {

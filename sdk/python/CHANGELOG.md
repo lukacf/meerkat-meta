@@ -7,15 +7,20 @@ All notable changes to the Python SDK are documented here.
 - `MobHandle.spawn_helper` and `MobHandle.fork_helper` take
   `transport_timeout` (seconds): how long the call waits for the helper's
   result. It defaults to the transport's request timeout (60 seconds) and is
-  not sent to the gateway. When it runs out the outcome is unknown: the
-  helper may still finish, so do not retry blindly.
+  not sent to the gateway. When it runs out the helper's outcome is unknown
+  and it may still be running: reconcile it before any retry. A retry under a
+  fresh `agent_identity` starts another helper (it neither cancels nor
+  deduplicates the first); one under the same identity queues behind the
+  first on identity-first gateways.
 - Test doubles that replace the private `MetaRuntime._rpc` must accept the
   `transport_timeout` keyword: `spawn_helper` and `fork_helper` now always
   pass it (`None` when unset).
-- A request timeout longer than `threading.TIMEOUT_MAX` is refused with
-  `ValueError` before the request is written. The transport used to write the
-  request and only then fail its wait with `OverflowError`, so the gateway ran
-  the call with nobody waiting for the reply.
+- A request timeout longer than `threading.TIMEOUT_MAX` is refused before the
+  request is written: the call raises `ValueError`, and `connect()` with such a
+  `gateway_init_timeout` raises `TransportError` caused by it, sending no
+  `meta/init`. The transport used to write the request and only then fail its
+  wait with `OverflowError`, so the gateway ran the call with nobody waiting
+  for the reply.
 
 ## 0.9.2
 

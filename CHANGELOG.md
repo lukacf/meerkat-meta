@@ -23,8 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   transport's default request timeout (60 seconds) gave up on longer helpers
   while they still ran. The value bounds only the client's wait and is not
   sent to the gateway, which sets no deadline of its own on a helper run.
-  When the wait runs out the outcome is unknown: the helper may still finish,
-  and a retry spawns another helper.
+  When the wait runs out the helper's outcome is unknown and it may still be
+  running: reconcile it before any retry, since a retry starts another
+  helper rather than cancelling or deduplicating the first.
 
 ### Changed
 
@@ -78,10 +79,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - Python SDK: a request timeout longer than `threading.TIMEOUT_MAX` (for
-  example `transport_timeout=1e10`) is refused with `ValueError` before the
-  request is written. The transport used to write the request and only then
-  fail its wait with `OverflowError`, so the gateway ran the call (a helper
-  spawn, for example) with nobody waiting for the reply.
+  example `transport_timeout=1e10`) is refused before the request is
+  written. A per-call `transport_timeout`, a server wait's deadline and a
+  transport's own default raise `ValueError`; `connect()` with such a
+  `gateway_init_timeout` raises `TransportError` ("meta/init failed: ...")
+  caused by that `ValueError`, and sends no `meta/init`. The transport used to
+  write the request and only then fail its wait with `OverflowError`, so the
+  gateway ran the call (a helper spawn, for example) with nobody waiting for
+  the reply.
 
 ## [0.9.2] - 2026-10-16
 
