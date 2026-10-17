@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking
+
+- With console access rules enabled, `meta/attach_existing_session`, and
+  `meta/ensure_member` with `resume_session_id`, refuse a session that no
+  member owns, such as one created outside a mob, unless the caller is an
+  admin. The refusal is `access_denied` with reason
+  `session_owner_unknown`. Attach such a session as an admin.
+
 ### Fixed
 
 - The per-agent event stream (`/agents/{id}/events`) evaluates the console
@@ -31,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `meta/attach_existing_session` or `meta/ensure_member`
   (`resume_session_id`) attaches as read and send access to the members it
   belongs to. A session whose owner cannot be established is refused unless
-  the caller is an admin.
+  the caller is an admin (see Breaking).
 - `meta/identity/resolved_tools`, and `resolved_tools_for_member` in Rust,
   resolve the supplied id through `roster_member_id_for_supplied_id`, as
   `meta/identity/routing_status` does (#366). A member named by its current
