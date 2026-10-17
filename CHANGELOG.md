@@ -13,9 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   changed, builds the dependency graph of each Rust CI job from that branch's
   crates.io dependencies, with no workspace code, and keeps it as a 3-day
   artifact. The branch's pull request extracts the matching artifact in each
-  Rust job (`scripts/ci-warm-deps.py`), so a Meerkat Core bump no longer
-  compiles its dependencies cold in every job. CONTRIBUTING.md has the
-  release-preparation steps.
+  Rust job (`scripts/ci-warm-deps.py`), but only from a dispatch on its head
+  commit or an ancestor with the same warm-deps files, so a Meerkat Core bump
+  no longer compiles its dependencies cold in every job. CONTRIBUTING.md has
+  the release-preparation steps.
 
 ### Changed
 

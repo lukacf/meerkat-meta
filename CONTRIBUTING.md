@@ -123,7 +123,10 @@ cold. Release preparation therefore runs:
    request's CI if it is already open.
 
 Each Rust job's `fetch-warm-deps` step prints one line: the artifact it
-extracted, or why it took none, in which case the job builds as before. The
+extracted, or why it took none, in which case the job builds as before. It
+takes an artifact only from a dispatch on the pull request's head commit or
+one of its ancestors, with the warm workflow, its script and the fetch action
+unchanged since. The
 warm job builds only the branch's crates.io dependencies (it refuses git and
 path sources and `[patch]`), with every workspace target blanked, and keeps
 each graph's artifact for 3 days. Artifacts are stored apart from the Actions

@@ -31,6 +31,10 @@ from pathlib import Path, PurePosixPath
 
 CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 WORKFLOW = ".github/workflows/warm-deps.yml"
+# A dispatch run warms a pull request only from the head commit or one of its
+# ancestors, and only if none of the files that build or fetch an artifact
+# changed in between.
+BUILDER_FILES = frozenset({WORKFLOW, "scripts/ci-warm-deps.py", ".github/actions/fetch-warm-deps/action.yml"})
 TARBALL = "warm-deps.tar"
 OUTPUTS = ("deps", "build", ".fingerprint")
 LINE_TABLES = {"CARGO_PROFILE_DEV_DEBUG": "line-tables-only"}
@@ -192,6 +196,18 @@ def extract(archive: Path) -> str | None:
     return None
 
 
+def lineage_refusal(repo: str, run_sha: str, head_sha: str) -> str | None:
+    """Why a dispatch run's commit may not warm the pull request head, or None."""
+    compare = json.loads(gh(f"repos/{repo}/compare/{run_sha}...{head_sha}"))
+    if compare["status"] not in ("identical", "ahead"):
+        return f"its commit {run_sha[:12]} is not the head or an ancestor ({compare['status']})"
+    files = compare.get("files", [])
+    if len(files) >= 300:
+        return f"{len(files)} files changed since {run_sha[:12]}, too many to check the builder files"
+    changed = sorted(BUILDER_FILES & {name for f in files for name in (f["filename"], f.get("previous_filename"))})
+    return f"{', '.join(changed)} changed since {run_sha[:12]}" if changed else None
+
+
 def fetch() -> str:
     if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
         return "not a pull request"
@@ -200,7 +216,7 @@ def fetch() -> str:
         return "a fork's pull request"
     if job not in JOB_GRAPHS:
         return f"job {job} has no graph"
-    name = artifact_name(JOB_GRAPHS[job])
+    name, head_sha, skipped = artifact_name(JOB_GRAPHS[job]), os.environ["PR_HEAD_SHA"], ""
     query = f"event=workflow_dispatch&status=success&per_page=20&branch={urllib.parse.quote(head, safe='')}"
     runs = json.loads(gh(f"repos/{repo}/actions/workflows/{Path(WORKFLOW).name}/runs?{query}"))
     for run in runs["workflow_runs"]:
@@ -211,13 +227,17 @@ def fetch() -> str:
         found = [a for a in listed["artifacts"] if a["name"] == name and not a["expired"]]
         if not found:
             continue
+        why = lineage_refusal(repo, run["head_sha"], head_sha)
+        if why:
+            skipped = f"; skipped run {run['id']}: {why}"
+            continue
         with tempfile.TemporaryDirectory() as tmp:
             archive = Path(tmp) / "artifact.zip"
             with archive.open("wb") as out:
                 gh(f"repos/{repo}/actions/artifacts/{found[0]['id']}/zip", stdout=out)
             why = extract(archive)
         return f"refused {name} from run {run['id']}: {why}" if why else f"extracted {name} from run {run['id']}"
-    return f"no {name} from a successful warm-deps dispatch on {head}"
+    return f"no {name} from a successful warm-deps dispatch on {head}{skipped}"
 
 
 def main(argv: list[str]) -> int:

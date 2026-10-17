@@ -12,6 +12,7 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
         HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       run: >-
         timeout -k 10 300 python3 scripts/ci-warm-deps.py fetch
         || echo "warm dependencies: none (the fetch failed or ran past 5 minutes)"

@@ -24,7 +24,7 @@ WARM = (ROOT / ".github/workflows/warm-deps.yml").read_text()
 ACTION = (ROOT / ".github/actions/fetch-warm-deps/action.yml").read_text()
 FETCH = "      - uses: ./.github/actions/fetch-warm-deps\n"
 PR = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REPOSITORY": "o/meta", "GITHUB_HEAD_REF": "rel/x",
-      "GITHUB_JOB": "test", "HEAD_REPOSITORY": "o/meta"}
+      "GITHUB_JOB": "test", "HEAD_REPOSITORY": "o/meta", "PR_HEAD_SHA": "f" * 40}
 
 
 def jobs(text: str) -> dict[str, str]:
@@ -61,6 +61,8 @@ class WarmDepsTests(unittest.TestCase):
         for name in sorted(consumers):
             with self.subTest(job=name):
                 block = blocks[name]
+                # The job token, which can now read actions, stays out of .git/config.
+                self.assertIn("      - uses: actions/checkout@v4\n        with:\n          persist-credentials: false\n", block)
                 builds = re.search(r"repo-cargo (build|test|nextest|clippy|check)|make test|npm --prefix console run "
                                    r"fixtures|topology_examples", block)
                 # After the cache restore, whose files the artifact overrides, and before any build.
@@ -91,6 +93,7 @@ class WarmDepsTests(unittest.TestCase):
 
     def test_the_fetch_runs_on_pull_requests_only_bounded_and_never_fails(self):
         self.assertIn("    - if: github.event_name == 'pull_request'\n", ACTION)
+        self.assertIn("        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}\n", ACTION)
         self.assertIn("timeout -k 10 300 python3 scripts/ci-warm-deps.py fetch\n"
                       "        || echo \"warm dependencies: none", ACTION)
         with mock.patch.object(warm, "gh", side_effect=AssertionError("no API call")):
@@ -103,7 +106,7 @@ class WarmDepsTests(unittest.TestCase):
     def test_fetch_takes_only_this_repositorys_dispatches_on_the_head_branch(self):
         name, calls = "warm-deps-test-x", []
         good = {"id": 5, "event": "workflow_dispatch", "head_branch": "rel/x", "path": warm.WORKFLOW,
-                "head_repository": {"full_name": "o/meta"}}
+                "head_repository": {"full_name": "o/meta"}, "head_sha": "a" * 40}
         runs = [{**good, "id": 1, "event": "push"}, {**good, "id": 2, "head_branch": "main"},
                 {**good, "id": 3, "path": ".github/workflows/ci.yml"},
                 {**good, "id": 4, "head_repository": {"full_name": "fork/meta"}}, good]
@@ -114,6 +117,8 @@ class WarmDepsTests(unittest.TestCase):
                 return json.dumps({"workflow_runs": runs}).encode()
             if path.endswith(f"/artifacts?name={name}"):
                 return json.dumps({"artifacts": [{"id": 9, "name": name, "expired": False}]}).encode()
+            if "/compare/" in path:
+                return json.dumps({"status": "ahead", "files": [{"filename": "src/lib.rs"}]}).encode()
             stdout.write(artifact([("deps/a.rlib", b"a", None)]).read_bytes())
             return b""
 
@@ -122,7 +127,31 @@ class WarmDepsTests(unittest.TestCase):
             self.assertEqual(warm.fetch(), f"extracted {name} from run 5")
             self.assertTrue((Path(target) / "debug/deps/a.rlib").is_file())
         self.assertIn("branch=rel%2Fx", calls[0])
+        self.assertIn(f"repos/o/meta/compare/{'a' * 40}...{'f' * 40}", calls)
         self.assertEqual([path for path in calls if "/runs/" in path], [f"repos/o/meta/actions/runs/5/artifacts?name={name}"])
+
+    def test_a_run_warms_only_its_own_commit_or_a_descendant_with_the_same_builders(self):
+        def compare(status, *files):
+            reply = json.dumps({"status": status, "files": [dict(f) for f in files]}).encode()
+            return mock.patch.object(warm, "gh", return_value=reply)
+
+        source = {"filename": "crates/meerkat-meta/src/lib.rs"}
+        for status, files, accepted in (("identical", [], True), ("ahead", [source], True),
+                                        ("behind", [], False), ("diverged", [source], False),
+                                        ("ahead", [source, {"filename": "scripts/ci-warm-deps.py"}], False),
+                                        ("ahead", [{"filename": "x.yml", "previous_filename": warm.WORKFLOW}], False),
+                                        ("ahead", [source] * 300, False)):
+            with self.subTest(status=status, files=len(files)), compare(status, *files):
+                self.assertEqual(warm.lineage_refusal("o/meta", "a" * 40, "f" * 40) is None, accepted)
+        # A refused run is skipped, and the job builds cold when none is left.
+        run = {"id": 5, "event": "workflow_dispatch", "head_branch": "rel/x", "path": warm.WORKFLOW,
+               "head_repository": {"full_name": "o/meta"}, "head_sha": "a" * 40}
+        replies = {"runs?": {"workflow_runs": [run]}, "artifacts?": {"artifacts": [{"id": 9, "name": "n", "expired": False}]},
+                   "compare/": {"status": "diverged", "files": []}}
+        gh = lambda path, stdout=None: json.dumps(next(v for k, v in replies.items() if k in path)).encode()
+        with mock.patch.dict(os.environ, PR), mock.patch.object(warm, "artifact_name", return_value="n"), \
+                mock.patch.object(warm, "gh", gh):
+            self.assertRegex(warm.fetch(), r"^no n from .*; skipped run 5: its commit a{12} is not the head")
 
     def test_extraction_keeps_mtimes_and_refuses_entries_outside_the_outputs(self):
         with tempfile.TemporaryDirectory() as target, mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": target}):
