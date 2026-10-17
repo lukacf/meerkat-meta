@@ -138,7 +138,7 @@ jobs:
     name: Require green exact-main CI
     needs: [resolve_release, build_binaries]
     if: >-
-      always() &&
+      !cancelled() &&
       needs.resolve_release.result == 'success' &&
       ((needs.resolve_release.outputs.mode == 'candidate' &&
         needs.build_binaries.result == 'success') ||
@@ -226,18 +226,21 @@ jobs:
             core.setOutput("run_attempt", String(success.run_attempt));
 
   # Every job that depends on the CI gate, directly or through another job,
-  # names each of its needs' results under always(). GitHub's status
+  # names each of its needs' results under !cancelled(). GitHub's status
   # functions, including the implicit success() of a condition that has none,
   # read every ancestor job, not only the declared needs. build_binaries is
   # skipped outside candidate mode and is an ancestor of all of these through
   # require_ci_green, so a condition without a status function skips them in
   # promote, assets and existing mode even when every declared need succeeded
-  # (v0.9.2 promotion run 38983785773 ran nothing after the CI gate).
+  # (v0.9.2 promotion run 38983785773 ran nothing after the CI gate). The
+  # status function is !cancelled(), not always(): always() still starts a job
+  # whose needs succeeded after the run was cancelled, so a cancelled
+  # promotion could go on to publish.
   release_validate:
     name: Validate release state
     needs: [resolve_release, require_ci_green]
     if: >-
-      always() &&
+      !cancelled() &&
       needs.resolve_release.result == 'success' &&
       needs.require_ci_green.result == 'success' &&
       needs.resolve_release.outputs.mode != 'tag'
@@ -612,7 +615,7 @@ jobs:
     name: Bind immutable candidate artifacts
     needs: [resolve_release, require_ci_green, release_validate, build_binaries]
     if: >-
-      always() &&
+      !cancelled() &&
       github.event_name == 'workflow_dispatch' &&
       needs.resolve_release.result == 'success' &&
       needs.require_ci_green.result == 'success' &&
@@ -687,7 +690,7 @@ jobs:
     name: Verify selected or published original bytes
     needs: [resolve_release, release_validate]
     if: >-
-      always() &&
+      !cancelled() &&
       github.event_name == 'workflow_dispatch' &&
       needs.resolve_release.result == 'success' &&
       needs.release_validate.result == 'success' &&
@@ -726,7 +729,7 @@ jobs:
     name: Add original release assets without replacement
     needs: [resolve_release, release_validate, verify_release_assets]
     if: >-
-      always() &&
+      !cancelled() &&
       github.event_name == 'workflow_dispatch' &&
       needs.resolve_release.result == 'success' &&
       needs.release_validate.result == 'success' &&
@@ -774,7 +777,7 @@ jobs:
     # Promotion verifies accepted bytes; registry-only retry reads existing
     # release assets without ever invoking their publisher.
     if: >-
-      always() &&
+      !cancelled() &&
       github.event_name == 'workflow_dispatch' &&
       needs.resolve_release.result == 'success' &&
       needs.release_validate.result == 'success' &&
@@ -875,7 +878,7 @@ jobs:
     name: Verify crate packages
     needs: [resolve_release, release_validate]
     if: >-
-      always() &&
+      !cancelled() &&
       github.event_name == 'workflow_dispatch' &&
       needs.resolve_release.result == 'success' &&
       needs.release_validate.result == 'success' &&
@@ -935,7 +938,7 @@ jobs:
     # job still stops them, and the final all-registry readback still fails
     # the run while any registry lacks the exact version.
     if: >-
-      always() &&
+      !cancelled() &&
       github.event_name == 'workflow_dispatch' &&
       needs.resolve_release.result == 'success' &&
       needs.release_validate.result == 'success' &&
