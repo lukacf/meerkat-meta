@@ -3961,7 +3961,10 @@ fn scope_for_realm(
 /// repair round-trip against the same ceiling and then blaming the model's
 /// JSON. Any other stop before a complete answer (a content filter, a
 /// cancelled response, a tool call) fails as [`StewardError::Incomplete`]:
-/// nothing is written from a body the model did not finish.
+/// nothing is written from a body the model did not finish. A stream that
+/// ends before its terminal event has no stop reason at all and fails as
+/// [`StewardError::Client`] ("the completion stream ended before its
+/// terminal event"); nothing is written from it either.
 pub async fn complete_text(
     profile: &StewardProfile,
     client: &dyn LlmClient,
