@@ -193,13 +193,13 @@ async def test_options_observe_chosen_local_port_with_exact_source_without_chang
     assert not service.root.exists() and not service.tasks and not service.processes
 
 
-async def test_remote_package_options_do_not_infer_local_or_cloud_port_availability(service, monkeypatch):
+async def test_remote_package_options_do_not_implicitly_probe_local_or_cloud_ports(service, monkeypatch):
     target = "linux" if service.guide.state["proposal"]["target"] == "mac" else "mac"
     service.guide.state["proposal"]["target"] = target
     service.implementation.original = deepcopy(service.guide.state)
     service.implementation.definition["target"] = target
     monkeypatch.setattr(deployment, "observe_local_console_port", lambda *_, **__: pytest.fail("No local probe for remote target"))
-    result = await service.options(service.guide.identity, service.implementation.identity, console_port=4110)
+    result = await service.options(service.guide.identity, service.implementation.identity)
     assert result["supported"] is False and "console_port_observation" not in result
 
 

@@ -298,9 +298,9 @@ def test_constructor_rejects_incomplete_or_async_supplier_before_invoking_it(sel
 
 
 def test_stock_binding_successor_changes_only_optional_provider_forwarding():
-    artifacts = Path(__file__).resolve().parents[1] / ".artifacts"
-    original = artifacts / "release09-stock-console-20261010/forge-host-source/stock_host_source.py"
-    successor = artifacts / "forge-prepare-setup-owner-join-20261011/stock_host_source.py"
+    artifacts = Path(__file__).resolve().parent / "fixtures/stock_host_binding"
+    original = artifacts / "original.py"
+    successor = artifacts / "successor.py"
     before, after = ast.parse(original.read_text()), ast.parse(successor.read_text())
     builder = next(node for node in after.body if isinstance(node, ast.FunctionDef) and node.name == "build_stock_host")
     assert builder.args.kwonlyargs[-1].arg == "preparation_inputs"

@@ -74,7 +74,11 @@ def services(monkeypatch, tmp_path):
                                 "resources": {kind: {"status": "waiting"} for kind in ("vm", "disk", "firewall")}}}
 
     class Remote:
-        async def connect_cloud(self, identity, version, build_id, selected):
+        product_control_selection = None
+        _product_control_selection = None
+
+        async def connect_cloud(self, identity, version, build_id, selected, *, product_owner=None):
+            assert product_owner is None, "No installed product owner is selected by this offline route fixture"
             calls.append(("connect-cloud", identity, version, build_id, deepcopy(selected)))
             if behavior["connect_error"]: raise behavior["connect_error"]
             if selected is None: raise DraftConflict("The original cloud computer receipt is required.")

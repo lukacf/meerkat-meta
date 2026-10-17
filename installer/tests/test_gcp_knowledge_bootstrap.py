@@ -42,12 +42,12 @@ def test_valid_local_knowledge_plan_selects_its_required_guest_tools():
     assert selected == original
 
 
-RUNTIME_SHA256 = "5d4068201a830e896cd884e0a056b4c693e8be50911c18e7e18eccb34b16ffd5"
+RUNTIME_SHA256 = "c1f880599035d1c82b29703f113a1998b40f249a9026ac7b687c7c427aa6bc15"
 OLD_SCRIPT_HASHES = {
     (False, False): "2de304f852d356aa13874db5cf4c52c3c62f007783fe029a6923aa771030c7c8",
-    (True, False): "a7e69cdd56cdb1d009311bf98611d19bea8ce108f68d0f4abca0bf1a702e165f",
-    (False, True): "31ddb2ad7a5f6693f39ae5a50fc60e9697e296b68e5c7a8d69cad06747c2f31c",
-    (True, True): "8e7807e72fe73a66646d963e828ca197885f51e09d68d05903acd566da969499",
+    (True, False): "251dcb081bac2a1a650710fdfba04fc4c0a2c216103182a1a2cb9375e71e83ee",
+    (False, True): "6db638e185403895e93b504f34abaa4f46221e49fa5e1ebe3677b151e73fa839",
+    (True, True): "dd183687ecc151e528bf19d2b44f62c5cfead6f55752f5ae7a5cd3768f2e1ed0",
 }
 TOOL_SELECTIONS = [((), (False, False)), (("npx",), (True, False)),
     (("uvx",), (False, True)), (("npm", "uv"), (True, True))]

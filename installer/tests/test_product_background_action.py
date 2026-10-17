@@ -147,14 +147,15 @@ async def test_owner_change_during_awaited_manager_capability_refuses_before_uni
     assert not any(row[0] == "start" for row in f.manager.calls)
 
 
-async def test_cancellation_during_supplier_read_drains_thread_before_unlock_and_no_replay(selected_restore):
+async def test_cancellation_during_restore_file_read_drains_thread_before_unlock_and_no_replay(selected_restore, monkeypatch):
     f = selected_restore
     entered, release = threading.Event(), threading.Event()
-    def suspended(*args):
+    original = f.owner._installed_configuration
+    def suspended(*args, **kwargs):
         entered.set()
         assert release.wait(5)
-        return deepcopy(f.restore)
-    f.owner.application_setup_selection = suspended
+        return original(*args, **kwargs)
+    monkeypatch.setattr(f.owner, "_installed_configuration", suspended)
     request_id = str(uuid.uuid4())
     task = asyncio.create_task(start(f, request_id))
     await asyncio.to_thread(entered.wait, 5)

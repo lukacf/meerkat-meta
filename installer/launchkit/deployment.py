@@ -349,8 +349,12 @@ async def interactive_worker(directory, mode, lifecycle_id, selection_path=None,
     return code
 
 
+def _local_host_target():
+    return {"darwin": "mac", "linux": "linux"}.get(sys.platform)
+
+
 def local_target(blueprint):
-    expected = {"darwin": "mac", "linux": "linux"}.get(sys.platform)
+    expected = _local_host_target()
     if not expected or blueprint.get("target") != expected:
         raise ValueError("This proposal targets another host. Ask the guide to choose this computer's operating system before local installation; GCP remains a separate deployment adapter.")
 
@@ -396,7 +400,7 @@ def deployment_handoff(definition, files, proposal, guide_id, build_id):
     target = definition.get("target")
     if target not in {"mac", "linux", "gcp"} or target != proposal.get("target"):
         raise DraftConflict("The package destination differs from this proposal. Rebuild before installing.")
-    host_target = {"darwin": "mac", "linux": "linux"}.get(sys.platform)
+    host_target = _local_host_target()
     local = target == host_target
     handoff = {"mode": "local" if local else "remote-package", "status": "not-connected",
                "package_url": f"/api/guide/{quote(guide_id, safe='')}/implementation/package?{urlencode({'build_id': build_id})}",
@@ -1485,7 +1489,7 @@ class DeploymentService:
                     or not package_matches(source, state)):
                 raise DraftConflict("The selected product changed while preparing setup. Reload before installing.")
         observation = observe_local_console_port(deployment["port"] if console_port is None else console_port,
-                                                suggest_alternate=True) if supported else None
+                                                suggest_alternate=True) if supported or console_port is not None else None
         return {"build_id": status["build_id"], "guide_version": status["guide_version"],
                 "source_digest": source["source_digest"], **native_fields(source),
                 "current_guide_version": state["version"], "current": True,
@@ -2848,11 +2852,14 @@ class DeploymentService:
                     raise DraftConflict("Background availability requires synchronous original-owner currentness.")
 
             async def validate(function, *args, **kwargs):
-                if source_custody is None:
-                    return await await_validation(function, *args, **kwargs)
-                from .product_runtime_custody import await_product_validation
+                # Application callbacks belong to this original task, while
+                # bounded filesystem validation belongs to the joined worker.
                 owner_current()
-                result = await await_product_validation(source_custody, function, *args, **kwargs)
+                if source_custody is None:
+                    result = await await_validation(function, *args, **kwargs)
+                else:
+                    from .product_runtime_custody import await_product_validation
+                    result = await await_product_validation(source_custody, function, *args, **kwargs)
                 owner_current()
                 return result
 
@@ -2874,8 +2881,6 @@ class DeploymentService:
                     raise DraftConflict("Background availability changed its original project lease.")
 
             def observe():
-                if source_custody is None:
-                    owner_current()
                 stopped_current()
                 require_replacement_history_settled(directory)
                 observed = _observe_inputs(directory, read_receipt(directory), selected,
@@ -2888,8 +2893,6 @@ class DeploymentService:
                     observed = replace(observed, files=(*observed.files, *history))
                 configuration = private_configuration_snapshot(destination)[1]
                 stopped_current()
-                if source_custody is None:
-                    owner_current()
                 observed.require_current()
                 return observed, configuration, bool(history)
 
@@ -2897,8 +2900,6 @@ class DeploymentService:
             capability = await manager.capability()
 
             def current():
-                if source_custody is None:
-                    owner_current()
                 stopped_current()
                 observed.require_current()
                 require_restore_history_current(directory, selected)

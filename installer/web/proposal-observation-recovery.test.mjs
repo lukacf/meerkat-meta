@@ -120,10 +120,10 @@ async function mountedAnimationRecovery(verify,{visualReview=false}={}) {
     await settle(async()=>{
       // Node's crypto completion can take more than one event-loop turn. Wait
       // for the actual scheduled sample, without firing or inventing a timer.
-      for(let turn=0;turn<20;turn++){
+      for(const deadline=performance.now()+5000;performance.now()<deadline;){
         entry=[...timers].find(([,value])=>value.delay===delay);
         if(entry)return;
-        await new Promise(resolve=>setImmediate(resolve));
+        await observationDelay(1);
       }
     });
     return entry;

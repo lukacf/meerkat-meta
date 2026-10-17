@@ -873,11 +873,9 @@ class ForgeApplicationHost:
                 if (application_setup_binding(current_settings, guide_id, deployment_id) != binding
                         or current_settings["fields"] != settings["fields"]):
                     raise CustodyError("The original installed setup changed while reading background availability.")
-                from .deployment import await_validation
-                if source_custody is None:
-                    await await_validation(current_restore)
-                else:
-                    current_restore()
+                # The retained supplier may call application-owned state;
+                # keep that callback on this original task after the file read.
+                current_restore()
             return {**binding, "available": True, **({"action": "prepare-setup"} if prepare else {}),
                 **({"background": background} if background is not None else {}),
                 "kind": value["kind"], "label": "Prepare application setup" if prepare else

@@ -175,36 +175,36 @@ KNOWLEDGE_USER_SETUP = """    if ! id -nG mobkit | grep -qw docker; then
 """
 
 KNOWLEDGE_MANAGER_SETUP = """    knowledge_uid=$(id -u mobkit)
-    [[ "$knowledge_uid" =~ ^[0-9]+$ ]]
+    [[ "$knowledge_uid" =~ ^[0-9]+$ ]] || exit 1
     knowledge_docker_gid=$(getent group docker | awk -F: 'NR!=1 || NF!=4 || $1!="docker" || $3 !~ /^[0-9]+$/ {exit 1} {print $3} END {if(NR!=1) exit 1}')
     knowledge_manager_pid() {
       knowledge_pid=$(systemctl show --property=MainPID --value "user@$knowledge_uid.service")
-      [[ "$knowledge_pid" =~ ^[0-9]+$ ]]
+      [[ "$knowledge_pid" =~ ^[0-9]+$ ]] || return 1
     }
     knowledge_manager_groups() {
       awk -v gid="$knowledge_docker_gid" '$1=="Groups:" {seen++; for(i=2;i<=NF;i++) {if($i !~ /^[0-9]+$/) bad=1; if($i==gid) found=1}} END {if(bad || seen!=1) exit 2; exit(found ? 0 : 1)}' "/proc/$knowledge_pid/status"
     }
-    knowledge_manager_pid
+    knowledge_manager_pid || exit 1
     if [[ "$knowledge_pid" == 0 ]]; then
-      knowledge_manager_pid
-      [[ "$knowledge_pid" == 0 ]]
+      knowledge_manager_pid || exit 1
+      [[ "$knowledge_pid" == 0 ]] || exit 1
       systemctl start "user@$knowledge_uid.service"
     elif knowledge_manager_groups; then
       :
     else
       knowledge_group_status=$?
-      [[ "$knowledge_group_status" == 1 ]]
+      [[ "$knowledge_group_status" == 1 ]] || exit 1
       knowledge_stale_pid=$knowledge_pid
-      knowledge_manager_pid
-      [[ "$knowledge_pid" == "$knowledge_stale_pid" ]]
+      knowledge_manager_pid || exit 1
+      [[ "$knowledge_pid" == "$knowledge_stale_pid" ]] || exit 1
       systemctl restart "user@$knowledge_uid.service"
     fi
-    knowledge_manager_pid
-    [[ "$knowledge_pid" != 0 ]]
-    knowledge_manager_groups
+    knowledge_manager_pid || exit 1
+    [[ "$knowledge_pid" != 0 ]] || exit 1
+    knowledge_manager_groups || exit 1
     knowledge_verified_pid=$knowledge_pid
-    knowledge_manager_pid
-    [[ "$knowledge_pid" == "$knowledge_verified_pid" ]]
+    knowledge_manager_pid || exit 1
+    [[ "$knowledge_pid" == "$knowledge_verified_pid" ]] || exit 1
 """
 
 

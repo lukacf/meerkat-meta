@@ -11,8 +11,6 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import sys
-from types import SimpleNamespace
 import uuid
 import zipfile
 
@@ -34,8 +32,9 @@ from test_runtime_candidates import Bundle, PLATFORM, PREFIX
 def selected_fixture_host(monkeypatch):
     # The inert candidate tuple below targets Apple Silicon. Exercise the real
     # host-target checks against that declared fixture, on any CI runner.
+    # Filesystem publication keeps the real runner OS and no-replace syscall.
     # Process and network entry points remain forbidden by the service fixture.
-    monkeypatch.setattr(deployment, "sys", SimpleNamespace(platform="darwin", executable=sys.executable))
+    monkeypatch.setattr(deployment, "_local_host_target", lambda: "mac")
 
 
 def sha(content):
