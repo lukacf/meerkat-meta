@@ -148,7 +148,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   goes to the first mob restored under it; holders are owner sessions, and
   every mob the host creates without one is the same holder (`Host`), so a
   re-creation under an id by the same owner session, or by the host, without
-  the extension's hooks is adopted as that holder's mob; and, as for the
+  the extension's hooks is adopted as that holder's mob; an admission whose
+  create failed after the check stays until the id's next admission or
+  activation, and a destroy under the id refreshes an admission made after
+  that destroy rather than expiring it, so the next activation under the id
+  that names the same holder binds without the holder check; and, as for the
   ordering, the check covers one runtime in one process.
 
 ## [0.9.2] - 2026-10-16

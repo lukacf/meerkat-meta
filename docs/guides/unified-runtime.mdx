@@ -178,7 +178,11 @@ generation (documents, holder records and mob state together) keeps its
 mobs bound. Holders are owner sessions, and every mob the host creates
 without one is the same holder, so a re-creation under an id by the same
 session, or by the host, without the extension's hooks is adopted as that
-holder's mob.
+holder's mob. An admission whose create failed after the check stays until
+the id's next admission or activation: a destroy under the id refreshes an
+admission made after that destroy rather than expiring it, and the next
+activation under the id that names the same holder binds without the holder
+check.
 
 A document store a host supplies through
 `MetaStorageProvider::open_extension_state` must implement

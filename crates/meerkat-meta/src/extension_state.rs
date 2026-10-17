@@ -456,6 +456,10 @@ impl BoundMob {
 struct Admission {
     holder: MobIdHolder,
     generation: Option<u64>,
+    /// Whether a mob that was not destroyed was bound under the id when the
+    /// create was admitted. Releasing that mob's destroyed binding drops
+    /// such an admission instead of refreshing it: it predates the destroy.
+    under_standing_mob: bool,
 }
 
 /// Holds runtime query authorities, never copied lineage or document policy.
@@ -548,6 +552,9 @@ impl NativeAuthorityRegistry {
                     .get(&id)
                     .is_some_and(BoundMob::is_live)
                 {
+                    // The refused activation's admission goes with it, so no
+                    // later activation under the id skips the holder check.
+                    registry.admissions().remove(&id);
                     return Err(already_bound());
                 }
                 // Who holds the id decides whether the mob binds with
@@ -605,11 +612,20 @@ impl NativeAuthorityRegistry {
                 .collect();
             // An operation whose caller was resolved while a destroyed mob
             // held its id is refused from now on. A create admitted under the
-            // id since is another mob: its admission stands.
+            // id after the mob was destroyed is another mob: its admission
+            // stands. One admitted while the mob stood predates the destroy
+            // and goes, so it lets no later activation skip the holder check.
             for id in &destroyed {
                 let generation = self.ordering.changed(id);
-                if let Some(admission) = self.admissions().get_mut(id) {
-                    admission.generation = Some(generation);
+                let mut admissions = self.admissions();
+                match admissions.get_mut(id) {
+                    Some(admission) if !admission.under_standing_mob => {
+                        admission.generation = Some(generation);
+                    }
+                    Some(_) => {
+                        admissions.remove(id);
+                    }
+                    None => {}
                 }
             }
             destroyed
@@ -624,6 +640,15 @@ impl NativeAuthorityRegistry {
         self.admissions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether a mob that is not destroyed is bound under `mob_id`.
+    fn binds_standing_mob(&self, mob_id: &str) -> bool {
+        self.handles
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(mob_id)
+            .is_some_and(|bound| !is_destroyed(&bound.handle))
     }
 
     /// The admission counterpart of [`Self::before_activation`] for the agent
@@ -695,11 +720,13 @@ impl NativeAuthorityRegistry {
     async fn admit_create(&self, mob_id: &str, holder: MobIdHolder) -> Result<(), String> {
         let generation =
             admit_mob_id_create(&self.ordering, self.store.as_ref(), &self.realm, mob_id).await?;
+        let under_standing_mob = self.binds_standing_mob(mob_id);
         self.admissions().insert(
             mob_id.to_owned(),
             Admission {
                 holder,
                 generation: Some(generation),
+                under_standing_mob,
             },
         );
         Ok(())
@@ -709,8 +736,15 @@ impl NativeAuthorityRegistry {
     /// for its activation, which binds it as the session's mob.
     fn admit_exempt(&self, mob_id: &str, holder: MobIdHolder) {
         let generation = self.ordering.last_change(mob_id);
-        self.admissions()
-            .insert(mob_id.to_owned(), Admission { holder, generation });
+        let under_standing_mob = self.binds_standing_mob(mob_id);
+        self.admissions().insert(
+            mob_id.to_owned(),
+            Admission {
+                holder,
+                generation,
+                under_standing_mob,
+            },
+        );
     }
 
     /// Who holds the id of a mob that activates, decided under the write
@@ -2409,6 +2443,79 @@ comms = true
             Some(MobIdHolder::OwnerSession(owner_session.to_string()))
         );
         child.stop().await.unwrap();
+        runtime.handle().stop().await.unwrap();
+    }
+
+    /// An activation refused because a live mob holds its id takes the id's
+    /// admission with it, so no later activation under the id skips the
+    /// holder check on that admission.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_a_refused_activation_drops_its_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, registry, _store, owner_session) =
+            bound_runtime(dir.path(), "refused-admission").await;
+        let child_id = "refused-admission-child";
+        let child = child_of(&runtime, &registry, child_id, &owner_session).await;
+        registry
+            .admit_create(
+                child_id,
+                MobIdHolder::OwnerSession(owner_session.to_string()),
+            )
+            .await
+            .expect("no document names the id");
+
+        let refused = registry.before_activation()(child.read_handle()).await;
+
+        assert!(refused.is_err(), "the live child holds the id");
+        assert!(
+            !registry.admissions().contains_key(child_id),
+            "the refused activation's admission went with it"
+        );
+        child.stop().await.unwrap();
+        runtime.handle().stop().await.unwrap();
+    }
+
+    /// Releasing a destroyed mob's binding refreshes only an admission made
+    /// after that mob was destroyed: another mob's create under the id. One
+    /// made while the mob stood predates the destroy and goes, so it cannot
+    /// let a later activation under the id skip the holder check.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_a_destroy_refreshes_only_an_admission_made_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, registry, _store, owner_session) =
+            bound_runtime(dir.path(), "destroy-admission").await;
+        let holder = MobIdHolder::OwnerSession(owner_session.to_string());
+
+        let standing_id = "destroy-admission-standing";
+        let standing = child_of(&runtime, &registry, standing_id, &owner_session).await;
+        registry
+            .admit_create(standing_id, holder.clone())
+            .await
+            .expect("no document names the id");
+        standing.destroy().await.unwrap();
+        registry.forget_destroyed();
+        assert!(
+            !registry.admissions().contains_key(standing_id),
+            "an admission made while the destroyed mob stood does not outlive its release"
+        );
+
+        let destroyed_id = "destroy-admission-destroyed";
+        let destroyed = child_of(&runtime, &registry, destroyed_id, &owner_session).await;
+        destroyed.destroy().await.unwrap();
+        registry
+            .admit_create(destroyed_id, holder)
+            .await
+            .expect("no document names the id");
+        registry.forget_destroyed();
+        let refreshed = registry
+            .admissions()
+            .get(destroyed_id)
+            .map(|admission| admission.generation);
+        assert_eq!(
+            refreshed,
+            Some(registry.ordering.last_change(destroyed_id)),
+            "a create admitted after the destroy stands, refreshed past the release"
+        );
         runtime.handle().stop().await.unwrap();
     }
 }
