@@ -240,9 +240,16 @@ host path it names:
   carry `store_path`, the store's host path, only to a caller with host
   access, and the draft store's errors and refusals name no host path to any
   other caller.
+- The catalogs name no host path to such a caller: each filesystem skill has
+  its path within its realm's directory, and the realm's directory is left
+  out. Deploy plans and `deploy_command` previews name the caller's own pack
+  path or the bare file name, and run `rkat`.
 - A path skill in a document (`skill_realms` entry with `source: "path"`) is
   read only when `meta/skills/catalog` lists that file and the document names
-  it by the listed path. Any other path is a
+  it by the listed path, or by its path within its realm with the realm's
+  `realm_id`, as the catalogs name it to such a caller. A path within a realm
+  with a `..`, `.`, empty, drive or backslash component is refused before
+  anything is read. Any other path is a
   `selected_skill_path_not_permitted` validation error, so source, export and
   deploy refuse the document instead of packing the file.
 - A listed file counts only while its real path stays inside the skill

@@ -642,17 +642,34 @@ fn default_schema_version() -> String {
 }
 
 fn discover_skill_realms(authoring_sources: &Value) -> Value {
+    let host = host_access();
     let mut realms = Vec::new();
     for (realm_id, label, dir) in skill_catalog_dirs() {
         let mut skills = discover_skills_in_dir(&dir);
         annotate_untrusted_skill_reads(&mut skills, &dir);
-        if !skills.is_empty() {
+        if skills.is_empty() {
+            continue;
+        }
+        let default = realms.is_empty();
+        if host {
             realms.push(json!({
                 "id": realm_id,
                 "label": label,
-                "default": realms.is_empty(),
+                "default": default,
                 "source": "filesystem",
                 "path": dir.to_string_lossy(),
+                "skills": skills,
+            }));
+        } else {
+            // A caller without host access is told no host path: each skill
+            // by its path within its realm, which a read joins to the realm's
+            // directory again (see `path_skill_host_path`).
+            name_skills_within_realm(&mut skills, &dir);
+            realms.push(json!({
+                "id": realm_id,
+                "label": label,
+                "default": default,
+                "source": "filesystem",
                 "skills": skills,
             }));
         }
@@ -661,6 +678,27 @@ fn discover_skill_realms(authoring_sources: &Value) -> Value {
         realms.push(authoring_realm);
     }
     Value::Array(realms)
+}
+
+/// Name each catalog skill by its path within its realm's directory `dir`,
+/// with `/` between components, in place of its host path.
+fn name_skills_within_realm(skills: &mut [Value], dir: &Path) {
+    for skill in skills {
+        let within = skill
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(|path| Path::new(path).strip_prefix(dir).ok())
+            .map(|within| {
+                within
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .unwrap_or_default();
+        skill["provenance"] = catalog_provenance("meta/skills/catalog", "filesystem", &within);
+        skill["path"] = json!(within);
+    }
 }
 
 /// Mark each discovered path skill with whether a caller without host
@@ -13846,7 +13884,13 @@ pub fn deploy_command_preview(params: &Value) -> Result<MobpackDeployCommandResu
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(|| rendered.filename.clone());
-    let rkat_bin = deploy_rkat_bin(params);
+    // A preview for a caller without host access runs `rkat`, never a
+    // binary the host configured.
+    let rkat_bin = if host_access() {
+        deploy_rkat_bin(params)
+    } else {
+        "rkat".to_string()
+    };
     let argv = deploy_argv(
         &rkat_bin,
         &deploy,
@@ -13952,7 +13996,16 @@ pub fn deploy_mobpack(params: &Value) -> Result<MobpackDeployResult, String> {
         .decode(export.content_base64.as_bytes())
         .map_err(|err| format!("failed to decode exported mobpack: {err}"))?;
     let pack_sha256 = source_file_sha256(&bytes);
-    let pack_path = deploy_pack_path(params, &export.filename)?;
+    let execute = params
+        .get("execute")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // A plan for a caller without host access names no host path: its pack
+    // path is the caller's own or the bare file name, and its command runs
+    // `rkat`, never a binary the host configured. A deploy that runs reports
+    // what it ran.
+    let host_view = execute || host_access();
+    let pack_path = deploy_pack_path(params, &export.filename, host_view)?;
 
     let document = document_from_params(params)?;
     let input_bindings = deploy_input_bindings(&document, params);
@@ -13970,17 +14023,17 @@ pub fn deploy_mobpack(params: &Value) -> Result<MobpackDeployResult, String> {
                 .filter(|value| !value.is_empty())
         })
         .unwrap_or("Reply with exactly OK.");
-    let rkat_bin = deploy_rkat_bin(params);
+    let rkat_bin = if host_view {
+        deploy_rkat_bin(params)
+    } else {
+        "rkat".to_string()
+    };
     let argv = deploy_argv(&rkat_bin, &deploy, &pack_path, prompt, &input_bindings);
     let command = shell_command(&argv);
     let definition = MobDefinition::from_toml(&export.mob_toml)
         .map_err(|err| format!("failed to parse exported mob.toml for deploy plan: {err}"))?;
     let plan_trace =
         deploy_plan_trace_from_definition(&definition, &export.validation, &command, &pack_path);
-    let execute = params
-        .get("execute")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
 
     let (status_code, stdout, stderr) = if execute {
         if let Some(parent) = pack_path.parent() {
@@ -14136,18 +14189,22 @@ fn deploy_display_rows(
     rows
 }
 
-fn deploy_pack_path(params: &Value, filename: &str) -> Result<PathBuf, String> {
+/// The deploy pack's path: the caller's `pack_path`, or a stamped file in the
+/// caller's `output_dir`, or, without either, in the temp directory. A plan
+/// shown without host access (`host_view` false) names no temp directory, so
+/// it gets the bare file name.
+fn deploy_pack_path(params: &Value, filename: &str, host_view: bool) -> Result<PathBuf, String> {
     if let Some(path) = params.get("pack_path").and_then(Value::as_str) {
         let path = path.trim();
         if !path.is_empty() {
             return Ok(PathBuf::from(path));
         }
     }
-    let output_dir = params
-        .get("output_dir")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+    let output_dir = match params.get("output_dir").and_then(Value::as_str) {
+        Some(dir) => PathBuf::from(dir),
+        None if !host_view => return Ok(PathBuf::from(filename)),
+        None => std::env::temp_dir(),
+    };
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|err| format!("system clock before unix epoch: {err}"))?
@@ -15687,6 +15744,60 @@ enum PathSkillReadError {
     /// The request has read its whole skill file budget.
     OverBudget,
     Unreadable(std::io::Error),
+    /// A path within a skill realm with a component that could step out of
+    /// the realm.
+    LeavesRealm,
+    /// A path within a skill realm the skills catalog does not list, named by
+    /// a caller without host access.
+    RealmNotListed(String),
+}
+
+/// The file a path skill names. A skill of a skills catalog realm
+/// (`realm_source` is `filesystem`) whose path is relative, as the catalogs
+/// name skills to a caller without host access, is in the directory of the
+/// realm its `realm_id` names. Such a path with a component that could step
+/// out of the realm (`..`, `.`, empty, a drive, a backslash) is refused, to a
+/// caller without host access before anything is read. A realm the catalog
+/// does not list is refused to such a caller; a host caller's document reads
+/// it as named, as before. Any other path is read as named, under the
+/// caller's read policy.
+fn path_skill_host_path(source: &Value, path: &str) -> Result<String, PathSkillReadError> {
+    let catalog_skill = source
+        .get("realm_source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        == Some("filesystem");
+    if !catalog_skill || Path::new(path).is_absolute() || is_refused_windows_path(path) {
+        return Ok(path.to_string());
+    }
+    let host = host_access();
+    let parts = path.split('/').collect::<Vec<_>>();
+    let leaves_realm = parts.iter().any(|part| {
+        part.is_empty() || matches!(*part, "." | "..") || part.contains(['\\', ':', '\0'])
+    });
+    if leaves_realm && !host {
+        return Err(PathSkillReadError::LeavesRealm);
+    }
+    let realm_id = source
+        .get("realm_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let Some((_, _, mut joined)) = skill_catalog_dirs()
+        .into_iter()
+        .find(|(id, _, _)| id == realm_id)
+    else {
+        return if host {
+            Ok(path.to_string())
+        } else {
+            Err(PathSkillReadError::RealmNotListed(realm_id.to_string()))
+        };
+    };
+    if leaves_realm {
+        return Err(PathSkillReadError::LeavesRealm);
+    }
+    joined.extend(parts);
+    Ok(joined.to_string_lossy().into_owned())
 }
 
 /// Read the path skill file `path` under this thread's read policy.
@@ -15742,6 +15853,21 @@ fn path_skill_refused(skill_id: &str, path: &str, reason: &str) -> String {
     )
 }
 
+fn path_skill_leaves_realm(skill_id: &str, path: &str) -> String {
+    format!(
+        "selected path skill '{skill_id}' names {path} within its skill realm, a path that \
+         could step out of the realm ('..', '.', or an empty, drive or backslash component); \
+         refusing to read it"
+    )
+}
+
+fn path_skill_realm_not_listed(skill_id: &str, realm_id: &str) -> String {
+    format!(
+        "selected path skill '{skill_id}' names a file within the skill realm '{realm_id}', \
+         which the skills catalog does not list; refusing to read it"
+    )
+}
+
 fn path_skill_not_permitted(skill_id: &str, path: &str) -> String {
     format!(
         "selected path skill '{skill_id}' names {path}, which is not a skill file this server \
@@ -15776,7 +15902,9 @@ fn selected_path_skill_files(
                 .ok_or_else(|| {
                     format!("selected path skill '{skill_id}' has no filesystem path")
                 })?;
-            match read_path_skill_file(path) {
+            match path_skill_host_path(&source, path)
+                .and_then(|host_path| read_path_skill_file(&host_path))
+            {
                 Ok(bytes) => bytes,
                 Err(PathSkillReadError::NotListed) => {
                     return Err(path_skill_not_permitted(&skill_id, path));
@@ -15791,6 +15919,12 @@ fn selected_path_skill_files(
                     return Err(format!(
                         "failed to read selected path skill '{skill_id}' at {path}: {err}"
                     ));
+                }
+                Err(PathSkillReadError::LeavesRealm) => {
+                    return Err(path_skill_leaves_realm(&skill_id, path));
+                }
+                Err(PathSkillReadError::RealmNotListed(realm_id)) => {
+                    return Err(path_skill_realm_not_listed(&skill_id, &realm_id));
                 }
             }
         };
@@ -15833,11 +15967,19 @@ fn selected_skill_sources(document: &MobpackDocument) -> BTreeMap<String, Value>
 }
 
 fn packed_skill_archive_path(skill_id: &str, source: &Value) -> String {
-    if let Some(path) = source
-        .get("path")
+    // A catalog skill's path, absolute or within its realm, names a host
+    // file, not a place in the archive.
+    let catalog_skill = source
+        .get("realm_source")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|path| is_safe_relative_archive_path(path))
+        == Some("filesystem");
+    if !catalog_skill
+        && let Some(path) = source
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| is_safe_relative_archive_path(path))
     {
         return path.to_string();
     }
@@ -23908,7 +24050,9 @@ fn validate_selected_path_skill_files(
             {
                 continue;
             }
-            match read_path_skill_file(path) {
+            match path_skill_host_path(&source, path)
+                .and_then(|host_path| read_path_skill_file(&host_path))
+            {
                 Ok(bytes) => Sha256::digest(&bytes).into(),
                 Err(PathSkillReadError::OverBudget) => {
                     diagnostics.push(MobpackDiagnostic {
@@ -23947,6 +24091,24 @@ fn validate_selected_path_skill_files(
                             "selected path skill '{skill_id}' cannot be read from {path}: {err}"
                         ),
                         path: Some(format!("skill_realms.skills[{skill_id}].path")),
+                    });
+                    continue;
+                }
+                Err(PathSkillReadError::LeavesRealm) => {
+                    diagnostics.push(MobpackDiagnostic {
+                        severity: "error".to_string(),
+                        code: "selected_skill_path_leaves_realm".to_string(),
+                        message: path_skill_leaves_realm(&skill_id, path),
+                        path: Some(format!("skill_realms.skills[{skill_id}].path")),
+                    });
+                    continue;
+                }
+                Err(PathSkillReadError::RealmNotListed(realm_id)) => {
+                    diagnostics.push(MobpackDiagnostic {
+                        severity: "error".to_string(),
+                        code: "selected_skill_realm_not_listed".to_string(),
+                        message: path_skill_realm_not_listed(&skill_id, &realm_id),
+                        path: Some(format!("skill_realms.skills[{skill_id}].realm_id")),
                     });
                     continue;
                 }
@@ -38405,31 +38567,50 @@ branch = "choice"
 
     /// Validation compares a digest per archive path, not a copy of each
     /// skill's bytes, and still reports two selected skills that pack
-    /// different content to one archive path.
+    /// different content to one archive path: two path skills that name one
+    /// archive path, and two filesystem skills, whose paths name host files
+    /// and which pack under their ids, with ids that name one archive file.
     #[test]
     fn validation_reports_different_skill_content_packed_to_one_archive_path() {
-        let mut document = document_with_expected_schema_ref();
-        document.mob_toml = None;
-        document.members.as_array_mut().unwrap()[0]["skills"] = json!(["one", "two"]);
-        document.skill_realms = json!([{
+        let path_realm = json!({
             "id": "local/clash",
             "label": "Clash",
-            "source": "filesystem",
             "skills": [
                 { "id": "one", "label": "One", "source": "path", "path": "skills/same.md", "content": "first" },
                 { "id": "two", "label": "Two", "source": "path", "path": "skills/same.md", "content": "second" }
             ]
-        }]);
+        });
+        let filesystem_realm = json!({
+            "id": "local/clash",
+            "label": "Clash",
+            "source": "filesystem",
+            "skills": [
+                { "id": "same.skill", "label": "One", "source": "path", "path": "one/SKILL.md", "content": "first" },
+                { "id": "same-skill", "label": "Two", "source": "path", "path": "two/SKILL.md", "content": "second" }
+            ]
+        });
+        for realm in [path_realm, filesystem_realm] {
+            let mut document = document_with_expected_schema_ref();
+            document.mob_toml = None;
+            let selected: Vec<Value> = realm["skills"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|skill| skill["id"].clone())
+                .collect();
+            document.members.as_array_mut().unwrap()[0]["skills"] = Value::Array(selected);
+            document.skill_realms = json!([realm]);
 
-        let validation = validate_document(&document);
+            let validation = validate_document(&document);
 
-        assert!(
-            validation
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "selected_skill_archive_path_conflict"),
-            "{validation:#?}"
-        );
+            assert!(
+                validation
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "selected_skill_archive_path_conflict"),
+                "{validation:#?}"
+            );
+        }
     }
 
     /// Every sample and template document is far under the `meta/editor.json`
@@ -38876,6 +39057,15 @@ branch = "choice"
         }
         let mut document = valid_document();
         document.mob_toml = None;
+        // Validate once first, past the diagnostic cap, so the pages of
+        // validation's code are resident before the measurement: they count
+        // toward the resident set, and grow with the code, not the document.
+        document.flow = json!({ "steps": vec![json!({}); 1_000] });
+        let warm = validate_document(&document);
+        assert_eq!(
+            warm.diagnostics.len(),
+            MOBPACK_MAX_VALIDATION_DIAGNOSTICS + 1
+        );
         document.flow = json!({ "steps": vec![json!({}); 100_000] });
         // Measure validation alone: reset the high-water mark to the resident
         // set it starts from, where the kernel allows it.
@@ -40686,6 +40876,301 @@ condition = { op = "eq", path = "params.kind", value = "c" }
         assert_eq!(
             (step_wiring(&from_graph), step_conditions(&from_graph)),
             (step_wiring(&definition), step_conditions(&definition))
+        );
+    }
+
+    /// A document whose member selects one path skill of the skills catalog
+    /// realm `realm_id`, named by `path`.
+    fn document_selecting_catalog_skill(realm_id: &str, path: &str) -> MobpackDocument {
+        let mut document = document_with_expected_schema_ref();
+        document.mob_toml = None;
+        document.members.as_array_mut().expect("members")[0]["skills"] = json!(["catalog.skill"]);
+        document.skill_realms = json!([{
+            "id": realm_id,
+            "label": "Catalog realm",
+            "source": "filesystem",
+            "skills": [{
+                "id": "catalog.skill",
+                "label": "Catalog skill",
+                "source": "path",
+                "path": path,
+            }]
+        }]);
+        document
+    }
+
+    /// The skill realm with `id` in a catalog response.
+    fn catalog_realm<'a>(response: &'a Value, id: &str) -> &'a Value {
+        response["skill_realms"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|realm| realm["id"] == id)
+            .unwrap_or_else(|| panic!("no skill realm {id} in {response:#}"))
+    }
+
+    /// The catalogs name no host path to a caller without host access: each
+    /// catalog skill's path is relative to its realm's directory, and neither
+    /// that directory nor an absolute provenance path is named.
+    #[test]
+    fn catalogs_name_no_host_path_to_a_caller_without_host_access() {
+        fn host_paths(value: &Value, key: Option<&str>, found: &mut Vec<String>) {
+            match value {
+                Value::Object(map) => {
+                    for (key, value) in map {
+                        host_paths(value, Some(key), found);
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        host_paths(item, key, found);
+                    }
+                }
+                Value::String(text) if key == Some("path") => {
+                    let bytes = text.as_bytes();
+                    let drive =
+                        bytes.len() > 1 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic();
+                    if text.starts_with('/') || text.starts_with('\\') || drive {
+                        found.push(text.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let responses = with_untrusted_path_skill_reads(None, || {
+            [
+                mobpack_catalogs_response(),
+                mobpack_skills_catalog_response(),
+                mobpack_agent_definitions_response(),
+            ]
+        });
+        let mut found = Vec::new();
+        for response in &responses {
+            host_paths(response, None, &mut found);
+        }
+        assert_eq!(found, Vec::<String>::new());
+        let repo = catalog_realm(&responses[1], "meta/repo");
+        assert!(
+            repo["skills"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|skill| skill["path"] == "meerkat-meta/SKILL.md"),
+            "{repo:#}"
+        );
+    }
+
+    /// A host caller's catalogs still name each catalog skill by its absolute
+    /// host path, and each realm by its directory.
+    #[test]
+    fn catalogs_still_name_host_paths_to_the_host() {
+        let skills = with_host_path_skill_reads(mobpack_skills_catalog_response);
+        let repo = catalog_realm(&skills, "meta/repo");
+        assert!(
+            repo["path"]
+                .as_str()
+                .is_some_and(|path| Path::new(path).is_absolute()),
+            "{repo:#}"
+        );
+        assert!(
+            repo["skills"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|skill| {
+                    skill["path"].as_str().is_some_and(|path| {
+                        Path::new(path).is_absolute() && path.ends_with("meerkat-meta/SKILL.md")
+                    })
+                }),
+            "{repo:#}"
+        );
+    }
+
+    /// A caller without host access names a catalog skill by its path within
+    /// its realm, as its catalogs name it, and the export packs the file the
+    /// catalog lists, where a host-named skill is packed.
+    #[test]
+    fn a_catalog_skill_named_within_its_realm_packs_without_host_access() {
+        let listed = std::fs::read(catalog_listed_skill_file()).expect("the listed skill file");
+        let document = document_selecting_catalog_skill("meta/repo", "meerkat-meta/SKILL.md");
+        let files = with_untrusted_path_skill_reads(None, || selected_path_skill_files(&document))
+            .expect("the catalog skill packs");
+        assert_eq!(
+            files.into_iter().collect::<Vec<_>>(),
+            [("skills/catalog-skill.md".to_string(), listed)]
+        );
+    }
+
+    /// A document naming a catalog skill by its absolute host path, as the
+    /// host's catalogs and documents from before name it, still packs it.
+    #[test]
+    fn a_catalog_skill_named_by_its_host_path_still_packs() {
+        let listed = std::fs::read(catalog_listed_skill_file()).expect("the listed skill file");
+        let document = document_selecting_path_skill(&catalog_listed_skill_file());
+        let files = with_untrusted_path_skill_reads(None, || selected_path_skill_files(&document))
+            .expect("the catalog skill packs");
+        assert!(files.values().any(|bytes| *bytes == listed), "{files:?}");
+    }
+
+    /// The codes of the diagnostics validating `document` reports.
+    fn diagnostic_codes(document: &MobpackDocument) -> BTreeSet<String> {
+        validate_document(document)
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect()
+    }
+
+    /// A path within a realm with a component that could step out of the
+    /// realm (`..`, `.`, empty, drive or backslash) is refused, typed, before
+    /// anything is read, for any caller. An encoded `..` is a name, not a
+    /// step, and names no listed file.
+    #[cfg(unix)]
+    #[test]
+    fn realm_skill_paths_that_could_leave_their_realm_are_refused() {
+        for path in [
+            "../skills/meerkat-meta/SKILL.md",
+            "meerkat-meta/../meerkat-meta/SKILL.md",
+            "./meerkat-meta/SKILL.md",
+            "meerkat-meta//SKILL.md",
+            "..\\skills\\meerkat-meta\\SKILL.md",
+            "C:\\skills\\meerkat-meta\\SKILL.md",
+            "C:meerkat-meta/SKILL.md",
+        ] {
+            let document = document_selecting_catalog_skill("meta/repo", path);
+            let expected = Err(path_skill_leaves_realm("catalog.skill", path));
+            let untrusted =
+                with_untrusted_path_skill_reads(None, || selected_path_skill_files(&document));
+            let host = with_host_path_skill_reads(|| selected_path_skill_files(&document));
+            assert_eq!(
+                (untrusted.map(|_| ()), host.map(|_| ())),
+                (expected.clone(), expected),
+                "{path}"
+            );
+            let codes = with_untrusted_path_skill_reads(None, || diagnostic_codes(&document));
+            assert!(
+                codes.contains("selected_skill_path_leaves_realm"),
+                "{path}: {codes:?}"
+            );
+        }
+        let encoded =
+            document_selecting_catalog_skill("meta/repo", "%2e%2e/skills/meerkat-meta/SKILL.md");
+        assert!(
+            with_untrusted_path_skill_reads(None, || selected_path_skill_files(&encoded)).is_err()
+        );
+    }
+
+    /// A path within a skill realm the catalog does not list (an unknown realm,
+    /// or one that is not a skills directory) is refused to a caller without
+    /// host access with its own typed error. A host caller's document is read
+    /// as named, as before.
+    #[test]
+    fn a_realm_the_catalog_does_not_list_is_refused_without_host_access() {
+        for realm_id in ["nowhere/realm", "meta/authoring-agent-definitions"] {
+            let document = document_selecting_catalog_skill(realm_id, "meerkat-meta/SKILL.md");
+            let untrusted =
+                with_untrusted_path_skill_reads(None, || selected_path_skill_files(&document));
+            assert_eq!(
+                untrusted.map(|_| ()),
+                Err(path_skill_realm_not_listed("catalog.skill", realm_id))
+            );
+            let codes = with_untrusted_path_skill_reads(None, || diagnostic_codes(&document));
+            assert!(
+                codes.contains("selected_skill_realm_not_listed"),
+                "{realm_id}: {codes:?}"
+            );
+            let host = with_host_path_skill_reads(|| selected_path_skill_files(&document));
+            assert!(
+                host.as_ref()
+                    .is_err_and(|error| error.starts_with("failed to read selected path skill")),
+                "{realm_id}: {host:?}"
+            );
+        }
+    }
+
+    /// Set in the child process of the realm link test, to its scratch
+    /// directory.
+    #[cfg(unix)]
+    const REALM_LINK_CHILD: &str = "META_TEST_REALM_LINK_CHILD";
+
+    /// A path within a realm that resolves through a link out of the realm's
+    /// directory is refused to a caller without host access, as the catalog
+    /// refuses the link it lists.
+    #[cfg(unix)]
+    #[test]
+    fn a_realm_skill_path_through_a_link_out_of_its_realm_is_refused() {
+        if std::env::var_os(REALM_LINK_CHILD).is_none() {
+            let scratch = tempfile::tempdir().expect("tempdir");
+            let skills = scratch.path().join("skills");
+            std::fs::create_dir_all(skills.join("escape")).expect("skill directory");
+            let outside = scratch.path().join("outside.md");
+            std::fs::write(&outside, "---\nname: escape\n---\nOUTSIDE-THE-REALM-5f2a")
+                .expect("outside file");
+            std::os::unix::fs::symlink(&outside, skills.join("escape").join("SKILL.md"))
+                .expect("link out of the realm");
+            run_test_in_child(
+                "mobpack::tests::a_realm_skill_path_through_a_link_out_of_its_realm_is_refused",
+                &[
+                    (REALM_LINK_CHILD, Some(scratch.path().as_os_str())),
+                    ("META_SKILL_DIRS", Some(skills.as_os_str())),
+                ],
+            );
+            return;
+        }
+        let document = document_selecting_catalog_skill("env/skills-0", "escape/SKILL.md");
+        let packed = with_untrusted_path_skill_reads(None, || selected_path_skill_files(&document));
+        assert!(
+            packed
+                .as_ref()
+                .is_err_and(|error| error.contains("leaves the skill directory")),
+            "{packed:?}"
+        );
+    }
+
+    /// Set in the child process of the deploy plan test.
+    #[cfg(unix)]
+    const DEPLOY_PLAN_CHILD: &str = "META_TEST_DEPLOY_PLAN_CHILD";
+
+    /// A deploy plan or command preview for a caller without host access
+    /// names no host path: the pack path is the caller's own or the bare file
+    /// name, never one in the temp directory, and the command runs `rkat`,
+    /// never the binary `RKAT_BIN` names. A host caller's plan is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn deploy_plans_name_no_host_path_to_a_caller_without_host_access() {
+        if std::env::var_os(DEPLOY_PLAN_CHILD).is_none() {
+            run_test_in_child(
+                "mobpack::tests::deploy_plans_name_no_host_path_to_a_caller_without_host_access",
+                &[
+                    (DEPLOY_PLAN_CHILD, Some(std::ffi::OsStr::new("1"))),
+                    (
+                        "RKAT_BIN",
+                        Some(std::ffi::OsStr::new("/opt/host-only/bin/rkat")),
+                    ),
+                ],
+            );
+            return;
+        }
+        let params = json!({ "document": valid_document() });
+        let plan = with_untrusted_path_skill_reads(None, || deploy_mobpack(&params))
+            .expect("a deploy plan");
+        let preview = with_untrusted_path_skill_reads(None, || deploy_command_preview(&params))
+            .expect("a deploy command preview");
+        let reply = json!({ "plan": plan, "preview": preview }).to_string();
+        let temp = std::env::temp_dir().to_string_lossy().into_owned();
+        assert!(
+            !reply.contains("/opt/host-only") && !reply.contains(&temp),
+            "{reply}"
+        );
+        assert_eq!(
+            (plan.argv.first(), preview.argv.first()),
+            (Some(&"rkat".to_string()), Some(&"rkat".to_string()))
+        );
+        let host = with_host_path_skill_reads(|| deploy_mobpack(&params)).expect("a host plan");
+        assert!(
+            host.pack_path.starts_with(&temp)
+                && host.argv.first().map(String::as_str) == Some("/opt/host-only/bin/rkat"),
+            "{host:?}"
         );
     }
 }

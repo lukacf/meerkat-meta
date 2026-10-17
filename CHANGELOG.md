@@ -325,6 +325,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   earlier lane to the same join walked. Each lane walked the whole chain
   again, so a fork of many lanes into one long chain took work quadratic in
   its size.
+- The Flow Editor's catalogs (`meta/skills/catalog`, `meta/mobpacks/catalogs`
+  and `meta/agent_definitions/list`) name no host path to a caller without
+  host access. They named every directory the skills catalog scans (under
+  the home directory, the working directory, the cargo registry and
+  `META_SKILL_DIRS`) and each skill file's absolute path. Each filesystem
+  skill now has its path within its realm's directory, and the realm's
+  directory and the absolute `provenance.path` are left out. A document may
+  name a catalog skill that way, with the `realm_id` of a catalog realm: it
+  is read from that realm's directory under the same checks as a skill
+  named by its host path. A path with a `..`, `.`, empty, drive or backslash
+  component is refused (`selected_skill_path_leaves_realm`), to such a caller
+  before anything is read, and so is a realm the catalog does not list
+  (`selected_skill_realm_not_listed`); a host caller's document with such a
+  realm is read as named, as before. Deploy plans and
+  `meta/mobpacks/deploy_command` previews for such a caller name no host
+  path either: the pack path is the caller's own or the bare file name,
+  never one in the temp directory, and the command runs `rkat`, never the
+  binary `RKAT_BIN` names.
 
 ### Added
 
@@ -435,6 +453,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rendering checks against `console_acceptance_fixture`, a
   `UnifiedRuntime::builder()` host with identity-first members whose routers
   carry no call-context provider.
+- Flow Editor catalogs give a caller without host access each filesystem
+  skill's path within its realm's directory and no realm `path`; a caller
+  with host access still gets absolute paths (see Security). A document may
+  name a catalog skill either way.
 
 ### Fixed
 
