@@ -229,6 +229,9 @@ def receive_archive(archive_path, destination, identity, expected_digest):
             with os.fdopen(descriptor, 'wb') as channel:
                 channel.write(content)
                 channel.flush()
+                # Preserve the validated archive mode even under a private
+                # launcher umask. This descriptor is still unpublished.
+                os.fchmod(channel.fileno(), mode)
                 os.fsync(channel.fileno())
             os.link(temporary, path, follow_symlinks=False)
         finally:

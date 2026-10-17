@@ -20,6 +20,11 @@ from .connect_installer_caller import CustodyError, _json, _path, _read, _same_j
 from .remote_product_artifacts import _joined
 
 
+def _overlapping_parts(left, right):
+    """Lexical ancestor-or-equal relation, including component boundaries."""
+    return left[:len(right)] == right or right[:len(left)] == left
+
+
 class _InstalledSourceView:
     """Installed reference inputs and finite original native output locations.
 
@@ -50,8 +55,10 @@ class _InstalledSourceView:
     def _native_context_paths(self):
         paths = (self.root / "shared/data/toolkit-native",
                  self.root / "shared/control/deny.lock", self.root / "shared/control/deny.json")
-        if any(path == self.root / name or path in (self.root / name).parents
-                or self.root / name in path.parents for path in paths for name in self.files):
+        # Derive the same lexical paths once per check. Filesystem custody is
+        # checked separately; no source, mode or ownership observation is cached.
+        accepted = tuple((self.root / name).parts for name in self.files)
+        if any(_overlapping_parts(path.parts, source) for path in paths for source in accepted):
             raise CustodyError("Native context outputs overlap the accepted application source.")
         return paths
 
@@ -102,10 +109,12 @@ class _InstalledSourceView:
         if activation is None:
             return root, outputs, None, None, None
         current, next_pointer = root / "current", root / (activation.name + ".current.next")
+        accepted = tuple((root / name).parts for name in self.files)
+        root_parts = root.parts
         for path in (*outputs, current, next_pointer):
-            if path == root or root not in path.parents or any(
-                    path == root / name or path in (root / name).parents
-                    or root / name in path.parents for name in self.files):
+            parts = path.parts
+            if parts == root_parts or parts[:len(root_parts)] != root_parts or any(
+                    _overlapping_parts(parts, source) for source in accepted):
                 raise CustodyError("Native lifecycle outputs overlap the accepted application source.")
         return root, tuple(dict.fromkeys(outputs)), activation, current, next_pointer
 

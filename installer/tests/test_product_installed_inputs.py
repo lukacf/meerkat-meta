@@ -311,3 +311,13 @@ def test_native_output_allowance_refuses_overlap_with_accepted_application_sourc
         name: (b"inert authored source", 0o644)}
     with pytest.raises(CustodyError, match="overlap"):
         installed._InstalledSourceView(f.directory, None, package, root=f.selected.destination)
+
+
+@pytest.mark.parametrize("name", ["shared/data/toolkit-native-notes.json", "shared/control/deny.json-notes"])
+def test_native_output_allowance_keeps_distinct_component_siblings(installed_bootstrap, name):
+    f = installed_bootstrap
+    package = {**deployment.package_files((f.directory / "package.zip").read_bytes()),
+        name: (b"inert authored sibling source", 0o644)}
+    view = installed._InstalledSourceView(f.directory, None, package, root=f.selected.destination)
+    assert view.native_context == (f.selected.destination / "shared/data/toolkit-native",
+        f.selected.destination / "shared/control/deny.lock", f.selected.destination / "shared/control/deny.json")

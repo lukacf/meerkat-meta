@@ -224,7 +224,17 @@ def test_valid_controller_global_pax_and_extended_path_keep_exact_transfer(monke
     assert len(calls) == 2, "The actual TAR parser must handle legitimate PAX records."
 
 
-def test_valid_receiver_global_pax_exact_retry_preserves_private_state(tmp_path):
+@pytest.fixture
+def receiver_umask(request):
+    previous = os.umask(request.param)
+    try:
+        yield request.param
+    finally:
+        os.umask(previous)
+
+
+@pytest.mark.parametrize("receiver_umask", [0o022, 0o077], indirect=True)
+def test_valid_receiver_global_pax_exact_retry_preserves_private_state(tmp_path, receiver_umask):
     module = load_module("templates_v2/remote_operations.py")
     files = public_files()
     archive, digest, _ = transfer(files)
