@@ -1238,10 +1238,12 @@ async fn a_stand_down_stops_the_runtime_delivery_owner() {
         .await
         .expect("root mob shutdown");
     let released = runtime.stand_down_child_mobs(release_deadline()).await;
+    // Stopped, and joined: the owner's task ended before the stand-down
+    // returned, so no pass of it can run past the release.
     let stopped = runtime
         .runtime_delivery
         .as_ref()
-        .map(|delivery| delivery.is_stopped());
+        .map(|delivery| (delivery.is_stopped(), delivery.owner_task_ended()));
     drop(runtime);
     // Work the dropped runtime still finishes may close files in the
     // directory while it goes: remove it again until it is gone.
@@ -1266,7 +1268,7 @@ async fn a_stand_down_stops_the_runtime_delivery_owner() {
         (released, stopped, dir.path().exists()),
         (
             crate::child_mob_storage::ChildMobStandDownOutcome::Released { child_mobs: 0 },
-            Some(true),
+            Some((true, true)),
             false
         )
     );

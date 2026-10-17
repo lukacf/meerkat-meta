@@ -307,6 +307,35 @@ impl RunningMobRuntimeDelivery {
         drop(handle);
     }
 
+    /// Whether the native owner's task has ended: its pass channel closes
+    /// with it.
+    #[cfg(test)]
+    pub(super) fn owner_task_ended(&self) -> bool {
+        self.passes.has_changed().is_err()
+    }
+
+    /// Retire the native owner and wait for its task, at most `bound`: no
+    /// pass starts after the request, and one already running (blocking
+    /// store work included) finishes first. Once the task ended, the handle
+    /// goes as [`Self::stop`] drops it; an owner still running at the bound
+    /// keeps its handle, so a later retirement joins the same task.
+    pub(super) async fn retire(
+        &self,
+        bound: std::time::Duration,
+    ) -> Result<(), meerkat::RuntimeDeliveryOwnerRetirementIncomplete> {
+        let retirement = self
+            .handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(meerkat::RuntimeDeliveryOwnerHandle::retire);
+        if let Some(retirement) = retirement {
+            retirement.join(bound).await?;
+        }
+        self.stop();
+        Ok(())
+    }
+
     pub(super) fn is_stopped(&self) -> bool {
         self.handle
             .lock()

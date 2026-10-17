@@ -15,7 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   child root, as `UnifiedRuntime`'s shutdown does. Nothing stopped the owner
   there: it kept reconciling over the runtime store after the root was
   released, held by the composition the dropped runtime left behind, and
-  recreated a state directory that had been removed.
+  recreated a state directory that had been removed. The stand-down joins
+  the owner within its deadline, so a pass already running finishes before
+  the release; an owner still running at the deadline keeps the root owned
+  (`HeldUntilProcessExit`).
 
 ## [0.9.2] - 2026-10-16
 
