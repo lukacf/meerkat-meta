@@ -12956,7 +12956,9 @@ fn graph_to_flow_segments_to_steps(
                 .then_some((edge, node))
             })
             .collect();
-        if branch_starts.len() < 2 {
+        // A parallel step needs two lanes; a branch of one lane is a step
+        // that runs only when its condition holds.
+        if branch_starts.len() < 2 && (gate_kind != "branch" || branch_starts.is_empty()) {
             continue;
         }
         let join = graph.find_join(
@@ -17287,6 +17289,14 @@ fn visual_steps_from_frame(frame: &FrameSpec, flow: &FlowSpec) -> Vec<Value> {
                             continue;
                         }
                     }
+                    if let Some(condition) = &step.condition {
+                        out.push(conditioned_step_as_branch(
+                            frame_step.step_id.as_ref(),
+                            step,
+                            condition,
+                        ));
+                        continue;
+                    }
                     out.push(visual_step_from_step(frame_step.step_id.as_ref(), step));
                 }
             }
@@ -17306,6 +17316,32 @@ fn visual_steps_from_frame(frame: &FrameSpec, flow: &FlowSpec) -> Vec<Value> {
         }
     }
     out
+}
+
+/// A step with a condition, shown as a branch step of one lane: the editor's
+/// member steps carry no condition, and a branch lane does. Without a
+/// controller the lane's step itself carries the condition, so an export
+/// writes the step back with it and adds no step.
+fn conditioned_step_as_branch(
+    step_id: &str,
+    step: &FlowStepSpec,
+    condition: &ConditionExpr,
+) -> Value {
+    let id = sanitize_identifier(step_id);
+    json!({
+        "id": format!("branch_{id}"),
+        "type": "branch",
+        "controllerRole": "",
+        "dependsMode": dependency_mode_string(&step.depends_on_mode),
+        "branches": [{
+            "id": format!("br_{id}"),
+            "label": step_id,
+            "condition": condition_to_label(condition),
+            "cond": condition_to_editor_cond_json(condition),
+            "steps": [visual_step_from_step(step_id, step)],
+        }],
+        "fallback": [],
+    })
 }
 
 fn branch_controller_role_from_depends_on(
@@ -40449,13 +40485,13 @@ condition = { op = "eq", path = "params.kind", value = "d" }
         assert!(taken > 250, "only {taken} nodes taken in 500 cases");
     }
 
-    /// A step with a condition but no branch is imported as a plain step of
-    /// its own, after the parallel step of the steps it shares its
-    /// dependencies with. The editor shows no condition on a member step, so
-    /// exporting the imported flow writes it without its condition, after
-    /// those steps (see the changelog's Known limitations).
+    /// A step with a condition but no branch is imported as a branch step of
+    /// one lane, after the parallel step of the steps it shares its
+    /// dependencies with, so exporting the imported flow writes it with its
+    /// condition. It runs after those steps, not beside them (see the
+    /// changelog's Known limitations).
     #[test]
-    fn a_conditioned_step_without_a_branch_exports_as_a_plain_step_after_its_siblings() {
+    fn a_conditioned_step_without_a_branch_keeps_its_condition_through_the_editor() {
         let mob_toml = r#"
 [mob]
 id = "siblings"
@@ -40502,7 +40538,7 @@ condition = { op = "eq", path = "params.kind", value = "c" }
             [
                 ("member", "plan"),
                 ("parallel", "parallel_review_a_review_b"),
-                ("member", "review_c")
+                ("branch", "branch_review_c")
             ]
         );
 
@@ -40522,9 +40558,11 @@ condition = { op = "eq", path = "params.kind", value = "c" }
             .filter_map(|id| message_of(id.as_str()))
             .collect();
         after.sort();
+        let authored = step_conditions(&MobDefinition::from_toml(mob_toml).expect("definition"));
+        assert!(authored["C."].is_some(), "{authored:?}");
         assert_eq!(
-            (after, c.condition.is_none()),
-            (vec!["A.".to_string(), "B.".to_string()], true)
+            (after, &c.condition),
+            (vec!["A.".to_string(), "B.".to_string()], &authored["C."])
         );
     }
 
@@ -40603,5 +40641,51 @@ condition = { op = "eq", path = "params.kind", value = "c" }
                 "{mob_toml}"
             );
         }
+    }
+
+    /// Each step of a definition's one flow, by its message, with its
+    /// condition.
+    fn step_conditions(definition: &MobDefinition) -> BTreeMap<String, Option<ConditionExpr>> {
+        let flow = definition.flows.values().next().expect("the flow");
+        flow.steps
+            .values()
+            .map(|step| (step.message.text_content(), step.condition.clone()))
+            .collect()
+    }
+
+    /// A step with a condition but no branch keeps its condition and its
+    /// wiring through the editor: in the flow exported from the imported
+    /// document, and in the flow derived again from the graph the import
+    /// projects. Import showed it as a plain member step, which carries no
+    /// condition, so the round trip ran it whatever its condition.
+    #[test]
+    fn a_conditioned_step_round_trips_with_its_condition() {
+        let mob_toml = "[mob]\nid = \"conditioned\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+                        peer_description = \"Worker\"\n\n[flows.main]\ndescription = \"One\"\n\n\
+                        [flows.main.steps.start]\nrole = \"worker\"\nmessage = \"Start.\"\n\n\
+                        [flows.main.steps.check]\nrole = \"worker\"\nmessage = \"Check.\"\n\
+                        depends_on = [\"start\"]\n\
+                        condition = { op = \"eq\", path = \"params.kind\", value = \"c\" }\n";
+        let definition = MobDefinition::from_toml(mob_toml).expect("the definition");
+        assert!(step_conditions(&definition)["Check."].is_some());
+        let exported = round_tripped_definition(mob_toml);
+        assert_eq!(
+            (step_wiring(&exported), step_conditions(&exported)),
+            (step_wiring(&definition), step_conditions(&definition))
+        );
+
+        let imported = import_mobpack(&json!({ "mob_toml": mob_toml })).expect("import");
+        let mut document: MobpackDocument =
+            serde_json::from_value(imported["document"].clone()).expect("document");
+        document.flow = graph_to_flow_from_document(&document);
+        document.mob_toml = None;
+        let from_graph = MobDefinition::from_toml(
+            &render_editor_document_mob_toml(&document).expect("export the derived flow"),
+        )
+        .expect("the definition exported from the graph");
+        assert_eq!(
+            (step_wiring(&from_graph), step_conditions(&from_graph)),
+            (step_wiring(&definition), step_conditions(&definition))
+        );
     }
 }

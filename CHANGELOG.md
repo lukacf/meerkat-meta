@@ -505,8 +505,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   once. A step with a condition but no branch that shares its dependencies
   with two or more steps without one was dropped, and the parallel step of
   those steps was shown again for each such step, so such an import also
-  grew with the product of the two counts. Such a step is now shown as its
-  own step after that parallel step (see Known limitations).
+  grew with the product of the two counts. Such a step is now shown once,
+  after that parallel step (see Known limitations).
 - Importing a mob definition into the Flow Editor shows its steps in
   dependency order. A definition's steps are parsed in id order, and import
   showed them in that order, so a step whose id sorts before a step it
@@ -515,6 +515,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   steps are now ordered by their dependencies, and by id where those leave
   the order open; a loop's last step, which its repeat condition names, is
   taken in the same order.
+- Importing a mob definition into the Flow Editor keeps the condition of a
+  step that has a condition but no branch. Import showed it as a plain
+  member step, which carries no condition, so a round trip through the
+  editor ran the step whatever its condition. It is now shown as a branch
+  step of one lane, which an export writes back with the condition, and a
+  graph with a one-lane branch derives that branch step again.
 
 ### Known limitations
 
@@ -528,11 +534,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   route: one caller can fill it to its caps, which refuses new drafts to
   everyone else and drops other drafts' undo history first, and any caller
   can overwrite or delete any draft. Per-caller stores or quotas are planned.
-- The Flow Editor shows a step with a condition but no branch as a plain
-  step, without its condition, so exporting an imported flow writes the
-  step without its condition, after the step before it in the editor's
-  flow: a step that ran beside parallel steps when its condition held then
-  runs after them, always.
+- The Flow Editor shows a step with a condition but no branch that shares
+  its dependencies with parallel steps after their parallel step, so an
+  exported flow runs it after them, when its condition holds, rather than
+  beside them.
 
 ## [0.9.1] - 2026-10-15
 
