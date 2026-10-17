@@ -59,7 +59,7 @@ def test_actual_public_asset_snapshot_and_native_html_composition(installed):
         for path in members if path.suffix in {".js", ".css"}
     }
     assert all(not name.endswith((".d.ts", ".md", "package.json", "LICENSE-MIT", "LICENSE-APACHE")) for name in assets)
-    native = (ROOT / ".artifacts/forge-console-scope-retirement-20261008/toolkit-shell/native-console.html").read_bytes()
+    native = (ROOT / "tests/fixtures/console_shell/native-console.html").read_bytes()
     result = transform(native)
     assert b'<div id="root"></div>' in result
     assert b'/console/assets/console-app.js?v=250bc27b79ec' in result

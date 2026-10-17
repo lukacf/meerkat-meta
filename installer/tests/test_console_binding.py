@@ -179,7 +179,7 @@ def test_public_presentation_is_frozen_and_no_private_bootstrap_is_embedded(inst
     original = selected["console_assets"]["/console/forge/assets/console_shell.mjs"][0]
     (installed / "console_shell.mjs").write_text("different public file")
     assert selected["console_assets"]["/console/forge/assets/console_shell.mjs"][0] == original
-    native = (TEMPLATES.parents[1] / ".artifacts/forge-console-scope-retirement-20261008/toolkit-shell/native-console.html").read_bytes()
+    native = (TEMPLATES.parents[1] / "tests/fixtures/console_shell/native-console.html").read_bytes()
     transformed = selected["document_transform"](native)
     assert b"selected-private-fixture" not in transformed and b"fixture-reader" not in transformed
     assert set(selected) == {"connect_factory", "console_assets", "document_transform"}
@@ -212,7 +212,7 @@ async def test_actual_normal_startup_always_composes_base_but_only_selected_setu
         posonlyargs=[], args=[ast.arg(arg="console_front"), ast.arg(arg="application")],
         kwonlyargs=[], kw_defaults=[], defaults=[]), body=[copy.deepcopy(branch)], decorator_list=[])
     source = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
-    namespace = {"ROOT": installed, "os": os}
+    namespace = {"ROOT": installed, "os": os, "application_startup": None}
     exec(compile(source, str(TEMPLATES / "app.py"), "exec"), namespace)
     monkeypatch.setitem(sys.modules, "console_presentation", console_presentation)
     monkeypatch.setitem(sys.modules, "console_binding", console_binding)

@@ -12,7 +12,7 @@ SPEC = importlib.util.spec_from_file_location(
     "console_shell", ROOT / "launchkit/templates_v2/console_shell.py")
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
-HTML = ROOT / ".artifacts/forge-console-scope-retirement-20261008/toolkit-shell/native-console.html"
+HTML = ROOT / "tests/fixtures/console_shell/native-console.html"
 URLS = {name: f"/console/forge/assets/{file}" for name, file in {
     "shell_js": "console_shell.mjs", "shell_css": "console_shell.css",
     "setup_js": "console_setup.mjs", "setup_css": "console_setup.css",
