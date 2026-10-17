@@ -3176,6 +3176,57 @@ fn normalized_console_rpc_string_param(params: &Value, key: &str) -> Option<Stri
         .map(str::to_string)
 }
 
+/// The member target fields a console RPC may carry, in the order the access
+/// requirements pick one. Every present field is judged, and they must all
+/// name one member.
+const CONSOLE_RPC_MEMBER_TARGET_FIELDS: [&str; 4] =
+    ["identity", "member_id", "agent_id", "agent_identity"];
+
+/// The present, non-empty member target fields of a request.
+fn console_rpc_member_targets(params: &Value) -> Vec<(&'static str, String)> {
+    CONSOLE_RPC_MEMBER_TARGET_FIELDS
+        .iter()
+        .filter_map(|field| {
+            normalized_console_rpc_string_param(params, field)
+                .filter(|value| !value.is_empty())
+                .map(|value| (*field, value))
+        })
+        .collect()
+}
+
+/// The member a target spelling names: decoded, and a runtime alias reduced
+/// to its durable identity, so every spelling of one member compares equal.
+fn console_rpc_target_member(spelling: &str) -> String {
+    let decoded = crate::member_comms_id::runtime_alias_str(spelling);
+    crate::member_comms_id::durable_identity_from_runtime_alias(&decoded)
+        .unwrap_or_else(|| decoded.into_owned())
+}
+
+/// Refuses a request whose member target fields name different members:
+/// the access rules must judge the member the handler acts on.
+fn console_rpc_member_target_conflict(params: &Value) -> Option<JsonRpcError> {
+    let targets = console_rpc_member_targets(params);
+    let first = console_rpc_target_member(&targets.first()?.1);
+    if targets
+        .iter()
+        .all(|(_, spelling)| console_rpc_target_member(spelling) == first)
+    {
+        return None;
+    }
+    let fields = targets.iter().map(|(field, _)| *field).collect::<Vec<_>>();
+    Some(JsonRpcError {
+        code: -32602,
+        message: format!(
+            "member target fields name different members: {}",
+            fields.join(", ")
+        ),
+        data: Some(json!({
+            "kind": "conflicting_member_targets",
+            "fields": fields,
+        })),
+    })
+}
+
 /// Returns the denial error when the caller's view forbids the method.
 /// Every mapped requirement must pass; the first failing one is reported.
 fn console_rpc_access_violation(
@@ -3185,10 +3236,16 @@ fn console_rpc_access_violation(
 ) -> Option<JsonRpcError> {
     let view = view.filter(|view| view.enforced())?;
     let requirements = console_rpc_access_requirements(method, params)?;
+    // Every member the request names is judged, not only the field the
+    // requirement picked: a handler may act on another target field.
+    let subjects = console_rpc_member_targets(params);
     for (action, target) in requirements {
-        let allowed = match target {
-            Some(ref identity) => view.allows_agent(action, identity),
-            None => view.allows(action),
+        let (allowed, target) = match target {
+            Some(target) => std::iter::once(target)
+                .chain(subjects.iter().map(|(_, subject)| subject.clone()))
+                .find(|subject| !view.allows_agent(action, subject))
+                .map_or((true, None), |denied| (false, Some(denied))),
+            None => (view.allows(action), None),
         };
         if !allowed {
             return Some(JsonRpcError {
@@ -6673,6 +6730,9 @@ async fn handle_console_aggregator_rpc(
     {
         return invalid_params(response_id, message);
     }
+    if let Some(conflict) = console_rpc_member_target_conflict(&request.params) {
+        return response_value(response_id, None, Some(conflict));
+    }
     let can_mutate = is_authenticated && !read_only;
     if is_console_mutating_rpc_method(request.method.as_str()) && !can_mutate {
         return console_read_only_rpc_error(response_id);
@@ -6995,6 +7055,9 @@ async fn handle_console_runtime_rpc_with_visibility(
         crate::member_comms_id::validate_public_rpc_member_aliases(&request.params)
     {
         return invalid_params(response_id, message);
+    }
+    if let Some(conflict) = console_rpc_member_target_conflict(&request.params) {
+        return response_value(response_id, None, Some(conflict));
     }
     let can_mutate = is_authenticated && !read_only;
     if is_console_mutating_rpc_method(request.method.as_str()) && !can_mutate {
@@ -18408,6 +18471,302 @@ comms = true
             ),
             "((read guarded durable, guarded alias, open durable, open alias), \
              (retire guarded alias, open alias), guarded identity state)"
+        );
+        Ok(())
+    }
+
+    /// The console access rules judge every member a request names, not only
+    /// the field a method's requirement picks first: a handler may act on a
+    /// different field.
+    #[test]
+    fn console_rpc_access_judges_every_member_target_field()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let both = |actions: [&str; 2]| actions.map(str::to_string).to_vec();
+        let controller =
+            crate::access::AccessController::new(crate::access::AccessControlConfig {
+                enabled: true,
+                admins: vec!["root@example.test".to_string()],
+                rules: vec![
+                    crate::access::AccessRule {
+                        id: "allow-all".to_string(),
+                        actions: both([
+                            crate::access::ACTION_AGENT_VIEW,
+                            crate::access::ACTION_AGENT_RETIRE,
+                        ]),
+                        agents: vec!["*".to_string()],
+                        ..crate::access::AccessRule::default()
+                    },
+                    crate::access::AccessRule {
+                        id: "deny-restricted".to_string(),
+                        effect: crate::access::AccessEffect::Deny,
+                        actions: both([
+                            crate::access::ACTION_AGENT_VIEW,
+                            crate::access::ACTION_AGENT_RETIRE,
+                        ]),
+                        match_labels: BTreeMap::from([(
+                            "org".to_string(),
+                            "restricted".to_string(),
+                        )]),
+                        ..crate::access::AccessRule::default()
+                    },
+                ],
+                ..crate::access::AccessControlConfig::default()
+            })?;
+        for (identity, labels) in [
+            ("review:open", BTreeMap::new()),
+            (
+                "review:guarded",
+                BTreeMap::from([("org".to_string(), "restricted".to_string())]),
+            ),
+        ] {
+            controller.record_agent_attributes(crate::access::AgentResourceAttributes {
+                identity: identity.to_string(),
+                agent_id: Some(identity.to_string()),
+                role: Some("worker".to_string()),
+                labels,
+            });
+        }
+        let view = controller.view_for_subject(None);
+        let denied = |method: &str, params: Value| {
+            crate::http_console::console_rpc_access_violation(Some(&view), method, &params).map(
+                |error| {
+                    error
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("resource"))
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                },
+            )
+        };
+        let mixed = json!({ "identity": "review:open", "member_id": "review:guarded" });
+        assert_eq!(
+            [
+                denied("meta/retire_member", mixed.clone()),
+                denied("meta/force_cancel_member", mixed.clone()),
+                denied("meta/stop_member_run", mixed.clone()),
+                denied("meta/get_member", mixed),
+                denied(
+                    crate::rpc::mob_methods::MEMBER_TOOL_DECLARATION,
+                    json!({ "identity": "review:open", "agent_identity": "review:guarded" }),
+                ),
+                denied("meta/retire_member", json!({ "member_id": "review:open" })),
+            ],
+            [
+                Some(json!("review:guarded")),
+                Some(json!("review:guarded")),
+                Some(json!("review:guarded")),
+                Some(json!("review:guarded")),
+                Some(json!("review:guarded")),
+                None,
+            ],
+            "the guarded member is judged whichever field names it"
+        );
+        Ok(())
+    }
+
+    /// A console RPC whose member target fields name different members is
+    /// refused before anything runs, so the access rules can never judge one
+    /// member while the handler acts on another. Fields that name one member,
+    /// in any spelling, still pass, and an admin is unchanged.
+    #[tokio::test]
+    async fn console_rpc_refuses_member_target_fields_naming_different_members()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const GUARDED: &str = "review:targets-guarded";
+        const OPEN: &str = "review:targets-open";
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-member-target-fields").await?;
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "console-member-target-fields".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        let mut specs = Vec::new();
+        for (durable, restricted) in [(GUARDED, true), (OPEN, false)] {
+            let mut labels = BTreeMap::from([("agent_identity".to_string(), durable.to_string())]);
+            if restricted {
+                labels.insert("org".to_string(), "restricted".to_string());
+            }
+            runtime
+                .handle()
+                .spawn_spec(
+                    SpawnMemberSpec::from_wire(
+                        "worker".to_string(),
+                        crate::member_comms_id::mob_member_id_str(durable).into_owned(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .with_labels(labels),
+                )
+                .await?;
+            let session_id = runtime
+                .handle()
+                .resolve_bridge_session_id(&crate::member_comms_id::mob_member_id(durable))
+                .await
+                .ok_or("the spawned member must have a bridge session")?;
+            let identity = AgentIdentity::parse(durable)?;
+            let spec = DurableAgentSpec {
+                identity: identity.clone(),
+                profile: ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            };
+            identity_runtime
+                .register(
+                    spec.clone(),
+                    IdentityLifecycleState::Active,
+                    Some(ContinuityRecord {
+                        identity: identity.clone(),
+                        agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{durable}:1"))?,
+                        session_id,
+                        generation: ContinuityGeneration::new(1),
+                        checkpoint_version: CheckpointVersion::new(0),
+                    }),
+                    Some(LeaseGrant {
+                        identity,
+                        fencing_token: FencingToken::new(1),
+                        ttl: Duration::from_mins(1),
+                    }),
+                )
+                .await;
+            specs.push(spec);
+        }
+        let roster = Arc::new(crate::identity_first::MutableRosterProvider::new(specs));
+        let actions = || {
+            vec![
+                crate::access::ACTION_AGENT_VIEW.to_string(),
+                crate::access::ACTION_AGENT_RETIRE.to_string(),
+                crate::access::ACTION_AGENT_RESPAWN.to_string(),
+            ]
+        };
+        let controller =
+            crate::access::AccessController::new(crate::access::AccessControlConfig {
+                enabled: true,
+                admins: vec!["root@example.test".to_string()],
+                rules: vec![
+                    crate::access::AccessRule {
+                        id: "allow-all".to_string(),
+                        actions: actions(),
+                        agents: vec!["*".to_string()],
+                        ..crate::access::AccessRule::default()
+                    },
+                    crate::access::AccessRule {
+                        id: "deny-restricted".to_string(),
+                        effect: crate::access::AccessEffect::Deny,
+                        actions: actions(),
+                        match_labels: BTreeMap::from([(
+                            "org".to_string(),
+                            "restricted".to_string(),
+                        )]),
+                        ..crate::access::AccessRule::default()
+                    },
+                ],
+                ..crate::access::AccessControlConfig::default()
+            })?;
+        let anonymous = controller.view_for_subject(None);
+        let admin = controller.view_for_subject(Some("root@example.test"));
+        let call = async |view: &crate::access::AccessView, method: &str, params: Value| {
+            let response = Box::pin(handle_console_runtime_rpc_with_visibility(
+                &runtime,
+                None,
+                None,
+                None,
+                Some(ConsoleEventStore::new()),
+                None,
+                Some(identity_runtime.clone()),
+                None,
+                None,
+                &crate::console_aggregator::AllowAllConsoleVisibilityPolicy,
+                rpc_request_with_params(method, params),
+                true,
+                false,
+                None,
+                Some(&controller),
+                Some(view),
+                None,
+                Some(roster.clone()),
+                None,
+                None,
+                &crate::http_console::ConsoleSendGovernance::default(),
+            ))
+            .await;
+            if response["error"]["data"]["kind"] == json!("conflicting_member_targets") {
+                "conflict"
+            } else if response["error"]["data"]["kind"] == json!("access_denied") {
+                "denied"
+            } else {
+                "passed"
+            }
+        };
+        let with_run = |mut params: Value| {
+            params["run_id"] = json!("01936f8b-0000-7000-8000-000000000042");
+            params["reason"] = json!("member target fields test");
+            params
+        };
+        let mixed = json!({ "identity": OPEN, "member_id": GUARDED });
+        let matching = json!({ "identity": OPEN, "member_id": OPEN });
+
+        let conflicts = (
+            call(&anonymous, "meta/get_member", mixed.clone()).await,
+            call(&anonymous, "meta/member_health", mixed.clone()).await,
+            call(&anonymous, "meta/stop_member_run", with_run(mixed.clone())).await,
+            call(&anonymous, "meta/force_cancel_member", mixed.clone()).await,
+            call(&anonymous, "meta/retire_member", mixed.clone()).await,
+        );
+        let same_member = (
+            call(&anonymous, "meta/get_member", matching.clone()).await,
+            call(
+                &anonymous,
+                "meta/get_member",
+                json!({ "identity": OPEN, "member_id": format!("rt:{OPEN}:1") }),
+            )
+            .await,
+            call(
+                &anonymous,
+                "meta/stop_member_run",
+                with_run(matching.clone()),
+            )
+            .await,
+            call(&anonymous, "meta/force_cancel_member", matching).await,
+        );
+        let single_field = (
+            call(
+                &anonymous,
+                "meta/get_member",
+                json!({ "member_id": GUARDED }),
+            )
+            .await,
+            call(&admin, "meta/get_member", json!({ "member_id": GUARDED })).await,
+            call(
+                &admin,
+                "meta/retire_member",
+                json!({ "member_id": GUARDED }),
+            )
+            .await,
+        );
+        assert_eq!(
+            (conflicts, same_member, single_field),
+            (
+                ("conflict", "conflict", "conflict", "conflict", "conflict"),
+                ("passed", "passed", "passed", "passed"),
+                ("denied", "passed", "passed"),
+            ),
+            "(conflicting fields: get, health, stop run, force cancel, retire), \
+             (one member: get, get by alias, stop run, force cancel), \
+             (single field: anonymous get guarded, admin get guarded, admin retire guarded)"
         );
         Ok(())
     }

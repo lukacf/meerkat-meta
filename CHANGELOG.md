@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   member, with its identity and labels, on every console route that takes
   a member id, as they judge its durable identity. A runtime alias that is
   not the current incarnation of a known member is refused.
+- A console RPC whose member target fields (`identity`, `member_id`,
+  `agent_id`, `agent_identity`) name different members is refused with
+  `conflicting_member_targets`, and the console access rules judge every
+  member a request names.
 - `meta/identity/resolved_tools`, and `resolved_tools_for_member` in Rust,
   resolve the supplied id through `roster_member_id_for_supplied_id`, as
   `meta/identity/routing_status` does (#366). A member named by its current
