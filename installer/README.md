@@ -1629,8 +1629,12 @@ repository access, and the configured pipeline provider/embedding credentials.
 
 ## Current scope
 
-Generated applications support static durable identities, native flows and console,
-scoped tools, local notes, optional Elephant, and Mac/Linux/GCP installation.
+Generated applications support static durable identities, native flows and Console,
+scoped tools, local notes and optional Elephant. Installation depends on the
+selected runtime and destination. The source includes Mac/Linux service controls
+and SSH/GCP transport paths. A prepared Meta preview names its supported platform
+in its generated manifest and README; remote startup needs its own original native
+setup owner and verified destination. A local package does not select those inputs.
 Authenticated end-user apps, inbound messaging adapters, automatic recurring
 triggers, data-driven rosters, ephemeral worker fleets, and synchronized ingestion
 are application extensions that the implementation agent can build as ordinary
@@ -1646,16 +1650,17 @@ The conversation layout and warm visual direction were informed by the supplied
 is included in `assets/meerkat-transparent.png`. Plan content, connection details,
 and package generation come from the actual installer services.
 
-### Refresh an accepted deployment without redesigning it
+## Retained 0.8 runtime refresh
 
-A runtime-only refresh preserves the accepted Blueprint, native roles and grants,
+For the retained 0.8 generation, a runtime-only refresh preserves the accepted
+Blueprint, native roles and grants,
 application source, console settings and connector configuration. It rebuilds
 the protected host framework for the qualified current runtime; within retained
 design and dependency files, only the MobKit release pins change. It runs new checks
 and independent acceptance before the existing Stage and Apply controls become
 available. No implementation author rewrites the application.
 
-The qualified local crossings are 0.8.42 to 0.8.47 and 0.8.46 to 0.8.47, both
+The retained qualified local crossings are 0.8.42 to 0.8.47 and 0.8.46 to 0.8.47, both
 with Meerkat 0.8.51. Background activation requires the exact owned, stopped
 service, confirmed native cleanup and its preserved startup protocol. Its frozen
 service definition is retained. After native admission, a failure retains the
