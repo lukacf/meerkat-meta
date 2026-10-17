@@ -613,9 +613,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the stop named in its skip reason, as an output-ceiling stop already was
   with `Truncated`. A completion stream that ends before its terminal event is
   refused too. A stop reason that a later Meerkat adds is refused the same
-  way. Meerkat 0.9.2 itself reports an Anthropic refusal as an ended turn, so
-  against it a refused reply still reads as an answer; it is refused once
-  Meerkat reports refusals as their own stop.
+  way. With Meerkat 0.9.3 the providers' other non-answers are refused too:
+  an Anthropic refusal, `pause_turn` or `model_context_window_exceeded`
+  arrives as its own stop; a Gemini safety, recitation, blocklist,
+  prohibited-content, sensitive-data, image-safety or language finish arrives
+  as a content filter; and a Gemini `OTHER` or unknown finish reason fails the
+  call.
 
 - A `MobRuntime` torn down without `UnifiedRuntime` (its root mob shut down,
   then `stand_down_child_mobs`) stops its runtime delivery owner and empties
