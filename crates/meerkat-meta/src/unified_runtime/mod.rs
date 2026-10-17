@@ -3040,21 +3040,16 @@ fn forwarder_should_subscribe(status: MobMemberStatus) -> bool {
 
 /// Whether `handle`'s mob is stopping or stopped, so a member subscribe that
 /// failed is the mob tearing its members down rather than a spawn or resume
-/// race: the actor refused the subscribe with a closed command or reply
-/// channel (its answer to every caller request while it shuts down, and
-/// after) or a closed admission, or the mob's admission is closed (it never
-/// reopens), or its last published phase is Stopped, Completed or Destroyed.
-/// A shutdown stops the mob before its terminal teardown ends the members'
-/// sessions, so their streams close in the Stopped phase.
-fn mob_is_stopping_or_stopped(handle: &MobHandle, refusal: Option<&MobError>) -> bool {
-    matches!(
-        refusal,
-        Some(
-            MobError::ActorCommandChannelClosed
-                | MobError::ActorReplyChannelClosed
-                | MobError::AdmissionClosed { .. }
-        )
-    ) || handle.admission_closed().borrow().is_some()
+/// race: the mob's admission is closed (it never reopens), or its last
+/// published phase is Stopped, Completed or Destroyed. Every teardown says
+/// so before the members' sessions end: a shutdown stops the mob before its
+/// terminal teardown, a child stand-down closes each child's admission
+/// first, and a destroy publishes Destroyed once it is admitted. What the
+/// actor answered does not count: an actor that refuses with a closed
+/// channel while its mob runs and admits died, and its members keep the
+/// warning, the backoff and the repair count.
+fn mob_is_stopping_or_stopped(handle: &MobHandle) -> bool {
+    handle.admission_closed().borrow().is_some()
         || matches!(
             handle.status_observation_snapshot(),
             MobState::Stopped | MobState::Completed | MobState::Destroyed
@@ -3797,7 +3792,7 @@ async fn reconcile_agent_event_streams(
             if let Some(backoff) = subscribe_failures.get(&tracked_key) {
                 let held = match backoff.next_attempt {
                     Some(next_attempt) => now < next_attempt,
-                    None => mob_is_stopping_or_stopped(handle, None),
+                    None => mob_is_stopping_or_stopped(handle),
                 };
                 if held {
                     continue;
@@ -3840,7 +3835,7 @@ async fn reconcile_agent_event_streams(
                     // its actor): the failure is the teardown. Park the
                     // member with no retry and nothing above debug until the
                     // mob runs again; identity repair does not count it.
-                    if mob_is_stopping_or_stopped(handle, Some(&error)) {
+                    if mob_is_stopping_or_stopped(handle) {
                         if identity_runtime.is_none() {
                             tracing::debug!(
                                 mob_id = %mob_id,
@@ -6286,6 +6281,78 @@ mod tests {
         let _ = handle.shutdown().await;
     }
 
+    /// Only a mob that says it stops parks its members: a closed admission,
+    /// or a Stopped, Completed or Destroyed phase. A mob that runs and admits
+    /// is no teardown, whatever its actor answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn only_a_mob_that_stops_or_closes_admission_parks_its_members() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (standing_down, _) = mob_with_idle_worker("console-park-stand-down", &temp_dir).await;
+        let handle = standing_down.handle();
+        assert!(
+            !mob_is_stopping_or_stopped(&handle),
+            "a mob that runs and admits"
+        );
+        handle
+            .close_admission(meerkat_mob::MobAdmissionCloseReason::StandDown)
+            .await
+            .expect("close admission");
+        assert!(mob_is_stopping_or_stopped(&handle), "a mob standing down");
+        let _ = handle.shutdown().await;
+
+        let other_dir = tempfile::tempdir().expect("temp dir");
+        let (stopped, _) = mob_with_idle_worker("console-park-stopped", &other_dir).await;
+        let handle = stopped.handle();
+        handle.stop().await.expect("stop the mob");
+        assert!(mob_is_stopping_or_stopped(&handle), "a stopped mob");
+        let _ = handle.shutdown().await;
+    }
+
+    /// A member of a destroyed mob leaves the subscribe bookkeeping once the
+    /// roster drops it: the pass prunes every entry whose member it no
+    /// longer lists, a parked one included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_prunes_a_destroyed_mobs_parked_member() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (mob_runtime, _session_id) =
+            mob_with_idle_worker("console-destroyed-member", &temp_dir).await;
+        let handle = mob_runtime.handle();
+        let entry = handle
+            .list_members_including_retiring()
+            .await
+            .into_iter()
+            .find(|entry| entry.agent_identity == IDLE_WORKER)
+            .expect("worker roster entry");
+        let (runtime_id, fence_token) = entry.binding_atoms().expect("worker binding atoms");
+        let key = TrackedAgentEventStream {
+            mob_id: handle.mob_id().to_string(),
+            durable_identity: durable_identity_label(&entry.labels),
+            member_identity: entry.agent_identity.clone(),
+            runtime_id,
+            identity_fencing_token: None,
+            fence_token,
+        };
+        let mut forwarder = DrivenForwarder::new();
+        forwarder.subscribe_failures.insert(
+            key,
+            SubscribeBackoff {
+                next_attempt: None,
+                consecutive_failures: 0,
+            },
+        );
+
+        handle.destroy().await.expect("destroy the mob");
+        assert_eq!(handle.status_observation_snapshot(), MobState::Destroyed);
+        forwarder.reconcile(&handle, &None).await;
+
+        assert!(
+            forwarder.subscribe_failures.is_empty(),
+            "the destroyed mob's member was pruned ({} entries left)",
+            forwarder.subscribe_failures.len()
+        );
+        assert!(forwarder.tracked.current.is_empty());
+    }
+
     const RESTART_MEMBER: &str = "lead-1";
 
     /// One gateway-shaped boot against a durable store: a persistent spec,
@@ -8399,6 +8466,64 @@ mod tests {
         assert_ne!(
             timeline[0].data.get("run_id"),
             timeline[second_start].data.get("run_id")
+        );
+
+        runtime.shutdown().await;
+    }
+
+    /// A member of a running, admitting mob whose subscribe fails keeps the
+    /// transient handling: the first-failure warning, a retry deadline, and
+    /// the failure counted toward identity repair.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_keeps_the_warning_backoff_and_count_for_a_running_mobs_member() {
+        let mob_id = "console-running-failure";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mob_path = temp.path().join("mob.sqlite3");
+        let state_root = temp.path().join("state");
+        let (first, first_identity) =
+            boot_identity_first_persistent(mob_id, &mob_path, &state_root).await;
+        let session_id = commit_restart_member_turn(&first_identity, "before restart").await;
+        first.shutdown().await;
+
+        let boot = boot_persistent_before_activation(mob_id, &mob_path, &state_root).await;
+        let _ingress = boot.runtime.install_test_event_ingress().await;
+        let identity_runtime = boot.identity_runtime.clone();
+        let runtime = boot.activate().await;
+        let handle = runtime.mob_handle();
+        let key = restart_member_key(&restart_member_entry(&handle).await, mob_id);
+        commit_restart_member_turn(&identity_runtime, "revoked run").await;
+        discard_restart_member_actor(&runtime, &session_id).await;
+        assert_eq!(handle.status_observation_snapshot(), MobState::Running);
+        assert!(handle.admission_closed().borrow().is_none());
+
+        let writer = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        // A second registered dispatcher keeps callsite interest computed for
+        // every dispatcher, so a callsite another test's thread reached first
+        // still records here.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
+        let guard = tracing::subscriber::set_default(subscriber);
+        let mut forwarder = DrivenForwarder::new();
+        forwarder.reconcile(&handle, &None).await;
+        drop(guard);
+        let logged = writer.contents();
+
+        let backoff = forwarder
+            .subscribe_failures
+            .get(&key)
+            .expect("the failed subscription is held");
+        assert!(backoff.next_attempt.is_some(), "a retry is scheduled");
+        assert_eq!(
+            backoff.consecutive_failures, 1,
+            "the failure counts toward identity repair"
+        );
+        assert!(
+            logged.contains("failed to subscribe; will retry with backoff"),
+            "{logged}"
         );
 
         runtime.shutdown().await;

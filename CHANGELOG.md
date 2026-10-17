@@ -11,8 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Behaviour-only (not measured by the semver gate): `ErrorEvent::HostLoopCrash`
   no longer fires for a member run that ended cancelled (`error_report.class`
-  `cancelled`): an interrupt, a mob stop or a shutdown cancels in-flight work
-  on purpose. Every other failed run still fires it, with the same detail.
+  `cancelled`): an interrupt (a hard interrupt that drops the run included,
+  which Meerkat reports as a cancelled `RunFailed`), a mob stop or a shutdown
+  cancels in-flight work on purpose. Every other failed run still fires it,
+  with the same detail.
   The cancelled run's `run_failed` event still reaches the console and the
   event log; a hook that counted cancellations through `host_loop_crash`
   reads those events instead.
@@ -35,11 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with backoff" for every member a shutdown stops, or for the persisted
   members of a restored mob while it stays Stopped before its resume, and no
   longer retries them. A subscribe that fails while the member's mob is
-  stopping or stopped (its actor refuses commands, its admission is closed,
-  or its last published phase is Stopped, Completed or Destroyed) parks the
-  member, logged at debug, until the mob runs again; the identity stream
-  health monitor does not count it toward identity repair. A failure while
-  the mob runs keeps the backoff and the first-failure warning.
+  stopping or stopped (its admission is closed, or its last published phase
+  is Stopped, Completed or Destroyed) parks the member, logged at debug,
+  until the mob runs again; the identity stream health monitor does not count
+  it toward identity repair. A failure while the mob runs and admits keeps
+  the backoff, the first-failure warning and the repair count, also when the
+  mob's actor refused with a closed channel.
 - An identity-first boot no longer logs `reconcile_incomplete: 0 failures, N
   skipped` at ERROR for the edges lazy identity bootstrap leaves pending (see
   Breaking).
