@@ -4303,9 +4303,11 @@ fn read_draft_store(
 }
 
 /// Write the draft store: streamed into a new file beside it, readable only
-/// by its user, then renamed over it. Each write gets a file of its own, so
-/// writers that share a store never write into one temporary file, and the
-/// store is never encoded into memory first.
+/// by its user, synced to disk, then renamed over it, and the directory
+/// synced after the rename, so a crash leaves either the old store or the
+/// new one whole. Each write gets a file of its own, so writers that share a
+/// store never write into one temporary file, and the store is never encoded
+/// into memory first.
 fn write_mobpack_draft_store(path: &Path, rows: &BTreeMap<String, Value>) -> Result<(), String> {
     let dir = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -4329,6 +4331,7 @@ fn write_mobpack_draft_store(path: &Path, rows: &BTreeMap<String, Value>) -> Res
         .map_err(|err| format!("failed to encode {}: {err}", draft_store_name(path)))?;
     writer.flush().map_err(unwritable)?;
     drop(writer);
+    file.as_file().sync_all().map_err(unwritable)?;
     file.persist(path).map_err(|err| {
         format!(
             "failed to replace {}: {}",
@@ -4336,6 +4339,36 @@ fn write_mobpack_draft_store(path: &Path, rows: &BTreeMap<String, Value>) -> Res
             err.error
         )
     })?;
+    sync_dir(dir).map_err(|err| {
+        format!(
+            "{} was replaced, but its directory could not be synced, so the write may not survive a crash: {err}",
+            draft_store_name(path)
+        )
+    })?;
+    Ok(())
+}
+
+/// Sync a directory's entries to disk, so a rename into it survives a crash.
+/// A directory this user cannot open, or one its filesystem cannot sync, is
+/// left as it is: the rename lasts as long as the filesystem keeps it.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    match std::fs::File::open(dir).and_then(|dir| dir.sync_all()) {
+        Err(err)
+            if !matches!(
+                err.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::InvalidInput | ErrorKind::Unsupported
+            ) =>
+        {
+            Err(err)
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -5173,6 +5206,24 @@ pub fn redo_mobpack_draft(params: &Value) -> Result<Value, String> {
         .map_err(|failure| failure.message)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// Runs once on this thread between an undo's or a redo's read of the
+    /// draft store and its write, for the tests of a draft that changes in
+    /// between.
+    static DRAFT_STEP_BETWEEN_READ_AND_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run the hook set on this thread, if any, between an undo's or a redo's
+/// read of the draft store and its write.
+#[cfg(test)]
+fn run_draft_step_between_read_and_write() {
+    if let Some(between) = DRAFT_STEP_BETWEEN_READ_AND_WRITE.with(|hook| hook.borrow_mut().take()) {
+        between();
+    }
+}
+
 /// Meta-owned undo/redo over the draft store. The history lives with the
 /// draft (bounded document snapshots the store itself recorded on save), so
 /// the browser never authors restore states; stepping rebuilds the row
@@ -5279,6 +5330,8 @@ fn step_mobpack_draft_history(
     )?;
     row["history"] = Value::Array(history);
     row["future"] = Value::Array(future);
+    #[cfg(test)]
+    run_draft_step_between_read_and_write();
     let lock = lock_draft_store()?;
     let (mut rows, before) = read_draft_store(&path)?;
     let stored_revision = rows
@@ -5287,6 +5340,15 @@ fn step_mobpack_draft_history(
     if !rows.contains_key(&id) || stored_revision != current_revision {
         return Err(format!(
             "{source} draft revision conflict for {id}: expected {current_revision}, found {stored_revision}"
+        )
+        .into());
+    }
+    // The same revision need not be the same draft: one deleted, created
+    // again and saved back to it has it too. Only the draft as read is
+    // overwritten.
+    if rows.get(&id) != Some(&existing) {
+        return Err(format!(
+            "{source} draft conflict for {id}: the draft changed after it was read at revision {current_revision}"
         )
         .into());
     }
@@ -41171,6 +41233,49 @@ condition = { op = "eq", path = "params.kind", value = "c" }
             host.pack_path.starts_with(&temp)
                 && host.argv.first().map(String::as_str) == Some("/opt/host-only/bin/rkat"),
             "{host:?}"
+        );
+    }
+
+    /// An undo writes only over the draft it read. A draft deleted, created
+    /// again and saved back to the revision the undo read, between the
+    /// undo's read and its write, is not overwritten by a step built from the
+    /// old draft: the revision alone matched it.
+    #[test]
+    fn an_undo_does_not_overwrite_a_draft_created_again_at_the_revision_it_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("drafts.json");
+        let save = |store_path: &Path, name: &str| {
+            let mut document = valid_document();
+            document.name = name.to_string();
+            save_mobpack_draft(&json!({
+                "store_path": store_path,
+                "id": "aba",
+                "document": document,
+            }))
+            .expect("save")
+        };
+        save(&store_path, "First");
+        save(&store_path, "Second");
+        let again = store_path.clone();
+        DRAFT_STEP_BETWEEN_READ_AND_WRITE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                delete_mobpack_draft(&json!({ "store_path": again, "id": "aba" })).expect("delete");
+                save(&again, "Third");
+                save(&again, "Fourth");
+            }));
+        });
+        let undone = undo_mobpack_draft(&json!({ "store_path": store_path, "id": "aba" }));
+        let fetched =
+            get_mobpack_draft(&json!({ "store_path": store_path, "id": "aba" })).expect("get");
+        assert_eq!(
+            (
+                undone
+                    .err()
+                    .is_some_and(|error| error.contains("draft conflict")),
+                fetched["row"]["revision"].clone(),
+                fetched["row"]["name"].clone(),
+            ),
+            (true, json!(2), json!("Fourth"))
         );
     }
 }

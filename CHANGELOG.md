@@ -307,6 +307,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   "max_read_bytes": 134217728, "store_bytes": ...}`. Before, every draft
   method read and parsed such a file whole, the store took the default file
   mode, and writers sharing a store raced on one fixed `.json.tmp` file.
+  The new file is synced to disk before the rename and its directory after
+  it, so a crash leaves either the old store or the new one whole.
 - The standalone Flow Editor server (`meta_flow_editor`) handles at most 16
   requests at once, and the rest wait for a slot. Any local process can call
   it, and every request it handled ran on the blocking pool, so it took any
@@ -560,6 +562,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   its dependencies with parallel steps after their parallel step, so an
   exported flow runs it after them, when its condition holds, rather than
   beside them.
+- The Flow Editor draft store's lock is per process. Two processes that
+  share one store each read it, change it and rename their copy over it, so
+  of their concurrent writes only the last one renamed survives: run one
+  process per store.
 
 ## [0.9.1] - 2026-10-15
 

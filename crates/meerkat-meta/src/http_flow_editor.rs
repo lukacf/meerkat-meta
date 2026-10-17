@@ -207,18 +207,29 @@ pub async fn flow_editor_rpc_handler_allowing_host_deploy(
     flow_editor_rpc_handler_with_policy(request, true).await
 }
 
-/// Requests the standalone Flow Editor RPC handler has started, for the test
-/// of how many it handles at once.
+/// The store path of each request the standalone Flow Editor RPC handler has
+/// started, for the test of how many it handles at once: the test counts
+/// only the requests that name its own store, whatever else runs in the
+/// process.
 #[cfg(test)]
-static STANDALONE_RPC_REQUESTS_STARTED: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static STANDALONE_RPC_REQUESTS_STARTED: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
 
 async fn flow_editor_rpc_handler_with_policy(
     request: Value,
     allow_host_deploy: bool,
 ) -> impl IntoResponse {
     #[cfg(test)]
-    STANDALONE_RPC_REQUESTS_STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Some(store_path) = request
+        .get("params")
+        .and_then(|params| params.get("store_path"))
+        .and_then(Value::as_str)
+    {
+        STANDALONE_RPC_REQUESTS_STARTED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(store_path.to_string());
+    }
     let parsed_request = match serde_json::from_value::<JsonRpcRequest>(request) {
         Ok(req) => req,
         Err(_) => {
@@ -2203,7 +2214,6 @@ mod tests {
     /// request it handles waits on the blocking pool, which it could fill.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_standalone_server_handles_at_most_sixteen_requests_at_once() {
-        use std::sync::atomic::Ordering;
         let store = tempfile::tempdir().expect("tempdir");
         let store_path = store.path().join("drafts.json");
         // Every draft method waits for the draft store lock this thread holds.
@@ -2237,7 +2247,15 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let started = || super::STANDALONE_RPC_REQUESTS_STARTED.load(Ordering::SeqCst);
+        let store_name = store_path.to_string_lossy().into_owned();
+        let started = || {
+            super::STANDALONE_RPC_REQUESTS_STARTED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|path| **path == store_name)
+                .count()
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while started() < 16 && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
