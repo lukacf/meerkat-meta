@@ -1130,8 +1130,20 @@ async function olderHistory(host) {
     // reachable only through prepended history. (Counting rows here would
     // mean reading through the transcript, and reaching its top pages.)
     const recentFrameIds = new Set(recentPages().flatMap((item) => item.response.result.frames.map((frame) => frame.id)));
-    const anchorRow = viewport.locator("[data-conversation-row-id]").nth(2);
-    const anchor = await anchorAt(viewport, anchorRow, -10);
+    // A prepend holds the first row the viewport still shows, so measure
+    // that row: the third row placed at the reading position, or the first
+    // later row that can be, when the recent page opens with a turn so short
+    // that the viewport cannot scroll the third row that far. A row below the
+    // held one moves whenever a row above it grows, and the reply of a turn
+    // the recent page cut gains its "Worked for" line once the older page
+    // brings the run's start.
+    let anchor = null;
+    for (let index = 2; !anchor && index < 12; index += 1) {
+      const candidate = await anchorAt(viewport, viewport.locator("[data-conversation-row-id]").nth(index), -10);
+      if (Math.abs(candidate.offset + 10) <= 2) anchor = { ...candidate, index };
+    }
+    assert(anchor, "a recent row can be held at the reading position");
+    result.anchor = anchor;
     let boundary = seed.response.result.frames[0].cursor;
     let exhausted = seed.response.result.exhausted === true;
     for (let index = 0; !exhausted && index < 16; index += 1) {
