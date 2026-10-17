@@ -259,11 +259,8 @@ jobs:
           cache: npm
           cache-dependency-path: console/package-lock.json
 
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
-
+      # No rust cache: the v0.9.2 runs restored none of this job's entries
+      # ("No cache found"), whose keys change with every Cargo.lock.
       - name: Install console dependencies
         run: npm --prefix console ci --silent --no-fund --no-audit
 
@@ -325,24 +322,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
-        with:
-          # The Linux key names the container. rust-cache keys on rustc, the
-          # lock and the environment, none of which changed when the Linux
-          # legs moved into bullseye, so the target directory the host builds
-          # left behind (C objects compiled against glibc 2.39 headers) would
-          # otherwise be restored into the container, the portability gate
-          # would refuse the result, and every retry would restore the same
-          # stale cache because rust-cache saves only on success. macOS and
-          # Windows keys are unchanged.
-          key: release-${{ contains(matrix.target, 'unknown-linux-gnu') && 'bullseye-' || '' }}${{ matrix.target }}
-          # Only successful legs of candidate runs, which build merged main,
-          # write these entries: a failed leg must not leave a half-built
-          # target behind as an exact hit. ~/.cargo/bin is never restored, so
-          # no cached executable can shadow a tool the build or the signing
-          # steps run.
-          cache-bin: false
+      # The legs build without a rust cache: no leg of the v0.9.2 release
+      # restored an entry ("No cache found" on all five), because the keys
+      # change with every Cargo.lock, yet the saved entries took 5.1 GB of
+      # the repository's cache budget. A leg that holds signing secrets also
+      # restores nothing it did not build.
 
       # Meerkat 0.8.40's `openai-live` path pulls `opus` -> `audiopus_sys`,
       # whose build script falls back to compiling bundled Opus with CMake when
@@ -883,7 +867,10 @@ jobs:
   # entry, so they match those jobs) and with no secret at all.
   # publish_registries then publishes the same checkout with --no-verify,
   # holding the token but restoring no cache, so no cached file runs beside
-  # the token. This job never saves.
+  # the token. This job never saves. The restore makes its "packages build"
+  # verdict only as trustworthy as main CI's cache, but a poisoned entry
+  # cannot ship: publish_registries packages again from source, refuses bytes
+  # that differ from the sha256 recorded here, and alone holds the secret.
   verify_crate_packages:
     name: Verify crate packages
     needs: [resolve_release, release_validate]

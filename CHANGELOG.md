@@ -294,6 +294,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with host access still gets absolute paths (see Security). A document may
   name a catalog skill either way.
 
+- Release builds no longer restore or save Rust caches in `build_binaries`
+  and `release_validate`. No v0.9.2 release job restored one of their entries,
+  whose keys change with every `Cargo.lock`, while the entries took 5.4 GB
+  of the repository's Actions cache. `verify_crate_packages` still restores
+  main CI's `meta-dev-bins` entry read-only.
+
 ### Fixed
 
 - Python SDK: when the gateway's stdout closed while `meta/init` was in
@@ -456,6 +462,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   resumable-session target Meta would rewrite to a mob member is refused as
   temporarily unavailable (`ToolError::Unavailable`), as Core refuses a
   stopped driver; other targets and the store-only calls are unchanged.
+
+- A cargo-release dry run (`./scripts/repo-cargo release <version>`) changes
+  nothing. cargo-release runs the pre-release hook in its dry run too, with
+  `DRY_RUN=true`, and the hook (`scripts/release-hook.sh`) bumped the SDK,
+  Bazel and install-doc versions anyway, then failed its parity check against
+  the unbumped Cargo version, so the dry run stopped with the version files
+  modified. The hook now only reports what an execute would bump and stage,
+  and refuses, writing nothing, a `DRY_RUN` other than `true` or `false`.
 
 ### Known limitations
 
