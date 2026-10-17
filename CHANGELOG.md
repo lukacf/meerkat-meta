@@ -24,10 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   after a rebuild instead of silently lapsing. A host filter applied before
   this release still names the old per-build source, so at the first build
   after the upgrade it stops matching and lapses (a callback tool it denied
-  becomes visible again) until the host applies it once more. Helpers spawned
-  before this release keep the per-build witnesses recorded in their
-  inherited ceiling, so their host callback tools stay hidden until they are
-  re-spawned. `fork_off` was not affected: it applies no inherited ceiling.
+  becomes visible again, and one it allowed is hidden) until the host
+  re-applies it once. Helpers spawned before this release keep the per-build
+  witnesses recorded in their inherited ceiling, so their host callback tools
+  stay hidden until they are re-spawned. `fork_off` was not affected: it
+  applies no inherited ceiling.
 
 ## [0.9.2] - 2026-10-16
 
