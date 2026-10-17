@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   commit or an ancestor with the same warm-deps files, so a Meerkat Core bump
   no longer compiles its dependencies cold in every job. CONTRIBUTING.md has
   the release-preparation steps.
+- Python SDK: `MobHandle.spawn_helper` and `MobHandle.fork_helper` take
+  `transport_timeout` (seconds), as `activate_member_instruction` already
+  does. Both calls answer only once the helper's turn has finished, so the
+  transport's default request timeout (60 seconds) gave up on longer helpers
+  while they still ran. The value bounds only the client's wait and is not
+  sent to the gateway, which sets no deadline of its own on a helper run.
+  When the wait runs out the outcome is unknown: the helper may still finish,
+  and a retry spawns another helper.
 
 ### Changed
 

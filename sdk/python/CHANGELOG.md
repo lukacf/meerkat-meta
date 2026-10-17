@@ -4,6 +4,12 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+- `MobHandle.spawn_helper` and `MobHandle.fork_helper` take
+  `transport_timeout` (seconds): how long the call waits for the helper's
+  result. It defaults to the transport's request timeout (60 seconds) and is
+  not sent to the gateway. When it runs out the outcome is unknown: the
+  helper may still finish, so do not retry blindly.
+
 ## 0.9.2
 
 - No SDK API changes; released with Meta 0.9.2 on Meerkat 0.9.2.
