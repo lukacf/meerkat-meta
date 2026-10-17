@@ -4294,10 +4294,44 @@ async fn run_actor_loop_probe<P, F>(
 /// Project a forwarded member event for the drain: the wire envelope plus
 /// any drain-side alert extracted while the member event is still typed.
 fn forwarded_member_event(attributed: AttributedEvent) -> ForwardedMemberEvent {
-    ForwardedMemberEvent {
-        alert: compaction_rejection_alert(&attributed),
-        envelope: attributed_event_to_unified(attributed),
-    }
+    let compaction_rejection = compaction_rejection_alert(&attributed);
+    let failed_run_pages = run_failure_pages(&attributed.envelope.payload);
+    let envelope = attributed_event_to_unified(attributed);
+    let alert = match compaction_rejection {
+        Some(alert) => Some(alert),
+        None if failed_run_pages => host_loop_crash_alert(&envelope),
+        None => None,
+    };
+    ForwardedMemberEvent { envelope, alert }
+}
+
+/// Whether a member event is a run failure that pages as `HostLoopCrash`: a
+/// `RunFailed` whose typed failure class is anything but `Cancelled`. A
+/// cancelled run ended because it was asked to (an interrupt, a mob stop, a
+/// shutdown cancelling in-flight work), not because the member's loop
+/// failed; its `run_failed` event still reaches the console and event log.
+fn run_failure_pages(payload: &AgentEvent) -> bool {
+    matches!(
+        payload,
+        AgentEvent::RunFailed { error_report, .. }
+            if error_report.class != meerkat_core::event::AgentErrorClass::Cancelled
+    )
+}
+
+/// The `HostLoopCrash` alert for a failed member run, named by the event id
+/// and member alias the console and event log key the run by, with the
+/// failure the projected payload carries.
+fn host_loop_crash_alert(envelope: &EventEnvelope<UnifiedEvent>) -> Option<ErrorEvent> {
+    let UnifiedEvent::Agent {
+        agent_id, payload, ..
+    } = &envelope.event
+    else {
+        return None;
+    };
+    Some(ErrorEvent::HostLoopCrash {
+        member_id: agent_id.clone(),
+        error: lifecycle::run_failed_crash_error(&envelope.event_id, payload.as_ref()),
+    })
 }
 
 /// Compaction persistence rejections must page rather than pass as ordinary
@@ -4618,15 +4652,12 @@ mod tests {
             meerkat::build_ephemeral_service(factory, meerkat::Config::default(), 16),
         );
 
-        let definition = meerkat_mob::MobDefinition::from_toml(
-            r#"
-[mob]
-id = "compaction-alert-mob"
-
-[profiles.worker]
-model = "gpt-5.5"
-"#,
-        )
+        // A mob id per call: it names process-wide comms participants, and
+        // the suite runs the tests that bootstrap this runtime concurrently.
+        let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"alert-mob-{}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n",
+            uuid::Uuid::new_v4().simple()
+        ))
         .expect("parse mob definition");
         let mob_spec = MobBootstrapSpec::new(
             definition,
@@ -4807,6 +4838,125 @@ model = "gpt-5.5"
         assert!(
             typed_error.contains("runtime epoch rotated under the coordinator"),
             "error must keep the human rendering: {typed_error}"
+        );
+    }
+
+    /// Push one member `RunFailed` event per `(class, message)` through the
+    /// real drain path and return the alerts the error hook received by the
+    /// time the last event's alert arrived. `#[tokio::test]` runs one thread,
+    /// so the detached hook tasks run in the order the drain fired them: once
+    /// the last event's alert is in, every earlier one is in too.
+    async fn run_failure_alerts_through_drain(
+        failures: Vec<(meerkat_core::event::AgentErrorClass, &str)>,
+    ) -> Vec<ErrorEvent> {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = bootstrap_minimal_runtime(&temp_dir).await;
+
+        let captured: Arc<tokio::sync::Mutex<Vec<ErrorEvent>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let hook_captured = captured.clone();
+        let hook: ErrorHook = Arc::new(move |event| {
+            let hook_captured = hook_captured.clone();
+            Box::pin(async move {
+                hook_captured.lock().await.push(event);
+            })
+        });
+        runtime.set_error_hook(hook);
+
+        let event_tx = runtime.install_test_event_ingress().await;
+        let session_id = meerkat_core::types::SessionId::new();
+        let last_message = failures
+            .last()
+            .map(|(_, message)| (*message).to_string())
+            .expect("at least one failed run");
+        for (seq, (class, message)) in failures.into_iter().enumerate() {
+            let attributed = AttributedEvent {
+                source: AgentRuntimeId::new(AgentIdentity::from("run-worker"), Generation::new(0)),
+                source_fence_token: FenceToken::new(1),
+                role: ProfileName::from("worker"),
+                envelope: meerkat_core::event::EventEnvelope {
+                    event_id: Default::default(),
+                    source: meerkat_core::event::EventSourceIdentity::session(session_id.clone()),
+                    seq: seq as u64,
+                    mob_id: None,
+                    timestamp_ms: 9,
+                    payload: AgentEvent::RunFailed {
+                        session_id: session_id.clone(),
+                        identity: Default::default(),
+                        error_report: meerkat_core::event::AgentErrorReport {
+                            class,
+                            reason: None,
+                            message: message.to_string(),
+                        },
+                        terminal_cause_kind: None,
+                    },
+                },
+            };
+            event_tx
+                .send(forwarded_member_event(attributed))
+                .await
+                .expect("send forwarded event");
+        }
+        runtime
+            .drain_mob_agent_events()
+            .await
+            .expect("drain member events");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let last_paged = captured.lock().await.iter().any(|alert| {
+                matches!(
+                    alert,
+                    ErrorEvent::HostLoopCrash { error, .. } if error.contains(&last_message)
+                )
+            });
+            if last_paged {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the last failed run did not page: {:?}",
+                captured.lock().await
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let alerts = captured.lock().await.clone();
+        runtime.shutdown().await;
+        alerts
+    }
+
+    /// A cancelled member run is not a host loop crash: an interrupt, a stop
+    /// or a shutdown cancels in-flight work on purpose. Only a run that
+    /// failed pages `HostLoopCrash`, decided on the typed failure class.
+    #[tokio::test]
+    async fn a_cancelled_member_run_does_not_page_as_a_host_loop_crash() {
+        use meerkat_core::event::AgentErrorClass;
+
+        let alerts = run_failure_alerts_through_drain(vec![
+            (AgentErrorClass::Cancelled, "Run was cancelled"),
+            (
+                AgentErrorClass::Llm,
+                "LLM error: authentication failed (401)",
+            ),
+        ])
+        .await;
+
+        let crashes: Vec<(&str, &str)> = alerts
+            .iter()
+            .filter_map(|alert| match alert {
+                ErrorEvent::HostLoopCrash { member_id, error } => {
+                    Some((member_id.as_str(), error.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(crashes.len(), 1, "only the failed run pages: {alerts:?}");
+        let (member_id, error) = crashes[0];
+        assert_eq!(member_id, "run-worker:0");
+        assert!(
+            error.starts_with("agent run failed (event_id: evt-agent-")
+                && error.ends_with("class=llm: LLM error: authentication failed (401)"),
+            "the alert keeps its detail: {error}"
         );
     }
 

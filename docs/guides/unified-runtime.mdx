@@ -454,7 +454,7 @@ let runtime = UnifiedRuntime::builder()
 | `actor_loop_stalled` | `probe_waited_secs`, `detail`, `stall_id?`, `prior_resolved_stalls?` | the actor-loop probe's round trip went unanswered past its budget |
 | `actor_loop_recovered` | `stall_id`, `stalled_for_secs` | that stall resolved; the one non-failure variant, correlated by `stall_id` |
 | `actor_loop_terminated` | `detail`, `stall_id?` | the probe observed the actor's command or reply channel closing; the actor is gone |
-| `host_loop_crash` | `member_id`, `error` | a member emitted `run_failed` during event drain |
+| `host_loop_crash` | `member_id`, `error` | a member run failed (`run_failed` during event drain); a run that ended cancelled, by an interrupt, a stop or a shutdown, does not fire it |
 | `rediscover_failure` | `error` | `rediscover` failed |
 | `event_log_flush_failure` | `error` | the operational event log could not flush |
 | `identity_materialization_failure` | `identity`, `initiator?`, `operation`, `error` | identity-first hydration skipped a member |

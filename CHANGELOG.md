@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the semver gate): `ErrorEvent::HostLoopCrash`
+  no longer fires for a member run that ended cancelled (`error_report.class`
+  `cancelled`): an interrupt, a mob stop or a shutdown cancels in-flight work
+  on purpose. Every other failed run still fires it, with the same detail.
+  The cancelled run's `run_failed` event still reaches the console and the
+  event log; a hook that counted cancellations through `host_loop_crash`
+  reads those events instead.
+
+### Fixed
+
+- A shutdown no longer reports the member runs it cancels as
+  `host_loop_crash` errors ("agent run failed ... class=cancelled: Run was
+  cancelled"). The forwarder decides from the run's typed failure class while
+  the member event is still typed (see Breaking).
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
