@@ -1600,8 +1600,14 @@ async fn disabled_and_read_only_modes_fail_closed_at_the_runtime_surface() {
     shutdown(&read_only).await;
 }
 
-#[tokio::test]
-async fn identity_reconcile_reports_dormant_endpoint_as_missing_and_incomplete() {
+/// A runtime (mob id `authority`, unique per test: mob ids name process-wide
+/// comms participants) whose identity-first context wants one managed edge
+/// from an active identity to a dormant one, and the edge reconcile expects
+/// to skip it: the dormant endpoint is not a member.
+async fn runtime_with_a_dormant_edge_endpoint(
+    root: &Path,
+    authority: &str,
+) -> (UnifiedRuntime, DesiredPeerEdge) {
     use meerkat_meta::identity_first::{
         AgentAddressability, AgentIdentity, AgentRuntimeId, CheckpointVersion,
         ContinuityGeneration, ContinuityRecord, DurabilityPolicy, DurableAgentSpec,
@@ -1650,12 +1656,11 @@ async fn identity_reconcile_reports_dormant_endpoint_as_missing_and_incomplete()
         }
     }
 
-    let root = tempfile::tempdir().expect("tempdir");
-    let mut unified = build_runtime(root.path(), "identity-dormant", "classic-member").await;
+    let mut unified = build_runtime(root, authority, "classic-member").await;
     let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
         continuity_store: Arc::new(LocalContinuityStore::in_memory().expect("continuity store")),
         lease_provider: Arc::new(LocalLeaseProvider::new()),
-        runtime_instance_id: "identity-dormant".to_string(),
+        runtime_instance_id: authority.to_string(),
         has_runtime_store: true,
         durability_policy: DurabilityPolicy::SyncWriteThrough,
         bridge: Some(Arc::new(MobSessionBridge::new(unified.mob_handle()))),
@@ -1690,10 +1695,18 @@ async fn identity_reconcile_reports_dormant_endpoint_as_missing_and_incomplete()
         None,
         Some(unified.mob_handle().definition().clone()),
     )));
-
-    let report = unified.reconcile_edges().await;
     let expected =
         DesiredPeerEdge::new(active.to_string(), dormant.to_string()).expect("desired peer edge");
+    (unified, expected)
+}
+
+#[tokio::test]
+async fn identity_reconcile_reports_dormant_endpoint_as_missing_and_incomplete() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let (unified, expected) =
+        runtime_with_a_dormant_edge_endpoint(root.path(), "identity-dormant").await;
+
+    let report = unified.reconcile_edges().await;
     assert_eq!(report.desired_edges, vec![expected.clone()]);
     assert_eq!(report.skipped_missing_members, vec![expected]);
     assert!(report.wired_edges.is_empty());
@@ -1701,6 +1714,44 @@ async fn identity_reconcile_reports_dormant_endpoint_as_missing_and_incomplete()
     assert!(
         !report.is_complete(),
         "a desired edge with a dormant endpoint must remain incomplete"
+    );
+
+    shutdown(&unified).await;
+}
+
+/// An edge reconcile that only skipped edges failed nothing, so it does not
+/// page: lazy identity bootstrap leaves an edge to a dormant endpoint
+/// pending by design, on every boot. The report still lists the edge.
+#[tokio::test]
+async fn an_edge_reconcile_that_only_skipped_edges_does_not_page() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let (mut unified, expected) =
+        runtime_with_a_dormant_edge_endpoint(root.path(), "identity-dormant-alert").await;
+    let captured: Arc<tokio::sync::Mutex<Vec<meerkat_meta::ErrorEvent>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    let hook: meerkat_meta::ErrorHook = Arc::new(move |event| {
+        let sink = sink.clone();
+        Box::pin(async move {
+            sink.lock().await.push(event);
+        })
+    });
+    unified.set_error_hook(hook);
+
+    let report = unified.reconcile_edges().await;
+    assert_eq!(report.skipped_missing_members, vec![expected]);
+    assert!(report.failures.is_empty());
+    // The hook runs on a detached task; this test's runtime has one thread,
+    // so yielding runs every task fired so far.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let alerts = captured.lock().await.clone();
+    assert!(
+        !alerts
+            .iter()
+            .any(|alert| matches!(alert, meerkat_meta::ErrorEvent::ReconcileIncomplete { .. })),
+        "a reconcile that failed nothing must not page: {alerts:?}"
     );
 
     shutdown(&unified).await;

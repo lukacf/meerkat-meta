@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   The cancelled run's `run_failed` event still reaches the console and the
   event log; a hook that counted cancellations through `host_loop_crash`
   reads those events instead.
+- Behaviour-only: `ErrorEvent::ReconcileIncomplete` fires only when an edge
+  operation failed (`failures` above zero; `skipped` still counts the edges
+  skipped beside them). A reconcile that only skipped edges, because an
+  endpoint is not a member yet, logs one INFO line instead: lazy identity
+  bootstrap leaves such edges pending by design, so it fired on every boot
+  with nothing failed. `reconcile_edges()` and `bootstrap_edges_report()`
+  still list those edges in `skipped_missing_members`, and `is_complete()`
+  is unchanged.
 
 ### Fixed
 
@@ -32,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   member, logged at debug, until the mob runs again; the identity stream
   health monitor does not count it toward identity repair. A failure while
   the mob runs keeps the backoff and the first-failure warning.
+- An identity-first boot no longer logs `reconcile_incomplete: 0 failures, N
+  skipped` at ERROR for the edges lazy identity bootstrap leaves pending (see
+  Breaking).
 
 ## [0.9.2] - 2026-10-16
 
