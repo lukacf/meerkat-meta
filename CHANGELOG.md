@@ -62,6 +62,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   not edit the graph can still walk it. `meta/mobpacks/graph_to_flow`,
   export and deploy refuse such a document too, and its validation fails
   with `too_many_graph_instances` or `too_many_graph_edges` (see Security).
+- Behaviour-only: Flow Editor draft replies other than `meta/mobpacks/get`
+  (`create`, `save`, `list`, `undo`, `redo` and `delete`) carry each draft as
+  stored, with the editor document it was saved with. They no longer
+  re-import each valid draft's archive and carry its document with
+  `document_source: "mobpack_archive"` and `document_authority: "artifact"`;
+  `get` still does, for the draft it returns. A document past a structure
+  cap now fails validation with the cap's diagnostic alone.
+
 ### Security
 
 - `Cargo.lock` updates quinn-proto from 0.11.16 to 0.11.19, which clears
@@ -271,6 +279,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   skills its members select in an index of its realms' skills, built once.
   Each selection scanned the realms again, so selecting many skills, or
   naming many that no realm defines, took work quadratic in their number.
+- Flow Editor draft methods no longer validate documents under the draft
+  store lock that every draft call waits for. Every reply (`create`, `save`,
+  `list`, `undo`, `redo`, `delete`) re-imported and re-validated the archive
+  of each valid draft in the store while holding it, and `save`, `undo`,
+  `redo` and `create` built their row under it, so a store of slow drafts
+  held every caller's draft calls, and the blocking threads they wait on,
+  for as long as that took. Rows are now built before the lock is taken
+  (`undo` and `redo` check when they write that the draft has not changed
+  since they read it), and only `get` re-imports an archive, of the one
+  draft it returns, outside the lock. Validation also stops at a document's
+  structure caps, before the checks whose work they bound, and a new draft
+  is refused as soon as the store is read when it already holds 256.
+
 ### Added
 
 - `meta_gateway storage-adopt-predecessor --mob-config <file>` checks the mob

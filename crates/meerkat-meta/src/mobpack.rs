@@ -157,6 +157,49 @@ const EDITOR_SCHEMA_FIELD_TYPES: &[&str] = &[
 
 static MOBPACK_DRAFT_STORE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Hold the draft store lock for one read, check and write of the store.
+/// Every draft call from every caller waits for it.
+fn lock_draft_store() -> Result<DraftStoreLock, String> {
+    let guard = MOBPACK_DRAFT_STORE_LOCK
+        .lock()
+        .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
+    #[cfg(test)]
+    DRAFT_STORE_LOCK_HELD.with(|held| held.set(true));
+    Ok(DraftStoreLock { _guard: guard })
+}
+
+/// The held draft store lock.
+struct DraftStoreLock {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for DraftStoreLock {
+    fn drop(&mut self) {
+        DRAFT_STORE_LOCK_HELD.with(|held| held.set(false));
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Whether this thread holds the draft store lock.
+    static DRAFT_STORE_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The documents this thread validated: in all, and while it held the
+    /// draft store lock.
+    static VALIDATIONS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Counts one document validation for the tests. Outside tests it does
+/// nothing.
+fn count_validation() {
+    #[cfg(test)]
+    VALIDATIONS.with(|count| {
+        let (all, under_lock) = count.get();
+        let locked = DRAFT_STORE_LOCK_HELD.with(std::cell::Cell::get);
+        count.set((all + 1, under_lock + u64::from(locked)));
+    });
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MobpackRuntimeCatalogState {
     pub loaded_modules: Vec<String>,
@@ -4379,9 +4422,7 @@ fn enforce_mobpack_draft_expected_revision(params: &Value, source: &str) -> Resu
     }
     let id = mobpack_draft_guard_id(params)
         .ok_or_else(|| format!("{source} expected revision/etag requires draft id"))?;
-    let _guard = MOBPACK_DRAFT_STORE_LOCK
-        .lock()
-        .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
+    let _guard = lock_draft_store()?;
     let path = mobpack_draft_store_path(params).map_err(|refusal| refusal.message())?;
     let rows = read_mobpack_draft_store(&path)?;
     let existing = rows.get(&id);
@@ -4402,6 +4443,16 @@ fn enforce_mobpack_draft_expected_revision(params: &Value, source: &str) -> Resu
         }
     }
     Ok(())
+}
+
+/// Stamp a draft row, built before the store was locked, with the revision
+/// it is stored at.
+fn set_draft_row_revision(row: &mut Value, id: &str, revision: u64) {
+    let etag = mobpack_draft_etag(id, revision);
+    row["revision"] = json!(revision);
+    row["draft_revision"] = json!(revision);
+    row["etag"] = json!(etag);
+    row["draft_etag"] = json!(etag);
 }
 
 fn mobpack_draft_row_from_params(params: &Value, revision: u64) -> Result<Value, String> {
@@ -4610,6 +4661,7 @@ fn create_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
         .filter(|value| !value.is_empty())
         .unwrap_or(fallback_name);
     let document = clone_draft_template_document(&template, name)?;
+    let path = mobpack_draft_store_path(params)?;
     let validation = validate_document(&document);
     let trigger = params
         .get("trigger")
@@ -4622,18 +4674,20 @@ fn create_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
         .get("source")
         .and_then(Value::as_str)
         .unwrap_or("meta/mobpacks/create");
-    let _guard = MOBPACK_DRAFT_STORE_LOCK
-        .lock()
-        .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
-    let path = mobpack_draft_store_path(params)?;
-    let (mut rows, before) = read_draft_store(&path)?;
-    let id = mobpack_create_draft_id(params, &document, &rows);
     let updated_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
     let validation_value = serde_json::to_value(&validation).unwrap_or(Value::Null);
+    // Exported before the store is locked: the lock covers only the store's
+    // read, checks and write.
     let artifact = mobpack_registry_artifact_for_document(&document, &validation_value);
+    let lock = lock_draft_store()?;
+    let (mut rows, before) = read_draft_store(&path)?;
+    let id = mobpack_create_draft_id(params, &document, &rows);
+    if !rows.contains_key(&id) && rows.len() >= MOBPACK_DRAFT_STORE_MAX_DRAFTS {
+        return Err(DraftStoreRefusal::TooManyDrafts.into());
+    }
     let revision = 1_u64;
     let draft_etag = mobpack_draft_etag(&id, revision);
     let row = json!({
@@ -4658,6 +4712,7 @@ fn create_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
     rows.insert(id.clone(), row.clone());
     let encoded = admit_draft_store_write(&mut rows, &id, before)?;
     write_draft_store_bytes(&path, &encoded)?;
+    drop(lock);
     // The create response keeps the freshly cloned editor document (no
     // artifact re-import); only the store-internal history fields are
     // projected to can_undo/can_redo.
@@ -4672,8 +4727,20 @@ fn create_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
     ))
 }
 
+/// Every stored draft, as a reply carries it ([`stored_draft_row`]).
 fn sorted_mobpack_draft_rows(rows: &BTreeMap<String, Value>) -> Vec<Value> {
-    rows.values().map(normalize_mobpack_draft_row).collect()
+    rows.values().map(stored_draft_row).collect()
+}
+
+/// A stored draft as a reply carries it: without its undo and redo
+/// snapshots, or, for a document past the skill content cap (a store written
+/// before the cap, or by hand), a placeholder that says why.
+fn stored_draft_row(row: &Value) -> Value {
+    let stored = row.get("document").map_or(0, value_skill_content_bytes);
+    if stored > MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES {
+        return refused_draft_row(row, &document_skill_content_too_large(stored));
+    }
+    draft_row_without_history(row)
 }
 
 /// History snapshots stay in the store; an outgoing row only advertises
@@ -4699,15 +4766,13 @@ fn draft_row_without_history(row: &Value) -> Value {
     Value::Object(stripped)
 }
 
+/// The draft `get` returns: the stored draft ([`stored_draft_row`]) with its
+/// document re-imported from the draft's archive once it validated, so the
+/// archive is the draft's authority. Only `get` re-imports, one draft per
+/// call and outside the draft store lock; every other reply carries its
+/// drafts as stored.
 fn normalize_mobpack_draft_row(row: &Value) -> Value {
-    // A stored document past the skill content cap is never returned (a
-    // store written before the cap, or by hand): list and get answer with a
-    // placeholder that says why.
-    let stored = row.get("document").map_or(0, value_skill_content_bytes);
-    if stored > MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES {
-        return refused_draft_row(row, &document_skill_content_too_large(stored));
-    }
-    let mut row = draft_row_without_history(row);
+    let mut row = stored_draft_row(row);
     let Some(artifact) = row.get("artifact") else {
         return row;
     };
@@ -4790,11 +4855,10 @@ fn list_drafts(
     params: &Value,
     runtime: Option<&MobpackRuntimeCatalogState>,
 ) -> Result<Value, DraftStoreFailure> {
-    let _guard = MOBPACK_DRAFT_STORE_LOCK
-        .lock()
-        .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
     let path = mobpack_draft_store_path(params)?;
-    let rows = read_mobpack_draft_store(&path)?;
+    let lock = lock_draft_store()?;
+    let (rows, _) = read_draft_store(&path)?;
+    drop(lock);
     let runtime_rows = runtime
         .map(|state| state.runtime_flow_rows.clone())
         .unwrap_or_default();
@@ -4854,16 +4918,14 @@ fn get_draft(
             "row": row,
         }));
     }
-    let _guard = MOBPACK_DRAFT_STORE_LOCK
-        .lock()
-        .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
     let path = mobpack_draft_store_path(params)?;
-    let rows = read_mobpack_draft_store(&path)?;
+    let lock = lock_draft_store()?;
+    let (rows, _) = read_draft_store(&path)?;
+    drop(lock);
     let row = rows
         .get(id)
-        .cloned()
         .ok_or_else(|| format!("mobpack draft not found: {id}"))?;
-    let row = normalize_mobpack_draft_row(&row);
+    let row = normalize_mobpack_draft_row(row);
     Ok(draft_store_reply(
         json!({
             "source": "meta/mobpacks/get",
@@ -4879,16 +4941,19 @@ pub fn save_mobpack_draft(params: &Value) -> Result<Value, String> {
 }
 
 fn save_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
-    let candidate = mobpack_draft_row_from_params(params, 0)?;
-    let id = candidate["id"]
+    let path = mobpack_draft_store_path(params)?;
+    // The row is built (validated and exported) before the store is locked:
+    // the lock covers only the store's read, checks and write.
+    let mut row = mobpack_draft_row_from_params(params, 0)?;
+    let id = row["id"]
         .as_str()
         .ok_or_else(|| "mobpack draft row missing id".to_string())?
         .to_string();
-    let _guard = MOBPACK_DRAFT_STORE_LOCK
-        .lock()
-        .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
-    let path = mobpack_draft_store_path(params)?;
+    let lock = lock_draft_store()?;
     let (mut rows, before) = read_draft_store(&path)?;
+    if !rows.contains_key(&id) && rows.len() >= MOBPACK_DRAFT_STORE_MAX_DRAFTS {
+        return Err(DraftStoreRefusal::TooManyDrafts.into());
+    }
     let existing = rows.get(&id);
     let current_revision = mobpack_draft_revision_from_row(existing);
     if let Some(expected_revision) = mobpack_draft_expected_revision(params)
@@ -4906,15 +4971,13 @@ fn save_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
             ).into());
         }
     }
-    let mut row = mobpack_draft_row_from_params(params, current_revision.saturating_add(1))?;
+    set_draft_row_revision(&mut row, &id, current_revision.saturating_add(1));
     attach_draft_history_on_save(existing, &mut row);
     rows.insert(id.clone(), row);
     let encoded = admit_draft_store_write(&mut rows, &id, before)?;
     write_draft_store_bytes(&path, &encoded)?;
-    let row = rows
-        .get(&id)
-        .map(normalize_mobpack_draft_row)
-        .unwrap_or_default();
+    drop(lock);
+    let row = rows.get(&id).map(stored_draft_row).unwrap_or_default();
     Ok(draft_store_reply(
         json!({
             "source": "meta/mobpacks/save",
@@ -4996,11 +5059,12 @@ fn step_mobpack_draft_history(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("{source} requires id"))?
         .to_string();
-    let _guard = MOBPACK_DRAFT_STORE_LOCK
-        .lock()
-        .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
     let path = mobpack_draft_store_path(params)?;
-    let (mut rows, before) = read_draft_store(&path)?;
+    // The draft is read under the lock and its restored row built without
+    // it; the write below checks the draft is still the one read.
+    let lock = lock_draft_store()?;
+    let (rows, _) = read_draft_store(&path)?;
+    drop(lock);
     let existing = rows
         .get(&id)
         .cloned()
@@ -5040,7 +5104,7 @@ fn step_mobpack_draft_history(
                         "source": source,
                         "stepped": false,
                         "reason": format!("nothing to {head}"),
-                        "row": normalize_mobpack_draft_row(&existing),
+                        "row": stored_draft_row(&existing),
                         "rows": sorted_mobpack_draft_rows(&rows),
                     }),
                     &path,
@@ -5056,7 +5120,7 @@ fn step_mobpack_draft_history(
                         "source": source,
                         "stepped": false,
                         "reason": format!("nothing to {head}"),
-                        "row": normalize_mobpack_draft_row(&existing),
+                        "row": stored_draft_row(&existing),
                         "rows": sorted_mobpack_draft_rows(&rows),
                     }),
                     &path,
@@ -5081,13 +5145,22 @@ fn step_mobpack_draft_history(
     )?;
     row["history"] = Value::Array(history);
     row["future"] = Value::Array(future);
+    let lock = lock_draft_store()?;
+    let (mut rows, before) = read_draft_store(&path)?;
+    let stored_revision = rows
+        .get(&id)
+        .map_or(0, |stored| mobpack_draft_revision_from_row(Some(stored)));
+    if !rows.contains_key(&id) || stored_revision != current_revision {
+        return Err(format!(
+            "{source} draft revision conflict for {id}: expected {current_revision}, found {stored_revision}"
+        )
+        .into());
+    }
     rows.insert(id.clone(), row);
     let encoded = admit_draft_store_write(&mut rows, &id, before)?;
     write_draft_store_bytes(&path, &encoded)?;
-    let row = rows
-        .get(&id)
-        .map(normalize_mobpack_draft_row)
-        .unwrap_or_default();
+    drop(lock);
+    let row = rows.get(&id).map(stored_draft_row).unwrap_or_default();
     Ok(draft_store_reply(
         json!({
             "source": source,
@@ -5111,11 +5184,9 @@ fn delete_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "meta/mobpacks/delete requires id".to_string())?
         .to_string();
-    let _guard = MOBPACK_DRAFT_STORE_LOCK
-        .lock()
-        .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
     let path = mobpack_draft_store_path(params)?;
-    let mut rows = read_mobpack_draft_store(&path)?;
+    let lock = lock_draft_store()?;
+    let (mut rows, _) = read_draft_store(&path)?;
     let current_revision = mobpack_draft_revision_from_row(rows.get(&id));
     if let Some(expected_revision) = mobpack_draft_expected_revision(params)
         && expected_revision != current_revision
@@ -5134,6 +5205,7 @@ fn delete_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
     }
     let deleted = rows.remove(&id).is_some();
     write_mobpack_draft_store(&path, &rows)?;
+    drop(lock);
     Ok(draft_store_reply(
         json!({
             "source": "meta/mobpacks/delete",
@@ -19237,6 +19309,7 @@ fn emit_json_toml(lines: &mut RenderedLines, table: &str, value: &Value) {
 }
 
 fn validate_document(document: &MobpackDocument) -> MobpackValidationResult {
+    count_validation();
     let mut diagnostics = MobpackDiagnostics::default();
     if document.schema_version.trim() != MOBPACK_SCHEMA_VERSION {
         diagnostics.push(MobpackDiagnostic {
@@ -19258,6 +19331,11 @@ fn validate_document(document: &MobpackDocument) -> MobpackValidationResult {
         });
     }
     validate_document_structure_caps(document, &mut diagnostics);
+    // A document past a structure cap is refused with the cap: the checks
+    // after the caps do the work the caps exist to bound.
+    if diagnostics.has_error() {
+        return invalid_validation_result(diagnostics);
+    }
     validate_removed_budget_split_policies(document, &mut diagnostics);
     validate_launch_modes(document, &mut diagnostics);
     validate_deploy_settings(&document.deploy, &mut diagnostics);
@@ -31203,12 +31281,19 @@ model = "gpt-5.5"
             "{deployed}"
         );
 
+        // The editor document the draft opens with: `get` re-imports its
+        // archive; the save reply carries the draft as stored.
+        let opened = get_mobpack_draft(&json!({
+            "store_path": store_path,
+            "id": "action_guard"
+        }))
+        .expect("get guarded draft");
         let fresh_params = json!({
             "store_path": store_path,
             "id": "action_guard",
             "expected_revision": 1,
             "expected_etag": "action_guard:1",
-            "document": saved["row"]["document"].clone(),
+            "document": opened["row"]["document"].clone(),
             "output_dir": dir.path().join("fresh-deploy"),
             "prompt": "Reply with exactly OK.",
             "execute": false,
@@ -31304,8 +31389,9 @@ model = "gpt-5.5"
         assert_eq!(saved["row"]["draft_etag"], json!("registry_draft:1"));
         assert_eq!(saved["row"]["document"]["name"], json!("Registry Draft"));
         assert_eq!(saved["row"]["document_kind"], json!("editor_projection"));
-        assert_eq!(saved["row"]["document_source"], json!("mobpack_archive"));
-        assert_eq!(saved["row"]["document_authority"], json!("artifact"));
+        // Only `get` re-imports the archive; the save reply carries the
+        // draft as stored.
+        assert_eq!(saved["row"]["document_authority"], Value::Null);
         assert_eq!(saved["row"]["stage"], json!("valid"));
         assert_eq!(saved["row"]["artifact"]["kind"], json!("mobpack_archive"));
         assert_eq!(saved["row"]["artifact"]["deployable"], json!(true));
@@ -31331,11 +31417,7 @@ model = "gpt-5.5"
         assert_eq!(listed["rows"][0]["id"], json!("registry_draft"));
         assert_eq!(listed["rows"][0]["revision"], json!(1));
         assert_eq!(listed["rows"][0]["draft_etag"], json!("registry_draft:1"));
-        assert_eq!(
-            listed["rows"][0]["document_source"],
-            json!("mobpack_archive")
-        );
-        assert_eq!(listed["rows"][0]["document_authority"], json!("artifact"));
+        assert_eq!(listed["rows"][0]["document_authority"], Value::Null);
         assert_eq!(listed["rows"][0]["artifact"]["deployable"], json!(true));
 
         let fetched = get_mobpack_draft(&json!({
@@ -31478,14 +31560,16 @@ model = "gpt-5.5"
         });
         write_mobpack_draft_store(&store_path, &rows).expect("write stale draft store");
 
+        // A list carries each draft as stored; only `get` re-imports the
+        // archive of the one draft it returns.
         let listed =
             list_mobpack_drafts(&json!({ "store_path": store_path })).expect("list drafts");
         let listed_row = &listed["rows"][0];
-        assert_eq!(listed_row["document_source"], json!("mobpack_archive"));
-        assert_eq!(listed_row["document_authority"], json!("artifact"));
-        assert_eq!(listed_row["document"]["mob_id"], json!("review-pack"));
-        assert_eq!(listed_row["document"]["name"], json!("Artifact Authority"));
-        assert_eq!(listed_row["validation"]["ok"], json!(true));
+        assert_eq!(listed_row["document_authority"], Value::Null);
+        assert_eq!(
+            listed_row["document"]["mob_id"],
+            json!("stale-registry-projection")
+        );
         assert_eq!(listed_row["artifact"]["pack_sha256"], pack_sha256);
 
         let fetched = get_mobpack_draft(&json!({
@@ -39537,5 +39621,141 @@ condition = { op = "eq", path = "params.kind", value = "d" }
             let document = many_skills_document(count);
             with_mobpack_work(|| render_editor_document_mob_toml(&document)).1
         });
+    }
+
+    /// Runs `f`, returning its result and the documents validated on this
+    /// thread meanwhile: in all, and while it held the draft store lock.
+    fn with_validations<R>(f: impl FnOnce() -> R) -> (R, (u64, u64)) {
+        let before = VALIDATIONS.with(std::cell::Cell::get);
+        let result = f();
+        let after = VALIDATIONS.with(std::cell::Cell::get);
+        (result, (after.0 - before.0, after.1 - before.1))
+    }
+
+    /// A draft store holding `count` valid drafts.
+    fn draft_store_with_valid_drafts(count: usize) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("drafts.json");
+        for index in 0..count {
+            save_mobpack_draft(&json!({
+                "store_path": store_path,
+                "id": format!("draft_{index}"),
+                "document": valid_document(),
+            }))
+            .expect("save a valid draft");
+        }
+        (dir, store_path)
+    }
+
+    /// A draft reply validates no draft but the one its call writes: every
+    /// reply re-imported and re-validated the archive of each valid draft in
+    /// the store, so its work grew with the store.
+    #[test]
+    fn draft_replies_validate_no_other_draft() {
+        let validations = |count: usize| {
+            let (_dir, store_path) = draft_store_with_valid_drafts(count);
+            let (_, listed) = with_validations(|| {
+                list_mobpack_drafts(&json!({ "store_path": store_path })).expect("list drafts")
+            });
+            let (_, saved) = with_validations(|| {
+                save_mobpack_draft(&json!({
+                    "store_path": store_path,
+                    "id": "probe",
+                    "document": valid_document(),
+                }))
+                .expect("save a draft")
+            });
+            (listed.0, saved.0)
+        };
+        assert_eq!(validations(1), validations(6));
+    }
+
+    /// No draft method validates a document while it holds the draft store
+    /// lock, which every draft call from every caller waits for: save, undo
+    /// and redo rebuilt their row under it, create exported its archive under
+    /// it, and every reply re-validated each stored draft under it.
+    #[test]
+    fn draft_methods_validate_nothing_under_the_store_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("drafts.json");
+        let mut renamed = valid_document();
+        renamed.name = "Renamed Draft".to_string();
+        let under_lock = |name: &'static str, call: &dyn Fn() -> Value| {
+            let (_, (_, under_lock)) = with_validations(call);
+            (name, under_lock)
+        };
+        let counts = [
+            under_lock("create", &|| {
+                create_mobpack_draft(&json!({ "store_path": store_path, "name": "Created" }))
+                    .expect("create a draft")
+            }),
+            under_lock("save", &|| {
+                save_mobpack_draft(&json!({
+                    "store_path": store_path,
+                    "id": "stepped",
+                    "document": valid_document(),
+                }))
+                .expect("save a draft")
+            }),
+            under_lock("save again", &|| {
+                save_mobpack_draft(&json!({
+                    "store_path": store_path,
+                    "id": "stepped",
+                    "document": renamed,
+                }))
+                .expect("save the draft again")
+            }),
+            under_lock("undo", &|| {
+                undo_mobpack_draft(&json!({ "store_path": store_path, "id": "stepped" }))
+                    .expect("undo")
+            }),
+            under_lock("redo", &|| {
+                redo_mobpack_draft(&json!({ "store_path": store_path, "id": "stepped" }))
+                    .expect("redo")
+            }),
+            under_lock("list", &|| {
+                list_mobpack_drafts(&json!({ "store_path": store_path })).expect("list drafts")
+            }),
+            under_lock("get", &|| {
+                get_mobpack_draft(&json!({ "store_path": store_path, "id": "stepped" }))
+                    .expect("get a draft")
+            }),
+        ];
+        assert_eq!(
+            counts,
+            [
+                ("create", 0),
+                ("save", 0),
+                ("save again", 0),
+                ("undo", 0),
+                ("redo", 0),
+                ("list", 0),
+                ("get", 0),
+            ]
+        );
+    }
+
+    /// Validation stops at the structure caps: a document past one is refused
+    /// with that cap alone, and none of the checks after the caps, whose work
+    /// the caps bound, reads it.
+    #[test]
+    fn validation_stops_at_the_structure_caps() {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.members = Value::Array(
+            (0..=MOBPACK_MAX_MEMBERS)
+                .map(|index| json!({ "id": format!("m{index}"), "name": format!("M{index}") }))
+                .collect(),
+        );
+        // Steps without an id or a type: each is an error a full validation
+        // reports.
+        document.flow = json!({ "steps": [{}, {}, {}] });
+        let errors: BTreeSet<String> = validate_document(&document)
+            .diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.severity == "error")
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert_eq!(errors, BTreeSet::from(["too_many_members".to_string()]));
     }
 }
