@@ -164,7 +164,8 @@ runs, so its memory does not grow with the number of problems a document
 has. Every method that takes a document
 (and import and draft save) refuses one whose skill content, summed over
 every skill entry, passes 16 MiB. A document with more than 1000 members,
-more than 256 branches in one parallel or branch step, or more than 1024
+a member that lists more than 1024 tools (`too_many_member_tools`), more
+than 256 branches in one parallel or branch step, or more than 1024
 branches in its flow is refused before it is rendered, and the rendered
 `mob.toml`, `definition.json` and expected schema files are each refused
 past 16 MiB. A document whose graph has more than 2048 instances or more

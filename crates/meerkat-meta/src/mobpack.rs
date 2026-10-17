@@ -11936,8 +11936,9 @@ fn reconcile_document_after_member_change(document: &mut MobpackDocument) {
         .filter_map(|member| member.get("id").and_then(Value::as_str))
         .map(ToString::to_string)
         .collect::<BTreeSet<_>>();
-    prune_flow_steps_for_members(&mut document.flow, &members, &member_ids);
-    prune_graph_instances_for_members(&mut document.instances, &members, &member_ids);
+    let member_tools = MemberTools::of(&members);
+    prune_flow_steps_for_members(&mut document.flow, &member_tools, &member_ids);
+    prune_graph_instances_for_members(&mut document.instances, &member_tools, &member_ids);
     prune_graph_edges_for_instances(&mut document.edges, &document.instances);
     reconcile_flow_step_launch_modes(document);
 }
@@ -12077,13 +12078,51 @@ fn member_tool_set(members: &[Value], member_id: &str) -> BTreeSet<String> {
     members
         .iter()
         .find(|member| {
+            count_mobpack_work();
             member
                 .get("id")
                 .and_then(Value::as_str)
                 .is_some_and(|id| id == member_id)
         })
-        .map(|member| string_vec(member.get("tools")).into_iter().collect())
+        .map(member_tools)
         .unwrap_or_default()
+}
+
+/// A member's tools, each read as one unit of work.
+fn member_tools(member: &Value) -> BTreeSet<String> {
+    string_vec(member.get("tools"))
+        .into_iter()
+        .inspect(|_| count_mobpack_work())
+        .collect()
+}
+
+/// The tools of a document's members by id, collected once: for each id the
+/// tools of the first member with it. Reconciling a document with its
+/// members looks each member step's and member instance's tools up here;
+/// each of them used to scan the members and collect its member's tools
+/// again.
+struct MemberTools<'a> {
+    by_id: BTreeMap<&'a str, BTreeSet<String>>,
+}
+
+impl<'a> MemberTools<'a> {
+    fn of(members: &'a [Value]) -> Self {
+        let mut by_id = BTreeMap::new();
+        for member in members {
+            count_mobpack_work();
+            if let Some(id) = member.get("id").and_then(Value::as_str) {
+                by_id.entry(id).or_insert_with(|| member_tools(member));
+            }
+        }
+        Self { by_id }
+    }
+
+    /// The tools of the member with this id; none for an id no member has.
+    fn tools_of(&self, member_id: &str) -> &BTreeSet<String> {
+        static NO_TOOLS: BTreeSet<String> = BTreeSet::new();
+        count_mobpack_work();
+        self.by_id.get(member_id).unwrap_or(&NO_TOOLS)
+    }
 }
 
 fn prune_tool_scope_fields(value: &mut Value, allowed_tools: &BTreeSet<String>) {
@@ -12108,18 +12147,18 @@ fn prune_tool_scope_fields(value: &mut Value, allowed_tools: &BTreeSet<String>) 
 
 fn prune_flow_steps_for_members(
     flow: &mut Value,
-    members: &[Value],
+    member_tools: &MemberTools<'_>,
     member_ids: &BTreeSet<String>,
 ) {
     let Some(steps) = flow.get_mut("steps").and_then(Value::as_array_mut) else {
         return;
     };
-    prune_step_array_for_members(steps, members, member_ids);
+    prune_step_array_for_members(steps, member_tools, member_ids);
 }
 
 fn prune_step_array_for_members(
     steps: &mut Vec<Value>,
-    members: &[Value],
+    member_tools: &MemberTools<'_>,
     member_ids: &BTreeSet<String>,
 ) {
     steps.retain(|step| {
@@ -12133,15 +12172,15 @@ fn prune_step_array_for_members(
         match step.get("type").and_then(Value::as_str) {
             Some("member") => {
                 let role = step.get("role").and_then(Value::as_str).unwrap_or_default();
-                let allowed_tools = member_tool_set(members, role);
-                prune_tool_scope_fields(step, &allowed_tools);
+                let allowed_tools = member_tools.tools_of(role);
+                prune_tool_scope_fields(step, allowed_tools);
             }
             Some("adaptive") => {
                 prune_adaptive_step_member_refs(step, member_ids);
             }
             Some("repeat") => {
                 if let Some(nested) = step.get_mut("steps").and_then(Value::as_array_mut) {
-                    prune_step_array_for_members(nested, members, member_ids);
+                    prune_step_array_for_members(nested, member_tools, member_ids);
                 }
             }
             Some("branch" | "parallel") => {
@@ -12150,12 +12189,12 @@ fn prune_step_array_for_members(
                         if let Some(branch_steps) =
                             branch.get_mut("steps").and_then(Value::as_array_mut)
                         {
-                            prune_step_array_for_members(branch_steps, members, member_ids);
+                            prune_step_array_for_members(branch_steps, member_tools, member_ids);
                         }
                     }
                 }
                 if let Some(fallback) = step.get_mut("fallback").and_then(Value::as_array_mut) {
-                    prune_step_array_for_members(fallback, members, member_ids);
+                    prune_step_array_for_members(fallback, member_tools, member_ids);
                 }
             }
             _ => {}
@@ -12165,7 +12204,7 @@ fn prune_step_array_for_members(
 
 fn prune_graph_instances_for_members(
     instances: &mut Value,
-    members: &[Value],
+    member_tools: &MemberTools<'_>,
     member_ids: &BTreeSet<String>,
 ) {
     let Some(instances) = instances.as_array_mut() else {
@@ -12190,8 +12229,8 @@ fn prune_graph_instances_for_members(
         let Some(member_id) = instance.get("memberId").and_then(Value::as_str) else {
             continue;
         };
-        let allowed_tools = member_tool_set(members, member_id);
-        prune_tool_scope_fields(instance, &allowed_tools);
+        let allowed_tools = member_tools.tools_of(member_id);
+        prune_tool_scope_fields(instance, allowed_tools);
     }
 }
 
@@ -17976,6 +18015,8 @@ impl RenderedLines {
 
 /// The most members one document may have.
 const MOBPACK_MAX_MEMBERS: usize = 1000;
+/// The most tools one member may list.
+const MOBPACK_MAX_MEMBER_TOOLS: usize = 1024;
 /// The most branches one parallel or branch step may have.
 const MOBPACK_MAX_STEP_BRANCHES: usize = 256;
 /// The most branches one flow may have, nested steps included. Branches
@@ -17988,9 +18029,10 @@ const MOBPACK_MAX_GRAPH_INSTANCES: usize = 2048;
 const MOBPACK_MAX_GRAPH_EDGES: usize = 8192;
 
 /// Structure caps checked before a document is rendered: at most
-/// [`MOBPACK_MAX_MEMBERS`] members, [`MOBPACK_MAX_STEP_BRANCHES`] branches in
-/// one step and [`MOBPACK_MAX_FLOW_BRANCHES`] in the flow, and the graph caps
-/// of [`graph_structure_refusals`].
+/// [`MOBPACK_MAX_MEMBERS`] members, [`MOBPACK_MAX_MEMBER_TOOLS`] tools listed
+/// by one member, [`MOBPACK_MAX_STEP_BRANCHES`] branches in one step and
+/// [`MOBPACK_MAX_FLOW_BRANCHES`] in the flow, and the graph caps of
+/// [`graph_structure_refusals`].
 fn validate_document_structure_caps(
     document: &MobpackDocument,
     diagnostics: &mut MobpackDiagnostics,
@@ -18006,6 +18048,27 @@ fn validate_document_structure_caps(
             ),
             path: Some("members".to_string()),
         });
+    }
+    for (member_index, member) in document
+        .members
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let tools = member_tool_count(member);
+        if tools > MOBPACK_MAX_MEMBER_TOOLS {
+            let id = member.get("id").and_then(Value::as_str).unwrap_or("member");
+            diagnostics.push(MobpackDiagnostic {
+                severity: "error".to_string(),
+                code: "too_many_member_tools".to_string(),
+                message: format!(
+                    "member '{id}' lists {tools} tools, more than \
+                     {MOBPACK_MAX_MEMBER_TOOLS}; refusing to render it"
+                ),
+                path: Some(format!("members[{member_index}].tools")),
+            });
+        }
     }
     let mut flow_branches = 0_usize;
     let mut pending = vec![document.flow.get("steps")];
@@ -18045,6 +18108,19 @@ fn validate_document_structure_caps(
         });
     }
     diagnostics.extend(graph_structure_refusals(document));
+}
+
+/// How many tools a member lists: the entries of its `tools` list, or of its
+/// comma-separated `tools` string.
+fn member_tool_count(member: &Value) -> usize {
+    match member.get("tools") {
+        Some(Value::Array(tools)) => tools.len(),
+        Some(Value::String(tools)) => tools
+            .split(',')
+            .filter(|tool| !tool.trim().is_empty())
+            .count(),
+        _ => 0,
+    }
 }
 
 /// The graph structure caps a document does not pass, each as a refusal: at
@@ -39901,5 +39977,97 @@ condition = { op = "eq", path = "params.kind", value = "d" }
                 & 0o777
         };
         assert_eq!((mode(&state), mode(&store_path)), (0o700, 0o600));
+    }
+
+    /// A document whose one member lists `size` tools, with `size` member
+    /// steps and `size` member instances, each scoped to one of its tools.
+    fn document_with_a_member_of_many_tools(size: usize) -> MobpackDocument {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        let tools: Vec<String> = (0..size).map(|index| format!("tool_{index}")).collect();
+        document.members = json!([{ "id": "worker", "name": "Worker", "tools": tools }]);
+        let steps: Vec<Value> = (0..size)
+            .map(|index| {
+                json!({
+                    "id": format!("s{index}"),
+                    "type": "member",
+                    "role": "worker",
+                    "allowedTools": [format!("tool_{index}")],
+                })
+            })
+            .collect();
+        document.flow = json!({ "steps": steps });
+        let instances: Vec<Value> = (0..size)
+            .map(|index| {
+                json!({
+                    "id": format!("n{index}"),
+                    "memberId": "worker",
+                    "col": index,
+                    "allowedTools": [format!("tool_{index}")],
+                })
+            })
+            .collect();
+        document.instances = Value::Array(instances);
+        document
+    }
+
+    /// Reconciling a document with its members looks each member step's and
+    /// member instance's tools up in an index of the members' tools, built
+    /// once. Each step and instance scanned the members and collected all of
+    /// its member's tools again, so a member of many tools in many steps took
+    /// work quadratic in their number.
+    #[test]
+    fn member_reconciliation_work_grows_linearly_with_steps_and_tools() {
+        let mut document = document_with_a_member_of_many_tools(3);
+        document.members[0]["tools"] = json!(["tool_0", "tool_2"]);
+        reconcile_document_after_member_change(&mut document);
+        assert_eq!(
+            (
+                &document.flow["steps"][1]["allowedTools"],
+                &document.flow["steps"][2]["allowedTools"],
+                &document.instances[1]["allowedTools"],
+                &document.instances[2]["allowedTools"],
+            ),
+            (
+                &json!([]),
+                &json!(["tool_2"]),
+                &json!([]),
+                &json!(["tool_2"])
+            ),
+        );
+        assert_work_grows_linearly("a member of n tools in n steps and n instances", |size| {
+            let mut document = document_with_a_member_of_many_tools(size);
+            with_mobpack_work(|| reconcile_document_after_member_change(&mut document)).1
+        });
+    }
+
+    /// A member lists at most [`MOBPACK_MAX_MEMBER_TOOLS`] tools: past that,
+    /// validation fails with `too_many_member_tools` alone, and rendering
+    /// refuses the document.
+    #[test]
+    fn a_member_past_the_tool_cap_is_refused() {
+        let with_tools = |count: usize| {
+            let mut document = valid_document();
+            document.mob_toml = None;
+            let tools: Vec<String> = (0..count).map(|index| format!("tool_{index}")).collect();
+            document.members = json!([{ "id": "worker", "name": "Worker", "tools": tools }]);
+            document
+        };
+        let codes = |document: &MobpackDocument| {
+            validate_document(document)
+                .diagnostics
+                .into_iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<BTreeSet<_>>()
+        };
+        let past = with_tools(MOBPACK_MAX_MEMBER_TOOLS + 1);
+        assert_eq!(
+            codes(&past),
+            BTreeSet::from(["too_many_member_tools".to_string()])
+        );
+        let refusal = render_editor_document_mob_toml(&past)
+            .expect_err("rendering a member past the tool cap is refused");
+        assert!(refusal.contains("refusing to render it"), "{refusal}");
+        assert!(!codes(&with_tools(MOBPACK_MAX_MEMBER_TOOLS)).contains("too_many_member_tools"));
     }
 }

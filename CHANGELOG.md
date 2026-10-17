@@ -305,6 +305,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   requests at once, and the rest wait for a slot. Any local process can call
   it, and every request it handled ran on the blocking pool, so it took any
   number of requests at once.
+- Reconciling a Flow Editor document with its members (the member
+  operations of `meta/mobpacks/apply_operation`, `reconcile_members` and
+  `delete_member` among them) looks each member step's and member
+  instance's tools up in an index of the members' tools, built once. Each
+  step and instance scanned the members and collected all of its member's
+  tools again, so one request with a member of many tools in many steps
+  took work quadratic in their number. A member now lists at most 1024
+  tools: past that, validation fails with `too_many_member_tools`, and
+  export and deploy refuse the document.
 
 ### Added
 
