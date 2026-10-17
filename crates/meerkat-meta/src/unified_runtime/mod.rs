@@ -3041,13 +3041,17 @@ fn forwarder_should_subscribe(status: MobMemberStatus) -> bool {
 /// Whether `handle`'s mob is stopping or stopped, so a member subscribe that
 /// failed is the mob tearing its members down rather than a spawn or resume
 /// race: the mob's admission is closed (it never reopens), or its last
-/// published phase is Stopped, Completed or Destroyed. Every teardown says
-/// so before the members' sessions end: a shutdown stops the mob before its
-/// terminal teardown, a child stand-down closes each child's admission
-/// first, and a destroy publishes Destroyed once it is admitted. What the
-/// actor answered does not count: an actor that refuses with a closed
-/// channel while its mob runs and admits died, and its members keep the
-/// warning, the backoff and the repair count.
+/// published phase is Stopped, Completed or Destroyed. Each teardown Meta
+/// drives says so before the members' sessions end: its shutdown stops the
+/// mob before the terminal teardown (Meerkat's own `MobHandle::shutdown`
+/// publishes Stopped only at its end), its child stand-down closes each
+/// child's admission first, and a destroy publishes Destroyed when its
+/// durable destroy marker is written, before the members are disposed. A
+/// destroy also marks every member Retiring, and the forwarder subscribes
+/// only Active members ([`forwarder_should_subscribe`]). What the actor
+/// answered does not count: an actor that refuses with a closed channel
+/// while its mob runs and admits died, and its members keep the warning,
+/// the backoff and the repair count.
 fn mob_is_stopping_or_stopped(handle: &MobHandle) -> bool {
     handle.admission_closed().borrow().is_some()
         || matches!(
