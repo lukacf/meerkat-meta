@@ -23,9 +23,9 @@ development.
 Source contributors should read [the development notes](DEVELOPMENT.md) for
 shared Console builds and the separate SDK/runtime selections.
 
-`VERIFICATION.md` is available in the source checkout. Links under `.artifacts`
-refer to retained private review evidence. These records are not included in the
-standalone ZIP.
+Historical local verification records and `.artifacts` directories remain
+private. They are not part of this source tree or a standalone ZIP. Current
+repository validation is recorded in the pull request and CI.
 
 Application authors adding transport or UI setup through the installed Console
 can use the [frontend integration contract](FRONTEND_INTEGRATION.md). It describes
