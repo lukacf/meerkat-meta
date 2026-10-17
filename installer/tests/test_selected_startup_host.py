@@ -1,7 +1,8 @@
 """Selected generated-host wiring with inert runtime settlement.
 
-The optional Meta controls use its exact staged SDK source for builder, roster,
-topology and callback types. No gateway, provider, native owner or Console starts.
+The controls use genuinely installed SDK builder, roster, topology and callback
+types. Toolkit checks require the selected product's installed Toolkit wheel.
+No gateway, provider, native owner or Console starts.
 """
 import asyncio
 import builtins
@@ -21,12 +22,6 @@ from launchkit.blueprint import starter_blueprint
 from launchkit.compiler import generate_files
 from launchkit.connect_application_callbacks import SelectedApplicationCallbacks
 from launchkit.connect_installer_caller import ExactFile
-
-
-META_SOURCE = (Path(__file__).parents[1] / ".artifacts/forge-maccomp2-intake-20261010"
-               / "source/meta/sdk/python")
-TOOLKIT_SOURCE = (Path(__file__).parents[1] / ".artifacts/forge-maccomp2-intake-20261010"
-                  / "source/toolkit/sdk/python/src")
 
 
 def generated_host(root, monkeypatch):
@@ -63,22 +58,10 @@ def build(context): return Integration(context)
     return host, json.loads(files["deployment.json"]), files
 
 
-def genuine_meta(monkeypatch):
-    source = META_SOURCE / "meerkat_meta/builder.py"
-    if not source.is_file():
-        pytest.skip("The optional exact Meta SDK intake is absent in this checkout.")
-    monkeypatch.syspath_prepend(str(META_SOURCE))
-    for name in tuple(sys.modules):
-        if name == "meerkat_meta" or name.startswith("meerkat_meta."):
-            monkeypatch.delitem(sys.modules, name)
+def genuine_meta():
     from meerkat_meta import agent_builder, builder, identity_first_models
-    assert Path(builder.__file__).resolve() == source.resolve()
-    # Track the new source-loaded modules as well as any displaced originals,
-    # so later controls do not inherit this optional SDK intake.
-    for name in tuple(sys.modules):
-        if name == "meerkat_meta" or name.startswith("meerkat_meta."):
-            loaded = sys.modules.pop(name)
-            monkeypatch.setitem(sys.modules, name, loaded)
+    # The test environment installs the reviewed client wheel. Preserve its
+    # real module/type identities rather than importing a private source tree.
     return builder.MetaBuilderConfig, agent_builder.CallbackDispatcher, identity_first_models
 
 
@@ -92,7 +75,7 @@ async def test_run_keeps_selected_gateway_and_sdk_types_through_host_callbacks(
             "provider_id": "host-wiring-specimen", "policy_id": "explicit-empty-intent",
             "revision": 1, "members": [{"member_identity": row["identity"], "grants": []}
                 for row in spec["agents"]]}))
-        config_type, dispatcher_type, models = genuine_meta(monkeypatch)
+        config_type, dispatcher_type, models = genuine_meta()
     else:
         from meerkat_mobkit import agent_builder, builder, identity_first_models
         config_type, dispatcher_type, models = (
@@ -236,21 +219,12 @@ async def test_run_keeps_selected_gateway_and_sdk_types_through_host_callbacks(
 
 def doctor_selection(root, monkeypatch):
     host, spec, _ = generated_host(root, monkeypatch)
-    genuine_meta(monkeypatch)
-    source = TOOLKIT_SOURCE / "meerkat_toolkit/application_runtime.py"
-    if not source.is_file():
-        pytest.skip("The optional exact Toolkit SDK intake is absent in this checkout.")
-    monkeypatch.syspath_prepend(str(TOOLKIT_SOURCE))
-    for name in tuple(sys.modules):
-        if name == "meerkat_toolkit" or name.startswith("meerkat_toolkit."):
-            monkeypatch.delitem(sys.modules, name)
+    genuine_meta()
+    if importlib.util.find_spec("meerkat_toolkit") is None:
+        pytest.skip("Install the exact Toolkit wheel from the selected product to run its SDK wiring checks.")
     from meerkat_toolkit import application_runtime, host_control
-    assert Path(application_runtime.__file__).resolve() == source.resolve()
+    assert callable(application_runtime.ToolkitApplicationRuntime)
     assert callable(host_control.ToolkitMobKitRuntime)
-    for name in tuple(sys.modules):
-        if name == "meerkat_toolkit" or name.startswith("meerkat_toolkit."):
-            loaded = sys.modules.pop(name)
-            monkeypatch.setitem(sys.modules, name, loaded)
     root.chmod(0o700)
     gateway = root / "selected-doctor-gateway"
     content = b"Inert selected executable specimen; never run.\n"

@@ -99,7 +99,12 @@ async def wait_status(service, wanted):
     async with asyncio.timeout(12):
         while True:
             receipt = await service.status(service.guide.identity)
-            if receipt["status"] == wanted and (wanted == "running" or not service.tasks):
+            # A concurrent readiness transition can conservatively project
+            # running/unknown until the next stable source observation. Wait
+            # for the actual checked health required by the assertions below.
+            ready = (receipt.get("health") == "ready"
+                and (receipt.get("startup_console_health") or {}).get("status") == "pass")
+            if receipt["status"] == wanted and (ready if wanted == "running" else not service.tasks):
                 return receipt
             await asyncio.sleep(0.02)
 

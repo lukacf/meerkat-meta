@@ -69,13 +69,23 @@ isolation. Use the same test commands as the Forge workflow:
 
 ```bash
 NODE_OPTIONS=--max-old-space-size=3072 node --test --test-concurrency=2 installer/web/*.test.mjs
-installer/.venv/bin/python -m pytest -vv installer/tests --maxfail=10 --tb=short --junitxml=installer/.artifacts/pytest.xml
+installer/.venv/bin/python -m pytest -vv installer/tests --maxfail=10 --tb=short --durations=20 --junitxml=installer/.artifacts/pytest.xml
 ```
 
-The full backend suite can take more than 30 minutes. `--maxfail=10` stops after
+Allow substantial time for the full backend suite. One hosted run reached its
+ten-failure limit after 41 minutes; a separate local run of the affected and
+remaining cases took another 48 minutes. Those are partial runs on different
+machines, not a measured duration for the full suite. The hosted backend job has
+a 120-minute limit and reports its 20 slowest tests. `--maxfail=10` stops after
 ten failures; it does not sample passing cases. A run stopped by that limit or a
 job timeout is incomplete even when its earlier cases passed. Preserve the
 failure output and XML before making a correction.
+
+Generated-host wiring checks use the installed Guide SDK, without a private
+source intake. Toolkit-specific doctor checks additionally require the selected
+product's genuine Toolkit wheel and skip explicitly when it is absent. Passing
+these checks establishes SDK wiring with inert runtime fixtures, not a live
+native application or compatibility of its persisted state.
 
 For a focused change, run the affected files first, for example:
 

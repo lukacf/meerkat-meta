@@ -91,11 +91,13 @@ def installation(tmp_path, crossing):
     destination.mkdir(mode=0o700)
     payload = packed(previous)
     (directory / "package.zip").write_bytes(payload)
+    (directory / "package.zip").chmod(0o600)
     receipt = {"deployment_id": str(uuid.uuid4()), "guide_id": str(uuid.uuid4()),
         "target": "local", "execution_mode": "interactive", "status": "stopped",
         "destination": str(destination), "package_sha256": updates.digest(payload),
         **{key: old_report[key] for key in updates.BOUND_KEYS if key != "package_sha256"}}
     (directory / "receipt.json").write_text(json.dumps(receipt))
+    (directory / "receipt.json").chmod(0o600)
     for name, (content, mode) in previous.items():
         path = destination / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,6 +106,7 @@ def installation(tmp_path, crossing):
     (destination / OWNER_FILE).parent.mkdir(parents=True, exist_ok=True)
     (destination / ".mobkit").chmod(0o700)
     (destination / OWNER_FILE).write_text(json.dumps(ownership(receipt)))
+    (destination / OWNER_FILE).chmod(0o600)
     for name, content in {".env": b"SYNTHETIC_PRIVATE=preserve\n", ".mobkit/state/native.db": b"inert native state",
             "data/ledger.db": b"inert application state", "workspace/user.txt": b"inert user reference"}.items():
         path = destination / name
