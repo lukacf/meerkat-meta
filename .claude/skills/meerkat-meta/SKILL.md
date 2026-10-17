@@ -410,6 +410,10 @@ Inspect a release first with the repository wrapper:
 ./scripts/repo-cargo release <version>
 ```
 
+This dry run changes nothing. cargo-release runs the release hook
+(`scripts/release-hook.sh`) in a dry run too, with `DRY_RUN=true`, and the hook
+then only reports what an execute would bump and stage.
+
 `--execute` creates the release commit and normally tags and pushes it. The
 release hook moves Cargo, Python, TypeScript, Bazel-module, generated BUILD,
 and install-documentation versions together. For a PR-reviewed cut, prepare
@@ -450,6 +454,9 @@ selections outside the repo and obtain consumer acceptance against those bytes.
 
 The release owner then tags the same source as `vX.Y.Z` and invokes
 `make release-promote RELEASE_TAG=vX.Y.Z ARTIFACT_SELECTION=<core json-file>`.
+`TIER` is for `release-candidate` only: `release-promote`,
+`release-assets-recover` and `release-registry-retry` refuse it (unset it if
+the shell still exports it from the candidate step).
 Promotion accepts only the core selection and verifies and publishes the
 original bytes without rebuilding or signing again. The trailing tier is added
 afterwards, add-only, with

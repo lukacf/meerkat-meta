@@ -8,6 +8,14 @@ set -euo pipefail
 VERSION="${1:?usage: release-hook.sh <version>}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# cargo-release runs this hook in its dry run too, with DRY_RUN=true (and
+# DRY_RUN=false on --execute). A dry run must leave the worktree as it found
+# it, so the hook only reports what an execute would do.
+if [ "${DRY_RUN:-false}" = "true" ]; then
+  echo "release-hook: dry run: would bump the SDK, Bazel and install-doc versions to $VERSION and stage them"
+  exit 0
+fi
+
 # Prevent duplicate execution within the same release
 SENTINEL="$ROOT/.release-hook-done"
 if [ -f "$SENTINEL" ] && [ "$(cat "$SENTINEL")" = "$VERSION" ]; then

@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   of the repository's Actions cache. `verify_crate_packages` still restores
   main CI's `meta-dev-bins` entry read-only.
 
+### Fixed
+
+- A cargo-release dry run (`./scripts/repo-cargo release <version>`) changes
+  nothing. cargo-release runs the pre-release hook in its dry run too, with
+  `DRY_RUN=true`, and the hook (`scripts/release-hook.sh`) bumped the SDK,
+  Bazel and install-doc versions anyway, then failed its parity check against
+  the unbumped Cargo version, so the dry run stopped with the version files
+  modified. The hook now only reports what an execute would bump and stage.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

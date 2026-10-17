@@ -92,9 +92,10 @@ class ReleaseVersionScriptsTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_command(self, *args, check=True):
+    def run_command(self, *args, check=True, extra_env=None):
         env = os.environ.copy()
         env["CARGO_TARGET_DIR"] = str(self.root / "target")
+        env.update(extra_env or {})
         result = subprocess.run(
             args,
             cwd=self.root,
@@ -147,6 +148,38 @@ class ReleaseVersionScriptsTests(unittest.TestCase):
         )
 
         self.run_command("scripts/verify-version-parity.sh")
+
+    def test_release_hook_writes_nothing_in_a_dry_run(self):
+        # cargo-release runs the pre-release hook in its dry run too, with
+        # DRY_RUN=true (and DRY_RUN=false on --execute). The 0.9.2 cut's dry
+        # run bumped the version files, then failed the parity check against
+        # the unbumped Cargo version and left them modified.
+        def worktree():
+            return self.run_command(
+                "git", "status", "--porcelain", "--ignored", "--untracked-files=all"
+            ).stdout
+
+        before = worktree()
+        dry = self.run_command(
+            "scripts/release-hook.sh", "0.8.1", extra_env={"DRY_RUN": "true"}
+        )
+        self.assertEqual(worktree(), before)
+        self.assertEqual(
+            self.run_command("git", "diff", "--cached", "--name-only").stdout, ""
+        )
+        self.assertFalse((self.root / ".release-hook-done").exists())
+        self.assertIn('version = "0.8.0"', (self.root / "MODULE.bazel").read_text())
+        self.assertIn("dry run", dry.stdout)
+
+        # An execute still bumps and stages.
+        self.run_command(
+            "scripts/release-hook.sh", "0.8.1", extra_env={"DRY_RUN": "false"}
+        )
+        self.assertIn('version = "0.8.1"', (self.root / "MODULE.bazel").read_text())
+        self.assertIn(
+            "MODULE.bazel",
+            self.run_command("git", "diff", "--cached", "--name-only").stdout.split(),
+        )
 
     def test_version_parity_rejects_unparsable_bazel_module_version(self):
         self.run_command("scripts/bump-sdk-versions.sh", "0.8.1")

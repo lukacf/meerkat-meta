@@ -1897,6 +1897,25 @@ class CandidateProtocolTests(unittest.TestCase):
                 self.make_command(target, *variables, success=False)
                 self.assertFalse(self.state["calls"])
 
+    def test_make_promote_and_assets_refuse_tier(self):
+        # TIER names a candidate's tier. Promotion and asset recovery take the
+        # tier from their selection and refuse TIER, as the runbook says: make
+        # reads it from the environment too, so a TIER the shell still exports
+        # from the candidate step is refused the same way.
+        accepted = {
+            "schema_version": 1, "kind": "accepted-candidate", "repository": REPO,
+            "run_id": RUN, "run_attempt": ATTEMPT,
+            "manifest_artifact": {"id": 300, "digest": "a" * 64, "manifest_sha256": "b" * 64},
+        }
+        path = self.root / "accepted.json"
+        path.write_text(json.dumps(accepted))
+        for target, tier in (("release-promote", "core"), ("release-assets-recover", "trailing")):
+            with self.subTest(target=target):
+                result = self.make_command(target, f"RELEASE_TAG={TAG}",
+                                           f"ARTIFACT_SELECTION={path}", f"TIER={tier}", success=False)
+                self.assertIn("TIER is only valid for candidate", result.stdout + result.stderr)
+                self.assertFalse(self.state["calls"])
+
     def test_make_assets_facade_accepts_explicit_original_selection_and_help_warns(self):
         target = "x86_64-unknown-linux-gnu"
         path = self.target_files[f"meta-gateway-{VERSION}-{target}.tar.gz"]
