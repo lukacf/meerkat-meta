@@ -3183,6 +3183,7 @@ dependencies = [
  "meerkat-runtime",
  "meerkat-store",
  "meerkat-store-conformance",
+ "meta-extension-state",
  "rusqlite",
  "serde_json",
  "sha2",

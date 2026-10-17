@@ -88,6 +88,22 @@ impl UnifiedRuntime {
         }
     }
 
+    /// The mobs bound without extension authority, each with its typed
+    /// reason. A mob activates (a create, a restore, a held child's resume)
+    /// under an id that live extension documents name for another holder, or
+    /// while the document store cannot tell who holds the id; it binds, but
+    /// its members resolve no document caller, it is no valid document owner
+    /// and nobody manages it, until it is destroyed or a later restore of it
+    /// binds normally. Empty without extension tool bundles or document
+    /// bindings.
+    #[cfg(feature = "extension-state")]
+    pub fn extension_mob_quarantines(&self) -> Vec<crate::extension_state::MobIdQuarantine> {
+        self.extension_authority
+            .as_ref()
+            .map(|registry| registry.quarantines())
+            .unwrap_or_default()
+    }
+
     /// Start a completion-bearing turn for a public member alias.
     ///
     /// Admission proves that the runtime input was accepted; it does not prove

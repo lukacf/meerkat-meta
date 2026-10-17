@@ -2181,7 +2181,11 @@ impl UnifiedRuntimeBuilder {
             Arc::clone(&spec.session_service),
             self.continuity_store.clone(),
             self.access_controller.clone(),
+            Arc::clone(&opened.store),
         );
+        // Every document service writes through the registry's ordering of
+        // mob id changes.
+        let document_store = registry.document_store();
         let mut namespaces = std::collections::BTreeSet::new();
         let mut document_tools = std::collections::BTreeSet::new();
         for (name, (requirements, factory)) in std::mem::take(&mut self.tool_bundle_factories) {
@@ -2198,7 +2202,7 @@ impl UnifiedRuntimeBuilder {
             let documents = meta_extension_state::DocumentService::new(
                 realm.as_str(),
                 requirements.namespace.clone(),
-                Arc::clone(&opened.store),
+                Arc::clone(&document_store),
             )
             .map_err(|error| {
                 UnifiedRuntimeBuilderError::ConflictingConfiguration(error.to_string())
@@ -2251,7 +2255,7 @@ impl UnifiedRuntimeBuilder {
             let documents = meta_extension_state::DocumentService::new(
                 realm.as_str(),
                 requirements.namespace.clone(),
-                Arc::clone(&opened.store),
+                Arc::clone(&document_store),
             )
             .map_err(|error| {
                 UnifiedRuntimeBuilderError::ConflictingConfiguration(error.to_string())
@@ -2284,7 +2288,7 @@ impl UnifiedRuntimeBuilder {
         // composing its child application policy and native tool bundles.
         spec.before_activation = Some(registry.before_activation());
         spec.after_destroy = Some(registry.after_destroy());
-        spec.before_create = Some(registry.before_create(Arc::clone(&opened.store)));
+        spec.before_create = Some(registry.before_create());
         Ok(Some(registry))
     }
 

@@ -19,6 +19,7 @@ use meerkat_meta::console_aggregator::ConsoleLogStore;
 use meerkat_meta::identity_first::{AgentMemoryProvider, ContinuityStore};
 use meerkat_meta::unified_runtime::EventLogStore;
 use meerkat_store_conformance::ConformanceFailure;
+use meta_extension_state::ExtensionDocumentStore;
 
 /// Produces handles to one underlying continuity-store storage.
 #[async_trait]
@@ -61,4 +62,12 @@ pub trait AgentMemoryProviderFactory: Send + Sync {
     /// Open an agent-memory provider handle. Same reopen contract as
     /// [`ContinuityStoreFactory::open`].
     async fn open(&self) -> Result<Arc<dyn AgentMemoryProvider>, ConformanceFailure>;
+}
+
+/// Produces handles to one underlying extension document storage.
+#[async_trait]
+pub trait ExtensionDocumentStoreFactory: Send + Sync {
+    /// Open a document store handle. Same reopen contract as
+    /// [`ContinuityStoreFactory::open`].
+    async fn open(&self) -> Result<Arc<dyn ExtensionDocumentStore>, ConformanceFailure>;
 }
