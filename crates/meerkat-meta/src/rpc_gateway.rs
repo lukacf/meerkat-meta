@@ -37,6 +37,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::contact_directory::ContactDirectory;
+use crate::identity_first::gateway_bridges::SDK_CALLBACK_SOURCE_ID;
 use crate::runtime::cross_mob_control::{ControlAuthorizer, ControlGrantTable, ControlListenAddr};
 use crate::shutdown_signal::ShutdownSignal;
 use crate::unified_runtime::EventLogError;
@@ -2155,7 +2156,7 @@ default_binding = "local"
     }
 
     /// A callback tool's artifact reference crosses the `callback/build_agent`
-    /// wire and lands on its provenance beside the per-build source; a
+    /// wire and lands on its provenance beside the SDK host's source; a
     /// malformed reference refuses the spec.
     #[test]
     fn callback_tool_artifact_crosses_the_wire_onto_provenance() {
@@ -2185,7 +2186,7 @@ default_binding = "local"
             defs[0].provenance,
             Some(ToolProvenance {
                 kind: ToolSourceKind::Callback,
-                source_id: "meta-callback:build-7".into(),
+                source_id: SDK_CALLBACK_SOURCE_ID.into(),
                 artifact: Some(artifact),
             })
         );
@@ -2288,7 +2289,7 @@ default_binding = "local"
             defs[0].provenance,
             Some(ToolProvenance {
                 kind: ToolSourceKind::Callback,
-                source_id: "meta-callback:build-1".into(),
+                source_id: SDK_CALLBACK_SOURCE_ID.into(),
                 artifact: None,
             })
         );
@@ -11844,7 +11845,6 @@ impl CallbackToolDispatcher {
         tools: Vec<CallbackToolSpec>,
         detached_jobs: Option<DetachedCallbackJobRuntime>,
     ) -> Self {
-        let provenance_source_id = format!("meta-callback:{scope_id}");
         let entries: Vec<(Arc<ToolDef>, ToolExecutionContract)> = tools
             .into_iter()
             .map(|tool| {
@@ -11860,7 +11860,9 @@ impl CallbackToolDispatcher {
                             .unwrap_or_else(|| json!({"type": "object"})),
                         provenance: Some(ToolProvenance {
                             kind: ToolSourceKind::Callback,
-                            source_id: provenance_source_id.as_str().into(),
+                            // The SDK host, not this build's routing scope:
+                            // see `SDK_CALLBACK_SOURCE_ID`.
+                            source_id: SDK_CALLBACK_SOURCE_ID.into(),
                             // Verified by the builder before this dispatcher
                             // is built.
                             artifact: tool.artifact,
@@ -21356,5 +21358,632 @@ mod held_bootstrap_close_tests {
         let _report = tokio::time::timeout(Duration::from_mins(1), runtime.shutdown())
             .await
             .expect("the runtime shuts down once the setup has settled");
+    }
+}
+
+/// Host callback tools reach a delegate helper whose tooling inherits its
+/// parent's visible tools.
+///
+/// Every SDK build mints its own routing scope, and every callback tool the
+/// build registered carried that scope as its provenance source. A helper's
+/// copy of a host tool therefore never matched the witness its parent's
+/// visibility pinned, and the inherited ceiling dropped it. These tests drive
+/// a delegating member through the gateway's own composition: a
+/// `StdioCallbackAgentBuilder` inside a persistent session service, the agent
+/// mob tools installed the way the gateway installs them, a scripted SDK host
+/// and a scripted model.
+#[cfg(test)]
+mod callback_tool_inheritance_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// The host tool the delegator's build and every helper's build register.
+    const HOST_TOOL: &str = "date_info";
+    /// A host tool only helper builds register: the parent never saw it.
+    const CHILD_ONLY_TOOL: &str = "child_only";
+    /// A native comms tool the delegator sees: the positive control.
+    const NATIVE_TOOL: &str = "peers";
+    const DELEGATOR: &str = "delegator";
+    const PROBE: &str = "CALLBACK-INHERITANCE-PROBE";
+    const HELPER_TASK: &str = "CALLBACK-INHERITANCE-HELPER-TASK";
+    /// Bound for every wait below; a correct run takes milliseconds.
+    const BOUND: Duration = Duration::from_mins(1);
+
+    static NEXT_MOB: AtomicUsize = AtomicUsize::new(0);
+
+    fn definition() -> MobDefinition {
+        MobDefinition::from_toml(&format!(
+            r#"
+[mob]
+id = "callback-inheritance-{}-{}"
+
+[profiles.delegator]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+
+[profiles.delegator.tools]
+comms = true
+mob = true
+"#,
+            std::process::id(),
+            NEXT_MOB.fetch_add(1, Ordering::SeqCst)
+        ))
+        .expect("mob definition")
+    }
+
+    fn host_tool(name: &str) -> Value {
+        json!({
+            "name": name,
+            "description": format!("host tool {name}"),
+            "input_schema": {"type": "object"}
+        })
+    }
+
+    /// What the scripted SDK host saw, in order: the options of every build
+    /// and the params of every tool call.
+    #[derive(Default)]
+    struct SdkHostLog {
+        builds: std::sync::Mutex<Vec<Value>>,
+        calls: std::sync::Mutex<Vec<Value>>,
+        call_seen: tokio::sync::Notify,
+    }
+
+    /// The scripted SDK host: every `callback/build_agent` registers the host
+    /// tool, and every build other than the delegator's also registers the
+    /// child-only tool. Every `callback/call_tool` gets an answer.
+    fn answer_sdk_host(
+        mut stdout_rx: mpsc::Receiver<GatewayStdoutLine>,
+        bridge: StdioCallbackBridge,
+    ) -> (Arc<SdkHostLog>, tokio::task::JoinHandle<()>) {
+        let log = Arc::new(SdkHostLog::default());
+        let sink = Arc::clone(&log);
+        let task = tokio::spawn(async move {
+            while let Some(mut line) = stdout_rx.recv().await {
+                let request: Value = serde_json::from_str(&line).expect("callback JSON");
+                line.settle_delivery(true).await;
+                let result = match request["method"].as_str() {
+                    Some("callback/build_agent") => {
+                        let options = request["params"]["options"].clone();
+                        let mut tools = vec![host_tool(HOST_TOOL)];
+                        if options["profile_name"] != DELEGATOR {
+                            tools.push(host_tool(CHILD_ONLY_TOOL));
+                        }
+                        sink.builds.lock().expect("build log").push(options);
+                        json!({"tools": tools})
+                    }
+                    Some("callback/call_tool") => {
+                        sink.calls
+                            .lock()
+                            .expect("call log")
+                            .push(request["params"].clone());
+                        sink.call_seen.notify_one();
+                        json!({"content": "answered by the SDK host"})
+                    }
+                    _ => continue,
+                };
+                bridge
+                    .route_callback_response(json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": result,
+                    }))
+                    .await;
+            }
+        });
+        (log, task)
+    }
+
+    /// The helper the delegator's probe turn starts.
+    #[derive(Clone)]
+    enum HelperCall {
+        /// `delegate`, with this `tooling` (left out when `None`).
+        Delegate(Option<Value>),
+        /// `fork_off`: a durable fork of the delegator itself.
+        ForkOff,
+    }
+
+    const HELPER_CALL_ID: &str = "call-helper";
+    const HOST_TOOL_CALL_ID: &str = "call-host-tool";
+
+    /// The scripted model. The delegator's probe turn starts the helper; the
+    /// helper's first request records the tool names it was offered, and a
+    /// helper offered the host tool calls it once; every other turn answers.
+    /// A probe turn is the one whose newest message is the probe: a forked
+    /// helper carries its source's earlier transcript, probe included, and
+    /// only the delegator ever sees the helper call's result.
+    #[derive(Clone)]
+    struct DelegatingModel {
+        call: HelperCall,
+        helper_tools: Arc<std::sync::Mutex<Option<Vec<String>>>>,
+        helper_seen: Arc<tokio::sync::Notify>,
+        delegated: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl meerkat_client::LlmClient for DelegatingModel {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a meerkat_client::LlmRequest,
+        ) -> meerkat_client::types::LlmStream<'a> {
+            // The probe and the task reach a member wrapped as its runtime
+            // delivers them, so look for their text in the serialized messages.
+            let last = request
+                .messages
+                .last()
+                .and_then(|message| serde_json::to_string(message).ok())
+                .unwrap_or_default();
+            let transcript = serde_json::to_string(&request.messages).unwrap_or_default();
+            let helper_result = request
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    meerkat_core::Message::ToolResults { results, .. } => Some(results),
+                    _ => None,
+                })
+                .flatten()
+                .find(|result| result.tool_use_id == HELPER_CALL_ID)
+                .map(meerkat_core::ToolResult::text_content);
+            if let Some(result) = &helper_result {
+                *self.delegated.lock().expect("delegated") = Some(result.clone());
+            }
+            let call_helper = helper_result.is_none() && last.contains(PROBE);
+            let helper_turn =
+                helper_result.is_none() && !call_helper && transcript.contains(HELPER_TASK);
+            let offered = request
+                .tools
+                .iter()
+                .map(|tool| tool.name.to_string())
+                .collect::<Vec<_>>();
+            if helper_turn {
+                let mut helper_tools = self.helper_tools.lock().expect("helper tools");
+                if helper_tools.is_none() {
+                    *helper_tools = Some(offered.clone());
+                    self.helper_seen.notify_one();
+                }
+            }
+            let call_host_tool = helper_turn
+                && !transcript.contains(HOST_TOOL_CALL_ID)
+                && offered.iter().any(|name| name == HOST_TOOL);
+            let stop = if call_helper || call_host_tool {
+                meerkat_core::StopReason::ToolUse
+            } else {
+                meerkat_core::StopReason::EndTurn
+            };
+            let [usage, done] = crate::mob_handle_runtime::test_llm_usage::usage_then_done(
+                request,
+                meerkat_core::Provider::OpenAI,
+                stop,
+            );
+            let lead = if call_helper {
+                let mut args = json!({
+                    "task": HELPER_TASK,
+                    "member_id": "helper",
+                    "result_label": "helper_result",
+                    "max_text_bytes": 4096,
+                });
+                let name = match &self.call {
+                    HelperCall::Delegate(tooling) => {
+                        if let Some(tooling) = tooling {
+                            args["tooling"] = tooling.clone();
+                        }
+                        "delegate"
+                    }
+                    HelperCall::ForkOff => "fork_off",
+                };
+                meerkat_client::LlmEvent::ToolCallComplete {
+                    id: HELPER_CALL_ID.to_string(),
+                    name: name.to_string(),
+                    args,
+                    meta: None,
+                }
+            } else if call_host_tool {
+                meerkat_client::LlmEvent::ToolCallComplete {
+                    id: HOST_TOOL_CALL_ID.to_string(),
+                    name: HOST_TOOL.to_string(),
+                    args: json!({}),
+                    meta: None,
+                }
+            } else {
+                meerkat_client::LlmEvent::TextDelta {
+                    delta: "done".to_string(),
+                    meta: None,
+                }
+            };
+            Box::pin(futures::stream::iter(vec![Ok(lead), Ok(usage), Ok(done)]))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::OpenAI
+        }
+
+        async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
+            Ok(())
+        }
+    }
+
+    /// What one delegation showed: the tool names the helper's model was
+    /// offered, the delegate result the delegator saw, the options of every
+    /// SDK build and the params of every SDK tool call, in order.
+    struct Delegation {
+        helper_tools: Vec<String>,
+        delegated: Value,
+        builds: Vec<Value>,
+        calls: Vec<Value>,
+    }
+
+    /// One delegator turn through the gateway composition: the delegator
+    /// starts the helper `call` names, and the helper's first request shows
+    /// which tools reached it.
+    async fn run_helper(call: HelperCall) -> Delegation {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state = temp.path();
+        let blob_store: Arc<dyn meerkat_core::BlobStore> =
+            Arc::new(meerkat_store::MemoryBlobStore::new());
+        let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
+            meerkat_store::SqliteSessionStore::open(state.join("session-store.sqlite3"))
+                .expect("session store"),
+        );
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new(state.join("runtime-store.sqlite3"))
+                .expect("runtime store"),
+        );
+        let (runtime_store, epochs) =
+            crate::mob_handle_runtime::epoch_tracking_runtime_store_with_durable_projection(
+                runtime_store,
+                session_store.clone(),
+            );
+        let adapter = Arc::new(
+            meerkat_runtime::MeerkatMachine::persistent(
+                Arc::clone(&runtime_store),
+                Arc::clone(&blob_store),
+            )
+            .expect("runtime machine"),
+        );
+        let factory = AgentFactory::new(state).builtins(false).comms(true);
+        let mut inner = FactoryAgentBuilder::new(factory, Config::default());
+        inner.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(
+            session_store.clone(),
+        )));
+        inner.default_blob_store = Some(Arc::clone(&blob_store));
+        let job_store: Arc<dyn meerkat::DetachedJobStore> =
+            Arc::new(meerkat::MemoryDetachedJobStore::new());
+        inner.default_detached_job_store = Some(Arc::clone(&job_store));
+        let mob_tools_slot = Arc::clone(&inner.default_mob_tools);
+        // A helper's default tools include WorkGraph's, as the gateway's do.
+        let (workgraph_service, workgraph_admission_slot) =
+            crate::workgraph_wiring::attach_workgraph_tools_ephemeral(
+                &inner,
+                "callback-inheritance",
+            );
+        let (stdout_tx, stdout_rx) = mpsc::channel(16);
+        let bridge = StdioCallbackBridge::new(stdout_tx);
+        let (sdk_host, responder) = answer_sdk_host(stdout_rx, bridge.clone());
+        let service = Arc::new(meerkat_session::PersistentSessionService::new(
+            StdioCallbackAgentBuilder {
+                inner,
+                bridge,
+                has_session_builder: true,
+                session_store: Some(session_store.clone()),
+                detached_jobs: None,
+                installed_artifacts: None,
+            },
+            16,
+            session_store,
+            Arc::clone(&runtime_store),
+            blob_store,
+        ));
+        let (mob_storage, provenance) =
+            crate::mob_composition_manifest::persistent_mob_storage(state.join("mob.sqlite3"))
+                .expect("mob storage");
+        let model = DelegatingModel {
+            call,
+            helper_tools: Arc::default(),
+            helper_seen: Arc::default(),
+            delegated: Arc::default(),
+        };
+        let spec = MobBootstrapSpec::new(definition(), mob_storage, service)
+            .with_mob_storage_provenance(provenance)
+            // The helpers' implicit child mobs live with this process.
+            .with_child_mob_storage(crate::ChildMobStorage::ProcessBound)
+            .with_session_write_epochs(&epochs)
+            .with_runtime_authority_prewarm(&runtime_store)
+            .with_runtime_archived_terminal_authority(Arc::clone(&runtime_store))
+            .with_session_runtime_adapter(adapter)
+            .expect("session runtime owner")
+            .with_workgraph_service(Some(workgraph_service))
+            .with_workgraph_admission_slot(workgraph_admission_slot)
+            .with_runtime_delivery(crate::MobRuntimeDelivery::new(
+                Arc::clone(&runtime_store),
+                job_store,
+            ))
+            .with_agent_mob_tools(mob_tools_slot)
+            .expect("install the agent mob tools")
+            .with_options(MobBootstrapOptions {
+                allow_ephemeral_sessions: true,
+                notify_orchestrator_on_resume: true,
+                default_llm_client: Some(Arc::new(model.clone())),
+            });
+        let runtime = crate::MobRuntime::bootstrap(spec)
+            .await
+            .expect("bootstrap the mob runtime");
+        let handle = runtime.handle();
+        let delegator = meerkat_mob::AgentIdentity::from(DELEGATOR);
+        handle
+            .ensure_member(meerkat_mob::SpawnMemberSpec::new(
+                meerkat_mob::ProfileName::from(DELEGATOR),
+                delegator.clone(),
+            ))
+            .await
+            .expect("seat the delegator");
+        let bounded = meerkat_mob::BoundedResultSpec::new("turn", 4096).expect("bounded result");
+        let work = handle
+            .start_work_for_identity_bounded(
+                delegator,
+                meerkat_mob::WorkSpec::new(
+                    meerkat_core::types::ContentInput::Text(PROBE.to_string()),
+                    meerkat_mob::WorkOrigin::Internal,
+                ),
+                meerkat_core::types::HandlingMode::Queue,
+                bounded.clone(),
+            )
+            .await
+            .expect("start the delegator's turn");
+        tokio::time::timeout(BOUND, work.wait_bounded(bounded))
+            .await
+            .expect("the delegator's turn completes within the bound")
+            .expect("the delegator's turn succeeds");
+        let delegated = model
+            .delegated
+            .lock()
+            .expect("delegated")
+            .clone()
+            .expect("the delegator saw its helper call's result");
+        // A `fork_off` helper runs in the background after the delegator's
+        // turn ends.
+        tokio::time::timeout(BOUND, model.helper_seen.notified())
+            .await
+            .expect("the helper's model is asked within the bound");
+        let helper_tools = model
+            .helper_tools
+            .lock()
+            .expect("helper tools")
+            .clone()
+            .expect("the helper's model was asked");
+        if helper_tools.iter().any(|name| name == HOST_TOOL) {
+            tokio::time::timeout(BOUND, sdk_host.call_seen.notified())
+                .await
+                .expect("the helper calls the host tool within the bound");
+        }
+        let builds = sdk_host.builds.lock().expect("build log").clone();
+        let calls = sdk_host.calls.lock().expect("call log").clone();
+        let _ = tokio::time::timeout(BOUND, handle.shutdown()).await;
+        responder.abort();
+        Delegation {
+            helper_tools,
+            delegated: serde_json::from_str(&delegated).expect("json delegate result"),
+            builds,
+            calls,
+        }
+    }
+
+    /// The delegate helper completed, and the delegator's build and the
+    /// helper's build each minted their own routing scope.
+    fn assert_completed_with_distinct_scopes(delegation: &Delegation) {
+        assert_eq!(
+            delegation.delegated["bounded_result"]["status"], "completed",
+            "{}",
+            delegation.delegated
+        );
+        assert_distinct_scopes(delegation);
+    }
+
+    /// The delegator's build and the helper's build each minted their own
+    /// routing scope.
+    fn assert_distinct_scopes(delegation: &Delegation) {
+        eprintln!(
+            "helper tools {:?}; builds {:?}; calls {:?}",
+            delegation.helper_tools, delegation.builds, delegation.calls
+        );
+        let scopes = delegation
+            .builds
+            .iter()
+            .map(|options| options["scope_id"].as_str().expect("scope id").to_string())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            scopes.len() >= 2 && scopes.len() == delegation.builds.len(),
+            "every build keeps its own routing scope: {:?}",
+            delegation.builds
+        );
+    }
+
+    /// The helper's one call of the host tool reached the SDK host under the
+    /// routing scope of the helper's own build, not its parent's: the shared
+    /// callback source leaves routing per build.
+    fn assert_host_tool_call_routed_to_the_helpers_build(delegation: &Delegation) {
+        let helper_scopes = delegation
+            .builds
+            .iter()
+            .filter(|options| options["labels"]["agent_identity"] == "helper")
+            .map(|options| options["scope_id"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            helper_scopes.len(),
+            1,
+            "one helper build: {:?}",
+            delegation.builds
+        );
+        assert_eq!(
+            delegation.calls,
+            vec![json!({
+                "scope_id": helper_scopes[0],
+                "tool": HOST_TOOL,
+                "arguments": {},
+            })],
+            "builds: {:?}",
+            delegation.builds
+        );
+    }
+
+    fn offered(delegation: &Delegation, tool: &str) -> bool {
+        delegation.helper_tools.iter().any(|name| name == tool)
+    }
+
+    /// (a) `inherit_parent`: the helper sees the host tool its parent sees,
+    /// and never one only its own build registered. Its call of the host
+    /// tool routes through its own build.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_inheriting_delegate_helper_sees_its_parents_host_callback_tool() {
+        let delegation = run_helper(HelperCall::Delegate(Some(
+            json!({"mode": "inherit_parent"}),
+        )))
+        .await;
+        assert_completed_with_distinct_scopes(&delegation);
+        assert!(
+            offered(&delegation, NATIVE_TOOL),
+            "{:?}",
+            delegation.helper_tools
+        );
+        assert!(
+            offered(&delegation, HOST_TOOL),
+            "the parent's host tool is inherited: {:?}",
+            delegation.helper_tools
+        );
+        assert!(
+            !offered(&delegation, CHILD_ONLY_TOOL),
+            "a host tool the parent never saw stays hidden: {:?}",
+            delegation.helper_tools
+        );
+        assert_host_tool_call_routed_to_the_helpers_build(&delegation);
+    }
+
+    /// (b) Omitted tooling is `inherit_parent`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delegate_helper_without_tooling_inherits_its_parents_host_callback_tool() {
+        let delegation = run_helper(HelperCall::Delegate(None)).await;
+        assert_completed_with_distinct_scopes(&delegation);
+        assert!(
+            offered(&delegation, NATIVE_TOOL),
+            "{:?}",
+            delegation.helper_tools
+        );
+        assert!(
+            offered(&delegation, HOST_TOOL),
+            "omitted tooling inherits the parent's host tool: {:?}",
+            delegation.helper_tools
+        );
+        assert!(
+            !offered(&delegation, CHILD_ONLY_TOOL),
+            "{:?}",
+            delegation.helper_tools
+        );
+        assert_host_tool_call_routed_to_the_helpers_build(&delegation);
+    }
+
+    /// (c) `minimal` hands the helper only the comms tools.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_minimal_delegate_helper_gets_no_host_callback_tool() {
+        let delegation = run_helper(HelperCall::Delegate(Some(json!({"mode": "minimal"})))).await;
+        assert_completed_with_distinct_scopes(&delegation);
+        assert!(
+            offered(&delegation, NATIVE_TOOL),
+            "{:?}",
+            delegation.helper_tools
+        );
+        assert!(
+            !offered(&delegation, HOST_TOOL) && !offered(&delegation, CHILD_ONLY_TOOL),
+            "{:?}",
+            delegation.helper_tools
+        );
+    }
+
+    /// (d) An empty allow overlay inherits nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_empty_allow_overlay_hides_the_host_callback_tool() {
+        let delegation = run_helper(HelperCall::Delegate(Some(json!({
+            "mode": "inherit_parent",
+            "allow_overlay": []
+        }))))
+        .await;
+        assert_completed_with_distinct_scopes(&delegation);
+        assert!(
+            !offered(&delegation, NATIVE_TOOL)
+                && !offered(&delegation, HOST_TOOL)
+                && !offered(&delegation, CHILD_ONLY_TOOL),
+            "{:?}",
+            delegation.helper_tools
+        );
+    }
+
+    /// (e) A name the delegation denies stays hidden.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_denied_host_callback_tool_stays_hidden_from_an_inheriting_helper() {
+        let delegation = run_helper(HelperCall::Delegate(Some(json!({
+            "mode": "inherit_parent",
+            "deny_overlay": [HOST_TOOL]
+        }))))
+        .await;
+        assert_completed_with_distinct_scopes(&delegation);
+        assert!(
+            offered(&delegation, NATIVE_TOOL),
+            "{:?}",
+            delegation.helper_tools
+        );
+        assert!(
+            !offered(&delegation, HOST_TOOL) && !offered(&delegation, CHILD_ONLY_TOOL),
+            "{:?}",
+            delegation.helper_tools
+        );
+    }
+
+    /// A `fork_off` helper, a durable fork of the delegator, sees its
+    /// source's host tool too, and calls it through its own build.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fork_off_helper_sees_its_sources_host_callback_tool() {
+        let delegation = run_helper(HelperCall::ForkOff).await;
+        assert!(
+            delegation.delegated["job_id"].is_string(),
+            "the fork runs as a background job: {}",
+            delegation.delegated
+        );
+        assert_distinct_scopes(&delegation);
+        assert!(
+            offered(&delegation, HOST_TOOL),
+            "the source's host tool reaches its fork: {:?}",
+            delegation.helper_tools
+        );
+        assert_host_tool_call_routed_to_the_helpers_build(&delegation);
+    }
+
+    /// Two builds for one SDK host keep their own routing scopes and stamp
+    /// one callback source, so a witness recorded against either matches the
+    /// other.
+    #[test]
+    fn two_builds_of_one_sdk_host_stamp_one_callback_source() {
+        let spec = || CallbackToolSpec::parse(&json!({"name": HOST_TOOL})).expect("tool spec");
+        let bridge = || StdioCallbackBridge::new(mpsc::channel(1).0);
+        let first =
+            CallbackToolDispatcher::new(bridge(), "build-1".to_string(), vec![spec()], None);
+        let second =
+            CallbackToolDispatcher::new(bridge(), "build-2".to_string(), vec![spec()], None);
+        assert_ne!(first.scope_id, second.scope_id, "routing stays per build");
+        let source = |dispatcher: &CallbackToolDispatcher| {
+            AgentToolDispatcher::tools(dispatcher)[0]
+                .provenance
+                .clone()
+                .expect("callback provenance")
+        };
+        assert!(
+            source(&first).same_source(&source(&second)),
+            "one SDK host, one callback source: {:?} vs {:?}",
+            source(&first),
+            source(&second)
+        );
     }
 }
