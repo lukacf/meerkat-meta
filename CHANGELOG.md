@@ -507,6 +507,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   those steps was shown again for each such step, so such an import also
   grew with the product of the two counts. Such a step is now shown as its
   own step after that parallel step (see Known limitations).
+- Importing a mob definition into the Flow Editor shows its steps in
+  dependency order. A definition's steps are parsed in id order, and import
+  showed them in that order, so a step whose id sorts before a step it
+  depends on was shown first, and the flow exported from the editor ran it
+  first: a round trip through the editor rewired the flow. Each frame's
+  steps are now ordered by their dependencies, and by id where those leave
+  the order open; a loop's last step, which its repeat condition names, is
+  taken in the same order.
 
 ### Known limitations
 

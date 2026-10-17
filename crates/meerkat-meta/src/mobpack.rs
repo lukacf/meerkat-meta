@@ -17168,11 +17168,60 @@ fn input_param_summary(params: &[Value]) -> String {
         .join(", ")
 }
 
-/// A frame's nodes in order, each visit counted as one unit of work.
+/// A frame's nodes in dependency order: each after the nodes of the frame it
+/// depends on, and in id order where the dependencies leave the order open.
+/// Each visit counts as one unit of work. A definition's steps are parsed in
+/// id order, and import showed them in that order, so a step whose id sorts
+/// before a step it depends on came first, and exporting the imported flow
+/// ran it first.
 fn frame_nodes(
     frame: &FrameSpec,
 ) -> impl Iterator<Item = (&meerkat_mob::FlowNodeId, &FlowNodeSpec)> {
-    frame.nodes.iter().inspect(|_| count_mobpack_work())
+    let mut waiting = BTreeMap::new();
+    let mut dependents: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for (id, node) in &frame.nodes {
+        let depends_on = match node {
+            FlowNodeSpec::Step(step) => &step.depends_on,
+            FlowNodeSpec::RepeatUntil(loop_spec) => &loop_spec.depends_on,
+        };
+        let within_frame = depends_on
+            .iter()
+            .filter(|dependency| *dependency != id && frame.nodes.contains_key(*dependency))
+            .collect::<BTreeSet<_>>();
+        waiting.insert(id, within_frame.len());
+        for dependency in within_frame {
+            dependents.entry(dependency).or_default().push(id);
+        }
+    }
+    let mut ready = waiting
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(id, _)| *id)
+        .collect::<BTreeSet<_>>();
+    let mut order = Vec::with_capacity(frame.nodes.len());
+    while let Some(id) = ready.pop_first() {
+        order.push(id);
+        for dependent in dependents.get(id).into_iter().flatten() {
+            if let Some(count) = waiting.get_mut(dependent) {
+                *count -= 1;
+                if *count == 0 {
+                    ready.insert(*dependent);
+                }
+            }
+        }
+    }
+    // Nodes on a dependency cycle, which validation refuses, and the nodes
+    // after them follow in id order.
+    order.extend(
+        waiting
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(id, _)| id),
+    );
+    order
+        .into_iter()
+        .filter_map(move |id| frame.nodes.get_key_value(id))
+        .inspect(|_| count_mobpack_work())
 }
 
 fn visual_steps_from_frame(frame: &FrameSpec, flow: &FlowSpec) -> Vec<Value> {
@@ -17472,7 +17521,7 @@ fn launch_modes_from_instances(instances: &[Value]) -> Value {
 
 fn last_step_id_in_frame(frame: &FrameSpec) -> Option<String> {
     let mut out = None;
-    for node in frame.nodes.values() {
+    for (_, node) in frame_nodes(frame) {
         match node {
             FlowNodeSpec::Step(step) => out = Some(step.step_id.to_string()),
             FlowNodeSpec::RepeatUntil(loop_spec) => {
@@ -40404,8 +40453,7 @@ condition = { op = "eq", path = "params.kind", value = "d" }
     /// its own, after the parallel step of the steps it shares its
     /// dependencies with. The editor shows no condition on a member step, so
     /// exporting the imported flow writes it without its condition, after
-    /// those steps (see the changelog's Known limitations). The step ids sort
-    /// in dependency order: import shows a frame's steps in id order.
+    /// those steps (see the changelog's Known limitations).
     #[test]
     fn a_conditioned_step_without_a_branch_exports_as_a_plain_step_after_its_siblings() {
         let mob_toml = r#"
@@ -40478,5 +40526,82 @@ condition = { op = "eq", path = "params.kind", value = "c" }
             (after, c.condition.is_none()),
             (vec!["A.".to_string(), "B.".to_string()], true)
         );
+    }
+
+    /// The definition `mob_toml` describes, after a round trip through the
+    /// Flow Editor: imported, then exported from the editor document.
+    fn round_tripped_definition(mob_toml: &str) -> MobDefinition {
+        let imported = import_mobpack(&json!({ "mob_toml": mob_toml })).expect("import");
+        let mut document: MobpackDocument =
+            serde_json::from_value(imported["document"].clone()).expect("document");
+        document.mob_toml = None;
+        let exported = render_editor_document_mob_toml(&document).expect("export the import");
+        MobDefinition::from_toml(&exported).expect("the exported definition")
+    }
+
+    /// Each step of a definition's one flow, by its message, with the
+    /// messages of the steps it depends on.
+    fn step_wiring(definition: &MobDefinition) -> BTreeMap<String, BTreeSet<String>> {
+        let flow = definition.flows.values().next().expect("the flow");
+        let message = |id: &str| {
+            flow.steps
+                .get(id)
+                .map(|step| step.message.text_content())
+                .unwrap_or_default()
+        };
+        flow.steps
+            .values()
+            .map(|step| {
+                let depends_on = step
+                    .depends_on
+                    .iter()
+                    .map(|id| message(id.as_str()))
+                    .collect();
+                (step.message.text_content(), depends_on)
+            })
+            .collect()
+    }
+
+    /// Import shows a definition's steps in dependency order, so the flow
+    /// exported from the imported document wires its steps as the
+    /// definition did. Steps are parsed in id order, and import showed them
+    /// in that order: steps whose ids sort before a step they depend on came
+    /// first, and the export ran them first.
+    #[test]
+    fn a_round_trip_through_the_editor_keeps_the_step_wiring() {
+        let header = "[mob]\nid = \"order\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+                      peer_description = \"Worker\"\n\n[flows.main]\ndescription = \"Order\"\n";
+        let step = |id: &str, depends_on: &[&str]| {
+            let depends_on = depends_on
+                .iter()
+                .map(|dependency| format!("\"{dependency}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "\n[flows.main.steps.{id}]\nrole = \"worker\"\nmessage = \"Step {id}.\"\n\
+                 depends_on = [{depends_on}]\n"
+            )
+        };
+        let fan_out = [
+            step("start", &[]),
+            step("a", &["start"]),
+            step("b", &["start"]),
+            step("c", &["start"]),
+        ];
+        let diamond = [
+            step("zeta", &[]),
+            step("alpha", &["zeta"]),
+            step("beta", &["zeta"]),
+            step("gamma", &["alpha", "beta"]),
+        ];
+        for steps in [fan_out, diamond] {
+            let mob_toml = format!("{header}{}", steps.concat());
+            let definition = MobDefinition::from_toml(&mob_toml).expect("the definition");
+            assert_eq!(
+                step_wiring(&round_tripped_definition(&mob_toml)),
+                step_wiring(&definition),
+                "{mob_toml}"
+            );
+        }
     }
 }
