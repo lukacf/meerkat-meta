@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The schedule tools a session service keeps no longer keep a stopped
+  host's mob state alive: Meta's schedule mob target registry holds it
+  weakly, so the runtime's mob runtime stays its only owner. Once that state
+  is gone, a `meerkat_schedule_create` or `meerkat_schedule_update` whose
+  resumable-session target Meta would rewrite to a mob member is refused as
+  temporarily unavailable (`ToolError::Unavailable`), as Core refuses a
+  stopped driver; other targets and the store-only calls are unchanged.
+
+## [0.9.2] - 2026-10-16
+
 ### Breaking
 
 - With the `extension-state` feature, a document store that an embedding
@@ -247,6 +259,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Requires Meerkat 0.9.2: every Meerkat dependency is pinned to
+  `=0.9.2` from crates.io.
 - Console: an operation refusal reads "Action refused" instead of
   "Permission denied". The host refuses an operation for a policy denial, for
   an authorization that changed after the operation was prepared and for
@@ -353,13 +367,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   then failed, the journal and startup's refusal named no unfinished step.
   A reopened journal now records no step as finished until the rerun
   finishes it.
-- The schedule tools a session service keeps no longer keep a stopped
-  host's mob state alive: Meta's schedule mob target registry holds it
-  weakly, so the runtime's mob runtime stays its only owner. Once that state
-  is gone, a `meerkat_schedule_create` or `meerkat_schedule_update` whose
-  resumable-session target Meta would rewrite to a mob member is refused as
-  temporarily unavailable (`ToolError::Unavailable`), as Core refuses a
-  stopped driver; other targets and the store-only calls are unchanged.
 
 ### Known limitations
 

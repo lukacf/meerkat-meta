@@ -41,7 +41,7 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.1",
+        "CARGO_PKG_VERSION": "0.9.2",
         "CARGO_MANIFEST_DIR": "./crates/meta-store-conformance",
     },
     proc_macro_deps = all_crate_deps(
@@ -75,7 +75,7 @@ rust_test(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.1",
+        "CARGO_PKG_VERSION": "0.9.2",
         "CARGO_MANIFEST_DIR": "./crates/meta-store-conformance",
     },
     tags = [
@@ -124,7 +124,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.1",
+        "CARGO_PKG_VERSION": "0.9.2",
         "CARGO_BIN_NAME": "conformance",
         "CARGO_MANIFEST_DIR": "./crates/meta-store-conformance",
     },
@@ -172,7 +172,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.1",
+        "CARGO_PKG_VERSION": "0.9.2",
         "CARGO_BIN_NAME": "json_console_store",
         "CARGO_MANIFEST_DIR": "./crates/meta-store-conformance",
     },
@@ -220,7 +220,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.1",
+        "CARGO_PKG_VERSION": "0.9.2",
         "CARGO_BIN_NAME": "one_remote_bundle",
         "CARGO_MANIFEST_DIR": "./crates/meta-store-conformance",
     },

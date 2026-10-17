@@ -4,6 +4,10 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+## 0.9.2
+
+- No SDK API changes; released with Meta 0.9.2 on Meerkat 0.9.2.
+
 ## 0.9.1
 
 - `MetaBuilder.gating("")` and `MetaBuilder.access_control("")` raise a
