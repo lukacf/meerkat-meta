@@ -490,6 +490,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   against it a refused reply still reads as an answer; it is refused once
   Meerkat reports refusals as their own stop.
 
+- A `MobRuntime` torn down without `UnifiedRuntime` (its root mob shut down,
+  then `stand_down_child_mobs`) stops its runtime delivery owner and empties
+  the composition slots that point back at it before it releases the durable
+  child root, as `UnifiedRuntime`'s shutdown does. Nothing stopped the owner
+  there: it kept reconciling over the runtime store after the root was
+  released, held by the composition the dropped runtime left behind, and
+  recreated a state directory that had been removed. There, the stand-down
+  joins the owner within its deadline, so a pass already running finishes
+  before the release; an owner still running at the deadline keeps the root
+  owned (`HeldUntilProcessExit`). `UnifiedRuntime`'s shutdown still stops
+  the owner without joining it, once the mob stops.
+
 ### Known limitations
 
 - The Flow Editor draft store is shared by every caller of a Flow Editor

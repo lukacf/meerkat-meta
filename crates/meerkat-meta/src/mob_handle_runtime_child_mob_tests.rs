@@ -1216,6 +1216,64 @@ async fn a_child_root_with_no_children_is_released_for_a_successor() {
     stand_down_released(successor, 0).await;
 }
 
+/// A stand-down is terminal for the runtime's delivery owner as well: a
+/// runtime torn down without `UnifiedRuntime` (the root mob shut down, then
+/// the child stand-down) stops it, as `UnifiedRuntime`'s shutdown does. The
+/// owner kept running after the root was released, held by the composition
+/// the dropped runtime left behind, and an owner pass in flight when the
+/// state directory was removed recreated it with an empty runtime store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stand_down_stops_the_runtime_delivery_owner() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let host = Host::new();
+    let mob_id = unique("delivery-stop");
+    let runtime = lifetime(dir.path(), &mob_id, &host, |spec| {
+        spec.with_child_mob_storage(durable(dir.path()))
+    })
+    .await
+    .expect("first lifetime");
+    runtime
+        .handle()
+        .shutdown()
+        .await
+        .expect("root mob shutdown");
+    let released = runtime.stand_down_child_mobs(release_deadline()).await;
+    // Stopped, and joined: the owner's task ended before the stand-down
+    // returned, so no pass of it can run past the release.
+    let stopped = runtime
+        .runtime_delivery
+        .as_ref()
+        .map(|delivery| (delivery.is_stopped(), delivery.owner_task_ended()));
+    drop(runtime);
+    // Work the dropped runtime still finishes may close files in the
+    // directory while it goes: remove it again until it is gone.
+    let removal_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::fs::remove_dir_all(dir.path()) {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => assert!(
+                std::time::Instant::now() < removal_deadline,
+                "remove the state dir: {error}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The delivery owner sweeps its store every 5 s by default.
+    let deadline = std::time::Instant::now() + Duration::from_secs(7);
+    while !dir.path().exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        (released, stopped, dir.path().exists()),
+        (
+            crate::child_mob_storage::ChildMobStandDownOutcome::Released { child_mobs: 0 },
+            Some((true, true)),
+            false
+        )
+    );
+}
+
 /// A child that shut down cleanly keeps that receipt for its incarnation: a
 /// second pass of the child stand-down helper over the same, now stopped,
 /// incarnation (the retry a stand-down makes after unsettled state work)

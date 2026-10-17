@@ -625,8 +625,9 @@ pub enum ChildMobStandDownOutcome {
     /// Every child actor reported a clean shutdown, but the agent mob-tool
     /// state did not settle before the deadline (a create admitted before
     /// its close still writing, a council run, a completion custodian or a
-    /// live delegation delivery still running), or another holder of the
-    /// root claim was still alive at the release, so cleanup is NOT complete.
+    /// live delegation delivery still running), the runtime's delivery owner
+    /// was still running at the deadline, or another holder of the root
+    /// claim was still alive at the release, so cleanup is NOT complete.
     /// The child root stays owned (a later stand-down retries); a successor
     /// in this process is refused with
     /// [`ChildMobStorageError::AlreadyClaimed`].
