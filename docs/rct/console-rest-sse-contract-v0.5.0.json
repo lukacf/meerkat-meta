@@ -264,6 +264,73 @@
           }
         ]
       },
+      "send_recover": {
+        "method": "POST",
+        "path": "/console/send/recover",
+        "rpc_twin": "meta/console/recover_send",
+        "request": {
+          "required_fields": [
+            "identity",
+            "origin",
+            "idempotency_key"
+          ],
+          "validation": "Only identity, origin and idempotency_key are accepted; any other field, including an interaction or frame id, is refused. Each must be non-empty after trimming. The caller is the request's authenticated principal, never a field, and only that caller's sends are found."
+        },
+        "success": {
+          "type_ref": "TYPE-023",
+          "native_state_values": [
+            "admitted",
+            "absent",
+            "unknown"
+          ],
+          "note": "The send's acceptance as meta/console/send answers it (TYPE-023), with its status as it is now, plus native: what the runtime holds for the send in the session it recorded ({state: admitted, input_id, phase?}, {state: absent} or {state: unknown, cause}). A send the evidence shows admitted but not yet settled is settled delivered first. Nothing is dispatched."
+        },
+        "errors": [
+          {
+            "status": 401,
+            "shape": {
+              "error": "unauthorized",
+              "message": "console send recovery requires a valid auth token"
+            }
+          },
+          {
+            "status": 403,
+            "shape": {
+              "error": "read_only|access_denied",
+              "message": "string"
+            }
+          },
+          {
+            "status": 400,
+            "shape": {
+              "error": "invalid_request",
+              "message": "string"
+            }
+          },
+          {
+            "status": 404,
+            "shape": {
+              "error": "send_not_found",
+              "message": "no console send of yours has this idempotency key"
+            },
+            "note": "Answered alike for a key the caller never used and for a key another caller used."
+          },
+          {
+            "status": 404,
+            "shape": {
+              "error": "unavailable",
+              "message": "console aggregator unavailable"
+            }
+          },
+          {
+            "status": 500,
+            "shape": {
+              "error": "internal_error",
+              "message": "string"
+            }
+          }
+        ]
+      },
       "blob": {
         "method": "GET",
         "path_template": "/blobs/{blob_id}",
@@ -543,6 +610,47 @@
                 -32009,
                 -32000,
                 -32602
+              ]
+            }
+          ]
+        },
+        "meta/console/recover_send": {
+          "policy_error_refs": [
+            "#/surfaces/rpc/policy_errors/read_only",
+            "#/surfaces/rpc/policy_errors/access_denied"
+          ],
+          "request": {
+            "required_fields": [
+              "identity",
+              "origin",
+              "idempotency_key"
+            ],
+            "validation": "Only identity, origin and idempotency_key are accepted; any other field, including an interaction or frame id, is refused. Each must be non-empty after trimming. The caller is the request's authenticated principal, never a field, and only that caller's sends are found."
+          },
+          "success": {
+            "type_ref": "TYPE-023",
+            "native_state_values": [
+              "admitted",
+              "absent",
+              "unknown"
+            ],
+            "note": "The send's acceptance as meta/console/send answers it (TYPE-023), with its status as it is now, plus native: what the runtime holds for the send in the session it recorded ({state: admitted, input_id, phase?}, {state: absent} or {state: unknown, cause}). A send the evidence shows admitted but not yet settled is settled delivered first. Nothing is dispatched."
+          },
+          "errors": [
+            {
+              "codes": [
+                -32001
+              ],
+              "data": {
+                "kind": "send_not_found"
+              },
+              "note": "Answered alike for a key the caller never used and for a key another caller used."
+            },
+            {
+              "codes": [
+                -32602,
+                -32004,
+                -32000
               ]
             }
           ]
