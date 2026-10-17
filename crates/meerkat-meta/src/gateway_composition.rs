@@ -1036,15 +1036,36 @@ const GATEWAY_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// Build the multi-threaded tokio runtime both gateway binaries run on.
 ///
+/// Its worker count is meerkat's `RKAT_WORKER_THREADS`, then Tokio's
+/// `TOKIO_WORKER_THREADS`, as
+/// [`meerkat_runtime::host_stack::worker_threads_from_env`] validates them;
+/// with neither set, Tokio starts one worker per available CPU. A value that
+/// is not a whole number of at least 1 is refused as an `InvalidInput` error
+/// naming the variable, before any worker starts.
+///
 /// The error is returned rather than handled: the two binaries report a
 /// build failure differently on purpose - `meta_gateway` emits a JSON-RPC
 /// init error on stdout (its parent is an SDK reading the handshake),
 /// `rpc_gateway` writes to stderr. Only the builder itself is shared.
 pub fn gateway_tokio_runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
+    let worker_threads = meerkat_runtime::host_stack::worker_threads_from_env()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    gateway_tokio_runtime_with(worker_threads)
+}
+
+/// [`gateway_tokio_runtime`] with its worker count already resolved; `None`
+/// keeps Tokio's one worker per available CPU.
+fn gateway_tokio_runtime_with(
+    worker_threads: Option<std::num::NonZeroUsize>,
+) -> std::io::Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
         .enable_all()
-        .thread_stack_size(GATEWAY_WORKER_STACK_BYTES)
-        .build()
+        .thread_stack_size(GATEWAY_WORKER_STACK_BYTES);
+    if let Some(workers) = worker_threads {
+        builder.worker_threads(workers.get());
+    }
+    builder.build()
 }
 
 /// Default tracing filter for a gateway binary when `RUST_LOG` is unset:
@@ -2264,6 +2285,16 @@ default_binding = "local"
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             ["profile_quiesce", "runtime_shutdown", "registry_cleanup"]
         );
+    }
+
+    #[test]
+    fn the_gateway_runtime_starts_the_resolved_worker_count() {
+        let runtime = gateway_tokio_runtime_with(std::num::NonZeroUsize::new(3))
+            .expect("gateway runtime with three workers");
+        assert_eq!(runtime.metrics().num_workers(), 3);
+        let single = gateway_tokio_runtime_with(std::num::NonZeroUsize::new(1))
+            .expect("gateway runtime with one worker");
+        assert_eq!(single.metrics().num_workers(), 1);
     }
 
     /// Golden envelope for the shared filter builder: the exact strings the

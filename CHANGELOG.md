@@ -361,6 +361,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `ConsoleLogStore::unsettled_send_frames` (defaulted to none) and
   `UnifiedRuntime::reconcile_interrupted_console_sends`, which both gateways
   run once at startup.
+- `rpc_gateway`, `meta_gateway` and `meta_flow_editor` take their Tokio worker
+  count from `RKAT_WORKER_THREADS`, the variable the Meerkat 0.9.3 host
+  binaries read, then from Tokio's `TOKIO_WORKER_THREADS`, as
+  `meerkat_runtime::host_stack::worker_threads_from_env` validates them. With
+  neither set they still start one worker per available CPU. A value that is
+  not a whole number of at least 1 is refused at startup, where an invalid
+  `TOKIO_WORKER_THREADS` used to make Tokio panic. A gateway whose container
+  allows fewer threads than its CPU count can now start with fewer workers
+  (see the deployment guide).
 
 ### Changed
 
