@@ -12559,11 +12559,12 @@ impl MobRuntime {
     /// Stand down every durable child mob this runtime manages.
     ///
     /// Call it after the root mob has stopped; [`crate::UnifiedRuntime`]
-    /// shutdown does. It is terminal: first it retires the runtime's delivery
-    /// owner and joins it within the deadline
-    /// ([`Self::retire_runtime_delivery`]), and empties the composition
-    /// slots that point back at this runtime, as that shutdown does once the
-    /// mob stops. It then closes the agent mob-tool state's admission
+    /// shutdown does. It is terminal: first the runtime's delivery owner is
+    /// retired and joined within the deadline, or already stopped
+    /// (`UnifiedRuntime`'s shutdown stops it, unjoined, once the mob stops),
+    /// and the composition slots that point back at this runtime are
+    /// emptied, as that shutdown does once the mob stops.
+    /// It then closes the agent mob-tool state's admission
     /// (Meerkat's `MobMcpState::close_admission`) and waits for the creates,
     /// inserts, restores and council admissions already past their check, so
     /// the child snapshot it takes next is final. Each child then gets a
@@ -12577,7 +12578,8 @@ impl MobRuntime {
     /// the work the state owns (council runs, completion custodians,
     /// teardown handoffs, live delegation deliveries) and aborts its loops.
     /// Only when admission and that work settled, the delivery owner was
-    /// joined, every child is clean, and no child appeared meanwhile, is the
+    /// joined or already stopped (unjoined, by `UnifiedRuntime`'s shutdown),
+    /// every child is clean, and no child appeared meanwhile, is the
     /// child-root claim released
     /// ([`crate::ChildMobStandDownOutcome::Released`]), so a successor over
     /// the same layout can claim it in this process; with no child at all
@@ -12597,7 +12599,8 @@ impl MobRuntime {
         // of a released root. The owner is joined, within the deadline: a
         // pass already in blocking store work finishes before the release,
         // and an owner still running at the deadline keeps the root owned.
-        // Both are idempotent; `UnifiedRuntime` stopped the owner already.
+        // Both are idempotent. `UnifiedRuntime`'s shutdown stopped the owner
+        // already, without joining it, so here there is nothing left to join.
         let delivery_retired = self.retire_runtime_delivery(deadline).await;
         self.release_composition_slots();
         // A root already released (or never claimed) answers at once.
@@ -12733,10 +12736,11 @@ impl MobRuntime {
         Ok(())
     }
 
-    /// Latest native delivery-owner pass, if this runtime owns delivery.
     /// Stop the native delivery owner now, even while clones of this runtime
     /// live. Teardown calls it after the mob stops; undelivered rows stay
-    /// pending in the durable inbox for the next owner.
+    /// pending in the durable inbox for the next owner. It aborts the owner's
+    /// task without joining it, so a pass already in blocking store work may
+    /// still finish after this returns.
     pub fn stop_runtime_delivery(&self) {
         if let Some(delivery) = self.runtime_delivery.as_ref() {
             delivery.stop();
@@ -12748,7 +12752,7 @@ impl MobRuntime {
     /// first, so nothing it does outlives the call. `Err` when it was still
     /// running at the deadline; a later call joins the same owner. A runtime
     /// without delivery, or whose owner already stopped, answers `Ok` at
-    /// once.
+    /// once (that owner is not joined).
     pub(crate) async fn retire_runtime_delivery(
         &self,
         deadline: std::time::Instant,
