@@ -10,6 +10,8 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Jobs that build Rust also read actions, to fetch the dependency builds
+# warm-deps.yml warmed for a pull request's branch (scripts/ci-warm-deps.py).
 permissions:
   contents: read
 
@@ -154,6 +156,7 @@ jobs:
       - run: python3 scripts/test_verify_crate_package_files.py
       - run: python3 scripts/test_memory_evals.py
       - run: python3 scripts/test_verify_unit_test_filter.py
+      - run: python3 scripts/test_ci_warm_deps.py
       - run: scripts/check-memory-bright-line
       - run: scripts/memory-evals --check
       - run: node scripts/generate-bazel-rust-builds.mjs --check
@@ -170,6 +173,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -179,6 +185,7 @@ jobs:
         with:
           shared-key: fmt-lint
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - run: scripts/repo-cargo clippy --workspace --all-targets -- -D warnings
 
   # Unit tests run in one job and integration tests in two halves. As one
@@ -208,6 +215,9 @@ jobs:
       # CI test binaries therefore carry no debuginfo; panics keep their
       # messages but backtraces lose file:line. Local builds are unaffected.
       CARGO_PROFILE_DEV_DEBUG: "0"
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -215,6 +225,7 @@ jobs:
         with:
           shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - uses: taiki-e/install-action@nextest
       # The idle CPU gate asserts an absolute per-30s CPU budget calibrated on
       # real hardware; GitHub's shared 2-vCPU runners read ~3-4s where real
@@ -262,6 +273,9 @@ jobs:
       # CI test binaries therefore carry no debuginfo; panics keep their
       # messages but backtraces lose file:line. Local builds are unaffected.
       CARGO_PROFILE_DEV_DEBUG: "0"
+    permissions:
+      actions: read
+      contents: read
     steps:
       # The workspace debug build (meerkat 0.7.25 dep tree + all test
       # binaries) plus the rust-cache restore no longer fits beside the
@@ -286,6 +300,7 @@ jobs:
         with:
           shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - uses: taiki-e/install-action@nextest
       # The idle CPU gate asserts an absolute per-30s CPU budget calibrated on
       # real hardware; GitHub's shared 2-vCPU runners read ~3-4s where real
@@ -316,12 +331,16 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_INCREMENTAL: "0"
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - run: scripts/repo-cargo test -p meta-extension-state --locked
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --lib --test extension_state --no-run
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --test extension_state
@@ -339,6 +358,9 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_INCREMENTAL: "0"
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -347,6 +369,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - run: scripts/repo-cargo check -p meerkat-meta --locked --no-default-features
       - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features extension-state --lib --test extension_state -- -D warnings
 
@@ -359,12 +382,16 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # The feature union triggers the repository's Rust 1.97 incremental ICE.
       CARGO_INCREMENTAL: "0"
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       # The shared host uses a loopback provider, never paid credentials.
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --lib --bin rpc_gateway --bin meta_gateway --test console_route_auth --test console_experience --test never_executed_persistence --test swarm_integration console_voice
       - run: scripts/repo-cargo test -p meerkat-meta --locked --features openai-live --lib gateway_openai_live_registration
@@ -384,6 +411,9 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # The feature union triggers the repository's Rust 1.97 incremental ICE.
       CARGO_INCREMENTAL: "0"
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -392,6 +422,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features openai-live --lib --bin rpc_gateway --bin meta_gateway -- -D warnings
 
   test-python:
@@ -401,6 +432,9 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -414,6 +448,7 @@ jobs:
           # release.yml's verify_crate_packages restores this entry; no
           # executable from ~/.cargo/bin rides along.
           cache-bin: false
+      - uses: ./.github/actions/fetch-warm-deps
       - run: python -m pip install 'sdk/python[dev]'
       # Gateway-backed structural tests materialize OpenAI profiles but never
       # issue provider requests. Meerkat resolves auth during construction, so
@@ -457,6 +492,9 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # Rust 1.97 incremental compilation can ICE in async identity iteration.
       CARGO_INCREMENTAL: "0"
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -469,6 +507,7 @@ jobs:
         with:
           shared-key: meta-dev-examples
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - run: npm --prefix console ci --silent --no-fund --no-audit
       - run: npm --prefix console run phase0:types --silent
       - run: npm --prefix console run contracts:console --silent
@@ -537,6 +576,9 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # Rust 1.97 incremental compilation can ICE in async identity iteration.
       CARGO_INCREMENTAL: "0"
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -549,6 +591,7 @@ jobs:
         with:
           shared-key: meta-dev-examples
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - run: npm --prefix console ci --silent --no-fund --no-audit
       - run: npm --prefix console run build --silent
       - run: npm --prefix console run build:acceptance --silent
@@ -633,6 +676,9 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -645,6 +691,7 @@ jobs:
         with:
           shared-key: meta-dev-examples
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - run: npm --prefix console ci --silent --no-fund --no-audit
       - run: npm --prefix console run fixtures:console-customization --silent
 
@@ -658,6 +705,9 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -670,6 +720,7 @@ jobs:
         with:
           shared-key: meta-dev-examples
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/fetch-warm-deps
       - run: npm --prefix console ci --silent --no-fund --no-audit
       - run: npm --prefix console exec -- playwright install --with-deps chromium
       - name: Stock incident topology acceptance
@@ -690,6 +741,9 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -705,6 +759,7 @@ jobs:
           # release.yml's verify_crate_packages restores this entry; no
           # executable from ~/.cargo/bin rides along.
           cache-bin: false
+      - uses: ./.github/actions/fetch-warm-deps
       - run: npm --prefix flow-editor ci --silent --no-fund --no-audit
       - run: npm --prefix flow-editor exec -- playwright install --with-deps chromium
       - run: CARGO_INCREMENTAL=0 scripts/repo-cargo build -p meerkat-meta --bin meta_flow_editor

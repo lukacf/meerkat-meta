@@ -482,8 +482,11 @@ class CiChangesTests(unittest.TestCase):
             "docs/rct/traceability.md",
             # src/mobpack.rs reads .claude/skills.
             ".claude/skills/meerkat-meta/SKILL.md",
-            # Every Rust job builds through it.
+            # Every Rust job builds through it, and on a pull request first
+            # fetches the warmed dependency builds.
             "scripts/repo-cargo",
+            "scripts/ci-warm-deps.py",
+            ".github/actions/fetch-warm-deps/action.yml",
             "scripts/nested/helper.py",
             # Unclassified files fail closed.
             "tests/memory-evals/README.md",

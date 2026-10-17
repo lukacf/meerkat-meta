@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `.github/workflows/warm-deps.yml`, dispatched on a branch whose `Cargo.lock`
+  changed, builds the dependency graph of each Rust CI job from that branch's
+  crates.io dependencies, with no workspace code, and keeps it as a 3-day
+  artifact. The branch's pull request extracts the matching artifact in each
+  Rust job (`scripts/ci-warm-deps.py`), so a Meerkat Core bump no longer
+  compiles its dependencies cold in every job. CONTRIBUTING.md has the
+  release-preparation steps.
+
 ### Changed
 
 - The pre-push hook runs only fast local checks. The workspace clippy and the
