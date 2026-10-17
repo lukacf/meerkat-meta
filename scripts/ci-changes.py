@@ -17,7 +17,8 @@ reach and do not leave to the push:
 - Rust sources and build configuration (RUST_INPUTS) reach every lane but
   console-perf, which bundles only console/ and packages/console-*;
 - any other file, a change to ci.yml itself (the pull request must prove its
-  own CI) and the repository wrapper every Rust job runs reach every lane.
+  own CI) and the files every Rust job runs (the repository's cargo wrapper
+  and the fetch of warmed dependency builds) reach every lane.
 
 A pull request runs the rust and integration lanes for a Rust change and
 leaves the lanes that compile the same crate in another configuration (the
@@ -219,12 +220,14 @@ LANE_INPUTS = (
 
 # The classifier and its contract decide every other path's lanes.
 CLASSIFIER_FILES = frozenset({"scripts/ci-changes.py", "scripts/test_ci_changes.py"})
-# Every Rust job builds through it.
-REPO_CARGO = "scripts/repo-cargo"
+# Every Rust job builds through the wrapper and, on a pull request, first
+# fetches the dependency builds warm-deps.yml warmed for its branch.
+RUST_JOB_FILES = frozenset({"scripts/repo-cargo", "scripts/ci-warm-deps.py",
+                            ".github/actions/fetch-warm-deps/action.yml"})
 
 
 def top_level_script(path: str) -> bool:
-    return path.startswith("scripts/") and path.count("/") == 1 and path != REPO_CARGO
+    return path.startswith("scripts/") and path.count("/") == 1 and path not in RUST_JOB_FILES
 
 
 def skippable(path: str) -> bool:
@@ -243,7 +246,7 @@ def rust_input(path: str) -> bool:
 
 def path_lanes(path: str) -> frozenset:
     """The lanes a change to this one path can reach."""
-    if path in CLASSIFIER_FILES or path == REPO_CARGO:
+    if path in CLASSIFIER_FILES or path in RUST_JOB_FILES:
         return EVERY_LANE
     if path in AREA_FILES:
         return AREA_FILES[path]

@@ -109,6 +109,29 @@ lane a pull request left to the push reports its failures on main, after the
 merge. Other branches get CI through their pull request; dispatch the CI
 workflow on a branch for a full run without one.
 
+### Warm dependency builds for a Meerkat Core bump
+
+A pull request's CI restores caches saved on main only, so every Rust job of
+a pull request that changes `Cargo.lock` compiles the changed dependencies
+cold. Release preparation therefore runs:
+
+1. Push the pin and lock commit to the release branch.
+2. Dispatch the warm job on it right away:
+   `gh workflow run warm-deps.yml --ref <branch>`.
+3. Do the local stamp, release and full-suite work while it runs.
+4. Open the pull request once the warm run has finished, or re-run the pull
+   request's CI if it is already open.
+
+Each Rust job's `fetch-warm-deps` step prints one line: the artifact it
+extracted, or why it took none, in which case the job builds as before. It
+takes an artifact only from a dispatch on the pull request's head commit or
+one of its ancestors, with the warm workflow, its script and the fetch action
+unchanged since. The
+warm job builds only the branch's crates.io dependencies (it refuses git and
+path sources and `[patch]`), with every workspace target blanked, and keeps
+each graph's artifact for 3 days. Artifacts are stored apart from the Actions
+cache and do not count against its size limit or budget.
+
 ## Code Style
 
 - **Rust**: `make fmt` for formatting, `make lint` for clippy

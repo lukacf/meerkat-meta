@@ -168,7 +168,8 @@ class CiWorkflowTests(unittest.TestCase):
         # Jobs that run pull request code stay read-only. Only the cleanup
         # job may delete caches: it runs for pushes to main alone, after every
         # job that saves a rust cache, and drops exactly their families.
-        self.assertEqual(re.findall(r"(?m)^ +permissions:$", source), ["    permissions:"])
+        # The Rust jobs only read actions, to fetch warmed dependency builds
+        # (scripts/test_ci_warm_deps.py pins those grants).
         self.assertEqual(re.findall(r"(?m)^ +actions: write$", source), ["      actions: write"])
         drop = job_block("drop-superseded-caches")
         self.assertIn("    if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n", drop)

@@ -1,0 +1,43 @@
+name: Warm dependencies
+
+# Release preparation (CONTRIBUTING.md): right after pushing a branch whose
+# Cargo.lock changed, dispatch this on it, and open its pull request once
+# this has finished. A pull request's CI restores caches saved on main only,
+# so without this every Rust job of a Meerkat Core bump compiles the changed
+# dependencies cold. Each leg builds one dependency graph of the branch with
+# no workspace code and uploads it as an artifact, which is kept 3 days and
+# stored apart from the Actions cache. scripts/ci-warm-deps.py has the rest.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+jobs:
+  warm:
+    name: warm (${{ matrix.graph }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        graph: [clippy, test, voice-test, voice-clippy, extension-state-test, extension-state-lint, dev-bins,
+                dev-examples]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: clippy
+      - id: warm
+        run: python3 scripts/ci-warm-deps.py build "${{ matrix.graph }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.warm.outputs.name }}
+          path: warm-deps.tar
+          if-no-files-found: error
+          retention-days: 3
