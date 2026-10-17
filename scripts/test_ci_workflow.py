@@ -15,6 +15,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
+# dtolnay/rust-toolchain keeps one branch per toolchain, and each branch's
+# commit hard-codes its version, so a toolchain is pinned to its branch's
+# commit. A toolchain bump re-pins it here and in the workflows.
+RUST_TOOLCHAIN_ACTION = {"1.97.0": "f08ac54821369508305fcb9e0121ec6e30ae9ada"}
 _CI_CHANGES_SPEC = importlib.util.spec_from_file_location("ci_changes", ROOT / "scripts/ci-changes.py")
 ci_changes = importlib.util.module_from_spec(_CI_CHANGES_SPEC)
 _CI_CHANGES_SPEC.loader.exec_module(ci_changes)
@@ -95,9 +99,30 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertRegex(version, r"^\d+\.\d+\.\d+$")
         for name in ("ci.yml", "release.yml", "e2e-live.yml"):
             source = (ROOT / ".github/workflows" / name).read_text()
-            installs = re.findall(r"uses:\s*dtolnay/rust-toolchain@(\S+)", source)
+            installs = re.findall(r"uses:\s*dtolnay/rust-toolchain@([0-9a-f]{40}) # (\S+)\n", source)
             self.assertTrue(installs, f"{name} must install its build toolchain")
-            self.assertEqual(set(installs), {version}, name)
+            self.assertEqual(set(installs), {(RUST_TOOLCHAIN_ACTION[version], version)}, name)
+            self.assertEqual(len(installs), source.count("dtolnay/rust-toolchain@"), name)
+
+    def test_every_external_action_is_pinned_to_a_full_commit_sha(self):
+        """The repository's Actions policy refuses an action that is not
+        pinned to a full-length commit SHA. Each pin names the ref it was taken
+        from in a trailing comment, and one ref pins one commit everywhere."""
+        pins = {}
+        for path in sorted((ROOT / ".github").rglob("*.y*ml")):
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                found = re.match(r"\s*(?:-\s+)?uses:\s*(\S+)(.*)$", line)
+                if not found or found.group(1).startswith(("./", "docker://")):
+                    continue
+                where = f"{path.relative_to(ROOT)}:{number}"
+                pinned = re.fullmatch(r"([\w.-]+/[\w./-]+)@([0-9a-f]{40})", found.group(1))
+                self.assertIsNotNone(pinned, f"{where}: {found.group(1)} is not pinned to a full commit SHA")
+                ref = re.fullmatch(r"\s+# (\S+)\s*", found.group(2))
+                self.assertIsNotNone(ref, f"{where}: the pin must name its ref in a trailing comment")
+                pins.setdefault((pinned.group(1), ref.group(1)), set()).add(pinned.group(2))
+        self.assertTrue(pins)
+        for (action, ref), shas in sorted(pins.items()):
+            self.assertEqual(len(shas), 1, f"{action} {ref} is pinned to {sorted(shas)}")
 
     def test_rust_cache_covers_the_wrapper_target(self):
         """rust-cache saves `<workspace>/target`; repo-cargo must build there.
@@ -140,12 +165,13 @@ class CiWorkflowTests(unittest.TestCase):
             "console-acceptance": "meta-dev-examples",
         }
         source = CI_WORKFLOW.read_text()
-        self.assertEqual(source.count("uses: Swatinem/rust-cache@v2"), len(expected))
+        self.assertEqual(len(re.findall(r"uses: Swatinem/rust-cache@[0-9a-f]{40} # v2\n", source)), len(expected))
+        self.assertEqual(source.count("uses: Swatinem/rust-cache@"), len(expected))
         hashed_env = re.compile(r"(?m)^      ((?:CARGO|CC|CFLAGS|CXX|CMAKE|RUST)\w*): (.*)$")
         group_envs = {}
         for name, shared_key in expected.items():
             step = re.search(
-                r"- uses: Swatinem/rust-cache@v2\n((?: {8}.*\n)+)", job_block(name) + "\n"
+                r"- uses: Swatinem/rust-cache@[0-9a-f]{40} # v2\n((?: {8}.*\n)+)", job_block(name) + "\n"
             )
             self.assertIsNotNone(step, name)
             settings = step.group(1)
@@ -182,10 +208,9 @@ class CiWorkflowTests(unittest.TestCase):
             if (shared_key or name) not in families:
                 families.append(shared_key or name)
         actions = [line.strip() for line in drop.splitlines() if re.match(r" +(- )?(uses|run): ", line)]
-        self.assertEqual(
-            actions,
-            ["- uses: actions/checkout@v4", f"run: scripts/ci-drop-superseded-caches.sh {' '.join(families)}"],
-        )
+        self.assertEqual(len(actions), 2, actions)
+        self.assertRegex(actions[0], r"^- uses: actions/checkout@[0-9a-f]{40} # v4$")
+        self.assertEqual(actions[1], f"run: scripts/ci-drop-superseded-caches.sh {' '.join(families)}")
         self.assertNotIn("drop-superseded-caches", job_block("gate"))
         self.assertNotIn("steps.rust-cache", source)
         self.assertIn("- run: python3 scripts/test_ci_drop_caches.py\n", job_block("fmt-lint"))
@@ -753,7 +778,7 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertIn("  push:\n    branches: [main]\n  pull_request:\n", triggers)
         # Any version or pinned SHA of the checkout action.
         uses = re.findall(r"(?m)^\s*-?\s*uses:\s*actions/checkout@\S+", source)
-        checkouts = re.findall(r"(?m)^ *- uses: actions/checkout@\S+\n((?: {8,}.*\n)*)", source)
+        checkouts = re.findall(r"(?m)^ *- uses: actions/checkout@\S+(?: #[^\n]*)?\n((?: {8,}.*\n)*)", source)
         self.assertTrue(uses)
         self.assertEqual(len(checkouts), len(uses))
         for settings in checkouts:
@@ -771,8 +796,8 @@ class CiWorkflowTests(unittest.TestCase):
           ref: ${{ github.event.inputs.sha }}
       - run: git fetch origin pull/1/head && git checkout FETCH_HEAD
 """
-        self.assertEqual(len(re.findall(r"(?m)^ *- uses: actions/checkout@\S+\n((?: {8,}.*\n)*)", probe)), 1)
-        self.assertIn("ref:", re.findall(r"(?m)^ *- uses: actions/checkout@\S+\n((?: {8,}.*\n)*)", probe)[0])
+        self.assertEqual(len(re.findall(r"(?m)^ *- uses: actions/checkout@\S+(?: #[^\n]*)?\n((?: {8,}.*\n)*)", probe)), 1)
+        self.assertIn("ref:", re.findall(r"(?m)^ *- uses: actions/checkout@\S+(?: #[^\n]*)?\n((?: {8,}.*\n)*)", probe)[0])
         self.assertEqual(re.findall(r"\bgit\s+(fetch|checkout|switch|reset|pull|clone|worktree|restore)\b", probe),
                          ["fetch", "checkout"])
 
