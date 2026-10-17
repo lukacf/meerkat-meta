@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   that alias even while it is the member's current incarnation.
 - The per-agent event stream answers `member_not_found` for a runtime alias
   that is not current, instead of an internal error.
+- The console access rules judge the source member of `meta/fork_helper`
+  as read access to that member, and a session that
+  `meta/attach_existing_session` or `meta/ensure_member`
+  (`resume_session_id`) attaches as read and send access to the members it
+  belongs to. A session whose owner cannot be established is refused unless
+  the caller is an admin.
 - `meta/identity/resolved_tools`, and `resolved_tools_for_member` in Rust,
   resolve the supplied id through `roster_member_id_for_supplied_id`, as
   `meta/identity/routing_status` does (#366). A member named by its current

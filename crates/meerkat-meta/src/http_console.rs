@@ -3080,6 +3080,9 @@ fn console_rpc_access_requirements(
         // action vocabulary is needed.
         "meta/reload_member" => one(ACTION_AGENT_RESPAWN, target),
         "meta/reset" | "meta/reset_all" => one(ACTION_AGENT_RESET, target),
+        // A fork's source member, and the session `meta/attach_existing_session`
+        // (or `meta/ensure_member` with `resume_session_id`) attaches, are
+        // judged in their handlers.
         "meta/ensure_member"
         | "meta/spawn_helper"
         | "meta/fork_helper"
@@ -5781,6 +5784,89 @@ fn console_live_only_fallback_allowed(
         && !crate::member_comms_id::is_reserved_generated_alias(requested_identity)
         && live_alias.is_some_and(|alias| {
             !crate::member_comms_id::is_reserved_generated_alias(&alias.runtime_member_id)
+        })
+}
+
+/// The access-denied error for `action` on a member.
+fn member_access_denied(action: &str, resource: Option<String>) -> JsonRpcError {
+    JsonRpcError {
+        code: ACCESS_DENIED_RPC_CODE,
+        message: format!("access denied: {action}"),
+        data: Some(json!({
+            "kind": "access_denied",
+            "action": action,
+            "resource": resource,
+        })),
+    }
+}
+
+/// A fork carries its source member's conversation into the helper, so
+/// under enforced access rules the source is judged as read access to that
+/// member. Judged here rather than in the requirements map, which would
+/// also judge read access to the new helper's id.
+fn fork_source_access_violation(view: Option<&AccessView>, source: &str) -> Option<JsonRpcError> {
+    let view = view.filter(|view| view.enforced())?;
+    (!view.allows_agent(ACTION_AGENT_VIEW, source))
+        .then(|| member_access_denied(ACTION_AGENT_VIEW, Some(source.to_string())))
+}
+
+/// The members a session belongs to, by console identity: the owner the
+/// continuity store records for it and every roster member bound to it.
+/// `None` when the continuity store cannot answer.
+async fn session_member_owners(
+    handle: &MobHandle,
+    identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+    session_id: &meerkat_core::types::SessionId,
+) -> Option<Vec<String>> {
+    let mut owners = Vec::new();
+    if let Some(identity_runtime) = identity_runtime {
+        match identity_runtime
+            .continuity_store()
+            .session_owner(session_id)
+            .await
+        {
+            Ok(Some(owner)) => owners.push(owner.as_str().to_string()),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+    }
+    for member in handle.list_members_including_retiring().await {
+        if handle
+            .resolve_bridge_session_id_observation(&member.agent_identity)
+            .await
+            .as_ref()
+            == Some(session_id)
+        {
+            owners.push(durable_identity_for_member(&member));
+        }
+    }
+    Some(owners)
+}
+
+/// A member attached to an existing session reads and continues that
+/// session's conversation, so under enforced access rules every member the
+/// session belongs to is judged for read and send access. A session whose
+/// owner cannot be established is refused unless the caller is an admin.
+async fn attached_session_access_violation(
+    view: Option<&AccessView>,
+    handle: &MobHandle,
+    identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+    session_id: &meerkat_core::types::SessionId,
+) -> Option<JsonRpcError> {
+    let view = view.filter(|view| view.enforced())?;
+    let owners = session_member_owners(handle, identity_runtime, session_id)
+        .await
+        .unwrap_or_default();
+    if owners.is_empty() {
+        return (!view.is_admin()).then(|| member_access_denied(ACTION_AGENT_VIEW, None));
+    }
+    [ACTION_AGENT_VIEW, ACTION_AGENT_SEND]
+        .into_iter()
+        .find_map(|action| {
+            owners
+                .iter()
+                .find(|owner| !view.allows_agent(action, owner))
+                .map(|owner| member_access_denied(action, Some(owner.clone())))
         })
 }
 
@@ -9283,6 +9369,17 @@ async fn handle_console_runtime_rpc_with_visibility(
                     }
                 },
             };
+            if let Some(session_id) = resume_session_id.as_ref()
+                && let Some(error) = attached_session_access_violation(
+                    access_view,
+                    &runtime.handle(),
+                    identity_runtime.as_ref(),
+                    session_id,
+                )
+                .await
+            {
+                return response_value(response_id, None, Some(error));
+            }
             let additional_instructions = match request.params.get("additional_instructions") {
                 None | Some(Value::Null) => None,
                 Some(Value::Array(arr)) => {
@@ -10500,6 +10597,9 @@ async fn handle_console_runtime_rpc_with_visibility(
                 return invalid_params(response_id, "source_member_id required");
             };
             let source = crate::member_comms_id::runtime_alias_str(source).into_owned();
+            if let Some(error) = fork_source_access_violation(access_view, &source) {
+                return response_value(response_id, None, Some(error));
+            }
             let Some(agent_identity) = request.params.get("agent_identity").and_then(Value::as_str)
             else {
                 return invalid_params(response_id, "agent_identity required");
@@ -10671,6 +10771,16 @@ async fn handle_console_runtime_rpc_with_visibility(
                 Ok(s) => s,
                 Err(_) => return invalid_params(response_id, "invalid session_id format"),
             };
+            if let Some(error) = attached_session_access_violation(
+                access_view,
+                &runtime.handle(),
+                identity_runtime.as_ref(),
+                &bridge_session_id,
+            )
+            .await
+            {
+                return response_value(response_id, None, Some(error));
+            }
             let raw_reservation = match crate::member_comms_id::reserve_raw_member_target(
                 identity_runtime.as_ref(),
                 agent_identity,
