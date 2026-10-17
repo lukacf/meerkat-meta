@@ -37,6 +37,13 @@ from test_meta_toolkit_runtime_update import catalog_target
 @pytest.fixture
 async def registry(tmp_path, product, monkeypatch):
     target = catalog_target(product)
+    # The inert product and starter proposal both select Apple policy. Keep
+    # that declared policy separate from the runner's real filesystem/kernel.
+    from launchkit import runtime_dependencies
+    from launchkit.runtime_selection import selected_runtime_platform
+    selected_platform = selected_runtime_platform(target)
+    monkeypatch.setattr(runtime_dependencies, "platform_target", lambda: selected_platform)
+    monkeypatch.setattr(deployment, "_local_host_target", lambda: "mac")
     store = GuideStore(tmp_path / "original-guide-store")
     monkeypatch.setattr("launchkit.planner.planner_capability", lambda: {"available": True})
     monkeypatch.setattr("launchkit.guide.planner_capability", lambda: {"available": True})

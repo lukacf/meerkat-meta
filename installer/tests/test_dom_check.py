@@ -468,12 +468,19 @@ def test_permission_probe_failure_is_unavailable_without_authored_execution(tmp_
         assert "25.9.0" in result["detail"]
 
 
-def test_bounded_stdin_channel_keeps_python_default_and_cleanup(tmp_path):
+def test_bounded_stdin_channel_keeps_python_default_and_cleanup(tmp_path, monkeypatch):
     import os
     import sys
     if not execution._sandbox_executable():pytest.skip('Trusted OS sandbox unavailable.')
     source=tmp_path/'source';source.mkdir();scratch=tmp_path/'scratch';scratch.mkdir()
     options=(execution._sandbox_executable(),execution._sandbox_profile(source,scratch,tmp_path),source,execution._check_environment(scratch))
+    started=[]
+    original_popen=execution.subprocess.Popen
+    def observed_popen(*args,**kwargs):
+        process=original_popen(*args,**kwargs)
+        started.append(process)
+        return process
+    monkeypatch.setattr(execution.subprocess,'Popen',observed_popen)
     command=[str(Path(sys.executable).resolve()),'-I','-S','-c','import sys; print(len(sys.stdin.buffer.read()))']
     default=execution._run_sandboxed(command,*options,timeout=2)
     assert default=={"status":"pass","detail":"0"}
@@ -482,9 +489,17 @@ def test_bounded_stdin_channel_keeps_python_default_and_cleanup(tmp_path):
     hung=[str(Path(sys.executable).resolve()),'-I','-S','-c','import sys,os,time;sys.stdin.buffer.read();print(os.getpid(),flush=True);time.sleep(10)']
     result=execution._run_sandboxed(hung,*options,timeout=.3,input_bytes=b'synthetic-input')
     assert result['status']=='fail' and 'time limit' in result['detail']
-    pid=int(result['detail'].splitlines()[-1])
-    with pytest.raises(ProcessLookupError):os.kill(pid,0)
+    assert int(result['detail'].splitlines()[-1])>0
     with pytest.raises(execution.WorkspaceError):execution._run_sandboxed(command,*options,input_bytes=b'x'*65)
+    assert len(started)==3
+    # Linux stdout reports a PID inside bubblewrap's namespace, not a host PID.
+    # Check the actual host-owned children and independently require that the
+    # OS no longer has a waitable child. WNOHANG keeps a cleanup regression from
+    # blocking this assertion on a still-running child.
+    for process in started:
+        assert process.returncode is not None and process.stdout.closed
+        assert process.stdin is None or process.stdin.closed
+        with pytest.raises(ChildProcessError):os.waitpid(process.pid,os.WNOHANG)
 
 
 def test_missing_native_key_symbol_cannot_reach_signer_through_object_prototype(run_dom):

@@ -43,6 +43,10 @@ def no_processes(monkeypatch):
 @pytest.fixture
 async def initial(implementation_service, product, tmp_path, monkeypatch):
     target = catalog_target(product)
+    # These bytes model an Apple target even when pytest runs on Linux.
+    selected_platform = selection.selected_runtime_platform(target)
+    monkeypatch.setattr(dependencies, "platform_target", lambda: selected_platform)
+    monkeypatch.setattr(deployment, "_local_host_target", lambda: "mac")
     implementation_service.guide.state["proposal"]["target"] = "mac"
     first = await implementation_service.submit(implementation_service.guide.identity, 3)
     project = workspace(implementation_service, first)
