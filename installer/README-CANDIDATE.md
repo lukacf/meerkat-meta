@@ -29,8 +29,8 @@ A source-only Meta 0.9 tree without that product manifest stops with concrete
 package preparation guidance instead of downloading a predecessor gateway.
 
 The product packager writes the actual candidate README with selected platform,
-source and artifact hashes. The retained README.md documents the predecessor
-alpha and historical controls; it is not the candidate's native version promise.
+source and artifact hashes. README.md separates current preview startup from retained predecessor
+instructions; the generated manifest remains the candidate's native version authority.
 GETTING_STARTED.md remains the detailed user journey and recovery reference.
 
 The actual Build/Install/use, correction and restart/history journey remains the

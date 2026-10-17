@@ -2,7 +2,7 @@
 
 Describe a useful job, shape its agent team, then install and try it on your own
 Mac or Linux computer. Forge guides design and packaging on top of Meerkat
-Core and Meta, currently published as MobKit. See the [component overview](README.md)
+Core and Meta. See the [component overview](README.md)
 for how they fit together. Forge is a developer alpha. A running process or an
 attractive simulation does not establish that your job works.
 
@@ -14,7 +14,7 @@ and saved settings and follow the [application setup guidance](#4-install-on-thi
 
 ## Quick path
 
-1. **[Open Forge](#1-open-meta-forge).** Unpack the ZIP, run `bash start.sh`,
+1. **[Open Forge](#1-open-meta-forge).** Unpack the complete prepared ZIP, run `bash start.sh`,
    and open the printed address. Keep that terminal open.
 2. **[Describe one useful job](#2-explain-the-job-before-choosing-tools).**
    Choose **In my own words** to write, or **Answer two questions** to pick
@@ -45,8 +45,9 @@ passwords and API keys in the private forms throughout the journey.
 
 ## 1. Open Meta Forge
 
-Unpack the standalone ZIP into a folder you will keep. Open a terminal in that
-folder and run:
+For the Meta 0.9 preview, use the complete owner-prepared product ZIP and its
+generated README. Unpack it into a folder you will keep. Open a terminal there
+and run:
 
 ```bash
 bash start.sh
@@ -59,9 +60,11 @@ product bundles include their application runtime and select it when you run
 `start.sh`; they do not need application-host environment variables.
 The standalone wizard opens without Node.js or npm. Follow the printed address, normally
 [http://127.0.0.1:8787](http://127.0.0.1:8787), and keep the terminal open.
-For a source checkout, use `bash installer/start.sh` from the repository root;
-that path also needs Node.js and npm. See [startup prerequisites](README.md#open-the-wizard)
-if preparation fails.
+A source-only Meta 0.9 checkout does not include the selected product runtime;
+its launcher stops before dependency preparation. Maintainers must first assemble
+[the complete product package](README.md#maintainer-preparation). Installing
+Node.js or a Python SDK alone does not turn that checkout into a launchable ZIP.
+See [startup prerequisites](README.md#open-the-wizard) if preparation fails.
 
 If you see **Forge dependency preparation did not finish**, correct the error
 shown above it and use the printed retry command in the same folder. A download

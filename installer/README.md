@@ -4,10 +4,11 @@ Turn an idea into an agent application through a guided conversation. Answer
 one focused question at a time, inspect the proposed team and behavior, and
 build a deployment package you can review and install.
 
-Forge is a developer alpha. Guided design and packaging are available;
-Meta/Toolkit application startup is still being integrated. The default launcher
-leaves those installations stopped before first use. Packages offering
-**Install and start** retain that installation path.
+Forge is a developer alpha. The current Meta 0.9 preview opens from a complete,
+owner-prepared product archive. Its generated README and manifest identify the
+selected platform, SDKs and native runtime. A source checkout alone is not that
+archive. Guided design, application setup and installed execution are separate
+steps; use the controls actually offered by your package.
 
 Forge is the setup and application authoring tool in Meerkat Meta.
 Core runs agents and mobs; Meta composes applications around
@@ -32,6 +33,54 @@ can use the [frontend integration contract](FRONTEND_INTEGRATION.md). It describ
 the existing application hook, protected proposal flow and recovery ownership.
 
 ## Open the wizard
+
+Use the complete prepared Meta 0.9 product ZIP and the operating system named in
+its generated README. Unpack it into a new folder you will keep, open a terminal
+there, and run:
+
+```bash
+bash start.sh
+```
+
+Open the address printed in that terminal, normally
+[Meta Forge](http://127.0.0.1:8787). Keep the terminal open while using Forge.
+The prepared package includes the frontend and its selected runtime; opening it
+does not require Node.js, npm or a source checkout. You need Python 3.11+ with
+`venv` and `ensurepip`, plus internet for initial pinned Python dependencies.
+
+To prepare the package without starting its web server or agents, use
+`bash start.sh --prepare-only`. To return to an existing setup, reuse the same
+extracted folder and private state directory. If Forge is already running,
+reopen its printed address instead of starting another copy.
+
+Continue with [your first setup](GETTING_STARTED.md). Its quick path follows the
+actual controls from describing a job to trying the installed application.
+A prepared package's generated README takes precedence for its artifact and
+platform selection; a retained handoff note does not select a new runtime.
+
+### Maintainer preparation
+
+The Meta 0.9 source launcher stops before dependency preparation when the
+complete product manifest is absent. Installing a Python SDK or running a
+frontend build does not supply its original runtime selection.
+[The product packager](launchkit/product_distribution.py) assembles the exact
+Meta/Toolkit wheels, selected Connect product, separate guide gateway and
+frontend into the launchable archive. Private model configuration stays with
+its original owner. The emitted manifest and generated README describe that
+specific package.
+
+The selected Meta guide uses native initialization and explicit revision-pinned
+updates. The predecessor registry-repair recipes below apply to their matching
+historical runtime. Current startup does not rewrite predecessor native stores.
+
+<details>
+<summary>Retained MobKit 0.8 startup and troubleshooting</summary>
+
+These instructions describe retained 0.8 bundles and their matching source
+checkouts. They are not the packaging or runtime selection for this Meta 0.9
+checkout. Keep an existing installation's original package and state together.
+
+### Retained launcher
 
 If Forge is already running, reopen the address printed in its terminal. Start
 it again only after it has stopped, using the same retained folder and private
@@ -171,13 +220,13 @@ See [Node's platform requirements](https://github.com/nodejs/node/blob/v25.9.0/B
 and [bubblewrap's isolation model](https://github.com/containers/bubblewrap/blob/main/README.md)
 for host prerequisites.
 
-To create a new bundle from a complete current checkout, first build the frontend
-and acquire the official `meerkat-mobkit` 0.8.47 wheel from PyPI, then run:
+To recreate a retained 0.8 bundle from its matching source checkout, first build
+the frontend and acquire its pinned `meerkat-mobkit` 0.8.47 wheel, then run:
 
 ```bash
 PYTHONPATH=installer installer/.venv/bin/python -m launchkit.distribution --root installer \
   --sdk-wheel /path/to/meerkat_mobkit-0.8.47-py3-none-any.whl \
-  --output /path/to/meta-forge-standalone.zip
+  --output /path/to/meta-forge-legacy-0.8-standalone.zip
 ```
 
 Packaging checks the published wheel against the fixed official SHA-256
@@ -192,7 +241,7 @@ excluded. The command prints the archive SHA-256 for distribution integrity chec
 
 ### Source checkout
 
-From the root of a complete repository checkout, use:
+From the root of the matching retained 0.8 repository checkout, use:
 
 ```bash
 bash installer/start.sh
@@ -235,7 +284,7 @@ For OpenAI animation, `MOBKIT_VISUALIZER_REASONING` accepts `low`, `medium` or `
 The application implementation agent also uses `gpt-6.1-sol` with low reasoning;
 `MOBKIT_IMPLEMENTATION_MODEL` can override it for the configured provider.
 
-The current MobKit 0.8.47/Core 0.8.51 runtime owns the `gpt-6.1-sol` model
+The retained MobKit 0.8.47/Core 0.8.51 runtime owns the `gpt-6.1-sol` model
 metadata. Forge preserves the selected model and reasoning without adding a
 duplicate custom registry entry. A saved setup with the exact earlier compiler
 declaration gets a retained, revision-pinned native definition update removing
@@ -245,6 +294,8 @@ require inspection; Forge does not replace them. An immutable completion record
 preserves the repair evidence while later cold configuration updates continue
 through the ordinary native revision checks. Historical 0.8.42 package generation
 retains its explicit metadata support.
+
+</details>
 
 ## Follow the guide
 
