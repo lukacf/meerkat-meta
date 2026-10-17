@@ -24,6 +24,13 @@ use crate::steps::Steps;
 
 /// Which mob holds a mob id: unrecorded until a host records it, the last
 /// recorded holder after, per realm and mob id, durably across a reopen.
+///
+/// A holder record the store cannot decode must fail the answer, never read
+/// as no holder (the host would adopt the id). This profile cannot plant such
+/// a record in a store generically, so it does not check that; for the
+/// built-in SQLite store, Meta's integration test
+/// `extension_an_unreadable_holder_quarantines_without_failing_the_restore`
+/// does.
 pub async fn mob_id_holders(
     factory: &dyn ExtensionDocumentStoreFactory,
 ) -> Result<(), ConformanceFailure> {
