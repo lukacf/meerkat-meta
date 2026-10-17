@@ -45,7 +45,7 @@ passwords and API keys in the private forms throughout the journey.
 
 ## 1. Open Meta Forge
 
-For the Meta 0.9 preview, use the complete owner-prepared product ZIP and its
+For the Meta 0.9 preview, use the complete prepared product ZIP and its
 generated README. Unpack it into a folder you will keep. Open a terminal there
 and run:
 

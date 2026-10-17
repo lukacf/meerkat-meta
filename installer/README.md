@@ -5,7 +5,7 @@ one focused question at a time, inspect the proposed team and behavior, and
 build a deployment package you can review and install.
 
 Forge is a developer alpha. The current Meta 0.9 preview opens from a complete,
-owner-prepared product archive. Its generated README and manifest identify the
+prepared product archive. Its generated README and manifest identify the
 selected platform, SDKs and native runtime. A source checkout alone is not that
 archive. Guided design, application setup and installed execution are separate
 steps; use the controls actually offered by your package.
@@ -758,16 +758,18 @@ the entry. The supported follow-on needs the original native outcome, and later
 replacement restart also needs the actual last accepted desired policy. Current
 source integration and focused tests do not establish these installed outcomes.
 
-The current private SDK package is source-verified without changing Forge's active
-environment. Native factory work still must return the selected policy binding
+The retained development SDK package was source-verified without changing
+Forge's active environment. Native factory work still must return the selected policy binding
 and verified artifact on the same construction, verify the final tool surface and
 retain cleanup ownership through refusal or cancellation. The installer input
 adapter retains explicit native identities or joins them through the same
 caller's retained inventory, then asks native code to compile the policy. It does
 not infer identities or create an operator. The browser presents the retained
 review; it does not choose the policy
-or start another host. See the [current verification record](VERIFICATION.md#october-9-2026-first-setup-approval-and-installer-process-boundary)
-for the source evidence and remaining execution limits.
+or start another host. See the [frontend integration contract](FRONTEND_INTEGRATION.md)
+for the source boundary. Current source checks are reported in
+[Forge CI](https://github.com/lukacf/meerkat-meta/actions/workflows/forge.yml);
+installed execution remains a separate outcome.
 
 Forge already has application composition and lifetime hooks in
 `launchkit/templates_v2/app.py`: `build(context)`, per-identity callbacks, native
@@ -1181,15 +1183,14 @@ must stop and clean up the attempted runtime before restoring source; unconfirme
 cleanup leaves an explicit recovery state. A manager acknowledgment or PID alone
 cannot complete an update.
 
-A real macOS Reading Companion installation passed background update, independence after
+A retained MobKit 0.8 macOS Reading Companion journey passed background update, independence after
 closing the wizard, explicit rollback and automatic previous-source recovery after a
 controlled failed native startup. Normal authenticated conversations verified its
 saved record and confirmation history after both restores. Private settings, all
 prior Console frame rows and the frozen unit/host bytes stayed exact. The service
-was stopped and disabled after the proof. Exact receipts and limitations are in
-[the background update report](.artifacts/background-update/20261001T080845Z-5120950d-e51d-4d6d-ac8a-2dab56c9e2fc/REPORT.md).
-This does not establish Linux updates, logout/reboot persistence or structural
-native migrations.
+was stopped and disabled after that proof. Its receipts remain in the private
+historical journey record. This does not qualify a current Meta 0.9 installation,
+Linux updates, logout/reboot persistence or structural native migrations.
 
 An owned stopped local background application can offer **Review update** under
 **Installation support**. Reviewing freezes the exact current and proposed support
@@ -1355,14 +1356,15 @@ establish a successful native memory write or later recall.
 
 If a native write reports **quarantined**, the record can survive restart while
 remaining unavailable to ordinary recall. This can happen after the continuing
-session uses a tool whose output is configured as untrusted. In the current
+session uses a tool whose output is configured as untrusted. In the retained
 MobKit 0.8.47 package, the Console quarantine queue is read-only and Forge does
 not supply a separate review action. Starting again does not release that record.
 Report the failed recall through **Report a problem or request an improvement**;
 include the record ID and the reported reason if available, without credentials
 or unrelated private data. Keep the original installation and history for a
-supported repair. The actual retained Reading example and its remaining review
-capability are recorded in [the verification notes](VERIFICATION.md#installed-reading-native-memory-and-retained-quarantine-october-6).
+supported repair. This describes the retained 0.8 example. For another package,
+use the capabilities advertised by its own installed native Console; the old
+private journey record does not establish its review support.
 
 ## Adjust the details
 
@@ -1617,7 +1619,9 @@ npm --prefix installer/web run check
 npm --prefix installer/web run build
 ```
 
-See [verification evidence](VERIFICATION.md) for measured acceptance and limits.
+Current source results are in [Forge CI](https://github.com/lukacf/meerkat-meta/actions/workflows/forge.yml).
+Use the [first-job walkthrough](GETTING_STARTED.md#5-complete-one-useful-job) to
+check useful installed work separately from source tests.
 Registry metadata is evidence about configuration, not a certification of a
 publisher or successful authentication. OAuth-only services need an authenticated
 bridge or supported client setup. Local Elephant source builds need Docker,
