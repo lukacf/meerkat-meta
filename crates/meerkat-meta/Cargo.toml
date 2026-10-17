@@ -163,6 +163,8 @@ experimental-gpt-live-test = [
 test-realtime-fixtures = [
     "openai-live",
 ]
+# Non-shipping deterministic fault points for the console send process tests.
+console-test-faults = []
 # Calibration-harness seam for the memory Distiller (§8.4/§11); same contract
 # as the other calibration bins, fixture in / structured ops out.
 # `scripts/memory-evals --mode live` drives these binaries per fixture. Each is

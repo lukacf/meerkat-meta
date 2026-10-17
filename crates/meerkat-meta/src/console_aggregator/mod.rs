@@ -4,6 +4,7 @@ mod tool_application_projection;
 
 #[cfg(test)]
 mod assistant_message_identity_tests;
+pub(crate) mod faults;
 #[cfg(test)]
 mod provenance_search_tests;
 #[cfg(test)]
@@ -11,6 +12,10 @@ mod provenance_store_revision_tests;
 mod query_error;
 #[cfg(test)]
 mod runtime_notice_tests;
+mod send_recovery;
+#[cfg(test)]
+mod send_recovery_tests;
+mod send_scope;
 mod state;
 mod store;
 mod types;
@@ -41,11 +46,18 @@ use crate::runtime::ConsoleMember;
 use crate::unified_runtime::{ConsoleEventStore, UnifiedRuntime};
 
 pub use query_error::{ConsoleTimelineQueryError, ConsoleTimelineQueryResult};
+pub(crate) use send_recovery::{
+    ConsoleSendRecovery, NativeSendObservation, ScopedReservation, SendDispatchClaim,
+};
+use send_recovery::{SendDispatchClaims, SendSweepOutcome};
+pub(crate) use send_scope::ConsoleSendScope;
+use state::SendEvidence;
 pub use state::{
     ReplaySubscriptionEffect, ReplaySubscriptionState, ReplaySubscriptionTransition, SendEffect,
     SendState, SendTransition, SourceIngestionEffect, SourceIngestionState,
     SourceIngestionTransition,
 };
+use store::stable_frame_id;
 pub use store::{
     ConsoleLogError, ConsoleLogResult, ConsoleLogStore, ConsoleSendDedupeDurability,
     InMemoryConsoleLogStore, SqliteConsoleLogStore,
@@ -222,6 +234,12 @@ struct AggregatorInner {
     /// broadcast receiver can never observe `Closed` while the runtime Arc
     /// lives) after the runtime was destroyed (issue #254 follow-up).
     live_projection_shutdowns: std::sync::Mutex<BTreeMap<String, tokio::sync::watch::Sender<bool>>>,
+    /// The live dispatch owner of each console send frame in this process,
+    /// shared with every policy view (see [`SendDispatchClaims`]).
+    send_dispatch_claims: Arc<SendDispatchClaims>,
+    /// Test seam: replaces the runtime's admission evidence for sends.
+    #[cfg(test)]
+    send_admission_override: std::sync::Mutex<Option<Arc<dyn send_recovery::SendAdmissionReader>>>,
 }
 
 #[derive(Clone)]
@@ -374,6 +392,65 @@ struct ResolvedConsoleMember {
     member: MobMemberListEntry,
     source_mob_id: String,
     runtime_identity: String,
+}
+
+/// What a classic send's replay needs to dispatch it again.
+struct ClassicResend<'a> {
+    resolved: &'a ResolvedConsoleMember,
+    host_policy: &'a Arc<dyn ConsoleVisibilityPolicy>,
+    content: &'a ContentInput,
+    skill_references: Vec<meerkat_core::skills::SkillKey>,
+    handling_mode: HandlingMode,
+}
+
+impl ClassicResend<'_> {
+    /// Whether dispatching `frame` again goes through a keyed delivery pinned
+    /// to the session the send recorded: the member is a durable identity's
+    /// local session (the identity runtime route of
+    /// [`dispatch_message_to_resolved_member`], which carries the send's
+    /// delivery identity and expected session). An externally bound or
+    /// mob-routed member is never dispatched again: its delivery may carry no
+    /// key, so a second submission could duplicate it.
+    async fn keyed_and_pinned(&self, frame: &ConsoleFrame) -> bool {
+        if frame.session_id.is_none() {
+            return false;
+        }
+        let Some(identity_runtime) = self.resolved.entry.identity_runtime.as_ref() else {
+            return false;
+        };
+        let Some(identity) = identity_runtime
+            .identity_for_member_mutation(&self.resolved.runtime_identity)
+            .await
+        else {
+            return false;
+        };
+        identity_runtime
+            .console_human_delivery_is_keyed(&identity)
+            .await
+    }
+}
+
+/// An existing console send found for a replay.
+enum ExistingSend {
+    /// Settled, or with a live dispatch owner: replayed, nothing dispatched.
+    Replay(ConsoleInteractionAccepted),
+    /// Unsettled, and now owned by the caller, who reconciles it.
+    Unsettled(
+        ConsoleInteractionAccepted,
+        SendDispatchClaim,
+        Box<ConsoleFrame>,
+    ),
+}
+
+impl From<ExistingSend> for ScopedReservation {
+    fn from(existing: ExistingSend) -> Self {
+        match existing {
+            ExistingSend::Replay(accepted) => Self::Replay(accepted),
+            ExistingSend::Unsettled(accepted, claim, frame) => {
+                Self::Unsettled(accepted, claim, frame)
+            }
+        }
+    }
 }
 
 fn console_member_for_resolved_member(
@@ -769,6 +846,9 @@ impl MetaConsoleAggregator {
                 identity_read_model: ConsoleIdentityReadModel::default(),
                 options,
                 live_projection_shutdowns: std::sync::Mutex::new(BTreeMap::new()),
+                send_dispatch_claims: Arc::new(SendDispatchClaims::default()),
+                #[cfg(test)]
+                send_admission_override: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -859,6 +939,9 @@ impl MetaConsoleAggregator {
                 identity_read_model: ConsoleIdentityReadModel::default(),
                 options: owner.options,
                 live_projection_shutdowns: std::sync::Mutex::new(BTreeMap::new()),
+                send_dispatch_claims: owner.send_dispatch_claims.clone(),
+                #[cfg(test)]
+                send_admission_override: std::sync::Mutex::new(None),
             }),
         };
         view.inner
@@ -2216,6 +2299,19 @@ impl MetaConsoleAggregator {
         &self,
         request: ConsoleSendRequest,
     ) -> Result<ConsoleInteractionAccepted, ConsoleSendError> {
+        Box::pin(self.send_scoped(request, &ConsoleSendScope::Unscoped)).await
+    }
+
+    /// [`Self::send`] deduplicated in the sending caller's `scope`. A scoped
+    /// replay of a send that has not settled, and whose dispatch has no live
+    /// owner, is reconciled from native admission evidence: an admitted input
+    /// settles it delivered; an absent one is dispatched again under the
+    /// send's own delivery identity, into the session it recorded.
+    pub(crate) async fn send_scoped(
+        &self,
+        request: ConsoleSendRequest,
+        scope: &ConsoleSendScope,
+    ) -> Result<ConsoleInteractionAccepted, ConsoleSendError> {
         validate_send_request(&request)?;
         let Some(resolved) = Box::pin(self.resolve_send_member(&request.identity)).await? else {
             return Err(ConsoleSendError::UnknownIdentity(request.identity));
@@ -2281,7 +2377,7 @@ impl MetaConsoleAggregator {
         .await
         .map_err(|err| ConsoleSendError::InvalidContent(err.to_string()))?;
 
-        let dedupe_key = send_dedupe_key(
+        let dedupe_key = scope.dedupe_key(
             &resolved.entry.runtime_key,
             &request.identity,
             &request.origin,
@@ -2299,6 +2395,13 @@ impl MetaConsoleAggregator {
             &handling_mode_value,
             &request.selected_skill_keys(),
         );
+        let resend = ClassicResend {
+            resolved: &resolved,
+            host_policy: &host_policy,
+            content: &content,
+            skill_references: request.selected_skill_keys(),
+            handling_mode,
+        };
         if let Some(existing) = self
             .inner
             .store
@@ -2326,9 +2429,18 @@ impl MetaConsoleAggregator {
                     request.idempotency_key,
                 ));
             }
-            return accepted_replay_from_frame(&existing);
+            return match self.existing_send(existing, scope, None)? {
+                ExistingSend::Replay(accepted) => Ok(accepted),
+                ExistingSend::Unsettled(accepted, claim, frame) => {
+                    Box::pin(self.reconcile_classic_send(resend, accepted, claim, *frame)).await
+                }
+            };
         }
 
+        // The dispatch claim is taken before the frame exists, so a
+        // concurrent identical send finds the frame owned.
+        let frame_id = stable_frame_id(&dedupe_key);
+        let claim = self.claim_scoped_send(scope, &frame_id);
         let interaction_id = identity_first_interaction_uuid(&dedupe_key);
         // Reserve under the DURABLE console identity with the runtime
         // incarnation as the mapping KEY - the same runtime-id -> identity
@@ -2372,7 +2484,7 @@ impl MetaConsoleAggregator {
                 retain_member_provenance(owner, &resolved, &record)
             });
         let mut new_frame = NewConsoleFrame {
-            id: None,
+            id: Some(frame_id),
             dedupe_key,
             timestamp_ms: current_time_ms(),
             runtime_key: resolved.entry.runtime_key.clone(),
@@ -2411,7 +2523,12 @@ impl MetaConsoleAggregator {
                     request.idempotency_key,
                 ));
             }
-            return accepted_replay_from_frame(&outcome.frame);
+            return match self.existing_send(outcome.frame, scope, claim)? {
+                ExistingSend::Replay(accepted) => Ok(accepted),
+                ExistingSend::Unsettled(accepted, claim, frame) => {
+                    Box::pin(self.reconcile_classic_send(resend, accepted, claim, *frame)).await
+                }
+            };
         }
         let _ = self
             .inner
@@ -2420,6 +2537,11 @@ impl MetaConsoleAggregator {
                 frame: outcome.frame.clone(),
             });
         let accepted = accepted_from_frame(&outcome.frame);
+        if scope.is_scoped() && claim.is_none() {
+            // A concurrent identical send holds the claim; it finds this
+            // frame and owns its dispatch.
+            return Ok(accepted);
+        }
 
         let (dispatching, _effects) = SendState::AcceptedPersisted
             .apply(SendTransition::StartDispatch)
@@ -2431,6 +2553,7 @@ impl MetaConsoleAggregator {
         )
         .await
         .map_err(ConsoleSendError::Log)?;
+        faults::after_console_reserve();
 
         spawn_console_send_dispatch(
             self.inner.clone(),
@@ -2438,10 +2561,288 @@ impl MetaConsoleAggregator {
             (content, request.selected_skill_keys()),
             handling_mode,
             dispatching,
-            outcome.frame,
+            (outcome.frame, claim),
             interaction_id,
         );
         Ok(accepted)
+    }
+
+    /// Reconcile a classic send this caller now owns from native evidence:
+    /// admitted settles it delivered; absent dispatches it again only through
+    /// a keyed, session-pinned delivery (a durable identity's local session),
+    /// never through an unkeyed external one; otherwise it stays unsettled.
+    async fn reconcile_classic_send(
+        &self,
+        resend: ClassicResend<'_>,
+        accepted: ConsoleInteractionAccepted,
+        claim: SendDispatchClaim,
+        frame: ConsoleFrame,
+    ) -> Result<ConsoleInteractionAccepted, ConsoleSendError> {
+        match self.observe_native_send(&frame).await {
+            NativeSendObservation::Admitted { .. } => {
+                self.settle_admitted_send(&frame, &claim).await
+            }
+            NativeSendObservation::Absent if resend.keyed_and_pinned(&frame).await => {
+                let state = self.begin_send_redispatch(&frame, &claim)?;
+                let dispatching = if state == SendState::Dispatching {
+                    state
+                } else {
+                    let (dispatching, _effects) = state
+                        .apply(SendTransition::StartDispatch)
+                        .map_err(ConsoleSendError::State)?;
+                    update_frame_status_and_emit(
+                        &self.inner,
+                        &frame.id,
+                        ConsoleFrameStatus::Dispatching,
+                    )
+                    .await
+                    .map_err(ConsoleSendError::Log)?;
+                    dispatching
+                };
+                let interaction_id = accepted.interaction_id.clone();
+                spawn_console_send_dispatch(
+                    self.inner.clone(),
+                    (resend.resolved.clone(), resend.host_policy.clone()),
+                    (resend.content.clone(), resend.skill_references),
+                    resend.handling_mode,
+                    dispatching,
+                    (frame, Some(claim)),
+                    interaction_id,
+                );
+                Ok(accepted)
+            }
+            NativeSendObservation::Absent | NativeSendObservation::Unknown { .. } => Ok(accepted),
+        }
+    }
+
+    fn claim_scoped_send(
+        &self,
+        scope: &ConsoleSendScope,
+        frame_id: &str,
+    ) -> Option<SendDispatchClaim> {
+        scope
+            .is_scoped()
+            .then(|| self.inner.send_dispatch_claims.claim(frame_id))
+            .flatten()
+    }
+
+    /// An existing send found for a replay. Settled, or with a live dispatch
+    /// owner, it is replayed. Unsettled and unowned (or owned by `held`, the
+    /// caller's own claim), a scoped caller owns its reconciliation. The
+    /// unscoped API only replays.
+    fn existing_send(
+        &self,
+        frame: ConsoleFrame,
+        scope: &ConsoleSendScope,
+        held: Option<SendDispatchClaim>,
+    ) -> Result<ExistingSend, ConsoleSendError> {
+        let unsettled =
+            SendState::from_send_frame_status(frame.status).is_some_and(SendState::is_unsettled);
+        if scope.is_scoped() && unsettled {
+            let claim = match held {
+                Some(claim) if claim.frame_id() == frame.id => Some(claim),
+                _ => self.inner.send_dispatch_claims.claim(&frame.id),
+            };
+            if let Some(claim) = claim {
+                return Ok(ExistingSend::Unsettled(
+                    accepted_from_frame(&frame),
+                    claim,
+                    Box::new(frame),
+                ));
+            }
+        }
+        Ok(ExistingSend::Replay(accepted_replay_from_frame(&frame)?))
+    }
+
+    /// Settle an unsettled send whose input the runtime admitted: delivered.
+    /// Only the frame's dispatch owner settles it.
+    pub(crate) async fn settle_admitted_send(
+        &self,
+        frame: &ConsoleFrame,
+        _owner: &SendDispatchClaim,
+    ) -> Result<ConsoleInteractionAccepted, ConsoleSendError> {
+        let state = SendState::from_send_frame_status(frame.status)
+            .ok_or(ConsoleSendError::State("not a console send frame"))?;
+        let (_delivered, _effects) = state
+            .reconcile(SendEvidence::Admitted)
+            .map_err(ConsoleSendError::State)?;
+        let updated =
+            update_frame_status_and_emit(&self.inner, &frame.id, ConsoleFrameStatus::Delivered)
+                .await
+                .map_err(ConsoleSendError::Log)?;
+        Ok(accepted_from_frame(updated.as_ref().unwrap_or(frame)))
+    }
+
+    /// The typed transition of an owned, unsettled send whose input the
+    /// runtime does not hold and whose delivery is keyed and pinned: it is
+    /// dispatched again, in the state it is in. The caller dispatches.
+    pub(crate) fn begin_send_redispatch(
+        &self,
+        frame: &ConsoleFrame,
+        _owner: &SendDispatchClaim,
+    ) -> Result<SendState, ConsoleSendError> {
+        let state = SendState::from_send_frame_status(frame.status)
+            .ok_or(ConsoleSendError::State("not a console send frame"))?;
+        let (state, _effects) = state
+            .reconcile(SendEvidence::AbsentRedispatchable)
+            .map_err(ConsoleSendError::State)?;
+        Ok(state)
+    }
+
+    /// What the runtime holding `frame`'s recorded session has admitted
+    /// under the send's delivery keys.
+    pub(crate) async fn observe_native_send(&self, frame: &ConsoleFrame) -> NativeSendObservation {
+        #[cfg(test)]
+        {
+            let reader = self
+                .inner
+                .send_admission_override
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(reader) = reader {
+                return send_recovery::observe_native_send(reader.as_ref(), frame).await;
+            }
+        }
+        let owner = self
+            .inner
+            .projection_owner
+            .as_deref()
+            .unwrap_or(&self.inner);
+        let service = owner.runtimes.read().ok().and_then(|runtimes| {
+            runtimes
+                .get(&frame.runtime_key)
+                .and_then(|entry| entry.runtime.session_service().cloned())
+        });
+        let Some(service) = service else {
+            return NativeSendObservation::Unknown {
+                cause: "no registered runtime serves the send".to_string(),
+            };
+        };
+        let Some(machine) = crate::mob_handle_runtime::observed_runtime_adapter(service.as_ref())
+        else {
+            return NativeSendObservation::Unknown {
+                cause: "the runtime exposes no admission evidence".to_string(),
+            };
+        };
+        send_recovery::observe_native_send(machine.as_ref(), frame).await
+    }
+
+    /// The caller's own send under `idempotency_key`, as it is now, with the
+    /// runtime's admission evidence for it. A send the evidence shows admitted
+    /// but that has not settled is settled delivered; nothing is dispatched.
+    /// `None` when the caller has no such send: a key another caller used is
+    /// a different key, so it answers exactly as a missing one.
+    pub(crate) async fn recover_send(
+        &self,
+        identities: &[String],
+        origin: &str,
+        idempotency_key: &str,
+        scope: &ConsoleSendScope,
+    ) -> Result<Option<ConsoleSendRecovery>, ConsoleSendError> {
+        let runtime_keys = self.send_runtime_keys();
+        let mut found = None;
+        'search: for runtime_key in &runtime_keys {
+            for identity in identities {
+                let key = scope.dedupe_key(runtime_key, identity, origin, idempotency_key);
+                if let Some(frame) = self
+                    .inner
+                    .store
+                    .frame_by_dedupe_key(&key)
+                    .await
+                    .map_err(ConsoleSendError::Log)?
+                {
+                    found = Some(frame);
+                    break 'search;
+                }
+            }
+        }
+        let Some(frame) = found else {
+            return Ok(None);
+        };
+        let native = self.observe_native_send(&frame).await;
+        let unsettled =
+            SendState::from_send_frame_status(frame.status).is_some_and(SendState::is_unsettled);
+        let mut accepted = accepted_from_frame(&frame);
+        if unsettled
+            && matches!(native, NativeSendObservation::Admitted { .. })
+            && let Some(claim) = self.inner.send_dispatch_claims.claim(&frame.id)
+        {
+            accepted = self.settle_admitted_send(&frame, &claim).await?;
+        }
+        Ok(Some(ConsoleSendRecovery { accepted, native }))
+    }
+
+    /// Settle, from native admission evidence, the console sends a previous
+    /// process accepted but did not see settle. Bounded (the newest
+    /// [`send_recovery::SEND_SWEEP_WINDOW`] frames, at most
+    /// [`send_recovery::SEND_SWEEP_LIMIT`] sends, one overall deadline);
+    /// evidence only: a send whose input was admitted is settled delivered,
+    /// and nothing is ever dispatched or failed here.
+    pub(crate) async fn reconcile_interrupted_sends(&self) -> SendSweepOutcome {
+        let deadline = tokio::time::Instant::now() + send_recovery::SEND_SWEEP_DEADLINE;
+        let frames = match self
+            .inner
+            .store
+            .unsettled_send_frames(
+                send_recovery::SEND_SWEEP_WINDOW,
+                send_recovery::SEND_SWEEP_LIMIT,
+            )
+            .await
+        {
+            Ok(frames) => frames,
+            Err(error) => {
+                tracing::warn!(%error, "console send reconciliation could not list unsettled sends");
+                return SendSweepOutcome::default();
+            }
+        };
+        let mut outcome = SendSweepOutcome::default();
+        for frame in frames {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    examined = outcome.examined,
+                    "console send reconciliation stopped at its deadline"
+                );
+                break;
+            }
+            outcome.examined += 1;
+            let Some(claim) = self.inner.send_dispatch_claims.claim(&frame.id) else {
+                continue;
+            };
+            if matches!(
+                self.observe_native_send(&frame).await,
+                NativeSendObservation::Admitted { .. }
+            ) {
+                match self.settle_admitted_send(&frame, &claim).await {
+                    Ok(_) => outcome.delivered += 1,
+                    Err(error) => tracing::warn!(
+                        frame_id = %frame.id,
+                        %error,
+                        "console send reconciliation could not settle an admitted send"
+                    ),
+                }
+            }
+        }
+        outcome
+    }
+
+    /// The runtime keys a console send can have been recorded under: this
+    /// view's registrations and its projection owner's, or the identity-first
+    /// key when no runtime is registered.
+    fn send_runtime_keys(&self) -> Vec<String> {
+        let mut keys = BTreeSet::new();
+        for inner in [Some(&self.inner), self.inner.projection_owner.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(runtimes) = inner.runtimes.read() {
+                keys.extend(runtimes.keys().cloned());
+            }
+        }
+        if keys.is_empty() {
+            keys.insert("identity-first".to_string());
+        }
+        keys.into_iter().collect()
     }
 
     /// Reserve the console interaction for an identity-first send.
@@ -2455,6 +2856,33 @@ impl MetaConsoleAggregator {
         request: ConsoleSendRequest,
         session_id: Option<&str>,
     ) -> Result<IdentityFirstReservation, ConsoleSendError> {
+        Ok(
+            match Box::pin(self.reserve_identity_first_interaction_scoped(
+                request,
+                session_id,
+                &ConsoleSendScope::Unscoped,
+            ))
+            .await?
+            {
+                ScopedReservation::Fresh(accepted, _) => IdentityFirstReservation::Fresh(accepted),
+                ScopedReservation::Replay(accepted)
+                | ScopedReservation::Unsettled(accepted, ..) => {
+                    IdentityFirstReservation::Existing(accepted)
+                }
+            },
+        )
+    }
+
+    /// [`Self::reserve_identity_first_interaction`] deduplicated in the
+    /// sending caller's `scope`. A scoped caller gets the dispatch claim of a
+    /// fresh interaction, and owns the reconciliation of a replayed one that
+    /// has not settled and whose dispatch has no live owner.
+    pub(crate) async fn reserve_identity_first_interaction_scoped(
+        &self,
+        request: ConsoleSendRequest,
+        session_id: Option<&str>,
+        scope: &ConsoleSendScope,
+    ) -> Result<ScopedReservation, ConsoleSendError> {
         validate_send_request(&request)?;
         let _content = content_input_from_value(&request.content)?;
         let (runtime_key, host_policy) =
@@ -2464,7 +2892,7 @@ impl MetaConsoleAggregator {
             .as_deref()
             .unwrap_or("queue")
             .to_string();
-        let dedupe_key = send_dedupe_key(
+        let dedupe_key = scope.dedupe_key(
             &runtime_key,
             &request.identity,
             &request.origin,
@@ -2504,11 +2932,13 @@ impl MetaConsoleAggregator {
                     request.idempotency_key,
                 ));
             }
-            return Ok(IdentityFirstReservation::Existing(
-                accepted_replay_from_frame(&existing)?,
-            ));
+            return Ok(self.existing_send(existing, scope, None)?.into());
         }
 
+        // Claimed before the frame exists: a concurrent identical send finds
+        // it owned and replays it.
+        let frame_id = stable_frame_id(&dedupe_key);
+        let claim = self.claim_scoped_send(scope, &frame_id);
         let interaction_id = identity_first_interaction_uuid(&dedupe_key);
         let owner = self
             .inner
@@ -2527,7 +2957,7 @@ impl MetaConsoleAggregator {
             None
         };
         let mut new_frame = NewConsoleFrame {
-            id: None,
+            id: Some(frame_id),
             dedupe_key,
             timestamp_ms: current_time_ms(),
             runtime_key,
@@ -2562,11 +2992,9 @@ impl MetaConsoleAggregator {
                     request.idempotency_key,
                 ));
             }
-            // Lost the race with a concurrent identical send, which owns the
-            // dispatch.
-            return Ok(IdentityFirstReservation::Existing(
-                accepted_replay_from_frame(&outcome.frame)?,
-            ));
+            // Lost the race with a concurrent identical send: it owns the
+            // dispatch, unless this caller holds the claim.
+            return Ok(self.existing_send(outcome.frame, scope, claim)?.into());
         }
         let _ = self
             .inner
@@ -2574,9 +3002,13 @@ impl MetaConsoleAggregator {
             .send(ConsoleTimelineEvent::ConsoleFrame {
                 frame: outcome.frame.clone(),
             });
-        Ok(IdentityFirstReservation::Fresh(accepted_from_frame(
-            &outcome.frame,
-        )))
+        let accepted = accepted_from_frame(&outcome.frame);
+        if scope.is_scoped() && claim.is_none() {
+            // A concurrent identical send holds the claim; it finds this
+            // frame and owns its dispatch.
+            return Ok(ScopedReservation::Replay(accepted));
+        }
+        Ok(ScopedReservation::Fresh(accepted, claim))
     }
 
     async fn runtime_key_for_identity_first_send(
@@ -3958,12 +4390,16 @@ fn spawn_console_send_dispatch(
     turn: (ContentInput, Vec<meerkat_core::skills::SkillKey>),
     handling_mode: meerkat_core::types::HandlingMode,
     dispatching: SendState,
-    user_frame: ConsoleFrame,
+    owned: (ConsoleFrame, Option<SendDispatchClaim>),
     interaction_id: String,
 ) {
     let (resolved, host_policy) = producer;
     let (content, skill_references) = turn;
+    let (user_frame, claim) = owned;
     tokio::spawn(async move {
+        // The claim names this task the frame's dispatch owner until it
+        // settles the frame (dropped at the end of the task).
+        let _claim = claim;
         match dispatch_message_to_resolved_member(
             &resolved,
             content,
@@ -3974,6 +4410,7 @@ fn spawn_console_send_dispatch(
         .await
         {
             Ok(_) => {
+                faults::after_console_admission();
                 let _ = dispatching.apply(SendTransition::MarkDelivered);
                 if let Err(err) = update_frame_status_and_emit(
                     &inner,
@@ -9032,13 +9469,14 @@ fn accepted_from_frame(frame: &ConsoleFrame) -> ConsoleInteractionAccepted {
     }
 }
 
+#[cfg(test)]
 fn send_dedupe_key(
     runtime_key: &str,
     identity: &str,
     origin: &str,
     idempotency_key: &str,
 ) -> String {
-    format!("send:{runtime_key}:{identity}:{origin}:{idempotency_key}")
+    send_scope::unscoped_send_dedupe_key(runtime_key, identity, origin, idempotency_key)
 }
 
 /// Request fingerprint for idempotent replay. A declared `origin_kind` is

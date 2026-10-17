@@ -83,6 +83,19 @@ pub trait ConsoleLogStore: Send + Sync {
     async fn frame_by_dedupe_key(&self, dedupe_key: &str)
     -> ConsoleLogResult<Option<ConsoleFrame>>;
 
+    /// Console sends that have not settled (`user_input` frames of a send,
+    /// still accepted, dispatching, or redacted at acceptance), oldest first.
+    /// Bounded: only the newest `window` frames are examined, and at most
+    /// `limit` are returned. Stores that cannot answer keep the default and
+    /// report none, so nothing is reconciled from them.
+    async fn unsettled_send_frames(
+        &self,
+        _window: usize,
+        _limit: usize,
+    ) -> ConsoleLogResult<Vec<ConsoleFrame>> {
+        Ok(Vec::new())
+    }
+
     /// Whether the dedupe records above survive a gateway restart. Stores
     /// that cannot vouch for it keep the default, which never claims
     /// durability.
@@ -365,6 +378,25 @@ impl ConsoleLogStore for InMemoryConsoleLogStore {
             return Ok(None);
         };
         Ok(state.frames.get(&seq).cloned())
+    }
+
+    async fn unsettled_send_frames(
+        &self,
+        window: usize,
+        limit: usize,
+    ) -> ConsoleLogResult<Vec<ConsoleFrame>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| boxed_error("console log lock poisoned"))?;
+        let mut newest: Vec<&ConsoleFrame> = state.frames.values().rev().take(window).collect();
+        newest.reverse();
+        Ok(newest
+            .into_iter()
+            .filter(|frame| is_unsettled_send_frame(frame))
+            .take(limit)
+            .cloned()
+            .collect())
     }
 
     async fn latest_cursor(&self) -> ConsoleLogResult<Option<ConsoleCursor>> {
@@ -938,6 +970,37 @@ impl ConsoleLogStore for SqliteConsoleLogStore {
         select_frame_by_dedupe(&conn, dedupe_key)
     }
 
+    async fn unsettled_send_frames(
+        &self,
+        window: usize,
+        limit: usize,
+    ) -> ConsoleLogResult<Vec<ConsoleFrame>> {
+        let window = i64::try_from(window).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let _fence = self.operation_fence()?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| boxed_error("console log lock poisoned"))?;
+        // The window is a range of the rowid, so the scan touches at most
+        // `window` rows whatever the log's length.
+        let frames = query_sql_frames(
+            &conn,
+            "SELECT cursor_seq, id, dedupe_key, timestamp_ms, runtime_key, identity,
+                    conversation_id, session_id, kind, status, frame_version, updated_at_ms, payload_json,
+                    source_kind, source_cursor, source_event_id, interaction_id,
+                    parent_frame_id, caused_by_frame_id, turn_id, run_id, COALESCE(member_provenance_json,
+                    (SELECT payload_json FROM console_member_provenance WHERE id = member_provenance_id)), member_provenance_id, update_marker_shares_provenance
+             FROM console_frames
+             WHERE cursor_seq > COALESCE((SELECT MAX(cursor_seq) FROM console_frames), 0) - ?1
+               AND kind = 'user_input' AND source_kind = 'send'
+               AND status IN ('accepted', 'dispatching', 'redacted')
+             ORDER BY cursor_seq ASC LIMIT ?2",
+            params![window, limit],
+        )?;
+        Ok(frames.into_iter().filter(is_unsettled_send_frame).collect())
+    }
+
     async fn latest_cursor(&self) -> ConsoleLogResult<Option<ConsoleCursor>> {
         let _fence = self.operation_fence()?;
         let conn = self
@@ -1261,6 +1324,18 @@ fn cursor_seq(cursor: &ConsoleCursor) -> ConsoleLogResult<u64> {
 fn cursor_seq_i64(cursor: &ConsoleCursor) -> ConsoleLogResult<i64> {
     let seq = cursor_seq(cursor)?;
     i64::try_from(seq).map_err(|_| boxed_error(format!("console cursor out of range: {cursor}")))
+}
+
+/// A `user_input` frame of a console send whose delivery has not settled.
+fn is_unsettled_send_frame(frame: &ConsoleFrame) -> bool {
+    frame.kind == "user_input"
+        && frame.source.kind == ConsoleFrameSourceKind::Send
+        && matches!(
+            frame.status,
+            ConsoleFrameStatus::Accepted
+                | ConsoleFrameStatus::Dispatching
+                | ConsoleFrameStatus::Redacted
+        )
 }
 
 pub(crate) fn stable_frame_id(dedupe_key: &str) -> String {
@@ -2254,6 +2329,80 @@ mod tests {
             .await
             .expect_err("oversized before cursor should be rejected");
         assert!(err.to_string().contains("out of range"));
+    }
+
+    fn send_frame(dedupe_key: &str, status: ConsoleFrameStatus) -> NewConsoleFrame {
+        NewConsoleFrame {
+            kind: "user_input".to_string(),
+            status,
+            payload: json!({ "content": "hi" }),
+            source: ConsoleFrameSource {
+                member_provenance: None,
+                kind: ConsoleFrameSourceKind::Send,
+                source_cursor: Some("fingerprint".to_string()),
+            },
+            source_event_id: None,
+            ..sample_frame(dedupe_key, "identity:a")
+        }
+    }
+
+    #[tokio::test]
+    async fn unsettled_send_frames_are_bounded_and_exclude_settled_and_other_frames() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sqlite =
+            SqliteConsoleLogStore::open(dir.path().join("console.sqlite3")).expect("sqlite store");
+        let memory = InMemoryConsoleLogStore::new();
+        let stores: [&dyn ConsoleLogStore; 2] = [&sqlite, &memory];
+        for store in stores {
+            for frame in [
+                send_frame("send-old", ConsoleFrameStatus::Accepted),
+                send_frame("send-delivered", ConsoleFrameStatus::Delivered),
+                send_frame("send-failed", ConsoleFrameStatus::DeliveryFailed),
+                sample_frame("not-a-send", "identity:a"),
+                send_frame("send-accepted", ConsoleFrameStatus::Accepted),
+                send_frame("send-dispatching", ConsoleFrameStatus::Dispatching),
+                send_frame("send-redacted", ConsoleFrameStatus::Redacted),
+            ] {
+                store.append_if_absent(frame).await.expect("append");
+            }
+            let keys = |frames: Vec<ConsoleFrame>| {
+                frames
+                    .into_iter()
+                    .map(|frame| frame.dedupe_key)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                keys(store.unsettled_send_frames(100, 100).await.expect("all")),
+                [
+                    "send-old",
+                    "send-accepted",
+                    "send-dispatching",
+                    "send-redacted"
+                ]
+            );
+            // The window covers only the newest three frames.
+            assert_eq!(
+                keys(store.unsettled_send_frames(3, 100).await.expect("window")),
+                ["send-accepted", "send-dispatching", "send-redacted"]
+            );
+            assert_eq!(
+                keys(store.unsettled_send_frames(100, 2).await.expect("limit")),
+                ["send-old", "send-accepted"]
+            );
+            let settled = store
+                .frame_by_dedupe_key("send-old")
+                .await
+                .expect("lookup")
+                .expect("present");
+            store
+                .update_frame_status(&settled.id, ConsoleFrameStatus::Delivered)
+                .await
+                .expect("settle");
+            assert_eq!(
+                keys(store.unsettled_send_frames(100, 100).await.expect("after")),
+                ["send-accepted", "send-dispatching", "send-redacted"]
+            );
+        }
     }
 
     #[tokio::test]

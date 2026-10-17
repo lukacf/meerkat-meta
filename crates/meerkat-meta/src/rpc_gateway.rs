@@ -18088,6 +18088,9 @@ external_addressable = true
     let viewer_resolver = runtime.console_viewer_resolver(&decision_state);
     let send_precheck = runtime.console_send_precheck(&decision_state);
     let app = runtime.build_reference_app_router(decision_state);
+    // Before anything is served: console sends a previous process accepted
+    // and did not see settle are settled from the runtime's evidence.
+    runtime.reconcile_interrupted_console_sends().await;
     let app =
         mount_host_app_routes(app, host, viewer_resolver, send_precheck).map_err(|error| {
             fail_init(

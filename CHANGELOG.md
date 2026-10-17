@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `meta/console/recover_send` and its REST twin `POST /console/send/recover`
+  report the caller's own console send by `identity`, `origin` and
+  `idempotency_key`: its acceptance as it is now, and what the runtime holds
+  for it (`native.state`: `admitted` with the input id and phase, `absent`, or
+  `unknown`). A send the evidence shows admitted but not yet settled is
+  settled `delivered`; nothing is dispatched. A key the caller never used and a
+  key another caller used answer the same `send_not_found`. It is gated like
+  `meta/console/send` (`agent.send`, refused on a read-only console).
+- `ConsoleLogStore::unsettled_send_frames` (defaulted to none) and
+  `UnifiedRuntime::reconcile_interrupted_console_sends`, which both gateways
+  run once at startup.
+
+### Fixed
+
+- Fix console send idempotency isolation between authenticated principals:
+  the dedupe keys of `meta/console/send` and `/console/send` are scoped to the
+  authenticated principal (a verified human by OIDC issuer and subject,
+  otherwise the console principal; anonymous callers of an open console share
+  one local account).
+- A console send the gateway accepted but stopped before it settled no longer
+  stays `accepted` or `dispatching` for good. A replay of the same send decides
+  from the runtime's admission evidence in the session the send recorded: an
+  admitted input settles it `delivered`; for a durable identity's local
+  session, an absent one is dispatched again under the send's own delivery
+  identity, pinned to that session (a moved session ends it
+  `delivery_failed`, never retargeted). Governed sends and other members' are
+  settled from evidence only. At startup the gateway settles, from evidence
+  only, the unsettled sends among the newest console frames whose input was
+  admitted.
+
+### Changed
+
+- The `dedupe_key` of a console send frame is an opaque digest for every
+  Console caller. The public Rust `MetaConsoleAggregator::send` and
+  `reserve_identity_first_interaction` keep their key shape and behaviour.
+- Upgrade note: console send records written before this version are not
+  matched by any Console caller. A send in flight during the upgrade and
+  retried afterwards with the same key is admitted as a new send.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
