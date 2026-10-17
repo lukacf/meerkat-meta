@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A delegate helper whose tooling inherits its parent's visible tools
+  (`inherit_parent`, also the default when tooling is omitted) now sees the
+  SDK callback tools its parent sees. Every `callback/build_agent` and
+  `customize_build` mints its own routing scope, and each callback tool
+  carried that scope as its provenance source, so the helper's own
+  registration of a host tool never matched the witness its parent's
+  visibility pinned, and the inherited ceiling dropped it. Callback tools now
+  carry one stable source for the gateway's SDK host,
+  `meta-callback:sdk-host`; the per-build scope still routes
+  `callback/call_tool`. Meerkat still matches visibility witnesses strictly
+  by source kind and id, so MCP and bundle tools are unaffected. A host filter
+  witnessed on a callback tool, such as a persisted deny, also keeps applying
+  after a rebuild instead of silently lapsing. Helpers spawned before this
+  release keep the per-build witnesses recorded in their inherited ceiling,
+  so their host callback tools stay hidden until they are re-spawned.
+  `fork_off` was not affected: it applies no inherited ceiling.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
