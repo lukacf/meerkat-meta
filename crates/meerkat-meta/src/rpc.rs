@@ -12449,6 +12449,114 @@ comms = true
         Ok(())
     }
 
+    /// The same-process topology primitives follow the member-id alias rule.
+    /// Identity-first topology names each end by its durable identity; the
+    /// primitives pin the identity's current runtime alias under its
+    /// lifecycle lock and act on the durable roster row that alias names.
+    /// Before, they handed the runtime alias itself to the mob, which no row
+    /// has, so wiring an identity-first pair failed with MemberNotFound.
+    #[tokio::test]
+    async fn same_process_topology_reaches_identity_first_members_by_their_durable_rows()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn identity_first_runtime(
+            temp_dir: &tempfile::TempDir,
+            namespace: &str,
+            durable: &str,
+        ) -> Result<UnifiedRuntime, Box<dyn std::error::Error + Send + Sync>> {
+            let mut runtime = alias_rule_test_runtime(temp_dir, namespace).await?;
+            spawn_identity_projection_fixture(
+                &runtime,
+                SpawnMemberSpec::from_wire(
+                    "worker".to_string(),
+                    durable.to_string(),
+                    None,
+                    Some(meerkat_mob::MobRuntimeMode::TurnDriven),
+                    None,
+                )
+                .with_labels(BTreeMap::from([(
+                    "agent_identity".to_string(),
+                    durable.to_string(),
+                )])),
+            )
+            .await?;
+            let session_id = runtime
+                .mob_handle()
+                .resolve_bridge_session_id(&crate::member_comms_id::mob_member_id(durable))
+                .await
+                .ok_or("the spawned member must have a bridge session")?;
+            let identity_rt = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+                continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+                lease_provider: Arc::new(LocalLeaseProvider::new()),
+                runtime_instance_id: namespace.to_string(),
+                has_runtime_store: true,
+                durability_policy: DurabilityPolicy::SyncWriteThrough,
+                bridge: None,
+                default_timeout: None,
+            }));
+            let identity = AgentIdentity::parse(durable)?;
+            identity_rt
+                .register(
+                    rpc_durable_spec(identity.as_str(), "worker"),
+                    IdentityLifecycleState::Active,
+                    Some(ContinuityRecord {
+                        identity: identity.clone(),
+                        agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{durable}:0"))?,
+                        session_id,
+                        generation: ContinuityGeneration::new(0),
+                        checkpoint_version: CheckpointVersion::new(0),
+                    }),
+                    Some(LeaseGrant {
+                        identity,
+                        fencing_token: FencingToken::new(1),
+                        ttl: Duration::from_mins(1),
+                    }),
+                )
+                .await;
+            runtime.attach_identity_first_context(Arc::new(
+                crate::identity_first::IdentityFirstRuntimeContext::new(
+                    identity_rt,
+                    Arc::new(EmptyRosterProvider),
+                    None,
+                    None,
+                    None,
+                ),
+            ));
+            Ok(runtime)
+        }
+
+        let left_dir = tempfile::tempdir()?;
+        let right_dir = tempfile::tempdir()?;
+        let left = identity_first_runtime(&left_dir, "rpc-topology-left", "review:left").await?;
+        let right =
+            identity_first_runtime(&right_dir, "rpc-topology-right", "review:right").await?;
+
+        let wired = left
+            .wire_bilateral_same_process(&right, "review:left", "review:right")
+            .await
+            .map_err(|error| error.to_string());
+        let after_wire = left
+            .bilateral_same_process_state(&right, "review:left", "review:right")
+            .await
+            .map_err(|error| error.to_string());
+        let unwired = left
+            .unwire_bilateral_same_process(&right, "review:left", "review:right")
+            .await
+            .map_err(|error| error.to_string());
+        let after_unwire = left
+            .bilateral_same_process_state(&right, "review:left", "review:right")
+            .await
+            .map_err(|error| error.to_string());
+        assert_eq!(
+            (wired, after_wire, unwired, after_unwire),
+            (Ok(()), Ok((true, true)), Ok(()), Ok((false, false))),
+            "(wire, state after wire, unwire, state after unwire)"
+        );
+
+        left.shutdown().await;
+        right.shutdown().await;
+        Ok(())
+    }
+
     /// Capturing durable ownership is a one-way authority decision for a
     /// request. If the identity disappears before the later status probe,
     /// the live projection must not resurrect it through compatibility mode.

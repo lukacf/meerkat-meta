@@ -38,6 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   refuse a runtime alias. The declaration apply used to report success for
   a member it never reached, and `reconcile` seated a phantom member for an
   encoded roster id.
+- Identity-first same-process topology reaches its members: the bilateral
+  wire, unwire, and state read handed each member's runtime alias to the
+  mob, which keys no row by it, and failed with `MemberNotFound`. Wire and
+  unwire now resolve both ends to their durable roster rows under the
+  lifecycle locks they hold, as the other cross-mob operations do.
+- An identity member's idle-retire opt-in follows its continuity rebind to
+  a respawned or delivery-repaired session. The rebind reported the member
+  under its runtime alias instead of its roster row, so the opt-in stayed
+  on the old session.
 
 ## [0.9.2] - 2026-10-16
 

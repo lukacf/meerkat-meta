@@ -14578,9 +14578,14 @@ impl IdentityRuntime {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             if let Some(observer) = observer {
+                // The observer keys the member by its roster row, the encoded
+                // DURABLE identity; the runtime alias names only this
+                // incarnation and no roster row.
                 observer
                     .member_session_rotated(
-                        &crate::member_comms_id::mob_member_id(record.agent_runtime_id.as_str()),
+                        &crate::member_comms_id::roster_member_id_for_identity(
+                            record.identity.as_str(),
+                        ),
                         &previous_session_id,
                         &record.session_id,
                     )
