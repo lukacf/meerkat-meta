@@ -142,15 +142,40 @@ def job_needs(name: str) -> list[str]:
     return [value.strip() for value in lines[0].split("[", 1)[1][:-1].split(",")]
 
 
+def job_ancestors(name: str) -> list[str]:
+    """Every job upstream of `name` through `needs`, transitively, in workflow order.
+
+    GitHub evaluates a job's status functions over this whole chain, not only
+    over the declared needs, and so does the implicit success() of a condition
+    without a status function. A job with no status function is skipped when
+    any ancestor was skipped, failed or cancelled, even if every declared need
+    succeeded: v0.9.2 promotion run 38983785773 skipped release_validate, and
+    every job after it, because build_binaries (a need of require_ci_green,
+    skipped outside candidate mode) is an ancestor, although both of
+    release_validate's own needs succeeded.
+    """
+    seen: set[str] = set()
+    pending = list(job_needs(name))
+    while pending:
+        job = pending.pop()
+        if job not in seen:
+            seen.add(job)
+            pending.extend(job_needs(job))
+    if name in seen:
+        raise AssertionError(f"{name} depends on itself")
+    return sorted(seen, key=lambda job: (JOBS.index(job) if job in JOBS else len(JOBS), job))
+
+
 def job_runs(name: str, **context) -> bool:
-    """Apply GitHub's implicit success() unless an explicit status function exists."""
+    """Apply GitHub's status semantics: status functions, explicit or the
+    implicit success() of a condition without one, read every ancestor."""
     expression = job_condition(name)
     dependencies = job_needs(name)
     references = set(re.findall(r"\bneeds\.([A-Za-z_][A-Za-z0-9_]*)\.", expression))
     if references - set(dependencies):
         raise AssertionError(f"{name} references undeclared needs: {references - set(dependencies)}")
     statuses = []
-    for dependency in dependencies:
+    for dependency in job_ancestors(name):
         key = f"needs_{dependency}_result"
         if key not in context:
             raise AssertionError(f"unsupplied dependency status: {key}")
@@ -972,17 +997,22 @@ class ReleaseProtocolConditionsTests(unittest.TestCase):
                             for need in required),
                     )
 
-    def test_ordinary_jobs_require_implicit_success_of_every_declared_need(self):
-        for job, mode in (("release_validate", "candidate"),
+    def test_jobs_run_only_when_every_declared_need_succeeded(self):
+        # build_binaries keeps the implicit success(): its only ancestor is the
+        # resolver. Every other job has an ancestor that some mode skips, so it
+        # states each need's result under always() (GitHubSkipPropagationTests).
+        self.assertNotIn("always()", job_condition("build_binaries"))
+        for job, mode in (("release_validate", "candidate"), ("release_validate", "promote"),
                           ("build_binaries", "candidate"), ("collect_candidate", "candidate"),
                           ("verify_release_assets", "promote"), ("verify_crate_packages", "promote")):
-            self.assertNotIn("always()", job_condition(job))
+            if job != "build_binaries":
+                self.assertIn("always()", job_condition(job))
             for statuses in itertools.product(("success", "failure", "skipped", "cancelled"),
                                               repeat=len(job_needs(job))):
                 context = protocol_context(mode)
                 context.update({f"needs_{need}_result": value
                                 for need, value in zip(job_needs(job), statuses)})
-                with self.subTest(job=job, statuses=statuses):
+                with self.subTest(job=job, mode=mode, statuses=statuses):
                     self.assertEqual(job_runs(job, **context), all(s == "success" for s in statuses))
 
     def test_tag_mode_stops_before_heavy_validation(self):
@@ -1011,6 +1041,85 @@ class ReleaseProtocolConditionsTests(unittest.TestCase):
                 for job in ("publish_github_release", "publish_sdk_packages",
                             "publish_registries"):
                     self.assertEqual(results[job], "skipped", (publish, status, job))
+
+
+class GitHubSkipPropagationTests(unittest.TestCase):
+    """GitHub reads a job's status functions over every ancestor, not only its
+    declared needs, and a condition without one gets an implicit success().
+    A job below a skipped ancestor therefore skips unless it states its needs'
+    results under an explicit status function. v0.9.2 promotion run 38983785773
+    and asset recovery run 38984295785 ran nothing after the CI gate this way,
+    while the declared-needs-only model here still passed.
+    """
+
+    # Each dispatch mode, and the tag event, with the exact jobs that run.
+    # Both candidate tiers share one DAG: no job condition reads the tier.
+    BASE = {"resolve_release", "require_ci_green"}
+    MODES = (
+        ("candidate core", "candidate", False, False, "workflow_dispatch",
+         {"build_binaries", "release_validate", "collect_candidate"}),
+        ("candidate trailing", "candidate", False, False, "workflow_dispatch",
+         {"build_binaries", "release_validate", "collect_candidate"}),
+        ("promote", "promote", True, False, "workflow_dispatch",
+         {"release_validate", "verify_release_assets", "publish_github_release",
+          "publish_sdk_packages", "verify_crate_packages", "publish_registries"}),
+        ("promote without registries", "promote", False, False, "workflow_dispatch",
+         {"release_validate", "verify_release_assets", "publish_github_release"}),
+        ("promote rehearsal", "promote", True, True, "workflow_dispatch",
+         {"release_validate", "verify_release_assets", "publish_sdk_packages",
+          "verify_crate_packages", "publish_registries"}),
+        ("assets", "assets", False, False, "workflow_dispatch",
+         {"release_validate", "publish_github_release"}),
+        ("existing registry retry", "existing", True, False, "workflow_dispatch",
+         {"release_validate", "verify_release_assets", "publish_sdk_packages",
+          "verify_crate_packages", "publish_registries"}),
+        ("existing rehearsal", "existing", True, True, "workflow_dispatch",
+         {"release_validate", "publish_sdk_packages", "verify_crate_packages",
+          "publish_registries"}),
+        ("tag", "tag", False, False, "push", set()),
+    )
+
+    def test_every_mode_runs_its_jobs_under_github_skip_propagation(self):
+        for label, mode, publish, dry, event, expected in self.MODES:
+            with self.subTest(mode=label):
+                results = release_results(protocol_context(mode, publish, dry, event=event))
+                self.assertEqual({job for job, result in results.items() if result == "success"},
+                                 self.BASE | expected)
+                self.assertEqual({job for job, result in results.items() if result == "skipped"},
+                                 set(JOBS) - self.BASE - expected)
+
+    def test_no_job_condition_reads_the_candidate_tier(self):
+        for job in JOBS:
+            with self.subTest(job=job):
+                self.assertNotIn("outputs.tier", job_condition(job))
+
+    def test_status_functions_read_every_ancestor_not_only_declared_needs(self):
+        self.assertEqual(job_ancestors("release_validate"),
+                         ["resolve_release", "build_binaries", "require_ci_green"])
+        self.assertEqual(job_ancestors("build_binaries"), ["resolve_release"])
+        # The facts of promotion run 38983785773: the resolver and the CI gate
+        # succeeded, the candidate legs were skipped.
+        context = protocol_context("promote")
+        context.update(needs_build_binaries_result="skipped")
+        statuses = [context[f"needs_{job}_result"] for job in job_ancestors("release_validate")]
+        self.assertTrue(all(context[f"needs_{need}_result"] == "success"
+                            for need in job_needs("release_validate")))
+        # The v0.9.2 condition had no status function: GitHub skipped it.
+        self.assertFalse(evaluate_condition(
+            "success() && needs.resolve_release.outputs.mode != 'tag'", statuses=statuses, **context))
+        self.assertTrue(job_runs("release_validate", **context))
+
+    def test_jobs_below_a_skippable_ancestor_state_every_need_under_a_status_function(self):
+        # Only the resolver can never be skipped; any other ancestor is skipped
+        # in some mode (build_binaries outside candidate mode, and so on down).
+        for job in JOBS:
+            if not set(job_ancestors(job)) - {"resolve_release"}:
+                continue
+            condition = job_condition(job)
+            with self.subTest(job=job):
+                self.assertRegex(condition, r"\b(?:always|success|failure|cancelled)\s*\(")
+                for need in job_needs(job):
+                    self.assertIn(f"needs.{need}.result", condition)
 
 
 class WorkflowExtractorTests(unittest.TestCase):

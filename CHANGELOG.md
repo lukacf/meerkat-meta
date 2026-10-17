@@ -9,52 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
-- With the `extension-state` feature, a document store that an embedding
-  host supplies through `MetaStorageProvider::open_extension_state` must
-  implement the new `ExtensionDocumentStore::references_mob`: report
-  whether any live document of the realm, in any namespace, names a mob id
-  as its owner or in an audience grant or deny, failing the answer (never
-  skipping the document) on a document it cannot read or decode. The default
-  implementation answers an error, and every mob create of the agent
-  mob-tool state, except a session's implicit delegation mob, is then
-  refused. The built-in `SqliteExtensionDocumentStore` implements it.
-- Host deploys from the runtime-mounted Flow Editor need an access-controller
-  grant of `mobpack.deploy` or the new host opt-in (see Security and Added).
-- `meta/mobpacks/apply_operation` ignores `rkat_validate` on every surface,
-  including the SDK's stdio RPC; run `meta/mobpacks/validate` for `rkat`
-  validation.
-- Without host access, the Flow Editor HTTP routes refuse `store_path` and
-  pack only path skills that `meta/skills/catalog` lists (see Security).
-- Rust code that calls the mobpack functions directly (`export_mobpack`,
-  `validate_mobpack`, `import_mobpack` and the rest of `meerkat_meta::mobpack`)
-  reads path skills only from files the skills catalog lists, unless it runs
-  them under the new `meerkat_meta::with_host_path_skill_reads`. The SDKs'
-  stdio and in-process JSON-RPC read as the host, as before.
-- Behaviour-only (not measured by the semver gate): the agent-memory
-  recorder's `memory` tool now names the memory operation each call performs,
-  with Meerkat 0.9.2's typed operation targets. Every plan it resolves carries
-  its own witness with `ToolOperationTarget::MemoryOperation`: `remember` and
-  `update` are a `Write`, `forget` a `Delete` and `recall` a `Read` of the
-  member's identity scope, and `propose_to_mob` a `Propose` to its mob scope.
-  The scope is always the one the recorder pinned when the member was built,
-  never one taken from the call's arguments. A host operation policy that
-  mapped the `memory` tool as an operation without a target now receives
-  that target, and under a targeted grant basis the tool uses only the
-  lineage selected for its memory scope, never the base lineage. Stock
-  governed realms keep refusing it, as they did while it had no target.
-- Behaviour-only: under governed work the `memory` tool reads or writes
-  memory only when the dispatch's prepared authorization names exactly the
-  operation the call performs. A wrapper that forwards its
-  `dispatch_with_context` but resolves its own plan without that target, or
-  with another scope's, is refused with `authorization_refused` (malformed
-  facts) before any memory access, and a plan the recorder did not resolve
-  for the call's own operation is refused as `ExecutionOwnerChanged`.
-  Forward `resolve_execution_plan` and `dispatch_resolved_with_context` to
-  the recorder instead. Ungoverned dispatch is unchanged.
-- Behaviour-only: in a session, a `memory` call with an unknown action, or
-  `propose_to_mob` from a member that is not in a mob, now fails at plan
-  resolution with `invalid_arguments` and the same reason, where the tool
-  returned it as an error result.
 - Behaviour-only: `meta/mobpacks/apply_operation` refuses every operation
   but the deletes (`delete_flow_step`, `delete_graph_node`,
   `delete_graph_edge` and `delete_member`) with `-32602`, not only the
@@ -87,125 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
-- `Cargo.lock` updates quinn-proto from 0.11.16 to 0.11.19, which clears
-  RUSTSEC-2026-0338, RUSTSEC-2026-0339, RUSTSEC-2026-0340, RUSTSEC-2026-0341
-  and RUSTSEC-2026-0342 from `cargo audit`. Meta was not exposed: no build
-  compiles quinn-proto, which the lockfile records only under reqwest's
-  optional HTTP/3 support, and no workspace feature enables it. Only that
-  lockfile entry changes.
-- With the `extension-state` feature, a new mob could take the id of a
-  destroyed one and inherit what extension documents grant that id, since
-  documents name a mob by its id alone, as their owner (`Owner::Mob`) or in
-  an audience entry (`Audience::Mob`). An agent's `mob_create` takes a
-  model-chosen id, so another session could manage a destroyed child's
-  documents through a new mob under its id: at once now that a destroy
-  releases the id, and after a restart before. The agent mob-tool state now
-  refuses every create (an agent's `mob_create`, a temporary council, a
-  create without an owner session) under an id that any live document of
-  the realm still names, whatever the registry binds under it, with a typed
-  refusal that names the remedies: choose another mob id, or have a host or
-  operator with access to the extension store transfer each document the id
-  owns and remove or replace each `Audience::Mob` grant or deny naming it.
-  The one exemption is the implicit delegation mob that its own session's
-  runtime path creates or recreates. Known limitations:
-  - Ownership is by id, so the destroyed mob's own owner session cannot
-    recreate the same explicit id while documents name it either;
-    per-instance ownership is the long-term model.
-  - Each such create reads every live document of the realm under the
-    extension store's one connection, so document reads and writes of every
-    session wait while it runs, and a caller that repeats creates under a
-    named id keeps them waiting. A refusal also tells the caller that some
-    document names the id, including one it cannot read. An index or a rate
-    limit is planned for 0.9.3.
-  - The check is not ordered against a document write already in flight,
-    whose caller the embedding host resolved while the destroyed mob was
-    live.
-  - Restoring a persisted mob is never re-checked: a takeover made before
-    0.9.2, or a mob created while no extension tool bundle or document
-    binding was composed (the check is installed only with them), keeps what
-    it inherited after a restart.
-- The Flow Editor that a runtime mounts on its reference app router, which
-  `meta_gateway` and `rpc_gateway` serve beside the console, no longer runs
-  `rkat` on the host for a caller that no access controller grants
-  `mobpack.deploy`. Without an access controller, any process that could
-  reach the gateway's listener (loopback by default, so any local user)
-  could send an unauthenticated `meta/mobpacks/deploy` with `execute: true`,
-  which writes an archive and runs `rkat mob run`, or
-  `meta/mobpacks/validate` with `rkat_validate: true`, which runs
-  `rkat mob validate`. Browsers could not send that request across origins.
-  Now the deploy is refused with `-32602` and the validation stays
-  structural, and `meta/capabilities` advertises
-  `deploy_execute_allowed: false` and `host_mutation_allowed: false`. An
-  enforced access controller still decides per caller, as before.
-  `http_flow_editor::protected_flow_editor_router` and
-  `http_flow_editor::flow_editor_rpc_router_with_decisions` take no access
-  controller, so they no longer run host deploys at all.
-- The Flow Editor HTTP routes no longer touch a host path that a caller
-  without host access names. On a gateway without an access controller,
-  any local process could, without a token:
-  - send `meta/mobpacks/apply_operation` with `rkat_validate: true`, which
-    wrote an archive and ran `rkat mob validate` (only
-    `meta/mobpacks/validate` stripped that flag);
-  - pass `store_path` to the draft methods, which created directories and
-    files at any writable path, replaced JSON files there, and read any JSON
-    object file back through `meta/mobpacks/list`;
-  - put a path skill naming any readable host file into a document, whose
-    bytes `meta/mobpacks/source` and `meta/mobpacks/export` returned.
-
-  Now `apply_operation` never runs `rkat` (on every surface), `store_path` is
-  refused with `-32602` on every Flow Editor method, and a path skill is
-  read only when `meta/skills/catalog` lists that file; any other path is a
-  `selected_skill_path_not_permitted` validation error. A read requires the
-  document's path to match a listed string before it opens anything, so an
-  unlisted path (a Windows UNC share, a path on a hung mount) is refused
-  without a stat that reaches it. A listed file counts only while its real
-  path stays inside the skill directory it was found in, and a catalog file
-  with other hard links counts only when another user owns it and it is
-  world-readable, as in a Nix store or another user's install (a store the
-  gateway's own user owns, as pnpm and uv stores usually are, does not
-  count, and neither does a link to the gateway user's own files). The
-  server reads the file it opened (comparing the opened file's device and
-  inode), so a link swapped in after listing reaches no other file.
-  `meta/skills/catalog` marks each filesystem skill with
-  `readable_without_host_access`, and with `read_refusal` when a caller
-  without host access cannot read it; reading such a skill names that
-  reason. One request without host access reads at most 64 MiB of skill
-  files in total, however many skills name a file: a file larger than what
-  is left is refused by its opened handle's size before it is read, and once
-  the budget is spent the request resolves no further path skill. Host
-  access is the caller's own per-call `mobpack.deploy` decision, so a deny
-  rule withholds it even beside an allow rule such as `mobpack.*`. Callers
-  with host access, and the SDKs' stdio and in-process RPC, may still name
-  such paths.
-- Importing a mobpack archive (`meta/mobpacks/import`, and the draft methods
-  that re-import a stored archive) refuses an archive that expands past
-  32 MiB, holds more than 4096 entries, holds a member that is not a regular
-  file, or holds a `meta/editor.json` or `meta/mob.toml` larger than 1 MiB
-  (parsing expands those many times over) or a `manifest.toml` larger than
-  4 MiB. Everything one import materializes, archive members, parsed text
-  and each path skill filled in from a member, counts against one 64 MiB
-  budget, so a member named by many path skills is not copied once per name.
-  Import, every document method and draft save refuse a document whose
-  skill content, summed over every skill entry, passes 16 MiB, so the copies
-  made after a document enters (the import reply, source and export, a
-  saved draft) stay a small constant times that. One validation reports at
-  most 1000 diagnostics, ending with `diagnostics_truncated`. Rendering is
-  bounded too, whatever the document's shape: the rendered `mob.toml`, the
-  `definition.json` parsed from it and the expected schema files beside it
-  are each refused past 16 MiB (a schema shared by many members was copied
-  into every one), and a document with more than 1000 members, more than 256
-  branches in one parallel or branch step, or more than 1024 branches in its
-  flow is refused before it is rendered (branches after a parallel step
-  without a join each depended on every branch before them). A stored draft
-  whose document passes the skill content cap is listed and fetched as a
-  placeholder with the reason. A pax global
-  header, which `git archive` writes, is skipped, and a contiguous file
-  reads as a regular one. Before, a request under the HTTP body limit could
-  expand into gigabytes of memory: a member's bytes were read with no
-  per-member cap, and a GNU sparse member's zero gaps, which the tar reader
-  synthesizes in memory outside the gzip stream, were not covered by the
-  stream cap at all, so a roughly 150-byte upload declaring an 8 GiB sparse
-  file could exhaust memory.
 - Flow Editor validation holds at most the 1000 diagnostics it reports while
   it runs. It built every diagnostic before it truncated the list, so its peak
   memory grew with the number of problems in a document: a flow of 100000
@@ -363,6 +198,224 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   memory. Replies now list the drafts as summaries of a few hundred bytes,
   and a draft id has at most 256 characters.
 
+### Changed
+
+- Flow Editor catalogs give a caller without host access each filesystem
+  skill's path within its realm's directory and no realm `path`; a caller
+  with host access still gets absolute paths (see Security). A document may
+  name a catalog skill either way.
+
+### Fixed
+
+- Importing a mob definition into the Flow Editor shows each of its steps
+  once. A step with a condition but no branch that shares its dependencies
+  with two or more steps without one was dropped, and the parallel step of
+  those steps was shown again for each such step, so such an import also
+  grew with the product of the two counts. Such a step is now shown once,
+  after that parallel step (see Known limitations).
+- Importing a mob definition into the Flow Editor shows its steps in
+  dependency order. A definition's steps are parsed in id order, and import
+  showed them in that order, so a step whose id sorts before a step it
+  depends on was shown first, and the flow exported from the editor ran it
+  first: a round trip through the editor rewired the flow. Each frame's
+  steps are now ordered by their dependencies, and by id where those leave
+  the order open; a loop's last step, which its repeat condition names, is
+  taken in the same order.
+- Importing a mob definition into the Flow Editor keeps the condition of a
+  step that has a condition but no branch. Import showed it as a plain
+  member step, which carries no condition, so a round trip through the
+  editor ran the step whatever its condition. It is now shown as a branch
+  step of one lane, which an export writes back with the condition, and a
+  graph with a one-lane branch derives that branch step again.
+
+### Known limitations
+
+- The Flow Editor draft store is shared by every caller of a Flow Editor
+  route: one caller can fill it to its caps, which refuses new drafts to
+  everyone else and drops other drafts' undo history first, and any caller
+  can overwrite or delete any draft. Per-caller stores or quotas are planned.
+- The Flow Editor shows a step with a condition but no branch that shares
+  its dependencies with parallel steps after their parallel step, so an
+  exported flow runs it after them, when its condition holds, rather than
+  beside them.
+- The Flow Editor draft store's lock is per process. Two processes that
+  share one store each read it, change it and rename their copy over it, so
+  of their concurrent writes only the last one renamed survives: run one
+  process per store.
+
+## [0.9.2] - 2026-10-16
+
+### Breaking
+
+- With the `extension-state` feature, a document store that an embedding
+  host supplies through `MetaStorageProvider::open_extension_state` must
+  implement the new `ExtensionDocumentStore::references_mob`: report
+  whether any live document of the realm, in any namespace, names a mob id
+  as its owner or in an audience grant or deny, failing the answer (never
+  skipping the document) on a document it cannot read or decode. The default
+  implementation answers an error, and every mob create of the agent
+  mob-tool state, except a session's implicit delegation mob, is then
+  refused. The built-in `SqliteExtensionDocumentStore` implements it.
+- Host deploys from the runtime-mounted Flow Editor need an access-controller
+  grant of `mobpack.deploy` or the new host opt-in (see Security and Added).
+- `meta/mobpacks/apply_operation` ignores `rkat_validate` on every surface,
+  including the SDK's stdio RPC; run `meta/mobpacks/validate` for `rkat`
+  validation.
+- Without host access, the Flow Editor HTTP routes refuse `store_path` and
+  pack only path skills that `meta/skills/catalog` lists (see Security).
+- Rust code that calls the mobpack functions directly (`export_mobpack`,
+  `validate_mobpack`, `import_mobpack` and the rest of `meerkat_meta::mobpack`)
+  reads path skills only from files the skills catalog lists, unless it runs
+  them under the new `meerkat_meta::with_host_path_skill_reads`. The SDKs'
+  stdio and in-process JSON-RPC read as the host, as before.
+- Behaviour-only (not measured by the semver gate): the agent-memory
+  recorder's `memory` tool now names the memory operation each call performs,
+  with Meerkat 0.9.2's typed operation targets. Every plan it resolves carries
+  its own witness with `ToolOperationTarget::MemoryOperation`: `remember` and
+  `update` are a `Write`, `forget` a `Delete` and `recall` a `Read` of the
+  member's identity scope, and `propose_to_mob` a `Propose` to its mob scope.
+  The scope is always the one the recorder pinned when the member was built,
+  never one taken from the call's arguments. A host operation policy that
+  mapped the `memory` tool as an operation without a target now receives
+  that target, and under a targeted grant basis the tool uses only the
+  lineage selected for its memory scope, never the base lineage. Stock
+  governed realms keep refusing it, as they did while it had no target.
+- Behaviour-only: under governed work the `memory` tool reads or writes
+  memory only when the dispatch's prepared authorization names exactly the
+  operation the call performs. A wrapper that forwards its
+  `dispatch_with_context` but resolves its own plan without that target, or
+  with another scope's, is refused with `authorization_refused` (malformed
+  facts) before any memory access, and a plan the recorder did not resolve
+  for the call's own operation is refused as `ExecutionOwnerChanged`.
+  Forward `resolve_execution_plan` and `dispatch_resolved_with_context` to
+  the recorder instead. Ungoverned dispatch is unchanged.
+- Behaviour-only: in a session, a `memory` call with an unknown action, or
+  `propose_to_mob` from a member that is not in a mob, now fails at plan
+  resolution with `invalid_arguments` and the same reason, where the tool
+  returned it as an error result.
+
+### Security
+
+- `Cargo.lock` updates quinn-proto from 0.11.16 to 0.11.19, which clears
+  RUSTSEC-2026-0338, RUSTSEC-2026-0339, RUSTSEC-2026-0340, RUSTSEC-2026-0341
+  and RUSTSEC-2026-0342 from `cargo audit`. Meta was not exposed: no build
+  compiles quinn-proto, which the lockfile records only under reqwest's
+  optional HTTP/3 support, and no workspace feature enables it. Only that
+  lockfile entry changes.
+- With the `extension-state` feature, a new mob could take the id of a
+  destroyed one and inherit what extension documents grant that id, since
+  documents name a mob by its id alone, as their owner (`Owner::Mob`) or in
+  an audience entry (`Audience::Mob`). An agent's `mob_create` takes a
+  model-chosen id, so another session could manage a destroyed child's
+  documents through a new mob under its id: at once now that a destroy
+  releases the id, and after a restart before. The agent mob-tool state now
+  refuses every create (an agent's `mob_create`, a temporary council, a
+  create without an owner session) under an id that any live document of
+  the realm still names, whatever the registry binds under it, with a typed
+  refusal that names the remedies: choose another mob id, or have a host or
+  operator with access to the extension store transfer each document the id
+  owns and remove or replace each `Audience::Mob` grant or deny naming it.
+  The one exemption is the implicit delegation mob that its own session's
+  runtime path creates or recreates. Known limitations:
+  - Ownership is by id, so the destroyed mob's own owner session cannot
+    recreate the same explicit id while documents name it either;
+    per-instance ownership is the long-term model.
+  - Each such create reads every live document of the realm under the
+    extension store's one connection, so document reads and writes of every
+    session wait while it runs, and a caller that repeats creates under a
+    named id keeps them waiting. A refusal also tells the caller that some
+    document names the id, including one it cannot read. An index or a rate
+    limit is planned for 0.9.3.
+  - The check is not ordered against a document write already in flight,
+    whose caller the embedding host resolved while the destroyed mob was
+    live.
+  - Restoring a persisted mob is never re-checked: a takeover made before
+    0.9.2, or a mob created while no extension tool bundle or document
+    binding was composed (the check is installed only with them), keeps what
+    it inherited after a restart.
+- The Flow Editor that a runtime mounts on its reference app router, which
+  `meta_gateway` and `rpc_gateway` serve beside the console, no longer runs
+  `rkat` on the host for a caller that no access controller grants
+  `mobpack.deploy`. Without an access controller, any process that could
+  reach the gateway's listener (loopback by default, so any local user)
+  could send an unauthenticated `meta/mobpacks/deploy` with `execute: true`,
+  which writes an archive and runs `rkat mob run`, or
+  `meta/mobpacks/validate` with `rkat_validate: true`, which runs
+  `rkat mob validate`. Browsers could not send that request across origins.
+  Now the deploy is refused with `-32602` and the validation stays
+  structural, and `meta/capabilities` advertises
+  `deploy_execute_allowed: false` and `host_mutation_allowed: false`. An
+  enforced access controller still decides per caller, as before.
+  `http_flow_editor::protected_flow_editor_router` and
+  `http_flow_editor::flow_editor_rpc_router_with_decisions` take no access
+  controller, so they no longer run host deploys at all.
+- The Flow Editor HTTP routes no longer touch a host path that a caller
+  without host access names. On a gateway without an access controller,
+  any local process could, without a token:
+  - send `meta/mobpacks/apply_operation` with `rkat_validate: true`, which
+    wrote an archive and ran `rkat mob validate` (only
+    `meta/mobpacks/validate` stripped that flag);
+  - pass `store_path` to the draft methods, which created directories and
+    files at any writable path, replaced JSON files there, and read any JSON
+    object file back through `meta/mobpacks/list`;
+  - put a path skill naming any readable host file into a document, whose
+    bytes `meta/mobpacks/source` and `meta/mobpacks/export` returned.
+
+  Now `apply_operation` never runs `rkat` (on every surface), `store_path` is
+  refused with `-32602` on every Flow Editor method, and a path skill is
+  read only when `meta/skills/catalog` lists that file; any other path is a
+  `selected_skill_path_not_permitted` validation error. A read requires the
+  document's path to match a listed string before it opens anything, so an
+  unlisted path (a Windows UNC share, a path on a hung mount) is refused
+  without a stat that reaches it. A listed file counts only while its real
+  path stays inside the skill directory it was found in, and a catalog file
+  with other hard links counts only when another user owns it and it is
+  world-readable, as in a Nix store or another user's install (a store the
+  gateway's own user owns, as pnpm and uv stores usually are, does not
+  count, and neither does a link to the gateway user's own files). The
+  server reads the file it opened (comparing the opened file's device and
+  inode), so a link swapped in after listing reaches no other file.
+  `meta/skills/catalog` marks each filesystem skill with
+  `readable_without_host_access`, and with `read_refusal` when a caller
+  without host access cannot read it; reading such a skill names that
+  reason. One request without host access reads at most 64 MiB of skill
+  files in total, however many skills name a file: a file larger than what
+  is left is refused by its opened handle's size before it is read, and once
+  the budget is spent the request resolves no further path skill. Host
+  access is the caller's own per-call `mobpack.deploy` decision, so a deny
+  rule withholds it even beside an allow rule such as `mobpack.*`. Callers
+  with host access, and the SDKs' stdio and in-process RPC, may still name
+  such paths.
+- Importing a mobpack archive (`meta/mobpacks/import`, and the draft methods
+  that re-import a stored archive) refuses an archive that expands past
+  32 MiB, holds more than 4096 entries, holds a member that is not a regular
+  file, or holds a `meta/editor.json` or `meta/mob.toml` larger than 1 MiB
+  (parsing expands those many times over) or a `manifest.toml` larger than
+  4 MiB. Everything one import materializes, archive members, parsed text
+  and each path skill filled in from a member, counts against one 64 MiB
+  budget, so a member named by many path skills is not copied once per name.
+  Import, every document method and draft save refuse a document whose
+  skill content, summed over every skill entry, passes 16 MiB, so the copies
+  made after a document enters (the import reply, source and export, a
+  saved draft) stay a small constant times that. One validation reports at
+  most 1000 diagnostics, ending with `diagnostics_truncated`. Rendering is
+  bounded too, whatever the document's shape: the rendered `mob.toml`, the
+  `definition.json` parsed from it and the expected schema files beside it
+  are each refused past 16 MiB (a schema shared by many members was copied
+  into every one), and a document with more than 1000 members, more than 256
+  branches in one parallel or branch step, or more than 1024 branches in its
+  flow is refused before it is rendered (branches after a parallel step
+  without a join each depended on every branch before them). A stored draft
+  whose document passes the skill content cap is listed and fetched as a
+  placeholder with the reason. A pax global
+  header, which `git archive` writes, is skipped, and a contiguous file
+  reads as a regular one. Before, a request under the HTTP body limit could
+  expand into gigabytes of memory: a member's bytes were read with no
+  per-member cap, and a GNU sparse member's zero gaps, which the tar reader
+  synthesizes in memory outside the gzip stream, were not covered by the
+  stream cap at all, so a roughly 150-byte upload declaring an 8 GiB sparse
+  file could exhaust memory.
+
 ### Added
 
 - `meta_gateway storage-adopt-predecessor --mob-config <file>` checks the mob
@@ -432,6 +485,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Requires Meerkat 0.9.2: every Meerkat dependency is pinned to
+  `=0.9.2` from crates.io.
 - Console: an operation refusal reads "Action refused" instead of
   "Permission denied". The host refuses an operation for a policy denial, for
   an authorization that changed after the operation was prepared and for
@@ -472,10 +527,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rendering checks against `console_acceptance_fixture`, a
   `UnifiedRuntime::builder()` host with identity-first members whose routers
   carry no call-context provider.
-- Flow Editor catalogs give a caller without host access each filesystem
-  skill's path within its realm's directory and no realm `path`; a caller
-  with host access still gets absolute paths (see Security). A document may
-  name a catalog skill either way.
 
 ### Fixed
 
@@ -542,26 +593,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   then failed, the journal and startup's refusal named no unfinished step.
   A reopened journal now records no step as finished until the rerun
   finishes it.
-- Importing a mob definition into the Flow Editor shows each of its steps
-  once. A step with a condition but no branch that shares its dependencies
-  with two or more steps without one was dropped, and the parallel step of
-  those steps was shown again for each such step, so such an import also
-  grew with the product of the two counts. Such a step is now shown once,
-  after that parallel step (see Known limitations).
-- Importing a mob definition into the Flow Editor shows its steps in
-  dependency order. A definition's steps are parsed in id order, and import
-  showed them in that order, so a step whose id sorts before a step it
-  depends on was shown first, and the flow exported from the editor ran it
-  first: a round trip through the editor rewired the flow. Each frame's
-  steps are now ordered by their dependencies, and by id where those leave
-  the order open; a loop's last step, which its repeat condition names, is
-  taken in the same order.
-- Importing a mob definition into the Flow Editor keeps the condition of a
-  step that has a condition but no branch. Import showed it as a plain
-  member step, which carries no condition, so a round trip through the
-  editor ran the step whatever its condition. It is now shown as a branch
-  step of one lane, which an export writes back with the condition, and a
-  graph with a one-lane branch derives that branch step again.
 
 ### Known limitations
 
@@ -571,18 +602,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The Flow Editor's remaining resource limits continue in 0.9.3: draft store
   totals, and validation, whose peak memory stays linear in its (capped)
   input.
-- The Flow Editor draft store is shared by every caller of a Flow Editor
-  route: one caller can fill it to its caps, which refuses new drafts to
-  everyone else and drops other drafts' undo history first, and any caller
-  can overwrite or delete any draft. Per-caller stores or quotas are planned.
-- The Flow Editor shows a step with a condition but no branch that shares
-  its dependencies with parallel steps after their parallel step, so an
-  exported flow runs it after them, when its condition holds, rather than
-  beside them.
-- The Flow Editor draft store's lock is per process. Two processes that
-  share one store each read it, change it and rename their copy over it, so
-  of their concurrent writes only the last one renamed survives: run one
-  process per store.
 
 ## [0.9.1] - 2026-10-15
 

@@ -8,6 +8,10 @@
   documents. A write's `row` is still a whole `MobpackDraftRow`;
   `meta/mobpacks/get` returns a draft's document.
 
+## 0.9.2
+
+- No SDK API changes; released with Meta 0.9.2 on Meerkat 0.9.2.
+
 ## 0.9.1
 
 - `MetaBuilder.gating("")` and `MetaBuilder.accessControl("")` throw an error
