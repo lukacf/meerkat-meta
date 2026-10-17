@@ -62,7 +62,8 @@ class WarmDepsTests(unittest.TestCase):
             with self.subTest(job=name):
                 block = blocks[name]
                 # The job token, which can now read actions, stays out of .git/config.
-                self.assertIn("      - uses: actions/checkout@v4\n        with:\n          persist-credentials: false\n", block)
+                self.assertRegex(block, r"      - uses: actions/checkout@[0-9a-f]{40} # v4\n"
+                                        r"        with:\n          persist-credentials: false\n")
                 builds = re.search(r"repo-cargo (build|test|nextest|clippy|check)|make test|npm --prefix console run "
                                    r"fixtures|topology_examples", block)
                 # After the cache restore, whose files the artifact overrides, and before any build.

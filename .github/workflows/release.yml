@@ -94,7 +94,7 @@ jobs:
       build_matrix: ${{ steps.resolve.outputs.build_matrix }}
     steps:
       - name: Checkout immutable workflow tools
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.workflow_sha }}
           fetch-depth: 0
@@ -151,7 +151,7 @@ jobs:
     steps:
       - name: Refuse unless exact-main CI is already green for this commit
         id: ci_run
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           RELEASE_SHA: ${{ needs.resolve_release.outputs.sha }}
           CI_BYPASS: ${{ needs.resolve_release.outputs.ci_bypass }}
@@ -247,16 +247,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.resolve_release.outputs.sha }}
           fetch-depth: 0
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -316,12 +316,12 @@ jobs:
       matrix: ${{ fromJSON(needs.resolve_release.outputs.build_matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.resolve_release.outputs.sha }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
         with:
           targets: ${{ matrix.target }}
 
@@ -592,7 +592,7 @@ jobs:
       # the divergence was only visible because the attestation recorded it.
       - name: Attest build provenance
         id: provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: dist/*
 
@@ -603,7 +603,7 @@ jobs:
         run: cp "$BUNDLE_PATH" dist/provenance.jsonl
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meta-gateway-binaries-${{ matrix.target }}-${{ github.run_attempt }}
           path: dist/*
@@ -637,7 +637,7 @@ jobs:
       RELEASE_TIER: ${{ needs.resolve_release.outputs.tier }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.resolve_release.outputs.sha }}
           fetch-depth: 0
@@ -654,7 +654,7 @@ jobs:
       # candidate-manifest-trailing.json, its name on the release.
       - name: Attest candidate manifest
         id: provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: candidate/candidate-manifest*.json
 
@@ -665,7 +665,7 @@ jobs:
 
       - name: Upload immutable candidate manifest
         id: manifest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meta-candidate-manifest-${{ github.run_attempt }}
           path: candidate/*
@@ -709,12 +709,12 @@ jobs:
       REGISTRY_DRY_RUN: ${{ needs.resolve_release.outputs.dry_run }}
     steps:
       - name: Checkout immutable source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.resolve_release.outputs.sha }}
           fetch-depth: 0
       - name: Checkout immutable workflow tools
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.workflow_sha }}
           path: .release-tools
@@ -752,12 +752,12 @@ jobs:
       REGISTRY_DRY_RUN: ${{ needs.resolve_release.outputs.dry_run }}
     steps:
       - name: Checkout immutable source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.resolve_release.outputs.sha }}
           fetch-depth: 0
       - name: Checkout immutable workflow tools
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.workflow_sha }}
           path: .release-tools
@@ -793,16 +793,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.resolve_release.outputs.sha }}
 
       - name: Install Python + Node tooling
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
@@ -894,15 +894,15 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.resolve_release.outputs.sha }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
 
       - name: Restore the exact-main CI dependency build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: meta-dev-bins
           save-if: false
@@ -968,15 +968,15 @@ jobs:
       VERIFIED_META_SHA256: ${{ needs.verify_crate_packages.outputs.meta_sha256 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.resolve_release.outputs.sha }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
 
       - name: Install Python tooling
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: Bind the crates to the verified bytes

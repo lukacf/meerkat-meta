@@ -1304,7 +1304,7 @@ class ImmutableReleaseWorkflowTests(unittest.TestCase):
                 self.assertIn("BUNDLE_PATH: ${{ steps.provenance.outputs.bundle-path }}", retained)
                 self.assertIn(f'run: cp "$BUNDLE_PATH" {directory}/provenance.jsonl', retained)
                 artifact = step_block(upload, job)
-                self.assertIn("uses: actions/upload-artifact@v4", artifact)
+                self.assertRegex(artifact, r"uses: actions/upload-artifact@[0-9a-f]{40} # v4\n")
                 for field, value in (("name", expected_name), ("overwrite", "false"),
                                      ("retention-days", "90"), ("if-no-files-found", "error"),
                                      ("path", f"{directory}/*")):
@@ -1920,8 +1920,9 @@ class ReleaseCacheReuseTests(unittest.TestCase):
         and it restores no ~/.cargo/bin executable."""
         source = RELEASE_WORKFLOW.read_text()
         self.assertNotIn("cache-on-failure", source)
-        steps = re.findall(r"- (?:name: [^\n]+\n\s+)?uses: Swatinem/rust-cache@v2\n((?: {8}.*\n)*)", source)
-        self.assertEqual(len(steps), source.count("uses: Swatinem/rust-cache@v2"))
+        steps = re.findall(r"- (?:name: [^\n]+\n\s+)?uses: Swatinem/rust-cache@[0-9a-f]{40} # v2\n((?: {8}.*\n)*)",
+                           source)
+        self.assertEqual(len(steps), source.count("uses: Swatinem/rust-cache@"))
         self.assertEqual(len(steps), 1)
         self.assertIn("          save-if: false\n          cache-bin: false\n", steps[0])
         for job in ("build_binaries", "release_validate", "publish_registries"):
