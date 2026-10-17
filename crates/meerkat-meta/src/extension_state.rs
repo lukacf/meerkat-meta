@@ -15,7 +15,7 @@ use meerkat_mob::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-pub use documents::{DocumentService, HostAccessContext, Owner};
+pub use documents::{DocumentService, HostAccessContext, MobIdHolder, Owner};
 pub use meta_extension_state as documents;
 
 /// Per-call authority from the runner's origin session. requested_owner is only
@@ -67,6 +67,56 @@ impl ToolBundleRequirements {
     }
 }
 
+/// A mob bound without extension authority: documents name its id for
+/// another mob, or whether they do could not be told. Its members resolve no
+/// document caller, it is no valid document owner and nobody manages it (so
+/// lineage through it does not resolve either), until it is destroyed or a
+/// later restore of it binds normally. See
+/// [`crate::UnifiedRuntime::extension_mob_quarantines`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MobIdQuarantine {
+    /// The quarantined mob's id.
+    pub mob_id: String,
+    /// Why the mob is quarantined.
+    pub reason: MobIdQuarantineReason,
+}
+
+/// Why a mob is bound without extension authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MobIdQuarantineReason {
+    /// Live documents name the mob's id, and the document store records
+    /// another holder for the id: the documents were written while that
+    /// holder's mob held the id, and this mob would inherit what they grant.
+    HeldByAnotherMob {
+        /// The holder the store records for the id.
+        holder: MobIdHolder,
+    },
+    /// The document store could not tell who holds the id, or whether
+    /// documents name it, so whether the mob would inherit is unknown.
+    Unverifiable {
+        /// The store's error.
+        error: String,
+    },
+}
+
+impl std::fmt::Display for MobIdQuarantineReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HeldByAnotherMob { holder } => write!(
+                f,
+                "live documents name the mob's id, which the document store records for \
+                 {holder}"
+            ),
+            Self::Unverifiable { error } => write!(
+                f,
+                "the document store could not tell who holds the mob's id ({error})"
+            ),
+        }
+    }
+}
+
 fn initialize_schema(tx: &rusqlite::Transaction<'_>) -> Result<(), rusqlite::Error> {
     tx.execute_batch(documents::SCHEMA)
 }
@@ -83,6 +133,10 @@ pub(crate) const EXTENSION_SCHEMA_DOMAIN: meerkat_sqlite::SchemaDomain =
         allowed_existing_versions: &[1],
         bridge_recoverable_versions: &[],
         released_predecessors: &[],
+        // The mob id holders table (`documents::MOB_ID_HOLDERS_SCHEMA`) is
+        // deliberately no owned object: a plain table beside this domain's,
+        // created with a new store and added at open to an older one, which
+        // a 0.9.2 binary opening the store ignores.
         owned_objects: &[
             meerkat_sqlite::SchemaObject {
                 kind: meerkat_sqlite::SchemaObjectKind::Table,
@@ -112,6 +166,12 @@ pub(crate) fn open_disk_store(
         .map_err(|error| error.to_string())?;
     meerkat_sqlite::apply_domain_migrations(&mut connection, &EXTENSION_SCHEMA_DOMAIN)
         .map_err(|error| error.to_string())?;
+    // The mob id holders are a plain table beside the ledger's own, outside
+    // its domain: a 0.9.2 binary still opens the store and ignores it, so a
+    // rollback refuses nothing. A store created before 0.9.3 gains it here.
+    connection
+        .execute_batch(documents::MOB_ID_HOLDERS_SCHEMA)
+        .map_err(|error| error.to_string())?;
     Ok(documents::SqliteExtensionDocumentStore::from_connection(
         connection,
         Some(Arc::new(DiskOperationFence(path))),
@@ -135,6 +195,13 @@ fn mob_id_still_named(mob_id: &str) -> String {
 /// Destroy is terminal: a destroyed mob's handle is no authority.
 fn is_destroyed(handle: &MobReadHandle) -> bool {
     handle.status_observation_snapshot() == meerkat_mob::MobState::Destroyed
+}
+
+/// A quarantine for a store that could not answer.
+fn unverifiable(error: documents::Error) -> MobIdQuarantineReason {
+    MobIdQuarantineReason::Unverifiable {
+        error: error.to_string(),
+    }
 }
 
 /// Orders the changes of which mob holds an id against document operations.
@@ -175,12 +242,19 @@ impl MobIdOrdering {
         self.generations().current
     }
 
-    /// Record a change of which mob holds `mob_id`.
-    fn changed(&self, mob_id: &str) {
+    /// Record a change of which mob holds `mob_id`, and return its new
+    /// generation.
+    fn changed(&self, mob_id: &str) -> u64 {
         let mut generations = self.generations();
         generations.current += 1;
         let current = generations.current;
         generations.changed.insert(mob_id.to_owned(), current);
+        current
+    }
+
+    /// The generation of the last change of which mob holds `mob_id`.
+    fn last_change(&self, mob_id: &str) -> Option<u64> {
+        self.generations().changed.get(mob_id).copied()
     }
 
     /// Whether which mob holds `mob_id` changed after `generation`.
@@ -298,27 +372,40 @@ impl documents::ExtensionDocumentStore for OrderedDocumentStore {
     async fn references_mob(&self, realm: &str, mob_id: &str) -> documents::Result<bool> {
         self.inner.references_mob(realm, mob_id).await
     }
+    async fn mob_id_holder(
+        &self,
+        realm: &str,
+        mob_id: &str,
+    ) -> documents::Result<Option<MobIdHolder>> {
+        self.inner.mob_id_holder(realm, mob_id).await
+    }
+    async fn record_mob_id_holder(
+        &self,
+        realm: &str,
+        mob_id: &str,
+        holder: &MobIdHolder,
+    ) -> documents::Result<()> {
+        self.inner.record_mob_id_holder(realm, mob_id, holder).await
+    }
 }
 
 /// The check a create runs under `mob_id`, ordered against document writes:
 /// it waits for every write in flight to commit, refuses the id while a live
 /// document of `realm` names it, and otherwise moves the id's generation, so
 /// a write whose caller was resolved before is refused when it commits.
+/// Returns the generation an admitted create moved the id to.
 async fn admit_mob_id_create(
     ordering: &MobIdOrdering,
     store: &dyn documents::ExtensionDocumentStore,
     realm: &str,
     mob_id: &str,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let _gate = ordering.gate.write().await;
     // Whatever the registry binds under the id is no reason to skip the
     // check: a mob that activates under it may replace a stopped binding,
     // and would inherit what the documents grant the id.
     match store.references_mob(realm, mob_id).await {
-        Ok(false) => {
-            ordering.changed(mob_id);
-            Ok(())
-        }
+        Ok(false) => Ok(ordering.changed(mob_id)),
         Ok(true) => Err(mob_id_still_named(mob_id)),
         Err(error) => Err(format!(
             "the extension documents could not be checked for references to mob id \
@@ -327,16 +414,63 @@ async fn admit_mob_id_create(
     }
 }
 
+/// The holder a mob's own owner bridge authority names: its owner session,
+/// or the host for a mob created with no owner session.
+fn mob_id_holder_of(handle: &MobReadHandle) -> MobIdHolder {
+    handle
+        .owner_bridge_session_lifecycle_authority()
+        .map_or(MobIdHolder::Host, |authority| {
+            MobIdHolder::OwnerSession(authority.bridge_session_id.to_string())
+        })
+}
+
+/// A mob bound in the registry: its read handle, and the quarantine its
+/// activation decided, if any.
+struct BoundMob {
+    handle: MobReadHandle,
+    quarantine: Option<MobIdQuarantineReason>,
+}
+
+impl BoundMob {
+    /// The handle, when the mob is extension authority: neither destroyed
+    /// nor quarantined.
+    fn authority(&self) -> Option<&MobReadHandle> {
+        (self.quarantine.is_none() && !is_destroyed(&self.handle)).then_some(&self.handle)
+    }
+
+    /// Whether the binding still stands for a live mob, which another
+    /// activation under the id may not replace.
+    fn is_live(&self) -> bool {
+        !matches!(
+            self.handle.status_observation_snapshot(),
+            meerkat_mob::MobState::Stopped
+                | meerkat_mob::MobState::Completed
+                | meerkat_mob::MobState::Destroyed
+        )
+    }
+}
+
+/// A create the registry admitted ([`NativeAuthorityRegistry::before_create`])
+/// whose mob has not activated yet: the holder the create named, and the
+/// id's generation as the admission left it.
+struct Admission {
+    holder: MobIdHolder,
+    generation: Option<u64>,
+}
+
 /// Holds runtime query authorities, never copied lineage or document policy.
 /// A handle is installed by Meerkat's pre-activation callback before its first
 /// member can dispatch. Every operation reads current authority afresh. A
 /// destroyed mob grants nothing: lookups and owner scans skip it, and the
 /// mob-tool state's after-destroy hook drops its handle before the destroy's
-/// storage cleanup, which a handle still held here would refuse.
+/// storage cleanup, which a handle still held here would refuse. A
+/// quarantined mob grants nothing either ([`MobIdQuarantine`]).
 pub(crate) struct NativeAuthorityRegistry {
     realm: String,
     identity_bridge_mob: String,
-    handles: std::sync::RwLock<BTreeMap<String, MobReadHandle>>,
+    handles: std::sync::RwLock<BTreeMap<String, BoundMob>>,
+    /// Creates [`Self::before_create`] admitted whose mob has not activated.
+    admissions: std::sync::Mutex<BTreeMap<String, Admission>>,
     sessions: Arc<dyn MobSessionService>,
     continuity: Option<Arc<dyn crate::identity_first::contracts::ContinuityStore>>,
     access: Option<crate::access::AccessController>,
@@ -360,6 +494,7 @@ impl NativeAuthorityRegistry {
             realm,
             identity_bridge_mob,
             handles: std::sync::RwLock::new(BTreeMap::new()),
+            admissions: std::sync::Mutex::new(BTreeMap::new()),
             sessions,
             continuity,
             access,
@@ -397,23 +532,42 @@ impl NativeAuthorityRegistry {
                         .await
                         .map_err(|e| meerkat_mob::MobError::Internal(e.to_string()))?;
                 }
-                let mut handles = registry.handles.write().map_err(|_| {
-                    meerkat_mob::MobError::Internal("extension authority registry poisoned".into())
-                })?;
                 let id = handle.mob_id().to_string();
-                if handles.get(&id).is_some_and(|existing| {
-                    !matches!(
-                        existing.status_observation_snapshot(),
-                        meerkat_mob::MobState::Stopped
-                            | meerkat_mob::MobState::Completed
-                            | meerkat_mob::MobState::Destroyed
-                    )
-                }) {
-                    return Err(meerkat_mob::MobError::Internal(
+                let poisoned = || {
+                    meerkat_mob::MobError::Internal("extension authority registry poisoned".into())
+                };
+                let already_bound = || {
+                    meerkat_mob::MobError::Internal(
                         "extension authority already bound for mob".into(),
-                    ));
+                    )
+                };
+                if registry
+                    .handles
+                    .read()
+                    .map_err(|_| poisoned())?
+                    .get(&id)
+                    .is_some_and(BoundMob::is_live)
+                {
+                    return Err(already_bound());
                 }
-                handles.insert(id, handle);
+                // Who holds the id decides whether the mob binds with
+                // extension authority. It never fails the activation: an
+                // error here would abort Meerkat's whole restore scan, so a
+                // mob that must not inherit binds quarantined instead.
+                let quarantine = registry.admit_holder(&handle).await;
+                let mut handles = registry.handles.write().map_err(|_| poisoned())?;
+                if handles.get(&id).is_some_and(BoundMob::is_live) {
+                    return Err(already_bound());
+                }
+                if let Some(reason) = &quarantine {
+                    tracing::warn!(
+                        mob_id = %id,
+                        %reason,
+                        "a mob is bound without extension authority: its members resolve no \
+                         document caller, it is no valid document owner and nobody manages it"
+                    );
+                }
+                handles.insert(id, BoundMob { handle, quarantine });
                 Ok(())
             })
         })
@@ -439,20 +593,24 @@ impl NativeAuthorityRegistry {
     /// mob and stays bound. The handles are dropped after the lock is
     /// released.
     fn forget_destroyed(&self) {
-        let released: Vec<MobReadHandle> = {
+        let released: Vec<BoundMob> = {
             let mut handles = self
                 .handles
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let destroyed: Vec<String> = handles
                 .iter()
-                .filter(|(_, handle)| is_destroyed(handle))
+                .filter(|(_, bound)| is_destroyed(&bound.handle))
                 .map(|(id, _)| id.clone())
                 .collect();
-            // A write whose caller was resolved while a destroyed mob held
-            // its id is refused from now on.
+            // An operation whose caller was resolved while a destroyed mob
+            // held its id is refused from now on. A create admitted under the
+            // id since is another mob: its admission stands.
             for id in &destroyed {
-                self.ordering.changed(id);
+                let generation = self.ordering.changed(id);
+                if let Some(admission) = self.admissions().get_mut(id) {
+                    admission.generation = Some(generation);
+                }
             }
             destroyed
                 .iter()
@@ -460,6 +618,12 @@ impl NativeAuthorityRegistry {
                 .collect()
         };
         drop(released);
+    }
+
+    fn admissions(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Admission>> {
+        self.admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The admission counterpart of [`Self::before_activation`] for the agent
@@ -488,32 +652,159 @@ impl NativeAuthorityRegistry {
     /// before an admitted create under the id is refused when it commits. The
     /// exemption above takes no part in that ordering. A refusal tells the
     /// caller that some document names the id, also one it cannot read.
-    /// Restoring a persisted mob is no create and is never checked.
+    ///
+    /// An admitted create, the exempt one included, is remembered with the
+    /// holder it names until its mob activates: the activation then records
+    /// that holder and binds without checking the documents again, so a
+    /// grant naming the id that commits in between cannot quarantine the
+    /// new mob. Restoring a persisted mob is no create; its activation checks
+    /// the recorded holder ([`Self::before_activation`]).
     pub(crate) fn before_create(self: &Arc<Self>) -> meerkat_mob_mcp::MobBeforeCreate {
         let registry = Arc::downgrade(self);
         Arc::new(move |request: meerkat_mob_mcp::MobCreateRequest| {
             let registry = registry.clone();
             Box::pin(async move {
+                let mob_id = request.mob_id.as_str();
+                let holder = request
+                    .owner_bridge_session_id
+                    .as_ref()
+                    .map_or(MobIdHolder::Host, |session| {
+                        MobIdHolder::OwnerSession(session.to_string())
+                    });
                 if request.implicit_delegation_mob {
+                    if let Some(registry) = registry.upgrade() {
+                        registry.admit_exempt(mob_id, holder);
+                    }
                     return Ok(());
                 }
-                let mob_id = request.mob_id.as_str();
                 let registry = registry.upgrade().ok_or_else(|| {
                     format!(
                         "the extension authority registry is gone, so no check that \
                          documents name mob id '{mob_id}' can run"
                     )
                 })?;
-                registry.admit_create(mob_id).await
+                registry.admit_create(mob_id, holder).await
             })
         })
     }
 
     /// The check [`Self::before_create`] runs for a create it does not
     /// exempt: refuse `mob_id` while a live document of this realm names it,
-    /// ordered against document writes ([`admit_mob_id_create`]).
-    async fn admit_create(&self, mob_id: &str) -> Result<(), String> {
-        admit_mob_id_create(&self.ordering, self.store.as_ref(), &self.realm, mob_id).await
+    /// ordered against document writes ([`admit_mob_id_create`]), and
+    /// remember the admission for the mob's activation.
+    async fn admit_create(&self, mob_id: &str, holder: MobIdHolder) -> Result<(), String> {
+        let generation =
+            admit_mob_id_create(&self.ordering, self.store.as_ref(), &self.realm, mob_id).await?;
+        self.admissions().insert(
+            mob_id.to_owned(),
+            Admission {
+                holder,
+                generation: Some(generation),
+            },
+        );
+        Ok(())
+    }
+
+    /// Remember the exempt create of a session's own implicit delegation mob
+    /// for its activation, which binds it as the session's mob.
+    fn admit_exempt(&self, mob_id: &str, holder: MobIdHolder) {
+        let generation = self.ordering.last_change(mob_id);
+        self.admissions()
+            .insert(mob_id.to_owned(), Admission { holder, generation });
+    }
+
+    /// Who holds the id of a mob that activates, decided under the write
+    /// side of the mob id gate and recorded in the document store. Returns
+    /// the quarantine of a mob that must not inherit what documents grant
+    /// its id.
+    ///
+    /// - A create this registry admitted (the check, or the implicit
+    ///   delegation mob's exemption) records its holder and binds.
+    /// - Any other activation (a restore, a held child's resume) binds when
+    ///   the store records the mob's own holder for the id, or when no live
+    ///   document names the id; with no holder recorded (references written
+    ///   before holders were recorded, or by a mob created without the
+    ///   extension's hooks) it adopts the id and records its holder. When
+    ///   live documents name the id and the store records another holder,
+    ///   the mob is quarantined.
+    /// - Any store error is a quarantine: the mob binds without authority.
+    ///
+    /// Every decision moves the id's generation, so a caller resolved before
+    /// it names the id no more.
+    async fn admit_holder(&self, handle: &MobReadHandle) -> Option<MobIdQuarantineReason> {
+        let _gate = self.ordering.gate.write().await;
+        let mob_id = handle.mob_id().as_str();
+        let holder = mob_id_holder_of(handle);
+        let admission = self.admissions().remove(mob_id);
+        let admitted = admission.is_some_and(|admission| {
+            admission.holder == holder && admission.generation == self.ordering.last_change(mob_id)
+        });
+        let quarantine = if admitted {
+            self.store
+                .record_mob_id_holder(&self.realm, mob_id, &holder)
+                .await
+                .err()
+                .map(unverifiable)
+        } else {
+            self.check_restored_holder(mob_id, &holder).await
+        };
+        self.ordering.changed(mob_id);
+        quarantine
+    }
+
+    /// [`Self::admit_holder`] for an activation no admitted create explains.
+    async fn check_restored_holder(
+        &self,
+        mob_id: &str,
+        holder: &MobIdHolder,
+    ) -> Option<MobIdQuarantineReason> {
+        let recorded = match self.store.mob_id_holder(&self.realm, mob_id).await {
+            Ok(recorded) => recorded,
+            Err(error) => return Some(unverifiable(error)),
+        };
+        if recorded.as_ref() == Some(holder) {
+            return None;
+        }
+        let named = match self.store.references_mob(&self.realm, mob_id).await {
+            Ok(named) => named,
+            Err(error) => return Some(unverifiable(error)),
+        };
+        if named && let Some(recorded) = recorded {
+            return Some(MobIdQuarantineReason::HeldByAnotherMob { holder: recorded });
+        }
+        if let Err(error) = self
+            .store
+            .record_mob_id_holder(&self.realm, mob_id, holder)
+            .await
+        {
+            return Some(unverifiable(error));
+        }
+        if named {
+            tracing::warn!(
+                mob_id,
+                %holder,
+                "a restored mob adopted the documents that name its id: no holder was recorded \
+                 for the id (references written before 0.9.3, or by a mob created without the \
+                 extension's hooks or by an earlier binary)"
+            );
+        }
+        None
+    }
+
+    /// The mobs bound without extension authority, with their reasons.
+    pub(crate) fn quarantines(&self) -> Vec<MobIdQuarantine> {
+        self.handles
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, bound)| !is_destroyed(&bound.handle))
+            .filter_map(|(mob_id, bound)| {
+                bound.quarantine.clone().map(|reason| MobIdQuarantine {
+                    mob_id: mob_id.clone(),
+                    reason,
+                })
+            })
+            .collect()
     }
 
     fn handle(&self, id: &str) -> documents::Result<MobReadHandle> {
@@ -521,7 +812,7 @@ impl NativeAuthorityRegistry {
             .read()
             .map_err(|_| documents::Error::AuthorityUnavailable)?
             .get(id)
-            .filter(|handle| !is_destroyed(handle))
+            .and_then(BoundMob::authority)
             .cloned()
             .ok_or(documents::Error::AuthorityUnavailable)
     }
@@ -879,12 +1170,13 @@ impl ToolCallerResolver for NativeCallerResolver {
             realm_admin = view.is_admin();
         }
         let member_mobs = BTreeSet::from([binding.mob_id.clone()]);
+        // A quarantined mob is managed by nobody, like a destroyed one.
         let handles: Vec<_> = registry
             .handles
             .read()
             .map_err(|_| documents::Error::AuthorityUnavailable)?
             .values()
-            .filter(|handle| !is_destroyed(handle))
+            .filter_map(BoundMob::authority)
             .cloned()
             .collect();
         let mut managed_mobs = BTreeSet::new();
@@ -1424,7 +1716,7 @@ comms = true
             .unwrap();
 
         let refused = registry
-            .admit_create(&mob_id)
+            .admit_create(&mob_id, MobIdHolder::Host)
             .await
             .expect_err("documents name the id, bound or not");
         assert!(refused.contains(&mob_id), "{refused}");
@@ -1567,6 +1859,21 @@ comms = true
         }
         async fn references_mob(&self, realm: &str, mob_id: &str) -> documents::Result<bool> {
             self.inner.references_mob(realm, mob_id).await
+        }
+        async fn mob_id_holder(
+            &self,
+            realm: &str,
+            mob_id: &str,
+        ) -> documents::Result<Option<MobIdHolder>> {
+            self.inner.mob_id_holder(realm, mob_id).await
+        }
+        async fn record_mob_id_holder(
+            &self,
+            realm: &str,
+            mob_id: &str,
+            holder: &MobIdHolder,
+        ) -> documents::Result<()> {
+            self.inner.record_mob_id_holder(realm, mob_id, holder).await
         }
     }
 
@@ -1790,5 +2097,318 @@ comms = true
         );
         drop(child);
         handle.stop().await.unwrap();
+    }
+
+    /// A runtime whose main mob the returned registry binds, with an owner
+    /// member whose session owns the children the tests create.
+    async fn bound_runtime(
+        dir: &std::path::Path,
+        mob_id: &str,
+    ) -> (
+        crate::MobRuntime,
+        Arc<NativeAuthorityRegistry>,
+        Arc<dyn documents::ExtensionDocumentStore>,
+        meerkat_core::SessionId,
+    ) {
+        let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"{mob_id}\"\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+             runtime_mode = \"turn_driven\"\n[profiles.worker.tools]\ncomms = true\n"
+        ))
+        .unwrap();
+        let spec = crate::MobBootstrapSpec::persistent(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            dir.to_path_buf(),
+            4,
+            Arc::new(
+                meerkat_store::SqliteSessionStore::open(dir.join("sessions.sqlite3")).unwrap(),
+            ),
+        )
+        .unwrap()
+        .with_options(crate::MobBootstrapOptions {
+            allow_ephemeral_sessions: false,
+            notify_orchestrator_on_resume: false,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        });
+        let sessions = spec.session_service.clone();
+        let runtime = crate::MobRuntime::bootstrap(spec).await.unwrap();
+        let handle = runtime.handle();
+        let owner = meerkat_mob::AgentIdentity::from("owner");
+        handle
+            .spawn_spec(meerkat_mob::SpawnMemberSpec::host_root(
+                "worker",
+                owner.clone(),
+            ))
+            .await
+            .unwrap();
+        let owner_session = handle
+            .get_member(&owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .bridge_session_id()
+            .unwrap()
+            .clone();
+        let store = test_store(dir);
+        let registry = NativeAuthorityRegistry::new(
+            "test".into(),
+            handle.mob_id().to_string(),
+            sessions,
+            None,
+            None,
+            Arc::clone(&store),
+        );
+        registry.before_activation()(handle.read_handle())
+            .await
+            .unwrap();
+        (runtime, registry, store, owner_session)
+    }
+
+    /// A child mob of `owner_session` under `mob_id`, activated through the
+    /// registry, as the agent mob-tool state creates or restores one.
+    async fn child_of(
+        runtime: &crate::MobRuntime,
+        registry: &Arc<NativeAuthorityRegistry>,
+        mob_id: &str,
+        owner_session: &meerkat_core::SessionId,
+    ) -> meerkat_mob::MobHandle {
+        let mut definition = runtime.handle().definition().clone();
+        definition.id = mob_id.into();
+        meerkat_mob::MobBuilder::new(definition, meerkat_mob::MobStorage::in_memory())
+            .with_session_service(runtime.session_service().unwrap().clone())
+            .with_default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .before_activation(registry.before_activation())
+            .with_owner_bridge_session_create_authority(owner_session.clone(), true, false)
+            .create()
+            .await
+            .unwrap()
+    }
+
+    fn host_operator(mob_id: &str) -> HostAccessContext {
+        HostAccessContext::new(
+            "test",
+            Principal::Agent("operator".into()),
+            VerifiedLineage::root(),
+            HostPolicy::ALLOW,
+        )
+        .unwrap()
+        .with_memberships(BTreeSet::new(), BTreeSet::from([mob_id.to_owned()]), false)
+        .unwrap()
+    }
+
+    /// A quarantined mob grants nothing on any path: its member resolves no
+    /// caller, it is no valid owner as a mob or through a worker of it, its
+    /// owner session does not manage it, and lineage through its member does
+    /// not resolve. A later activation (a restore, or a held child's resume,
+    /// which run the same hook) binds it once no document names its id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_a_quarantined_mob_grants_nothing_on_any_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, registry, store, owner_session) =
+            bound_runtime(dir.path(), "quarantine-paths").await;
+        let child_id = "quarantine-paths-child";
+        store
+            .record_mob_id_holder(
+                "test",
+                child_id,
+                &MobIdHolder::OwnerSession("an-earlier-session".into()),
+            )
+            .await
+            .unwrap();
+        let raw = DocumentService::new("test", "notes", Arc::clone(&store)).unwrap();
+        let written = raw
+            .mutate(
+                &host_operator(child_id),
+                &documents::RequestIdentity::new("earlier", b"earlier").unwrap(),
+                owned_by(child_id),
+            )
+            .await
+            .unwrap()
+            .receipt;
+
+        // No create admitted it: the activation is checked as a restore.
+        let child = child_of(&runtime, &registry, child_id, &owner_session).await;
+        assert_eq!(
+            registry.quarantines(),
+            vec![MobIdQuarantine {
+                mob_id: child_id.into(),
+                reason: MobIdQuarantineReason::HeldByAnotherMob {
+                    holder: MobIdHolder::OwnerSession("an-earlier-session".into()),
+                },
+            }]
+        );
+        let member = meerkat_mob::AgentIdentity::from("child-worker");
+        child
+            .spawn_spec(meerkat_mob::SpawnMemberSpec::host_root(
+                "worker",
+                member.clone(),
+            ))
+            .await
+            .unwrap();
+        let entry = child.get_member(&member).await.unwrap().unwrap();
+        let member_session = entry.bridge_session_id().unwrap().clone();
+        let resolver = NativeCallerResolver {
+            registry: Arc::downgrade(&registry),
+            requirements: ToolBundleRequirements::durable_documents(
+                "durable-documents-test",
+                "documents_read",
+                "documents_apply",
+            ),
+            child_availability: Some(ChildMcpAvailability::ChildAvailable),
+        };
+        let dispatch = |session: &meerkat_core::SessionId| {
+            ToolDispatchContext::default().with_runtime_identity(session.clone(), None)
+        };
+        assert!(matches!(
+            resolver.resolve(&dispatch(&member_session), None).await,
+            Err(documents::Error::AuthorityUnavailable)
+        ));
+        assert!(matches!(
+            resolver
+                .resolve(
+                    &dispatch(&owner_session),
+                    Some(&Owner::Mob(child_id.into()))
+                )
+                .await,
+            Err(documents::Error::AuthorityUnavailable)
+        ));
+        assert!(matches!(
+            resolver
+                .resolve(
+                    &dispatch(&owner_session),
+                    Some(&Owner::Agent(Principal::Worker {
+                        mob_id: child_id.into(),
+                        member_id: member.to_string(),
+                        creation_id: "any".into(),
+                    })),
+                )
+                .await,
+            Err(documents::Error::AuthorityUnavailable)
+        ));
+        let owner = resolver
+            .resolve(&dispatch(&owner_session), None)
+            .await
+            .unwrap();
+        assert!(!documents::can_create(&owner, &Owner::Mob(child_id.into())));
+        let binding = meerkat_core::MobMemberBinding {
+            mob_id: child_id.into(),
+            member: member.to_string(),
+            role: entry.role.as_str().to_owned(),
+        };
+        assert!(
+            registry.snapshot(&binding, &member_session).await.is_err(),
+            "lineage through the quarantined mob's member does not resolve"
+        );
+
+        // The references cleared, a later activation binds the mob.
+        let current = raw
+            .get(&host_operator(child_id), &written.document_id)
+            .await
+            .unwrap();
+        raw.mutate(
+            &host_operator(child_id),
+            &documents::RequestIdentity::new("clear", b"clear").unwrap(),
+            documents::Mutation::Delete {
+                id: written.document_id,
+                expected_revision: current.revision,
+            },
+        )
+        .await
+        .unwrap();
+        let restarted = NativeAuthorityRegistry::new(
+            "test".into(),
+            runtime.handle().mob_id().to_string(),
+            runtime.session_service().unwrap().clone(),
+            None,
+            None,
+            Arc::clone(&store),
+        );
+        restarted.before_activation()(child.read_handle())
+            .await
+            .unwrap();
+        assert!(restarted.quarantines().is_empty());
+        assert!(restarted.handle(child_id).is_ok());
+        assert_eq!(
+            store.mob_id_holder("test", child_id).await.unwrap(),
+            Some(MobIdHolder::OwnerSession(owner_session.to_string()))
+        );
+        child.stop().await.unwrap();
+        runtime.handle().stop().await.unwrap();
+    }
+
+    /// The activation of a create the registry admitted binds it without a
+    /// second look at the documents: a grant naming the id that commits
+    /// between the admission and the activation cannot quarantine the new
+    /// mob, even where another holder was recorded for the id before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_a_grant_racing_an_admitted_create_does_not_quarantine_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, registry, store, owner_session) =
+            bound_runtime(dir.path(), "admission-race").await;
+        let child_id = "admission-race-child";
+        store
+            .record_mob_id_holder(
+                "test",
+                child_id,
+                &MobIdHolder::OwnerSession("an-earlier-session".into()),
+            )
+            .await
+            .unwrap();
+        registry
+            .admit_create(
+                child_id,
+                MobIdHolder::OwnerSession(owner_session.to_string()),
+            )
+            .await
+            .expect("no document names the id");
+
+        // A grant naming the id commits between admission and activation.
+        let documents = DocumentService::new("test", "notes", registry.document_store()).unwrap();
+        let granter = HostAccessContext::new(
+            "test",
+            Principal::Agent("granter".into()),
+            VerifiedLineage::root(),
+            HostPolicy::ALLOW,
+        )
+        .unwrap()
+        .with_authority_generation(registry.ordering.current());
+        documents
+            .mutate(
+                &granter,
+                &documents::RequestIdentity::new("racing-grant", b"racing-grant").unwrap(),
+                documents::Mutation::Create(documents::NewDocument {
+                    content: documents::DocumentContent {
+                        title: "shared".into(),
+                        content_type: "application/test".into(),
+                        schema_version: 1,
+                        payload: vec![1],
+                    },
+                    owner: None,
+                    access: documents::DocumentAccess {
+                        grants: vec![documents::Grant {
+                            audience: documents::Audience::Mob(child_id.into()),
+                            role: Role::Reader,
+                        }],
+                        ..documents::DocumentAccess::default()
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(store.references_mob("test", child_id).await.unwrap());
+
+        let child = child_of(&runtime, &registry, child_id, &owner_session).await;
+        assert!(
+            registry.quarantines().is_empty(),
+            "{:?}",
+            registry.quarantines()
+        );
+        assert!(registry.handle(child_id).is_ok());
+        assert_eq!(
+            store.mob_id_holder("test", child_id).await.unwrap(),
+            Some(MobIdHolder::OwnerSession(owner_session.to_string()))
+        );
+        child.stop().await.unwrap();
+        runtime.handle().stop().await.unwrap();
     }
 }

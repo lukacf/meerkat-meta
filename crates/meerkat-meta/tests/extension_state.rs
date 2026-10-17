@@ -2250,3 +2250,587 @@ async fn extension_mob_id_reuse_refuses_a_write_resolved_before_the_id_changed()
     drop(owned);
     runtime.shutdown().await;
 }
+
+/// The document bundle of a runtime composed without the extension: the
+/// same tool declarations, no document authority behind them, so no
+/// extension hook is installed on the agent mob-tool state.
+struct UncomposedDocuments;
+#[async_trait::async_trait]
+impl AgentToolDispatcher for UncomposedDocuments {
+    fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+        ["documents_read", "documents_apply"]
+            .into_iter()
+            .map(|name| {
+                Arc::new(
+                    ToolDef::new(
+                        name,
+                        "Document tools without the extension",
+                        serde_json::json!({"type":"object","properties":{}}),
+                    )
+                    .with_provenance(meerkat_core::ToolProvenance::new(
+                        meerkat_core::ToolSourceKind::RustBundle,
+                        NAME,
+                    )),
+                )
+            })
+            .collect::<Vec<_>>()
+            .into()
+    }
+    fn tool_mutation_class(&self, name: &str) -> ToolMutationClass {
+        if name == "documents_read" {
+            ToolMutationClass::ReadOnly
+        } else {
+            ToolMutationClass::Mutating
+        }
+    }
+    async fn dispatch(
+        &self,
+        _: ToolCallView<'_>,
+    ) -> std::result::Result<ToolDispatchOutcome, ToolError> {
+        panic!("no member calls a document tool while the extension is not composed")
+    }
+}
+
+/// The runtime over `path` composed as [`harness`] composes it, but with the
+/// extension switched off: the document bundle registered as a plain tool
+/// bundle, no tool bundle factory and no document binding, so the agent
+/// mob-tool state creates mobs without the extension's create check.
+async fn harness_without_extension(path: &std::path::Path) -> UnifiedRuntime {
+    let sessions =
+        Arc::new(meerkat_store::SqliteSessionStore::open(path.join("sessions.sqlite3")).unwrap());
+    let (storage, provenance) =
+        meerkat_meta::mob_composition_manifest::persistent_mob_storage(path.join("mob.sqlite3"))
+            .unwrap();
+    let spec =
+        MobBootstrapSpec::persistent(definition(path), storage, path.to_path_buf(), 16, sessions)
+            .unwrap()
+            .with_mob_storage_provenance(provenance)
+            .with_child_application_tool_policy(
+                meerkat_core::ApplicationToolPolicyBinding::Unmanaged,
+            )
+            .with_options(MobBootstrapOptions {
+                allow_ephemeral_sessions: false,
+                notify_orchestrator_on_resume: false,
+                default_llm_client: Some(Arc::new(ScriptClient {
+                    calls: AtomicUsize::new(0),
+                    tool: "documents_read",
+                })),
+            });
+    Box::pin(
+        UnifiedRuntime::builder()
+            .mob_spec(spec)
+            .module_config(meerkat_meta::MetaConfig {
+                modules: vec![],
+                discovery: meerkat_meta::DiscoverySpec {
+                    namespace: "extension-test".into(),
+                    modules: vec![],
+                },
+                pre_spawn: vec![],
+            })
+            .timeout(Duration::from_secs(10))
+            .persistent_state(path)
+            .register_tool_bundle(NAME, Arc::new(UncomposedDocuments))
+            .build(),
+    )
+    .await
+    .unwrap()
+}
+
+/// The holder a store records for `mob_id`, read from the document store
+/// file directly, as an operator inspecting it would.
+fn recorded_holder(path: &std::path::Path, mob_id: &str) -> Option<String> {
+    rusqlite::Connection::open(path.join("extension_state.sqlite3"))
+        .unwrap()
+        .query_row(
+            "SELECT holder FROM extension_mob_holders WHERE mob_id = ?1",
+            [mob_id],
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+/// The recorded holder of an owner session, as the store spells it.
+fn session_holder(session: &meerkat_core::SessionId) -> String {
+    serde_json::to_string(&MobIdHolder::OwnerSession(session.to_string())).unwrap()
+}
+
+/// Remove every live document naming `mob_id`, as an operator with access to
+/// the extension store does: through the provider's own store, with a
+/// context that manages the id (a document whose owning mob was destroyed is
+/// beyond the document tools).
+async fn clear_references(
+    path: &std::path::Path,
+    realm: &str,
+    namespace: &str,
+    mob_id: &str,
+    documents: &[DocumentId],
+) {
+    let operator = HostAccessContext::new(
+        realm,
+        Principal::Agent("operator".into()),
+        VerifiedLineage::root(),
+        HostPolicy::ALLOW,
+    )
+    .unwrap()
+    .with_memberships(
+        std::collections::BTreeSet::new(),
+        std::collections::BTreeSet::from([mob_id.to_string()]),
+        false,
+    )
+    .unwrap();
+    let service = DocumentService::new(
+        realm,
+        namespace,
+        Arc::new(SqliteExtensionDocumentStore::open(path.join("extension_state.sqlite3")).unwrap()),
+    )
+    .unwrap();
+    for (index, id) in documents.iter().enumerate() {
+        let current = service.get(&operator, id).await.unwrap();
+        service
+            .mutate(
+                &operator,
+                &request(&format!("operator-clear-{index}")),
+                Mutation::Delete {
+                    id: id.clone(),
+                    expected_revision: current.revision,
+                },
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// Restoring a persisted mob re-checks who holds its id. A mob that took a
+/// destroyed child's id while the extension was not composed (so no create
+/// check saw it) is restored, once the extension is composed again, but
+/// quarantined while documents written for the child name the id: its owner
+/// session manages none of them, its members resolve no document caller,
+/// and the runtime reports the quarantine typed. The holder record outlives
+/// the destroy that left the documents behind. Once an operator clears the
+/// references, the next restore binds the mob normally.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_restored_mob_under_a_reused_id_is_quarantined() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, _) = harness(dir.path(), None).await;
+    let realm = context.documents.scope().realm().to_owned();
+    let namespace = context.documents.scope().namespace().to_owned();
+    let owned = OwnedChild::create(&runtime, &context, dir.path()).await;
+    let owner = caller(&context, &owned.owner_session).await;
+    let written = context
+        .documents
+        .mutate(
+            &owner,
+            &request("child-owned"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: Some(owned.child_owner()),
+                access: DocumentAccess::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .receipt;
+    let report = owned
+        .state
+        .mob_destroy(&owned.child)
+        .await
+        .unwrap_or_else(|error| panic!("the child's destroy must complete: {error}"));
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(
+        recorded_holder(dir.path(), owned.child.as_str()),
+        Some(session_holder(&owned.owner_session)),
+        "the holder record outlives the destroy while documents name the id"
+    );
+    let other = runtime.spawn(worker("other-owner")).await.unwrap();
+    let other_session = member_session(&runtime, &other.agent_identity).await;
+    let child = owned.child.clone();
+    let first_owner = owned.owner_session.clone();
+    drop(owned);
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(context);
+
+    let uncomposed = harness_without_extension(dir.path()).await;
+    let state = uncomposed
+        .mob_runtime()
+        .agent_mob_mcp_state()
+        .expect("the runtime composes the agent mob-tool state");
+    create_for_session(&state, &child, other_session.clone())
+        .await
+        .expect("without the extension no create check runs");
+    drop(state);
+    uncomposed.shutdown().await;
+    drop(uncomposed);
+
+    let (reopened, context, _) = harness(dir.path(), None).await;
+    let state = reopened
+        .mob_runtime()
+        .agent_mob_mcp_state()
+        .expect("the runtime composes the agent mob-tool state");
+    let taken = state
+        .handle_for(&child)
+        .await
+        .expect("the mob under the reused id is restored");
+    let quarantines = reopened.extension_mob_quarantines();
+    assert_eq!(quarantines.len(), 1, "{quarantines:?}");
+    assert_eq!(quarantines[0].mob_id, child.as_str());
+    assert_eq!(
+        quarantines[0].reason,
+        meerkat_meta::extension_state::MobIdQuarantineReason::HeldByAnotherMob {
+            holder: MobIdHolder::OwnerSession(first_owner.to_string()),
+        }
+    );
+    let taker = caller(&context, &other_session).await;
+    assert!(
+        !can_create(&taker, &Owner::Mob(child.to_string())),
+        "the restored mob's owner session does not manage the reused id"
+    );
+    assert!(
+        matches!(
+            context.documents.get(&taker, &written.document_id).await,
+            Err(Error::NotFound)
+        ),
+        "a document written for the destroyed child stays out of reach"
+    );
+    let as_owner = context
+        .caller_resolver
+        .resolve(
+            &ToolDispatchContext::default().with_runtime_identity(other_session.clone(), None),
+            Some(&Owner::Mob(child.to_string())),
+        )
+        .await;
+    assert!(
+        matches!(as_owner, Err(Error::AuthorityUnavailable)),
+        "a quarantined mob is no valid owner: {as_owner:?}"
+    );
+    taken.spawn_spec(worker("taken-worker")).await.unwrap();
+    let taken_member = taken
+        .get_member(&AgentIdentity::from("taken-worker"))
+        .await
+        .unwrap()
+        .unwrap()
+        .bridge_session_id()
+        .unwrap()
+        .clone();
+    drop(taken);
+    let member = context
+        .caller_resolver
+        .resolve(
+            &ToolDispatchContext::default().with_runtime_identity(taken_member, None),
+            None,
+        )
+        .await;
+    assert!(
+        matches!(member, Err(Error::AuthorityUnavailable)),
+        "a quarantined mob's member resolves no document caller: {member:?}"
+    );
+    drop(state);
+    reopened.shutdown().await;
+    drop(reopened);
+    drop(context);
+
+    clear_references(
+        dir.path(),
+        &realm,
+        &namespace,
+        child.as_str(),
+        &[written.document_id],
+    )
+    .await;
+    let (cleared, context, _) = harness(dir.path(), None).await;
+    assert!(
+        cleared.extension_mob_quarantines().is_empty(),
+        "with no document naming the id, the restored mob binds"
+    );
+    let taker = caller(&context, &other_session).await;
+    assert!(
+        can_create(&taker, &Owner::Mob(child.to_string())),
+        "the owner session manages its restored mob"
+    );
+    assert_eq!(
+        recorded_holder(dir.path(), child.as_str()),
+        Some(session_holder(&other_session)),
+        "the binding recorded the restored mob's holder"
+    );
+    let state = cleared
+        .mob_runtime()
+        .agent_mob_mcp_state()
+        .expect("the runtime composes the agent mob-tool state");
+    let report = state
+        .mob_destroy(&child)
+        .await
+        .unwrap_or_else(|error| panic!("the restored mob's destroy must complete: {error}"));
+    assert!(report.errors.is_empty(), "{report:?}");
+    drop(state);
+    cleared.shutdown().await;
+}
+
+/// Copy a stopped installation's whole state directory, as a host that
+/// keeps generations of it does.
+fn copy_state(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_state(&entry.path(), &target);
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// Put a copied generation back in place of the installation's state.
+fn restore_state(generation: &std::path::Path, state: &std::path::Path) {
+    std::fs::remove_dir_all(state).unwrap();
+    copy_state(generation, state);
+}
+
+/// Restoring a whole state generation keeps its mobs bound: the documents,
+/// their holder records and the mob state travel together, so a mob restored
+/// with its own generation binds with full authority, also after a later
+/// generation re-claimed its id and was abandoned. The holder the store
+/// records is the owner session of the first run, unchanged by the copies.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_whole_state_generation_restore_keeps_its_mobs_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let generation = dir.path().join("generation-a");
+    std::fs::create_dir_all(&state).unwrap();
+    let (runtime, context, _) = harness(&state, None).await;
+    let owned = OwnedChild::create(&runtime, &context, &state).await;
+    let owner = caller(&context, &owned.owner_session).await;
+    let owned_document = context
+        .documents
+        .mutate(
+            &owner,
+            &request("generation-owned"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: Some(owned.child_owner()),
+                access: DocumentAccess::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .receipt;
+    let child = owned.child.clone();
+    let child_owner = owned.owner_session.clone();
+    drop(owned);
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(context);
+    copy_state(&state, &generation);
+    assert_eq!(
+        recorded_holder(&generation, child.as_str()),
+        Some(session_holder(&child_owner)),
+        "the copy carries the holder record"
+    );
+
+    // The generation restored into a fresh process.
+    restore_state(&generation, &state);
+    let (restored, context, _) = harness(&state, None).await;
+    assert!(
+        restored.extension_mob_quarantines().is_empty(),
+        "{:?}",
+        restored.extension_mob_quarantines()
+    );
+    let owner = caller(&context, &child_owner).await;
+    assert!(can_create(&owner, &Owner::Mob(child.to_string())));
+    let document = context
+        .documents
+        .get(&owner, &owned_document.document_id)
+        .await
+        .expect("the restored mob's owner reads what the mob owns");
+    assert!(authorize(&owner, &document, Operation::Manage));
+
+    // A later generation clears the id and re-claims it for another session.
+    context
+        .documents
+        .mutate(
+            &owner,
+            &request("generation-b-delete"),
+            Mutation::Delete {
+                id: owned_document.document_id.clone(),
+                expected_revision: document.revision.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let mob_state = restored
+        .mob_runtime()
+        .agent_mob_mcp_state()
+        .expect("the runtime composes the agent mob-tool state");
+    let report = mob_state
+        .mob_destroy(&child)
+        .await
+        .unwrap_or_else(|error| panic!("the child's destroy must complete: {error}"));
+    assert!(report.errors.is_empty(), "{report:?}");
+    let other = restored.spawn(worker("generation-b-owner")).await.unwrap();
+    let other_session = member_session(&restored, &other.agent_identity).await;
+    create_for_session(&mob_state, &child, other_session.clone())
+        .await
+        .expect("no document names the id in this generation");
+    let other_caller = caller(&context, &other_session).await;
+    context
+        .documents
+        .mutate(
+            &other_caller,
+            &request("generation-b-owned"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: Some(Owner::Mob(child.to_string())),
+                access: DocumentAccess::default(),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recorded_holder(&state, child.as_str()),
+        Some(session_holder(&other_session))
+    );
+    drop(mob_state);
+    restored.shutdown().await;
+    drop(restored);
+    drop(context);
+
+    // Generation B is abandoned: the installation rolls back to generation A.
+    restore_state(&generation, &state);
+    let (rolled_back, context, _) = harness(&state, None).await;
+    assert!(
+        rolled_back.extension_mob_quarantines().is_empty(),
+        "{:?}",
+        rolled_back.extension_mob_quarantines()
+    );
+    assert_eq!(
+        recorded_holder(&state, child.as_str()),
+        Some(session_holder(&child_owner)),
+        "the rolled-back store records generation A's holder"
+    );
+    let owner = caller(&context, &child_owner).await;
+    assert!(can_create(&owner, &Owner::Mob(child.to_string())));
+    let document = context
+        .documents
+        .get(&owner, &owned_document.document_id)
+        .await
+        .expect("the rolled-back mob's owner reads what the mob owns");
+    assert!(authorize(&owner, &document, Operation::Manage));
+    rolled_back.shutdown().await;
+}
+
+/// A store written before holders were recorded (references from before
+/// 0.9.3, or a mob created without the extension's hooks) has no holder for
+/// a restored mob's id: the mob adopts the id and its documents, and the
+/// holder is recorded once, so the next restore compares against it.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_restore_adopts_an_id_with_no_holder_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, _) = harness(dir.path(), None).await;
+    let owned = OwnedChild::create(&runtime, &context, dir.path()).await;
+    let owner = caller(&context, &owned.owner_session).await;
+    let written = context
+        .documents
+        .mutate(
+            &owner,
+            &request("before-holders"),
+            Mutation::Create(NewDocument {
+                content: content(),
+                owner: Some(owned.child_owner()),
+                access: DocumentAccess::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .receipt;
+    let child = owned.child.clone();
+    let child_owner = owned.owner_session.clone();
+    drop(owned);
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(context);
+    rusqlite::Connection::open(dir.path().join("extension_state.sqlite3"))
+        .unwrap()
+        .execute("DELETE FROM extension_mob_holders", [])
+        .unwrap();
+
+    for restart in ["adopts", "compares"] {
+        let (reopened, context, _) = harness(dir.path(), None).await;
+        assert!(
+            reopened.extension_mob_quarantines().is_empty(),
+            "{restart}: {:?}",
+            reopened.extension_mob_quarantines()
+        );
+        let owner = caller(&context, &child_owner).await;
+        context
+            .documents
+            .get(&owner, &written.document_id)
+            .await
+            .unwrap_or_else(|error| panic!("{restart}: the owner keeps its documents: {error}"));
+        assert_eq!(
+            recorded_holder(dir.path(), child.as_str()),
+            Some(session_holder(&child_owner)),
+            "{restart}: the adoption recorded the holder"
+        );
+        reopened.shutdown().await;
+    }
+}
+
+/// A holder record that does not decode is a quarantine, never a missing
+/// holder, and the quarantine never aborts the restore: every other
+/// persisted mob is restored and bound beside the quarantined one.
+#[tokio::test(flavor = "multi_thread")]
+async fn extension_an_unreadable_holder_quarantines_without_failing_the_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, context, _) = harness(dir.path(), None).await;
+    let owned = OwnedChild::create(&runtime, &context, dir.path()).await;
+    let sibling = meerkat_mob::MobId::from(format!("{}-sibling", owned.child).as_str());
+    create_for_session(&owned.state, &sibling, owned.owner_session.clone())
+        .await
+        .unwrap();
+    let child = owned.child.clone();
+    let child_owner = owned.owner_session.clone();
+    drop(owned);
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(context);
+    rusqlite::Connection::open(dir.path().join("extension_state.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE extension_mob_holders SET holder = '{' WHERE mob_id = ?1",
+            [child.as_str()],
+        )
+        .unwrap();
+
+    let (reopened, context, _) = harness(dir.path(), None).await;
+    let state = reopened
+        .mob_runtime()
+        .agent_mob_mcp_state()
+        .expect("the runtime composes the agent mob-tool state");
+    for mob_id in [&child, &sibling] {
+        drop(
+            state
+                .handle_for(mob_id)
+                .await
+                .unwrap_or_else(|error| panic!("{mob_id} is restored: {error}")),
+        );
+    }
+    let quarantines = reopened.extension_mob_quarantines();
+    assert_eq!(quarantines.len(), 1, "{quarantines:?}");
+    assert_eq!(quarantines[0].mob_id, child.as_str());
+    assert!(
+        matches!(
+            quarantines[0].reason,
+            meerkat_meta::extension_state::MobIdQuarantineReason::Unverifiable { .. }
+        ),
+        "{quarantines:?}"
+    );
+    let owner = caller(&context, &child_owner).await;
+    assert!(!can_create(&owner, &Owner::Mob(child.to_string())));
+    assert!(
+        can_create(&owner, &Owner::Mob(sibling.to_string())),
+        "the sibling restored beside it binds with full authority"
+    );
+    drop(state);
+    reopened.shutdown().await;
+}

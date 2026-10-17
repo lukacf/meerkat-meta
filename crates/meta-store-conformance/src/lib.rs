@@ -46,6 +46,12 @@
 //!   capability flag backed by a behavioral test; a provider advertising a
 //!   capability must pass its operation, one refusing must return the typed
 //!   `Unsupported` error.
+//! - [`chapters::mob_references`] / [`chapters::mob_id_holders`] - the
+//!   host-facing mob id contract of an `ExtensionDocumentStore`: whether live
+//!   documents name a mob id, and which mob holds it. A store that keeps the
+//!   trait's default holder methods fails `mob_id_holders`, as a host treats
+//!   their error as a quarantine of every restored mob whose id documents
+//!   name.
 //! - [`chapters::legacy_continuity_database`] /
 //!   [`chapters::legacy_memory_database`] — the legacy-data axis: pre-ledger
 //!   continuity and memory databases (below the mobkit 0.8.8 floor) must be
@@ -64,7 +70,7 @@ mod steps;
 
 pub use factory::{
     AgentMemoryProviderFactory, BinaryBlobStoreFactory, ConsoleLogStoreFactory,
-    ContinuityStoreFactory, EventLogStoreFactory,
+    ContinuityStoreFactory, EventLogStoreFactory, ExtensionDocumentStoreFactory,
 };
 pub use meerkat_store_conformance::ConformanceFailure;
 pub use reference::{

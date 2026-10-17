@@ -50,6 +50,7 @@ rust_library(
     ),
     deps = [
         "//crates/meerkat-meta:meerkat_meta",
+        "//crates/meta-extension-state:meta_extension_state",
     ] + all_crate_deps(
         package_name = "crates/meta-store-conformance",
         normal = True,
@@ -96,6 +97,7 @@ rust_test(
     ),
     deps = [
         "//crates/meerkat-meta:meerkat_meta",
+        "//crates/meta-extension-state:meta_extension_state",
     ] + all_crate_deps(
         package_name = "crates/meta-store-conformance",
         normal = True,
@@ -143,6 +145,7 @@ rust_test(
     ),
     deps = [
         "//crates/meerkat-meta:meerkat_meta",
+        "//crates/meta-extension-state:meta_extension_state",
         "//crates/meta-store-conformance:meta_store_conformance",
     ] + all_crate_deps(
         package_name = "crates/meta-store-conformance",
@@ -191,6 +194,7 @@ rust_test(
     ),
     deps = [
         "//crates/meerkat-meta:meerkat_meta",
+        "//crates/meta-extension-state:meta_extension_state",
         "//crates/meta-store-conformance:meta_store_conformance",
     ] + all_crate_deps(
         package_name = "crates/meta-store-conformance",
@@ -239,6 +243,7 @@ rust_test(
     ),
     deps = [
         "//crates/meerkat-meta:meerkat_meta",
+        "//crates/meta-extension-state:meta_extension_state",
         "//crates/meta-store-conformance:meta_store_conformance",
     ] + all_crate_deps(
         package_name = "crates/meta-store-conformance",

@@ -64,6 +64,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Resolve the caller through `ToolBundleContext::caller_resolver` for each
   call; a host that needs unordered access uses the store its
   `MetaStorageProvider` opened directly.
+- Behaviour-only: with the `extension-state` feature, a document store that
+  an embedding host supplies through `MetaStorageProvider::open_extension_state`
+  must implement the new `ExtensionDocumentStore::mob_id_holder` and
+  `ExtensionDocumentStore::record_mob_id_holder`. Their default
+  implementations answer an error, which the runtime treats as a quarantine:
+  every mob is then bound without extension authority when it activates
+  (see Fixed). A provider that applies `SCHEMA` through its own migration
+  ledger and opens the store with `SqliteExtensionDocumentStore::from_connection`
+  must apply the new `extension_mob_holders` table before 0.9.3 opens the
+  store; until then the holder calls fail, with the same effect. Migration
+  notes:
+  - A store a host implements: implement both methods, durably and in the
+    same storage as the documents, and run
+    `meta_store_conformance::chapters::mob_id_holders` (and `mob_references`)
+    against it.
+  - A provider that applies `SCHEMA` itself: apply `MOB_ID_HOLDERS_SCHEMA`,
+    the end of `SCHEMA` (a `CREATE TABLE IF NOT EXISTS`).
+  - The built-in store needs nothing: it adds the table when it opens, as a
+    plain table outside its ledger domain, so Meta 0.9.2 still opens a store
+    that 0.9.3 opened, ignores the table and refuses nothing.
+  - Restoring a whole state generation keeps its mobs bound: documents,
+    holder records and mob state are restored together.
+  - After running 0.9.2 against a store, a mob that 0.9.2 created under an id
+    another holder held before can be quarantined at the next 0.9.3 restore
+    while documents name its id. To accept it, delete the id's row from
+    `extension_mob_holders`: the next restore adopts the id.
 
 ### Security
 
@@ -260,6 +286,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   authority names. Meta's caller resolver stamps every context it resolves,
   and its document services refuse an operation naming a mob id whose
   holder changed after the stamp (see Fixed). Stores do not read them.
+- `meta-extension-state`: `MobIdHolder`, `ExtensionDocumentStore::mob_id_holder`
+  and `ExtensionDocumentStore::record_mob_id_holder`, which
+  `SqliteExtensionDocumentStore` implements in the new `extension_mob_holders`
+  table of `SCHEMA`; `MOB_ID_HOLDERS_SCHEMA` is that table's DDL alone.
+- `UnifiedRuntime::extension_mob_quarantines`, with
+  `extension_state::MobIdQuarantine` and
+  `extension_state::MobIdQuarantineReason`, reports the mobs bound without
+  extension authority; `extension_state::MobIdHolder` re-exports the
+  holder type.
+- `meta-store-conformance` (workspace-only): the `chapters::mob_references`
+  and `chapters::mob_id_holders` profiles, with
+  `ExtensionDocumentStoreFactory`, hold a host's own extension document store
+  to the mob id contract; a store that keeps the default holder methods
+  fails `mob_id_holders`.
 
 ### Changed
 
@@ -413,6 +453,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   stays exempt from the check and the ordering, so a write naming its id
   lands on the recreated mob, which keeps what its predecessor's documents
   grant.
+- With the `extension-state` feature, restoring a persisted mob re-checks who
+  holds its id. A mob that took a destroyed mob's id without the create check
+  (created before 0.9.2, or while no extension tool bundle or document
+  binding was composed) kept, after a restart, what documents written for the
+  destroyed mob granted the id. The document store now records, per realm
+  and mob id, the holder of the mob that took the id: the owner session it
+  was created for, or the host for a mob created with no owner session
+  (`MobIdHolder`). A create the check admitted (the implicit delegation mob's
+  exempt create included) records its holder and binds when its mob
+  activates. A restore, or a held child's resume, binds when the store
+  records the mob's own holder for the id, or when no live document names the
+  id. When live documents name the id and the store records another holder,
+  the documents were written while that holder's mob held the id, and the
+  restored mob is quarantined: it is bound, but its members resolve no
+  document caller, it is no valid document owner, nobody manages it and
+  lineage through it does not resolve, until it is destroyed or a later
+  restore binds it once an operator has cleared the references. A store that
+  cannot answer (an error, a holder record that does not decode) quarantines
+  the mob as well. A quarantine never fails the activation, which would
+  abort Meerkat's whole restore scan: `UnifiedRuntime::extension_mob_quarantines`
+  reports each quarantined mob with a typed reason
+  (`MobIdQuarantineReason::HeldByAnotherMob`, naming the recorded holder, or
+  `Unverifiable`), and a warn line names it. An id with no holder record
+  (references written before 0.9.3, or by a mob created without the
+  extension's hooks or by an earlier binary) is adopted by the first mob
+  restored under it, which records its holder once, with a warn line naming
+  the id. Holder records outlive a destroy, and restoring a whole state
+  generation (documents, holder records and mob state together) keeps its
+  mobs bound. This resolves the 0.9.2 known limitation that restoring a
+  persisted mob was never re-checked. Residuals: an id with no holder record
+  goes to the first mob restored under it; holders are owner sessions, and
+  every mob the host creates without one is the same holder (`Host`), so a
+  re-creation under an id by the same owner session, or by the host, without
+  the extension's hooks is adopted as that holder's mob; and, as for the
+  ordering, the check covers one runtime in one process.
 
 ### Known limitations
 

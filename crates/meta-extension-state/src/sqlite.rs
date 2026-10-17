@@ -10,6 +10,8 @@ use std::{
 };
 
 /// Provider migration owners may apply this DDL through their own ledger.
+/// A provider that applied it before 0.9.3 applies
+/// [`MOB_ID_HOLDERS_SCHEMA`], the part 0.9.3 added.
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS extension_documents (
  realm TEXT NOT NULL, namespace TEXT NOT NULL, id TEXT NOT NULL,
@@ -19,7 +21,20 @@ CREATE TABLE IF NOT EXISTS extension_receipts (
  realm TEXT NOT NULL, namespace TEXT NOT NULL, principal TEXT NOT NULL,
  request_id TEXT NOT NULL, fingerprint BLOB NOT NULL, receipt TEXT NOT NULL,
  document_id TEXT NOT NULL, operation TEXT NOT NULL,
- PRIMARY KEY(realm, namespace, principal, request_id));";
+ PRIMARY KEY(realm, namespace, principal, request_id));
+CREATE TABLE IF NOT EXISTS extension_mob_holders (
+ realm TEXT NOT NULL, mob_id TEXT NOT NULL, holder TEXT NOT NULL,
+ PRIMARY KEY(realm, mob_id));";
+
+/// The table of the mob id holders a host records
+/// ([`ExtensionDocumentStore::record_mob_id_holder`]): the end of [`SCHEMA`],
+/// for a store whose other tables exist already. It is a plain table that a
+/// store's earlier readers ignore, so applying it keeps the store open to
+/// them.
+pub const MOB_ID_HOLDERS_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS extension_mob_holders (
+ realm TEXT NOT NULL, mob_id TEXT NOT NULL, holder TEXT NOT NULL,
+ PRIMARY KEY(realm, mob_id));";
 
 fn storage(error: impl std::fmt::Display) -> Error {
     Error::Storage(error.to_string())
@@ -368,6 +383,46 @@ impl ExtensionDocumentStore for SqliteExtensionDocumentStore {
         // only when it has not, or no longer, counted them.
         self.run_indexed(move |connection, references| {
             references.names(connection, &realm, &mob_id)
+        })
+        .await
+    }
+    async fn mob_id_holder(&self, realm: &str, mob_id: &str) -> Result<Option<MobIdHolder>> {
+        types::identifier(realm)?;
+        types::identifier(mob_id)?;
+        let (realm, mob_id) = (realm.to_owned(), mob_id.to_owned());
+        self.run(move |connection| {
+            let holder: Option<String> = connection
+                .query_row(
+                    "SELECT holder FROM extension_mob_holders WHERE realm=?1 AND mob_id=?2",
+                    params![realm, mob_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage)?;
+            // A row that does not decode fails the answer: it is no holder.
+            holder.map(|holder| decode(&holder)).transpose()
+        })
+        .await
+    }
+    async fn record_mob_id_holder(
+        &self,
+        realm: &str,
+        mob_id: &str,
+        holder: &MobIdHolder,
+    ) -> Result<()> {
+        types::identifier(realm)?;
+        types::identifier(mob_id)?;
+        holder.validate()?;
+        let (realm, mob_id, holder) = (realm.to_owned(), mob_id.to_owned(), encode(holder)?);
+        self.run(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO extension_mob_holders(realm,mob_id,holder) VALUES (?1,?2,?3) \
+                     ON CONFLICT(realm,mob_id) DO UPDATE SET holder=excluded.holder",
+                    params![realm, mob_id, holder],
+                )
+                .map_err(storage)?;
+            Ok(())
         })
         .await
     }
@@ -728,5 +783,12 @@ mod tests {
             .and_then(|counts| counts.get("twice"))
             .copied();
         assert_eq!(count, None, "the count returned to zero and left the index");
+    }
+
+    /// The holders table is the end of the full schema, spelled once for a
+    /// provider that applied the schema before it existed.
+    #[test]
+    fn the_holders_table_ends_the_schema() {
+        assert!(SCHEMA.ends_with(MOB_ID_HOLDERS_SCHEMA));
     }
 }

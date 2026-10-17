@@ -5,7 +5,7 @@ mod sqlite;
 mod types;
 
 pub use policy::{Operation, authorize, can_create};
-pub use sqlite::{ConnectionGuard, SCHEMA, SqliteExtensionDocumentStore};
+pub use sqlite::{ConnectionGuard, MOB_ID_HOLDERS_SCHEMA, SCHEMA, SqliteExtensionDocumentStore};
 pub use types::*;
 
 use async_trait::async_trait;
@@ -43,8 +43,10 @@ pub trait ExtensionDocumentStore: Send + Sync {
     ) -> Result<MutationOutcome>;
     /// Whether any live document of `realm`, in any namespace, names the mob
     /// `mob_id` as its owner or in an audience grant or deny
-    /// ([`Document::names_mob`]). A host asks before a new mob takes an id:
-    /// the new mob would inherit what those documents grant the id.
+    /// ([`Document::names_mob`]). A host asks before a new mob takes an id,
+    /// and when a persisted mob is restored under an id recorded for another
+    /// holder ([`Self::mob_id_holder`]): the mob would inherit what those
+    /// documents grant the id.
     ///
     /// An implementation answers over the documents committed when it
     /// reads them, and must fail the answer, never skip the document, when
@@ -66,6 +68,41 @@ pub trait ExtensionDocumentStore: Send + Sync {
         let _ = (realm, mob_id);
         Err(Error::Storage(
             "this document store cannot report which documents name a mob".into(),
+        ))
+    }
+    /// The holder recorded for `mob_id` in `realm`
+    /// ([`Self::record_mob_id_holder`]), or `None` when none is recorded. A
+    /// host compares it each time a persisted mob is restored under the id:
+    /// a mob of another holder, while live documents name the id, is bound
+    /// without extension authority (quarantined), since those documents were
+    /// written for the recorded holder.
+    ///
+    /// A recorded holder that cannot be read or decoded fails the answer,
+    /// never reads as `None`. The default implementation cannot answer and
+    /// returns an error, which a host treats as a quarantine of the mob, so
+    /// a store a host supplies must implement this and
+    /// [`Self::record_mob_id_holder`].
+    async fn mob_id_holder(&self, realm: &str, mob_id: &str) -> Result<Option<MobIdHolder>> {
+        let _ = (realm, mob_id);
+        Err(Error::Storage(
+            "this document store cannot record which mob holds a mob id".into(),
+        ))
+    }
+    /// Record `holder` as the holder of `mob_id` in `realm`, replacing any
+    /// holder recorded before, durably in the same storage as the documents
+    /// that name the id, so a copy or restore of the documents carries their
+    /// holders with them. A host records the holder each time a mob takes or
+    /// keeps an id, and never removes one. The default implementation returns
+    /// an error, which a host treats as a quarantine of the mob.
+    async fn record_mob_id_holder(
+        &self,
+        realm: &str,
+        mob_id: &str,
+        holder: &MobIdHolder,
+    ) -> Result<()> {
+        let _ = (realm, mob_id, holder);
+        Err(Error::Storage(
+            "this document store cannot record which mob holds a mob id".into(),
         ))
     }
 }

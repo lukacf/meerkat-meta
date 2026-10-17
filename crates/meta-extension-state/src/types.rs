@@ -275,6 +275,46 @@ impl HostAccessContext {
     }
 }
 
+/// The holder of a mob id in a realm, as a host names it: the owner session
+/// the mob under the id was created for, or the host itself for a mob
+/// created with no owner session. Documents name a mob by its id alone
+/// ([`Owner::Mob`], [`Audience::Mob`]), so a host records the holder each
+/// time a mob takes or keeps an id
+/// ([`crate::ExtensionDocumentStore::record_mob_id_holder`]) and compares it
+/// when a persisted mob is restored: a mob of another holder would inherit
+/// what documents written for the recorded one grant the id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum MobIdHolder {
+    /// A mob the host created with no owner session. Every such mob is the
+    /// same holder.
+    Host,
+    /// A mob created for this owner session: an agent's own mob, its
+    /// implicit delegation mob or a temporary council's mob.
+    OwnerSession(String),
+}
+impl MobIdHolder {
+    pub(crate) fn validate(&self) -> Result<()> {
+        match self {
+            Self::Host => Ok(()),
+            Self::OwnerSession(session) => identifier(session),
+        }
+    }
+}
+impl std::fmt::Display for MobIdHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Host => f.write_str("the host"),
+            Self::OwnerSession(session) => write!(f, "owner session {session}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
