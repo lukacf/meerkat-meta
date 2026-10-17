@@ -19122,6 +19122,86 @@ comms = true
         Ok(())
     }
 
+    /// Attaching a session that no member owns is refused for a caller who is
+    /// not an admin with its own reason, `session_owner_unknown`, rather than
+    /// as a read denial on no member. An admin passes the owner check.
+    #[tokio::test]
+    async fn console_attach_names_a_session_without_an_established_owner()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-attach-unowned-session").await?;
+        let controller =
+            crate::access::AccessController::new(crate::access::AccessControlConfig {
+                enabled: true,
+                admins: vec!["root@example.test".to_string()],
+                rules: vec![crate::access::AccessRule {
+                    id: "allow-all".to_string(),
+                    actions: vec![
+                        crate::access::ACTION_AGENT_VIEW.to_string(),
+                        crate::access::ACTION_AGENT_SEND.to_string(),
+                        crate::access::ACTION_AGENT_SPAWN.to_string(),
+                    ],
+                    agents: vec!["*".to_string()],
+                    ..crate::access::AccessRule::default()
+                }],
+                ..crate::access::AccessControlConfig::default()
+            })?;
+        let session_id = meerkat_core::types::SessionId::new().to_string();
+        let attach = async |view: &crate::access::AccessView, member: &str| {
+            Box::pin(handle_console_runtime_rpc_with_visibility(
+                &runtime,
+                None,
+                None,
+                None,
+                Some(ConsoleEventStore::new()),
+                None,
+                None,
+                None,
+                None,
+                &crate::console_aggregator::AllowAllConsoleVisibilityPolicy,
+                rpc_request_with_params(
+                    "meta/attach_existing_session",
+                    json!({ "role": "worker", "agent_identity": member, "session_id": session_id }),
+                ),
+                true,
+                false,
+                None,
+                Some(&controller),
+                Some(view),
+                None,
+                None,
+                None,
+                None,
+                &crate::http_console::ConsoleSendGovernance::default(),
+            ))
+            .await
+        };
+        let anonymous = controller.view_for_subject(None);
+        let admin = controller.view_for_subject(Some("root@example.test"));
+
+        let refused = attach(&anonymous, "attach-unowned-a").await;
+        assert_eq!(
+            (
+                &refused["error"]["data"]["kind"],
+                &refused["error"]["data"]["reason"],
+                &refused["error"]["data"]["session_id"],
+            ),
+            (
+                &json!("access_denied"),
+                &json!("session_owner_unknown"),
+                &json!(session_id),
+            ),
+            "a caller who is not an admin is refused with the missing owner named: {refused}"
+        );
+        let admitted = attach(&admin, "attach-unowned-b").await;
+        assert_ne!(
+            admitted["error"]["data"]["kind"],
+            json!("access_denied"),
+            "an admin passes the owner check: {admitted}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn console_runtime_identity_reads_reject_stale_runtime_aliases()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
