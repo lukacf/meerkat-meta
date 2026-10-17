@@ -1,0 +1,72 @@
+# Releasing Meta Forge
+
+Meta Forge ships in its own GitHub release, beside Meta's releases:
+
+- tag `forge-v<version>`, where the version comes from `installer/pyproject.toml`;
+- packages built by `.github/workflows/forge-release.yml` and attested;
+- published as a prerelease that never becomes the repository's latest release.
+
+Meta's own release workflow takes no part. No step reads a secret.
+
+## Pinned inputs
+
+`installer/release/forge-release-inputs.json` (schema 1) pins every file the
+packager reads, per target (`linux-x86_64`, `macos-arm64`):
+
+- `files`: a relative name for each input, and its pin. A pin is one of:
+  - `{"path", "size", "sha256"}`: a file committed under `installer/release/inputs/`;
+  - `{"url", "size", "sha256"}`: a public file;
+  - `{"url", "archive_size", "archive_sha256", "member", "size", "sha256"}`:
+    one file taken out of a pinned `.tar.gz`.
+  URLs must be Meta or Connect release downloads, or PyPI files.
+- `selection`: the product owner's `forge-meta-toolkit-runtime-selection-v1`
+  document. Its artifact sizes and SHA-256 values must equal the pins.
+- `paths`: where each selected artifact sits among `files`, under
+  `artifact_root`, in the form `launchkit.packaged_runtime.relocate_selection` reads.
+- `gateway`: the pinned guide gateway, outside the product root.
+
+`guide` holds the guide's Meta and Core versions and their source commits.
+Inputs must be public, and they must not carry private paths, user names or
+host details. A target without pins is not built.
+
+## Forge CI evidence
+
+A candidate does not rerun Forge's own suite. Instead it binds the green
+`forge.yml` run (backend and frontend) that tested exactly the Forge inputs at
+the candidate's commit. The binding covers:
+
+- the trees of `installer`, `console`, `packages/console-core`,
+  `packages/console-components` and `sdk/python`;
+- `forge.yml`, the lockfiles, the installer requirements and the vendored wheels;
+- a recorded toolchain that fits `forge.yml`'s declared Python and Node versions.
+
+If no run qualifies, the candidate refuses and names the members that changed.
+Dispatch `forge.yml` on main for the commit, then run the candidate again.
+
+## Steps
+
+1. Dry run, from any branch. It builds, verifies and attests packages, but its
+   candidate can never be published:
+   `gh workflow run forge-release.yml --ref <branch> -f release_mode=candidate -f source_sha=<branch head>`
+2. Candidate, on main at the release commit, once `ci.yml` is green for that commit:
+   `gh workflow run forge-release.yml --ref main -f release_mode=candidate -f source_sha=<main head>`.
+   Keep the selection JSON from the run summary.
+3. Review the manifest and the packages in the run's artifacts.
+4. Tag the candidate's commit and push the tag:
+   `git tag -a forge-v<version> <source_sha> -m "Meta Forge <version>"`.
+5. Publish:
+   `gh workflow run forge-release.yml --ref main -f release_mode=publish -f artifact_selection='<selection JSON>'`.
+   Publication re-verifies every attestation against main and binds the draft
+   to the selection first. It then publishes the draft as a prerelease and
+   checks that Meta's latest release has not changed.
+
+To verify a download:
+
+```bash
+gh attestation verify meta-forge-<version>-<target>.zip --repo lukacf/meerkat-meta \
+  --signer-workflow lukacf/meerkat-meta/.github/workflows/forge-release.yml
+sha256sum -c meta-forge-<version>-<target>.zip.sha256
+```
+
+Each package's README states the destination it supports. Nothing else is
+qualified.

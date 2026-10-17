@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `.github/workflows/forge-release.yml` releases Meta Forge on its own
+  `forge-v<version>` tag, beside Meta's releases. A candidate builds each target's
+  package from public inputs pinned in `installer/release/forge-release-inputs.json`,
+  verifies and attests it, and binds the set, together with the green `forge.yml`
+  run that tested the same Forge inputs, in an attested candidate manifest.
+  Publication releases those exact bytes as a prerelease that never becomes the
+  latest release. `forge.yml` can now be dispatched, and records each job's
+  toolchain. `installer/RELEASING.md` has the steps.
 - `.github/workflows/warm-deps.yml`, dispatched on a branch whose `Cargo.lock`
   changed, builds the dependency graph of each Rust CI job from that branch's
   crates.io dependencies, with no workspace code, and keeps it as a 3-day
