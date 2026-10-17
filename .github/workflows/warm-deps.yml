@@ -27,15 +27,15 @@ jobs:
         graph: [clippy, test, voice-test, voice-clippy, extension-state-test, extension-state-lint, dev-bins,
                 dev-examples]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@f08ac54821369508305fcb9e0121ec6e30ae9ada # 1.97.0
         with:
           components: clippy
       - id: warm
         run: python3 scripts/ci-warm-deps.py build "${{ matrix.graph }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ steps.warm.outputs.name }}
           path: warm-deps.tar
