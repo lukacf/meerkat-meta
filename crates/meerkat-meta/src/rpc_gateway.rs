@@ -21219,41 +21219,58 @@ mob = true
         })
     }
 
+    /// What the scripted SDK host saw, in order: the options of every build
+    /// and the params of every tool call.
+    #[derive(Default)]
+    struct SdkHostLog {
+        builds: std::sync::Mutex<Vec<Value>>,
+        calls: std::sync::Mutex<Vec<Value>>,
+        call_seen: tokio::sync::Notify,
+    }
+
     /// The scripted SDK host: every `callback/build_agent` registers the host
     /// tool, and every build other than the delegator's also registers the
-    /// child-only tool. Records each build's options, in order.
-    fn answer_builds_by_profile(
+    /// child-only tool. Every `callback/call_tool` gets an answer.
+    fn answer_sdk_host(
         mut stdout_rx: mpsc::Receiver<GatewayStdoutLine>,
         bridge: StdioCallbackBridge,
-    ) -> (
-        Arc<std::sync::Mutex<Vec<Value>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = Arc::clone(&seen);
+    ) -> (Arc<SdkHostLog>, tokio::task::JoinHandle<()>) {
+        let log = Arc::new(SdkHostLog::default());
+        let sink = Arc::clone(&log);
         let task = tokio::spawn(async move {
             while let Some(mut line) = stdout_rx.recv().await {
                 let request: Value = serde_json::from_str(&line).expect("callback JSON");
                 line.settle_delivery(true).await;
-                if request["method"] != "callback/build_agent" {
-                    continue;
-                }
-                let options = request["params"]["options"].clone();
-                let mut tools = vec![host_tool(HOST_TOOL)];
-                if options["profile_name"] != DELEGATOR {
-                    tools.push(host_tool(CHILD_ONLY_TOOL));
-                }
-                sink.lock().expect("build log").push(options);
+                let result = match request["method"].as_str() {
+                    Some("callback/build_agent") => {
+                        let options = request["params"]["options"].clone();
+                        let mut tools = vec![host_tool(HOST_TOOL)];
+                        if options["profile_name"] != DELEGATOR {
+                            tools.push(host_tool(CHILD_ONLY_TOOL));
+                        }
+                        sink.builds.lock().expect("build log").push(options);
+                        json!({"tools": tools})
+                    }
+                    Some("callback/call_tool") => {
+                        sink.calls
+                            .lock()
+                            .expect("call log")
+                            .push(request["params"].clone());
+                        sink.call_seen.notify_one();
+                        json!({"content": "answered by the SDK host"})
+                    }
+                    _ => continue,
+                };
                 bridge
                     .route_callback_response(json!({
                         "jsonrpc": "2.0",
                         "id": request["id"],
-                        "result": {"tools": tools},
+                        "result": result,
                     }))
                     .await;
             }
         });
-        (seen, task)
+        (log, task)
     }
 
     /// The helper the delegator's probe turn starts.
@@ -21266,12 +21283,14 @@ mob = true
     }
 
     const HELPER_CALL_ID: &str = "call-helper";
+    const HOST_TOOL_CALL_ID: &str = "call-host-tool";
 
     /// The scripted model. The delegator's probe turn starts the helper; the
-    /// helper's first request records the tool names it was offered; every
-    /// other turn answers. A probe turn is the one whose newest message is the
-    /// probe: a forked helper carries its source's earlier transcript, probe
-    /// included, and only the delegator ever sees the helper call's result.
+    /// helper's first request records the tool names it was offered, and a
+    /// helper offered the host tool calls it once; every other turn answers.
+    /// A probe turn is the one whose newest message is the probe: a forked
+    /// helper carries its source's earlier transcript, probe included, and
+    /// only the delegator ever sees the helper call's result.
     #[derive(Clone)]
     struct DelegatingModel {
         call: HelperCall,
@@ -21315,20 +21334,24 @@ mob = true
                 *self.delegated.lock().expect("delegated") = Some(result.clone());
             }
             let call_helper = helper_result.is_none() && last.contains(PROBE);
-            if helper_result.is_none() && !call_helper && transcript.contains(HELPER_TASK) {
+            let helper_turn =
+                helper_result.is_none() && !call_helper && transcript.contains(HELPER_TASK);
+            let offered = request
+                .tools
+                .iter()
+                .map(|tool| tool.name.to_string())
+                .collect::<Vec<_>>();
+            if helper_turn {
                 let mut helper_tools = self.helper_tools.lock().expect("helper tools");
                 if helper_tools.is_none() {
-                    *helper_tools = Some(
-                        request
-                            .tools
-                            .iter()
-                            .map(|tool| tool.name.to_string())
-                            .collect(),
-                    );
+                    *helper_tools = Some(offered.clone());
                     self.helper_seen.notify_one();
                 }
             }
-            let stop = if call_helper {
+            let call_host_tool = helper_turn
+                && !transcript.contains(HOST_TOOL_CALL_ID)
+                && offered.iter().any(|name| name == HOST_TOOL);
+            let stop = if call_helper || call_host_tool {
                 meerkat_core::StopReason::ToolUse
             } else {
                 meerkat_core::StopReason::EndTurn
@@ -21360,6 +21383,13 @@ mob = true
                     args,
                     meta: None,
                 }
+            } else if call_host_tool {
+                meerkat_client::LlmEvent::ToolCallComplete {
+                    id: HOST_TOOL_CALL_ID.to_string(),
+                    name: HOST_TOOL.to_string(),
+                    args: json!({}),
+                    meta: None,
+                }
             } else {
                 meerkat_client::LlmEvent::TextDelta {
                     delta: "done".to_string(),
@@ -21379,12 +21409,13 @@ mob = true
     }
 
     /// What one delegation showed: the tool names the helper's model was
-    /// offered, the delegate result the delegator saw, and the options of
-    /// every SDK build, in order.
+    /// offered, the delegate result the delegator saw, the options of every
+    /// SDK build and the params of every SDK tool call, in order.
     struct Delegation {
         helper_tools: Vec<String>,
         delegated: Value,
         builds: Vec<Value>,
+        calls: Vec<Value>,
     }
 
     /// One delegator turn through the gateway composition: the delegator
@@ -21433,7 +21464,7 @@ mob = true
             );
         let (stdout_tx, stdout_rx) = mpsc::channel(16);
         let bridge = StdioCallbackBridge::new(stdout_tx);
-        let (builds, responder) = answer_builds_by_profile(stdout_rx, bridge.clone());
+        let (sdk_host, responder) = answer_sdk_host(stdout_rx, bridge.clone());
         let service = Arc::new(meerkat_session::PersistentSessionService::new(
             StdioCallbackAgentBuilder {
                 inner,
@@ -21525,13 +21556,20 @@ mob = true
             .expect("helper tools")
             .clone()
             .expect("the helper's model was asked");
-        let builds = builds.lock().expect("build log").clone();
+        if helper_tools.iter().any(|name| name == HOST_TOOL) {
+            tokio::time::timeout(BOUND, sdk_host.call_seen.notified())
+                .await
+                .expect("the helper calls the host tool within the bound");
+        }
+        let builds = sdk_host.builds.lock().expect("build log").clone();
+        let calls = sdk_host.calls.lock().expect("call log").clone();
         let _ = tokio::time::timeout(BOUND, handle.shutdown()).await;
         responder.abort();
         Delegation {
             helper_tools,
             delegated: serde_json::from_str(&delegated).expect("json delegate result"),
             builds,
+            calls,
         }
     }
 
@@ -21550,8 +21588,8 @@ mob = true
     /// routing scope.
     fn assert_distinct_scopes(delegation: &Delegation) {
         eprintln!(
-            "helper tools {:?}; builds {:?}",
-            delegation.helper_tools, delegation.builds
+            "helper tools {:?}; builds {:?}; calls {:?}",
+            delegation.helper_tools, delegation.builds, delegation.calls
         );
         let scopes = delegation
             .builds
@@ -21565,12 +21603,41 @@ mob = true
         );
     }
 
+    /// The helper's one call of the host tool reached the SDK host under the
+    /// routing scope of the helper's own build, not its parent's: the shared
+    /// callback source leaves routing per build.
+    fn assert_host_tool_call_routed_to_the_helpers_build(delegation: &Delegation) {
+        let helper_scopes = delegation
+            .builds
+            .iter()
+            .filter(|options| options["labels"]["agent_identity"] == "helper")
+            .map(|options| options["scope_id"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            helper_scopes.len(),
+            1,
+            "one helper build: {:?}",
+            delegation.builds
+        );
+        assert_eq!(
+            delegation.calls,
+            vec![json!({
+                "scope_id": helper_scopes[0],
+                "tool": HOST_TOOL,
+                "arguments": {},
+            })],
+            "builds: {:?}",
+            delegation.builds
+        );
+    }
+
     fn offered(delegation: &Delegation, tool: &str) -> bool {
         delegation.helper_tools.iter().any(|name| name == tool)
     }
 
     /// (a) `inherit_parent`: the helper sees the host tool its parent sees,
-    /// and never one only its own build registered.
+    /// and never one only its own build registered. Its call of the host
+    /// tool routes through its own build.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_inheriting_delegate_helper_sees_its_parents_host_callback_tool() {
         let delegation = run_helper(HelperCall::Delegate(Some(
@@ -21593,6 +21660,7 @@ mob = true
             "a host tool the parent never saw stays hidden: {:?}",
             delegation.helper_tools
         );
+        assert_host_tool_call_routed_to_the_helpers_build(&delegation);
     }
 
     /// (b) Omitted tooling is `inherit_parent`.
@@ -21615,6 +21683,7 @@ mob = true
             "{:?}",
             delegation.helper_tools
         );
+        assert_host_tool_call_routed_to_the_helpers_build(&delegation);
     }
 
     /// (c) `minimal` hands the helper only the comms tools.
@@ -21652,7 +21721,7 @@ mob = true
         );
     }
 
-    /// (f) A name the delegation denies stays hidden.
+    /// (e) A name the delegation denies stays hidden.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_denied_host_callback_tool_stays_hidden_from_an_inheriting_helper() {
         let delegation = run_helper(HelperCall::Delegate(Some(json!({
@@ -21674,7 +21743,7 @@ mob = true
     }
 
     /// A `fork_off` helper, a durable fork of the delegator, sees its
-    /// source's host tool too.
+    /// source's host tool too, and calls it through its own build.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_fork_off_helper_sees_its_sources_host_callback_tool() {
         let delegation = run_helper(HelperCall::ForkOff).await;
@@ -21689,6 +21758,7 @@ mob = true
             "the source's host tool reaches its fork: {:?}",
             delegation.helper_tools
         );
+        assert_host_tool_call_routed_to_the_helpers_build(&delegation);
     }
 
     /// Two builds for one SDK host keep their own routing scopes and stamp

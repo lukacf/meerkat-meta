@@ -21,10 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `callback/call_tool`. Meerkat still matches visibility witnesses strictly
   by source kind and id, so MCP and bundle tools are unaffected. A host filter
   witnessed on a callback tool, such as a persisted deny, also keeps applying
-  after a rebuild instead of silently lapsing. Helpers spawned before this
-  release keep the per-build witnesses recorded in their inherited ceiling,
-  so their host callback tools stay hidden until they are re-spawned.
-  `fork_off` was not affected: it applies no inherited ceiling.
+  after a rebuild instead of silently lapsing. A host filter applied before
+  this release still names the old per-build source, so at the first build
+  after the upgrade it stops matching and lapses (a callback tool it denied
+  becomes visible again) until the host applies it once more. Helpers spawned
+  before this release keep the per-build witnesses recorded in their
+  inherited ceiling, so their host callback tools stay hidden until they are
+  re-spawned. `fork_off` was not affected: it applies no inherited ceiling.
 
 ## [0.9.2] - 2026-10-16
 
