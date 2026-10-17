@@ -1338,6 +1338,11 @@ async fn local_edge_name_for_remote(
     let Some(entry) = local_handle.get_member(local).await? else {
         return Ok(None);
     };
+    // Deliberately the exact spelling (member-id alias rule 4): this fallback
+    // runs when the peer cannot be asked, so nothing can confirm which
+    // generation a generated alias names. Collapsing it onto the durable
+    // member could let a stale alias remove the current edge; the lookup
+    // error is reported instead.
     let remote_member = crate::member_comms_id::mob_member_id_str(remote_member_id);
     let matched = entry.wired_to.iter().find(|identity| {
         identity

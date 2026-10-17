@@ -7005,6 +7005,7 @@ async fn handle_console_runtime_rpc_with_visibility(
         let handle = runtime.handle();
         if let Some(response) = crate::rpc::mob_methods::handle_member_declaration_rpc(
             &handle,
+            identity_runtime.as_ref(),
             runtime.speaks_for_composition(),
             request.method.as_str(),
             response_id.clone(),
@@ -7878,7 +7879,9 @@ async fn handle_console_runtime_rpc_with_visibility(
                 return response_value(response_id, None, Some(error));
             }
             let handle = runtime.handle();
-            let identity = crate::member_comms_id::mob_member_id(member_id);
+            // Decode before encoding, as the stdio `meta/get_member` does: the
+            // current runtime alias names the durable roster row.
+            let identity = crate::member_comms_id::roster_member_id_for_supplied_id(member_id);
             let entries = handle.list_members_including_retiring().await;
             match entries.into_iter().find(|e| e.agent_identity == identity) {
                 Some(entry) => response_value(
@@ -10458,7 +10461,6 @@ async fn handle_console_runtime_rpc_with_visibility(
                 return invalid_params(response_id, "max_text_bytes exceeds platform bounds");
             };
             let handle = runtime.handle();
-            let source_member_id = crate::member_comms_id::mob_member_id(&source);
             let helper_alias = agent_identity.to_string();
             let task = task.to_string();
             let identity_runtime_owned = identity_runtime.clone();
@@ -10468,6 +10470,16 @@ async fn handle_console_runtime_rpc_with_visibility(
                     .await
             } else {
                 Ok(None)
+            };
+            // A source the identity authority owns resolves to its durable
+            // roster row: the lifecycle target already checked that a
+            // generated alias is the current incarnation, and the tracked
+            // operation checks it again under the lock. A classic source keeps
+            // its own roster spelling.
+            let source_member_id = if matches!(authority_target, Ok(Some(_))) {
+                crate::member_comms_id::roster_member_id_for_supplied_id(&source)
+            } else {
+                crate::member_comms_id::mob_member_id(&source)
             };
             let fork_result = match authority_target {
                 Err(error) => Err(error.to_string()),
@@ -11047,6 +11059,10 @@ async fn handle_console_wire_local(
     let result = match authority_target {
         Err(error) => Err(error.to_string()),
         Ok(Some(target)) => {
+            // The lifecycle target owns this alias: a generated alias was
+            // checked current and is checked again under the lock, so it
+            // names the durable roster row, not a row keyed by its own
+            // encoding.
             let operation_alias = local_alias.clone();
             crate::identity_first::IdentityRuntime::run_member_alias_targets_operation_tracked(
                 vec![target],
@@ -11054,14 +11070,18 @@ async fn handle_console_wire_local(
                     let result = if wire {
                         handle
                             .wire(
-                                crate::member_comms_id::mob_member_id(&operation_alias),
+                                crate::member_comms_id::roster_member_id_for_supplied_id(
+                                    &operation_alias,
+                                ),
                                 PeerTarget::External(spec),
                             )
                             .await
                     } else {
                         handle
                             .unwire(
-                                crate::member_comms_id::mob_member_id(&operation_alias),
+                                crate::member_comms_id::roster_member_id_for_supplied_id(
+                                    &operation_alias,
+                                ),
                                 PeerTarget::External(spec),
                             )
                             .await
@@ -17656,6 +17676,238 @@ comms = true
         Ok(())
     }
 
+    /// The console `meta/get_member` decodes a supplied id the way the stdio
+    /// `meta/get_member` and the console `meta/member_status` do: the current
+    /// runtime alias reads the member its durable identity names. Before, it
+    /// answered "member not found" for a healthy member.
+    #[tokio::test]
+    async fn console_get_member_reads_a_member_by_its_runtime_alias()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const DURABLE: &str = "review:get-alias";
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-get-member-alias").await?;
+        runtime
+            .handle()
+            .spawn_spec(SpawnMemberSpec::from_wire(
+                "worker".to_string(),
+                crate::member_comms_id::mob_member_id_str(DURABLE).into_owned(),
+                None,
+                None,
+                None,
+            ))
+            .await?;
+        let get_member = async |member_id: &str| {
+            Box::pin(handle_console_runtime_rpc(
+                &runtime,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                rpc_request_with_params("meta/get_member", json!({ "member_id": member_id })),
+                true,
+            ))
+            .await
+        };
+
+        let durable = get_member(DURABLE).await;
+        assert_eq!(
+            durable["result"]["agent_identity"],
+            json!(DURABLE),
+            "{durable:#?}"
+        );
+        let alias = format!("rt:{DURABLE}:0");
+        let aliased = get_member(&alias).await;
+        assert_eq!(
+            aliased["result"]["agent_identity"],
+            json!(DURABLE),
+            "{alias} must read the member {DURABLE} names: {aliased:#?}"
+        );
+        Ok(())
+    }
+
+    /// A console runtime whose `worker` member is keyed by the durable
+    /// identity, plus an identity runtime that owns that identity at
+    /// generation 1 with `current_alias` as its live runtime alias.
+    async fn console_runtime_with_current_alias(
+        mob_id: &str,
+        durable: &str,
+        current_alias: &str,
+    ) -> Result<
+        (tempfile::TempDir, MobRuntime, Arc<IdentityRuntime>),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let (temp_dir, runtime) = build_empty_console_test_runtime(mob_id).await?;
+        runtime
+            .handle()
+            .spawn_spec(SpawnMemberSpec::from_wire(
+                "worker".to_string(),
+                crate::member_comms_id::mob_member_id_str(durable).into_owned(),
+                None,
+                None,
+                None,
+            ))
+            .await?;
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: mob_id.to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        let identity = AgentIdentity::parse(durable)?;
+        identity_runtime
+            .register(
+                DurableAgentSpec {
+                    identity: identity.clone(),
+                    profile: ProfileName::from("worker"),
+                    addressability: AgentAddressability::Addressable,
+                    display_name: None,
+                    labels: BTreeMap::new(),
+                    context: None,
+                    additional_instructions: Vec::new(),
+                    initial_message: None,
+                    runtime_mode_override: None,
+                    backend: None,
+                    binding: None,
+                    placement: None,
+                },
+                IdentityLifecycleState::Active,
+                Some(ContinuityRecord {
+                    identity: identity.clone(),
+                    agent_runtime_id: AgentRuntimeId::parse(current_alias)?,
+                    session_id: meerkat_core::types::SessionId::new(),
+                    generation: ContinuityGeneration::new(1),
+                    checkpoint_version: CheckpointVersion::new(0),
+                }),
+                Some(LeaseGrant {
+                    identity,
+                    fencing_token: FencingToken::new(1),
+                    ttl: Duration::from_mins(1),
+                }),
+            )
+            .await;
+        Ok((temp_dir, runtime, identity_runtime))
+    }
+
+    /// The console `meta/fork_helper` with the CURRENT runtime alias as its
+    /// source forks the member the identity authority owns. The lifecycle
+    /// target accepts the alias; the fork then has to name the durable roster
+    /// row, not the alias's own encoding, which no row has.
+    #[tokio::test]
+    async fn console_fork_helper_forks_the_source_its_current_runtime_alias_names()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let current_alias = "rt:review:console-fork:1";
+        let (_temp_dir, runtime, identity_runtime) = console_runtime_with_current_alias(
+            "console-fork-current-alias",
+            "review:console-fork",
+            current_alias,
+        )
+        .await?;
+
+        let response = Box::pin(handle_console_runtime_rpc(
+            &runtime,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(identity_runtime),
+            None,
+            None,
+            rpc_request_with_params(
+                "meta/fork_helper",
+                json!({
+                    "source_member_id": current_alias,
+                    "agent_identity": "console-fork-current-probe",
+                    "task": "answer briefly",
+                    "result_label": "console-fork-current-probe",
+                    "max_text_bytes": 4096,
+                }),
+            ),
+            true,
+        ))
+        .await;
+        assert!(
+            !response.to_string().contains("mob member not found"),
+            "a current runtime alias must fork its durable source member: {response:#?}"
+        );
+        Ok(())
+    }
+
+    /// The console `meta/cross_mob/wire_local` and `unwire_local` with the
+    /// CURRENT runtime alias as the local member act on the durable roster
+    /// row the identity authority owns, not on a row keyed by the alias's own
+    /// encoding, which no row has.
+    #[tokio::test]
+    async fn console_wire_local_acts_on_the_member_its_current_runtime_alias_names()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const DURABLE: &str = "review:console-wire";
+        let current_alias = "rt:review:console-wire:1";
+        let (_temp_dir, runtime, identity_runtime) = console_runtime_with_current_alias(
+            "console-wire-current-alias",
+            DURABLE,
+            current_alias,
+        )
+        .await?;
+        let remote_comms_name = "remote-mob/worker/peer";
+        let remote_peer_id =
+            meerkat_core::comms::PeerId::from_ed25519_pubkey(&[42_u8; 32]).to_string();
+        let wired_on_durable_row = async || -> Result<bool, meerkat_mob::MobError> {
+            Ok(runtime
+                .handle()
+                .get_member(&crate::member_comms_id::mob_member_id(DURABLE))
+                .await?
+                .is_some_and(|entry| {
+                    entry
+                        .wired_to
+                        .iter()
+                        .any(|peer| peer.as_str() == remote_comms_name)
+                }))
+        };
+
+        for (method, expect_wired) in [
+            ("meta/cross_mob/wire_local", true),
+            ("meta/cross_mob/unwire_local", false),
+        ] {
+            let response = Box::pin(handle_console_runtime_rpc(
+                &runtime,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(identity_runtime.clone()),
+                None,
+                None,
+                rpc_request_with_params(
+                    method,
+                    json!({
+                        "local_member_id": current_alias,
+                        "remote_comms_name": remote_comms_name,
+                        "remote_peer_id": remote_peer_id,
+                        "remote_address": format!("inproc://{remote_comms_name}"),
+                        // The 32-byte key [42; 32] the peer id is derived from.
+                        "remote_pubkey_b64": "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=",
+                    }),
+                ),
+                true,
+            ))
+            .await;
+            assert_eq!(
+                (response["error"].clone(), wired_on_durable_row().await?),
+                (Value::Null, expect_wired),
+                "(error, durable row wired) after {method} through {current_alias}"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn console_runtime_identity_reads_reject_stale_runtime_aliases()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -17792,6 +18044,34 @@ comms = true
         assert_eq!(
             resolved_tools["error"]["data"]["registered_runtime_member_id"],
             json!("rt:review:singleton:1")
+        );
+
+        // The member-declaration read takes the same rule: it maps a current
+        // runtime alias to the durable row, so a stale one is refused first.
+        let declaration = Box::pin(handle_console_runtime_rpc(
+            &runtime,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(identity_runtime.clone()),
+            None,
+            None,
+            rpc_request_with_params(
+                crate::rpc::mob_methods::MEMBER_TOOL_DECLARATION,
+                json!({
+                    "mob_id": runtime.handle().mob_id().to_string(),
+                    "agent_identity": "rt:review:singleton:0",
+                }),
+            ),
+            true,
+        ))
+        .await;
+        assert_eq!(
+            declaration["error"]["data"]["kind"],
+            json!("stale_identity_runtime_binding"),
+            "the declaration read must refuse a stale runtime alias: {declaration:#?}"
         );
 
         let list_response = Box::pin(handle_console_runtime_rpc(

@@ -17,6 +17,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   to fail with "identity has no current session". The response still echoes
   the spelling the caller supplied, and a stale runtime alias is still
   refused with `stale_identity_runtime_binding`.
+- Every caller-supplied member id follows one alias rule, documented in
+  `member_comms_id`. An encoded roster id is decoded rather than encoded a
+  second time. A runtime alias (`rt:{identity}:{generation}`) that the
+  identity runtime confirms is current names its durable member, and a
+  stale one is refused (`stale_identity_runtime_binding` on the RPC
+  surfaces). An action with no identity authority refuses a runtime alias
+  instead of acting on whichever incarnation is current. These surfaces
+  used to report a healthy member missing when it was named by its current
+  runtime alias, and now reach it: console `meta/get_member`; stdio
+  `meta/member_status`; the `meta/fork_helper` source on both surfaces and
+  in `fork_member_with_identity_runtime`; console
+  `meta/cross_mob/wire_local` and `unwire_local`; cross-mob control
+  lookup, inject, and wire; `mob/member_tool_declaration`; the image-input
+  check; and the console aggregator's member resolution, which console
+  inspect, send, and retire share. `mob/adopt_member_identity_declaration`,
+  `mob/apply_member_tool_declaration`, `send_message_on_mob`,
+  `UnifiedRuntime::start_member_turn`, `UnifiedRuntime::reconcile`, and
+  `fork_member_with_identity_runtime` without an identity runtime now
+  refuse a runtime alias. The declaration apply used to report success for
+  a member it never reached, and `reconcile` seated a phantom member for an
+  encoded roster id.
 
 ## [0.9.2] - 2026-10-16
 

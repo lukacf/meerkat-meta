@@ -13849,9 +13849,10 @@ pub async fn assert_member_accepts_images(
     if !content_input_has_images(content) {
         return Ok(());
     }
-    // Wire member ids are public aliases; the roster id is the comms-safe
-    // encoding (meerkat 0.7 MemberCommsName).
-    let mid = crate::member_comms_id::mob_member_id(member_id);
+    // A read: resolve the supplied id the way `resolved_tools_for_member`
+    // does, so a current runtime alias or an encoded roster id reaches the
+    // durable row it names instead of "member not found".
+    let mid = crate::member_comms_id::roster_member_id_for_supplied_id(member_id);
     let Some(member) = handle
         .get_member(&mid)
         .await
@@ -13944,8 +13945,19 @@ async fn send_message_on_mob_inner(
         return Err(MobRuntimeError::InvalidInput("content must not be empty"));
     }
     // Wire member ids are public aliases; the roster id is the comms-safe
-    // encoding (meerkat 0.7 MemberCommsName).
-    let mid = crate::member_comms_id::mob_member_id(member_id);
+    // encoding (meerkat 0.7 MemberCommsName). Decode first, so an already
+    // encoded roster id is not encoded twice. A generated runtime alias names
+    // an incarnation that only the identity authority can pin, and this
+    // direct send has no authority to ask; collapsing it to the durable row
+    // could deliver an old generation's message to the current incarnation,
+    // so it is refused like the stdio send without an identity runtime.
+    let decoded = crate::member_comms_id::runtime_alias_str(member_id);
+    if crate::member_comms_id::is_reserved_generated_alias(&decoded) {
+        return Err(MobRuntimeError::InvalidInput(
+            "generated member alias requires identity authority",
+        ));
+    }
+    let mid = crate::member_comms_id::mob_member_id(&decoded);
     match interaction_id {
         None => {
             handle
@@ -15357,6 +15369,96 @@ mod tests {
                 "{supplied} must resolve the member {DURABLE} names, with the same session and tools"
             );
         }
+        let _ = handle.shutdown().await;
+    }
+
+    /// The image-capability guard is a read: like `resolved_tools_for_member`
+    /// it reaches the member a durable identity, its current runtime alias or
+    /// its encoded roster id names. Before, the alias and the encoded id read
+    /// as "member not found" for a healthy, image-capable member.
+    #[tokio::test]
+    async fn image_guard_reads_every_spelling_of_one_member() {
+        const DURABLE: &str = "review:singleton";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = bootstrap_opt_in_runtime("image-guard-member-alias", dir.path()).await;
+        let handle = runtime.handle();
+        let roster_id = crate::member_comms_id::mob_member_id_str(DURABLE).into_owned();
+        seat_worker(&handle, &roster_id).await;
+        let image = meerkat_core::ContentInput::Blocks(vec![meerkat_core::ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: meerkat_core::types::ImageData::Inline {
+                data: "iVBORw0KGgo=".to_string(),
+            },
+        }]);
+
+        for supplied in [DURABLE.to_string(), format!("rt:{DURABLE}:0"), roster_id] {
+            let verdict =
+                assert_member_accepts_images(&handle, runtime.session_service(), &supplied, &image)
+                    .await
+                    .map_err(|error| error.to_string());
+            assert_eq!(
+                verdict,
+                Ok(()),
+                "{supplied} must reach the image-capable member {DURABLE} names"
+            );
+        }
+        let _ = handle.shutdown().await;
+    }
+
+    /// A direct send is an action with no identity authority to consult. It
+    /// decodes an encoded roster id instead of encoding it twice, and it
+    /// refuses a generated runtime alias, which only the identity authority
+    /// can pin to a generation, instead of delivering to the durable row.
+    #[tokio::test]
+    async fn direct_send_decodes_roster_ids_and_refuses_generated_aliases() {
+        const DURABLE: &str = "review:singleton";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            "[mob]\nid = \"direct-send-member-alias\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+             external_addressable = true\n\n[profiles.worker.tools]\ncomms = true\n",
+        )
+        .expect("mob definition");
+        let spec = MobBootstrapSpec::ephemeral(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            dir.path().to_path_buf(),
+            4,
+            None,
+        )
+        .expect("bootstrap spec")
+        .with_options(MobBootstrapOptions {
+            allow_ephemeral_sessions: true,
+            notify_orchestrator_on_resume: true,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        });
+        let runtime = MobRuntime::bootstrap(spec)
+            .await
+            .expect("bootstrap runtime");
+        let handle = runtime.handle();
+        let roster_id = crate::member_comms_id::mob_member_id_str(DURABLE).into_owned();
+        let session_id = seat_worker(&handle, &roster_id).await.to_string();
+
+        for supplied in [DURABLE, roster_id.as_str()] {
+            let sent = send_message_on_mob(&handle, supplied, "hello".to_string())
+                .await
+                .map_err(|error| error.to_string());
+            assert_eq!(
+                sent,
+                Ok(session_id.clone()),
+                "{supplied} must deliver to the member {DURABLE} names"
+            );
+        }
+        let refused = send_message_on_mob(&handle, &format!("rt:{DURABLE}:0"), "hello".to_string())
+            .await
+            .map_err(|error| error.to_string());
+        assert_eq!(
+            refused,
+            Err(MobRuntimeError::InvalidInput(
+                "generated member alias requires identity authority"
+            )
+            .to_string()),
+            "a direct send must not pick an incarnation for a generated alias"
+        );
         let _ = handle.shutdown().await;
     }
 

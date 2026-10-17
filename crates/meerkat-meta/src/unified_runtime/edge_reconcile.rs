@@ -121,6 +121,25 @@ impl UnifiedRuntime {
                 ),
             ));
         }
+        // Member-id alias rule: decode every spec id first, so an encoded
+        // roster id is not encoded twice into a phantom member, and refuse a
+        // generated runtime alias, which only the identity authority owns, as
+        // spawn does. The baseline then holds the public aliases.
+        let mut decoded_specs = Vec::with_capacity(desired_specs.len());
+        for mut spec in desired_specs {
+            let alias =
+                crate::member_comms_id::runtime_alias_str(spec.identity.as_str()).into_owned();
+            if crate::member_comms_id::is_reserved_generated_alias(&alias) {
+                return Err(UnifiedRuntimeReconcileError::Mob(
+                    crate::mob_handle_runtime::MobRuntimeError::InvalidConfig(format!(
+                        "generated member alias requires identity authority: {alias}"
+                    )),
+                ));
+            }
+            spec.identity = meerkat_mob::AgentIdentity::from(alias.as_str());
+            decoded_specs.push(spec);
+        }
+        let desired_specs = decoded_specs;
         self.mob_runtime
             .set_baseline_member_specs(desired_specs.clone())
             .await;
