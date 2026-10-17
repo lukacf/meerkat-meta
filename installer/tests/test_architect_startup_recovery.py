@@ -784,22 +784,21 @@ async def test_warmup_typed_timeout_cleans_owner_and_does_not_project_message(st
 
 
 @pytest.mark.asyncio
-async def test_storage_initializer_and_final_owner_both_use_same_ready_barrier(startup, monkeypatch):
+async def test_fresh_meta_uses_one_owner_and_native_materialization_barrier(startup, monkeypatch):
     from launchkit.templates import storage_setup
     service, controller = startup
-    initial, final = FakeRuntime(), FakeRuntime()
-    controller.outcomes = [initial, final]
-    async def initialize(root, build):
-        runtime = await build()
-        assert service.runtime is None
-        await runtime.shutdown()
+    final = FakeRuntime()
+    controller.outcomes = [final]
+    async def initialize(*args):
+        pytest.fail("Fresh Meta startup must not construct a predecessor storage initializer")
     monkeypatch.setattr(storage_setup, "prepare_storage", initialize)
     result = await service.start()
     assert result["status"] == "ready" and service.runtime is final
-    assert initial.shutdown_calls == 1 and final.shutdown_calls == 0
-    assert controller.gateway_init_timeouts == [300, 300]
-    assert initial.wait_calls == final.wait_calls == [{"timeout": 180, "target": "materialized"}]
-    assert controller.modes == [{"mode": "lazy_with_background_warm", "concurrency": 1}] * 2
+    assert final.shutdown_calls == 0
+    assert controller.gateway_init_timeouts == [300]
+    assert final.wait_calls == [{"timeout": 180, "target": "materialized"}]
+    assert controller.modes == [{"mode": "lazy_with_background_warm", "concurrency": 1}]
+    assert controller.builds == 1
     await service.shutdown()
     assert final.shutdown_calls == 1
 
@@ -812,7 +811,7 @@ async def test_cancelled_local_warmup_cleans_once_releases_lock_and_latches_fail
     controller.outcomes = [runtime]
     task = asyncio.create_task(service.start())
     await runtime.wait_entered.wait()
-    assert service.runtime is None and service.startup_phase == "identity_warmup"
+    assert service.runtime is runtime and service.startup_phase == "identity_warmup"
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -844,33 +843,31 @@ async def test_fresh_status_error_after_successful_wait_still_fails_readiness(st
 
 
 @pytest.mark.asyncio
-async def test_post_initializer_migration_failure_restores_storage_phase_after_cleanup(startup, monkeypatch):
-    from launchkit.templates import storage_setup
+async def test_selected_guide_change_after_warmup_cleans_owner_and_latches_failure(startup, monkeypatch):
+    from launchkit import bootstrap
+    from launchkit.connect_installer_caller import CustodyError
     service, controller = startup
-    initial = FakeRuntime()
-    controller.outcomes = [initial]
-    async def initialize_then_fail_migration(root, build):
-        runtime = await build()
-        assert service.runtime is None
-        try:
-            status = await runtime.identity_bootstrap_status()
-            assert status.complete and status.ready and not status.counts.broken
-        finally:
-            await runtime.shutdown()
-        raise RuntimeError("private-canary migration refused /private/canary")
-    monkeypatch.setattr(storage_setup, "prepare_storage", initialize_then_fail_migration)
-    with pytest.raises(RuntimeError, match="migration refused"):
+    runtime = FakeRuntime()
+    controller.outcomes = [runtime]
+    selected = bootstrap.selected_guide_runtime()
+    original_status = runtime.status
+    async def changed_after_warmup(identity):
+        status = await original_status(identity)
+        if identity == "visualizer:main":
+            selected.gateway.path.write_bytes(b"Changed after owned native warmup")
+        return status
+    runtime.status = changed_after_warmup
+    with pytest.raises(CustodyError):
         await service.start()
-    assert initial.wait_calls == [{"timeout": 180, "target": "materialized"}]
-    assert initial.shutdown_calls == 1
+    assert runtime.wait_calls == [{"timeout": 180, "target": "materialized"}]
+    assert runtime.shutdown_calls == 1
     assert service.runtime is None and service.lock_context is None
     assert controller.lock_events == ["acquired", "released"]
     assert not service.start_lock.locked()
     status = service.status()
     assert status["status"] == "failed" and status["startup_retry_required"] is True
-    assert status["startup_phase"] == status["startup_error_kind"] == "storage_preparation"
-    assert status["startup_error_code"] is None
-    assert "private-canary" not in json.dumps(status)
+    assert status["startup_phase"] == "identity_warmup"
+    assert status["startup_error_kind"] == "startup_failure" and status["startup_error_code"] is None
     with pytest.raises(ArchitectUnavailable):
         await service.start()
     assert controller.builds == 1 and service.status() == status
@@ -886,7 +883,7 @@ SATURATED_OBSERVATION = "identity bootstrap readiness failed: mob lifecycle oper
 
 def saturated_observation():
     return RpcError(-32000, SATURATED_OBSERVATION,
-                    method="mobkit/wait_identity_bootstrap")
+                    method="meta/wait_identity_bootstrap")
 
 
 def fake_readiness_clock(monkeypatch):
@@ -956,12 +953,12 @@ async def test_saturated_readiness_exhaustion_is_bounded_and_cleans_same_owner(s
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error", [
-    RpcError(-32001, SATURATED_OBSERVATION, method="mobkit/wait_identity_bootstrap"),
-    RpcError(True, SATURATED_OBSERVATION, method="mobkit/wait_identity_bootstrap"),
+    RpcError(-32001, SATURATED_OBSERVATION, method="meta/wait_identity_bootstrap"),
+    RpcError(True, SATURATED_OBSERVATION, method="meta/wait_identity_bootstrap"),
     RpcError(-32000, SATURATED_OBSERVATION, method="mobkit/init"),
     RpcError(-32000, SATURATED_OBSERVATION),
-    RpcError(-32000, "identity bootstrap readiness mapping is incomplete", method="mobkit/wait_identity_bootstrap"),
-    RpcError(-32000, SATURATED_OBSERVATION + " private-canary", method="mobkit/wait_identity_bootstrap"),
+    RpcError(-32000, "identity bootstrap readiness mapping is incomplete", method="meta/wait_identity_bootstrap"),
+    RpcError(-32000, SATURATED_OBSERVATION + " private-canary", method="meta/wait_identity_bootstrap"),
     RuntimeError(SATURATED_OBSERVATION),
     TransportError(SATURATED_OBSERVATION),
 ])
@@ -1017,7 +1014,7 @@ async def test_actual_startup_callbacks_mark_entered_then_returned_without_conte
         assert service.status()["startup_callback_progress"]["topology"] == "entered"
         entered.append("topology")
         return SimpleNamespace(**kwargs)
-    monkeypatch.setitem(sys.modules, "meerkat_mobkit.identity_first_models", SimpleNamespace(
+    monkeypatch.setitem(sys.modules, "meerkat_meta.identity_first_models", SimpleNamespace(
         DurableAgentSpec=spec, ManagedPeerEdge=edge))
     async def callbacks(builder):
         await builder.roster_callback.roster({"private_context": canary})
@@ -1100,9 +1097,9 @@ async def test_callback_failure_never_reports_returned(startup, monkeypatch, cal
     def refused(*args, **kwargs):
         raise RuntimeError("PRIVATE_CALLBACK_FAILURE")
     if callback == "roster":
-        monkeypatch.setattr(sys.modules["meerkat_mobkit.identity_first_models"], "DurableAgentSpec", refused)
+        monkeypatch.setattr(sys.modules["meerkat_meta.identity_first_models"], "DurableAgentSpec", refused)
     elif callback == "topology":
-        monkeypatch.setattr(sys.modules["meerkat_mobkit.identity_first_models"], "ManagedPeerEdge", refused)
+        monkeypatch.setattr(sys.modules["meerkat_meta.identity_first_models"], "ManagedPeerEdge", refused)
     else:
         monkeypatch.setattr(service.visualizer, "register_tools", refused)
     async def callbacks(builder):
