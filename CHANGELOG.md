@@ -63,6 +63,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   still list those edges in `skipped_missing_members`, and `is_complete()`
   is unchanged.
 
+- Behaviour-only: `meta/mobpacks/apply_operation` refuses every operation
+  but the deletes (`delete_flow_step`, `delete_graph_node`,
+  `delete_graph_edge` and `delete_member`) with `-32602`, not only the
+  graph operations, on a document whose graph has more than 2048 instances
+  or more than 8192 edges: operations that do not edit the graph can still
+  walk it. The deletes are let through so such a document can be brought
+  back under the caps. An operation that would push the graph past the
+  caps, a flow operation that derives the graph again from the flow
+  included, is refused too. `meta/mobpacks/graph_to_flow`, export and
+  deploy refuse such a document, and its validation fails with
+  `too_many_graph_instances` or `too_many_graph_edges` (see Security).
+- Behaviour-only: the `row` of a Flow Editor draft write
+  (`meta/mobpacks/create`, `save`, `undo` and `redo`) is the draft as
+  stored, with the editor document it was saved with. Draft replies other
+  than `meta/mobpacks/get` no longer re-import each valid draft's archive
+  and carry its document with `document_source: "mobpack_archive"` and
+  `document_authority: "artifact"`; `get` still does, for the draft it
+  returns. A document past a structure cap now fails validation with the
+  cap's diagnostic alone.
+- Behaviour and SDK types: Flow Editor draft replies list the drafts as
+  summaries. The `rows` of `meta/mobpacks/create`, `save`, `list`, `undo`,
+  `redo` and `delete` hold each draft's `id`, `name`, `version`, `stage`,
+  `trigger`, `source`, `description`, `revision`, `etag`,
+  `updated_at_unix_ms`, `can_undo` and `can_redo` (labels cut to 256
+  characters), and no `document`, `artifact` or `validation`. The `row` of
+  a write is the written draft whole, as before, and `meta/mobpacks/get`
+  returns a draft's document: the Flow Editor library opens a draft with
+  `get`. The Python SDK's draft results type `rows` as the new
+  `MobpackDraftSummary`, and the TypeScript SDK's as `MobpackDraftSummary`.
+  A draft id longer than 256 characters is refused.
+
 ### Security
 
 - The stock reference app router's documented bound on requests in flight
@@ -71,6 +102,166 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   spreading requests over routes and connections, and the routes the gateway
   adds after the reference router (the host's routes and the live WebSocket
   door) had no bound at all. The bound now holds app-wide (see Fixed).
+
+- Flow Editor validation holds at most the 1000 diagnostics it reports while
+  it runs. It built every diagnostic before it truncated the list, so its peak
+  memory grew with the number of problems in a document: a flow of 100000
+  empty steps, about 300 KiB of JSON that any caller reaching a Flow Editor
+  route could send, took about 100 MiB. Every check now passes its
+  diagnostics to one collector that keeps the first 1000 and only notes the
+  rest. A validation still fails on an error past the cap and still ends with
+  `diagnostics_truncated`, whose severity is `error` when a dropped
+  diagnostic was one.
+- Deriving a flow from a Flow Editor graph (`meta/mobpacks/graph_to_flow`,
+  the graph operations of `meta/mobpacks/apply_operation`, and the graph
+  check every validation runs, import and draft save included) turns each
+  graph node into at most one step. The lanes of a fork that ran into one
+  shared chain without a join each copied the whole chain, B lanes into a
+  chain of T nodes making B x T steps, and instances repeating one id each
+  became a step that copied the prior step of that id. The derived flow grew
+  with those references, not with the graph, which no structure cap counts:
+  a document under the HTTP body limit could expand into gigabytes. Now a
+  repeated id is one node, and a lane stops at a node another lane already
+  took. Prior steps are also read in place instead of cloned, which copied
+  each step once for every step enclosing it.
+- The Flow Editor draft store no longer falls back to a fixed file in the OS
+  temp directory when neither `XDG_STATE_HOME` nor `HOME` is set and
+  `META_FLOW_EDITOR_DRAFT_STORE` names no store, as can happen for a
+  standalone `meta_flow_editor` started by a service manager. Another local
+  user could create, link or read that predictable shared path first. The
+  draft methods now refuse with `-32602` and
+  `data: {"kind": "draft_store_unavailable", "reason": "gateway_home_unavailable"}`,
+  and the message names the remedy: set `META_FLOW_EDITOR_DRAFT_STORE` to a
+  file in a directory only the gateway's user can write, or set
+  `XDG_STATE_HOME` or `HOME`. An unadopted predecessor gateway home, which
+  already refused, refuses with the same kind and `reason`
+  `predecessor_gateway_home` or `adoption_incomplete`.
+- Flow Editor draft replies (`meta/mobpacks/create`, `save`, `list`, `get`,
+  `undo`, `redo` and `delete`) name the draft store's host path as
+  `store_path` only to a caller with host access: the host's stdio and
+  in-process RPC, and a Flow Editor caller with the `mobpack.deploy` grant or
+  the host deploy opt-in. Every reply to any other caller, such as an
+  anonymous caller of a loopback Flow Editor route, carried the store's
+  absolute path. Those replies now carry no `store_path` (the SDKs' draft
+  results already read it as optional), and the store's read, parse and
+  write errors and its predecessor-home refusal name no host path to such a
+  caller. A Rust host that calls the `meerkat_meta::mobpack` draft functions
+  itself gets `store_path` when it runs them under
+  `with_host_path_skill_reads`, as it already does to read path skills.
+- The Flow Editor draft store holds at most 256 drafts and 64 MiB. Every
+  draft method reads and rewrites the whole store, and each draft keeps up
+  to 25 undo and 25 redo snapshots of its document, so any caller reaching a
+  Flow Editor route could grow the store, and with it every later call's
+  memory and time, without bound. A new draft past the count, or a write
+  that would grow the store file past 64 MiB, is now refused with `-32602`
+  and `data: {"kind": "draft_store_full", "limit": "drafts", "max_drafts": 256}`
+  or `{"kind": "draft_store_full", "limit": "bytes", "max_bytes": 67108864,
+  "required_bytes": ...}`, and writes nothing. Undo and redo history yields
+  first: before a write is refused, the oldest snapshots go, of the drafts
+  updated longest ago first and of the written draft last, so history alone
+  never blocks a save. Deletes always run, and a store already past a cap
+  takes writes that leave it no larger. Draft replies also stop copying the
+  snapshots they strip from each row.
+- Deriving a flow from a Flow Editor graph (`meta/mobpacks/graph_to_flow`,
+  the graph operations of `meta/mobpacks/apply_operation`, and the graph
+  check every validation runs) indexes the graph once. Every lookup of a
+  node, an edge or a lane's member scanned the whole graph, and finding the
+  join that closes a fork walked the graph again, scanning at each step, for
+  every join it tried and every lane, so the work grew quadratically, and
+  for many forks faster, with the graph's size. A fork's join is now read
+  from where each node's lanes lead, worked out once for the whole graph,
+  and nodes outside the forks are told apart from the forks' columns by a
+  sorted search.
+- A Flow Editor document's graph holds at most 2048 instances and 8192
+  edges. No structure cap counted the graph, and deriving a flow from it
+  still walks a node once for each join whose lanes run through it. Past the
+  caps, validation fails with `too_many_graph_instances` or
+  `too_many_graph_edges` and checks nothing after the caps, and
+  `meta/mobpacks/graph_to_flow`, rendering (export and deploy) and every
+  `meta/mobpacks/apply_operation` but the deletes refuse the document with
+  `-32602` before deriving anything from its graph. The deletes are let
+  through so the document can be brought back under the caps; while its
+  graph stays past them, a deleted node or edge leaves the flow as it was.
+  An operation that would push a graph past the caps, a flow operation
+  that derives the graph again from the flow included, is refused.
+- Importing a mob definition into the Flow Editor (`meta/mobpacks/import`,
+  and the draft methods that re-import a stored archive) groups each frame's
+  steps in one pass over the frame. Every step searched the whole frame for
+  its parallel siblings, and every branched step for the rest of its branch,
+  so a definition of many steps took work quadratic in their number.
+- Validating, exporting and rendering a Flow Editor document look up the
+  skills its members select in an index of its realms' skills, built once.
+  Each selection scanned the realms again, so selecting many skills, or
+  naming many that no realm defines, took work quadratic in their number.
+- Flow Editor draft methods no longer validate documents under the draft
+  store lock that every draft call waits for. Every reply (`create`, `save`,
+  `list`, `undo`, `redo`, `delete`) re-imported and re-validated the archive
+  of each valid draft in the store while holding it, and `save`, `undo`,
+  `redo` and `create` built their row under it, so a store of slow drafts
+  held every caller's draft calls, and the blocking threads they wait on,
+  for as long as that took. Rows are now built before the lock is taken
+  (`undo` and `redo` check when they write that the draft has not changed
+  since they read it), and only `get` re-imports an archive, of the one
+  draft it returns, outside the lock. Validation also stops at a document's
+  structure caps, before the checks whose work they bound, and a new draft
+  is refused as soon as the store is read when it already holds 256.
+- The Flow Editor draft store is written through a new, uniquely named file
+  readable only by its user, in directories created readable only by that
+  user, then renamed over the store. Each write streams the store to that
+  file, and the byte cap is checked by counting, so no write builds a copy
+  of the store in memory. A store file past 128 MiB (written before the
+  caps) is refused before it is read, with `-32602` and
+  `data: {"kind": "draft_store_unavailable", "reason": "store_too_large",
+  "max_read_bytes": 134217728, "store_bytes": ...}`. Before, every draft
+  method read and parsed such a file whole, the store took the default file
+  mode, and writers sharing a store raced on one fixed `.json.tmp` file.
+  The new file is synced to disk before the rename and its directory after
+  it, so a crash leaves either the old store or the new one whole. A write
+  whose directory then cannot be synced has taken effect: it is reported
+  done, with the written draft and a `durability_warning` in its reply,
+  not as a failure that a client would retry.
+- The standalone Flow Editor server (`meta_flow_editor`) handles at most 16
+  requests at once, and the rest wait for a slot. Any local process can call
+  it, and every request it handled ran on the blocking pool, so it took any
+  number of requests at once.
+- Reconciling a Flow Editor document with its members (the member
+  operations of `meta/mobpacks/apply_operation`, `reconcile_members` and
+  `delete_member` among them) looks each member step's and member
+  instance's tools up in an index of the members' tools, built once. Each
+  step and instance scanned the members and collected all of its member's
+  tools again, so one request with a member of many tools in many steps
+  took work quadratic in their number. A member now lists at most 1024
+  tools: past that, validation fails with `too_many_member_tools`, and
+  export and deploy refuse the document.
+- Deriving a flow from a Flow Editor graph walks a chain of nodes that
+  several lanes to one join run through once: a lane stops at a node an
+  earlier lane to the same join walked. Each lane walked the whole chain
+  again, so a fork of many lanes into one long chain took work quadratic in
+  its size.
+- The Flow Editor's catalogs (`meta/skills/catalog`, `meta/mobpacks/catalogs`
+  and `meta/agent_definitions/list`) name no host path to a caller without
+  host access. They named every directory the skills catalog scans (under
+  the home directory, the working directory, the cargo registry and
+  `META_SKILL_DIRS`) and each skill file's absolute path. Each filesystem
+  skill now has its path within its realm's directory, and the realm's
+  directory and the absolute `provenance.path` are left out. A document may
+  name a catalog skill that way, with the `realm_id` of a catalog realm: it
+  is read from that realm's directory under the same checks as a skill
+  named by its host path. A path with a `..`, `.`, empty, drive or backslash
+  component is refused (`selected_skill_path_leaves_realm`), to such a caller
+  before anything is read, and so is a realm the catalog does not list
+  (`selected_skill_realm_not_listed`); a host caller's document with such a
+  realm is read as named, as before. Deploy plans and
+  `meta/mobpacks/deploy_command` previews for such a caller name no host
+  path either: the pack path is the caller's own or the bare file name,
+  never one in the temp directory, and the command runs `rkat`, never the
+  binary `RKAT_BIN` names.
+- Flow Editor draft replies no longer carry every draft's document. Each
+  reply but `meta/mobpacks/get` (`create`, `save`, `list`, `undo`, `redo`
+  and `delete`) carried every draft in the store with its document, archive
+  and validation, up to about 64 MiB a reply, which a slow reader held in
+  memory. Replies now list the drafts as summaries of a few hundred bytes,
+  and a draft id has at most 256 characters.
 
 ### Added
 
@@ -95,6 +286,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ExtensionDocumentStoreFactory`, hold a host's own extension document store
   to the mob id contract; a store that keeps the default holder methods
   fails `mob_id_holders`.
+
+### Changed
+
+- Flow Editor catalogs give a caller without host access each filesystem
+  skill's path within its realm's directory and no realm `path`; a caller
+  with host access still gets absolute paths (see Security). A document may
+  name a catalog skill either way.
 
 ### Fixed
 
@@ -228,6 +426,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - An identity-first boot no longer logs `reconcile_incomplete: 0 failures, N
   skipped` at ERROR for the edges lazy identity bootstrap leaves pending (see
   Breaking).
+
+- Importing a mob definition into the Flow Editor shows each of its steps
+  once. A step with a condition but no branch that shares its dependencies
+  with two or more steps without one was dropped, and the parallel step of
+  those steps was shown again for each such step, so such an import also
+  grew with the product of the two counts. Such a step is now shown once,
+  after that parallel step (see Known limitations).
+- Importing a mob definition into the Flow Editor shows its steps in
+  dependency order. A definition's steps are parsed in id order, and import
+  showed them in that order, so a step whose id sorts before a step it
+  depends on was shown first, and the flow exported from the editor ran it
+  first: a round trip through the editor rewired the flow. Each frame's
+  steps are now ordered by their dependencies, and by id where those leave
+  the order open; a loop's last step, which its repeat condition names, is
+  taken in the same order.
+- Importing a mob definition into the Flow Editor keeps the condition of a
+  step that has a condition but no branch. Import showed it as a plain
+  member step, which carries no condition, so a round trip through the
+  editor ran the step whatever its condition. It is now shown as a branch
+  step of one lane, which an export writes back with the condition, and a
+  graph with a one-lane branch derives that branch step again.
+
+### Known limitations
+
+- The Flow Editor draft store is shared by every caller of a Flow Editor
+  route: one caller can fill it to its caps, which refuses new drafts to
+  everyone else and drops other drafts' undo history first, and any caller
+  can overwrite or delete any draft. Per-caller stores or quotas are planned.
+- The Flow Editor shows a step with a condition but no branch that shares
+  its dependencies with parallel steps after their parallel step, so an
+  exported flow runs it after them, when its condition holds, rather than
+  beside them.
+- The Flow Editor draft store's lock is per process. Two processes that
+  share one store each read it, change it and rename their copy over it, so
+  of their concurrent writes only the last one renamed survives: run one
+  process per store.
+- A Flow Editor client that holds a draft's etag or revision from before
+  the draft was deleted and created again can overwrite the new draft once
+  it reaches the same revision: the etag names the draft's id and revision,
+  not which draft of that id it is.
 
 ## [0.9.2] - 2026-10-16
 

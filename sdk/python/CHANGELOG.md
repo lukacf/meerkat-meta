@@ -4,6 +4,17 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+- Breaking: the draft results of `meta/mobpacks/list`, `create`, `save`,
+  `undo`, `redo` and `delete` type `rows` as the new `MobpackDraftSummary`
+  (id, name, version, stage, trigger, source, description, revision, etag,
+  `updated_at_unix_ms`, `can_undo` and `can_redo`): Meta lists drafts
+  without their documents. A write's `row` is still a whole
+  `MobpackDraftRow`; `meta/mobpacks/get` returns a draft's document.
+- `MobpackDraftSaveResult`, `MobpackDraftHistoryResult` and
+  `MobpackDraftDeleteResult` carry `durability_warning`, set when Meta wrote
+  the draft store but could not sync its directory: the write took effect
+  and may not survive a crash.
+
 ### Fixed
 
 - A gateway whose stdout closes while `meta/init` is in flight (it exits, or

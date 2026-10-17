@@ -276,6 +276,25 @@ fn mobpack_authoring_response(
     response_id: Value,
     runtime: Option<&crate::mobpack::MobpackRuntimeCatalogState>,
 ) -> Option<JsonRpcResponse> {
+    if let Some(result) = crate::mobpack::mobpack_draft_store_method(method, params, runtime) {
+        let (result, error) = match result {
+            Ok(result) => (Some(result), None),
+            Err(failure) => (
+                None,
+                Some(JsonRpcError {
+                    code: -32602,
+                    message: failure.message,
+                    data: failure.data,
+                }),
+            ),
+        };
+        return Some(JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: response_id,
+            result,
+            error,
+        });
+    }
     let result = match method {
         "meta/mobpacks/schema" => Ok(crate::mobpack::mobpack_schema_response_with_runtime(
             runtime,
@@ -302,13 +321,6 @@ fn mobpack_authoring_response(
         "meta/mobpacks/export" => crate::mobpack::export_mobpack(params)
             .and_then(|result| serde_json::to_value(result).map_err(|err| err.to_string())),
         "meta/mobpacks/import" => crate::mobpack::import_mobpack(params),
-        "meta/mobpacks/list" => crate::mobpack::list_mobpack_drafts_with_runtime(params, runtime),
-        "meta/mobpacks/get" => crate::mobpack::get_mobpack_draft_with_runtime(params, runtime),
-        "meta/mobpacks/create" => crate::mobpack::create_mobpack_draft(params),
-        "meta/mobpacks/save" => crate::mobpack::save_mobpack_draft(params),
-        "meta/mobpacks/delete" => crate::mobpack::delete_mobpack_draft(params),
-        "meta/mobpacks/undo" => crate::mobpack::undo_mobpack_draft(params),
-        "meta/mobpacks/redo" => crate::mobpack::redo_mobpack_draft(params),
         "meta/mobpacks/apply_operation" => {
             crate::mobpack::apply_mobpack_authoring_operation_with_runtime(params, runtime)
         }
