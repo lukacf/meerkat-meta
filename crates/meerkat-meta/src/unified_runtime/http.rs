@@ -78,6 +78,32 @@ async fn healthz_response(
 /// a ceiling high enough for real console usage.
 pub const DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS: usize = 1024;
 
+/// The reference app's bound on requests in flight, applied to each group of
+/// routes the app serves.
+#[derive(Clone, Debug)]
+pub(crate) struct ReferenceAppRequestBound {
+    max_concurrent_requests: usize,
+}
+
+impl ReferenceAppRequestBound {
+    pub(crate) fn new(max_concurrent_requests: usize) -> Self {
+        Self {
+            max_concurrent_requests,
+        }
+    }
+
+    /// Put `routes` under this bound.
+    pub(crate) fn apply(&self, routes: Router) -> Router {
+        routes.layer(ConcurrencyLimitLayer::new(self.max_concurrent_requests))
+    }
+}
+
+impl Default for ReferenceAppRequestBound {
+    fn default() -> Self {
+        Self::new(DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS)
+    }
+}
+
 async fn resolve_agent_event_member_id(
     handle: &meerkat_mob::MobHandle,
     agent_id: &str,
@@ -317,10 +343,20 @@ impl UnifiedRuntime {
     }
 
     pub fn build_reference_app_router(&self, decisions: RuntimeDecisionState) -> Router {
-        self.build_reference_app_router_with_console_visibility_policy(
+        self.reference_app_router_under(decisions, &ReferenceAppRequestBound::default())
+    }
+
+    /// [`Self::build_reference_app_router`] under `bound`, for a caller that
+    /// merges more routes into the same app (see [`ReferenceAppRequestBound`]).
+    pub(crate) fn reference_app_router_under(
+        &self,
+        decisions: RuntimeDecisionState,
+        bound: &ReferenceAppRequestBound,
+    ) -> Router {
+        bound.apply(self.reference_app_routes(
             decisions,
             Arc::new(HideImplicitDelegateMembersConsoleVisibilityPolicy),
-        )
+        ))
     }
 
     /// The reference router plus the live doors the builder registered.
@@ -370,6 +406,16 @@ impl UnifiedRuntime {
     }
 
     pub fn build_reference_app_router_with_console_visibility_policy(
+        &self,
+        decisions: RuntimeDecisionState,
+        visibility_policy: Arc<dyn ConsoleVisibilityPolicy>,
+    ) -> Router {
+        ReferenceAppRequestBound::default()
+            .apply(self.reference_app_routes(decisions, visibility_policy))
+    }
+
+    /// The reference app's routes, before its request bound.
+    fn reference_app_routes(
         &self,
         decisions: RuntimeDecisionState,
         visibility_policy: Arc<dyn ConsoleVisibilityPolicy>,
@@ -527,9 +573,6 @@ impl UnifiedRuntime {
             .merge(self.workgraph_fact_hub().map_or_else(Router::new, |hub| {
                 workgraph_facts_sse_router(hub, Some(sse_decisions_d), access)
             }))
-            .layer(ConcurrencyLimitLayer::new(
-                DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS,
-            ))
     }
 }
 

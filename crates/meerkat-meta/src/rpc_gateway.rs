@@ -14046,6 +14046,24 @@ fn mount_host_app_routes(
     )
 }
 
+/// The console app this gateway serves: the runtime's reference router and
+/// the host's routes, if any, under [`HOST_APP_ROUTES_PREFIX`].
+fn gateway_console_app(
+    runtime: &UnifiedRuntime,
+    decisions: RuntimeDecisionState,
+    host: Option<&Arc<dyn GatewayHostComposition>>,
+    viewer: crate::http_console::ConsoleViewerResolver,
+    send_precheck: crate::http_console::ConsoleSendPrecheck,
+    request_bound: &crate::unified_runtime::http::ReferenceAppRequestBound,
+) -> Result<axum::Router, GatewayHostError> {
+    mount_host_app_routes(
+        runtime.reference_app_router_under(decisions, request_bound),
+        host,
+        viewer,
+        send_precheck,
+    )
+}
+
 /// Native process composition only. Public initialization JSON cannot construct
 /// or replace this participant. Each operation is required: missing composition
 /// is an error for hosts that call `run_persistent_with_host`.
@@ -18087,15 +18105,22 @@ external_addressable = true
     }
     let viewer_resolver = runtime.console_viewer_resolver(&decision_state);
     let send_precheck = runtime.console_send_precheck(&decision_state);
-    let app = runtime.build_reference_app_router(decision_state);
-    let app =
-        mount_host_app_routes(app, host, viewer_resolver, send_precheck).map_err(|error| {
-            fail_init(
-                &request_id,
-                -32603,
-                format!("host app routes refused: {error}"),
-            )
-        })?;
+    let request_bound = crate::unified_runtime::http::ReferenceAppRequestBound::default();
+    let app = gateway_console_app(
+        &runtime,
+        decision_state,
+        host,
+        viewer_resolver,
+        send_precheck,
+        &request_bound,
+    )
+    .map_err(|error| {
+        fail_init(
+            &request_id,
+            -32603,
+            format!("host app routes refused: {error}"),
+        )
+    })?;
     // Live (realtime) transport: ONE live context per gateway (one adapter
     // host, one WS state, one provider registration) serves every live door.
     // Console voice and the external `meta/live/*` surface share it and
