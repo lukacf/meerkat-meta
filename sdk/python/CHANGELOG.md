@@ -4,6 +4,13 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+- Breaking: the draft results of `meta/mobpacks/list`, `create`, `save`,
+  `undo`, `redo` and `delete` type `rows` as the new `MobpackDraftSummary`
+  (id, name, version, stage, trigger, source, description, revision, etag,
+  `updated_at_unix_ms`, `can_undo` and `can_redo`): Meta lists drafts
+  without their documents. A write's `row` is still a whole
+  `MobpackDraftRow`; `meta/mobpacks/get` returns a draft's document.
+
 ## 0.9.1
 
 - `MetaBuilder.gating("")` and `MetaBuilder.access_control("")` raise a

@@ -35,6 +35,7 @@ from meerkat_meta.types import (
     MobpackDraftListResult,
     MobpackDraftRow,
     MobpackDraftSaveResult,
+    MobpackDraftSummary,
     MobpackExportResult,
     MobpackImportResult,
     MobpackSkillsCatalogResult,
@@ -370,6 +371,21 @@ class TestMobpackAuthoringResults:
         assert listed.store_path == "/tmp/drafts.json"
         assert listed.runtime_backed is True
         assert listed.rows[0].id == "f_demo"
+        # Draft results list drafts as summaries: no document.
+        assert listed.rows[0] == MobpackDraftSummary(
+            id="f_demo",
+            name="Demo",
+            version="mobpack.editor.v1",
+            stage="draft",
+            trigger="Meta authoring draft",
+            source="meta/mobpacks/create",
+            description="",
+            revision=3,
+            etag="f_demo:3",
+            updated_at_unix_ms=1700000000000,
+            can_undo=True,
+            can_redo=False,
+        )
 
         got = MobpackDraftGetResult.from_dict({
             "source": "meta/mobpacks/get",

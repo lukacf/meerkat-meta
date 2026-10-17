@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Breaking: the draft results of `meta/mobpacks/list`, `create`, `save`,
+  `undo`, `redo` and `delete` type `rows` as the new `MobpackDraftSummary`
+  (parsed by `parseMobpackDraftSummary`): Meta lists drafts without their
+  documents. A write's `row` is still a whole `MobpackDraftRow`;
+  `meta/mobpacks/get` returns a draft's document.
+
 ## 0.9.1
 
 - `MetaBuilder.gating("")` and `MetaBuilder.accessControl("")` throw an error

@@ -154,6 +154,12 @@ The store holds at most 256 drafts and 64 MiB. Every draft method reads and rewr
 
 The draft store is shared by every caller of a Flow Editor route: one caller can fill it, and any caller can overwrite or delete any draft.
 
+Draft replies list the drafts as summaries: each draft's id, name, version,
+stage, description, revision and etag, without its document, archive or
+validation. `meta/mobpacks/get` returns a draft's document, and the reply of a
+write (`create`, `save`, `undo`, `redo`) carries the written draft whole. A
+draft id has at most 256 characters.
+
 ## Validation and deploy
 
 `meta/mobpacks/validate` always runs Meta structural validation

@@ -56,6 +56,7 @@ import {
   parseMobpackImportResult,
   parseIdentityResolvedToolsResult,
   parseMobpackDraftRow,
+  parseMobpackDraftSummary,
   parseMobpackDraftListResult,
   parseMobpackDraftGetResult,
   parseMobpackDraftSaveResult,
@@ -2004,6 +2005,22 @@ describe("mobpack authoring parsers", () => {
     assert.equal(listed.storePath, "/tmp/drafts.json");
     assert.equal(listed.runtimeBacked, true);
     assert.equal(listed.rows[0].id, "f_demo");
+    // Draft results list drafts as summaries: no document.
+    assert.deepEqual(listed.rows[0], parseMobpackDraftSummary(rowPayload));
+    assert.deepEqual(listed.rows[0], {
+      id: "f_demo",
+      name: "Demo",
+      version: "mobpack.editor.v1",
+      stage: "draft",
+      trigger: "Meta authoring draft",
+      source: "meta/mobpacks/create",
+      description: "",
+      revision: 3,
+      etag: "f_demo:3",
+      updatedAtUnixMs: 1700000000000,
+      canUndo: true,
+      canRedo: false,
+    });
 
     const got = parseMobpackDraftGetResult({
       source: "meta/mobpacks/get",

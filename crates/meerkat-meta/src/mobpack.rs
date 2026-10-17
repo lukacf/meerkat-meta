@@ -2235,7 +2235,8 @@ pub fn mobpack_schema_response_with_runtime(runtime: Option<&MobpackRuntimeCatal
             "graph_projection": "Meta graph projection failed",
             "graph_sync": "Meta graph sync failed",
             "graph_node_insert": "Meta graph node insert failed",
-            "draft_save": "Meta draft save failed"
+            "draft_save": "Meta draft save failed",
+            "draft_open": "Meta draft open failed"
         },
         "authoring_operation_stale_error": "stale authoring operation",
         "authoring_operation_missing_document_error": "Meta authoring operation did not return a document",
@@ -4493,6 +4494,10 @@ fn draft_store_len(rows: &BTreeMap<String, Value>) -> usize {
     serde_json::to_writer_pretty(&mut counter, rows).map_or(0, |()| counter.0)
 }
 
+/// The most characters of a draft's id. A draft summary carries its id
+/// whole.
+const MOBPACK_DRAFT_MAX_ID_CHARS: usize = 256;
+
 fn mobpack_draft_id_from_params(
     params: &Value,
     document: &MobpackDocument,
@@ -4512,6 +4517,12 @@ fn mobpack_draft_id_from_params(
         })
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "meta/mobpacks/save requires id or document.mob_id".to_string())?;
+    let chars = id.chars().count();
+    if chars > MOBPACK_DRAFT_MAX_ID_CHARS {
+        return Err(format!(
+            "mobpack draft id has {chars} characters, more than {MOBPACK_DRAFT_MAX_ID_CHARS}"
+        ));
+    }
     Ok(id)
 }
 
@@ -4888,20 +4899,111 @@ fn create_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
         json!({
             "source": "meta/mobpacks/create",
             "row": row,
-            "rows": sorted_mobpack_draft_rows(&rows),
+            "rows": draft_summaries(&rows),
         }),
         &path,
     ))
 }
 
-/// Every stored draft, as a reply carries it ([`stored_draft_row`]).
-fn sorted_mobpack_draft_rows(rows: &BTreeMap<String, Value>) -> Vec<Value> {
-    rows.values().map(stored_draft_row).collect()
+/// The most characters of a draft's name, description and other labels
+/// that its summary carries.
+const MOBPACK_DRAFT_SUMMARY_MAX_CHARS: usize = 256;
+
+/// Every stored draft as a summary ([`draft_summary`]).
+fn draft_summaries(rows: &BTreeMap<String, Value>) -> Vec<Value> {
+    rows.values().map(draft_summary).collect()
 }
 
-/// A stored draft as a reply carries it: without its undo and redo
-/// snapshots, or, for a document past the skill content cap (a store written
-/// before the cap, or by hand), a placeholder that says why.
+/// A draft as replies list it: its id, revision and etag and what the
+/// library shows of it, without its document, archive, validation or
+/// history, so no reply grows with the drafts' documents. `get` returns a
+/// draft's document, and so does the reply of the write that changed it.
+fn draft_summary(row: &Value) -> Value {
+    let mut summary = serde_json::Map::new();
+    for key in [
+        "id",
+        "revision",
+        "draft_revision",
+        "etag",
+        "draft_etag",
+        "updated_at_unix_ms",
+        "runtime_projection",
+    ] {
+        if let Some(value) = row.get(key) {
+            summary.insert(key.to_string(), value.clone());
+        }
+    }
+    for key in [
+        "name",
+        "version",
+        "stage",
+        "trigger",
+        "source",
+        "registry_source",
+        "document_kind",
+    ] {
+        if let Some(text) = row.get(key).and_then(Value::as_str) {
+            summary.insert(key.to_string(), json!(draft_summary_text(text)));
+        }
+    }
+    if let Some(description) = draft_description(row) {
+        summary.insert(
+            "description".to_string(),
+            json!(draft_summary_text(description)),
+        );
+    }
+    let can_step = |key: &str, flag: &str| {
+        row.get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|entries| !entries.is_empty())
+            || row.get(flag).and_then(Value::as_bool).unwrap_or(false)
+    };
+    summary.insert(
+        "can_undo".to_string(),
+        json!(can_step("history", "can_undo")),
+    );
+    summary.insert(
+        "can_redo".to_string(),
+        json!(can_step("future", "can_redo")),
+    );
+    let stored = row.get("document").map_or(0, value_skill_content_bytes);
+    if stored > MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES {
+        summary.insert("document_authority".to_string(), json!("refused"));
+        summary.insert(
+            "document_refusal".to_string(),
+            json!(document_skill_content_too_large(stored)),
+        );
+    }
+    Value::Object(summary)
+}
+
+/// At most [`MOBPACK_DRAFT_SUMMARY_MAX_CHARS`] characters of a summary label.
+fn draft_summary_text(text: &str) -> String {
+    text.chars().take(MOBPACK_DRAFT_SUMMARY_MAX_CHARS).collect()
+}
+
+/// What the library shows as a draft's description: its flow's description,
+/// or else the task of its flow's input step.
+fn draft_description(row: &Value) -> Option<&str> {
+    fn nonempty(text: Option<&Value>) -> Option<&str> {
+        text.and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    }
+    let flow = row.get("document")?.get("flow")?;
+    nonempty(flow.get("description")).or_else(|| {
+        let input = flow
+            .get("steps")?
+            .as_array()?
+            .iter()
+            .find(|step| step.get("type").and_then(Value::as_str) == Some("input"))?;
+        nonempty(input.get("task"))
+    })
+}
+
+/// The draft a write's reply carries: without its undo and redo snapshots,
+/// or, for a document past the skill content cap (a store written before
+/// the cap, or by hand), a placeholder that says why.
 fn stored_draft_row(row: &Value) -> Value {
     let stored = row.get("document").map_or(0, value_skill_content_bytes);
     if stored > MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES {
@@ -5027,13 +5129,19 @@ fn list_drafts(
     let (rows, _) = read_draft_store(&path)?;
     drop(lock);
     let runtime_rows = runtime
-        .map(|state| state.runtime_flow_rows.clone())
+        .map(|state| {
+            state
+                .runtime_flow_rows
+                .iter()
+                .map(draft_summary)
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let runtime_ids = runtime_rows
         .iter()
         .filter_map(|row| row.get("id").and_then(Value::as_str).map(str::to_string))
         .collect::<BTreeSet<_>>();
-    let draft_rows = sorted_mobpack_draft_rows(&rows).into_iter().filter(|row| {
+    let draft_rows = draft_summaries(&rows).into_iter().filter(|row| {
         row.get("id")
             .and_then(Value::as_str)
             .map(|id| !runtime_ids.contains(id))
@@ -5149,7 +5257,7 @@ fn save_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
         json!({
             "source": "meta/mobpacks/save",
             "row": row,
-            "rows": sorted_mobpack_draft_rows(&rows),
+            "rows": draft_summaries(&rows),
         }),
         &path,
     ))
@@ -5290,7 +5398,7 @@ fn step_mobpack_draft_history(
                         "stepped": false,
                         "reason": format!("nothing to {head}"),
                         "row": stored_draft_row(&existing),
-                        "rows": sorted_mobpack_draft_rows(&rows),
+                        "rows": draft_summaries(&rows),
                     }),
                     &path,
                 ));
@@ -5306,7 +5414,7 @@ fn step_mobpack_draft_history(
                         "stepped": false,
                         "reason": format!("nothing to {head}"),
                         "row": stored_draft_row(&existing),
-                        "rows": sorted_mobpack_draft_rows(&rows),
+                        "rows": draft_summaries(&rows),
                     }),
                     &path,
                 ));
@@ -5363,7 +5471,7 @@ fn step_mobpack_draft_history(
             "source": source,
             "stepped": true,
             "row": row,
-            "rows": sorted_mobpack_draft_rows(&rows),
+            "rows": draft_summaries(&rows),
         }),
         &path,
     ))
@@ -5408,7 +5516,7 @@ fn delete_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
             "source": "meta/mobpacks/delete",
             "id": id,
             "deleted": deleted,
-            "rows": sorted_mobpack_draft_rows(&rows),
+            "rows": draft_summaries(&rows),
         }),
         &path,
     ))
@@ -31962,7 +32070,8 @@ model = "gpt-5.5"
         assert_eq!(listed["rows"][0]["revision"], json!(1));
         assert_eq!(listed["rows"][0]["draft_etag"], json!("registry_draft:1"));
         assert_eq!(listed["rows"][0]["document_authority"], Value::Null);
-        assert_eq!(listed["rows"][0]["artifact"]["deployable"], json!(true));
+        // A list carries summaries; the archive comes with the draft.
+        assert_eq!(listed["rows"][0].get("artifact"), None);
 
         let fetched = get_mobpack_draft(&json!({
             "store_path": store_path,
@@ -32104,23 +32213,23 @@ model = "gpt-5.5"
         });
         write_mobpack_draft_store(&store_path, &rows).expect("write stale draft store");
 
-        // A list carries each draft as stored; only `get` re-imports the
-        // archive of the one draft it returns.
+        // A list carries summaries; only `get` returns a draft's document,
+        // re-imported from its archive.
         let listed =
             list_mobpack_drafts(&json!({ "store_path": store_path })).expect("list drafts");
         let listed_row = &listed["rows"][0];
         assert_eq!(listed_row["document_authority"], Value::Null);
         assert_eq!(
-            listed_row["document"]["mob_id"],
-            json!("stale-registry-projection")
+            (listed_row.get("document"), listed_row.get("artifact")),
+            (None, None)
         );
-        assert_eq!(listed_row["artifact"]["pack_sha256"], pack_sha256);
 
         let fetched = get_mobpack_draft(&json!({
             "store_path": store_path,
             "id": "artifact_authority"
         }))
         .expect("get draft");
+        assert_eq!(fetched["row"]["artifact"]["pack_sha256"], pack_sha256);
         assert_eq!(fetched["row"]["document_source"], json!("mobpack_archive"));
         assert_eq!(fetched["row"]["document_authority"], json!("artifact"));
         assert_eq!(fetched["row"]["document"]["mob_id"], json!("review-pack"));
@@ -41280,5 +41389,82 @@ condition = { op = "eq", path = "params.kind", value = "c" }
             ),
             (true, json!(2), json!("Fourth"))
         );
+    }
+
+    /// A store of six drafts whose `mob.toml` each ends in a comment of
+    /// `padding` bytes.
+    fn draft_store_with_padded_drafts(padding: usize) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("drafts.json");
+        for index in 0..6 {
+            let mut document = valid_document();
+            let mob_toml = document.mob_toml.take().unwrap_or_default();
+            document.mob_toml = Some(format!("{mob_toml}\n# {}\n", "x".repeat(padding)));
+            save_mobpack_draft(&json!({
+                "store_path": store_path,
+                "id": format!("draft_{index}"),
+                "document": document,
+            }))
+            .expect("save a padded draft");
+        }
+        (dir, store_path)
+    }
+
+    /// Draft replies list the drafts as summaries, without their documents,
+    /// archives or validations, so no reply but `get` grows with the
+    /// documents in the store: each listed every draft whole.
+    #[test]
+    fn draft_replies_do_not_grow_with_the_stored_documents() {
+        let sizes = |padding: usize| {
+            let (_dir, store_path) = draft_store_with_padded_drafts(padding);
+            let size = |reply: Value| serde_json::to_vec(&reply).map_or(0, |bytes| bytes.len());
+            let listed =
+                size(list_mobpack_drafts(&json!({ "store_path": store_path })).expect("list"));
+            let saved = size(
+                save_mobpack_draft(&json!({
+                    "store_path": store_path,
+                    "id": "probe",
+                    "document": valid_document(),
+                }))
+                .expect("save"),
+            );
+            let deleted = size(
+                delete_mobpack_draft(&json!({ "store_path": store_path, "id": "probe" }))
+                    .expect("delete"),
+            );
+            let fetched = size(
+                get_mobpack_draft(&json!({ "store_path": store_path, "id": "draft_0" }))
+                    .expect("get"),
+            );
+            (listed, saved, deleted, fetched)
+        };
+        let (small, large) = (sizes(0), sizes(256 * 1024));
+        assert!(
+            large.0 <= small.0 + 64 && large.1 <= small.1 + 64 && large.2 <= small.2 + 64,
+            "reply bytes with small documents {small:?}, with 256 KiB more each {large:?}"
+        );
+        assert!(
+            large.3 > small.3 + 256 * 1024,
+            "get returns the document: {small:?} {large:?}"
+        );
+    }
+
+    /// A draft id has at most [`MOBPACK_DRAFT_MAX_ID_CHARS`] characters, so a
+    /// summary, which carries its draft's id whole, stays small.
+    #[test]
+    fn a_draft_id_past_the_cap_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("drafts.json");
+        let save = |id: String| {
+            save_mobpack_draft(&json!({
+                "store_path": store_path,
+                "id": id,
+                "document": valid_document(),
+            }))
+        };
+        let refusal = save("d".repeat(MOBPACK_DRAFT_MAX_ID_CHARS + 1))
+            .expect_err("an id past the cap is refused");
+        assert!(refusal.contains("more than 256"), "{refusal}");
+        assert!(save("d".repeat(MOBPACK_DRAFT_MAX_ID_CHARS)).is_ok());
     }
 }

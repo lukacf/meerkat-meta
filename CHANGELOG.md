@@ -73,6 +73,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `document_source: "mobpack_archive"` and `document_authority: "artifact"`;
   `get` still does, for the draft it returns. A document past a structure
   cap now fails validation with the cap's diagnostic alone.
+- Behaviour and SDK types: Flow Editor draft replies list the drafts as
+  summaries. The `rows` of `meta/mobpacks/create`, `save`, `list`, `undo`,
+  `redo` and `delete` hold each draft's `id`, `name`, `version`, `stage`,
+  `trigger`, `source`, `description`, `revision`, `etag`,
+  `updated_at_unix_ms`, `can_undo` and `can_redo` (labels cut to 256
+  characters), and no `document`, `artifact` or `validation`. The `row` of
+  a write is the written draft whole, as before, and `meta/mobpacks/get`
+  returns a draft's document: the Flow Editor library opens a draft with
+  `get`. The Python SDK's draft results type `rows` as the new
+  `MobpackDraftSummary`, and the TypeScript SDK's as `MobpackDraftSummary`.
+  A draft id longer than 256 characters is refused.
 
 ### Security
 
@@ -345,6 +356,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   path either: the pack path is the caller's own or the bare file name,
   never one in the temp directory, and the command runs `rkat`, never the
   binary `RKAT_BIN` names.
+- Flow Editor draft replies no longer carry every draft's document. Each
+  reply but `meta/mobpacks/get` (`create`, `save`, `list`, `undo`, `redo`
+  and `delete`) carried every draft in the store with its document, archive
+  and validation, up to about 64 MiB a reply, which a slow reader held in
+  memory. Replies now list the drafts as summaries of a few hundred bytes,
+  and a draft id has at most 256 characters.
 
 ### Added
 
