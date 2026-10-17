@@ -29,7 +29,7 @@ def snapshot(paths):
 
 def fake_python(path, kind):
     path.write_text('''#!/bin/sh
-printf '%s\n' "$*" >> "$ENVIRONMENT_TEST_LOG"
+printf '%s\\0' "$*" >> "$ENVIRONMENT_TEST_LOG"
 case "$1:${2:-}" in
   -c:*)
     if [ "$INERT_PYTHON_KIND" = old-host ]; then
@@ -110,7 +110,7 @@ def test_candidate_environment_failure_keeps_saved_owner_and_stops_before_mutati
         assert (root / ".venv").stat().st_ino == venv_inode
     assert not (root / ".venv.previous").exists()
     log = Path(environment["ENVIRONMENT_TEST_LOG"])
-    calls = log.read_text().splitlines() if log.exists() else []
+    calls = log.read_text().rstrip("\0").split("\0") if log.exists() else []
     version_check = '-c import sys; sys.exit(0 if sys.version_info >= (3, 11) else "Python 3.11 or newer is required")'
     venv_check = '-c import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'
     expected = [] if failure == "missing-host" else [version_check]
@@ -126,6 +126,10 @@ def test_candidate_environment_failure_keeps_saved_owner_and_stops_before_mutati
             assert "INERT ORIGINAL MISSING PIP ERROR" not in result.stderr
     elif failure == "old-host":
         assert "INERT ORIGINAL HOST VERSION ERROR" in result.stderr
+    if failure not in {"missing-host", "old-host"}:
+        directory_check = calls.pop(1)
+        assert directory_check.startswith("-c from pathlib import Path\n")
+        assert "require_project_directory(Path.cwd())" in directory_check
     assert calls == expected
     assert "It cannot create a fresh installation" in files["README.md"]
     assert "Do not extract this ZIP into\na new folder or run `bash install.sh`" in files["README.md"]

@@ -71,7 +71,8 @@ def test_candidate_compilation_binds_source_outside_unchanged_user_design(select
     assert "unsigned and unpublished" in generated["README.md"].content
     assert compiler.MOBKIT_VERSION == generator.MOBKIT_VERSION == "0.8.47"
     assert not any(item.path.endswith((".whl", ".tar.gz", ".zip")) for item in files)
-    assert sum(len(item.content.encode()) for item in files) < 1024 * 1024
+    for payload in bundle.binary_payloads.values():
+        assert all(payload not in item.as_bytes() for item in files), "Native executables stay in the selected external bundle"
 
 
 def test_candidate_sdk_precedes_registry_and_gateway_install_with_no_official_fallback(selected):
@@ -142,7 +143,8 @@ def test_local_candidate_cannot_be_exported_to_a_different_host_platform(selecte
     spec["target"] = target
     if target == "gcp":
         spec["gcp"]["project"] = "forge-candidate-fixture"
-    with pytest.raises(ValueError, match="platform"):
+    reason = "platform" if target == "linux" else "GCP product source.*Linux x86_64"
+    with pytest.raises(ValueError, match=reason):
         compiler.generate_package(spec, runtime_target=selected_target)
 
 
