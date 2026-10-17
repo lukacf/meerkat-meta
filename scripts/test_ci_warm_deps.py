@@ -150,6 +150,27 @@ class WarmDepsTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "refused"):
                     warm.refuse_foreign_sources(workspace, Path(tmp))
 
+    def test_hard_linked_build_scripts_are_packed_and_extracted_under_every_name(self):
+        packages = [{"name": "meerkat-meta", "targets": [{"name": "meerkat_meta"}]}]
+        with tempfile.TemporaryDirectory() as tmp:
+            debug = Path(tmp, "debug")
+            script = debug / "build/serde-0123456789abcdef/build_script_build-0123456789abcdef"
+            script.parent.mkdir(parents=True)
+            script.write_bytes(b"\x7fELF")
+            os.link(script, script.with_name("build-script-build"))
+            Path(debug, "build/serde-0123456789abcdef/link").symlink_to(script)
+            (debug / "deps").mkdir()
+            (debug / ".fingerprint").mkdir()
+            Path(debug, "deps/libmeerkat_meta-0123456789abcdef.rlib").write_bytes(b"own")
+            left_out = warm.pack(debug, packages, Path(tmp, "warm.tar"))
+            with tarfile.open(Path(tmp, "warm.tar")) as tar:
+                members = {member.name: member for member in tar}
+            self.assertEqual(left_out, ["build/serde-0123456789abcdef/link"])
+            for name in ("build_script_build-0123456789abcdef", "build-script-build"):
+                member = members[f"build/serde-0123456789abcdef/{name}"]
+                self.assertTrue(member.isfile() and member.size == 4, name)
+            self.assertNotIn("deps/libmeerkat_meta-0123456789abcdef.rlib", members)
+
     def test_only_dependency_outputs_are_packed(self):
         packages = [{"name": "meerkat-meta", "targets": [{"name": "rpc_gateway"}, {"name": "meerkat_meta"}]}]
         for name, own in (("libmeerkat_meta-0123456789abcdef.rlib", True), ("meerkat-meta-0123456789abcdef", True),

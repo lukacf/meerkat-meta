@@ -133,21 +133,34 @@ def build(graph: str) -> str:
             Path(target["src_path"]).write_text("" if library else "fn main() {}\n")
     for command in commands:
         subprocess.run(["scripts/repo-cargo", *command], check=True)
-    left_out = []
-
-    def plain(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
-        if member.isfile() or member.isdir():
-            return member
-        left_out.append(member.name)
-        return None
-
-    with tarfile.open(TARBALL, "w", format=tarfile.PAX_FORMAT) as tar:
-        for output in OUTPUTS:
-            for entry in sorted((debug_dir() / output).iterdir()):
-                if not workspace_output(entry.name, packages):
-                    tar.add(entry, arcname=f"{output}/{entry.name}", filter=plain)
-    print(f"packed {Path(TARBALL).stat().st_size} bytes; left out {len(left_out)} links or special files")
+    left_out = pack(debug_dir(), packages, Path(TARBALL))
+    print(f"packed {Path(TARBALL).stat().st_size} bytes; left out {len(left_out)} symlinks or special files")
     return name
+
+
+def pack(debug: Path, packages: list[dict], tarball: Path) -> list[str]:
+    """Pack the dependency outputs under `debug` into `tarball`, mtimes kept,
+    and return the entries left out. Every name is a plain file: cargo
+    hard-links each build script binary, and a fingerprint whose binary is
+    missing rebuilds the script and everything that depends on its crate."""
+    left_out = []
+    with tarfile.open(tarball, "w", format=tarfile.PAX_FORMAT) as tar:
+        for output in OUTPUTS:
+            for entry in sorted((debug / output).iterdir()):
+                if workspace_output(entry.name, packages):
+                    continue
+                for path in [entry, *sorted(entry.rglob("*"))] if entry.is_dir() else [entry]:
+                    info = tar.gettarinfo(path, f"{output}/{path.relative_to(debug / output)}")
+                    if info.islnk():
+                        info.type, info.linkname, info.size = tarfile.REGTYPE, "", path.stat().st_size
+                    if info.isfile():
+                        with path.open("rb") as data:
+                            tar.addfile(info, data)
+                    elif info.isdir():
+                        tar.addfile(info)
+                    else:
+                        left_out.append(info.name)
+    return left_out
 
 
 def gh(path: str, stdout=subprocess.PIPE) -> bytes:
