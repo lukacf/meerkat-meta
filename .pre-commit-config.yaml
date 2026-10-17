@@ -87,7 +87,16 @@ repos:
         pass_filenames: false
         stages: [pre-push]
 
-  # On push: clippy on changed crates only (falls back to workspace for root manifest changes)
+  # On demand, never on push: the two compile-heavy gates. A push that ran
+  # them took 28m19s on 2026-10-16, 712.88 s in clippy and 974.16 s in the
+  # unit gate, and CI runs both on every pull request that touches Rust: its
+  # clippy job lints the whole workspace with every target, and its test job
+  # runs every lib and bin test. Run either before a push when it helps:
+  #
+  #   pre-commit run --hook-stage manual cargo-clippy --from-ref origin/main --to-ref HEAD
+  #   pre-commit run --hook-stage manual cargo-test --from-ref origin/main --to-ref HEAD
+
+  # Clippy on changed crates only (falls back to workspace for root manifest changes)
   - repo: local
     hooks:
       - id: cargo-clippy
@@ -97,9 +106,9 @@ repos:
         files: (\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$)
         pass_filenames: false
         verbose: true
-        stages: [pre-push]
+        stages: [manual]
 
-  # On push: unit tests only (integration tests run in CI)
+  # Unit tests only (integration tests run in CI)
   - repo: local
     hooks:
       - id: cargo-test
@@ -109,4 +118,4 @@ repos:
         types: [rust]
         pass_filenames: false
         verbose: true
-        stages: [pre-push]
+        stages: [manual]

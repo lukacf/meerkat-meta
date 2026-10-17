@@ -16,6 +16,22 @@ import { mapFramesToTimelineEntries } from "./adapters";
 import type { ConsoleFrame } from "../types";
 import { accessSaveFailure, accessSaveNotice } from "./errors";
 
+// Wait until `condition` holds or fail after `timeoutMs`. The timeline
+// subscription reconnects after a jittered 200-300 ms backoff, and parallel
+// test files can hold a timer past any fixed margin, so the tests wait for
+// what they observe rather than for a fixed time.
+async function until(condition: () => boolean, label: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) assert.fail(`timed out after ${timeoutMs} ms waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+// How long a test watches for a reconnect the subscription must not make:
+// twice the longest first backoff (250 ms plus 20% jitter).
+const NO_RECONNECT_WINDOW_MS = 600;
+
 test("fetchJson defaults console requests to a 60 second timeout with an abort reason", async () => {
   const originalFetch = globalThis.fetch;
   const originalSetTimeout = globalThis.setTimeout;
@@ -164,7 +180,7 @@ test("timeline stream HTTP errors expose bounded previews as transport state, wi
     onTransportState: (state) => { if (state.error) errors.push(state.error); },
   });
   try {
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await until(() => errors.length > 0, "the stream's transport error");
     assert.equal(frames.length, 0);
     const message = String((errors[0] as Error)?.message || "");
     assert.match(message, /interaction stream request failed 502/);
@@ -670,7 +686,7 @@ test("subscribeTimelineEvents reconnects with the latest aggregate cursor", asyn
         unsubscribe();
       }
     });
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    await until(() => seen.length === 2, "the frame after the reconnect");
     assert.equal(calls[0], "http://127.0.0.1:7000/console/timeline/stream");
     assert.equal(calls[1], "http://127.0.0.1:7000/console/timeline/stream");
     assert.deepEqual(lastEventIds, [undefined, "console:10"]);
@@ -724,7 +740,8 @@ test("subscribeTimelineEvents reports stale cursor without adopting an unaccepte
         }
       },
     );
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await until(() => seen.length === 1, "the replay_unavailable report");
+    await new Promise((resolve) => setTimeout(resolve, NO_RECONNECT_WINDOW_MS));
     assert.equal(calls[0], "http://127.0.0.1:7000/console/timeline/stream");
     assert.equal(calls.length, 1);
     assert.deepEqual(lastEventIds, ["bad"]);
@@ -778,7 +795,8 @@ test("subscribeTimelineEvents delegates in-stream gap recovery without skipping 
         }
       },
     );
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await until(() => seen.length === 1, "the replay_unavailable report");
+    await new Promise((resolve) => setTimeout(resolve, NO_RECONNECT_WINDOW_MS));
     assert.equal(calls[0], "http://127.0.0.1:7000/console/timeline/stream");
     assert.equal(calls.length, 1);
     assert.deepEqual(lastEventIds, [undefined]);
@@ -833,7 +851,7 @@ test("subscribeTimelineEvents reconnects from the last delivered cursor after st
         }
       },
     );
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await until(() => seen.length === 2, "the frame replayed after the reconnect");
     assert.equal(calls[0], "http://127.0.0.1:7000/console/timeline/stream");
     assert.equal(calls[1], "http://127.0.0.1:7000/console/timeline/stream");
     assert.deepEqual(lastEventIds, [undefined, "console:41"]);

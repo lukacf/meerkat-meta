@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `.github/workflows/warm-deps.yml`, dispatched on a branch whose `Cargo.lock`
+  changed, builds the dependency graph of each Rust CI job from that branch's
+  crates.io dependencies, with no workspace code, and keeps it as a 3-day
+  artifact. The branch's pull request extracts the matching artifact in each
+  Rust job (`scripts/ci-warm-deps.py`), but only from a dispatch on its head
+  commit or an ancestor with the same warm-deps files, so a Meerkat Core bump
+  no longer compiles its dependencies cold in every job. CONTRIBUTING.md has
+  the release-preparation steps.
+
 ### Changed
 
 - Release builds no longer restore or save Rust caches in `build_binaries`
@@ -14,6 +25,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   whose keys change with every `Cargo.lock`, while the entries took 5.4 GB
   of the repository's Actions cache. `verify_crate_packages` still restores
   main CI's `meta-dev-bins` entry read-only.
+- The pre-push hook runs only fast local checks. The workspace clippy and the
+  workspace unit gate, which took 712.88 s and 974.16 s of a 28m19s push,
+  moved to the hook's manual stage (`pre-commit run --hook-stage manual
+  cargo-clippy|cargo-test --from-ref origin/main --to-ref HEAD`); CI's clippy
+  and test jobs run both on every pull request that touches Rust. The push
+  stage now takes about 10 seconds warm.
+- A pull request runs only its own CI lanes. For a Rust change it runs
+  clippy, the unit tests and the integration tests, and leaves the voice and
+  extension-state jobs, the Python SDK tests, the console jobs and the flow
+  editor job to the push to main, unless it changes their own inputs: code
+  gated on `openai-live` or `extension-state`, those features' modules and
+  crate, the backend modules a lane drives end to end (the HTTP console and
+  console aggregator, the flow editor binary, its HTTP surface and mobpack,
+  the RPC gateway), the crate files a lane's tests read or its inputs embed
+  (the console and flow editor bundles, contract-checked sources, fixtures),
+  or their own directories. A change to the build configuration
+  (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`,
+  `crates/meerkat-meta/Cargo.toml`) runs every lane that compiles Rust.
+  Console fixtures, the component packages, examples, the
+  Makefile and the nextest configuration reach only the lanes that read them,
+  and the Bazel files, `deny.toml`, `.gitignore` and the hook configuration
+  reach none. Pushes to main and dispatches still run every lane, and a
+  release tag still requires that run to be green for its exact commit.
+- CI runs the workspace clippy in its own job beside `fmt-lint`, which now
+  compiles nothing; balances the two integration halves by measured build and
+  run time (`[a-hj-mstv-z]*` and `[inopqru]*`); drops the unit job's disk
+  reclaim and runs the integration halves' reclaim in the background; and
+  deals the console browser scenarios to three legs instead of two. Projected
+  from measured step times, a warm pull request that touches only Rust
+  finishes in about 11 minutes instead of 17.
+- CI no longer runs on pushes to `ci/**` and `feat/**` branches; those runs
+  ran every lane beside the pull request run of the same commit. A branch
+  gets CI through its pull request, or a dispatch of the CI workflow.
+- The console aggregator's live-event burst test holds its backfill read on
+  a gate and asserts that every live frame reaches the store while the read
+  is held, instead of racing a slow backfill against a deadline. CI's unit
+  test job, which left it out as timing-sensitive, runs it again, without
+  retries; it had run only in the pre-push unit gate, which is now manual.
+- CI's unit test job, now the only automatic run of the lib and bin tests,
+  lists them with its own filter before running them and fails if the
+  filter leaves any out.
 
 ## [0.9.2] - 2026-10-16
 
