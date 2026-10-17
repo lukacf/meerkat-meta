@@ -27,6 +27,8 @@ async def reading_background(tmp_path, monkeypatch):
     monkeypatch.setattr(deployment, "require_available_console_port", lambda port: None)
     previous_files, candidate_files, _, _ = refresh_pair(tmp_path, monkeypatch)
     blueprint = json.loads(previous_files["blueprint.json"][0])
+    selected_target = blueprint["target"]
+    monkeypatch.setattr(deployment, "_local_host_target", lambda: selected_target)
     guide = Guide()
     guide.state["proposal"] = blueprint
     implementation = Implementation(guide)

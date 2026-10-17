@@ -44,6 +44,10 @@ def service(tmp_path, monkeypatch):
                         (socket, "create_connection")):
         monkeypatch.setattr(owner, name, forbidden)
     value = Service(tmp_path / "host", Guide())
+    # Candidate packages select a synthetic target policy, independent of the
+    # CI runner kernel used for actual temporary-file publication.
+    selected_target = value.guide.state["proposal"]["target"]
+    monkeypatch.setattr("launchkit.deployment._local_host_target", lambda: selected_target)
     for profile in value.guide.state["proposal"]["agent_classes"]:
         profile["model"] = "gpt-6-astra"
     return value

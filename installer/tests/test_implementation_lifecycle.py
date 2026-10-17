@@ -19,6 +19,7 @@ from launchkit.implementation import ImplementationService, read_receipt, update
 from launchkit.implementation_workspace import ImplementationWorkspace
 from launchkit.projects import DraftConflict, fingerprint
 from launchkit.templates.storage_setup import write_private
+from test_meta_guide_runtime import selected as selected_guide_runtime
 
 pytestmark = pytest.mark.asyncio
 
@@ -36,7 +37,7 @@ class Guide:
 
 
 @pytest.fixture
-def build(tmp_path):
+def build(tmp_path, selected_guide_runtime):
     guide = Guide()
     service = ImplementationService(tmp_path, guide)
     identity = str(uuid.uuid4())
@@ -97,7 +98,7 @@ async def test_stop_is_prompt_idempotent_and_keeps_owned_cleanup_until_confirmed
     monkeypatch.setattr(service, "_stop_process", stop)
     task = own_task(service, directory, service._run(directory))
     try:
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), 5)
         first = await asyncio.wait_for(service.request_stop(service.guide.identity, 3, directory.name), .2)
         await draining.wait()
         count = task.cancelling()
@@ -259,7 +260,7 @@ async def test_lost_pending_custody_is_visible_and_cannot_acknowledge_cleanup_re
     assert current["status"] == "interrupted" and current["cleanup_pending"]
     assert current["cleanup_custody_lost"] and not current["cleanup_in_progress"]
     assert not current["ready_to_package"]
-    with pytest.raises(DraftConflict, match="cleanup is not confirmed"):
+    with pytest.raises(DraftConflict, match="cleanup cannot be confirmed"):
         await service.submit(service.guide.identity, 3, expected_selected_build_id=directory.name)
     assert not service.tasks and not service.processes
 
@@ -421,7 +422,7 @@ async def test_registered_stop_context_disarms_timer_and_does_not_recancel_drain
     monkeypatch.setattr(worker, "execute", execute)
     task = asyncio.create_task(worker.run(directory, owned_stdin=True))
     try:
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), 5)
         callback, context = callbacks[signal.SIGTERM]
         assert context.get(owned_worker.owned_job_deadline) is None
         if trigger == "signal":
@@ -447,15 +448,13 @@ async def test_registered_stop_context_disarms_timer_and_does_not_recancel_drain
 
 
 def fake_native_build(monkeypatch, runtime):
-    import meerkat_mobkit
+    import meerkat_meta
     class Builder:
         def __getattr__(self, name):
             return lambda *args, **kwargs: self
         async def build(self):
             return runtime
-    monkeypatch.setattr(meerkat_mobkit.MobKit, "builder", lambda: Builder())
-    monkeypatch.setattr("launchkit.bootstrap.download_gateway", lambda *args, **kwargs: None)
-    monkeypatch.setattr(worker, "gateway_path", lambda: Path("/synthetic/gateway"))
+    monkeypatch.setattr(meerkat_meta.Meta, "builder", lambda: Builder())
     monkeypatch.setattr(worker, "planner_capability", lambda: {"provider": "openai"})
     monkeypatch.setenv("MOBKIT_IMPLEMENTATION_MODEL", "gpt-6.1-sol")
 
@@ -477,13 +476,13 @@ async def test_actual_execute_retains_initialization_runtime_and_reawaits_shutdo
                     self.finished = True
                 self.cleanup_task = asyncio.create_task(cleanup())
             await asyncio.shield(self.cleanup_task)
+        async def identity_bootstrap_status(self):
+            # Current Meta initializes the identity directly. Cancellation must
+            # retain this same runtime and reawait its original cleanup task.
+            await self.shutdown()
+            pytest.fail("Cancelled initialization must not admit a model turn.")
     runtime = Runtime()
     fake_native_build(monkeypatch, runtime)
-    async def prepared(root, build_runtime):
-        initial = await build_runtime()
-        await initial.shutdown()
-        pytest.fail("Cancelled initialization must not admit a model turn.")
-    monkeypatch.setattr(worker, "prepare_storage", prepared)
     async def no_turn(*args, **kwargs):
         pytest.fail("No native/model call is allowed in this lifecycle fixture.")
     monkeypatch.setattr(worker, "native_turn", no_turn)

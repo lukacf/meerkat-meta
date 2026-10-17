@@ -1545,10 +1545,11 @@ async def test_explicit_remote_console_port_check_retains_accepted_source_fences
 
 async def test_handoff_never_invents_missing_scripts_or_uses_another_package_destination(service, monkeypatch):
     monkeypatch.setattr("launchkit.deployment.sys.platform", "darwin")
-    service.guide.state["proposal"]["target"] = "linux"
+    # GCP differs from either real localhost OS used by the service fixture.
+    service.guide.state["proposal"]["target"] = "gcp"
     with pytest.raises(DraftConflict, match="destination differs"):
         await service.options(service.guide.identity)
-    service.implementation.definition["target"] = "linux"
+    service.implementation.definition["target"] = "gcp"
     options = await service.options(service.guide.identity)
     assert options["handoff"]["steps"] == []
     assert any("lacks the required handoff scripts" in item for item in options["handoff"]["limitations"])

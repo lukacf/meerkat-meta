@@ -159,5 +159,5 @@ def test_actual_service_preserves_later_no_change_question_or_operational_turn(g
     state = answer(client, state, action="chat", text="What remains uncertain in this draft?")
     assert state["proposal"] == before["proposal"] and state["brief"] == before["brief"]
     assert state["changes"] == [] and state["readiness"] == before["readiness"]
-    assert state["question"] == (context_question() if publication_kind == "question" else None)
+    assert state["question"] == context_question(), "An operational update does not answer or discard the retained decision"
     assert state["status"] == before["status"] and state["version"] == before["version"] + 1
