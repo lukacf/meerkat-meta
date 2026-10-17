@@ -398,6 +398,9 @@ async def test_stdout_closing_during_init_leaves_no_unretrieved_settlement(
         assert runtime.last_gateway_termination == _STOPPED_CLEANLY
         assert not runtime.is_running
         (transport,) = transports
+        # stop() does not join the reader thread; a reader still running its
+        # EOF handling would keep the watch alive past the collection below.
+        await asyncio.to_thread(transport._reader_thread.join, 5)
         await _assert_settlements_retired(transport.settlements, reports)
 
 
