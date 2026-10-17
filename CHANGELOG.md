@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Release builds no longer restore or save Rust caches in `build_binaries`
+  and `release_validate`. No v0.9.2 release job restored one of their entries,
+  whose keys change with every `Cargo.lock`, while the entries took 5.4 GB
+  of the repository's Actions cache. `verify_crate_packages` still restores
+  main CI's `meta-dev-bins` entry read-only.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
