@@ -25,6 +25,11 @@ pub(crate) enum CompletionStop {
     Incomplete(StopReason),
 }
 
+/// Why a completion whose stream ended before its terminal event is refused:
+/// with no stop reason there is no answer to read.
+pub(crate) const UNTERMINATED_STREAM: &str =
+    "the completion stream ended before its terminal event";
+
 /// Read a successful completion's stop reason.
 pub(crate) fn completion_stop(stop_reason: StopReason) -> CompletionStop {
     match stop_reason {

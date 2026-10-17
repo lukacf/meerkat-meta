@@ -44,7 +44,7 @@ use meerkat_core::{Message, Provider, SystemNoticeKind, SystemNoticeMessage, Use
 
 use crate::identity_first::agent_memory::{compact_whitespace, truncate_utf8_boundary};
 use crate::memory::capabilities::StewardStore;
-use crate::memory::completion::{CompletionStop, completion_stop};
+use crate::memory::completion::{CompletionStop, UNTERMINATED_STREAM, completion_stop};
 use crate::memory::distiller::{CompactionFollowUp, DistillOutcome, DistillerEngine};
 use crate::memory::events::{MemoryEventSink, MemoryTimelineEvent};
 use crate::memory::factory_handle::FactoryModelClientHandle;
@@ -1640,6 +1640,7 @@ pub async fn complete_text(
     .with_temperature(profile.params.temperature);
     let mut stream = client.stream(&request);
     let mut assembler = BlockAssembler::new();
+    let mut answered = false;
     while let Some(event) = stream.next().await {
         match event.map_err(classify_llm_error)? {
             LlmEvent::AssistantOutput { blocks } => {
@@ -1648,7 +1649,10 @@ pub async fn complete_text(
             LlmEvent::TextDelta { delta, meta } => assembler.on_text_delta(&delta, meta),
             LlmEvent::Done { outcome } => match outcome {
                 LlmDoneOutcome::Success { stop_reason } => match completion_stop(stop_reason) {
-                    CompletionStop::Answered => break,
+                    CompletionStop::Answered => {
+                        answered = true;
+                        break;
+                    }
                     // Do NOT discard stop_reason. A MaxTokens stop arrives with a
                     // partial or empty body; returning it as a short answer sends a
                     // truncation into a strict parse, which then blames the model.
@@ -1680,6 +1684,10 @@ pub async fn complete_text(
             | LlmEvent::UsageUpdate { .. }
             | LlmEvent::WireLiveness => {}
         }
+    }
+    // A stream that ends before its terminal event has no answer either.
+    if !answered {
+        return Err(HygienistError::Client(UNTERMINATED_STREAM.to_string()));
     }
     Ok(meerkat_core::types::BlockAssistantMessage::new(
         assembler.finalize(),
@@ -1792,6 +1800,11 @@ mod tests {
                     Err(HygienistError::Truncated { max_output_tokens })
                         if max_output_tokens == profile.params.max_output_tokens
                 )),
+                CompletionCase::Unterminated => assert!(
+                    matches!(result, Err(HygienistError::Client(message))
+                        if message == UNTERMINATED_STREAM),
+                    "a stream with no terminal event is not an answer",
+                ),
             }
             client.assert_observed_once_without_retry(&log);
         }

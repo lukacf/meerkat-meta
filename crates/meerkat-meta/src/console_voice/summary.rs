@@ -317,6 +317,9 @@ mod tests {
                     assert_eq!(result, Err(SummaryError::Provider));
                 }
                 CompletionCase::Truncated => assert_eq!(result, Err(SummaryError::Incomplete)),
+                CompletionCase::Unterminated => {
+                    assert_eq!(result, Err(SummaryError::Incomplete));
+                }
             }
             client.assert_observed_once_without_retry(&log);
         }

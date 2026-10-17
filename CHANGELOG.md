@@ -22,12 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   could be written as memory or applied as a transcript revision. A
   completion is now an answer only when the model ended its turn or matched
   a stop sequence. Any other stop fails the call as
-  `Incomplete { stop_reason }`, and the run is skipped with the stop named in
-  its skip reason, as an output-ceiling stop already was with `Truncated`. A
-  stop reason that a later Meerkat adds is refused the same way. Meerkat
-  0.9.2 itself reports an Anthropic refusal as an ended turn, so against it a
-  refused reply still reads as an answer; it is refused once Meerkat reports
-  refusals as their own stop.
+  `Incomplete { stop_reason }`, and the run, or that harvest, is skipped with
+  the stop named in its skip reason, as an output-ceiling stop already was
+  with `Truncated`. A completion stream that ends before its terminal event is
+  refused too. A stop reason that a later Meerkat adds is refused the same
+  way. Meerkat 0.9.2 itself reports an Anthropic refusal as an ended turn, so
+  against it a refused reply still reads as an answer; it is refused once
+  Meerkat reports refusals as their own stop.
 
 ## [0.9.2] - 2026-10-16
 
