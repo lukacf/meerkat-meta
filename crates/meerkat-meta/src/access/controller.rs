@@ -672,6 +672,17 @@ impl AccessDecisionFence<'_> {
         let identity = match self.view.runtime_alias_member(identity) {
             RuntimeAliasMember::NotAnAlias => identity,
             RuntimeAliasMember::Current(member_key) => {
+                // A deny written against the requested spelling still holds.
+                if super::engine::matching_deny_rule(
+                    &self.view.config,
+                    &self.view.principal,
+                    ACTION_AGENT_VIEW,
+                    &AccessResource::for_identity(identity),
+                )
+                .is_some()
+                {
+                    return false;
+                }
                 member = member_key;
                 member.as_str()
             }
@@ -796,6 +807,17 @@ impl AccessView {
         let identity = match self.runtime_alias_member(identity) {
             RuntimeAliasMember::NotAnAlias => identity,
             RuntimeAliasMember::Current(member_key) => {
+                // A deny written against the requested spelling still holds.
+                if let Some(rule) = super::engine::matching_deny_rule(
+                    &self.config,
+                    &self.principal,
+                    action,
+                    &AccessResource::for_identity(identity),
+                ) {
+                    return AccessDecision::Deny {
+                        reason: format!("denied by rule {rule}"),
+                    };
+                }
                 member = member_key;
                 member.as_str()
             }
@@ -1158,6 +1180,56 @@ mod tests {
             ],
             "rows: labelled, named, open (durable, current alias); open stale alias, \
              unknown alias; admin current alias, admin stale alias"
+        );
+    }
+
+    /// A deny rule written against a member's runtime alias still holds when
+    /// that alias is the member's current incarnation, which is otherwise
+    /// judged as the member it names.
+    #[test]
+    fn a_deny_written_for_a_runtime_alias_still_holds() {
+        let retire = crate::access::ACTION_AGENT_RETIRE;
+        let controller = AccessController::new(AccessControlConfig {
+            enabled: true,
+            admins: vec!["root@example.test".to_string()],
+            rules: vec![
+                AccessRule {
+                    id: "retire-all".to_string(),
+                    actions: vec![retire.to_string()],
+                    agents: vec!["*".to_string()],
+                    ..AccessRule::default()
+                },
+                AccessRule {
+                    id: "deny-alias-spelling".to_string(),
+                    effect: AccessEffect::Deny,
+                    actions: vec![retire.to_string()],
+                    agents: vec!["rt:review:pinned:1".to_string()],
+                    ..AccessRule::default()
+                },
+            ],
+            ..AccessControlConfig::default()
+        })
+        .expect("controller");
+        controller.record_agent_attributes(AgentResourceAttributes {
+            identity: "review:pinned".to_string(),
+            agent_id: Some("review:pinned".to_string()),
+            role: Some("worker".to_string()),
+            labels: BTreeMap::new(),
+        });
+        controller.record_current_runtime_aliases([(
+            "review:pinned".to_string(),
+            Some("rt:review:pinned:1".to_string()),
+        )]);
+        let anonymous = controller.view_for_subject(None);
+        let admin = controller.view_for_subject(Some("root@example.test"));
+        assert_eq!(
+            (
+                anonymous.allows_agent(retire, "review:pinned"),
+                anonymous.allows_agent(retire, "rt:review:pinned:1"),
+                admin.allows_agent(retire, "rt:review:pinned:1"),
+            ),
+            (true, false, true),
+            "(durable spelling, denied alias spelling, admin with the denied alias spelling)"
         );
     }
 

@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `agent_id`, `agent_identity`) name different members is refused with
   `conflicting_member_targets`, and the console access rules judge every
   member a request names.
+- A console access deny rule written against a runtime alias applies to
+  that alias even while it is the member's current incarnation.
 - `meta/identity/resolved_tools`, and `resolved_tools_for_member` in Rust,
   resolve the supplied id through `roster_member_id_for_supplied_id`, as
   `meta/identity/routing_status` does (#366). A member named by its current
