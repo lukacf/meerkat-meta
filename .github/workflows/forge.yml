@@ -42,7 +42,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - run: python -m pip install -e './installer[test]'
+      - run: npm --prefix installer/web ci
+      - run: npm --prefix installer/web run build
       - name: Backend regression tests
         run: python -m pytest -q installer/tests --tb=short --junitxml=forge-pytest.xml
       - name: Retain test results
