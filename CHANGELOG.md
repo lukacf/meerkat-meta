@@ -28,7 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the same key is evaluated as a new apply (refused with
   `topology_revision_conflict` when its `expected_revision` is stale), and a
   scoped retry of an apply still pending at the upgrade answers
-  `topology_operation_in_progress` until recovery closes it.
+  `topology_operation_in_progress` until recovery closes it. A downgrade and
+  re-upgrade drops the keys scoped callers recorded before the downgrade (the
+  earlier version rewrites the state without marking them), so their retries
+  are likewise evaluated as new applies.
 
 ## [0.9.2] - 2026-10-16
 
