@@ -540,32 +540,31 @@ impl NativeAuthorityRegistry {
                 let poisoned = || {
                     meerkat_mob::MobError::Internal("extension authority registry poisoned".into())
                 };
-                let already_bound = || {
-                    meerkat_mob::MobError::Internal(
-                        "extension authority already bound for mob".into(),
-                    )
-                };
-                if registry
+                // Activations are decided one at a time: the write side of
+                // the mob id gate is held from this check through the
+                // binding's insert, so an activation that raced another
+                // under the id finds it bound here and decides nothing.
+                let gate = registry.ordering.gate.write().await;
+                let bound_live = registry
                     .handles
                     .read()
                     .map_err(|_| poisoned())?
                     .get(&id)
-                    .is_some_and(BoundMob::is_live)
-                {
+                    .is_some_and(BoundMob::is_live);
+                if bound_live {
                     // The refused activation's admission goes with it, so no
                     // later activation under the id skips the holder check.
                     registry.admissions().remove(&id);
-                    return Err(already_bound());
+                    return Err(meerkat_mob::MobError::Internal(
+                        "extension authority already bound for mob".into(),
+                    ));
                 }
                 // Who holds the id decides whether the mob binds with
                 // extension authority. It never fails the activation: an
                 // error here would abort Meerkat's whole restore scan, so a
                 // mob that must not inherit binds quarantined instead.
-                let quarantine = registry.admit_holder(&handle).await;
+                let quarantine = registry.admit_holder(&gate, &handle).await;
                 let mut handles = registry.handles.write().map_err(|_| poisoned())?;
-                if handles.get(&id).is_some_and(BoundMob::is_live) {
-                    return Err(already_bound());
-                }
                 if let Some(reason) = &quarantine {
                     tracing::warn!(
                         mob_id = %id,
@@ -575,6 +574,8 @@ impl NativeAuthorityRegistry {
                     );
                 }
                 handles.insert(id, BoundMob { handle, quarantine });
+                drop(handles);
+                drop(gate);
                 Ok(())
             })
         })
@@ -748,9 +749,10 @@ impl NativeAuthorityRegistry {
     }
 
     /// Who holds the id of a mob that activates, decided under the write
-    /// side of the mob id gate and recorded in the document store. Returns
-    /// the quarantine of a mob that must not inherit what documents grant
-    /// its id.
+    /// side of the mob id gate, which the activation holds through its
+    /// binding's insert, and recorded in the document store. Returns the
+    /// quarantine of a mob that must not inherit what documents grant its
+    /// id.
     ///
     /// - A create this registry admitted (the check, or the implicit
     ///   delegation mob's exemption) records its holder and binds.
@@ -765,8 +767,11 @@ impl NativeAuthorityRegistry {
     ///
     /// Every decision moves the id's generation, so a caller resolved before
     /// it names the id no more.
-    async fn admit_holder(&self, handle: &MobReadHandle) -> Option<MobIdQuarantineReason> {
-        let _gate = self.ordering.gate.write().await;
+    async fn admit_holder(
+        &self,
+        _gate: &tokio::sync::RwLockWriteGuard<'_, ()>,
+        handle: &MobReadHandle,
+    ) -> Option<MobIdQuarantineReason> {
         let mob_id = handle.mob_id().as_str();
         let holder = mob_id_holder_of(handle);
         let admission = self.admissions().remove(mob_id);
@@ -2516,6 +2521,140 @@ comms = true
             Some(registry.ordering.last_change(destroyed_id)),
             "a create admitted after the destroy stands, refreshed past the release"
         );
+        runtime.handle().stop().await.unwrap();
+    }
+
+    /// A document store whose first holder record waits at a gate the test
+    /// opens, and which counts the holder reads.
+    struct PausedHolderRecord {
+        inner: Arc<dyn documents::ExtensionDocumentStore>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        paused: std::sync::atomic::AtomicBool,
+        holder_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl documents::ExtensionDocumentStore for PausedHolderRecord {
+        async fn get(
+            &self,
+            scope: &documents::DocumentScope,
+            caller: &HostAccessContext,
+            id: &documents::DocumentId,
+        ) -> documents::Result<documents::Document> {
+            self.inner.get(scope, caller, id).await
+        }
+        async fn list(
+            &self,
+            scope: &documents::DocumentScope,
+            caller: &HostAccessContext,
+            request: documents::ListRequest,
+        ) -> documents::Result<documents::DocumentPage> {
+            self.inner.list(scope, caller, request).await
+        }
+        async fn lookup_receipt(
+            &self,
+            scope: &documents::DocumentScope,
+            caller: &HostAccessContext,
+            request: &documents::RequestIdentity,
+        ) -> documents::Result<Option<documents::MutationReceipt>> {
+            self.inner.lookup_receipt(scope, caller, request).await
+        }
+        async fn mutate(
+            &self,
+            scope: &documents::DocumentScope,
+            caller: &HostAccessContext,
+            request: &documents::RequestIdentity,
+            mutation: documents::Mutation,
+        ) -> documents::Result<documents::MutationOutcome> {
+            self.inner.mutate(scope, caller, request, mutation).await
+        }
+        async fn references_mob(&self, realm: &str, mob_id: &str) -> documents::Result<bool> {
+            self.inner.references_mob(realm, mob_id).await
+        }
+        async fn mob_id_holder(
+            &self,
+            realm: &str,
+            mob_id: &str,
+        ) -> documents::Result<Option<MobIdHolder>> {
+            self.holder_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.mob_id_holder(realm, mob_id).await
+        }
+        async fn record_mob_id_holder(
+            &self,
+            realm: &str,
+            mob_id: &str,
+            holder: &MobIdHolder,
+        ) -> documents::Result<()> {
+            if !self.paused.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.record_mob_id_holder(realm, mob_id, holder).await
+        }
+    }
+
+    /// Activations under one id are decided one at a time, through the
+    /// binding's insert. An activation that raced the winner under the id
+    /// waits, finds the winner bound and is refused before it reads or
+    /// records who holds the id, so it cannot overwrite the winner's record.
+    /// A gate inside the winner's holder record forces the interleaving.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_a_racing_activation_under_a_taken_id_decides_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runtime, _bound, _store, owner_session) =
+            bound_runtime(dir.path(), "racing-activation").await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        std::fs::create_dir_all(dir.path().join("racing")).unwrap();
+        let store = Arc::new(PausedHolderRecord {
+            inner: test_store(&dir.path().join("racing")),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            paused: std::sync::atomic::AtomicBool::new(false),
+            holder_reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let registry = NativeAuthorityRegistry::new(
+            "test".into(),
+            runtime.handle().mob_id().to_string(),
+            runtime.session_service().unwrap().clone(),
+            None,
+            None,
+            Arc::clone(&store) as Arc<dyn documents::ExtensionDocumentStore>,
+        );
+        // A live child no registry has bound yet.
+        let mut definition = runtime.handle().definition().clone();
+        definition.id = "racing-activation-child".into();
+        let child = meerkat_mob::MobBuilder::new(definition, meerkat_mob::MobStorage::in_memory())
+            .with_session_service(runtime.session_service().unwrap().clone())
+            .with_default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .with_owner_bridge_session_create_authority(owner_session.clone(), true, false)
+            .create()
+            .await
+            .unwrap();
+        let activate = registry.before_activation();
+
+        let winner = tokio::spawn(activate(child.read_handle()));
+        // The winner holds the gate inside its holder record.
+        entered.notified().await;
+        let mut racer = activate(child.read_handle());
+        assert!(
+            futures::poll!(&mut racer).is_pending(),
+            "the racing activation waits for the gate"
+        );
+        release.notify_one();
+        winner.await.unwrap().expect("the winner binds");
+        let refused = racer.await;
+
+        assert!(refused.is_err(), "the winner holds the id");
+        assert_eq!(
+            store.holder_reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the winner read who holds the id"
+        );
+        assert!(registry.handle("racing-activation-child").is_ok());
+        child.stop().await.unwrap();
         runtime.handle().stop().await.unwrap();
     }
 }

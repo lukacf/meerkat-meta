@@ -124,7 +124,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   was created for, or the host for a mob created with no owner session
   (`MobIdHolder`). A create the check admitted (the implicit delegation mob's
   exempt create included) records its holder and binds when its mob
-  activates. A restore, or a held child's resume, binds when the store
+  activates. Activations under an id are decided one at a time: one that
+  finds a live mob bound under the id is refused, records nothing and drops
+  its admission. A restore, or a held child's resume, binds when the store
   records the mob's own holder for the id, or when no live document names the
   id. When live documents name the id and the store records another holder,
   the documents were written while that holder's mob held the id, and the
