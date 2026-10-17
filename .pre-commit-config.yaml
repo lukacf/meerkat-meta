@@ -30,10 +30,10 @@ repos:
         stages: [pre-push]
         # Byte-lossless corpus fixtures (release-minted realms, forensic
         # bundles with checksum manifests) must never be text-normalized.
-        exclude: ^crates/meerkat-meta/tests/fixtures/
+        exclude: ^(crates/meerkat-meta/tests/fixtures/|installer/tests/fixtures/|installer/launchkit/templates_v2/toolkit-ui/vendor/)
       - id: end-of-file-fixer
         stages: [pre-push]
-        exclude: ^crates/meerkat-meta/tests/fixtures/
+        exclude: ^(crates/meerkat-meta/tests/fixtures/|installer/tests/fixtures/|installer/launchkit/templates_v2/toolkit-ui/vendor/)
       - id: check-yaml
         stages: [pre-push]
       - id: check-toml
