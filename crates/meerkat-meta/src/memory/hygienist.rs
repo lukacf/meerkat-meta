@@ -1657,6 +1657,11 @@ pub async fn complete_text(
                             max_output_tokens: profile.params.max_output_tokens,
                         });
                     }
+                    // Nor is any other unfinished body an answer, however well
+                    // it parses: no revision is applied from a filtered reply.
+                    CompletionStop::Incomplete(stop_reason) => {
+                        return Err(HygienistError::Incomplete { stop_reason });
+                    }
                 },
                 LlmDoneOutcome::Error { error } => return Err(classify_llm_error(error)),
             },
@@ -1808,6 +1813,26 @@ mod tests {
             Err(HygienistError::Truncated { max_output_tokens })
                 if max_output_tokens == profile.params.max_output_tokens
         ));
+    }
+
+    /// A body the model did not finish is not an answer, however well it
+    /// parses: every stop before a complete answer is typed.
+    #[tokio::test]
+    async fn complete_text_refuses_an_incomplete_stop() {
+        use crate::test_diagnostics::{INCOMPLETE_STOPS, stopping_client};
+
+        let profile = HygienistProfile::embedded_default();
+        for stop in INCOMPLETE_STOPS {
+            let client = stopping_client(PRUNE_REPLY, stop);
+            let result = complete_text(&client, &profile, "test".into()).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(HygienistError::Incomplete { stop_reason }) if stop_reason == stop
+                ),
+                "{stop:?}: {result:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2385,6 +2410,7 @@ mod tests {
 
     struct ScriptedLlm {
         reply: String,
+        stop_reason: StopReason,
     }
 
     #[async_trait]
@@ -2398,7 +2424,7 @@ mod tests {
                 }),
                 Ok(LlmEvent::Done {
                     outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
+                        stop_reason: self.stop_reason,
                     },
                 }),
             ]))
@@ -2415,6 +2441,7 @@ mod tests {
 
     struct ScriptedHandle {
         reply: String,
+        stop_reason: StopReason,
     }
 
     #[async_trait]
@@ -2422,6 +2449,7 @@ mod tests {
         async fn client(&self) -> Result<Arc<dyn LlmClient>, HygienistError> {
             Ok(Arc::new(ScriptedLlm {
                 reply: self.reply.clone(),
+                stop_reason: self.stop_reason,
             }))
         }
     }
@@ -2441,6 +2469,19 @@ mod tests {
         gate: Option<Arc<dyn DistillationGate>>,
         runs_per_day: u32,
     ) -> Arc<HygienistEngine> {
+        engine_stopping_with(reply, StopReason::EndTurn, seam, spans, gate, runs_per_day)
+    }
+
+    /// An engine whose every completion streams `reply` and then stops with
+    /// `stop_reason`.
+    fn engine_stopping_with(
+        reply: &str,
+        stop_reason: StopReason,
+        seam: Arc<ScriptedSeam>,
+        spans: Vec<SpanReference>,
+        gate: Option<Arc<dyn DistillationGate>>,
+        runs_per_day: u32,
+    ) -> Arc<HygienistEngine> {
         Arc::new(HygienistEngine::new(
             HygienistProfile::embedded_default(),
             HygienistConfig {
@@ -2450,6 +2491,7 @@ mod tests {
             },
             Arc::new(ScriptedHandle {
                 reply: reply.to_string(),
+                stop_reason,
             }),
             seam,
             Arc::new(ScriptedSpans(spans)),
@@ -2538,6 +2580,49 @@ mod tests {
             "blocked revision must not reach the seam"
         );
         assert_eq!(sink.types(), vec!["memory.hygiene.blocked"]);
+    }
+
+    /// A reply the model did not finish applies no revision, even one that
+    /// validates: the pass is skipped, and its reason and timeline event name
+    /// the stop.
+    #[tokio::test]
+    async fn engine_applies_nothing_from_an_incomplete_reply() {
+        use crate::test_diagnostics::INCOMPLETE_STOPS;
+
+        for stop in INCOMPLETE_STOPS {
+            let scripted = seam();
+            let engine =
+                engine_stopping_with(PRUNE_REPLY, stop, scripted.clone(), Vec::new(), None, 2);
+            let sink = Arc::new(crate::memory::events::CollectingEventSink::new());
+            engine.set_event_sink(sink.clone());
+            let outcome = engine
+                .hygiene_now("identity:luka", "sess-1", HygieneCause::PostCompaction)
+                .await;
+            let named = format!("{stop:?}");
+            assert!(
+                matches!(&outcome, HygieneOutcome::Skipped { reason } if reason.contains(&named)),
+                "{stop:?}: {outcome:?}"
+            );
+            assert!(
+                scripted
+                    .rewrites
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty(),
+                "{stop:?}: an unfinished reply must not reach the seam"
+            );
+            let events = sink
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [MemoryTimelineEvent::HygieneSkipped { reason, .. }] if reason.contains(&named)
+                ),
+                "{stop:?}: {events:?}"
+            );
+        }
     }
 
     #[tokio::test]

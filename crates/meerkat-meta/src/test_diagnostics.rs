@@ -26,6 +26,32 @@ impl CompletionCase {
     ];
 }
 
+/// Every stop reason that ends a memory stage's completion before a complete
+/// answer, apart from the output ceiling's own `Truncated`. Each stage's tests
+/// refuse all of them.
+pub(crate) const INCOMPLETE_STOPS: [meerkat_core::StopReason; 3] = [
+    meerkat_core::StopReason::ContentFilter,
+    meerkat_core::StopReason::ToolUse,
+    meerkat_core::StopReason::Cancelled,
+];
+
+/// A client whose completion streams `body` and then stops with
+/// `stop_reason`.
+pub(crate) fn stopping_client(
+    body: &str,
+    stop_reason: meerkat_core::StopReason,
+) -> meerkat_client::TestClient {
+    meerkat_client::TestClient::new(vec![
+        LlmEvent::TextDelta {
+            delta: body.to_string(),
+            meta: None,
+        },
+        LlmEvent::Done {
+            outcome: LlmDoneOutcome::Success { stop_reason },
+        },
+    ])
+}
+
 pub(crate) struct ObservationClient {
     events: Vec<Result<LlmEvent, LlmError>>,
     calls: AtomicUsize,

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking
+
+- `DistillerError`, `HygienistError` and `StewardError` gain an
+  `Incomplete { stop_reason }` variant (see Fixed). Code that matches one of
+  them exhaustively needs an arm for it.
+
+### Fixed
+
+- **Agent-memory stages write nothing from an answer the model did not
+  finish.** The distiller, the hygienist and the steward refused only an
+  output-ceiling stop, so a reply that a provider's content filter cut off,
+  a cancelled response or a tool-call stop was parsed like an answer and
+  could be written as memory or applied as a transcript revision. A
+  completion is now an answer only when the model ended its turn or matched
+  a stop sequence. Any other stop fails the call as
+  `Incomplete { stop_reason }`, and the run is skipped with the stop named in
+  its skip reason, as an output-ceiling stop already was with `Truncated`. A
+  stop reason that a later Meerkat adds is refused the same way.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking
