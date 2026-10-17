@@ -23,6 +23,8 @@ from test_installed_sdk_wheel_proof import inert_wheel as sdk_wheel
 from test_selected_dependency_install import inert_wheel as dependency_wheel, put
 from test_selected_sdk_supervisor import command_owner, assert_reaped
 
+from sdk_source_import_guard import no_selected_sdk_import
+
 
 @pytest.fixture
 async def actual_pip(tmp_path, monkeypatch):
@@ -149,7 +151,7 @@ def assert_real_sdk_readback(files, facts):
     assert files.meta_path.read_bytes() == files.meta[0] and files.toolkit_path.read_bytes() == files.toolkit[0]
     assert not list((files.root / ".venv").glob(".forge-selected-*"))
     assert not (files.root / ".venv/forge-sdk.receipt.json").exists()
-    assert not any(name in sys.modules for name in ("meerkat_meta", "meerkat_toolkit", "fixture_actual_pip"))
+    assert "fixture_actual_pip" not in sys.modules
 
 
 async def test_actual_offline_pip_installs_pair_dependency_and_reads_back_generated_metadata(actual_pip):

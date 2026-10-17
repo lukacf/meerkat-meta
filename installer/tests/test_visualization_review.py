@@ -23,8 +23,8 @@ VisualizationReviewService = module.VisualizationReviewService
 _advisory_feedback, checked_submission = module._advisory_feedback, module.checked_submission
 from launchkit.blueprint import starter_blueprint
 from launchkit.projects import fingerprint
-from meerkat_mobkit.agent_builder import CallbackDispatcher
-from meerkat_mobkit.types import HelperResult
+from meerkat_meta.agent_builder import CallbackDispatcher
+from meerkat_meta.types import HelperResult
 
 RENDERER = fingerprint({"renderer": "fixture"})
 
@@ -171,7 +171,6 @@ async def test_installed_dispatcher_delivers_actual_image_and_source_bound_advis
     assert result["status"] == "reviewed" and result["report"]["verdict"] == "needs_revision"
     assert runtime.images and len(runtime.calls) == 1
     options = dict(runtime.calls[0][2])
-    assert 0 < options.pop("timeout") <= review.timeout
     assert options == {"result_label": "visual-review-result", "max_text_bytes": 16000, "role": "visual-review", "runtime_mode": "turn_driven"}
     assert result["correction_advisory"]["expected_parent"] == {"operation_id": before["binding"]["id"], **{key: before["binding"][key] for key in ("code_hash", "blueprint_hash", "model_hash", "setup_id", "stream_id")}}
     assert result["correction_advisory"]["eligible_now"] is True and not operations.mutations
@@ -227,7 +226,7 @@ async def test_duplicate_submission_and_lost_response_preserve_checked_publicati
         original_import = builtins.__import__
 
         def import_without_diagnostic_classes(name, globals=None, locals=None, fromlist=(), level=0):
-            if name == "meerkat_mobkit.errors" and set(fromlist or ()) == {"RpcError", "TransportError"}:
+            if name == "meerkat_meta.errors" and set(fromlist or ()) == {"RpcError", "TransportError"}:
                 blocked_imports.append(True)
                 raise ImportError("Synthetic private diagnostic import detail.")
             return original_import(name, globals, locals, fromlist, level)
@@ -561,7 +560,7 @@ async def test_async_runtime_provider_is_resolved_once_and_uses_native_helper_co
 
 @pytest.mark.asyncio
 async def test_same_helper_can_correct_invalid_publication_after_sixty_second_transport_default():
-    from meerkat_mobkit.runtime import MobKitRuntime
+    from meerkat_meta.runtime import MetaRuntime
 
     operations, native = Operations(), Runtime()
 
@@ -577,11 +576,11 @@ async def test_same_helper_can_correct_invalid_publication_after_sixty_second_tr
             self.calls.append(request)
             self.wait = self.request_timeout if timeout is None else timeout
             params = request["params"]
-            assert request["method"] == "mobkit/spawn_helper" and "timeout" not in params
-            result = await native.spawn_helper(params["agent_identity"], params["task"], **params["options"])
+            assert request["method"] == "meta/spawn_helper" and "timeout" not in params
+            result = await native.spawn_helper(params["agent_identity"], params["task"], **params["options"], result_label=params["result_label"], max_text_bytes=params["max_text_bytes"])
             return {"result": {"output": result.output, "session_id": result.session_id, "tokens_used": result.tokens_used}}
 
-    runtime = MobKitRuntime.__new__(MobKitRuntime)
+    runtime = MetaRuntime.__new__(MetaRuntime)
     runtime._transport = transport = CriticTransport()
     review = VisualizationReviewService(runtime=runtime, operations=operations, expected_renderer_hash=RENDERER)
     native.service = review

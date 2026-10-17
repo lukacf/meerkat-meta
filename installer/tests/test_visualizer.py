@@ -90,7 +90,7 @@ class NativeMembers:
         self.session_override = None
 
     async def ensure_member(self, identity, role, **options):
-        from meerkat_mobkit.types import MemberSnapshot
+        from meerkat_meta.types import MemberSnapshot
         self.ensures.append((identity, role, copy.deepcopy(options)))
         if identity not in self.members:
             self.members[identity] = MemberSnapshot(identity, role, "active", [], options["labels"])
@@ -98,7 +98,7 @@ class NativeMembers:
         return self.members[identity]
 
     async def member_status(self, identity):
-        from meerkat_mobkit.types import RichMemberSnapshot
+        from meerkat_meta.types import RichMemberSnapshot
         return RichMemberSnapshot("idle", None, None, 0, False, self.sessions[identity])
 
     async def retire_member(self, identity):
@@ -1454,7 +1454,7 @@ async def test_inapplicable_fields_still_obey_global_bounds_and_relevant_filters
 
 @pytest.mark.asyncio
 async def test_current_inspection_schema_and_handlers_cross_fresh_and_resumed_sdk_build_callbacks(service):
-    from meerkat_mobkit.agent_builder import CallbackDispatcher
+    from meerkat_meta.agent_builder import CallbackDispatcher
     dispatcher = CallbackDispatcher()
     class SessionBuilder:
         async def build_agent(self, draft):
@@ -1532,7 +1532,7 @@ async def test_restart_recovers_old_publication_from_exact_native_ack_without_pa
         return SimpleNamespace(json=lambda: {"frames": frames})
     monkeypatch.setattr("launchkit.architect._native_request", request)
     async def status_post(client, url, **kwargs):
-        assert url.endswith("/console/rpc") and kwargs["json"]["method"] == "mobkit/member_status"
+        assert url.endswith("/console/rpc") and kwargs["json"]["method"] == "meta/member_status"
         return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"result": {
             "current_session_id": "saved-session", "progress": {"run_state": "idle", "in_flight_work": 0}}})
     monkeypatch.setattr("httpx.AsyncClient.post", status_post)
@@ -1742,7 +1742,7 @@ async def test_source_edits_require_the_exact_frozen_base_and_current_request_bi
 
 @pytest.mark.asyncio
 async def test_source_edit_publication_schema_and_handler_cross_fresh_and_resumed_callbacks(service):
-    from meerkat_mobkit.agent_builder import CallbackDispatcher
+    from meerkat_meta.agent_builder import CallbackDispatcher
     dispatcher = CallbackDispatcher()
     class SessionBuilder:
         async def build_agent(self, draft):

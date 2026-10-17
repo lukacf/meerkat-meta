@@ -16,6 +16,8 @@ from launchkit import sdk_wheel_integrity as integrity
 from launchkit.templates import install_candidate as installed
 from test_installed_sdk_wheel_proof import inert_wheel
 
+from sdk_source_import_guard import no_selected_sdk_import
+
 
 def hashed(value):
     return hashlib.sha256(value).hexdigest()
@@ -149,7 +151,6 @@ def test_exact_pair_private_copies_hashes_isolation_readback_and_original_facts(
     assert {path: path.read_bytes() for path in before} == before
     assert pair_files.copied and all(not path.exists() for path in pair_files.copied)
     assert_no_success_receipt_or_private_copy(pair_files)
-    assert not any(name in sys.modules for name in ("meerkat_meta", "meerkat_toolkit"))
 
 
 @pytest.mark.parametrize("defect", ["meta-bytes", "toolkit-bytes", "selected-hash", "selected-type",

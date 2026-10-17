@@ -23,6 +23,8 @@ from test_trial_replay_capsule import (
     artifact_bytes, as_flow_trial, attach_repair, load_repair, replay_fixture, write_build,
 )
 
+from meta_trial_fixtures import selected, meta_trial_runtime
+
 
 class OfflineTerminalReplayService(RehearsalService):
     """Real host admission with labelled offline worker rows, no native calls."""
@@ -62,7 +64,7 @@ class OfflineTerminalReplayService(RehearsalService):
 
 
 @pytest.fixture
-def fresh_service(replay_fixture, monkeypatch):
+def fresh_service(replay_fixture, monkeypatch, selected):
     monkeypatch.setenv("OPENAI_API_KEY", "offline-provider-fixture-never-used")
     monkeypatch.setattr("launchkit.rehearsal.planner_capability", lambda: {"available": True})
     fixture = replay_fixture

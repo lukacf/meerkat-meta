@@ -2,6 +2,8 @@ import asyncio
 import pytest
 from launchkit.visualization_operations import VisualizationOperations
 from launchkit.visualizer import VisualizerPending
+from test_meta_guide_runtime import selected as selected_guide_runtime
+
 
 
 @pytest.fixture
@@ -244,7 +246,7 @@ async def test_stream_coalesces_three_queued_changes_without_cancelling_admitted
     (False, 'none'), (False, 'before'), (False, 'after'), (True, 'none'),
 ])
 async def test_restored_native_owner_drains_before_latest_stream_revision_is_admitted(
-        tmp_path, monkeypatch, same_owner, window):
+        tmp_path, monkeypatch, same_owner, window, selected_guide_runtime):
     import copy
     import hashlib
     import json
@@ -253,12 +255,16 @@ async def test_restored_native_owner_drains_before_latest_stream_revision_is_adm
     from launchkit.projects import fingerprint
     from launchkit.visualizer import CONTRACT_VERSION, REFERENCE_ROOT, VisualizerService, visualization_examples
     from launchkit.visualization_review import bundled_review_reference_context
-    from meerkat_mobkit import ToolResultContent
+    from meerkat_meta import ToolResultContent
 
     async def start():
         pass
+    from test_visualizer import NativeMembers
+    members = NativeMembers()
+    members.session_override = "new-C"
     architect = SimpleNamespace(root=tmp_path, start=start,
-                                runtime=SimpleNamespace(rust_http_base_url='http://native.invalid'))
+                                runtime=SimpleNamespace(rust_http_base_url='http://native.invalid',
+                                                        mob_handle=lambda: members))
     service = VisualizerService(architect, timeout=.02 if window != 'none' else 1, poll_interval=.001)
     # This regression exercises an earlier host's unscoped native protocol.
     # Continuous requests have separate scoped-key coverage below.
@@ -302,6 +308,7 @@ async def test_restored_native_owner_drains_before_latest_stream_revision_is_adm
             assert url.endswith('/console/send')
             sends.append(copy.deepcopy(kwargs['json']))
             return SimpleNamespace(json=lambda: {'interaction_id': 'native-C',
+                                                'identity': service.pending['author_identity'],
                                                 'session_id': 'new-C', 'cursor': 'console:20'})
         assert method == 'get' and url.endswith('/console/timeline')
         if service.pending['admission']['interaction_id'] == 'native-A':
@@ -368,9 +375,13 @@ async def test_restored_native_owner_drains_before_latest_stream_revision_is_adm
     release.set()
     await asyncio.wait_for(asyncio.gather(first_task, *operations.tasks.values(), return_exceptions=True), .5)
     assert len(sends) == 1
+    assert latest['status'] == 'completed', latest.get('error', latest)
     latest_key = service.request_binding(latest_spec, model)['native_request_key']
     assert author_reads == [latest_key]
-    assert f'request {latest_key}.' in sends[0]['content'] and sends[0]['identity'] == 'visualizer:main'
+    assert f'request {latest_key}.' in sends[0]['content']
+    assert sends[0]['identity'].startswith('visualizer-request-')
+    assert members.ensures[0][0] == sends[0]['identity']
+    assert members.retirements == [sends[0]['identity']]
     assert latest['status'] == 'completed' and latest['artifact']['key'] == latest_key
     assert latest['artifact']['native_run']['interaction_id'] == 'native-C'
     assert reads == ['console:10'] * (2 if window != 'none' else 1)

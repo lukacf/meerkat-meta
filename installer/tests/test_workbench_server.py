@@ -174,14 +174,18 @@ def test_live_proposal_is_scoped_to_its_running_setup(
 
     async def read(service, requested_identity):
         calls.append((service, requested_identity))
-        return {'id': identity, 'operation': {'status': operation_status}, 'proposal': None}
+        return {'id': identity, 'version': 1,
+                'operation': {'status': operation_status, 'version': 1, 'request_id': 'a' * 64},
+                'proposal': None}
 
     context = None if context_identity is None else {
         'guide_id': identity if context_identity == 'current' else 'another-setup',
+        'guide_version': 1, 'operation_request_id': 'a' * 64,
     }
     monkeypatch.setattr(server, 'guide_operations', SimpleNamespace(read=read))
     monkeypatch.setattr(server, 'architect', SimpleNamespace(
-        guide_context=context, proposal={'blueprint': blueprint},
+        guide_context=context, proposal={'blueprint': blueprint}, guide_result=None,
+        message_lock=SimpleNamespace(locked=lambda: True),
     ))
 
     response = client.get(f'/api/guide/{identity}')
@@ -189,9 +193,11 @@ def test_live_proposal_is_scoped_to_its_running_setup(
     assert calls == [(server.guide, identity)]
     assert response.json()['proposal'] is None
     if exposes_live:
-        assert response.json()['live_proposal'] == blueprint
+        assert response.json()['live_design'] == {
+            'guide_id': identity, 'guide_version': 1, 'request_id': 'a' * 64,
+            'blueprint': blueprint, 'brief': None, 'context_pending': True}
     else:
-        assert 'live_proposal' not in response.json()
+        assert 'live_design' not in response.json()
 
 
 def test_native_guide_timeline_validates_limit_before_delegating(client, monkeypatch):

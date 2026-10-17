@@ -343,6 +343,7 @@ def test_existing_private_port_validation_fails_closed_without_disclosing_other_
     target = tmp_path / "application"
     target.mkdir()
     (target / ".env").write_text('MOBKIT_PORT="invalid"\nOPENAI_API_KEY="synthetic-private-value"\n')
+    (target / ".env").chmod(0o600)
     with pytest.raises(ValueError, match="Choose a Console port") as failure:
         ports.installed_console_port(target, 4110)
     assert "synthetic-private-value" not in str(failure.value)

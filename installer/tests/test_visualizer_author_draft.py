@@ -11,7 +11,7 @@ from launchkit.visualizer import (
     MAX_CODE_LENGTH, VisualizerPending, VisualizerService, VisualizerUnavailable,
     visualization_request_message,
 )
-from test_visualizer import CODE, inputs, native_completion, service
+from test_visualizer import CODE, inputs, native_admission, native_completion, service
 
 
 DRAFT = CODE.replace("duration:36", "duration:43") + "\r\n// Distinct caf\u00e9 composition.\r\n"
@@ -46,7 +46,9 @@ async def test_exact_owner_source_is_saved_before_one_ordinary_native_send(servi
     artifact = await service.generate(*inputs(), feedback=feedback)
     sends = [kwargs["json"] for method, _, kwargs in calls if method == "post"]
     assert len(sends) == len(frozen) == 1
-    assert sends[0]["identity"] == "visualizer:main" and sends[0]["origin"] == "launch-visualizer"
+    assert sends[0]["identity"] == frozen[0]["author_identity"]
+    assert sends[0]["identity"].startswith("visualizer-request-")
+    assert sends[0]["origin"] == "launch-visualizer"
     assert DRAFT not in sends[0]["content"]
     assert frozen[0]["author_draft_delivery"] == "inspection-v1"
     assert frozen[0]["author_draft"]["code_hash"] in sends[0]["content"]
@@ -296,7 +298,7 @@ async def test_preupgrade_lost_response_keeps_original_inline_admission_body_and
 @pytest.mark.asyncio
 async def test_draft_retrieval_tool_is_available_to_fresh_and_resumed_native_build_callbacks(
         service, monkeypatch, tmp_path):
-    from meerkat_mobkit.agent_builder import CallbackDispatcher
+    from meerkat_meta.agent_builder import CallbackDispatcher
 
     path = tmp_path / "owner-draft.js"
     path.write_bytes(DRAFT.encode("utf-8"))
@@ -316,8 +318,11 @@ async def test_draft_retrieval_tool_is_available_to_fresh_and_resumed_native_bui
 
     dispatcher.register_builder(SessionBuilder())
     before = copy.deepcopy(service.pending)
-    for scope, resume in (("fresh-draft", None), ("restored-draft", "saved-native-session")):
-        options = {"scope_id": scope, "profile_name": "visualizer"}
+    for scope, resume in (("fresh-draft", None), ("restored-draft", before["author_session_id"])):
+        options = {"scope_id": scope, "profile_name": "visualizer",
+                   "session_id": before["author_session_id"],
+                   "labels": {"visualization_author_identity": before["author_identity"],
+                              "visualization_request_key": before["key"]}}
         if resume:
             options["resume_session_id"] = resume
         result = await dispatcher.handle_callback("callback/build_agent", {"options": options})
@@ -345,7 +350,7 @@ async def test_native_author_can_publish_exact_frozen_draft_by_hash_after_comple
     async def request(client, method, url, **kwargs):
         calls.append((method, copy.deepcopy(kwargs)))
         if method == "post":
-            return SimpleNamespace(json=lambda: {"cursor": 1, "interaction_id": "native-visualization"})
+            return SimpleNamespace(json=lambda: native_admission(service, "native-visualization"))
         job = service.pending
         await service.inspect({"view": "overview", "request_key": job["key"], "include_author_references": True})
         await service.inspect({"view": "author_draft", "request_key": job["key"]})

@@ -11,8 +11,8 @@ import pytest
 from launchkit import visualization_review as references
 from launchkit import visualizer as module
 from launchkit.projects import fingerprint
-from meerkat_mobkit import ToolResultContent
-from meerkat_mobkit.agent_builder import CallbackDispatcher
+from meerkat_meta import ToolResultContent
+from meerkat_meta.agent_builder import CallbackDispatcher
 from test_visualizer import CODE, inputs, large_inspection_inputs, native_admission, native_completion, revision_context, service, view_scope_inputs
 from test_visualizer_author_references import active_job, callbacks
 

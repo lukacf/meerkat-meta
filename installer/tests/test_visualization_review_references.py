@@ -12,8 +12,8 @@ import pytest
 
 from launchkit import visualization_review as module
 from launchkit.projects import fingerprint
-from meerkat_mobkit.agent_builder import CallbackDispatcher
-from meerkat_mobkit.types import HelperResult
+from meerkat_meta.agent_builder import CallbackDispatcher
+from meerkat_meta.types import HelperResult
 from test_visualization_review import Operations, Runtime, frame, png, report, service, source, finish
 
 

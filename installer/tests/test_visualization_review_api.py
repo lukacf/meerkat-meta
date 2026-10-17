@@ -1,4 +1,6 @@
 from types import SimpleNamespace
+from test_meta_guide_runtime import selected as selected_guide_runtime
+
 
 import pytest
 from fastapi.testclient import TestClient
@@ -109,11 +111,11 @@ def test_correction_requires_the_saved_report_and_rechecks_atomic_head(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_critic_runtime_has_no_seeds_or_mutable_setup_tools(tmp_path, monkeypatch):
+async def test_critic_runtime_has_no_seeds_or_mutable_setup_tools(tmp_path, monkeypatch, selected_guide_runtime):
     import tomllib
     from unittest.mock import AsyncMock
     from launchkit import visual_review_runtime as module
-    from meerkat_mobkit import MobKit
+    from meerkat_meta import Meta
 
     captured, builds = {}, []
     process = SimpleNamespace(pid=123, returncode=None)
@@ -133,7 +135,7 @@ async def test_critic_runtime_has_no_seeds_or_mutable_setup_tools(tmp_path, monk
             builds.append(True)
             return runtime
 
-    monkeypatch.setattr(MobKit, 'builder', lambda: Builder())
+    monkeypatch.setattr(Meta, 'builder', lambda: Builder())
     monkeypatch.setattr(module, 'planner_capability', lambda: {'available': True, 'provider': 'openai'})
     monkeypatch.setattr(module, 'gateway_path', lambda: tmp_path / 'fixture-gateway')
     owner = module.VisualReviewRuntime(tmp_path)
@@ -167,9 +169,9 @@ async def test_critic_runtime_has_no_seeds_or_mutable_setup_tools(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_failed_critic_start_does_not_retry_automatically(tmp_path, monkeypatch):
+async def test_failed_critic_start_does_not_retry_automatically(tmp_path, monkeypatch, selected_guide_runtime):
     from launchkit import visual_review_runtime as module
-    from meerkat_mobkit import MobKit
+    from meerkat_meta import Meta
     builds = []
 
     class Builder:
@@ -180,7 +182,7 @@ async def test_failed_critic_start_does_not_retry_automatically(tmp_path, monkey
             builds.append(True)
             raise RuntimeError('private-native-start-failure')
 
-    monkeypatch.setattr(MobKit, 'builder', lambda: Builder())
+    monkeypatch.setattr(Meta, 'builder', lambda: Builder())
     monkeypatch.setattr(module, 'planner_capability', lambda: {'available': True, 'provider': 'openai'})
     monkeypatch.setattr(module, 'gateway_path', lambda: tmp_path / 'fixture-gateway')
     owner = module.VisualReviewRuntime(tmp_path)

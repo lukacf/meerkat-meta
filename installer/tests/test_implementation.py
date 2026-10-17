@@ -17,6 +17,8 @@ from launchkit.implementation_workspace import ImplementationWorkspace
 from launchkit.generator import PackageFile
 from launchkit.projects import DraftConflict, fingerprint
 
+from launchkit.implementation_workspace import _sandbox_executable as actual_sandbox_executable
+
 
 class Guide:
     def __init__(self):
@@ -47,6 +49,9 @@ class Service(ImplementationService):
 
 @pytest.fixture
 def service(tmp_path, monkeypatch):
+    # Service._run is an inert caller fixture; no generated code executes here.
+    sandbox = actual_sandbox_executable()
+    monkeypatch.setattr("launchkit.implementation_workspace._sandbox_executable", lambda: sandbox or "/fictional/sandbox")
     monkeypatch.setattr("launchkit.planner.planner_capability", lambda: {"available": True, "provider": "openai"})
     return Service(tmp_path, Guide())
 
@@ -978,8 +983,7 @@ async def test_new_feedback_retains_earlier_implementation_requests_as_original_
 
 async def test_first_partial_review_retry_exposes_protected_tests_without_inventing_assessment(service):
     from launchkit.acceptance import SemanticAcceptance
-    from launchkit.implementation_workspace import _sandbox_executable
-    if not _sandbox_executable():
+    if not actual_sandbox_executable():
         pytest.skip("Independent checks have no unsandboxed execution fallback.")
     original_request = "Revoked approval must reject the next action."
     first = await service.submit(service.guide.identity, 3, original_request)

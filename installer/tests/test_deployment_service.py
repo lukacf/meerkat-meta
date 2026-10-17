@@ -664,19 +664,20 @@ async def test_manager_interprets_actual_launchd_paths_and_systemd_states(owned)
     assert str(error.value) == "The user service manager could not be queried."
     assert error.value.query_failures == failures
     # Unavailable manager access is observation failure, not native terminality.
-    _, _, directory, _ = owned
+    _, _, directory, owned_service = owned
+    owned_failures = failures if owned_service["manager"] == "launchd" else failures[:1]
     bootstrap = {"complete": True, "ready": True, "counts": {"broken": 0}, "identities": {"lead:main": {}}}
     update_receipt(directory, status="running", health="ready", runtime_pid=9000,
                    service_supervisor_pid=4567, service_instance_id="current-generation",
                    bootstrap=bootstrap, process_live=True)
     unavailable = await background_status(directory, Queries([(141, hostile), (113, "")]))
     assert unavailable["health"] == "unknown" and not unavailable["process_live"]
-    assert unavailable["service_observation"]["query_failures"] == failures
+    assert unavailable["service_observation"]["query_failures"] == owned_failures
     assert unavailable["service_observation"]["owned"] is False
     assert unavailable["service"]["public_summary"]["definition_verified"] is False
     assert unavailable["detail"] == "The user service manager could not be queried."
     stored = read_receipt(directory)
-    assert stored["service_observation"]["query_failures"] == failures
+    assert stored["service_observation"]["query_failures"] == owned_failures
     assert stored["status"] == "running" and stored["health"] == "ready"
     assert stored["runtime_pid"] == 9000 and stored["bootstrap"] == bootstrap
     assert stored["service_instance_id"] == "current-generation" and stored["process_live"]

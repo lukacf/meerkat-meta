@@ -16,6 +16,8 @@ from launchkit.templates import install_candidate as installed
 from test_sdk_wheel_pair_install import pair_files, put_installed
 from test_sdk_dependency_install_sequence import sequence_files
 
+from sdk_source_import_guard import no_selected_sdk_import
+
 
 def command_owner(root):
     owner = worker.Supervisor.__new__(worker.Supervisor)
@@ -200,7 +202,7 @@ async def test_selected_pair_dependencies_and_nested_bytecode_use_original_super
     assert (files.site / "fixture_sequence/__init__.py").read_bytes() == files.dependencies[0].values["fixture_sequence/__init__.py"]
     for process in files.children:
         assert_reaped(process)
-    assert not any(name in sys.modules for name in ("meerkat_meta", "meerkat_toolkit", "fixture_sequence"))
+    assert "fixture_sequence" not in sys.modules
 
 
 @pytest.mark.parametrize("interruption", ["stop", "cancel"])

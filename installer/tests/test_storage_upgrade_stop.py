@@ -113,7 +113,7 @@ def checked_start(project, monkeypatch):
         return None, project.root, {}
 
     namespace = {**worker.__dict__, "supervisor": supervisor, "directory": project.root,
-        "recover_current": False, "dependency_update": {"from_version": "0.8.42", "to_version": "0.8.46"},
+        "recover_current": False, "product_update": False, "dependency_update": {"from_version": "0.8.42", "to_version": "0.8.46"},
         "verification_kwargs": {}, "current_transaction": current_transaction,
         "expected_binding": None, "expected_installation": None, "updates": updates,
         "journal": lambda *args, **kwargs: None, "verify_destination": lambda *args: None,

@@ -15,6 +15,8 @@ from launchkit.templates import install_candidate as installed
 from test_sdk_wheel_pair_install import pair_files, install as install_pair, assert_no_success_receipt_or_private_copy
 from test_selected_dependency_install import inert_wheel, put
 
+from sdk_source_import_guard import no_selected_sdk_import
+
 
 @pytest.fixture
 def sequence_files(pair_files, monkeypatch):
@@ -107,7 +109,7 @@ def test_selected_batch_sdk_then_dependencies_then_final_sdk_readback(sequence_f
     assert set(kwargs) == {"root", "python", "current"} and callable(kwargs["current"])
     assert before > 0 and all(files.checks), "Both SDK and dependency phases consult the same original owner."
     assert (files.site / "fixture_sequence/__init__.py").read_bytes() == files.dependencies[0].values["fixture_sequence/__init__.py"]
-    assert not any(name in sys.modules for name in ("meerkat_meta", "meerkat_toolkit", "fixture_sequence"))
+    assert "fixture_sequence" not in sys.modules
     assert_retained(files)
 
 

@@ -13,6 +13,7 @@ import pytest
 from launchkit import toolkit_catalog as module
 from launchkit.toolkit_catalog import ToolkitCatalog, ToolkitCatalogUnavailable
 from launchkit.templates_v2.mcp_connections import MCPConnection
+from launchkit.architect import ArchitectUnavailable
 from test_architect_startup_recovery import FakeRuntime, startup
 
 
@@ -310,17 +311,29 @@ async def test_native_start_failure_closes_catalog_and_releases_existing_lock(ho
 async def test_catalog_cleanup_error_preserves_both_failures_and_lock_cleanup(startup, monkeypatch):
     service, controller = startup
     runtime = FakeRuntime()
+    original_native_shutdown = runtime.shutdown
     async def native_shutdown(): raise RuntimeError("NATIVE_CLEANUP_ERROR")
     runtime.shutdown = native_shutdown
     controller.outcomes = [runtime]
     monkeypatch.delenv(module.CONFIG_ENV, raising=False)
     await service.start()
+    original_catalog_shutdown = service.toolkit_catalog.shutdown
+    original_lease = service.lock_context
     async def catalog_shutdown(): raise RuntimeError("PRIVATE_CATALOG_CLEANUP_ERROR")
     monkeypatch.setattr(service.toolkit_catalog, "shutdown", catalog_shutdown)
     with pytest.raises(BaseExceptionGroup) as error: await service.shutdown()
     assert [str(item) for item in error.value.exceptions] == ["NATIVE_CLEANUP_ERROR", "PRIVATE_CATALOG_CLEANUP_ERROR"]
+    assert service.runtime is runtime and service.lock_context is original_lease
+    assert controller.lock_events == ["acquired"] and service.state == "failed"
+    assert service.provider_stop_failed
+    with pytest.raises(ArchitectUnavailable, match="cleanup is unconfirmed"):
+        await service.start(retry_failed=True)
+    assert controller.builds == 1
+    runtime.shutdown = original_native_shutdown
+    monkeypatch.setattr(service.toolkit_catalog, "shutdown", original_catalog_shutdown)
+    await service.shutdown()
     assert service.runtime is None and service.lock_context is None
-    assert controller.lock_events == ["acquired", "released"] and service.state == "stopped"
+    assert controller.lock_events == ["acquired", "released"] and not service.provider_stop_failed
 
 
 @pytest.mark.asyncio
@@ -330,14 +343,17 @@ async def test_catalog_close_failure_is_unavailable_and_retains_owned_connection
     controller.outcomes = [runtime]
     await service.start()
     connection = host.instances[0]
+    original_lease = service.lock_context
     async def failed_close(): raise RuntimeError("CATALOG_CLOSE_FAILED")
     original_close = connection.close
     connection.close = failed_close
     with pytest.raises(RuntimeError, match="CATALOG_CLOSE_FAILED"): await service.shutdown()
-    assert runtime.shutdown_calls == 1 and service.lock_context is None and service.state == "stopped"
+    assert runtime.shutdown_calls == 1 and service.lock_context is original_lease and service.state == "failed"
     assert service.toolkit_catalog.connection is connection
     assert not service.toolkit_catalog.status()["available"]
-    assert controller.lock_events == ["acquired", "released"]
+    assert controller.lock_events == ["acquired"] and service.provider_stop_failed
     connection.close = original_close
     await service.shutdown()
     assert connection.closed == 1 and service.toolkit_catalog.connection is None
+    assert runtime.shutdown_calls == 1 and service.lock_context is None
+    assert controller.lock_events == ["acquired", "released"] and not service.provider_stop_failed

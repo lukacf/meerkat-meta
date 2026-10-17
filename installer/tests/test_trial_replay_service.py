@@ -19,6 +19,8 @@ from test_rehearsal_conversation import native_seam
 from test_trial_replay_capsule import attach_repair, artifact_bytes, replay_fixture, write_build
 from test_trial_replay_journey import fresh_service, replay
 
+from meta_trial_fixtures import selected, meta_trial_runtime
+
 
 class NativePipeFixture:
     """A fake owned command pipe that acknowledges real host commands on disk.
@@ -266,7 +268,7 @@ async def test_completed_native_first_turn_does_not_pass_a_longer_saved_journey(
 @pytest.mark.parametrize("mode", ["text", "flow"])
 async def test_closed_replay_uses_actual_worker_ledger_semantics(native_seam, monkeypatch, mode):
     """Run production execute/trace wiring with only native I/O replaced."""
-    import meerkat_mobkit
+    import meerkat_meta
     worker, directory, observed = native_seam
     frozen = json.loads((directory / "input.json").read_text())
     frozen.update(keep_open=False, replay_continuations=[], trial_replay={"expected_turns": 1})
@@ -277,7 +279,7 @@ async def test_closed_replay_uses_actual_worker_ledger_semantics(native_seam, mo
              "prompt": "Prepare this isolated sample."}]}]
         frozen.update(flow_id="briefing", params={"sample": "exact saved parameters"},
                       trial_replay={"expected_turns": 0})
-        original_builder = meerkat_mobkit.MobKit.builder
+        original_builder = meerkat_meta.Meta.builder
         class Flow:
             async def run_flow(self, flow_id, params):
                 flow_calls.append((flow_id, params))
@@ -293,17 +295,18 @@ async def test_closed_replay_uses_actual_worker_ledger_semantics(native_seam, mo
                 return runtime
             value.build = build
             return value
-        monkeypatch.setattr(meerkat_mobkit.MobKit, "builder", builder)
+        monkeypatch.setattr(meerkat_meta.Meta, "builder", builder)
     write_private(directory / "input.json", frozen)
     update_receipt(directory, trial_replay=frozen["trial_replay"])
     await worker.execute(directory, asyncio.Event())
     turns = trial_turn_state(directory)
     if mode == "text":
-        assert turns["status"] == "running" and turns["turn_count"] == 1
+        assert turns["status"] == "completed" and turns["turn_count"] == 1
         assert len(turns["turns"]) == 1 and turns["turns"][0]["status"] == "settled"
         assert observed.calls[0]["content"] == frozen["text"]
     else:
-        assert not turns and not observed.calls
+        assert turns["status"] == "completed" and turns["turn_count"] == 0
+        assert turns["turns"] == [] and not observed.calls
         assert flow_calls == [("briefing", frozen["params"])]
         assert read_receipt(directory)["flow_run_id"] == "offline-flow-execution"
     service = RehearsalService(directory.parent, SimpleNamespace())

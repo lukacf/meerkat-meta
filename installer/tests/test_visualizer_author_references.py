@@ -12,7 +12,7 @@ import pytest
 from launchkit import visualization_review as references
 from launchkit import visualizer as module
 from launchkit.projects import fingerprint
-from meerkat_mobkit.agent_builder import CallbackDispatcher
+from meerkat_meta.agent_builder import CallbackDispatcher
 from test_visualizer import CODE, inputs, native_completion, service
 
 
