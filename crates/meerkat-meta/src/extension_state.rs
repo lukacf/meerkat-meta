@@ -118,9 +118,31 @@ pub(crate) fn open_disk_store(
     ))
 }
 
+/// The refusal of a create under an id that documents still name, with
+/// every way to clear the references.
+fn mob_id_still_named(mob_id: &str) -> String {
+    format!(
+        "mob id '{mob_id}' is still named by extension documents of this realm, as their \
+         owner (Owner::Mob) or in an audience grant or deny (Audience::Mob): a new mob under \
+         it would inherit what they grant. Choose another mob id, or \
+         have a host or operator with access to the extension store clear every reference \
+         first: transfer each document the id owns to another owner, and remove or replace \
+         each Audience::Mob grant or deny naming it (an owner transfer leaves those). The \
+         document tools alone cannot manage a document whose owning mob was destroyed."
+    )
+}
+
+/// Destroy is terminal: a destroyed mob's handle is no authority.
+fn is_destroyed(handle: &MobReadHandle) -> bool {
+    handle.status_observation_snapshot() == meerkat_mob::MobState::Destroyed
+}
+
 /// Holds runtime query authorities, never copied lineage or document policy.
 /// A handle is installed by Meerkat's pre-activation callback before its first
-/// member can dispatch. Every operation reads current authority afresh.
+/// member can dispatch. Every operation reads current authority afresh. A
+/// destroyed mob grants nothing: lookups and owner scans skip it, and the
+/// mob-tool state's after-destroy hook drops its handle before the destroy's
+/// storage cleanup, which a handle still held here would refuse.
 pub(crate) struct NativeAuthorityRegistry {
     realm: String,
     identity_bridge_mob: String,
@@ -190,11 +212,124 @@ impl NativeAuthorityRegistry {
         })
     }
 
+    /// The release counterpart of [`Self::before_activation`] for the agent
+    /// mob-tool state: it drops a destroyed child's handle before that
+    /// destroy's storage cleanup drains the child's database observer, and
+    /// with it the handle of every other mob destroyed by then.
+    pub(crate) fn after_destroy(self: &Arc<Self>) -> meerkat_mob_mcp::MobAfterDestroy {
+        let registry = Arc::downgrade(self);
+        Arc::new(move |_destroyed: &meerkat_mob::MobId| {
+            if let Some(registry) = registry.upgrade() {
+                registry.forget_destroyed();
+            }
+        })
+    }
+
+    /// Drop every bound handle that observes a destroyed mob. The destroy the
+    /// hook reports is one of them; a mob destroyed through its own handle,
+    /// or by a rollback inside Meerkat, reports none of its own and is
+    /// released here with the next. A mob bound under an id since is another
+    /// mob and stays bound. The handles are dropped after the lock is
+    /// released.
+    fn forget_destroyed(&self) {
+        let released: Vec<MobReadHandle> = {
+            let mut handles = self
+                .handles
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let destroyed: Vec<String> = handles
+                .iter()
+                .filter(|(_, handle)| is_destroyed(handle))
+                .map(|(id, _)| id.clone())
+                .collect();
+            destroyed
+                .iter()
+                .filter_map(|id| handles.remove(id))
+                .collect()
+        };
+        drop(released);
+    }
+
+    /// The admission counterpart of [`Self::before_activation`] for the agent
+    /// mob-tool state. Documents name a mob by its id alone, as their owner
+    /// or in an audience entry, so a new mob under the id of a destroyed one
+    /// would inherit what those documents grant it. Before the state creates
+    /// any mob (an agent's `mob_create`, a temporary council, a create with
+    /// no owner session), this refuses an id that a live document of this
+    /// realm still names.
+    ///
+    /// - The one exemption is the implicit delegation mob that its own
+    ///   session's runtime path creates or recreates: Meerkat reports that
+    ///   origin only for that path, under the id it derives from the session,
+    ///   and the mob keeps what its predecessor's documents grant, as the
+    ///   same session's delegation mob. A mob a caller names is never
+    ///   reported as one, whatever its id, and a create without an owner
+    ///   session gets no exemption.
+    /// - Any other id is refused while documents name it, whatever the
+    ///   registry binds under it, also for the owner session that created
+    ///   the destroyed mob: ownership is by id, not by mob instance.
+    /// - A store that cannot answer, a registry that is gone and a failed
+    ///   read all refuse the create.
+    ///
+    /// The check reads every live document of the realm under the store's
+    /// one connection, so document reads and writes of every session wait
+    /// for it, and a refusal tells the caller that some document names the
+    /// id, also one it cannot read. It is not ordered against a document
+    /// write already in flight: a write whose caller authority was resolved
+    /// while the destroyed mob was live (the embedding host's tool resolves
+    /// the caller, then mutates) can still commit a reference to the id
+    /// after the check passed. Restoring a persisted mob is no create and is
+    /// never checked.
+    pub(crate) fn before_create(
+        self: &Arc<Self>,
+        store: Arc<dyn documents::ExtensionDocumentStore>,
+    ) -> meerkat_mob_mcp::MobBeforeCreate {
+        let registry = Arc::downgrade(self);
+        Arc::new(move |request: meerkat_mob_mcp::MobCreateRequest| {
+            let registry = registry.clone();
+            let store = Arc::clone(&store);
+            Box::pin(async move {
+                if request.implicit_delegation_mob {
+                    return Ok(());
+                }
+                let mob_id = request.mob_id.as_str();
+                let registry = registry.upgrade().ok_or_else(|| {
+                    format!(
+                        "the extension authority registry is gone, so no check that \
+                         documents name mob id '{mob_id}' can run"
+                    )
+                })?;
+                registry.check_mob_id_unnamed(store.as_ref(), mob_id).await
+            })
+        })
+    }
+
+    /// The check [`Self::before_create`] runs for a create it does not
+    /// exempt: refuse `mob_id` while a live document of this realm names it.
+    async fn check_mob_id_unnamed(
+        &self,
+        store: &dyn documents::ExtensionDocumentStore,
+        mob_id: &str,
+    ) -> Result<(), String> {
+        // Whatever the registry binds under the id is no reason to skip
+        // the check: a mob that activates under it may replace a stopped
+        // binding, and would inherit what the documents grant the id.
+        match store.references_mob(&self.realm, mob_id).await {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(mob_id_still_named(mob_id)),
+            Err(error) => Err(format!(
+                "the extension documents could not be checked for references to mob id \
+                 '{mob_id}' ({error}), so the create is refused"
+            )),
+        }
+    }
+
     fn handle(&self, id: &str) -> documents::Result<MobReadHandle> {
         self.handles
             .read()
             .map_err(|_| documents::Error::AuthorityUnavailable)?
             .get(id)
+            .filter(|handle| !is_destroyed(handle))
             .cloned()
             .ok_or(documents::Error::AuthorityUnavailable)
     }
@@ -554,6 +689,7 @@ impl ToolCallerResolver for NativeCallerResolver {
             .read()
             .map_err(|_| documents::Error::AuthorityUnavailable)?
             .values()
+            .filter(|handle| !is_destroyed(handle))
             .cloned()
             .collect();
         let mut managed_mobs = BTreeSet::new();
@@ -808,5 +944,376 @@ comms = true
         assert!(child_available.resolve(&child_context, None).await.is_ok());
         child.stop().await.unwrap();
         handle.stop().await.unwrap();
+    }
+
+    /// A child mob destroyed through its own handle, outside the agent
+    /// mob-tool state, keeps no extension authority: it is no valid document
+    /// owner any more, and its owner no longer manages it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_authority_registry_refuses_a_mob_destroyed_outside_the_mob_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            r#"
+[mob]
+id = "destroyed-authority"
+[profiles.worker]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+[profiles.worker.tools]
+comms = true
+"#,
+        )
+        .unwrap();
+        let spec = crate::MobBootstrapSpec::persistent(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            dir.path().to_path_buf(),
+            4,
+            Arc::new(
+                meerkat_store::SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
+                    .unwrap(),
+            ),
+        )
+        .unwrap()
+        .with_options(crate::MobBootstrapOptions {
+            allow_ephemeral_sessions: false,
+            notify_orchestrator_on_resume: false,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        });
+        let sessions = spec.session_service.clone();
+        let runtime = crate::MobRuntime::bootstrap(spec).await.unwrap();
+        let handle = runtime.handle();
+        let owner = meerkat_mob::AgentIdentity::from("owner");
+        handle
+            .spawn_spec(meerkat_mob::SpawnMemberSpec::host_root(
+                "worker",
+                owner.clone(),
+            ))
+            .await
+            .unwrap();
+        let owner_session = handle
+            .get_member(&owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .bridge_session_id()
+            .unwrap()
+            .clone();
+        let registry = NativeAuthorityRegistry::new(
+            "test".into(),
+            handle.mob_id().to_string(),
+            sessions.clone(),
+            None,
+            None,
+        );
+        registry.before_activation()(handle.read_handle())
+            .await
+            .unwrap();
+        let resolver = NativeCallerResolver {
+            registry: Arc::downgrade(&registry),
+            child_availability: None,
+            requirements: ToolBundleRequirements::durable_documents(
+                "durable-documents-test",
+                "documents_read",
+                "documents_apply",
+            ),
+        };
+        let mut child_definition = handle.definition().clone();
+        child_definition.id = "destroyed-authority-child".into();
+        let child =
+            meerkat_mob::MobBuilder::new(child_definition, meerkat_mob::MobStorage::in_memory())
+                .with_session_service(sessions.clone())
+                .with_default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+                .before_activation(registry.before_activation())
+                .with_owner_bridge_session_create_authority(owner_session.clone(), true, false)
+                .create()
+                .await
+                .unwrap();
+        let child_owner = Owner::Mob(child.mob_id().to_string());
+        let owner_context =
+            ToolDispatchContext::default().with_runtime_identity(owner_session, None);
+        let live = resolver
+            .resolve(&owner_context, Some(&child_owner))
+            .await
+            .unwrap();
+        assert!(documents::can_create(&live, &child_owner));
+
+        child.destroy().await.unwrap();
+        assert!(matches!(
+            resolver.resolve(&owner_context, Some(&child_owner)).await,
+            Err(documents::Error::AuthorityUnavailable)
+        ));
+        let former_owner = resolver.resolve(&owner_context, None).await.unwrap();
+        assert!(!documents::can_create(&former_owner, &child_owner));
+        drop(child);
+        handle.stop().await.unwrap();
+    }
+
+    /// The after-destroy hook releases every bound handle that observes a
+    /// destroyed mob, not only the one it reports: a mob destroyed through
+    /// its own handle, or by a rollback inside Meerkat, reports no destroy of
+    /// its own. A live mob stays bound.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_after_destroy_releases_every_destroyed_mob() {
+        let dir = tempfile::tempdir().unwrap();
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            r#"
+[mob]
+id = "destroyed-sweep"
+[profiles.worker]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+[profiles.worker.tools]
+comms = true
+"#,
+        )
+        .unwrap();
+        let spec = crate::MobBootstrapSpec::persistent(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            dir.path().to_path_buf(),
+            4,
+            Arc::new(
+                meerkat_store::SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
+                    .unwrap(),
+            ),
+        )
+        .unwrap()
+        .with_options(crate::MobBootstrapOptions {
+            allow_ephemeral_sessions: false,
+            notify_orchestrator_on_resume: false,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        });
+        let sessions = spec.session_service.clone();
+        let runtime = crate::MobRuntime::bootstrap(spec).await.unwrap();
+        let handle = runtime.handle();
+        let registry = NativeAuthorityRegistry::new(
+            "test".into(),
+            handle.mob_id().to_string(),
+            sessions.clone(),
+            None,
+            None,
+        );
+        registry.before_activation()(handle.read_handle())
+            .await
+            .unwrap();
+        let mut children = Vec::new();
+        for id in ["sweep-own-handle", "sweep-reported"] {
+            let mut child_definition = handle.definition().clone();
+            child_definition.id = id.into();
+            children.push(
+                meerkat_mob::MobBuilder::new(
+                    child_definition,
+                    meerkat_mob::MobStorage::in_memory(),
+                )
+                .with_session_service(sessions.clone())
+                .with_default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+                .before_activation(registry.before_activation())
+                .create()
+                .await
+                .unwrap(),
+            );
+        }
+        let bound =
+            || -> BTreeSet<String> { registry.handles.read().unwrap().keys().cloned().collect() };
+        assert_eq!(
+            bound(),
+            BTreeSet::from([
+                handle.mob_id().to_string(),
+                "sweep-own-handle".to_string(),
+                "sweep-reported".to_string(),
+            ])
+        );
+
+        for child in &children {
+            child.destroy().await.unwrap();
+        }
+        // Only the second destroy is reported, as the mob-tool state reports
+        // the destroys it runs; the first went through the mob's own handle.
+        registry.after_destroy()(children[1].mob_id());
+        assert_eq!(bound(), BTreeSet::from([handle.mob_id().to_string()]));
+        drop(children);
+        handle.stop().await.unwrap();
+    }
+
+    /// A live binding under an id does not let a create skip the reference
+    /// check: a mob that binds the id at its activation could be another
+    /// mob than the bound one (a stopped binding is replaced), so the
+    /// documents naming the id are checked whatever the registry holds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_a_live_binding_does_not_skip_the_mob_reference_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            r#"
+[mob]
+id = "bound-and-named"
+[profiles.worker]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+[profiles.worker.tools]
+comms = true
+"#,
+        )
+        .unwrap();
+        let spec = crate::MobBootstrapSpec::persistent(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            dir.path().to_path_buf(),
+            4,
+            Arc::new(
+                meerkat_store::SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
+                    .unwrap(),
+            ),
+        )
+        .unwrap()
+        .with_options(crate::MobBootstrapOptions {
+            allow_ephemeral_sessions: false,
+            notify_orchestrator_on_resume: false,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        });
+        let sessions = spec.session_service.clone();
+        let runtime = crate::MobRuntime::bootstrap(spec).await.unwrap();
+        let handle = runtime.handle();
+        let registry = NativeAuthorityRegistry::new(
+            "test".into(),
+            handle.mob_id().to_string(),
+            sessions.clone(),
+            None,
+            None,
+        );
+        registry.before_activation()(handle.read_handle())
+            .await
+            .unwrap();
+        let mob_id = handle.mob_id().to_string();
+        assert!(registry.handle(&mob_id).is_ok(), "the id is bound and live");
+
+        let store: Arc<dyn documents::ExtensionDocumentStore> = Arc::new(
+            documents::SqliteExtensionDocumentStore::open(dir.path().join("documents.sqlite3"))
+                .unwrap(),
+        );
+        let manager = HostAccessContext::new(
+            "test",
+            Principal::Agent("manager".into()),
+            VerifiedLineage::root(),
+            HostPolicy::ALLOW,
+        )
+        .unwrap()
+        .with_memberships(BTreeSet::new(), BTreeSet::from([mob_id.clone()]), false)
+        .unwrap();
+        DocumentService::new("test", "notes", Arc::clone(&store))
+            .unwrap()
+            .mutate(
+                &manager,
+                &documents::RequestIdentity::new("named", b"named").unwrap(),
+                documents::Mutation::Create(documents::NewDocument {
+                    content: documents::DocumentContent {
+                        title: "named".into(),
+                        content_type: "application/test".into(),
+                        schema_version: 1,
+                        payload: vec![1],
+                    },
+                    owner: Some(Owner::Mob(mob_id.clone())),
+                    access: documents::DocumentAccess::default(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let refused = registry
+            .check_mob_id_unnamed(store.as_ref(), &mob_id)
+            .await
+            .expect_err("documents name the id, bound or not");
+        assert!(refused.contains(&mob_id), "{refused}");
+        handle.stop().await.unwrap();
+    }
+
+    /// A document store a pre-0.9 writer left opens under 0.9 once the
+    /// installation is adopted, with its documents intact. Its file name and
+    /// schema did not change; only its ledger domain did, so the fixture is
+    /// this build's store with the predecessor writer's domain. Before the
+    /// adoption the store refuses typed and names the adoption.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_predecessor_document_store_opens_after_adoption() {
+        use crate::storage_provider::MetaStorageProvider as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extension_state.sqlite3");
+        let caller = HostAccessContext::new(
+            "meta",
+            documents::Principal::Agent("writer".into()),
+            documents::VerifiedLineage::root(),
+            documents::HostPolicy::ALLOW,
+        )
+        .unwrap();
+        let content = documents::DocumentContent {
+            title: "written before the rename".into(),
+            content_type: "application/test".into(),
+            schema_version: 1,
+            payload: vec![1, 2, 3],
+        };
+        let written = DocumentService::new(
+            "meta",
+            "notes",
+            Arc::new(open_disk_store(path.clone()).unwrap()),
+        )
+        .unwrap()
+        .mutate(
+            &caller,
+            &documents::RequestIdentity::new("written-before", b"written-before").unwrap(),
+            documents::Mutation::Create(documents::NewDocument {
+                content: content.clone(),
+                owner: None,
+                access: documents::DocumentAccess::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .receipt;
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE meerkat_schema SET domain = 'mobkit-extension-state' \
+                 WHERE domain = 'meta-extension-state'",
+                [],
+            )
+            .unwrap();
+
+        let provider = crate::storage_provider::DiskMetaStorageProvider;
+        let Err(refused) = provider
+            .open_extension_state(
+                &crate::storage_provider::MetaRealmOpenContext::for_state_dir(dir.path()),
+            )
+            .await
+        else {
+            panic!("a predecessor document store must not open");
+        };
+        assert!(
+            refused.to_string().contains("storage-adopt-predecessor"),
+            "{refused}"
+        );
+
+        let adopted = crate::storage_predecessor::adopt_predecessor_state(
+            &crate::storage_predecessor::PredecessorAdoptRequest {
+                state_dir: dir.path().to_path_buf(),
+                mode: crate::storage_migrate::MigrateMode::Apply,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(!adopted.has_errors(), "{:?}", adopted.errors);
+        let Ok(opened) = provider
+            .open_extension_state(
+                &crate::storage_provider::MetaRealmOpenContext::for_state_dir(dir.path()),
+            )
+            .await
+        else {
+            panic!("the adopted document store opens");
+        };
+        let document = DocumentService::new("meta", "notes", opened.store)
+            .unwrap()
+            .get(&caller, &written.document_id)
+            .await
+            .unwrap();
+        assert_eq!(document.revision, written.revision);
+        assert_eq!(document.content, content);
     }
 }

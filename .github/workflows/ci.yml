@@ -262,11 +262,6 @@ jobs:
       # CI test binaries therefore carry no debuginfo; panics keep their
       # messages but backtraces lose file:line. Local builds are unaffected.
       CARGO_PROFILE_DEV_DEBUG: "0"
-      # The in-process held-bootstrap and native-grant tests resolve a
-      # provider identity while they build members but never call the
-      # provider. This is the same fake value the gateway test fixtures give
-      # their child processes, not a secret.
-      OPENAI_API_KEY: sk-regression-test
     steps:
       # The workspace debug build (meerkat 0.7.25 dep tree + all test
       # binaries) plus the rust-cache restore no longer fits beside the
@@ -560,9 +555,13 @@ jobs:
       - run: npm --prefix console exec -- playwright install --with-deps chromium
       - name: Build console acceptance backends
         run: |
-          scripts/repo-cargo build -p meerkat-meta --example library_mode_reference --example console_acceptance_fixture --example memory_console_reference --example workgraph_console_reference
+          scripts/repo-cargo build -p meerkat-meta --example library_mode_reference --example console_acceptance_fixture --example memory_console_reference --example workgraph_console_reference --example mcp_apps_gateway_fixture
           target_dir="$(scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')"
           echo "META_EXAMPLE_BIN_DIR=${target_dir}/debug/examples" >> "$GITHUB_ENV"
+      # The first two MCP Apps steps run the persistent rpc_gateway composition
+      # (mcp_apps_gateway_fixture): members come from the gateway's own member
+      # factories, whose MCP routers carry the stock connector call-context
+      # provider, so an MCP App resource-read regression there fails here.
       - name: Native MCP Apps rendering and reload
         if: matrix.shard == 1
         timeout-minutes: 5
@@ -577,6 +576,16 @@ jobs:
         run: npm --prefix console run e2e:mcp-apps --silent
         env:
           META_MCP_APPS_LONG_POLL: "1"
+          META_BROWSER_EVIDENCE: ${{ github.workspace }}/output/playwright/console-acceptance/mcp-apps
+      # The gateway lane spawns classic members. This one runs the same quick
+      # checks on console_acceptance_fixture, a UnifiedRuntime::builder() host
+      # whose identity-first members carry no call-context provider.
+      - name: Native MCP Apps on a builder host with identity-first members
+        if: matrix.shard == 1
+        timeout-minutes: 5
+        run: npm --prefix console run e2e:mcp-apps --silent
+        env:
+          META_MCP_APPS_BACKEND: builder
           META_BROWSER_EVIDENCE: ${{ github.workspace }}/output/playwright/console-acceptance/mcp-apps
       - run: node console/browser-e2e.cjs --shard=${{ matrix.shard }}/3
       - name: Upload console browser evidence

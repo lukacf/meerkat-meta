@@ -34,7 +34,7 @@ test("authorization feedback projects a typed operation refusal without ending t
   ];
   const entries = mapFramesToTimelineEntries({ agent_id: "a", label: "Agent" }, frames);
   const feedback = entries.find(entry => "operationFeedback" in entry && entry.operationFeedback)?.operationFeedback;
-  assert.equal(feedback?.kind, "permission-refused");
+  assert.equal(feedback?.kind, "operation-refused");
   assert.doesNotMatch(JSON.stringify(feedback), /private-owner-detail-canary/);
   assert.equal(inferResponsePhaseFromFrames(frames, null), "waiting");
   assert.equal(systemNoticeClearsBusyState(frames[1]), false);
@@ -47,11 +47,45 @@ test("authorization feedback distinguishes actual tool refusal from ordinary tex
   const tool = { id: "auth-tool", event: "tool_result_received", data: { id: "call", name: "calendar", is_error: true,
     content: [{ type: "text", text: JSON.stringify({ error: "operation_refused", message: "operation refused" }) }] } };
   const entries = mapFramesToTimelineEntries({ agent_id: "a", label: "Agent" }, [tool]);
-  assert.equal(entries.filter(entry => "operationFeedback" in entry && entry.operationFeedback?.kind === "permission-refused").length, 1);
+  assert.equal(entries.filter(entry => "operationFeedback" in entry && entry.operationFeedback?.kind === "operation-refused").length, 1);
   const ordinary = mapFramesToTimelineEntries({ agent_id: "a", label: "Agent" }, [{
     ...tool, id: "ordinary", data: { ...tool.data, is_error: false, content: [{ type: "text", text: "operation_refused is an example string" }] },
   }]);
   assert.equal(ordinary.some(entry => "operationFeedback" in entry && entry.operationFeedback), false);
+});
+
+test("authorization feedback names no permission cause for an operation refusal", () => {
+  // The host refuses an operation for a policy denial, for an authorization
+  // that changed after the operation was prepared and for request facts it
+  // could not evaluate, and sends all of them alike: the runtime notice and
+  // the tool error name the refusal, never its reason. The card says only
+  // what holds for every one of them.
+  const expected = {
+    kind: "operation-refused",
+    title: "Action refused",
+    detail: "This action was refused under the current authorization, so it did not run. The agent can continue with other work.",
+  };
+  const notice = (id: string, payload: Record<string, unknown>) => ({ id, event: "system_notice", data: { message: {
+    role: "system_notice", kind: "generic", body: "The requested model operation is unavailable under current authorization.",
+    blocks: [{ type: "runtime_notice", category: "operation_refused", payload }],
+  } } });
+  const tool = (id: string, refusal: Record<string, unknown>) => ({ id, event: "tool_result_received", data: {
+    id: "call", name: "calendar", is_error: true, content: [{ type: "text", text: JSON.stringify(refusal) }],
+  } });
+  const message = "operation unavailable under current authorization";
+  for (const frame of [
+    notice("notice", { code: "operation_refused" }),
+    tool("tool", { error: "operation_refused", message }),
+    // A reason no host contract defines falls back to the same card, and is
+    // never shown.
+    notice("notice-with-reason", { code: "operation_refused", kind: "reprepare_required" }),
+    tool("tool-with-reason", { error: "operation_refused", message, data: { kind: "malformed_facts" } }),
+  ]) {
+    const entries = mapFramesToTimelineEntries({ agent_id: "a", label: "Agent" }, [frame]);
+    const feedback = entries.flatMap(entry => "operationFeedback" in entry && entry.operationFeedback ? [entry.operationFeedback] : []);
+    assert.deepEqual(feedback, [expected], frame.id);
+    assert.doesNotMatch(JSON.stringify(feedback), /Permission denied|not permitted|reprepare|malformed/, frame.id);
+  }
 });
 
 test("authorization feedback keeps audit observation failure distinct and nonterminal", () => {
@@ -9931,7 +9965,7 @@ for (const [name, map] of [["console", mapFramesToTimelineEntries], ["shared", m
       { ...base, id: "allowed-result", event: "tool_result_received", data: { id: "allowed", name: "read", is_error: false, content: [{ type: "text", text: "Actual permitted result" }] } },
       { ...base, id: "audit", event: "operation_observation_failed", data: { operation_id: "op-a", phase: "outcome", secret: "audit-secret-canary" } },
     ]);
-    assert.equal(result.filter(e => "operationFeedback" in e && e.operationFeedback?.kind === "permission-refused").length, 2);
+    assert.equal(result.filter(e => "operationFeedback" in e && e.operationFeedback?.kind === "operation-refused").length, 2);
     assert.match(JSON.stringify(result), /Actual permitted result/);
     assert.doesNotMatch(JSON.stringify(result), /private-refusal-canary|hidden-policy-canary|audit-secret-canary/);
     const ordinary = map({ agent_id: "a", label: "Agent" }, [{ ...refused, data: { ...refused.data,

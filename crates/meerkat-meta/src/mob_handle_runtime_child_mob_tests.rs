@@ -1261,6 +1261,61 @@ async fn a_retry_keeps_the_clean_receipt_of_a_stopped_child() {
     );
 }
 
+/// A child destroyed through its own handle stays in the agent mob-tool
+/// state's managed set, and the stand-down still asks it although handle
+/// snapshots withhold a destroyed mob: the answer is accounted for the
+/// child instead of the stand-down passing over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_destroyed_through_its_own_handle_is_still_stood_down() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let host = Host::new();
+    let runtime = lifetime(dir.path(), &unique("own-destroy-root"), &host, |spec| {
+        spec.with_child_mob_storage(durable(dir.path()))
+    })
+    .await
+    .expect("lifetime");
+    let coordinator = coordinator_session(&runtime).await;
+    let child_id = MobId::from(unique("own-destroy-child").as_str());
+    let child = create_child(&runtime, &child_id, coordinator).await;
+    child
+        .destroy()
+        .await
+        .expect("destroy through the child's own handle");
+    drop(child);
+    let state = runtime.agent_mob_mcp_state().expect("agent mob-tool state");
+    assert!(
+        state
+            .mob_handles_snapshot()
+            .await
+            .expect("snapshot")
+            .iter()
+            .all(|(mob_id, _)| mob_id != &child_id),
+        "handle snapshots withhold the destroyed child"
+    );
+    runtime
+        .handle()
+        .shutdown()
+        .await
+        .expect("root mob shutdown");
+    let outcome = runtime
+        .stand_down_child_mobs(std::time::Instant::now() + Duration::from_secs(15))
+        .await;
+    let accounted = match &outcome {
+        crate::child_mob_storage::ChildMobStandDownOutcome::Retained { unsettled } => unsettled
+            .iter()
+            .any(|unsettled| unsettled.contains(child_id.as_str())),
+        crate::child_mob_storage::ChildMobStandDownOutcome::Released { child_mobs }
+        | crate::child_mob_storage::ChildMobStandDownOutcome::HeldUntilProcessExit { child_mobs } => {
+            *child_mobs == 1
+        }
+        _ => false,
+    };
+    assert!(
+        accounted,
+        "the stand-down asked the destroyed child: {outcome:?}"
+    );
+}
+
 /// A child whose member did not settle on the first stand-down keeps that
 /// specific member debt after its actor has gone and a later call only sees
 /// the closed channel.

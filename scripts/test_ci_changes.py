@@ -141,6 +141,15 @@ CROSS_AREA_READS = {
     ("crates/*/tests/", "sdk/python/"): {"integration"},
     # Rust integration tests validate the TypeScript SDK and read its types.
     ("crates/*/tests/", "sdk/typescript/"): {"integration"},
+    # The MCP Apps sandbox tests (src/mcp_apps_sandbox.rs and
+    # tests/meta_gateway_bootstrap.rs) compare the console's sandbox sources
+    # with the copies the crate embeds from console-dist. A console change
+    # that leaves console-dist behind fails embedded:freshness in the console
+    # lane, and one that updates console-dist changes crates/ and so runs the
+    # rust and integration lanes these tests run in, so these reads need no
+    # lane of their own.
+    ("crates/*/src/", "console/"): set(),
+    ("crates/*/tests/", "console/"): set(),
     # examples/001 runs in console-acceptance and loads console sources; the
     # other packs name the console or the TypeScript SDK for manual runs.
     ("examples/", "console/"): {"console"},

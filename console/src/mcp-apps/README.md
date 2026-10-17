@@ -34,15 +34,27 @@ serve credentials, sensitive files, or application APIs on the sandbox origin.
 The proxy needs Node's standard library and `src/mcp-apps/sandbox.js`, with no
 npm dependencies.
 
-Released gateway binaries, the Python package and the npm package do not
-include the proxy. Outside a source checkout, copy `console/mcp-apps-sandbox.cjs`
-and `console/src/mcp-apps/sandbox.js` from the release tag that matches the
-gateway. Keep the second file at `src/mcp-apps/sandbox.js` relative to the
-first, and start the proxy with `node mcp-apps-sandbox.cjs` and the same
-environment variables. The proxy and the Console embedded in the gateway
-share an internal sandbox protocol, so upgrade them together. Check the copies
-against the SHA-256 digests in the release notes; `docs/guides/console.mdx`
-lists the 0.9.0 values.
+The gateway binaries embed the proxy. Outside a source checkout, have the
+gateway you run write it out, then start it with Node and the same
+environment variables:
+
+```sh
+meta_gateway --write-mcp-apps-sandbox ./mcp-apps-sandbox   # or rpc_gateway
+MCP_APPS_HOST_ORIGIN=http://127.0.0.1:5000 MCP_APPS_SANDBOX_PORT=5001 node ./mcp-apps-sandbox/mcp-apps-sandbox.cjs
+```
+
+The flag writes `mcp-apps-sandbox.cjs` and `src/mcp-apps/sandbox.js` into the
+directory, creating it and replacing earlier copies, prints each file's
+SHA-256 and path, and exits without starting a gateway. The proxy and the
+Console embedded in the gateway share an internal sandbox protocol, so write
+the proxy again from the new binary whenever you upgrade the gateway. The
+Python and npm packages do not include the proxy.
+
+Gateways before 0.9.2 do not embed it. For those, copy
+`console/mcp-apps-sandbox.cjs` and `console/src/mcp-apps/sandbox.js` from the
+release tag that matches the gateway, keep the second file at
+`src/mcp-apps/sandbox.js` relative to the first, and check both against the
+SHA-256 digests that `docs/guides/console.mdx` lists for 0.9.0 and 0.9.1.
 
 Omitting the URL or setting a realm override to an empty string retains text
 tool results and disables the corresponding HTTP app operations. Native live
@@ -212,18 +224,26 @@ member policy or durable replay. `/counts` reports resolve, resource-read and
 action counts. A native end-to-end check must exercise the real gateway and its
 MCP connection separately.
 
-Build the stock Console and native `console_acceptance_fixture` first, then run
-the native browser lane against those artifacts:
+Build the stock Console and the native `mcp_apps_gateway_fixture` example
+first, then run the native browser lane against those artifacts:
 
 ```sh
 META_EXAMPLE_BIN_DIR=/path/to/prebuilt/examples npm --prefix console run e2e:mcp-apps
 ```
 
-That lane starts the real native member runtime and a stdio MCP server, loads
-the stock Console, invokes its app-only action, and checks reload, original
-connection custody, private metadata separation and native request rejection.
-It writes screenshots and wire evidence under `output/playwright/` and never
-contacts a model provider.
+That lane starts the persistent `rpc_gateway` composition with a scripted
+model, drives it over stdin like an SDK, and spawns its members through the
+gateway's own member factories. Their MCP routers carry the stock connector
+call-context provider that every gateway deployment uses, so a regression in
+that provider's resource reads fails the lane. It starts a stdio MCP server,
+loads the stock Console, invokes its app-only action, and checks reload,
+original connection custody, private metadata separation and native request
+rejection. It writes screenshots and wire evidence under `output/playwright/`
+and never contacts a model provider. The gateway lane spawns classic members.
+`META_MCP_APPS_BACKEND=builder` runs the same lane against
+`console_acceptance_fixture`, a `UnifiedRuntime::builder()` host with
+identity-first members whose routers carry no call-context provider; CI runs
+both.
 
 To also exercise live polling through a model turn longer than the host's
 request timeout, run the same lane with `META_MCP_APPS_LONG_POLL=1`. This mounts

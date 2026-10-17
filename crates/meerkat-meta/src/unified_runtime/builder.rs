@@ -172,6 +172,7 @@ pub struct UnifiedRuntimeBuilder {
     control_grants: Option<crate::runtime::cross_mob_control::ControlGrantTable>,
     persistent_metadata: Option<Arc<dyn PersistentMetadataStore>>,
     access_controller: Option<crate::access::AccessController>,
+    flow_editor_host_deploy: bool,
     topology_control_policy: crate::topology_control::TopologyControlPolicy,
     live: Option<super::live_compose::LiveOptions>,
     #[cfg(feature = "openai-live")]
@@ -1061,6 +1062,14 @@ impl UnifiedRuntimeBuilder {
         self
     }
 
+    /// Let the Flow Editor on the reference app router run `rkat` on this
+    /// host for callers that no enforced access controller governs. Off by
+    /// default; see [`UnifiedRuntime::allow_flow_editor_host_deploy`].
+    pub fn allow_flow_editor_host_deploy(mut self, allowed: bool) -> Self {
+        self.flow_editor_host_deploy = allowed;
+        self
+    }
+
     /// Enable access control backed by an existing TOML file
     /// (conventionally `config/access.toml`); admin edits from the console
     /// persist back to the same path. A missing path, a directory, or an
@@ -1785,6 +1794,7 @@ impl UnifiedRuntimeBuilder {
         let mut runtime = UnifiedRuntime::from_parts_unchecked(
             super::UnifiedRuntimeCore {
                 access_controller: self.access_controller,
+                flow_editor_host_deploy: self.flow_editor_host_deploy,
                 topology_controller,
                 post_spawn_hook: self.post_spawn_hook,
                 post_reconcile_hook: self.post_reconcile_hook,
@@ -2273,6 +2283,8 @@ impl UnifiedRuntimeBuilder {
         // Bootstrap installs these on the final agent mob-tool state, after
         // composing its child application policy and native tool bundles.
         spec.before_activation = Some(registry.before_activation());
+        spec.after_destroy = Some(registry.after_destroy());
+        spec.before_create = Some(registry.before_create(Arc::clone(&opened.store)));
         Ok(Some(registry))
     }
 
@@ -3024,6 +3036,8 @@ mod tests {
             "refusal must precede opening document storage"
         );
         assert!(spec.before_activation.is_none());
+        assert!(spec.after_destroy.is_none());
+        assert!(spec.before_create.is_none());
     }
 
     /// A document bundle's declared read/edit tools; composition never

@@ -121,10 +121,20 @@ fn unified_builder_roots_funnel_through_wrapped_stock_constructors() {
     assert_eq!(
         occurrences(
             RUNTIME_SOURCE,
-            "let mut spec = Self::new(definition, storage, session_service);"
+            "Self::with_base_layer(definition, storage, session_service, no_op_pre_build_hook());"
         ),
         3,
         "every stock constructor used by the builder must install the common wrapper"
+    );
+    // Each wraps the concrete service first, with its own hook followed by
+    // the refusal of an unresolved document MCP marker.
+    assert_eq!(
+        occurrences(
+            RUNTIME_SOURCE,
+            "let hook = refusing_unresolved_document_markers(hook);"
+        ),
+        3,
+        "every stock constructor must refuse an unresolved marker after its hook"
     );
 }
 

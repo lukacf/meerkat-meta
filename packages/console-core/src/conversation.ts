@@ -133,7 +133,7 @@ export interface ConversationMessageEntry extends ConversationTimelineEntryBase 
   runtimeEvent?: ConversationRuntimeEvent | null;
   /** Display-only projection of an explicit runtime refusal or audit diagnostic. */
   operationFeedback?: {
-    kind: "permission-refused" | "audit-unavailable" | "confinement-refused" | "hook-denied" | "hook-launch-failed" | "review-unsatisfied" | "review-unavailable";
+    kind: "operation-refused" | "audit-unavailable" | "confinement-refused" | "hook-denied" | "hook-launch-failed" | "review-unsatisfied" | "review-unavailable";
     title: string;
     detail: string;
     operationId?: string;

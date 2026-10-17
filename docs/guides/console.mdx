@@ -123,28 +123,34 @@ Run the sandbox on a separate origin, with the exact Console origin allowed:
 MCP_APPS_HOST_ORIGIN=http://127.0.0.1:5000 MCP_APPS_SANDBOX_PORT=5001 npm --prefix console run mcp-apps:sandbox
 ```
 
-The sandbox proxy is distributed as source only: the gateway binaries, the
-Python package and the npm package do not include it. To run it outside a
-source checkout, copy two files from the release tag that matches your
-gateway into one directory, keeping their relative layout:
-
-| Repository file | Copy to |
-| --- | --- |
-| `console/mcp-apps-sandbox.cjs` | `mcp-apps-sandbox.cjs` |
-| `console/src/mcp-apps/sandbox.js` | `src/mcp-apps/sandbox.js` |
-
-Then start it with Node.js. It uses only the standard library, so it needs no
-`npm install`:
+Both gateway binaries embed the sandbox proxy, so a released gateway is all
+you need to run it outside a source checkout. Have the gateway write it into a
+directory, then start it with Node.js. It uses only the standard library, so
+it needs no `npm install`:
 
 ```sh
-MCP_APPS_HOST_ORIGIN=http://127.0.0.1:5000 MCP_APPS_SANDBOX_PORT=5001 node mcp-apps-sandbox.cjs
+meta_gateway --write-mcp-apps-sandbox ./mcp-apps-sandbox   # or rpc_gateway
+MCP_APPS_HOST_ORIGIN=http://127.0.0.1:5000 MCP_APPS_SANDBOX_PORT=5001 node ./mcp-apps-sandbox/mcp-apps-sandbox.cjs
 ```
+
+`--write-mcp-apps-sandbox <dir>` writes two files, creating the directory and
+replacing earlier copies, prints each file's SHA-256 and path, and exits
+without starting a gateway:
+
+| Written file | Repository source |
+| --- | --- |
+| `<dir>/mcp-apps-sandbox.cjs` | `console/mcp-apps-sandbox.cjs` |
+| `<dir>/src/mcp-apps/sandbox.js` | `console/src/mcp-apps/sandbox.js` |
 
 The proxy loads `src/mcp-apps/sandbox.js` relative to its own file. The two
 files and the Console embedded in the gateway share an internal sandbox
-protocol, so take the files from the same release as the gateway and replace
-them when you upgrade it. Each release's notes list both files' SHA-256
-digests; check your copies against them. For 0.9.0:
+protocol, so write them again from the new binary whenever you upgrade the
+gateway. The Python package and the npm package do not include the proxy.
+
+Gateways before 0.9.2 do not embed the proxy. For those, copy the two
+repository files from the release tag that matches your gateway into one
+directory, keeping the layout above, and check your copies against these
+SHA-256 digests (identical for 0.9.0 and 0.9.1):
 
 | File | SHA-256 |
 | --- | --- |
@@ -359,7 +365,7 @@ can still appear in the same run.
 
 | Card | Meaning |
 |------|---------|
-| Permission denied | The request's operation permission was refused. |
+| Action refused | The action was refused under the current authorization, so it did not run. The host does not say why: a policy denial, an authorization that changed after the action was prepared, and request details the authorization could not evaluate all arrive as the same refusal, so the card names no cause. |
 | Action could not start | Required process confinement was refused before the action ran. The card retains the exact typed cause. |
 | Action blocked by hook | A pre-tool hook explicitly denied this call. Its typed hook reason remains distinct from operation permission. |
 | Hook could not start | A pre-tool hook failed to launch. This is infrastructure feedback, without an invented permission or confinement cause. |

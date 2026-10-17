@@ -51,6 +51,366 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   lists them with its own filter before running them and fails if the
   filter leaves any out.
 
+## [0.9.2] - 2026-10-16
+
+### Breaking
+
+- With the `extension-state` feature, a document store that an embedding
+  host supplies through `MetaStorageProvider::open_extension_state` must
+  implement the new `ExtensionDocumentStore::references_mob`: report
+  whether any live document of the realm, in any namespace, names a mob id
+  as its owner or in an audience grant or deny, failing the answer (never
+  skipping the document) on a document it cannot read or decode. The default
+  implementation answers an error, and every mob create of the agent
+  mob-tool state, except a session's implicit delegation mob, is then
+  refused. The built-in `SqliteExtensionDocumentStore` implements it.
+- Host deploys from the runtime-mounted Flow Editor need an access-controller
+  grant of `mobpack.deploy` or the new host opt-in (see Security and Added).
+- `meta/mobpacks/apply_operation` ignores `rkat_validate` on every surface,
+  including the SDK's stdio RPC; run `meta/mobpacks/validate` for `rkat`
+  validation.
+- Without host access, the Flow Editor HTTP routes refuse `store_path` and
+  pack only path skills that `meta/skills/catalog` lists (see Security).
+- Rust code that calls the mobpack functions directly (`export_mobpack`,
+  `validate_mobpack`, `import_mobpack` and the rest of `meerkat_meta::mobpack`)
+  reads path skills only from files the skills catalog lists, unless it runs
+  them under the new `meerkat_meta::with_host_path_skill_reads`. The SDKs'
+  stdio and in-process JSON-RPC read as the host, as before.
+- Behaviour-only (not measured by the semver gate): the agent-memory
+  recorder's `memory` tool now names the memory operation each call performs,
+  with Meerkat 0.9.2's typed operation targets. Every plan it resolves carries
+  its own witness with `ToolOperationTarget::MemoryOperation`: `remember` and
+  `update` are a `Write`, `forget` a `Delete` and `recall` a `Read` of the
+  member's identity scope, and `propose_to_mob` a `Propose` to its mob scope.
+  The scope is always the one the recorder pinned when the member was built,
+  never one taken from the call's arguments. A host operation policy that
+  mapped the `memory` tool as an operation without a target now receives
+  that target, and under a targeted grant basis the tool uses only the
+  lineage selected for its memory scope, never the base lineage. Stock
+  governed realms keep refusing it, as they did while it had no target.
+- Behaviour-only: under governed work the `memory` tool reads or writes
+  memory only when the dispatch's prepared authorization names exactly the
+  operation the call performs. A wrapper that forwards its
+  `dispatch_with_context` but resolves its own plan without that target, or
+  with another scope's, is refused with `authorization_refused` (malformed
+  facts) before any memory access, and a plan the recorder did not resolve
+  for the call's own operation is refused as `ExecutionOwnerChanged`.
+  Forward `resolve_execution_plan` and `dispatch_resolved_with_context` to
+  the recorder instead. Ungoverned dispatch is unchanged.
+- Behaviour-only: in a session, a `memory` call with an unknown action, or
+  `propose_to_mob` from a member that is not in a mob, now fails at plan
+  resolution with `invalid_arguments` and the same reason, where the tool
+  returned it as an error result.
+
+### Security
+
+- `Cargo.lock` updates quinn-proto from 0.11.16 to 0.11.19, which clears
+  RUSTSEC-2026-0338, RUSTSEC-2026-0339, RUSTSEC-2026-0340, RUSTSEC-2026-0341
+  and RUSTSEC-2026-0342 from `cargo audit`. Meta was not exposed: no build
+  compiles quinn-proto, which the lockfile records only under reqwest's
+  optional HTTP/3 support, and no workspace feature enables it. Only that
+  lockfile entry changes.
+- With the `extension-state` feature, a new mob could take the id of a
+  destroyed one and inherit what extension documents grant that id, since
+  documents name a mob by its id alone, as their owner (`Owner::Mob`) or in
+  an audience entry (`Audience::Mob`). An agent's `mob_create` takes a
+  model-chosen id, so another session could manage a destroyed child's
+  documents through a new mob under its id: at once now that a destroy
+  releases the id, and after a restart before. The agent mob-tool state now
+  refuses every create (an agent's `mob_create`, a temporary council, a
+  create without an owner session) under an id that any live document of
+  the realm still names, whatever the registry binds under it, with a typed
+  refusal that names the remedies: choose another mob id, or have a host or
+  operator with access to the extension store transfer each document the id
+  owns and remove or replace each `Audience::Mob` grant or deny naming it.
+  The one exemption is the implicit delegation mob that its own session's
+  runtime path creates or recreates. Known limitations:
+  - Ownership is by id, so the destroyed mob's own owner session cannot
+    recreate the same explicit id while documents name it either;
+    per-instance ownership is the long-term model.
+  - Each such create reads every live document of the realm under the
+    extension store's one connection, so document reads and writes of every
+    session wait while it runs, and a caller that repeats creates under a
+    named id keeps them waiting. A refusal also tells the caller that some
+    document names the id, including one it cannot read. An index or a rate
+    limit is planned for 0.9.3.
+  - The check is not ordered against a document write already in flight,
+    whose caller the embedding host resolved while the destroyed mob was
+    live.
+  - Restoring a persisted mob is never re-checked: a takeover made before
+    0.9.2, or a mob created while no extension tool bundle or document
+    binding was composed (the check is installed only with them), keeps what
+    it inherited after a restart.
+- The Flow Editor that a runtime mounts on its reference app router, which
+  `meta_gateway` and `rpc_gateway` serve beside the console, no longer runs
+  `rkat` on the host for a caller that no access controller grants
+  `mobpack.deploy`. Without an access controller, any process that could
+  reach the gateway's listener (loopback by default, so any local user)
+  could send an unauthenticated `meta/mobpacks/deploy` with `execute: true`,
+  which writes an archive and runs `rkat mob run`, or
+  `meta/mobpacks/validate` with `rkat_validate: true`, which runs
+  `rkat mob validate`. Browsers could not send that request across origins.
+  Now the deploy is refused with `-32602` and the validation stays
+  structural, and `meta/capabilities` advertises
+  `deploy_execute_allowed: false` and `host_mutation_allowed: false`. An
+  enforced access controller still decides per caller, as before.
+  `http_flow_editor::protected_flow_editor_router` and
+  `http_flow_editor::flow_editor_rpc_router_with_decisions` take no access
+  controller, so they no longer run host deploys at all.
+- The Flow Editor HTTP routes no longer touch a host path that a caller
+  without host access names. On a gateway without an access controller,
+  any local process could, without a token:
+  - send `meta/mobpacks/apply_operation` with `rkat_validate: true`, which
+    wrote an archive and ran `rkat mob validate` (only
+    `meta/mobpacks/validate` stripped that flag);
+  - pass `store_path` to the draft methods, which created directories and
+    files at any writable path, replaced JSON files there, and read any JSON
+    object file back through `meta/mobpacks/list`;
+  - put a path skill naming any readable host file into a document, whose
+    bytes `meta/mobpacks/source` and `meta/mobpacks/export` returned.
+
+  Now `apply_operation` never runs `rkat` (on every surface), `store_path` is
+  refused with `-32602` on every Flow Editor method, and a path skill is
+  read only when `meta/skills/catalog` lists that file; any other path is a
+  `selected_skill_path_not_permitted` validation error. A read requires the
+  document's path to match a listed string before it opens anything, so an
+  unlisted path (a Windows UNC share, a path on a hung mount) is refused
+  without a stat that reaches it. A listed file counts only while its real
+  path stays inside the skill directory it was found in, and a catalog file
+  with other hard links counts only when another user owns it and it is
+  world-readable, as in a Nix store or another user's install (a store the
+  gateway's own user owns, as pnpm and uv stores usually are, does not
+  count, and neither does a link to the gateway user's own files). The
+  server reads the file it opened (comparing the opened file's device and
+  inode), so a link swapped in after listing reaches no other file.
+  `meta/skills/catalog` marks each filesystem skill with
+  `readable_without_host_access`, and with `read_refusal` when a caller
+  without host access cannot read it; reading such a skill names that
+  reason. One request without host access reads at most 64 MiB of skill
+  files in total, however many skills name a file: a file larger than what
+  is left is refused by its opened handle's size before it is read, and once
+  the budget is spent the request resolves no further path skill. Host
+  access is the caller's own per-call `mobpack.deploy` decision, so a deny
+  rule withholds it even beside an allow rule such as `mobpack.*`. Callers
+  with host access, and the SDKs' stdio and in-process RPC, may still name
+  such paths.
+- Importing a mobpack archive (`meta/mobpacks/import`, and the draft methods
+  that re-import a stored archive) refuses an archive that expands past
+  32 MiB, holds more than 4096 entries, holds a member that is not a regular
+  file, or holds a `meta/editor.json` or `meta/mob.toml` larger than 1 MiB
+  (parsing expands those many times over) or a `manifest.toml` larger than
+  4 MiB. Everything one import materializes, archive members, parsed text
+  and each path skill filled in from a member, counts against one 64 MiB
+  budget, so a member named by many path skills is not copied once per name.
+  Import, every document method and draft save refuse a document whose
+  skill content, summed over every skill entry, passes 16 MiB, so the copies
+  made after a document enters (the import reply, source and export, a
+  saved draft) stay a small constant times that. One validation reports at
+  most 1000 diagnostics, ending with `diagnostics_truncated`. Rendering is
+  bounded too, whatever the document's shape: the rendered `mob.toml`, the
+  `definition.json` parsed from it and the expected schema files beside it
+  are each refused past 16 MiB (a schema shared by many members was copied
+  into every one), and a document with more than 1000 members, more than 256
+  branches in one parallel or branch step, or more than 1024 branches in its
+  flow is refused before it is rendered (branches after a parallel step
+  without a join each depended on every branch before them). A stored draft
+  whose document passes the skill content cap is listed and fetched as a
+  placeholder with the reason. A pax global
+  header, which `git archive` writes, is skipped, and a contiguous file
+  reads as a regular one. Before, a request under the HTTP body limit could
+  expand into gigabytes of memory: a member's bytes were read with no
+  per-member cap, and a GNU sparse member's zero gaps, which the tar reader
+  synthesizes in memory outside the gzip stream, were not covered by the
+  stream cap at all, so a roughly 150-byte upload declaring an 8 GiB sparse
+  file could exhaust memory.
+
+### Added
+
+- `meta_gateway storage-adopt-predecessor --mob-config <file>` checks the mob
+  definition an installation boots with (repeat it for each mob) against every
+  persistent mob storage the predecessor created. It reads the definition each
+  store holds now from a private copy of its event log, the store itself not
+  opened, and names each key that the release which created the store ignored,
+  that Meta 0.9 applies and that the held definition does not record: a
+  profile's or `[runtime]`'s `model_fallback` on a store created by MobKit
+  0.8.33 or earlier, and a profile's `tools.deny` on a store created by 0.8.45
+  or earlier. A key a later release's definition update recorded is in force
+  and is not named. Adoption refuses before any change until each named key
+  is removed, which keeps the behaviour the store has run with, or
+  acknowledged with `--acknowledge-ignored-keys`. An acknowledgement changes
+  no definition: the keys take effect only once the stored definition is
+  advanced with the one-shot mob definition update, and until then an
+  authoritative resume that keeps them refuses as `divergent`, as in 0.9.1.
+  The JSON report lists them under `ignored_keys`. Without `--mob-config`, a
+  note names each store whose creating release ignored such keys. A
+  `--mob-config` that does not parse, or a `mob.toml` that declares a
+  `[self_hosted]` or `[realm]` table, is refused before planning; a `.json`
+  file is read as a `definition.json`. Library callers use
+  `storage_predecessor::adopt_predecessor_state_with_definitions` with a
+  `PredecessorDefinitionCheck`.
+- `meta-extension-state`: `ExtensionDocumentStore::references_mob` reports
+  whether any live document of a realm names a mob, and
+  `Document::names_mob` whether one document does, as its owner
+  (`Owner::Mob`) or in an audience grant or deny (`Audience::Mob`).
+  `SqliteExtensionDocumentStore` answers in one read transaction over every
+  live document of the realm.
+- `meerkat_meta::with_host_path_skill_reads(f)` runs mobpack functions as
+  the host, so a path skill reads any file its document names (see
+  Breaking).
+- `--allow-flow-editor-host-deploy` on `meta_gateway` and on
+  `rpc_gateway --persistent`, and `allow_flow_editor_host_deploy(bool)` on
+  `UnifiedRuntimeBuilder` and `UnifiedRuntime`, let the runtime-mounted Flow
+  Editor run host deploys for callers that no enforced access controller
+  governs. It allows every caller the route admits, so enable it only where
+  every process that can reach the listener is trusted. `meta_gateway`
+  includes it in the resume fingerprint, and `rpc_gateway` refuses it
+  without `--persistent`.
+- `meta_gateway --write-mcp-apps-sandbox <dir>` and
+  `rpc_gateway --write-mcp-apps-sandbox <dir>` write the MCP Apps sandbox
+  proxy that the binary embeds, `mcp-apps-sandbox.cjs` and
+  `src/mcp-apps/sandbox.js`, in the layout `node <dir>/mcp-apps-sandbox.cjs`
+  loads. They create the directory, replace earlier copies, print each
+  file's SHA-256 and path, and exit without starting a gateway. Rust hosts
+  call `meerkat_meta::mcp_apps_sandbox::write_mcp_apps_sandbox`. The console
+  build copies both files into `crates/meerkat-meta/console-dist/`, and
+  `npm --prefix console run embedded:freshness` fails when a copy differs
+  from its console source.
+- `MemoryScope::operation_scope_ref` and `AGENT_MEMORY_TARGET_OWNER`
+  (`meerkat_meta::memory`): the typed reference by which Meta's memory tools
+  name a memory scope in operation targets, `MemoryScopeRef::Host` with owner
+  `meta.agent_memory` and scope `<kind>/<realm>/<key>`, where every `%` in
+  the realm and key is written `%25` and every `/` is written `%2F`. A host
+  operation policy maps it to its own action, and a targeted grant selects
+  one lineage for exactly that scope. The format is a stored contract (work
+  associations persist it as the grant target of memory operations) and will
+  not change; `operation_scope_ref` documents it in full.
+- Meta's mob session wrappers forward Meerkat's `tool_catalog_view` query to
+  the session service they wrap, like its tool-scope siblings, instead of
+  answering that no view is available. An embedder's own session-service
+  wrapper must forward `tool_catalog_view` as well: Meerkat's default
+  implementation reports no view, so a wrapper that leaves it out hides the
+  wrapped session's catalog view.
+
+### Changed
+
+- Requires Meerkat 0.9.2: every Meerkat dependency is pinned to
+  `=0.9.2` from crates.io.
+- Console: an operation refusal reads "Action refused" instead of
+  "Permission denied". The host refuses an operation for a policy denial, for
+  an authorization that changed after the operation was prepared and for
+  request facts it could not evaluate, and sends all of them alike, as the
+  `operation_refused` runtime notice or tool error without a reason, so the
+  card now names no cause: "This action was refused under the current
+  authorization, so it did not run." Its feedback kind
+  (`operationFeedback.kind`, the card's `data-feedback-kind`) is
+  `operation-refused` instead of `permission-refused`.
+- CI: the `test-integration` jobs no longer set a fake `OPENAI_API_KEY`. The
+  test fixtures give their members and child gateways their own fake key, so
+  the integration tests, like the unit tests since 0.9.1, run without one.
+  `scripts/test_ci_workflow.py` checks that neither job sets it.
+- `Cargo.lock` updates chacha20 from 0.10.1, which crates.io yanked, to
+  0.10.2. No Meta build compiles it: the lockfile records it only under
+  reqwest's optional HTTP/3 support (rand 0.10 for quinn-proto), which no
+  workspace feature enables, so no build or test changes.
+- The console voice readiness latency test takes its p99 over 500 polls
+  instead of 50. Over 50 polls the nearest-rank p99 is the slowest poll, so
+  one stalled poll on a loaded machine decided the verdict; work sized to the
+  member's 20 MB body, which slows every poll, still fails the 100 ms bound.
+- The Console guide and the MCP Apps host README describe writing the
+  sandbox proxy with `--write-mcp-apps-sandbox` instead of copying it from
+  the release tag. Copying stays the way for gateways before 0.9.2; both
+  files are unchanged since 0.9.0:
+  - `console/mcp-apps-sandbox.cjs`:
+    `157fed890922c4c3fe7c9b7a6319455f0604e9c789818f9c38d45bc115a98ad6`
+  - `console/src/mcp-apps/sandbox.js`:
+    `4e3592ba5b8bf198322126ccb27919a8d4c4c1976a198f9c497c16833f6c3024`
+- The native MCP Apps browser lane (`npm --prefix console run e2e:mcp-apps`)
+  runs by default against a new example, `mcp_apps_gateway_fixture`, which
+  serves the persistent `rpc_gateway` composition with a scripted model. Its
+  members are built by the gateway's own member factories, whose MCP routers
+  carry the stock connector call-context provider, so a regression in that
+  provider's MCP App resource reads (the failure that Meerkat 0.9.1 fixed)
+  now fails CI. The rendering and polling CI steps use it. A third CI step
+  keeps the previous coverage: `META_MCP_APPS_BACKEND=builder` runs the
+  rendering checks against `console_acceptance_fixture`, a
+  `UnifiedRuntime::builder()` host with identity-first members whose routers
+  carry no call-context provider.
+
+### Fixed
+
+- Docs: the upgrading guide and the 0.9.1 notes said MobKit 0.8.x ignored
+  `model_fallback` and `tools.deny`. MobKit 0.8.33 and earlier ignored
+  `model_fallback`, and 0.8.45 and earlier ignored `tools.deny`; later 0.8
+  releases applied them, and their stores recorded them.
+- `meta/gating/decide` refusals for a missing or unknown decision list every
+  decision it accepts, `escalate` included (`decision must be one of:
+  approve, reject, escalate`, and `decision '<value>' is unsupported
+  (allowed: approve, reject, escalate)`); they named only approve and reject.
+- With the `extension-state` feature and any extension tool bundle or
+  document MCP binding configured, the extension authority registry kept the
+  read handle of every child mob the agent mob-tool state activated, whether
+  or not its members ever resolved extension documents. Destroying such a
+  child answered `Incomplete` ("storage cleanup outstanding: the observer
+  drain refused: 3 owner handle(s) still observe this mob database"), the
+  child's database, file watch and threads stayed, and its id could not be
+  reused. The registry now drops a destroyed
+  child through the agent mob-tool state's after-destroy hook
+  (`MobMcpState::set_after_destroy`) before the destroy's storage cleanup
+  runs, so the destroy completes and removes the child's storage. The hook
+  also drops every other mob destroyed by then, such as one destroyed
+  through its own handle or by a rollback inside Meerkat, which reports no
+  destroy of its own.
+- A destroyed mob no longer counts as extension authority, also when it was
+  destroyed outside the agent mob-tool state: it is no valid document owner
+  any more, it leaves its former owner's managed mobs, and a former owner
+  that is still live can no longer create documents owned by it.
+- A child mob restored with its runtime still could not be destroyed
+  completely: the runtime's agent event forwarder and identity stream
+  health monitor kept the handles of every mob their first reconcile pass
+  enumerated, restored child mobs included, for as long as they ran. Such a
+  child's destroy answered `Incomplete` with the same storage cleanup
+  refusal. Only their state watchers outlive that pass now.
+- An extension document store written before 0.9 (`extension_state.sqlite3`
+  under the ledger domain `mobkit-extension-state`) failed to open with an
+  unledgered-objects error that no tool resolved, because
+  `meta_gateway storage-adopt-predecessor` did not adopt that domain. It is
+  predecessor state now: startup refuses it with the adoption command, and
+  the adoption renames its ledger domain to `meta-extension-state` and keeps
+  every document. This covers an installation an earlier 0.9 adoption
+  finished too (rerun the command), and builds without the
+  `extension-state` feature, which now fence the store as well. The store's
+  file name and schema did not change.
+- A document MCP descriptor that a mob definition persisted before 0.9
+  carries its public marker as `MOBKIT_MCP_DOCUMENT_BINDING`. It now
+  resolves to the host's document binding like the current
+  `META_MCP_DOCUMENT_BINDING` spelling. It was not recognized before: next
+  to a binding with the same server name it refused as a mismatch, and
+  otherwise it launched without the host's endpoint and credentials. With
+  no binding to resolve it, a descriptor in either spelling now refuses.
+- Without the `extension-state` feature, as in the stock gateways, a member
+  whose profile carries a marked document MCP descriptor
+  (`META_MCP_DOCUMENT_BINDING`, or `MOBKIT_MCP_DOCUMENT_BINDING` from before
+  0.9) is refused at its build instead of launching the descriptor's
+  command without the host's binding. Every composition checks this after
+  its pre-build hook, so feature-on compositions that install no document
+  binding, such as a runtime bootstrapped from a ready `MobBootstrapSpec`,
+  refuse too.
+- Rerunning `meta_gateway storage-adopt-predecessor --apply` over a finished
+  adoption, for predecessor state found since, reopened its journal with
+  every step of the earlier run still recorded as finished. When the rerun
+  then failed, the journal and startup's refusal named no unfinished step.
+  A reopened journal now records no step as finished until the rerun
+  finishes it.
+
+### Known limitations
+
+- The Flow Editor draft store has no total size or draft count limit yet:
+  each draft is bounded (its document's skill content is capped at 16 MiB),
+  but the number of drafts is not. Store-wide limits are planned for 0.9.3.
+- The Flow Editor's remaining resource limits continue in 0.9.3: draft store
+  totals, and validation, whose peak memory stays linear in its (capped)
+  input.
+
 ## [0.9.1] - 2026-10-15
 
 ### Breaking

@@ -56,9 +56,10 @@ pub use hygienist::{
     validate_revision,
 };
 pub use records::{
-    CalibrationRef, EvidenceRef, InjectionLogEntry, InjectionSurface, ManifestTier, MemoryAuthor,
-    MemoryId, MemoryKind, MemoryProvenance, MemoryRecord, MemoryScope, NewMemoryRecord, ProposalId,
-    RecordMeta, RecordStatus, TrustTier, UsageEvent, UsageStats, VerificationClaim, content_hash,
+    AGENT_MEMORY_TARGET_OWNER, CalibrationRef, EvidenceRef, InjectionLogEntry, InjectionSurface,
+    ManifestTier, MemoryAuthor, MemoryId, MemoryKind, MemoryProvenance, MemoryRecord, MemoryScope,
+    NewMemoryRecord, ProposalId, RecordMeta, RecordStatus, TrustTier, UsageEvent, UsageStats,
+    VerificationClaim, content_hash,
 };
 pub use review::{
     QuarantineDecision, QuarantineReviewError, QuarantineReviewOutcome, QuarantineReviewRefusal,

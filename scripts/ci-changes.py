@@ -201,6 +201,7 @@ LANE_INPUTS = (
     ("crates/meerkat-meta/src/rpc.rs", {"python", "flow_editor"}),
     ("crates/meerkat-meta/src/rpc/", {"python"}),
     # Other sources the console and flow editor contract tests read.
+    ("crates/meerkat-meta/src/mcp_apps_sandbox.rs", {"console"}),
     ("crates/meerkat-meta/src/rpc/topology_methods.rs", {"console"}),
     ("crates/meerkat-meta/src/rpc/workgraph_methods.rs", {"console"}),
     ("crates/meerkat-meta/src/unified_runtime/http.rs", {"flow_editor"}),
