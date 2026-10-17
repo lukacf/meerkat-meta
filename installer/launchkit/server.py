@@ -704,7 +704,7 @@ class GuideApply(BaseModel):
     version: int = Field(ge=1, strict=True)
 
 
-async def guide_result(operation):
+async def guide_result(operation, *, failure_detail=None, timeout_detail=None):
     try:
         return await operation
     except (InstalledFeedbackNotAdmitted, InstalledSuccessNotAdmitted) as error:
@@ -723,10 +723,10 @@ async def guide_result(operation):
     except ValueError as error:
         raise HTTPException(422, str(error)) from None
     except TimeoutError:
-        raise HTTPException(504, "The setup agent is still working. Open its console for progress before retrying.") from None
+        raise HTTPException(504, timeout_detail or "The setup agent is still working. Open its console for progress before retrying.") from None
     except Exception as error:
         LOG.warning("Guided setup failed (%s)", type(error).__name__)
-        raise HTTPException(502, "The setup agent could not finish. Your last saved step is preserved. Retry or inspect its native console.") from None
+        raise HTTPException(502, failure_detail or "The setup agent could not finish. Your last saved step is preserved. Retry or inspect its native console.") from None
 
 
 @app.get("/api/guide/new")
@@ -1544,7 +1544,9 @@ async def operate_deployment(identity: str, value: DeploymentAction):
             revision=value.revision, descriptor_sha256=value.descriptor_sha256)
         if value.resume:
             options["resume"] = True
-    return await guide_result(deployment.action(identity, value.deployment_id, value.action, **options))
+    return await guide_result(deployment.action(identity, value.deployment_id, value.action, **options),
+        failure_detail="The installation command reported an error. Some steps may have finished. Check installation status before choosing another action.",
+        timeout_detail="The installation command has not finished reporting. Check installation status before choosing another action.")
 
 
 @app.get("/api/guide/{identity}/deployment/action/{deployment_id}/{action_request_id}")

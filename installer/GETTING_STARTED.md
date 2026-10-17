@@ -463,6 +463,13 @@ If Forge confirms the saved command and current installation while its original
 response is still waiting, choose **Return to checked installation** when
 offered. This restores the checked controls without sending Start or Stop again.
 
+If an installation command reports an error, some of its work may already have
+finished. Wait for the checked installation status before choosing another
+action. For example, an application can be confirmed stopped while its Stop
+request is recorded as failed. The stopped state does not prove that setup or
+recovery completed. Keep the same installation and use its offered
+controls; do not send another Stop just to clear the error.
+
 The same option can appear after Forge has checked that a new installation was
 admitted, even while its original response is waiting. It uses the checked
 installation status without submitting another installation or cancelling the

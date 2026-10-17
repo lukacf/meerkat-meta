@@ -46,6 +46,7 @@ def api():
                  "InstalledSuccessNotAdmitted": type("SuccessNotAdmitted", (RuntimeError,), {}),
                  "LOG": logging.getLogger(__name__)}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(source), "exec"), namespace)
+    app.state.deployment = namespace["deployment"]
     return TestClient(app), calls
 
 
@@ -85,6 +86,26 @@ def test_exact_readback_is_get_only_and_preserves_missing_or_changed_refusal(api
     assert client.get("/api/guide/owned/deployment/action/installed/missing").status_code == 404
     assert client.get("/api/guide/owned/deployment/action/installed/changed").status_code == 409
     assert all(kind == "readback" for kind, _, _ in calls)
+
+
+@pytest.mark.parametrize("error,status", [(RuntimeError, 502), (TimeoutError, 504)])
+def test_action_failure_does_not_invent_progress_or_recommend_repeating_stop(api, monkeypatch, error, status):
+    client, calls = api
+
+    async def failed(*args, **kwargs):
+        calls.append(("action", args, deepcopy(kwargs)))
+        raise error("private-provider-payload-not-for-the-browser")
+
+    monkeypatch.setattr(client.app.state.deployment, "action", failed)
+    request_id = str(uuid.uuid4())
+    response = client.post("/api/guide/owned/deployment/action", json={
+        "deployment_id": "installed", "action": "stop", "action_request_id": request_id})
+    assert response.status_code == status
+    message = response.json()["detail"]
+    assert "installation command" in message and "Check installation status" in message
+    assert "setup agent" not in message and "retry" not in message.lower()
+    assert "stopped" not in message and "private-provider" not in message
+    assert calls == [("action", ("owned", "installed", "stop"), {"action_request_id": request_id})]
 
 
 @pytest.mark.parametrize("action,resume", [("prepare-support", False), ("prepare-support", True),
