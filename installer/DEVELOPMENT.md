@@ -41,6 +41,9 @@ On Linux, protected acceptance execution also requires `bubblewrap`,
 Forge workflow installs those packages and runs the actual isolation probe
 before the suite. A missing or failed sandbox cannot qualify generated-code
 execution; keep that failure visible instead of using an unsandboxed fallback.
+On Ubuntu, the workflow also loads the distribution's `bwrap-userns-restrict`
+AppArmor profile so bubblewrap can prepare its namespaces while its children
+remain restricted. See Ubuntu's [user-namespace release notes](https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions).
 
 Build the frontend with the commands above before running the complete backend
 suite. Some backend cases inspect or package those built browser files. Use the
