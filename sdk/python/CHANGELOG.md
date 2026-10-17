@@ -9,6 +9,13 @@ All notable changes to the Python SDK are documented here.
   result. It defaults to the transport's request timeout (60 seconds) and is
   not sent to the gateway. When it runs out the outcome is unknown: the
   helper may still finish, so do not retry blindly.
+- Test doubles that replace the private `MetaRuntime._rpc` must accept the
+  `transport_timeout` keyword: `spawn_helper` and `fork_helper` now always
+  pass it (`None` when unset).
+- A request timeout longer than `threading.TIMEOUT_MAX` is refused with
+  `ValueError` before the request is written. The transport used to write the
+  request and only then fail its wait with `OverflowError`, so the gateway ran
+  the call with nobody waiting for the reply.
 
 ## 0.9.2
 

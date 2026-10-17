@@ -226,10 +226,11 @@ async def test_an_expired_wait_leaves_the_outcome_unknown_and_drops_the_late_rep
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(60)
-@pytest.mark.parametrize("bad", [0, -1.0, math.nan, math.inf, True])
-async def test_a_transport_timeout_that_is_not_a_positive_finite_number_sends_nothing(
-    tmp_path, bad
-):
+@pytest.mark.parametrize("bad", [0, -1.0, math.nan, math.inf, True, 1e10])
+async def test_a_transport_timeout_the_transport_cannot_wait_sends_nothing(tmp_path, bad):
+    """Each value is refused before the request is written: not a positive
+    finite number, or (``1e10``) longer than ``threading.TIMEOUT_MAX``, which
+    ``Event.wait`` would refuse only after the helper was already spawned."""
     stand_in = _StandIn(tmp_path, {
         "meta/spawn_helper": [{"result": _helper_reply("unused")}],
     })

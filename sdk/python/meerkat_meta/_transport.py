@@ -944,14 +944,19 @@ class PersistentTransport:
     ) -> Any:
         """Send on the current child without starting a replacement process."""
         request_timeout = self._timeout if timeout is None else timeout
+        # ``Event.wait`` refuses a timeout past ``threading.TIMEOUT_MAX`` with
+        # OverflowError, which would surface only after the request is written:
+        # the gateway would run it with nobody waiting. Refuse it here instead.
         if (
             isinstance(request_timeout, bool)
             or not isinstance(request_timeout, (int, float))
             or not math.isfinite(request_timeout)
             or request_timeout <= 0
+            or request_timeout > threading.TIMEOUT_MAX
         ):
             raise ValueError(
-                "persistent transport: timeout must be a positive finite number"
+                "persistent transport: timeout must be a positive finite number "
+                f"of seconds, at most threading.TIMEOUT_MAX ({threading.TIMEOUT_MAX:g})"
             )
         # Pre-fix, requests with no `id` (or two callers using the
         # same id) collided on `self._pending[""]`: the second

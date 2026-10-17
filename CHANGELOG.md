@@ -75,6 +75,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   lists them with its own filter before running them and fails if the
   filter leaves any out.
 
+### Fixed
+
+- Python SDK: a request timeout longer than `threading.TIMEOUT_MAX` (for
+  example `transport_timeout=1e10`) is refused with `ValueError` before the
+  request is written. The transport used to write the request and only then
+  fail its wait with `OverflowError`, so the gateway ran the call (a helper
+  spawn, for example) with nobody waiting for the reply.
+
 ## [0.9.2] - 2026-10-16
 
 ### Breaking

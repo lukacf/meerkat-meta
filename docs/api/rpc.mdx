@@ -470,6 +470,11 @@ not establish that no identities are registered.
 | `meta/request_continuity_repair` (SDK/stdin only) | none | `{continuity_repair}`: the explicit continuity repair trigger, answering `scheduled`, `nothing_to_repair` or `no_supervisor` (identity-first runtimes only) |
 | `meta/reconcile` (SDK/stdin only) | `{modules: string[]}` | module reconcile report; this reconciles modules, not the roster |
 
+`meta/spawn_helper` and `meta/fork_helper` reply only after the helper's turn
+has finished and its retirement has been attempted, and the gateway applies no
+deadline to that, so a client should give these requests a reply timeout that
+covers the whole helper run.
+
 ### `meta/ensure_member`
 
 Ensure a member exists, spawning it when missing. On the SDK-facing
