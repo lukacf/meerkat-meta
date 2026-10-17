@@ -986,7 +986,7 @@ async fn a_release_is_reported_only_after_the_last_claim_holder_is_gone() {
     assert_root_owned(dir.path());
 
     drop(holder);
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let deadline = release_deadline();
     let (first, retry) = tokio::join!(
         runtime.stand_down_child_mobs(deadline),
         runtime_clone.stand_down_child_mobs(deadline),
@@ -1063,9 +1063,7 @@ async fn a_child_created_during_the_stand_down_is_counted_or_refused() {
             panic!("the state never refused a create during its stand-down");
         })
     };
-    let outcome = runtime
-        .stand_down_child_mobs(std::time::Instant::now() + Duration::from_secs(15))
-        .await;
+    let outcome = runtime.stand_down_child_mobs(release_deadline()).await;
     let during = tokio::time::timeout(Duration::from_secs(15), creator)
         .await
         .expect("the creator stops once refused")
@@ -1243,7 +1241,7 @@ async fn a_retry_keeps_the_clean_receipt_of_a_stopped_child() {
         .await
         .expect("root mob shutdown");
     let state = runtime.agent_mob_mcp_state().expect("agent mob-tool state");
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let deadline = release_deadline();
     // The first attempt shuts the child down cleanly.
     let (mut seen, mut child_mobs) = (std::collections::BTreeSet::new(), 0);
     runtime
