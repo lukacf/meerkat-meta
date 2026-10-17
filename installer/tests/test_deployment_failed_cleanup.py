@@ -448,7 +448,7 @@ async def test_transaction_worker_admission_discards_old_interactive_completion_
     assert str(uuid.UUID(receipt["interactive_lifecycle_id"])) == receipt["interactive_lifecycle_id"]
     assert receipt["interactive_cleanup_attempt_id"] is None and receipt["interactive_cleanup"] is None
     assert service.worker_admissions[directory.name] == {
-        "lifecycle_id": receipt["interactive_lifecycle_id"], "spawn_started": False}
+        "lifecycle_id": receipt["interactive_lifecycle_id"], "spawn_started": False, "mode": mode}
     await service.shutdown()
 
 

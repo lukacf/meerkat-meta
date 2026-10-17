@@ -545,7 +545,9 @@ async def test_rehearsal_cannot_expand_actual_production_names_or_schema(frozen,
 
 
 @pytest.mark.asyncio
-async def test_source_change_before_start_never_executes_generated_code(frozen):
+async def test_source_change_before_start_never_executes_generated_code(frozen, monkeypatch):
+    # Only the pre-execution source guard is entered; no checker may launch.
+    monkeypatch.setattr(trial_module, "_sandbox_executable", lambda: "/inert/never-executed-checker")
     (frozen[1] / "application/__init__.py").write_text("raise AssertionError('must not execute')\n")
     trial = bridge(frozen)
     with pytest.raises(ApplicationTrialError, match="source changed"):

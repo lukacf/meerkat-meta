@@ -332,7 +332,9 @@ async def test_real_qualified_private_wheel_through_existing_package_owner(servi
         await service.shutdown()
 
 
-async def test_failed_host_preparation_never_publishes_or_starts_build(service, artifact):
+async def test_failed_host_preparation_never_publishes_or_starts_build(service, artifact, monkeypatch):
+    # Preparation fails before any isolated checker or generated code runs.
+    monkeypatch.setattr("launchkit.implementation_workspace._sandbox_executable", lambda: "/inert/never-executed-checker")
     def prepare(guide_id, build_id, project):
         adopt(project, artifact)
         raise WorkspaceError("Controlled preparation refusal")

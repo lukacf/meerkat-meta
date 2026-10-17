@@ -181,7 +181,7 @@ async def test_host_waits_for_owned_worker_then_bounds_exact_force_reap(tmp_path
 
 @pytest.mark.parametrize("platform", ["darwin", "linux"])
 async def test_legacy_recorded_unit_keeps_its_original_exact_budget(tmp_path, monkeypatch, platform):
-    monkeypatch.setattr(deployment_service.sys, "platform", platform)
+    monkeypatch.setattr(deployment_service, "sys", SimpleNamespace(platform=platform, executable=sys.executable))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     Path.home().mkdir()
     guide = Guide()

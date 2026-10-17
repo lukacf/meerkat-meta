@@ -16,7 +16,7 @@ from launchkit.templates_v2.console_auth import ConsoleConnectLogin, ISSUER
 @pytest.fixture(autouse=True)
 def adopted_source_imports(monkeypatch):
     """Isolate uncalled Meta type imports; this is not SDK compatibility proof."""
-    source = Path(__file__).parents[1] / ".artifacts/forge-retained-login-source-20261009/upstream/host_control.py"
+    source = Path(__file__).parents[1] / "tests/fixtures/retained_login_sdk/host_control.py"
     assert hashlib.sha256(source.read_bytes()).hexdigest() == (
         "bec462e8e0538fb887151d76754998055cbd311b394cfcc30a5225d2cb7ea03f")
 

@@ -15,7 +15,7 @@ def release_cache(tmp_path):
         binary = directory / name
         binary.write_bytes((name + " official fixture").encode())
         binary.chmod(0o700)
-        metadata = {"version": bootstrap.VERSION, "release_url": bootstrap.RELEASE_URL,
+        metadata = {"version": bootstrap.VERSION, "core_version": bootstrap.CORE_VERSION, "release_url": bootstrap.RELEASE_URL,
             "archive": f"{prefix}-{bootstrap.VERSION}-{bootstrap.platform_target()}.tar.gz",
             "archive_sha256": "a" * 64, "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}
         receipt = directory / (name + ".receipt.json")
@@ -42,16 +42,16 @@ def test_official_cache_copies_exact_checked_bytes_and_private_receipts(tmp_path
     assert installed.read_bytes() == b"owner change"
 
 
-@pytest.mark.parametrize("invalid", ["digest", "version", "platform", "public", "public_directory", "link", "hardlink", "override", "missing"])
+@pytest.mark.parametrize("invalid", ["digest", "version", "core_version", "platform", "public", "public_directory", "link", "hardlink", "override", "missing"])
 def test_ineligible_cache_falls_back_without_writing_any_binary(tmp_path, invalid):
     source = release_cache(tmp_path)
     binary = source / "mobkit_gateway"
     receipt = source / "mobkit_gateway.receipt.json"
     if invalid == "digest":
         binary.write_bytes(b"modified binary")
-    elif invalid in {"version", "platform"}:
+    elif invalid in {"version", "core_version", "platform"}:
         value = json.loads(receipt.read_text())
-        value["version" if invalid == "version" else "archive"] = "not-this-pinned-release"
+        value["archive" if invalid == "platform" else invalid] = "not-this-pinned-release"
         receipt.write_text(json.dumps(value))
     elif invalid == "public":
         receipt.chmod(0o644)

@@ -11,6 +11,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
+from types import SimpleNamespace
 import uuid
 import zipfile
 
@@ -26,6 +28,14 @@ from test_candidate_implementation import (service as implementation_service,
     bundle as implementation_bundle, accepted_ordinary, accepted_fixture, target)
 from test_deployment import Service as DeploymentFixture
 from test_runtime_candidates import Bundle, PLATFORM, PREFIX
+
+
+@pytest.fixture(autouse=True)
+def selected_fixture_host(monkeypatch):
+    # The inert candidate tuple below targets Apple Silicon. Exercise the real
+    # host-target checks against that declared fixture, on any CI runner.
+    # Process and network entry points remain forbidden by the service fixture.
+    monkeypatch.setattr(deployment, "sys", SimpleNamespace(platform="darwin", executable=sys.executable))
 
 
 def sha(content):

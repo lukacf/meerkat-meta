@@ -601,7 +601,7 @@ async def test_directory_preparation_failure_latches_before_native_and_recovers_
     context_before = copy.deepcopy(service.context)
     console_failure = failure.startswith("console_")
     if failure == "console_directory":
-        runtime_root.mkdir(parents=True)
+        runtime_root.mkdir(parents=True, mode=0o700)
         console_path.mkdir()
     elif not console_failure:
         failed_directory = {

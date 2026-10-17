@@ -14,7 +14,9 @@ import pytest
 from launchkit import deployment, deployment_supervisor as refresh
 from launchkit.projects import DraftConflict
 from test_deployment_supervisor import (owned, crossing, candidate_owned,
-    maintained_owned, prepared, snapshot, rewrite)
+    maintained_owned, prepared, snapshot, rewrite, trusted_supervisor_sources,
+    current_admission_owned, historical_candidate_owned, historical_candidate_crossing,
+    retained_candidate_v1)
 
 
 async def test_support_read_keeps_loop_responsive(owned, monkeypatch):

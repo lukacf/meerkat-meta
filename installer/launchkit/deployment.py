@@ -1485,7 +1485,7 @@ class DeploymentService:
                     or not package_matches(source, state)):
                 raise DraftConflict("The selected product changed while preparing setup. Reload before installing.")
         observation = observe_local_console_port(deployment["port"] if console_port is None else console_port,
-                                                suggest_alternate=True) if supported or console_port is not None else None
+                                                suggest_alternate=True) if supported else None
         return {"build_id": status["build_id"], "guide_version": status["guide_version"],
                 "source_digest": source["source_digest"], **native_fields(source),
                 "current_guide_version": state["version"], "current": True,
