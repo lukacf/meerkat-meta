@@ -215,7 +215,9 @@ def test_canonical_text_and_blob_preserve_exact_utf8_authority_bytes(registry, b
     assert before == (database.read_bytes(), database.stat().st_ino)
 
 
-@pytest.mark.parametrize("raw", [b"\xffnot-utf8", b"x" * 2_000_001])
+@pytest.mark.parametrize(
+    "raw", [b"\xffnot-utf8", b"x" * 2_000_001], ids=["invalid-utf8", "oversized"]
+)
 def test_invalid_or_oversized_canonical_blob_refuses_before_receipt(registry, raw):
     write_spec(registry.root, registry.original, raw=raw, blob=True)
     with pytest.raises(RuntimeError, match="could not be verified"):
