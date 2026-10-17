@@ -12931,6 +12931,9 @@ fn graph_to_flow_segments_to_steps(
         .collect();
     gate_nodes.sort_by(graph_to_flow_compare_nodes);
     let mut consumed = BTreeSet::new();
+    // The nodes the lanes to each join walked: a lane that reaches a node an
+    // earlier lane to the same join walked stops there.
+    let mut walked: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
     let mut segments = Vec::new();
 
     for gate in gate_nodes {
@@ -12970,6 +12973,7 @@ fn graph_to_flow_segments_to_steps(
                 &graph_to_flow_string(node, "id"),
                 join_id.as_deref(),
                 &consumed,
+                walked.entry(join_id.clone()).or_default(),
             );
             for lane_node in &lane_nodes {
                 consumed.insert(graph_to_flow_string(lane_node, "id"));
@@ -13467,20 +13471,26 @@ fn graph_to_flow_normalized_edge_condition(edge: &Value) -> Option<(String, Stri
 /// The lane from `start_id` up to its join. It stops at a node another lane
 /// already took (`consumed`), so lanes that run into one shared chain without
 /// a join do not each copy the whole chain.
+/// The flow nodes of the lane from `start_id` to its join: the walk follows
+/// each node's first edge on, and stops at the join, at a node an earlier
+/// lane took, or at a node it or an earlier lane to the same join already
+/// walked (`walked`). From such a node the walk would go where that lane went,
+/// and that lane took every flow node there, so stopping changes no lane;
+/// lanes that run through one chain of nodes walk it once, not once each.
 fn graph_to_flow_collect_lane_to_join(
     graph: &GraphToFlowGraph<'_>,
     start_id: &str,
     join_id: Option<&str>,
     consumed: &BTreeSet<String>,
+    walked: &mut BTreeSet<String>,
 ) -> Vec<Value> {
     let mut out = Vec::new();
     let mut current = graph.node(start_id);
-    let mut seen = BTreeSet::new();
     while let Some(node) = current {
         let node_id = graph_to_flow_string(node, "id");
         if join_id == Some(node_id.as_str())
             || consumed.contains(&node_id)
-            || !seen.insert(node_id.clone())
+            || !walked.insert(node_id.clone())
         {
             break;
         }
@@ -18129,9 +18139,9 @@ fn member_tool_count(member: &Value) -> usize {
 /// The graph structure caps a document does not pass, each as a refusal: at
 /// most [`MOBPACK_MAX_GRAPH_INSTANCES`] instances and
 /// [`MOBPACK_MAX_GRAPH_EDGES`] edges. Deriving a flow indexes the graph once,
-/// but lanes that run through shared nodes still walk them again, so a graph
-/// past the caps is refused before anything derives a flow from it or checks
-/// it further, and only a delete edits it.
+/// but walks a node once for each join whose lanes run through it, so a
+/// graph past the caps is refused before anything derives a flow from it or
+/// checks it further, and only a delete edits it.
 fn graph_structure_refusals(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
     let mut refusals = Vec::new();
     let (instances, edges) = graph_structure_sizes(document);
@@ -40234,5 +40244,159 @@ condition = { op = "eq", path = "params.kind", value = "d" }
             !derived.contains(&"s0") && !derived.contains(&"s1"),
             "{derived:?}"
         );
+    }
+
+    /// A document whose graph is a fork of `lanes` one-node lanes that all
+    /// run on through one chain of `length` plain nodes to the join.
+    fn shared_chain_graph_document(lanes: usize, length: usize) -> MobpackDocument {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.members = json!([{ "id": "worker", "name": "Worker" }]);
+        let mut instances = vec![
+            json!({ "id": "fork", "isGate": true, "gateKind": "fork", "col": 0 }),
+            json!({ "id": "join", "isGate": true, "gateKind": "join", "col": length + 2 }),
+        ];
+        let mut edges = Vec::new();
+        for lane in 0..lanes {
+            let id = format!("a{lane}");
+            instances.push(json!({ "id": id, "memberId": "worker", "col": 1, "row": lane }));
+            edges.push(json!({ "from": "fork", "to": id, "kind": "fanout" }));
+            edges.push(json!({ "from": id, "to": "p0", "kind": "next" }));
+        }
+        for step in 0..length {
+            instances.push(json!({ "id": format!("p{step}"), "col": step + 2 }));
+            let next = if step + 1 < length {
+                format!("p{}", step + 1)
+            } else {
+                "join".to_string()
+            };
+            edges.push(json!({ "from": format!("p{step}"), "to": next, "kind": "next" }));
+        }
+        document.instances = Value::Array(instances);
+        document.edges = Value::Array(edges);
+        document
+    }
+
+    /// Lanes to one join that run through one chain of nodes walk it once:
+    /// a lane stops at a node an earlier lane to the same join walked. Each
+    /// lane walked the whole chain again, so a fork of many lanes into one
+    /// long chain took work quadratic in its size.
+    #[test]
+    fn lanes_through_one_chain_walk_it_once() {
+        let flow = graph_to_flow_from_document(&shared_chain_graph_document(2, 2));
+        let lanes: Vec<_> = flow["steps"][1]["branches"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|branch| branch["steps"].as_array().map(Vec::len))
+            .collect();
+        assert_eq!(
+            (flow["steps"][1]["type"].as_str(), lanes),
+            (Some("parallel"), vec![Some(1), Some(1)]),
+            "{flow:#}"
+        );
+        assert_work_grows_linearly("n lanes through one chain of n nodes", |size| {
+            let document = shared_chain_graph_document(size, size);
+            with_mobpack_work(|| graph_to_flow_from_document(&document)).1
+        });
+    }
+
+    /// The lane walk before lanes to one join shared what they walked: it
+    /// stopped only at the join, at a node an earlier lane took, or at a node
+    /// it had walked itself.
+    fn unshared_lane_to_join(
+        graph: &GraphToFlowGraph<'_>,
+        start_id: &str,
+        join_id: Option<&str>,
+        consumed: &BTreeSet<String>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = graph.node(start_id);
+        let mut seen = BTreeSet::new();
+        while let Some(node) = current {
+            let node_id = graph_to_flow_string(node, "id");
+            if join_id == Some(node_id.as_str())
+                || consumed.contains(&node_id)
+                || !seen.insert(node_id.clone())
+            {
+                break;
+            }
+            if graph_to_flow_is_flow_node(node) {
+                out.push(node_id.clone());
+            }
+            current = graph
+                .outgoing(&node_id)
+                .iter()
+                .filter(|edge| join_id != Some(graph_to_flow_string(edge, "to").as_str()))
+                .filter_map(|edge| graph.node(&graph_to_flow_string(edge, "to")))
+                .filter(|node| !graph_to_flow_bool(node, "isTerminal"))
+                .min_by(|a, b| graph_to_flow_compare_nodes(a, b));
+        }
+        out
+    }
+
+    /// Lanes that stop where an earlier lane to their join walked take the
+    /// nodes they took when each lane walked on alone, lane after lane as the
+    /// derivation runs them, on graphs with cycles, terminals, plain nodes,
+    /// shared chains and lanes to several joins or none.
+    #[test]
+    fn lanes_that_share_what_they_walked_take_the_same_nodes() {
+        let mut random = Xorshift(0x5851_f42d_4c95_7f2d);
+        let mut taken = 0;
+        for case in 0..500 {
+            let count = 2 + random.below(14);
+            let instances: Vec<Value> = (0..count)
+                .map(|index| {
+                    let mut node = json!({
+                        "id": format!("n{index}"),
+                        "col": random.below(6),
+                        "row": random.below(3),
+                    });
+                    match random.below(4) {
+                        0 => node["gateKind"] = json!("join"),
+                        1 => {}
+                        _ => node["memberId"] = json!("worker"),
+                    }
+                    if random.below(6) == 0 {
+                        node["isTerminal"] = json!(true);
+                    }
+                    node
+                })
+                .collect();
+            let edges: Vec<Value> = (0..random.below(3 * count))
+                .map(|_| {
+                    json!({
+                        "from": format!("n{}", random.below(count)),
+                        "to": format!("n{}", random.below(count)),
+                        "kind": "next",
+                    })
+                })
+                .collect();
+            let graph = GraphToFlowGraph::new(&instances, &edges, &[]);
+            let mut consumed = BTreeSet::new();
+            let mut walked: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
+            for lane in 0..=random.below(7) {
+                let start = format!("n{}", random.below(count));
+                let join = (random.below(3) > 0).then(|| format!("n{}", random.below(count)));
+                let alone = unshared_lane_to_join(&graph, &start, join.as_deref(), &consumed);
+                let shared: Vec<String> = graph_to_flow_collect_lane_to_join(
+                    &graph,
+                    &start,
+                    join.as_deref(),
+                    &consumed,
+                    walked.entry(join.clone()).or_default(),
+                )
+                .iter()
+                .map(|node| graph_to_flow_string(node, "id"))
+                .collect();
+                assert_eq!(
+                    shared, alone,
+                    "case {case}, lane {lane} from {start} to {join:?}: {instances:?} {edges:?}"
+                );
+                taken += shared.len();
+                consumed.extend(shared);
+            }
+        }
+        assert!(taken > 250, "only {taken} nodes taken in 500 cases");
     }
 }

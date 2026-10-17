@@ -268,7 +268,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sorted search.
 - A Flow Editor document's graph holds at most 2048 instances and 8192
   edges. No structure cap counted the graph, and deriving a flow from it
-  still walks nodes that several lanes run through once per lane. Past the
+  still walks a node once for each join whose lanes run through it. Past the
   caps, validation fails with `too_many_graph_instances` or
   `too_many_graph_edges` and checks nothing after the caps, and
   `meta/mobpacks/graph_to_flow`, rendering (export and deploy) and every
@@ -322,6 +322,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   took work quadratic in their number. A member now lists at most 1024
   tools: past that, validation fails with `too_many_member_tools`, and
   export and deploy refuse the document.
+- Deriving a flow from a Flow Editor graph walks a chain of nodes that
+  several lanes to one join run through once: a lane stops at a node an
+  earlier lane to the same join walked. Each lane walked the whole chain
+  again, so a fork of many lanes into one long chain took work quadratic in
+  its size.
 
 ### Added
 
