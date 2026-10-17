@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the semver gate): console send records
+  written before this version are not matched by any Console caller, so a
+  send in flight during the upgrade and retried afterwards with the same key
+  is admitted as a new send.
+
 ### Added
 
 - `meta/console/recover_send` and its REST twin `POST /console/send/recover`
@@ -31,12 +38,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Console sends are deduplicated per caller: the dedupe keys of
+  `meta/console/send` and `/console/send` are scoped to the authenticated
+  principal (a verified human by OIDC issuer and subject, otherwise the
+  console principal with its provider and verified issuer; anonymous
+  callers of an open console share one local account). The same key from
+  two callers names two sends. An open console without an access
+  controller never resolves tokens, so every caller there is that shared
+  account: isolating users needs `require_app_auth` or an access
+  controller.
 - The `dedupe_key` of a console send frame is an opaque digest for every
   Console caller. The public Rust `MetaConsoleAggregator::send` and
   `reserve_identity_first_interaction` keep their key shape and behaviour.
-- Upgrade note: console send records written before this version are not
-  matched by any Console caller. A send in flight during the upgrade and
-  retried afterwards with the same key is admitted as a new send.
 - Release builds no longer restore or save Rust caches in `build_binaries`
   and `release_validate`. No v0.9.2 release job restored one of their entries,
   whose keys change with every `Cargo.lock`, while the entries took 5.4 GB
@@ -86,14 +99,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- Fix console send idempotency isolation between authenticated principals:
-  the dedupe keys of `meta/console/send` and `/console/send` are scoped to the
-  authenticated principal (a verified human by OIDC issuer and subject,
-  otherwise the console principal with its provider and verified issuer;
-  anonymous callers of an open console share one local account). An open
-  console without an access controller never resolves tokens, so every caller
-  there is that shared account: isolating users needs `require_app_auth` or
-  an access controller.
 - A console send the gateway accepted but stopped before it settled no longer
   stays `accepted` or `dispatching` for good. A replay of the same send decides
   from the runtime's admission evidence in the session the send recorded: an
