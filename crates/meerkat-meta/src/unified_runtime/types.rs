@@ -765,9 +765,13 @@ impl From<meerkat_core::event::CompactionPreservedHistoryFit> for CompactionPres
 ///
 /// **Wired fire points:**
 /// - `SpawnFailure` — `mob_ops.rs` spawn error path
-/// - `ReconcileIncomplete` — `edge_reconcile.rs` after `reconcile_edges`
+/// - `ReconcileIncomplete` - `edge_reconcile.rs` after `reconcile_edges`, when
+///   an edge operation failed; a reconcile that only skipped edges for an
+///   endpoint that is not a member yet logs at INFO instead
 /// - `RediscoverFailure` — `lifecycle.rs` rediscover error path
-/// - `HostLoopCrash` — `lifecycle.rs` detects `run_failed` agent events during drain
+/// - `HostLoopCrash` - `lifecycle.rs` drain fires the alert the agent-event
+///   forwarder extracted from a member `RunFailed` whose typed class is not
+///   `Cancelled` (a cancelled run is not a crash)
 /// - `CheckpointFailure` — via `run_periodic_gc_with_error_callback` in session store
 /// - `CompactionPersistenceRejected` — `lifecycle.rs` drain fires the alert the
 ///   agent-event forwarder extracted from a member `CompactionFailed` event

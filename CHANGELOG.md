@@ -45,6 +45,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     while documents name its id. To accept it, delete the id's row from
     `extension_mob_holders`: the next restore adopts the id.
 
+- Behaviour-only (not measured by the semver gate): `ErrorEvent::HostLoopCrash`
+  no longer fires for a member run that ended cancelled (`error_report.class`
+  `cancelled`): an interrupt (a hard interrupt that drops the run included,
+  which Meerkat reports as a cancelled `RunFailed`), a mob stop or a shutdown
+  cancels in-flight work on purpose. Every other failed run still fires it,
+  with the same detail.
+  The cancelled run's `run_failed` event still reaches the console and the
+  event log; a hook that counted cancellations through `host_loop_crash`
+  reads those events instead.
+- Behaviour-only: `ErrorEvent::ReconcileIncomplete` fires only when an edge
+  operation failed (`failures` above zero; `skipped` still counts the edges
+  skipped beside them). A reconcile that only skipped edges, because an
+  endpoint is not a member yet, logs one INFO line instead: lazy identity
+  bootstrap leaves such edges pending by design, so it fired on every boot
+  with nothing failed. `reconcile_edges()` and `bootstrap_edges_report()`
+  still list those edges in `skipped_missing_members`, and `is_complete()`
+  is unchanged.
+
 ### Security
 
 - The stock reference app router's documented bound on requests in flight
@@ -192,6 +210,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   that destroy rather than expiring it, so the next activation under the id
   that names the same holder binds without the holder check; and, as for the
   ordering, the check covers one runtime in one process.
+
+- A shutdown no longer reports the member runs it cancels as
+  `host_loop_crash` errors ("agent run failed ... class=cancelled: Run was
+  cancelled"). The forwarder decides from the run's typed failure class while
+  the member event is still typed (see Breaking).
+- The agent event forwarder no longer warns "failed to subscribe; will retry
+  with backoff" for every member a shutdown stops, or for the persisted
+  members of a restored mob while it stays Stopped before its resume, and no
+  longer retries them. A subscribe that fails while the member's mob is
+  stopping or stopped (its admission is closed, or its last published phase
+  is Stopped, Completed or Destroyed) parks the member, logged at debug,
+  until the mob runs again; the identity stream health monitor does not count
+  it toward identity repair. A failure while the mob runs and admits keeps
+  the backoff, the first-failure warning and the repair count, also when the
+  mob's actor refused with a closed channel.
+- An identity-first boot no longer logs `reconcile_incomplete: 0 failures, N
+  skipped` at ERROR for the edges lazy identity bootstrap leaves pending (see
+  Breaking).
 
 ## [0.9.2] - 2026-10-16
 
