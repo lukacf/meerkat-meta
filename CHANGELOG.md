@@ -26,10 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Fix console send idempotency isolation between authenticated principals:
   the dedupe keys of `meta/console/send` and `/console/send` are scoped to the
   authenticated principal (a verified human by OIDC issuer and subject,
-  otherwise the console principal; anonymous callers of an open console share
-  one local account). An open console without an access controller never
-  resolves tokens, so every caller there is that shared account: isolating
-  users needs `require_app_auth` or an access controller.
+  otherwise the console principal with its provider and verified issuer;
+  anonymous callers of an open console share one local account). An open
+  console without an access controller never resolves tokens, so every caller
+  there is that shared account: isolating users needs `require_app_auth` or
+  an access controller.
 - A console send the gateway accepted but stopped before it settled no longer
   stays `accepted` or `dispatching` for good. A replay of the same send decides
   from the runtime's admission evidence in the session the send recorded: an

@@ -145,7 +145,8 @@ async fn anonymous_and_authenticated_callers_do_not_share_keys() {
         fresh(reserve(&aggregator, "k1", "hello", &ConsoleSendScope::Anonymous).await);
     let service = ConsoleSendScope::Principal {
         principal: "svc:reporter".to_string(),
-        service_identity: true,
+        provider: "service_identity".to_string(),
+        issuer: "https://issuer.example".to_string(),
     };
     let (principal, _p) = fresh(reserve(&aggregator, "k1", "hello", &service).await);
     let (verified, _v) = fresh(reserve(&aggregator, "k1", "hello", &human("u1")).await);

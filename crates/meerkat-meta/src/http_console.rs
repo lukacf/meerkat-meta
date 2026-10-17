@@ -143,6 +143,9 @@ struct ConsoleHttpAuthContext {
     /// Whether the verified token classified the principal as a service
     /// identity rather than a human.
     service_identity: bool,
+    /// The trust source of a resolved principal: the provider the verified
+    /// token was classified as, and the issuer it verified against.
+    principal_source: Option<(crate::AuthProvider, String)>,
     /// Per-request access snapshot when an [`AccessController`] is wired.
     access_view: Option<AccessView>,
     /// The verified human behind the request's token, when there is one.
@@ -161,10 +164,26 @@ impl ConsoleHttpAuthContext {
             };
         }
         match &self.principal {
-            Some(principal) => ConsoleSendScope::Principal {
-                principal: principal.clone(),
-                service_identity: self.service_identity,
-            },
+            Some(principal) => {
+                let (provider, issuer) = self
+                    .principal_source
+                    .as_ref()
+                    .map(|(provider, issuer)| {
+                        (
+                            serde_json::to_value(provider)
+                                .ok()
+                                .and_then(|value| value.as_str().map(ToString::to_string))
+                                .unwrap_or_default(),
+                            issuer.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
+                ConsoleSendScope::Principal {
+                    principal: principal.clone(),
+                    provider,
+                    issuer,
+                }
+            }
             None => ConsoleSendScope::Anonymous,
         }
     }
@@ -5257,11 +5276,15 @@ fn console_request_auth_context_for(
         let service_identity = auth
             .as_ref()
             .is_some_and(|auth| auth.provider == crate::AuthProvider::ServiceIdentity);
+        let principal_source = auth
+            .as_ref()
+            .and_then(|auth| console_principal_source(decisions, &auth.provider));
         let principal = auth.map(|auth| auth.email);
         return Some(ConsoleHttpAuthContext {
             access_view: access.map(|controller| controller.view_for_subject(principal.as_deref())),
             principal,
             service_identity,
+            principal_source,
             human,
         });
     }
@@ -5272,9 +5295,22 @@ fn console_request_auth_context_for(
         access_view: access
             .map(|controller| controller.view_for_subject(Some(auth.email.as_str()))),
         service_identity: auth.provider == crate::AuthProvider::ServiceIdentity,
+        principal_source: console_principal_source(decisions, &auth.provider),
         principal: Some(auth.email),
         human,
     })
+}
+
+/// The trust source of a principal the Console resolved from a verified
+/// token: its provider classification and the issuer the token verified
+/// against (the Console's trusted OIDC issuer).
+fn console_principal_source(
+    decisions: &RuntimeDecisionState,
+    provider: &crate::AuthProvider,
+) -> Option<(crate::AuthProvider, String)> {
+    let discovery =
+        crate::auth::parse_oidc_discovery_json(&decisions.trusted_oidc.discovery_json).ok()?;
+    Some((provider.clone(), discovery.issuer))
 }
 
 /// The human principal Meta uses for an authenticated Console human when it
@@ -21786,6 +21822,63 @@ mod console_viewer_resolver_tests {
 
         let required = state(decisions(true), None);
         assert_eq!(send_scope_of(&required, &bearer(BOB)), bob);
+    }
+
+    #[test]
+    fn a_principal_without_a_verified_human_is_scoped_by_its_trust_source() {
+        let required = state(decisions(true), None);
+        let robot = send_scope_of(&required, &bearer(ROBOT));
+        assert_eq!(
+            robot,
+            ConsoleSendScope::Principal {
+                principal: ROBOT.to_string(),
+                provider: "service_identity".to_string(),
+                issuer: ISSUER.to_string(),
+            }
+        );
+
+        // The same name verified against another issuer is another caller.
+        const OTHER_ISSUER: &str = "https://other.meta.localhost";
+        let mut other = decisions(true);
+        other.trusted_oidc.discovery_json = json!({
+            "issuer": OTHER_ISSUER,
+            "jwks_uri": format!("{OTHER_ISSUER}/.well-known/jwks.json"),
+        })
+        .to_string();
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        header.kid = Some("kid-current".to_string());
+        let other_token = jsonwebtoken::encode(
+            &header,
+            &json!({
+                "iss": OTHER_ISSUER,
+                "aud": "meerkat-console",
+                "sub": ROBOT,
+                "email": ROBOT,
+                "email_verified": true,
+                "provider": "google_oauth",
+                "exp": chrono::Utc::now().timestamp() + 300,
+            }),
+            &jsonwebtoken::EncodingKey::from_secret(b"phase7-trusted-current-secret"),
+        )
+        .expect("signed fixture JWT");
+        let mut other_bearer = HeaderMap::new();
+        other_bearer.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {other_token}").parse().unwrap(),
+        );
+        let other_robot = send_scope_of(&state(other, None), &other_bearer);
+        assert_eq!(
+            other_robot,
+            ConsoleSendScope::Principal {
+                principal: ROBOT.to_string(),
+                provider: "service_identity".to_string(),
+                issuer: OTHER_ISSUER.to_string(),
+            }
+        );
+        assert_ne!(
+            robot.dedupe_key("runtime", "agent", "console", "k"),
+            other_robot.dedupe_key("runtime", "agent", "console", "k")
+        );
     }
 
     #[test]

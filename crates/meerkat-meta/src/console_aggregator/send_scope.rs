@@ -28,10 +28,13 @@ pub(crate) enum ConsoleSendScope {
     /// A verified Console human, by OIDC issuer and subject.
     Human { issuer: String, subject: String },
     /// An authenticated principal with no verified human behind it: a
-    /// service identity, or a token without a subject.
+    /// service identity, or a token without a subject. Scoped by its trust
+    /// source too (the provider its token was classified as, and the issuer
+    /// it verified against), so one name from two sources is two callers.
     Principal {
         principal: String,
-        service_identity: bool,
+        provider: String,
+        issuer: String,
     },
 }
 
@@ -61,8 +64,9 @@ impl ConsoleSendScope {
             Self::Human { issuer, subject } => json!(["human", issuer, subject]),
             Self::Principal {
                 principal,
-                service_identity,
-            } => json!(["principal", principal, service_identity]),
+                provider,
+                issuer,
+            } => json!(["principal", provider, issuer, principal]),
         };
         let input = json!([
             SCOPED_SEND_KEY_DOMAIN,
@@ -99,6 +103,14 @@ mod tests {
         }
     }
 
+    fn principal(name: &str, provider: &str, issuer: &str) -> ConsoleSendScope {
+        ConsoleSendScope::Principal {
+            principal: name.to_string(),
+            provider: provider.to_string(),
+            issuer: issuer.to_string(),
+        }
+    }
+
     #[test]
     fn scoped_keys_are_stable_and_separate_every_component() {
         let key = |scope: &ConsoleSendScope| scope.dedupe_key("runtime", "agent", "console", "k1");
@@ -112,14 +124,9 @@ mod tests {
                 subject: "alice-sub".to_string(),
             },
             ConsoleSendScope::Anonymous,
-            ConsoleSendScope::Principal {
-                principal: "alice-sub".to_string(),
-                service_identity: false,
-            },
-            ConsoleSendScope::Principal {
-                principal: "alice-sub".to_string(),
-                service_identity: true,
-            },
+            principal("alice-sub", "generic_oidc", "https://issuer.example"),
+            principal("alice-sub", "service_identity", "https://issuer.example"),
+            principal("alice-sub", "generic_oidc", "https://other.example"),
         ];
         for other in &others {
             assert_ne!(key(&alice), key(other), "{other:?}");
@@ -152,13 +159,10 @@ mod tests {
             scope.dedupe_key("a:b", "c", "o", "k"),
             scope.dedupe_key("a", "b:c", "o", "k")
         );
-        let principal = |principal: &str| ConsoleSendScope::Principal {
-            principal: principal.to_string(),
-            service_identity: false,
-        };
+        let named = |name: &str| principal(name, "generic_oidc", "https://issuer.example");
         assert_ne!(
-            principal("x\",\"y").dedupe_key("r", "i", "o", "k"),
-            principal("x").dedupe_key("r", "i", "o", "\",\"y\"")
+            named("x\",\"y").dedupe_key("r", "i", "o", "k"),
+            named("x").dedupe_key("r", "i", "o", "\",\"y\"")
         );
     }
 
