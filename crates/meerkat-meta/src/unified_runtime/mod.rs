@@ -2843,9 +2843,14 @@ fn attach_member_event_stream(
 /// on every wake indefinitely and floods the log (observed: ~49k "failed to
 /// subscribe" warnings over 3.4h on a single wedged-retiring alias). Both
 /// retry transient failures with exponential backoff; only the independent
-/// health monitor hands persistent loss to identity repair.
+/// health monitor hands persistent loss to identity repair. A failure while
+/// the member's mob is stopping or stopped is its teardown, not a transient
+/// failure: it parks the member instead ([`mob_is_stopping_or_stopped`]).
 struct SubscribeBackoff {
-    next_attempt: tokio::time::Instant,
+    /// When the next subscribe may be attempted. `None` parks the member
+    /// while its mob is stopping or stopped: no deadline ends that, only the
+    /// mob running again, so no retry is scheduled for it.
+    next_attempt: Option<tokio::time::Instant>,
     consecutive_failures: u32,
 }
 
@@ -3015,7 +3020,7 @@ fn earliest_backoff_attempt(
 ) -> Option<tokio::time::Instant> {
     subscribe_failures
         .values()
-        .map(|backoff| backoff.next_attempt)
+        .filter_map(|backoff| backoff.next_attempt)
         .min()
 }
 
@@ -3031,6 +3036,29 @@ fn subscribe_backoff_delay(consecutive_failures: u32) -> Duration {
 /// (which can still carry stale binding atoms) fails every reconcile tick.
 fn forwarder_should_subscribe(status: MobMemberStatus) -> bool {
     matches!(status, MobMemberStatus::Active)
+}
+
+/// Whether `handle`'s mob is stopping or stopped, so a member subscribe that
+/// failed is the mob tearing its members down rather than a spawn or resume
+/// race: the actor refused the subscribe with a closed command or reply
+/// channel (its answer to every caller request while it shuts down, and
+/// after) or a closed admission, or the mob's admission is closed (it never
+/// reopens), or its last published phase is Stopped, Completed or Destroyed.
+/// A shutdown stops the mob before its terminal teardown ends the members'
+/// sessions, so their streams close in the Stopped phase.
+fn mob_is_stopping_or_stopped(handle: &MobHandle, refusal: Option<&MobError>) -> bool {
+    matches!(
+        refusal,
+        Some(
+            MobError::ActorCommandChannelClosed
+                | MobError::ActorReplyChannelClosed
+                | MobError::AdmissionClosed { .. }
+        )
+    ) || handle.admission_closed().borrow().is_some()
+        || matches!(
+            handle.status_observation_snapshot(),
+            MobState::Stopped | MobState::Completed | MobState::Destroyed
+        )
 }
 
 fn durable_identity_label(labels: &BTreeMap<String, String>) -> Option<String> {
@@ -3763,11 +3791,17 @@ async fn reconcile_agent_event_streams(
 
             // Back off an Active member that keeps failing to subscribe (a
             // genuinely stuck injector), so even that case can't spin the log.
+            // A member parked by its mob's teardown waits for the mob to run
+            // again.
             let now = tokio::time::Instant::now();
-            if let Some(backoff) = subscribe_failures.get(&tracked_key)
-                && now < backoff.next_attempt
-            {
-                continue;
+            if let Some(backoff) = subscribe_failures.get(&tracked_key) {
+                let held = match backoff.next_attempt {
+                    Some(next_attempt) => now < next_attempt,
+                    None => mob_is_stopping_or_stopped(handle, None),
+                };
+                if held {
+                    continue;
+                }
             }
 
             let role = entry.role.clone();
@@ -3801,6 +3835,30 @@ async fn reconcile_agent_event_streams(
                     tracked.current.insert(tracked_key, attachment);
                 }
                 Err(error) => {
+                    // The member's mob is tearing its members down (a
+                    // shutdown stops the mob, then ends their sessions and
+                    // its actor): the failure is the teardown. Park the
+                    // member with no retry and nothing above debug until the
+                    // mob runs again; identity repair does not count it.
+                    if mob_is_stopping_or_stopped(handle, Some(&error)) {
+                        if identity_runtime.is_none() {
+                            tracing::debug!(
+                                mob_id = %mob_id,
+                                identity = %identity,
+                                error = %error,
+                                "meta agent event forwarder: subscribe failed while the member's \
+                                 mob is stopping or stopped; not retrying until it runs again"
+                            );
+                        }
+                        subscribe_failures
+                            .entry(tracked_key)
+                            .and_modify(|backoff| backoff.next_attempt = None)
+                            .or_insert(SubscribeBackoff {
+                                next_attempt: None,
+                                consecutive_failures: 0,
+                            });
+                        continue;
+                    }
                     // Usually a short-lived spawn/resume race while Meerkat
                     // finishes installing the session event injector. Retry
                     // with exponential backoff and warn only on the first
@@ -3812,7 +3870,7 @@ async fn reconcile_agent_event_streams(
                         subscribe_failures
                             .entry(tracked_key)
                             .or_insert(SubscribeBackoff {
-                                next_attempt: now,
+                                next_attempt: Some(now),
                                 consecutive_failures: 0,
                             });
                     if identity_runtime.is_none() && backoff.consecutive_failures == 0 {
@@ -3832,7 +3890,7 @@ async fn reconcile_agent_event_streams(
                         );
                     }
                     backoff.next_attempt =
-                        now + subscribe_backoff_delay(backoff.consecutive_failures);
+                        Some(now + subscribe_backoff_delay(backoff.consecutive_failures));
                     backoff.consecutive_failures = backoff.consecutive_failures.saturating_add(1);
                     let stream_is_permanently_lost =
                         backoff.consecutive_failures >= PERMANENT_STREAM_FAILURE_THRESHOLD;
@@ -5981,7 +6039,7 @@ mod tests {
         let mut subscribe_failures = HashMap::from([(
             key.clone(),
             SubscribeBackoff {
-                next_attempt: tokio::time::Instant::now(),
+                next_attempt: Some(tokio::time::Instant::now()),
                 consecutive_failures: 1,
             },
         )]);
@@ -6106,6 +6164,125 @@ mod tests {
         );
 
         drop(streams);
+        let _ = handle.shutdown().await;
+    }
+
+    /// A member whose mob is shutting down is neither retried nor warned
+    /// about: its stream closing and its re-subscribe failing are the
+    /// teardown, not a spawn race. The closed stream re-runs the pass, as in
+    /// the forwarder task; the failed subscribe parks the member with no
+    /// retry deadline, a later pass does not try again, and nothing is
+    /// logged above debug.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_neither_retries_nor_warns_for_a_member_of_a_mob_shutting_down() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (mob_runtime, _session_id) =
+            mob_with_idle_worker("console-teardown-member", &temp_dir).await;
+        let handle = mob_runtime.handle();
+        let mut forwarder = DrivenForwarder::new();
+        forwarder.reconcile(&handle, &None).await;
+        assert_eq!(
+            forwarder.tracked.current.len(),
+            1,
+            "the worker's stream attached"
+        );
+
+        // The teardown the runtime's shutdown drives: Stop, then the mob's
+        // terminal shutdown, which ends the worker's session and its stream.
+        handle.stop().await.expect("stop the mob");
+        let shutdown_handle = handle.clone();
+        let shutdown = tokio::spawn(async move { shutdown_handle.shutdown().await });
+        let (closed_key, generation) = loop {
+            if let ForwardedAgentEvent::Closed(key, generation) = forwarder.next().await {
+                break (key, generation);
+            }
+        };
+        assert!(forwarder.tracked.close(&closed_key, generation));
+
+        let writer = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        // A second registered dispatcher keeps callsite interest computed for
+        // every dispatcher, so a callsite another test's thread reached first
+        // still records here.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
+        let guard = tracing::subscriber::set_default(subscriber);
+        forwarder.reconcile(&handle, &None).await;
+        let parked_after_first_pass = forwarder.subscribe_failures.contains_key(&closed_key);
+        forwarder.reconcile(&handle, &None).await;
+        drop(guard);
+        let logged = writer.contents();
+        let _ = shutdown.await;
+
+        let retry = earliest_backoff_attempt(&forwarder.subscribe_failures);
+        assert!(
+            retry.is_none() && !logged.contains("will retry with backoff"),
+            "a member of a mob shutting down is neither retried (next attempt \
+             {retry:?}) nor warned about: {logged}"
+        );
+        assert!(
+            forwarder.tracked.current.is_empty(),
+            "nothing attaches to a member being torn down"
+        );
+        assert!(
+            parked_after_first_pass,
+            "the failed subscribe parks the member: {logged}"
+        );
+        assert_eq!(
+            logged.matches("not retrying").count(),
+            1,
+            "one debug line, and the second pass does not try again: {logged}"
+        );
+    }
+
+    /// A member parked by its mob's teardown is tried again once the mob
+    /// runs: the park holds only while the mob is stopping or stopped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_tries_a_parked_member_again_once_its_mob_runs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (mob_runtime, _session_id) =
+            mob_with_idle_worker("console-parked-member", &temp_dir).await;
+        let handle = mob_runtime.handle();
+        let entry = handle
+            .list_members_including_retiring()
+            .await
+            .into_iter()
+            .find(|entry| entry.agent_identity == IDLE_WORKER)
+            .expect("worker roster entry");
+        let (runtime_id, fence_token) = entry.binding_atoms().expect("worker binding atoms");
+        let key = TrackedAgentEventStream {
+            mob_id: handle.mob_id().to_string(),
+            durable_identity: durable_identity_label(&entry.labels),
+            member_identity: entry.agent_identity.clone(),
+            runtime_id,
+            identity_fencing_token: None,
+            fence_token,
+        };
+        let mut forwarder = DrivenForwarder::new();
+        forwarder.subscribe_failures.insert(
+            key.clone(),
+            SubscribeBackoff {
+                next_attempt: None,
+                consecutive_failures: 0,
+            },
+        );
+        assert_eq!(
+            earliest_backoff_attempt(&forwarder.subscribe_failures),
+            None,
+            "a parked member schedules no retry"
+        );
+
+        forwarder.reconcile(&handle, &None).await;
+
+        assert!(
+            forwarder.tracked.current.contains_key(&key),
+            "the running mob's member attached"
+        );
+        assert!(forwarder.subscribe_failures.is_empty());
+        drop(forwarder);
         let _ = handle.shutdown().await;
     }
 
@@ -7174,14 +7351,20 @@ mod tests {
             forwarder.tracked.current.is_empty(),
             "no actor to attach to yet"
         );
+        // The restored mob stays Stopped until activation resumes it, so the
+        // failed subscription parks the member: no retry deadline, no count.
+        assert_eq!(handle.status_observation_snapshot(), MobState::Stopped);
         let backoff = forwarder
             .subscribe_failures
             .get_mut(&key)
-            .expect("the failed subscription parked the member in backoff");
-        assert_eq!(backoff.consecutive_failures, 1);
+            .expect("the failed subscription parked the member");
+        assert_eq!(
+            (backoff.next_attempt, backoff.consecutive_failures),
+            (None, 0)
+        );
         // Keep the member parked until its run finished unobserved,
         // whatever the scheduling.
-        backoff.next_attempt = tokio::time::Instant::now() + Duration::from_hours(1);
+        backoff.next_attempt = Some(tokio::time::Instant::now() + Duration::from_hours(1));
 
         let identity_runtime = boot.identity_runtime.clone();
         let runtime = boot.activate().await;
@@ -7207,7 +7390,7 @@ mod tests {
             .subscribe_failures
             .get_mut(&key)
             .expect("parked member")
-            .next_attempt = tokio::time::Instant::now();
+            .next_attempt = Some(tokio::time::Instant::now());
         forwarder.reconcile(&handle, &None).await;
         assert!(
             forwarder
@@ -8258,7 +8441,7 @@ mod tests {
             .subscribe_failures
             .get_mut(&key)
             .expect("parked member")
-            .next_attempt = tokio::time::Instant::now();
+            .next_attempt = Some(tokio::time::Instant::now());
         forwarder.reconcile(&handle, &None).await;
         assert!(
             forwarder

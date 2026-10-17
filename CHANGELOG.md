@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `host_loop_crash` errors ("agent run failed ... class=cancelled: Run was
   cancelled"). The forwarder decides from the run's typed failure class while
   the member event is still typed (see Breaking).
+- The agent event forwarder no longer warns "failed to subscribe; will retry
+  with backoff" for every member a shutdown stops, or for the persisted
+  members of a restored mob while it stays Stopped before its resume, and no
+  longer retries them. A subscribe that fails while the member's mob is
+  stopping or stopped (its actor refuses commands, its admission is closed,
+  or its last published phase is Stopped, Completed or Destroyed) parks the
+  member, logged at debug, until the mob runs again; the identity stream
+  health monitor does not count it toward identity repair. A failure while
+  the mob runs keeps the backoff and the first-failure warning.
 
 ## [0.9.2] - 2026-10-16
 
