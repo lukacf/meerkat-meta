@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   only: a roster member that already has continuity refuses the whole pass
   (`HeldBootstrapRefusal::ExistingContinuity`) before any member is held, as
   it did before.
+- The durable-behind repair's INFO log names the first committed rewrite it
+  replays (`first_rewrite_generation`) and how many it replays
+  (`replayed_rewrites`). It said the durable row was a prefix of the sealed
+  commit's parent, which is wrong when the row is several rewrites behind:
+  the repair proves the earliest rewrite whose parent the row is a prefix of
+  and replays every rewrite from there to the sealed head.
 
 ## [0.9.3] - 2026-10-18
 
