@@ -18,12 +18,12 @@ use serde::de::DeserializeOwned;
 use super::store::AnnouncementStore;
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
-    BatchId, BatchItem, BatchPosition, BatchQuery, BatchState, BatchStateTag, MAX_BACKFILL,
-    MAX_ITEM_WIRE_BYTES, MAX_PAGE, Member, MemberBacklog, MobId, MobLineage, OperationId,
-    PruneReport, PutSubscription, Result, SealingPolicy, SourceKey, StartFrontier, Subscription,
-    SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
-    SubscriptionState, Topic, content_digest, header_wire_bound, render_batch, render_item,
-    request_fingerprint, wire_len,
+    BatchGap, BatchId, BatchItem, BatchPosition, BatchQuery, BatchState, BatchStateTag,
+    ExpiryReport, GapReason, MAX_BACKFILL, MAX_ITEM_WIRE_BYTES, MAX_PAGE, Member, MemberBacklog,
+    MobId, MobLineage, OperationId, PruneReport, PutSubscription, Result, SealingPolicy, SourceKey,
+    StartFrontier, Subscription, SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd,
+    SubscriptionId, SubscriptionState, Topic, content_digest, header_wire_bound, merge_gaps,
+    render_batch, render_gap, render_item, request_fingerprint, wire_len,
 };
 
 /// The mob announcement store's tables. A provider applies this through its own
@@ -86,7 +86,10 @@ CREATE TABLE IF NOT EXISTS mob_lineage (
  ended_at_ms INTEGER, record TEXT NOT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS mob_lineage_live
  ON mob_lineage (mob_id) WHERE ended_at_ms IS NULL;
-CREATE INDEX IF NOT EXISTS mob_lineage_by_parent ON mob_lineage (parent_mob_id);";
+CREATE INDEX IF NOT EXISTS mob_lineage_by_parent ON mob_lineage (parent_mob_id);
+CREATE TABLE IF NOT EXISTS announcement_gaps (
+ member TEXT NOT NULL, mob_id TEXT NOT NULL, reason TEXT NOT NULL, count INTEGER NOT NULL,
+ PRIMARY KEY (member, mob_id, reason));";
 
 fn storage(error: impl std::fmt::Display) -> AnnouncementStoreError {
     AnnouncementStoreError::Storage(error.to_string())
@@ -485,6 +488,80 @@ fn settle_owed(db: &Connection, batch: &BatchId, settlement: &str) -> Result<()>
     )
     .map_err(storage)?;
     Ok(())
+}
+
+/// Add `gaps` to the member's pending gaps, which its next batch reports.
+fn add_gaps(db: &Connection, member: &Member, gaps: &[BatchGap]) -> Result<()> {
+    for gap in gaps {
+        db.execute(
+            "INSERT INTO announcement_gaps (member, mob_id, reason, count) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(member, mob_id, reason) DO UPDATE SET count = count + excluded.count",
+            params![
+                member.key(),
+                gap.mob_id.as_str(),
+                gap.reason.as_str(),
+                int(gap.count)?
+            ],
+        )
+        .map_err(storage)?;
+    }
+    Ok(())
+}
+
+/// The member's pending gaps, in a stable order.
+fn pending_gaps(db: &Connection, member: &Member) -> Result<Vec<BatchGap>> {
+    let mut statement = db
+        .prepare(
+            "SELECT mob_id, reason, count FROM announcement_gaps WHERE member = ?1
+             ORDER BY mob_id, reason",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(params![member.key()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(storage)?;
+    let mut gaps = Vec::new();
+    for row in rows {
+        let (mob_id, reason, count) = row.map_err(storage)?;
+        gaps.push(BatchGap {
+            mob_id: MobId::new(mob_id)?,
+            count: uint(count)?,
+            reason: GapReason::parse(&reason)?,
+        });
+    }
+    Ok(gaps)
+}
+
+/// What the unsettled owed announcements of `batch` amount to as expired
+/// gaps: distinct announcements per mob, so one held for two of the
+/// member's subscriptions counts once.
+fn batch_expired_gaps(db: &Connection, batch: &BatchId) -> Result<Vec<BatchGap>> {
+    let mut statement = db
+        .prepare(
+            "SELECT mob_id, COUNT(DISTINCT sequence) FROM owed_announcements
+             WHERE batch_id = ?1 AND settlement IS NULL GROUP BY mob_id ORDER BY mob_id",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(params![batch.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(storage)?;
+    let mut gaps = Vec::new();
+    for row in rows {
+        let (mob_id, count) = row.map_err(storage)?;
+        gaps.push(BatchGap {
+            mob_id: MobId::new(mob_id)?,
+            count: uint(count)?,
+            reason: GapReason::Expired,
+        });
+    }
+    Ok(gaps)
 }
 
 fn mark_sealed(db: &Connection, member: &Member, now_ms: u64) -> Result<()> {
@@ -1240,9 +1317,15 @@ fn seal_batch_in(
     let mut announcements = BTreeMap::new();
     let mut items = Vec::new();
     let mut bytes = 0_u64;
-    // The encoded body is its header plus each item's encoding without the
-    // quotes: JSON escapes character by character.
-    let mut wire = wire_budget.map_or(0, |_| header_wire_bound(batch_id));
+    // What the member was owed and never got rides on its next batch.
+    let gaps = pending_gaps(db, member)?;
+    // The encoded body is its header, its gap lines and each item's
+    // encoding without the quotes: JSON escapes character by character.
+    let mut wire = wire_budget.map_or(0, |_| {
+        gaps.iter().fold(header_wire_bound(batch_id), |wire, gap| {
+            wire.saturating_add(wire_len(&render_gap(gap)).saturating_sub(2))
+        })
+    });
     for (subscription, revision, mob_id, sequence, rendered) in candidates {
         let key = (MobId::new(mob_id)?, uint(sequence)?);
         let rendered = uint(rendered)?;
@@ -1266,7 +1349,12 @@ fn seal_batch_in(
     if owed.is_empty() {
         return Ok(None);
     }
-    let body = render_batch(batch_id, None, &items);
+    let body = render_batch(batch_id, None, &gaps, &items);
+    db.execute(
+        "DELETE FROM announcement_gaps WHERE member = ?1",
+        params![member.key()],
+    )
+    .map_err(storage)?;
     let mut batch_items = Vec::with_capacity(owed.len());
     for (subscription_id, subscription_revision, key) in owed {
         let source_key = announcements
@@ -1296,6 +1384,7 @@ fn seal_batch_in(
         id: batch_id.clone(),
         member: member.clone(),
         items: batch_items,
+        gaps,
         content_digest: content_digest(&body),
         body,
         predecessor: None,
@@ -1337,6 +1426,7 @@ fn transition_batch_in(
             id: successor.id.clone(),
             member: batch.member.clone(),
             items: batch.items.clone(),
+            gaps: successor.gaps.clone(),
             body: successor.body.clone(),
             content_digest: content_digest(&successor.body),
             predecessor: Some(batch.id.clone()),
@@ -1354,6 +1444,12 @@ fn transition_batch_in(
         .map_err(storage)?;
         mark_sealed(db, &batch.member, now_ms)?;
         batch.successor = Some(successor.id.clone());
+    }
+    if matches!(event, BatchEvent::Expire | BatchEvent::ExpireNotCommitted) {
+        // The member learns of what expired, and of the gaps this batch was
+        // to report, from its next batch.
+        let expired = batch_expired_gaps(db, &batch.id)?;
+        add_gaps(db, &batch.member, &merge_gaps(&batch.gaps, &expired))?;
     }
     if let Some(settlement) = event.settlement() {
         settle_owed(db, &batch.id, settlement.as_str())?;
@@ -1381,6 +1477,94 @@ fn oldest_announcement(db: &Connection, mob_id: &str) -> Result<Option<(i64, Str
     )
     .optional()
     .map_err(storage)
+}
+
+fn expire_in(
+    db: &Connection,
+    now_ms: u64,
+    retention_ms: u64,
+    limit: usize,
+) -> Result<ExpiryReport> {
+    let cutoff = int(now_ms.saturating_sub(retention_ms))?;
+    let budget = u64::try_from(limit.max(1)).unwrap_or(u64::MAX);
+    let mut report = ExpiryReport::default();
+
+    // Captures no batch holds, owed longer than the window: each
+    // announcement once per member, oldest first.
+    let mut statement = db
+        .prepare(
+            "SELECT member, mob_id, sequence, MIN(captured_at_ms) AS at FROM owed_announcements
+             WHERE batch_id IS NULL AND settlement IS NULL AND captured_at_ms <= ?1
+             GROUP BY member, mob_id, sequence ORDER BY at, member, mob_id, sequence LIMIT ?2",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(params![cutoff, int(budget.saturating_add(1))?], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(storage)?;
+    let mut expired = Vec::new();
+    for row in rows {
+        expired.push(row.map_err(storage)?);
+    }
+    drop(statement);
+    if expired.len() as u64 > budget {
+        expired.truncate(usize::try_from(budget).unwrap_or(usize::MAX));
+        report.more = true;
+    }
+    let mut gaps = BTreeMap::<String, Vec<BatchGap>>::new();
+    for (member, mob_id, sequence) in expired {
+        db.execute(
+            "UPDATE owed_announcements SET settlement = 'expired'
+             WHERE member = ?1 AND mob_id = ?2 AND sequence = ?3
+               AND batch_id IS NULL AND settlement IS NULL",
+            params![member, mob_id, sequence],
+        )
+        .map_err(storage)?;
+        let gap = BatchGap {
+            mob_id: MobId::new(mob_id)?,
+            count: 1,
+            reason: GapReason::Expired,
+        };
+        let member_gaps = gaps.entry(member).or_default();
+        *member_gaps = merge_gaps(member_gaps, &[gap]);
+        report.captures += 1;
+    }
+    for (member, member_gaps) in gaps {
+        add_gaps(db, &Member::from_key(&member)?, &member_gaps)?;
+    }
+
+    // Sealed batches nothing native ever started for, sealed before the
+    // window: every item they hold is at least that old.
+    let mut statement = db
+        .prepare(
+            "SELECT id FROM announcement_batches WHERE state = 'sealed' AND sealed_at_ms <= ?1
+             ORDER BY sealed_at_ms, id LIMIT ?2",
+        )
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(params![cutoff, int(budget.saturating_add(1))?], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(storage)?;
+    let mut sealed = Vec::new();
+    for row in rows {
+        sealed.push(BatchId::new(row.map_err(storage)?)?);
+    }
+    drop(statement);
+    if sealed.len() as u64 > budget {
+        sealed.truncate(usize::try_from(budget).unwrap_or(usize::MAX));
+        report.more = true;
+    }
+    for id in sealed {
+        transition_batch_in(db, &id, BatchStateTag::Sealed, &BatchEvent::Expire, now_ms)?;
+        report.batches += 1;
+    }
+    Ok(report)
 }
 
 fn prune_in(db: &Connection, now_ms: u64, retention_ms: u64, limit: usize) -> Result<PruneReport> {
@@ -1420,10 +1604,16 @@ fn prune_in(db: &Connection, now_ms: u64, retention_ms: u64, limit: usize) -> Re
         if announced_at > cutoff {
             continue;
         }
+        // Still owed by a capture no batch holds, or by a batch nothing
+        // native holds yet: kept until it is delivered or expires. A batch
+        // the native owner may hold already carries its own body, so it
+        // keeps only its owed rows, never the announcement.
         let owed: bool = db
             .query_row(
-                "SELECT EXISTS (SELECT 1 FROM owed_announcements
-                   WHERE mob_id = ?1 AND sequence = ?2 AND settlement IS NULL)",
+                "SELECT EXISTS (SELECT 1 FROM owed_announcements o
+                   LEFT JOIN announcement_batches b ON b.id = o.batch_id
+                   WHERE o.mob_id = ?1 AND o.sequence = ?2 AND o.settlement IS NULL
+                     AND (o.batch_id IS NULL OR b.state = 'sealed'))",
                 params![mob_id, sequence],
                 |row| row.get(0),
             )
@@ -1435,7 +1625,13 @@ fn prune_in(db: &Connection, now_ms: u64, retention_ms: u64, limit: usize) -> Re
             report.more = true;
             break;
         }
-        for table in ["owed_announcements", "announcement_topics", "announcements"] {
+        db.execute(
+            "DELETE FROM owed_announcements
+             WHERE mob_id = ?1 AND sequence = ?2 AND settlement IS NOT NULL",
+            params![mob_id, sequence],
+        )
+        .map_err(storage)?;
+        for table in ["announcement_topics", "announcements"] {
             db.execute(
                 &format!("DELETE FROM {table} WHERE mob_id = ?1 AND sequence = ?2"),
                 params![mob_id, sequence],
@@ -1470,6 +1666,20 @@ fn prune_in(db: &Connection, now_ms: u64, retention_ms: u64, limit: usize) -> Re
         )
         .map_err(storage)?;
     }
+
+    // Owed rows a native-held batch kept after its announcement was removed,
+    // once that batch settled them.
+    let orphaned = db
+        .execute(
+            "DELETE FROM owed_announcements WHERE rowid IN (
+               SELECT o.rowid FROM owed_announcements o
+               WHERE o.settlement IS NOT NULL AND NOT EXISTS (SELECT 1 FROM announcements a
+                 WHERE a.mob_id = o.mob_id AND a.sequence = o.sequence)
+               LIMIT ?1)",
+            params![int(budget)?],
+        )
+        .map_err(storage)? as u64;
+    report.more |= orphaned >= budget;
 
     // Settled batches no owed announcement still names, oldest first, with their
     // own budget.
@@ -1606,6 +1816,13 @@ fn prune_in(db: &Connection, now_ms: u64, retention_ms: u64, limit: usize) -> Re
         )
         .map_err(storage)? as u64;
     report.more |= members >= budget || logs >= budget;
+    // Gaps of a member with no live subscription have no one to reach.
+    db.execute(
+        "DELETE FROM announcement_gaps WHERE NOT EXISTS (SELECT 1 FROM member_subscriptions s
+           WHERE s.member = announcement_gaps.member AND s.state IN ('active', 'paused'))",
+        [],
+    )
+    .map_err(storage)?;
     report.lineage = db
         .execute(
             "DELETE FROM mob_lineage WHERE row_id IN (
@@ -1878,6 +2095,11 @@ impl AnnouncementStore for SqliteAnnouncementStore {
     ) -> Result<Batch> {
         let id = id.clone();
         self.run(move |db| transition_batch_in(db, &id, expected, &event, now_ms))
+            .await
+    }
+
+    async fn expire(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<ExpiryReport> {
+        self.run(move |db| expire_in(db, now_ms, retention_ms, limit))
             .await
     }
 

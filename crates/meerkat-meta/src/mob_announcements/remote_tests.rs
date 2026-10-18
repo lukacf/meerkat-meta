@@ -243,6 +243,7 @@ fn remote_batch(id: &str, body_text: &str) -> Batch {
     let body = render_batch(
         &id,
         None,
+        &[],
         &[format!("- [ios] payments #1 key=k\n  {body_text}\n")],
     );
     Batch {
@@ -257,6 +258,7 @@ fn remote_batch(id: &str, body_text: &str) -> Batch {
             sequence: 1,
             source_key: SourceKey::new("k").unwrap(),
         }],
+        gaps: Vec::new(),
         content_digest: content_digest(&body),
         body,
         id,

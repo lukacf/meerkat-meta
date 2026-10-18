@@ -6,9 +6,9 @@ use async_trait::async_trait;
 
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, Batch, BatchEvent, BatchId, BatchPosition,
-    BatchQuery, BatchStateTag, Member, MemberBacklog, MobId, MobLineage, OperationId, PruneReport,
-    PutSubscription, Result, SealingPolicy, SourceKey, Subscription, SubscriptionChange,
-    SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
+    BatchQuery, BatchStateTag, ExpiryReport, Member, MemberBacklog, MobId, MobLineage, OperationId,
+    PruneReport, PutSubscription, Result, SealingPolicy, SourceKey, Subscription,
+    SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
 };
 
 /// Durable mob announcements, member subscriptions and delivery batches.
@@ -159,5 +159,13 @@ pub trait AnnouncementStore: Send + Sync {
     /// nothing and that no subscription names; and lineage records that
     /// ended before the window and that no live record names as parent.
     /// [`PruneReport::more`] says whether another pass has work.
+    /// Settle as expired what waited longer than the retention window for
+    /// a delivery that never started, at most `limit` of each kind: owed
+    /// announcements no batch holds (each once per member), and sealed
+    /// batches sealed before the window. The member's next batch reports
+    /// them as gaps. A batch the native owner may hold is never expired
+    /// here.
+    async fn expire(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<ExpiryReport>;
+
     async fn prune(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<PruneReport>;
 }

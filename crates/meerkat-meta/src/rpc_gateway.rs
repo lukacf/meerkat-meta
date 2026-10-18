@@ -18404,7 +18404,10 @@ external_addressable = true
 
     // Mob announcements attach once the identity runtime and the agent mob
     // tool state exist, before the first request is served.
-    if let Some(config) = gateway_options.mob_announcements {
+    if let Some(mut config) = gateway_options.mob_announcements {
+        // A peer refuses a keyed inject issued further from its clock than
+        // this window, which bounds when a peer member's batch may expire.
+        config.peer_request_window_ms = gateway_options.control_request_window_ms;
         crate::mob_announcements::compose_for_runtime(
             &runtime,
             &storage_layout,

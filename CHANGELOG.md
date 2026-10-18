@@ -42,7 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `runtime_options.mob_announcements`; without it nothing opens the
   announcement database (`mob_announcements.sqlite3`, fenced by storage
   maintenance in every build) and the methods answer
-  `mob_announcements_unavailable`. See `docs/design/mob-announcements.md`.
+  `mob_announcements_unavailable`. Nothing holds retention much past the
+  window: what waited longer for a delivery that never started expires, and
+  the member's next batch reports it as a gap. See
+  `docs/design/mob-announcements.md`.
 
 - Mob announcement member tools. A profile that lists the
   `mob_announcements` bundle in `tools.rust_bundles` gives its members

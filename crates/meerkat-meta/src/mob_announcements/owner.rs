@@ -26,10 +26,11 @@ use super::native::{
 use super::store::AnnouncementStore;
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
-    BatchId, BatchPosition, BatchQuery, BatchState, BatchStateTag, MAX_REMOTE_BODY_WIRE_BYTES,
-    Member, MobId, MobIncarnation, MobLineage, NativeReceipt, OperationId, PutSubscription,
-    SealingPolicy, SourceKey, Subscription, SubscriptionChange, SubscriptionChangeOutcome,
-    SubscriptionEnd, SubscriptionId, SubscriptionState, SuccessorBatch, render_batch, render_item,
+    BatchGap, BatchId, BatchPosition, BatchQuery, BatchState, BatchStateTag, GapReason,
+    MAX_REMOTE_BODY_WIRE_BYTES, Member, MobId, MobIncarnation, MobLineage, NativeReceipt,
+    OperationId, PutSubscription, SealingPolicy, SourceKey, Subscription, SubscriptionChange,
+    SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId, SubscriptionState, SuccessorBatch,
+    merge_gaps, render_batch, render_item,
 };
 
 /// Announcements and settled batches are kept this long after they settle.
@@ -70,6 +71,10 @@ pub struct AnnouncementConfig {
     pub settle_check_max_ms: u64,
     /// Per-member limits on the member tools.
     pub member_limits: super::tools::MemberLimits,
+    /// How far a keyed inject request's issue time may be from a peer's
+    /// clock: a request older than this is refused as stale, so a batch
+    /// for a peer member whose last attempt is older may expire.
+    pub peer_request_window_ms: u64,
 }
 
 impl Default for AnnouncementConfig {
@@ -80,6 +85,7 @@ impl Default for AnnouncementConfig {
             settle_check_min_ms: 1_000,
             settle_check_max_ms: 30_000,
             member_limits: super::tools::MemberLimits::default(),
+            peer_request_window_ms: crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS,
         }
     }
 }
@@ -212,6 +218,15 @@ pub struct RoundReport {
 }
 
 type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// When a batch nothing native holds expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expiry {
+    NotYet,
+    Now,
+    /// Once the peer's request window has passed since the last attempt.
+    AfterQuietWindow(u64),
+}
 
 /// Which subscriptions still want a batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1168,15 +1183,23 @@ impl AnnouncementService {
                         now.saturating_sub(last_prune) >= PRUNE_INTERVAL_MS
                     };
                     if pass_due {
-                        match service
-                            .inner
-                            .store
-                            .prune(now, service.inner.config.retention_ms, PRUNE_LIMIT)
-                            .await
-                        {
-                            Ok(report) => retention_behind = report.more,
+                        let retention_ms = service.inner.config.retention_ms;
+                        // What waited longer than the window for a delivery
+                        // that never started expires first, so the prune
+                        // after it is never held back by it.
+                        let store = &service.inner.store;
+                        match store.expire(now, retention_ms, PRUNE_LIMIT).await {
+                            Ok(expired) => {
+                                match store.prune(now, retention_ms, PRUNE_LIMIT).await {
+                                    Ok(report) => retention_behind = expired.more || report.more,
+                                    Err(error) => {
+                                        tracing::warn!(%error, "announcement retention pass failed");
+                                        retention_behind = false;
+                                    }
+                                }
+                            }
                             Err(error) => {
-                                tracing::warn!(%error, "announcement retention pass failed");
+                                tracing::warn!(%error, "announcement expiry pass failed");
                                 retention_behind = false;
                             }
                         }
@@ -1262,25 +1285,54 @@ impl AnnouncementService {
         let id = new_batch_id()?;
         let mut seen = BTreeSet::new();
         let mut items = Vec::new();
+        let mut not_retained = Vec::new();
         for item in &batch.items {
             if !seen.insert((item.mob_id.clone(), item.sequence)) {
                 continue;
             }
-            let announcement = self
+            // Retention may have removed an announcement while the native
+            // owner held this batch: the successor reports it as a gap.
+            match self
                 .inner
                 .store
                 .announcement(&item.mob_id, &item.source_key)
                 .await?
-                .ok_or_else(|| {
-                    AnnouncementStoreError::Storage(format!(
-                        "an owed announcement names {} #{}, which is not retained",
-                        item.mob_id, item.sequence
-                    ))
-                })?;
-            items.push(render_item(&announcement));
+            {
+                Some(announcement) => items.push(render_item(&announcement)),
+                None => not_retained.push(BatchGap {
+                    mob_id: item.mob_id.clone(),
+                    count: 1,
+                    reason: GapReason::NotRetained,
+                }),
+            }
         }
-        let body = render_batch(&id, Some(&batch.id), &items);
-        Ok(Some(SuccessorBatch { id, body }))
+        let gaps = merge_gaps(&batch.gaps, &not_retained);
+        let body = render_batch(&id, Some(&batch.id), &gaps, &items);
+        Ok(Some(SuccessorBatch { id, body, gaps }))
+    }
+
+    /// Whether a batch the native owner reads as not committed expires:
+    /// once it was sealed before the retention window, every item it holds
+    /// is at least that old. For a member on a peer gateway its last
+    /// submission must also be older than the peer's request window, so a
+    /// request still in flight is refused as stale instead of landing after
+    /// the expiry; until then nothing is submitted again.
+    fn expiry(&self, batch: &Batch, now: u64) -> Expiry {
+        let config = &self.inner.config;
+        if now.saturating_sub(batch.sealed_at_ms) < config.retention_ms {
+            return Expiry::NotYet;
+        }
+        if self.inner.native.route(&batch.member) == MemberRoute::Local
+            || now.saturating_sub(batch.updated_at_ms) > config.peer_request_window_ms
+        {
+            return Expiry::Now;
+        }
+        Expiry::AfterQuietWindow(
+            batch
+                .updated_at_ms
+                .saturating_add(config.peer_request_window_ms)
+                .saturating_add(1),
+        )
     }
 
     fn settle_pause_ms(&self, batch: &Batch, now: u64) -> u64 {
@@ -1354,15 +1406,31 @@ impl AnnouncementService {
                     };
                     match status {
                         NativeStatus::NotCommitted => {
-                            match self.interest(&batch).await? {
-                                Interest::None => {
+                            let interest = self.interest(&batch).await?;
+                            if interest == Interest::None {
+                                batch = self
+                                    .apply(&batch, BatchEvent::CancelNotCommitted, now)
+                                    .await?;
+                                continue;
+                            }
+                            // Nothing native holds it and it waited longer than
+                            // the retention window: its announcements expire,
+                            // paused or not, and the next batch reports them.
+                            match self.expiry(&batch, now) {
+                                Expiry::NotYet => {}
+                                Expiry::Now => {
                                     batch = self
-                                        .apply(&batch, BatchEvent::CancelNotCommitted, now)
+                                        .apply(&batch, BatchEvent::ExpireNotCommitted, now)
                                         .await?;
                                     continue;
                                 }
-                                Interest::Paused => return Ok(None),
-                                Interest::Active => {}
+                                // A peer's request may still be in flight: no
+                                // further attempt, and the expiry waits until
+                                // the peer would refuse it as stale.
+                                Expiry::AfterQuietWindow(due) => return Ok(Some(due)),
+                            }
+                            if interest == Interest::Paused {
+                                return Ok(None);
                             }
                             if submitted_this_round {
                                 return Ok(retry_at);
@@ -1443,6 +1511,7 @@ impl AnnouncementService {
                 BatchState::Delivered { .. }
                 | BatchState::Refused { .. }
                 | BatchState::Cancelled
+                | BatchState::Expired
                 | BatchState::Blocked { .. } => return Ok(None),
             }
         }

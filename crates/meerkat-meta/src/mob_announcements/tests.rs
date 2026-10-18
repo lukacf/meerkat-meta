@@ -645,6 +645,7 @@ async fn stranded_batches_hand_over_to_a_successor(store: &dyn AnnouncementStore
                 successor: Some(SuccessorBatch {
                     id: batch_id("b2"),
                     body: "redelivery".into(),
+                    gaps: Vec::new(),
                 }),
             },
             5,
@@ -931,7 +932,7 @@ async fn remote_batches_fit_one_delivery_request(store: &dyn AnnouncementStore) 
         items.push(render_item(&announcement));
     }
     let successor_id = BatchId::new(format!("batch-{}", uuid::Uuid::new_v4())).unwrap();
-    let successor = render_batch(&successor_id, Some(&batch.id), &items);
+    let successor = render_batch(&successor_id, Some(&batch.id), &[], &items);
     assert!(wire_len(&successor) <= MAX_REMOTE_BODY_WIRE_BYTES);
     // A local member's batch is bounded by its byte cap alone.
     let local = store
@@ -1417,6 +1418,14 @@ async fn sqlite_store_conforms() {
         lineage_is_recorded_once_per_incarnation(store.as_ref()).await;
     })
     .await;
+    run_conformance("expiry", |store| async move {
+        expiry_settles_what_waited_past_the_window(store.as_ref()).await;
+    })
+    .await;
+    run_conformance("retention of native-held bodies", |store| async move {
+        retention_drops_bodies_a_native_held_batch_carries(store.as_ref()).await;
+    })
+    .await;
 }
 
 fn incarnation(owner: &str, first_event_at_ms: u64) -> MobIncarnation {
@@ -1568,6 +1577,8 @@ struct Ledger {
     submits: u64,
     lose_next_ack: bool,
     refuse_owner_retired: bool,
+    /// Every submission meets no live incarnation until this is cleared.
+    retired: bool,
     strand: BTreeSet<String>,
     /// Native status reads, for pacing checks.
     status_reads: u64,
@@ -1751,7 +1762,7 @@ impl NativeDelivery for ScriptedNative {
         if let Some(end) = self.submit_gone.lock().unwrap().take() {
             return Err(NativeSubmitError::MemberGone(end));
         }
-        if ledger.refuse_owner_retired {
+        if ledger.refuse_owner_retired || ledger.retired {
             ledger.refuse_owner_retired = false;
             return Err(NativeSubmitError::OwnerRetired);
         }
@@ -2512,6 +2523,10 @@ impl AnnouncementStore for FaultyStore {
         self.inner
             .transition_batch(id, expected, event, now_ms)
             .await
+    }
+
+    async fn expire(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<ExpiryReport> {
+        self.inner.expire(now_ms, retention_ms, limit).await
     }
 
     async fn prune(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<PruneReport> {
@@ -4640,4 +4655,479 @@ fn a_member_created_a_mob_only_when_all_three_records_agree() {
         origin_from(&parent_at(ParentRecord::Held)).is_err(),
         "a held parent may run again: nothing is final yet"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Expiry, gaps and the retention of native-held bodies
+// ---------------------------------------------------------------------------
+
+const WINDOW: u64 = 3_600_000;
+
+fn applied(id: &str) -> BatchEvent {
+    BatchEvent::NativeApplied {
+        receipt: receipt(id),
+        session_id: "session-1".into(),
+        input_id: "input-1".into(),
+    }
+}
+
+fn expired_gap(count: u64) -> BatchGap {
+    BatchGap {
+        mob_id: mob("payments"),
+        count,
+        reason: GapReason::Expired,
+    }
+}
+
+async fn expiry_settles_what_waited_past_the_window(store: &dyn AnnouncementStore) {
+    store
+        .put_subscription(
+            &op("o1"),
+            put("s1", "agent:a", &["ios"], StartFrontier::Now),
+            1_000,
+        )
+        .await
+        .unwrap();
+    // A second subscription of the same member captures the same
+    // announcement: it still expires once.
+    store
+        .put_subscription(
+            &op("o2"),
+            put("s2", "agent:a", &["ios"], StartFrontier::Now),
+            1_000,
+        )
+        .await
+        .unwrap();
+    store
+        .announce(announce_request("payments", "k1", &["ios"], "old"), 1_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.expire(1_000 + WINDOW - 1, WINDOW, 100).await.unwrap(),
+        ExpiryReport::default(),
+        "inside the window nothing expires"
+    );
+    let report = store.expire(1_000 + WINDOW, WINDOW, 100).await.unwrap();
+    assert_eq!(report.captures, 1, "once per member: {report:?}");
+
+    let now = 1_000 + WINDOW + 10;
+    store
+        .announce(announce_request("payments", "k2", &["ios"], "new"), now)
+        .await
+        .unwrap();
+    let batch = store
+        .seal_batch(
+            &member("agent:a"),
+            &batch_id("b1"),
+            &policy(),
+            None,
+            now + 1_000,
+        )
+        .await
+        .unwrap()
+        .expect("the new announcement is due");
+    assert_eq!(batch.gaps, vec![expired_gap(1)]);
+    assert_eq!(
+        batch
+            .items
+            .iter()
+            .map(|item| item.source_key.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["k2"]),
+        "only what is still owed"
+    );
+    assert!(
+        batch
+            .body
+            .contains("Not delivered: 1 announcement in mob \"payments\""),
+        "{}",
+        batch.body
+    );
+    for (expected, event) in [
+        (BatchStateTag::Sealed, BatchEvent::BeginSubmit),
+        (
+            BatchStateTag::Submitting,
+            BatchEvent::NativeCommitted {
+                receipt: receipt("b1"),
+            },
+        ),
+        (BatchStateTag::Committed, applied("b1")),
+    ] {
+        store
+            .transition_batch(&batch.id, expected, event, now + 2_000)
+            .await
+            .unwrap();
+    }
+    store
+        .announce(
+            announce_request("payments", "k3", &["ios"], "later"),
+            now + 3_000,
+        )
+        .await
+        .unwrap();
+    let next = store
+        .seal_batch(
+            &member("agent:a"),
+            &batch_id("b2"),
+            &policy(),
+            None,
+            now + 5_000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(next.gaps.is_empty(), "a gap is reported once");
+
+    // A sealed batch nothing native ever started for expires once it was
+    // sealed before the window, and the next batch reports what it held.
+    let later = now + 5_000 + WINDOW;
+    let report = store.expire(later - 1, WINDOW, 100).await.unwrap();
+    assert_eq!(report.batches, 0);
+    let report = store.expire(later, WINDOW, 100).await.unwrap();
+    assert_eq!(report.batches, 1);
+    assert_eq!(
+        store.batch(&next.id).await.unwrap().unwrap().state,
+        BatchState::Expired
+    );
+    store
+        .announce(announce_request("payments", "k4", &["ios"], "after"), later)
+        .await
+        .unwrap();
+    let after = store
+        .seal_batch(
+            &member("agent:a"),
+            &batch_id("b3"),
+            &policy(),
+            None,
+            later + 1_000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.gaps, vec![expired_gap(1)]);
+}
+
+async fn retention_drops_bodies_a_native_held_batch_carries(store: &dyn AnnouncementStore) {
+    store
+        .put_subscription(
+            &op("o1"),
+            put("s1", "agent:a", &["ios"], StartFrontier::Now),
+            1_000,
+        )
+        .await
+        .unwrap();
+    store
+        .put_subscription(
+            &op("o2"),
+            put("s2", "agent:b", &["web"], StartFrontier::Now),
+            1_000,
+        )
+        .await
+        .unwrap();
+    store
+        .announce(announce_request("payments", "k1", &["ios"], "held"), 1_000)
+        .await
+        .unwrap();
+    store
+        .announce(
+            announce_request("payments", "k2", &["web"], "sealed"),
+            1_500,
+        )
+        .await
+        .unwrap();
+    let held = store
+        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), None, 3_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .transition_batch(
+            &held.id,
+            BatchStateTag::Sealed,
+            BatchEvent::BeginSubmit,
+            3_000,
+        )
+        .await
+        .unwrap();
+    store
+        .transition_batch(
+            &held.id,
+            BatchStateTag::Submitting,
+            BatchEvent::NativeCommitted {
+                receipt: receipt("b1"),
+            },
+            3_000,
+        )
+        .await
+        .unwrap();
+    store
+        .seal_batch(&member("agent:b"), &batch_id("b2"), &policy(), None, 3_000)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let report = store.prune(3_000 + WINDOW, WINDOW, 100).await.unwrap();
+    assert_eq!(
+        report.announcements, 1,
+        "a batch the native owner holds carries its own body"
+    );
+    let k = |key: &str| SourceKey::new(key).unwrap();
+    assert!(
+        store
+            .announcement(&mob("payments"), &k("k1"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .announcement(&mob("payments"), &k("k2"))
+            .await
+            .unwrap()
+            .is_some(),
+        "a sealed batch nothing native holds still needs its announcement"
+    );
+    assert_eq!(
+        store.batch(&held.id).await.unwrap().unwrap().items,
+        held.items,
+        "the held batch keeps what it owes"
+    );
+
+    // Once it settles, what it owed and then the batch itself go.
+    store
+        .transition_batch(
+            &held.id,
+            BatchStateTag::Committed,
+            applied("b1"),
+            4_000 + WINDOW,
+        )
+        .await
+        .unwrap();
+    let report = store.prune(4_000 + 2 * WINDOW, WINDOW, 100).await.unwrap();
+    assert_eq!(report.batches, 1, "{report:?}");
+}
+
+#[tokio::test]
+async fn a_member_without_an_incarnation_does_not_hold_retention_past_the_window() {
+    let native = ScriptedNative::new();
+    native.ledger.lock().unwrap().retired = true;
+    let harness = harness_with(native);
+    harness.subscribe("s1").await;
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let batch = harness.only_batch().await;
+    assert_eq!(batch.state.tag(), BatchStateTag::Submitting);
+    let retention = AnnouncementConfig::default().retention_ms;
+
+    // Still inside the window from its sealing: it waits.
+    harness
+        .clock
+        .store(batch.sealed_at_ms + retention - 1, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    assert_eq!(
+        harness.only_batch().await.state.tag(),
+        BatchStateTag::Submitting
+    );
+
+    // Past it (and past its next look), nothing native holds it: it expires
+    // and the announcement can be pruned.
+    let settle = AnnouncementConfig::default().settle_check_max_ms;
+    harness
+        .clock
+        .store(batch.sealed_at_ms + retention + settle, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    assert_eq!(harness.only_batch().await.state, BatchState::Expired);
+    let now = harness.clock.load(Ordering::SeqCst);
+    let report = harness.store.prune(now, retention, 100).await.unwrap();
+    assert_eq!(report.announcements, 1, "{report:?}");
+
+    // Back again: its next batch reports the gap.
+    harness.native.ledger.lock().unwrap().retired = false;
+    harness
+        .service
+        .announce(announce_request(
+            "payments",
+            "back",
+            &["ios"],
+            "after the gap",
+        ))
+        .await
+        .unwrap();
+    harness.clock.fetch_add(60_001, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let batches = harness
+        .service
+        .deliveries(&BatchQuery {
+            member: Some(member("agent:a")),
+            limit: 10,
+            ..BatchQuery::default()
+        })
+        .await
+        .unwrap();
+    let delivered = batches
+        .iter()
+        .find(|batch| batch.state.tag() == BatchStateTag::Delivered)
+        .expect("the member got its next batch");
+    assert_eq!(delivered.gaps, vec![expired_gap(1)]);
+    assert!(
+        delivered.body.contains("Not delivered"),
+        "{}",
+        delivered.body
+    );
+}
+
+#[tokio::test]
+async fn a_peer_batch_expires_only_once_its_last_request_is_stale() {
+    let native = ScriptedNative::new();
+    native.ledger.lock().unwrap().retired = true;
+    let harness = harness_with(native);
+    let peer = Member::new(mob("mob-b"), MemberIdentity::new("agent:p").unwrap());
+    harness
+        .service
+        .put_subscription(
+            &op("p1"),
+            PutSubscription {
+                member: peer.clone(),
+                ..put("p1", "agent:a", &["ios"], StartFrontier::Now)
+            },
+        )
+        .await
+        .unwrap();
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let query = BatchQuery {
+        member: Some(peer.clone()),
+        limit: 10,
+        ..BatchQuery::default()
+    };
+    let batch = harness.service.deliveries(&query).await.unwrap().remove(0);
+    let retention = AnnouncementConfig::default().retention_ms;
+    let window = AnnouncementConfig::default().peer_request_window_ms;
+
+    // A retry just before the window ends: a request may be in flight.
+    harness
+        .clock
+        .store(batch.sealed_at_ms + retention - 1_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let submits = harness.native.submits();
+    let retried = harness.service.deliveries(&query).await.unwrap().remove(0);
+    // Past the window (and past its next look) it neither expires nor is
+    // submitted again while that request could still land.
+    let settle = AnnouncementConfig::default().settle_check_max_ms;
+    assert!(retried.updated_at_ms + settle + 1 > batch.sealed_at_ms + retention);
+    harness
+        .clock
+        .store(retried.updated_at_ms + settle + 1, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let waiting = harness.service.deliveries(&query).await.unwrap().remove(0);
+    assert_eq!(waiting.state.tag(), BatchStateTag::Submitting);
+    assert_eq!(harness.native.submits(), submits, "no further attempt");
+    // Once the peer would refuse that request as stale, it expires.
+    harness
+        .clock
+        .store(retried.updated_at_ms + window + 1, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let expired = harness.service.deliveries(&query).await.unwrap().remove(0);
+    assert_eq!(expired.state, BatchState::Expired);
+    assert_eq!(harness.native.submits(), submits);
+}
+
+#[tokio::test]
+async fn a_stranded_batch_whose_announcements_were_pruned_hands_on_a_gap() {
+    let mut native = ScriptedNative::new();
+    native.apply_on_commit = false;
+    let harness = harness_with(native);
+    harness.subscribe("s1").await;
+    harness.announce_burst(2).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let first = harness.only_batch().await;
+    assert_eq!(first.state.tag(), BatchStateTag::Committed);
+    let retention = AnnouncementConfig::default().retention_ms;
+    let report = harness
+        .store
+        .prune(10_000_000 + retention, retention, 100)
+        .await
+        .unwrap();
+    assert_eq!(report.announcements, 2, "{report:?}");
+    harness
+        .native
+        .ledger
+        .lock()
+        .unwrap()
+        .strand
+        .insert(first.id.to_string());
+    harness.round_after_pause().await;
+    let stranded = harness.store.batch(&first.id).await.unwrap().unwrap();
+    assert_eq!(stranded.state.tag(), BatchStateTag::Stranded);
+    let successor = harness
+        .store
+        .batch(&stranded.successor.expect("a successor"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        successor.gaps,
+        vec![BatchGap {
+            mob_id: mob("payments"),
+            count: 2,
+            reason: GapReason::NotRetained,
+        }]
+    );
+    assert!(
+        successor.body.contains("no longer retained"),
+        "{}",
+        successor.body
+    );
+}
+
+#[tokio::test]
+async fn a_backlog_paused_past_the_window_expires_and_the_resume_reports_it() {
+    let harness = harness_with(ScriptedNative::new());
+    let subscription = harness.subscribe("s1").await;
+    harness
+        .service
+        .change_subscription(
+            &op("pause"),
+            &sid("s1"),
+            subscription.revision,
+            SubscriptionChange::Pause,
+        )
+        .await
+        .unwrap();
+    harness.announce_burst(3).await;
+    let retention = AnnouncementConfig::default().retention_ms;
+    let report = harness
+        .store
+        .expire(1_000 + retention, retention, 100)
+        .await
+        .unwrap();
+    assert_eq!(report.captures, 3);
+    harness
+        .service
+        .change_subscription(
+            &op("resume"),
+            &sid("s1"),
+            subscription.revision + 1,
+            SubscriptionChange::Resume,
+        )
+        .await
+        .unwrap();
+    harness
+        .service
+        .announce(announce_request(
+            "payments",
+            "after",
+            &["ios"],
+            "after the pause",
+        ))
+        .await
+        .unwrap();
+    harness.clock.store(1_000 + retention + 1, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let batch = harness.only_batch().await;
+    assert_eq!(batch.gaps, vec![expired_gap(3)]);
+    assert_eq!(batch.items.len(), 1);
 }

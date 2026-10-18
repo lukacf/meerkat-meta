@@ -665,6 +665,9 @@ pub enum BatchState {
     Cancelled,
     /// Native evidence contradicts this batch. Terminal, kept for operators.
     Blocked { cause: String },
+    /// Waited longer than the retention window with nothing native ever
+    /// holding it. Terminal; the member's next batch reports the gap.
+    Expired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -678,6 +681,7 @@ pub enum BatchStateTag {
     Stranded,
     Cancelled,
     Blocked,
+    Expired,
 }
 
 impl BatchStateTag {
@@ -693,6 +697,7 @@ impl BatchStateTag {
             Self::Stranded => "stranded",
             Self::Cancelled => "cancelled",
             Self::Blocked => "blocked",
+            Self::Expired => "expired",
         }
     }
 
@@ -706,6 +711,7 @@ impl BatchStateTag {
             "stranded" => Self::Stranded,
             "cancelled" => Self::Cancelled,
             "blocked" => Self::Blocked,
+            "expired" => Self::Expired,
             other => {
                 return Err(AnnouncementStoreError::Storage(format!(
                     "unknown batch state {other}"
@@ -731,6 +737,69 @@ impl fmt::Display for BatchStateTag {
 pub struct SuccessorBatch {
     pub id: BatchId,
     pub body: String,
+    /// What the successor reports as not delivered: the predecessor's own
+    /// gaps, and the announcements no longer retained.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<BatchGap>,
+}
+
+/// Why announcements owed to a member were not delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GapReason {
+    /// They waited longer than the retention window for a delivery that
+    /// never started.
+    Expired,
+    /// Their content was no longer retained when a stranded delivery was
+    /// handed on to a successor.
+    NotRetained,
+}
+
+impl GapReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::NotRetained => "not_retained",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "expired" => Ok(Self::Expired),
+            "not_retained" => Ok(Self::NotRetained),
+            other => Err(AnnouncementStoreError::Storage(format!(
+                "unknown gap reason {other}"
+            ))),
+        }
+    }
+}
+
+/// Announcements owed to a batch's member that it reports as not
+/// delivered: how many, from which mob, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchGap {
+    pub mob_id: MobId,
+    pub count: u64,
+    pub reason: GapReason,
+}
+
+/// Merge `more` into `gaps`, one entry per mob and reason, in a stable
+/// order.
+pub fn merge_gaps(gaps: &[BatchGap], more: &[BatchGap]) -> Vec<BatchGap> {
+    let mut merged = BTreeMap::<(MobId, GapReason), u64>::new();
+    for gap in gaps.iter().chain(more) {
+        let count = merged.entry((gap.mob_id.clone(), gap.reason)).or_default();
+        *count = count.saturating_add(gap.count);
+    }
+    merged
+        .into_iter()
+        .map(|((mob_id, reason), count)| BatchGap {
+            mob_id,
+            count,
+            reason,
+        })
+        .collect()
 }
 
 /// The facts that move a batch.
@@ -769,6 +838,12 @@ pub enum BatchEvent {
     Block {
         cause: String,
     },
+    /// The batch waited longer than the retention window and nothing native
+    /// was ever started for it: its announcements expire.
+    Expire,
+    /// Native status reads "not committed" for a batch that waited longer
+    /// than the retention window: its announcements expire.
+    ExpireNotCommitted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -783,6 +858,8 @@ pub enum BatchEventTag {
     NativeStranded,
     Cancel,
     Block,
+    Expire,
+    ExpireNotCommitted,
 }
 
 impl fmt::Display for BatchEventTag {
@@ -797,6 +874,8 @@ impl fmt::Display for BatchEventTag {
             Self::NativeStranded => "native_stranded",
             Self::Cancel => "cancel",
             Self::Block => "block",
+            Self::Expire => "expire",
+            Self::ExpireNotCommitted => "expire_not_committed",
         })
     }
 }
@@ -813,6 +892,8 @@ impl BatchEvent {
             Self::NativeStranded { .. } => BatchEventTag::NativeStranded,
             Self::Cancel => BatchEventTag::Cancel,
             Self::Block { .. } => BatchEventTag::Block,
+            Self::Expire => BatchEventTag::Expire,
+            Self::ExpireNotCommitted => BatchEventTag::ExpireNotCommitted,
         }
     }
 
@@ -824,6 +905,7 @@ impl BatchEvent {
             Self::NativeRefused { .. } => Some(Settlement::Refused),
             Self::CancelNotCommitted | Self::Cancel => Some(Settlement::Cancelled),
             Self::Block { .. } => Some(Settlement::Blocked),
+            Self::Expire | Self::ExpireNotCommitted => Some(Settlement::Expired),
             Self::NativeStranded {
                 successor: None, ..
             } => Some(Settlement::Stranded),
@@ -846,6 +928,9 @@ pub enum Settlement {
     Cancelled,
     Stranded,
     Blocked,
+    /// Owed longer than the retention window without a delivery that ever
+    /// started: the member learns of it as a gap.
+    Expired,
 }
 
 impl Settlement {
@@ -856,6 +941,7 @@ impl Settlement {
             Self::Cancelled => "cancelled",
             Self::Stranded => "stranded",
             Self::Blocked => "blocked",
+            Self::Expired => "expired",
         }
     }
 }
@@ -871,6 +957,7 @@ impl BatchState {
             Self::Stranded { .. } => BatchStateTag::Stranded,
             Self::Cancelled => BatchStateTag::Cancelled,
             Self::Blocked { .. } => BatchStateTag::Blocked,
+            Self::Expired => BatchStateTag::Expired,
         }
     }
 
@@ -910,6 +997,8 @@ impl BatchState {
                 attempt: attempt.saturating_add(1),
             }),
             (Self::Submitting { .. }, BatchEvent::CancelNotCommitted) => Ok(Self::Cancelled),
+            (Self::Sealed, BatchEvent::Expire)
+            | (Self::Submitting { .. }, BatchEvent::ExpireNotCommitted) => Ok(Self::Expired),
             (Self::Submitting { .. }, BatchEvent::NativeCommitted { receipt }) => {
                 Ok(Self::Committed {
                     receipt: receipt.clone(),
@@ -986,6 +1075,10 @@ pub struct Batch {
     pub id: BatchId,
     pub member: Member,
     pub items: Vec<BatchItem>,
+    /// Announcements owed to the member that this batch reports as not
+    /// delivered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<BatchGap>,
     pub body: String,
     pub content_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1105,6 +1198,17 @@ pub struct BatchQuery {
     pub limit: usize,
 }
 
+/// What one expiry pass settled as expired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ExpiryReport {
+    /// Announcements no batch held, once per member.
+    pub captures: u64,
+    /// Sealed batches nothing native ever started for.
+    pub batches: u64,
+    /// Whether a kind stopped at the pass's limit with more to expire.
+    pub more: bool,
+}
+
 /// What one retention pass removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PruneReport {
@@ -1178,10 +1282,32 @@ fn render_header(batch_id: &BatchId, predecessor: Option<&str>, count: usize) ->
     out
 }
 
-/// The immutable body of a batch: a header naming the batch, then each
-/// announcement once, in capture order.
-pub fn render_batch(batch_id: &BatchId, predecessor: Option<&BatchId>, items: &[String]) -> String {
+/// The line a batch body reports one gap with.
+pub fn render_gap(gap: &BatchGap) -> String {
+    let why = match gap.reason {
+        GapReason::Expired => "they waited longer than the retention window for a delivery",
+        GapReason::NotRetained => "they were no longer retained when this delivery was handed on",
+    };
+    format!(
+        "- Not delivered: {count} announcement{plural} in mob {mob_id}; {why}.\n",
+        count = gap.count,
+        plural = if gap.count == 1 { "" } else { "s" },
+        mob_id = quoted(gap.mob_id.as_str()),
+    )
+}
+
+/// The immutable body of a batch: a header naming the batch, a line for
+/// each gap, then each announcement once, in capture order.
+pub fn render_batch(
+    batch_id: &BatchId,
+    predecessor: Option<&BatchId>,
+    gaps: &[BatchGap],
+    items: &[String],
+) -> String {
     let mut out = render_header(batch_id, predecessor.map(BatchId::as_str), items.len());
+    for gap in gaps {
+        out.push_str(&render_gap(gap));
+    }
     for item in items {
         out.push_str(item);
     }
@@ -1382,7 +1508,7 @@ mod tests {
         let id = BatchId::new(format!("batch-{}", uuid::Uuid::new_v4())).unwrap();
         let predecessor = BatchId::new(format!("batch-{}", uuid::Uuid::new_v4())).unwrap();
         let items = vec!["- [t] s #1 key=k\n  body\n".to_string(); 1_000];
-        let body = render_batch(&id, Some(&predecessor), &items);
+        let body = render_batch(&id, Some(&predecessor), &[], &items);
         let items_wire: u64 = items.iter().map(|item| wire_len(item) - 2).sum();
         assert!(wire_len(&body) <= header_wire_bound(&id) + items_wire);
         assert_eq!(wire_len("a\"b"), 6, "quotes and escapes count");

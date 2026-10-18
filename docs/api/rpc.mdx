@@ -1939,7 +1939,11 @@ mobs. A sequence beyond a mob's head is refused with `-32046`
 continuation owner's own status (`not_submitted`, `not_committed`, `pending`,
 `applied`, `stranded`, `refused`, or `unavailable` when it could not be
 read), and `input` is the admitted input's runtime state. Admission is not
-processing: read `input` for what the runtime did with it.
+processing: read `input` for what the runtime did with it. A batch in state
+`expired` waited longer than the retention window with nothing native ever
+holding it; the member's next batch lists what it did not get in `gaps`
+(`[{mob_id, count, reason}]`, reason `expired` or `not_retained`) and in a
+gap line of its body.
 
 `member` is `{"mob_id": "<mob id>", "identity": "<identity>"}`: an identity
 is unique only within its mob. A member of this gateway's mob must be a

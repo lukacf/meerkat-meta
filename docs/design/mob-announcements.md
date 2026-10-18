@@ -59,6 +59,17 @@ only from native evidence:
   (its incarnation retired before admission) hands its announcements to a
   successor batch with a new id that names its predecessor; a key is never
   reused for other content.
+- `expired`: settled. It was sealed before the retention window and nothing
+  native ever held it: still sealed, or submitting while the native status
+  reads not committed. For a member on a peer gateway it expires only once
+  its last request is older than `control_request_window_ms`, and it is not
+  submitted again meanwhile, so a request still in flight is refused by the
+  peer as stale instead of landing after the expiry.
+
+What a member was owed and never got is reported, never dropped silently:
+the member's next batch opens with a gap line per mob saying how many
+announcements it did not receive and why (`expired` or `not_retained`), and
+the batch's `gaps` field carries the same counts.
 
 ## Subscription lifecycle
 
@@ -246,7 +257,14 @@ persistent, identity-first launch:
 
 The values shown are the defaults. Announcements are retained until every
 subscription that captured them has settled them and the retention window has
-passed; a mob's retained announcements never have holes. `retention_ms` is
+passed; a mob's retained announcements never have holes. What waits longer
+than the window for a delivery that never started expires instead of holding
+retention: a capture no batch holds settles `expired` once it is older than
+the window, and so does a batch nothing native holds once it was sealed
+before it (so an announcement captured into such a batch waits at most about
+twice the window). A batch the native owner may already hold keeps its owed
+record but not the announcement, since its own body carries the content; if
+it later strands, its successor reports what is no longer retained as a gap. `retention_ms` is
 at least 3600000 (one hour), so a retried announcement or subscription change
 inside it still meets its original result. Retention runs hourly; one pass
 removes at most 1000 announcements (oldest first across mobs), 1000 settled
@@ -297,10 +315,11 @@ read any delivery, the same reach as `meta/send`.
 - A sealed batch whose subscriptions are all paused waits for a resume, and
   while it waits the member gets no other batch.
 - A paused subscription, or one whose member keeps a batch unsettled, keeps
-  capturing. What it has captured is not capped and holds retention for every
-  mob it names; after a resume the backlog drains at `max_count` per wake
-  interval (100 a minute by default). Cancel a subscription that will not
-  resume.
+  capturing. What it captured expires after the retention window, so a
+  subscription paused longer than that gets a gap line on resume instead of
+  those announcements; a shorter pause gets everything, and after a resume
+  the backlog drains at `max_count` per wake interval (100 a minute by
+  default).
 - Members of other mobs hosted here (child mobs) cannot subscribe yet:
   Meerkat records no final fact that such a member left its mob (a respawn
   removes the roster entry and adds it back), so their subscriptions could
