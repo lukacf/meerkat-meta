@@ -12626,7 +12626,7 @@ impl MobRuntime {
         };
         // Admission closes before the snapshot: no caller admitted before
         // the close can add a child after it.
-        let admission = state.close_admission(deadline).await;
+        let admission = self.close_state_admission(state, deadline).await;
         let mut stood_down = std::collections::BTreeSet::new();
         let mut child_mobs = 0_usize;
         if let Err(unsettled) = self
@@ -12672,6 +12672,35 @@ impl MobRuntime {
             );
         }
         released
+    }
+
+    /// Close the agent mob-tool state's admission
+    /// (`MobMcpState::close_admission`), and close it again if the root mob's
+    /// actor task ends while the first close still waits.
+    ///
+    /// The root has stopped, but its actor may still be dropping its command
+    /// channel. Meerkat 0.9.3 and earlier drop it without waiting for a send
+    /// already under way, so the root's close can stay queued with no reply
+    /// and hold the stand-down to its deadline. Once the task has ended, the
+    /// channel refuses a new close at once, which the state counts as closed.
+    /// A live root answers the first close. The close is idempotent, and a
+    /// close left waiting is abandoned, not undone.
+    async fn close_state_admission(
+        &self,
+        state: &meerkat_mob_mcp::MobMcpState,
+        deadline: std::time::Instant,
+    ) -> meerkat_mob_mcp::MobStateStandDown {
+        let mut root_actor = self.handle.actor_task_watch();
+        {
+            let close = state.close_admission(deadline);
+            tokio::pin!(close);
+            tokio::select! {
+                biased;
+                admission = &mut close => return admission,
+                _ = root_actor.wait() => {}
+            }
+        }
+        state.close_admission(deadline).await
     }
 
     /// Shut down every child mob in the state's snapshot not yet in
