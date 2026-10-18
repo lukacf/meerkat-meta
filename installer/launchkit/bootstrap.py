@@ -46,13 +46,15 @@ class SelectedGuideRuntime:
     _gateway_observation: tuple | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self):
+        from . import guide_sdk
         from .connect_installer_caller import ExactFile
 
+        selected = guide_sdk.SELECTED_VERSION
         if (type(self.gateway) is not ExactFile
-                or self.version != "0.9.3" or self.core_version != "0.9.3"
+                or self.version != selected or self.core_version != selected
                 or any(type(value) is not str or not re.fullmatch("[0-9a-f]{40}", value)
                     for value in (self.meta_source, self.core_source))):
-            raise GatewayInstallError("The guide requires its exact selected Meta 0.9.3 runtime.")
+            raise GatewayInstallError(f"The guide requires its exact selected Meta {selected} runtime.")
         object.__setattr__(self, "_gateway_pin", (self.gateway.path, self.gateway.sha256))
         route = deepcopy(self._model_route)
         if route is not None:

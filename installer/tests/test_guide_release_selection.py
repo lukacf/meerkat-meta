@@ -1,8 +1,10 @@
-"""The Guide's exact Meta 0.9.3 selection: runtime admission, the pending
-client pin and the release inputs skeleton. Inert files only; nothing runs."""
+"""The Guide's one exact selected release: runtime admission, the pending
+client pin and the release inputs skeleton. Every accepted and refused version
+derives from guide_sdk.SELECTED_VERSION. Inert files only; nothing runs."""
 import hashlib
 import json
 from pathlib import Path
+import re
 
 import pytest
 
@@ -10,9 +12,26 @@ from launchkit import guide_sdk
 from launchkit.bootstrap import GatewayInstallError, SelectedGuideRuntime
 from launchkit.connect_installer_caller import ExactFile
 
-SKELETON = Path(__file__).parents[1] / "release/inputs/forge-release-inputs-0.9.3.skeleton.json"
+SELECTED = guide_sdk.SELECTED_VERSION
+SKELETON = Path(__file__).parents[1] / "release/inputs/forge-release-inputs.skeleton.json"
 PIN = ("SOURCE", "TREE", "SHA256", "SIZE")
 CLIENT = b"inert guide client wheel, never install\n"
+
+
+def neighbours(version):
+    """The adjacent patch releases of an exact x.y.z version."""
+    major, minor, patch = (int(part) for part in version.split("."))
+    return [f"{major}.{minor}.{patch + step}" for step in (-1, 1) if patch + step >= 0]
+
+
+# Both neighbours, the Guide's previous 0.9.0 selection, mixed pairs and
+# near-miss spellings of the selected version.
+REFUSED = list(dict.fromkeys([
+    *((version, version) for version in ("0.9.0", *neighbours(SELECTED))),
+    *(pair for version in neighbours(SELECTED) for pair in ((SELECTED, version), (version, SELECTED))),
+    (f"{SELECTED}+meta.0bc6b4fa", SELECTED), (f"v{SELECTED}", SELECTED), (f"{SELECTED}0", SELECTED),
+    (SELECTED, f"{SELECTED} "),
+]))
 
 
 @pytest.fixture
@@ -23,29 +42,30 @@ def gateway(tmp_path):
     return ExactFile(path, hashlib.sha256(path.read_bytes()).hexdigest())
 
 
-def test_the_guide_admits_the_selected_meta_093_runtime(gateway):
-    selected = SelectedGuideRuntime(gateway, "0.9.3", "0.9.3", "a" * 40, "b" * 40)
-    assert (selected.version, selected.core_version) == ("0.9.3", "0.9.3")
+def test_neighbours_are_the_adjacent_patch_releases():
+    assert neighbours("0.9.3") == ["0.9.2", "0.9.4"]
+    assert neighbours("0.10.0") == ["0.10.1"]
 
 
-@pytest.mark.parametrize("version, core_version", [
-    ("0.9.0", "0.9.0"), ("0.9.2", "0.9.2"), ("0.9.4", "0.9.4"),
-    ("0.9.3", "0.9.0"), ("0.9.3", "0.9.2"), ("0.9.0", "0.9.3"), ("0.9.2", "0.9.3"),
-    ("0.9.3+meta.0bc6b4fa", "0.9.3"), ("v0.9.3", "0.9.3"), ("0.9.30", "0.9.3"), ("0.9.3", "0.9.3 "),
-])
+def test_the_guide_admits_its_selected_runtime(gateway):
+    assert re.fullmatch("[0-9]+\\.[0-9]+\\.[0-9]+", SELECTED)
+    selected = SelectedGuideRuntime(gateway, SELECTED, SELECTED, "a" * 40, "b" * 40)
+    assert (selected.version, selected.core_version) == (SELECTED, SELECTED)
+
+
+@pytest.mark.parametrize("version, core_version", REFUSED)
 def test_the_guide_refuses_every_other_runtime_version(gateway, version, core_version):
-    with pytest.raises(GatewayInstallError, match="exact selected Meta"):
+    with pytest.raises(GatewayInstallError, match=re.escape(f"exact selected Meta {SELECTED} runtime")):
         SelectedGuideRuntime(gateway, version, core_version, "a" * 40, "b" * 40)
 
 
-def test_the_committed_guide_client_pin_is_pending_until_meta_093_publishes():
+def test_the_committed_guide_client_pin_is_pending_until_the_selected_release_publishes():
     """The published wheel's bytes cannot exist before its release. Filling the
     pin replaces this test with one that checks the vendored wheel against it."""
-    assert guide_sdk.VERSION == "0.9.3"
-    assert guide_sdk.WHEEL == "vendor/guide/meerkat_meta-0.9.3-py3-none-any.whl"
+    assert guide_sdk.WHEEL == f"vendor/guide/meerkat_meta-{SELECTED}-py3-none-any.whl"
     assert [getattr(guide_sdk, name) for name in PIN] == [None] * len(PIN)
     for use in (guide_sdk.require_pinned, guide_sdk.selection, lambda: guide_sdk.verify(CLIENT)):
-        with pytest.raises(ValueError, match="pending the published Meta 0.9.3 wheel"):
+        with pytest.raises(ValueError, match=re.escape(f"pending the published Meta {SELECTED} wheel")):
             use()
 
 
@@ -63,7 +83,8 @@ def complete_pin(monkeypatch, content=CLIENT):
 ])
 def test_a_partial_or_placeholder_guide_client_pin_fails_closed(monkeypatch, name, value):
     complete_pin(monkeypatch)
-    assert guide_sdk.selection()["sha256"] == hashlib.sha256(CLIENT).hexdigest()
+    assert guide_sdk.selection() == {"path": guide_sdk.WHEEL, "version": SELECTED, "source": "c" * 40,
+        "tree": "d" * 40, "sha256": hashlib.sha256(CLIENT).hexdigest(), "bytes": len(CLIENT)}
     guide_sdk.verify(CLIENT)
     monkeypatch.setattr(guide_sdk, name, value)
     for use in (guide_sdk.require_pinned, guide_sdk.selection, lambda: guide_sdk.verify(CLIENT)):
@@ -80,9 +101,10 @@ def test_an_invented_complete_pin_still_refuses_the_actual_wheel(monkeypatch):
 
 def test_the_release_inputs_skeleton_selects_the_admitted_guide(gateway):
     guide = json.loads(SKELETON.read_text())["guide"]
-    assert (guide["version"], guide["core_version"]) == ("0.9.3", "0.9.3")
-    SelectedGuideRuntime(gateway, guide["version"], guide["core_version"], "c" * 40, guide["core_source"])
+    assert (guide["version"], guide["core_version"]) == (SELECTED, SELECTED)
+    core_source = guide["core_source"] or "d" * 40
+    SelectedGuideRuntime(gateway, guide["version"], guide["core_version"], "c" * 40, core_source)
     # Meta's source is pending until its release, and the runtime refuses it.
     with pytest.raises(GatewayInstallError):
         SelectedGuideRuntime(gateway, guide["version"], guide["core_version"],
-            guide["meta_source"], guide["core_source"])
+            guide["meta_source"], core_source)

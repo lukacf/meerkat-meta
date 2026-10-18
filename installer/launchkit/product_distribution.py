@@ -93,7 +93,7 @@ configuration files to upload or publish.
 
 - Guide Core: `{guide.core_source}`
 - Guide Meta: `{guide.meta_source}`
-- Guide client SDK: `{guide_sdk.VERSION}` (source `{guide_sdk.SOURCE}`)
+- Guide client SDK: `{guide_sdk.SELECTED_VERSION}` (source `{guide_sdk.SOURCE}`)
 - Guide client SDK wheel: `{guide_sdk.SHA256}`
 - Application Meta SDK wheel: `{target.meta_wheel.sha256}`
 - Toolkit SDK wheel: `{target.toolkit_wheel.sha256}`
@@ -350,8 +350,8 @@ def verify(root):
     selected_runtime_artifacts(target)
     guide = data["guide"]
     if (type(guide) is not dict or guide.keys() != {"version", "core_version", "meta_source", "core_source", "gateway", "sdk"}
-            or guide["version"] != "0.9.3"
-            or guide["core_version"] != "0.9.3"
+            or guide["version"] != guide_sdk.SELECTED_VERSION
+            or guide["core_version"] != guide_sdk.SELECTED_VERSION
             or guide["sdk"] != guide_sdk.selection()
             or guide_sdk.WHEEL not in data["files"]
             or guide["gateway"] != {"path": "vendor/guide/rpc_gateway",

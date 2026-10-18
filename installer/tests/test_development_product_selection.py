@@ -3,6 +3,7 @@ from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
+import re
 import zipfile
 
 import pytest
@@ -12,6 +13,7 @@ from test_meta_toolkit_runtime_selection import (product, no_product_execution,
     json_bytes, put, PREFIX)
 from test_sdk_wheel_integrity import InertWheel
 from test_distribution import bundle_source
+from test_guide_release_selection import neighbours
 
 
 def development(product, meta_version="0.9.0"):
@@ -181,7 +183,8 @@ def guide_product_inputs(product, bundle_source, monkeypatch):
         (root / name).write_text("Inert public license.\n")
     gateway = put(product.root / "guide/rpc_gateway", b"inert guide, never execute\n")
     gateway.path.chmod(0o700)
-    guide = SelectedGuideRuntime(ExactFile(gateway.path, gateway.sha256), "0.9.3", "0.9.3", "a" * 40, "b" * 40)
+    selected = guide_sdk.SELECTED_VERSION
+    guide = SelectedGuideRuntime(ExactFile(gateway.path, gateway.sha256), selected, selected, "a" * 40, "b" * 40)
     return root, sdk, gateway, guide
 
 
@@ -199,7 +202,8 @@ def test_development_distribution_keeps_guide_and_application_owners_separate(
     with zipfile.ZipFile(output) as archive:
         archive.extractall(extracted)
     observed = product_distribution.verify(extracted)
-    assert observed["guide"]["version"] == observed["guide"]["core_version"] == "0.9.3"
+    selected = guide_sdk.SELECTED_VERSION
+    assert observed["guide"]["version"] == observed["guide"]["core_version"] == selected
     assert observed["product"]["selection"]["meta"]["version"] == meta_version
     assert observed["guide"]["gateway"]["sha256"] == gateway.sha256
     assert observed["guide"]["sdk"] == guide_sdk.selection()
@@ -208,14 +212,14 @@ def test_development_distribution_keeps_guide_and_application_owners_separate(
     assert distribution.sdk_wheels(extracted) == expected_clients
     assert distribution.bootstrap_inputs(extracted) == ["meta-toolkit", *expected_clients]
     readme = (extracted / "README.md").read_text()
-    assert "The Forge guide uses Core 0.9.3 and Meta 0.9.3" in readme
+    assert f"The Forge guide uses Core {selected} and Meta {selected}" in readme
     assert f"application uses the separately selected Meta {meta_version} and Toolkit" in readme
     # Each independently bound guide field still refuses drift. No target or
     # guide program runs, and the selected application bytes stay unchanged.
     manifest = extracted / distribution.MANIFEST
     original = manifest.read_bytes()
-    for field, value in (("version", "0.9.0"), ("version", "0.9.1"), ("version", "0.9.2"),
-            ("core_version", "0.9.0"), ("core_version", "0.9.1"), ("core_version", "0.9.2"),
+    versions = dict.fromkeys(("0.9.0", *neighbours(selected)))
+    for field, value in (*((field, version) for field in ("version", "core_version") for version in versions),
             ("meta_source", "not-a-source-hash"), ("gateway", {**observed["guide"]["gateway"], "sha256": "f" * 64}),
             ("sdk", {**observed["guide"]["sdk"], "version": "0.9.0"})):
         changed = deepcopy(observed)
@@ -264,7 +268,8 @@ def test_a_pending_guide_client_pin_refuses_packaging_and_verification(
     for name in ("SOURCE", "TREE", "SHA256", "SIZE"):
         monkeypatch.setattr(guide_sdk, name, None)
     refused_output = tmp_path / "pending-guide-sdk.zip"
-    with pytest.raises(distribution.DistributionError, match="pending the published Meta 0.9.3 wheel"):
+    with pytest.raises(distribution.DistributionError,
+            match=re.escape(f"pending the published Meta {guide_sdk.SELECTED_VERSION} wheel")):
         product_distribution.package(root, target, guide, refused_output)
     assert not refused_output.exists()
     for check in (product_distribution.verify, distribution.sdk_wheels, distribution.bootstrap_inputs):

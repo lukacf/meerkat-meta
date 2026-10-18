@@ -42,6 +42,8 @@ def load(name, path):
 
 
 forge = load("forge_release", ROOT / "scripts/forge-release.py")
+# The Guide's one exact selected release; the module has no package imports.
+guide_sdk = load("forge_guide_sdk", ROOT / "installer/launchkit/guide_sdk.py")
 release_tests = load("release_workflow_tests", ROOT / "scripts/test_release_workflow.py")
 REPO = "lukacf/meerkat-meta"
 SHA = "a" * 40
@@ -461,22 +463,24 @@ class InputsTests(unittest.TestCase):
         self.assertEqual(value["guide"]["meta_source"], "b275e0ed4fe61cf4ff43d16691c54efb17812919")
         self.assertEqual(value["guide"]["core_source"], "a00bafaf1d862fb41112ff1f30312b350ad05246")
 
-    def test_the_guide_093_skeleton_is_refused_until_every_pending_value_is_filled(self):
-        skeleton = json.loads((ROOT / forge.INPUTS_DIR / "forge-release-inputs-0.9.3.skeleton.json").read_text())
-        self.assertEqual(skeleton["guide"], {"version": "0.9.3", "core_version": "0.9.3", "meta_source": None,
-                                             "core_source": "d21cd3ef1d0fdefa43f826464802702149decdee"})
+    def test_the_guide_skeleton_is_refused_until_every_pending_value_is_filled(self):
+        selected = guide_sdk.SELECTED_VERSION
+        skeleton = json.loads((ROOT / forge.INPUTS_DIR / "forge-release-inputs.skeleton.json").read_text())
+        guide = skeleton["guide"]
+        self.assertEqual((guide["version"], guide["core_version"], guide["meta_source"]), (selected, selected, None))
+        self.assertTrue(guide["core_source"] is None or re.fullmatch("[0-9a-f]{40}", guide["core_source"]))
         self.assertEqual(list(skeleton["targets"]), ["linux-x86_64"])
         entry = skeleton["targets"]["linux-x86_64"]
         self.assertEqual((list(entry["files"]), entry["selection"], entry["paths"]), ([entry["gateway"]], None, None))
         self.assertEqual(entry["files"][entry["gateway"]]["url"],
-                         "https://github.com/lukacf/meerkat-meta/releases/download/v0.9.3/"
-                         "meta-rpc-gateway-0.9.3-x86_64-unknown-linux-gnu.tar.gz")
+                         f"https://github.com/lukacf/meerkat-meta/releases/download/v{selected}/"
+                         f"meta-rpc-gateway-{selected}-x86_64-unknown-linux-gnu.tar.gz")
         with self.assertRaisesRegex(forge.ProtocolError, "meta_source"):
             forge.validate_inputs(skeleton)
         # Filled with fixture values, every value the skeleton already holds is valid.
         product = target_inputs()
         filled = copy.deepcopy(skeleton)
-        filled["guide"]["meta_source"] = "c" * 40
+        filled["guide"].update(meta_source="c" * 40, core_source=guide["core_source"] or "d" * 40)
         target = filled["targets"]["linux-x86_64"]
         target["files"][target["gateway"]].update(archive_size=len(ARCHIVE), archive_sha256=sha256(ARCHIVE),
                                                   size=len(GATEWAY), sha256=sha256(GATEWAY))
@@ -489,6 +493,7 @@ class InputsTests(unittest.TestCase):
 
         pending = {
             "meta source": lambda value: value["guide"].__setitem__("meta_source", None),
+            "core source": lambda value: value["guide"].__setitem__("core_source", None),
             "selection": lambda value: value["targets"]["linux-x86_64"].__setitem__("selection", None),
             "paths": lambda value: value["targets"]["linux-x86_64"].__setitem__("paths", None),
             "product files": lambda value: value["targets"]["linux-x86_64"].__setitem__(
