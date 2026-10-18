@@ -14,47 +14,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub use super::types::NativeReceipt;
+use super::remote::RemoteMemberDelivery;
 use super::types::{Batch, Member, MemberIdentity, MobId, SubscriptionEnd};
-
-/// An admitted input, as the native owner names it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdmittedInput {
-    pub session_id: String,
-    pub input_id: String,
-}
-
-/// A delivery's native status: the continuation owner's own status of the
-/// batch's key on the gateway that hosts the member. None of these says that
-/// the member processed anything.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum NativeStatus {
-    /// The native owner holds no commit for the key.
-    NotCommitted,
-    /// Committed to the member's inbox, not yet applied.
-    Pending {
-        receipt: NativeReceipt,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        admitted: Option<AdmittedInput>,
-    },
-    /// Admitted as one input of the member's session.
-    Applied {
-        receipt: NativeReceipt,
-        session_id: String,
-        input_id: String,
-    },
-    /// Committed to an incarnation that retired before admitting it.
-    Stranded { receipt: NativeReceipt },
-    /// Settled as refused by the native owner.
-    Refused {
-        receipt: NativeReceipt,
-        reason: String,
-    },
-}
+pub use crate::runtime::keyed_inject::{AdmittedInput, NativeReceipt, NativeStatus};
 
 /// The continuation namespace announcement batches are delivered under.
 pub const ANNOUNCEMENT_CONTINUATION_NAMESPACE: &str = "meta.mob_announcements";
@@ -643,5 +607,122 @@ impl NativeDelivery for MobNativeDelivery {
         input_id: &str,
     ) -> Result<Option<Value>, NativeUnavailable> {
         self.input_state(session_id, input_id).await
+    }
+}
+
+/// The owner's seam: this gateway's runtime for members of its own mob, and
+/// keyed inject over the signed control channel for members of mobs on peer
+/// gateways.
+pub struct AnnouncementNativeDelivery {
+    local: Arc<MobNativeDelivery>,
+    remote: Option<Arc<RemoteMemberDelivery>>,
+}
+
+impl AnnouncementNativeDelivery {
+    pub(crate) fn new(
+        local: Arc<MobNativeDelivery>,
+        remote: Option<Arc<RemoteMemberDelivery>>,
+    ) -> Self {
+        Self { local, remote }
+    }
+
+    fn remote(&self) -> Result<&RemoteMemberDelivery, String> {
+        self.remote
+            .as_deref()
+            .ok_or_else(|| "this gateway has no contact directory for peer members".to_string())
+    }
+}
+
+#[async_trait]
+impl NativeDelivery for AnnouncementNativeDelivery {
+    fn governs_work_authority(&self) -> Result<bool, NativeUnavailable> {
+        self.local.governs_work_authority()
+    }
+
+    fn route(&self, member: &Member) -> MemberRoute {
+        NativeDelivery::route(self.local.as_ref(), member)
+    }
+
+    async fn mob_presence(
+        &self,
+        mobs: &BTreeSet<MobId>,
+    ) -> Result<BTreeMap<MobId, MobPresence>, NativeUnavailable> {
+        self.local.hosted_mobs(mobs).await
+    }
+
+    fn mob_set_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        NativeDelivery::mob_set_changes(self.local.as_ref())
+    }
+
+    async fn check_member(&self, member: &Member) -> Result<(), MemberProblem> {
+        match self.route(member) {
+            MemberRoute::Local => NativeDelivery::check_member(self.local.as_ref(), member).await,
+            MemberRoute::Peer => {
+                // A mob hosted here is never reached as a peer: the local
+                // seam refuses its members typed.
+                let named = BTreeSet::from([member.mob_id.clone()]);
+                let presence = self
+                    .local
+                    .hosted_mobs(&named)
+                    .await
+                    .map_err(|error| MemberProblem::Unavailable(error.0))?;
+                if presence.get(&member.mob_id) == Some(&MobPresence::Hosted) {
+                    return NativeDelivery::check_member(self.local.as_ref(), member).await;
+                }
+                self.remote()
+                    .map_err(MemberProblem::UnusablePeer)?
+                    .check_member(member)
+            }
+        }
+    }
+
+    async fn prepare_member(&self, member: &Member) -> Result<(), PrepareError> {
+        match self.route(member) {
+            MemberRoute::Local => self.local.prepare_identity(&member.identity).await,
+            // The peer prepares its own member when the batch reaches it.
+            MemberRoute::Peer => Ok(()),
+        }
+    }
+
+    async fn submit(
+        &self,
+        batch: &Batch,
+        committed_at_ms: u64,
+    ) -> Result<NativeReceipt, NativeSubmitError> {
+        match self.route(&batch.member) {
+            MemberRoute::Local => {
+                NativeDelivery::submit(self.local.as_ref(), batch, committed_at_ms).await
+            }
+            MemberRoute::Peer => {
+                self.remote()
+                    .map_err(NativeSubmitError::Unavailable)?
+                    .submit(batch)
+                    .await
+            }
+        }
+    }
+
+    async fn status(&self, batch: &Batch) -> Result<NativeStatus, NativeUnavailable> {
+        match self.route(&batch.member) {
+            MemberRoute::Local => NativeDelivery::status(self.local.as_ref(), batch).await,
+            MemberRoute::Peer => {
+                self.remote()
+                    .map_err(NativeUnavailable)?
+                    .status(batch)
+                    .await
+            }
+        }
+    }
+
+    async fn input(
+        &self,
+        batch: &Batch,
+        session_id: &str,
+        input_id: &str,
+    ) -> Result<Option<Value>, NativeUnavailable> {
+        match self.route(&batch.member) {
+            MemberRoute::Local => self.local.input_state(session_id, input_id).await,
+            MemberRoute::Peer => self.remote().map_err(NativeUnavailable)?.input(batch).await,
+        }
     }
 }

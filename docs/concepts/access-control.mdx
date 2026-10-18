@@ -378,6 +378,16 @@ Two separately granted host-plane verbs address the runtime host, not a member:
 Host verbs must be explicitly named in the grant and require an installed
 host-facts provider to return data; member selectors do not scope them.
 
+Two more member-plane verbs carry keyed, reconcilable delivery, which mob
+announcements use to reach members of a mob on a peer gateway:
+
+| Verb | Reaches |
+|------|---------|
+| `inject_keyed` | Commit a keyed delivery into one of your members' runtime inbox, once per key |
+| `inject_status` | Read the status of a keyed delivery the same caller made |
+
+They too must be named explicitly in a grant (see [Keyed inject](#keyed-inject)).
+
 A **control grant** binds one calling gateway - identified by its Ed25519 pubkey, the same one `meta/peer_pubkey` reports - to the verbs it may use and, for member-plane operations, the members it may reach. Anything outside the grant is refused before the request reaches your mob, so an ungranted caller never learns whether the member it named exists.
 
 ### How a caller is identified
@@ -402,7 +412,8 @@ verbs = ["inject"]
 ```
 
 `verbs = ["*"]` grants only the four member-plane verbs, never
-`host_describe` or `host_health`; include those names explicitly when intended.
+`host_describe`, `host_health`, `inject_keyed` or `inject_status`; include those
+names explicitly when intended.
 An unknown verb, a missing or empty `verbs` list, an undecodable pubkey, or two
 labels sharing one pubkey are all config errors - the table refuses to load
 rather than granting something the operator did not write.
@@ -440,6 +451,32 @@ Use `ControlAuthorizer::with_grants_for_audience(table, "my-mob-id")` when one c
 <Note>
 The SDK-driven `rpc_gateway` accepts the same TOML under `runtime_options.control_grants_toml`; the conventional `meta_gateway` reads `[control_grants]` beside `[mobs]` in `config/contacts.toml`. The Rust builder accepts a `ControlGrantTable` through `control_grants`. Every configured-listener path binds the table to the runtime's mob id as the signed audience. `ControlAuthorizer::from_toml` still distinguishes an absent section from an empty section for embedders that explicitly choose compatibility behavior.
 </Note>
+
+### Keyed inject
+
+`inject_keyed` delivers one keyed continuation to a member: the serving
+gateway commits it into the member's durable runtime inbox under the key,
+scoped to the caller (the label of the grant that admitted it), and admits it
+as one input when the member is served. An identical request under the same
+key answers the original receipt; other content under it is refused
+(`conflict`). `inject_status` reads such a delivery back, for the caller's
+own keys only. Both need:
+
+- a grant that names the verb explicitly, on a listener with grants (an open
+  authorizer refuses them);
+- a request issued within the serving gateway's freshness window of its own
+  clock (`runtime_options.control_request_window_ms`, five minutes by
+  default) and not before the serving process started;
+- an identity-first serving gateway, which composes the receiver with its
+  control listener whether or not it enables mob announcements itself.
+  Otherwise the verbs answer `keyed_inject_unavailable`.
+
+Every answer is signed with the serving gateway's key, and the caller treats
+only an answer its pinned key verifies as evidence. A signed `unknown_member`
+or `unusable_member` (a member placed on a host, or bound to an external
+runtime) ends the caller's subscriptions for that member. A gateway that
+predates these verbs cannot decode them and answers so unsigned; the caller
+ends the subscription as `peer_unsupported` rather than retrying forever.
 
 Three limits worth stating plainly:
 

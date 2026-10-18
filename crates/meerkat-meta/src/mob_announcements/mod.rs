@@ -38,12 +38,15 @@
 mod faults;
 pub mod native;
 pub mod owner;
+pub mod remote;
 pub mod rpc;
 pub mod sqlite;
 pub(crate) mod storage;
 pub mod store;
 pub mod types;
 
+#[cfg(test)]
+mod remote_tests;
 #[cfg(test)]
 mod tests;
 
@@ -52,14 +55,16 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 pub use native::{
-    ANNOUNCEMENT_CONTINUATION_NAMESPACE, IdentityService, MemberProblem, MemberRoute,
-    MobNativeDelivery, MobPresence, NativeDelivery, NativeStatus, NativeSubmitError,
-    NativeUnavailable, PrepareError, batch_summary, continuation_delivery, continuation_for,
+    ANNOUNCEMENT_CONTINUATION_NAMESPACE, AnnouncementNativeDelivery, IdentityService,
+    MemberProblem, MemberRoute, MobNativeDelivery, MobPresence, NativeDelivery, NativeStatus,
+    NativeSubmitError, NativeUnavailable, PrepareError, batch_summary, continuation_delivery,
+    continuation_for,
 };
 pub use owner::{
     AdmittedInput, AnnouncementConfig, AnnouncementError, AnnouncementService,
     DEFAULT_RETENTION_MS, DeliveryObservation, MIN_RETENTION_MS, NativeObservation, RoundReport,
 };
+pub use remote::{KeyedInjectServer, RemoteMemberDelivery};
 pub use sqlite::{ConnectionGuard, SCHEMA, SqliteAnnouncementStore};
 pub use store::AnnouncementStore;
 pub use types::{
@@ -141,6 +146,31 @@ pub(crate) fn compose_for_runtime(
     layout: &crate::storage_layout::MetaStorageLayout,
     config: AnnouncementConfig,
 ) -> Result<AnnouncementService, String> {
+    let local = Arc::new(local_delivery(runtime)?);
+    let path = layout
+        .mob_announcements_db()
+        .map_err(|error| format!("mob announcement database: {error}"))?;
+    let store = storage::open_disk_store(path)
+        .map_err(|error| format!("mob announcement database: {error}"))?;
+    let remote = runtime
+        .peer_delivery_access()
+        .map(|(contacts, keys)| Arc::new(RemoteMemberDelivery::new(contacts, keys)));
+    let native = AnnouncementNativeDelivery::new(local, remote);
+    let service = AnnouncementService::new(Arc::new(store), Arc::new(native), config)
+        .map_err(|error| error.to_string())?;
+    if !runtime.attach_mob_announcements(service.clone()) {
+        return Err("mob announcements are already attached to this runtime".to_string());
+    }
+    drop(service.start());
+    drop(service.watch_mobs());
+    Ok(service)
+}
+
+/// The seam to this gateway's own runtime: its identity runtime, its agent
+/// mob tool state and its runtime machine.
+fn local_delivery(
+    runtime: &crate::unified_runtime::UnifiedRuntime,
+) -> Result<MobNativeDelivery, String> {
     let identities = runtime
         .identity_runtime_ref()
         .cloned()
@@ -155,18 +185,23 @@ pub(crate) fn compose_for_runtime(
         .ok_or("mob announcements require the gateway's runtime machine")?;
     let mob_id = MobId::new(runtime.mob_handle().mob_id().to_string())
         .map_err(|error| format!("this gateway's mob id: {error}"))?;
-    let path = layout
-        .mob_announcements_db()
-        .map_err(|error| format!("mob announcement database: {error}"))?;
-    let store = storage::open_disk_store(path)
-        .map_err(|error| format!("mob announcement database: {error}"))?;
-    let native = MobNativeDelivery::new(mob_id, identities, mob_tools, machine);
-    let service = AnnouncementService::new(Arc::new(store), Arc::new(native), config)
-        .map_err(|error| error.to_string())?;
-    if !runtime.attach_mob_announcements(service.clone()) {
-        return Err("mob announcements are already attached to this runtime".to_string());
+    Ok(MobNativeDelivery::new(
+        mob_id, identities, mob_tools, machine,
+    ))
+}
+
+/// Serve peers' keyed injects on this gateway's control channel: what a peer
+/// delivers to one of this gateway's members is submitted to this gateway's
+/// own continuation owner. Composed with the control listener, whether or
+/// not this gateway enables mob announcements itself. `window_ms` is how far
+/// a request's issue time may be from this gateway's clock.
+pub(crate) fn compose_keyed_inject_receiver(
+    runtime: &crate::unified_runtime::UnifiedRuntime,
+    window_ms: u64,
+) -> Result<(), String> {
+    let local = Arc::new(local_delivery(runtime)?);
+    if !runtime.install_keyed_inject_receiver(Arc::new(KeyedInjectServer::new(local, window_ms))) {
+        return Err("a keyed inject receiver is already installed on this runtime".to_string());
     }
-    drop(service.start());
-    drop(service.watch_mobs());
-    Ok(service)
+    Ok(())
 }

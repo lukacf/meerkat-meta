@@ -72,6 +72,10 @@ its member or its mobs:
   a host, or bound to an external runtime), so a delivery could never be
   admitted.
 - `mobs_ended`: every mob the subscription named was destroyed.
+- `peer_unsupported`: the member's peer gateway predates keyed inject.
+
+A peer gateway's signed `unknown_member` or `unusable_member` answer ends
+the subscription as `member_left` or `member_unusable`.
 
 The member checks run when a subscription is created and before every
 submission, so a subscription whose member left ends at its next delivery
@@ -118,14 +122,33 @@ pace.
   its owner resolves.
 - A member is `{mob_id, identity}`: identities are unique only within one
   mob. Subscribers are registered identities of this gateway's mob that its
-  runtime serves. A member of another mob hosted here is refused with
-  `unsupported_member`, and a member on a peer gateway with `unusable_peer`.
+  runtime serves, and members of mobs on peer gateways. A member of another
+  mob hosted here is refused with `unsupported_member`.
 - A subscription names its mobs explicitly (this gateway's mob by default).
   Nothing reaches it from a mob it does not name.
 - The announcer is part of an announcement's content digest, so a replay
   under the same source key must name the same announcer.
 - The announce result counts the subscriptions that captured an
   announcement; it never names them.
+
+## Members on peer gateways
+
+A member of a mob on a peer gateway is delivered to with `inject_keyed` over
+the signed cross-mob control channel, and its status read with
+`inject_status`. The peer is the gateway this gateway's contact directory
+files the member's mob id under, with a pinned key; this gateway signs as its
+own gateway key. The peer commits the batch to the member's continuation
+owner under the batch id, scoped to the grant that admitted the call, and
+every answer it gives is signed: only an answer the pinned key verifies is
+evidence. A lost answer leaves the batch submitting until `inject_status`
+settles it, exactly as for a local member. A body whose JSON encoding would
+not fit one control frame is never sealed for a peer member: batches for
+peer members are bounded by the frame as well as by `max_bytes`.
+
+The serving side needs a control listener with a grant that names
+`inject_keyed` and `inject_status` for this gateway's key (see the access
+control guide); `runtime_options.control_request_window_ms` bounds how far a
+request's issue time may be from the serving gateway's clock.
 
 ## Configuration
 

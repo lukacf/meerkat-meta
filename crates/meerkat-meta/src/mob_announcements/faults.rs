@@ -25,3 +25,11 @@ pub(crate) fn after_begin_submit() {
     #[cfg(feature = "announcement-test-faults")]
     hit("after_begin_submit");
 }
+
+/// On a gateway serving a peer's keyed inject: after its continuation owner
+/// committed the delivery, before the signed receipt is answered. The caller
+/// never learns the outcome from this attempt.
+pub(crate) fn after_remote_commit() {
+    #[cfg(feature = "announcement-test-faults")]
+    hit("after_remote_commit");
+}

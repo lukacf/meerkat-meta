@@ -1945,14 +1945,20 @@ processing: read `input` for what the runtime did with it.
 is unique only within its mob. A member of this gateway's mob must be a
 registered identity served by this gateway's runtime: one placed on a host or
 bound to an external runtime is refused with `-32047` `unusable_member`. A
-member of another mob hosted here is refused with `unsupported_member`, and
-one on a peer gateway with `unusable_peer`.
+member of another mob hosted here is refused with `unsupported_member`. A
+member of a mob on a peer gateway is reached through keyed inject (see
+[Keyed inject](/concepts/access-control#keyed-inject)) when this gateway's
+contact directory files that mob with a pinned key and this gateway holds a
+signing key; otherwise it is refused with `unusable_peer`.
 
 A subscription's `state` is `active`, `paused`, `cancelled` or `ended`. It
 ends, with `ended` saying why, when its member is no longer registered
 (`member_left`), when the member stops being served here
 (`member_unusable`), or when every mob it named was destroyed
-(`mobs_ended`); what it captured and no batch holds settles. A destroyed mob
+(`mobs_ended`), or, for a member on a peer gateway, when that gateway answers
+that it has no such member (`member_left`), cannot serve it
+(`member_unusable`), or predates keyed inject (`peer_unsupported`); what it
+captured and no batch holds settles. A destroyed mob
 leaves the subscriptions that name it at a new revision and is listed in
 their `ended_mobs`.
 

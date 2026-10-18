@@ -31,6 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   maintenance in every build) and the methods answer
   `mob_announcements_unavailable`. See `docs/design/mob-announcements.md`.
 
+- Keyed cross-mob inject. Two new control verbs, `inject_keyed` and
+  `inject_status`, deliver one keyed continuation to a member of the serving
+  gateway's mob, once per key and scoped to the calling grant, and read it
+  back. Requests and answers are signed, requests must be issued within
+  `runtime_options.control_request_window_ms` (five minutes by default) of
+  the serving gateway's clock, and a grant must name the verbs (`*` does not
+  cover them). An identity-first gateway with a control listener serves
+  them. Mob announcements use them to deliver to members of mobs on peer
+  gateways; a gateway that predates them ends such a subscription as
+  `peer_unsupported`.
+
 - `.github/workflows/warm-deps.yml`, dispatched on a branch whose `Cargo.lock`
   changed, builds the dependency graph of each Rust CI job from that branch's
   crates.io dependencies, with no workspace code, and keeps it as a 3-day

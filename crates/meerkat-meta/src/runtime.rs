@@ -49,6 +49,7 @@ pub use module_process::{
     ModuleCleanupFailure, ModuleCleanupObservation, ModuleCleanupOperation, ModuleCleanupPhase,
     ModuleCleanupProcessObservation, ModuleCleanupReapedProcess,
 };
+pub mod keyed_inject;
 #[cfg(all(test, unix))]
 mod module_process_tests;
 pub mod remote_host;

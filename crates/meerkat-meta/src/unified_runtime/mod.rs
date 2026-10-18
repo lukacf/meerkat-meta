@@ -464,6 +464,10 @@ pub struct UnifiedRuntimeCore {
     /// Mob announcements: attached once by the host after boot, absent
     /// until then and in every host that did not enable them.
     mob_announcements: std::sync::OnceLock<crate::mob_announcements::AnnouncementService>,
+    /// The serving side of the keyed inject plane on the cross-mob control
+    /// channel. The control listener starts before the receiver is composed,
+    /// so it re-reads this per request.
+    keyed_inject_slot: crate::runtime::keyed_inject::KeyedInjectSlot,
     /// §16 Q1 provisional operator keying: the console-principal resolver,
     /// shared between the memory coordinator (reads) and the console send
     /// path (notes interactions). `&self`-settable like the panel store.
@@ -910,6 +914,7 @@ impl UnifiedRuntime {
                 )),
                 console_identity_roster: std::sync::RwLock::new(None),
                 mob_announcements: std::sync::OnceLock::new(),
+                keyed_inject_slot: crate::runtime::keyed_inject::empty_keyed_inject_slot(),
                 console_operator_resolver: std::sync::RwLock::new(None),
                 console_governed_ingress: Default::default(),
                 metadata_table,
@@ -2004,6 +2009,36 @@ impl UnifiedRuntime {
     /// The attached mob announcement owner, when the host enabled them.
     pub fn mob_announcements(&self) -> Option<crate::mob_announcements::AnnouncementService> {
         self.mob_announcements.get().cloned()
+    }
+
+    /// Serve the keyed inject plane of the cross-mob control channel from
+    /// `receiver`. Once per runtime: `false` when one is already installed.
+    pub fn install_keyed_inject_receiver(
+        &self,
+        receiver: Arc<dyn crate::runtime::keyed_inject::KeyedInjectReceiver>,
+    ) -> bool {
+        let mut slot = self
+            .keyed_inject_slot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(receiver);
+        true
+    }
+
+    /// The contact directory and the signing-key slot that delivery to
+    /// members on peer gateways uses.
+    pub(crate) fn peer_delivery_access(
+        &self,
+    ) -> Option<(
+        crate::contact_directory::ContactDirectory,
+        crate::runtime::cross_mob_control::ControlSignerSlot,
+    )> {
+        self.contact_directory
+            .clone()
+            .map(|contacts| (contacts, Arc::clone(&self.gateway_peer_keys)))
     }
 
     pub fn set_memory_panel_store(

@@ -52,6 +52,16 @@
 //! scoped grant. Callers stamp their signature unconditionally, which is why
 //! the field is additive per variant rather than a wrapper frame - see
 //! [`ControlCaller`].
+//!
+//! # Keyed inject plane
+//!
+//! `inject_keyed` and `inject_status` carry a keyed host continuation to a
+//! durable identity hosted by this gateway and read its native status back
+//! (see [`super::keyed_inject`]). Unlike `inject`, a keyed delivery can be
+//! reconciled: an identical replay returns the original receipt. They are
+//! grant-only: `verbs = ["*"]` never covers them, an open listener refuses
+//! them, and both their requests and every answer, refusals included, are
+//! signed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -207,7 +217,7 @@ impl BoundControlListener {
 /// Maximum control payload size. Control messages are tiny (a few hundred
 /// bytes typical, ~1 KiB max for an injected text turn) — we cap well below
 /// that so a misbehaving peer can't tie up reads.
-const MAX_CONTROL_PAYLOAD: u32 = 64 * 1024;
+pub(crate) const MAX_CONTROL_PAYLOAD: u32 = 64 * 1024;
 
 /// Default request timeout. Control RPC should be fast — local mob
 /// dispatch on the remote side is sub-millisecond. We give it 5s to absorb
@@ -294,6 +304,40 @@ pub enum ControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<ControlCaller>,
     },
+    /// Deliver one keyed host continuation to a durable identity this
+    /// gateway hosts. The delivery key, under the caller's scope, becomes
+    /// the continuation key, so an identical replay returns the original
+    /// receipt. See [`super::keyed_inject`].
+    InjectKeyed {
+        /// The member identity, in its public form.
+        remote_member: String,
+        delivery_key: String,
+        /// The caller's digest of `body`.
+        content_digest: String,
+        summary: String,
+        body: String,
+        /// The caller's clock when it signed this request, in milliseconds
+        /// since the Unix epoch. The serving gateway refuses a request
+        /// outside its freshness window.
+        issued_at_ms: u64,
+        /// Fresh per request; the signed answer covers it.
+        nonce: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<ControlCaller>,
+    },
+    /// Read the native status of a keyed delivery for a durable identity
+    /// this gateway hosts.
+    InjectStatus {
+        remote_member: String,
+        delivery_key: String,
+        /// Also report the admitted input's own runtime state.
+        #[serde(default)]
+        with_input: bool,
+        issued_at_ms: u64,
+        nonce: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<ControlCaller>,
+    },
 }
 
 impl ControlRequest {
@@ -307,19 +351,23 @@ impl ControlRequest {
             Self::LookupMember { .. } => ControlVerb::LookupMember,
             Self::HostDescribe { .. } => ControlVerb::HostDescribe,
             Self::HostHealth { .. } => ControlVerb::HostHealth,
+            Self::InjectKeyed { .. } => ControlVerb::InjectKeyed,
+            Self::InjectStatus { .. } => ControlVerb::InjectStatus,
         }
     }
 
     /// The member of the RECEIVING mob this request reaches. Every
     /// MEMBER-plane verb names exactly one, which is what makes a member
     /// scope expressible; host-plane verbs address the gateway itself and
-    /// answer [`HOST_PLANE_MEMBER`].
+    /// answer [`HOST_PLANE_MEMBER`]. Keyed inject verbs name their member.
     pub fn remote_member(&self) -> &str {
         match self {
             Self::Wire { remote_member, .. }
             | Self::Unwire { remote_member, .. }
             | Self::Inject { remote_member, .. }
-            | Self::LookupMember { remote_member, .. } => remote_member,
+            | Self::LookupMember { remote_member, .. }
+            | Self::InjectKeyed { remote_member, .. }
+            | Self::InjectStatus { remote_member, .. } => remote_member,
             Self::HostDescribe { .. } | Self::HostHealth { .. } => HOST_PLANE_MEMBER,
         }
     }
@@ -341,7 +389,9 @@ impl ControlRequest {
             | Self::Inject { caller, .. }
             | Self::LookupMember { caller, .. }
             | Self::HostDescribe { caller, .. }
-            | Self::HostHealth { caller, .. } => caller.as_ref(),
+            | Self::HostHealth { caller, .. }
+            | Self::InjectKeyed { caller, .. }
+            | Self::InjectStatus { caller, .. } => caller.as_ref(),
         }
     }
 
@@ -352,7 +402,9 @@ impl ControlRequest {
             | Self::Inject { caller, .. }
             | Self::LookupMember { caller, .. }
             | Self::HostDescribe { caller, .. }
-            | Self::HostHealth { caller, .. } => caller.as_mut(),
+            | Self::HostHealth { caller, .. }
+            | Self::InjectKeyed { caller, .. }
+            | Self::InjectStatus { caller, .. } => caller.as_mut(),
         }
     }
 
@@ -366,7 +418,9 @@ impl ControlRequest {
             | Self::Inject { caller, .. }
             | Self::LookupMember { caller, .. }
             | Self::HostDescribe { caller, .. }
-            | Self::HostHealth { caller, .. } => *caller = value,
+            | Self::HostHealth { caller, .. }
+            | Self::InjectKeyed { caller, .. }
+            | Self::InjectStatus { caller, .. } => *caller = value,
         }
     }
 }
@@ -442,6 +496,34 @@ pub enum ControlResponse {
     /// projection, in meerkat's health vocabulary.
     HostHealth {
         health: meerkat_contracts::RuntimeHostHealth,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sig_b64: Option<String>,
+    },
+    /// `InjectKeyed` reached the member's continuation owner, which
+    /// committed the delivery (or had committed it already: an identical
+    /// replay returns the original receipt). TRUSTED MATERIAL: the caller
+    /// settles a delivery from it only when the signature verifies.
+    InjectReceipt {
+        receipt: super::keyed_inject::NativeReceipt,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sig_b64: Option<String>,
+    },
+    /// `InjectStatus` answered: the continuation owner's own status of the
+    /// delivery's key, and the admitted input's state when asked for.
+    InjectStatus {
+        status: super::keyed_inject::NativeStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sig_b64: Option<String>,
+    },
+    /// A keyed inject verb was refused by the serving side. Unlike `Err`, this
+    /// is signed: a caller may settle a delivery from some refusals (see
+    /// [`super::keyed_inject::KeyedInjectRefusalCode`]), so they have to be
+    /// attributable.
+    InjectRefused {
+        code: String,
+        message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sig_b64: Option<String>,
     },
@@ -539,6 +621,20 @@ pub fn control_response_signing_payload(
             "host_health\n{}",
             super::remote_host::host_health_digest_hex(health)
         ),
+        // Keyed inject answers enter length-prefixed field by field, so no
+        // value (a refusal message, a reason) can pass for another answer.
+        ControlResponse::InjectReceipt { receipt, .. } => format!(
+            "inject_receipt\n{}",
+            super::keyed_inject::receipt_facts(receipt)
+        ),
+        ControlResponse::InjectStatus { status, input, .. } => format!(
+            "inject_status\n{}",
+            super::keyed_inject::status_facts(status, input.as_ref())
+        ),
+        ControlResponse::InjectRefused { code, message, .. } => format!(
+            "inject_refused\n{}",
+            super::keyed_inject::refusal_facts(code, message)
+        ),
         ControlResponse::Err { .. } => return None,
     };
     Some(format!(
@@ -564,7 +660,10 @@ fn sign_control_response(
         | ControlResponse::Injected { sig_b64, .. }
         | ControlResponse::Member { sig_b64, .. }
         | ControlResponse::Host { sig_b64, .. }
-        | ControlResponse::HostHealth { sig_b64, .. } => *sig_b64 = Some(encoded),
+        | ControlResponse::HostHealth { sig_b64, .. }
+        | ControlResponse::InjectReceipt { sig_b64, .. }
+        | ControlResponse::InjectStatus { sig_b64, .. }
+        | ControlResponse::InjectRefused { sig_b64, .. } => *sig_b64 = Some(encoded),
         ControlResponse::Err { .. } => {}
     }
 }
@@ -586,7 +685,10 @@ pub fn verify_control_response(
         | ControlResponse::Injected { sig_b64, .. }
         | ControlResponse::Member { sig_b64, .. }
         | ControlResponse::Host { sig_b64, .. }
-        | ControlResponse::HostHealth { sig_b64, .. } => sig_b64.as_deref(),
+        | ControlResponse::HostHealth { sig_b64, .. }
+        | ControlResponse::InjectReceipt { sig_b64, .. }
+        | ControlResponse::InjectStatus { sig_b64, .. }
+        | ControlResponse::InjectRefused { sig_b64, .. } => sig_b64.as_deref(),
         ControlResponse::Err { .. } => None,
     };
     let Some(sig_b64) = sig_b64 else {
@@ -647,7 +749,7 @@ pub struct ControlCaller {
 
 /// One control operation, as a grantable unit.
 ///
-/// Two planes live in this enum:
+/// Three planes live in this enum:
 ///
 /// * The MEMBER plane ([`Self::member_plane`]) - every verb that names a
 ///   member of the receiving mob and reaches it.
@@ -655,6 +757,11 @@ pub struct ControlCaller {
 ///   gateway makes about ITSELF as a runtime host (see
 ///   [`super::remote_host`]). These name no member, mutate nothing, and
 ///   are never covered by `verbs = ["*"]`.
+/// * The KEYED INJECT plane ([`Self::is_keyed_inject_plane`]) - keyed,
+///   reconcilable delivery to a durable identity this gateway hosts (see
+///   [`super::keyed_inject`]). These name their member, so member scope
+///   applies, but they are never covered by `verbs = ["*"]` and an open
+///   listener refuses them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlVerb {
@@ -666,6 +773,10 @@ pub enum ControlVerb {
     HostDescribe,
     /// Runtime-host health projection.
     HostHealth,
+    /// Deliver one keyed host continuation to a hosted identity.
+    InjectKeyed,
+    /// Read a keyed delivery's native status for a hosted identity.
+    InjectStatus,
 }
 
 impl ControlVerb {
@@ -678,6 +789,8 @@ impl ControlVerb {
             Self::LookupMember => "lookup_member",
             Self::HostDescribe => "host_describe",
             Self::HostHealth => "host_health",
+            Self::InjectKeyed => "inject_keyed",
+            Self::InjectStatus => "inject_status",
         }
     }
 
@@ -692,6 +805,8 @@ impl ControlVerb {
             "lookup_member" => Some(Self::LookupMember),
             "host_describe" => Some(Self::HostDescribe),
             "host_health" => Some(Self::HostHealth),
+            "inject_keyed" => Some(Self::InjectKeyed),
+            "inject_status" => Some(Self::InjectStatus),
             _ => None,
         }
     }
@@ -699,7 +814,7 @@ impl ControlVerb {
     /// Every verb this gateway knows, for tests and for exhaustive
     /// tables. NOT what `verbs = ["*"]` expands to - see
     /// [`Self::member_plane`].
-    pub fn all() -> [Self; 6] {
+    pub fn all() -> [Self; 8] {
         [
             Self::Wire,
             Self::Unwire,
@@ -707,18 +822,20 @@ impl ControlVerb {
             Self::LookupMember,
             Self::HostDescribe,
             Self::HostHealth,
+            Self::InjectKeyed,
+            Self::InjectStatus,
         ]
     }
 
     /// What `verbs = ["*"]` expands to: the member-plane verbs, and only
     /// those.
     ///
-    /// Host-plane verbs are deliberately EXCLUDED. Every `*` grant
-    /// already deployed was written when this enum held four verbs, and
-    /// widening those grants by adding variants here would be a silent
-    /// privilege change made by an upgrade rather than by an operator.
-    /// A gateway that wants to serve host facts to a caller names
-    /// `host_describe` / `host_health` explicitly.
+    /// Host-plane and keyed-inject-plane verbs are deliberately EXCLUDED. Every
+    /// `*` grant already deployed was written when this enum held four
+    /// verbs, and widening those grants by adding variants here would be a
+    /// silent privilege change made by an upgrade rather than by an
+    /// operator. A gateway that wants to serve them to a caller names them
+    /// explicitly.
     pub fn member_plane() -> [Self; 4] {
         [Self::Wire, Self::Unwire, Self::Inject, Self::LookupMember]
     }
@@ -729,7 +846,26 @@ impl ControlVerb {
     pub fn is_host_plane(&self) -> bool {
         match self {
             Self::HostDescribe | Self::HostHealth => true,
-            Self::Wire | Self::Unwire | Self::Inject | Self::LookupMember => false,
+            Self::Wire
+            | Self::Unwire
+            | Self::Inject
+            | Self::LookupMember
+            | Self::InjectKeyed
+            | Self::InjectStatus => false,
+        }
+    }
+
+    /// Whether this verb carries keyed delivery. Only a grant that names
+    /// it admits it; a listener that enforces no grants refuses it.
+    pub fn is_keyed_inject_plane(&self) -> bool {
+        match self {
+            Self::InjectKeyed | Self::InjectStatus => true,
+            Self::Wire
+            | Self::Unwire
+            | Self::Inject
+            | Self::LookupMember
+            | Self::HostDescribe
+            | Self::HostHealth => false,
         }
     }
 }
@@ -860,6 +996,41 @@ pub fn control_request_signing_payload(request: &ControlRequest) -> String {
         } => {
             push_signed_field(&mut payload, nonce.as_deref().unwrap_or(""));
         }
+        // The body enters as its own SHA-256 beside the claimed content
+        // digest, so the signature binds the exact bytes the serving side
+        // checks against that digest.
+        ControlRequest::InjectKeyed {
+            remote_member,
+            delivery_key,
+            content_digest,
+            summary,
+            body,
+            issued_at_ms,
+            nonce,
+            caller: _caller,
+        } => {
+            push_signed_field(&mut payload, remote_member);
+            push_signed_field(&mut payload, delivery_key);
+            push_signed_field(&mut payload, content_digest);
+            push_signed_field(&mut payload, summary);
+            push_signed_field(&mut payload, &sha256_hex(body.as_bytes()));
+            push_signed_field(&mut payload, &issued_at_ms.to_string());
+            push_signed_field(&mut payload, nonce);
+        }
+        ControlRequest::InjectStatus {
+            remote_member,
+            delivery_key,
+            with_input,
+            issued_at_ms,
+            nonce,
+            caller: _caller,
+        } => {
+            push_signed_field(&mut payload, remote_member);
+            push_signed_field(&mut payload, delivery_key);
+            push_signed_field(&mut payload, if *with_input { "with_input" } else { "" });
+            push_signed_field(&mut payload, &issued_at_ms.to_string());
+            push_signed_field(&mut payload, nonce);
+        }
     }
     push_signed_field(
         &mut payload,
@@ -927,12 +1098,15 @@ pub enum ControlAuthzDenial {
         expected: String,
         presented: String,
     },
+    /// The verb is admitted only under a grant that names it, and this
+    /// listener enforces no grants.
+    GrantsRequired { verb: ControlVerb },
 }
 
 /// Every stable denial code this module can answer with. Callers use it to
 /// classify a peer's `Err` response as an authorization refusal rather
 /// than string-matching one code at a time.
-pub const CONTROL_AUTHZ_DENIAL_CODES: [&str; 7] = [
+pub const CONTROL_AUTHZ_DENIAL_CODES: [&str; 8] = [
     "unauthenticated_caller",
     "invalid_caller_credential",
     "invalid_caller_signature",
@@ -940,6 +1114,7 @@ pub const CONTROL_AUTHZ_DENIAL_CODES: [&str; 7] = [
     "verb_not_granted",
     "member_not_granted",
     "audience_mismatch",
+    "grants_required",
 ];
 
 impl ControlAuthzDenial {
@@ -953,6 +1128,7 @@ impl ControlAuthzDenial {
             Self::VerbNotGranted { .. } => "verb_not_granted",
             Self::MemberNotGranted { .. } => "member_not_granted",
             Self::AudienceMismatch { .. } => "audience_mismatch",
+            Self::GrantsRequired { .. } => "grants_required",
         }
     }
 
@@ -988,6 +1164,12 @@ impl std::fmt::Display for ControlAuthzDenial {
                  gateway; host-plane verbs are never covered by verbs = [\"*\"] and must be \
                  named explicitly"
             ),
+            Self::VerbNotGranted { label, verb } if verb.is_keyed_inject_plane() => write!(
+                f,
+                "caller '{label}' is not granted keyed inject control verb '{verb}' on this \
+                 gateway; keyed inject verbs are never covered by verbs = [\"*\"] and must be \
+                 named explicitly"
+            ),
             Self::VerbNotGranted { label, verb } => write!(
                 f,
                 "caller '{label}' is not granted control verb '{verb}' on this gateway"
@@ -1008,6 +1190,11 @@ impl std::fmt::Display for ControlAuthzDenial {
                 f,
                 "caller '{label}' presented a request minted for '{presented}', but this \
                  gateway answers for '{expected}'"
+            ),
+            Self::GrantsRequired { verb } => write!(
+                f,
+                "control verb '{verb}' is served only under a control grant that names it, and \
+                 this listener enforces no grants"
             ),
         }
     }
@@ -1383,11 +1570,12 @@ pub struct AuthorizedCaller {
 /// way as "empty policy":
 ///
 /// * [`Self::Open`] - authorize nothing. Every decodable request is
-///   dispatched, exactly as before caller authorization existed. Any
-///   credential a caller stamps is left UNVERIFIED here on purpose: there
-///   is nothing to authorize, and verifying would turn a future payload
-///   revision into a cross-version outage for deployments that never
-///   opted in.
+///   dispatched, exactly as before caller authorization existed, except a
+///   keyed-inject-plane verb, which only a grant naming it admits and which is
+///   therefore refused here. Any credential a caller stamps is left
+///   UNVERIFIED here on purpose: there is nothing to authorize, and
+///   verifying would turn a future payload revision into a cross-version
+///   outage for deployments that never opted in.
 /// * [`Self::Grants`] - enforce. A request must carry a credential that
 ///   verifies, name a caller filed in the table, and fall inside that
 ///   caller's verbs and member scope.
@@ -1450,14 +1638,19 @@ impl ControlAuthorizer {
         &self,
         request: &ControlRequest,
     ) -> Result<Option<AuthorizedCaller>, ControlAuthzDenial> {
+        let verb = request.verb();
         let Self::Grants {
             table,
             expected_audience,
         } = self
         else {
+            // Open authorizes nothing, so it cannot admit a verb that is
+            // served only under a grant naming it.
+            if verb.is_keyed_inject_plane() {
+                return Err(ControlAuthzDenial::GrantsRequired { verb });
+            }
             return Ok(None);
         };
-        let verb = request.verb();
         let Some(caller) = request.caller() else {
             return Err(ControlAuthzDenial::UnauthenticatedCaller { verb });
         };
@@ -1694,6 +1887,19 @@ pub trait ControlHandler: Send + Sync + 'static {
         &self,
         request: ControlRequest,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ControlResponse> + Send + '_>>;
+
+    /// [`Self::handle`] for a request the listener's grant policy admitted,
+    /// with the caller it admitted (`None` when the listener enforces no
+    /// grants). The listener dispatches through this. Keyed inject verbs
+    /// are scoped to their caller; the default ignores it.
+    fn handle_admitted(
+        &self,
+        request: ControlRequest,
+        caller: Option<AuthorizedCaller>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ControlResponse> + Send + '_>> {
+        let _ = caller;
+        self.handle(request)
+    }
 }
 
 /// Real `ControlHandler` that dispatches requests against a local
@@ -1715,6 +1921,9 @@ pub struct MobHandleControlHandler {
     /// is present, so facts and endpoint identity are always served under an
     /// authenticated host key while both bootstrap orders remain supported.
     host_facts: HostFactsProviderSlot,
+    /// Late-bound serving side of the keyed inject plane. An empty slot
+    /// answers both verbs with a signed `keyed_inject_unavailable` refusal.
+    keyed_inject: super::keyed_inject::KeyedInjectSlot,
 }
 
 /// How the handler resolves the durable identity authority for generated
@@ -1755,6 +1964,7 @@ impl MobHandleControlHandler {
             identity_authority: ControlIdentityAuthority::None,
             session_service: None,
             host_facts: empty_host_facts_provider(),
+            keyed_inject: super::keyed_inject::empty_keyed_inject_slot(),
         }
     }
 
@@ -1769,6 +1979,7 @@ impl MobHandleControlHandler {
             identity_authority: ControlIdentityAuthority::Fixed(Box::new(identity_runtime)),
             session_service: None,
             host_facts: empty_host_facts_provider(),
+            keyed_inject: super::keyed_inject::empty_keyed_inject_slot(),
         }
     }
 
@@ -1786,6 +1997,7 @@ impl MobHandleControlHandler {
             identity_authority: ControlIdentityAuthority::Shared(identity_slot),
             session_service: None,
             host_facts: empty_host_facts_provider(),
+            keyed_inject: super::keyed_inject::empty_keyed_inject_slot(),
         }
     }
 
@@ -1824,6 +2036,15 @@ impl MobHandleControlHandler {
     #[must_use]
     pub fn with_host_facts_slot(mut self, slot: HostFactsProviderSlot) -> Self {
         self.host_facts = slot;
+        self
+    }
+
+    /// Serve the keyed inject plane from a host-owned slot that the
+    /// gateway's mob announcement composition may populate after this
+    /// handler starts serving. Every keyed inject request re-reads it.
+    #[must_use]
+    pub fn with_keyed_inject_slot(mut self, slot: super::keyed_inject::KeyedInjectSlot) -> Self {
+        self.keyed_inject = slot;
         self
     }
 }
@@ -1886,6 +2107,7 @@ impl ControlHandler for MobHandleControlHandler {
         let identity_runtime = self.identity_authority.current();
         let session_service = self.session_service.clone();
         let host_facts = self.host_facts.clone();
+        let keyed_inject = self.keyed_inject.clone();
         Box::pin(async move {
             // `nonce` and `caller` are consumed at the listener seam
             // (response signing binds the nonce via the request digest;
@@ -1977,7 +2199,36 @@ impl ControlHandler for MobHandleControlHandler {
                     let provider = current_host_facts(&host_facts);
                     host_health_response(provider.as_deref())
                 }
+                // The keyed inject plane never touches `handle` either: the
+                // gateway's mob announcement composition reaches its own
+                // continuation owner.
+                // Reached only without an admitting caller: a keyed inject
+                // verb is answered through `handle_admitted`, scoped to it.
+                request @ (ControlRequest::InjectKeyed { .. }
+                | ControlRequest::InjectStatus { .. }) => {
+                    super::keyed_inject::answer_keyed_inject_request(&keyed_inject, request, None)
+                        .await
+                }
             }
+        })
+    }
+
+    fn handle_admitted(
+        &self,
+        request: ControlRequest,
+        caller: Option<AuthorizedCaller>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ControlResponse> + Send + '_>> {
+        if !request.verb().is_keyed_inject_plane() {
+            return self.handle(request);
+        }
+        let keyed_inject = self.keyed_inject.clone();
+        Box::pin(async move {
+            super::keyed_inject::answer_keyed_inject_request(
+                &keyed_inject,
+                request,
+                caller.as_ref(),
+            )
+            .await
         })
     }
 }
@@ -2532,14 +2783,15 @@ async fn serve_one(
     // has to cover every ControlHandler implementation rather than only
     // the one that happens to be mounted.
     let verb = request.verb();
-    match authorizer.authorize(&request) {
-        Ok(None) => {}
+    let admitted = match authorizer.authorize(&request) {
+        Ok(None) => None,
         Ok(Some(caller)) => {
             tracing::debug!(
                 caller = %caller.label,
                 verb = %verb,
                 "cross-mob control request admitted by grant"
             );
+            Some(caller)
         }
         Err(denial) => {
             tracing::warn!(
@@ -2556,8 +2808,8 @@ async fn serve_one(
             let _ = stream.write_frame(&response_payload).await;
             return;
         }
-    }
-    let mut response = handler.handle(request).await;
+    };
+    let mut response = handler.handle_admitted(request, admitted).await;
     // Bind the response to this gateway's pinned identity and to the exact
     // request bytes. Re-read per request: hosts install keys after the
     // listener exists.
@@ -2665,6 +2917,15 @@ mod tests {
                         health: echo_host_health(),
                         sig_b64: None,
                     },
+                    request @ (ControlRequest::InjectKeyed { .. }
+                    | ControlRequest::InjectStatus { .. }) => {
+                        crate::runtime::keyed_inject::answer_keyed_inject_request(
+                            &crate::runtime::keyed_inject::empty_keyed_inject_slot(),
+                            request,
+                            None,
+                        )
+                        .await
+                    }
                 }
             })
         }
@@ -3565,6 +3826,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Keyed inject verbs are reached only through a grant that names them: `*`
+    /// never covers them, an open listener refuses them, and a named grant
+    /// still scopes them to its members.
+    #[test]
+    fn keyed_inject_verbs_are_grant_only_and_member_scoped() {
+        let table = ControlGrantTable::from_toml(&format!(
+            r#"
+            [control_grants.ops-mob]
+            pubkey = "{TEST_PUBKEY_B64}"
+            verbs = ["*"]
+            "#
+        ))
+        .expect("parse")
+        .expect("section is present");
+        let grant = table.get(&[42u8; 32]).expect("filed");
+        let keyed = ControlVerb::all()
+            .into_iter()
+            .filter(ControlVerb::is_keyed_inject_plane)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keyed,
+            [ControlVerb::InjectKeyed, ControlVerb::InjectStatus],
+            "the positive control: both keyed inject verbs exist"
+        );
+        for verb in &keyed {
+            assert!(
+                !grant.verbs().contains(verb),
+                "'*' must not grant keyed inject verb {verb}"
+            );
+        }
+        let status = ControlRequest::InjectStatus {
+            remote_member: "bob".into(),
+            delivery_key: "batch-1".into(),
+            with_input: false,
+            issued_at_ms: 1,
+            nonce: "n".into(),
+            caller: None,
+        };
+        assert_eq!(
+            ControlAuthorizer::open().authorize(&status),
+            Err(ControlAuthzDenial::GrantsRequired {
+                verb: ControlVerb::InjectStatus
+            })
+        );
+        assert_eq!(
+            ControlAuthorizer::open().authorize(&inject_request("bob")),
+            Ok(None),
+            "an open listener still admits the member plane"
+        );
+        let keys = crate::auth::peer_keys::GatewayPeerKeys::ephemeral();
+        let named = ControlAuthorizer::with_grants(table_for(
+            &keys,
+            &[ControlVerb::InjectStatus],
+            ControlMemberScope::members(["alice"]),
+        ));
+        let mut for_alice = status.clone();
+        if let ControlRequest::InjectStatus { remote_member, .. } = &mut for_alice {
+            *remote_member = "alice".into();
+        }
+        sign_control_request_as_caller(&keys, None, &mut for_alice);
+        assert!(
+            named.authorize(&for_alice).is_ok(),
+            "the named member is reached"
+        );
+        let mut for_bob = status;
+        sign_control_request_as_caller(&keys, None, &mut for_bob);
+        assert!(matches!(
+            named.authorize(&for_bob),
+            Err(ControlAuthzDenial::MemberNotGranted { .. })
+        ));
     }
 
     /// A host-plane verb is reachable only when it is named, and its

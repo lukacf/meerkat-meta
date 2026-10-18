@@ -218,6 +218,10 @@ struct GatewayRuntimeOptions {
     /// and receive what they subscribe to in batches. Persistent
     /// identity-first launches only; `None` keeps them off.
     mob_announcements: Option<crate::mob_announcements::AnnouncementConfig>,
+    /// `runtime_options.control_request_window_ms`: how far a signed keyed
+    /// inject request's issue time may be from this gateway's clock, in
+    /// either direction, before the control listener refuses it as stale.
+    control_request_window_ms: u64,
 }
 
 /// `runtime_options.live` wire forms: `true` mounts the live WebSocket
@@ -451,6 +455,7 @@ impl Default for GatewayRuntimeOptions {
             http_public_base_url: None,
             allow_remote: false,
             mob_announcements: None,
+            control_request_window_ms: crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS,
         }
     }
 }
@@ -8254,6 +8259,7 @@ fn parse_gateway_runtime_options(
         "http_public_base_url",
         "allow_remote",
         "mob_announcements",
+        "control_request_window_ms",
     ];
     let unsupported = runtime_options
         .keys()
@@ -8322,6 +8328,16 @@ fn parse_gateway_runtime_options(
         parsed.allow_remote = value
             .as_bool()
             .ok_or_else(|| "runtime_options.allow_remote must be a boolean".to_string())?;
+    }
+    if let Some(value) = runtime_options.get("control_request_window_ms") {
+        let window = value
+            .as_u64()
+            .filter(|window| (1_000..=3_600_000).contains(window))
+            .ok_or_else(|| {
+                "runtime_options.control_request_window_ms must be an integer in 1000..=3600000"
+                    .to_string()
+            })?;
+        parsed.control_request_window_ms = window;
     }
     if let Some(value) = runtime_options.get("mob_announcements") {
         parsed.mob_announcements = crate::mob_announcements::parse_runtime_options(value)?;
@@ -18378,6 +18394,15 @@ external_addressable = true
     if let Some(config) = gateway_options.mob_announcements {
         crate::mob_announcements::compose_for_runtime(&runtime, &storage_layout, config)
             .map_err(|message| fail_init(&request_id, -32602, message))?;
+    }
+    // A control listener on an identity-first gateway serves peers' keyed
+    // injects, whether or not this gateway enables mob announcements itself.
+    if control_listen_address.is_some() && runtime.identity_runtime_ref().is_some() {
+        crate::mob_announcements::compose_keyed_inject_receiver(
+            &runtime,
+            gateway_options.control_request_window_ms,
+        )
+        .map_err(|message| fail_init(&request_id, -32602, message))?;
     }
 
     // 8. Send init response via stdout channel

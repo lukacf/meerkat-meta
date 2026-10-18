@@ -602,14 +602,8 @@ pub struct BatchItem {
 }
 
 /// The native owner's commit receipt for a batch: a reference, retained as
-/// the native owner issued it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeReceipt {
-    pub delivery_id: String,
-    pub address: String,
-    pub submission_digest: String,
-    pub committed_at_ms: u64,
-}
+/// the native owner issued it. The same record travels between gateways.
+pub use crate::runtime::keyed_inject::NativeReceipt;
 
 /// A batch's delivery state. Only [`BatchState::apply`] moves it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
