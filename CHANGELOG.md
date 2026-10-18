@@ -44,7 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   maintenance in every build) and the methods answer
   `mob_announcements_unavailable`. Nothing holds retention much past the
   window: what waited longer for a delivery that never started expires, and
-  the member's next batch reports it as a gap. See
+  the member's next batch reports it as a gap. The Rust surface's
+  `AnnouncementStoreError`, `SubscriptionEnd`, `MemberRoute`, `BatchState`,
+  `GapReason` and `Settlement` are `#[non_exhaustive]`. See
   `docs/design/mob-announcements.md`.
 
 - Mob announcement member tools. A profile that lists the

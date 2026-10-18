@@ -44,6 +44,7 @@ pub const MAX_REMOTE_BODY_WIRE_BYTES: u64 = 56 * 1024;
 
 /// Typed store outcomes. Every refusal leaves the store unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AnnouncementStoreError {
     /// The source key is already bound to other content; the original
     /// announcement is untouched.
@@ -528,6 +529,7 @@ impl SubscriptionState {
 /// unreachable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum SubscriptionEnd {
     /// The member left its mob: its identity is no longer registered, or
     /// its peer gateway answered, signed, that it has no such member.
@@ -565,6 +567,7 @@ impl fmt::Display for SubscriptionEnd {
 /// kept: a later collision of ids never reroutes a member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MemberRoute {
     /// A member of this gateway's mob, through this gateway's runtime.
     #[default]
@@ -765,6 +768,7 @@ pub use crate::runtime::keyed_inject::NativeReceipt;
 /// A batch's delivery state. Only [`BatchState::apply`] moves it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum BatchState {
     /// Sealed and persisted; no native submission has started.
     Sealed,
@@ -878,6 +882,7 @@ pub struct SuccessorBatch {
 /// Why announcements owed to a member were not delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GapReason {
     /// They waited longer than the retention window for a delivery that
     /// never started.
@@ -1054,6 +1059,7 @@ impl BatchEvent {
 /// How an owed announcement was settled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Settlement {
     Delivered,
     Refused,

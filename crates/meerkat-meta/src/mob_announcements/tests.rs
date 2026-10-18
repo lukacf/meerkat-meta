@@ -6874,3 +6874,45 @@ async fn a_hosted_mob_id_this_store_cannot_hold_is_skipped_and_warned_once() {
         "{log}"
     );
 }
+
+/// The attributes directly above `pub enum {name}` in `source`, or `None`
+/// when `source` declares no such enum.
+fn enum_attributes<'a>(source: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    let at = source.find(&format!("\npub enum {name} {{"))?;
+    Some(
+        source[..at]
+            .lines()
+            .rev()
+            .take_while(|line| line.starts_with("#["))
+            .collect(),
+    )
+}
+
+/// The public enums of the announcement surface are new in this release.
+/// Each is `#[non_exhaustive]`, so a later variant (a typed suspend cause, a
+/// typed end cause) is not a breaking change for callers that match on it.
+#[test]
+fn the_public_announcement_enums_are_non_exhaustive() {
+    let source = include_str!("types.rs");
+    let names = [
+        "AnnouncementStoreError",
+        "SubscriptionEnd",
+        "MemberRoute",
+        "BatchState",
+        "GapReason",
+        "Settlement",
+    ];
+    let marked: Vec<(&str, Option<bool>)> = names
+        .iter()
+        .map(|name| {
+            let attributes = enum_attributes(source, name);
+            (
+                *name,
+                attributes.map(|attributes| attributes.contains(&"#[non_exhaustive]")),
+            )
+        })
+        .collect();
+    let expected: Vec<(&str, Option<bool>)> =
+        names.iter().map(|name| (*name, Some(true))).collect();
+    assert_eq!(marked, expected);
+}
