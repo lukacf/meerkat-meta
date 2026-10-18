@@ -1507,7 +1507,10 @@ comms = true
 
     /// An identity member's continuity rebind to a respawned (or delivery
     /// repaired) session carries its opt-in: the identity runtime tells the
-    /// runtime's opt-ins which session the member moved from and to.
+    /// runtime's opt-ins which session the member moved from and to. The
+    /// member is seated, as identity-first materialization seats it, at the
+    /// roster row of its DURABLE identity: the opt-in is keyed by that row,
+    /// and the runtime alias names only the current incarnation.
     #[tokio::test]
     async fn identity_continuity_rebind_carries_the_opt_in() {
         use crate::identity_first::{
@@ -1545,7 +1548,8 @@ comms = true
 
         let identity = DurableIdentity::parse("domain:rotating").expect("identity");
         let alias = "rt:domain:rotating:0";
-        let roster_member = crate::member_comms_id::mob_member_id(alias);
+        let roster_member =
+            crate::member_comms_id::roster_member_id_for_identity(identity.as_str());
         handle
             .ensure_member(meerkat_mob::SpawnMemberSpec::new(
                 meerkat_mob::ProfileName::from("worker"),

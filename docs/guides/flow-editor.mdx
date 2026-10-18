@@ -68,7 +68,8 @@ Without `--allow-host-deploy`, the standalone server refuses
 `meta/mobpacks/deploy` with `execute: true` and points you at deploy planning
 or running `rkat mob run` manually. A validate request with
 `rkat_validate: true` is reduced to structural validation, so it cannot write
-an archive or spawn `rkat`.
+an archive or spawn `rkat`. The standalone server handles at most 16 requests
+at once; the rest wait for a slot.
 
 ### Library routers
 
@@ -147,18 +148,42 @@ Drafts autosave through `meta/mobpacks/save` into a host JSON store with optimis
 3. `$XDG_STATE_HOME/meerkat-meta/meerkat-meta-flow-editor-drafts.json`
 4. `~/.local/state/meerkat-meta/meerkat-meta-flow-editor-drafts.json`
 
+With none of these (no `META_FLOW_EDITOR_DRAFT_STORE`, and neither `XDG_STATE_HOME` nor `HOME` set) the draft methods refuse with `-32602` and `data: {"kind": "draft_store_unavailable", "reason": "gateway_home_unavailable"}`. The store is never kept in the OS temp directory, where another local user could create, link or read a file at a predictable path first. While the host has not adopted its predecessor (pre-0.9) gateway home, the draft methods refuse with the same kind and `reason` `predecessor_gateway_home` or `adoption_incomplete`.
+
+The store holds at most 256 drafts and 64 MiB. Every draft method reads and rewrites the whole store, so the caps bound what one call holds in memory as well as the disk the store takes. A new draft past the count, or a write that would grow the store file past 64 MiB, is refused with `-32602` and `data: {"kind": "draft_store_full", "limit": "drafts", "max_drafts": 256}` or `{"kind": "draft_store_full", "limit": "bytes", "max_bytes": 67108864, "required_bytes": ...}`, and writes nothing: delete drafts to make room. Undo and redo history yields first. Each draft keeps up to 25 undo and 25 redo snapshots, and before a write is refused the oldest of them go, of the drafts updated longest ago first and of the written draft last. Deletes always run. A store file past 128 MiB (one written before the caps) is not read: the draft methods refuse with `-32602` and `data: {"kind": "draft_store_unavailable", "reason": "store_too_large", ...}` until it is moved aside. The store is written readable only by its user, and directories it creates are readable only by that user.
+
+The draft store is shared by every caller of a Flow Editor route: one caller can fill it, and any caller can overwrite or delete any draft.
+
+Draft replies list the drafts as summaries: each draft's id, name, version,
+stage, description, revision and etag, without its document, archive or
+validation. `meta/mobpacks/get` returns a draft's document, and the reply of a
+write (`create`, `save`, `undo`, `redo`) carries the written draft whole. A
+draft id has at most 256 characters.
+
 ## Validation and deploy
 
 `meta/mobpacks/validate` always runs Meta structural validation
 (`meerkat_mob::validate_definition` + `SpecValidator`). One validation
 reports at most 1000 diagnostics; past that it ends with a
-`diagnostics_truncated` diagnostic. Every method that takes a document
+`diagnostics_truncated` diagnostic. It holds no more than those 1000 while it
+runs, so its memory does not grow with the number of problems a document
+has. Every method that takes a document
 (and import and draft save) refuses one whose skill content, summed over
 every skill entry, passes 16 MiB. A document with more than 1000 members,
-more than 256 branches in one parallel or branch step, or more than 1024
+a member that lists more than 1024 tools (`too_many_member_tools`), more
+than 256 branches in one parallel or branch step, or more than 1024
 branches in its flow is refused before it is rendered, and the rendered
 `mob.toml`, `definition.json` and expected schema files are each refused
-past 16 MiB. Setting
+past 16 MiB. A document whose graph has more than 2048 instances or more
+than 8192 edges is refused before anything derives a flow from its graph:
+validation fails with `too_many_graph_instances` or `too_many_graph_edges`,
+and `graph_to_flow`, export, deploy and every `apply_operation` but the
+deletes (`delete_flow_step`, `delete_graph_node`, `delete_graph_edge` and
+`delete_member`) refuse it with `-32602`. The deletes are let through so
+the document can be brought back under the caps; while its graph stays past
+them, deleting a node or an edge leaves the flow as it was. An operation
+that would push the graph past the caps, a flow operation that derives the
+graph again included, is refused. Setting
 `rkat_validate: true` requests a second, host-mutating phase: after structural
 validation passes, the server writes a rendered archive and spawns
 `rkat mob validate`. Only `meta/mobpacks/validate` has this phase:
@@ -217,9 +242,20 @@ host path it names:
 
 - `store_path` is refused with `-32602` on every method. The draft store is
   the host's: `META_FLOW_EDITOR_DRAFT_STORE` or the gateway home.
+- Draft replies (`create`, `save`, `list`, `get`, `undo`, `redo`, `delete`)
+  carry `store_path`, the store's host path, only to a caller with host
+  access, and the draft store's errors and refusals name no host path to any
+  other caller.
+- The catalogs name no host path to such a caller: each filesystem skill has
+  its path within its realm's directory, and the realm's directory is left
+  out. Deploy plans and `deploy_command` previews name the caller's own pack
+  path or the bare file name, and run `rkat`.
 - A path skill in a document (`skill_realms` entry with `source: "path"`) is
   read only when `meta/skills/catalog` lists that file and the document names
-  it by the listed path. Any other path is a
+  it by the listed path, or by its path within its realm with the realm's
+  `realm_id`, as the catalogs name it to such a caller. A path within a realm
+  with a `..`, `.`, empty, drive or backslash component is refused before
+  anything is read. Any other path is a
   `selected_skill_path_not_permitted` validation error, so source, export and
   deploy refuse the document instead of packing the file.
 - A listed file counts only while its real path stays inside the skill

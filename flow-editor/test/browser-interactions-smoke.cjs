@@ -314,7 +314,14 @@ async function main() {
     await page.keyboard.type("  ", { delay: 20 });
     await page.waitForTimeout(1_000);
     await promptArea.evaluate((el) => el.blur());
-    await page.waitForTimeout(500); // unfocused draft resyncs from the document
+    // Unfocused, the field shows the server document, which trails the typing
+    // by the serial per-keystroke apply_operation queue: wait (bounded) for it
+    // to converge instead of sampling it after a fixed delay.
+    await page.waitForFunction(
+      (expected) => document.querySelector(".bld-panel .field__textarea")?.value === expected,
+      "plan and deep wide layers  ",
+      { timeout: 20_000 },
+    ).catch(() => {});
     const promptAfterBlur = await promptArea.inputValue();
     if (promptAfterBlur !== "plan and deep wide layers  ") {
       throw new Error(`Adaptive prompt did not round-trip verbatim through Meta: ${JSON.stringify(promptAfterBlur)}`);

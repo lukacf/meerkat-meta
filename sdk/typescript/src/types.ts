@@ -2049,11 +2049,49 @@ export function parseMobpackDraftRow(raw: unknown): MobpackDraftRow {
   };
 }
 
+/**
+ * A draft as draft results list it: its id, revision and etag and what the
+ * Flow Editor library shows of it, without its document, archive or
+ * validation. `meta/mobpacks/get` returns a draft's document.
+ */
+export interface MobpackDraftSummary {
+  readonly id: string;
+  readonly name: string;
+  readonly version: string;
+  readonly stage: string;
+  readonly trigger: string;
+  readonly source: string;
+  readonly description: string;
+  readonly revision: number;
+  readonly etag: string;
+  readonly updatedAtUnixMs: number;
+  readonly canUndo: boolean;
+  readonly canRedo: boolean;
+}
+
+export function parseMobpackDraftSummary(raw: unknown): MobpackDraftSummary {
+  const d = asRecord(raw);
+  return {
+    id: String(d.id ?? ""),
+    name: String(d.name ?? ""),
+    version: String(d.version ?? ""),
+    stage: String(d.stage ?? ""),
+    trigger: String(d.trigger ?? ""),
+    source: String(d.source ?? ""),
+    description: String(d.description ?? ""),
+    revision: Number(d.revision ?? 0),
+    etag: String(d.etag ?? ""),
+    updatedAtUnixMs: Number(d.updated_at_unix_ms ?? 0),
+    canUndo: Boolean(d.can_undo),
+    canRedo: Boolean(d.can_redo),
+  };
+}
+
 export interface MobpackDraftListResult {
   readonly source: string;
   readonly storePath: string | null;
   readonly runtimeBacked: boolean;
-  readonly rows: readonly MobpackDraftRow[];
+  readonly rows: readonly MobpackDraftSummary[];
 }
 
 export function parseMobpackDraftListResult(
@@ -2064,7 +2102,7 @@ export function parseMobpackDraftListResult(
     source: String(d.source ?? ""),
     storePath: d.store_path == null ? null : String(d.store_path),
     runtimeBacked: Boolean(d.runtime_backed),
-    rows: asRecordArray(d.rows).map(parseMobpackDraftRow),
+    rows: asRecordArray(d.rows).map(parseMobpackDraftSummary),
   };
 }
 
@@ -2092,7 +2130,12 @@ export interface MobpackDraftSaveResult {
   readonly source: string;
   readonly storePath: string | null;
   readonly row: MobpackDraftRow;
-  readonly rows: readonly MobpackDraftRow[];
+  readonly rows: readonly MobpackDraftSummary[];
+  /**
+   * Set when Meta wrote the draft store but could not sync its directory:
+   * the write took effect and may not survive a crash.
+   */
+  readonly durabilityWarning: string | null;
 }
 
 export function parseMobpackDraftSaveResult(
@@ -2103,7 +2146,8 @@ export function parseMobpackDraftSaveResult(
     source: String(d.source ?? ""),
     storePath: d.store_path == null ? null : String(d.store_path),
     row: parseMobpackDraftRow(d.row),
-    rows: asRecordArray(d.rows).map(parseMobpackDraftRow),
+    rows: asRecordArray(d.rows).map(parseMobpackDraftSummary),
+    durabilityWarning: d.durability_warning == null ? null : String(d.durability_warning),
   };
 }
 
@@ -2118,7 +2162,12 @@ export interface MobpackDraftHistoryResult {
   readonly stepped: boolean;
   readonly reason: string | null;
   readonly row: MobpackDraftRow;
-  readonly rows: readonly MobpackDraftRow[];
+  readonly rows: readonly MobpackDraftSummary[];
+  /**
+   * Set when Meta wrote the draft store but could not sync its directory:
+   * the write took effect and may not survive a crash.
+   */
+  readonly durabilityWarning: string | null;
 }
 
 export function parseMobpackDraftHistoryResult(
@@ -2131,7 +2180,8 @@ export function parseMobpackDraftHistoryResult(
     stepped: Boolean(d.stepped),
     reason: d.reason == null ? null : String(d.reason),
     row: parseMobpackDraftRow(d.row),
-    rows: asRecordArray(d.rows).map(parseMobpackDraftRow),
+    rows: asRecordArray(d.rows).map(parseMobpackDraftSummary),
+    durabilityWarning: d.durability_warning == null ? null : String(d.durability_warning),
   };
 }
 
@@ -2140,7 +2190,12 @@ export interface MobpackDraftDeleteResult {
   readonly storePath: string | null;
   readonly id: string;
   readonly deleted: boolean;
-  readonly rows: readonly MobpackDraftRow[];
+  readonly rows: readonly MobpackDraftSummary[];
+  /**
+   * Set when Meta wrote the draft store but could not sync its directory:
+   * the write took effect and may not survive a crash.
+   */
+  readonly durabilityWarning: string | null;
 }
 
 export function parseMobpackDraftDeleteResult(
@@ -2152,7 +2207,8 @@ export function parseMobpackDraftDeleteResult(
     storePath: d.store_path == null ? null : String(d.store_path),
     id: String(d.id ?? ""),
     deleted: Boolean(d.deleted),
-    rows: asRecordArray(d.rows).map(parseMobpackDraftRow),
+    rows: asRecordArray(d.rows).map(parseMobpackDraftSummary),
+    durabilityWarning: d.durability_warning == null ? null : String(d.durability_warning),
   };
 }
 

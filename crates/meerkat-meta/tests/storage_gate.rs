@@ -112,10 +112,10 @@ const AMBIENT_ALLOWLIST: [AllowlistEntry; 3] = [
     entry(
         "mobpack.rs",
         "std::env::temp_dir",
-        3,
-        "caller-overridable scratch outputs (mobpack export/validate default output dir) and \
-         the draft store's last resort when no state root exists; the durable draft-store \
-         default routes through storage_layout::default_gateway_home",
+        2,
+        "caller-overridable scratch outputs (mobpack deploy/validate default output dir); the \
+         draft store never uses the temp directory: its default routes through \
+         storage_layout::default_gateway_home and refuses without a state root",
     ),
 ];
 

@@ -56,6 +56,7 @@ import {
   parseMobpackImportResult,
   parseIdentityResolvedToolsResult,
   parseMobpackDraftRow,
+  parseMobpackDraftSummary,
   parseMobpackDraftListResult,
   parseMobpackDraftGetResult,
   parseMobpackDraftSaveResult,
@@ -2004,6 +2005,22 @@ describe("mobpack authoring parsers", () => {
     assert.equal(listed.storePath, "/tmp/drafts.json");
     assert.equal(listed.runtimeBacked, true);
     assert.equal(listed.rows[0].id, "f_demo");
+    // Draft results list drafts as summaries: no document.
+    assert.deepEqual(listed.rows[0], parseMobpackDraftSummary(rowPayload));
+    assert.deepEqual(listed.rows[0], {
+      id: "f_demo",
+      name: "Demo",
+      version: "mobpack.editor.v1",
+      stage: "draft",
+      trigger: "Meta authoring draft",
+      source: "meta/mobpacks/create",
+      description: "",
+      revision: 3,
+      etag: "f_demo:3",
+      updatedAtUnixMs: 1700000000000,
+      canUndo: true,
+      canRedo: false,
+    });
 
     const got = parseMobpackDraftGetResult({
       source: "meta/mobpacks/get",
@@ -2021,6 +2038,17 @@ describe("mobpack authoring parsers", () => {
     });
     assert.equal(saved.row.id, "f_demo");
     assert.equal(saved.rows.length, 1);
+    assert.equal(saved.durabilityWarning, null);
+    const warned = parseMobpackDraftSaveResult({
+      source: "meta/mobpacks/save",
+      row: rowPayload,
+      rows: [],
+      durability_warning: "mobpack draft store was replaced, but its directory could not be synced",
+    });
+    assert.equal(
+      warned.durabilityWarning,
+      "mobpack draft store was replaced, but its directory could not be synced",
+    );
 
     const deleted = parseMobpackDraftDeleteResult({
       source: "meta/mobpacks/delete",
@@ -2073,6 +2101,20 @@ describe("mobpack authoring parsers", () => {
     assert.equal(blocked.stepped, false);
     assert.equal(blocked.reason, "nothing to redo");
     assert.equal(blocked.row.etag, "f_demo:4");
+    assert.equal(blocked.durabilityWarning, null);
+    const warned = parseMobpackDraftHistoryResult({
+      source: "meta/mobpacks/undo",
+      stepped: true,
+      row: rowPayload,
+      rows: [],
+      durability_warning: "not synced",
+    });
+    assert.equal(warned.durabilityWarning, "not synced");
+    assert.equal(
+      parseMobpackDraftDeleteResult({ id: "f_demo", deleted: true, durability_warning: "not synced" })
+        .durabilityWarning,
+      "not synced",
+    );
   });
 
   it("parses apply-operation results with and without selection", () => {

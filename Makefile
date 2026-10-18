@@ -258,14 +258,14 @@ release-promote: export RELEASE_TIER := $(TIER)
 release-promote: export ARTIFACT_SELECTION_FILE = $(ARTIFACT_SELECTION)
 release-promote: export PUBLISH_RELEASE_PACKAGES ?= true
 release-promote: export REGISTRY_DRY_RUN ?= false
-release-promote: ## Promote accepted original bytes (RELEASE_TAG, ARTIFACT_SELECTION required)
+release-promote: ## Promote accepted original bytes (RELEASE_TAG, ARTIFACT_SELECTION required; no TIER)
 	@python3 scripts/release-candidate.py dispatch --mode promote
 
 release-registry-retry: export RELEASE_TAG := $(RELEASE_TAG)
 release-registry-retry: export RELEASE_TIER := $(TIER)
 release-registry-retry: export PUBLISH_RELEASE_PACKAGES = true
 release-registry-retry: export REGISTRY_DRY_RUN ?= false
-release-registry-retry: ## Retry registries only, never touch GitHub assets (RELEASE_TAG required)
+release-registry-retry: ## Retry registries only, never touch GitHub assets (RELEASE_TAG required; no TIER)
 	@python3 scripts/release-candidate.py dispatch --mode existing
 
 release-assets-recover: export RELEASE_TAG := $(RELEASE_TAG)
@@ -273,7 +273,7 @@ release-assets-recover: export RELEASE_TIER := $(TIER)
 release-assets-recover: export ARTIFACT_SELECTION_FILE = $(ARTIFACT_SELECTION)
 release-assets-recover: export PUBLISH_RELEASE_PACKAGES = false
 release-assets-recover: export REGISTRY_DRY_RUN = false
-release-assets-recover: ## Add missing original assets only (RELEASE_TAG, ARTIFACT_SELECTION required)
+release-assets-recover: ## Add missing original assets only (RELEASE_TAG, ARTIFACT_SELECTION required; no TIER)
 	@python3 scripts/release-candidate.py dispatch --mode assets
 
 # ── help ──────────────────────────────────────────────────────

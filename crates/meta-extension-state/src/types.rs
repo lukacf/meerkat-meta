@@ -176,6 +176,7 @@ pub struct HostAccessContext {
     pub(crate) realm_admin: bool,
     pub(crate) policy: HostPolicy,
     pub(crate) valid_owners: BTreeSet<Owner>,
+    pub(crate) authority_generation: Option<u64>,
 }
 impl HostAccessContext {
     pub fn new(
@@ -203,6 +204,7 @@ impl HostAccessContext {
             realm_admin: false,
             policy,
             valid_owners: BTreeSet::new(),
+            authority_generation: None,
         })
     }
     pub fn with_memberships(
@@ -231,6 +233,38 @@ impl HostAccessContext {
         self.valid_owners = owners;
         self
     }
+    /// Stamp the host's authority generation this context was resolved at.
+    /// A host that orders the changes of which mob holds an id (a create
+    /// admitted under it, a destroy) against document writes compares the
+    /// stamp when a write commits, and refuses a write that names a mob id
+    /// changed after its caller was resolved: that caller was resolved
+    /// against the mob that held the id before. Stores do not read it.
+    pub fn with_authority_generation(mut self, generation: u64) -> Self {
+        self.authority_generation = Some(generation);
+        self
+    }
+    /// The generation [`Self::with_authority_generation`] stamped, if any.
+    pub fn authority_generation(&self) -> Option<u64> {
+        self.authority_generation
+    }
+    /// The mob ids this context's authority names: the mobs the caller is a
+    /// member of, the mobs it manages, and the mob of every owner it was
+    /// validated for ([`Self::with_valid_owners`]), a worker's mob included.
+    /// A host that orders changes of which mob holds an id checks each of
+    /// them against [`Self::authority_generation`].
+    pub fn authority_mob_ids(&self) -> BTreeSet<&str> {
+        let owners = self.valid_owners.iter().filter_map(|owner| match owner {
+            Owner::Mob(id) => Some(id.as_str()),
+            Owner::Agent(Principal::Worker { mob_id, .. }) => Some(mob_id.as_str()),
+            Owner::Agent(Principal::Agent(_)) | Owner::Realm => None,
+        });
+        self.member_mobs
+            .iter()
+            .chain(&self.managed_mobs)
+            .map(String::as_str)
+            .chain(owners)
+            .collect()
+    }
     pub(crate) fn owner_is_valid(&self, owner: &Owner) -> bool {
         self.valid_owners.contains(owner)
             || match owner {
@@ -238,6 +272,46 @@ impl HostAccessContext {
                 Owner::Mob(id) => self.managed_mobs.contains(id),
                 Owner::Realm => self.realm_admin,
             }
+    }
+}
+
+/// The holder of a mob id in a realm, as a host names it: the owner session
+/// the mob under the id was created for, or the host itself for a mob
+/// created with no owner session. Documents name a mob by its id alone
+/// ([`Owner::Mob`], [`Audience::Mob`]), so a host records the holder each
+/// time a mob takes or keeps an id
+/// ([`crate::ExtensionDocumentStore::record_mob_id_holder`]) and compares it
+/// when a persisted mob is restored: a mob of another holder would inherit
+/// what documents written for the recorded one grant the id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum MobIdHolder {
+    /// A mob the host created with no owner session. Every such mob is the
+    /// same holder.
+    Host,
+    /// A mob created for this owner session: an agent's own mob, its
+    /// implicit delegation mob or a temporary council's mob.
+    OwnerSession(String),
+}
+impl MobIdHolder {
+    pub(crate) fn validate(&self) -> Result<()> {
+        match self {
+            Self::Host => Ok(()),
+            Self::OwnerSession(session) => identifier(session),
+        }
+    }
+}
+impl std::fmt::Display for MobIdHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Host => f.write_str("the host"),
+            Self::OwnerSession(session) => write!(f, "owner session {session}"),
+        }
     }
 }
 
@@ -370,6 +444,25 @@ impl Document {
                 .map(|grant| &grant.audience)
                 .chain(self.access.denies.iter().map(|deny| &deny.audience))
                 .any(|audience| matches!(audience, Audience::Mob(id) if id == mob_id))
+    }
+    /// Every mob id this document names, as its owner or in an audience
+    /// grant or deny ([`Self::names_mob`]).
+    pub(crate) fn named_mobs(&self) -> BTreeSet<&str> {
+        let owner = match &self.owner {
+            Owner::Mob(id) => Some(id.as_str()),
+            Owner::Agent(_) | Owner::Realm => None,
+        };
+        let audiences = self
+            .access
+            .grants
+            .iter()
+            .map(|grant| &grant.audience)
+            .chain(self.access.denies.iter().map(|deny| &deny.audience))
+            .filter_map(|audience| match audience {
+                Audience::Mob(id) => Some(id.as_str()),
+                Audience::Agent { .. } | Audience::Realm => None,
+            });
+        owner.into_iter().chain(audiences).collect()
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

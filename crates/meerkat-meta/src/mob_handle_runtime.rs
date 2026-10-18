@@ -12559,7 +12559,12 @@ impl MobRuntime {
     /// Stand down every durable child mob this runtime manages.
     ///
     /// Call it after the root mob has stopped; [`crate::UnifiedRuntime`]
-    /// shutdown does. It first closes the agent mob-tool state's admission
+    /// shutdown does. It is terminal: first the runtime's delivery owner is
+    /// retired and joined within the deadline, or already stopped
+    /// (`UnifiedRuntime`'s shutdown stops it, unjoined, once the mob stops),
+    /// and the composition slots that point back at this runtime are
+    /// emptied, as that shutdown does once the mob stops.
+    /// It then closes the agent mob-tool state's admission
     /// (Meerkat's `MobMcpState::close_admission`) and waits for the creates,
     /// inserts, restores and council admissions already past their check, so
     /// the child snapshot it takes next is final. Each child then gets a
@@ -12567,13 +12572,19 @@ impl MobRuntime {
     /// over the same layout restores it as it was. An unsettled child stays
     /// recorded across repeated calls; a closed actor channel is not a
     /// settlement report. A child that already shut down cleanly in the same
-    /// incarnation is not asked again.
+    /// incarnation is not asked again. A close sent while a mob's actor is
+    /// still exiting from its shutdown can go unanswered in Meerkat 0.9.3 and
+    /// earlier, so the admission close is sent again once the root's actor
+    /// task ends, and each child's actor task is waited for, within the
+    /// deadline, after its shutdown.
     ///
     /// It then stands the state down (`MobMcpState::stand_down`): it joins
     /// the work the state owns (council runs, completion custodians,
     /// teardown handoffs, live delegation deliveries) and aborts its loops.
-    /// Only when admission and that work settled, every child is clean, and
-    /// no child appeared meanwhile, is the child-root claim released
+    /// Only when admission and that work settled, the delivery owner was
+    /// joined or already stopped (unjoined, by `UnifiedRuntime`'s shutdown),
+    /// every child is clean, and no child appeared meanwhile, is the
+    /// child-root claim released
     /// ([`crate::ChildMobStandDownOutcome::Released`]), so a successor over
     /// the same layout can claim it in this process; with no child at all
     /// that is the outcome too. Otherwise the root stays owned and a
@@ -12584,6 +12595,18 @@ impl MobRuntime {
         &self,
         deadline: std::time::Instant,
     ) -> crate::child_mob_storage::ChildMobStandDownOutcome {
+        // A stand-down is terminal, as `UnifiedRuntime`'s shutdown is: the
+        // delivery owner retires and the composition slots that point back
+        // at this runtime empty before the child root can be released. A
+        // runtime torn down without `UnifiedRuntime` has nothing else that
+        // stops them, and its owner kept reconciling over the runtime store
+        // of a released root. The owner is joined, within the deadline: a
+        // pass already in blocking store work finishes before the release,
+        // and an owner still running at the deadline keeps the root owned.
+        // Both are idempotent. `UnifiedRuntime`'s shutdown stopped the owner
+        // already, without joining it, so here there is nothing left to join.
+        let delivery_retired = self.retire_runtime_delivery(deadline).await;
+        self.release_composition_slots();
         // A root already released (or never claimed) answers at once.
         if let Some(unclaimed) = self.child_mob_root.unclaimed_outcome() {
             return unclaimed;
@@ -12607,7 +12630,7 @@ impl MobRuntime {
         };
         // Admission closes before the snapshot: no caller admitted before
         // the close can add a child after it.
-        let admission = state.close_admission(deadline).await;
+        let admission = self.close_state_admission(state, deadline).await;
         let mut stood_down = std::collections::BTreeSet::new();
         let mut child_mobs = 0_usize;
         if let Err(unsettled) = self
@@ -12629,14 +12652,18 @@ impl MobRuntime {
             }
         }
         let outcome = self.child_mob_root.outcome(child_mobs);
-        if !outcome.child_actors_settled() || !admission.is_clean() || !state_stand_down.is_clean()
+        if !outcome.child_actors_settled()
+            || !admission.is_clean()
+            || !state_stand_down.is_clean()
+            || delivery_retired.is_err()
         {
             tracing::warn!(
                 ?outcome,
                 ?admission,
                 ?state_stand_down,
-                "durable child mobs or the agent mob-tool state did not all settle; the child \
-                 root stays owned"
+                ?delivery_retired,
+                "durable child mobs, the agent mob-tool state or the runtime delivery owner \
+                 did not all settle; the child root stays owned"
             );
             return outcome;
         }
@@ -12649,6 +12676,35 @@ impl MobRuntime {
             );
         }
         released
+    }
+
+    /// Close the agent mob-tool state's admission
+    /// (`MobMcpState::close_admission`), and close it again if the root mob's
+    /// actor task ends while the first close still waits.
+    ///
+    /// The root has stopped, but its actor may still be dropping its command
+    /// channel. Meerkat 0.9.3 and earlier drop it without waiting for a send
+    /// already under way, so the root's close can stay queued with no reply
+    /// and hold the stand-down to its deadline. Once the task has ended, the
+    /// channel refuses a new close at once, which the state counts as closed.
+    /// A live root answers the first close. The close is idempotent, and a
+    /// close left waiting is abandoned, not undone.
+    async fn close_state_admission(
+        &self,
+        state: &meerkat_mob_mcp::MobMcpState,
+        deadline: std::time::Instant,
+    ) -> meerkat_mob_mcp::MobStateStandDown {
+        let mut root_actor = self.handle.actor_task_watch();
+        {
+            let close = state.close_admission(deadline);
+            tokio::pin!(close);
+            tokio::select! {
+                biased;
+                admission = &mut close => return admission,
+                _ = root_actor.wait() => {}
+            }
+        }
+        state.close_admission(deadline).await
     }
 
     /// Shut down every child mob in the state's snapshot not yet in
@@ -12686,12 +12742,24 @@ impl MobRuntime {
             if self.child_mob_root.clean_in(mob_id.as_ref(), &incarnation) {
                 continue;
             }
-            let outcome = match handle
+            let shutdown = handle
                 .shutdown_with_report(
                     meerkat_mob::ShutdownOptions::default().with_deadline(deadline),
                 )
-                .await
-            {
+                .await;
+            if shutdown.is_ok() {
+                // The child's actor drops its command channel right after it
+                // answers, and the state's stand-down sends every managed
+                // child a close. Meerkat 0.9.3 and earlier can leave a
+                // command sent into that drop unanswered: wait for the task
+                // to end, so the close is refused at once.
+                let _ = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    handle.actor_task_watch().wait(),
+                )
+                .await;
+            }
+            let outcome = match shutdown {
                 Ok(report) if report.is_clean() => ChildShutdown::Clean,
                 // Only the members the native report names as not clean.
                 Ok(report) => ChildShutdown::Unsettled(format!(
@@ -12713,13 +12781,34 @@ impl MobRuntime {
         Ok(())
     }
 
-    /// Latest native delivery-owner pass, if this runtime owns delivery.
     /// Stop the native delivery owner now, even while clones of this runtime
     /// live. Teardown calls it after the mob stops; undelivered rows stay
-    /// pending in the durable inbox for the next owner.
+    /// pending in the durable inbox for the next owner. It aborts the owner's
+    /// task without joining it, so a pass already in blocking store work may
+    /// still finish after this returns.
     pub fn stop_runtime_delivery(&self) {
         if let Some(delivery) = self.runtime_delivery.as_ref() {
             delivery.stop();
+        }
+    }
+
+    /// Retire the native delivery owner and wait for it until `deadline`: no
+    /// pass starts after the request, and one already running finishes
+    /// first, so nothing it does outlives the call. `Err` when it was still
+    /// running at the deadline; a later call joins the same owner. A runtime
+    /// without delivery, or whose owner already stopped, answers `Ok` at
+    /// once (that owner is not joined).
+    pub(crate) async fn retire_runtime_delivery(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), meerkat::RuntimeDeliveryOwnerRetirementIncomplete> {
+        match self.runtime_delivery.as_ref() {
+            Some(delivery) => {
+                delivery
+                    .retire(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .await
+            }
+            None => Ok(()),
         }
     }
 
@@ -12836,6 +12925,17 @@ impl MobRuntime {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity_runtime);
         }
+    }
+
+    /// The installed identity authority, if any.
+    pub(crate) fn installed_identity_runtime(
+        &self,
+    ) -> Option<Arc<crate::identity_first::IdentityRuntime>> {
+        self.identity_runtime_slot.as_ref().and_then(|slot| {
+            slot.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
     }
 
     /// Remove the late-bound identity authority after the mob has fully
@@ -13662,6 +13762,9 @@ pub async fn model_routing_status_for_member(
     model_routing_status_for_session(session_service, member_id, session_id).await
 }
 
+/// Resolve a supplied member id to its current session through the mob
+/// handle, then read that session's visible tools. Mirrors
+/// `model_routing_status_for_member`.
 pub async fn resolved_tools_for_member(
     handle: &MobHandle,
     session_service: Option<&Arc<dyn MobSessionService>>,
@@ -13670,7 +13773,14 @@ pub async fn resolved_tools_for_member(
     if member_id.trim().is_empty() {
         return Err(MobRuntimeError::InvalidInput("identity must not be empty"));
     }
-    let mid = crate::member_comms_id::mob_member_id(member_id);
+    // `roster_member_id_for_supplied_id`, NOT `mob_member_id`, for the same
+    // reason as the routing-status lookup (#366): the roster is keyed by the
+    // encoded DURABLE identity, so a current runtime alias
+    // (`rt:{identity}:{generation}`) handed straight to `mob_member_id` names
+    // a roster row nobody owns, and a healthy member reads as having no
+    // session. The SUPPLIED identity is still what the snapshot echoes. A
+    // stale alias is refused by the surfaces before this lookup.
+    let mid = crate::member_comms_id::roster_member_id_for_supplied_id(member_id);
     let status = handle.member_status(&mid).await?;
     let Some(session_id) = status.current_session_id else {
         return Err(MobRuntimeError::InvalidInput(
@@ -13839,9 +13949,10 @@ pub async fn assert_member_accepts_images(
     if !content_input_has_images(content) {
         return Ok(());
     }
-    // Wire member ids are public aliases; the roster id is the comms-safe
-    // encoding (meerkat 0.7 MemberCommsName).
-    let mid = crate::member_comms_id::mob_member_id(member_id);
+    // A read: resolve the supplied id the way `resolved_tools_for_member`
+    // does, so a current runtime alias or an encoded roster id reaches the
+    // durable row it names instead of "member not found".
+    let mid = crate::member_comms_id::roster_member_id_for_supplied_id(member_id);
     let Some(member) = handle
         .get_member(&mid)
         .await
@@ -13934,8 +14045,19 @@ async fn send_message_on_mob_inner(
         return Err(MobRuntimeError::InvalidInput("content must not be empty"));
     }
     // Wire member ids are public aliases; the roster id is the comms-safe
-    // encoding (meerkat 0.7 MemberCommsName).
-    let mid = crate::member_comms_id::mob_member_id(member_id);
+    // encoding (meerkat 0.7 MemberCommsName). Decode first, so an already
+    // encoded roster id is not encoded twice. A generated runtime alias names
+    // an incarnation that only the identity authority can pin, and this
+    // direct send has no authority to ask; collapsing it to the durable row
+    // could deliver an old generation's message to the current incarnation,
+    // so it is refused like the stdio send without an identity runtime.
+    let decoded = crate::member_comms_id::runtime_alias_str(member_id);
+    if crate::member_comms_id::is_reserved_generated_alias(&decoded) {
+        return Err(MobRuntimeError::InvalidInput(
+            "generated member alias requires identity authority",
+        ));
+    }
+    let mid = crate::member_comms_id::mob_member_id(&decoded);
     match interaction_id {
         None => {
             handle
@@ -15306,6 +15428,138 @@ mod tests {
             .resolve_bridge_session_id(&meerkat_mob::AgentIdentity::from(member))
             .await
             .expect("member session")
+    }
+
+    /// #366: every spelling of one member reaches the same resolved tools.
+    /// The roster is keyed by the encoded durable identity, so the lookup has
+    /// to decode a supplied id the way `model_routing_status_for_member` does.
+    /// A current runtime alias (`rt:{identity}:{generation}`) handed straight
+    /// to `mob_member_id` names a roster row nobody owns, and the healthy
+    /// member reads as having no current session. Each snapshot echoes the
+    /// spelling it was asked with.
+    #[tokio::test]
+    async fn resolved_tools_for_member_resolves_every_spelling_of_one_member() {
+        const DURABLE: &str = "review:singleton";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = bootstrap_opt_in_runtime("resolved-tools-member-alias", dir.path()).await;
+        let handle = runtime.handle();
+        let roster_id = crate::member_comms_id::mob_member_id_str(DURABLE).into_owned();
+        let session_id = seat_worker(&handle, &roster_id).await;
+
+        let durable = resolved_tools_for_member(&handle, runtime.session_service(), DURABLE)
+            .await
+            .expect("the durable identity resolves its seated member");
+        assert_eq!(durable.session_id, session_id.to_string());
+        assert!(
+            !durable.tools.is_empty(),
+            "the seated member exposes tools: {durable:?}"
+        );
+
+        for supplied in [format!("rt:{DURABLE}:0"), roster_id.clone()] {
+            let resolved = resolved_tools_for_member(&handle, runtime.session_service(), &supplied)
+                .await
+                .map_err(|error| error.to_string());
+            assert_eq!(
+                resolved,
+                Ok(ResolvedToolsSnapshot {
+                    identity: supplied.clone(),
+                    session_id: durable.session_id.clone(),
+                    tools: durable.tools.clone(),
+                }),
+                "{supplied} must resolve the member {DURABLE} names, with the same session and tools"
+            );
+        }
+        let _ = handle.shutdown().await;
+    }
+
+    /// The image-capability guard is a read: like `resolved_tools_for_member`
+    /// it reaches the member a durable identity, its current runtime alias or
+    /// its encoded roster id names. Before, the alias and the encoded id read
+    /// as "member not found" for a healthy, image-capable member.
+    #[tokio::test]
+    async fn image_guard_reads_every_spelling_of_one_member() {
+        const DURABLE: &str = "review:singleton";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = bootstrap_opt_in_runtime("image-guard-member-alias", dir.path()).await;
+        let handle = runtime.handle();
+        let roster_id = crate::member_comms_id::mob_member_id_str(DURABLE).into_owned();
+        seat_worker(&handle, &roster_id).await;
+        let image = meerkat_core::ContentInput::Blocks(vec![meerkat_core::ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: meerkat_core::types::ImageData::Inline {
+                data: "iVBORw0KGgo=".to_string(),
+            },
+        }]);
+
+        for supplied in [DURABLE.to_string(), format!("rt:{DURABLE}:0"), roster_id] {
+            let verdict =
+                assert_member_accepts_images(&handle, runtime.session_service(), &supplied, &image)
+                    .await
+                    .map_err(|error| error.to_string());
+            assert_eq!(
+                verdict,
+                Ok(()),
+                "{supplied} must reach the image-capable member {DURABLE} names"
+            );
+        }
+        let _ = handle.shutdown().await;
+    }
+
+    /// A direct send is an action with no identity authority to consult. It
+    /// decodes an encoded roster id instead of encoding it twice, and it
+    /// refuses a generated runtime alias, which only the identity authority
+    /// can pin to a generation, instead of delivering to the durable row.
+    #[tokio::test]
+    async fn direct_send_decodes_roster_ids_and_refuses_generated_aliases() {
+        const DURABLE: &str = "review:singleton";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            "[mob]\nid = \"direct-send-member-alias\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+             external_addressable = true\n\n[profiles.worker.tools]\ncomms = true\n",
+        )
+        .expect("mob definition");
+        let spec = MobBootstrapSpec::ephemeral(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            dir.path().to_path_buf(),
+            4,
+            None,
+        )
+        .expect("bootstrap spec")
+        .with_options(MobBootstrapOptions {
+            allow_ephemeral_sessions: true,
+            notify_orchestrator_on_resume: true,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        });
+        let runtime = MobRuntime::bootstrap(spec)
+            .await
+            .expect("bootstrap runtime");
+        let handle = runtime.handle();
+        let roster_id = crate::member_comms_id::mob_member_id_str(DURABLE).into_owned();
+        let session_id = seat_worker(&handle, &roster_id).await.to_string();
+
+        for supplied in [DURABLE, roster_id.as_str()] {
+            let sent = send_message_on_mob(&handle, supplied, "hello".to_string())
+                .await
+                .map_err(|error| error.to_string());
+            assert_eq!(
+                sent,
+                Ok(session_id.clone()),
+                "{supplied} must deliver to the member {DURABLE} names"
+            );
+        }
+        let refused = send_message_on_mob(&handle, &format!("rt:{DURABLE}:0"), "hello".to_string())
+            .await
+            .map_err(|error| error.to_string());
+        assert_eq!(
+            refused,
+            Err(MobRuntimeError::InvalidInput(
+                "generated member alias requires identity authority"
+            )
+            .to_string()),
+            "a direct send must not pick an incarnation for a generated alias"
+        );
+        let _ = handle.shutdown().await;
     }
 
     /// Review of #442 (hardening): a forker respawning its own child with the

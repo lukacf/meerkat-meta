@@ -254,6 +254,9 @@ struct AgentSseState {
     /// label/role/lineage rules resolve without a prior
     /// `/console/experience` call. `None` keeps the route behaviour unchanged.
     prime_runtime: Option<MobRuntime>,
+    /// Identity authority whose current runtime aliases the access rules
+    /// need to judge an alias as the member it names.
+    prime_identity_runtime: Option<Arc<crate::identity_first::IdentityRuntime>>,
 }
 
 pub fn agent_events_sse_router(
@@ -273,6 +276,7 @@ pub fn agent_events_sse_router_with_access(
         decisions,
         access,
         None,
+        None,
         Arc::new(AllowAllConsoleVisibilityPolicy),
     )
 }
@@ -282,6 +286,7 @@ pub(crate) fn agent_events_sse_router_with_access_and_priming(
     decisions: Option<RuntimeDecisionState>,
     access: Option<AccessController>,
     prime_runtime: Option<MobRuntime>,
+    prime_identity_runtime: Option<Arc<crate::identity_first::IdentityRuntime>>,
     visibility_policy: Arc<dyn ConsoleVisibilityPolicy>,
 ) -> Router {
     Router::new()
@@ -292,6 +297,7 @@ pub(crate) fn agent_events_sse_router_with_access_and_priming(
             access,
             visibility_policy,
             prime_runtime,
+            prime_identity_runtime,
         })
 }
 
@@ -320,26 +326,42 @@ async fn agent_events_sse_handler(
     {
         return Err(http_error(StatusCode::BAD_REQUEST, &message));
     }
-    let policy_identity = if let Some(runtime) = state.prime_runtime.as_ref()
-        && let Some((identity, visible)) = crate::http_console::sse_member_identity_visibility(
+    let policy_identity = if let Some(runtime) = state.prime_runtime.as_ref() {
+        match crate::http_console::sse_agent_stream_identity_visibility(
             &runtime.handle(),
             state.visibility_policy.as_ref(),
             &agent_id,
         )
         .await
-    {
-        if !visible {
-            return Err(http_error(StatusCode::NOT_FOUND, "member_not_found"));
+        {
+            Some((identity, true)) => identity,
+            Some((_, false)) => {
+                return Err(http_error(StatusCode::NOT_FOUND, "member_not_found"));
+            }
+            // A runtime alias that names no live member is refused: it has
+            // no member for the visibility policy to judge.
+            None if crate::member_comms_id::is_reserved_generated_alias(&agent_id) => {
+                return Err(http_error(StatusCode::NOT_FOUND, "member_not_found"));
+            }
+            None => agent_id.clone(),
         }
-        identity
     } else {
         agent_id.clone()
     };
     prime_sse_access_cache(state.prime_runtime.as_ref(), state.access.as_ref()).await;
-    if access_view
-        .as_ref()
-        .is_some_and(|view| view.enforced() && !view.allows_agent(ACTION_AGENT_VIEW, &agent_id))
+    if let (Some(identity_runtime), Some(controller)) =
+        (state.prime_identity_runtime.as_ref(), state.access.as_ref())
     {
+        crate::http_console::prime_current_runtime_aliases(identity_runtime, controller).await;
+    }
+    // The access rules judge the member the request resolved to as well
+    // as the spelling it used: a runtime alias is not a name the rules
+    // describe, the member it names is.
+    if access_view.as_ref().is_some_and(|view| {
+        view.enforced()
+            && (!view.allows_agent(ACTION_AGENT_VIEW, &agent_id)
+                || !view.allows_agent(ACTION_AGENT_VIEW, &policy_identity))
+    }) {
         return Err(sse_access_denied(ACTION_AGENT_VIEW));
     }
 
@@ -743,6 +765,7 @@ mod tests {
         });
         let app = agent_events_sse_router_with_access_and_priming(
             subscribe,
+            None,
             None,
             None,
             None,

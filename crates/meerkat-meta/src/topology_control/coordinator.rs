@@ -100,6 +100,11 @@ struct PendingBilateralOperation {
     #[serde(default)]
     audit_record_id: String,
     idempotency_key: String,
+    /// The key the apply is filed under, when its scope is not the host's
+    /// (absent for the host's keys and for journals from before keys were
+    /// scoped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scoped_idempotency_key: Option<String>,
     fingerprint: String,
     actor: String,
     created_at: String,
@@ -114,6 +119,17 @@ struct PendingBilateralOperation {
     last_recovery_error: Option<String>,
     #[serde(default)]
     recovery_attempts: u64,
+}
+
+impl PendingBilateralOperation {
+    /// The key this operation's idempotency entry is filed under, if any
+    /// (see [`filing_key`]).
+    fn idempotency_map_key(&self) -> Option<&str> {
+        filing_key(
+            self.scoped_idempotency_key.as_deref(),
+            &self.idempotency_key,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +244,7 @@ impl SameProcessTopologyCoordinator {
             )));
         }
         state.schema_version = COORDINATOR_SCHEMA_VERSION;
+        drop_unscoped_reserved_entries(&mut state.idempotency);
         if state.coordinator_id.is_empty() {
             state.coordinator_id = uuid::Uuid::new_v4().to_string();
         }
@@ -320,11 +337,25 @@ impl SameProcessTopologyCoordinator {
         normalized.idempotency_key = normalized.idempotency_key.trim().to_string();
         normalized.operations =
             normalize_bilateral_operations(first, second, normalized.operations)?;
+        // The principal's own keys: the same key from another principal, or
+        // from the host without one, names a different operation.
+        let scope = TopologyApplyScope::for_host_principal(principal);
+        let scoped_key = scope.idempotency_key(
+            &[first.mob_id().as_str(), second.mob_id().as_str()],
+            &normalized.idempotency_key,
+        );
         let preflight = validate_unique_operations(&normalized.operations)
             .and_then(|()| validate_pair_policies(first, second, normalized.operations.len(), true))
-            .and_then(|()| authorize_bilateral(first, second, principal, &normalized.operations));
-        let mut record =
-            operation_record_for_bilateral_request(first, second, &normalized, actor, principal)?;
+            .and_then(|()| authorize_bilateral(first, second, principal, &normalized.operations))
+            .and_then(|()| scope.validate_key(&normalized.idempotency_key));
+        let mut record = operation_record_for_bilateral_request(
+            first,
+            second,
+            &normalized,
+            &scoped_key,
+            actor,
+            principal,
+        )?;
         if let Err(error) = &preflight {
             let (status, _) =
                 operation_record_outcome(&Err::<TopologyOperationReceipt, _>(error.clone()));
@@ -338,8 +369,16 @@ impl SameProcessTopologyCoordinator {
         } else if let Some(error) = self.inner.last_clean_reconcile_error.read().await.clone() {
             Err(TopologyControlError::Actuator(error))
         } else {
-            self.apply_locked(first, second, normalized, principal, actor, &record_id)
-                .await
+            self.apply_locked(
+                first,
+                second,
+                normalized,
+                &scoped_key,
+                principal,
+                actor,
+                &record_id,
+            )
+            .await
         };
         let (status, error) = operation_record_outcome(&result);
         self.update_operation_record_locked(&record_id, status, error)
@@ -839,11 +878,13 @@ impl SameProcessTopologyCoordinator {
 
     // Implemented below, kept separate so public methods all establish the
     // same coordinator -> authority-A -> authority-B lock order.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_locked(
         &self,
         first: &UnifiedRuntime,
         second: &UnifiedRuntime,
         mut request: TopologyBilateralApplyRequest,
+        scoped_key: &str,
         principal: Option<&str>,
         actor: &str,
         audit_record_id: &str,
@@ -873,7 +914,7 @@ impl SameProcessTopologyCoordinator {
                 pending.operation_id.clone(),
             ));
         }
-        if let Some(record) = coordinator_before.idempotency.get(&request.idempotency_key) {
+        if let Some(record) = coordinator_before.idempotency.get(scoped_key) {
             if record.fingerprint != fingerprint {
                 return Err(TopologyControlError::IdempotencyConflict(
                     request.idempotency_key,
@@ -891,7 +932,7 @@ impl SameProcessTopologyCoordinator {
         }
         if coordinator_before
             .compacted_idempotency
-            .contains(&idempotency_key_fingerprint(&request.idempotency_key))
+            .contains(&compacted_key_fingerprint(scoped_key))
         {
             return Err(TopologyControlError::IdempotencyHistoryCompacted(
                 request.idempotency_key,
@@ -1013,7 +1054,7 @@ impl SameProcessTopologyCoordinator {
                     .collect(),
             })
             .collect::<Vec<_>>();
-        let operation_id = operation_id(&request.idempotency_key, &fingerprint);
+        let operation_id = operation_id(scoped_key, &fingerprint);
         let created_at = chrono::Utc::now().to_rfc3339();
         if !changed {
             let receipt = bilateral_receipt(
@@ -1033,6 +1074,7 @@ impl SameProcessTopologyCoordinator {
                 states_before,
                 receipt.clone(),
                 fingerprint,
+                Some(scoped_key),
                 first,
                 second,
             )
@@ -1044,6 +1086,8 @@ impl SameProcessTopologyCoordinator {
             operation_id: operation_id.clone(),
             audit_record_id: audit_record_id.to_string(),
             idempotency_key: request.idempotency_key.clone(),
+            scoped_idempotency_key: (scoped_key != request.idempotency_key)
+                .then(|| scoped_key.to_string()),
             fingerprint: fingerprint.clone(),
             actor: actor.to_string(),
             created_at: created_at.clone(),
@@ -1116,6 +1160,7 @@ impl SameProcessTopologyCoordinator {
                     states_before,
                     receipt.clone(),
                     fingerprint,
+                    Some(scoped_key),
                     first,
                     second,
                 )
@@ -1172,6 +1217,7 @@ impl SameProcessTopologyCoordinator {
             states_after,
             receipt.clone(),
             fingerprint,
+            Some(scoped_key),
             first,
             second,
         )
@@ -1315,6 +1361,7 @@ impl SameProcessTopologyCoordinator {
                 })
                 .collect(),
         };
+        let idempotency_map_key = pending.idempotency_map_key().map(str::to_string);
         let receipt = bilateral_receipt(
             &pending.operation_id,
             &pending.idempotency_key,
@@ -1332,6 +1379,7 @@ impl SameProcessTopologyCoordinator {
             current_states,
             receipt.clone(),
             pending.fingerprint,
+            idempotency_map_key.as_deref(),
             first,
             second,
         )
@@ -1403,12 +1451,14 @@ impl SameProcessTopologyCoordinator {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn commit_terminal_receipt(
         &self,
         mut coordinator: BilateralCoordinatorState,
         mut controller_states: BTreeMap<String, TopologyIntentState>,
         receipt: TopologyOperationReceipt,
         fingerprint: String,
+        idempotency_map_key: Option<&str>,
         first: &UnifiedRuntime,
         second: &UnifiedRuntime,
     ) -> Result<(), TopologyControlError> {
@@ -1456,13 +1506,16 @@ impl SameProcessTopologyCoordinator {
         }) {
             set_operation_record_status(record, audit_status, None);
         }
-        coordinator.idempotency.insert(
-            receipt.idempotency_key.clone(),
-            IdempotencyRecord {
-                fingerprint,
-                operation_id: receipt.operation_id.clone(),
-            },
-        );
+        if let Some(key) = idempotency_map_key {
+            coordinator.idempotency.insert(
+                key.to_string(),
+                IdempotencyRecord {
+                    fingerprint,
+                    operation_id: receipt.operation_id.clone(),
+                    scoped: key != receipt.idempotency_key,
+                },
+            );
+        }
         if !coordinator
             .receipts
             .iter()
@@ -1479,11 +1532,16 @@ impl SameProcessTopologyCoordinator {
             let Some(evicted) = coordinator.receipts.pop_front() else {
                 break;
             };
-            let compacted = idempotency_key_fingerprint(&evicted.idempotency_key);
+            // A receipt that no entry names compacts and removes nothing.
+            let Some(evicted_key) = filed_idempotency_key(&coordinator.idempotency, &evicted)
+            else {
+                continue;
+            };
+            let compacted = compacted_key_fingerprint(&evicted_key);
             if !coordinator.compacted_idempotency.contains(&compacted) {
                 coordinator.compacted_idempotency.push_back(compacted);
             }
-            coordinator.idempotency.remove(&evicted.idempotency_key);
+            coordinator.idempotency.remove(&evicted_key);
         }
         let history_limit = first
             .topology_controller()
@@ -2041,11 +2099,12 @@ fn operation_record_for_bilateral_request(
     first: &UnifiedRuntime,
     second: &UnifiedRuntime,
     request: &TopologyBilateralApplyRequest,
+    scoped_key: &str,
     actor: &str,
     principal: Option<&str>,
 ) -> Result<TopologyOperationRecord, TopologyControlError> {
     let fingerprint = bilateral_fingerprint(request)?;
-    let operation_id = operation_id(&request.idempotency_key, &fingerprint);
+    let operation_id = operation_id(scoped_key, &fingerprint);
     let now = chrono::Utc::now().to_rfc3339();
     Ok(TopologyOperationRecord {
         version: TOPOLOGY_OPERATION_RECORD_VERSION,

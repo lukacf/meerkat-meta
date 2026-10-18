@@ -167,6 +167,14 @@ Identity-filtered convenience route for the same console timeline stream. It set
 
 Legacy console send route backed by the console aggregator. New clients should prefer `POST /console/rpc` with `meta/console/send`.
 
+### `POST /console/send/recover`
+
+REST twin of [`meta/console/recover_send`](/api/rpc):
+the body is `{identity, origin, idempotency_key}` and the caller is the
+request's authenticated principal. It runs the same gate as `/console/send`
+(read-only and `agent.send` refusals). A send the caller does not own, or
+never made, answers HTTP **404** with `{"error":"send_not_found"}`.
+
 ### `POST /console/rpc`
 
 JSON-RPC 2.0 endpoint for console and runtime operations.

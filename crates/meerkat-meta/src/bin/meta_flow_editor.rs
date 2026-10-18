@@ -2,8 +2,19 @@ use std::net::SocketAddr;
 
 use meerkat_meta::{flow_editor_router, flow_editor_router_with_host_deploy};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The worker count follows meerkat's `RKAT_WORKER_THREADS`, then
+    // `TOKIO_WORKER_THREADS`, as for the gateways; unset, Tokio starts one
+    // worker per available CPU.
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.enable_all();
+    if let Some(workers) = meerkat_runtime::host_stack::worker_threads_from_env()? {
+        runtime.worker_threads(workers.get());
+    }
+    runtime.build()?.block_on(serve())
+}
+
+async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // Predecessor environment variables would be silently ignored.
     meerkat_meta::storage_predecessor::refuse_predecessor_environment()?;
     let options = server_options()?;

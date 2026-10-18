@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.9.3
+
+- Breaking: the draft results of `meta/mobpacks/list`, `create`, `save`,
+  `undo`, `redo` and `delete` type `rows` as the new `MobpackDraftSummary`
+  (parsed by `parseMobpackDraftSummary`): Meta lists drafts without their
+  documents. A write's `row` is still a whole `MobpackDraftRow`;
+  `meta/mobpacks/get` returns a draft's document.
+- `MobpackDraftSaveResult`, `MobpackDraftHistoryResult` and
+  `MobpackDraftDeleteResult` carry `durabilityWarning`, set when Meta wrote
+  the draft store but could not sync its directory: the write took effect
+  and may not survive a crash.
+
 ## 0.9.2
 
 - No SDK API changes; released with Meta 0.9.2 on Meerkat 0.9.2.

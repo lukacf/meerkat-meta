@@ -1,3 +1,5 @@
+use super::types::ConsoleFrameStatus;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendState {
     Requested,
@@ -48,6 +50,59 @@ impl SendState {
             _ => Err("illegal send state transition"),
         }
     }
+
+    /// The lifecycle state of a stored `user_input` send frame. A send
+    /// accepted under a redacting host policy is stored `redacted` until its
+    /// delivery settles, so it reads as accepted.
+    pub(crate) fn from_send_frame_status(status: ConsoleFrameStatus) -> Option<Self> {
+        match status {
+            ConsoleFrameStatus::Accepted | ConsoleFrameStatus::Redacted => {
+                Some(Self::AcceptedPersisted)
+            }
+            ConsoleFrameStatus::Dispatching => Some(Self::Dispatching),
+            ConsoleFrameStatus::Delivered => Some(Self::Delivered),
+            ConsoleFrameStatus::DeliveryFailed => Some(Self::DeliveryFailed),
+            ConsoleFrameStatus::Completed => None,
+        }
+    }
+
+    /// Whether the send has not settled: accepted or dispatching.
+    pub(crate) fn is_unsettled(self) -> bool {
+        matches!(self, Self::AcceptedPersisted | Self::Dispatching)
+    }
+
+    /// Reconcile an unsettled send, whose dispatch no live owner holds, from
+    /// the runtime's admission evidence. Only native evidence settles it: an
+    /// admitted input is a delivery; an absent one is dispatched again under
+    /// the send's own delivery identity, into the session it recorded. Absent
+    /// evidence never settles a send as failed here.
+    pub(crate) fn reconcile(
+        self,
+        evidence: SendEvidence,
+    ) -> Result<(Self, Vec<SendEffect>), &'static str> {
+        match (self, evidence) {
+            (Self::AcceptedPersisted | Self::Dispatching, SendEvidence::Admitted) => Ok((
+                Self::Delivered,
+                vec![SendEffect::UpdateFrameStatus, SendEffect::EmitFrame],
+            )),
+            (
+                state @ (Self::AcceptedPersisted | Self::Dispatching),
+                SendEvidence::AbsentRedispatchable,
+            ) => Ok((state, vec![SendEffect::DispatchSend])),
+            _ => Err("illegal send reconciliation"),
+        }
+    }
+}
+
+/// Native admission evidence for one unsettled console send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendEvidence {
+    /// The runtime holds an input under the send's delivery key.
+    Admitted,
+    /// The runtime holds no input under the send's delivery keys, and the
+    /// send's delivery is keyed and pinned to the session it recorded, so
+    /// dispatching it again cannot duplicate or retarget it.
+    AbsentRedispatchable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +246,68 @@ mod tests {
             .expect("dispatching -> delivered should be legal");
         assert_eq!(state, SendState::Delivered);
         assert!(effects.contains(&SendEffect::UpdateFrameStatus));
+    }
+
+    #[test]
+    fn send_reconciliation_settles_only_unsettled_sends_from_evidence() {
+        for unsettled in [SendState::AcceptedPersisted, SendState::Dispatching] {
+            assert_eq!(
+                unsettled.reconcile(SendEvidence::Admitted),
+                Ok((
+                    SendState::Delivered,
+                    vec![SendEffect::UpdateFrameStatus, SendEffect::EmitFrame]
+                ))
+            );
+            assert_eq!(
+                unsettled.reconcile(SendEvidence::AbsentRedispatchable),
+                Ok((unsettled, vec![SendEffect::DispatchSend]))
+            );
+        }
+        for settled in [
+            SendState::Requested,
+            SendState::Delivered,
+            SendState::DeliveryFailed,
+        ] {
+            for evidence in [SendEvidence::Admitted, SendEvidence::AbsentRedispatchable] {
+                assert_eq!(
+                    settled.reconcile(evidence),
+                    Err("illegal send reconciliation"),
+                    "{settled:?} {evidence:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn send_frame_statuses_map_to_send_states() {
+        assert_eq!(
+            SendState::from_send_frame_status(ConsoleFrameStatus::Accepted),
+            Some(SendState::AcceptedPersisted)
+        );
+        assert_eq!(
+            SendState::from_send_frame_status(ConsoleFrameStatus::Redacted),
+            Some(SendState::AcceptedPersisted)
+        );
+        assert_eq!(
+            SendState::from_send_frame_status(ConsoleFrameStatus::Dispatching),
+            Some(SendState::Dispatching)
+        );
+        assert_eq!(
+            SendState::from_send_frame_status(ConsoleFrameStatus::Delivered),
+            Some(SendState::Delivered)
+        );
+        assert_eq!(
+            SendState::from_send_frame_status(ConsoleFrameStatus::DeliveryFailed),
+            Some(SendState::DeliveryFailed)
+        );
+        assert_eq!(
+            SendState::from_send_frame_status(ConsoleFrameStatus::Completed),
+            None
+        );
+        assert!(SendState::AcceptedPersisted.is_unsettled());
+        assert!(SendState::Dispatching.is_unsettled());
+        assert!(!SendState::Delivered.is_unsettled());
+        assert!(!SendState::DeliveryFailed.is_unsettled());
     }
 
     #[test]

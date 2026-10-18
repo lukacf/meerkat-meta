@@ -1338,6 +1338,11 @@ async fn local_edge_name_for_remote(
     let Some(entry) = local_handle.get_member(local).await? else {
         return Ok(None);
     };
+    // Deliberately the exact spelling (member-id alias rule 4): this fallback
+    // runs when the peer cannot be asked, so nothing can confirm which
+    // generation a generated alias names. Collapsing it onto the durable
+    // member could let a stale alias remove the current edge; the lookup
+    // error is reported instead.
     let remote_member = crate::member_comms_id::mob_member_id_str(remote_member_id);
     let matched = entry.wired_to.iter().find(|identity| {
         identity
@@ -1669,13 +1674,39 @@ impl UnifiedRuntime {
             &peer.mob_id(),
         )
         .await?;
+        let local_authoritative = local_target.is_some();
+        let peer_authoritative = peer_target.is_some();
+        let local_identity_runtime = self.identity_runtime_ref().cloned();
+        let peer_identity_runtime = peer.identity_runtime_ref().cloned();
+        let local_mob_id = self.mob_id();
+        let peer_mob_id = peer.mob_id();
         let local_runtime = self.mob_runtime.clone();
         let peer_runtime = peer.mob_runtime.clone();
         run_member_authority_transaction(
             [local_target, peer_target],
             format!("{local_member_id} <-> {peer_member_id}"),
-            format!("{} <-> {}", self.mob_id(), peer.mob_id()),
+            format!("{local_mob_id} <-> {peer_mob_id}"),
             move || async move {
+                // Member-id alias rule: under the lifecycle targets this
+                // transaction holds, the topology's runtime id names the
+                // durable roster row of its identity, as in the other
+                // cross-mob operations.
+                let local_member_id = resolve_member_alias_under_authority(
+                    &local_runtime.handle(),
+                    local_identity_runtime.as_ref(),
+                    local_authoritative,
+                    &local_member_id,
+                    &local_mob_id,
+                )
+                .await?;
+                let peer_member_id = resolve_member_alias_under_authority(
+                    &peer_runtime.handle(),
+                    peer_identity_runtime.as_ref(),
+                    peer_authoritative,
+                    &peer_member_id,
+                    &peer_mob_id,
+                )
+                .await?;
                 wire_bilateral_transaction(
                     local_runtime,
                     peer_runtime,
@@ -1708,13 +1739,39 @@ impl UnifiedRuntime {
             &peer.mob_id(),
         )
         .await?;
+        let local_authoritative = local_target.is_some();
+        let peer_authoritative = peer_target.is_some();
+        let local_identity_runtime = self.identity_runtime_ref().cloned();
+        let peer_identity_runtime = peer.identity_runtime_ref().cloned();
+        let local_mob_id = self.mob_id();
+        let peer_mob_id = peer.mob_id();
         let local_runtime = self.mob_runtime.clone();
         let peer_runtime = peer.mob_runtime.clone();
         run_member_authority_transaction(
             [local_target, peer_target],
             format!("{local_member_id} <-> {peer_member_id}"),
-            format!("{} <-> {}", self.mob_id(), peer.mob_id()),
+            format!("{local_mob_id} <-> {peer_mob_id}"),
             move || async move {
+                // Member-id alias rule: under the lifecycle targets this
+                // transaction holds, the topology's runtime id names the
+                // durable roster row of its identity, as in the other
+                // cross-mob operations.
+                let local_member_id = resolve_member_alias_under_authority(
+                    &local_runtime.handle(),
+                    local_identity_runtime.as_ref(),
+                    local_authoritative,
+                    &local_member_id,
+                    &local_mob_id,
+                )
+                .await?;
+                let peer_member_id = resolve_member_alias_under_authority(
+                    &peer_runtime.handle(),
+                    peer_identity_runtime.as_ref(),
+                    peer_authoritative,
+                    &peer_member_id,
+                    &peer_mob_id,
+                )
+                .await?;
                 unwire_bilateral_transaction(
                     local_runtime,
                     peer_runtime,
@@ -1737,8 +1794,11 @@ impl UnifiedRuntime {
         let peer_member_id = peer.topology_concrete_member_id(peer_member_id).await?;
         let local_handle = self.mob_runtime.handle();
         let peer_handle = peer.mob_runtime.handle();
-        let local_mid = crate::member_comms_id::mob_member_id(&local_member_id);
-        let peer_mid = crate::member_comms_id::mob_member_id(&peer_member_id);
+        // A read under the member-id alias rule: the topology's runtime id
+        // came from the identity runtime just now, and it names the durable
+        // roster row of its identity.
+        let local_mid = crate::member_comms_id::roster_member_id_for_supplied_id(&local_member_id);
+        let peer_mid = crate::member_comms_id::roster_member_id_for_supplied_id(&peer_member_id);
         let local_info = self
             .get_member_peer_info(&local_handle, &local_mid, &self.mob_id())
             .await?;

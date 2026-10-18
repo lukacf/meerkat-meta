@@ -514,6 +514,18 @@ pub fn callback_result_to_content(result: &Value) -> Vec<ContentBlock> {
     vec![ContentBlock::Text { text }]
 }
 
+/// Provenance source of every SDK callback tool the gateway publishes, from
+/// either `callback/build_agent` or `customize_build`.
+///
+/// A build's `scope_id` routes `callback/call_tool` to the handlers the SDK
+/// registered for that build, so it stays per build. The source names the
+/// SDK host itself: one id for every build of the gateway's one SDK host,
+/// stable across restarts. A visibility witness recorded against one build,
+/// such as a delegate helper's inherited ceiling or a host filter, therefore
+/// matches the same host tool in any later build, while Meerkat still matches
+/// it strictly by kind and source id.
+pub(crate) const SDK_CALLBACK_SOURCE_ID: &str = "meta-callback:sdk-host";
+
 struct GatewayCallbackToolDispatcher {
     bridge: Arc<dyn CallbackBridge>,
     scope_id: String,
@@ -533,9 +545,9 @@ impl GatewayCallbackToolDispatcher {
         // delegate whose EFFECTIVE ceiling includes an unwitnessed SDK tool is
         // refused. Minimal selects only the comms tools, and overlays can
         // exclude a tool, so not every such delegate includes these. The
-        // source id is registration identity for this build, not a durable
-        // identity across builds.
-        let provenance_source_id = format!("meta-callback:{scope_id}");
+        // source is the SDK host, not this build's routing scope, so a
+        // child's own build of the same host tool matches its parent's
+        // witness.
         let tool_defs = external_tools
             .into_iter()
             .map(|tool| {
@@ -546,7 +558,7 @@ impl GatewayCallbackToolDispatcher {
                     input_schema: tool.input_schema,
                     provenance: Some(meerkat_core::types::ToolProvenance {
                         kind: meerkat_core::types::ToolSourceKind::Callback,
-                        source_id: provenance_source_id.as_str().into(),
+                        source_id: SDK_CALLBACK_SOURCE_ID.into(),
                         // Verified by the customizer before this dispatcher
                         // is built.
                         artifact: tool.artifact,
@@ -1490,7 +1502,7 @@ model = "gpt-5.5"
     }
 
     #[test]
-    fn a_verified_callback_tool_carries_its_artifact_beside_the_per_build_source() {
+    fn a_verified_callback_tool_carries_its_artifact_beside_the_sdk_host_source() {
         let mock = Arc::new(MockBridge::new());
         let dispatcher = GatewayCallbackToolDispatcher::new(
             Arc::new(mock) as Arc<dyn CallbackBridge>,
@@ -1500,9 +1512,37 @@ model = "gpt-5.5"
         let tools = dispatcher.tools();
         let provenance = tools[0].provenance.as_ref().expect("callback provenance");
         assert_eq!(provenance.artifact, Some(weather_artifact("sha256:aa")));
-        assert_eq!(
-            provenance.source_id.as_str(),
-            "meta-callback:customize-agent:alpha-1"
+        assert_eq!(provenance.source_id.as_str(), SDK_CALLBACK_SOURCE_ID);
+    }
+
+    /// Two customizer builds for one SDK host keep their own routing scopes
+    /// and stamp one callback source, so a witness recorded against either
+    /// matches the other.
+    #[test]
+    fn two_customizer_builds_of_one_sdk_host_stamp_one_callback_source() {
+        let mock: Arc<dyn CallbackBridge> = Arc::new(Arc::new(MockBridge::new()));
+        let first = GatewayCallbackToolDispatcher::new(
+            Arc::clone(&mock),
+            "customize-agent:alpha-1".to_string(),
+            draft_with_tool(None).external_tools,
+        );
+        let second = GatewayCallbackToolDispatcher::new(
+            mock,
+            "customize-agent:alpha-2".to_string(),
+            draft_with_tool(None).external_tools,
+        );
+        assert_ne!(first.scope_id, second.scope_id, "routing stays per build");
+        let source = |dispatcher: &GatewayCallbackToolDispatcher| {
+            dispatcher.tools()[0]
+                .provenance
+                .clone()
+                .expect("callback provenance")
+        };
+        assert!(
+            source(&first).same_source(&source(&second)),
+            "one SDK host, one callback source: {:?} vs {:?}",
+            source(&first),
+            source(&second)
         );
     }
 
@@ -1669,6 +1709,10 @@ model = "gpt-5.5"
         // member's visible tools (profile, minimal and inherited delegate
         // tooling) can include it instead of refusing the delegate.
         let (_, sent) = mock.last_call().await;
+        // The routing scope stays this build's own; the source names the SDK
+        // host.
+        let scope = sent["scope_id"].as_str().expect("scope id");
+        assert!(scope.starts_with("customize-agent:alpha-"), "{scope}");
         let tools = dispatcher.tools();
         let defs: Vec<ToolDef> = tools.iter().map(|tool| tool.as_ref().clone()).collect();
         for def in &defs {
@@ -1676,12 +1720,7 @@ model = "gpt-5.5"
                 def.provenance,
                 Some(meerkat_core::types::ToolProvenance {
                     kind: meerkat_core::types::ToolSourceKind::Callback,
-                    source_id: format!(
-                        "meta-callback:{}",
-                        sent["scope_id"].as_str().expect("scope id")
-                    )
-                    .as_str()
-                    .into(),
+                    source_id: SDK_CALLBACK_SOURCE_ID.into(),
                     artifact: None,
                 }),
                 "{def:?}"
