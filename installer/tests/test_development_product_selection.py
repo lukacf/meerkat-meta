@@ -177,7 +177,7 @@ def test_development_distribution_keeps_guide_and_application_owners_separate(
         (root / name).write_text("Inert public license.\n")
     gateway = put(product.root / "guide/rpc_gateway", b"inert guide, never execute\n")
     gateway.path.chmod(0o700)
-    guide = SelectedGuideRuntime(ExactFile(gateway.path, gateway.sha256), "0.9.0", "0.9.0", "a" * 40, "b" * 40)
+    guide = SelectedGuideRuntime(ExactFile(gateway.path, gateway.sha256), "0.9.3", "0.9.3", "a" * 40, "b" * 40)
     target, _, _ = development(product, meta_version)
     output = tmp_path / "selected-product.zip"
     result = product_distribution.package(root, target, guide, output)
@@ -186,7 +186,7 @@ def test_development_distribution_keeps_guide_and_application_owners_separate(
     with zipfile.ZipFile(output) as archive:
         archive.extractall(extracted)
     observed = product_distribution.verify(extracted)
-    assert observed["guide"]["version"] == observed["guide"]["core_version"] == "0.9.0"
+    assert observed["guide"]["version"] == observed["guide"]["core_version"] == "0.9.3"
     assert observed["product"]["selection"]["meta"]["version"] == meta_version
     assert observed["guide"]["gateway"]["sha256"] == gateway.sha256
     assert observed["guide"]["sdk"] == guide_sdk.selection()
@@ -195,7 +195,7 @@ def test_development_distribution_keeps_guide_and_application_owners_separate(
     assert distribution.sdk_wheels(extracted) == expected_clients
     assert distribution.bootstrap_inputs(extracted) == ["meta-toolkit", *expected_clients]
     readme = (extracted / "README.md").read_text()
-    assert "The Forge guide uses Core 0.9.0 and Meta 0.9.0" in readme
+    assert "The Forge guide uses Core 0.9.3 and Meta 0.9.3" in readme
     assert f"application uses the separately selected Meta {meta_version} and Toolkit" in readme
     # Each independently bound guide field still refuses drift. No target or
     # guide program runs, and the selected application bytes stay unchanged.

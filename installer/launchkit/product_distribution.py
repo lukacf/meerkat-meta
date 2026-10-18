@@ -341,8 +341,8 @@ def verify(root):
     selected_runtime_artifacts(target)
     guide = data["guide"]
     if (type(guide) is not dict or guide.keys() != {"version", "core_version", "meta_source", "core_source", "gateway", "sdk"}
-            or guide["version"] != "0.9.0"
-            or guide["core_version"] != "0.9.0"
+            or guide["version"] != "0.9.3"
+            or guide["core_version"] != "0.9.3"
             or guide["sdk"] != guide_sdk.selection()
             or guide_sdk.WHEEL not in data["files"]
             or guide["gateway"] != {"path": "vendor/guide/rpc_gateway",

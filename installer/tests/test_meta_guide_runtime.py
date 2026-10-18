@@ -18,7 +18,7 @@ def selected(tmp_path, monkeypatch):
     gateway.chmod(0o700)
     selection = bootstrap.SelectedGuideRuntime(
         ExactFile(gateway, hashlib.sha256(gateway.read_bytes()).hexdigest()),
-        "0.9.0", "0.9.0", "a" * 40, "b" * 40,
+        "0.9.3", "0.9.3", "a" * 40, "b" * 40,
         {"provider": "openai", "model": "gpt-6.1-sol", "auth_binding": "fixture-host-route"},
     )
     monkeypatch.setattr(bootstrap, "_selected_guide_runtime", selection)

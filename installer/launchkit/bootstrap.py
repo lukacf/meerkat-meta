@@ -49,10 +49,10 @@ class SelectedGuideRuntime:
         from .connect_installer_caller import ExactFile
 
         if (type(self.gateway) is not ExactFile
-                or self.version != "0.9.0" or self.core_version != "0.9.0"
+                or self.version != "0.9.3" or self.core_version != "0.9.3"
                 or any(type(value) is not str or not re.fullmatch("[0-9a-f]{40}", value)
                     for value in (self.meta_source, self.core_source))):
-            raise GatewayInstallError("The guide requires its exact selected Meta 0.9 runtime.")
+            raise GatewayInstallError("The guide requires its exact selected Meta 0.9.3 runtime.")
         object.__setattr__(self, "_gateway_pin", (self.gateway.path, self.gateway.sha256))
         route = deepcopy(self._model_route)
         if route is not None:

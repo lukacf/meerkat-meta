@@ -185,7 +185,7 @@ def startup(tmp_path, monkeypatch):
     from launchkit.connect_installer_caller import ExactFile
     selected = bootstrap.SelectedGuideRuntime(
         ExactFile(rpc_gateway, hashlib.sha256(rpc_gateway.read_bytes()).hexdigest()),
-        "0.9.0", "0.9.0", "a" * 40, "b" * 40)
+        "0.9.3", "0.9.3", "a" * 40, "b" * 40)
     monkeypatch.setattr(bootstrap, "_selected_guide_runtime", selected)
     monkeypatch.setattr(module, "gateway_path", lambda: rpc_gateway)
     monkeypatch.setattr(module, "__file__", str(tmp_path / "owned-source/launchkit/architect.py"))

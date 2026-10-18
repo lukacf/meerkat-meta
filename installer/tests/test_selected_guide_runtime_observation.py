@@ -23,7 +23,7 @@ def selected(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ExactFile, 'verify', verify)
     pin = ExactFile(path, hashlib.sha256(path.read_bytes()).hexdigest())
-    runtime = SelectedGuideRuntime(pin, '0.9.0', '0.9.0', 'a' * 40, 'b' * 40,
+    runtime = SelectedGuideRuntime(pin, '0.9.3', '0.9.3', 'a' * 40, 'b' * 40,
         _model_route={'provider': 'openai', 'model': 'gpt-6.1-sol'})
     return runtime, path, reads
 

@@ -73,7 +73,7 @@ def test_package_selection_does_not_fall_back_to_retained_legacy_cache(tmp_path,
     assert planner.gateway_path() is None, "A cached executable is not a selected Meta runtime."
     selected = bootstrap.SelectedGuideRuntime(
         ExactFile(current, hashlib.sha256(current.read_bytes()).hexdigest()),
-        "0.9.0", "0.9.0", "a" * 40, "b" * 40)
+        "0.9.3", "0.9.3", "a" * 40, "b" * 40)
     monkeypatch.setattr(bootstrap, "_selected_guide_runtime", selected)
     assert planner.gateway_path() == current
     assert legacy.read_bytes() == b"Retained legacy runtime, never executed."

@@ -25,7 +25,8 @@ and rejects browser dependencies resolved from a sibling installation.
 The Python project selects the reviewed development client
 `meerkat-meta==0.9.2+meta.0bc6b4fa` for the Guide. Its hash-pinned wheel and
 rebuild provenance are in `vendor/guide/`. This pure Python client adds the
-public helper transport-wait option; the Guide's native gateway stays at 0.9.0.
+public helper transport-wait option; the Guide's native gateway is the selected
+Meta 0.9.3 runtime (Core 0.9.3), admitted by exact version equality.
 This is separate from the repository's current Meta release version and from
 each application's selected runtime. Updating repository source does not upgrade
 an installed application, choose its gateway, or qualify a new SDK/native pair.
