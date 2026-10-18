@@ -199,9 +199,10 @@ jobs:
 
   collect:
     name: Bind the Forge candidate
-    # Besides the packages, it binds the green forge.yml run (backend and
-    # frontend) that tested exactly the Forge inputs at this commit, so the
-    # release does not rerun Forge's suite. With none, it refuses until
+    # Besides the packages, it binds a green dispatched forge.yml run
+    # (backend and frontend) that tested exactly the Forge inputs at this
+    # commit, so the release does not rerun Forge's suite. Pull request runs
+    # test a merge commit and never count. With none, it refuses until
     # forge.yml is dispatched for this commit.
     needs: [resolve, build_package, require_ci_green]
     if: >-

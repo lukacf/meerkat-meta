@@ -31,9 +31,11 @@ host details. A target without pins is not built.
 
 ## Forge CI evidence
 
-A candidate does not rerun Forge's own suite. Instead it binds the green
-`forge.yml` run (backend and frontend) that tested exactly the Forge inputs at
-the candidate's commit. The binding covers:
+A candidate does not rerun Forge's own suite. Instead it binds a green
+dispatched `forge.yml` run (backend and frontend) that tested exactly the
+Forge inputs at the candidate's commit. A pull request run never counts: it
+tests GitHub's merge of its head into the base, not its head commit. The
+binding covers:
 
 - the trees of `installer`, `console`, `packages/console-core`,
   `packages/console-components` and `sdk/python`;
@@ -41,30 +43,36 @@ the candidate's commit. The binding covers:
 - a recorded toolchain that fits `forge.yml`'s declared Python and Node versions.
 
 If no run qualifies, the candidate refuses and names the members that changed.
-Dispatch `forge.yml` on main for the commit, then run the candidate again.
+Dispatch `forge.yml` on main for the commit (`gh workflow run forge.yml --ref main`)
+and let it pass, then run the candidate again.
 
 ## Steps
 
 1. Dry run, from any branch. It builds, verifies and attests packages, but its
    candidate can never be published:
    `gh workflow run forge-release.yml --ref <branch> -f release_mode=candidate -f source_sha=<branch head>`
-2. Candidate, on main at the release commit, once `ci.yml` is green for that commit:
+2. Candidate, on main at the release commit, once `ci.yml` is green for that
+   commit and a dispatched `forge.yml` run has passed for the same Forge inputs:
    `gh workflow run forge-release.yml --ref main -f release_mode=candidate -f source_sha=<main head>`.
    Keep the selection JSON from the run summary.
 3. Review the manifest and the packages in the run's artifacts.
-4. Tag the candidate's commit and push the tag:
-   `git tag -a forge-v<version> <source_sha> -m "Meta Forge <version>"`.
+4. Tag the candidate's commit and push the tag, which publication checks on
+   the remote:
+   `git tag -a forge-v<version> <source_sha> -m "Meta Forge <version>"`, then
+   `git push origin forge-v<version>`.
 5. Publish:
    `gh workflow run forge-release.yml --ref main -f release_mode=publish -f artifact_selection='<selection JSON>'`.
    Publication re-verifies every attestation against main and binds the draft
    to the selection first. It then publishes the draft as a prerelease and
    checks that Meta's latest release has not changed.
 
-To verify a download:
+To verify a download (the release notes give the same command with the
+candidate's `--source-digest`):
 
 ```bash
 gh attestation verify meta-forge-<version>-<target>.zip --repo lukacf/meerkat-meta \
-  --signer-workflow lukacf/meerkat-meta/.github/workflows/forge-release.yml
+  --signer-workflow lukacf/meerkat-meta/.github/workflows/forge-release.yml \
+  --source-ref refs/heads/main
 sha256sum -c meta-forge-<version>-<target>.zip.sha256
 ```
 

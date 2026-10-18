@@ -19,12 +19,15 @@ Modes (workflow_dispatch only):
     forge-v<version> tag. It adds the exact attested bytes to a draft, reads
     them back, then publishes the draft as a prerelease that is not latest.
 
-A candidate does not rerun Forge's own suite. It binds the green forge.yml run
-(backend and frontend) that tested exactly the Forge inputs at its commit: the
+A candidate does not rerun Forge's own suite. It binds a green dispatched
+forge.yml run (backend and frontend) that tested exactly the Forge inputs at
+its commit: the
 trees of installer, console, packages/console-core, packages/console-components
 and sdk/python, forge.yml itself, the lockfiles, installer requirements and
-vendored wheels, and a toolchain that fits forge.yml's declared versions. If
-none did, it refuses until forge.yml is dispatched for that commit.
+vendored wheels, and a toolchain that fits forge.yml's declared versions. A
+pull request run never counts: it tests GitHub's merge of its head into the
+base (refs/pull/N/merge), not its head commit. If no dispatched run did, it
+refuses until forge.yml is dispatched for that commit.
 
 Inputs (installer/release/forge-release-inputs.json, schema 1): per target,
 every file the packager reads, each pinned by size and SHA-256 and taken
@@ -263,7 +266,7 @@ def validate_forge_ci(value):
     rc.integer(value["run_id"], "Forge run ID")
     rc.integer(value["run_attempt"], "Forge run attempt")
     rc.digest(value["head_sha"], "Forge run SHA", 40)
-    require(value["event"] in ("pull_request", "workflow_dispatch"), "unexpected Forge run event")
+    require(value["event"] == "workflow_dispatch", "Forge evidence must be a dispatched forge.yml run")
     rc.exact_keys(value["tuple"], "trees files", "Forge inputs tuple")
     trees, files = value["tuple"]["trees"], value["tuple"]["files"]
     require(isinstance(trees, dict) and set(trees) == set(EVIDENCE_TREES)
@@ -482,14 +485,18 @@ def run_jobs_green(run_id, attempt):
 
 
 def forge_ci_evidence(sha, work, objects=None):
-    """The newest green Forge run that tested exactly this commit's Forge
-    inputs, preferring a run of this commit itself. Refuses when none did."""
+    """The newest green dispatched Forge run that tested exactly this
+    commit's Forge inputs, preferring a run of this commit itself. A pull
+    request run tested a merge commit, not its head_sha, so it never counts.
+    Refuses when no dispatched run did."""
     objects = objects or GitObjects()
     wanted = evidence_tuple(objects, sha)
     declared = declared_toolchain(objects, wanted["files"])
     runs = rc.api(rc.repo_endpoint(
-        f"actions/workflows/forge.yml/runs?status=success&per_page={MAX_EVIDENCE_RUNS}"))["workflow_runs"]
-    runs = [run for run in runs if run.get("path") == FORGE_CI and run.get("status") == "completed"
+        f"actions/workflows/forge.yml/runs?event=workflow_dispatch&status=success&per_page={MAX_EVIDENCE_RUNS}"
+    ))["workflow_runs"]
+    runs = [run for run in runs if run.get("event") == "workflow_dispatch"
+            and run.get("path") == FORGE_CI and run.get("status") == "completed"
             and run.get("conclusion") == "success" and run["repository"]["full_name"] == rc.repository()]
     nearest = None
     for run in sorted(runs, key=lambda run: (run["head_sha"] != sha, -run["id"])):
@@ -506,7 +513,8 @@ def forge_ci_evidence(sha, work, objects=None):
         return {"run_id": run["id"], "run_attempt": run["run_attempt"], "head_sha": run["head_sha"],
                 "event": run["event"], "tuple": wanted, "toolchain": {"declared": declared, **toolchain}}
     detail = (f"; the newest green run {nearest[0]} differs in {', '.join(nearest[1])}" if nearest else "")
-    raise ProtocolError(f"no green Forge run (backend and frontend) tested the Forge inputs at {sha}{detail}. "
+    raise ProtocolError(f"no green dispatched Forge run (backend and frontend) tested the Forge inputs at "
+                        f"{sha}{detail}. "
                         "Dispatch forge.yml for this commit, then rerun the candidate")
 
 
@@ -519,6 +527,7 @@ def recheck_forge_ci(manifest):
     run = rc.api(rc.repo_endpoint(f"actions/runs/{record['run_id']}"))
     require(run["id"] == record["run_id"] and run["run_attempt"] == record["run_attempt"]
             and run["head_sha"] == record["head_sha"] and run["path"] == FORGE_CI
+            and run["event"] == "workflow_dispatch"
             and run["status"] == "completed" and run["conclusion"] == "success"
             and run_jobs_green(record["run_id"], record["run_attempt"]), "the bound Forge run is no longer green")
 
@@ -784,7 +793,8 @@ def release_notes(manifest):
         "Unpack a package into a new folder and run `bash start.sh` there. "
         "Each package has a .sha256 file and a GitHub build attestation: "
         f"`gh attestation verify <package> --repo {rc.repository()} "
-        f"--signer-workflow {rc.repository()}/{WORKFLOW}`. "
+        f"--signer-workflow {rc.repository()}/{WORKFLOW} --source-ref {MAIN} "
+        f"--source-digest {manifest['source_sha']}`. "
         f"{MANIFEST} binds the packages; {SELECTION} records the accepted candidate. "
         "This prerelease is separate from Meta's own releases."
     )

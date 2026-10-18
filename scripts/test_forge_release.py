@@ -662,7 +662,7 @@ class CheckPackageTests(unittest.TestCase):
 
 
 def evidence_record(head=SHA, run_id=FORGE_RUN):
-    return {"run_id": run_id, "run_attempt": 1, "head_sha": head, "event": "pull_request",
+    return {"run_id": run_id, "run_attempt": 1, "head_sha": head, "event": "workflow_dispatch",
             "tuple": {"trees": {path: "1" * 40 for path in forge.EVIDENCE_TREES},
                       "files": {path: "2" * 40 for path in forge.EVIDENCE_FILES}},
             "toolchain": {"declared": {"python": "3.12", "node": "22"},
@@ -714,6 +714,8 @@ class ManifestTests(unittest.TestCase):
             "duplicate target": (lambda v: v["packages"].append(copy.deepcopy(v["packages"][0])), "unique"),
             "oversize": (lambda v: v["packages"][0].__setitem__("size", 2 * 1024**3), "release asset limit"),
             "tuple": (lambda v: v["forge_ci"]["tuple"]["trees"].pop("sdk/python"), "incomplete"),
+            "pull request evidence": (lambda v: v["forge_ci"].__setitem__("event", "pull_request"),
+                                      "dispatched forge.yml run"),
             "toolchain": (lambda v: v["forge_ci"]["toolchain"]["backend"].__setitem__("python", "Python 3.11.9"),
                           "toolchain differs"),
             "unknown key": (lambda v: v.__setitem__("extra", 1), "fields"),
@@ -756,6 +758,7 @@ class FakeGitHub:
     def __init__(self):
         self.trees, self.blobs, self.commits = {}, {}, {}
         self.runs, self.jobs, self.artifacts, self.downloads = [], {}, {}, {}
+        self.listings = []
         self.extra = {}
 
     def tree(self, node):
@@ -781,9 +784,9 @@ class FakeGitHub:
             node[parts[-1]] = content
         self.commits[sha] = self.tree(root)
 
-    def forge_run(self, run_id, head, *, jobs=None, toolchain=None, attempt=1):
+    def forge_run(self, run_id, head, *, jobs=None, toolchain=None, attempt=1, event="workflow_dispatch"):
         self.runs.append({"id": run_id, "run_attempt": attempt, "head_sha": head, "path": forge.FORGE_CI,
-                          "status": "completed", "conclusion": "success", "event": "pull_request",
+                          "status": "completed", "conclusion": "success", "event": event,
                           "repository": {"full_name": REPO, "id": 1}, "head_repository": {"full_name": REPO, "id": 1}})
         self.jobs[(run_id, attempt)] = [{"name": name, "conclusion": conclusion}
                                         for name, conclusion in (jobs or {"backend": "success",
@@ -811,7 +814,8 @@ class FakeGitHub:
             return {"tree": copy.deepcopy(self.trees[match.group(1)]), "truncated": False}
         if match := re.fullmatch(r"git/blobs/([0-9a-f]{40})", path):
             return {"encoding": "base64", "content": base64.b64encode(self.blobs[match.group(1)].encode()).decode()}
-        if path.startswith("actions/workflows/forge.yml/runs?status=success"):
+        if path.startswith("actions/workflows/forge.yml/runs?"):
+            self.listings.append(path)
             return {"workflow_runs": copy.deepcopy(self.runs)}
         if match := re.fullmatch(r"actions/runs/(\d+)/attempts/(\d+)/jobs\?per_page=100", path):
             return {"jobs": copy.deepcopy(self.jobs[(int(match.group(1)), int(match.group(2)))])}
@@ -900,8 +904,27 @@ class EvidenceTests(unittest.TestCase):
                                          "frontend": {"python": "Python 3.12.3", "node": "v20.19.0"}}},
         }
         for label, run in cases.items():
-            with self.subTest(label), self.assertRaisesRegex(forge.ProtocolError, "no green Forge run"):
+            with self.subTest(label), self.assertRaisesRegex(forge.ProtocolError, "no green dispatched Forge run"):
                 self.evidence(self.github(**run))
+
+    def test_only_dispatched_runs_are_listed_and_counted(self):
+        github = self.github()
+        self.evidence(github)
+        self.assertEqual(len(github.listings), 1)
+        self.assertIn("event=workflow_dispatch", github.listings[0])
+        self.assertIn("status=success", github.listings[0])
+
+    def test_a_pull_request_run_is_never_evidence(self):
+        """It tested refs/pull/N/merge, not its head_sha, so even a run whose
+        head has the release commit's exact Forge inputs is refused."""
+        for head in (OTHER, SHA):
+            with self.subTest(head=head):
+                github = FakeGitHub()
+                github.commit(SHA, BASE_TREE)
+                github.commit(OTHER, BASE_TREE)
+                github.forge_run(FORGE_RUN, head, event="pull_request")
+                with self.assertRaisesRegex(forge.ProtocolError, "no green dispatched Forge run"):
+                    self.evidence(github)
 
     def test_publication_rechecks_the_bound_run(self):
         github = self.github()
@@ -914,9 +937,11 @@ class EvidenceTests(unittest.TestCase):
         with github.installed(), self.assertRaisesRegex(forge.ProtocolError, "no longer tested"):
             forge.recheck_forge_ci(manifest)
         github.commit(SHA, BASE_TREE)
-        github.extra[f"actions/runs/{FORGE_RUN}"] = {**github.runs[0], "conclusion": "failure"}
-        with github.installed(), self.assertRaisesRegex(forge.ProtocolError, "no longer green"):
-            forge.recheck_forge_ci(manifest)
+        for change in ({"conclusion": "failure"}, {"event": "pull_request"}):
+            github.extra[f"actions/runs/{FORGE_RUN}"] = {**github.runs[0], **change}
+            with self.subTest(change), github.installed(), \
+                    self.assertRaisesRegex(forge.ProtocolError, "no longer green"):
+                forge.recheck_forge_ci(manifest)
 
 
 def artifact_zip(path, members):
@@ -1093,6 +1118,14 @@ class PublishTests(unittest.TestCase):
             with self.subTest(label), fixture_directory() as directory, \
                     self.assertRaisesRegex(forge.ProtocolError, message):
                 self.publish(directory, **options)
+
+    def test_the_published_verify_command_pins_main_and_the_source(self):
+        notes = forge.release_notes(manifest_value())
+        self.assertIn(f"--signer-workflow {REPO}/{forge.WORKFLOW} --source-ref refs/heads/main "
+                      f"--source-digest {SHA}`", notes)
+        guide = (ROOT / "installer/RELEASING.md").read_text()
+        self.assertIn("  --source-ref refs/heads/main\n", guide)
+        self.assertIn("`git push origin forge-v<version>`", guide)
 
     def test_a_draft_holding_another_candidates_receipt_is_refused(self):
         existing = {"id": 5, "draft": True, "inventory": {forge.SELECTION: {}},

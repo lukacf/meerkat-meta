@@ -12,8 +12,9 @@ on:
       - 'LICENSE-MIT'
       - 'LICENSE-APACHE'
       - '.github/workflows/forge.yml'
-  # A Forge release (forge-release.yml) reuses the green run that tested its
-  # exact Forge inputs. Dispatch this for a commit no pull request run tested.
+  # A Forge release (forge-release.yml) binds a green dispatched run that
+  # tested its exact Forge inputs. A pull request run tests a merge commit,
+  # so it never counts: dispatch this for the release commit.
   workflow_dispatch:
 
 permissions:
