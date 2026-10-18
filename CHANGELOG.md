@@ -31,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   maintenance in every build) and the methods answer
   `mob_announcements_unavailable`. See `docs/design/mob-announcements.md`.
 
+- Mob announcement member tools. A profile that lists the
+  `mob_announcements` bundle in `tools.rust_bundles` gives its members
+  `mob_announce` and `mob_subscription`: a member announces into its own mob
+  as itself and manages its own subscriptions to it. Every call is attributed
+  to exactly one member through the mob roster and the identity runtime, or
+  refused; per-member limits come from
+  `runtime_options.mob_announcements.member_limits`.
+
 - Keyed cross-mob inject. Two new control verbs, `inject_keyed` and
   `inject_status`, deliver one keyed continuation to a member of the serving
   gateway's mob, once per key and scoped to the calling grant, and read it

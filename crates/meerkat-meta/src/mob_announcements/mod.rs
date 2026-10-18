@@ -43,6 +43,7 @@ pub mod rpc;
 pub mod sqlite;
 pub(crate) mod storage;
 pub mod store;
+pub mod tools;
 pub mod types;
 
 #[cfg(test)]
@@ -86,6 +87,21 @@ struct AnnouncementOptions {
     batch: Option<BatchOptions>,
     #[serde(default)]
     retention_ms: Option<u64>,
+    #[serde(default)]
+    member_limits: Option<MemberLimitOptions>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemberLimitOptions {
+    #[serde(default)]
+    announcements_per_minute: Option<u32>,
+    #[serde(default)]
+    announcement_bytes_per_minute: Option<u64>,
+    #[serde(default)]
+    subscriptions: Option<u32>,
+    #[serde(default)]
+    topics_per_subscription: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -130,6 +146,22 @@ pub(crate) fn parse_runtime_options(
         }
         config.retention_ms = retention_ms;
     }
+    if let Some(limits) = options.member_limits {
+        let current = &mut config.member_limits;
+        current.announcements_per_minute = limits
+            .announcements_per_minute
+            .unwrap_or(current.announcements_per_minute);
+        current.announcement_bytes_per_minute = limits
+            .announcement_bytes_per_minute
+            .unwrap_or(current.announcement_bytes_per_minute);
+        current.subscriptions = limits.subscriptions.unwrap_or(current.subscriptions);
+        current.topics_per_subscription = limits
+            .topics_per_subscription
+            .unwrap_or(current.topics_per_subscription);
+        current
+            .validate()
+            .map_err(|error| format!("runtime_options.mob_announcements.member_limits: {error}"))?;
+    }
     config
         .policy
         .validate()
@@ -145,8 +177,15 @@ pub(crate) fn compose_for_runtime(
     runtime: &crate::unified_runtime::UnifiedRuntime,
     layout: &crate::storage_layout::MetaStorageLayout,
     config: AnnouncementConfig,
+    member_tools: Option<&tools::ToolSlot>,
 ) -> Result<AnnouncementService, String> {
     let local = Arc::new(local_delivery(runtime)?);
+    let identities = runtime
+        .identity_runtime_ref()
+        .cloned()
+        .ok_or("mob announcements require an identity-first gateway")?;
+    let own_mob = MobId::new(runtime.mob_handle().mob_id().to_string())
+        .map_err(|error| format!("this gateway's mob id: {error}"))?;
     let path = layout
         .mob_announcements_db()
         .map_err(|error| format!("mob announcement database: {error}"))?;
@@ -160,6 +199,21 @@ pub(crate) fn compose_for_runtime(
         .map_err(|error| error.to_string())?;
     if !runtime.attach_mob_announcements(service.clone()) {
         return Err("mob announcements are already attached to this runtime".to_string());
+    }
+    if let Some(slot) = member_tools {
+        // A non-owning handle: the member tools never keep the mob open.
+        let callers =
+            tools::RosterCallerResolver::new(own_mob, runtime.mob_handle().observer(), identities);
+        let bound = slot
+            .set(tools::ToolBackend {
+                service: service.clone(),
+                callers: Arc::new(callers),
+                limits: config.member_limits,
+            })
+            .is_ok();
+        if !bound {
+            return Err("the member tools are already bound".to_string());
+        }
     }
     drop(service.start());
     drop(service.watch_mobs());

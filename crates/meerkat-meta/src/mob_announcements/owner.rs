@@ -68,6 +68,8 @@ pub struct AnnouncementConfig {
     pub settle_check_min_ms: u64,
     /// Longest such pause.
     pub settle_check_max_ms: u64,
+    /// Per-member limits on the member tools.
+    pub member_limits: super::tools::MemberLimits,
 }
 
 impl Default for AnnouncementConfig {
@@ -77,6 +79,7 @@ impl Default for AnnouncementConfig {
             retention_ms: DEFAULT_RETENTION_MS,
             settle_check_min_ms: 1_000,
             settle_check_max_ms: 30_000,
+            member_limits: super::tools::MemberLimits::default(),
         }
     }
 }

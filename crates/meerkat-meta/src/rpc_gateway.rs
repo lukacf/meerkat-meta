@@ -16001,6 +16001,11 @@ external_addressable = true
             .map_err(|error| fail_init(&request_id, -32603, error.to_string()))?,
         None => None,
     };
+    // The member tool bundle a profile opts into with `tools.rust_bundles`. It
+    // is registered with the mob spec and serves once mob announcements are
+    // composed, after the runtime is built.
+    let announcement_tools: crate::mob_announcements::tools::ToolSlot =
+        Arc::new(std::sync::OnceLock::new());
     let (
         mob_spec,
         _temp_dir,
@@ -16611,6 +16616,14 @@ external_addressable = true
             });
         }
         slots.extend(crate::storage_health::scratch_ring_buffer_slots());
+        if gateway_options.mob_announcements.is_some() {
+            spec = spec.register_tool_bundle(
+                crate::mob_announcements::tools::TOOL_BUNDLE,
+                Arc::new(crate::mob_announcements::tools::MobAnnouncementTools::new(
+                    Arc::clone(&announcement_tools),
+                )),
+            );
+        }
         // The M4 census had no mob slot at all, which is why an in-memory mob
         // storage on this persistent launch was invisible to healthz and the
         // storage doctor while sessions correctly reported persistent. It now
@@ -18392,8 +18405,13 @@ external_addressable = true
     // Mob announcements attach once the identity runtime and the agent mob
     // tool state exist, before the first request is served.
     if let Some(config) = gateway_options.mob_announcements {
-        crate::mob_announcements::compose_for_runtime(&runtime, &storage_layout, config)
-            .map_err(|message| fail_init(&request_id, -32602, message))?;
+        crate::mob_announcements::compose_for_runtime(
+            &runtime,
+            &storage_layout,
+            config,
+            Some(&announcement_tools),
+        )
+        .map_err(|message| fail_init(&request_id, -32602, message))?;
     }
     // A control listener on an identity-first gateway serves peers' keyed
     // injects, whether or not this gateway enables mob announcements itself.

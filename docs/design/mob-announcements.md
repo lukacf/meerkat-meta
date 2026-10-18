@@ -117,7 +117,8 @@ pace.
 
 - The host reaches every mob this gateway hosts, the same reach as
   `meta/send`. A host call announces as `{"kind": "host"}`; it cannot
-  announce as a member. Every mob an announcement or a subscription names
+  announce as a member. Members announce as themselves, into their own mob
+  only, through the member tools. Every mob an announcement or a subscription names
   must be hosted here: managed and not destroyed, or restored and held until
   its owner resolves.
 - A member is `{mob_id, identity}`: identities are unique only within one
@@ -130,6 +131,31 @@ pace.
   under the same source key must name the same announcer.
 - The announce result counts the subscriptions that captured an
   announcement; it never names them.
+
+## Member tools
+
+A member profile opts into the `mob_announcements` tool bundle by listing it
+in `tools.rust_bundles`. The bundle is host-only: agent-created child mobs
+never receive it. It has two tools:
+
+- `mob_announce` `{topics, body, key?, correlation_id?}`: announce into the
+  caller's own mob, as `{"kind": "member", "identity": ...}`. A retry with
+  the same key and content is not announced twice; without a key, the call
+  itself is the key. The result counts the subscriptions that captured the
+  announcement and never names them.
+- `mob_subscription` `{action, subscription?, topics?, expected_revision?}`:
+  `subscribe` (create, or replace the topics at `expected_revision`),
+  `pause`, `resume`, `cancel` and `list`, for the caller's own
+  subscriptions to its own mob.
+
+Every call is attributed to exactly one member: the member of this gateway's
+mob whose session the call comes from, as both the mob roster and the
+identity runtime record it. A call that cannot be attributed so is refused
+and changes nothing. A member's keys and subscription names live in a
+namespace of their own, so no member can reach or learn another member's.
+Per-member limits (`member_limits`, defaults shown below) bound announcements
+and bytes per minute, live subscriptions, and topics per subscription; the
+minute windows live in memory and start over on a restart.
 
 ## Members on peer gateways
 
@@ -165,7 +191,13 @@ persistent, identity-first launch:
       "max_delay_ms": 60000,
       "min_wake_interval_ms": 60000
     },
-    "retention_ms": 604800000
+    "retention_ms": 604800000,
+    "member_limits": {
+      "announcements_per_minute": 30,
+      "announcement_bytes_per_minute": 65536,
+      "subscriptions": 8,
+      "topics_per_subscription": 16
+    }
   }
 }
 ```

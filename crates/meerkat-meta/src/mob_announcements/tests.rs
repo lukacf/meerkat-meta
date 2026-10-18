@@ -3720,3 +3720,267 @@ async fn a_clock_step_back_does_not_mute_failure_reports() {
     );
     drop(dir);
 }
+
+// ---------------------------------------------------------------------------
+// Member tools
+// ---------------------------------------------------------------------------
+
+/// Sessions the scripted resolver attributes to members.
+struct ScriptedCallers {
+    sessions: BTreeMap<String, Member>,
+}
+
+#[async_trait]
+impl super::tools::CallerResolver for ScriptedCallers {
+    async fn caller(
+        &self,
+        session: &meerkat_core::types::SessionId,
+    ) -> std::result::Result<Member, String> {
+        self.sessions
+            .get(&session.to_string())
+            .cloned()
+            .ok_or_else(|| "the calling session is not a member of this gateway's mob".to_string())
+    }
+}
+
+struct ToolHarness {
+    harness: Harness,
+    tools: super::tools::MobAnnouncementTools,
+    sessions: BTreeMap<&'static str, meerkat_core::types::SessionId>,
+}
+
+fn tool_harness(limits: super::tools::MemberLimits) -> ToolHarness {
+    let mut native = ScriptedNative::new();
+    native.known.insert("agent:b".into());
+    let harness = harness_with(native);
+    let sessions = BTreeMap::from([
+        ("agent:a", meerkat_core::types::SessionId::new()),
+        ("agent:b", meerkat_core::types::SessionId::new()),
+    ]);
+    let callers = ScriptedCallers {
+        sessions: sessions
+            .iter()
+            .map(|(identity, session)| (session.to_string(), member(identity)))
+            .collect(),
+    };
+    let slot: super::tools::ToolSlot = Arc::new(std::sync::OnceLock::new());
+    let bound = slot
+        .set(super::tools::ToolBackend {
+            service: harness.service.clone(),
+            callers: Arc::new(callers),
+            limits,
+        })
+        .is_ok();
+    assert!(bound);
+    let clock = Arc::clone(&harness.clock);
+    let tools = super::tools::MobAnnouncementTools::with_clock(
+        slot,
+        Arc::new(move || clock.load(Ordering::SeqCst)),
+    );
+    ToolHarness {
+        harness,
+        tools,
+        sessions,
+    }
+}
+
+impl ToolHarness {
+    /// Call a tool as `who` (`None`: a call with no session at all), in a
+    /// turn of its own.
+    async fn call(
+        &self,
+        who: Option<&str>,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> (bool, serde_json::Value) {
+        use meerkat_core::AgentToolDispatcher as _;
+        let raw = serde_json::value::RawValue::from_string(args.to_string()).unwrap();
+        let call = meerkat_core::types::ToolCallView {
+            id: "call-1",
+            name: tool,
+            args: &raw,
+        };
+        let mut context = meerkat_core::ToolDispatchContext::default();
+        if let Some(who) = who {
+            let session = self
+                .sessions
+                .get(who)
+                .cloned()
+                .unwrap_or_else(meerkat_core::types::SessionId::new);
+            context = context.with_runtime_identity(
+                session,
+                Some(meerkat_core::interaction::InteractionId::new()),
+            );
+        }
+        let outcome = self
+            .tools
+            .dispatch_with_context(call, &context)
+            .await
+            .unwrap();
+        let text = meerkat_core::types::text_content(&outcome.result.content);
+        let value = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
+        (outcome.result.is_error, value)
+    }
+}
+
+#[tokio::test]
+async fn a_member_announces_as_itself_into_its_own_mob() {
+    let tools = tool_harness(super::tools::MemberLimits::default());
+    tools
+        .harness
+        .service
+        .put_subscription(
+            &op("o1"),
+            put("s1", "agent:b", &["ios"], StartFrontier::Now),
+        )
+        .await
+        .unwrap();
+    let (failed, result) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::ANNOUNCE_TOOL,
+            serde_json::json!({ "topics": ["ios"], "body": "checkout fixed", "key": "fix-1" }),
+        )
+        .await;
+    assert!(!failed, "{result}");
+    assert_eq!(result["mob_id"], OWN_MOB);
+    assert_eq!(result["captured"], 1);
+    assert!(
+        result.get("captured_for").is_none(),
+        "who subscribes is not the announcer's to learn: {result}"
+    );
+    let key = format!("{}-fix-1", super::tools::member_prefix(&member("agent:a")));
+    let stored = tools
+        .harness
+        .store
+        .announcement(&mob(OWN_MOB), &SourceKey::new(key).unwrap())
+        .await
+        .unwrap()
+        .expect("the key lives in the calling member's namespace");
+    assert_eq!(
+        stored.announced_by,
+        Announcer::Member {
+            identity: MemberIdentity::new("agent:a").unwrap(),
+        },
+        "the announcement is attributed to the calling member"
+    );
+}
+
+#[tokio::test]
+async fn a_call_that_cannot_be_attributed_changes_nothing() {
+    let tools = tool_harness(super::tools::MemberLimits::default());
+    for who in [None, Some("a session of no member")] {
+        let (failed, result) = tools
+            .call(
+                who,
+                super::tools::ANNOUNCE_TOOL,
+                serde_json::json!({ "topics": ["ios"], "body": "x" }),
+            )
+            .await;
+        assert!(failed, "{who:?}: {result}");
+    }
+    assert!(
+        tools.harness.store.known_mobs().await.unwrap().is_empty(),
+        "nothing was announced"
+    );
+}
+
+#[tokio::test]
+async fn member_limits_bound_announcements_and_subscriptions() {
+    let tools = tool_harness(super::tools::MemberLimits {
+        announcements_per_minute: 2,
+        announcement_bytes_per_minute: 1_000,
+        subscriptions: 1,
+        topics_per_subscription: 2,
+    });
+    for (index, expected_failure) in [(0, false), (1, false), (2, true)] {
+        let (failed, result) = tools
+            .call(
+                Some("agent:a"),
+                super::tools::ANNOUNCE_TOOL,
+                serde_json::json!({ "topics": ["ios"], "body": "x", "key": format!("k{index}") }),
+            )
+            .await;
+        assert_eq!(failed, expected_failure, "announcement {index}: {result}");
+    }
+    tools.harness.clock.fetch_add(60_000, Ordering::SeqCst);
+    let (failed, result) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::ANNOUNCE_TOOL,
+            serde_json::json!({ "topics": ["ios"], "body": "x".repeat(1_001) }),
+        )
+        .await;
+    assert!(
+        failed,
+        "the byte limit holds within a fresh minute: {result}"
+    );
+    let subscribe = |name: &str, topics: serde_json::Value| serde_json::json!({ "action": "subscribe", "subscription": name, "topics": topics });
+    let (failed, result) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::SUBSCRIPTION_TOOL,
+            subscribe("wide", serde_json::json!(["a", "b", "c"])),
+        )
+        .await;
+    assert!(failed, "too many topics: {result}");
+    let (failed, result) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::SUBSCRIPTION_TOOL,
+            subscribe("first", serde_json::json!(["ios"])),
+        )
+        .await;
+    assert!(!failed, "{result}");
+    let (failed, result) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::SUBSCRIPTION_TOOL,
+            subscribe("second", serde_json::json!(["web"])),
+        )
+        .await;
+    assert!(failed, "one subscription at most: {result}");
+}
+
+#[tokio::test]
+async fn members_see_and_change_only_their_own_subscriptions() {
+    let tools = tool_harness(super::tools::MemberLimits::default());
+    let (failed, result) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::SUBSCRIPTION_TOOL,
+            serde_json::json!({ "action": "subscribe", "subscription": "news", "topics": ["ios"] }),
+        )
+        .await;
+    assert!(!failed, "{result}");
+    assert_eq!(result["subscription"], "news");
+    assert_eq!(result["revision"], 1);
+    let (failed, result) = tools
+        .call(
+            Some("agent:b"),
+            super::tools::SUBSCRIPTION_TOOL,
+            serde_json::json!({ "action": "cancel", "subscription": "news", "expected_revision": 1 }),
+        )
+        .await;
+    assert!(
+        failed,
+        "another member's subscription is out of reach: {result}"
+    );
+    let (_, listed) = tools
+        .call(
+            Some("agent:b"),
+            super::tools::SUBSCRIPTION_TOOL,
+            serde_json::json!({ "action": "list" }),
+        )
+        .await;
+    assert_eq!(listed["subscriptions"], serde_json::json!([]));
+    let (_, listed) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::SUBSCRIPTION_TOOL,
+            serde_json::json!({ "action": "list" }),
+        )
+        .await;
+    assert_eq!(listed["subscriptions"][0]["subscription"], "news");
+    assert_eq!(listed["subscriptions"][0]["state"], "active", "{listed}");
+}
