@@ -4747,10 +4747,12 @@ impl SessionStoreBackedRuntimeStore {
 
     /// DURABLE-BEHIND ADMISSION (task #56 corpus iteration 5, a production
     /// member's true field shape; admission authored downstream and landed
-    /// here with the lane's conventions): the tear is a FAILED projection,
-    /// so the durable row never received the wedged turn's final appends -
-    /// durable is a strict digest-PREFIX of a committed rewrite's parent (the
-    /// exact inverse of the inverse-append shape). The walk proves the
+    /// here with the lane's conventions): the durable row is a strict
+    /// digest-PREFIX of a committed rewrite's parent - it lacks the parent's
+    /// last rows (the exact inverse of the inverse-append shape). The shape
+    /// says nothing about its cause: a projection that failed before the
+    /// rewrite leaves it, and so do appends inside one committed boundary
+    /// before a compaction, with no failure at all. The walk proves the
     /// earliest such rewrite and returns the chain from it to the sealed
     /// head, so a row several rewrites behind replays every one of them.
     /// Proof is exact content:
@@ -5323,14 +5325,19 @@ impl SessionStoreBackedRuntimeStore {
                                         tracing::info!(
                                             runtime_id = %runtime_id,
                                             session_id = %successor.id(),
+                                            durable_messages =
+                                                durable_predecessor.messages().len(),
+                                            parent_messages = chain
+                                                .first()
+                                                .map_or(0, |commit| commit.messages_before),
                                             first_rewrite_generation = chain
                                                 .first()
                                                 .map_or(0, |commit| commit.rewrite_generation),
                                             replayed_rewrites = chain.len(),
                                             "durable-behind admission: the durable row is a \
-                                             digest-prefix of the first replayed rewrite's \
-                                             parent (failed projection tear); replaying the \
-                                             committed rewrites from there to the sealed head"
+                                             strict digest-prefix of the first replayed \
+                                             rewrite's parent; replaying the committed \
+                                             rewrites from there to the sealed head"
                                         );
                                         Some(chain)
                                     }
@@ -21693,9 +21700,16 @@ comms = true
             .find(|line| line.contains("durable-behind admission"))
             .unwrap_or_else(|| panic!("the admission must be logged: {captured}"));
         assert!(
-            admission.contains("first_rewrite_generation=1")
+            admission.contains("durable_messages=3")
+                && admission.contains("parent_messages=4")
+                && admission.contains("first_rewrite_generation=1")
                 && admission.contains("replayed_rewrites=2"),
-            "the admission log must name the first replayed rewrite and the count: {admission}"
+            "the admission log must name the row counts, the first replayed rewrite and the count: \
+             {admission}"
+        );
+        assert!(
+            !admission.contains("tear"),
+            "the admission log states the observed shape, not a presumed cause: {admission}"
         );
     }
 
