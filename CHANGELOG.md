@@ -30,8 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reserved, and the host gets it inside its publication boundary from
   `GatewayBootstrapReady::take_runtime_completion`. A runtime from a legacy
   constructor (`UnifiedRuntime::bootstrap` and the `bootstrap_with_*` family)
-  has no completion until `activate_without_identity_context` returns `Ok`,
-  and installing an identity context withdraws a completion not yet taken.
+  has no completion until `activate_without_identity_context` returns `Ok`.
+  Installing an identity context withdraws a completion not yet taken;
+  attaching one leaves it as it is.
 
 ### Changed
 
