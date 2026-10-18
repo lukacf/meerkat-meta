@@ -131,10 +131,11 @@ jobs:
           name: forge-toolchain-${{ github.job }}-${{ github.run_attempt }}
           path: forge-toolchain.json
           if-no-files-found: error
+      # Artifact names are unique within a run; a rerun attempt uploads its own.
       - name: Retain test results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: forge-pytest
+          name: forge-pytest-${{ github.run_attempt }}
           path: forge-pytest.xml
           if-no-files-found: ignore

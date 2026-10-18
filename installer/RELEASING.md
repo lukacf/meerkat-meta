@@ -42,6 +42,11 @@ binding covers:
 - `forge.yml`, the lockfiles, the installer requirements and the vendored wheels;
 - a recorded toolchain that fits `forge.yml`'s declared Python and Node versions.
 
+Evidence and packages are matched to one run attempt. A rerun of only the
+failed jobs leaves the other jobs' records under the earlier attempt, so it
+is not complete evidence, for a `forge.yml` run or for a candidate. Dispatch
+a fresh run, or rerun all jobs, when the run must count.
+
 If no run qualifies, the candidate refuses and names the members that changed.
 Dispatch `forge.yml` on main for the commit (`gh workflow run forge.yml --ref main`)
 and let it pass, then run the candidate again.

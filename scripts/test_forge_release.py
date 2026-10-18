@@ -363,6 +363,26 @@ class WorkflowShapeTests(unittest.TestCase):
             self.assertIn(f"path: {forge.TOOLCHAIN_FILE}", block)
         self.assertEqual(forge.toolchain_artifact_name("backend", 2), "forge-toolchain-backend-2")
 
+    def test_every_forge_ci_artifact_name_carries_the_run_attempt(self):
+        """Artifact names are unique within a run, so a rerun attempt that
+        uploads a fixed name fails with a conflict."""
+        names = re.findall(r"^\s+name: (.+)$", "\n".join(
+            line for job in forge.EVIDENCE_JOBS for line in job_block(job, FORGE_CI).splitlines()
+            if not line.lstrip().startswith("- name:")), re.M)
+        self.assertEqual(sorted(names), sorted([
+            "forge-toolchain-${{ github.job }}-${{ github.run_attempt }}",
+            "forge-toolchain-${{ github.job }}-${{ github.run_attempt }}",
+            "forge-pytest-${{ github.run_attempt }}"]))
+        backend = job_block("backend", FORGE_CI)
+        self.assertIn("      - name: Retain test results\n        if: always()\n", backend)
+        self.assertIn("          path: forge-pytest.xml\n", backend)
+        self.assertNotIn("overwrite:", text(FORGE_CI))
+
+    def test_the_guide_says_a_partial_rerun_is_not_evidence(self):
+        guide = (ROOT / "installer/RELEASING.md").read_text()
+        self.assertIn("A rerun of only the\nfailed jobs", guide)
+        self.assertIn("rerun all jobs, when the run must count", guide)
+
     def test_ci_runs_these_tests_and_meta_release_stays_separate(self):
         self.assertIn("      - run: python3 scripts/test_forge_release.py\n", (ROOT / ".github/workflows/ci.yml").read_text())
         self.assertNotIn("forge", (ROOT / ".github/workflows/release.yml").read_text().lower())
