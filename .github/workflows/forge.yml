@@ -1,0 +1,118 @@
+name: Forge
+
+on:
+  pull_request:
+    paths:
+      - 'installer/**'
+      - 'console/**'
+      - 'packages/console-core/**'
+      - 'packages/console-components/**'
+      - 'sdk/python/**'
+      - 'README.md'
+      - 'LICENSE-MIT'
+      - 'LICENSE-APACHE'
+      - '.github/workflows/forge.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: forge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - run: npm --prefix console ci --ignore-scripts
+      - run: npm --prefix installer/web ci
+      - run: npm --prefix installer/web run build
+      - name: Frontend regression tests
+        working-directory: installer/web
+        env:
+          NODE_OPTIONS: --max-old-space-size=3072
+        run: node --test --test-concurrency=2 *.test.mjs
+
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Install the reviewed Guide client SDK
+        run: python -m pip install --no-index --no-deps --require-hashes --find-links installer/vendor/guide -r installer/requirements-guide-sdk.txt
+      - run: python -m pip install -e './installer[test]'
+      - name: Prepare Linux acceptance isolation
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y bubblewrap libseccomp2 apparmor apparmor-profiles
+          forge_bwrap_profile=
+          for candidate in /etc/apparmor.d/bwrap /etc/apparmor.d/bwrap-userns-restrict /usr/share/apparmor/extra-profiles/bwrap-userns-restrict; do
+            if test -f "$candidate"; then
+              forge_bwrap_profile=$candidate
+              break
+            fi
+          done
+          test -n "$forge_bwrap_profile"
+          printf 'Loading packaged bubblewrap policy: %s\n' "$forge_bwrap_profile"
+          sudo apparmor_parser -r "$forge_bwrap_profile"
+      - name: Verify Linux acceptance isolation
+        env:
+          PYTHONPATH: installer
+        run: |
+          bwrap --version
+          bwrap --unshare-user --unshare-pid --unshare-net --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 -- /usr/bin/true
+          python - <<'PY'
+          import pathlib
+          import sysconfig
+          from launchkit.implementation_workspace import _sandbox_executable
+          library = pathlib.Path(sysconfig.get_config_var("LIBDIR")) / sysconfig.get_config_var("LDLIBRARY")
+          print("Selected Python shared library:", library, "->", library.resolve(), flush=True)
+          if not _sandbox_executable():
+              raise SystemExit("Linux acceptance isolation is unavailable; no generated-code checks can run.")
+          print("Linux acceptance isolation probe passed.")
+          PY
+      - name: Prepare private DOM dependencies
+        run: |
+          umask 077
+          npm --prefix console ci --ignore-scripts
+      - run: npm --prefix installer/web ci
+      - run: npm --prefix installer/web run build
+      - name: Prepare protected DOM checks
+        env:
+          PYTHONPATH: installer
+        run: |
+          python -m launchkit.checker_runtime
+          python - <<'PY'
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+          from launchkit.dom_check import prepare_dependencies
+          with TemporaryDirectory() as folder:
+              prepare_dependencies(Path(folder).resolve())
+          print("Authenticated DOM dependency closure is ready.")
+          PY
+      - name: Isolated controller subprocess checks
+        run: >-
+          python -m pytest -q
+          installer/tests/test_remote_destination.py::test_actual_isolated_cli_emits_one_bounded_frame_and_no_raw_error
+          installer/tests/test_remote_interface_bundle.py
+          --tb=short
+      - name: Backend regression tests
+        run: python -m pytest -vv installer/tests --maxfail=10 --tb=short --durations=20 --junitxml=forge-pytest.xml
+      - name: Retain test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: forge-pytest
+          path: forge-pytest.xml
+          if-no-files-found: ignore
