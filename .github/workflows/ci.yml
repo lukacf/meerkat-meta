@@ -324,12 +324,14 @@ jobs:
         if: always()
         run: df -h /
 
-  # The two meerkat-meta test targets are separate compilations of the
-  # library: the integration test links it as a dependency, the --lib run
+  # The meerkat-meta test targets are separate compilations of the
+  # library: the integration tests link it as a dependency, the --lib run
   # compiles it again with cfg(test). Run one after the other they built
   # serially (run 38714502600: 25m52 then 10m20) while rustc's front end
-  # kept one of the 4 CPUs busy, so one `--no-run` invocation builds both
-  # in parallel and the filtered runs below only execute them.
+  # kept one of the 4 CPUs busy, so one `--no-run` invocation builds them
+  # in parallel and the filtered runs below only execute them. The mob
+  # announcement process tests ride the same build: their fault points
+  # (announcement-test-faults) are inert unless a test sets one.
   test-extension-state:
     name: test-extension-state
     needs: changes
@@ -351,9 +353,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/fetch-warm-deps
       - run: scripts/repo-cargo test -p meta-extension-state --locked
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --lib --test extension_state --no-run
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --test extension_state
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --lib -- extension_ document_mcp_child_supply
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state,announcement-test-faults --lib --test extension_state --test mob_announcements_delivery_process --test mob_announcements_remote_process --no-run
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state,announcement-test-faults --test extension_state
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state,announcement-test-faults --test mob_announcements_delivery_process --test mob_announcements_remote_process
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state,announcement-test-faults --lib -- extension_ document_mcp_child_supply
 
   # test-extension-state's check and clippy, split out: both only emit
   # metadata, so they share little with the two full test builds, which
@@ -382,7 +385,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/fetch-warm-deps
       - run: scripts/repo-cargo check -p meerkat-meta --locked --no-default-features
-      - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features extension-state --lib --test extension_state -- -D warnings
+      - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features extension-state,announcement-test-faults --lib --test extension_state --test mob_announcements_delivery_process --test mob_announcements_remote_process -- -D warnings
 
   test-voice:
     name: test-voice

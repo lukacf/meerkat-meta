@@ -216,6 +216,12 @@ LANE_INPUTS = (
     ("crates/meerkat-meta/tests/fixtures/role_migrations_init_params.json", {"extension_state", "python"}),
     ("crates/meerkat-meta/tests/fixtures/security_idempotency/security-head-evolution.json",
      {"voice", "extension_state"}),
+    # The mob announcement process tests run in the extension-state jobs and
+    # drive the announcement module and keyed inject end to end.
+    ("crates/meerkat-meta/src/mob_announcements/", {"extension_state"}),
+    ("crates/meerkat-meta/src/runtime/keyed_inject.rs", {"extension_state"}),
+    ("crates/meerkat-meta/tests/mob_announcements_delivery_process.rs", {"extension_state"}),
+    ("crates/meerkat-meta/tests/mob_announcements_remote_process.rs", {"extension_state"}),
 )
 
 # The classifier and its contract decide every other path's lanes.
