@@ -200,6 +200,83 @@ fn traceability_yaml_refuses_merges_documents_and_duplicate_fields() {
     }
 }
 
+/// Traceability YAML refused as a malformed row since the parser moved to
+/// serde-saphyr. serde_yaml accepted seven of these: a custom tag (it dropped
+/// the tag and kept the text), a key given twice in a row or at the top level
+/// (it kept the last), a null evidence entry (stored as "~", which passed as
+/// evidence), a `...` document end marker, and nesting deeper than 64 levels.
+/// It refused the other two differently: a null status as the status "~", and
+/// an empty evidence entry as missing evidence.
+#[test]
+fn traceability_yaml_refuses_tags_duplicates_nulls_end_markers_and_depth() {
+    let deep = format!(
+        "rows:\n  - status: TYPED\n    evidence: [x]\n    deep: {}{}\n",
+        "[".repeat(70),
+        "]".repeat(70)
+    );
+    let cases = [
+        (
+            "tagged status",
+            "rows:\n  - status: !custom TYPED\n    evidence: [x]\n".to_string(),
+        ),
+        (
+            "tagged evidence",
+            "rows:\n  - status: TYPED\n    evidence: [!custom x]\n".to_string(),
+        ),
+        (
+            "duplicate key in a row",
+            "rows:\n  - id: A\n    id: B\n    status: TYPED\n    evidence: [x]\n".to_string(),
+        ),
+        (
+            "duplicate top-level key",
+            "owner: a\nowner: b\nrows:\n  - status: TYPED\n    evidence: [x]\n".to_string(),
+        ),
+        (
+            "null evidence",
+            "rows:\n  - status: TYPED\n    evidence: [~]\n".to_string(),
+        ),
+        (
+            "empty evidence entry",
+            "rows:\n  - status: TYPED\n    evidence:\n      -\n".to_string(),
+        ),
+        (
+            "null status",
+            "rows:\n  - status: ~\n    evidence: [x]\n".to_string(),
+        ),
+        (
+            "document end marker",
+            "rows:\n  - status: TYPED\n    evidence: [x]\n... # end\n".to_string(),
+        ),
+        ("nesting past the budget", deep),
+    ];
+    let mismatched: Vec<(&str, Result<(), GovernanceValidationError>)> = cases
+        .iter()
+        .map(|(case, yaml)| (*case, validate_traceability_statuses(yaml)))
+        .filter(|(_, result)| {
+            *result != Err(GovernanceValidationError::InvalidTraceabilityRow { line: 1 })
+        })
+        .collect();
+    assert!(
+        mismatched.is_empty(),
+        "not refused as a malformed row: {mismatched:?}"
+    );
+}
+
+/// Text after a `...` document end marker is refused, malformed or not.
+/// serde_yaml refused it; serde-saphyr 2.0.0 alone would ignore it, so the
+/// marker itself is refused.
+#[test]
+fn traceability_yaml_refuses_text_after_a_document_end_marker() {
+    let err = validate_traceability_statuses(
+        "rows:\n  - status: TYPED\n    evidence: [x]\n...\n]]] not yaml\n",
+    )
+    .expect_err("text after the marker is not ignored");
+    assert_eq!(
+        err,
+        GovernanceValidationError::InvalidTraceabilityRow { line: 1 }
+    );
+}
+
 #[test]
 fn governance_contracts_accepts_markdown_traceability_after_leading_prose() {
     let markdown = r#"
