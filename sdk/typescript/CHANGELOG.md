@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.3
+
 - Breaking: the draft results of `meta/mobpacks/list`, `create`, `save`,
   `undo`, `redo` and `delete` type `rows` as the new `MobpackDraftSummary`
   (parsed by `parseMobpackDraftSummary`): Meta lists drafts without their

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-10-18
+
 ### Breaking
 
 - Behaviour-only: with the `extension-state` feature, the document service
@@ -396,6 +398,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Requires Meerkat 0.9.3: every Meerkat dependency is pinned to
+  `=0.9.3` from crates.io.
 - Flow Editor catalogs give a caller without host access each filesystem
   skill's path within its realm's directory and no realm `path`; a caller
   with host access still gets absolute paths (see Security). A document may

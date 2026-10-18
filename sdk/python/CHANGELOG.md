@@ -4,6 +4,8 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+## 0.9.3
+
 - Breaking: the draft results of `meta/mobpacks/list`, `create`, `save`,
   `undo`, `redo` and `delete` type `rows` as the new `MobpackDraftSummary`
   (id, name, version, stage, trigger, source, description, revision, etag,
