@@ -66,6 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - CI's unit test job, now the only automatic run of the lib and bin tests,
   lists them with its own filter before running them and fails if the
   filter leaves any out.
+- `meta/reset` of one identity, on the SDK gateway and the console, no
+  longer says it published the new generation without retiring the stale
+  live member. Its successor transition is meerkat's respawn, which retires
+  the previous live member, so the `cleanup_warning` message now says that,
+  and still says that identity control calls reject the stale runtime id.
+  Its `kind` and its other fields are unchanged, in the response and in the
+  `identity_reset` lifecycle frame.
 
 ## [0.9.2] - 2026-10-16
 

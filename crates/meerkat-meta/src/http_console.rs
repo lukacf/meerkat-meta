@@ -8683,7 +8683,7 @@ async fn handle_console_runtime_rpc_with_visibility(
                         "kind": "stale_member_cleanup_skipped_after_identity_reset",
                         "identity": parsed_identity.as_str(),
                         "agent_runtime_id": record.agent_runtime_id.as_str(),
-                        "message": "reset published the new generation without retiring stale live mob members; identity control calls reject stale runtime ids",
+                        "message": "reset published the new generation through a successor transition that retired the previous live mob member; identity control calls reject stale runtime ids",
                     }));
                     if let Some(store) = &console_events {
                         store
@@ -16222,10 +16222,31 @@ comms = true
         runtime_instance_id: &str,
         identity: &AgentIdentity,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        register_leased_active_identity_on_session(
+            identity_runtime,
+            store,
+            lease_provider,
+            runtime_instance_id,
+            identity,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await
+    }
+
+    /// [`register_leased_active_identity`] bound to `session_id`, the
+    /// session the identity's live member runs.
+    async fn register_leased_active_identity_on_session(
+        identity_runtime: &IdentityRuntime,
+        store: &LocalContinuityStore,
+        lease_provider: &LocalLeaseProvider,
+        runtime_instance_id: &str,
+        identity: &AgentIdentity,
+        session_id: meerkat_core::types::SessionId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let record = ContinuityRecord {
             identity: identity.clone(),
             agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{identity}:0"))?,
-            session_id: meerkat_core::types::SessionId::new(),
+            session_id,
             generation: ContinuityGeneration::new(0),
             checkpoint_version: CheckpointVersion::new(0),
         };
@@ -16374,6 +16395,79 @@ comms = true
                 .all(|event| event.event_type != "identity_retired"),
             "reset_all retires nothing here: {lifecycle:#?}"
         );
+
+        let _ = runtime.handle().stop().await;
+        Ok(())
+    }
+
+    /// A single identity reset answers with what its successor transition
+    /// did: the previous live member was retired, and identity control calls
+    /// reject the stale runtime id. The `identity_reset` lifecycle frame
+    /// carries the same note.
+    #[tokio::test]
+    async fn console_runtime_reset_notes_that_the_successor_transition_retired_the_member()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-reset-successor-note").await?;
+        spawn_identity_control_test_member(&runtime, "review:active", "review:active").await?;
+        let store = Arc::new(LocalContinuityStore::in_memory()?);
+        let lease_provider = Arc::new(LocalLeaseProvider::new());
+        let identity_runtime =
+            reset_all_test_identity_runtime(&store, &lease_provider, "test-runtime");
+        let identity = AgentIdentity::parse("review:active")?;
+        // The registered binding names the live member's own session, so
+        // the reset passes the console's live-binding check.
+        let live_session = runtime
+            .handle()
+            .resolve_bridge_session_id_observation(&crate::member_comms_id::mob_member_id(
+                "review:active",
+            ))
+            .await
+            .expect("spawned member has a bridge session");
+        register_leased_active_identity_on_session(
+            &identity_runtime,
+            &store,
+            &lease_provider,
+            "test-runtime",
+            &identity,
+            live_session,
+        )
+        .await?;
+
+        let console_events = ConsoleEventStore::new();
+        let response = Box::pin(handle_console_runtime_rpc(
+            &runtime,
+            None,
+            None,
+            None,
+            Some(console_events.clone()),
+            None,
+            Some(identity_runtime.clone()),
+            None,
+            None,
+            rpc_request_with_params("meta/reset", json!({ "identity": "review:active" })),
+            true,
+        ))
+        .await;
+        assert_eq!(response["error"], Value::Null, "{response:#?}");
+        let note = json!({
+            "kind": "stale_member_cleanup_skipped_after_identity_reset",
+            "identity": "review:active",
+            "agent_runtime_id": "rt:review:active:1",
+            "message": "reset published the new generation through a successor transition \
+                        that retired the previous live mob member; identity control calls \
+                        reject stale runtime ids",
+        });
+        assert_eq!(response["result"]["cleanup_warning"], note, "{response:#?}");
+        let lifecycle = console_events
+            .replay_all(None)
+            .await
+            .map_err(|err| format!("replay_all: {}", err.error))?;
+        let frame = lifecycle
+            .iter()
+            .find(|event| event.event_type == "identity_reset")
+            .ok_or("the reset records an identity_reset frame")?;
+        assert_eq!(frame.data["cleanup_warning"], note, "{lifecycle:#?}");
 
         let _ = runtime.handle().stop().await;
         Ok(())

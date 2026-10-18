@@ -4996,7 +4996,7 @@ async fn handle_unified_rpc_json_inner(
                 Ok(record) => {
                     let cleanup_warning = Some(serde_json::json!({
                         "kind": "stale_member_cleanup_skipped_after_identity_reset",
-                        "message": "reset published the new generation without retiring stale live mob members; identity control calls reject stale runtime ids",
+                        "message": "reset published the new generation through a successor transition that retired the previous live mob member; identity control calls reject stale runtime ids",
                         "identity": identity.as_str(),
                         "agent_runtime_id": record.agent_runtime_id.as_str(),
                     }));
@@ -8796,6 +8796,20 @@ shell = true
             roster_provider.missing_definition_calls(),
             0,
             "meta/reset must preserve mob_definition when installing the reset roster provider"
+        );
+        // The reset's note: its successor transition retired the previous
+        // live member, and identity control calls reject the stale runtime id.
+        assert_eq!(
+            response["result"]["cleanup_warning"],
+            json!({
+                "kind": "stale_member_cleanup_skipped_after_identity_reset",
+                "message": "reset published the new generation through a successor transition \
+                            that retired the previous live mob member; identity control calls \
+                            reject stale runtime ids",
+                "identity": identity.as_str(),
+                "agent_runtime_id": response["result"]["agent_runtime_id"],
+            }),
+            "{response:#?}"
         );
         assert_eq!(
             bridge
