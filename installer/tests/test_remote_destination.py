@@ -19,6 +19,7 @@ import uuid
 import pytest
 
 from launchkit import remote_destination as controller
+from launchkit.remote_deployment import controller_program
 from launchkit.blueprint import starter_blueprint
 from launchkit.compiler import generate_files
 from launchkit.templates_v2.console_configuration import CONSOLE_FIELDS
@@ -866,7 +867,8 @@ def test_fifo_private_receipt_is_rejected_without_blocking(tmp_path):
 
 def test_actual_isolated_cli_emits_one_bounded_frame_and_no_raw_error(tmp_path):
     source = Path(controller.__file__).read_bytes()
-    bootstrap = "import base64; b=base64.b64decode(" + repr(base64.b64encode(source).decode()) + "); n={'__name__':'launch_remote','CONTROLLER_SOURCE':b}; exec(compile(b,'controller.py','exec'),n); n['main']()"
+    bootstrap = controller_program(source)
+    assert len(bootstrap.encode('utf-8')) < 128 * 1024
     process = subprocess.run([sys.executable, '-I', '-c', bootstrap], input=b'{"action":"private-canary", "action":"status"}',
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
     assert process.returncode == 0 and process.stderr == b''

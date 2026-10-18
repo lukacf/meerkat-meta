@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {build} from 'esbuild';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {createRequire} from 'node:module';
+import {setTimeout as wait} from 'node:timers/promises';
 import React,{act} from 'react';
 import {fingerprint} from './state.mjs';
 import {animationFailureDetail} from './freeform-animation.mjs';
@@ -86,7 +87,9 @@ async function mounted(verify,{strict=false}={}) {
   const settle=callback=>act(async()=>{await callback?.();await new Promise(resolve=>setImmediate(resolve));});
   const mount=(next=currentPlan)=>settle(()=>{currentPlan=next;const element=React.createElement(ProposalSimulation,{plan:next,setupId:'owned-guide'});
     root.render(strict?React.createElement(React.StrictMode,null,element):element);});
-  const until=async check=>{for(let count=0;count<100&&!check();count++)await settle();assert.ok(check(),'Reached the actual owned boundary');};
+  const until=async check=>{const deadline=performance.now()+5000;
+    while(!check()&&performance.now()<deadline)await settle(()=>wait(5));
+    assert.ok(check(),'Reached the actual owned boundary');};
   const fire=(delay,wait=true)=>settle(async()=>{const entry=[...timers].find(([,item])=>item.delay===delay);assert.ok(entry,`Existing ${delay}ms timer`);
     timers.delete(entry[0]);const result=entry[1].callback();if(wait)await result;});
   const button=text=>[...dom.window.document.querySelectorAll('button')].find(item=>item.textContent===text);
