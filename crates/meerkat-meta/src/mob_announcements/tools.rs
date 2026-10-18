@@ -1,14 +1,17 @@
-//! Member tools: a member of this gateway's mob announces into its own mob
-//! and manages its own subscriptions to it.
+//! Member tools: a member announces into its own mob and manages its own
+//! subscriptions.
 //!
 //! A profile opts in by naming [`TOOL_BUNDLE`] in its `tools.rust_bundles`.
-//! The bundle is host-only, so agent-created child mobs never receive it.
-//! Every call is attributed to exactly one member: the member of this
-//! gateway's mob whose session the call comes from, as both the mob roster
-//! and the identity runtime record it. A call that cannot be attributed so is
-//! refused, and nothing is announced or changed for it. Per-member limits
-//! bound how fast a member announces, how much it writes, and how many
-//! subscriptions and topics it holds.
+//! The bundle is host-only unless the gateway sets
+//! `member_tools_in_child_mobs`, which gives it to every inline profile of
+//! every mob a member creates. Every call is attributed to exactly one
+//! member: the member of this gateway's mob whose session the call comes
+//! from, as both the mob roster and the identity runtime record it, or, for
+//! a member of a mob a member created, as the session's persisted member
+//! binding and that mob's roster record it. A call that cannot be
+//! attributed so is refused, and nothing is announced or changed for it.
+//! Per-member limits bound how fast a member announces, how much it
+//! writes, and how many subscriptions and topics it holds.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -24,9 +27,9 @@ use serde_json::{Value, json};
 
 use super::owner::{AnnouncementError, AnnouncementService};
 use super::types::{
-    AnnounceRequest, Announcer, MAX_PAGE, Member, MemberIdentity, MemberRouteRecord, MobId,
-    OperationId, PutSubscription, Selector, SourceKey, StartFrontier, Subscription,
-    SubscriptionChange, SubscriptionId, Topic,
+    AnnounceRequest, Announcer, ChildMemberLimits, MAX_PAGE, Member, MemberIdentity,
+    MemberRouteRecord, MobId, OperationId, PutSubscription, Selector, SourceKey, StartFrontier,
+    Subscription, SubscriptionChange, SubscriptionId, Topic,
 };
 
 /// The name a profile lists in `tools.rust_bundles` to get the member tools.
@@ -97,6 +100,9 @@ pub(crate) struct RosterCallerResolver {
     /// A non-owning handle: it never keeps the mob open.
     mob: meerkat_mob::MobHandle,
     identities: Arc<crate::identity_first::IdentityRuntime>,
+    /// Reads the records of callers in mobs members created; `None` when
+    /// those mobs are not offered the tools.
+    children: Option<Arc<super::native::MobNativeDelivery>>,
 }
 
 impl RosterCallerResolver {
@@ -104,11 +110,13 @@ impl RosterCallerResolver {
         own_mob: MobId,
         mob: meerkat_mob::MobHandle,
         identities: Arc<crate::identity_first::IdentityRuntime>,
+        children: Option<Arc<super::native::MobNativeDelivery>>,
     ) -> Self {
         Self {
             own_mob,
             mob,
             identities,
+            children,
         }
     }
 }
@@ -122,6 +130,12 @@ impl CallerResolver for RosterCallerResolver {
             .filter(|entry| entry.bridge_session_id() == Some(session))
             .map(|entry| entry.agent_identity.as_str().to_string())
             .collect::<Vec<_>>();
+        if bound.is_empty()
+            && let Some(children) = &self.children
+        {
+            let records = children.child_caller_records(session).await?;
+            return attribute_child(&self.own_mob, session, &records);
+        }
         attribute(&self.own_mob, session, &bound, |agent| async move {
             let status =
                 self.identities.status(&agent).await.map_err(|error| {
@@ -188,6 +202,44 @@ where
     }
     let identity = MemberIdentity::new(identity).map_err(|error| error.to_string())?;
     Ok(Member::new(own_mob.clone(), identity))
+}
+
+/// What Meerkat records for a call from a session that is not on this
+/// gateway's own mob roster.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ChildCallerRecords {
+    /// The member binding persisted with the calling session: its mob, role
+    /// and roster id.
+    pub(crate) binding: Option<(String, String, String)>,
+    /// That member's roster entry in that mob now: its session and role.
+    pub(crate) entry: Option<(Option<String>, String)>,
+}
+
+/// Attribute a call from `session` to a member of a mob hosted here other
+/// than `own_mob`: the session's persisted member binding names the member,
+/// and that mob's roster binds this very session to the member under the
+/// same role. Anything else is refused.
+pub(crate) fn attribute_child(
+    own_mob: &MobId,
+    session: &SessionId,
+    records: &ChildCallerRecords,
+) -> Result<Member, String> {
+    let Some((mob_id, role, member)) = &records.binding else {
+        return Err("the calling session is not a member of a mob hosted here".into());
+    };
+    if mob_id == own_mob.as_str() {
+        return Err("the calling session is not on this gateway's mob roster".into());
+    }
+    let Some((entry_session, entry_role)) = &records.entry else {
+        return Err("the calling member is not on its mob's roster".into());
+    };
+    let session = session.to_string();
+    if entry_session.as_deref() != Some(session.as_str()) || entry_role != role {
+        return Err("the mob roster does not bind the calling session to this member".into());
+    }
+    let mob_id = MobId::new(mob_id.clone()).map_err(|error| error.to_string())?;
+    let identity = MemberIdentity::new(member.clone()).map_err(|error| error.to_string())?;
+    Ok(Member::new(mob_id, identity))
 }
 
 /// What the bundle serves from. Set once, when mob announcements are
@@ -602,6 +654,7 @@ async fn subscription(
                         expected_revision,
                         route: MemberRouteRecord::default(),
                         member_mob_cursor: None,
+                        child_limits: ChildMemberLimits::default(),
                     },
                 )
                 .await

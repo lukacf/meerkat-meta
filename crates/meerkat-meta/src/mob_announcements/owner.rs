@@ -26,11 +26,11 @@ use super::native::{
 use super::store::AnnouncementStore;
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
-    BatchGap, BatchId, BatchPosition, BatchQuery, BatchState, BatchStateTag, GapReason,
-    MAX_REMOTE_BODY_WIRE_BYTES, Member, MemberRouteRecord, MobId, MobIncarnation, MobLineage,
-    NativeReceipt, OperationId, PutSubscription, SealingPolicy, SourceKey, Subscription,
-    SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
-    SubscriptionState, SuccessorBatch, merge_gaps, render_batch, render_item,
+    BatchGap, BatchId, BatchPosition, BatchQuery, BatchState, BatchStateTag, ChildMemberLimits,
+    GapReason, MAX_REMOTE_BODY_WIRE_BYTES, Member, MemberRouteRecord, MobId, MobIncarnation,
+    MobLineage, NativeReceipt, OperationId, PutSubscription, SealingPolicy, SourceKey,
+    Subscription, SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
+    SubscriptionState, SuccessorBatch, merge_gaps, render_item, successor_batch,
 };
 
 /// The owner's error for a member a put cannot subscribe.
@@ -87,6 +87,12 @@ pub struct AnnouncementConfig {
     /// clock: a request older than this is refused as stale, so a batch
     /// for a peer member whose last attempt is older may expire.
     pub peer_request_window_ms: u64,
+    /// Bounds on subscriptions for members of mobs hosted here other than
+    /// this gateway's own.
+    pub child_limits: ChildMemberLimits,
+    /// Whether every inline profile of every mob a member creates gets the
+    /// member tools, so the members of those mobs subscribe themselves.
+    pub member_tools_in_child_mobs: bool,
 }
 
 impl Default for AnnouncementConfig {
@@ -98,6 +104,8 @@ impl Default for AnnouncementConfig {
             settle_check_max_ms: 30_000,
             member_limits: super::tools::MemberLimits::default(),
             peer_request_window_ms: crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS,
+            child_limits: ChildMemberLimits::default(),
+            member_tools_in_child_mobs: false,
         }
     }
 }
@@ -278,6 +286,9 @@ struct Walk {
     due: BTreeMap<BatchPosition, u64>,
     /// When a batch that keeps failing was last reported.
     reported: BTreeMap<BatchPosition, u64>,
+    /// Members whose backlog failed to seal since it last sealed: reported
+    /// once until it seals again or is gone.
+    unsealed: BTreeSet<Member>,
 }
 
 impl Walk {
@@ -578,6 +589,7 @@ impl AnnouncementService {
             return Err(member_problem(&request.member, problem));
         }
         request.route = route;
+        request.child_limits = self.inner.config.child_limits;
         let mobs = self.ensure_hosted(&request.selector.mobs).await?;
         let member_mob = request.member.mob_id.clone();
         let subscription = self
@@ -1134,11 +1146,17 @@ impl AnnouncementService {
             }
         }
         let policy = config.policy;
-        for backlog in self.inner.store.backlogs(ROUND_MEMBERS).await? {
+        let backlogs = self.inner.store.backlogs(ROUND_MEMBERS).await?;
+        walk.unsealed
+            .retain(|member| backlogs.iter().any(|backlog| backlog.member == *member));
+        for backlog in backlogs {
             match policy.due_at(&backlog) {
                 Some(due) if due <= now => {
                     let id = new_batch_id()?;
                     let sealed = self.seal_backlog(&backlog.member, &id, &policy, now).await;
+                    if sealed.is_ok() {
+                        walk.unsealed.remove(&backlog.member);
+                    }
                     match sealed {
                         Ok(Some(batch)) => {
                             report.sealed += 1;
@@ -1152,11 +1170,22 @@ impl AnnouncementService {
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            tracing::warn!(
-                                member = %backlog.member,
-                                %error,
-                                "announcement backlog not sealed this round"
-                            );
+                            // Reported once while it keeps failing: a mob
+                            // held until its owner resolves fails every
+                            // round until it runs again.
+                            if walk.unsealed.insert(backlog.member.clone()) {
+                                tracing::warn!(
+                                    member = %backlog.member,
+                                    %error,
+                                    "announcement backlog not sealed this round"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    member = %backlog.member,
+                                    %error,
+                                    "announcement backlog still not sealed"
+                                );
+                            }
                             report.next_due_ms = min_due(
                                 report.next_due_ms,
                                 Some(now.saturating_add(config.settle_check_max_ms)),
@@ -1462,9 +1491,13 @@ impl AnnouncementService {
                 }),
             }
         }
-        let gaps = merge_gaps(&batch.gaps, &not_retained);
-        let body = render_batch(&id, Some(&batch.id), &gaps, &items);
-        Ok(Some(SuccessorBatch { id, body, gaps }))
+        Ok(Some(successor_batch(
+            id,
+            &batch.id,
+            merge_gaps(&batch.gaps, &not_retained),
+            &items,
+            wire_budget(batch.route),
+        )))
     }
 
     /// For a member kept for a mob a member created: end its subscriptions

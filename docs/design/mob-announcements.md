@@ -76,7 +76,8 @@ the member's next batch opens with a gap line per mob saying how many
 announcements it did not receive and why (`expired` or `not_retained`), and
 the batch's `gaps` field carries the same counts. A batch for a member on a
 peer gateway carries as many gap lines as fit what its items leave of one
-request; the rest wait for the next batch. A batch that ends without
+request; the rest wait for the next batch. A successor does the same, since
+a gap line can be longer than the item it stands for. A batch that ends without
 delivering (cancelled, refused, blocked, or stranded with no successor)
 hands its gap lines to the member's next batch.
 
@@ -160,8 +161,13 @@ pace.
 ## Member tools
 
 A member profile opts into the `mob_announcements` tool bundle by listing it
-in `tools.rust_bundles`. The bundle is host-only: agent-created child mobs
-never receive it. It has two tools:
+in `tools.rust_bundles`. By default the bundle is host-only: mobs members
+create never receive it, and the host RPC subscribes their members (see
+Members of mobs members created). With `member_tools_in_child_mobs` set,
+every inline profile of every mob a member creates gets the bundle, with a
+profile's deny list as the only narrowing: every member of those mobs can
+then subscribe itself to the announcements of every mob above its own and
+announce into its own. It has two tools:
 
 - `mob_announce` `{topics, body, key?, correlation_id?}`: announce into the
   caller's own mob, as `{"kind": "member", "identity": ...}`. A retry with
@@ -177,8 +183,11 @@ never receive it. It has two tools:
 
 Every call is attributed to exactly one member: the member of this gateway's
 mob whose session the call comes from, as both the mob roster and the
-identity runtime record it. A call that cannot be attributed so is refused
-and changes nothing. A member's keys and subscription names live in a
+identity runtime record it, or, with `member_tools_in_child_mobs`, the
+member of a mob a member created that the session's persisted member
+binding names and that mob's roster binds to the same session under the
+same role. A call that cannot be attributed so is refused and changes
+nothing. A member's keys and subscription names live in a
 namespace of their own, so no member can reach or learn another member's.
 Per-member limits (`member_limits`, defaults shown below) bound announcements
 and bytes per minute, live subscriptions, and topics per subscription; the
@@ -232,6 +241,16 @@ hosted its record ends; ended records are removed by retention once no
 live record names the mob as parent. A mob held after a restart keeps its
 record; a held mob whose parent's record ended loses its reach upward.
 
+Every reader lists the mobs hosted here in one order. The managed listing
+comes first only to finish the restore of persisted mobs: it fails rather
+than answer before the restore, where the held listing answers empty. Held
+mobs come next, then running ones: activation adds a held mob to the
+running ones before it drops the hold, so a mob that activates between two
+reads is in one of them. Today a held mob stays held until a later restart:
+Meerkat activates or tears down a held mob only within its restore, or when
+its host calls for that, which this gateway never does. The order protects
+activation paths still to come.
+
 ## Members of mobs members created
 
 A member of a mob hosted here other than this gateway's own (a mob a member
@@ -273,6 +292,13 @@ records:
 - `destroyed`: the mob is neither running nor held after this gateway
   restored every mob it hosts. The mob set reconcile ends the member's
   subscriptions, as does the next delivery.
+
+Subscriptions for these members are bounded, whoever makes them:
+`child_member_limits.subscriptions` live ones on the gateway (1024 by
+default), and `child_member_limits.per_mob` live ones naming any one mob
+(256), so one announcement is captured for at most that many of them. A put
+past either is refused with `child_member_limit` and changes nothing; an
+ended or cancelled subscription no longer counts.
 
 A delivery already committed to a member of a mob that is then destroyed
 stays pending in Meerkat, which keeps a delivery to a mob it does not host
@@ -323,6 +349,11 @@ persistent, identity-first launch:
       "announcement_bytes_per_minute": 65536,
       "subscriptions": 8,
       "topics_per_subscription": 16
+    },
+    "member_tools_in_child_mobs": false,
+    "child_member_limits": {
+      "subscriptions": 1024,
+      "per_mob": 256
     }
   }
 }

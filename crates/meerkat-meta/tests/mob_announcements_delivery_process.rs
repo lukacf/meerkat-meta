@@ -62,6 +62,23 @@ const ANNOUNCED_BODY: &str = "refunds to every card issuer are delayed by one da
 const ANNOUNCED_KEY: &str = "refund-delays";
 /// The member tools, as the model is offered them.
 const MEMBER_TOOLS: [&str; 2] = ["mob_announce", "mob_subscription"];
+/// A member of the gateway's mob whose profile may create mobs.
+const LEAD: &str = "agent:lead";
+/// The mob the lead creates, and the member it spawns there.
+const CHILD_MOB: &str = "announcement-child-mob";
+const CHILD_MEMBER: &str = "worker-1";
+/// The prompt the loopback model answers by creating the child mob and
+/// spawning its member.
+const CREATE_MARKER: &str = "CREATE-CHILD-MOB";
+/// The child member's first prompt: offered the member tools, it subscribes
+/// itself to the lead's mob.
+const SUBSCRIBE_MARKER: &str = "SUBSCRIBE-TO-THE-ROOT-MOB";
+/// The prompt the loopback model answers by destroying the child mob.
+const DESTROY_MARKER: &str = "DESTROY-CHILD-MOB";
+/// The prompt the loopback model answers by retiring the child member.
+const RETIRE_MARKER: &str = "RETIRE-CHILD-MEMBER";
+/// The subscription the child member makes for itself.
+const CHILD_SUBSCRIPTION: &str = "from-the-root";
 
 const INIT_TIMEOUT: Duration = Duration::from_mins(3);
 const RPC_TIMEOUT: Duration = Duration::from_mins(1);
@@ -96,6 +113,16 @@ runtime_mode = "turn_driven"
 [profiles.announcer.tools]
 comms = true
 rust_bundles = ["mob_announcements"]
+
+[profiles.lead]
+model = "{MODEL}"
+provider = "self_hosted"
+external_addressable = true
+runtime_mode = "turn_driven"
+
+[profiles.lead.tools]
+comms = true
+mob = true
 "#
     )
 }
@@ -143,6 +170,7 @@ family = "{MODEL}"
     );
     config.push_str(&realm_binding("global"));
     config.push_str(&realm_binding(&format!("mob.{MOB_ID}")));
+    config.push_str(&realm_binding(&format!("mob.{CHILD_MOB}")));
     config
 }
 
@@ -189,6 +217,24 @@ fn announcer_roster_spec() -> Value {
 /// A member of this gateway's mob, in the form every method takes.
 fn member(identity: &str) -> Value {
     json!({ "mob_id": MOB_ID, "identity": identity })
+}
+
+/// A roster row for the member whose profile may create mobs.
+fn lead_roster_spec() -> Value {
+    json!({
+        "identity": LEAD,
+        "profile": "lead",
+        "addressability": "addressable",
+        "display_name": null,
+        "labels": {},
+        "context": null,
+        "additional_instructions": []
+    })
+}
+
+/// The member of the child mob, by its plain roster id.
+fn child_member() -> Value {
+    json!({ "mob_id": CHILD_MOB, "identity": CHILD_MEMBER })
 }
 
 /// The stderr line a fault point prints right before it aborts the process.
@@ -274,6 +320,106 @@ fn offered_tools(request: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The name of the last tool the model called in a chat-completions
+/// request's history.
+fn last_tool_called(request: &Value) -> Option<String> {
+    request["messages"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find_map(|message| {
+            message["tool_calls"].as_array()?.first()?["function"]["name"]
+                .as_str()
+                .map(str::to_owned)
+        })
+}
+
+/// A streamed reply that is one call of `name` with `arguments`.
+fn tool_call(id: &str, name: &str, arguments: &Value) -> String {
+    let call = json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments.to_string() }
+                }]
+            }
+        }]
+    });
+    let done = json!({
+        "choices": [{ "finish_reason": "tool_calls" }],
+        "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+    });
+    format!("data: {call}\n\ndata: {done}\n\ndata: [DONE]\n\n")
+}
+
+/// The lead's calls: create the child mob, then spawn its member with the
+/// prompt that subscribes it.
+fn create_child_call() -> String {
+    tool_call(
+        "call-create-1",
+        "mob_create",
+        &json!({
+            "definition": {
+                "id": CHILD_MOB,
+                "profiles": {
+                    "worker": {
+                        "model": MODEL,
+                        "provider": "self_hosted",
+                        "runtime_mode": "turn_driven",
+                        "tools": { "comms": true }
+                    }
+                }
+            }
+        }),
+    )
+}
+
+fn spawn_child_call() -> String {
+    tool_call(
+        "call-spawn-1",
+        "mob_spawn_member",
+        &json!({
+            "mob_id": CHILD_MOB,
+            "profile": "worker",
+            "member_id": CHILD_MEMBER,
+            "runtime_mode": "turn_driven",
+            "initial_message": format!("{SUBSCRIBE_MARKER}: follow the root mob")
+        }),
+    )
+}
+
+fn subscribe_call() -> String {
+    tool_call(
+        "call-subscribe-1",
+        "mob_subscription",
+        &json!({
+            "action": "subscribe",
+            "subscription": CHILD_SUBSCRIPTION,
+            "topics": [TOPIC],
+            "mobs": [MOB_ID]
+        }),
+    )
+}
+
+fn retire_child_member_call() -> String {
+    tool_call(
+        "call-retire-1",
+        "mob_retire_member",
+        &json!({ "mob_id": CHILD_MOB, "member_id": CHILD_MEMBER }),
+    )
+}
+
+fn destroy_child_call() -> String {
+    tool_call(
+        "call-destroy-1",
+        "mob_destroy",
+        &json!({ "mob_id": CHILD_MOB }),
+    )
+}
+
 /// A streamed reply that is one `mob_announce` call and nothing else.
 fn announce_call() -> String {
     let arguments = json!({
@@ -307,6 +453,7 @@ async fn chat_completions(
 ) -> impl axum::response::IntoResponse {
     let last = last_message_text(&request);
     let answers_a_tool = last_message_role(&request) == "tool";
+    let request_seen = request.clone();
     let hold = {
         let mut log = log.lock().unwrap();
         log.requests.push(request);
@@ -323,6 +470,34 @@ async fn chat_completions(
     }
     if last.contains(ANNOUNCE_MARKER) && !answers_a_tool {
         return ([("content-type", "text/event-stream")], announce_call());
+    }
+    if answers_a_tool && last_tool_called(&request_seen) == Some("mob_create".to_string()) {
+        return ([("content-type", "text/event-stream")], spawn_child_call());
+    }
+    if !answers_a_tool {
+        if last.contains(CREATE_MARKER) {
+            return ([("content-type", "text/event-stream")], create_child_call());
+        }
+        if last.contains(DESTROY_MARKER) {
+            return (
+                [("content-type", "text/event-stream")],
+                destroy_child_call(),
+            );
+        }
+        if last.contains(RETIRE_MARKER) {
+            return (
+                [("content-type", "text/event-stream")],
+                retire_child_member_call(),
+            );
+        }
+        // Only a member offered the member tools can subscribe itself.
+        if last.contains(SUBSCRIBE_MARKER)
+            && offered_tools(&request_seen)
+                .iter()
+                .any(|tool| tool == "mob_subscription")
+        {
+            return ([("content-type", "text/event-stream")], subscribe_call());
+        }
     }
     let reply = if answers_a_tool {
         "announced the refund delays"
@@ -1125,5 +1300,401 @@ fn a_member_announces_from_its_own_turn_as_itself() {
         log.requests.len()
     );
     drop(log);
+    gateway.shutdown_and_reap();
+}
+
+// ---------------------------------------------------------------------------
+// Members of a mob a member created
+// ---------------------------------------------------------------------------
+
+/// Boot a gateway whose roster is the lead alone, sealing an owed
+/// announcement at once, with or without the member tools in the mobs its
+/// members create.
+fn boot_lead(label: &str, state: &Path, host_config: &Path, child_tools: bool) -> Gateway {
+    let mut gateway = Gateway::start(label, None);
+    gateway.roster = vec![lead_roster_spec()];
+    let response = gateway.request(
+        "meta/init",
+        json!({
+            "persistent_state": state,
+            "mob_config": mob_config(),
+            "has_roster_provider": true,
+            "runtime_options": {
+                "meerkat_config_path": host_config,
+                "identity_bootstrap_mode": { "mode": "eager_materialize" },
+                "mob_announcements": {
+                    "enabled": true,
+                    "batch": {
+                        "max_count": 256,
+                        "max_bytes": 1_048_576,
+                        "max_delay_ms": 0,
+                        "min_wake_interval_ms": 0
+                    },
+                    "member_tools_in_child_mobs": child_tools
+                }
+            }
+        }),
+        INIT_TIMEOUT,
+    );
+    assert!(
+        response.get("error").is_none(),
+        "[{label}] init failed: {response}\n{}",
+        gateway.stderr_tail()
+    );
+    gateway
+}
+
+/// The lead creates the child mob and spawns its member, whose first turn
+/// answers the subscribe prompt. Returns once that turn reached the model.
+fn create_child(gateway: &mut Gateway, log: &Arc<Mutex<ModelLog>>) {
+    gateway.call(
+        "meta/send",
+        json!({ "identity": LEAD, "content": format!("{CREATE_MARKER}: start a team") }),
+    );
+    let start = Instant::now();
+    loop {
+        gateway.pump();
+        let log = log.lock().unwrap();
+        if log.requests.iter().any(|request| {
+            last_message_role(request) != "tool"
+                && last_message_text(request).contains(SUBSCRIBE_MARKER)
+        }) {
+            return;
+        }
+        if start.elapsed() > SETTLE_TIMEOUT {
+            let answered = log
+                .requests
+                .iter()
+                .filter(|request| last_message_role(request) == "tool")
+                .map(|request| (last_tool_called(request), last_message_text(request)))
+                .collect::<Vec<_>>();
+            panic!(
+                "the child member's first turn never reached the model; the lead's \
+                 tools answered {answered:?}\n{}",
+                gateway.stderr_tail()
+            );
+        }
+        drop(log);
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The tools the child member's first turn was offered.
+fn child_turn_tools(log: &Arc<Mutex<ModelLog>>) -> Vec<String> {
+    let log = log.lock().unwrap();
+    let turn = log
+        .requests
+        .iter()
+        .find(|request| {
+            last_message_role(request) != "tool"
+                && last_message_text(request).contains(SUBSCRIBE_MARKER)
+        })
+        .expect("the child member's first turn");
+    offered_tools(turn)
+}
+
+/// Announce into the lead's mob and wait until the child member's batch is
+/// delivered; returns its id.
+fn announce_and_deliver_to_child(gateway: &mut Gateway, key: &str) -> String {
+    gateway.call(
+        "meta/mob_announcements/announce",
+        json!({
+            "mob_id": MOB_ID,
+            "source_key": key,
+            "topics": [TOPIC],
+            "body": format!("{key}: the payment provider is degraded")
+        }),
+    );
+    let start = Instant::now();
+    loop {
+        assert!(
+            start.elapsed() < SETTLE_TIMEOUT,
+            "the child member never received {key}\n{}",
+            gateway.stderr_tail()
+        );
+        let delivered = gateway.call(
+            "meta/mob_announcements/deliveries/list",
+            json!({ "member": child_member() }),
+        )["deliveries"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|batch| {
+                batch["state"]["state"] == json!("delivered")
+                    && batch["body"]
+                        .as_str()
+                        .is_some_and(|body| body.contains(key))
+            });
+        if let Some(batch) = delivered {
+            return batch["id"].as_str().expect("a batch id").to_owned();
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Prompt the lead, and wait until the `tool` call its turn makes has
+/// returned to the model; returns what the tool answered.
+fn lead_calls(
+    gateway: &mut Gateway,
+    log: &Arc<Mutex<ModelLog>>,
+    prompt: &str,
+    tool: &str,
+) -> String {
+    gateway.call("meta/send", json!({ "identity": LEAD, "content": prompt }));
+    let mut answer = None;
+    wait_until(
+        &format!("the lead's {tool} call to return"),
+        SETTLE_TIMEOUT,
+        || {
+            gateway.pump();
+            answer = log
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .find(|request| {
+                    last_message_role(request) == "tool"
+                        && last_tool_called(request).as_deref() == Some(tool)
+                })
+                .map(last_message_text);
+            answer.is_some()
+        },
+    );
+    answer.unwrap_or_default()
+}
+
+/// The child member's subscription named `id`, as the host reads it now.
+fn child_subscription(gateway: &mut Gateway, id: &str) -> Value {
+    gateway.call(
+        "meta/mob_announcements/subscriptions/get",
+        json!({ "subscription_id": id }),
+    )["subscription"]
+        .clone()
+}
+
+/// Wait until the subscription named `id` has ended; returns it.
+fn wait_until_ended(gateway: &mut Gateway, id: &str) -> Value {
+    let start = Instant::now();
+    loop {
+        assert!(
+            start.elapsed() < SETTLE_TIMEOUT,
+            "the child member's subscription never ended\n{}",
+            gateway.stderr_tail()
+        );
+        let current = child_subscription(gateway, id);
+        if current["state"] == json!("ended") {
+            return current;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// P1: with `member_tools_in_child_mobs`, a member of a mob the lead
+/// created is offered the member tools, subscribes itself to the lead's
+/// mob from its own turn, and receives what is announced there.
+#[test]
+fn a_member_of_a_mob_a_member_created_subscribes_itself_to_the_mob_above() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+    let mut gateway = boot_lead("child-tools", state.path(), &host_config, true);
+
+    create_child(&mut gateway, &log);
+    let offered = child_turn_tools(&log);
+    for tool in MEMBER_TOOLS {
+        assert!(
+            offered.iter().any(|name| name == tool),
+            "the child's profile is given {tool}: {offered:?}"
+        );
+    }
+    // Its own subscription, attributed to it, names the lead's mob.
+    let start = Instant::now();
+    let subscription = loop {
+        assert!(
+            start.elapsed() < SETTLE_TIMEOUT,
+            "the child member never subscribed itself\n{}",
+            gateway.stderr_tail()
+        );
+        let listed = gateway.call(
+            "meta/mob_announcements/subscriptions/list",
+            json!({ "member": child_member() }),
+        )["subscriptions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(subscription) = listed.into_iter().next() {
+            break subscription;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(subscription["member"], child_member(), "{subscription}");
+    assert_eq!(
+        subscription["selector"]["mobs"],
+        json!([MOB_ID]),
+        "{subscription}"
+    );
+    assert_eq!(subscription["state"], json!("active"), "{subscription}");
+
+    announce_and_deliver_to_child(&mut gateway, "outage-1");
+    gateway.shutdown_and_reap();
+}
+
+/// Boot a gateway whose lead creates a mob and spawns its member, and
+/// subscribe that member to the lead's mob through the host RPC. Without
+/// the option the member is not offered the member tools.
+fn host_subscribed_child(
+    label: &str,
+    state: &Path,
+    host_config: &Path,
+    log: &Arc<Mutex<ModelLog>>,
+) -> (Gateway, Value) {
+    let mut gateway = boot_lead(label, state, host_config, false);
+    create_child(&mut gateway, log);
+    let offered = child_turn_tools(log);
+    for tool in MEMBER_TOOLS {
+        assert!(
+            !offered.iter().any(|name| name == tool),
+            "the member tools are host-only by default: {offered:?}"
+        );
+    }
+    let subscription = gateway.call(
+        "meta/mob_announcements/subscriptions/put",
+        json!({
+            "operation_id": "subscribe-child",
+            "subscription_id": "child-from-root",
+            "member": child_member(),
+            "topics": [TOPIC],
+            "mobs": [MOB_ID]
+        }),
+    )["subscription"]
+        .clone();
+    assert_eq!(subscription["state"], json!("active"), "{subscription}");
+    (gateway, subscription)
+}
+
+/// P2: the host RPC subscribes a member of a mob the lead created to the
+/// lead's mob, and it receives what is announced there. A restart restores
+/// the child mob with every other: its owner's session is durable, so it is
+/// not held. The subscription stays active and the member is delivered to
+/// again.
+#[test]
+fn the_host_subscribes_a_member_of_a_mob_a_member_created_across_a_restart() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+    let (mut gateway, subscription) =
+        host_subscribed_child("child-host-1", state.path(), &host_config, &log);
+    announce_and_deliver_to_child(&mut gateway, "outage-1");
+    gateway.shutdown_and_reap();
+    drop(gateway);
+
+    // The same state again: the child mob is restored, running.
+    let mut gateway = boot_lead("child-host-2", state.path(), &host_config, false);
+    announce_and_deliver_to_child(&mut gateway, "outage-2");
+    let current = child_subscription(&mut gateway, "child-from-root");
+    assert_eq!(current["state"], json!("active"), "{current}");
+    assert_eq!(current["revision"], subscription["revision"], "{current}");
+    gateway.shutdown_and_reap();
+}
+
+/// P3: a member retired from its mob's roster has no live incarnation to
+/// deliver to, so its batch waits and nothing ends. Destroying its mob then
+/// ends the subscription as `member_mob_ended`.
+#[test]
+fn a_retired_member_waits_until_its_destroyed_mob_ends_the_subscription() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+    let (mut gateway, _) = host_subscribed_child("child-retire", state.path(), &host_config, &log);
+    announce_and_deliver_to_child(&mut gateway, "outage-1");
+
+    // The lead retires the member: off its mob's roster, it has no live
+    // incarnation to deliver to, so its batch waits and nothing ends.
+    let answer = lead_calls(
+        &mut gateway,
+        &log,
+        &format!("{RETIRE_MARKER}: the worker is done"),
+        "mob_retire_member",
+    );
+    gateway.call(
+        "meta/mob_announcements/announce",
+        json!({
+            "mob_id": MOB_ID,
+            "source_key": "outage-2",
+            "topics": [TOPIC],
+            "body": "outage-2: the payment provider is degraded"
+        }),
+    );
+    let start = Instant::now();
+    let waiting = loop {
+        if start.elapsed() > SETTLE_TIMEOUT {
+            let listed = gateway.call(
+                "meta/mob_announcements/deliveries/list",
+                json!({ "member": child_member() }),
+            );
+            panic!(
+                "no batch was submitted for the retired member; retire answered \
+                 {answer}; deliveries {listed}\n{}",
+                gateway.stderr_tail()
+            );
+        }
+        if child_subscription(&mut gateway, "child-from-root")["state"] == json!("ended") {
+            break None;
+        }
+        let submitting = gateway.call(
+            "meta/mob_announcements/deliveries/list",
+            json!({ "member": child_member() }),
+        )["deliveries"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|batch| {
+                batch["state"]["state"] == json!("submitting")
+                    && batch["body"]
+                        .as_str()
+                        .is_some_and(|body| body.contains("outage-2"))
+            });
+        if let Some(batch) = submitting {
+            break Some(batch);
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    if let Some(batch) = &waiting {
+        // One more attempt, made and answered before this returns.
+        gateway.call(
+            "meta/mob_announcements/deliveries/reconcile",
+            json!({ "batch_id": batch["id"] }),
+        );
+    }
+    let current = child_subscription(&mut gateway, "child-from-root");
+    assert_eq!(
+        current["state"],
+        json!("active"),
+        "{current}\nretire answered: {answer}"
+    );
+    assert!(waiting.is_some(), "the batch waits for the member");
+
+    // The lead destroys the child mob: the subscription ends typed.
+    gateway.call(
+        "meta/send",
+        json!({ "identity": LEAD, "content": format!("{DESTROY_MARKER}: the team is done") }),
+    );
+    let ended = wait_until_ended(&mut gateway, "child-from-root");
+    assert_eq!(
+        ended["ended"],
+        json!({ "kind": "member_mob_ended", "why": "destroyed" }),
+        "{ended}"
+    );
     gateway.shutdown_and_reap();
 }

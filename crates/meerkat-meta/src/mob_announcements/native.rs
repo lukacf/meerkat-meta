@@ -511,6 +511,137 @@ fn native_status(status: meerkat::ContinuationStatus) -> NativeStatus {
     }
 }
 
+/// The agent mob tool state's listings of the mobs hosted here. A seam:
+/// which mobs a reader finds depends on the order it reads them in.
+#[async_trait]
+pub(crate) trait HostedListings: Send + Sync {
+    /// A running mob's handle.
+    type Handle: Send;
+
+    /// Every managed mob with its state. Fails until the restore of
+    /// persisted mobs is done.
+    async fn mob_list(
+        &self,
+    ) -> Result<Vec<(meerkat_mob::MobId, meerkat_mob::MobState)>, meerkat_mob::MobError>;
+
+    /// The restored mobs held until their owner resolves. Empty when the
+    /// restore fails.
+    async fn held_child_mobs(&self) -> Vec<(meerkat_mob::MobId, meerkat_core::types::SessionId)>;
+
+    /// The handles of the managed mobs not destroyed. Fails until the
+    /// restore is done.
+    async fn mob_handles_snapshot(
+        &self,
+    ) -> Result<Vec<(meerkat_mob::MobId, Self::Handle)>, meerkat_mob::MobError>;
+}
+
+#[async_trait]
+impl HostedListings for meerkat_mob_mcp::MobMcpState {
+    type Handle = meerkat_mob::MobHandle;
+
+    async fn mob_list(
+        &self,
+    ) -> Result<Vec<(meerkat_mob::MobId, meerkat_mob::MobState)>, meerkat_mob::MobError> {
+        meerkat_mob_mcp::MobMcpState::mob_list(self).await
+    }
+
+    async fn held_child_mobs(&self) -> Vec<(meerkat_mob::MobId, meerkat_core::types::SessionId)> {
+        meerkat_mob_mcp::MobMcpState::held_child_mobs(self).await
+    }
+
+    async fn mob_handles_snapshot(
+        &self,
+    ) -> Result<Vec<(meerkat_mob::MobId, meerkat_mob::MobHandle)>, meerkat_mob::MobError> {
+        meerkat_mob_mcp::MobMcpState::mob_handles_snapshot(self).await
+    }
+}
+
+/// Every mob hosted here, this gateway's own included: managed and not
+/// destroyed, or restored and held until its owner resolves.
+///
+/// The managed listing is read first only to finish the restore of
+/// persisted mobs: it fails rather than answer before the restore, where
+/// the held listing answers empty. Held mobs are then read before managed
+/// ones, because activation adds a held mob to the managed ones before it
+/// drops the hold: a mob that activates between the two reads is in one of
+/// them.
+pub(crate) async fn hosted_set<L: HostedListings>(
+    listings: &L,
+) -> Result<BTreeSet<String>, NativeUnavailable> {
+    managed_listing(listings).await?;
+    let held = held_listing(listings).await;
+    let managed = managed_listing(listings)
+        .await?
+        .into_iter()
+        .filter(|(_, state)| *state != meerkat_mob::MobState::Destroyed)
+        .map(|(mob_id, _)| mob_id.as_str().to_string());
+    Ok(held.into_iter().chain(managed).collect())
+}
+
+/// The held mobs and the running mobs' handles, read in the order
+/// [`hosted_set`] reads them in: the restore finished, then held, then
+/// running. A mob in neither is not one still being restored, nor one
+/// about to run.
+pub(crate) async fn hosted_handles<L: HostedListings>(
+    listings: &L,
+) -> Result<(BTreeSet<String>, Vec<(meerkat_mob::MobId, L::Handle)>), NativeUnavailable> {
+    managed_listing(listings).await?;
+    let held = held_listing(listings).await;
+    let running = listings
+        .mob_handles_snapshot()
+        .await
+        .map_err(|error| NativeUnavailable(error.to_string()))?;
+    Ok((held, running))
+}
+
+/// The mobs hosted here other than `own`. An id this store cannot hold is
+/// skipped, so the others stay readable, and warned about once: `warned`
+/// keeps the ids already reported.
+pub(crate) async fn hosted_mob_ids_in<L: HostedListings>(
+    listings: &L,
+    own: &MobId,
+    warned: &std::sync::Mutex<BTreeSet<String>>,
+) -> Result<BTreeSet<MobId>, NativeUnavailable> {
+    Ok(hosted_set(listings)
+        .await?
+        .into_iter()
+        .filter(|mob_id| mob_id != own.as_str())
+        .filter_map(|mob_id| match MobId::new(mob_id.clone()) {
+            Ok(mob_id) => Some(mob_id),
+            Err(error) => {
+                let first = warned
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(mob_id.clone());
+                if first {
+                    tracing::warn!(mob = %mob_id, %error, "hosted mob id not usable here");
+                }
+                None
+            }
+        })
+        .collect())
+}
+
+/// The managed mobs, once the restore of persisted mobs is finished.
+async fn managed_listing<L: HostedListings>(
+    listings: &L,
+) -> Result<Vec<(meerkat_mob::MobId, meerkat_mob::MobState)>, NativeUnavailable> {
+    listings
+        .mob_list()
+        .await
+        .map_err(|error| NativeUnavailable(error.to_string()))
+}
+
+/// The ids of the restored mobs held until their owner resolves.
+async fn held_listing<L: HostedListings>(listings: &L) -> BTreeSet<String> {
+    listings
+        .held_child_mobs()
+        .await
+        .into_iter()
+        .map(|(mob_id, _)| mob_id.as_str().to_string())
+        .collect()
+}
+
 /// The production seam over this gateway's mob runtime.
 ///
 /// It holds the composition's non-owning identity runtime, the agent mob
@@ -621,12 +752,11 @@ impl MobNativeDelivery {
         &self,
         mobs: &BTreeSet<MobId>,
     ) -> Result<BTreeMap<MobId, MobPresence>, NativeUnavailable> {
-        let hosted_set = self.hosted_set().await?;
+        let hosted = hosted_set(&*self.mob_tools).await?;
         Ok(mobs
             .iter()
             .map(|mob_id| {
-                let hosted = hosted_set.contains(mob_id.as_str());
-                let presence = if hosted {
+                let presence = if hosted.contains(mob_id.as_str()) {
                     MobPresence::Hosted
                 } else {
                     MobPresence::Gone
@@ -642,63 +772,7 @@ impl MobNativeDelivery {
     /// its restore of persisted child mobs before they answer, so a mob
     /// missing here is not one still being restored.
     pub async fn hosted_mob_ids(&self) -> Result<BTreeSet<MobId>, NativeUnavailable> {
-        Ok(self
-            .hosted_set()
-            .await?
-            .into_iter()
-            .filter(|mob_id| mob_id != self.mob_id.as_str())
-            .filter_map(|mob_id| match MobId::new(mob_id.clone()) {
-                Ok(mob_id) => Some(mob_id),
-                // One id this store cannot hold leaves the others readable.
-                Err(error) => {
-                    let first = self
-                        .unusable_ids
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(mob_id.clone());
-                    if first {
-                        tracing::warn!(mob = %mob_id, %error, "hosted mob id not usable here");
-                    }
-                    None
-                }
-            })
-            .collect())
-    }
-
-    /// Every mob hosted here, this gateway's own included: managed and not
-    /// destroyed, or restored and held until its owner resolves.
-    ///
-    /// The managed listing is read first only to finish the restore of
-    /// persisted mobs: it fails rather than answer before the restore. Held
-    /// mobs are then read before managed ones, because activation adds a
-    /// held mob to the managed ones before it drops the hold: a mob that
-    /// activates between the two reads is in one of them.
-    async fn hosted_set(&self) -> Result<BTreeSet<String>, NativeUnavailable> {
-        self.restored_listing().await?;
-        let held = self
-            .mob_tools
-            .held_child_mobs()
-            .await
-            .into_iter()
-            .map(|(mob_id, _)| mob_id.as_str().to_string())
-            .collect::<BTreeSet<_>>();
-        let managed = self
-            .restored_listing()
-            .await?
-            .into_iter()
-            .filter(|(_, state)| *state != meerkat_mob::MobState::Destroyed)
-            .map(|(mob_id, _)| mob_id.as_str().to_string());
-        Ok(held.into_iter().chain(managed).collect())
-    }
-
-    /// The managed mobs, once the restore of persisted mobs is finished.
-    async fn restored_listing(
-        &self,
-    ) -> Result<Vec<(meerkat_mob::MobId, meerkat_mob::MobState)>, NativeUnavailable> {
-        self.mob_tools
-            .mob_list()
-            .await
-            .map_err(|error| NativeUnavailable(error.to_string()))
+        hosted_mob_ids_in(&*self.mob_tools, &self.mob_id, &self.unusable_ids).await
     }
 
     /// The incarnation of a running hosted mob and who created it, from
@@ -711,23 +785,9 @@ impl MobNativeDelivery {
         mob_id: &MobId,
     ) -> Result<Option<MobOriginFacts>, NativeUnavailable> {
         let unavailable = |error: &dyn std::fmt::Display| NativeUnavailable(error.to_string());
-        // The restore of persisted mobs is finished first. Held mobs are
-        // then read before running ones: activation moves a held mob to the
-        // running ones, never back, so a parent in neither is not one about
-        // to run.
-        self.restored_listing().await?;
-        let held = self
-            .mob_tools
-            .held_child_mobs()
-            .await
-            .into_iter()
-            .map(|(id, _)| id.as_str().to_string())
-            .collect::<BTreeSet<_>>();
-        let handles = self
-            .mob_tools
-            .mob_handles_snapshot()
-            .await
-            .map_err(|error| unavailable(&error))?;
+        // A parent in neither listing is not one still being restored, nor
+        // one about to run.
+        let (held, handles) = hosted_handles(&*self.mob_tools).await?;
         let Some(handle) = handles
             .iter()
             .find(|(id, _)| id.as_str() == mob_id.as_str())
@@ -831,43 +891,20 @@ impl MobNativeDelivery {
         })
     }
 
-    /// The running handle of a mob hosted here other than this gateway's
-    /// own.
-    async fn child_handle(
-        &self,
-        mob_id: &MobId,
-    ) -> Result<Option<meerkat_mob::MobHandle>, NativeUnavailable> {
-        if *mob_id == self.mob_id {
-            return Ok(None);
-        }
-        Ok(self
-            .mob_tools
-            .mob_handles_snapshot()
-            .await
-            .map_err(|error| NativeUnavailable(error.to_string()))?
-            .into_iter()
-            .find(|(id, _)| id.as_str() == mob_id.as_str())
-            .map(|(_, handle)| handle))
-    }
-
     /// A mob hosted here other than this gateway's own: running, held until
     /// its owner resolves, or gone.
     ///
-    /// The listing finishes the restore of persisted mobs first, so a mob
-    /// that is neither held nor running is not one still being restored.
-    /// Held mobs are read before running ones: activation moves a held mob
-    /// to the running ones, never back.
+    /// Read through [`hosted_handles`]: a mob that is neither held nor
+    /// running is not one still being restored, nor one about to run.
     async fn child_mob(&self, mob_id: &MobId) -> Result<ChildMob, NativeUnavailable> {
-        self.restored_listing().await?;
-        let held = self
-            .mob_tools
-            .held_child_mobs()
-            .await
+        let (held, running) = hosted_handles(&*self.mob_tools).await?;
+        let handle = running
             .into_iter()
-            .any(|(id, _)| id.as_str() == mob_id.as_str());
-        Ok(match self.child_handle(mob_id).await? {
+            .find(|(id, _)| *mob_id != self.mob_id && id.as_str() == mob_id.as_str())
+            .map(|(_, handle)| handle);
+        Ok(match handle {
             Some(handle) => ChildMob::Running(Box::new(handle)),
-            None if held => ChildMob::Held,
+            None if held.contains(mob_id.as_str()) => ChildMob::Held,
             None => ChildMob::Gone,
         })
     }
@@ -898,6 +935,49 @@ impl MobNativeDelivery {
             Some(handle) => Ok(Some(Self::incarnation_of(&handle, mob_id).await?)),
             None => Ok(None),
         }
+    }
+
+    /// What Meerkat records for a call from `session` that is not on this
+    /// gateway's own roster: the member binding persisted with the session,
+    /// and that member's roster entry in its mob now. Read only from durable
+    /// session metadata and the mob's own roster.
+    pub(crate) async fn child_caller_records(
+        &self,
+        session: &meerkat_core::types::SessionId,
+    ) -> Result<super::tools::ChildCallerRecords, String> {
+        let binding = self
+            .sessions
+            .load_persisted_session_metadata(session)
+            .await
+            .map_err(|error| format!("the calling session's records cannot be read: {error}"))?
+            .filter(|view| view.session_id == *session)
+            .and_then(|view| view.session_metadata)
+            .and_then(|metadata| metadata.mob_member_binding);
+        let Some(binding) = binding else {
+            return Ok(super::tools::ChildCallerRecords::default());
+        };
+        let entry = match MobId::new(binding.mob_id.clone()) {
+            Ok(mob_id) if mob_id != self.mob_id => {
+                match self.running_child(&mob_id).await.map_err(|error| error.0)? {
+                    Some(handle) => handle
+                        .get_member(&meerkat_mob::AgentIdentity::from(binding.member.as_str()))
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .map(|entry| {
+                            (
+                                entry.bridge_session_id().map(ToString::to_string),
+                                entry.role.as_str().to_string(),
+                            )
+                        }),
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        Ok(super::tools::ChildCallerRecords {
+            binding: Some((binding.mob_id, binding.role, binding.member)),
+            entry,
+        })
     }
 
     /// A member of a mob a member created can be subscribed while that mob

@@ -74,6 +74,14 @@ pub enum AnnouncementStoreError {
     RouteKept {
         kept: MemberRoute,
     },
+    /// A subscription for a member of a mob hosted here would pass a bound
+    /// on such subscriptions: the gateway's (`mob_id` absent) or the one on
+    /// those naming `mob_id`, which bounds how many of them one announcement
+    /// into that mob is captured for.
+    ChildMemberLimit {
+        limit: u32,
+        mob_id: Option<MobId>,
+    },
     /// The batch owner's transition table refuses this event here.
     IllegalTransition {
         from: BatchStateTag,
@@ -123,6 +131,21 @@ impl fmt::Display for AnnouncementStoreError {
                 f,
                 "the member is kept on the {} route and is never rerouted",
                 kept.as_str()
+            ),
+            Self::ChildMemberLimit {
+                limit,
+                mob_id: None,
+            } => write!(
+                f,
+                "limit reached: at most {limit} live subscriptions of members of mobs hosted here"
+            ),
+            Self::ChildMemberLimit {
+                limit,
+                mob_id: Some(mob_id),
+            } => write!(
+                f,
+                "limit reached: at most {limit} live subscriptions of members of mobs hosted \
+                 here may name mob {mob_id}"
             ),
             Self::IllegalTransition { from, event } => {
                 write!(f, "a {from} batch cannot take {event}")
@@ -670,6 +693,41 @@ pub struct PutSubscription {
     /// is not part of the request a caller makes.
     #[serde(skip)]
     pub member_mob_cursor: Option<u64>,
+    /// The bounds on subscriptions for members of mobs hosted here. The
+    /// owner fills them in from its configuration.
+    #[serde(skip)]
+    pub child_limits: ChildMemberLimits,
+}
+
+/// Bounds on live subscriptions for members of mobs hosted here other than
+/// this gateway's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildMemberLimits {
+    /// Live such subscriptions on this gateway.
+    pub subscriptions: u32,
+    /// Live such subscriptions naming any one mob: one announcement into
+    /// that mob is captured for at most this many of them.
+    pub per_mob: u32,
+}
+
+impl Default for ChildMemberLimits {
+    fn default() -> Self {
+        Self {
+            subscriptions: 1_024,
+            per_mob: 256,
+        }
+    }
+}
+
+impl ChildMemberLimits {
+    pub fn validate(&self) -> Result<()> {
+        if self.subscriptions == 0 || self.per_mob == 0 {
+            return Err(AnnouncementStoreError::Invalid(
+                "every child member limit is at least 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -811,6 +869,10 @@ pub struct SuccessorBatch {
     /// gaps, and the announcements no longer retained.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gaps: Vec<BatchGap>,
+    /// Gap lines past what the successor has room for in one request to a
+    /// peer gateway: they wait for the member's next batch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred: Vec<BatchGap>,
 }
 
 /// Why announcements owed to a member were not delivered.
@@ -1367,6 +1429,57 @@ pub fn render_gap(gap: &BatchGap) -> String {
         plural = if gap.count == 1 { "" } else { "s" },
         mob_id = quoted(gap.mob_id.as_str()),
     )
+}
+
+/// Split `gaps` into the lines a body of one request to a peer gateway has
+/// room for, after its header (`header_wire`, quotes included) and its
+/// items, in order, and the rest, which wait for a later batch.
+pub fn fit_gap_lines(
+    header_wire: u64,
+    items: &[String],
+    gaps: Vec<BatchGap>,
+    budget: u64,
+) -> (Vec<BatchGap>, Vec<BatchGap>) {
+    let mut wire = items.iter().fold(header_wire, |wire, item| {
+        wire.saturating_add(wire_len(item).saturating_sub(2))
+    });
+    let mut fitting = Vec::new();
+    let mut rest = Vec::new();
+    for gap in gaps {
+        let line = wire_len(&render_gap(&gap)).saturating_sub(2);
+        if rest.is_empty() && wire.saturating_add(line) <= budget {
+            wire = wire.saturating_add(line);
+            fitting.push(gap);
+        } else {
+            rest.push(gap);
+        }
+    }
+    (fitting, rest)
+}
+
+/// The successor of `predecessor`, carrying `gaps` and `items`. A gap line
+/// can be longer than the item it stands for, so with a `budget` (a member
+/// on a peer gateway) the gap lines past what the items leave of one
+/// request are deferred to the member's next batch: a successor fits
+/// wherever its predecessor did.
+pub fn successor_batch(
+    id: BatchId,
+    predecessor: &BatchId,
+    gaps: Vec<BatchGap>,
+    items: &[String],
+    budget: Option<u64>,
+) -> SuccessorBatch {
+    let (gaps, deferred) = match budget {
+        Some(budget) => fit_gap_lines(header_wire_bound(&id), items, gaps, budget),
+        None => (gaps, Vec::new()),
+    };
+    let body = render_batch(&id, Some(predecessor), &gaps, items);
+    SuccessorBatch {
+        id,
+        body,
+        gaps,
+        deferred,
+    }
 }
 
 /// The immutable body of a batch: a header naming the batch, a line for

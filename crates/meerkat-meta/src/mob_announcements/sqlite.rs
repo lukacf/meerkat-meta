@@ -879,6 +879,9 @@ fn put_subscription_in(
     }
     request.selector.validate()?;
     keep_member_route_in(db, &request.member, &request.route)?;
+    if request.route.route == MemberRoute::Child {
+        within_child_limits(db, request)?;
+    }
     let subscription = match (
         load_subscription(db, &request.id)?,
         request.expected_revision,
@@ -1164,6 +1167,56 @@ fn keep_member_route_in(db: &Connection, member: &Member, route: &MemberRouteRec
             Ok(())
         }
     }
+}
+
+/// Refuse a subscription for a member of a mob hosted here that would pass
+/// a bound on such subscriptions. The subscription it replaces, if any, is
+/// not counted.
+fn within_child_limits(db: &Connection, request: &PutSubscription) -> Result<()> {
+    let limits = request.child_limits;
+    let live: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM member_subscriptions s
+             JOIN member_routes r ON r.member = s.member
+             WHERE r.route = ?1 AND s.state IN ('active', 'paused') AND s.id != ?2",
+            params![MemberRoute::Child.as_str(), request.id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if uint(live)? >= u64::from(limits.subscriptions) {
+        return Err(AnnouncementStoreError::ChildMemberLimit {
+            limit: limits.subscriptions,
+            mob_id: None,
+        });
+    }
+    let mut statement = db
+        .prepare_cached(
+            "SELECT COUNT(*) FROM member_subscriptions s
+             JOIN member_routes r ON r.member = s.member
+             JOIN member_subscription_mobs m ON m.subscription_id = s.id
+             WHERE r.route = ?1 AND s.state IN ('active', 'paused') AND s.id != ?2
+               AND m.mob_id = ?3",
+        )
+        .map_err(storage)?;
+    for mob_id in &request.selector.mobs {
+        let naming: i64 = statement
+            .query_row(
+                params![
+                    MemberRoute::Child.as_str(),
+                    request.id.as_str(),
+                    mob_id.as_str()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        if uint(naming)? >= u64::from(limits.per_mob) {
+            return Err(AnnouncementStoreError::ChildMemberLimit {
+                limit: limits.per_mob,
+                mob_id: Some(mob_id.clone()),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// End the member's live subscriptions and drop its kept route.
@@ -1602,6 +1655,8 @@ fn transition_batch_in(
         )
         .map_err(storage)?;
         mark_sealed(db, &batch.member, now_ms)?;
+        // What the successor had no room for reaches the member's next batch.
+        add_gaps(db, &batch.member, &successor.deferred)?;
         batch.successor = Some(successor.id.clone());
     }
     if matches!(event, BatchEvent::Expire | BatchEvent::ExpireNotCommitted) {

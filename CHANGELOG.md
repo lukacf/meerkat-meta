@@ -68,7 +68,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   being respawned, or a mob held after a restart, ends nothing. How a member
   is reached is kept from its first subscription and never changes: a mob
   id that names a mob hosted here and a peer alike is refused with
-  `ambiguous_mob`.
+  `ambiguous_mob`. Live subscriptions for such members are bounded on the
+  gateway and per named mob
+  (`runtime_options.mob_announcements.child_member_limits`); a put past a
+  bound is refused with `child_member_limit`.
+
+- `runtime_options.mob_announcements.member_tools_in_child_mobs` (default
+  false) gives the mob announcement member tools to every inline profile of
+  every mob a member creates. Their members then subscribe themselves to the
+  announcements of the mobs above their own, attributed through the
+  session's persisted member binding and that mob's roster, role included.
+  Without it the host RPC subscribes them.
 
 - Keyed cross-mob inject. Two new control verbs, `inject_keyed` and
   `inject_status`, deliver one keyed continuation to a member of the serving

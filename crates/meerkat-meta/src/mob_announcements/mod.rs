@@ -71,10 +71,10 @@ pub use store::AnnouncementStore;
 pub use types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementRef, AnnouncementStoreError,
     Announcer, Batch, BatchEvent, BatchEventTag, BatchId, BatchItem, BatchQuery, BatchState,
-    BatchStateTag, MAX_ITEM_WIRE_BYTES, MAX_REMOTE_BODY_WIRE_BYTES, Member, MemberBacklog,
-    MemberIdentity, MemberRouteRecord, MobId, NativeReceipt, OperationId, PruneReport,
-    PutSubscription, SealingPolicy, Selector, Settlement, SourceKey, StartFrontier, Subscription,
-    SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
+    BatchStateTag, ChildMemberLimits, MAX_ITEM_WIRE_BYTES, MAX_REMOTE_BODY_WIRE_BYTES, Member,
+    MemberBacklog, MemberIdentity, MemberRouteRecord, MobId, NativeReceipt, OperationId,
+    PruneReport, PutSubscription, SealingPolicy, Selector, Settlement, SourceKey, StartFrontier,
+    Subscription, SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
     SubscriptionState, SuccessorBatch, Topic,
 };
 
@@ -89,6 +89,19 @@ struct AnnouncementOptions {
     retention_ms: Option<u64>,
     #[serde(default)]
     member_limits: Option<MemberLimitOptions>,
+    #[serde(default)]
+    member_tools_in_child_mobs: bool,
+    #[serde(default)]
+    child_member_limits: Option<ChildMemberLimitOptions>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChildMemberLimitOptions {
+    #[serde(default)]
+    subscriptions: Option<u32>,
+    #[serde(default)]
+    per_mob: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -162,6 +175,15 @@ pub(crate) fn parse_runtime_options(
             .validate()
             .map_err(|error| format!("runtime_options.mob_announcements.member_limits: {error}"))?;
     }
+    config.member_tools_in_child_mobs = options.member_tools_in_child_mobs;
+    if let Some(limits) = options.child_member_limits {
+        let current = &mut config.child_limits;
+        current.subscriptions = limits.subscriptions.unwrap_or(current.subscriptions);
+        current.per_mob = limits.per_mob.unwrap_or(current.per_mob);
+        current.validate().map_err(|error| {
+            format!("runtime_options.mob_announcements.child_member_limits: {error}")
+        })?;
+    }
     config
         .policy
         .validate()
@@ -194,6 +216,11 @@ pub(crate) fn compose_for_runtime(
     let remote = runtime
         .peer_delivery_access()
         .map(|(contacts, keys)| Arc::new(RemoteMemberDelivery::new(contacts, keys)));
+    // Callers in mobs members created are attributed through this
+    // gateway's runtime only when they can be offered the tools.
+    let children = config
+        .member_tools_in_child_mobs
+        .then(|| Arc::clone(&local));
     let native = AnnouncementNativeDelivery::new(local, remote);
     let service = AnnouncementService::new(Arc::new(store), Arc::new(native), config)
         .map_err(|error| error.to_string())?;
@@ -202,8 +229,12 @@ pub(crate) fn compose_for_runtime(
     }
     if let Some(slot) = member_tools {
         // A non-owning handle: the member tools never keep the mob open.
-        let callers =
-            tools::RosterCallerResolver::new(own_mob, runtime.mob_handle().observer(), identities);
+        let callers = tools::RosterCallerResolver::new(
+            own_mob,
+            runtime.mob_handle().observer(),
+            identities,
+            children,
+        );
         let bound = slot
             .set(tools::ToolBackend {
                 service: service.clone(),

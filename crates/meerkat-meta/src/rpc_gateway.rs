@@ -16616,12 +16616,20 @@ external_addressable = true
             });
         }
         slots.extend(crate::storage_health::scratch_ring_buffer_slots());
-        if gateway_options.mob_announcements.is_some() {
-            spec = spec.register_tool_bundle(
+        if let Some(config) = gateway_options.mob_announcements.as_ref() {
+            // With `member_tools_in_child_mobs`, every inline profile of
+            // every mob a member creates gets the bundle too.
+            let availability = if config.member_tools_in_child_mobs {
+                meerkat_mob_mcp::ChildToolBundleAvailability::ChildAvailable
+            } else {
+                meerkat_mob_mcp::ChildToolBundleAvailability::HostOnly
+            };
+            spec = spec.register_tool_bundle_with_availability(
                 crate::mob_announcements::tools::TOOL_BUNDLE,
                 Arc::new(crate::mob_announcements::tools::MobAnnouncementTools::new(
                     Arc::clone(&announcement_tools),
                 )),
+                availability,
             );
         }
         // The M4 census had no mob slot at all, which is why an in-memory mob

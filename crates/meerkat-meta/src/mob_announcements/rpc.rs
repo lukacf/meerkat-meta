@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use super::owner::{AnnouncementError, AnnouncementService};
 use super::types::{
     AnnounceRequest, AnnouncementRef, AnnouncementStoreError, Announcer, BatchId, BatchQuery,
-    Member, MemberRouteRecord, MobId, OperationId, PutSubscription, Selector, SourceKey,
-    StartFrontier, SubscriptionChange, SubscriptionId, Topic,
+    ChildMemberLimits, Member, MemberRouteRecord, MobId, OperationId, PutSubscription, Selector,
+    SourceKey, StartFrontier, SubscriptionChange, SubscriptionId, Topic,
 };
 use crate::rpc::JsonRpcError;
 
@@ -199,6 +199,12 @@ fn rpc_error(error: AnnouncementError) -> JsonRpcError {
                 "ambiguous_mob",
                 message,
                 json!({ "kept_route": kept }),
+            ),
+            AnnouncementStoreError::ChildMemberLimit { limit, mob_id } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "child_member_limit",
+                message,
+                json!({ "limit": limit, "mob_id": mob_id }),
             ),
             AnnouncementStoreError::IllegalTransition { .. } => JsonRpcError::new(-32000, message),
             AnnouncementStoreError::TooLarge(_) | AnnouncementStoreError::Invalid(_) => {
@@ -385,6 +391,7 @@ pub async fn handle_announcement_method(
                         expected_revision: request.expected_revision,
                         route: MemberRouteRecord::default(),
                         member_mob_cursor: None,
+                        child_limits: ChildMemberLimits::default(),
                     },
                 )
                 .await

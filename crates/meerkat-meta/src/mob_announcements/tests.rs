@@ -83,6 +83,7 @@ fn put(id: &str, to: &str, topic: &[&str], start: StartFrontier) -> PutSubscript
         expected_revision: None,
         route: MemberRouteRecord::default(),
         member_mob_cursor: None,
+        child_limits: ChildMemberLimits::default(),
     }
 }
 
@@ -649,6 +650,7 @@ async fn stranded_batches_hand_over_to_a_successor(store: &dyn AnnouncementStore
                     id: batch_id("b2"),
                     body: "redelivery".into(),
                     gaps: Vec::new(),
+                    deferred: Vec::new(),
                 }),
             },
             5,
@@ -1455,6 +1457,93 @@ async fn sqlite_store_conforms() {
         },
     )
     .await;
+    run_conformance("child member limits", |store| async move {
+        child_member_subscriptions_are_bounded(store.as_ref()).await;
+    })
+    .await;
+    run_conformance("gap lines a successor defers", |store| async move {
+        gap_lines_a_successor_defers_reach_the_next_batch(store.as_ref()).await;
+    })
+    .await;
+}
+
+async fn gap_lines_a_successor_defers_reach_the_next_batch(store: &dyn AnnouncementStore) {
+    store
+        .put_subscription(
+            &op("s1"),
+            put("s1", "agent:a", &["ios"], StartFrontier::Now),
+            1_000,
+        )
+        .await
+        .unwrap();
+    store
+        .announce(announce_request("payments", "k1", &["ios"], "x"), 1_000)
+        .await
+        .unwrap();
+    store
+        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), None, 2_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let deliver = |id: &'static str| async move {
+        for (expected, event) in [
+            (BatchStateTag::Sealed, BatchEvent::BeginSubmit),
+            (
+                BatchStateTag::Submitting,
+                BatchEvent::NativeCommitted {
+                    receipt: receipt(id),
+                },
+            ),
+        ] {
+            store
+                .transition_batch(&batch_id(id), expected, event, 3_000)
+                .await
+                .unwrap();
+        }
+    };
+    deliver("b1").await;
+    let deferred = vec![expired_gap(3)];
+    store
+        .transition_batch(
+            &batch_id("b1"),
+            BatchStateTag::Committed,
+            BatchEvent::NativeStranded {
+                receipt: receipt("b1"),
+                successor: Some(SuccessorBatch {
+                    id: batch_id("b2"),
+                    body: "redelivery".into(),
+                    gaps: Vec::new(),
+                    deferred: deferred.clone(),
+                }),
+            },
+            4_000,
+        )
+        .await
+        .unwrap();
+    deliver("b2").await;
+    store
+        .transition_batch(
+            &batch_id("b2"),
+            BatchStateTag::Committed,
+            BatchEvent::NativeApplied {
+                receipt: receipt("b2"),
+                session_id: "session".into(),
+                input_id: "input".into(),
+            },
+            5_000,
+        )
+        .await
+        .unwrap();
+    store
+        .announce(announce_request("payments", "k2", &["ios"], "y"), 6_000)
+        .await
+        .unwrap();
+    let next = store
+        .seal_batch(&member("agent:a"), &batch_id("b3"), &policy(), None, 7_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.gaps, deferred);
 }
 
 async fn gap_lines_fit_what_the_items_leave_of_a_peer_request(store: &dyn AnnouncementStore) {
@@ -1692,6 +1781,97 @@ async fn gaps_of_a_batch_that_reports_nothing_go_back(store: &dyn AnnouncementSt
         .unwrap()
         .unwrap();
     assert_eq!(after_refusal.gaps, vec![expired_gap(1)]);
+}
+
+async fn child_member_subscriptions_are_bounded(store: &dyn AnnouncementStore) {
+    let limits = ChildMemberLimits {
+        subscriptions: 3,
+        per_mob: 2,
+    };
+    let child_put = |id: &str, identity: &str, mobs: &[&str]| PutSubscription {
+        member: peer_member(identity, "builds"),
+        route: MemberRouteRecord {
+            route: MemberRoute::Child,
+            incarnation: Some(incarnation("owner-1", 10)),
+        },
+        member_mob_cursor: Some(1),
+        child_limits: limits,
+        selector: Selector {
+            topics: topics(&["ios"]),
+            mobs: mobs.iter().map(|name| mob(name)).collect(),
+        },
+        ..put(id, "agent:a", &["ios"], StartFrontier::Now)
+    };
+    store
+        .put_subscription(&op("c1"), child_put("c1", "w1", &["payments"]), 1)
+        .await
+        .unwrap();
+    store
+        .put_subscription(&op("c2"), child_put("c2", "w2", &["payments"]), 1)
+        .await
+        .unwrap();
+    // A third naming the same mob would make one announcement into it owed
+    // to three of them.
+    assert_eq!(
+        store
+            .put_subscription(&op("c3"), child_put("c3", "w3", &["payments"]), 1)
+            .await
+            .unwrap_err(),
+        AnnouncementStoreError::ChildMemberLimit {
+            limit: 2,
+            mob_id: Some(mob("payments")),
+        }
+    );
+    assert!(store.subscription(&sid("c3")).await.unwrap().is_none());
+    // Replacing one does not count it against itself.
+    let replaced = store
+        .put_subscription(
+            &op("c1-r"),
+            PutSubscription {
+                expected_revision: Some(1),
+                ..child_put("c1", "w1", &["payments", "events"])
+            },
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replaced.revision, 2);
+    store
+        .put_subscription(&op("c4"), child_put("c4", "w4", &["events"]), 3)
+        .await
+        .unwrap();
+    // The gateway's bound counts every live one.
+    assert_eq!(
+        store
+            .put_subscription(&op("c5"), child_put("c5", "w5", &["refunds"]), 4)
+            .await
+            .unwrap_err(),
+        AnnouncementStoreError::ChildMemberLimit {
+            limit: 3,
+            mob_id: None,
+        }
+    );
+    // An ended or cancelled one no longer counts; nor does a member of
+    // this gateway's own mob.
+    store
+        .change_subscription(&op("c2-x"), &sid("c2"), 1, SubscriptionChange::Cancel, 5)
+        .await
+        .unwrap();
+    store
+        .put_subscription(&op("c5-b"), child_put("c5", "w5", &["refunds"]), 6)
+        .await
+        .unwrap();
+    store
+        .put_subscription(
+            &op("own"),
+            PutSubscription {
+                child_limits: limits,
+                ..put("own", "agent:a", &["ios"], StartFrontier::Now)
+            },
+            7,
+        )
+        .await
+        .unwrap();
 }
 
 fn worker() -> Member {
@@ -5672,6 +5852,37 @@ async fn a_peer_batch_expires_only_once_its_last_request_is_stale() {
     assert_eq!(harness.native.submits(), submits);
 }
 
+/// A gap line can be longer than the item it stands for: a successor for a
+/// member on a peer gateway carries the gap lines its items leave room for
+/// in one request, and defers the rest to the member's next batch.
+#[test]
+fn a_successor_defers_the_gap_lines_one_peer_request_has_no_room_for() {
+    let items = vec!["x".repeat(40 * 1024)];
+    let gaps = (0..100)
+        .map(|index| BatchGap {
+            mob_id: mob(&format!("{}-{index:03}", "m".repeat(240))),
+            count: 1,
+            reason: GapReason::NotRetained,
+        })
+        .collect::<Vec<_>>();
+    let successor = successor_batch(
+        batch_id("b2"),
+        &batch_id("b1"),
+        gaps.clone(),
+        &items,
+        Some(MAX_REMOTE_BODY_WIRE_BYTES),
+    );
+    assert!(wire_len(&successor.body) <= MAX_REMOTE_BODY_WIRE_BYTES);
+    assert!(!successor.gaps.is_empty() && !successor.deferred.is_empty());
+    let mut all = successor.gaps.clone();
+    all.extend(successor.deferred);
+    assert_eq!(all, gaps);
+    // For a member of a mob hosted here every gap line rides along.
+    let local = successor_batch(batch_id("b3"), &batch_id("b1"), gaps.clone(), &items, None);
+    assert_eq!(local.gaps, gaps);
+    assert!(local.deferred.is_empty());
+}
+
 #[tokio::test]
 async fn a_stranded_batch_whose_announcements_were_pruned_hands_on_a_gap() {
     let mut native = ScriptedNative::new();
@@ -6090,6 +6301,37 @@ async fn a_mob_created_again_ends_its_members_subscriptions_at_reconcile_and_del
     assert_eq!(harness.native.submits(), 0, "nothing reached the member");
 }
 
+/// A backlog that cannot be sealed, such as a member's of a mob held until
+/// its owner resolves, is reported once while it keeps failing, not at
+/// every round; once its mob runs again it is delivered.
+#[tokio::test]
+async fn a_held_members_backlog_is_reported_once_while_it_waits() {
+    let harness = harness_with(child_native());
+    subscribe_worker(&harness, "w1").await.unwrap();
+    harness.announce_burst(1).await;
+    harness.native.held.lock().unwrap().insert("builds".into());
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    // A second registered dispatcher, so the interest in the warning's
+    // callsite is never decided by another test thread's empty default.
+    let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
+    let ((), log) = crate::test_diagnostics::capture_warnings(async {
+        for _ in 0..3 {
+            harness.round_after_pause().await;
+        }
+    })
+    .await;
+    assert_eq!(
+        log.matches("announcement backlog not sealed this round")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert_eq!(harness.native.submits(), 0);
+    harness.native.held.lock().unwrap().clear();
+    harness.round_after_pause().await;
+    assert_eq!(harness.native.submits(), 1);
+}
+
 #[tokio::test]
 async fn the_member_mob_log_is_read_on_from_the_last_read() {
     let harness = harness_with(child_native());
@@ -6280,5 +6522,355 @@ async fn a_mob_id_hosted_here_and_filed_as_a_peer_is_ambiguous() {
             .unwrap()
             .state,
         SubscriptionState::Active
+    );
+}
+
+#[test]
+fn child_members_are_attributed_only_through_their_binding_and_their_roster() {
+    let session = meerkat_core::types::SessionId::new();
+    let own = mob(OWN_MOB);
+    let bound = |mob_id: &str, role: &str| {
+        Some((mob_id.to_string(), role.to_string(), "worker-1".to_string()))
+    };
+    let entry = |session: Option<&meerkat_core::types::SessionId>, role: &str| {
+        Some((session.map(ToString::to_string), role.to_string()))
+    };
+    let records = |binding, entry| super::tools::ChildCallerRecords { binding, entry };
+    assert_eq!(
+        super::tools::attribute_child(
+            &own,
+            &session,
+            &records(bound("builds", "worker"), entry(Some(&session), "worker"))
+        ),
+        Ok(peer_member("worker-1", "builds"))
+    );
+    let refused = [
+        ("no binding", records(None, entry(Some(&session), "worker"))),
+        (
+            "bound to this gateway's own mob",
+            records(bound(OWN_MOB, "worker"), entry(Some(&session), "worker")),
+        ),
+        (
+            "not on the roster",
+            records(bound("builds", "worker"), None),
+        ),
+        (
+            "another session on the roster",
+            records(
+                bound("builds", "worker"),
+                entry(Some(&meerkat_core::types::SessionId::new()), "worker"),
+            ),
+        ),
+        (
+            "no session on the roster",
+            records(bound("builds", "worker"), entry(None, "worker")),
+        ),
+        (
+            "another role on the roster",
+            records(bound("builds", "worker"), entry(Some(&session), "lead")),
+        ),
+    ];
+    for (case, records) in refused {
+        assert!(
+            super::tools::attribute_child(&own, &session, &records).is_err(),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn child_member_options_are_read_and_bounded() {
+    let parsed = super::parse_runtime_options(&serde_json::json!({
+        "enabled": true,
+        "member_tools_in_child_mobs": true,
+        "child_member_limits": { "subscriptions": 10, "per_mob": 4 }
+    }))
+    .unwrap()
+    .unwrap();
+    assert!(parsed.member_tools_in_child_mobs);
+    assert_eq!(
+        parsed.child_limits,
+        ChildMemberLimits {
+            subscriptions: 10,
+            per_mob: 4
+        }
+    );
+    let defaults = super::parse_runtime_options(&serde_json::json!({ "enabled": true }))
+        .unwrap()
+        .unwrap();
+    assert!(
+        !defaults.member_tools_in_child_mobs,
+        "the member tools are host-only by default"
+    );
+    assert_eq!(defaults.child_limits, ChildMemberLimits::default());
+    for limits in [
+        serde_json::json!({ "subscriptions": 0 }),
+        serde_json::json!({ "per_mob": 0 }),
+        serde_json::json!({ "fan_out": 3 }),
+    ] {
+        assert!(
+            super::parse_runtime_options(&serde_json::json!({
+                "enabled": true,
+                "child_member_limits": limits
+            }))
+            .is_err(),
+            "{limits}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_put_past_a_child_member_limit_is_refused_typed() {
+    let native = child_native();
+    native.add_child_member("builds", "worker-2");
+    let (dir, store) = temp_store();
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let reader = Arc::clone(&clock);
+    let service = AnnouncementService::with_clock(
+        Arc::new(store) as Arc<dyn AnnouncementStore>,
+        Arc::new(native) as Arc<dyn NativeDelivery>,
+        AnnouncementConfig {
+            child_limits: ChildMemberLimits {
+                subscriptions: 1,
+                per_mob: 1,
+            },
+            ..AnnouncementConfig::default()
+        },
+        Arc::new(move || reader.load(Ordering::SeqCst)),
+    )
+    .unwrap();
+    service
+        .put_subscription(&op("w1"), put_for("w1", worker(), &["ios"]))
+        .await
+        .unwrap();
+    let refused = service
+        .put_subscription(
+            &op("w2"),
+            put_for("w2", peer_member("worker-2", "builds"), &["ios"]),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            AnnouncementError::Store(AnnouncementStoreError::ChildMemberLimit { limit: 1, .. })
+        ),
+        "{refused:?}"
+    );
+    drop(dir);
+}
+
+// ---------------------------------------------------------------------------
+// Hosted listings
+// ---------------------------------------------------------------------------
+
+/// The agent mob tool state's listings as Meerkat answers them
+/// (meerkat-mob-mcp 0.9.2, the same at 0.9.3; the lines are 0.9.3's
+/// lib.rs):
+/// - `held_child_mobs` restores best effort and answers empty when the
+///   restore fails (3637-3646);
+/// - `mob_list` and `mob_handles_snapshot` fail until the restore is done,
+///   through `ensure_restored` (4496-4531);
+/// - activation registers a held mob as managed before it drops the hold
+///   (resume 3770-3776, teardown 3620-3625).
+///
+/// This gateway's own mob `root` runs, `running` runs, `gone` is destroyed
+/// but still managed, and `child` is held after a restart. Calls are
+/// numbered from 1: `child` activates right after the call numbered
+/// `activate_after_call`, and the first `failed_restores` restore attempts
+/// fail.
+struct CoreListings(Mutex<CoreListingState>);
+
+struct CoreListingState {
+    calls: usize,
+    activate_after_call: usize,
+    failed_restores: usize,
+    restored: bool,
+    managed: BTreeMap<String, meerkat_mob::MobState>,
+    held: BTreeSet<String>,
+}
+
+impl CoreListings {
+    fn new(activate_after_call: usize, failed_restores: usize) -> Self {
+        Self(Mutex::new(CoreListingState {
+            calls: 0,
+            activate_after_call,
+            failed_restores,
+            restored: false,
+            managed: BTreeMap::from([
+                ("root".to_string(), meerkat_mob::MobState::Running),
+                ("running".to_string(), meerkat_mob::MobState::Running),
+                ("gone".to_string(), meerkat_mob::MobState::Destroyed),
+            ]),
+            held: BTreeSet::from(["child".to_string()]),
+        }))
+    }
+
+    /// One listing call: it tries the restore until one attempt is done,
+    /// then reads with `answer`; `None` when its restore attempt failed.
+    fn call<T>(&self, answer: impl FnOnce(&CoreListingState) -> T) -> Option<T> {
+        let mut state = self.0.lock().unwrap();
+        if !state.restored {
+            if state.failed_restores > 0 {
+                state.failed_restores -= 1;
+            } else {
+                state.restored = true;
+            }
+        }
+        let answered = state.restored.then(|| answer(&state));
+        state.calls += 1;
+        if state.calls == state.activate_after_call {
+            let activated = state.held.clone();
+            // Managed first; only then is the hold dropped.
+            for mob_id in &activated {
+                state
+                    .managed
+                    .insert(mob_id.clone(), meerkat_mob::MobState::Running);
+            }
+            for mob_id in &activated {
+                state.held.remove(mob_id);
+            }
+        }
+        answered
+    }
+
+    fn calls(&self) -> usize {
+        self.0.lock().unwrap().calls
+    }
+}
+
+fn restore_failed() -> meerkat_mob::MobError {
+    meerkat_mob::MobError::Internal("persistent mob state restore failed".to_string())
+}
+
+#[async_trait]
+impl super::native::HostedListings for CoreListings {
+    type Handle = ();
+
+    async fn mob_list(
+        &self,
+    ) -> std::result::Result<Vec<(meerkat_mob::MobId, meerkat_mob::MobState)>, meerkat_mob::MobError>
+    {
+        self.call(|state| {
+            state
+                .managed
+                .iter()
+                .map(|(mob_id, phase)| (meerkat_mob::MobId::from(mob_id.as_str()), *phase))
+                .collect()
+        })
+        .ok_or_else(restore_failed)
+    }
+
+    async fn held_child_mobs(&self) -> Vec<(meerkat_mob::MobId, meerkat_core::types::SessionId)> {
+        self.call(|state| {
+            state
+                .held
+                .iter()
+                .map(|mob_id| {
+                    (
+                        meerkat_mob::MobId::from(mob_id.as_str()),
+                        meerkat_core::types::SessionId::new(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    async fn mob_handles_snapshot(
+        &self,
+    ) -> std::result::Result<Vec<(meerkat_mob::MobId, ())>, meerkat_mob::MobError> {
+        self.call(|state| {
+            state
+                .managed
+                .iter()
+                .filter(|(_, phase)| **phase != meerkat_mob::MobState::Destroyed)
+                .map(|(mob_id, _)| (meerkat_mob::MobId::from(mob_id.as_str()), ()))
+                .collect()
+        })
+        .ok_or_else(restore_failed)
+    }
+}
+
+fn listed(values: &[&str]) -> BTreeSet<String> {
+    values.iter().map(ToString::to_string).collect()
+}
+
+/// The first call is the managed listing that finishes the restore; the
+/// held mob activates right after the second. Read held first, it is held
+/// in the one listing and managed in the next. Read the other way round,
+/// it would be in neither.
+#[tokio::test]
+async fn a_held_mob_that_activates_between_the_listings_stays_hosted() {
+    let listings = CoreListings::new(2, 0);
+    assert_eq!(
+        super::native::hosted_set(&listings).await.unwrap(),
+        listed(&["child", "root", "running"])
+    );
+    assert_eq!(listings.calls(), 3);
+
+    // The order the origin of a mob and a member's own mob are read in.
+    let listings = CoreListings::new(2, 0);
+    let (held, running) = super::native::hosted_handles(&listings).await.unwrap();
+    let running = running
+        .into_iter()
+        .map(|(mob_id, ())| mob_id.as_str().to_string())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        held.contains("child") || running.contains("child"),
+        "held {held:?}, running {running:?}"
+    );
+    assert_eq!(listings.calls(), 3);
+}
+
+/// A restore that fails fails the read. The held listing alone answers
+/// empty then, and a later listing whose own attempt restores would list
+/// the managed mobs without the held one.
+#[tokio::test]
+async fn a_failed_restore_fails_the_hosted_listings() {
+    let listings = CoreListings::new(usize::MAX, 1);
+    super::native::hosted_set(&listings).await.unwrap_err();
+    assert!(
+        super::native::hosted_set(&listings)
+            .await
+            .unwrap()
+            .contains("child")
+    );
+
+    let listings = CoreListings::new(usize::MAX, 1);
+    super::native::hosted_handles(&listings).await.unwrap_err();
+    let (held, _) = super::native::hosted_handles(&listings).await.unwrap();
+    assert!(held.contains("child"), "{held:?}");
+}
+
+/// A hosted mob id this store cannot hold is skipped, so the other mobs
+/// stay readable, and it is warned about once, not at every read.
+#[tokio::test]
+async fn a_hosted_mob_id_this_store_cannot_hold_is_skipped_and_warned_once() {
+    let unusable = "m".repeat(MAX_ID_BYTES + 1);
+    let listings = CoreListings::new(usize::MAX, 0);
+    listings
+        .0
+        .lock()
+        .unwrap()
+        .managed
+        .insert(unusable, meerkat_mob::MobState::Running);
+    let warned = Mutex::new(BTreeSet::new());
+    // A second registered dispatcher, so the interest in the warning's
+    // callsite is never decided by another test thread's empty default.
+    let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
+    let ((first, second), log) = crate::test_diagnostics::capture_warnings(async {
+        let first = super::native::hosted_mob_ids_in(&listings, &mob("root"), &warned).await;
+        let second = super::native::hosted_mob_ids_in(&listings, &mob("root"), &warned).await;
+        (first, second)
+    })
+    .await;
+    let readable = BTreeSet::from([mob("child"), mob("running")]);
+    assert_eq!(first.unwrap(), readable);
+    assert_eq!(second.unwrap(), readable);
+    assert_eq!(
+        log.matches("hosted mob id not usable here").count(),
+        1,
+        "{log}"
     );
 }
