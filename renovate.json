@@ -1,0 +1,28 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Meta keeps one dependency under Renovate: the release build container, pinned by digest (the same image and digest management as Core's release lane).",
+  "enabledManagers": ["custom.regex"],
+  "schedule": ["before 9am on Monday"],
+  "prConcurrentLimit": 1,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The release workflow's build container, pinned by digest inside a job expression that no built-in manager reads.",
+      "managerFilePatterns": ["/^\\.github/workflows/release\\.yml$/"],
+      "matchStrings": [
+        "(?:docker://)?(?<depName>docker\\.io/[a-z0-9._/-]+):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "The build container builds every Linux release binary: a new digest is proposed a week after its release, in a group of its own, and never automerged.",
+      "matchManagers": ["custom.regex"],
+      "groupName": "pinned images",
+      "groupSlug": "pinned-images",
+      "minimumReleaseAge": "7 days",
+      "automerge": false
+    }
+  ]
+}

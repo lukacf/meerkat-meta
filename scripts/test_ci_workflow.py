@@ -124,16 +124,18 @@ class CiWorkflowTests(unittest.TestCase):
         for (action, ref), shas in sorted(pins.items()):
             self.assertEqual(len(shas), 1, f"{action} {ref} is pinned to {sorted(shas)}")
 
+    PINNED_RUNNER = r"^(ubuntu-\d\d\.\d\d(-arm)?|macos-\d+|windows-\d{4}(-vs\d{4})?)$"
+
     def test_every_job_runs_on_a_pinned_runner_image(self):
         """A -latest label moves to a new image on GitHub's schedule
         (ubuntu-latest left 24.04 on 2026-10-19), and with it the
         toolchains, glibc and preinstalled tools every job reads. Each job
-        names its image; a matrix job's labels are pinned where its matrix
-        is defined."""
+        names its image, and so does every matrix entry a job takes its
+        runs-on from: inline ones here, the release build legs below."""
         labels = []
         for path in sorted((ROOT / ".github").rglob("*.y*ml")):
             for number, line in enumerate(path.read_text().splitlines(), 1):
-                found = re.match(r"\s*runs-on:\s*(.+?)\s*$", line)
+                found = re.match(r"\s*(?:-\s+)?runs-on:\s*(.+?)\s*$", line)
                 if not found:
                     continue
                 labels.append(found.group(1))
@@ -142,8 +144,52 @@ class CiWorkflowTests(unittest.TestCase):
                     self.assertEqual(found.group(1), "${{ matrix.runs-on }}", where)
                     continue
                 self.assertNotIn("latest", found.group(1), f"{where}: {found.group(1)} floats")
-                self.assertRegex(found.group(1), r"^(ubuntu-\d\d\.\d\d(-arm)?|macos-\d+|windows-\d{4})$", where)
+                self.assertRegex(found.group(1), self.PINNED_RUNNER, where)
         self.assertGreater(len(labels), 20)
+
+    def test_the_release_build_legs_run_on_pinned_runner_images(self):
+        """build_binaries takes runs-on from matrix data: the resolver's
+        build_matrix, made of release-candidate.py BUILD_LEGS. A floating
+        label there reaches the job without ever appearing in a workflow."""
+        release = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertEqual(release.count("runs-on: ${{ matrix.runs-on }}"), 1)
+        self.assertEqual(release.count("matrix: ${{ fromJSON(needs.resolve_release.outputs.build_matrix) }}"), 1)
+        spec = importlib.util.spec_from_file_location("release_candidate_legs", ROOT / "scripts/release-candidate.py")
+        candidate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(candidate)
+        legs = [leg["runs-on"] for leg in candidate.BUILD_LEGS]
+        emitted = [leg["runs-on"] for tier in ("core", "trailing") for leg in candidate.build_matrix(tier)["include"]]
+        self.assertEqual(sorted(emitted), sorted(legs))
+        for label in legs:
+            self.assertNotIn("latest", label, f"BUILD_LEGS runs-on {label} floats")
+            self.assertRegex(label, self.PINNED_RUNNER)
+
+    def test_every_container_image_is_pinned_by_digest_under_renovate(self):
+        """A container tag moves when its publisher pushes; the build
+        container fixes the release binaries' glibc floor. Each image a
+        workflow names carries its digest, and renovate.json proposes new
+        digests (never automerged) for exactly those files."""
+        renovate = json.loads((ROOT / "renovate.json").read_text())
+        self.assertEqual(renovate["enabledManagers"], ["custom.regex"])
+        (manager,) = renovate["customManagers"]
+        self.assertEqual(manager["datasourceTemplate"], "docker")
+        patterns = [re.compile(item.strip("/")) for item in manager["managerFilePatterns"]]
+        (match,) = [re.compile(item.replace("(?<", "(?P<")) for item in manager["matchStrings"]]
+        (rule,) = [rule for rule in renovate["packageRules"] if rule.get("matchManagers") == ["custom.regex"]]
+        self.assertIs(rule["automerge"], False)
+        images = []
+        for path in sorted((ROOT / ".github").rglob("*.y*ml")):
+            relative = path.relative_to(ROOT).as_posix()
+            source = path.read_text()
+            for found in re.finditer(r"(?:docker://)?docker\.io/[a-z0-9._/-]+:[A-Za-z0-9._-]+(?:@sha256:[0-9a-f]{64})?",
+                                     source):
+                images.append(found.group(0))
+                self.assertRegex(found.group(0), r"@sha256:[0-9a-f]{64}$", f"{relative}: {found.group(0)} floats")
+                self.assertTrue(any(pattern.search(relative) for pattern in patterns),
+                                f"{relative} is not under Renovate's digest management")
+                self.assertEqual(match.fullmatch(found.group(0)).group("currentDigest"),
+                                 found.group(0).rsplit("@", 1)[1])
+        self.assertTrue(images, "no container image found; the scan is wrong")
 
     def test_rust_cache_covers_the_wrapper_target(self):
         """rust-cache saves `<workspace>/target`; repo-cargo must build there.

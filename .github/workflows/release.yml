@@ -301,8 +301,9 @@ jobs:
     # the floor at 2.31, the same image and floor meerkat's release lane
     # ships, and scripts/check-linux-release-binary-portability.sh refuses
     # any binary above it before packaging. Non-Linux matrix entries get no
-    # container.
-    container: ${{ contains(matrix.target, 'unknown-linux-gnu') && 'docker.io/library/buildpack-deps:bullseye' || '' }}
+    # container. The image is pinned by digest, the one Core's release lane
+    # pins; renovate.json proposes a new digest for review, never automerged.
+    container: ${{ contains(matrix.target, 'unknown-linux-gnu') && 'docker.io/library/buildpack-deps:bullseye@sha256:30d62be8c0d1960899261429cd3960bccffbd075f324adae967c79f410bde24f' || '' }}
     strategy:
       fail-fast: false
       # The candidate tier's legs only (release-candidate.py BUILD_LEGS):
