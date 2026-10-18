@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A durable child mob whose member's runtime unregister was still running at
+  the stand-down deadline no longer keeps the child root claimed for the rest
+  of the process. The stand-down records that member's pending unregister and
+  follows its exact registration through Meerkat's
+  `MemberUnregisterSettlement`. A later stand-down in the same process clears
+  the debt once the unregister settles, without asking the exited child actor
+  again, and releases the root. Other debt (a stuck or interrupted
+  retirement, an effect whose custody is retained, a failed unregister or
+  request, or an actor that exited before its report was read) still keeps
+  the root claimed for the rest of the process.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking
