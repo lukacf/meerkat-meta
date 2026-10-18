@@ -379,6 +379,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   allows fewer threads than its CPU count can now start with fewer workers
   (see the deployment guide).
 
+- `GatewayMcpComposition::with_attempt_guards`: a host composing a gateway
+  member factory can install its Meerkat MCP attempt guard installation
+  (`meerkat_mcp::McpAttemptGuards`) on that factory together with its
+  composer. Every first, restored and rebuilt member construction of the
+  factory then begins the host's guard before any stdio server of its own is
+  spawned, and the guard is finished once the attempt's open outcome and
+  process end are both known. Gateway custody and defaults are unchanged; a
+  composition without it installs no guards.
+
 ### Changed
 
 - Flow Editor catalogs give a caller without host access each filesystem
