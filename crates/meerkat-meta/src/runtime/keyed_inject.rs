@@ -663,6 +663,97 @@ mod tests {
         assert_eq!(KeyedInjectRefusalCode::parse("decode"), None);
     }
 
+    /// A receiver that serves anything and counts what reaches it.
+    #[derive(Default)]
+    struct CountingReceiver {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl KeyedInjectReceiver for CountingReceiver {
+        fn window_ms(&self) -> u64 {
+            300_000
+        }
+
+        fn now_ms(&self) -> u64 {
+            1_000_000
+        }
+
+        fn deliver<'a>(
+            &'a self,
+            _scope: &'a KeyedInjectCallerScope,
+            _delivery: KeyedInject<'a>,
+        ) -> KeyedInjectFuture<'a, Result<NativeReceipt, KeyedInjectRefusal>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(receipt()) })
+        }
+
+        fn status<'a>(
+            &'a self,
+            _scope: &'a KeyedInjectCallerScope,
+            _member: &'a str,
+            _delivery_key: &'a str,
+            _with_input: bool,
+        ) -> KeyedInjectFuture<'a, Result<KeyedInjectStatusAnswer, KeyedInjectRefusal>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(KeyedInjectStatusAnswer {
+                    status: NativeStatus::NotCommitted,
+                    input: None,
+                })
+            })
+        }
+    }
+
+    /// The serving side refuses a member in any form but its public durable
+    /// identity before its receiver sees the request, for a delivery and a
+    /// status read alike.
+    #[tokio::test]
+    async fn a_member_not_in_its_public_form_never_reaches_the_receiver() {
+        let receiver = Arc::new(CountingReceiver::default());
+        let slot: KeyedInjectSlot = Arc::new(RwLock::new(Some(
+            Arc::clone(&receiver) as Arc<dyn KeyedInjectReceiver>
+        )));
+        let caller = AuthorizedCaller {
+            label: "first-gateway".to_string(),
+            pubkey: [7; 32],
+        };
+        for member in ["mk--agent_cspecialist", "rt:agent:specialist:0", ""] {
+            let deliver = ControlRequest::InjectKeyed {
+                remote_member: member.to_string(),
+                delivery_key: "batch-1".to_string(),
+                content_digest: "digest".to_string(),
+                summary: "1 announcement".to_string(),
+                body: "a body".to_string(),
+                issued_at_ms: 1_000_000,
+                nonce: "n1".to_string(),
+                caller: None,
+            };
+            let status = ControlRequest::InjectStatus {
+                remote_member: member.to_string(),
+                delivery_key: "batch-1".to_string(),
+                with_input: false,
+                issued_at_ms: 1_000_000,
+                nonce: "n2".to_string(),
+                caller: None,
+            };
+            for request in [deliver, status] {
+                match answer_keyed_inject_request(&slot, request, Some(&caller)).await {
+                    ControlResponse::InjectRefused { code, .. } => assert_eq!(
+                        code,
+                        KeyedInjectRefusalCode::InvalidRequest.as_str(),
+                        "{member:?}"
+                    ),
+                    other => panic!("expected a refusal for {member:?}, got {other:?}"),
+                }
+            }
+        }
+        assert_eq!(
+            receiver.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing reached the receiver"
+        );
+    }
+
     #[test]
     fn members_must_be_public_durable_identities() {
         assert!(check_member_form("agent:specialist").is_ok());
