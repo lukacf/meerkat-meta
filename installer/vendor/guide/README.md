@@ -43,7 +43,9 @@ checks do not establish installed application usefulness, persisted-state
 compatibility, or a real native helper running past 60 seconds. The wheel does
 not carry the separate r3 InitWatch EOF fix.
 
-The existing Guide native 0.9.0 selection stays unchanged. Generated applications
-keep the exact SDK/native pair in their own selected product. Move to a supported
-final SDK/gateway pair through its separate qualification. Never upload this
-development wheel to a registry serving published 0.9.2.
+The Guide's native selection is now the exact Meta 0.9.3 runtime. This wheel
+stays the development environment's client; packaged products carry the
+published Meta 0.9.3 client wheel, whose pin in `launchkit/guide_sdk.py` stays
+pending until that release publishes. Generated applications keep the exact
+SDK/native pair in their own selected product. Never upload this development
+wheel to a registry serving published 0.9.2.

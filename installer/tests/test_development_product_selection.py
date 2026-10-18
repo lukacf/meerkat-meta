@@ -3,7 +3,6 @@ from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
-from pathlib import Path
 import zipfile
 
 import pytest
@@ -164,7 +163,7 @@ def test_development_catalog_uses_exact_full_meta_profiles(product, meta_version
 
 @pytest.mark.parametrize("meta_version", ["0.9.0", "0.9.1"])
 def test_development_distribution_keeps_guide_and_application_owners_separate(
-        product, bundle_source, tmp_path, meta_version):
+        product, bundle_source, tmp_path, monkeypatch, meta_version):
     from launchkit.bootstrap import SelectedGuideRuntime
     from launchkit.connect_installer_caller import ExactFile
     from launchkit import distribution, product_distribution, guide_sdk
@@ -172,7 +171,13 @@ def test_development_distribution_keeps_guide_and_application_owners_separate(
     root, _, _ = bundle_source
     sdk = root / guide_sdk.WHEEL
     sdk.parent.mkdir(parents=True)
-    sdk.write_bytes((Path(__file__).parents[1] / guide_sdk.WHEEL).read_bytes())
+    # An inert stand-in with its own complete pin: the published client
+    # wheel's pin is pending until its release exists.
+    client = b"inert guide client wheel, never install\n"
+    for name, value in (("SOURCE", "c" * 40), ("TREE", "d" * 40),
+            ("SHA256", hashlib.sha256(client).hexdigest()), ("SIZE", len(client))):
+        monkeypatch.setattr(guide_sdk, name, value)
+    sdk.write_bytes(client)
     for name in ("LICENSE-MIT", "LICENSE-APACHE"):
         (root / name).write_text("Inert public license.\n")
     gateway = put(product.root / "guide/rpc_gateway", b"inert guide, never execute\n")

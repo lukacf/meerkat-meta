@@ -27,6 +27,9 @@ The Python project selects the reviewed development client
 rebuild provenance are in `vendor/guide/`. This pure Python client adds the
 public helper transport-wait option; the Guide's native gateway is the selected
 Meta 0.9.3 runtime (Core 0.9.3), admitted by exact version equality.
+Packaged products carry the published Meta 0.9.3 client wheel instead. Its pin
+in `launchkit/guide_sdk.py` stays pending, and packaging refuses, until that
+release publishes.
 This is separate from the repository's current Meta release version and from
 each application's selected runtime. Updating repository source does not upgrade
 an installed application, choose its gateway, or qualify a new SDK/native pair.

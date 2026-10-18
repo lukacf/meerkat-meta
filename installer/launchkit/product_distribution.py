@@ -156,6 +156,13 @@ def _product_inputs(target, artifacts):
     return selected
 
 
+def _pinned_guide_sdk():
+    try:
+        guide_sdk.require_pinned()
+    except ValueError as exc:
+        raise legacy.DistributionError(str(exc)) from exc
+
+
 def package(root, target, guide, output):
     """Select public source and the actual owner's complete product closure.
 
@@ -170,6 +177,7 @@ def package(root, target, guide, output):
     if (type(target) is not MetaToolkitRuntimeTarget or type(guide) is not SelectedGuideRuntime
             or output.exists() or output.is_symlink()):
         raise legacy.DistributionError("Select exact product inputs and a fresh archive output.")
+    _pinned_guide_sdk()
     guide.recheck()
     artifacts = selected_runtime_artifacts(target)
     selection = candidate_selection(target, verified_artifacts=artifacts)
@@ -287,6 +295,7 @@ def package(root, target, guide, output):
 
 def verify(root):
     """Verify an extracted product without model or native process execution."""
+    _pinned_guide_sdk()
     root = Path(root).resolve(strict=True)
     raw = legacy._read(root / legacy.MANIFEST)
     data = json.loads(raw, object_pairs_hook=legacy._unique_object)
