@@ -124,6 +124,27 @@ class CiWorkflowTests(unittest.TestCase):
         for (action, ref), shas in sorted(pins.items()):
             self.assertEqual(len(shas), 1, f"{action} {ref} is pinned to {sorted(shas)}")
 
+    def test_every_job_runs_on_a_pinned_runner_image(self):
+        """A -latest label moves to a new image on GitHub's schedule
+        (ubuntu-latest left 24.04 on 2026-10-19), and with it the
+        toolchains, glibc and preinstalled tools every job reads. Each job
+        names its image; a matrix job's labels are pinned where its matrix
+        is defined."""
+        labels = []
+        for path in sorted((ROOT / ".github").rglob("*.y*ml")):
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                found = re.match(r"\s*runs-on:\s*(.+?)\s*$", line)
+                if not found:
+                    continue
+                labels.append(found.group(1))
+                where = f"{path.relative_to(ROOT)}:{number}"
+                if found.group(1).startswith("${{"):
+                    self.assertEqual(found.group(1), "${{ matrix.runs-on }}", where)
+                    continue
+                self.assertNotIn("latest", found.group(1), f"{where}: {found.group(1)} floats")
+                self.assertRegex(found.group(1), r"^(ubuntu-\d\d\.\d\d(-arm)?|macos-\d+|windows-\d{4})$", where)
+        self.assertGreater(len(labels), 20)
+
     def test_rust_cache_covers_the_wrapper_target(self):
         """rust-cache saves `<workspace>/target`; repo-cargo must build there.
 
