@@ -461,6 +461,9 @@ pub struct UnifiedRuntimeCore {
     /// host beside `attach_identity_first_context`.
     console_identity_roster:
         std::sync::RwLock<Option<Arc<crate::identity_first::MutableRosterProvider>>>,
+    /// Mob announcements: attached once by the host after boot, absent
+    /// until then and in every host that did not enable them.
+    mob_announcements: std::sync::OnceLock<crate::mob_announcements::AnnouncementService>,
     /// §16 Q1 provisional operator keying: the console-principal resolver,
     /// shared between the memory coordinator (reads) and the console send
     /// path (notes interactions). `&self`-settable like the panel store.
@@ -906,6 +909,7 @@ impl UnifiedRuntime {
                     workgraph_fact_tail_task,
                 )),
                 console_identity_roster: std::sync::RwLock::new(None),
+                mob_announcements: std::sync::OnceLock::new(),
                 console_operator_resolver: std::sync::RwLock::new(None),
                 console_governed_ingress: Default::default(),
                 metadata_table,
@@ -1986,6 +1990,20 @@ impl UnifiedRuntime {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Attach the mob announcement owner. Once per runtime: `false` when one
+    /// is already attached.
+    pub fn attach_mob_announcements(
+        &self,
+        service: crate::mob_announcements::AnnouncementService,
+    ) -> bool {
+        self.mob_announcements.set(service).is_ok()
+    }
+
+    /// The attached mob announcement owner, when the host enabled them.
+    pub fn mob_announcements(&self) -> Option<crate::mob_announcements::AnnouncementService> {
+        self.mob_announcements.get().cloned()
     }
 
     pub fn set_memory_panel_store(

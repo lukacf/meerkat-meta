@@ -11436,6 +11436,27 @@ impl IdentityRuntime {
     /// console reservation. HTTP replays return that original frame/status or
     /// typed unknown fate after failure; they never re-prepare changed memory.
     /// No replay cache (or eviction which could make an old key executable).
+    /// Why this gateway's runtime does not serve `identity`'s member, read
+    /// from its registered spec: `None` for a local session-backed member,
+    /// otherwise its remote placement or its external binding. A runtime
+    /// inbox row for such a member is never applied here.
+    pub(crate) async fn not_served_here(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<String>, IdentityRuntimeError> {
+        let entries = self.entries.read().await;
+        let entry = entries
+            .get(identity)
+            .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
+        Ok(if entry.spec.placement.is_some() {
+            Some(format!("{identity} is placed on a host"))
+        } else if durable_spec_uses_external_binding(&entry.spec) {
+            Some(format!("{identity} is bound to an external runtime"))
+        } else {
+            None
+        })
+    }
+
     /// Whether a console send to `identity` can carry a native skill
     /// selection: only a local session-backed member (no external binding,
     /// no remote placement) has meerkat's host-human skill carrier. Read

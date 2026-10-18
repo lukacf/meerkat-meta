@@ -92,6 +92,10 @@ pub const CANONICAL_AGENT_MEMORY_DIR_NAME: &str = "agent-memory";
 /// Named in every build: a state directory an extension-state embedder wrote
 /// is fenced and adopted by the stock gateway too.
 pub const EXTENSION_STATE_DB_FILE_NAME: &str = "extension_state.sqlite3";
+/// The mob announcement database file. Not a [`DatabaseSlot`]: it is new in
+/// 0.9.4 and has no legacy spelling to reconcile. Opened only when a gateway
+/// enables mob announcements; storage maintenance fences it in every build.
+pub const MOB_ANNOUNCEMENTS_DB_FILE_NAME: &str = "mob_announcements.sqlite3";
 /// Reserved event-log database file name. Nothing opens it before the M4
 /// disk factory; the locator exists so the name is decided exactly once.
 pub const EVENT_LOG_DB_FILE_NAME: &str = "event_log.sqlite3";
@@ -642,6 +646,16 @@ impl MetaStorageLayout {
     #[cfg(feature = "extension-state")]
     pub fn extension_state_db(&self) -> Result<ResolvedDatabase, StorageLayoutError> {
         self.resolve_database(DatabaseSlot::ExtensionState)
+    }
+
+    /// The mob announcement database
+    /// ([`MOB_ANNOUNCEMENTS_DB_FILE_NAME`] in the state directory). Refused,
+    /// like every slot, while the installation is refused.
+    pub fn mob_announcements_db(&self) -> Result<PathBuf, StorageLayoutError> {
+        if let Err(refusal) = &self.installation {
+            return Err(refusal.clone());
+        }
+        Ok(self.state_dir.join(MOB_ANNOUNCEMENTS_DB_FILE_NAME))
     }
 
     /// Canonical Meerkat-level detached-job database inherited by Meta's

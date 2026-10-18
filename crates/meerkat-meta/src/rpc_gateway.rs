@@ -214,6 +214,10 @@ struct GatewayRuntimeOptions {
     /// `http_listen` exposes the listener beyond this host. Same word and
     /// rule as `--allow-remote` on `rkat-rpc --tcp`.
     allow_remote: bool,
+    /// `runtime_options.mob_announcements`: members announce to their mob
+    /// and receive what they subscribe to in batches. Persistent
+    /// identity-first launches only; `None` keeps them off.
+    mob_announcements: Option<crate::mob_announcements::AnnouncementConfig>,
 }
 
 /// `runtime_options.live` wire forms: `true` mounts the live WebSocket
@@ -446,6 +450,7 @@ impl Default for GatewayRuntimeOptions {
             http_listen: crate::gateway_composition::DEFAULT_GATEWAY_HTTP_LISTEN,
             http_public_base_url: None,
             allow_remote: false,
+            mob_announcements: None,
         }
     }
 }
@@ -8248,6 +8253,7 @@ fn parse_gateway_runtime_options(
         "http_listen",
         "http_public_base_url",
         "allow_remote",
+        "mob_announcements",
     ];
     let unsupported = runtime_options
         .keys()
@@ -8316,6 +8322,12 @@ fn parse_gateway_runtime_options(
         parsed.allow_remote = value
             .as_bool()
             .ok_or_else(|| "runtime_options.allow_remote must be a boolean".to_string())?;
+    }
+    if let Some(value) = runtime_options.get("mob_announcements") {
+        parsed.mob_announcements = crate::mob_announcements::parse_runtime_options(value)?;
+        if parsed.mob_announcements.is_some() && persistent_state.is_none() {
+            return Err("runtime_options.mob_announcements needs a persistent launch".to_string());
+        }
     }
     if let Some(memory_config) = runtime_options.get("memory_config") {
         parsed.runtime_options.memory_backend = Some(parse_gateway_memory_config(
@@ -18361,6 +18373,13 @@ external_addressable = true
         };
     let app = app.layer(axum::Extension(console_voice_controller.clone()));
 
+    // Mob announcements attach once the identity runtime and the agent mob
+    // tool state exist, before the first request is served.
+    if let Some(config) = gateway_options.mob_announcements {
+        crate::mob_announcements::compose_for_runtime(&runtime, &storage_layout, config)
+            .map_err(|message| fail_init(&request_id, -32602, message))?;
+    }
+
     // 8. Send init response via stdout channel
     let loaded_modules = runtime.loaded_modules().await;
     let runtime_origin = if prepared.is_some() {
@@ -18545,6 +18564,9 @@ external_addressable = true
             signal = dispatch_end.signal().map(tracing::field::display),
             "rpc_gateway dispatch loop ended; running graceful shutdown"
         );
+        if let Some(announcements) = runtime.mob_announcements() {
+            announcements.stop();
+        }
         if let Some(closed) = observed_stdio_close(&resources.stdio) {
             gateway_shutdown = gateway_shutdown.or(closed.shutdown_request);
         }

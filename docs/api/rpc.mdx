@@ -252,6 +252,11 @@ errors. SDKs surface it on `RpcError.data`.
 | `-32018` | stdio gateway: an ordinary request arrived before `meta/init` settled. It was refused at once, not queued. Startup provider callbacks must not issue ordinary RPCs on the runtime that is starting. `meta/shutdown` is still admitted. | `{kind: "init_in_progress", method}` |
 | `-32019` | `meta/init` mob composition provenance refusal: the persistent mob storage's recorded composition cannot be proven to match the launch. Raised before the mob actuates, for a supplied definition that differs from the recorded one, a candidate launch whose definition differs from the stored one it would boot, a store created by a rehearsal launch, a composition manifest that is unreadable, malformed, of an unsupported version or could not be written, or undeclared non-empty storage. (`missing` is part of the kind vocabulary but the gateway does not raise it today: an authoritative launch adopts and records the definition when the manifest is absent.) The message keeps the `Runtime bootstrap failed: ` prefix and names the remedy. The gateway writes the error response (or, for an accepted init, the `failed` settlement) and exits. | `{kind, fields, manifest?, storage?, found_version?, supported_version?}`; `kind` is `divergent`, `candidate_divergent`, `created_by_rehearsal`, `missing`, `unreadable`, `malformed`, `unsupported_version`, `not_recorded` or `unproven_storage`; `fields` is always present and lists the diverged definition fields as dotted paths (empty for other kinds) |
 | `-32030` | HTTP console ABAC gate refused the operation | `{kind: "access_denied", ...}` |
+| `-32044` | A mob announcement method on a gateway that did not enable mob announcements (see [Mob announcements](#mob-announcements-optional)) | `{kind: "mob_announcements_unavailable"}` |
+| `-32045` | Mob announcement conflict: a source key already bound to other content, a stale subscription revision, a reused operation id, a batch that moved | `{kind: "announcement_conflict", existing}`, `{kind: "stale_revision", current_revision}`, `{kind: "operation_reused"}` or `{kind: "batch_moved", current}` |
+| `-32046` | `meta/mob_announcements/subscriptions/put` start frontier outside a mob's announcements: older than what is retained, or beyond its head (a mob that has announced nothing yet is at head 0) | `{kind: "gap", mob_id, earliest_retained}` or `{kind: "frontier_beyond_head", mob_id, head}` |
+| `-32047` | Mob announcement typed refusal | `{kind}`: `governed_runtime`, `unknown_member` (with `member`), `unsupported_member`, `unusable_member`, `unusable_peer`, `subscription_cancelled`, `subscription_ended` (with `end`), `member_mismatch` or `native_unavailable` |
+| `-32048` | A mob announcement method names a subscription, delivery or mob that does not exist here | `{kind: "unknown_subscription"}`, `{kind: "unknown_delivery"}` or `{kind: "unknown_mob", mobs}` |
 
 The `-32010` constant is exported from both SDKs as
 `MOB_EVENTS_STALE_CURSOR_CODE`. The Python and TypeScript SDKs auto-
@@ -1899,6 +1904,57 @@ the first replayed event by `event_id`.
 ## Console ingress
 
 The older `console.route` style is not the stock console contract. Use `GET /console/experience`, `GET /console/timeline`, and `POST /console/rpc` instead.
+
+## Mob announcements (optional)
+
+Available on gateways launched persistent and identity-first with
+`runtime_options.mob_announcements = {"enabled": true}`; otherwise these
+methods answer `-32044`. The host announces a development to a mob hosted on
+this gateway, once per mob and source key. Every member subscription that
+names the mob and one of the announcement's topics captures it in the same
+transaction, and each subscriber receives what it is owed in bounded batches,
+each as one Meerkat host continuation. The design, defaults and limits are in
+`docs/design/mob-announcements.md` in the repository.
+
+| Method | Params | Result |
+|--------|--------|--------|
+| `meta/mob_announcements/announce` | `{mob_id?, source_key, topics, body, correlation_id?, causes?}` | `{announcement, replayed, captured}` |
+| `meta/mob_announcements/get` | `{mob_id, source_key}` | `{announcement}` (`null` when absent) |
+| `meta/mob_announcements/subscriptions/put` | `{operation_id, subscription_id, member, topics, mobs?, start?, expected_revision?}` | `{subscription}` |
+| `meta/mob_announcements/subscriptions/pause`, `resume`, `cancel` | `{operation_id, subscription_id, expected_revision}` | `{subscription, unresolved_batches}` |
+| `meta/mob_announcements/subscriptions/get` | `{subscription_id}` | `{subscription}` |
+| `meta/mob_announcements/subscriptions/list` | `{member?, after?, limit?}` | `{subscriptions}` |
+| `meta/mob_announcements/deliveries/list` | `{member?, subscription_id?, after?, limit?}` | `{deliveries}` |
+| `meta/mob_announcements/deliveries/observe` | `{batch_id}` | `{batch, native, input?}` |
+| `meta/mob_announcements/deliveries/reconcile` | `{batch_id}` | `{batch, native, input?}` |
+
+`mob_id` and `mobs` default to this gateway's mob, and every mob named must
+be hosted here (`-32048` `unknown_mob` otherwise). A host call announces as
+`{"kind": "host"}`; `captured` counts the subscriptions that captured the
+announcement and never names them. `start` is `{"kind": "now"}` (default) or
+`{"kind": "after", "frontier": {"<mob id>": <sequence>}}`; capture starts
+after each named sequence, and the frontier may name only the subscription's
+mobs. A sequence beyond a mob's head is refused with `-32046`
+`frontier_beyond_head`, never clamped. `native.status` is the native
+continuation owner's own status (`not_submitted`, `not_committed`, `pending`,
+`applied`, `stranded`, `refused`, or `unavailable` when it could not be
+read), and `input` is the admitted input's runtime state. Admission is not
+processing: read `input` for what the runtime did with it.
+
+`member` is `{"mob_id": "<mob id>", "identity": "<identity>"}`: an identity
+is unique only within its mob. A member of this gateway's mob must be a
+registered identity served by this gateway's runtime: one placed on a host or
+bound to an external runtime is refused with `-32047` `unusable_member`. A
+member of another mob hosted here is refused with `unsupported_member`, and
+one on a peer gateway with `unusable_peer`.
+
+A subscription's `state` is `active`, `paused`, `cancelled` or `ended`. It
+ends, with `ended` saying why, when its member is no longer registered
+(`member_left`), when the member stops being served here
+(`member_unusable`), or when every mob it named was destroyed
+(`mobs_ended`); what it captured and no batch holds settles. A destroyed mob
+leaves the subscriptions that name it at a new revision and is listed in
+their `ended_mobs`.
 
 ## See also
 

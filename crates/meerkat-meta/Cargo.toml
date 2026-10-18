@@ -123,6 +123,9 @@ rustix = { version = "1.1.4", features = ["fs", "event", "process"] }
 
 [features]
 extension-state = ["dep:meta-extension-state"]
+# Non-shipping deterministic fault points for the mob announcement process
+# tests.
+announcement-test-faults = []
 integration-real-tests = []
 # Public OpenAI Live (`gpt-live-1`) execution path: the neutral GPT Live
 # runtime machinery (WebRTC answer transport, mob live bridge, Mob MCP live

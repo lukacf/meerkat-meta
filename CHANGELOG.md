@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Mob announcements. The host announces a development to a mob hosted on
+  this gateway; member subscriptions, keyed by `{mob_id, identity}`, take the
+  topics they name from the mobs they name (this gateway's mob by default);
+  and each subscriber receives what it is owed in bounded batches, each one
+  Meerkat host continuation keyed by batch id (`meta.mob_announcements`
+  namespace). An announcement is captured for every matching subscription in
+  its own transaction. A lost acknowledgment is reconciled from native status
+  without a second submission, and a delivery stranded on a retired
+  incarnation moves to a successor batch that names its predecessor. A
+  subscription ends, typed, when its member is no longer registered or every
+  mob it named was destroyed; a destroyed mob leaves the subscriptions that
+  name it, and retention removes ended subscriptions and the logs of
+  destroyed mobs. Batch bodies quote each announcement and name its mob and
+  announcer. New methods `meta/mob_announcements/{announce, get,
+  subscriptions/{put,pause,resume,cancel,get,list},
+  deliveries/{list,observe,reconcile}}`, with typed errors `-32044` to
+  `-32048`. A persistent, identity-first `rpc_gateway` enables them with
+  `runtime_options.mob_announcements`; without it nothing opens the
+  announcement database (`mob_announcements.sqlite3`, fenced by storage
+  maintenance in every build) and the methods answer
+  `mob_announcements_unavailable`. See `docs/design/mob-announcements.md`.
+
 - `.github/workflows/warm-deps.yml`, dispatched on a branch whose `Cargo.lock`
   changed, builds the dependency graph of each Rust CI job from that branch's
   crates.io dependencies, with no workspace code, and keeps it as a 3-day
