@@ -3,7 +3,9 @@
 //! before the identity bootstrap registers persisted owners, consumes the
 //! pending activation or restores the roster. A refusal there fails init
 //! before any of those, and the no-identity path never calls it. Each case is a separate gateway process
-//! over real stdio, answering the SDK roster callbacks itself.
+//! over real stdio, answering the SDK roster callbacks itself. On both paths
+//! the Ready carries the runtime's bootstrap completion, which the host
+//! publishes inside its publication boundary.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -83,8 +85,16 @@ impl GatewayHostComposition for BindingHost {
 
     fn publish_bootstrap_ready(
         &self,
-        publication: GatewayBootstrapReady<'_>,
+        mut publication: GatewayBootstrapReady<'_>,
     ) -> Result<(), GatewayHostError> {
+        let completion = match publication.take_runtime_completion() {
+            Some(completion) => match completion.publish(|| ()) {
+                Ok(()) => "published",
+                Err(_) => "refused",
+            },
+            None => "absent",
+        };
+        self.append(&format!("ready completion={completion}"));
         publication.publish();
         Ok(())
     }
@@ -267,6 +277,12 @@ fn the_host_binds_the_installed_identity_view_before_bootstrap() {
         phases(&seen)
     );
     assert_eq!(seen.last().unwrap()["params"]["outcome"], "ready");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "ready completion=published"),
+        "the identity bootstrap's completion rides the Ready: {lines:?}"
+    );
 
     // A refused identity bind fails init before any bootstrap phase, and the
     // gateway run returns failure after cleanup handling and the host-close
@@ -307,5 +323,11 @@ fn the_host_binds_the_installed_identity_view_before_bootstrap() {
         seen.last().unwrap()["params"]["outcome"],
         "ready",
         "{seen:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "ready completion=published"),
+        "the activation's completion rides the Ready: {lines:?}"
     );
 }

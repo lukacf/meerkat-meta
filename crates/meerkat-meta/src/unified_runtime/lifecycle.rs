@@ -249,6 +249,9 @@ impl UnifiedRuntime {
     }
 
     pub async fn shutdown(&self) -> UnifiedRuntimeShutdownReport {
+        // The close begins under the bootstrap completion's gate: a running
+        // publication finishes first, and every later one is refused.
+        self.close_gate.close();
         self.shutting_down.store(true, Ordering::SeqCst);
         // The liveness probe is observation only. Abort it before anything
         // can quiesce the mob actor so an intentional shutdown stall cannot
