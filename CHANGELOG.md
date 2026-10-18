@@ -59,6 +59,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   roster and the identity runtime, or refused; per-member limits come from
   `runtime_options.mob_announcements.member_limits`.
 
+- Members of mobs hosted here as mob announcement subscribers. The host can
+  subscribe a member of any mob this gateway hosts, such as a mob a member
+  created, by its plain roster id; it is delivered to through this
+  gateway's runtime. Its subscriptions end with `member_mob_ended` when that
+  mob is destroyed, created again, completed or reset after the
+  subscription was made, read from the mob's own durable records; a member
+  being respawned, or a mob held after a restart, ends nothing. How a member
+  is reached is kept from its first subscription and never changes: a mob
+  id that names a mob hosted here and a peer alike is refused with
+  `ambiguous_mob`.
+
 - Keyed cross-mob inject. Two new control verbs, `inject_keyed` and
   `inject_status`, deliver one keyed continuation to a member of the serving
   gateway's mob, once per key and scoped to the calling grant, and read it

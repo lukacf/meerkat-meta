@@ -56,10 +56,10 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 pub use native::{
-    ANNOUNCEMENT_CONTINUATION_NAMESPACE, AnnouncementNativeDelivery, IdentityService,
-    MemberProblem, MemberRoute, MobNativeDelivery, MobPresence, NativeDelivery, NativeStatus,
-    NativeSubmitError, NativeUnavailable, PrepareError, batch_summary, continuation_delivery,
-    continuation_for,
+    ANNOUNCEMENT_CONTINUATION_NAMESPACE, AnnouncementNativeDelivery, IdentityService, MemberMobEnd,
+    MemberMobScan, MemberProblem, MemberRoute, MobNativeDelivery, MobPresence, NativeDelivery,
+    NativeStatus, NativeSubmitError, NativeUnavailable, PrepareError, batch_summary,
+    continuation_delivery, continuation_for,
 };
 pub use owner::{
     AdmittedInput, AnnouncementConfig, AnnouncementError, AnnouncementService,
@@ -72,10 +72,10 @@ pub use types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementRef, AnnouncementStoreError,
     Announcer, Batch, BatchEvent, BatchEventTag, BatchId, BatchItem, BatchQuery, BatchState,
     BatchStateTag, MAX_ITEM_WIRE_BYTES, MAX_REMOTE_BODY_WIRE_BYTES, Member, MemberBacklog,
-    MemberIdentity, MobId, NativeReceipt, OperationId, PruneReport, PutSubscription, SealingPolicy,
-    Selector, Settlement, SourceKey, StartFrontier, Subscription, SubscriptionChange,
-    SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId, SubscriptionState, SuccessorBatch,
-    Topic,
+    MemberIdentity, MemberRouteRecord, MobId, NativeReceipt, OperationId, PruneReport,
+    PutSubscription, SealingPolicy, Selector, Settlement, SourceKey, StartFrontier, Subscription,
+    SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
+    SubscriptionState, SuccessorBatch, Topic,
 };
 
 /// `runtime_options.mob_announcements`, as a host passes it at startup.

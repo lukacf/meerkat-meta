@@ -69,6 +69,11 @@ pub enum AnnouncementStoreError {
     },
     /// An update named another member than the subscription's own.
     MemberMismatch,
+    /// The member is kept on another route than the one the request would
+    /// take: a member is never rerouted.
+    RouteKept {
+        kept: MemberRoute,
+    },
     /// The batch owner's transition table refuses this event here.
     IllegalTransition {
         from: BatchStateTag,
@@ -114,6 +119,11 @@ impl fmt::Display for AnnouncementStoreError {
             Self::SubscriptionCancelled => f.write_str("the subscription is cancelled"),
             Self::SubscriptionEnded { end } => write!(f, "the subscription ended: {end}"),
             Self::MemberMismatch => f.write_str("a subscription's member cannot change"),
+            Self::RouteKept { kept } => write!(
+                f,
+                "the member is kept on the {} route and is never rerouted",
+                kept.as_str()
+            ),
             Self::IllegalTransition { from, event } => {
                 write!(f, "a {from} batch cannot take {event}")
             }
@@ -506,6 +516,10 @@ pub enum SubscriptionEnd {
     PeerUnsupported,
     /// Every mob the subscription named was destroyed.
     MobsEnded,
+    /// The member's own mob, a mob a member created, ended after the
+    /// subscription was made: destroyed, completed, reset, or created again
+    /// under the same id. `why` says which.
+    MemberMobEnded { why: String },
 }
 
 impl fmt::Display for SubscriptionEnd {
@@ -519,15 +533,51 @@ impl fmt::Display for SubscriptionEnd {
                 f.write_str("the member's gateway does not serve keyed delivery")
             }
             Self::MobsEnded => f.write_str("every mob it named was destroyed"),
+            Self::MemberMobEnded { why } => write!(f, "the member's mob ended: {why}"),
         }
     }
+}
+
+/// How a member is reached. Decided when the member is first subscribed and
+/// kept: a later collision of ids never reroutes a member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberRoute {
+    /// A member of this gateway's mob, through this gateway's runtime.
+    #[default]
+    Local,
+    /// A member of a mob a member created on this gateway, through this
+    /// gateway's runtime.
+    Child,
+    /// A member of a mob on a peer gateway, through that gateway.
+    Peer,
+}
+
+impl MemberRoute {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Child => "child",
+            Self::Peer => "peer",
+        }
+    }
+}
+
+/// A member's kept route: for a member of a mob a member created, the
+/// incarnation of that mob it was subscribed in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberRouteRecord {
+    pub route: MemberRoute,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<MobIncarnation>,
 }
 
 /// One incarnation of a mob a member created: the owner session Meerkat
 /// bound it to at creation, and the time of the first event in its own
 /// log. A mob destroyed and created again under the same id starts a new
 /// log, so it is another incarnation even under the same owner.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MobIncarnation {
     /// `None` for a mob no member created: it has no owner binding.
@@ -578,6 +628,11 @@ pub struct Subscription {
     /// Why the subscription ended, when its state is `ended`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<SubscriptionEnd>,
+    /// For a member of a mob a member created: that mob's event cursor when
+    /// the subscription was made. A completion or reset of that mob after
+    /// it ends the subscription.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_mob_cursor: Option<u64>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -605,6 +660,16 @@ pub struct PutSubscription {
     pub start: StartFrontier,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,
+    /// How the member is reached. The owner fills it in from the member's
+    /// own records; it is kept with the member's first subscription and is
+    /// not part of the request a caller makes.
+    #[serde(skip)]
+    pub route: MemberRouteRecord,
+    /// For a member of a mob a member created: the cursor of that mob's
+    /// event log when the subscription was made. The owner fills it in; it
+    /// is not part of the request a caller makes.
+    #[serde(skip)]
+    pub member_mob_cursor: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1084,6 +1149,9 @@ pub struct Batch {
     /// delivered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gaps: Vec<BatchGap>,
+    /// How the member is reached, kept from its subscription.
+    #[serde(default)]
+    pub route: MemberRoute,
     pub body: String,
     pub content_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

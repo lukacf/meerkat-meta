@@ -259,6 +259,7 @@ fn remote_batch(id: &str, body_text: &str) -> Batch {
             source_key: SourceKey::new("k").unwrap(),
         }],
         gaps: Vec::new(),
+        route: MemberRoute::Peer,
         content_digest: content_digest(&body),
         body,
         id,

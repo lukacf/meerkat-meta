@@ -17,8 +17,14 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::remote::RemoteMemberDelivery;
-use super::types::{Batch, Member, MemberIdentity, MobId, MobIncarnation, SubscriptionEnd};
+pub use super::types::MemberRoute;
+use super::types::{
+    Batch, Member, MemberIdentity, MemberRouteRecord, MobId, MobIncarnation, SubscriptionEnd,
+};
 pub use crate::runtime::keyed_inject::{AdmittedInput, NativeReceipt, NativeStatus};
+
+/// Events read per page when a member's mob is checked for its end.
+const MEMBER_MOB_EVENT_PAGE: usize = 256;
 
 /// The continuation namespace announcement batches are delivered under.
 pub const ANNOUNCEMENT_CONTINUATION_NAMESPACE: &str = "meta.mob_announcements";
@@ -62,9 +68,6 @@ pub enum MemberProblem {
     Unknown,
     /// Not a durable identity in its public form.
     Invalid(String),
-    /// A member of another mob hosted on this gateway. Deliveries reach the
-    /// members of this gateway's own mob and of peer gateways' mobs.
-    Unsupported(String),
     /// A member this gateway's runtime does not serve (placed on a host, or
     /// bound to an external runtime), so a delivery could never be admitted.
     Unusable(String),
@@ -72,6 +75,9 @@ pub enum MemberProblem {
     UnusablePeer(String),
     /// A read the check needs could not be made now.
     Unavailable(String),
+    /// The member's mob id names a mob hosted here and a peer in the
+    /// contact directory alike.
+    Ambiguous(String),
 }
 
 /// Why a member could not be made ready for a delivery.
@@ -92,13 +98,43 @@ impl std::fmt::Display for PrepareError {
     }
 }
 
-/// How a member is reached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemberRoute {
-    /// A member of this gateway's mob, through this gateway's runtime.
-    Local,
-    /// A member of a mob on a peer gateway, through that gateway.
-    Peer,
+/// A mob hosted here other than this gateway's own.
+enum ChildMob {
+    Running(Box<meerkat_mob::MobHandle>),
+    /// Restored and held until its owner resolves: it may run again.
+    Held,
+    /// Neither running nor held: destroyed, or never created here.
+    Gone,
+}
+
+/// That a member's own mob, a mob a member created, ended after a cursor of
+/// its event log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberMobEnd {
+    /// Subscriptions made before this cursor end. `u64::MAX` when the mob
+    /// is gone or another incarnation: every subscription made in it ends.
+    pub cursor: u64,
+    pub why: String,
+}
+
+impl MemberMobEnd {
+    fn gone(why: &str) -> Self {
+        Self {
+            cursor: u64::MAX,
+            why: why.to_string(),
+        }
+    }
+}
+
+/// What a member's own mob, a mob a member created, did after a cursor of its
+/// event log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberMobScan {
+    /// It ended.
+    Ended(MemberMobEnd),
+    /// It runs, and neither completed nor reset after the cursor through
+    /// `through`.
+    Running { through: u64 },
 }
 
 /// Whether a mob named by an announcement or a subscription is hosted here.
@@ -259,8 +295,12 @@ pub trait NativeDelivery: Send + Sync {
     /// when a batch reaches it.
     fn governs_work_authority(&self) -> Result<bool, NativeUnavailable>;
 
-    /// How the member is reached, from this gateway's own mob id alone.
-    fn route(&self, member: &Member) -> MemberRoute;
+    /// How the member would be reached if it were subscribed now: a member
+    /// of this gateway's mob, of a mob a member created here (with that
+    /// mob's incarnation), or of a mob on a peer gateway. The route a member
+    /// was first subscribed with is kept by the store; this answers only for
+    /// a member without one.
+    async fn route_for(&self, member: &Member) -> Result<MemberRouteRecord, MemberProblem>;
 
     /// Whether each named mob is hosted here, from the mob owner's own
     /// records.
@@ -306,13 +346,14 @@ pub trait NativeDelivery: Send + Sync {
     /// this gateway and served by its runtime, or one on a peer gateway this
     /// gateway can call authenticated. A peer's roster is not read here;
     /// the peer refuses an unknown member when a batch reaches it.
-    async fn check_member(&self, member: &Member) -> Result<(), MemberProblem>;
+    async fn check_member(&self, member: &Member, route: MemberRoute) -> Result<(), MemberProblem>;
 
     /// Make the member's current incarnation resolvable before a
     /// submission binds to it, or report the final fact that it never will
     /// be. Submits nothing. A peer prepares its own member when a batch
     /// reaches it.
-    async fn prepare_member(&self, member: &Member) -> Result<(), PrepareError>;
+    async fn prepare_member(&self, member: &Member, route: MemberRoute)
+    -> Result<(), PrepareError>;
 
     /// Submit the batch's exact continuation for its member.
     async fn submit(
@@ -333,6 +374,40 @@ pub trait NativeDelivery: Send + Sync {
         session_id: &str,
         input_id: &str,
     ) -> Result<Option<Value>, NativeUnavailable>;
+
+    /// The current cursor of the event log of a mob a member created: a
+    /// subscription made now is made at it.
+    async fn member_mob_cursor(&self, mob_id: &MobId) -> Result<u64, NativeUnavailable> {
+        Err(NativeUnavailable(format!(
+            "{mob_id} keeps no event log here"
+        )))
+    }
+
+    /// Whether the mob a member was subscribed in (`incarnation` of
+    /// `mob_id`) is gone for good: destroyed, or created again under the
+    /// same id. Read once every mob hosted across a restart is restored.
+    async fn member_mob_gone(
+        &self,
+        _mob_id: &MobId,
+        _incarnation: Option<&MobIncarnation>,
+    ) -> Result<Option<MemberMobEnd>, NativeUnavailable> {
+        Ok(None)
+    }
+
+    /// What the mob a member was subscribed in did after `after`: gone (as
+    /// [`Self::member_mob_gone`] reads it), or completed or reset per its
+    /// own durable event log, or neither through the cursor read.
+    async fn member_mob_end(
+        &self,
+        mob_id: &MobId,
+        incarnation: Option<&MobIncarnation>,
+        after: u64,
+    ) -> Result<MemberMobScan, NativeUnavailable> {
+        Ok(match self.member_mob_gone(mob_id, incarnation).await? {
+            Some(end) => MemberMobScan::Ended(end),
+            None => MemberMobScan::Running { through: after },
+        })
+    }
 }
 
 /// The summary a batch's continuation carries: how many distinct
@@ -744,6 +819,223 @@ impl MobNativeDelivery {
         })
     }
 
+    /// The running handle of a mob hosted here other than this gateway's
+    /// own.
+    async fn child_handle(
+        &self,
+        mob_id: &MobId,
+    ) -> Result<Option<meerkat_mob::MobHandle>, NativeUnavailable> {
+        if *mob_id == self.mob_id {
+            return Ok(None);
+        }
+        Ok(self
+            .mob_tools
+            .mob_handles_snapshot()
+            .await
+            .map_err(|error| NativeUnavailable(error.to_string()))?
+            .into_iter()
+            .find(|(id, _)| id.as_str() == mob_id.as_str())
+            .map(|(_, handle)| handle))
+    }
+
+    /// A mob hosted here other than this gateway's own: running, held until
+    /// its owner resolves, or gone.
+    ///
+    /// The listing finishes the restore of persisted mobs first, so a mob
+    /// that is neither held nor running is not one still being restored.
+    /// Held mobs are read before running ones: activation moves a held mob
+    /// to the running ones, never back.
+    async fn child_mob(&self, mob_id: &MobId) -> Result<ChildMob, NativeUnavailable> {
+        self.restored_listing().await?;
+        let held = self
+            .mob_tools
+            .held_child_mobs()
+            .await
+            .into_iter()
+            .any(|(id, _)| id.as_str() == mob_id.as_str());
+        Ok(match self.child_handle(mob_id).await? {
+            Some(handle) => ChildMob::Running(Box::new(handle)),
+            None if held => ChildMob::Held,
+            None => ChildMob::Gone,
+        })
+    }
+
+    /// The running handle of a mob hosted here other than this gateway's
+    /// own; `None` when it is gone; unavailable while it is held.
+    async fn running_child(
+        &self,
+        mob_id: &MobId,
+    ) -> Result<Option<meerkat_mob::MobHandle>, NativeUnavailable> {
+        match self.child_mob(mob_id).await? {
+            ChildMob::Running(handle) => Ok(Some(*handle)),
+            ChildMob::Held => Err(NativeUnavailable(format!(
+                "{mob_id} is held until its owner resolves"
+            ))),
+            ChildMob::Gone => Ok(None),
+        }
+    }
+
+    /// The incarnation of a running mob hosted here other than this
+    /// gateway's own, or `None` when it is gone. Unavailable while the mob
+    /// is held until its owner resolves.
+    pub async fn child_incarnation(
+        &self,
+        mob_id: &MobId,
+    ) -> Result<Option<MobIncarnation>, NativeUnavailable> {
+        match self.running_child(mob_id).await? {
+            Some(handle) => Ok(Some(Self::incarnation_of(&handle, mob_id).await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// A member of a mob a member created can be subscribed while that mob
+    /// runs and has not completed, and the member is on its roster now. Its
+    /// absence later ends nothing: a respawn takes it off for a while.
+    async fn check_child_member(&self, member: &Member) -> Result<(), MemberProblem> {
+        let Some(handle) = self
+            .running_child(&member.mob_id)
+            .await
+            .map_err(|error| MemberProblem::Unavailable(error.0))?
+        else {
+            return Err(MemberProblem::Unusable(format!(
+                "{} does not run here",
+                member.mob_id
+            )));
+        };
+        if matches!(
+            handle.status_observation_snapshot(),
+            meerkat_mob::MobState::Completed | meerkat_mob::MobState::Destroyed
+        ) {
+            return Err(MemberProblem::Unusable(format!(
+                "{} has completed",
+                member.mob_id
+            )));
+        }
+        match handle
+            .get_member(&meerkat_mob::AgentIdentity::from(member.identity.as_str()))
+            .await
+        {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(MemberProblem::Unknown),
+            Err(error) => Err(MemberProblem::Unavailable(error.to_string())),
+        }
+    }
+
+    /// A member of a mob a member created is ready while that mob runs here;
+    /// once it is gone for good the member's subscriptions end. A held mob
+    /// may run again: its members wait.
+    async fn prepare_child_member(&self, member: &Member) -> Result<(), PrepareError> {
+        match self.running_child(&member.mob_id).await {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(PrepareError::Gone(SubscriptionEnd::MemberMobEnded {
+                why: "destroyed".to_string(),
+            })),
+            Err(error) => Err(PrepareError::Unavailable(error.0)),
+        }
+    }
+
+    /// The continuation owner of a member by its kept route. A member of a
+    /// mob a member created is named by its plain roster id.
+    fn owner_for(
+        &self,
+        member: &Member,
+        route: MemberRoute,
+    ) -> Result<meerkat::ContinuationOwner, String> {
+        match route {
+            MemberRoute::Local => Ok(self.owner(&member.identity)),
+            MemberRoute::Child => Ok(meerkat::ContinuationOwner::Member {
+                mob_id: member.mob_id.to_string(),
+                identity: member.identity.to_string(),
+            }),
+            MemberRoute::Peer => {
+                Err("this gateway has no delivery path to peer members".to_string())
+            }
+        }
+    }
+
+    /// The current cursor of a running child mob's event log.
+    pub async fn member_mob_cursor(&self, mob_id: &MobId) -> Result<u64, NativeUnavailable> {
+        let handle = self
+            .running_child(mob_id)
+            .await?
+            .ok_or_else(|| NativeUnavailable(format!("{mob_id} does not run here")))?;
+        handle
+            .events()
+            .latest_cursor()
+            .await
+            .map_err(|error| NativeUnavailable(error.to_string()))
+    }
+
+    /// The running handle of the mob a member was subscribed in, or the
+    /// final fact that it is gone: destroyed (neither running nor held once
+    /// every mob is restored), or created again (another incarnation under
+    /// the same id). Unavailable while it is held until its owner resolves.
+    async fn member_mob_handle(
+        &self,
+        mob_id: &MobId,
+        incarnation: Option<&MobIncarnation>,
+    ) -> Result<Result<meerkat_mob::MobHandle, MemberMobEnd>, NativeUnavailable> {
+        let Some(handle) = self.running_child(mob_id).await? else {
+            return Ok(Err(MemberMobEnd::gone("destroyed")));
+        };
+        if let Some(subscribed_in) = incarnation
+            && Self::incarnation_of(&handle, mob_id).await? != *subscribed_in
+        {
+            return Ok(Err(MemberMobEnd::gone("created again")));
+        }
+        Ok(Ok(handle))
+    }
+
+    /// Whether the mob a member was subscribed in is gone for good.
+    pub async fn member_mob_gone(
+        &self,
+        mob_id: &MobId,
+        incarnation: Option<&MobIncarnation>,
+    ) -> Result<Option<MemberMobEnd>, NativeUnavailable> {
+        Ok(self.member_mob_handle(mob_id, incarnation).await?.err())
+    }
+
+    /// What the mob a member was subscribed in did after `after`, from its
+    /// own durable records: gone, or the first completion or reset in its
+    /// event log after `after`, or neither through the last event read.
+    pub async fn member_mob_end(
+        &self,
+        mob_id: &MobId,
+        incarnation: Option<&MobIncarnation>,
+        after: u64,
+    ) -> Result<MemberMobScan, NativeUnavailable> {
+        let handle = match self.member_mob_handle(mob_id, incarnation).await? {
+            Ok(handle) => handle,
+            Err(end) => return Ok(MemberMobScan::Ended(end)),
+        };
+        let view = handle.events();
+        let mut through = after;
+        loop {
+            let page = view
+                .poll(through, MEMBER_MOB_EVENT_PAGE)
+                .await
+                .map_err(|error| NativeUnavailable(error.to_string()))?;
+            for event in &page {
+                let why = match event.kind {
+                    meerkat_mob::event::MobEventKind::MobCompleted => "completed",
+                    meerkat_mob::event::MobEventKind::MobReset => "reset",
+                    _ => continue,
+                };
+                return Ok(MemberMobScan::Ended(MemberMobEnd {
+                    cursor: event.cursor,
+                    why: why.to_string(),
+                }));
+            }
+            match page.last() {
+                Some(last) if last.cursor > through => through = last.cursor,
+                _ => return Ok(MemberMobScan::Running { through }),
+            }
+            if page.len() < MEMBER_MOB_EVENT_PAGE {
+                return Ok(MemberMobScan::Running { through });
+            }
+        }
+    }
+
     /// Submit one continuation for the identity.
     pub async fn submit_delivery(
         &self,
@@ -751,11 +1043,22 @@ impl MobNativeDelivery {
         delivery: meerkat::ContinuationDelivery,
         committed_at_ms: u64,
     ) -> Result<NativeReceipt, NativeSubmitError> {
+        self.submit_delivery_to(&self.owner(identity), delivery, committed_at_ms)
+            .await
+    }
+
+    /// Submit one continuation for a continuation owner.
+    async fn submit_delivery_to(
+        &self,
+        owner: &meerkat::ContinuationOwner,
+        delivery: meerkat::ContinuationDelivery,
+        committed_at_ms: u64,
+    ) -> Result<NativeReceipt, NativeSubmitError> {
         let service = self
             .service()
             .map_err(|error| NativeSubmitError::Unavailable(error.0))?;
         service
-            .submit(&self.owner(identity), delivery, committed_at_ms)
+            .submit(owner, delivery, committed_at_ms)
             .await
             .map(|receipt| native_receipt(&receipt))
             .map_err(|error| match error {
@@ -784,10 +1087,19 @@ impl MobNativeDelivery {
         identity: &MemberIdentity,
         key: &str,
     ) -> Result<NativeStatus, NativeUnavailable> {
+        self.status_at(&self.owner(identity), key).await
+    }
+
+    /// The continuation owner's status of a native key for an owner.
+    async fn status_at(
+        &self,
+        owner: &meerkat::ContinuationOwner,
+        key: &str,
+    ) -> Result<NativeStatus, NativeUnavailable> {
         let key = meerkat::ContinuationKey::new(key)
             .map_err(|error| NativeUnavailable(error.to_string()))?;
         self.service()?
-            .continuation_status(&self.owner(identity), &key)
+            .continuation_status(owner, &key)
             .await
             .map(native_status)
             .map_err(|error| NativeUnavailable(error.to_string()))
@@ -847,20 +1159,35 @@ pub enum IdentityService {
     Elsewhere(String),
 }
 
-/// Members of this gateway's mob are delivered to through its own runtime. A
-/// member on a peer gateway has no path from this seam: it is refused at
-/// subscription time.
+/// Members of this gateway's mob, and of mobs its members created, are
+/// delivered to through its own runtime. A member on a peer gateway has no
+/// path from this seam.
 #[async_trait]
 impl NativeDelivery for MobNativeDelivery {
     fn governs_work_authority(&self) -> Result<bool, NativeUnavailable> {
         MobNativeDelivery::governs_work_authority(self)
     }
 
-    fn route(&self, member: &Member) -> MemberRoute {
+    async fn route_for(&self, member: &Member) -> Result<MemberRouteRecord, MemberProblem> {
         if member.mob_id == self.mob_id {
-            MemberRoute::Local
-        } else {
-            MemberRoute::Peer
+            return Ok(MemberRouteRecord {
+                route: MemberRoute::Local,
+                incarnation: None,
+            });
+        }
+        match self
+            .child_incarnation(&member.mob_id)
+            .await
+            .map_err(|error| MemberProblem::Unavailable(error.0))?
+        {
+            Some(incarnation) => Ok(MemberRouteRecord {
+                route: MemberRoute::Child,
+                incarnation: Some(incarnation),
+            }),
+            None => Ok(MemberRouteRecord {
+                route: MemberRoute::Peer,
+                incarnation: None,
+            }),
         }
     }
 
@@ -890,40 +1217,34 @@ impl NativeDelivery for MobNativeDelivery {
         MobNativeDelivery::mob_origin(self, mob_id).await
     }
 
-    async fn check_member(&self, member: &Member) -> Result<(), MemberProblem> {
-        if self.route(member) == MemberRoute::Peer {
-            let named = BTreeSet::from([member.mob_id.clone()]);
-            let presence = self
-                .hosted_mobs(&named)
-                .await
-                .map_err(|error| MemberProblem::Unavailable(error.0))?;
-            if presence.get(&member.mob_id) == Some(&MobPresence::Hosted) {
-                return Err(MemberProblem::Unsupported(format!(
-                    "{} is another mob hosted on this gateway; deliveries reach members of \
-                     this gateway's own mob and of peer gateways' mobs",
-                    member.mob_id
-                )));
-            }
-            return Err(MemberProblem::UnusablePeer(format!(
+    async fn check_member(&self, member: &Member, route: MemberRoute) -> Result<(), MemberProblem> {
+        match route {
+            MemberRoute::Local => match self.identity_service(&member.identity).await {
+                Ok(IdentityService::Local) => Ok(()),
+                Ok(IdentityService::Unknown) => Err(MemberProblem::Unknown),
+                Ok(IdentityService::Elsewhere(detail)) => Err(MemberProblem::Unusable(detail)),
+                Err(error) => Err(MemberProblem::Unavailable(error.0)),
+            },
+            MemberRoute::Child => self.check_child_member(member).await,
+            MemberRoute::Peer => Err(MemberProblem::UnusablePeer(format!(
                 "this gateway has no delivery path to members of {}",
                 member.mob_id
-            )));
-        }
-        match self.identity_service(&member.identity).await {
-            Ok(IdentityService::Local) => Ok(()),
-            Ok(IdentityService::Unknown) => Err(MemberProblem::Unknown),
-            Ok(IdentityService::Elsewhere(detail)) => Err(MemberProblem::Unusable(detail)),
-            Err(error) => Err(MemberProblem::Unavailable(error.0)),
+            ))),
         }
     }
 
-    async fn prepare_member(&self, member: &Member) -> Result<(), PrepareError> {
-        if self.route(member) == MemberRoute::Peer {
-            return Err(PrepareError::Unavailable(
+    async fn prepare_member(
+        &self,
+        member: &Member,
+        route: MemberRoute,
+    ) -> Result<(), PrepareError> {
+        match route {
+            MemberRoute::Local => self.prepare_identity(&member.identity).await,
+            MemberRoute::Child => self.prepare_child_member(member).await,
+            MemberRoute::Peer => Err(PrepareError::Unavailable(
                 "this gateway has no delivery path to peer members".to_string(),
-            ));
+            )),
         }
-        self.prepare_identity(&member.identity).await
     }
 
     async fn submit(
@@ -931,27 +1252,22 @@ impl NativeDelivery for MobNativeDelivery {
         batch: &Batch,
         committed_at_ms: u64,
     ) -> Result<NativeReceipt, NativeSubmitError> {
-        if self.route(&batch.member) == MemberRoute::Peer {
-            return Err(NativeSubmitError::Unavailable(
-                "this gateway has no delivery path to peer members".to_string(),
-            ));
-        }
+        let owner = self
+            .owner_for(&batch.member, batch.route)
+            .map_err(NativeSubmitError::Unavailable)?;
         let delivery = continuation_for(batch).map_err(NativeSubmitError::Invalid)?;
         let receipt = self
-            .submit_delivery(&batch.member.identity, delivery, committed_at_ms)
+            .submit_delivery_to(&owner, delivery, committed_at_ms)
             .await?;
         super::faults::after_native_commit();
         Ok(receipt)
     }
 
     async fn status(&self, batch: &Batch) -> Result<NativeStatus, NativeUnavailable> {
-        if self.route(&batch.member) == MemberRoute::Peer {
-            return Err(NativeUnavailable(
-                "this gateway has no delivery path to peer members".to_string(),
-            ));
-        }
-        self.status_of(&batch.member.identity, batch.id.as_str())
-            .await
+        let owner = self
+            .owner_for(&batch.member, batch.route)
+            .map_err(NativeUnavailable)?;
+        self.status_at(&owner, batch.id.as_str()).await
     }
 
     async fn input(
@@ -962,11 +1278,32 @@ impl NativeDelivery for MobNativeDelivery {
     ) -> Result<Option<Value>, NativeUnavailable> {
         self.input_state(session_id, input_id).await
     }
+
+    async fn member_mob_cursor(&self, mob_id: &MobId) -> Result<u64, NativeUnavailable> {
+        MobNativeDelivery::member_mob_cursor(self, mob_id).await
+    }
+
+    async fn member_mob_gone(
+        &self,
+        mob_id: &MobId,
+        incarnation: Option<&MobIncarnation>,
+    ) -> Result<Option<MemberMobEnd>, NativeUnavailable> {
+        MobNativeDelivery::member_mob_gone(self, mob_id, incarnation).await
+    }
+
+    async fn member_mob_end(
+        &self,
+        mob_id: &MobId,
+        incarnation: Option<&MobIncarnation>,
+        after: u64,
+    ) -> Result<MemberMobScan, NativeUnavailable> {
+        MobNativeDelivery::member_mob_end(self, mob_id, incarnation, after).await
+    }
 }
 
-/// The owner's seam: this gateway's runtime for members of its own mob, and
-/// keyed inject over the signed control channel for members of mobs on peer
-/// gateways.
+/// The owner's seam: this gateway's runtime for members of its own mob and
+/// of mobs its members created, and keyed inject over the signed control
+/// channel for members of mobs on peer gateways.
 pub struct AnnouncementNativeDelivery {
     local: Arc<MobNativeDelivery>,
     remote: Option<Arc<RemoteMemberDelivery>>,
@@ -993,8 +1330,22 @@ impl NativeDelivery for AnnouncementNativeDelivery {
         self.local.governs_work_authority()
     }
 
-    fn route(&self, member: &Member) -> MemberRoute {
-        NativeDelivery::route(self.local.as_ref(), member)
+    /// A mob id hosted here as a mob a member created and also filed in the
+    /// contact directory names two mobs: it is refused, never guessed.
+    async fn route_for(&self, member: &Member) -> Result<MemberRouteRecord, MemberProblem> {
+        let route = NativeDelivery::route_for(self.local.as_ref(), member).await?;
+        if route.route == MemberRoute::Child
+            && self
+                .remote
+                .as_deref()
+                .is_some_and(|remote| remote.files(&member.mob_id))
+        {
+            return Err(MemberProblem::Ambiguous(format!(
+                "{} is a mob hosted here and also a peer in the contact directory",
+                member.mob_id
+            )));
+        }
+        Ok(route)
     }
 
     async fn mob_presence(
@@ -1023,31 +1374,27 @@ impl NativeDelivery for AnnouncementNativeDelivery {
         self.local.mob_origin(mob_id).await
     }
 
-    async fn check_member(&self, member: &Member) -> Result<(), MemberProblem> {
-        match self.route(member) {
-            MemberRoute::Local => NativeDelivery::check_member(self.local.as_ref(), member).await,
-            MemberRoute::Peer => {
-                // A mob hosted here is never reached as a peer: the local
-                // seam refuses its members typed.
-                let named = BTreeSet::from([member.mob_id.clone()]);
-                let presence = self
-                    .local
-                    .hosted_mobs(&named)
-                    .await
-                    .map_err(|error| MemberProblem::Unavailable(error.0))?;
-                if presence.get(&member.mob_id) == Some(&MobPresence::Hosted) {
-                    return NativeDelivery::check_member(self.local.as_ref(), member).await;
-                }
-                self.remote()
-                    .map_err(MemberProblem::UnusablePeer)?
-                    .check_member(member)
+    async fn check_member(&self, member: &Member, route: MemberRoute) -> Result<(), MemberProblem> {
+        match route {
+            MemberRoute::Local | MemberRoute::Child => {
+                NativeDelivery::check_member(self.local.as_ref(), member, route).await
             }
+            MemberRoute::Peer => self
+                .remote()
+                .map_err(MemberProblem::UnusablePeer)?
+                .check_member(member),
         }
     }
 
-    async fn prepare_member(&self, member: &Member) -> Result<(), PrepareError> {
-        match self.route(member) {
-            MemberRoute::Local => self.local.prepare_identity(&member.identity).await,
+    async fn prepare_member(
+        &self,
+        member: &Member,
+        route: MemberRoute,
+    ) -> Result<(), PrepareError> {
+        match route {
+            MemberRoute::Local | MemberRoute::Child => {
+                NativeDelivery::prepare_member(self.local.as_ref(), member, route).await
+            }
             // The peer prepares its own member when the batch reaches it.
             MemberRoute::Peer => Ok(()),
         }
@@ -1058,8 +1405,8 @@ impl NativeDelivery for AnnouncementNativeDelivery {
         batch: &Batch,
         committed_at_ms: u64,
     ) -> Result<NativeReceipt, NativeSubmitError> {
-        match self.route(&batch.member) {
-            MemberRoute::Local => {
+        match batch.route {
+            MemberRoute::Local | MemberRoute::Child => {
                 NativeDelivery::submit(self.local.as_ref(), batch, committed_at_ms).await
             }
             MemberRoute::Peer => {
@@ -1072,8 +1419,10 @@ impl NativeDelivery for AnnouncementNativeDelivery {
     }
 
     async fn status(&self, batch: &Batch) -> Result<NativeStatus, NativeUnavailable> {
-        match self.route(&batch.member) {
-            MemberRoute::Local => NativeDelivery::status(self.local.as_ref(), batch).await,
+        match batch.route {
+            MemberRoute::Local | MemberRoute::Child => {
+                NativeDelivery::status(self.local.as_ref(), batch).await
+            }
             MemberRoute::Peer => {
                 self.remote()
                     .map_err(NativeUnavailable)?
@@ -1089,9 +1438,32 @@ impl NativeDelivery for AnnouncementNativeDelivery {
         session_id: &str,
         input_id: &str,
     ) -> Result<Option<Value>, NativeUnavailable> {
-        match self.route(&batch.member) {
-            MemberRoute::Local => self.local.input_state(session_id, input_id).await,
+        match batch.route {
+            MemberRoute::Local | MemberRoute::Child => {
+                self.local.input_state(session_id, input_id).await
+            }
             MemberRoute::Peer => self.remote().map_err(NativeUnavailable)?.input(batch).await,
         }
+    }
+
+    async fn member_mob_cursor(&self, mob_id: &MobId) -> Result<u64, NativeUnavailable> {
+        self.local.member_mob_cursor(mob_id).await
+    }
+
+    async fn member_mob_gone(
+        &self,
+        mob_id: &MobId,
+        incarnation: Option<&MobIncarnation>,
+    ) -> Result<Option<MemberMobEnd>, NativeUnavailable> {
+        self.local.member_mob_gone(mob_id, incarnation).await
+    }
+
+    async fn member_mob_end(
+        &self,
+        mob_id: &MobId,
+        incarnation: Option<&MobIncarnation>,
+        after: u64,
+    ) -> Result<MemberMobScan, NativeUnavailable> {
+        self.local.member_mob_end(mob_id, incarnation, after).await
     }
 }

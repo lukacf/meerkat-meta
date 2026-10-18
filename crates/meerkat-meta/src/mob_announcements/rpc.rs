@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use super::owner::{AnnouncementError, AnnouncementService};
 use super::types::{
     AnnounceRequest, AnnouncementRef, AnnouncementStoreError, Announcer, BatchId, BatchQuery,
-    Member, MobId, OperationId, PutSubscription, Selector, SourceKey, StartFrontier,
-    SubscriptionChange, SubscriptionId, Topic,
+    Member, MemberRouteRecord, MobId, OperationId, PutSubscription, Selector, SourceKey,
+    StartFrontier, SubscriptionChange, SubscriptionId, Topic,
 };
 use crate::rpc::JsonRpcError;
 
@@ -88,12 +88,6 @@ fn rpc_error(error: AnnouncementError) -> JsonRpcError {
             json!({ "member": member }),
         ),
         AnnouncementError::InvalidMember(_) => invalid_params(message),
-        AnnouncementError::UnsupportedMember(_) => typed(
-            ANNOUNCEMENTS_REFUSED_CODE,
-            "unsupported_member",
-            message,
-            Value::Null,
-        ),
         AnnouncementError::UnusableMember(_) => typed(
             ANNOUNCEMENTS_REFUSED_CODE,
             "unusable_member",
@@ -121,6 +115,12 @@ fn rpc_error(error: AnnouncementError) -> JsonRpcError {
         AnnouncementError::UnrelatedMob(mob_id) => typed(
             ANNOUNCEMENTS_REFUSED_CODE,
             "unrelated_mob",
+            message,
+            json!({ "mob_id": mob_id }),
+        ),
+        AnnouncementError::AmbiguousMob(mob_id) => typed(
+            ANNOUNCEMENTS_REFUSED_CODE,
+            "ambiguous_mob",
             message,
             json!({ "mob_id": mob_id }),
         ),
@@ -193,6 +193,12 @@ fn rpc_error(error: AnnouncementError) -> JsonRpcError {
                 "member_mismatch",
                 message,
                 Value::Null,
+            ),
+            AnnouncementStoreError::RouteKept { kept } => typed(
+                ANNOUNCEMENTS_REFUSED_CODE,
+                "ambiguous_mob",
+                message,
+                json!({ "kept_route": kept }),
             ),
             AnnouncementStoreError::IllegalTransition { .. } => JsonRpcError::new(-32000, message),
             AnnouncementStoreError::TooLarge(_) | AnnouncementStoreError::Invalid(_) => {
@@ -377,6 +383,8 @@ pub async fn handle_announcement_method(
                         },
                         start: request.start,
                         expected_revision: request.expected_revision,
+                        route: MemberRouteRecord::default(),
+                        member_mob_cursor: None,
                     },
                 )
                 .await

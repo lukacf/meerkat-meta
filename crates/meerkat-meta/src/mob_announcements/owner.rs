@@ -20,18 +20,30 @@ use tokio::sync::{Mutex, Notify};
 
 pub use super::native::AdmittedInput;
 use super::native::{
-    MemberProblem, MemberRoute, MobOrigin, MobPresence, NativeDelivery, NativeStatus,
-    NativeSubmitError, PrepareError,
+    MemberMobScan, MemberProblem, MemberRoute, MobOrigin, MobPresence, NativeDelivery,
+    NativeStatus, NativeSubmitError, PrepareError,
 };
 use super::store::AnnouncementStore;
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
     BatchGap, BatchId, BatchPosition, BatchQuery, BatchState, BatchStateTag, GapReason,
-    MAX_REMOTE_BODY_WIRE_BYTES, Member, MobId, MobIncarnation, MobLineage, NativeReceipt,
-    OperationId, PutSubscription, SealingPolicy, SourceKey, Subscription, SubscriptionChange,
-    SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId, SubscriptionState, SuccessorBatch,
-    merge_gaps, render_batch, render_item,
+    MAX_REMOTE_BODY_WIRE_BYTES, Member, MemberRouteRecord, MobId, MobIncarnation, MobLineage,
+    NativeReceipt, OperationId, PutSubscription, SealingPolicy, SourceKey, Subscription,
+    SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
+    SubscriptionState, SuccessorBatch, merge_gaps, render_batch, render_item,
 };
+
+/// The owner's error for a member a put cannot subscribe.
+fn member_problem(member: &Member, problem: MemberProblem) -> AnnouncementError {
+    match problem {
+        MemberProblem::Unknown => AnnouncementError::UnknownMember(member.clone()),
+        MemberProblem::Invalid(detail) => AnnouncementError::InvalidMember(detail),
+        MemberProblem::Unusable(detail) => AnnouncementError::UnusableMember(detail),
+        MemberProblem::UnusablePeer(detail) => AnnouncementError::UnusablePeer(detail),
+        MemberProblem::Unavailable(detail) => AnnouncementError::NativeUnavailable(detail),
+        MemberProblem::Ambiguous(_) => AnnouncementError::AmbiguousMob(member.mob_id.clone()),
+    }
+}
 
 /// Announcements and settled batches are kept this long after they settle.
 pub const DEFAULT_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
@@ -101,9 +113,6 @@ pub enum AnnouncementError {
     UnknownMember(Member),
     /// The member is not a durable identity in its public form.
     InvalidMember(String),
-    /// The member belongs to another mob hosted on this gateway; deliveries
-    /// reach members of this gateway's own mob and of peer gateways' mobs.
-    UnsupportedMember(String),
     /// This gateway's runtime does not serve the member (it is placed on a
     /// host, or bound to an external runtime), so a delivery could never be
     /// admitted.
@@ -119,6 +128,10 @@ pub enum AnnouncementError {
     /// A member asked for a mob that is not its own, above it or below it
     /// in the lineage of mobs members created.
     UnrelatedMob(MobId),
+    /// The member's mob id names a mob hosted here and a peer in the
+    /// contact directory alike, or would now route differently from how the
+    /// member was first subscribed.
+    AmbiguousMob(MobId),
 }
 
 impl std::fmt::Display for AnnouncementError {
@@ -133,7 +146,6 @@ impl std::fmt::Display for AnnouncementError {
                 write!(f, "{member} is not an identity registered with this host")
             }
             Self::InvalidMember(detail) => write!(f, "invalid member: {detail}"),
-            Self::UnsupportedMember(detail) => write!(f, "unsupported member: {detail}"),
             Self::UnusableMember(detail) => {
                 write!(f, "the member cannot take a delivery: {detail}")
             }
@@ -152,6 +164,10 @@ impl std::fmt::Display for AnnouncementError {
             Self::UnrelatedMob(mob_id) => write!(
                 f,
                 "mob {mob_id} is not the member's own mob, above it or below it"
+            ),
+            Self::AmbiguousMob(mob_id) => write!(
+                f,
+                "mob {mob_id} names a mob hosted here and a peer gateway alike"
             ),
         }
     }
@@ -343,7 +359,7 @@ fn min_due(current: Option<u64>, candidate: Option<u64>) -> Option<u64> {
 /// delivery request.
 fn wire_budget(route: MemberRoute) -> Option<u64> {
     match route {
-        MemberRoute::Local => None,
+        MemberRoute::Local | MemberRoute::Child => None,
         MemberRoute::Peer => Some(MAX_REMOTE_BODY_WIRE_BYTES),
     }
 }
@@ -532,39 +548,50 @@ impl AnnouncementService {
     pub async fn put_subscription(
         &self,
         operation: &OperationId,
-        request: PutSubscription,
+        mut request: PutSubscription,
     ) -> Result<Subscription, AnnouncementError> {
+        let route = self.member_route(&request.member).await?;
         // A peer answers for its own runtime when a batch reaches it.
-        if self.inner.native.route(&request.member) == MemberRoute::Local {
+        if route.route != MemberRoute::Peer {
             self.ensure_deliverable()?;
         }
-        match self.inner.native.check_member(&request.member).await {
-            Ok(()) => {}
-            Err(MemberProblem::Unknown) => {
-                return Err(AnnouncementError::UnknownMember(request.member.clone()));
-            }
-            Err(MemberProblem::Invalid(detail)) => {
-                return Err(AnnouncementError::InvalidMember(detail));
-            }
-            Err(MemberProblem::Unsupported(detail)) => {
-                return Err(AnnouncementError::UnsupportedMember(detail));
-            }
-            Err(MemberProblem::Unusable(detail)) => {
-                return Err(AnnouncementError::UnusableMember(detail));
-            }
-            Err(MemberProblem::UnusablePeer(detail)) => {
-                return Err(AnnouncementError::UnusablePeer(detail));
-            }
-            Err(MemberProblem::Unavailable(detail)) => {
-                return Err(AnnouncementError::NativeUnavailable(detail));
-            }
+        // A member of a mob a member created is subscribed at that mob's
+        // current event cursor, read before the member is checked: a
+        // completion or reset the check does not see is in the log after it
+        // and ends the subscription.
+        request.member_mob_cursor = match route.route {
+            MemberRoute::Child => Some(
+                self.inner
+                    .native
+                    .member_mob_cursor(&request.member.mob_id)
+                    .await
+                    .map_err(|error| AnnouncementError::NativeUnavailable(error.0))?,
+            ),
+            MemberRoute::Local | MemberRoute::Peer => None,
+        };
+        if let Err(problem) = self
+            .inner
+            .native
+            .check_member(&request.member, route.route)
+            .await
+        {
+            return Err(member_problem(&request.member, problem));
         }
+        request.route = route;
         let mobs = self.ensure_hosted(&request.selector.mobs).await?;
+        let member_mob = request.member.mob_id.clone();
         let subscription = self
             .inner
             .store
             .put_subscription(operation, request, self.now())
-            .await?;
+            .await
+            .map_err(|error| match error {
+                // Another put kept the member on another route meanwhile.
+                AnnouncementStoreError::RouteKept { .. } => {
+                    AnnouncementError::AmbiguousMob(member_mob)
+                }
+                other => AnnouncementError::Store(other),
+            })?;
         // A mob destroyed between the check and the commit would otherwise
         // stay named until the mob set changes again.
         if let Err(error) = self.drop_ended(&mobs).await {
@@ -572,6 +599,52 @@ impl AnnouncementService {
         }
         self.wake();
         Ok(subscription)
+    }
+
+    /// The route a put subscribes the member on: the route it is kept on,
+    /// or the route it takes now when it has none. A kept route never
+    /// changes. A member kept for a mob a member created that is now gone or
+    /// created again first ends there and loses its kept route; a member
+    /// whose mob id would now route another way is refused as ambiguous.
+    async fn member_route(&self, member: &Member) -> Result<MemberRouteRecord, AnnouncementError> {
+        let current = self
+            .inner
+            .native
+            .route_for(member)
+            .await
+            .map_err(|problem| member_problem(member, problem))?;
+        let Some(kept) = self.inner.store.member_route(member).await? else {
+            return Ok(current);
+        };
+        if kept == current {
+            return Ok(kept);
+        }
+        if kept.route != MemberRoute::Child {
+            return Err(AnnouncementError::AmbiguousMob(member.mob_id.clone()));
+        }
+        let why = if current.route == MemberRoute::Child {
+            "created again"
+        } else {
+            "destroyed"
+        };
+        let ended = self
+            .inner
+            .store
+            .unbind_member_route(
+                member,
+                SubscriptionEnd::MemberMobEnded {
+                    why: why.to_string(),
+                },
+                self.now(),
+            )
+            .await?;
+        tracing::info!(
+            member = %member,
+            why,
+            subscriptions = ended.len(),
+            "member's mob ended; its subscriptions ended there"
+        );
+        Ok(current)
     }
 
     /// Create or replace a subscription a member asks for itself: every mob
@@ -755,8 +828,53 @@ impl AnnouncementService {
     pub async fn reconcile_mobs(&self) -> Result<Vec<SubscriptionId>, AnnouncementError> {
         let known = self.inner.store.known_mobs().await?;
         let changed = self.drop_ended(&known).await?;
+        self.reconcile_child_members().await?;
         self.reconcile_lineage().await?;
         Ok(changed)
+    }
+
+    /// End the subscriptions of members kept for a mob a member created
+    /// that is now gone or was created again. A mob that cannot be read now
+    /// (held until its owner resolves, or unavailable) is left to the next
+    /// reconcile or delivery.
+    async fn reconcile_child_members(&self) -> Result<(), AnnouncementError> {
+        let routes = self.inner.store.child_member_routes().await?;
+        let mut gone: BTreeMap<(MobId, Option<MobIncarnation>), Option<String>> = BTreeMap::new();
+        let now = self.now();
+        for (member, kept) in routes {
+            let key = (member.mob_id.clone(), kept.incarnation.clone());
+            let why = match gone.get(&key) {
+                Some(why) => why.clone(),
+                None => {
+                    match self
+                        .inner
+                        .native
+                        .member_mob_gone(&member.mob_id, kept.incarnation.as_ref())
+                        .await
+                    {
+                        Ok(end) => {
+                            let why = end.map(|end| end.why);
+                            gone.insert(key, why.clone());
+                            why
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                mob = %member.mob_id,
+                                error = %error,
+                                "member's mob not read; its members are reconciled later"
+                            );
+                            gone.insert(key, None);
+                            None
+                        }
+                    }
+                }
+            };
+            if let Some(why) = why {
+                self.end_member(&member, SubscriptionEnd::MemberMobEnded { why }, now)
+                    .await;
+            }
+        }
+        Ok(())
     }
 
     /// Follow the mob owner's set of mobs: reconcile once now, then on every
@@ -1020,17 +1138,16 @@ impl AnnouncementService {
             match policy.due_at(&backlog) {
                 Some(due) if due <= now => {
                     let id = new_batch_id()?;
-                    let sealed = self
-                        .inner
-                        .store
-                        .seal_batch(
-                            &backlog.member,
-                            &id,
-                            &policy,
-                            wire_budget(self.inner.native.route(&backlog.member)),
-                            now,
-                        )
-                        .await;
+                    let sealed = match self.inner.store.member_route(&backlog.member).await {
+                        Ok(kept) => {
+                            let route = kept.map(|kept| kept.route).unwrap_or_default();
+                            self.inner
+                                .store
+                                .seal_batch(&backlog.member, &id, &policy, wire_budget(route), now)
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    };
                     match sealed {
                         Ok(Some(batch)) => {
                             report.sealed += 1;
@@ -1330,6 +1447,76 @@ impl AnnouncementService {
         Ok(Some(SuccessorBatch { id, body, gaps }))
     }
 
+    /// For a member kept for a mob a member created: end its subscriptions
+    /// made before that mob ended (destroyed, created again, completed or
+    /// reset), read from the mob's own durable records; otherwise record how
+    /// far its event log was read, so the next check reads on from there.
+    /// Returns whether any subscription ended.
+    async fn member_mob_ended(&self, member: &Member, now: u64) -> Result<bool, AnnouncementError> {
+        let Some(kept) = self.inner.store.member_route(member).await? else {
+            return Ok(false);
+        };
+        if kept.route != MemberRoute::Child {
+            return Ok(false);
+        }
+        let Some(from) = self.inner.store.member_mob_check_from(member).await? else {
+            return Ok(false);
+        };
+        let scan = self
+            .inner
+            .native
+            .member_mob_end(&member.mob_id, kept.incarnation.as_ref(), from)
+            .await
+            .map_err(|error| AnnouncementError::NativeUnavailable(error.0))?;
+        match scan {
+            MemberMobScan::Running { through } => {
+                if through > from {
+                    self.inner
+                        .store
+                        .record_member_mob_check(member, through)
+                        .await?;
+                }
+                Ok(false)
+            }
+            MemberMobScan::Ended(end) => {
+                let ended = self
+                    .inner
+                    .store
+                    .end_member_before(
+                        member,
+                        end.cursor,
+                        SubscriptionEnd::MemberMobEnded {
+                            why: end.why.clone(),
+                        },
+                        now,
+                    )
+                    .await?;
+                if !ended.is_empty() {
+                    tracing::info!(
+                        member = %member,
+                        why = %end.why,
+                        subscriptions = ended.len(),
+                        "member's mob ended; its subscriptions ended there"
+                    );
+                }
+                Ok(!ended.is_empty())
+            }
+        }
+    }
+
+    /// Whether the mob a member was kept for is destroyed: not hosted here
+    /// once every mob is restored.
+    async fn member_mob_destroyed(&self, member: &Member) -> Result<bool, AnnouncementError> {
+        let named = BTreeSet::from([member.mob_id.clone()]);
+        let presence = self
+            .inner
+            .native
+            .mob_presence(&named)
+            .await
+            .map_err(|error| AnnouncementError::NativeUnavailable(error.0))?;
+        Ok(presence.get(&member.mob_id) == Some(&MobPresence::Gone))
+    }
+
     /// Whether a batch the native owner reads as not committed expires:
     /// once it was sealed before the retention window, every item it holds
     /// is at least that old. For a member on a peer gateway its last
@@ -1341,7 +1528,7 @@ impl AnnouncementService {
         if now.saturating_sub(batch.sealed_at_ms) < config.retention_ms {
             return Expiry::NotYet;
         }
-        if self.inner.native.route(&batch.member) == MemberRoute::Local
+        if batch.route != MemberRoute::Peer
             || now.saturating_sub(batch.updated_at_ms) > config.peer_request_window_ms
         {
             return Expiry::Now;
@@ -1392,7 +1579,18 @@ impl AnnouncementService {
                         Interest::Paused => return Ok(None),
                         Interest::Active => {}
                     }
-                    match self.inner.native.prepare_member(&batch.member).await {
+                    if batch.route == MemberRoute::Child
+                        && self.member_mob_ended(&batch.member, now).await?
+                    {
+                        batch = self.reload(&batch).await?;
+                        continue;
+                    }
+                    match self
+                        .inner
+                        .native
+                        .prepare_member(&batch.member, batch.route)
+                        .await
+                    {
                         Ok(()) => {}
                         // Nothing native exists yet: the member's
                         // subscriptions end and this batch is cancelled.
@@ -1454,7 +1652,18 @@ impl AnnouncementService {
                             if submitted_this_round {
                                 return Ok(retry_at);
                             }
-                            match self.inner.native.prepare_member(&batch.member).await {
+                            if batch.route == MemberRoute::Child
+                                && self.member_mob_ended(&batch.member, now).await?
+                            {
+                                batch = self.reload(&batch).await?;
+                                continue;
+                            }
+                            match self
+                                .inner
+                                .native
+                                .prepare_member(&batch.member, batch.route)
+                                .await
+                            {
                                 Ok(()) => {}
                                 // Read "not committed": the member's
                                 // subscriptions end and the batch is
@@ -1499,7 +1708,36 @@ impl AnnouncementService {
                                         .apply(&batch, BatchEvent::Block { cause }, now)
                                         .await?;
                                 }
-                                None => return Ok(retry_at),
+                                None => {
+                                    // Meerkat keeps a delivery to a member of a mob it
+                                    // does not host waiting, in case that mob is
+                                    // restored. A destroyed mob a member created never
+                                    // is: the delivery strands, after the member's
+                                    // subscriptions there end.
+                                    if batch.route != MemberRoute::Child
+                                        || !self.member_mob_destroyed(&batch.member).await?
+                                    {
+                                        return Ok(retry_at);
+                                    }
+                                    self.inner
+                                        .store
+                                        .end_member(
+                                            &batch.member,
+                                            SubscriptionEnd::MemberMobEnded {
+                                                why: "destroyed".to_string(),
+                                            },
+                                            now,
+                                        )
+                                        .await?;
+                                    let successor = self.successor_for(&batch).await?;
+                                    batch = self
+                                        .apply(
+                                            &batch,
+                                            BatchEvent::NativeStranded { receipt, successor },
+                                            now,
+                                        )
+                                        .await?;
+                                }
                             }
                         }
                         NativeStatus::NotCommitted => {

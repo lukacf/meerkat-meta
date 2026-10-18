@@ -135,6 +135,11 @@ impl RemoteMemberDelivery {
         &member.mob_id
     }
 
+    /// Whether the contact directory files a peer under `mob_id`.
+    pub(crate) fn files(&self, mob_id: &MobId) -> bool {
+        self.contacts.get(mob_id.as_str()).is_some()
+    }
+
     /// A member on a peer is deliverable when its identity is in public
     /// form and the peer can be called authenticated. Nothing is sent.
     pub(crate) fn check_member(&self, member: &Member) -> Result<(), MemberProblem> {

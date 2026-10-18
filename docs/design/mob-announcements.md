@@ -84,6 +84,9 @@ its member or its mobs:
   admitted.
 - `mobs_ended`: every mob the subscription named was destroyed.
 - `peer_unsupported`: the member's peer gateway predates keyed inject.
+- `member_mob_ended` (with `why`): the member's own mob, a mob hosted here
+  other than this gateway's, was destroyed, created again, completed or
+  reset after the subscription was made.
 
 A peer gateway's signed `unknown_member` or `unusable_member` answer ends
 the subscription as `member_left` or `member_unusable`.
@@ -134,8 +137,10 @@ pace.
   its owner resolves.
 - A member is `{mob_id, identity}`: identities are unique only within one
   mob. Subscribers are registered identities of this gateway's mob that its
-  runtime serves, and members of mobs on peer gateways. A member of another
-  mob hosted here is refused with `unsupported_member`.
+  runtime serves, members of mobs hosted here (the mobs members created,
+  see Members of mobs members created), and members of mobs on peer
+  gateways. A mob id that names a mob hosted here and a peer in the contact
+  directory alike is refused with `ambiguous_mob`.
 - A subscription names its mobs explicitly (this gateway's mob by default).
   Nothing reaches it from a mob it does not name.
 - The announcer is part of an announcement's content digest, so a replay
@@ -217,6 +222,54 @@ next reconcile records the mob in between: it fails closed. When a mob is no lon
 hosted its record ends; ended records are removed by retention once no
 live record names the mob as parent. A mob held after a restart keeps its
 record; a held mob whose parent's record ended loses its reach upward.
+
+## Members of mobs members created
+
+A member of a mob hosted here other than this gateway's own (a mob a member
+created, or any other mob this gateway hosts) is `{mob_id, identity}` with
+its plain roster id, and is delivered to through this gateway's runtime: the
+batch is a continuation for that mob's member, with the native key, binding
+and status rules of members of this gateway's own mob.
+
+How a member is reached (this gateway's mob, a mob hosted here, or a peer)
+is decided when it is first subscribed and kept with it, together with the
+incarnation of its mob; every batch carries the route it was sealed with.
+A member is never rerouted: a put whose route would differ from the kept
+one is refused with `ambiguous_mob`, as is a mob id that names a mob hosted
+here and a peer in the contact directory alike.
+
+A put for such a member checks that its mob runs here and has not
+completed, and that the member is on its roster now (`unknown_member`
+otherwise). A mob held after a restart until its owner resolves is
+`native_unavailable`, never an end: its members' batches wait. Roster
+absence later ends nothing: a member being respawned is off the roster for
+a while, and its batch waits and is retried.
+
+Its subscriptions end with `member_mob_ended` only on the mob's own durable
+records:
+
+- `completed` or `reset`: a `MobCompleted` or `MobReset` event in the mob's
+  log after the cursor the subscription was made at. The log is read before
+  a sealed batch's first submission and before every resubmission, and the
+  owner records how far it read, so each event is read once per member. A
+  member subscribed again after a reset is delivered to again; a completed
+  mob refuses new puts. The completion of a mob named in a selector ends
+  nothing: only the subscriber's own mob does.
+- `created again`: the mob runs under the same id with another incarnation
+  (owner session and first event time). The next put for the member ends
+  what it had in the old incarnation before it subscribes in the new one.
+- `destroyed`: the mob is neither running nor held after this gateway
+  restored every mob it hosts. The mob set reconcile ends the member's
+  subscriptions, as does the next delivery.
+
+A delivery already committed to a member of a mob that is then destroyed
+stays pending in Meerkat, which keeps a delivery to a mob it does not host
+waiting in case that mob is restored. Once the mob is destroyed for good,
+the owner settles the batch `stranded` after ending the member's
+subscriptions, so it has no successor and retention is not held. Meerkat's
+member delivery address has no mob incarnation: if a mob is created again
+under the same id with the same member at the same generation before the
+row settles, Meerkat may still deliver it there.
 
 ## Members on peer gateways
 

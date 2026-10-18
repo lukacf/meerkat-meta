@@ -20,10 +20,11 @@ use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
     BatchGap, BatchId, BatchItem, BatchPosition, BatchQuery, BatchState, BatchStateTag,
     ExpiryReport, GapReason, MAX_BACKFILL, MAX_ITEM_WIRE_BYTES, MAX_PAGE, Member, MemberBacklog,
-    MobId, MobLineage, OperationId, PruneReport, PutSubscription, Result, SealingPolicy, SourceKey,
-    StartFrontier, Subscription, SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd,
-    SubscriptionId, SubscriptionState, Topic, content_digest, header_wire_bound, merge_gaps,
-    render_batch, render_gap, render_item, request_fingerprint, wire_len,
+    MemberRoute, MemberRouteRecord, MobId, MobLineage, OperationId, PruneReport, PutSubscription,
+    Result, SealingPolicy, SourceKey, StartFrontier, Subscription, SubscriptionChange,
+    SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId, SubscriptionState, Topic,
+    content_digest, header_wire_bound, merge_gaps, render_batch, render_gap, render_item,
+    request_fingerprint, wire_len,
 };
 
 /// The mob announcement store's tables. A provider applies this through its own
@@ -89,7 +90,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS mob_lineage_live
 CREATE INDEX IF NOT EXISTS mob_lineage_by_parent ON mob_lineage (parent_mob_id);
 CREATE TABLE IF NOT EXISTS announcement_gaps (
  member TEXT NOT NULL, mob_id TEXT NOT NULL, reason TEXT NOT NULL, count INTEGER NOT NULL,
- PRIMARY KEY (member, mob_id, reason));";
+ PRIMARY KEY (member, mob_id, reason));
+CREATE TABLE IF NOT EXISTS member_routes (
+ member TEXT PRIMARY KEY, route TEXT NOT NULL, record TEXT NOT NULL,
+ checked_through INTEGER);
+CREATE INDEX IF NOT EXISTS member_routes_by_route ON member_routes (route, member);";
 
 fn storage(error: impl std::fmt::Display) -> AnnouncementStoreError {
     AnnouncementStoreError::Storage(error.to_string())
@@ -821,6 +826,7 @@ fn create_subscription(
         frontier,
         ended_mobs: BTreeSet::new(),
         ended: None,
+        member_mob_cursor: request.member_mob_cursor,
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
     };
@@ -872,6 +878,7 @@ fn put_subscription_in(
         return decode(&result);
     }
     request.selector.validate()?;
+    keep_member_route_in(db, &request.member, &request.route)?;
     let subscription = match (
         load_subscription(db, &request.id)?,
         request.expected_revision,
@@ -1094,6 +1101,141 @@ fn end_member_in(
         ended.push(id);
     }
     Ok(ended)
+}
+
+/// End the member's live subscriptions made before `cursor` of its own mob's
+/// event log: a completion, a reset or a new incarnation at `cursor`
+/// ended the mob they were made in.
+fn end_member_before_in(
+    db: &Connection,
+    member: &Member,
+    cursor: u64,
+    end: &SubscriptionEnd,
+    now_ms: u64,
+) -> Result<Vec<SubscriptionId>> {
+    let ids = subscription_ids(
+        db,
+        "SELECT id FROM member_subscriptions
+         WHERE member = ?1 AND state IN ('active', 'paused') ORDER BY id",
+        &member.key(),
+    )?;
+    let mut ended = Vec::new();
+    for id in ids {
+        let Some(mut subscription) = load_subscription(db, &id)? else {
+            continue;
+        };
+        if subscription
+            .member_mob_cursor
+            .is_none_or(|made_at| made_at < cursor)
+        {
+            end_subscription(db, &mut subscription, end.clone(), now_ms)?;
+            ended.push(id);
+        }
+    }
+    Ok(ended)
+}
+
+fn member_route_in(db: &Connection, member: &Member) -> Result<Option<MemberRouteRecord>> {
+    db.query_row(
+        "SELECT record FROM member_routes WHERE member = ?1",
+        params![member.key()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(storage)?
+    .map(|record| decode(&record))
+    .transpose()
+}
+
+/// Keep `route` for the member with its first subscription. A member kept on
+/// another route is refused: it is never rerouted.
+fn keep_member_route_in(db: &Connection, member: &Member, route: &MemberRouteRecord) -> Result<()> {
+    match member_route_in(db, member)? {
+        Some(kept) if kept == *route => Ok(()),
+        Some(kept) => Err(AnnouncementStoreError::RouteKept { kept: kept.route }),
+        None => {
+            db.execute(
+                "INSERT INTO member_routes (member, route, record) VALUES (?1, ?2, ?3)",
+                params![member.key(), route.route.as_str(), encode(route)?],
+            )
+            .map_err(storage)?;
+            Ok(())
+        }
+    }
+}
+
+/// End the member's live subscriptions and drop its kept route.
+fn unbind_member_route_in(
+    db: &Connection,
+    member: &Member,
+    end: &SubscriptionEnd,
+    now_ms: u64,
+) -> Result<Vec<SubscriptionId>> {
+    let ended = end_member_in(db, member, end, now_ms)?;
+    db.execute(
+        "DELETE FROM member_routes WHERE member = ?1",
+        params![member.key()],
+    )
+    .map_err(storage)?;
+    Ok(ended)
+}
+
+fn child_member_routes_in(db: &Connection) -> Result<Vec<(Member, MemberRouteRecord)>> {
+    let mut statement = db
+        .prepare_cached("SELECT member, record FROM member_routes WHERE route = ?1 ORDER BY member")
+        .map_err(storage)?;
+    let rows = statement
+        .query_map(params![MemberRoute::Child.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(storage)?;
+    rows.map(|row| {
+        let (member, record) = row.map_err(storage)?;
+        Ok((Member::from_key(&member)?, decode(&record)?))
+    })
+    .collect()
+}
+
+fn member_mob_check_from_in(db: &Connection, member: &Member) -> Result<Option<u64>> {
+    let ids = subscription_ids(
+        db,
+        "SELECT id FROM member_subscriptions
+         WHERE member = ?1 AND state IN ('active', 'paused') ORDER BY id",
+        &member.key(),
+    )?;
+    let mut earliest: Option<u64> = None;
+    for id in ids {
+        if let Some(made_at) = load_subscription(db, &id)?.and_then(|s| s.member_mob_cursor) {
+            earliest = Some(earliest.map_or(made_at, |earliest| earliest.min(made_at)));
+        }
+    }
+    let Some(earliest) = earliest else {
+        return Ok(None);
+    };
+    let checked = db
+        .query_row(
+            "SELECT checked_through FROM member_routes WHERE member = ?1",
+            params![member.key()],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map_err(storage)?
+        .flatten()
+        .map(uint)
+        .transpose()?;
+    Ok(Some(
+        checked.map_or(earliest, |checked| checked.max(earliest)),
+    ))
+}
+
+fn record_member_mob_check_in(db: &Connection, member: &Member, through: u64) -> Result<()> {
+    db.execute(
+        "UPDATE member_routes SET checked_through = ?2
+         WHERE member = ?1 AND (checked_through IS NULL OR checked_through < ?2)",
+        params![member.key(), int(through)?],
+    )
+    .map_err(storage)?;
+    Ok(())
 }
 
 /// Mobs that live subscriptions name, and mobs whose log is not marked
@@ -1380,11 +1522,17 @@ fn seal_batch_in(
             source_key,
         });
     }
+    // Every subscription keeps its member's route, so a member with owed
+    // captures has one.
+    let route = member_route_in(db, member)?
+        .ok_or_else(|| storage(format!("no route is kept for member {member}")))?
+        .route;
     let batch = Batch {
         id: batch_id.clone(),
         member: member.clone(),
         items: batch_items,
         gaps,
+        route,
         content_digest: content_digest(&body),
         body,
         predecessor: None,
@@ -1427,6 +1575,7 @@ fn transition_batch_in(
             member: batch.member.clone(),
             items: batch.items.clone(),
             gaps: successor.gaps.clone(),
+            route: batch.route,
             body: successor.body.clone(),
             content_digest: content_digest(&successor.body),
             predecessor: Some(batch.id.clone()),
@@ -1816,6 +1965,15 @@ fn prune_in(db: &Connection, now_ms: u64, retention_ms: u64, limit: usize) -> Re
         )
         .map_err(storage)? as u64;
     report.more |= members >= budget || logs >= budget;
+    // A kept route goes with the last subscription and batch of its member.
+    db.execute(
+        "DELETE FROM member_routes WHERE NOT EXISTS (SELECT 1 FROM member_subscriptions s
+           WHERE s.member = member_routes.member)
+           AND NOT EXISTS (SELECT 1 FROM announcement_batches b
+           WHERE b.member = member_routes.member)",
+        [],
+    )
+    .map_err(storage)?;
     // Gaps of a member with no live subscription have no one to reach.
     db.execute(
         "DELETE FROM announcement_gaps WHERE NOT EXISTS (SELECT 1 FROM member_subscriptions s
@@ -1912,6 +2070,50 @@ impl AnnouncementStore for SqliteAnnouncementStore {
 
     async fn lineage(&self) -> Result<Vec<MobLineage>> {
         self.run(lineage_in).await
+    }
+
+    async fn member_route(&self, member: &Member) -> Result<Option<MemberRouteRecord>> {
+        let member = member.clone();
+        self.run(move |db| member_route_in(db, &member)).await
+    }
+
+    async fn unbind_member_route(
+        &self,
+        member: &Member,
+        end: SubscriptionEnd,
+        now_ms: u64,
+    ) -> Result<Vec<SubscriptionId>> {
+        let member = member.clone();
+        self.run(move |db| unbind_member_route_in(db, &member, &end, now_ms))
+            .await
+    }
+
+    async fn child_member_routes(&self) -> Result<Vec<(Member, MemberRouteRecord)>> {
+        self.run(child_member_routes_in).await
+    }
+
+    async fn member_mob_check_from(&self, member: &Member) -> Result<Option<u64>> {
+        let member = member.clone();
+        self.run(move |db| member_mob_check_from_in(db, &member))
+            .await
+    }
+
+    async fn record_member_mob_check(&self, member: &Member, through: u64) -> Result<()> {
+        let member = member.clone();
+        self.run(move |db| record_member_mob_check_in(db, &member, through))
+            .await
+    }
+
+    async fn end_member_before(
+        &self,
+        member: &Member,
+        cursor: u64,
+        end: SubscriptionEnd,
+        now_ms: u64,
+    ) -> Result<Vec<SubscriptionId>> {
+        let member = member.clone();
+        self.run(move |db| end_member_before_in(db, &member, cursor, &end, now_ms))
+            .await
     }
 
     async fn record_lineage(&self, lineage: &MobLineage, now_ms: u64) -> Result<bool> {

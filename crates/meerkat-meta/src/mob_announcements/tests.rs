@@ -16,8 +16,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use super::native::{
-    MemberProblem, MemberRoute, MobOrigin, MobOriginFacts, MobPresence, NativeDelivery,
-    NativeStatus, NativeSubmitError, NativeUnavailable, PrepareError, continuation_for,
+    MemberMobEnd, MemberMobScan, MemberProblem, MemberRoute, MobOrigin, MobOriginFacts,
+    MobPresence, NativeDelivery, NativeStatus, NativeSubmitError, NativeUnavailable, PrepareError,
+    continuation_for,
 };
 use super::owner::{
     AnnouncementConfig, AnnouncementError, AnnouncementService, NativeObservation, RoundReport,
@@ -80,6 +81,8 @@ fn put(id: &str, to: &str, topic: &[&str], start: StartFrontier) -> PutSubscript
         },
         start,
         expected_revision: None,
+        route: MemberRouteRecord::default(),
+        member_mob_cursor: None,
     }
 }
 
@@ -870,9 +873,20 @@ fn peer_member(identity: &str, peer: &str) -> Member {
     Member::new(mob(peer), MemberIdentity::new(identity).unwrap())
 }
 
+/// A subscription for `to`, kept on the route the owner gives a member of
+/// its mob: this gateway's own, or a peer's.
 fn put_for(id: &str, to: Member, topic: &[&str]) -> PutSubscription {
+    let route = if to.mob_id.as_str() == OWN_MOB {
+        MemberRoute::Local
+    } else {
+        MemberRoute::Peer
+    };
     PutSubscription {
         member: to,
+        route: MemberRouteRecord {
+            route,
+            incarnation: None,
+        },
         ..put(id, "agent:a", topic, StartFrontier::Now)
     }
 }
@@ -1426,6 +1440,123 @@ async fn sqlite_store_conforms() {
         retention_drops_bodies_a_native_held_batch_carries(store.as_ref()).await;
     })
     .await;
+    run_conformance("member routes", |store| async move {
+        member_routes_are_kept_and_member_mob_logs_read_on(store.as_ref()).await;
+    })
+    .await;
+}
+
+fn worker() -> Member {
+    peer_member("worker-1", "builds")
+}
+
+async fn member_routes_are_kept_and_member_mob_logs_read_on(store: &dyn AnnouncementStore) {
+    let child = MemberRouteRecord {
+        route: MemberRoute::Child,
+        incarnation: Some(incarnation("owner-1", 10)),
+    };
+    let child_put = |id: &str, cursor: u64| PutSubscription {
+        member: worker(),
+        route: child.clone(),
+        member_mob_cursor: Some(cursor),
+        ..put(id, "agent:a", &["ios"], StartFrontier::Now)
+    };
+    store
+        .put_subscription(&op("c1"), child_put("c1", 5), 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.member_route(&worker()).await.unwrap(),
+        Some(child.clone())
+    );
+    // A member is never rerouted, and nothing is recorded for the refusal.
+    assert!(matches!(
+        store
+            .put_subscription(&op("c2"), put_for("c2", worker(), &["ios"]), 2)
+            .await,
+        Err(AnnouncementStoreError::RouteKept {
+            kept: MemberRoute::Child
+        })
+    ));
+    assert!(store.subscription(&sid("c2")).await.unwrap().is_none());
+    store
+        .put_subscription(&op("c3"), child_put("c3", 9), 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.child_member_routes().await.unwrap(),
+        vec![(worker(), child.clone())]
+    );
+    // The log is read on from the earliest live cursor, then from where
+    // the last read ended; never back.
+    assert_eq!(
+        store.member_mob_check_from(&worker()).await.unwrap(),
+        Some(5)
+    );
+    store.record_member_mob_check(&worker(), 7).await.unwrap();
+    assert_eq!(
+        store.member_mob_check_from(&worker()).await.unwrap(),
+        Some(7)
+    );
+    store.record_member_mob_check(&worker(), 6).await.unwrap();
+    assert_eq!(
+        store.member_mob_check_from(&worker()).await.unwrap(),
+        Some(7)
+    );
+    // An end at cursor 8 ends only what was made before it.
+    let completed = SubscriptionEnd::MemberMobEnded {
+        why: "completed".into(),
+    };
+    assert_eq!(
+        store
+            .end_member_before(&worker(), 8, completed.clone(), 4)
+            .await
+            .unwrap(),
+        vec![sid("c1")]
+    );
+    let ended = store.subscription(&sid("c1")).await.unwrap().unwrap();
+    assert_eq!(ended.ended, Some(completed));
+    assert_eq!(
+        store.subscription(&sid("c3")).await.unwrap().unwrap().state,
+        SubscriptionState::Active
+    );
+    assert_eq!(
+        store.member_mob_check_from(&worker()).await.unwrap(),
+        Some(9),
+        "the earliest live subscription was made after the last read"
+    );
+    // Unbinding ends the rest and drops the route: another can be kept.
+    assert_eq!(
+        store
+            .unbind_member_route(
+                &worker(),
+                SubscriptionEnd::MemberMobEnded {
+                    why: "destroyed".into()
+                },
+                5
+            )
+            .await
+            .unwrap(),
+        vec![sid("c3")]
+    );
+    assert_eq!(store.member_route(&worker()).await.unwrap(), None);
+    assert!(store.child_member_routes().await.unwrap().is_empty());
+    assert_eq!(store.member_mob_check_from(&worker()).await.unwrap(), None);
+    store
+        .put_subscription(&op("c4"), put_for("c4", worker(), &["ios"]), 6)
+        .await
+        .unwrap();
+    // A batch carries the route its member is kept on.
+    store
+        .announce(announce_request("payments", "k1", &["ios"], "x"), 7)
+        .await
+        .unwrap();
+    let batch = store
+        .seal_batch(&worker(), &batch_id("b1"), &policy(), None, 2_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.route, MemberRoute::Peer);
 }
 
 fn incarnation(owner: &str, first_event_at_ms: u64) -> MobIncarnation {
@@ -1606,6 +1737,19 @@ struct ScriptedNative {
     unreadable_origins: Mutex<BTreeSet<String>>,
     /// Whether every hosted mob has been restored.
     restored: std::sync::atomic::AtomicBool,
+    /// Members on the rosters of mobs members created, as `(mob, identity)`.
+    child_roster: Mutex<BTreeSet<(String, String)>>,
+    /// Mobs members created that are held until their owner resolves.
+    held: Mutex<BTreeSet<String>>,
+    /// Mobs members created whose state reads completed now.
+    completed: Mutex<BTreeSet<String>>,
+    /// The incarnation of each mob members created, when not the first.
+    incarnations: Mutex<BTreeMap<String, MobIncarnation>>,
+    /// Each mob's event log: `(cursor, kind)`, kinds `completed`, `reset` or
+    /// anything else.
+    mob_events: Mutex<BTreeMap<String, Vec<(u64, &'static str)>>>,
+    /// The cursors member mob logs were read after, in order.
+    log_reads: Mutex<Vec<u64>>,
 }
 
 impl ScriptedNative {
@@ -1623,7 +1767,46 @@ impl ScriptedNative {
             origins: Mutex::new(BTreeMap::new()),
             unreadable_origins: Mutex::new(BTreeSet::new()),
             restored: std::sync::atomic::AtomicBool::new(true),
+            child_roster: Mutex::new(BTreeSet::new()),
+            held: Mutex::new(BTreeSet::new()),
+            completed: Mutex::new(BTreeSet::new()),
+            incarnations: Mutex::new(BTreeMap::new()),
+            mob_events: Mutex::new(BTreeMap::new()),
+            log_reads: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Put `identity` on the roster of the mob `mob_id` a member created.
+    fn add_child_member(&self, mob_id: &str, identity: &str) {
+        self.child_roster
+            .lock()
+            .unwrap()
+            .insert((mob_id.to_string(), identity.to_string()));
+    }
+
+    /// Append an event to the log of the mob `mob_id`.
+    fn log_event(&self, mob_id: &str, kind: &'static str) -> u64 {
+        let mut logs = self.mob_events.lock().unwrap();
+        let log = logs.entry(mob_id.to_string()).or_default();
+        let cursor = log.last().map_or(1, |(cursor, _)| cursor + 1);
+        log.push((cursor, kind));
+        cursor
+    }
+
+    fn incarnation(&self, mob_id: &str) -> MobIncarnation {
+        self.incarnations
+            .lock()
+            .unwrap()
+            .get(mob_id)
+            .cloned()
+            .unwrap_or(MobIncarnation {
+                owner_session: Some("owner-1".into()),
+                first_event_at_ms: 1,
+            })
+    }
+
+    fn held(&self, mob_id: &MobId) -> bool {
+        self.held.lock().unwrap().contains(mob_id.as_str())
     }
 
     /// Script the origin Meerkat's records give the mob `mob_id`.
@@ -1680,12 +1863,32 @@ impl NativeDelivery for ScriptedNative {
         Ok(self.governed)
     }
 
-    fn route(&self, member: &Member) -> MemberRoute {
-        if member.mob_id.as_str() == OWN_MOB {
-            MemberRoute::Local
-        } else {
-            MemberRoute::Peer
+    async fn route_for(
+        &self,
+        member: &Member,
+    ) -> std::result::Result<MemberRouteRecord, MemberProblem> {
+        let mob_id = member.mob_id.as_str();
+        if mob_id == OWN_MOB {
+            return Ok(MemberRouteRecord::default());
         }
+        if !self.hosted(&member.mob_id) {
+            return Ok(MemberRouteRecord {
+                route: MemberRoute::Peer,
+                incarnation: None,
+            });
+        }
+        if self.peers.contains(mob_id) {
+            return Err(MemberProblem::Ambiguous(format!(
+                "{mob_id} is hosted here and filed as a peer"
+            )));
+        }
+        if self.held(&member.mob_id) {
+            return Err(MemberProblem::Unavailable(format!("{mob_id} is held")));
+        }
+        Ok(MemberRouteRecord {
+            route: MemberRoute::Child,
+            incarnation: Some(self.incarnation(mob_id)),
+        })
     }
 
     async fn mob_presence(
@@ -1742,30 +1945,124 @@ impl NativeDelivery for ScriptedNative {
         Ok(self.origins.lock().unwrap().get(mob_id.as_str()).cloned())
     }
 
-    async fn check_member(&self, member: &Member) -> std::result::Result<(), MemberProblem> {
+    async fn check_member(
+        &self,
+        member: &Member,
+        route: MemberRoute,
+    ) -> std::result::Result<(), MemberProblem> {
         let identity = member.identity.as_str();
-        match self.route(member) {
+        let mob_id = member.mob_id.as_str();
+        match route {
             MemberRoute::Local if self.unusable.contains(identity) => Err(MemberProblem::Unusable(
                 format!("{identity} is placed on a host"),
             )),
             MemberRoute::Local if self.known.contains(identity) => Ok(()),
             MemberRoute::Local => Err(MemberProblem::Unknown),
-            MemberRoute::Peer if self.hosted(&member.mob_id) => Err(MemberProblem::Unsupported(
-                format!("{} is hosted here", member.mob_id),
-            )),
-            MemberRoute::Peer if self.peers.contains(member.mob_id.as_str()) => Ok(()),
+            MemberRoute::Child if self.completed.lock().unwrap().contains(mob_id) => {
+                Err(MemberProblem::Unusable(format!("{mob_id} has completed")))
+            }
+            MemberRoute::Child
+                if self
+                    .child_roster
+                    .lock()
+                    .unwrap()
+                    .contains(&(mob_id.to_string(), identity.to_string())) =>
+            {
+                Ok(())
+            }
+            MemberRoute::Child => Err(MemberProblem::Unknown),
+            MemberRoute::Peer if self.peers.contains(mob_id) => Ok(()),
             MemberRoute::Peer => Err(MemberProblem::UnusablePeer(format!(
-                "no pinned contact for {}",
-                member.mob_id
+                "no pinned contact for {mob_id}"
             ))),
         }
     }
 
-    async fn prepare_member(&self, member: &Member) -> std::result::Result<(), PrepareError> {
+    async fn prepare_member(
+        &self,
+        member: &Member,
+        route: MemberRoute,
+    ) -> std::result::Result<(), PrepareError> {
+        if route == MemberRoute::Child {
+            if self.held(&member.mob_id) {
+                return Err(PrepareError::Unavailable(format!(
+                    "{} is held",
+                    member.mob_id
+                )));
+            }
+            if !self.hosted(&member.mob_id) {
+                return Err(PrepareError::Gone(SubscriptionEnd::MemberMobEnded {
+                    why: "destroyed".into(),
+                }));
+            }
+        }
         match self.gone.lock().unwrap().get(member.identity.as_str()) {
             Some(end) => Err(PrepareError::Gone(end.clone())),
             None => Ok(()),
         }
+    }
+
+    async fn member_mob_cursor(
+        &self,
+        mob_id: &MobId,
+    ) -> std::result::Result<u64, NativeUnavailable> {
+        Ok(self
+            .mob_events
+            .lock()
+            .unwrap()
+            .get(mob_id.as_str())
+            .and_then(|log| log.last())
+            .map_or(0, |(cursor, _)| *cursor))
+    }
+
+    async fn member_mob_gone(
+        &self,
+        mob_id: &MobId,
+        incarnation: Option<&MobIncarnation>,
+    ) -> std::result::Result<Option<MemberMobEnd>, NativeUnavailable> {
+        if self.held(mob_id) {
+            return Err(NativeUnavailable(format!("{mob_id} is held")));
+        }
+        let why = if !self.hosted(mob_id) {
+            "destroyed"
+        } else if incarnation
+            .is_some_and(|subscribed_in| *subscribed_in != self.incarnation(mob_id.as_str()))
+        {
+            "created again"
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(MemberMobEnd {
+            cursor: u64::MAX,
+            why: why.into(),
+        }))
+    }
+
+    async fn member_mob_end(
+        &self,
+        mob_id: &MobId,
+        incarnation: Option<&MobIncarnation>,
+        after: u64,
+    ) -> std::result::Result<MemberMobScan, NativeUnavailable> {
+        if let Some(end) = self.member_mob_gone(mob_id, incarnation).await? {
+            return Ok(MemberMobScan::Ended(end));
+        }
+        self.log_reads.lock().unwrap().push(after);
+        let logs = self.mob_events.lock().unwrap();
+        let mut through = after;
+        for (cursor, kind) in logs.get(mob_id.as_str()).into_iter().flatten() {
+            if *cursor <= after {
+                continue;
+            }
+            if matches!(*kind, "completed" | "reset") {
+                return Ok(MemberMobScan::Ended(MemberMobEnd {
+                    cursor: *cursor,
+                    why: (*kind).into(),
+                }));
+            }
+            through = *cursor;
+        }
+        Ok(MemberMobScan::Running { through })
     }
 
     async fn submit(
@@ -2462,6 +2759,43 @@ impl AnnouncementStore for FaultyStore {
         now_ms: u64,
     ) -> Result<Vec<SubscriptionId>> {
         self.inner.drop_ended_mobs(ended, now_ms).await
+    }
+
+    async fn member_route(&self, member: &Member) -> Result<Option<MemberRouteRecord>> {
+        self.inner.member_route(member).await
+    }
+
+    async fn unbind_member_route(
+        &self,
+        member: &Member,
+        end: SubscriptionEnd,
+        now_ms: u64,
+    ) -> Result<Vec<SubscriptionId>> {
+        self.inner.unbind_member_route(member, end, now_ms).await
+    }
+
+    async fn child_member_routes(&self) -> Result<Vec<(Member, MemberRouteRecord)>> {
+        self.inner.child_member_routes().await
+    }
+
+    async fn end_member_before(
+        &self,
+        member: &Member,
+        cursor: u64,
+        end: SubscriptionEnd,
+        now_ms: u64,
+    ) -> Result<Vec<SubscriptionId>> {
+        self.inner
+            .end_member_before(member, cursor, end, now_ms)
+            .await
+    }
+
+    async fn member_mob_check_from(&self, member: &Member) -> Result<Option<u64>> {
+        self.inner.member_mob_check_from(member).await
+    }
+
+    async fn record_member_mob_check(&self, member: &Member, through: u64) -> Result<()> {
+        self.inner.record_member_mob_check(member, through).await
     }
 
     async fn lineage(&self) -> Result<Vec<MobLineage>> {
@@ -3313,8 +3647,8 @@ async fn the_rpc_surface_is_strict_and_typed() {
     assert_eq!(child.code, ANNOUNCEMENTS_REFUSED_CODE);
     assert_eq!(
         child.data.unwrap()["kind"],
-        "unsupported_member",
-        "a member of another mob hosted here cannot subscribe yet"
+        "unknown_member",
+        "a member of a mob a member created is checked against that mob's roster"
     );
     let malformed = call(
         "meta/mob_announcements/subscriptions/put",
@@ -3525,9 +3859,9 @@ async fn members_this_runtime_cannot_deliver_to_are_refused_at_put() {
                     put_for("s2", peer_member("worker-1", "builds"), &["ios"])
                 )
                 .await,
-            Err(AnnouncementError::UnsupportedMember(_))
+            Err(AnnouncementError::UnknownMember(_))
         ),
-        "a member of another mob hosted here cannot subscribe yet"
+        "a member of a mob a member created is checked against that mob's roster"
     );
 }
 
@@ -5228,4 +5562,325 @@ async fn this_gateways_own_mob_never_gets_a_lineage_record() {
     assert_eq!(recorded(&harness).await, ["refunds"]);
     harness.service.reconcile_lineage().await.unwrap();
     assert_eq!(recorded(&harness).await, ["refunds"]);
+}
+
+/// A member of a mob a member created, subscribed through the owner.
+async fn subscribe_worker(
+    harness: &Harness,
+    id: &str,
+) -> std::result::Result<Subscription, AnnouncementError> {
+    harness
+        .service
+        .put_subscription(&op(id), put_for(id, worker(), &["ios"]))
+        .await
+}
+
+fn worker_batches_query() -> BatchQuery {
+    BatchQuery {
+        member: Some(worker()),
+        limit: 10,
+        ..BatchQuery::default()
+    }
+}
+
+fn child_native() -> ScriptedNative {
+    let native = ScriptedNative::new();
+    native.add_child_member("builds", "worker-1");
+    native.log_event("builds", "spawned");
+    native.log_event("builds", "spawned");
+    native
+}
+
+#[tokio::test]
+async fn a_member_of_a_mob_a_member_created_is_delivered_on_its_kept_route() {
+    let harness = harness_with(child_native());
+    let subscription = subscribe_worker(&harness, "w1").await.unwrap();
+    assert_eq!(
+        subscription.member_mob_cursor,
+        Some(2),
+        "made at the mob's current cursor"
+    );
+    let kept = harness
+        .store
+        .member_route(&worker())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.route, MemberRoute::Child);
+    assert_eq!(kept.incarnation, Some(harness.native.incarnation("builds")));
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let batches = harness
+        .service
+        .deliveries(&worker_batches_query())
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].route, MemberRoute::Child);
+    assert_eq!(batches[0].state.tag(), BatchStateTag::Delivered);
+    assert_eq!(harness.native.submits(), 1);
+    // A member not on its mob's roster, and a member of a completed mob,
+    // are refused.
+    assert!(matches!(
+        harness
+            .service
+            .put_subscription(
+                &op("w2"),
+                put_for("w2", peer_member("worker-2", "builds"), &["ios"])
+            )
+            .await,
+        Err(AnnouncementError::UnknownMember(_))
+    ));
+    harness
+        .native
+        .completed
+        .lock()
+        .unwrap()
+        .insert("builds".into());
+    assert!(matches!(
+        subscribe_worker(&harness, "w3").await,
+        Err(AnnouncementError::UnusableMember(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_completion_or_reset_after_the_put_ends_the_subscription_before_any_submission() {
+    for kind in ["completed", "reset"] {
+        let harness = harness_with(child_native());
+        // A completion and reset before the put end nothing.
+        harness.native.log_event("builds", "completed");
+        harness.native.log_event("builds", "reset");
+        subscribe_worker(&harness, "w1").await.unwrap();
+        harness.native.log_event("builds", "spawned");
+        let at = harness.native.log_event("builds", kind);
+        harness.announce_burst(1).await;
+        harness.clock.store(10_000_000, Ordering::SeqCst);
+        harness.service.run_round().await.unwrap();
+        let ended = harness
+            .service
+            .subscription(&sid("w1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended.state, SubscriptionState::Ended, "{kind} at {at}");
+        assert_eq!(
+            ended.ended,
+            Some(SubscriptionEnd::MemberMobEnded { why: kind.into() })
+        );
+        assert_eq!(harness.native.submits(), 0, "nothing reached the member");
+        let batches = harness
+            .service
+            .deliveries(&worker_batches_query())
+            .await
+            .unwrap();
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.state.tag() == BatchStateTag::Cancelled),
+            "{batches:?}"
+        );
+        // Subscribed again after it, the member is delivered to.
+        subscribe_worker(&harness, "w2").await.unwrap();
+        harness
+            .service
+            .announce(announce_request("payments", "again", &["ios"], "x"))
+            .await
+            .unwrap();
+        harness.round_after_pause().await;
+        harness.clock.fetch_add(60_001, Ordering::SeqCst);
+        harness.service.run_round().await.unwrap();
+        assert_eq!(harness.native.submits(), 1, "{kind}");
+    }
+}
+
+#[tokio::test]
+async fn the_member_mob_log_is_read_on_from_the_last_read() {
+    let harness = harness_with(child_native());
+    subscribe_worker(&harness, "w1").await.unwrap();
+    harness.native.log_event("builds", "spawned");
+    harness.native.log_event("builds", "spawned");
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    assert_eq!(harness.native.submits(), 1);
+    harness.native.log_event("builds", "spawned");
+    harness
+        .service
+        .announce(announce_request("payments", "again", &["ios"], "x"))
+        .await
+        .unwrap();
+    harness.clock.fetch_add(60_001, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    assert_eq!(harness.native.submits(), 2);
+    assert_eq!(
+        *harness.native.log_reads.lock().unwrap(),
+        vec![2, 4],
+        "the second read starts where the first ended"
+    );
+}
+
+#[tokio::test]
+async fn a_mob_created_again_or_destroyed_ends_what_its_members_had() {
+    let harness = harness_with(child_native());
+    subscribe_worker(&harness, "w1").await.unwrap();
+    // Created again under the same id: the next put ends the old
+    // incarnation's subscriptions and keeps the new incarnation.
+    let second = incarnation("owner-2", 20);
+    harness
+        .native
+        .incarnations
+        .lock()
+        .unwrap()
+        .insert("builds".into(), second.clone());
+    subscribe_worker(&harness, "w2").await.unwrap();
+    let old = harness
+        .service
+        .subscription(&sid("w1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        old.ended,
+        Some(SubscriptionEnd::MemberMobEnded {
+            why: "created again".into()
+        })
+    );
+    let kept = harness
+        .store
+        .member_route(&worker())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.incarnation, Some(second));
+    // Destroyed: the mob set reconcile ends the member's subscriptions.
+    harness
+        .native
+        .destroyed
+        .lock()
+        .unwrap()
+        .insert("builds".into());
+    harness.service.reconcile_mobs().await.unwrap();
+    let gone = harness
+        .service
+        .subscription(&sid("w2"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        gone.ended,
+        Some(SubscriptionEnd::MemberMobEnded {
+            why: "destroyed".into()
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_held_mob_ends_nothing_and_its_members_wait() {
+    let harness = harness_with(child_native());
+    subscribe_worker(&harness, "w1").await.unwrap();
+    harness.native.held.lock().unwrap().insert("builds".into());
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    harness.service.reconcile_mobs().await.unwrap();
+    let subscription = harness
+        .service
+        .subscription(&sid("w1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(subscription.state, SubscriptionState::Active);
+    assert_eq!(harness.native.submits(), 0);
+    // A put while it is held is refused as unavailable, not as gone.
+    assert!(matches!(
+        subscribe_worker(&harness, "w2").await,
+        Err(AnnouncementError::NativeUnavailable(_))
+    ));
+    harness.native.held.lock().unwrap().clear();
+    harness.round_after_pause().await;
+    assert_eq!(harness.native.submits(), 1, "delivered once it runs again");
+}
+
+#[tokio::test]
+async fn a_committed_delivery_in_a_destroyed_mob_strands_without_a_successor() {
+    let mut native = child_native();
+    native.apply_on_commit = false;
+    let harness = harness_with(native);
+    subscribe_worker(&harness, "w1").await.unwrap();
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let batches = harness
+        .service
+        .deliveries(&worker_batches_query())
+        .await
+        .unwrap();
+    assert_eq!(batches[0].state.tag(), BatchStateTag::Committed);
+    // Still pending, as Meerkat reports a delivery to a mob it no longer
+    // hosts: Meta knows the mob is gone for good.
+    harness
+        .native
+        .destroyed
+        .lock()
+        .unwrap()
+        .insert("builds".into());
+    harness.round_after_pause().await;
+    let batch = harness.store.batch(&batches[0].id).await.unwrap().unwrap();
+    assert_eq!(batch.state.tag(), BatchStateTag::Stranded);
+    assert_eq!(batch.successor, None, "the member's subscriptions ended");
+    let ended = harness
+        .service
+        .subscription(&sid("w1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ended.ended,
+        Some(SubscriptionEnd::MemberMobEnded {
+            why: "destroyed".into()
+        })
+    );
+    assert_eq!(harness.native.submits(), 1);
+}
+
+#[tokio::test]
+async fn a_mob_id_hosted_here_and_filed_as_a_peer_is_ambiguous() {
+    let mut native = child_native();
+    native.peers.insert("builds".into());
+    let harness = harness_with(native);
+    assert!(matches!(
+        subscribe_worker(&harness, "w1").await,
+        Err(AnnouncementError::AmbiguousMob(mob_id)) if mob_id.as_str() == "builds"
+    ));
+    assert_eq!(harness.store.member_route(&worker()).await.unwrap(), None);
+    // A member kept on the peer route is never rerouted to a mob hosted
+    // here under the same id, and what it has stays as it is.
+    let harness = harness_with(child_native());
+    harness
+        .store
+        .put_subscription(&op("p1"), put_for("p1", worker(), &["ios"]), 1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        subscribe_worker(&harness, "w1").await,
+        Err(AnnouncementError::AmbiguousMob(_))
+    ));
+    let kept = harness
+        .store
+        .member_route(&worker())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.route, MemberRoute::Peer);
+    assert_eq!(
+        harness
+            .service
+            .subscription(&sid("p1"))
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        SubscriptionState::Active
+    );
 }

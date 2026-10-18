@@ -6,9 +6,9 @@ use async_trait::async_trait;
 
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, Batch, BatchEvent, BatchId, BatchPosition,
-    BatchQuery, BatchStateTag, ExpiryReport, Member, MemberBacklog, MobId, MobLineage, OperationId,
-    PruneReport, PutSubscription, Result, SealingPolicy, SourceKey, Subscription,
-    SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
+    BatchQuery, BatchStateTag, ExpiryReport, Member, MemberBacklog, MemberRouteRecord, MobId,
+    MobLineage, OperationId, PruneReport, PutSubscription, Result, SealingPolicy, SourceKey,
+    Subscription, SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
 };
 
 /// Durable mob announcements, member subscriptions and delivery batches.
@@ -97,6 +97,48 @@ pub trait AnnouncementStore: Send + Sync {
     /// The live lineage records: at most one per mob, for the incarnation
     /// hosted when it was derived.
     async fn lineage(&self) -> Result<Vec<MobLineage>>;
+
+    /// The member's kept route: the route of its first subscription, kept
+    /// while it has subscriptions or batches. A put whose route differs is
+    /// refused with
+    /// [`RouteKept`](super::types::AnnouncementStoreError::RouteKept).
+    async fn member_route(&self, member: &Member) -> Result<Option<MemberRouteRecord>>;
+
+    /// End every live subscription of the member, as [`Self::end_member`]
+    /// does, and drop its kept route in the same transaction: the mob it
+    /// was kept for is gone or was created again. Batches keep the route
+    /// they were sealed with.
+    async fn unbind_member_route(
+        &self,
+        member: &Member,
+        end: SubscriptionEnd,
+        now_ms: u64,
+    ) -> Result<Vec<SubscriptionId>>;
+
+    /// Members kept on the route to mobs members created, with their kept
+    /// routes.
+    async fn child_member_routes(&self) -> Result<Vec<(Member, MemberRouteRecord)>>;
+
+    /// End the member's live subscriptions made before `cursor` of its own
+    /// mob's event log, as [`Self::end_member`] ends them.
+    async fn end_member_before(
+        &self,
+        member: &Member,
+        cursor: u64,
+        end: SubscriptionEnd,
+        now_ms: u64,
+    ) -> Result<Vec<SubscriptionId>>;
+
+    /// Where the next check of the member's own mob log starts: after the
+    /// earliest cursor a live subscription of the member was made at, or
+    /// after the cursor a check already read through, whichever is later.
+    /// `None` when no live subscription of the member records a cursor.
+    async fn member_mob_check_from(&self, member: &Member) -> Result<Option<u64>>;
+
+    /// Record that the member's own mob neither completed nor reset after
+    /// [`Self::member_mob_check_from`] through `through`. Only ever
+    /// advances.
+    async fn record_member_mob_check(&self, member: &Member, through: u64) -> Result<()>;
 
     /// Record a derived lineage. A live record of the same mob and
     /// incarnation stays as it is: a relation is derived once. A live

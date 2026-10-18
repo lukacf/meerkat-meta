@@ -255,7 +255,7 @@ errors. SDKs surface it on `RpcError.data`.
 | `-32044` | A mob announcement method on a gateway that did not enable mob announcements (see [Mob announcements](#mob-announcements-optional)) | `{kind: "mob_announcements_unavailable"}` |
 | `-32045` | Mob announcement conflict: a source key already bound to other content, a stale subscription revision, a reused operation id, a batch that moved | `{kind: "announcement_conflict", existing}`, `{kind: "stale_revision", current_revision}`, `{kind: "operation_reused"}` or `{kind: "batch_moved", current}` |
 | `-32046` | `meta/mob_announcements/subscriptions/put` start frontier outside a mob's announcements: older than what is retained, or beyond its head (a mob that has announced nothing yet is at head 0) | `{kind: "gap", mob_id, earliest_retained}` or `{kind: "frontier_beyond_head", mob_id, head}` |
-| `-32047` | Mob announcement typed refusal | `{kind}`: `governed_runtime`, `unknown_member` (with `member`), `unsupported_member`, `unusable_member`, `unusable_peer`, `subscription_cancelled`, `subscription_ended` (with `end`), `member_mismatch`, `unrelated_mob` (with `mob_id`; member tools only) or `native_unavailable` |
+| `-32047` | Mob announcement typed refusal | `{kind}`: `governed_runtime`, `unknown_member` (with `member`), `unusable_member`, `unusable_peer`, `subscription_cancelled`, `subscription_ended` (with `end`), `member_mismatch`, `unrelated_mob` (with `mob_id`; member tools only), `ambiguous_mob` (with `mob_id`, or `kept_route`) or `native_unavailable` |
 | `-32048` | A mob announcement method names a subscription, delivery or mob that does not exist here | `{kind: "unknown_subscription"}`, `{kind: "unknown_delivery"}` or `{kind: "unknown_mob", mobs}` |
 
 The `-32010` constant is exported from both SDKs as
@@ -1949,7 +1949,12 @@ gap line of its body.
 is unique only within its mob. A member of this gateway's mob must be a
 registered identity served by this gateway's runtime: one placed on a host or
 bound to an external runtime is refused with `-32047` `unusable_member`. A
-member of another mob hosted here is refused with `unsupported_member`. A
+member of another mob hosted here (a mob a member created) must be on that
+mob's roster now, and the mob running and not completed; it is reached
+through this gateway's runtime by its plain roster id. A mob held until its
+owner resolves is `native_unavailable`. A mob id that names a mob hosted
+here and a peer alike, or a member whose kept route would change, is
+refused with `ambiguous_mob`. A
 member of a mob on a peer gateway is reached through keyed inject (see
 [Keyed inject](/concepts/access-control#keyed-inject)) when this gateway's
 contact directory files that mob with a pinned key and this gateway holds a
@@ -1961,7 +1966,10 @@ ends, with `ended` saying why, when its member is no longer registered
 (`member_unusable`), or when every mob it named was destroyed
 (`mobs_ended`), or, for a member on a peer gateway, when that gateway answers
 that it has no such member (`member_left`), cannot serve it
-(`member_unusable`), or predates keyed inject (`peer_unsupported`); what it
+(`member_unusable`), or predates keyed inject (`peer_unsupported`), or,
+for a member of another mob hosted here, when that mob was destroyed,
+created again, completed or reset after the subscription was made
+(`member_mob_ended`, with `why`); what it
 captured and no batch holds settles. A destroyed mob
 leaves the subscriptions that name it at a new revision and is listed in
 their `ended_mobs`.
