@@ -30,6 +30,9 @@ use crate::types::{
     AgentDiscoverySpec, EventEnvelope, MetaConfig, MobStructuralEventEnvelope, UnifiedEvent,
 };
 
+mod bootstrap_completion;
+#[cfg(test)]
+mod bootstrap_completion_tests;
 pub mod builder;
 /// Completes an application from a held identity bootstrap's held members,
 /// with the pass's [`crate::identity_first::HeldCompletion`]; see
@@ -64,6 +67,9 @@ pub mod module_ops;
 pub mod types;
 
 pub use crate::identity_first::IdentityBootstrapMode;
+pub use bootstrap_completion::{
+    BootstrapCompletionRefused, BootstrapCompletionUnavailable, RuntimeBootstrapCompleted,
+};
 pub use builder::UnifiedRuntimeBuilder;
 pub use edge_types::{
     DesiredPeerEdge, DesiredPeerEdgeError, Discovery, EdgeDiscovery, EdgeReconcileFailure,
@@ -309,6 +315,11 @@ pub struct UnifiedRuntimeCore {
     module_runtime: Arc<tokio::sync::Mutex<MetaRuntimeHandle>>,
     managed_dynamic_edges: Arc<tokio::sync::RwLock<BTreeSet<(String, String)>>>,
     shutting_down: AtomicBool,
+    /// The runtime's close begins under this gate, serialized against a
+    /// running publication of its bootstrap completion.
+    close_gate: Arc<bootstrap_completion::RuntimeCloseGate>,
+    /// The one-use bootstrap completion, between its mint and its take.
+    bootstrap_completion: std::sync::Mutex<bootstrap_completion::CompletionSlot>,
     mob_event_ingress: tokio::sync::Mutex<Option<MobEventIngress>>,
     bootstrap_edges_report: tokio::sync::RwLock<Option<UnifiedRuntimeReconcileEdgesReport>>,
     /// Optional observer for bootstrap phase transitions (set once).
@@ -861,6 +872,10 @@ impl UnifiedRuntime {
                 module_runtime: Arc::new(tokio::sync::Mutex::new(module_runtime)),
                 managed_dynamic_edges: Arc::new(tokio::sync::RwLock::new(BTreeSet::new())),
                 shutting_down: AtomicBool::new(false),
+                close_gate: bootstrap_completion::RuntimeCloseGate::new(),
+                bootstrap_completion: std::sync::Mutex::new(
+                    bootstrap_completion::CompletionSlot::Pending,
+                ),
                 mob_event_ingress: tokio::sync::Mutex::new(mob_event_ingress),
                 bootstrap_edges_report: tokio::sync::RwLock::new(None),
                 bootstrap_phase_observer: std::sync::OnceLock::new(),
@@ -1141,6 +1156,12 @@ impl UnifiedRuntime {
     /// Identity compositions must instead use
     /// [`Self::install_and_bootstrap_identity_first_context`] to register
     /// continuity owners before resumed sessions become runnable.
+    ///
+    /// On `Ok` it mints the runtime's bootstrap completion
+    /// ([`Self::take_bootstrap_completion`]), also when nothing was pending:
+    /// a runtime built by a legacy constructor ([`Self::bootstrap`] and the
+    /// `bootstrap_with_*` family) is already active, but it has no
+    /// completion until this returns.
     pub async fn activate_without_identity_context(&mut self) -> Result<(), MobRuntimeError> {
         if self.identity_first_context.is_some() {
             return Err(MobRuntimeError::InvalidConfig(
@@ -1158,6 +1179,7 @@ impl UnifiedRuntime {
             }
             self.reconcile_bootstrap_edges_if_configured().await;
         }
+        self.mint_bootstrap_completion();
         Ok(())
     }
 
@@ -1588,6 +1610,7 @@ impl UnifiedRuntime {
                     self.reconcile_bootstrap_edges_if_configured().await;
                 }
                 self.start_identity_first_supervisors();
+                self.mint_bootstrap_completion();
                 Ok(HeldBootstrapStart::Activated(result))
             }
             // The setup did not activate: whatever it entered still settles
@@ -1715,6 +1738,7 @@ impl UnifiedRuntime {
                     self.reconcile_bootstrap_edges_if_configured().await;
                 }
                 self.start_identity_first_supervisors();
+                self.mint_bootstrap_completion();
                 Ok(result)
             }
             Err(error) => {
@@ -1729,6 +1753,9 @@ impl UnifiedRuntime {
         &mut self,
         context: Arc<crate::identity_first::IdentityFirstRuntimeContext>,
     ) {
+        // The runtime's bootstrap is now its identity bootstrap: a classic
+        // activation's completion not yet taken no longer attests it.
+        self.withdraw_bootstrap_completion();
         self.install_identity_first_flow_target_provisioner(&context.runtime);
         // The probe's verdict reaches the identity delivery path through the
         // identity runtime (and from there its session bridge): a send issued
