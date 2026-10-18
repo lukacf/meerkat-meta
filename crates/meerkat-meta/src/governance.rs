@@ -189,7 +189,11 @@ fn traceability_yaml_options() -> serde_saphyr::Options {
 
 /// A `...` document end marker line. A traceability document is one YAML
 /// document, and serde-saphyr 2.0.0 stops at the marker and ignores what
-/// follows it, even malformed text.
+/// follows it, even malformed text: upstream issue #228, fixed after 2.0.0 by
+/// <https://github.com/bourumir-wyngs/serde-saphyr/pull/230>. Remove this
+/// guard at the bump to a release with that fix, and decide then whether a
+/// marker with nothing after it stays refused (the traceability_yaml tests
+/// pin both).
 fn has_document_end_marker(yaml: &str) -> bool {
     yaml.lines().any(|line| {
         line.strip_prefix("...")
