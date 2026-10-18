@@ -12572,7 +12572,11 @@ impl MobRuntime {
     /// over the same layout restores it as it was. An unsettled child stays
     /// recorded across repeated calls; a closed actor channel is not a
     /// settlement report. A child that already shut down cleanly in the same
-    /// incarnation is not asked again.
+    /// incarnation is not asked again. A close sent while a mob's actor is
+    /// still exiting from its shutdown can go unanswered in Meerkat 0.9.3 and
+    /// earlier, so the admission close is sent again once the root's actor
+    /// task ends, and each child's actor task is waited for, within the
+    /// deadline, after its shutdown.
     ///
     /// It then stands the state down (`MobMcpState::stand_down`): it joins
     /// the work the state owns (council runs, completion custodians,
@@ -12626,7 +12630,7 @@ impl MobRuntime {
         };
         // Admission closes before the snapshot: no caller admitted before
         // the close can add a child after it.
-        let admission = state.close_admission(deadline).await;
+        let admission = self.close_state_admission(state, deadline).await;
         let mut stood_down = std::collections::BTreeSet::new();
         let mut child_mobs = 0_usize;
         if let Err(unsettled) = self
@@ -12674,6 +12678,35 @@ impl MobRuntime {
         released
     }
 
+    /// Close the agent mob-tool state's admission
+    /// (`MobMcpState::close_admission`), and close it again if the root mob's
+    /// actor task ends while the first close still waits.
+    ///
+    /// The root has stopped, but its actor may still be dropping its command
+    /// channel. Meerkat 0.9.3 and earlier drop it without waiting for a send
+    /// already under way, so the root's close can stay queued with no reply
+    /// and hold the stand-down to its deadline. Once the task has ended, the
+    /// channel refuses a new close at once, which the state counts as closed.
+    /// A live root answers the first close. The close is idempotent, and a
+    /// close left waiting is abandoned, not undone.
+    async fn close_state_admission(
+        &self,
+        state: &meerkat_mob_mcp::MobMcpState,
+        deadline: std::time::Instant,
+    ) -> meerkat_mob_mcp::MobStateStandDown {
+        let mut root_actor = self.handle.actor_task_watch();
+        {
+            let close = state.close_admission(deadline);
+            tokio::pin!(close);
+            tokio::select! {
+                biased;
+                admission = &mut close => return admission,
+                _ = root_actor.wait() => {}
+            }
+        }
+        state.close_admission(deadline).await
+    }
+
     /// Shut down every child mob in the state's snapshot not yet in
     /// `stood_down`, recording each answer. A child already clean in the
     /// same incarnation is counted without being asked again.
@@ -12709,12 +12742,24 @@ impl MobRuntime {
             if self.child_mob_root.clean_in(mob_id.as_ref(), &incarnation) {
                 continue;
             }
-            let outcome = match handle
+            let shutdown = handle
                 .shutdown_with_report(
                     meerkat_mob::ShutdownOptions::default().with_deadline(deadline),
                 )
-                .await
-            {
+                .await;
+            if shutdown.is_ok() {
+                // The child's actor drops its command channel right after it
+                // answers, and the state's stand-down sends every managed
+                // child a close. Meerkat 0.9.3 and earlier can leave a
+                // command sent into that drop unanswered: wait for the task
+                // to end, so the close is refused at once.
+                let _ = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    handle.actor_task_watch().wait(),
+                )
+                .await;
+            }
+            let outcome = match shutdown {
                 Ok(report) if report.is_clean() => ChildShutdown::Clean,
                 // Only the members the native report names as not clean.
                 Ok(report) => ChildShutdown::Unsettled(format!(
