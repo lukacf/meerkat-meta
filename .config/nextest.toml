@@ -106,13 +106,6 @@ retries = 2
 # twice on loaded 16-core local full-suite runs (passes 1/1 isolated and in
 # its binary) — same aggregate-load crash family as access_control.
 
-# The console-aggregator burst test races a deliberately-slow backfill against
-# live frames; under peak suite load the burst window starves the same way the
-# heavy-runtime family does (passes 1/1 isolated). Same scoped remedy.
-[[profile.default.overrides]]
-filter = 'package(meerkat-meta) & test(live_event_burst_reaches_store_while_slow_backfill_is_running)'
-retries = 2
-
 # The idle CPU gate measures the gateway's CPU-time over real 30s windows;
 # sibling tests on the same runner inflate the reading (it failed 2x on
 # GitHub's shared 2-core runners inside the parallel suite while passing solo

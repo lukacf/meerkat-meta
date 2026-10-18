@@ -64,6 +64,81 @@ for the console, voice, TypeScript, and other required hosted checks.
 3. Run the applicable local checks above (`make test-all` covers Rust + Python + Flow Editor; TypeScript changes also need `npm --prefix sdk/typescript run validate`)
 4. Open a PR against `main` with a description of changes; ensure the required hosted-CI gates pass before merging
 
+## Git Hooks and CI
+
+`make install-hooks` installs the pre-commit and pre-push hooks. A commit runs
+`cargo fmt` on Rust files. A push runs only fast local checks: the secret
+scan, file hygiene, YAML and TOML syntax, conflict markers, large files,
+`cargo fmt --check`, the generated Bazel BUILD files and decorator authority,
+about 10 seconds on a warm checkout. The workspace clippy and the unit tests
+run in CI; to run them before a push:
+
+```bash
+pre-commit run --hook-stage manual cargo-clippy --from-ref origin/main --to-ref HEAD
+pre-commit run --hook-stage manual cargo-test --from-ref origin/main --to-ref HEAD
+```
+
+CI (`.github/workflows/ci.yml`) runs `fmt-lint`, `test-typescript` and `audit`
+on every pull request. Its other jobs form lanes, and a pull request runs only
+the lanes its changed files reach (`scripts/ci-changes.py`):
+
+- A Rust change runs `clippy`, `test` and the two `test-integration` halves.
+  `test` is the only automatic run of the lib and bin tests: it lists them
+  first and fails if its filter leaves any out.
+- A change to the build configuration (`Cargo.toml`, `Cargo.lock`,
+  `rust-toolchain.toml`, `.cargo/`, `crates/meerkat-meta/Cargo.toml`) runs
+  every lane that compiles Rust.
+- The voice and extension-state jobs, the Python SDK tests, the console jobs
+  and the flow editor job compile the same crate in other configurations. A
+  pull request leaves them to the push unless it changes one of their own
+  inputs: code gated on the `openai-live` or `extension-state` feature, those
+  features' modules and crate, the backend modules a lane drives end to end
+  (the HTTP console and console aggregator, the flow editor binary, its HTTP
+  surface and mobpack, the RPC gateway), the crate files a lane's tests read
+  or its inputs embed (the console and flow editor bundles, contract-checked
+  sources, fixtures), or their own directories (`sdk/python/`, `console/`,
+  `flow-editor/`, `packages/`). `LANE_INPUTS` in `scripts/ci-changes.py`
+  lists those crate files, and `scripts/test_ci_changes.py` fails on a read
+  or embedded crate file it does not list. The `changes` job's log names the
+  lanes a pull request left to the push.
+- Docs and the files only `fmt-lint` and `audit` read reach no lane.
+
+Pushes to main and dispatches run every lane, and a release tag requires a
+green run for its exact commit on main, so every lane gates every release. A
+lane a pull request left to the push reports its failures on main, after the
+merge. Other branches get CI through their pull request; dispatch the CI
+workflow on a branch for a full run without one.
+
+### Warm dependency builds for a Meerkat Core bump
+
+A pull request's CI restores caches saved on main only, so every Rust job of
+a pull request that changes `Cargo.lock` compiles the changed dependencies
+cold. Release preparation therefore runs:
+
+1. Push the commit that brings `Cargo.lock` and every `Cargo.toml` to their
+   final state: the Core pins, the lock and the release version stamp. A
+   warm artifact's name binds the exact bytes of all of them, so an artifact
+   built before the version stamp matches no job of the pull request.
+2. Dispatch the warm job on it right away:
+   `gh workflow run warm-deps.yml --ref <branch>`.
+3. Do the CHANGELOG stamp, the adoption changes and the full-suite work while
+   it runs. If one of them changes `Cargo.lock` or a `Cargo.toml`, dispatch
+   the warm job again on that commit.
+4. Open the pull request once the warm run has finished, or re-run the pull
+   request's CI if it is already open.
+
+Each Rust job's `fetch-warm-deps` step prints one line: the artifact it
+extracted, or why it took none, in which case the job builds as before. A
+"no warm-deps-..." line after a finished dispatch means `Cargo.lock`, a
+`Cargo.toml` or the job's build environment changed since it. It
+takes an artifact only from a dispatch on the pull request's head commit or
+one of its ancestors, with the warm workflow, its script and the fetch action
+unchanged since. The
+warm job builds only the branch's crates.io dependencies (it refuses git and
+path sources and `[patch]`), with every workspace target blanked, and keeps
+each graph's artifact for 3 days. Artifacts are stored apart from the Actions
+cache and do not count against its size limit or budget.
+
 ## Code Style
 
 - **Rust**: `make fmt` for formatting, `make lint` for clippy

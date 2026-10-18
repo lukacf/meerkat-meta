@@ -7,7 +7,11 @@
 //! (`AgentFactory::with_mcp_adapter_composer`) is offered here instead: once
 //! per gateway factory, before the factory is cloned for live or handed to
 //! its builder. Every first, restored and rebuilt member construction of that
-//! factory then calls the host's composer for its own adapter.
+//! factory then calls the host's composer for its own adapter. The same
+//! composition can carry the host's MCP attempt guard installation
+//! ([`GatewayMcpComposition::with_attempt_guards`]), installed on the factory
+//! at the same point, so each of those constructions begins the host's guard
+//! before any stdio server of its own is spawned.
 //!
 //! Every member factory's builder also gets the meerkat facade's canonical
 //! MCP credential source for the installation's meerkat-level realm
@@ -366,10 +370,13 @@ pub(crate) fn gateway_member_builder(
     )
 }
 
-/// The host's trusted MCP composition for one gateway member factory.
+/// The host's trusted MCP composition for one gateway member factory: its
+/// adapter composer and, optionally, a per-call MCP context provider and an
+/// MCP attempt guard installation.
 pub struct GatewayMcpComposition {
     composer: Arc<dyn McpAdapterComposer>,
     call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
+    attempt_guards: Option<meerkat_mcp::McpAttemptGuards>,
 }
 
 impl GatewayMcpComposition {
@@ -382,6 +389,7 @@ impl GatewayMcpComposition {
         Self {
             composer,
             call_context_provider: None,
+            attempt_guards: None,
         }
     }
 
@@ -395,20 +403,40 @@ impl GatewayMcpComposition {
         self
     }
 
+    /// Also guard every stdio MCP server attempt of this factory's
+    /// constructions with the host's installation (see
+    /// [`meerkat_mcp::McpAttemptGuards`]). Each first, restored and rebuilt
+    /// member construction begins the guard for its own session and member
+    /// before the attempt's secret resolution, physical entry or spawn; the
+    /// guard is finished once the attempt's open outcome and process end are
+    /// both known. The session routers Meerkat's surfaces build around the
+    /// factory's builder install the same installation. Remote (HTTP and SSE)
+    /// attempts are neither guarded nor refused. The host keeps its own clone
+    /// of the installation and closes and joins it
+    /// ([`meerkat_mcp::McpAttemptGuards::close_and_join`]) at its shutdown.
+    pub fn with_attempt_guards(mut self, guards: meerkat_mcp::McpAttemptGuards) -> Self {
+        self.attempt_guards = Some(guards);
+        self
+    }
+
     fn install(self, factory: AgentFactory) -> AgentFactory {
         let factory = factory.with_mcp_adapter_composer(self.composer);
-        match self.call_context_provider {
+        let factory = match self.call_context_provider {
             Some(provider) => factory.mcp_call_context_provider(provider),
+            None => factory,
+        };
+        match self.attempt_guards {
+            Some(guards) => factory.with_mcp_attempt_guards(guards),
             None => factory,
         }
     }
 }
 
 /// Offer a freshly constructed gateway member factory to the host. This is
-/// the only place the gateway sets a member factory's MCP composer or
-/// call-context provider, and the gateway sets neither (nor a connector
-/// authority) on these factories before it, so a host selection replaces no
-/// existing choice. Every factory adopts its MCP adapters into the gateway's
+/// the only place the gateway sets a member factory's MCP composer,
+/// call-context provider or attempt guards, and the gateway sets none of them
+/// (nor a connector authority) on these factories before it, so a host
+/// selection replaces no existing choice. Every factory adopts its MCP adapters into the gateway's
 /// `custody` at its ownership seam, before any server is staged, whatever the
 /// host answers. No host, or a host answering `None`, leaves the factory
 /// otherwise exactly as constructed.
@@ -468,6 +496,7 @@ mod tests {
 
     enum Answer {
         Compose(Arc<Recording>),
+        Guarded(Arc<Recording>, meerkat_mcp::McpAttemptGuards),
         Ordinary,
         Refuse,
     }
@@ -540,6 +569,14 @@ mod tests {
                     recording,
                 )
                     as Arc<dyn McpAdapterComposer>))),
+                Answer::Guarded(recording, guards) => {
+                    Ok(Some(
+                        GatewayMcpComposition::new(
+                            Arc::clone(recording) as Arc<dyn McpAdapterComposer>
+                        )
+                        .with_attempt_guards(guards.clone()),
+                    ))
+                }
                 Answer::Ordinary => Ok(None),
                 Answer::Refuse => Err(GatewayHostError::Denied),
             }
@@ -719,6 +756,242 @@ mod tests {
             .err(),
             Some(GatewayHostError::Denied)
         );
+    }
+
+    /// Every begin and finish of a host's attempt guard installation.
+    #[derive(Default)]
+    struct GuardRecord {
+        /// The server, its construction's session, and whether its process
+        /// had already started (written its probe) when the begin ran.
+        begun: Mutex<Vec<(String, SessionId, bool)>>,
+        /// The server, the finish called, and how its process ended.
+        finished: Mutex<Vec<(String, &'static str, &'static str)>>,
+    }
+
+    /// A host's guard factory: begins a recording guard for every attempt.
+    struct RecordingGuards {
+        record: Arc<GuardRecord>,
+        probes: std::path::PathBuf,
+    }
+
+    #[async_trait]
+    impl meerkat_mcp::McpAttemptGuardFactory for RecordingGuards {
+        async fn begin(
+            &self,
+            request: meerkat_mcp::McpAttemptGuardRequest,
+            _cancel: meerkat_mcp::McpAttemptCancellation,
+        ) -> Result<
+            Option<Box<dyn meerkat_mcp::McpAttemptGuard>>,
+            meerkat_core::mcp_attachment::McpAttachmentRefusal,
+        > {
+            let server = request.key.server.clone();
+            let started = self.probes.join(&server).exists();
+            self.record.begun.lock().unwrap().push((
+                server.clone(),
+                request.owner.session_id.clone(),
+                started,
+            ));
+            Ok(Some(Box::new(RecordingGuard {
+                record: Arc::clone(&self.record),
+                server,
+            })))
+        }
+    }
+
+    struct RecordingGuard {
+        record: Arc<GuardRecord>,
+        server: String,
+    }
+
+    impl RecordingGuard {
+        fn finish(&self, call: &'static str, disposition: &meerkat_mcp::McpAttemptDisposition) {
+            let process = match disposition.process {
+                meerkat_mcp::McpAttemptProcessEnd::NotSpawned => "not spawned",
+                meerkat_mcp::McpAttemptProcessEnd::Closed(_) => "closed",
+                _ => "ended otherwise",
+            };
+            self.record
+                .finished
+                .lock()
+                .unwrap()
+                .push((self.server.clone(), call, process));
+        }
+    }
+
+    #[async_trait]
+    impl meerkat_mcp::McpAttemptGuard for RecordingGuard {
+        async fn settle(
+            self: Box<Self>,
+            disposition: meerkat_mcp::McpAttemptDisposition,
+        ) -> Result<(), meerkat_mcp::McpGuardFinishError> {
+            self.finish("settle", &disposition);
+            Ok(())
+        }
+
+        async fn cancel(
+            self: Box<Self>,
+            disposition: meerkat_mcp::McpAttemptDisposition,
+        ) -> Result<(), meerkat_mcp::McpGuardFinishError> {
+            self.finish("cancel", &disposition);
+            Ok(())
+        }
+    }
+
+    fn recording_guards(
+        record: &Arc<GuardRecord>,
+        probes: &std::path::Path,
+    ) -> meerkat_mcp::McpAttemptGuards {
+        meerkat_mcp::McpAttemptGuards::new(
+            Arc::new(RecordingGuards {
+                record: Arc::clone(record),
+                probes: probes.to_path_buf(),
+            }),
+            meerkat_mcp::McpAttemptGuardBounds::default(),
+        )
+    }
+
+    /// A stdio server whose process writes its probe (`probes/<name>`) as soon
+    /// as it starts, then idles for two seconds without speaking MCP, so its
+    /// connection fails after one second and its process ends soon after: a
+    /// construction waiting for its MCP servers waits for that end.
+    fn started_server(name: &str, probes: &std::path::Path) -> McpServerConfig {
+        let mut server = McpServerConfig::stdio(
+            name,
+            "sh",
+            vec![
+                "-c".to_string(),
+                format!(
+                    "printf started > '{}'; exec sleep 2",
+                    probes.join(name).display()
+                ),
+            ],
+            std::collections::HashMap::new(),
+        );
+        server.connect_timeout_secs = Some(1);
+        server
+    }
+
+    /// The host's attempt guard installation reaches every construction of
+    /// the factory it composed: a first construction and a rebuild of the
+    /// same session each begin the guard for their own server, with that
+    /// session, before the server's process starts, and each guard is
+    /// finished once, after its process has ended.
+    #[tokio::test]
+    async fn host_attempt_guards_begin_before_each_construction_spawns_its_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let probes = dir.path().join("probes");
+        std::fs::create_dir_all(&probes).unwrap();
+        let machine = runtime_machine();
+        let record = Arc::new(GuardRecord::default());
+        let guards = recording_guards(&record, &probes);
+        let recording = Arc::new(Recording {
+            composed: Mutex::new(Vec::new()),
+        });
+        let host = composing_host(Answer::Guarded(Arc::clone(&recording), guards.clone()));
+        let custody = crate::member_mcp_custody::MemberMcpCustody::new();
+        let factory = composed(&host, dir.path(), &machine, &custody).expect("composed");
+        let mut builder = FactoryAgentBuilder::new(factory, meerkat::Config::default());
+        builder.default_llm_client = Some(Arc::new(BuildOnlyLlmClient));
+        builder.wait_for_mcp = true;
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let first = builder
+            .build_agent(
+                &request_with(vec![started_server("first", &probes)]),
+                event_tx,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("first construction: {error}"));
+        let session = first.agent().session().clone();
+        let mut rebuild = request_with(vec![started_server("rebuild", &probes)]);
+        rebuild
+            .build
+            .as_mut()
+            .expect("build options")
+            .resume_existing_session(session.clone());
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let _rebuilt = builder
+            .build_agent(&rebuild, event_tx)
+            .await
+            .unwrap_or_else(|error| panic!("same-session rebuild: {error}"));
+
+        assert_eq!(
+            *record.begun.lock().unwrap(),
+            [
+                ("first".to_string(), session.id().clone(), false),
+                ("rebuild".to_string(), session.id().clone(), false),
+            ],
+            "each construction begins the guard for its server and session before the process starts"
+        );
+        assert!(
+            probes.join("first").exists() && probes.join("rebuild").exists(),
+            "both servers started after their guard was begun"
+        );
+        assert_eq!(
+            *recording.composed.lock().unwrap(),
+            [session.id().clone(), session.id().clone()],
+            "the host's composer still composes each construction"
+        );
+
+        // Closing the gateway's custody ends both processes.
+        custody.settle().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while record.finished.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let mut finished = record.finished.lock().unwrap().clone();
+        finished.sort();
+        assert_eq!(
+            finished.len(),
+            2,
+            "each begun guard is finished exactly once: {finished:?}"
+        );
+        assert!(
+            finished
+                .iter()
+                .zip(["first", "rebuild"])
+                .all(|((server, _, process), expected)| server == expected
+                    && *process != "not spawned"),
+            "each guard is finished after its process ended: {finished:?}"
+        );
+        guards
+            .close_and_join(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await;
+    }
+
+    /// A composition without attempt guards installs none: the factory
+    /// carries no installation and its builder offers none to the session
+    /// routers Meerkat's surfaces build. With them, both carry the host's.
+    #[tokio::test]
+    async fn attempt_guards_reach_the_factory_only_when_the_host_installs_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = runtime_machine();
+        let recording = Arc::new(Recording {
+            composed: Mutex::new(Vec::new()),
+        });
+        let custody = crate::member_mcp_custody::MemberMcpCustody::new();
+        let plain = composed(
+            &composing_host(Answer::Compose(Arc::clone(&recording))),
+            dir.path(),
+            &machine,
+            &custody,
+        )
+        .expect("composed");
+        assert!(plain.mcp_attempt_guards().is_none());
+        let builder = FactoryAgentBuilder::new(plain, meerkat::Config::default());
+        assert!(meerkat_session::McpAttemptGuardSource::mcp_attempt_guards(&builder).is_none());
+
+        let guards = recording_guards(&Arc::new(GuardRecord::default()), dir.path());
+        let guarded = composed(
+            &composing_host(Answer::Guarded(recording, guards)),
+            dir.path(),
+            &machine,
+            &custody,
+        )
+        .expect("composed");
+        assert!(guarded.mcp_attempt_guards().is_some());
+        let builder = FactoryAgentBuilder::new(guarded, meerkat::Config::default());
+        assert!(meerkat_session::McpAttemptGuardSource::mcp_attempt_guards(&builder).is_some());
     }
 
     const SLOT: &str = "SEARCH_API_KEY";
