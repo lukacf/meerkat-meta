@@ -50,6 +50,10 @@ const PRUNE_INTERVAL_MS: u64 = 60 * 60 * 1_000;
 const CATCH_UP_PAUSE: Duration = Duration::from_millis(10);
 /// How often a batch that keeps failing is reported again.
 const FAILURE_REPORT_INTERVAL_MS: u64 = 10 * 60 * 1_000;
+/// The first pause before a dispatcher that ended without a stop request is
+/// started again; it doubles up to [`RESTART_PAUSE_MAX`].
+const RESTART_PAUSE_MIN: Duration = Duration::from_secs(1);
+const RESTART_PAUSE_MAX: Duration = Duration::from_mins(1);
 /// One retention pass removes at most this many announcements, this many
 /// batches and this many receipts; passes repeat while one stops at a limit.
 const PRUNE_LIMIT: usize = 1_000;
@@ -726,9 +730,13 @@ impl AnnouncementService {
         let now = self.now();
         let config = self.inner.config;
         let mut report = RoundReport::default();
-        walk.due.retain(|_, at| *at > now);
+        // No next look is ever written further ahead than the slowest settle
+        // pause, and no report is in the future; one that is predates a step
+        // back of the clock.
+        walk.due
+            .retain(|_, at| *at > now && *at - now <= config.settle_check_max_ms);
         walk.reported
-            .retain(|_, at| now.saturating_sub(*at) < FAILURE_REPORT_INTERVAL_MS);
+            .retain(|_, at| *at <= now && now - *at < FAILURE_REPORT_INTERVAL_MS);
         if walk.position.is_none() {
             walk.lap_end = self.inner.store.newest_unsettled_batch().await?;
         }
@@ -752,7 +760,12 @@ impl AnnouncementService {
                 report.next_due_ms = Some(now.saturating_add(config.settle_check_min_ms));
                 Some(last)
             }
-            _ => None,
+            _ => {
+                // The lap ends: the next one starts by the time the first
+                // batch it remembers is due again.
+                report.next_due_ms = min_due(report.next_due_ms, walk.due.values().min().copied());
+                None
+            }
         };
         // A batch or backlog the round cannot advance is reported and
         // retried at the slowest pace; it never ends the round for the
@@ -867,6 +880,13 @@ impl AnnouncementService {
         (walk.due.len(), walk.reported.len())
     }
 
+    /// When each batch the walk reports as failing was last reported.
+    #[cfg(test)]
+    pub(crate) async fn walk_reported_at(&self) -> Vec<u64> {
+        let walk = self.inner.round.lock().await;
+        walk.reported.values().copied().collect()
+    }
+
     /// Drive one unsettled batch: whether its state moved, and when it
     /// should be looked at again.
     async fn advance(
@@ -886,17 +906,51 @@ impl AnnouncementService {
         Ok((moved, due))
     }
 
-    /// Start the dispatcher. It holds the service weakly and ends when the
-    /// service is dropped or stopped.
+    /// Start the dispatcher under a supervisor. Both hold the service weakly
+    /// and end when it is dropped or stopped. A dispatcher that ends any
+    /// other way (a panic) is reported and started again after a pause that
+    /// doubles up to a minute.
     pub fn start(&self) -> tokio::task::JoinHandle<()> {
         self.inner.stopped.store(false, Ordering::SeqCst);
+        let first = self.spawn_dispatcher();
+        let weak = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            let mut dispatcher = first;
+            let mut pause = RESTART_PAUSE_MIN;
+            loop {
+                let Err(error) = dispatcher.await else {
+                    return;
+                };
+                tracing::error!(
+                    %error,
+                    "mob announcement dispatcher ended unexpectedly; it starts again"
+                );
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(RESTART_PAUSE_MAX);
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                if inner.stopped.load(Ordering::SeqCst) {
+                    return;
+                }
+                dispatcher = AnnouncementService { inner }.spawn_dispatcher();
+            }
+        })
+    }
+
+    /// One dispatcher task. It never clears a stop request, so a restart
+    /// racing a stop ends at once.
+    fn spawn_dispatcher(&self) -> tokio::task::JoinHandle<()> {
         let weak = Arc::downgrade(&self.inner);
         let wake = Arc::clone(&self.inner.wake);
         tokio::spawn(async move {
             let mut last_prune = 0_u64;
             // Set while the last retention pass stopped at its limit: the
-            // next iteration passes again instead of waiting an interval.
+            // next pass follows after a short pause instead of an interval.
             let mut retention_behind = false;
+            // When the next catch-up pass may run. Wakes bring rounds, never
+            // an early pass, so commands get the store between passes.
+            let mut next_pass_at = tokio::time::Instant::now();
             // When the next round is due. A wake or the round's own timer
             // runs it; retention passes in between do not.
             let mut round_due = 0_u64;
@@ -911,7 +965,12 @@ impl AnnouncementService {
                     }
                     let service = AnnouncementService { inner };
                     let now = service.now();
-                    if retention_behind || now.saturating_sub(last_prune) >= PRUNE_INTERVAL_MS {
+                    let pass_due = if retention_behind {
+                        tokio::time::Instant::now() >= next_pass_at
+                    } else {
+                        now.saturating_sub(last_prune) >= PRUNE_INTERVAL_MS
+                    };
+                    if pass_due {
                         match service
                             .inner
                             .store
@@ -924,12 +983,19 @@ impl AnnouncementService {
                                 retention_behind = false;
                             }
                         }
-                        if !retention_behind {
+                        if retention_behind {
+                            next_pass_at = tokio::time::Instant::now() + CATCH_UP_PAUSE;
+                        } else {
                             last_prune = now;
                         }
                     }
                     let now = service.now();
-                    if round_wanted || now >= round_due {
+                    // A round is never further off than the longest idle: one
+                    // that is was scheduled before the clock stepped back.
+                    if round_wanted
+                        || now >= round_due
+                        || round_due.saturating_sub(now) > MAX_IDLE_MS
+                    {
                         let latest = now.saturating_add(MAX_IDLE_MS);
                         round_due = match service.run_round().await {
                             Ok(report) => report.next_due_ms.map_or(latest, |due| due.min(latest)),
@@ -939,14 +1005,17 @@ impl AnnouncementService {
                             }
                         };
                     }
-                    // A retention backlog continues after a short pause,
-                    // not an interval.
+                    let round_pause = Duration::from_millis(
+                        round_due.saturating_sub(service.now()).min(MAX_IDLE_MS),
+                    );
+                    // A retention backlog continues after a short pause, not
+                    // an interval.
                     if retention_behind {
-                        CATCH_UP_PAUSE
-                    } else {
-                        Duration::from_millis(
-                            round_due.saturating_sub(service.now()).min(MAX_IDLE_MS),
+                        round_pause.min(
+                            next_pass_at.saturating_duration_since(tokio::time::Instant::now()),
                         )
+                    } else {
+                        round_pause
                     }
                 };
                 round_wanted = tokio::select! {

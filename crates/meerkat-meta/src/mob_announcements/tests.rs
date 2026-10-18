@@ -2215,6 +2215,10 @@ struct FaultyStore {
     prune_passes: AtomicU64,
     /// Backlog reads: one per dispatcher round.
     backlog_reads: AtomicU64,
+    /// When each retention pass started.
+    pass_times: Mutex<Vec<std::time::Instant>>,
+    /// Panics the next backlog read, as a fault inside a round would.
+    panic_next_round: std::sync::atomic::AtomicBool,
 }
 
 impl FaultyStore {
@@ -2226,6 +2230,8 @@ impl FaultyStore {
             more_passes: AtomicU64::new(0),
             prune_passes: AtomicU64::new(0),
             backlog_reads: AtomicU64::new(0),
+            pass_times: Mutex::new(Vec::new()),
+            panic_next_round: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -2304,6 +2310,10 @@ impl AnnouncementStore for FaultyStore {
 
     async fn backlogs(&self, limit: usize) -> Result<Vec<MemberBacklog>> {
         self.backlog_reads.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !self.panic_next_round.swap(false, Ordering::SeqCst),
+            "injected fault inside a dispatcher round"
+        );
         self.inner.backlogs(limit).await
     }
 
@@ -2364,6 +2374,10 @@ impl AnnouncementStore for FaultyStore {
     }
 
     async fn prune(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<PruneReport> {
+        self.pass_times
+            .lock()
+            .unwrap()
+            .push(std::time::Instant::now());
         self.prune_passes.fetch_add(1, Ordering::SeqCst);
         let mut report = self.inner.prune(now_ms, retention_ms, limit).await?;
         if self
@@ -3356,4 +3370,353 @@ fn storage_maintenance_fences_the_announcement_database() {
         crate::storage_migrate::enumerate_state_dir_databases(dir.path()).contains(&path),
         "a database only some gateways open is still fenced in every build"
     );
+}
+
+fn admit(harness: &Harness, id: &BatchId) {
+    harness
+        .native
+        .ledger
+        .lock()
+        .unwrap()
+        .bindings
+        .get_mut(id.as_str())
+        .expect("committed")
+        .2 = true;
+}
+
+/// Two windows of unsettled batches. The first round seals a full window
+/// of batches (one round's member limit); the second reads them and seals
+/// one more, the newest. The round at 184 s starts a lap that ends at the
+/// newest batch: it reads the full window of older batches (due again at
+/// 196.2 s) and resumes after them. Returns the harness and the newest
+/// batch.
+async fn two_window_lap() -> (Harness, BatchId) {
+    const MEMBERS: usize = super::owner::ROUND_BATCHES + 1;
+    assert_eq!(
+        super::owner::ROUND_MEMBERS,
+        super::owner::ROUND_BATCHES,
+        "the first round seals exactly one window"
+    );
+    let mut native = ScriptedNative::new();
+    native.apply_on_commit = false;
+    native.known = (0..MEMBERS)
+        .map(|index| format!("agent:r{index:02}"))
+        .collect();
+    let harness = harness_with(native);
+    for index in 0..MEMBERS {
+        let agent = format!("agent:r{index:02}");
+        let topic = agent.replace(':', "-");
+        harness
+            .service
+            .put_subscription(
+                &op(&format!("o-{topic}")),
+                put(
+                    &format!("s-{topic}"),
+                    &agent,
+                    &[topic.as_str()],
+                    StartFrontier::Now,
+                ),
+            )
+            .await
+            .unwrap();
+        harness
+            .service
+            .announce(announce_request("events", &topic, &[topic.as_str()], "x"))
+            .await
+            .unwrap();
+    }
+    for now in [62_000_u64, 123_000] {
+        harness.clock.store(now, Ordering::SeqCst);
+        harness.service.run_round().await.unwrap();
+    }
+    let unsettled = harness.store.unsettled_batches(None, 100).await.unwrap();
+    assert_eq!(unsettled.len(), MEMBERS);
+    let newest = unsettled.last().unwrap().clone();
+    assert_eq!(newest.sealed_at_ms, 123_000);
+    harness.clock.store(184_000, Ordering::SeqCst);
+    let report = harness.service.run_round().await.unwrap();
+    assert_eq!(
+        report.next_due_ms,
+        Some(185_000),
+        "the lap continues after the full window of older batches: {report:?}"
+    );
+    (harness, newest.id)
+}
+
+/// A reconcile settles the lap's last batch between rounds, so the next
+/// round's window over the rest of the lap is empty. The round still names a
+/// next look no later than when the batches the walk read at 184 s are due
+/// again (196.2 s); with none, the dispatcher would idle five minutes.
+#[tokio::test]
+async fn a_lap_ending_on_an_empty_window_names_the_next_look() {
+    let (harness, newest) = two_window_lap().await;
+    admit(&harness, &newest);
+    let reconciled = harness.service.reconcile_delivery(&newest).await.unwrap();
+    assert_eq!(reconciled.batch.state.tag(), BatchStateTag::Delivered);
+    harness.clock.store(185_000, Ordering::SeqCst);
+    let report = harness.service.run_round().await.unwrap();
+    assert!(
+        report.next_due_ms.is_some_and(|due| due <= 196_200),
+        "a window of unsettled batches is due again at 196200; the round names no look \
+         by then: {report:?}"
+    );
+}
+
+/// The lap's last window settles everything it reads (the newest batch was
+/// admitted meanwhile). Same expectation.
+#[tokio::test]
+async fn a_lap_ending_on_a_settled_window_names_the_next_look() {
+    let (harness, newest) = two_window_lap().await;
+    admit(&harness, &newest);
+    harness.clock.store(185_000, Ordering::SeqCst);
+    let report = harness.service.run_round().await.unwrap();
+    assert_eq!(
+        harness
+            .store
+            .batch(&newest)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+            .tag(),
+        BatchStateTag::Delivered,
+        "the round read and settled the newest batch"
+    );
+    assert!(
+        report.next_due_ms.is_some_and(|due| due <= 196_200),
+        "a window of unsettled batches is due again at 196200; the round names no look \
+         by then: {report:?}"
+    );
+}
+
+/// The wall clock steps back an hour after a committed batch was read; the
+/// native owner then admits it. Rounds over the next 155 s of clock time read
+/// it again once a settle pause (at most 30 s) has passed.
+#[tokio::test]
+async fn a_clock_step_back_does_not_hide_a_remembered_batch() {
+    let mut native = ScriptedNative::new();
+    native.apply_on_commit = false;
+    let harness = harness_with(native);
+    harness.subscribe("s1").await;
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let batch = harness.only_batch().await;
+    assert_eq!(batch.state.tag(), BatchStateTag::Committed);
+    admit(&harness, &batch.id);
+    let mut now = 10_000_000 - 3_600_000;
+    for _ in 0..5 {
+        now += 31_000;
+        harness.clock.store(now, Ordering::SeqCst);
+        harness.service.run_round().await.unwrap();
+    }
+    assert_eq!(
+        harness.only_batch().await.state.tag(),
+        BatchStateTag::Delivered,
+        "155 s of clock time after a one-hour step back, the admitted batch is still unread"
+    );
+}
+
+/// The wall clock steps back an hour while retention catches up. The round
+/// it had scheduled now lies more than the longest idle ahead; the
+/// dispatcher runs a round anyway instead of waiting for the clock.
+#[tokio::test]
+async fn a_clock_step_back_during_catch_up_still_runs_rounds() {
+    const PASSES: u64 = 300;
+    let (dir, inner) = temp_store();
+    let store = Arc::new(FaultyStore::new(inner, None));
+    store.more_passes.store(PASSES, Ordering::SeqCst);
+    let clock = Arc::new(AtomicU64::new(10_000_000));
+    let reader = Arc::clone(&clock);
+    let service = AnnouncementService::with_clock(
+        Arc::clone(&store) as Arc<dyn AnnouncementStore>,
+        Arc::new(ScriptedNative::new()) as Arc<dyn NativeDelivery>,
+        AnnouncementConfig::default(),
+        Arc::new(move || reader.load(Ordering::SeqCst)),
+    )
+    .unwrap();
+    let dispatcher = service.start();
+    let first_round = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while store.backlog_reads.load(Ordering::SeqCst) < 1
+            || store.prune_passes.load(Ordering::SeqCst) < 2
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(first_round.is_ok(), "the dispatcher started");
+    clock.store(10_000_000 - 3_600_000, Ordering::SeqCst);
+    let caught_up = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while store.prune_passes.load(Ordering::SeqCst) <= PASSES {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    service.stop();
+    dispatcher.await.unwrap();
+    assert!(caught_up.is_ok(), "the passes ran");
+    assert!(
+        store.backlog_reads.load(Ordering::SeqCst) >= 2,
+        "after the clock stepped back an hour, no round ran for the rest of the catch-up"
+    );
+    drop(dir);
+}
+
+/// Wakes arrive every millisecond while retention catches up. Each wake may
+/// bring a round, but the passes keep their own spacing, so commands get the
+/// store between them.
+#[tokio::test]
+async fn catch_up_passes_keep_their_spacing_under_wakes() {
+    const PASSES: u64 = 30;
+    let (dir, inner) = temp_store();
+    let store = Arc::new(FaultyStore::new(inner, None));
+    store.more_passes.store(PASSES, Ordering::SeqCst);
+    let service = AnnouncementService::with_clock(
+        Arc::clone(&store) as Arc<dyn AnnouncementStore>,
+        Arc::new(ScriptedNative::new()) as Arc<dyn NativeDelivery>,
+        AnnouncementConfig::default(),
+        // Past the first retention interval, so the first iteration passes.
+        Arc::new(|| 10_000_000),
+    )
+    .unwrap();
+    let dispatcher = service.start();
+    let waker = {
+        let service = service.clone();
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            while store.prune_passes.load(Ordering::SeqCst) <= PASSES {
+                service.wake();
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+    };
+    let caught_up = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while store.prune_passes.load(Ordering::SeqCst) <= PASSES {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    waker.await.unwrap();
+    service.stop();
+    dispatcher.await.unwrap();
+    assert!(caught_up.is_ok(), "the passes ran");
+    let times = store.pass_times.lock().unwrap().clone();
+    let shortest = times
+        .windows(2)
+        .map(|pair| pair[1].duration_since(pair[0]))
+        .min()
+        .unwrap();
+    assert!(
+        shortest >= std::time::Duration::from_millis(10),
+        "wakes brought passes {shortest:?} apart"
+    );
+    drop(dir);
+}
+
+/// A fault inside a round ends the dispatcher task. It is reported and
+/// started again, so the owed announcement is still delivered.
+#[tokio::test]
+async fn a_dispatcher_that_panics_is_started_again() {
+    let (dir, inner) = temp_store();
+    let store = Arc::new(FaultyStore::new(inner, None));
+    let native = Arc::new(ScriptedNative::new());
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let reader = Arc::clone(&clock);
+    let service = AnnouncementService::with_clock(
+        Arc::clone(&store) as Arc<dyn AnnouncementStore>,
+        Arc::clone(&native) as Arc<dyn NativeDelivery>,
+        AnnouncementConfig {
+            policy: policy(),
+            ..AnnouncementConfig::default()
+        },
+        Arc::new(move || reader.load(Ordering::SeqCst)),
+    )
+    .unwrap();
+    service
+        .put_subscription(
+            &op("o1"),
+            put("s1", "agent:a", &["ios"], StartFrontier::Now),
+        )
+        .await
+        .unwrap();
+    service
+        .announce(announce_request("payments", "k1", &["ios"], "x"))
+        .await
+        .unwrap();
+    clock.store(100_000, Ordering::SeqCst);
+    store.panic_next_round.store(true, Ordering::SeqCst);
+    let dispatcher = service.start();
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let batches = service
+                .deliveries(&BatchQuery {
+                    member: Some(member("agent:a")),
+                    limit: 10,
+                    ..BatchQuery::default()
+                })
+                .await
+                .unwrap();
+            if batches
+                .first()
+                .is_some_and(|batch| batch.state.tag() == BatchStateTag::Delivered)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    service.stop();
+    dispatcher.await.unwrap();
+    assert!(
+        delivered.is_ok(),
+        "after a fault inside a round, no dispatcher delivers the owed announcement"
+    );
+    drop(dir);
+}
+
+/// A batch that keeps failing is reported once per interval. After the
+/// clock steps back an hour, its next failure is reported at once, not an
+/// hour and an interval later.
+#[tokio::test]
+async fn a_clock_step_back_does_not_mute_failure_reports() {
+    let (dir, inner) = temp_store();
+    let store = Arc::new(FaultyStore::new(inner, Some("agent:a")));
+    let native = Arc::new(ScriptedNative::new());
+    let clock = Arc::new(AtomicU64::new(1_000));
+    let reader = Arc::clone(&clock);
+    let service = AnnouncementService::with_clock(
+        Arc::clone(&store) as Arc<dyn AnnouncementStore>,
+        Arc::clone(&native) as Arc<dyn NativeDelivery>,
+        AnnouncementConfig {
+            policy: policy(),
+            ..AnnouncementConfig::default()
+        },
+        Arc::new(move || reader.load(Ordering::SeqCst)),
+    )
+    .unwrap();
+    service
+        .put_subscription(
+            &op("o1"),
+            put("s1", "agent:a", &["ios"], StartFrontier::Now),
+        )
+        .await
+        .unwrap();
+    service
+        .announce(announce_request("events", "k1", &["ios"], "x"))
+        .await
+        .unwrap();
+    clock.store(10_000_000, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert_eq!(service.walk_reported_at().await, vec![10_000_000]);
+    let stepped_back = 10_000_000 - 3_600_000;
+    clock.store(stepped_back, Ordering::SeqCst);
+    service.run_round().await.unwrap();
+    assert_eq!(
+        service.walk_reported_at().await,
+        vec![stepped_back],
+        "a report dated after the stepped-back clock is dropped, so the failure is reported \
+         again now"
+    );
+    drop(dir);
 }
