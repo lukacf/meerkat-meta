@@ -29,12 +29,12 @@ const DENIED: &str = "host_lookup";
 const ALLOWED: &str = "host_echo";
 const CHILD_WORKERS: [&str; 2] = ["worker-a", "worker-b"];
 /// A member's native shutdown outcome while its unregister admission waits
-/// on a held registration transaction.
+/// on a held registration transaction (its settlement follows).
 const ADMISSION_PENDING: &str =
-    "UnregisterPending { stage: \"registration_transaction_admission\" }";
+    "UnregisterPending { stage: \"registration_transaction_admission\", ";
 /// A member's native shutdown outcome while its admitted runtime unregister
-/// is still running at the stand-down deadline.
-const UNREGISTER_PENDING: &str = "UnregisterPending { stage: \"shutdown_runtime_unregister\" }";
+/// is still running at the stand-down deadline (its settlement follows).
+const UNREGISTER_PENDING: &str = "UnregisterPending { stage: \"shutdown_runtime_unregister\", ";
 
 static NEXT_MOB: AtomicU64 = AtomicU64::new(0);
 
@@ -1380,11 +1380,13 @@ async fn a_child_destroyed_through_its_own_handle_is_still_stood_down() {
     );
 }
 
-/// A child whose member did not settle on the first stand-down keeps that
-/// specific member debt after its actor has gone and a later call only sees
-/// the closed channel.
+/// A child whose member's unregister admission was still held at the first
+/// stand-down's deadline keeps the child root claimed. Once that exact
+/// registration is free, a later stand-down in the same process settles the
+/// pending unregister itself, without asking the exited child actor again
+/// (its closed channel would read as unknown debt), and releases the root.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_prior_unsettled_child_report_survives_a_later_closed_channel() {
+async fn a_pending_unregister_admission_releases_the_root_once_it_settles() {
     let dir = tempfile::tempdir().expect("state dir");
     let host = Host::new();
     let adapter = Arc::new(Mutex::new(None));
@@ -1452,11 +1454,12 @@ async fn a_prior_unsettled_child_report_survives_a_later_closed_channel() {
             "the free member may only be pending at its runtime unregister: {debt}"
         );
     }
+    assert_root_owned(dir.path());
 
     // Release the hold. The child actor's dispatch ends once its retained
-    // completions settle, so the native shutdown call the stand-down makes
-    // then sees the closed channel rather than a second report. (`status()`
-    // maps a closed actor to its last terminal phase, so it cannot tell.)
+    // completions settle, so a native shutdown call would then see the
+    // closed channel rather than a second report. (`status()` maps a closed
+    // actor to its last terminal phase, so it cannot tell.)
     drop(guard);
     tokio::time::timeout(Duration::from_secs(30), async {
         while !matches!(
@@ -1470,15 +1473,112 @@ async fn a_prior_unsettled_child_report_survives_a_later_closed_channel() {
     })
     .await
     .expect("the child actor's dispatch ends after its shutdown");
+    assert!(
+        adapter
+            .current_session_registration_witness(&sessions[0])
+            .await
+            .is_some(),
+        "the held member's registration is still current: only the settlement unregisters it"
+    );
     let second = runtime
         .clone()
-        .stand_down_child_mobs(std::time::Instant::now() + Duration::from_secs(5))
+        .stand_down_child_mobs(release_deadline())
         .await;
     assert_eq!(
-        second, first,
-        "the earlier member debt must survive the closed channel"
+        second,
+        crate::child_mob_storage::ChildMobStandDownOutcome::Released { child_mobs: 1 },
+        "the settled pending unregister clears the debt"
+    );
+    assert!(
+        adapter
+            .current_session_registration_witness(&sessions[0])
+            .await
+            .is_none(),
+        "the held member's registration is gone"
+    );
+    crate::child_mob_storage::ChildMobRootClaim::acquire(
+        &crate::child_mob_storage::child_mob_root(dir.path()),
+    )
+    .expect("the released root is claimable in the same process");
+}
+
+/// A child member's admitted runtime unregister still running at the first
+/// stand-down's deadline keeps the child root claimed. Once that exact
+/// unregister settles, a later stand-down in the same process clears the
+/// debt and releases the root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_runtime_unregister_releases_the_root_once_it_settles() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let host = Host::new();
+    let adapter = Arc::new(Mutex::new(None));
+    let captured = Arc::clone(&adapter);
+    let runtime = lifetime(dir.path(), &unique("settle-root"), &host, |spec| {
+        *captured.lock().expect("adapter slot") = spec.runtime_adapter.clone();
+        spec.with_child_mob_storage(durable(dir.path()))
+    })
+    .await
+    .expect("lifetime");
+    let adapter = adapter
+        .lock()
+        .expect("adapter slot")
+        .clone()
+        .expect("the persistent composition carries its runtime adapter");
+    let coordinator = coordinator_session(&runtime).await;
+    let child = create_child(
+        &runtime,
+        &MobId::from(unique("settle-child").as_str()),
+        coordinator,
+    )
+    .await;
+    let sessions = worker_sessions(&child).await;
+
+    runtime
+        .handle()
+        .shutdown()
+        .await
+        .expect("root mob shutdown");
+    // Armed after the root shutdown: the first unregister saga the child
+    // stand-down starts holds before it unregisters.
+    let (entered, release) = adapter.test_hold_next_unregister_saga();
+    let first = runtime
+        .stand_down_child_mobs(std::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    let crate::child_mob_storage::ChildMobStandDownOutcome::Retained { unsettled } = &first else {
+        panic!("a held unregister must leave the first stand-down unsettled: {first:?}");
+    };
+    let [debt] = unsettled.as_slice() else {
+        panic!("one child with debt expected: {unsettled:?}");
+    };
+    assert!(
+        debt.contains(UNREGISTER_PENDING) && !debt.contains(ADMISSION_PENDING),
+        "the held member is pending at its runtime unregister: {debt}"
     );
     assert_root_owned(dir.path());
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("the unregister saga reached the hold")
+        .expect("the saga hold reports its entry");
+
+    let _ = release.send(());
+    let second = runtime.stand_down_child_mobs(release_deadline()).await;
+    assert_eq!(
+        second,
+        crate::child_mob_storage::ChildMobStandDownOutcome::Released { child_mobs: 1 },
+        "the settled pending unregister clears the debt"
+    );
+    for session in &sessions {
+        assert!(
+            adapter
+                .current_session_registration_witness(session)
+                .await
+                .is_none(),
+            "every child member's registration is gone"
+        );
+    }
+    crate::child_mob_storage::ChildMobRootClaim::acquire(
+        &crate::child_mob_storage::child_mob_root(dir.path()),
+    )
+    .expect("the released root is claimable in the same process");
 }
 
 /// The native report's entry for `worker` within one child's debt line

@@ -395,12 +395,19 @@ pub(crate) fn release_retained(claim: &Arc<ChildMobRootClaim>) {
 }
 
 /// How one child mob answered its terminal shutdown.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum ChildShutdown {
     /// Its shutdown report settled every member.
     Clean,
     /// Its report named unsettled members, or the request itself failed.
     Unsettled(String),
+    /// Its report named only members whose runtime unregister was still
+    /// running at the deadline. Each settlement follows its member's exact
+    /// registration after the child's actor exited.
+    UnregisterPending {
+        detail: String,
+        settlements: Vec<meerkat_mob::MemberUnregisterSettlement>,
+    },
     /// Its actor was already gone. That is not a settlement report: the
     /// actor may have exited after reporting unsettled members.
     ChannelClosed,
@@ -441,16 +448,84 @@ impl std::fmt::Debug for ChildIncarnation {
     }
 }
 
+/// Debt a child left at a stand-down.
+///
+/// Recorded decision: only a pending runtime unregister is cleared here. A
+/// stuck or interrupted retirement (`RetirementStuck`,
+/// `RetirementInterrupted`) and an effect whose custody is retained
+/// (`EffectCustodyRetained`) carry no settlement this process can follow:
+/// their owner drives them again on the next start. So they, a failed
+/// unregister, a failed request, and an actor that exited before this call
+/// could read its report stay [`ChildDebt::Specific`] for the rest of the
+/// process, and the child root stays claimed. That fails closed by design:
+/// the child root is never released while debt that nothing here can prove
+/// settled may still touch it.
+#[derive(Debug, Clone)]
+enum ChildDebt {
+    /// Never cleared here.
+    Specific(String),
+    /// Only members whose runtime unregister was still running at the
+    /// deadline, reported by `incarnation`. Cleared once each exact
+    /// registration's unregister settled
+    /// ([`ChildMobRootOwnership::settle_pending_unregisters`]).
+    PendingUnregister {
+        detail: String,
+        incarnation: ChildIncarnation,
+        settlements: Vec<meerkat_mob::MemberUnregisterSettlement>,
+    },
+}
+
+impl ChildDebt {
+    fn detail(&self) -> &str {
+        match self {
+            Self::Specific(detail) | Self::PendingUnregister { detail, .. } => detail,
+        }
+    }
+}
+
+/// Where a child's pending runtime unregisters stand together.
+pub(crate) enum PendingUnregisters {
+    /// Every one settled.
+    Settled,
+    /// At least one is still running, and none failed.
+    Pending,
+    /// At least one failed: nothing settles it later.
+    Failed(String),
+}
+
+impl PendingUnregisters {
+    pub(crate) fn of(states: &[meerkat_mob::MemberUnregisterState]) -> Self {
+        let failures = states
+            .iter()
+            .filter_map(|state| match state {
+                meerkat_mob::MemberUnregisterState::Failed(failure) => Some(failure.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !failures.is_empty() {
+            Self::Failed(failures.join("; "))
+        } else if states
+            .iter()
+            .all(|state| *state == meerkat_mob::MemberUnregisterState::Settled)
+        {
+            Self::Settled
+        } else {
+            Self::Pending
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct OwnershipState {
     claim: Option<Arc<ChildMobRootClaim>>,
     /// How many child mobs the stand-down that released the claim shut down;
     /// set once the claim is released.
     released_child_mobs: Option<usize>,
-    /// The debt first seen for each child, so a repeat call reports it again
+    /// The debt seen for each child, so a repeat call reports it again
     /// instead of reading a closed channel as clean. Meerkat keeps the full
-    /// report itself; this only remembers that debt was seen.
-    debt_seen: BTreeMap<String, String>,
+    /// report itself; this remembers which debt was seen, and follows a
+    /// pending runtime unregister until it settles.
+    debt_seen: BTreeMap<String, ChildDebt>,
     /// The incarnation each child last shut down cleanly in, so a retry
     /// does not ask that stopped actor again (its closed channel would read
     /// as unknown debt).
@@ -569,30 +644,146 @@ impl ChildMobRootOwnership {
             .is_some_and(|clean| clean.key == incarnation.key)
     }
 
-    /// Record how `mob_id` answered a stand-down in `incarnation`. Debt,
-    /// once seen, is never cleared here: like Meerkat's own report, a later
-    /// clean answer does not overwrite an outstanding one. A clean answer is
-    /// kept as that incarnation's receipt.
+    /// Whether `mob_id` holds a pending runtime unregister reported by
+    /// exactly `incarnation`. Its actor exited after that report, so it is
+    /// not asked again: asking would only read its closed channel.
+    /// [`Self::settle_pending_unregisters`] follows the debt instead.
+    pub(crate) fn pending_in(&self, mob_id: &str, incarnation: &ChildIncarnation) -> bool {
+        matches!(
+            self.state().debt_seen.get(mob_id),
+            Some(ChildDebt::PendingUnregister { incarnation: pending, .. })
+                if pending.key == incarnation.key
+        )
+    }
+
+    /// Follow every pending runtime unregister until `deadline`. A child
+    /// whose unregisters all settled has its debt cleared and counts as shut
+    /// down cleanly in the incarnation that reported it; a failed one turns
+    /// the debt specific; any still running stays pending for a later call.
+    pub(crate) async fn settle_pending_unregisters(&self, deadline: std::time::Instant) {
+        let pending = self
+            .state()
+            .debt_seen
+            .iter()
+            .filter_map(|(mob_id, debt)| match debt {
+                ChildDebt::PendingUnregister { settlements, .. } => {
+                    Some((mob_id.clone(), settlements.clone()))
+                }
+                ChildDebt::Specific(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return;
+        }
+        let followed = futures::future::join_all(pending.into_iter().map(
+            |(mob_id, mut settlements)| async move {
+                let states = futures::future::join_all(
+                    settlements
+                        .iter_mut()
+                        .map(|settlement| settlement.settle_within(deadline)),
+                )
+                .await;
+                (mob_id, settlements, PendingUnregisters::of(&states))
+            },
+        ))
+        .await;
+        let mut state = self.state();
+        for (mob_id, settlements, settled) in followed {
+            // Only the debt this call followed; anything recorded meanwhile
+            // stands.
+            let Some(ChildDebt::PendingUnregister {
+                detail,
+                incarnation,
+                ..
+            }) = state.debt_seen.get(&mob_id).cloned()
+            else {
+                continue;
+            };
+            match settled {
+                PendingUnregisters::Settled => {
+                    state.debt_seen.remove(&mob_id);
+                    state.clean.insert(mob_id, incarnation);
+                }
+                PendingUnregisters::Failed(failure) => {
+                    state
+                        .debt_seen
+                        .insert(mob_id, ChildDebt::Specific(format!("{detail}; {failure}")));
+                }
+                PendingUnregisters::Pending => {
+                    state.debt_seen.insert(
+                        mob_id,
+                        ChildDebt::PendingUnregister {
+                            detail,
+                            incarnation,
+                            settlements,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Record how `mob_id` answered a stand-down in `incarnation`. Specific
+    /// debt is never cleared; a pending runtime unregister clears once its
+    /// exact registration's coordinator reports it settled
+    /// ([`Self::settle_pending_unregisters`]). Like Meerkat's own report, a
+    /// later clean answer does not overwrite outstanding debt, and specific
+    /// debt seen later replaces a pending unregister. A clean answer is kept
+    /// as that incarnation's receipt.
     pub(crate) fn record(
         &self,
         mob_id: &str,
         incarnation: ChildIncarnation,
         outcome: ChildShutdown,
     ) {
-        let detail = match outcome {
+        let debt = match outcome {
             ChildShutdown::Clean => {
                 self.state().clean.insert(mob_id.to_string(), incarnation);
                 return;
             }
-            ChildShutdown::Unsettled(detail) => detail,
-            ChildShutdown::ChannelClosed => {
-                "actor exited; its settlement is unknown to this call".to_string()
-            }
+            ChildShutdown::Unsettled(detail) => ChildDebt::Specific(detail),
+            ChildShutdown::ChannelClosed => ChildDebt::Specific(
+                "actor exited; its settlement is unknown to this call".to_string(),
+            ),
+            ChildShutdown::UnregisterPending {
+                detail,
+                settlements,
+            } => ChildDebt::PendingUnregister {
+                detail,
+                incarnation,
+                settlements,
+            },
         };
-        self.state()
-            .debt_seen
-            .entry(mob_id.to_string())
-            .or_insert(detail);
+        let mut state = self.state();
+        let merged = match state.debt_seen.remove(mob_id) {
+            None => debt,
+            // Specific debt stays, whatever is seen later.
+            Some(specific @ ChildDebt::Specific(_)) => specific,
+            Some(ChildDebt::PendingUnregister { .. }) if matches!(debt, ChildDebt::Specific(_)) => {
+                debt
+            }
+            // A later incarnation's pending unregisters join the earlier
+            // ones: each settlement follows its own registration.
+            Some(ChildDebt::PendingUnregister {
+                settlements: mut earlier,
+                ..
+            }) => match debt {
+                ChildDebt::PendingUnregister {
+                    detail,
+                    incarnation,
+                    settlements,
+                } => {
+                    earlier.extend(settlements);
+                    ChildDebt::PendingUnregister {
+                        detail,
+                        incarnation,
+                        settlements: earlier,
+                    }
+                }
+                specific @ ChildDebt::Specific(_) => specific,
+            },
+        };
+        state.debt_seen.insert(mob_id.to_string(), merged);
     }
 
     /// The stand-down result over everything seen so far. The claim is never
@@ -606,7 +797,7 @@ impl ChildMobRootOwnership {
                 unsettled: state
                     .debt_seen
                     .iter()
-                    .map(|(mob_id, detail)| format!("{mob_id}: {detail}"))
+                    .map(|(mob_id, debt)| format!("{mob_id}: {}", debt.detail()))
                     .collect(),
             }
         }
@@ -643,8 +834,11 @@ pub enum ChildMobStandDownOutcome {
         /// How many child mobs were shut down.
         child_mobs: usize,
     },
-    /// At least one child mob left specific or unknown debt, now or on an
-    /// earlier call.
+    /// At least one child mob left debt, now or on an earlier call: specific
+    /// or unknown debt, which keeps the child root for the rest of the
+    /// process, or a member's runtime unregister still running at the
+    /// deadline. A later stand-down follows such an unregister and releases
+    /// the root once it settles (and nothing else is owed).
     Retained {
         /// One entry per child mob with debt.
         unsettled: Vec<String>,
@@ -959,6 +1153,50 @@ mod tests {
         );
         assert!(held.child_actors_settled());
         assert!(!held.cleanup_complete());
+    }
+
+    #[test]
+    fn specific_child_debt_outranks_a_pending_unregister() {
+        let pending = || ChildShutdown::UnregisterPending {
+            detail: "pending unregister".into(),
+            settlements: Vec::new(),
+        };
+        let child = ChildIncarnation::for_test(1);
+        // Specific debt seen first is never replaced.
+        let specific_first = ChildMobRootOwnership::new(None);
+        specific_first.record(
+            "child",
+            child.clone(),
+            ChildShutdown::Unsettled("retirement stuck".into()),
+        );
+        specific_first.record("child", child.clone(), pending());
+        assert!(!specific_first.pending_in("child", &child));
+        assert_eq!(
+            specific_first.outcome(1),
+            ChildMobStandDownOutcome::Retained {
+                unsettled: vec!["child: retirement stuck".to_string()]
+            }
+        );
+        // A pending unregister is followed only for the incarnation that
+        // reported it, and gives way to specific debt seen later.
+        let pending_first = ChildMobRootOwnership::new(None);
+        pending_first.record("child", child.clone(), pending());
+        assert!(pending_first.pending_in("child", &child));
+        assert!(!pending_first.pending_in("child", &ChildIncarnation::for_test(2)));
+        pending_first.record(
+            "child",
+            ChildIncarnation::for_test(2),
+            ChildShutdown::ChannelClosed,
+        );
+        assert!(!pending_first.pending_in("child", &child));
+        assert_eq!(
+            pending_first.outcome(1),
+            ChildMobStandDownOutcome::Retained {
+                unsettled: vec![
+                    "child: actor exited; its settlement is unknown to this call".to_string()
+                ]
+            }
+        );
     }
 
     #[test]
