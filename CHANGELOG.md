@@ -92,9 +92,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`meerkat_mcp::McpAttemptGuards`) on that factory together with its
   composer. Every first, restored and rebuilt member construction of the
   factory then begins the host's guard before any stdio server of its own is
-  spawned, and the guard is finished once the attempt's process has ended.
-  Gateway custody and defaults are unchanged; a composition without it
-  installs no guards.
+  spawned, and the guard is finished once the attempt's open outcome and
+  process end are both known. Gateway custody and defaults are unchanged; a
+  composition without it installs no guards.
 - `.github/workflows/warm-deps.yml`, dispatched on a branch whose `Cargo.lock`
   changed, builds the dependency graph of each Rust CI job from that branch's
   crates.io dependencies, with no workspace code, and keeps it as a 3-day
