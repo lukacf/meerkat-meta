@@ -409,8 +409,10 @@ impl GatewayMcpComposition {
     /// member construction begins the guard for its own session and member
     /// before the attempt's secret resolution, physical entry or spawn; the
     /// guard is finished once the attempt's open outcome and process end are
-    /// both known. The session routers Meerkat's surfaces build around the
-    /// factory's builder install the same installation. Remote (HTTP and SSE)
+    /// both known. The installation covers the routers these constructions
+    /// build. The gateway's member session services do not offer it to any
+    /// other router: they do not forward
+    /// `meerkat_session::McpAttemptGuardSource`. Remote (HTTP and SSE)
     /// attempts are neither guarded nor refused. The host keeps its own clone
     /// of the installation and closes and joins it
     /// ([`meerkat_mcp::McpAttemptGuards::close_and_join`]) at its shutdown.
@@ -436,10 +438,10 @@ impl GatewayMcpComposition {
 /// the only place the gateway sets a member factory's MCP composer,
 /// call-context provider or attempt guards, and the gateway sets none of them
 /// (nor a connector authority) on these factories before it, so a host
-/// selection replaces no existing choice. Every factory adopts its MCP adapters into the gateway's
-/// `custody` at its ownership seam, before any server is staged, whatever the
-/// host answers. No host, or a host answering `None`, leaves the factory
-/// otherwise exactly as constructed.
+/// selection replaces no existing choice. Every factory adopts its MCP
+/// adapters into the gateway's `custody` at its ownership seam, before any
+/// server is staged, whatever the host answers. No host, or a host answering
+/// `None`, leaves the factory otherwise exactly as constructed.
 pub(crate) fn compose_gateway_member_factory(
     host: Option<&Arc<dyn GatewayHostComposition>>,
     kind: GatewayFactoryKind,
