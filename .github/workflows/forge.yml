@@ -43,7 +43,8 @@ jobs:
         run: node --test --test-concurrency=2 *.test.mjs
       # forge-release.py binds a reused run to the versions it ran with.
       - name: Record the toolchain
-        run: printf '{"python": "%s", "node": "%s"}\n' "$(python3 --version 2>&1)" "$(node --version)" > forge-toolchain.json
+        run: |
+          printf '{"python": "%s", "node": "%s"}\n' "$(python3 --version 2>&1)" "$(node --version)" > forge-toolchain.json
       - name: Retain the toolchain
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -124,7 +125,8 @@ jobs:
         run: python -m pytest -vv installer/tests --maxfail=10 --tb=short --durations=20 --junitxml=forge-pytest.xml
       # forge-release.py binds a reused run to the versions it ran with.
       - name: Record the toolchain
-        run: printf '{"python": "%s", "node": "%s"}\n' "$(python3 --version 2>&1)" "$(node --version)" > forge-toolchain.json
+        run: |
+          printf '{"python": "%s", "node": "%s"}\n' "$(python3 --version 2>&1)" "$(node --version)" > forge-toolchain.json
       - name: Retain the toolchain
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

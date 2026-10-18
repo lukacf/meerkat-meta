@@ -378,6 +378,33 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertIn("          path: forge-pytest.xml\n", backend)
         self.assertNotIn("overwrite:", text(FORGE_CI))
 
+    def test_single_line_run_values_stay_plain_yaml_scalars(self):
+        """A plain scalar cannot hold ": " or " #", nor start with a YAML
+        indicator: forge.yml once carried a printf of JSON that way and no
+        longer parsed. Multi-line scripts use a block scalar."""
+        for path in (WORKFLOW, FORGE_CI):
+            for line in text(path).splitlines():
+                match = re.match(r"\s*(?:- )?run: (.*)$", line)
+                if not match or match.group(1) in ("|", "|-", ">", ">-"):
+                    continue
+                value = match.group(1)
+                self.assertNotIn(": ", value, f"{path.name}: {line}")
+                self.assertNotIn(" #", value, f"{path.name}: {line}")
+                self.assertFalse(value[:1] in "'\"{[&*!|>%@`", f"{path.name}: {line}")
+
+    @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML is not installed")
+    def test_the_forge_workflows_parse_as_yaml(self):
+        import yaml
+
+        release = yaml.safe_load(text(WORKFLOW))
+        self.assertEqual(sorted(release["jobs"]), sorted(JOBS))
+        forge_ci = yaml.safe_load(text(FORGE_CI))
+        for job in forge.EVIDENCE_JOBS:
+            steps = {step.get("name"): step for step in forge_ci["jobs"][job]["steps"]}
+            self.assertEqual(steps["Record the toolchain"]["run"],
+                             "printf '{\"python\": \"%s\", \"node\": \"%s\"}\\n' \"$(python3 --version 2>&1)\" "
+                             "\"$(node --version)\" > forge-toolchain.json\n")
+
     def test_the_guide_says_a_partial_rerun_is_not_evidence(self):
         guide = (ROOT / "installer/RELEASING.md").read_text()
         self.assertIn("A rerun of only the\nfailed jobs", guide)
