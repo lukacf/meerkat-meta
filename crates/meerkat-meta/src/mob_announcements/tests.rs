@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use super::native::{
-    MemberProblem, MemberRoute, MobPresence, NativeDelivery, NativeStatus, NativeSubmitError,
-    NativeUnavailable, PrepareError, continuation_for,
+    MemberProblem, MemberRoute, MobOrigin, MobOriginFacts, MobPresence, NativeDelivery,
+    NativeStatus, NativeSubmitError, NativeUnavailable, PrepareError, continuation_for,
 };
 use super::owner::{
     AnnouncementConfig, AnnouncementError, AnnouncementService, NativeObservation, RoundReport,
@@ -1413,6 +1413,75 @@ async fn sqlite_store_conforms() {
         retention_reads_only_mobs_with_old_announcements(store.as_ref()).await;
     })
     .await;
+    run_conformance("lineage", |store| async move {
+        lineage_is_recorded_once_per_incarnation(store.as_ref()).await;
+    })
+    .await;
+}
+
+fn incarnation(owner: &str, first_event_at_ms: u64) -> MobIncarnation {
+    MobIncarnation {
+        owner_session: Some(owner.to_string()),
+        first_event_at_ms,
+    }
+}
+
+fn lineage_record(
+    mob_id: &str,
+    parent: Option<&str>,
+    incarnation: MobIncarnation,
+    at: u64,
+) -> MobLineage {
+    MobLineage {
+        mob_id: mob(mob_id),
+        incarnation,
+        parent: parent.map(mob),
+        creator: parent.map(|_| "creator".to_string()),
+        recorded_at_ms: at,
+    }
+}
+
+async fn lineage_is_recorded_once_per_incarnation(store: &dyn AnnouncementStore) {
+    let first = lineage_record("events", Some("payments"), incarnation("s1", 10), 100);
+    assert!(store.record_lineage(&first, 100).await.unwrap());
+    // Derived once: the same incarnation keeps its first record.
+    let again = lineage_record("events", Some("builds"), incarnation("s1", 10), 200);
+    assert!(!store.record_lineage(&again, 200).await.unwrap());
+    assert_eq!(store.lineage().await.unwrap(), vec![first.clone()]);
+    // Another incarnation (same id, created again) replaces it.
+    let second = lineage_record("events", Some("refunds"), incarnation("s1", 20), 300);
+    assert!(store.record_lineage(&second, 300).await.unwrap());
+    assert_eq!(store.lineage().await.unwrap(), vec![second.clone()]);
+    let child = lineage_record("builds", Some("events"), incarnation("s2", 30), 300);
+    let unrelated = lineage_record("refunds", None, incarnation("s3", 40), 300);
+    store.record_lineage(&child, 300).await.unwrap();
+    store.record_lineage(&unrelated, 300).await.unwrap();
+    store
+        .end_lineage(&BTreeSet::from([mob("events"), mob("refunds")]), 400)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.lineage().await.unwrap(),
+        vec![child.clone()],
+        "ended records are not live"
+    );
+    // Retention removes ended records before the window, except the
+    // records of a mob a live record still names as parent.
+    let report = store.prune(10_000, 1_000, 100).await.unwrap();
+    assert_eq!(
+        report.lineage, 1,
+        "refunds; events is still named by builds"
+    );
+    assert_eq!(store.lineage().await.unwrap(), vec![child.clone()]);
+    store
+        .end_lineage(&BTreeSet::from([mob("builds")]), 500)
+        .await
+        .unwrap();
+    let report = store.prune(10_000, 1_000, 100).await.unwrap();
+    assert_eq!(report.lineage, 3, "both events records and builds");
+    assert!(store.lineage().await.unwrap().is_empty());
+    let report = store.prune(10_000, 1_000, 100).await.unwrap();
+    assert_eq!(report.lineage, 0);
 }
 
 #[tokio::test]
@@ -1519,6 +1588,12 @@ struct ScriptedNative {
     /// The next submission's final answer that its member is gone.
     submit_gone: Mutex<Option<SubscriptionEnd>>,
     apply_on_commit: bool,
+    /// What Meerkat's records say about the mobs members created, by mob.
+    origins: Mutex<BTreeMap<String, MobOriginFacts>>,
+    /// Mobs whose origin cannot be read now.
+    unreadable_origins: Mutex<BTreeSet<String>>,
+    /// Whether every hosted mob has been restored.
+    restored: std::sync::atomic::AtomicBool,
 }
 
 impl ScriptedNative {
@@ -1533,6 +1608,27 @@ impl ScriptedNative {
             gone: Mutex::new(BTreeMap::new()),
             submit_gone: Mutex::new(None),
             apply_on_commit: true,
+            origins: Mutex::new(BTreeMap::new()),
+            unreadable_origins: Mutex::new(BTreeSet::new()),
+            restored: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// Script the origin Meerkat's records give the mob `mob_id`.
+    fn set_origin(&self, mob_id: &str, incarnation: MobIncarnation, origin: MobOrigin) {
+        self.origins.lock().unwrap().insert(
+            mob_id.to_string(),
+            MobOriginFacts {
+                incarnation,
+                origin,
+            },
+        );
+    }
+
+    fn created_by(parent: &str, creator: &str) -> MobOrigin {
+        MobOrigin::Member {
+            parent: mob(parent),
+            creator: creator.to_string(),
         }
     }
 
@@ -1584,6 +1680,39 @@ impl NativeDelivery for ScriptedNative {
                 (mob_id.clone(), presence)
             })
             .collect())
+    }
+
+    async fn hosted_mob_ids(&self) -> std::result::Result<BTreeSet<MobId>, NativeUnavailable> {
+        Ok(TEST_MOBS
+            .iter()
+            .filter(|mob_id| **mob_id != OWN_MOB)
+            .map(|mob_id| mob(mob_id))
+            .filter(|mob_id| self.hosted(mob_id))
+            .collect())
+    }
+
+    fn mobs_restored(&self) -> bool {
+        self.restored.load(Ordering::SeqCst)
+    }
+
+    async fn mob_origin(
+        &self,
+        mob_id: &MobId,
+    ) -> std::result::Result<Option<MobOriginFacts>, NativeUnavailable> {
+        if self
+            .unreadable_origins
+            .lock()
+            .unwrap()
+            .contains(mob_id.as_str())
+        {
+            return Err(NativeUnavailable(
+                "the session store is not reachable".into(),
+            ));
+        }
+        if !self.hosted(mob_id) {
+            return Ok(None);
+        }
+        Ok(self.origins.lock().unwrap().get(mob_id.as_str()).cloned())
     }
 
     async fn check_member(&self, member: &Member) -> std::result::Result<(), MemberProblem> {
@@ -2306,6 +2435,18 @@ impl AnnouncementStore for FaultyStore {
         now_ms: u64,
     ) -> Result<Vec<SubscriptionId>> {
         self.inner.drop_ended_mobs(ended, now_ms).await
+    }
+
+    async fn lineage(&self) -> Result<Vec<MobLineage>> {
+        self.inner.lineage().await
+    }
+
+    async fn record_lineage(&self, lineage: &MobLineage, now_ms: u64) -> Result<bool> {
+        self.inner.record_lineage(lineage, now_ms).await
+    }
+
+    async fn end_lineage(&self, mobs: &BTreeSet<MobId>, now_ms: u64) -> Result<()> {
+        self.inner.end_lineage(mobs, now_ms).await
     }
 
     async fn backlogs(&self, limit: usize) -> Result<Vec<MemberBacklog>> {
@@ -4146,4 +4287,272 @@ async fn two_members_never_meet_under_one_name() {
             "{who}: {listed}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Lineage and reach
+// ---------------------------------------------------------------------------
+
+/// Records for the reach walk: `(mob, parent)`.
+fn records(pairs: &[(&str, Option<&str>)]) -> Vec<MobLineage> {
+    pairs
+        .iter()
+        .enumerate()
+        .map(|(index, (mob_id, parent))| {
+            lineage_record(mob_id, *parent, incarnation("s", index as u64), 1)
+        })
+        .collect()
+}
+
+fn names(reach: &BTreeSet<MobId>) -> Vec<&str> {
+    reach.iter().map(MobId::as_str).collect()
+}
+
+#[test]
+fn reach_is_the_own_mob_its_ancestors_and_its_descendants() {
+    use super::owner::reach_from;
+    // root
+    //  +- team (+- task, +- sibling-task)
+    //  +- other-team
+    let lineage = records(&[
+        ("team", Some("root")),
+        ("task", Some("team")),
+        ("sibling-task", Some("team")),
+        ("deep", Some("task")),
+        ("other-team", Some("root")),
+        ("unrelated", None),
+    ]);
+    assert_eq!(
+        names(&reach_from(&lineage, &mob("task"))),
+        ["deep", "root", "task", "team"],
+        "never sideways: sibling-task, other-team and unrelated are out"
+    );
+    assert_eq!(
+        names(&reach_from(&lineage, &mob("root"))),
+        ["deep", "other-team", "root", "sibling-task", "task", "team"],
+        "the root reaches every mob below it, not one without a member origin"
+    );
+    assert_eq!(
+        names(&reach_from(&lineage, &mob("unrelated"))),
+        ["unrelated"]
+    );
+
+    // Records that loop (an id reused under a new parent) end the walk.
+    let looping = records(&[("x", Some("y")), ("y", Some("x"))]);
+    assert_eq!(names(&reach_from(&looping, &mob("x"))), ["x", "y"]);
+
+    // A chain longer than the walk's bound stops at the bound.
+    let mut chain = vec![("m0".to_string(), Some("root".to_string()))];
+    for level in 1..100 {
+        chain.push((format!("m{level}"), Some(format!("m{}", level - 1))));
+    }
+    let chain = chain
+        .iter()
+        .map(|(mob_id, parent)| (mob_id.as_str(), parent.as_deref()))
+        .collect::<Vec<_>>();
+    assert_eq!(reach_from(&records(&chain), &mob("root")).len(), 65);
+    assert_eq!(reach_from(&records(&chain), &mob("m99")).len(), 65);
+}
+
+#[tokio::test]
+async fn lineage_is_derived_once_and_only_from_proofs() {
+    let native = ScriptedNative::new();
+    native.set_origin(
+        "events",
+        incarnation("s1", 10),
+        ScriptedNative::created_by(OWN_MOB, "agent:a"),
+    );
+    native.set_origin(
+        "builds",
+        incarnation("s2", 20),
+        ScriptedNative::created_by("events", "worker"),
+    );
+    native.set_origin(
+        "refunds",
+        incarnation("s3", 30),
+        MobOrigin::Unproven("its owner session is bound to no member".into()),
+    );
+    native.set_origin(
+        "a-mob",
+        incarnation("s4", 40),
+        MobOrigin::ParentNotHosted(mob("gone-mob")),
+    );
+    native
+        .unreadable_origins
+        .lock()
+        .unwrap()
+        .insert("b-mob".into());
+    native.set_origin(
+        "b-mob",
+        incarnation("s5", 50),
+        ScriptedNative::created_by(OWN_MOB, "agent:a"),
+    );
+    native.restored.store(false, Ordering::SeqCst);
+    let harness = harness_with(native);
+    let lineage = |harness: &Harness| {
+        let store = Arc::clone(&harness.store);
+        async move {
+            store
+                .lineage()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|record| {
+                    (
+                        record.mob_id.to_string(),
+                        record.parent.map(|parent| parent.to_string()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // A read that fails writes nothing and is reported; the others are
+    // recorded. A missing parent before the restore point waits.
+    assert!(harness.service.reconcile_lineage().await.is_err());
+    assert_eq!(
+        lineage(&harness).await,
+        [
+            ("builds".to_string(), Some("events".to_string())),
+            ("events".to_string(), Some(OWN_MOB.to_string())),
+            ("refunds".to_string(), None),
+        ]
+    );
+
+    // After the restore point a missing parent is final: an orphan.
+    harness.native.restored.store(true, Ordering::SeqCst);
+    harness.native.unreadable_origins.lock().unwrap().clear();
+    harness.service.reconcile_lineage().await.unwrap();
+    assert_eq!(
+        lineage(&harness).await,
+        [
+            ("a-mob".to_string(), None),
+            ("b-mob".to_string(), Some(OWN_MOB.to_string())),
+            ("builds".to_string(), Some("events".to_string())),
+            ("events".to_string(), Some(OWN_MOB.to_string())),
+            ("refunds".to_string(), None),
+        ]
+    );
+
+    // Derived once: the same incarnation is never rewritten from what the
+    // records say later.
+    harness.native.set_origin(
+        "events",
+        incarnation("s1", 10),
+        ScriptedNative::created_by("refunds", "someone-else"),
+    );
+    harness.service.reconcile_lineage().await.unwrap();
+    assert!(
+        lineage(&harness)
+            .await
+            .contains(&("events".to_string(), Some(OWN_MOB.to_string())))
+    );
+
+    // A new incarnation (destroyed and created again, even by the same
+    // owner session) is derived again.
+    harness.native.set_origin(
+        "events",
+        incarnation("s1", 11),
+        ScriptedNative::created_by("refunds", "someone-else"),
+    );
+    harness.service.reconcile_lineage().await.unwrap();
+    assert!(
+        lineage(&harness)
+            .await
+            .contains(&("events".to_string(), Some("refunds".to_string())))
+    );
+
+    // A mob no longer hosted leaves the live records.
+    harness
+        .native
+        .destroyed
+        .lock()
+        .unwrap()
+        .insert("builds".into());
+    harness.service.reconcile_lineage().await.unwrap();
+    assert!(
+        !lineage(&harness)
+            .await
+            .iter()
+            .any(|(mob_id, _)| mob_id == "builds")
+    );
+}
+
+#[tokio::test]
+async fn members_subscribe_within_their_reach_only() {
+    let tools = tool_harness(super::tools::MemberLimits::default());
+    let native = &tools.harness.native;
+    native.set_origin(
+        "events",
+        incarnation("s1", 10),
+        ScriptedNative::created_by(OWN_MOB, "agent:a"),
+    );
+    native.set_origin(
+        "builds",
+        incarnation("s2", 20),
+        ScriptedNative::created_by("events", "worker"),
+    );
+    native.set_origin(
+        "refunds",
+        incarnation("s3", 30),
+        MobOrigin::Unproven("no member created it".into()),
+    );
+    let subscribe = |name: &str, mobs: serde_json::Value| {
+        serde_json::json!({
+            "action": "subscribe",
+            "subscription": name,
+            "topics": ["ios"],
+            "mobs": mobs,
+        })
+    };
+    // Below the caller's mob, derived on first use.
+    let (failed, result) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::SUBSCRIPTION_TOOL,
+            subscribe("below", serde_json::json!(["events", "builds"])),
+        )
+        .await;
+    assert!(!failed, "{result}");
+    assert_eq!(result["mobs"], serde_json::json!(["builds", "events"]));
+    // Its own mob by default.
+    let (failed, result) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::SUBSCRIPTION_TOOL,
+            serde_json::json!({ "action": "subscribe", "subscription": "own", "topics": ["ios"] }),
+        )
+        .await;
+    assert!(!failed, "{result}");
+    assert_eq!(result["mobs"], serde_json::json!([OWN_MOB]));
+    // A mob no member created is outside every member's reach.
+    let (failed, result) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::SUBSCRIPTION_TOOL,
+            subscribe("unrelated", serde_json::json!(["refunds"])),
+        )
+        .await;
+    assert!(failed, "{result}");
+    assert!(
+        result
+            .to_string()
+            .contains("mob refunds is not the member's own mob"),
+        "{result}"
+    );
+    let (failed, result) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::SUBSCRIPTION_TOOL,
+            subscribe("none", serde_json::json!([])),
+        )
+        .await;
+    assert!(failed, "{result}");
+    let listed = tools
+        .harness
+        .store
+        .subscriptions(Some(&member("agent:a")), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 2, "refusals change nothing: {listed:?}");
 }

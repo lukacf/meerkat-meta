@@ -233,14 +233,16 @@ fn local_delivery(
     let mob_tools = mob_runtime
         .agent_mob_mcp_state()
         .ok_or("mob announcements require the gateway's agent mob tool state")?;
-    let machine = mob_runtime
+    let sessions = mob_runtime
         .session_service()
-        .and_then(|service| crate::mob_handle_runtime::observed_runtime_adapter(service.as_ref()))
+        .cloned()
+        .ok_or("mob announcements require the gateway's session service")?;
+    let machine = crate::mob_handle_runtime::observed_runtime_adapter(sessions.as_ref())
         .ok_or("mob announcements require the gateway's runtime machine")?;
     let mob_id = MobId::new(runtime.mob_handle().mob_id().to_string())
         .map_err(|error| format!("this gateway's mob id: {error}"))?;
     Ok(MobNativeDelivery::new(
-        mob_id, identities, mob_tools, machine,
+        mob_id, identities, mob_tools, machine, sessions,
     ))
 }
 

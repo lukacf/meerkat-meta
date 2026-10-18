@@ -20,16 +20,16 @@ use tokio::sync::{Mutex, Notify};
 
 pub use super::native::AdmittedInput;
 use super::native::{
-    MemberProblem, MemberRoute, MobPresence, NativeDelivery, NativeStatus, NativeSubmitError,
-    PrepareError,
+    MemberProblem, MemberRoute, MobOrigin, MobPresence, NativeDelivery, NativeStatus,
+    NativeSubmitError, PrepareError,
 };
 use super::store::AnnouncementStore;
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
     BatchId, BatchPosition, BatchQuery, BatchState, BatchStateTag, MAX_REMOTE_BODY_WIRE_BYTES,
-    Member, MobId, NativeReceipt, OperationId, PutSubscription, SealingPolicy, SourceKey,
-    Subscription, SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
-    SubscriptionState, SuccessorBatch, render_batch, render_item,
+    Member, MobId, MobIncarnation, MobLineage, NativeReceipt, OperationId, PutSubscription,
+    SealingPolicy, SourceKey, Subscription, SubscriptionChange, SubscriptionChangeOutcome,
+    SubscriptionEnd, SubscriptionId, SubscriptionState, SuccessorBatch, render_batch, render_item,
 };
 
 /// Announcements and settled batches are kept this long after they settle.
@@ -110,6 +110,9 @@ pub enum AnnouncementError {
     UnusablePeer(String),
     /// A native read the request needs could not be made now.
     NativeUnavailable(String),
+    /// A member asked for a mob that is not its own, above it or below it
+    /// in the lineage of mobs members created.
+    UnrelatedMob(MobId),
 }
 
 impl std::fmt::Display for AnnouncementError {
@@ -140,6 +143,10 @@ impl std::fmt::Display for AnnouncementError {
                 write!(f, "the member's peer gateway is not usable: {detail}")
             }
             Self::NativeUnavailable(detail) => write!(f, "native state unavailable: {detail}"),
+            Self::UnrelatedMob(mob_id) => write!(
+                f,
+                "mob {mob_id} is not the member's own mob, above it or below it"
+            ),
         }
     }
 }
@@ -326,6 +333,56 @@ fn wire_budget(route: MemberRoute) -> Option<u64> {
     }
 }
 
+/// The longest chain of mobs a lineage walk follows, up or down.
+const MAX_LINEAGE_DEPTH: usize = 64;
+
+/// The mobs a member of `own` reaches by the lineage `records`: its own
+/// mob, the chain of mobs above it, and every mob below it. Siblings and
+/// cousins are not reached. Each mob is visited once, so records that loop
+/// (an id reused under a new parent) end the walk instead of repeating it.
+pub(crate) fn reach_from(records: &[MobLineage], own: &MobId) -> BTreeSet<MobId> {
+    let parent_of = records
+        .iter()
+        .filter_map(|record| {
+            record
+                .parent
+                .as_ref()
+                .map(|parent| (&record.mob_id, parent))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut children = BTreeMap::<&MobId, Vec<&MobId>>::new();
+    for (child, parent) in &parent_of {
+        children.entry(*parent).or_default().push(*child);
+    }
+    let mut reach = BTreeSet::from([own.clone()]);
+    let mut at = own;
+    for _ in 0..MAX_LINEAGE_DEPTH {
+        let Some(parent) = parent_of.get(at) else {
+            break;
+        };
+        if !reach.insert((*parent).clone()) {
+            break;
+        }
+        at = parent;
+    }
+    let mut frontier = vec![own];
+    for _ in 0..MAX_LINEAGE_DEPTH {
+        let mut next = Vec::new();
+        for mob_id in frontier {
+            for child in children.get(mob_id).into_iter().flatten() {
+                if reach.insert((*child).clone()) {
+                    next.push(*child);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    reach
+}
+
 fn new_batch_id() -> Result<BatchId, AnnouncementError> {
     Ok(BatchId::new(format!("batch-{}", uuid::Uuid::new_v4()))?)
 }
@@ -492,6 +549,140 @@ impl AnnouncementService {
         Ok(subscription)
     }
 
+    /// Create or replace a subscription a member asks for itself: every mob
+    /// it names must be its own mob, above it, or below it in the lineage
+    /// of mobs members created. A named mob without a live lineage record
+    /// is derived first. A mob still outside that reach is refused with
+    /// [`AnnouncementError::UnrelatedMob`], and nothing changes.
+    pub async fn put_member_subscription(
+        &self,
+        operation: &OperationId,
+        request: PutSubscription,
+    ) -> Result<Subscription, AnnouncementError> {
+        self.ensure_within_reach(&request.member.mob_id, &request.selector.mobs)
+            .await?;
+        self.put_subscription(operation, request).await
+    }
+
+    /// The mobs a member of `own` may name in a subscription it makes
+    /// itself, by the live lineage records.
+    pub async fn reach(&self, own: &MobId) -> Result<BTreeSet<MobId>, AnnouncementError> {
+        Ok(reach_from(&self.inner.store.lineage().await?, own))
+    }
+
+    async fn ensure_within_reach(
+        &self,
+        own: &MobId,
+        mobs: &BTreeSet<MobId>,
+    ) -> Result<(), AnnouncementError> {
+        let records = self.inner.store.lineage().await?;
+        if mobs.is_subset(&reach_from(&records, own)) {
+            return Ok(());
+        }
+        // A mob seen for the first time gets its record before the check.
+        let recorded = records
+            .into_iter()
+            .map(|record| (record.mob_id, record.incarnation))
+            .collect::<BTreeMap<_, _>>();
+        for mob_id in mobs.iter().chain([own]) {
+            if !recorded.contains_key(mob_id) {
+                self.derive_lineage(mob_id, None).await?;
+            }
+        }
+        let reach = self.reach(own).await?;
+        match mobs.iter().find(|mob_id| !reach.contains(*mob_id)) {
+            Some(mob_id) => Err(AnnouncementError::UnrelatedMob(mob_id.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Record the lineage of the hosted mob `mob_id` unless its live record
+    /// is already for the incarnation hosted now: a relation is derived
+    /// once. A missing parent is final only once every mob this gateway
+    /// hosts has been restored; before that nothing is written. A read
+    /// that fails writes nothing.
+    async fn derive_lineage(
+        &self,
+        mob_id: &MobId,
+        recorded: Option<&MobIncarnation>,
+    ) -> Result<(), AnnouncementError> {
+        let Some(facts) = self
+            .inner
+            .native
+            .mob_origin(mob_id)
+            .await
+            .map_err(|error| AnnouncementError::NativeUnavailable(error.0))?
+        else {
+            return Ok(());
+        };
+        if recorded == Some(&facts.incarnation) {
+            return Ok(());
+        }
+        let (parent, creator) = match facts.origin {
+            MobOrigin::Member { parent, creator } => (Some(parent), Some(creator)),
+            MobOrigin::Unproven(detail) => {
+                tracing::info!(mob = %mob_id, %detail, "mob has no member origin");
+                (None, None)
+            }
+            MobOrigin::ParentNotHosted(parent) => {
+                if !self.inner.native.mobs_restored() {
+                    return Ok(());
+                }
+                tracing::info!(mob = %mob_id, parent = %parent, "the mob's parent is gone");
+                (None, None)
+            }
+        };
+        let now = self.now();
+        self.inner
+            .store
+            .record_lineage(
+                &MobLineage {
+                    mob_id: mob_id.clone(),
+                    incarnation: facts.incarnation,
+                    parent,
+                    creator,
+                    recorded_at_ms: now,
+                },
+                now,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Derive the lineage of every hosted mob whose current incarnation has
+    /// no live record, and end the records of mobs no longer hosted. A mob
+    /// whose read fails is tried again at the next reconcile; the others
+    /// are recorded meanwhile.
+    pub async fn reconcile_lineage(&self) -> Result<(), AnnouncementError> {
+        let hosted = self
+            .inner
+            .native
+            .hosted_mob_ids()
+            .await
+            .map_err(|error| AnnouncementError::NativeUnavailable(error.0))?;
+        let records = self.inner.store.lineage().await?;
+        let gone = records
+            .iter()
+            .filter(|record| !hosted.contains(&record.mob_id))
+            .map(|record| record.mob_id.clone())
+            .collect::<BTreeSet<_>>();
+        if !gone.is_empty() {
+            self.inner.store.end_lineage(&gone, self.now()).await?;
+        }
+        let recorded = records
+            .into_iter()
+            .map(|record| (record.mob_id, record.incarnation))
+            .collect::<BTreeMap<_, _>>();
+        let mut failed = None;
+        for mob_id in &hosted {
+            if let Err(error) = self.derive_lineage(mob_id, recorded.get(mob_id)).await {
+                tracing::warn!(mob = %mob_id, %error, "mob lineage not derived yet");
+                failed = Some(error);
+            }
+        }
+        failed.map_or(Ok(()), Err)
+    }
+
     /// Drop the mobs among `mobs` that are no longer hosted here from every
     /// live subscription that names them; a subscription left with none
     /// ends. Returns the subscriptions that changed.
@@ -525,10 +716,13 @@ impl AnnouncementService {
 
     /// Reconcile every mob the store knows against the mob owner's records:
     /// destroyed mobs leave the subscriptions that name them, and their logs
-    /// are marked ended for retention.
+    /// are marked ended for retention. Then reconcile the lineage records
+    /// ([`Self::reconcile_lineage`]).
     pub async fn reconcile_mobs(&self) -> Result<Vec<SubscriptionId>, AnnouncementError> {
         let known = self.inner.store.known_mobs().await?;
-        self.drop_ended(&known).await
+        let changed = self.drop_ended(&known).await?;
+        self.reconcile_lineage().await?;
+        Ok(changed)
     }
 
     /// Follow the mob owner's set of mobs: reconcile once now, then on every

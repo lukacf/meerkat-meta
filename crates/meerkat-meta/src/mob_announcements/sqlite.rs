@@ -19,8 +19,8 @@ use super::store::AnnouncementStore;
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
     BatchId, BatchItem, BatchPosition, BatchQuery, BatchState, BatchStateTag, MAX_BACKFILL,
-    MAX_ITEM_WIRE_BYTES, MAX_PAGE, Member, MemberBacklog, MobId, OperationId, PruneReport,
-    PutSubscription, Result, SealingPolicy, SourceKey, StartFrontier, Subscription,
+    MAX_ITEM_WIRE_BYTES, MAX_PAGE, Member, MemberBacklog, MobId, MobLineage, OperationId,
+    PruneReport, PutSubscription, Result, SealingPolicy, SourceKey, StartFrontier, Subscription,
     SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
     SubscriptionState, Topic, content_digest, header_wire_bound, render_batch, render_item,
     request_fingerprint, wire_len,
@@ -80,7 +80,13 @@ CREATE TABLE IF NOT EXISTS announcement_batch_subscriptions (
  PRIMARY KEY (subscription_id, batch_id));
 CREATE TABLE IF NOT EXISTS announcement_operations (
  operation_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
- created_at_ms INTEGER NOT NULL, result TEXT NOT NULL);";
+ created_at_ms INTEGER NOT NULL, result TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS mob_lineage (
+ row_id INTEGER PRIMARY KEY AUTOINCREMENT, mob_id TEXT NOT NULL, parent_mob_id TEXT,
+ ended_at_ms INTEGER, record TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS mob_lineage_live
+ ON mob_lineage (mob_id) WHERE ended_at_ms IS NULL;
+CREATE INDEX IF NOT EXISTS mob_lineage_by_parent ON mob_lineage (parent_mob_id);";
 
 fn storage(error: impl std::fmt::Display) -> AnnouncementStoreError {
     AnnouncementStoreError::Storage(error.to_string())
@@ -1028,6 +1034,61 @@ fn known_mobs_in(db: &Connection) -> Result<BTreeSet<MobId>> {
     rows.map(|row| MobId::new(row.map_err(storage)?)).collect()
 }
 
+fn lineage_in(db: &Connection) -> Result<Vec<MobLineage>> {
+    let mut statement = db
+        .prepare("SELECT record FROM mob_lineage WHERE ended_at_ms IS NULL ORDER BY mob_id")
+        .map_err(storage)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(storage)?;
+    rows.map(|row| decode(&row.map_err(storage)?)).collect()
+}
+
+fn record_lineage_in(db: &Connection, lineage: &MobLineage, now_ms: u64) -> Result<bool> {
+    let live = db
+        .query_row(
+            "SELECT record FROM mob_lineage WHERE mob_id = ?1 AND ended_at_ms IS NULL",
+            params![lineage.mob_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    if let Some(live) = live {
+        let live: MobLineage = decode(&live)?;
+        // Derived once: the same incarnation keeps its first record.
+        if live.incarnation == lineage.incarnation {
+            return Ok(false);
+        }
+        db.execute(
+            "UPDATE mob_lineage SET ended_at_ms = ?2 WHERE mob_id = ?1 AND ended_at_ms IS NULL",
+            params![lineage.mob_id.as_str(), int(now_ms)?],
+        )
+        .map_err(storage)?;
+    }
+    db.execute(
+        "INSERT INTO mob_lineage (mob_id, parent_mob_id, ended_at_ms, record)
+         VALUES (?1, ?2, NULL, ?3)",
+        params![
+            lineage.mob_id.as_str(),
+            lineage.parent.as_ref().map(MobId::as_str),
+            encode(lineage)?
+        ],
+    )
+    .map_err(storage)?;
+    Ok(true)
+}
+
+fn end_lineage_in(db: &Connection, mobs: &BTreeSet<MobId>, now_ms: u64) -> Result<()> {
+    for mob_id in mobs {
+        db.execute(
+            "UPDATE mob_lineage SET ended_at_ms = ?2 WHERE mob_id = ?1 AND ended_at_ms IS NULL",
+            params![mob_id.as_str(), int(now_ms)?],
+        )
+        .map_err(storage)?;
+    }
+    Ok(())
+}
+
 fn drop_ended_mobs_in(
     db: &Connection,
     ended: &BTreeSet<MobId>,
@@ -1545,6 +1606,18 @@ fn prune_in(db: &Connection, now_ms: u64, retention_ms: u64, limit: usize) -> Re
         )
         .map_err(storage)? as u64;
     report.more |= members >= budget || logs >= budget;
+    report.lineage = db
+        .execute(
+            "DELETE FROM mob_lineage WHERE row_id IN (
+               SELECT l.row_id FROM mob_lineage l
+               WHERE l.ended_at_ms IS NOT NULL AND l.ended_at_ms <= ?1
+                 AND NOT EXISTS (SELECT 1 FROM mob_lineage c
+                   WHERE c.parent_mob_id = l.mob_id AND c.ended_at_ms IS NULL)
+               ORDER BY l.row_id LIMIT ?2)",
+            params![cutoff, int(budget)?],
+        )
+        .map_err(storage)? as u64;
+    report.more |= report.lineage >= budget;
     Ok(report)
 }
 
@@ -1618,6 +1691,21 @@ impl AnnouncementStore for SqliteAnnouncementStore {
         let ended = ended.clone();
         self.run(move |db| drop_ended_mobs_in(db, &ended, now_ms))
             .await
+    }
+
+    async fn lineage(&self) -> Result<Vec<MobLineage>> {
+        self.run(lineage_in).await
+    }
+
+    async fn record_lineage(&self, lineage: &MobLineage, now_ms: u64) -> Result<bool> {
+        let lineage = lineage.clone();
+        self.run(move |db| record_lineage_in(db, &lineage, now_ms))
+            .await
+    }
+
+    async fn end_lineage(&self, mobs: &BTreeSet<MobId>, now_ms: u64) -> Result<()> {
+        let mobs = mobs.clone();
+        self.run(move |db| end_lineage_in(db, &mobs, now_ms)).await
     }
 
     async fn subscriptions(

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, Batch, BatchEvent, BatchId, BatchPosition,
-    BatchQuery, BatchStateTag, Member, MemberBacklog, MobId, OperationId, PruneReport,
+    BatchQuery, BatchStateTag, Member, MemberBacklog, MobId, MobLineage, OperationId, PruneReport,
     PutSubscription, Result, SealingPolicy, SourceKey, Subscription, SubscriptionChange,
     SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
 };
@@ -94,6 +94,19 @@ pub trait AnnouncementStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<Subscription>>;
 
+    /// The live lineage records: at most one per mob, for the incarnation
+    /// hosted when it was derived.
+    async fn lineage(&self) -> Result<Vec<MobLineage>>;
+
+    /// Record a derived lineage. A live record of the same mob and
+    /// incarnation stays as it is: a relation is derived once. A live
+    /// record of another incarnation ends first. Returns whether a record
+    /// was written.
+    async fn record_lineage(&self, lineage: &MobLineage, now_ms: u64) -> Result<bool>;
+
+    /// End the live lineage records of `mobs`: they are no longer hosted.
+    async fn end_lineage(&self, mobs: &BTreeSet<MobId>, now_ms: u64) -> Result<()>;
+
     /// Members with deliverable announcements and no unsettled batch,
     /// oldest first. A member whose batch is outstanding cannot be sealed
     /// again until that batch settles, so it takes no place in the page.
@@ -143,7 +156,8 @@ pub trait AnnouncementStore: Send + Sync {
     /// operation receipts; and cancelled or ended subscriptions that
     /// changed before the window and hold no unsettled batch, with the
     /// member rows nothing refers to and the logs of ended mobs that retain
-    /// nothing and that no subscription names. [`PruneReport::more`] says
-    /// whether another pass has work.
+    /// nothing and that no subscription names; and lineage records that
+    /// ended before the window and that no live record names as parent.
+    /// [`PruneReport::more`] says whether another pass has work.
     async fn prune(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<PruneReport>;
 }

@@ -523,6 +523,35 @@ impl fmt::Display for SubscriptionEnd {
     }
 }
 
+/// One incarnation of a mob a member created: the owner session Meerkat
+/// bound it to at creation, and the time of the first event in its own
+/// log. A mob destroyed and created again under the same id starts a new
+/// log, so it is another incarnation even under the same owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MobIncarnation {
+    /// `None` for a mob no member created: it has no owner binding.
+    pub owner_session: Option<String>,
+    pub first_event_at_ms: u64,
+}
+
+/// Where one incarnation of a mob hosted here sits among the mobs members
+/// created, derived once from Meerkat's durable records: the mob's owner
+/// binding, that session's own member binding, and the parent's
+/// member-creation journal. Never rewritten from live state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MobLineage {
+    pub mob_id: MobId,
+    pub incarnation: MobIncarnation,
+    /// The mob whose member created this one; `None` when the records prove
+    /// no member origin, and then no member reaches this mob.
+    pub parent: Option<MobId>,
+    /// The creating member's roster id in the parent mob.
+    pub creator: Option<String>,
+    pub recorded_at_ms: u64,
+}
+
 /// A durable subscription.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subscription {
@@ -1085,6 +1114,8 @@ pub struct PruneReport {
     /// Cancelled and ended subscriptions, with the member rows and the
     /// announcement logs of destroyed mobs nothing refers to any more.
     pub subscriptions: u64,
+    /// Lineage records of ended mobs that no live record names as parent.
+    pub lineage: u64,
     /// Whether a kind stopped at the pass's limit with more it may remove:
     /// another pass has work.
     pub more: bool,

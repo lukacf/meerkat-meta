@@ -47,9 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Mob announcement member tools. A profile that lists the
   `mob_announcements` bundle in `tools.rust_bundles` gives its members
   `mob_announce` and `mob_subscription`: a member announces into its own mob
-  as itself and manages its own subscriptions to it. Every call is attributed
-  to exactly one member through the mob roster and the identity runtime, or
-  refused; per-member limits come from
+  as itself and manages its own subscriptions. A subscription a member makes
+  can name its own mob and the mobs above and below it among the mobs
+  members created, never a sibling's; any other mob is refused with
+  `unrelated_mob`. Which mob a member created is derived once from
+  Meerkat's durable records and kept, so a repoint of the creator does not
+  lose it. Every call is attributed to exactly one member through the mob
+  roster and the identity runtime, or refused; per-member limits come from
   `runtime_options.mob_announcements.member_limits`.
 
 - Keyed cross-mob inject. Two new control verbs, `inject_keyed` and

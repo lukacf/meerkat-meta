@@ -118,6 +118,12 @@ fn rpc_error(error: AnnouncementError) -> JsonRpcError {
             message,
             Value::Null,
         ),
+        AnnouncementError::UnrelatedMob(mob_id) => typed(
+            ANNOUNCEMENTS_REFUSED_CODE,
+            "unrelated_mob",
+            message,
+            json!({ "mob_id": mob_id }),
+        ),
         AnnouncementError::Store(error) => match error {
             AnnouncementStoreError::AnnouncementConflict { existing } => typed(
                 ANNOUNCEMENTS_CONFLICT_CODE,

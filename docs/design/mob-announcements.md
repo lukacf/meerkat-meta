@@ -143,10 +143,12 @@ never receive it. It has two tools:
   the same key and content is not announced twice; without a key, the call
   itself is the key. The result counts the subscriptions that captured the
   announcement and never names them.
-- `mob_subscription` `{action, subscription?, topics?, expected_revision?}`:
-  `subscribe` (create, or replace the topics at `expected_revision`),
-  `pause`, `resume`, `cancel` and `list`, for the caller's own
-  subscriptions to its own mob.
+- `mob_subscription` `{action, subscription?, topics?, mobs?, expected_revision?}`:
+  `subscribe` (create, or replace the topics and mobs at
+  `expected_revision`), `pause`, `resume`, `cancel` and `list`, for the
+  caller's own subscriptions. `mobs` defaults to the caller's own mob and
+  may name only mobs in its reach (see Mob lineage); any other mob is
+  refused with `unrelated_mob` and nothing changes.
 
 Every call is attributed to exactly one member: the member of this gateway's
 mob whose session the call comes from, as both the mob roster and the
@@ -156,6 +158,46 @@ namespace of their own, so no member can reach or learn another member's.
 Per-member limits (`member_limits`, defaults shown below) bound announcements
 and bytes per minute, live subscriptions, and topics per subscription; the
 minute windows live in memory and start over on a restart.
+
+## Mob lineage
+
+A member reaches its own mob, the chain of mobs above it, and every mob
+below it, among the mobs members created; never a sibling's or a cousin's.
+The host RPC is not bound by this and reaches every mob hosted here. For a
+member of this gateway's own mob, the mobs below it are every mob any of
+its members created, `delegate`'s helper mobs (`implicit-{session}`)
+included, not only the ones that member created.
+
+Which mob created which is a record the announcement store keeps, one per
+incarnation of a hosted mob. It is derived once, from three durable
+records Meerkat keeps, and never rewritten from live state:
+
+1. The mob's owner binding: the session of the member that created it,
+   bound once at creation (`mob_create`, and `delegate`'s helper mobs).
+2. That session's own persisted member binding: the parent mob and the
+   member.
+3. The parent's member-creation journal, which must record the same
+   session for the same member and role.
+
+The live roster is not read, so a repoint of the creator to a new session
+loses nothing. The record is derived when the mob set changes, at startup,
+and when a member's subscription first names the mob.
+
+A mob gets a record with no parent, which no member reaches, only on a
+proof: it has no owner binding, its owner session's metadata is absent or
+names no member, the parent's journal disagrees, or its parent is not
+hosted here after this gateway restored every mob it hosts. A read that
+fails writes nothing and is tried again. One window fails closed: a mob
+first seen after its creator respawned finds the creator's archived session
+unreadable and stays unreached until Meerkat tears it down at the next
+restart (a child mob does not outlive its creator's respawn there).
+
+A record belongs to one incarnation: the owner session and the time of the
+first event in the mob's own log. A mob destroyed and created again under
+the same id starts a new log and gets a new record. When a mob is no longer
+hosted its record ends; ended records are removed by retention once no
+live record names the mob as parent. A mob held after a restart keeps its
+record; a held mob whose parent's record ended loses its reach upward.
 
 ## Members on peer gateways
 
