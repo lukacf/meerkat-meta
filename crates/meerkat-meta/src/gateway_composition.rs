@@ -2288,13 +2288,12 @@ default_binding = "local"
     }
 
     #[test]
-    fn the_gateway_runtime_starts_the_resolved_worker_count() {
-        let runtime = gateway_tokio_runtime_with(std::num::NonZeroUsize::new(3))
-            .expect("gateway runtime with three workers");
+    fn the_gateway_runtime_starts_the_resolved_worker_count() -> std::io::Result<()> {
+        let runtime = gateway_tokio_runtime_with(std::num::NonZeroUsize::new(3))?;
         assert_eq!(runtime.metrics().num_workers(), 3);
-        let single = gateway_tokio_runtime_with(std::num::NonZeroUsize::new(1))
-            .expect("gateway runtime with one worker");
+        let single = gateway_tokio_runtime_with(std::num::NonZeroUsize::new(1))?;
         assert_eq!(single.metrics().num_workers(), 1);
+        Ok(())
     }
 
     /// Golden envelope for the shared filter builder: the exact strings the
