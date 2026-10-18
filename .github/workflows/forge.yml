@@ -101,6 +101,12 @@ jobs:
               prepare_dependencies(Path(folder).resolve())
           print("Authenticated DOM dependency closure is ready.")
           PY
+      - name: Isolated controller subprocess checks
+        run: >-
+          python -m pytest -q
+          installer/tests/test_remote_destination.py::test_actual_isolated_cli_emits_one_bounded_frame_and_no_raw_error
+          installer/tests/test_remote_interface_bundle.py
+          --tb=short
       - name: Backend regression tests
         run: python -m pytest -vv installer/tests --maxfail=10 --tb=short --durations=20 --junitxml=forge-pytest.xml
       - name: Retain test results

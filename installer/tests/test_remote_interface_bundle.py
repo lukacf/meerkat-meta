@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import zlib
 
 from launchkit.remote_interface_bundle import controller_bytes
 from launchkit import application_experiences, remote_destination
@@ -38,9 +39,10 @@ def test_actual_isolated_bundled_parser_uses_verified_dependency_without_mutable
     (root / 'application_configuration.py').write_text("raise RuntimeError('mutable-canary')")
     (root / 'application').mkdir()
     (root / 'application/__init__.py').write_text("raise RuntimeError('mutable-canary')")
-    payload = base64.b64encode(controller_bytes()).decode()
-    program = '''import base64,json,pathlib,sys
-s=base64.b64decode(sys.argv[1]);n={'__name__':'fixture','CONTROLLER_SOURCE':s}
+    payload = base64.b64encode(zlib.compress(controller_bytes(), level=9)).decode()
+    assert len(payload.encode('ascii')) < 128 * 1024
+    program = '''import base64,json,pathlib,sys,zlib
+s=zlib.decompress(base64.b64decode(sys.argv[1]));n={'__name__':'fixture','CONTROLLER_SOURCE':s}
 exec(compile(s,'<frozen-controller>','exec'),n)
 root=pathlib.Path(sys.argv[2]); owner={'snapshots':{'application-configuration.py':sys.argv[3]}}
 p=n['_experience_parser'](root,owner)
@@ -64,9 +66,10 @@ print(json.dumps(r))
 
 def test_actual_isolated_controller_enforces_console_rules_without_accepted_or_mutable_helper_imports(tmp_path):
     (tmp_path / 'console_configuration.py').write_text("raise RuntimeError('mutable-canary')")
-    payload = base64.b64encode(controller_bytes()).decode()
-    program = '''import base64,json,pathlib,sys
-s=base64.b64decode(sys.argv[1]);n={'__name__':'fixture','CONTROLLER_SOURCE':s}
+    payload = base64.b64encode(zlib.compress(controller_bytes(), level=9)).decode()
+    assert len(payload.encode('ascii')) < 128 * 1024
+    program = '''import base64,json,pathlib,sys,zlib
+s=zlib.decompress(base64.b64decode(sys.argv[1]));n={'__name__':'fixture','CONTROLLER_SOURCE':s}
 exec(compile(s,'<frozen-controller>','exec'),n)
 fields=[{'key':'CONSOLE_USER_ID','label':'Console user','secret':False,'required':True},
 {'key':'CONSOLE_LOGIN_PASSWORD','label':'Console password','secret':True,'required':True}]
