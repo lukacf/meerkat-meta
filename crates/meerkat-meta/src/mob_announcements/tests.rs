@@ -4556,3 +4556,88 @@ async fn members_subscribe_within_their_reach_only() {
         .unwrap();
     assert_eq!(listed.len(), 2, "refusals change nothing: {listed:?}");
 }
+
+#[test]
+fn a_member_created_a_mob_only_when_all_three_records_agree() {
+    use super::native::{BindingRecord, OriginRecords, OwnerMetadata, ParentRecord, origin_from};
+    let binding = |mob_id: &str, role: &str, member: &str| BindingRecord {
+        mob_id: mob_id.to_string(),
+        role: role.to_string(),
+        member: member.to_string(),
+    };
+    let owned = |journal: Option<(&str, BindingRecord)>| OriginRecords {
+        owner_session: Some("session-1".to_string()),
+        owner_metadata: Some(OwnerMetadata::Bound(binding("payments", "lead", "agent:a"))),
+        parent: Some(ParentRecord::Running {
+            journal: journal.map(|(session, recorded)| (session.to_string(), recorded)),
+        }),
+    };
+    assert_eq!(
+        origin_from(&owned(Some((
+            "session-1",
+            binding("payments", "lead", "agent:a")
+        )))),
+        Ok(MobOrigin::Member {
+            parent: mob("payments"),
+            creator: "agent:a".to_string(),
+        })
+    );
+    let unproven = [
+        ("no owner binding", OriginRecords::default()),
+        (
+            "no persisted metadata",
+            OriginRecords {
+                owner_session: Some("session-1".to_string()),
+                owner_metadata: Some(OwnerMetadata::Absent),
+                parent: None,
+            },
+        ),
+        (
+            "no member binding",
+            OriginRecords {
+                owner_session: Some("session-1".to_string()),
+                owner_metadata: Some(OwnerMetadata::Unbound),
+                parent: None,
+            },
+        ),
+        ("no journal entry", owned(None)),
+        (
+            "another session in the journal",
+            owned(Some(("session-2", binding("payments", "lead", "agent:a")))),
+        ),
+        (
+            "another mob in the journal",
+            owned(Some(("session-1", binding("events", "lead", "agent:a")))),
+        ),
+        (
+            "another role in the journal",
+            owned(Some((
+                "session-1",
+                binding("payments", "worker", "agent:a"),
+            ))),
+        ),
+        (
+            "another member in the journal",
+            owned(Some(("session-1", binding("payments", "lead", "agent:b")))),
+        ),
+    ];
+    for (case, records) in unproven {
+        assert!(
+            matches!(origin_from(&records), Ok(MobOrigin::Unproven(_))),
+            "{case}: {:?}",
+            origin_from(&records)
+        );
+    }
+    let parent_at = |parent: ParentRecord| OriginRecords {
+        parent: Some(parent),
+        ..owned(None)
+    };
+    assert_eq!(
+        origin_from(&parent_at(ParentRecord::NotHosted)),
+        Ok(MobOrigin::ParentNotHosted(mob("payments")))
+    );
+    assert!(
+        origin_from(&parent_at(ParentRecord::Held)).is_err(),
+        "a held parent may run again: nothing is final yet"
+    );
+}

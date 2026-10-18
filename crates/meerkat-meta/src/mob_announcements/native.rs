@@ -135,6 +135,102 @@ pub struct MobOriginFacts {
     pub origin: MobOrigin,
 }
 
+/// A member binding as Meerkat persists it: the mob, the member's role and
+/// its roster id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BindingRecord {
+    pub(crate) mob_id: String,
+    pub(crate) role: String,
+    pub(crate) member: String,
+}
+
+/// The parent a member binding names, as this gateway hosts it now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParentRecord {
+    /// Running: its member-creation journal entry for the owner session,
+    /// as the session it records and the binding it records.
+    Running {
+        journal: Option<(String, BindingRecord)>,
+    },
+    /// Restored and held until its owner resolves: it may run again.
+    Held,
+    /// Neither running nor held.
+    NotHosted,
+}
+
+/// What the owner session's persisted metadata says about its member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OwnerMetadata {
+    /// No persisted metadata: an archived session reads so.
+    Absent,
+    /// Persisted, and bound to no member.
+    Unbound,
+    /// Persisted, and bound to this member.
+    Bound(BindingRecord),
+}
+
+/// What Meerkat's durable records say about who created a hosted mob, each
+/// read only when the one before it names something.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OriginRecords {
+    /// The mob's set-once owner binding: the session of the member that
+    /// created it.
+    pub(crate) owner_session: Option<String>,
+    /// That session's persisted metadata, read when there is one.
+    pub(crate) owner_metadata: Option<OwnerMetadata>,
+    /// Where the parent that binding names is.
+    pub(crate) parent: Option<ParentRecord>,
+}
+
+/// Who created a mob, from its records, or `Err` while that cannot be told
+/// yet (its parent is held until its owner resolves). A member created it
+/// only when the owner session's binding names it and the parent's journal
+/// records that same session for the same mob, role and member.
+pub(crate) fn origin_from(records: &OriginRecords) -> Result<MobOrigin, String> {
+    let Some(owner) = &records.owner_session else {
+        return Ok(MobOrigin::Unproven("no member created it".to_string()));
+    };
+    let binding = match &records.owner_metadata {
+        // An archived owner session reads as absent: the window a mob first
+        // seen after its creator respawned falls into. It fails closed.
+        None | Some(OwnerMetadata::Absent) => {
+            return Ok(MobOrigin::Unproven(
+                "its owner session has no persisted metadata".to_string(),
+            ));
+        }
+        Some(OwnerMetadata::Unbound) => {
+            return Ok(MobOrigin::Unproven(
+                "its owner session is bound to no member".to_string(),
+            ));
+        }
+        Some(OwnerMetadata::Bound(binding)) => binding,
+    };
+    let parent = MobId::new(binding.mob_id.clone()).map_err(|error| error.to_string())?;
+    match &records.parent {
+        Some(ParentRecord::Running { journal }) => {
+            let agrees = journal
+                .as_ref()
+                .is_some_and(|(session, recorded)| session == owner && recorded == binding);
+            if agrees {
+                Ok(MobOrigin::Member {
+                    parent,
+                    creator: binding.member.clone(),
+                })
+            } else {
+                Ok(MobOrigin::Unproven(
+                    "the parent's member-creation journal does not record its owner session \
+                     for that member"
+                        .to_string(),
+                ))
+            }
+        }
+        Some(ParentRecord::Held) => Err(format!(
+            "its parent {parent} is held until its owner resolves"
+        )),
+        Some(ParentRecord::NotHosted) | None => Ok(MobOrigin::ParentNotHosted(parent)),
+    }
+}
+
 /// What the announcement owner needs from the hosts of its members.
 #[async_trait]
 pub trait NativeDelivery: Send + Sync {
@@ -490,6 +586,16 @@ impl MobNativeDelivery {
         mob_id: &MobId,
     ) -> Result<Option<MobOriginFacts>, NativeUnavailable> {
         let unavailable = |error: &dyn std::fmt::Display| NativeUnavailable(error.to_string());
+        // Held mobs are read before running ones: activation moves a held
+        // mob to the running ones, never back, so a parent in neither is
+        // not one about to run.
+        let held = self
+            .mob_tools
+            .held_child_mobs()
+            .await
+            .into_iter()
+            .map(|(id, _)| id.as_str().to_string())
+            .collect::<BTreeSet<_>>();
         let handles = self
             .mob_tools
             .mob_handles_snapshot()
@@ -517,66 +623,65 @@ impl MobNativeDelivery {
             owner_session: owner.as_ref().map(ToString::to_string),
             first_event_at_ms,
         };
-        let facts = |origin| {
-            Ok(Some(MobOriginFacts {
-                incarnation: incarnation.clone(),
-                origin,
-            }))
+        let mut records = OriginRecords {
+            owner_session: owner.as_ref().map(ToString::to_string),
+            ..OriginRecords::default()
         };
-        let Some(owner) = owner else {
-            return facts(MobOrigin::Unproven("no member created it".to_string()));
-        };
-        let metadata = self
-            .sessions
-            .load_persisted_session_metadata(&owner)
-            .await
-            .map_err(|error| unavailable(&error))?
-            .filter(|view| view.session_id == owner);
-        // An archived owner session reads as absent: the window a mob first
-        // seen after its creator respawned falls into. It fails closed.
-        let Some(metadata) = metadata else {
-            return facts(MobOrigin::Unproven(
-                "its owner session has no persisted metadata".to_string(),
-            ));
-        };
-        let Some(binding) = metadata
-            .session_metadata
-            .and_then(|metadata| metadata.mob_member_binding)
-        else {
-            return facts(MobOrigin::Unproven(
-                "its owner session is bound to no member".to_string(),
-            ));
-        };
-        let parent = MobId::new(binding.mob_id.clone()).map_err(|error| unavailable(&error))?;
-        let Some(parent_handle) = handles
-            .iter()
-            .find(|(id, _)| id.as_str() == parent.as_str())
-            .map(|(_, handle)| handle.clone())
-        else {
-            return facts(MobOrigin::ParentNotHosted(parent));
-        };
-        let journal = parent_handle
-            .read_handle()
-            .member_creation_for_session(&owner)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let agrees = journal.as_ref().is_some_and(|snapshot| {
-            snapshot.session_id == owner
-                && snapshot.member_binding.mob_id == binding.mob_id
-                && snapshot.member_binding.role == binding.role
-                && snapshot.member_binding.member == binding.member
-        });
-        if !agrees {
-            return facts(MobOrigin::Unproven(
-                "the parent's member-creation journal does not record its owner session for \
-                 that member"
-                    .to_string(),
-            ));
+        if let Some(owner) = &owner {
+            let metadata = match self
+                .sessions
+                .load_persisted_session_metadata(owner)
+                .await
+                .map_err(|error| unavailable(&error))?
+                .filter(|view| view.session_id == *owner)
+            {
+                None => OwnerMetadata::Absent,
+                Some(view) => match view
+                    .session_metadata
+                    .and_then(|metadata| metadata.mob_member_binding)
+                {
+                    None => OwnerMetadata::Unbound,
+                    Some(binding) => OwnerMetadata::Bound(BindingRecord {
+                        mob_id: binding.mob_id,
+                        role: binding.role,
+                        member: binding.member,
+                    }),
+                },
+            };
+            if let OwnerMetadata::Bound(binding) = &metadata {
+                let parent = handles
+                    .iter()
+                    .find(|(id, _)| id.as_str() == binding.mob_id)
+                    .map(|(_, handle)| handle.clone());
+                records.parent = Some(match parent {
+                    Some(parent) => ParentRecord::Running {
+                        journal: parent
+                            .read_handle()
+                            .member_creation_for_session(owner)
+                            .await
+                            .map_err(|error| unavailable(&error))?
+                            .map(|snapshot| {
+                                (
+                                    snapshot.session_id.to_string(),
+                                    BindingRecord {
+                                        mob_id: snapshot.member_binding.mob_id,
+                                        role: snapshot.member_binding.role,
+                                        member: snapshot.member_binding.member,
+                                    },
+                                )
+                            }),
+                    },
+                    None if held.contains(&binding.mob_id) => ParentRecord::Held,
+                    None => ParentRecord::NotHosted,
+                });
+            }
+            records.owner_metadata = Some(metadata);
         }
-        facts(MobOrigin::Member {
-            parent,
-            creator: binding.member,
-        })
+        let origin = origin_from(&records).map_err(NativeUnavailable)?;
+        Ok(Some(MobOriginFacts {
+            incarnation,
+            origin,
+        }))
     }
 
     /// Submit one continuation for the identity.
