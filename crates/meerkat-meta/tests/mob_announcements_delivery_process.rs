@@ -16,6 +16,10 @@
 //! A second test boots the same gateway over its own state with a member
 //! placed on a host in the roster, and shows that a subscription for that
 //! member is refused typed.
+//!
+//! A third has a member whose profile opts into the member tools announce
+//! from its own model turn: the loopback model calls `mob_announce`, and
+//! another member's subscription receives the announcement as that member's.
 
 #![cfg(feature = "announcement-test-faults")]
 #![allow(
@@ -50,12 +54,23 @@ const BURST: usize = 200;
 const HOLD_MARKER: &str = "ORIGINAL-WORK";
 const BATCH_MARKER: &str = "Mob announcements batch-";
 const FINAL_MARKER: &str = "FINAL-CHECK";
+/// A member of the same mob whose profile opts into the member tools.
+const ANNOUNCER: &str = "agent:announcer";
+/// The prompt the loopback model answers with one `mob_announce` call.
+const ANNOUNCE_MARKER: &str = "ANNOUNCE-REFUND-DELAYS";
+const ANNOUNCED_BODY: &str = "refunds to every card issuer are delayed by one day";
+const ANNOUNCED_KEY: &str = "refund-delays";
+/// The member tools, as the model is offered them.
+const MEMBER_TOOLS: [&str; 2] = ["mob_announce", "mob_subscription"];
 
 const INIT_TIMEOUT: Duration = Duration::from_mins(3);
 const RPC_TIMEOUT: Duration = Duration::from_mins(1);
 const SETTLE_TIMEOUT: Duration = Duration::from_mins(3);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_mins(3);
 const EXIT_TIMEOUT: Duration = Duration::from_mins(1);
+/// How long an owed announcement waits to be sealed in the tests that
+/// seal a batch only by resuming its subscription.
+const HELD_DELAY_MS: u64 = 60_000;
 
 fn mob_config() -> String {
     format!(
@@ -71,6 +86,16 @@ runtime_mode = "turn_driven"
 
 [profiles.specialist.tools]
 comms = true
+
+[profiles.announcer]
+model = "{MODEL}"
+provider = "self_hosted"
+external_addressable = true
+runtime_mode = "turn_driven"
+
+[profiles.announcer.tools]
+comms = true
+rust_bundles = ["mob_announcements"]
 "#
     )
 }
@@ -148,6 +173,19 @@ fn placed_roster_spec() -> Value {
     })
 }
 
+/// A roster row for the member whose profile opts into the member tools.
+fn announcer_roster_spec() -> Value {
+    json!({
+        "identity": ANNOUNCER,
+        "profile": "announcer",
+        "addressability": "addressable",
+        "display_name": null,
+        "labels": {},
+        "context": null,
+        "additional_instructions": []
+    })
+}
+
 /// A member of this gateway's mob, in the form every method takes.
 fn member(identity: &str) -> Value {
     json!({ "mob_id": MOB_ID, "identity": identity })
@@ -212,11 +250,63 @@ fn message_texts(request: &Value) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// The role of the last message in a chat-completions request: `tool` when
+/// the request carries a tool's answer back to the model.
+fn last_message_role(request: &Value) -> String {
+    request["messages"]
+        .as_array()
+        .and_then(|all| all.last())
+        .and_then(|message| message["role"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The names of the tools a chat-completions request offers the model.
+fn offered_tools(request: &Value) -> Vec<String> {
+    request["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A streamed reply that is one `mob_announce` call and nothing else.
+fn announce_call() -> String {
+    let arguments = json!({
+        "topics": [TOPIC],
+        "body": ANNOUNCED_BODY,
+        "key": ANNOUNCED_KEY
+    })
+    .to_string();
+    let call = json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call-announce-1",
+                    "type": "function",
+                    "function": { "name": "mob_announce", "arguments": arguments }
+                }]
+            }
+        }]
+    });
+    let done = json!({
+        "choices": [{ "finish_reason": "tool_calls" }],
+        "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+    });
+    format!("data: {call}\n\ndata: {done}\n\ndata: [DONE]\n\n")
+}
+
 async fn chat_completions(
     axum::extract::State(log): axum::extract::State<Arc<Mutex<ModelLog>>>,
     axum::Json(request): axum::Json<Value>,
 ) -> impl axum::response::IntoResponse {
     let last = last_message_text(&request);
+    let answers_a_tool = last_message_role(&request) == "tool";
     let hold = {
         let mut log = log.lock().unwrap();
         log.requests.push(request);
@@ -231,7 +321,12 @@ async fn chat_completions(
         // gateway is killed while it waits.
         std::future::pending::<()>().await;
     }
-    let reply = if last.contains(HOLD_MARKER) {
+    if last.contains(ANNOUNCE_MARKER) && !answers_a_tool {
+        return ([("content-type", "text/event-stream")], announce_call());
+    }
+    let reply = if answers_a_tool {
+        "announced the refund delays"
+    } else if last.contains(HOLD_MARKER) {
         "original work complete"
     } else if last.contains(BATCH_MARKER) {
         "noted the payment failures"
@@ -519,12 +614,14 @@ fn boot(label: &str, state: &Path, host_config: &Path, fault: Option<&str>) -> G
         fault,
         vec![roster_spec()],
         "eager_materialize",
+        HELD_DELAY_MS,
     )
 }
 
 /// Boot a gateway with mob announcements enabled over `state`, answering
-/// its roster callback with `roster` and bootstrapping identities in
-/// `bootstrap_mode`.
+/// its roster callback with `roster`, bootstrapping identities in
+/// `bootstrap_mode`, and sealing an owed announcement once it has waited
+/// `max_delay_ms`.
 fn boot_with(
     label: &str,
     state: &Path,
@@ -532,6 +629,7 @@ fn boot_with(
     fault: Option<&str>,
     roster: Vec<Value>,
     bootstrap_mode: &str,
+    max_delay_ms: u64,
 ) -> Gateway {
     let mut gateway = Gateway::start(label, fault);
     gateway.roster = roster;
@@ -549,7 +647,7 @@ fn boot_with(
                     "batch": {
                         "max_count": 256,
                         "max_bytes": 1_048_576,
-                        "max_delay_ms": 60_000,
+                        "max_delay_ms": max_delay_ms,
                         "min_wake_interval_ms": 0
                     }
                 }
@@ -816,6 +914,7 @@ fn a_subscription_for_a_member_placed_on_a_host_is_refused() {
         None,
         vec![roster_spec(), placed_roster_spec()],
         "lazy_materialize",
+        HELD_DELAY_MS,
     );
     let refused = gateway.request(
         "meta/mob_announcements/subscriptions/put",
@@ -855,5 +954,176 @@ fn a_subscription_for_a_member_placed_on_a_host_is_refused() {
     )["subscription"]
         .clone();
     assert_eq!(served["state"], json!("active"), "{served}");
+    gateway.shutdown_and_reap();
+}
+
+/// A member whose profile opts into the member tools announces from its own
+/// model turn. The call is attributed to it from this gateway's mob roster
+/// and identity runtime, nothing else: the tool answers with a count, and
+/// another member's subscription receives the announcement introduced as
+/// the announcer's. The subscriber's profile does not opt in, so its model
+/// is never offered the tools.
+#[test]
+fn a_member_announces_from_its_own_turn_as_itself() {
+    let state = tempfile::tempdir().expect("state dir");
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let log = Arc::new(Mutex::new(ModelLog::default()));
+    let base_url = start_model(Arc::clone(&log));
+    let host_config = config_dir.path().join("config.toml");
+    std::fs::write(&host_config, host_config_text(&base_url)).expect("write host config");
+
+    let mut gateway = boot_with(
+        "member-tools",
+        state.path(),
+        &host_config,
+        None,
+        vec![roster_spec(), announcer_roster_spec()],
+        "eager_materialize",
+        // An owed announcement is sealed at once.
+        0,
+    );
+    gateway.call(
+        "meta/mob_announcements/subscriptions/put",
+        json!({
+            "operation_id": "subscribe-refunds",
+            "subscription_id": "refunds",
+            "member": member(IDENTITY),
+            "topics": [TOPIC]
+        }),
+    );
+
+    // The announcer's turn: its model calls mob_announce, and the tool's
+    // answer comes back in the next request.
+    gateway.call(
+        "meta/send",
+        json!({ "identity": ANNOUNCER, "content": format!("{ANNOUNCE_MARKER}: tell the mob") }),
+    );
+    wait_until(
+        "the tool's answer to reach the model",
+        SETTLE_TIMEOUT,
+        || {
+            log.lock()
+                .unwrap()
+                .requests
+                .iter()
+                .any(|request| last_message_role(request) == "tool")
+        },
+    );
+    let (offered, answer) = {
+        let log = log.lock().unwrap();
+        let turn = log
+            .requests
+            .iter()
+            .find(|request| {
+                last_message_role(request) != "tool"
+                    && last_message_text(request).contains(ANNOUNCE_MARKER)
+            })
+            .expect("the announcer's turn");
+        let answered = log
+            .requests
+            .iter()
+            .find(|request| last_message_role(request) == "tool")
+            .expect("the tool's answer");
+        (offered_tools(turn), last_message_text(answered))
+    };
+    for tool in MEMBER_TOOLS {
+        assert!(
+            offered.iter().any(|name| name == tool),
+            "the announcer's profile opts into {tool}: {offered:?}"
+        );
+    }
+    let answer: Value = serde_json::from_str(&answer).unwrap_or_else(|error| {
+        panic!("the tool refused or did not answer JSON ({error}): {answer}")
+    });
+    assert_eq!(answer["mob_id"], json!(MOB_ID), "{answer}");
+    assert_eq!(answer["key"], json!(ANNOUNCED_KEY), "{answer}");
+    assert_eq!(answer["replayed"], json!(false), "{answer}");
+    assert_eq!(
+        answer["captured"],
+        json!(1),
+        "a count of the subscriptions that captured it: {answer}"
+    );
+
+    // The subscriber's batch carries it, as the announcer's.
+    let batch_id = {
+        let mut found = None;
+        let start = Instant::now();
+        while found.is_none() {
+            assert!(
+                start.elapsed() < SETTLE_TIMEOUT,
+                "the announcement was never delivered\n{}",
+                gateway.stderr_tail()
+            );
+            if let Some(batch) = deliveries(&mut gateway).first()
+                && batch["state"]["state"] == json!("delivered")
+            {
+                found = batch["id"].as_str().map(str::to_owned);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        found.unwrap()
+    };
+    let observed = gateway.call(
+        "meta/mob_announcements/deliveries/observe",
+        json!({ "batch_id": batch_id }),
+    );
+    let items = observed["batch"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(items.len(), 1, "{observed}");
+    let announcement = gateway.call(
+        "meta/mob_announcements/get",
+        json!({ "mob_id": items[0]["mob_id"], "source_key": items[0]["source_key"] }),
+    )["announcement"]
+        .clone();
+    assert_eq!(
+        announcement["announced_by"],
+        json!({ "kind": "member", "identity": ANNOUNCER }),
+        "{announcement}"
+    );
+    assert_eq!(
+        announcement["body"],
+        json!(ANNOUNCED_BODY),
+        "{announcement}"
+    );
+    assert_eq!(announcement["mob_id"], json!(MOB_ID), "{announcement}");
+
+    wait_until("the batch turn to reach the model", SETTLE_TIMEOUT, || {
+        log.lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| last_message_text(request).contains(BATCH_MARKER))
+    });
+    let log = log.lock().unwrap();
+    let batch_turn = log
+        .requests
+        .iter()
+        .find(|request| last_message_text(request).contains(BATCH_MARKER))
+        .expect("the batch turn");
+    let text = last_message_text(batch_turn);
+    assert!(
+        text.contains(&format!("by member \"{ANNOUNCER}\"")),
+        "the batch introduces the announcement as the announcer's: {text}"
+    );
+    assert!(
+        text.contains(&format!("> {ANNOUNCED_BODY}")),
+        "the body is quoted: {text}"
+    );
+    let offered = offered_tools(batch_turn);
+    assert!(
+        !offered
+            .iter()
+            .any(|name| MEMBER_TOOLS.contains(&name.as_str())),
+        "a profile that does not opt in is not offered the member tools: {offered:?}"
+    );
+    eprintln!(
+        "mob announcement member tool evidence: answer={answer} batch={batch_id} \
+         announced_by={} model_requests={}",
+        announcement["announced_by"],
+        log.requests.len()
+    );
+    drop(log);
     gateway.shutdown_and_reap();
 }

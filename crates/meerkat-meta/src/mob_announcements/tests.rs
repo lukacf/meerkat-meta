@@ -3885,6 +3885,105 @@ async fn a_call_that_cannot_be_attributed_changes_nothing() {
     );
 }
 
+/// What attributing a call from `session` decides when the roster binds
+/// `bound` to it and the identity runtime records `record` for `agent:a`
+/// and knows no other identity.
+async fn attributed(
+    session: &meerkat_core::types::SessionId,
+    bound: &[&str],
+    record: super::tools::RecordedBinding,
+) -> std::result::Result<Member, String> {
+    let bound = bound.iter().map(|id| (*id).to_string()).collect::<Vec<_>>();
+    super::tools::attribute(&mob(OWN_MOB), session, &bound, |agent| {
+        std::future::ready(if agent.as_str() == "agent:a" {
+            Ok(record)
+        } else {
+            Err(format!(
+                "the calling member is not registered here: unknown identity {agent}"
+            ))
+        })
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_call_is_attributed_only_to_the_one_member_both_records_agree_on() {
+    let session = meerkat_core::types::SessionId::new();
+    let current = super::tools::RecordedBinding {
+        session_id: Some(session.to_string()),
+        runtime_id: Some("rt:agent:a:1".to_string()),
+    };
+    let encoded = crate::member_comms_id::mob_member_id_str("agent:a").into_owned();
+    // The roster row in either spelling, bound to the session the identity
+    // runtime records: the call is that member's.
+    for roster_id in ["agent:a", encoded.as_str()] {
+        assert_eq!(
+            attributed(&session, &[roster_id], current.clone()).await,
+            Ok(member("agent:a")),
+            "{roster_id}"
+        );
+    }
+
+    let another_session = super::tools::RecordedBinding {
+        session_id: Some(meerkat_core::types::SessionId::new().to_string()),
+        ..current.clone()
+    };
+    let no_session = super::tools::RecordedBinding {
+        session_id: None,
+        ..current.clone()
+    };
+    let cases: [(&str, &[&str], super::tools::RecordedBinding, &str); 7] = [
+        (
+            "no roster entry is bound to the session",
+            &[],
+            current.clone(),
+            "not a member of this gateway's mob",
+        ),
+        (
+            "two roster entries are bound to the session",
+            &["agent:a", "agent:b"],
+            current.clone(),
+            "more than one member",
+        ),
+        (
+            "the roster id is no durable identity",
+            &["not durable"],
+            current.clone(),
+            "not a durable identity",
+        ),
+        (
+            "the identity runtime does not know the identity",
+            &["agent:b"],
+            current.clone(),
+            "not registered here",
+        ),
+        (
+            "the identity runtime records another session",
+            &["agent:a"],
+            another_session,
+            "does not record the calling session",
+        ),
+        (
+            "the identity runtime records no session",
+            &["agent:a"],
+            no_session,
+            "does not record the calling session",
+        ),
+        // A generated runtime alias is never decoded to the durable
+        // identity, even when it names the current incarnation.
+        (
+            "the roster id is a runtime alias",
+            &["rt:agent:a:1"],
+            current.clone(),
+            "not registered here",
+        ),
+    ];
+    for (what, bound, record, reason) in cases {
+        let refused = attributed(&session, bound, record).await.expect_err(what);
+        assert!(refused.contains(reason), "{what}: {refused}");
+    }
+}
+
 #[tokio::test]
 async fn member_limits_bound_announcements_and_subscriptions() {
     let tools = tool_harness(super::tools::MemberLimits {
@@ -3903,6 +4002,14 @@ async fn member_limits_bound_announcements_and_subscriptions() {
             .await;
         assert_eq!(failed, expected_failure, "announcement {index}: {result}");
     }
+    let (failed, result) = tools
+        .call(
+            Some("agent:b"),
+            super::tools::ANNOUNCE_TOOL,
+            serde_json::json!({ "topics": ["ios"], "body": "x", "key": "k0" }),
+        )
+        .await;
+    assert!(!failed, "another member's minute is its own: {result}");
     tools.harness.clock.fetch_add(60_000, Ordering::SeqCst);
     let (failed, result) = tools
         .call(
@@ -3983,4 +4090,60 @@ async fn members_see_and_change_only_their_own_subscriptions() {
         .await;
     assert_eq!(listed["subscriptions"][0]["subscription"], "news");
     assert_eq!(listed["subscriptions"][0]["state"], "active", "{listed}");
+}
+
+/// Two members naming the same key or the same subscription never meet:
+/// each name lives in its member's own namespace.
+#[tokio::test]
+async fn two_members_never_meet_under_one_name() {
+    let tools = tool_harness(super::tools::MemberLimits::default());
+    for who in ["agent:a", "agent:b"] {
+        let (failed, result) = tools
+            .call(
+                Some(who),
+                super::tools::ANNOUNCE_TOOL,
+                serde_json::json!({ "topics": ["ios"], "body": "checkout fixed", "key": "fix-1" }),
+            )
+            .await;
+        assert!(!failed, "{who}: {result}");
+        assert_eq!(result["replayed"], false, "{who}: {result}");
+        let (failed, result) = tools
+            .call(
+                Some(who),
+                super::tools::SUBSCRIPTION_TOOL,
+                serde_json::json!({ "action": "subscribe", "subscription": "news", "topics": ["ios"] }),
+            )
+            .await;
+        assert!(!failed, "{who}: {result}");
+        assert_eq!(result["revision"], 1, "{who}: {result}");
+    }
+    for who in ["agent:a", "agent:b"] {
+        let key = format!("{}-fix-1", super::tools::member_prefix(&member(who)));
+        let stored = tools
+            .harness
+            .store
+            .announcement(&mob(OWN_MOB), &SourceKey::new(key).unwrap())
+            .await
+            .unwrap()
+            .expect("each member's key is its own");
+        assert_eq!(
+            stored.announced_by,
+            Announcer::Member {
+                identity: MemberIdentity::new(who).unwrap(),
+            },
+            "{who}"
+        );
+        let (_, listed) = tools
+            .call(
+                Some(who),
+                super::tools::SUBSCRIPTION_TOOL,
+                serde_json::json!({ "action": "list" }),
+            )
+            .await;
+        assert_eq!(
+            listed["subscriptions"].as_array().map(Vec::len),
+            Some(1),
+            "{who}: {listed}"
+        );
+    }
 }

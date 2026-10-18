@@ -122,40 +122,72 @@ impl CallerResolver for RosterCallerResolver {
             .filter(|entry| entry.bridge_session_id() == Some(session))
             .map(|entry| entry.agent_identity.as_str().to_string())
             .collect::<Vec<_>>();
-        let roster_id = match bound.as_slice() {
-            [one] => one.clone(),
-            [] => return Err("the calling session is not a member of this gateway's mob".into()),
-            _ => return Err("the calling session is bound to more than one member".into()),
-        };
-        // Decode only the comms-safe encoding: a generated runtime alias is
-        // never taken for the durable identity.
-        let identity = crate::member_comms_id::runtime_alias_str(&roster_id).into_owned();
-        let agent = crate::identity_first::AgentIdentity::parse(&identity)
-            .map_err(|error| format!("the calling member is not a durable identity: {error}"))?;
-        let status = self
-            .identities
-            .status(&agent)
-            .await
-            .map_err(|error| format!("the calling member is not registered here: {error}"))?;
-        let session = session.to_string();
-        let registered_session = status.session_id.as_ref().map(ToString::to_string);
-        if !crate::member_comms_id::live_binding_matches_identity(
-            &roster_id,
-            Some(session.as_str()),
-            &identity,
-            registered_session.as_deref(),
-            status
-                .agent_runtime_id
-                .as_ref()
-                .map(crate::identity_first::AgentRuntimeId::as_str),
-        ) {
-            return Err(
-                "the identity runtime does not record the calling session for this member".into(),
-            );
-        }
-        let identity = MemberIdentity::new(identity).map_err(|error| error.to_string())?;
-        Ok(Member::new(self.own_mob.clone(), identity))
+        attribute(&self.own_mob, session, &bound, |agent| async move {
+            let status =
+                self.identities.status(&agent).await.map_err(|error| {
+                    format!("the calling member is not registered here: {error}")
+                })?;
+            Ok(RecordedBinding {
+                session_id: status.session_id.as_ref().map(ToString::to_string),
+                runtime_id: status
+                    .agent_runtime_id
+                    .as_ref()
+                    .map(|runtime_id| runtime_id.as_str().to_string()),
+            })
+        })
+        .await
     }
+}
+
+/// What the identity runtime records for an identity: the session it is
+/// bound to and the runtime id of its current incarnation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RecordedBinding {
+    pub(crate) session_id: Option<String>,
+    pub(crate) runtime_id: Option<String>,
+}
+
+/// Attribute a call from `session` to a member of `own_mob`. `bound` is the
+/// roster ids of the entries the mob roster binds to that session, and
+/// `recorded` reads what the identity runtime records for an identity. The
+/// call belongs to a member only when exactly one entry is bound, it names a
+/// durable identity, and the identity runtime records this very session for
+/// it; anything else is refused.
+pub(crate) async fn attribute<F, Fut>(
+    own_mob: &MobId,
+    session: &SessionId,
+    bound: &[String],
+    recorded: F,
+) -> Result<Member, String>
+where
+    F: FnOnce(crate::identity_first::AgentIdentity) -> Fut,
+    Fut: std::future::Future<Output = Result<RecordedBinding, String>>,
+{
+    let roster_id = match bound {
+        [one] => one.as_str(),
+        [] => return Err("the calling session is not a member of this gateway's mob".into()),
+        _ => return Err("the calling session is bound to more than one member".into()),
+    };
+    // Decode only the comms-safe encoding: a generated runtime alias is
+    // never taken for the durable identity.
+    let identity = crate::member_comms_id::runtime_alias_str(roster_id).into_owned();
+    let agent = crate::identity_first::AgentIdentity::parse(&identity)
+        .map_err(|error| format!("the calling member is not a durable identity: {error}"))?;
+    let record = recorded(agent).await?;
+    let session = session.to_string();
+    if !crate::member_comms_id::live_binding_matches_identity(
+        roster_id,
+        Some(session.as_str()),
+        &identity,
+        record.session_id.as_deref(),
+        record.runtime_id.as_deref(),
+    ) {
+        return Err(
+            "the identity runtime does not record the calling session for this member".into(),
+        );
+    }
+    let identity = MemberIdentity::new(identity).map_err(|error| error.to_string())?;
+    Ok(Member::new(own_mob.clone(), identity))
 }
 
 /// What the bundle serves from. Set once, when mob announcements are
