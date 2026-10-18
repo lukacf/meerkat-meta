@@ -5211,18 +5211,21 @@ async fn this_gateways_own_mob_never_gets_a_lineage_record() {
         matches!(refused, Err(AnnouncementError::UnrelatedMob(_))),
         "{refused:?}"
     );
+    let recorded = |harness: &Harness| {
+        let store = Arc::clone(&harness.store);
+        async move {
+            store
+                .lineage()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|record| record.mob_id.to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    // Read before a reconcile could end a record of the root: there is none
+    // to end, so none can leak.
+    assert_eq!(recorded(&harness).await, ["refunds"]);
     harness.service.reconcile_lineage().await.unwrap();
-    let recorded = harness
-        .store
-        .lineage()
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|record| record.mob_id.to_string())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        recorded,
-        ["refunds"],
-        "the root has no record to end or leak"
-    );
+    assert_eq!(recorded(&harness).await, ["refunds"]);
 }
