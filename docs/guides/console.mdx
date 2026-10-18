@@ -811,12 +811,23 @@ Identity-first status and inspect payloads use lowercase wire enums for addressa
 
     `idempotency_key` must be unique per send; the stock console mints one
     UUID per send. An idempotent retry reuses the same key in the same
-    runtime/identity/origin namespace with identical content and effective
-    `handling_mode` (default `queue`). The original acceptance is returned
-    and the turn is not run again. Changed content or handling mode in that
-    namespace is rejected with HTTP `409` / JSON-RPC
-    `-32009 idempotency_conflict`. A different identity or origin is a
-    different send namespace, not a guaranteed replay.
+    caller/runtime/identity/origin namespace with identical content and
+    effective `handling_mode` (default `queue`). The caller is the
+    authenticated principal (anonymous callers of an open console share one
+    local account), so another user's identical key is a different send. An
+    open console without an access controller does not resolve tokens, so all
+    of its callers share that one account; isolating users needs
+    `require_app_auth` or an access controller.
+    The original acceptance is returned and the turn is not run again. Changed
+    content or handling mode in that namespace is rejected with HTTP `409` /
+    JSON-RPC `-32009 idempotency_conflict`. A different identity or origin is
+    a different send namespace, not a guaranteed replay.
+
+    A retry of a send the gateway accepted but stopped before submitting is
+    dispatched then, once, into the session the send recorded; a retry of a
+    send the runtime already admitted only settles it. `meta/console/recover_send`
+    (`POST /console/send/recover`) reports a send's status and what the runtime
+    holds for it, for the caller's own sends only.
 
     `skill_refs` is optional: typed, source-pinned skills selected for this
     turn (`[{"kind": "structured", "source_uuid": "...", "skill_name": "..."}]`,

@@ -2119,7 +2119,10 @@ async fn handle_wire(
     let wire = params.wire;
     let result =
         run_control_member_operation(identity_runtime, params.remote_member, move || async move {
-            let mid = crate::member_comms_id::mob_member_id(&operation_member);
+            // `run_control_member_operation` gates this closure: a generated
+            // alias here is the identity's current incarnation, held under its
+            // lifecycle lock, so it names the durable roster row.
+            let mid = crate::member_comms_id::roster_member_id_for_supplied_id(&operation_member);
             let result = if wire {
                 operation_handle
                     .wire(mid, meerkat_mob::PeerTarget::External(spec))
@@ -2156,7 +2159,8 @@ async fn handle_inject(
     let operation_handle = handle.clone();
     let operation_member = crate::member_comms_id::runtime_alias_str(remote_member).into_owned();
     match run_control_member_operation(identity_runtime, remote_member, move || async move {
-        let mid = crate::member_comms_id::mob_member_id(&operation_member);
+        // Gated by `run_control_member_operation`, as in `handle_wire`.
+        let mid = crate::member_comms_id::roster_member_id_for_supplied_id(&operation_member);
         operation_handle
             .member(&mid)
             .await
@@ -2336,12 +2340,17 @@ pub(crate) fn lookup_address_fault(fault: MemberPlaneFault) -> (String, String) 
     }
 }
 
+/// Look a member up by `remote_member` with no identity gate of its own.
+///
+/// `remote_member` must already have passed `run_control_member_operation`
+/// (as `handle_lookup_member` does): a generated alias that reaches here is
+/// the identity's current incarnation, so it names the durable roster row.
 pub(crate) async fn handle_lookup_member_raw(
     handle: &meerkat_mob::MobHandle,
     session_service: Option<&std::sync::Arc<dyn meerkat_mob::MobSessionService>>,
     remote_member: &str,
 ) -> Result<ControlResponse, (String, String)> {
-    let mid = crate::member_comms_id::mob_member_id(remote_member);
+    let mid = crate::member_comms_id::roster_member_id_for_supplied_id(remote_member);
     let mob_id = handle.mob_id().to_string();
     let entry = match handle.get_member(&mid).await {
         Ok(Some(e)) => e,
@@ -3173,6 +3182,79 @@ mod tests {
 
         assert_eq!(error.0, "identity_authority_unavailable");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The control plane follows the member-id alias rule: a request naming a
+    /// member by its CURRENT runtime alias runs under that identity's
+    /// lifecycle lock and acts on the durable roster row the alias names.
+    /// Before, the operation encoded the alias itself, which no row has, so
+    /// lookup and inject answered unknown_member and wire failed for a
+    /// healthy member.
+    #[tokio::test]
+    async fn control_requests_reach_the_member_a_current_runtime_alias_names()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let identity_runtime = identity_runtime_with_current_alias().await?;
+        let dir = tempfile::tempdir()?;
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            "[mob]\nid = \"control-current-alias\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+             external_addressable = true\n\n[profiles.worker.tools]\ncomms = true\n",
+        )?;
+        let spec = crate::mob_handle_runtime::MobBootstrapSpec::ephemeral(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            dir.path().to_path_buf(),
+            4,
+            None,
+        )?
+        .with_options(crate::mob_handle_runtime::MobBootstrapOptions {
+            allow_ephemeral_sessions: true,
+            notify_orchestrator_on_resume: true,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        });
+        let runtime = crate::mob_handle_runtime::MobRuntime::bootstrap(spec).await?;
+        let handle = runtime.handle();
+        handle
+            .ensure_member(meerkat_mob::SpawnMemberSpec::new(
+                meerkat_mob::ProfileName::from("worker"),
+                meerkat_mob::AgentIdentity::from("worker"),
+            ))
+            .await?;
+
+        let lookup =
+            handle_lookup_member(&handle, None, "rt:worker:0", Some(&identity_runtime)).await;
+        let injected = handle_inject(
+            &handle,
+            "rt:worker:0",
+            serde_json::json!("hello"),
+            Some(&identity_runtime),
+        )
+        .await;
+        let remote_peer_id =
+            meerkat_core::comms::PeerId::from_ed25519_pubkey(&[42_u8; 32]).to_string();
+        let wired = handle_wire(
+            &handle,
+            WireControlParams {
+                remote_member: "rt:worker:0",
+                local_peer_spec_address: "tcp://127.0.0.1:9001",
+                local_comms_name: "remote-mob/worker/peer",
+                local_peer_id: &remote_peer_id,
+                local_pubkey_b64: Some("KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="),
+                wire: true,
+            },
+            Some(&identity_runtime),
+        )
+        .await;
+        assert_eq!(
+            (
+                matches!(&lookup, ControlResponse::Member { comms_name, .. } if comms_name.ends_with("/worker")),
+                matches!(&injected, ControlResponse::Injected { .. }),
+                matches!(&wired, ControlResponse::Ok { .. }),
+            ),
+            (true, true, true),
+            "lookup: {lookup:?}\ninject: {injected:?}\nwire: {wired:?}"
+        );
+        let _ = handle.shutdown().await;
+        Ok(())
     }
 
     // -- caller authorization (scoped grants) --

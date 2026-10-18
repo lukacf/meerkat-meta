@@ -43,7 +43,10 @@ use super::{MobEventIngress, UnifiedRuntime, discovery_spec_to_spawn_spec};
 /// A payload without a report (a producer that predates it, or a
 /// payload-less envelope) falls back to the bare event id the line always
 /// carried.
-fn run_failed_crash_error(event_id: &str, payload: Option<&serde_json::Value>) -> String {
+pub(super) fn run_failed_crash_error(
+    event_id: &str,
+    payload: Option<&serde_json::Value>,
+) -> String {
     fn string_field(value: Option<&serde_json::Value>) -> Option<&str> {
         value.and_then(serde_json::Value::as_str)
     }
@@ -771,32 +774,17 @@ impl UnifiedRuntime {
         loop {
             match Self::try_recv_ingress_event(ingress) {
                 Some(Ok(forwarded)) => {
-                    // Fire the typed alert the forwarder extracted at ingest
-                    // (e.g. a member compaction persistence rejection). The
-                    // hook is read here, at drain time, so hooks installed
-                    // via `set_error_hook` after construction still fire.
+                    // Fire the typed alert the forwarder extracted at ingest,
+                    // while the member event was still typed: a member
+                    // compaction persistence rejection, or a failed member
+                    // run as `HostLoopCrash` (a cancelled run is not a
+                    // crash). The hook is read here, at drain time, so hooks
+                    // installed via `set_error_hook` after construction still
+                    // fire.
                     if let Some(alert) = forwarded.alert {
                         self.fire_error(alert);
                     }
                     let unified_event = forwarded.envelope;
-                    // Detect agent run failures and fire HostLoopCrash, naming
-                    // the typed failure (class, reason, message) carried in
-                    // the payload's `error_report`.
-                    if let crate::types::UnifiedEvent::Agent {
-                        ref agent_id,
-                        ref event_type,
-                        ref payload,
-                    } = unified_event.event
-                        && event_type == "run_failed"
-                    {
-                        self.fire_error(super::types::ErrorEvent::HostLoopCrash {
-                            member_id: agent_id.clone(),
-                            error: run_failed_crash_error(
-                                &unified_event.event_id,
-                                payload.as_ref(),
-                            ),
-                        });
-                    }
                     // Ingest into event log (non-blocking, buffered)
                     self.ingest_event(&unified_event);
                     self.project_console_event_from_unified(&unified_event)

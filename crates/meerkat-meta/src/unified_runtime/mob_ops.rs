@@ -88,6 +88,22 @@ impl UnifiedRuntime {
         }
     }
 
+    /// The mobs bound without extension authority, each with its typed
+    /// reason. A mob activates (a create, a restore, a held child's resume)
+    /// under an id that live extension documents name for another holder, or
+    /// while the document store cannot tell who holds the id; it binds, but
+    /// its members resolve no document caller, it is no valid document owner
+    /// and nobody manages it, until it is destroyed or a later restore of it
+    /// binds normally. Empty without extension tool bundles or document
+    /// bindings.
+    #[cfg(feature = "extension-state")]
+    pub fn extension_mob_quarantines(&self) -> Vec<crate::extension_state::MobIdQuarantine> {
+        self.extension_authority
+            .as_ref()
+            .map(|registry| registry.quarantines())
+            .unwrap_or_default()
+    }
+
     /// Start a completion-bearing turn for a public member alias.
     ///
     /// Admission proves that the runtime input was accepted; it does not prove
@@ -105,7 +121,16 @@ impl UnifiedRuntime {
         options: MemberTurnOptions,
         event_tx: Option<MemberTurnEventSender>,
     ) -> Result<MemberTurnAdmission, MobRuntimeError> {
-        let identity = crate::member_comms_id::mob_member_id(member_alias);
+        // Member-id alias rule: decode first, so an encoded roster id is not
+        // encoded twice, and refuse a generated runtime alias, which this
+        // direct turn start has no identity authority to pin to a generation.
+        let alias = crate::member_comms_id::runtime_alias_str(member_alias);
+        if crate::member_comms_id::is_reserved_generated_alias(&alias) {
+            return Err(MobRuntimeError::InvalidInput(
+                "generated member alias requires identity authority",
+            ));
+        }
+        let identity = crate::member_comms_id::mob_member_id(&alias);
         let member = self.mob_handle().member(&identity).await?;
         let turn = member
             .start_turn(content, handling_mode, options, event_tx)

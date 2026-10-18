@@ -164,7 +164,9 @@ complete candidate matrix together.
 an explicit selection of accepted, immutable candidate artifacts. `make release`
 still means a local optimized build; it is not a publication command.
 
-Prepare the release-version/dependency changes in a PR and merge it. Candidate
+Prepare the release-version/dependency changes in a PR and merge it
+(`./scripts/repo-cargo release <version>` previews the version cut and changes
+nothing; `--execute --no-tag --no-push` makes the release commit). Candidate
 production must run from that final merged commit, not a PR head or an earlier
 build. Candidate runs may start as soon as the commit is on main: their build
 legs run beside the commit's `ci.yml` **push-to-main** run, and collection
@@ -261,6 +263,12 @@ make release-promote RELEASE_TAG=vX.Y.Z \
   ARTIFACT_SELECTION=/absolute/path/accepted-candidate.json \
   REGISTRY_DRY_RUN=true
 ```
+
+`TIER` is for `release-candidate` only. `release-promote`,
+`release-assets-recover` and `release-registry-retry` take the tier from the
+selection (or the published release) and refuse `TIER` with "TIER is only valid
+for candidate". Leave it off, and unset it if your shell still exports it from
+the candidate step: make reads `TIER` from the environment too.
 
 Promotion verifies the original signed provenance, including the certificate's
 source digest and workflow identity, run/attempt, artifact ZIP digests, archive

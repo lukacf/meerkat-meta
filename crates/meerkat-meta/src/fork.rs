@@ -286,7 +286,6 @@ impl UnifiedRuntime {
                 "fork source member alias must not be empty".to_string(),
             ));
         }
-        let source_identity = crate::member_comms_id::mob_member_id(source_alias.as_str());
         let requested_child_alias = spec.identity.as_str().to_string();
         let profile = spec.role_name.to_string();
         // The fork is foreground work: it holds the public owner (`handle`)
@@ -315,8 +314,8 @@ impl UnifiedRuntime {
         // Pin the SOURCE alias to a current identity first.
         //
         // `meta/fork_helper` carries a fourth arm here -
-        // `Ok(None) if is_reserved_generated_alias(&source)` -> refuse. That
-        // arm is NOT missing from this function; it is UNREACHABLE.
+        // `Ok(None) if is_reserved_generated_alias(&source)` -> refuse. With
+        // an identity runtime that arm is UNREACHABLE:
         // `IdentityRuntime::member_alias_lifecycle_target`
         // (identity_first/runtime.rs, the `None if
         // crate::member_comms_id::is_reserved_generated_alias(&alias)` arm)
@@ -324,12 +323,13 @@ impl UnifiedRuntime {
         // member alias requires identity authority: ..."))` for precisely
         // that case, so a generated source alias can never reach an
         // `Ok(None)` here. It becomes `SourceAuthority` through the `map_err`
-        // below. A second copy of the check would only be able to drift.
+        // below.
         //
         // `Ok(None)` therefore means exactly one thing: the alias is a plain
         // raw member. `None` from the `match` means no identity runtime was
-        // supplied or installed. Both run the fork unlocked, exactly as
-        // `meta/fork_helper` does in the same cases.
+        // supplied or installed; there the source mapping below refuses a
+        // generated alias, as that fourth arm does. A plain alias runs the
+        // fork unlocked in both cases, exactly as `meta/fork_helper` does.
         let source_target = match identity_runtime {
             Some(identity_runtime) => identity_runtime
                 .member_alias_lifecycle_target(&source_alias)
@@ -338,6 +338,19 @@ impl UnifiedRuntime {
             None => None,
         };
 
+        // Member-id alias rule for the source: one the identity authority owns
+        // (checked current, and again under the lock below) names its durable
+        // roster row; with no identity runtime a generated alias has no
+        // authority to pin its generation and is refused.
+        let source_identity = if source_target.is_some() {
+            crate::member_comms_id::roster_member_id_for_supplied_id(source_alias.as_str())
+        } else if crate::member_comms_id::is_reserved_generated_alias(&source_alias) {
+            return Err(ForkMemberError::SourceAuthority(format!(
+                "generated member alias requires identity authority: {source_alias}"
+            )));
+        } else {
+            crate::member_comms_id::mob_member_id(source_alias.as_str())
+        };
         let (member_alias, fork) = if let Some(source_target) = source_target {
             // The tracked wrapper acquires the source alias's lifecycle lock
             // before the operation body runs, so a stale or mid-lifecycle

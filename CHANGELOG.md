@@ -7,7 +7,326 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-10-18
+
+### Breaking
+
+- Behaviour-only: with the `extension-state` feature, the document service
+  in the `ToolBundleContext` that a tool bundle or document MCP binding
+  factory receives refuses, with `AuthorityUnavailable`, every operation of
+  a caller context its caller resolver did not resolve, such as one the
+  embedding host built with `HostAccessContext::new`, and of a caller whose
+  authority names a mob id that changed after it was resolved (see Fixed).
+  Resolve the caller through `ToolBundleContext::caller_resolver` for each
+  call; a host that needs unordered access uses the store its
+  `MetaStorageProvider` opened directly.
+- Behaviour-only: with the `extension-state` feature, a document store that
+  an embedding host supplies through `MetaStorageProvider::open_extension_state`
+  must implement the new `ExtensionDocumentStore::mob_id_holder` and
+  `ExtensionDocumentStore::record_mob_id_holder`. Their default
+  implementations answer an error, which the runtime treats as a quarantine:
+  every mob is then bound without extension authority when it activates
+  (see Fixed). A provider that applies `SCHEMA` through its own migration
+  ledger and opens the store with `SqliteExtensionDocumentStore::from_connection`
+  must apply the new `extension_mob_holders` table before 0.9.3 opens the
+  store; until then the holder calls fail, with the same effect. Migration
+  notes:
+  - A store a host implements: implement both methods, durably and in the
+    same storage as the documents, and run
+    `meta_store_conformance::chapters::mob_id_holders` (and `mob_references`)
+    against it.
+  - A provider that applies `SCHEMA` itself: apply `MOB_ID_HOLDERS_SCHEMA`,
+    the end of `SCHEMA` (a `CREATE TABLE IF NOT EXISTS`).
+  - The built-in store needs nothing: it adds the table when it opens, as a
+    plain table outside its ledger domain, so Meta 0.9.2 still opens a store
+    that 0.9.3 opened, ignores the table and refuses nothing.
+  - Restoring a whole state generation keeps its mobs bound: documents,
+    holder records and mob state are restored together.
+  - After running 0.9.2 against a store, a mob that 0.9.2 created under an id
+    another holder held before can be quarantined at the next 0.9.3 restore
+    while documents name its id. To accept it, delete the id's row from
+    `extension_mob_holders`: the next restore adopts the id.
+
+- Behaviour-only (not measured by the semver gate): `ErrorEvent::HostLoopCrash`
+  no longer fires for a member run that ended cancelled (`error_report.class`
+  `cancelled`): an interrupt (a hard interrupt that drops the run included,
+  which Meerkat reports as a cancelled `RunFailed`), a mob stop or a shutdown
+  cancels in-flight work on purpose. Every other failed run still fires it,
+  with the same detail.
+  The cancelled run's `run_failed` event still reaches the console and the
+  event log; a hook that counted cancellations through `host_loop_crash`
+  reads those events instead.
+- Behaviour-only: `ErrorEvent::ReconcileIncomplete` fires only when an edge
+  operation failed (`failures` above zero; `skipped` still counts the edges
+  skipped beside them). A reconcile that only skipped edges, because an
+  endpoint is not a member yet, logs one INFO line instead: lazy identity
+  bootstrap leaves such edges pending by design, so it fired on every boot
+  with nothing failed. `reconcile_edges()` and `bootstrap_edges_report()`
+  still list those edges in `skipped_missing_members`, and `is_complete()`
+  is unchanged.
+
+- Behaviour-only: `meta/mobpacks/apply_operation` refuses every operation
+  but the deletes (`delete_flow_step`, `delete_graph_node`,
+  `delete_graph_edge` and `delete_member`) with `-32602`, not only the
+  graph operations, on a document whose graph has more than 2048 instances
+  or more than 8192 edges: operations that do not edit the graph can still
+  walk it. The deletes are let through so such a document can be brought
+  back under the caps. An operation that would push the graph past the
+  caps, a flow operation that derives the graph again from the flow
+  included, is refused too. `meta/mobpacks/graph_to_flow`, export and
+  deploy refuse such a document, and its validation fails with
+  `too_many_graph_instances` or `too_many_graph_edges` (see Security).
+- Behaviour-only: the `row` of a Flow Editor draft write
+  (`meta/mobpacks/create`, `save`, `undo` and `redo`) is the draft as
+  stored, with the editor document it was saved with. Draft replies other
+  than `meta/mobpacks/get` no longer re-import each valid draft's archive
+  and carry its document with `document_source: "mobpack_archive"` and
+  `document_authority: "artifact"`; `get` still does, for the draft it
+  returns. A document past a structure cap now fails validation with the
+  cap's diagnostic alone.
+- Behaviour and SDK types: Flow Editor draft replies list the drafts as
+  summaries. The `rows` of `meta/mobpacks/create`, `save`, `list`, `undo`,
+  `redo` and `delete` hold each draft's `id`, `name`, `version`, `stage`,
+  `trigger`, `source`, `description`, `revision`, `etag`,
+  `updated_at_unix_ms`, `can_undo` and `can_redo` (labels cut to 256
+  characters), and no `document`, `artifact` or `validation`. The `row` of
+  a write is the written draft whole, as before, and `meta/mobpacks/get`
+  returns a draft's document: the Flow Editor library opens a draft with
+  `get`. The Python SDK's draft results type `rows` as the new
+  `MobpackDraftSummary`, and the TypeScript SDK's as `MobpackDraftSummary`.
+  A draft id longer than 256 characters is refused.
+
+- `DistillerError`, `HygienistError` and `StewardError` gain an
+  `Incomplete { stop_reason }` variant (see Fixed). Code that matches one of
+  them exhaustively needs an arm for it.
+
+- `meta/topology/apply` idempotency keys are scoped to the caller. A Console
+  caller (its verified human; else its authenticated principal, with the
+  provider and issuer that verified it; else the open Console's anonymous
+  account), the gateway's JSON-RPC surface, and each principal a host names to
+  `TopologyRuntimeHandle::apply_as` or `SameProcessTopologyCoordinator::apply`
+  have their own keys: the same key from two callers names two operations, and
+  a retry replays only its own caller's apply. An open Console without an
+  access controller never resolves tokens, so every caller there, even one
+  presenting a valid token, is that shared anonymous account; isolating
+  callers needs `require_app_auth` or an access controller. The host's
+  `TopologyRuntimeHandle::apply`, and `apply_as` or the coordinator without a
+  principal, keep their keys as before; such a host key may no longer begin
+  with `apply-scoped:`.
+- Upgrade note: an apply recorded before this version is not matched by any
+  scoped caller, and one recorded under a key that begins with
+  `apply-scoped:` is matched by no caller. A retry across the upgrade with
+  the same key is evaluated as a new apply (refused with
+  `topology_revision_conflict` when its `expected_revision` is stale), and a
+  scoped retry of an apply still pending at the upgrade answers
+  `topology_operation_in_progress` until recovery closes it. A downgrade and
+  re-upgrade drops the keys scoped callers recorded before the downgrade (the
+  earlier version rewrites the state without marking them), so their retries
+  are likewise evaluated as new applies.
+
+- Behaviour-only (not measured by the semver gate): console send records
+  written before this version are not matched by any Console caller, so a
+  send in flight during the upgrade and retried afterwards with the same key
+  is admitted as a new send.
+
+- With console access rules enabled, `meta/attach_existing_session`, and
+  `meta/ensure_member` with `resume_session_id`, refuse a session that no
+  member owns, such as one created outside a mob, unless the caller is an
+  admin. The refusal is `access_denied` with reason
+  `session_owner_unknown`. Attach such a session as an admin.
+
+### Security
+
+- The stock reference app router's documented bound on requests in flight
+  (`DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS`) was not enforced across
+  routes and connections: a client could run more handlers at once by
+  spreading requests over routes and connections, and the routes the gateway
+  adds after the reference router (the host's routes and the live WebSocket
+  door) had no bound at all. The bound now holds app-wide (see Fixed).
+
+- Flow Editor validation holds at most the 1000 diagnostics it reports while
+  it runs. It built every diagnostic before it truncated the list, so its peak
+  memory grew with the number of problems in a document: a flow of 100000
+  empty steps, about 300 KiB of JSON that any caller reaching a Flow Editor
+  route could send, took about 100 MiB. Every check now passes its
+  diagnostics to one collector that keeps the first 1000 and only notes the
+  rest. A validation still fails on an error past the cap and still ends with
+  `diagnostics_truncated`, whose severity is `error` when a dropped
+  diagnostic was one.
+- Deriving a flow from a Flow Editor graph (`meta/mobpacks/graph_to_flow`,
+  the graph operations of `meta/mobpacks/apply_operation`, and the graph
+  check every validation runs, import and draft save included) turns each
+  graph node into at most one step. The lanes of a fork that ran into one
+  shared chain without a join each copied the whole chain, B lanes into a
+  chain of T nodes making B x T steps, and instances repeating one id each
+  became a step that copied the prior step of that id. The derived flow grew
+  with those references, not with the graph, which no structure cap counts:
+  a document under the HTTP body limit could expand into gigabytes. Now a
+  repeated id is one node, and a lane stops at a node another lane already
+  took. Prior steps are also read in place instead of cloned, which copied
+  each step once for every step enclosing it.
+- The Flow Editor draft store no longer falls back to a fixed file in the OS
+  temp directory when neither `XDG_STATE_HOME` nor `HOME` is set and
+  `META_FLOW_EDITOR_DRAFT_STORE` names no store, as can happen for a
+  standalone `meta_flow_editor` started by a service manager. Another local
+  user could create, link or read that predictable shared path first. The
+  draft methods now refuse with `-32602` and
+  `data: {"kind": "draft_store_unavailable", "reason": "gateway_home_unavailable"}`,
+  and the message names the remedy: set `META_FLOW_EDITOR_DRAFT_STORE` to a
+  file in a directory only the gateway's user can write, or set
+  `XDG_STATE_HOME` or `HOME`. An unadopted predecessor gateway home, which
+  already refused, refuses with the same kind and `reason`
+  `predecessor_gateway_home` or `adoption_incomplete`.
+- Flow Editor draft replies (`meta/mobpacks/create`, `save`, `list`, `get`,
+  `undo`, `redo` and `delete`) name the draft store's host path as
+  `store_path` only to a caller with host access: the host's stdio and
+  in-process RPC, and a Flow Editor caller with the `mobpack.deploy` grant or
+  the host deploy opt-in. Every reply to any other caller, such as an
+  anonymous caller of a loopback Flow Editor route, carried the store's
+  absolute path. Those replies now carry no `store_path` (the SDKs' draft
+  results already read it as optional), and the store's read, parse and
+  write errors and its predecessor-home refusal name no host path to such a
+  caller. A Rust host that calls the `meerkat_meta::mobpack` draft functions
+  itself gets `store_path` when it runs them under
+  `with_host_path_skill_reads`, as it already does to read path skills.
+- The Flow Editor draft store holds at most 256 drafts and 64 MiB. Every
+  draft method reads and rewrites the whole store, and each draft keeps up
+  to 25 undo and 25 redo snapshots of its document, so any caller reaching a
+  Flow Editor route could grow the store, and with it every later call's
+  memory and time, without bound. A new draft past the count, or a write
+  that would grow the store file past 64 MiB, is now refused with `-32602`
+  and `data: {"kind": "draft_store_full", "limit": "drafts", "max_drafts": 256}`
+  or `{"kind": "draft_store_full", "limit": "bytes", "max_bytes": 67108864,
+  "required_bytes": ...}`, and writes nothing. Undo and redo history yields
+  first: before a write is refused, the oldest snapshots go, of the drafts
+  updated longest ago first and of the written draft last, so history alone
+  never blocks a save. Deletes always run, and a store already past a cap
+  takes writes that leave it no larger. Draft replies also stop copying the
+  snapshots they strip from each row.
+- Deriving a flow from a Flow Editor graph (`meta/mobpacks/graph_to_flow`,
+  the graph operations of `meta/mobpacks/apply_operation`, and the graph
+  check every validation runs) indexes the graph once. Every lookup of a
+  node, an edge or a lane's member scanned the whole graph, and finding the
+  join that closes a fork walked the graph again, scanning at each step, for
+  every join it tried and every lane, so the work grew quadratically, and
+  for many forks faster, with the graph's size. A fork's join is now read
+  from where each node's lanes lead, worked out once for the whole graph,
+  and nodes outside the forks are told apart from the forks' columns by a
+  sorted search.
+- A Flow Editor document's graph holds at most 2048 instances and 8192
+  edges. No structure cap counted the graph, and deriving a flow from it
+  still walks a node once for each join whose lanes run through it. Past the
+  caps, validation fails with `too_many_graph_instances` or
+  `too_many_graph_edges` and checks nothing after the caps, and
+  `meta/mobpacks/graph_to_flow`, rendering (export and deploy) and every
+  `meta/mobpacks/apply_operation` but the deletes refuse the document with
+  `-32602` before deriving anything from its graph. The deletes are let
+  through so the document can be brought back under the caps; while its
+  graph stays past them, a deleted node or edge leaves the flow as it was.
+  An operation that would push a graph past the caps, a flow operation
+  that derives the graph again from the flow included, is refused.
+- Importing a mob definition into the Flow Editor (`meta/mobpacks/import`,
+  and the draft methods that re-import a stored archive) groups each frame's
+  steps in one pass over the frame. Every step searched the whole frame for
+  its parallel siblings, and every branched step for the rest of its branch,
+  so a definition of many steps took work quadratic in their number.
+- Validating, exporting and rendering a Flow Editor document look up the
+  skills its members select in an index of its realms' skills, built once.
+  Each selection scanned the realms again, so selecting many skills, or
+  naming many that no realm defines, took work quadratic in their number.
+- Flow Editor draft methods no longer validate documents under the draft
+  store lock that every draft call waits for. Every reply (`create`, `save`,
+  `list`, `undo`, `redo`, `delete`) re-imported and re-validated the archive
+  of each valid draft in the store while holding it, and `save`, `undo`,
+  `redo` and `create` built their row under it, so a store of slow drafts
+  held every caller's draft calls, and the blocking threads they wait on,
+  for as long as that took. Rows are now built before the lock is taken
+  (`undo` and `redo` check when they write that the draft has not changed
+  since they read it), and only `get` re-imports an archive, of the one
+  draft it returns, outside the lock. Validation also stops at a document's
+  structure caps, before the checks whose work they bound, and a new draft
+  is refused as soon as the store is read when it already holds 256.
+- The Flow Editor draft store is written through a new, uniquely named file
+  readable only by its user, in directories created readable only by that
+  user, then renamed over the store. Each write streams the store to that
+  file, and the byte cap is checked by counting, so no write builds a copy
+  of the store in memory. A store file past 128 MiB (written before the
+  caps) is refused before it is read, with `-32602` and
+  `data: {"kind": "draft_store_unavailable", "reason": "store_too_large",
+  "max_read_bytes": 134217728, "store_bytes": ...}`. Before, every draft
+  method read and parsed such a file whole, the store took the default file
+  mode, and writers sharing a store raced on one fixed `.json.tmp` file.
+  The new file is synced to disk before the rename and its directory after
+  it, so a crash leaves either the old store or the new one whole. A write
+  whose directory then cannot be synced has taken effect: it is reported
+  done, with the written draft and a `durability_warning` in its reply,
+  not as a failure that a client would retry.
+- The standalone Flow Editor server (`meta_flow_editor`) handles at most 16
+  requests at once, and the rest wait for a slot. Any local process can call
+  it, and every request it handled ran on the blocking pool, so it took any
+  number of requests at once.
+- Reconciling a Flow Editor document with its members (the member
+  operations of `meta/mobpacks/apply_operation`, `reconcile_members` and
+  `delete_member` among them) looks each member step's and member
+  instance's tools up in an index of the members' tools, built once. Each
+  step and instance scanned the members and collected all of its member's
+  tools again, so one request with a member of many tools in many steps
+  took work quadratic in their number. A member now lists at most 1024
+  tools: past that, validation fails with `too_many_member_tools`, and
+  export and deploy refuse the document.
+- Deriving a flow from a Flow Editor graph walks a chain of nodes that
+  several lanes to one join run through once: a lane stops at a node an
+  earlier lane to the same join walked. Each lane walked the whole chain
+  again, so a fork of many lanes into one long chain took work quadratic in
+  its size.
+- The Flow Editor's catalogs (`meta/skills/catalog`, `meta/mobpacks/catalogs`
+  and `meta/agent_definitions/list`) name no host path to a caller without
+  host access. They named every directory the skills catalog scans (under
+  the home directory, the working directory, the cargo registry and
+  `META_SKILL_DIRS`) and each skill file's absolute path. Each filesystem
+  skill now has its path within its realm's directory, and the realm's
+  directory and the absolute `provenance.path` are left out. A document may
+  name a catalog skill that way, with the `realm_id` of a catalog realm: it
+  is read from that realm's directory under the same checks as a skill
+  named by its host path. A path with a `..`, `.`, empty, drive or backslash
+  component is refused (`selected_skill_path_leaves_realm`), to such a caller
+  before anything is read, and so is a realm the catalog does not list
+  (`selected_skill_realm_not_listed`); a host caller's document with such a
+  realm is read as named, as before. Deploy plans and
+  `meta/mobpacks/deploy_command` previews for such a caller name no host
+  path either: the pack path is the caller's own or the bare file name,
+  never one in the temp directory, and the command runs `rkat`, never the
+  binary `RKAT_BIN` names.
+- Flow Editor draft replies no longer carry every draft's document. Each
+  reply but `meta/mobpacks/get` (`create`, `save`, `list`, `undo`, `redo`
+  and `delete`) carried every draft in the store with its document, archive
+  and validation, up to about 64 MiB a reply, which a slow reader held in
+  memory. Replies now list the drafts as summaries of a few hundred bytes,
+  and a draft id has at most 256 characters.
+
 ### Added
+
+- `meta-extension-state`: `HostAccessContext::with_authority_generation` and
+  `HostAccessContext::authority_generation` carry the host's authority
+  generation a caller was resolved at, and
+  `HostAccessContext::authority_mob_ids` lists the mob ids the caller's
+  authority names. Meta's caller resolver stamps every context it resolves,
+  and its document services refuse an operation naming a mob id whose
+  holder changed after the stamp (see Fixed). Stores do not read them.
+- `meta-extension-state`: `MobIdHolder`, `ExtensionDocumentStore::mob_id_holder`
+  and `ExtensionDocumentStore::record_mob_id_holder`, which
+  `SqliteExtensionDocumentStore` implements in the new `extension_mob_holders`
+  table of `SCHEMA`; `MOB_ID_HOLDERS_SCHEMA` is that table's DDL alone.
+- `UnifiedRuntime::extension_mob_quarantines`, with
+  `extension_state::MobIdQuarantine` and
+  `extension_state::MobIdQuarantineReason`, reports the mobs bound without
+  extension authority; `extension_state::MobIdHolder` re-exports the
+  holder type.
+- `meta-store-conformance` (workspace-only): the `chapters::mob_references`
+  and `chapters::mob_id_holders` profiles, with
+  `ExtensionDocumentStoreFactory`, hold a host's own extension document store
+  to the mob id contract; a store that keeps the default holder methods
+  fails `mob_id_holders`.
 
 - `.github/workflows/warm-deps.yml`, dispatched on a branch whose `Cargo.lock`
   changed, builds the dependency graph of each Rust CI job from that branch's
@@ -17,14 +336,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   commit or an ancestor with the same warm-deps files, so a Meerkat Core bump
   no longer compiles its dependencies cold in every job. CONTRIBUTING.md has
   the release-preparation steps.
+- Python SDK: `MobHandle.spawn_helper` and `MobHandle.fork_helper` take
+  `transport_timeout` (seconds), as `activate_member_instruction` already
+  does. Both calls answer only once the helper's turn has finished, so the
+  transport's default request timeout (60 seconds) gave up on longer helpers
+  while they still ran. The value bounds only the client's wait and is not
+  sent to the gateway, which sets no deadline of its own on a helper run.
+  When the wait runs out the helper's outcome is unknown and it may still be
+  running: reconcile it before any retry, since a retry starts another
+  helper rather than cancelling or deduplicating the first.
+
+- `meta/console/recover_send` and its REST twin `POST /console/send/recover`
+  report the caller's own console send by `identity`, `origin` and
+  `idempotency_key`: its acceptance as it is now, and what the runtime holds
+  for it (`native.state`: `admitted` with the input id and, when known, its
+  phase; `absent`; or `unknown`). A send the evidence shows admitted but not
+  yet settled is settled `delivered`, unless this process is still
+  dispatching it, which is left to that dispatch; nothing is dispatched. A key
+  the caller never used and a key another caller used answer the same
+  `send_not_found`. It is gated like `meta/console/send` (`agent.send`,
+  refused on a read-only console).
+- `ConsoleLogStore::unsettled_send_frames` (defaulted to none) and
+  `UnifiedRuntime::reconcile_interrupted_console_sends`, which both gateways
+  run once at startup.
+- **Forge developer alpha (source):** `installer/` adds Meta Forge, the
+  guided setup and application authoring tool. Describe an idea in a
+  conversation, review the proposed team and behaviour, then build a
+  deployment package to review and install. This release ships the source
+  only: Forge opens from a complete prepared product archive, and a packaged
+  Forge download follows in a later release.
+
+- The attempt in a `PublicIdentityRuntime::attach_live_mcp_server` receipt
+  forwards meerkat's new stdio setup diagnostics,
+  `McpAttachmentAttempt::setup_failure` and `stderr_tail`, under the same
+  identity checks as `observe`: they answer only while the identity is still
+  on the session the server was attached to, checked before and after each
+  read, and `None` otherwise. Without the forwarding the trait's defaults
+  answered `None`, so a host attaching through the identity entry never saw
+  the typed failure or the stderr tail of a stdio server that failed its
+  launch, handshake or tool discovery. The tail stays with the host: Meta
+  does not log it or add it to any event, RPC, SDK or console payload.
+
+- `rpc_gateway`, `meta_gateway` and `meta_flow_editor` take their Tokio worker
+  count from `RKAT_WORKER_THREADS`, the variable the Meerkat 0.9.3 host
+  binaries read, then from Tokio's `TOKIO_WORKER_THREADS`, as
+  `meerkat_runtime::host_stack::worker_threads_from_env` validates them. With
+  neither set they still start one worker per available CPU. A value that is
+  not a whole number of at least 1 is refused at startup, where an invalid
+  `TOKIO_WORKER_THREADS` used to make Tokio panic. A gateway whose container
+  allows fewer threads than its CPU count can now start with fewer workers
+  (see the deployment guide).
+
+- `GatewayMcpComposition::with_attempt_guards`: a host composing a gateway
+  member factory can install its Meerkat MCP attempt guard installation
+  (`meerkat_mcp::McpAttemptGuards`) on that factory together with its
+  composer. Every first, restored and rebuilt member construction of the
+  factory then begins the host's guard before any stdio server of its own is
+  spawned, and the guard is finished once the attempt's open outcome and
+  process end are both known. Gateway custody and defaults are unchanged; a
+  composition without it installs no guards.
 
 ### Changed
+
+- Requires Meerkat 0.9.3: every Meerkat dependency is pinned to
+  `=0.9.3` from crates.io.
+- Flow Editor catalogs give a caller without host access each filesystem
+  skill's path within its realm's directory and no realm `path`; a caller
+  with host access still gets absolute paths (see Security). A document may
+  name a catalog skill either way.
 
 - Release builds no longer restore or save Rust caches in `build_binaries`
   and `release_validate`. No v0.9.2 release job restored one of their entries,
   whose keys change with every `Cargo.lock`, while the entries took 5.4 GB
   of the repository's Actions cache. `verify_crate_packages` still restores
   main CI's `meta-dev-bins` entry read-only.
+
 - The pre-push hook runs only fast local checks. The workspace clippy and the
   workspace unit gate, which took 712.88 s and 974.16 s of a 28m19s push,
   moved to the hook's manual stage (`pre-commit run --hook-stage manual
@@ -66,6 +452,405 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - CI's unit test job, now the only automatic run of the lib and bin tests,
   lists them with its own filter before running them and fails if the
   filter leaves any out.
+
+- Console sends are deduplicated per caller: the dedupe keys of
+  `meta/console/send` and `/console/send` are scoped to the authenticated
+  principal (a verified human by OIDC issuer and subject, otherwise the
+  console principal with its provider and verified issuer; anonymous
+  callers of an open console share one local account). The same key from
+  two callers names two sends. An open console without an access
+  controller never resolves tokens, so every caller there is that shared
+  account; with `require_app_auth` or an access controller each verified
+  caller has its own scope (on an open console, a caller without a token
+  stays in the shared account).
+- The `dedupe_key` of a console send frame is an opaque digest for every
+  Console caller. The public Rust `MetaConsoleAggregator::send` and
+  `reserve_identity_first_interaction` keep their key shape and behaviour.
+
+### Fixed
+
+- Python SDK: when the gateway's stdout closed while `meta/init` was in
+  flight (the gateway exited, or wrote a fail-closed init refusal and
+  exited), asyncio logged "Future exception was never retrieved" with a
+  `TransportReaderFailedError`. The reader fails the init request and the
+  init's settlement future together, and only the request's failure was
+  raised. Closing the init watch now retires that future on the host loop: a
+  delivered failure is read, and a pending one is cancelled, so a delivery
+  still queued does nothing. The caller's typed error is unchanged
+  (`InitOutcomeUnknownError`, the typed refusal such as
+  `StorageResolutionError`, or `GatewayStartupCleanupError` when the stop
+  then fails). Waiting for the settlement no longer goes through
+  `asyncio.shield`, which after a deadline or a cancelled wait left a later
+  failure unretrieved (Python 3.14 logged it as an exception in a shielded
+  future). The deadline still raises `asyncio.TimeoutError`, and neither it
+  nor a cancelled caller ends the settlement.
+- The reference app router's request bound is one set of permits for the
+  whole app. axum applies a `Router::layer` to every route on its own, and
+  again for every connection a handler route is served on, and tower's
+  `ConcurrencyLimitLayer` made new permits each time, so the bound held per
+  route and, for routes such as `/healthz`, per connection. It now uses one
+  shared semaphore (`GlobalConcurrencyLimitLayer`), which `rpc_gateway`'s host
+  routes and live WebSocket door, and the live door
+  `UnifiedRuntime::build_reference_app_router_with_live` mounts, share. A
+  request holds its permit until its response is produced: an SSE stream runs
+  without one once its headers are sent, and a WebSocket upgrade holds one
+  only until its 101 response.
+
+- With the `extension-state` feature, the check that refuses a mob create
+  under an id that extension documents still name no longer reads every live
+  document of the realm on each create. `SqliteExtensionDocumentStore` now
+  counts, per realm, the live documents naming each mob id: it reads a
+  realm's documents once, at the first check after the store opens, keeps
+  the counts with its own writes, and reads the realm again only after
+  another connection committed to the database (SQLite's `data_version`
+  changed: another process, an out-of-band edit). A check is a lookup after
+  that, so a caller that repeats creates under a named id no longer holds the
+  store's one connection, and with it the document reads and writes of every
+  session, for a scan of the realm each time. As before, a live document
+  that does not decode fails the check, now from the next read of its realm
+  on. This resolves the cost half of the 0.9.2 known limitation that each
+  checked create reads every live document of the realm under the store's
+  one connection; the index replaces the rate limit 0.9.2 named. A refusal
+  still tells the caller that some document names the id. The
+  `ExtensionDocumentStore::references_mob` documentation now asks a store an
+  embedding host supplies to answer in constant time per id too, from an
+  index read again whenever another writer may have changed the documents.
+- With the `extension-state` feature, document operations are ordered
+  against the mob id check. A caller resolved while a destroyed child mob
+  lived could still commit a document owned by the child's id, or shared
+  with it, after another session created a new mob under that id, and the
+  new mob inherited the document; the stale caller could also still read and
+  manage what the new mob owns. Now every operation through the document
+  services the runtime builds (tool bundles and document MCP bindings) holds
+  a shared gate through its store call, and the check holds it exclusively,
+  so the check waits for every write in flight and sees what it committed.
+  The caller resolver stamps each caller with the generation it read before
+  any authority (`HostAccessContext::with_authority_generation`). An admitted
+  create under an id, or the release of the destroyed mob that held it,
+  moves that id's generation, and an operation is refused with
+  `AuthorityUnavailable` when a mob id the caller's authority names (its own
+  mob, the mobs it manages, an owner it was validated for), or a write's new
+  owner or access names, changed after the stamp: the tool resolves its
+  caller again. The after-destroy hook moves the generations without
+  waiting for the gate. This resolves the 0.9.2 known limitation that the
+  check was not ordered against a document write already in flight.
+  Residuals: the ordering covers one runtime in one process, so a writer in
+  another process or through the provider's own store is not ordered; and
+  the implicit delegation mob that its own session's runtime path recreates
+  stays exempt from the check and the ordering, so a write naming its id
+  lands on the recreated mob, which keeps what its predecessor's documents
+  grant.
+- With the `extension-state` feature, restoring a persisted mob re-checks who
+  holds its id. A mob that took a destroyed mob's id without the create check
+  (created before 0.9.2, or while no extension tool bundle or document
+  binding was composed) kept, after a restart, what documents written for the
+  destroyed mob granted the id. The document store now records, per realm
+  and mob id, the holder of the mob that took the id: the owner session it
+  was created for, or the host for a mob created with no owner session
+  (`MobIdHolder`). A create the check admitted (the implicit delegation mob's
+  exempt create included) records its holder and binds when its mob
+  activates. Activations under an id are decided one at a time: one that
+  finds a live mob bound under the id is refused, records nothing and drops
+  whatever admission is pending under the id. A restore, or a held child's
+  resume, binds when the store records the mob's own holder for the id, or
+  when no live document names the
+  id. When live documents name the id and the store records another holder,
+  the documents were written while that holder's mob held the id, and the
+  restored mob is quarantined: it is bound, but its members resolve no
+  document caller, it is no valid document owner, nobody manages it and
+  lineage through it does not resolve, until it is destroyed or a later
+  restore binds it once an operator has cleared the references. A store that
+  cannot answer (an error, a holder record that does not decode) quarantines
+  the mob as well. A quarantine never fails the activation, which would
+  abort Meerkat's whole restore scan: `UnifiedRuntime::extension_mob_quarantines`
+  reports each quarantined mob with a typed reason
+  (`MobIdQuarantineReason::HeldByAnotherMob`, naming the recorded holder, or
+  `Unverifiable`), and a warn line names it. An id with no holder record
+  (references written before 0.9.3, or by a mob created without the
+  extension's hooks or by an earlier binary) is adopted by the first mob
+  restored under it, which records its holder once, with a warn line naming
+  the id. Holder records outlive a destroy, and restoring a whole state
+  generation (documents, holder records and mob state together) keeps its
+  mobs bound. This resolves the 0.9.2 known limitation that restoring a
+  persisted mob was never re-checked. Residuals: an id with no holder record
+  goes to the first mob restored under it; holders are owner sessions, and
+  every mob the host creates without one is the same holder (`Host`), so a
+  re-creation under an id by the same owner session, or by the host, without
+  the extension's hooks is adopted as that holder's mob; an admission whose
+  create failed after the check stays until the id's next admission or
+  activation, and a destroy under the id refreshes an admission made after
+  that destroy rather than expiring it, so the next activation under the id
+  that names the same holder binds without the holder check; and, as for the
+  ordering, the check covers one runtime in one process.
+
+- A shutdown no longer reports the member runs it cancels as
+  `host_loop_crash` errors ("agent run failed ... class=cancelled: Run was
+  cancelled"). The forwarder decides from the run's typed failure class while
+  the member event is still typed (see Breaking).
+- The agent event forwarder no longer warns "failed to subscribe; will retry
+  with backoff" for every member a shutdown stops, or for the persisted
+  members of a restored mob while it stays Stopped before its resume, and no
+  longer retries them. A subscribe that fails while the member's mob is
+  stopping or stopped (its admission is closed, or its last published phase
+  is Stopped, Completed or Destroyed) parks the member, logged at debug,
+  until the mob runs again; the identity stream health monitor does not count
+  it toward identity repair. A failure while the mob runs and admits keeps
+  the backoff, the first-failure warning and the repair count, also when the
+  mob's actor refused with a closed channel.
+- An identity-first boot no longer logs `reconcile_incomplete: 0 failures, N
+  skipped` at ERROR for the edges lazy identity bootstrap leaves pending (see
+  Breaking).
+
+- Importing a mob definition into the Flow Editor shows each of its steps
+  once. A step with a condition but no branch that shares its dependencies
+  with two or more steps without one was dropped, and the parallel step of
+  those steps was shown again for each such step, so such an import also
+  grew with the product of the two counts. Such a step is now shown once,
+  after that parallel step (see Known limitations).
+- Importing a mob definition into the Flow Editor shows its steps in
+  dependency order. A definition's steps are parsed in id order, and import
+  showed them in that order, so a step whose id sorts before a step it
+  depends on was shown first, and the flow exported from the editor ran it
+  first: a round trip through the editor rewired the flow. Each frame's
+  steps are now ordered by their dependencies, and by id where those leave
+  the order open; a loop's last step, which its repeat condition names, is
+  taken in the same order.
+- Importing a mob definition into the Flow Editor keeps the condition of a
+  step that has a condition but no branch. Import showed it as a plain
+  member step, which carries no condition, so a round trip through the
+  editor ran the step whatever its condition. It is now shown as a branch
+  step of one lane, which an export writes back with the condition, and a
+  graph with a one-lane branch derives that branch step again.
+
+- The schedule tools a session service keeps no longer keep a stopped
+  host's mob state alive: Meta's schedule mob target registry holds it
+  weakly, so the runtime's mob runtime stays its only owner. Once that state
+  is gone, a `meerkat_schedule_create` or `meerkat_schedule_update` whose
+  resumable-session target Meta would rewrite to a mob member is refused as
+  temporarily unavailable (`ToolError::Unavailable`), as Core refuses a
+  stopped driver; other targets and the store-only calls are unchanged.
+
+- A cargo-release dry run (`./scripts/repo-cargo release <version>`) changes
+  nothing. cargo-release runs the pre-release hook in its dry run too, with
+  `DRY_RUN=true`, and the hook (`scripts/release-hook.sh`) bumped the SDK,
+  Bazel and install-doc versions anyway, then failed its parity check against
+  the unbumped Cargo version, so the dry run stopped with the version files
+  modified. The hook now only reports what an execute would bump and stage,
+  and refuses, writing nothing, a `DRY_RUN` other than `true` or `false`.
+
+- A `MobRuntime` torn down without `UnifiedRuntime` (its root mob shut down,
+  then `stand_down_child_mobs`) stops its runtime delivery owner and empties
+  the composition slots that point back at it before it releases the durable
+  child root, as `UnifiedRuntime`'s shutdown does. Nothing stopped the owner
+  there: it kept reconciling over the runtime store after the root was
+  released, held by the composition the dropped runtime left behind, and
+  recreated a state directory that had been removed. There, the stand-down
+  joins the owner within its deadline, so a pass already running finishes
+  before the release; an owner still running at the deadline keeps the root
+  owned (`HeldUntilProcessExit`). `UnifiedRuntime`'s shutdown still stops
+  the owner without joining it, once the mob stops.
+
+- A durable child-mob stand-down (`MobRuntime::stand_down_child_mobs`, run
+  by `UnifiedRuntime` shutdown) no longer waits out its deadline and keeps
+  the child root owned when its admission close reaches a mob whose actor is
+  still exiting from its shutdown. It now waits for that actor's task to end,
+  so the close is refused at once. Meerkat 0.9.3 and earlier can leave a
+  command sent into an exiting actor unanswered.
+
+- A delegate helper whose tooling inherits its parent's visible tools
+  (`inherit_parent`, also the default when tooling is omitted) now sees the
+  SDK callback tools its parent sees. Every `callback/build_agent` and
+  `customize_build` mints its own routing scope, and each callback tool
+  carried that scope as its provenance source, so the helper's own
+  registration of a host tool never matched the witness its parent's
+  visibility pinned, and the inherited ceiling dropped it. Callback tools now
+  carry one stable source for the gateway's SDK host,
+  `meta-callback:sdk-host`; the per-build scope still routes
+  `callback/call_tool`. Meerkat still matches visibility witnesses strictly
+  by source kind and id, so MCP and bundle tools are unaffected. A host filter
+  witnessed on a callback tool, such as a persisted deny, also keeps applying
+  after a rebuild instead of silently lapsing. A host filter applied before
+  this release still names the old per-build source, so at the first build
+  after the upgrade it stops matching and lapses (a callback tool it denied
+  becomes visible again, and one it allowed is hidden) until the host
+  re-applies it once. Helpers spawned before this release keep the per-build
+  witnesses recorded in their inherited ceiling, so their host callback tools
+  stay hidden until they are re-spawned. `fork_off` was not affected: it
+  applies no inherited ceiling.
+
+- The identity health monitor logs a member it fails to subscribe to, as
+  the console forwarder does: a warning on the first failure, then debug
+  while the subscription keeps failing, each with `watcher` set to
+  `identity_health_monitor` or `console_forwarder`. The monitor logged
+  neither, so a member whose turns it could not count left no trace until
+  the stream repair (#455).
+
+- Python SDK: a request timeout longer than `threading.TIMEOUT_MAX` (for
+  example `transport_timeout=1e10`) is refused before the request is
+  written. A per-call `transport_timeout`, a server wait's deadline and a
+  transport's own default raise `ValueError`; `connect()` with such a
+  `gateway_init_timeout` raises `TransportError` ("meta/init failed: ...")
+  caused by that `ValueError`, and sends no `meta/init`. The transport used to
+  write the request and only then fail its wait with `OverflowError`, so the
+  gateway ran the call (a helper spawn, for example) with nobody waiting for
+  the reply.
+
+- A replay of a console send the gateway accepted but stopped before it
+  settled now decides from the runtime's admission evidence in the session
+  the send recorded. An admitted input settles it `delivered`. An absent one
+  is dispatched again only for a durable identity's local session, under the
+  send's own delivery identity and pinned to that session (a moved session
+  ends it `delivery_failed`, never retargeted); governed sends and other
+  members' sends are settled from evidence only, so an absent one stays
+  unsettled. A send this process is still dispatching is left to that
+  dispatch. At startup the gateway settles, from evidence only, the unsettled
+  sends among the newest console frames whose input was admitted.
+
+- **Agent-memory stages write nothing from an answer the model did not
+  finish.** The distiller, the hygienist and the steward refused only an
+  output-ceiling stop, so a reply that a provider's content filter cut off,
+  a cancelled response or a tool-call stop was parsed like an answer and
+  could be written as memory or applied as a transcript revision. A
+  completion is now an answer only when the model ended its turn or matched
+  a stop sequence. Any other stop fails the call as
+  `Incomplete { stop_reason }`, and the run, or that harvest, is skipped with
+  the stop named in its skip reason, as an output-ceiling stop already was
+  with `Truncated`. A completion stream that ends before its terminal event is
+  refused too. A stop reason that a later Meerkat adds is refused the same
+  way. With Meerkat 0.9.3 the providers' other non-answers are refused too:
+  an Anthropic refusal, `pause_turn` or `model_context_window_exceeded`
+  arrives as its own stop; a Gemini safety, recitation, blocklist,
+  prohibited-content, sensitive-data, image-safety or language finish arrives
+  as a content filter; and a Gemini `OTHER` or unknown finish reason fails the
+  call.
+
+- The per-agent event stream (`/agents/{id}/events`) evaluates the console
+  visibility policy for a member named by its runtime alias against that
+  identity's member, as it does for the durable identity, and answers
+  `member_not_found` for a runtime alias that names no live member. Its
+  access rules judge that member too, with the member's own labels.
+- Console access rules judge a member named by its runtime alias as that
+  member, with its identity and labels, on every console route that takes
+  a member id, as they judge its durable identity. A runtime alias that is
+  not the current incarnation of a known member is refused.
+- A console RPC whose member target fields (`identity`, `member_id`,
+  `agent_id`, `agent_identity`) name different members is refused with
+  `conflicting_member_targets`, and the console access rules judge every
+  member a request names.
+- A console access deny rule written against a runtime alias applies to
+  that alias even while it is the member's current incarnation.
+- The per-agent event stream answers `member_not_found` for a runtime alias
+  that is not current, instead of an internal error.
+- The console access rules judge the source member of `meta/fork_helper`
+  as read access to that member, and a session that
+  `meta/attach_existing_session` or `meta/ensure_member`
+  (`resume_session_id`) attaches as read and send access to the members it
+  belongs to. A session whose owner cannot be established is refused unless
+  the caller is an admin (see Breaking).
+- `meta/identity/resolved_tools`, and `resolved_tools_for_member` in Rust,
+  resolve the supplied id through `roster_member_id_for_supplied_id`, as
+  `meta/identity/routing_status` does (#366). A member named by its current
+  runtime alias (`rt:{identity}:{generation}`) or by its encoded roster id
+  now returns the same session and tools as its durable identity; it used
+  to fail with "identity has no current session". The response still echoes
+  the spelling the caller supplied, and a stale runtime alias is still
+  refused with `stale_identity_runtime_binding`.
+- Every caller-supplied member id follows one alias rule, documented in
+  `member_comms_id`. An encoded roster id is decoded rather than encoded a
+  second time. A runtime alias (`rt:{identity}:{generation}`) that the
+  identity runtime confirms is current names its durable member, and a
+  stale one is refused (`stale_identity_runtime_binding` on the RPC
+  surfaces). An action with no identity authority refuses a runtime alias
+  instead of acting on whichever incarnation is current. These surfaces
+  used to report a healthy member missing when it was named by its current
+  runtime alias, and now reach it: console `meta/get_member`; stdio
+  `meta/member_status`; the `meta/fork_helper` source on both surfaces and
+  in `fork_member_with_identity_runtime`; console
+  `meta/cross_mob/wire_local` and `unwire_local`; cross-mob control
+  lookup, inject, and wire; `mob/member_tool_declaration`; the image-input
+  check; and the console aggregator's member resolution, which console
+  inspect, send, and retire share. `mob/adopt_member_identity_declaration`,
+  `mob/apply_member_tool_declaration`, `send_message_on_mob`,
+  `UnifiedRuntime::start_member_turn`, `UnifiedRuntime::reconcile`, and
+  `fork_member_with_identity_runtime` without an identity runtime now
+  refuse a runtime alias. The declaration apply used to report success for
+  a member it never reached, and `reconcile` seated a phantom member for an
+  encoded roster id.
+- Identity-first same-process topology reaches its members: the bilateral
+  wire, unwire, and state read handed each member's runtime alias to the
+  mob, which keys no row by it, and failed with `MemberNotFound`. Wire and
+  unwire now resolve both ends to their durable roster rows under the
+  lifecycle locks they hold, as the other cross-mob operations do.
+- An identity member's idle-retire opt-in follows its continuity rebind to
+  a respawned or delivery-repaired session. The rebind reported the member
+  under its runtime alias instead of its roster row, so the opt-in stayed
+  on the old session.
+
+### Known limitations
+
+- The Flow Editor draft store is shared by every caller of a Flow Editor
+  route: one caller can fill it to its caps, which refuses new drafts to
+  everyone else and drops other drafts' undo history first, and any caller
+  can overwrite or delete any draft. Per-caller stores or quotas are planned.
+- The Flow Editor shows a step with a condition but no branch that shares
+  its dependencies with parallel steps after their parallel step, so an
+  exported flow runs it after them, when its condition holds, rather than
+  beside them.
+- The Flow Editor draft store's lock is per process. Two processes that
+  share one store each read it, change it and rename their copy over it, so
+  of their concurrent writes only the last one renamed survives: run one
+  process per store.
+- A Flow Editor client that holds a draft's etag or revision from before
+  the draft was deleted and created again can overwrite the new draft once
+  it reaches the same revision: the etag names the draft's id and revision,
+  not which draft of that id it is.
+
+- A restarted gateway, or a second gateway on the same persistent_state
+  directory and realm, takes over the detached callback jobs of any callback
+  tool its host declares with the same tool name, runner name and runner
+  version, whatever that tool now declares. Its host is offered their running
+  attempts. The gateway also starts their queued and retry-due jobs. Once a
+  running job's lease has expired, it restarts the job if its restart class
+  allows. It uses the original arguments and the credential scope names
+  recorded at submission; the host resolves the credentials as it now
+  registers that runner. Change a detached tool's runner version whenever its
+  declaration, its runner implementation or the profile it runs under changes:
+  a gateway neither offers nor starts jobs of a runner version it does not
+  register. Such jobs stay as they are until a gateway registers that version
+  again, so let a tool's jobs finish, or cancel them, before changing it.
+  Meerkat 0.9.3's own RPC server binds a detached callback job to its tool's
+  declaration; Meta's gateway adopts that binding in a later release.
+
+### Known issues
+
+- A runtime whose machine carries a native grant owner (built with
+  `UnifiedRuntimeBuilder::native_grant_work_configuration`, or an
+  `rpc_gateway` whose host supplies one through
+  `GatewayHostComposition::native_grant_work_configuration`) does not run
+  scheduled work sent to its mob members or to its sessions, and each such
+  fire fails late: the schedule is accepted, and at every fire the input is
+  refused at native admission ("native work authority association is
+  unavailable or mismatched"), because the schedule host submits it without
+  an input authority association. No run starts and no provider call is
+  made; the same fires on a runtime without a native grant owner run. How
+  the occurrence ends depends on the target:
+  - A mob target naming a member, or the member's `mob_member:` identity
+    (the target a member's own current-session schedule carries): the
+    member's session refuses the internal work Meta submits, the occurrence
+    ends `DeliveryFailed` with `RuntimeRejected`, and the member's session
+    and transcript are unchanged. A scheduled fire whose target member is a
+    durable identity goes through Meta's identity runtime and is refused the
+    same way; if that identity is dormant, it is first materialized (its
+    member is created and its session is created or resumed, and both stay
+    live), and the fire is then refused.
+  - A session target naming an existing session: the schedule host's
+    session host submits the prompt as runtime input, which is refused, and
+    refused again on its exact redrive, so the occurrence ends
+    `DeliveryFailed` with `TransportError`.
+  - A session target materialized on demand: the session host first
+    materializes the session and binds it to the schedule; the prompt is
+    then refused as above (`DeliveryFailed` with `TransportError`), and the
+    new session is left holding only its system prompt.
 
 ## [0.9.2] - 2026-10-16
 

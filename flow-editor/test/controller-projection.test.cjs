@@ -10738,13 +10738,61 @@ assert.deepEqual(documentSelection.hydration.options, {
 });
 assert.equal(documentSelection.fallback, null);
 
-const fallbackSelection = controller.flowRegistrySelectionState(selectionRows, "f_draft");
-assert.equal(fallbackSelection.found, true);
-assert.equal(fallbackSelection.hasDocument, false);
-assert.equal(fallbackSelection.hydration, null);
-assert.equal(fallbackSelection.fallback, null);
-assert.equal(fallbackSelection.error, "missing_registry_document");
+// A draft listed as a summary (no document) opens through meta/mobpacks/get.
+const fetchSelection = controller.flowRegistrySelectionState(selectionRows, "f_draft");
+assert.equal(fetchSelection.found, true);
+assert.equal(fetchSelection.hasDocument, false);
+assert.equal(fetchSelection.hydration, null);
+assert.equal(fetchSelection.fallback, null);
+assert.deepEqual(fetchSelection.fetch, { id: "f_draft" });
+assert.equal(fetchSelection.error, undefined);
 assert.equal(controller.flowRegistryFallbackOpenTransition, undefined);
+// The row get returns hydrates like any row with a document.
+const fetchedRow = { id: "f_draft", name: "Draft", stage: "valid", validation: { ok: true }, document: registryDocument, revision: 3 };
+const fetchedSelection = controller.flowRegistrySelectionState([fetchedRow], "f_draft");
+assert.deepEqual(fetchedSelection.hydration.result, { document: registryDocument, validation: { ok: true } });
+assert.deepEqual(fetchedSelection.hydration.options, { id: "f_draft", flowRow: fetchedRow, addToRegistry: false });
+// A runtime projection without a document still fails closed.
+const runtimeSelection = controller.flowRegistrySelectionState([
+  { id: "f_runtime", name: "Runtime", stage: "valid", runtime_projection: true },
+], "f_runtime");
+assert.equal(runtimeSelection.error, "missing_registry_document");
+assert.equal(runtimeSelection.fetch, undefined);
+
+// The library lists drafts from summaries: rows without documents keep their
+// labels, description and optimistic-concurrency fields.
+const summaryRows = controller.flowRegistryRowsFromBackend([
+  {
+    id: "f_summary",
+    name: "Summary Draft",
+    version: "0.1.0",
+    stage: "valid",
+    trigger: "Meta authoring draft",
+    source: "meta/mobpacks/save",
+    description: "Plans and reviews",
+    revision: 5,
+    draft_revision: 5,
+    etag: "f_summary:5",
+    draft_etag: "f_summary:5",
+    updated_at_unix_ms: 1000,
+    can_undo: true,
+    can_redo: false,
+  },
+]);
+assert.equal(summaryRows.length, 1);
+assert.equal(summaryRows[0].document, undefined);
+assert.equal(summaryRows[0].validation, null);
+assert.deepEqual(
+  controller.flowRegistryDraftGuard(summaryRows[0]),
+  { id: "f_summary", expected_revision: 5, expected_etag: "f_summary:5" },
+  "summary rows must keep the draft guard",
+);
+const summaryView = controller.flowRegistryViewState(summaryRows, null, { nowUnixMs: 61000 });
+assert.deepEqual(
+  summaryView.sections[0].rows.map((row) => [row.id, row.name, row.description, row.stage, row.updated]),
+  [["f_summary", "Summary Draft", "Plans and reviews", "valid", "1m ago"]],
+);
+assert.deepEqual(controller.flowRegistrySelectionState(summaryRows, "f_summary").fetch, { id: "f_summary" });
 
 const missingSelection = controller.flowRegistrySelectionState(selectionRows, "missing");
 assert.equal(missingSelection.found, false);

@@ -76,7 +76,8 @@ export function flowCatalogBootstrapState(catalogPayload, options = {}) {
 export function flowRegistryRowsFromBackend(rows = []) {
   return (Array.isArray(rows) ? rows : [])
     .map((row) => {
-      if (!row || typeof row !== "object" || !row.document) return null;
+      if (!row || typeof row !== "object") return null;
+      if (!row.document) return flowRegistryRowFromSummary(row);
       return flowRegistryRowFromDocument({
         id: row.id,
         document: row.document,
@@ -88,6 +89,24 @@ export function flowRegistryRowsFromBackend(rows = []) {
       });
     })
     .filter(Boolean);
+}
+
+// Draft replies list drafts as summaries, without their documents: the
+// library row keeps what the summary carries (revision and etag included),
+// and opening the draft fetches its document with meta/mobpacks/get.
+function flowRegistryRowFromSummary(row) {
+  const id = String(row?.id || "").trim();
+  if (!id) return null;
+  return {
+    ...row,
+    id,
+    name: String(row.name || id),
+    version: String(row.version || ""),
+    stage: String(row.stage || "draft"),
+    trigger: String(row.trigger || ""),
+    source: String(row.source || ""),
+    validation: null,
+  };
 }
 
 export function blankMobpackFromCatalogs(schema) {
@@ -279,6 +298,19 @@ export function flowRegistrySelectionState(rows, id) {
     },
     fallback: null,
   };
+  }
+  // A draft listed as a summary opens with its document from
+  // meta/mobpacks/get. A runtime projection always carries its document.
+  if (!flowRegistryRowIsRuntimeProjection(row)) {
+    return {
+      found: true,
+      id: selectedId,
+      row,
+      hasDocument: false,
+      hydration: null,
+      fallback: null,
+      fetch: { id: selectedId },
+    };
   }
   return {
     found: true,

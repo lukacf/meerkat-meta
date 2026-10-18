@@ -351,9 +351,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/fetch-warm-deps
       - run: scripts/repo-cargo test -p meta-extension-state --locked
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --lib --test extension_state --no-run
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --test extension_state
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state --lib -- extension_ document_mcp_child_supply
+      # console-test-faults only adds the console send process test's abort
+      # points, so it shares the extension-state build.
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state,console-test-faults --lib --test extension_state --test console_send_recovery_process --no-run
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state,console-test-faults --test extension_state
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state,console-test-faults --test console_send_recovery_process
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state,console-test-faults --lib -- extension_ document_mcp_child_supply
 
   # test-extension-state's check and clippy, split out: both only emit
   # metadata, so they share little with the two full test builds, which
@@ -382,7 +385,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/fetch-warm-deps
       - run: scripts/repo-cargo check -p meerkat-meta --locked --no-default-features
-      - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features extension-state --lib --test extension_state -- -D warnings
+      - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features extension-state,console-test-faults --lib --test extension_state --test console_send_recovery_process -- -D warnings
 
   test-voice:
     name: test-voice
