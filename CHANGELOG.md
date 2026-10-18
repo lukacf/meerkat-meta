@@ -67,15 +67,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   lists them with its own filter before running them and fails if the
   filter leaves any out.
 - `meta/reset` of one identity, on the SDK gateway and the console, no
-  longer returns a `cleanup_warning`
-  (`stale_member_cleanup_skipped_after_identity_reset`), and its
-  `identity_reset` lifecycle frame no longer carries one. This is a
-  wire-visible removal: the field is gone from the response and the frame,
-  not set to `null`. The warning said the reset published the new
-  generation without retiring stale live members, which is not true: the
-  reset's successor transition is meerkat's respawn, which retires the
-  previous live member. `meta/reset_all` dropped the same warning for the
-  same reason. Identity control calls still reject a stale runtime id.
+  longer reports a cleanup warning: its `cleanup_warning` is now always
+  `null`, in the response and in the `identity_reset` lifecycle frame. It
+  used to report `stale_member_cleanup_skipped_after_identity_reset`, saying
+  the reset published the new generation without retiring stale live
+  members, which is not true: the reset's successor transition is
+  meerkat's respawn, which retires the previous live member. The field
+  stays for wire compatibility, as `meta/respawn` keeps its retired
+  warnings; `meta/reset_all` dropped the same warning for the same reason.
+  Identity control calls still reject a stale runtime id.
 
 ## [0.9.2] - 2026-10-16
 

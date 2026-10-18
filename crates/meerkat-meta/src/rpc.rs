@@ -4996,7 +4996,9 @@ async fn handle_unified_rpc_json_inner(
                 Ok(record) => {
                     // The reset's successor transition retired the previous
                     // live member, so there is no cleanup to report (as for
-                    // reset_all).
+                    // reset_all). Keep the legacy warning field, always null,
+                    // for wire compatibility, as respawn does.
+                    let cleanup_warning: Option<Value> = None;
                     runtime
                         .record_console_lifecycle(
                             identity.as_str(),
@@ -5004,6 +5006,7 @@ async fn handle_unified_rpc_json_inner(
                             serde_json::json!({
                                 "generation": record.generation.get(),
                                 "checkpoint_version": record.checkpoint_version.get(),
+                                "cleanup_warning": cleanup_warning.clone(),
                             }),
                         )
                         .await;
@@ -5016,6 +5019,7 @@ async fn handle_unified_rpc_json_inner(
                             "session_id": record.session_id.to_string(),
                             "generation": record.generation.get(),
                             "checkpoint_version": record.checkpoint_version.get(),
+                            "cleanup_warning": cleanup_warning,
                         })),
                         error: None,
                     }
@@ -8793,7 +8797,7 @@ shell = true
             "meta/reset must preserve mob_definition when installing the reset roster provider"
         );
         // The reset's successor transition retired the previous live member:
-        // the reset reports no cleanup warning, and no such field.
+        // the reset reports no cleanup warning. The field stays, always null.
         let mut fields = response["result"]
             .as_object()
             .expect("reset result")
@@ -8806,10 +8810,16 @@ shell = true
             [
                 "agent_runtime_id",
                 "checkpoint_version",
+                "cleanup_warning",
                 "generation",
                 "identity",
                 "session_id"
             ],
+            "{response:#?}"
+        );
+        assert_eq!(
+            response["result"]["cleanup_warning"],
+            Value::Null,
             "{response:#?}"
         );
         assert_eq!(

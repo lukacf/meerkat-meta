@@ -8681,7 +8681,9 @@ async fn handle_console_runtime_rpc_with_visibility(
                 Ok(record) => {
                     // The reset's successor transition retired the previous
                     // live member, so there is no cleanup to report (as for
-                    // reset_all).
+                    // reset_all). Keep the legacy warning field, always null,
+                    // for wire compatibility, as respawn does.
+                    let cleanup_warning: Option<Value> = None;
                     if let Some(store) = &console_events {
                         store
                             .record_lifecycle(
@@ -8690,6 +8692,7 @@ async fn handle_console_runtime_rpc_with_visibility(
                                 json!({
                                     "generation": record.generation.get(),
                                     "checkpoint_version": record.checkpoint_version.get(),
+                                    "cleanup_warning": cleanup_warning.clone(),
                                 }),
                             )
                             .await;
@@ -8702,6 +8705,7 @@ async fn handle_console_runtime_rpc_with_visibility(
                             "session_id": record.session_id.to_string(),
                             "generation": record.generation.get(),
                             "checkpoint_version": record.checkpoint_version.get(),
+                            "cleanup_warning": cleanup_warning,
                         })),
                         None,
                     )
@@ -16396,8 +16400,9 @@ comms = true
     }
 
     /// A single identity reset reports no cleanup warning: its successor
-    /// transition retired the previous live member. Neither the response nor
-    /// the `identity_reset` lifecycle frame carries one, as for `reset_all`.
+    /// transition retired the previous live member. The response and the
+    /// `identity_reset` lifecycle frame keep the field, always null, for wire
+    /// compatibility (as respawn keeps its retired warnings).
     #[tokio::test]
     async fn console_runtime_reset_reports_no_cleanup_warning()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -16452,12 +16457,14 @@ comms = true
             [
                 "agent_runtime_id",
                 "checkpoint_version",
+                "cleanup_warning",
                 "generation",
                 "identity",
                 "session_id"
             ],
             "{response:#?}"
         );
+        assert_eq!(result["cleanup_warning"], Value::Null, "{response:#?}");
         assert_eq!(result["agent_runtime_id"], json!("rt:review:active:1"));
         let lifecycle = console_events
             .replay_all(None)
@@ -16472,6 +16479,7 @@ comms = true
             json!({
                 "generation": result["generation"],
                 "checkpoint_version": result["checkpoint_version"],
+                "cleanup_warning": null,
             }),
             "{lifecycle:#?}"
         );

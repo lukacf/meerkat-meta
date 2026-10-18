@@ -863,8 +863,8 @@ target set and are neither reset nor retired.
 |-------|-------------|
 | `reset` | Identities reset or respawned, in order |
 | `retired_delegates` | `{identity, mob_id?}` per retired delegate |
-| `reset_details` / `retired_delegate_details` | Per-row detail, including any `topology_restore_warning` or `cleanup_warning` |
-| `warnings` | Non-fatal per-identity notes (for example a stale live member left for identity control to reject) |
+| `reset_details` / `retired_delegate_details` | Per-row detail, including any `topology_restore_warning` |
+| `warnings` | Always empty; kept for shape stability. A registered identity resets through its successor transition, which retires the previous live member, so no stale live member is left to warn about |
 | `failed` | `{identity, error, kind?}` rows. When non-empty the response is `-32000` `reset_all failed for one or more identities` with this whole body as `error.data` |
 | `startup_history` | `{timeout, ready, pending}` from the 10 s wait; `null` when preflight failed or no console aggregator is attached |
 </Accordion>
