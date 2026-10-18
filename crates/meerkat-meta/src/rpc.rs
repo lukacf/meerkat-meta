@@ -8822,6 +8822,25 @@ shell = true
             Value::Null,
             "{response:#?}"
         );
+        // The identity_reset lifecycle frame carries the same null field.
+        let lifecycle = runtime
+            .console_events()
+            .replay_all(None)
+            .await
+            .map_err(|err| format!("replay_all: {}", err.error))?;
+        let frame = lifecycle
+            .iter()
+            .find(|event| event.event_type == "identity_reset")
+            .ok_or("the reset records an identity_reset frame")?;
+        assert_eq!(
+            frame.data,
+            json!({
+                "generation": response["result"]["generation"],
+                "checkpoint_version": response["result"]["checkpoint_version"],
+                "cleanup_warning": null,
+            }),
+            "{lifecycle:#?}"
+        );
         assert_eq!(
             bridge
                 .create_calls
