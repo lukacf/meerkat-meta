@@ -62,14 +62,23 @@ only from native evidence:
 - `expired`: settled. It was sealed before the retention window and nothing
   native ever held it: still sealed, or submitting while the native status
   reads not committed. For a member on a peer gateway it expires only once
-  its last request is older than `control_request_window_ms`, and it is not
+  its last request, stamped when it was issued, is older than
+  `control_request_window_ms` plus the slowest settle pause, and it is not
   submitted again meanwhile, so a request still in flight is refused by the
-  peer as stale instead of landing after the expiry.
+  peer as stale instead of landing after the expiry. Gateways that deliver
+  to each other should use the same window: a peer with a larger one, or a
+  clock behind this gateway's, may still admit such a request, and then the
+  announcements are delivered and also reported as expired, a false gap,
+  never a loss.
 
 What a member was owed and never got is reported, never dropped silently:
 the member's next batch opens with a gap line per mob saying how many
 announcements it did not receive and why (`expired` or `not_retained`), and
-the batch's `gaps` field carries the same counts.
+the batch's `gaps` field carries the same counts. A batch for a member on a
+peer gateway carries as many gap lines as fit what its items leave of one
+request; the rest wait for the next batch. A batch that ends without
+delivering (cancelled, refused, blocked, or stranded with no successor)
+hands its gap lines to the member's next batch.
 
 ## Subscription lifecycle
 
@@ -249,15 +258,18 @@ Its subscriptions end with `member_mob_ended` only on the mob's own durable
 records:
 
 - `completed` or `reset`: a `MobCompleted` or `MobReset` event in the mob's
-  log after the cursor the subscription was made at. The log is read before
-  a sealed batch's first submission and before every resubmission, and the
-  owner records how far it read, so each event is read once per member. A
-  member subscribed again after a reset is delivered to again; a completed
-  mob refuses new puts. The completion of a mob named in a selector ends
-  nothing: only the subscriber's own mob does.
+  log after the cursor the subscription was made at. The log is read when
+  the member's backlog is sealed, before a batch's first submission and
+  before every resubmission, and the owner records how far it read, so each
+  event is read once per member. A batch therefore never carries what was
+  captured for a subscription the event ended next to what one made after
+  it wants. A member subscribed again after a reset is delivered to again;
+  a completed mob refuses new puts. The completion of a mob named in a
+  selector ends nothing: only the subscriber's own mob does.
 - `created again`: the mob runs under the same id with another incarnation
-  (owner session and first event time). The next put for the member ends
-  what it had in the old incarnation before it subscribes in the new one.
+  (owner session and first event time). What the member had in the old
+  incarnation ends at the mob set reconcile, the read before a delivery, or
+  the next put for the member, which then subscribes it in the new one.
 - `destroyed`: the mob is neither running nor held after this gateway
   restored every mob it hosts. The mob set reconcile ends the member's
   subscriptions, as does the next delivery.

@@ -1444,6 +1444,254 @@ async fn sqlite_store_conforms() {
         member_routes_are_kept_and_member_mob_logs_read_on(store.as_ref()).await;
     })
     .await;
+    run_conformance("gap lines within a peer request", |store| async move {
+        gap_lines_fit_what_the_items_leave_of_a_peer_request(store.as_ref()).await;
+    })
+    .await;
+    run_conformance(
+        "gap lines of a batch that reports nothing",
+        |store| async move {
+            gaps_of_a_batch_that_reports_nothing_go_back(store.as_ref()).await;
+        },
+    )
+    .await;
+}
+
+async fn gap_lines_fit_what_the_items_leave_of_a_peer_request(store: &dyn AnnouncementStore) {
+    let peer = peer_member("agent:p", "mob-b");
+    // Ids near the longest a mob id may be, so each gap line is long: 150
+    // of them make more than a peer request holds next to a large item.
+    let long = |index: usize| mob(&format!("{}-{index:03}", "m".repeat(240)));
+    let lines = 150_usize;
+    let indexes = (0..lines).collect::<Vec<_>>();
+    // A selector names at most 64 mobs: three subscriptions name the long
+    // mobs, and one the mob the later announcements go to.
+    for (part, chunk) in indexes.chunks(50).enumerate() {
+        let id = format!("p{part}");
+        store
+            .put_subscription(
+                &op(&id),
+                PutSubscription {
+                    selector: Selector {
+                        topics: topics(&["ios"]),
+                        mobs: chunk.iter().map(|index| long(*index)).collect(),
+                    },
+                    ..put_for(&id, peer.clone(), &["ios"])
+                },
+                1_000,
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .put_subscription(
+            &op("p-payments"),
+            PutSubscription {
+                selector: Selector {
+                    topics: topics(&["ios"]),
+                    mobs: BTreeSet::from([mob("payments")]),
+                },
+                ..put_for("p-payments", peer.clone(), &["ios"])
+            },
+            1_000,
+        )
+        .await
+        .unwrap();
+    for index in 0..lines {
+        store
+            .announce(
+                announce_request(long(index).as_str(), "k", &["ios"], "old"),
+                1_000,
+            )
+            .await
+            .unwrap();
+    }
+    let report = store.expire(1_000 + WINDOW, WINDOW, 1_000).await.unwrap();
+    assert_eq!(report.captures, 150);
+    // One announcement as large as a body may be: what it leaves of the
+    // request holds some of the gap lines, not all.
+    let now = 1_000 + WINDOW + 10;
+    store
+        .announce(
+            announce_request("payments", "big", &["ios"], &"x".repeat(MAX_BODY_BYTES)),
+            now,
+        )
+        .await
+        .unwrap();
+    let first = store
+        .seal_batch(
+            &peer,
+            &batch_id("b1"),
+            &policy(),
+            Some(MAX_REMOTE_BODY_WIRE_BYTES),
+            now + 1_000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(wire_len(&first.body) <= MAX_REMOTE_BODY_WIRE_BYTES);
+    let reported = first.gaps.iter().map(|gap| gap.count).sum::<u64>();
+    assert!(reported > 0 && reported < 150, "{reported}");
+    // Once it is delivered, the rest ride on the member's next batch.
+    for (expected, event) in [
+        (BatchStateTag::Sealed, BatchEvent::BeginSubmit),
+        (
+            BatchStateTag::Submitting,
+            BatchEvent::NativeCommitted {
+                receipt: receipt("b1"),
+            },
+        ),
+        (
+            BatchStateTag::Committed,
+            BatchEvent::NativeApplied {
+                receipt: receipt("b1"),
+                session_id: "session".into(),
+                input_id: "input".into(),
+            },
+        ),
+    ] {
+        store
+            .transition_batch(&batch_id("b1"), expected, event, now + 1_500)
+            .await
+            .unwrap();
+    }
+    store
+        .announce(
+            announce_request("payments", "small", &["ios"], "x"),
+            now + 2_000,
+        )
+        .await
+        .unwrap();
+    let second = store
+        .seal_batch(
+            &peer,
+            &batch_id("b2"),
+            &policy(),
+            Some(MAX_REMOTE_BODY_WIRE_BYTES),
+            now + 5_000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(wire_len(&second.body) <= MAX_REMOTE_BODY_WIRE_BYTES);
+    let rest = second.gaps.iter().map(|gap| gap.count).sum::<u64>();
+    assert_eq!(reported + rest, 150);
+}
+
+async fn gaps_of_a_batch_that_reports_nothing_go_back(store: &dyn AnnouncementStore) {
+    let subscribe = |id: &str, mob_id: &str| PutSubscription {
+        selector: Selector {
+            topics: topics(&["ios"]),
+            mobs: BTreeSet::from([mob(mob_id)]),
+        },
+        ..put(id, "agent:a", &["ios"], StartFrontier::Now)
+    };
+    store
+        .put_subscription(&op("sa"), subscribe("sa", "payments"), 1_000)
+        .await
+        .unwrap();
+    store
+        .put_subscription(&op("sb"), subscribe("sb", "events"), 1_000)
+        .await
+        .unwrap();
+    store
+        .announce(announce_request("payments", "old", &["ios"], "old"), 1_000)
+        .await
+        .unwrap();
+    store.expire(1_000 + WINDOW, WINDOW, 100).await.unwrap();
+    let now = 1_000 + WINDOW + 10;
+    store
+        .announce(announce_request("events", "k1", &["ios"], "x"), now)
+        .await
+        .unwrap();
+    let carrier = store
+        .seal_batch(
+            &member("agent:a"),
+            &batch_id("b1"),
+            &policy(),
+            None,
+            now + 1_000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(carrier.gaps, vec![expired_gap(1)]);
+    // The one subscription the batch holds items for is cancelled before it
+    // is submitted: the batch is cancelled and its gap line goes back.
+    store
+        .change_subscription(
+            &op("cb"),
+            &sid("sb"),
+            1,
+            SubscriptionChange::Cancel,
+            now + 2_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.batch(&batch_id("b1")).await.unwrap().unwrap().state,
+        BatchState::Cancelled
+    );
+    store
+        .announce(
+            announce_request("payments", "k2", &["ios"], "y"),
+            now + 3_000,
+        )
+        .await
+        .unwrap();
+    let next = store
+        .seal_batch(
+            &member("agent:a"),
+            &batch_id("b2"),
+            &policy(),
+            None,
+            now + 5_000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.gaps, vec![expired_gap(1)]);
+    // A batch the native owner refuses hands its gap line on as well.
+    store
+        .transition_batch(
+            &batch_id("b2"),
+            BatchStateTag::Sealed,
+            BatchEvent::BeginSubmit,
+            now + 6_000,
+        )
+        .await
+        .unwrap();
+    store
+        .transition_batch(
+            &batch_id("b2"),
+            BatchStateTag::Submitting,
+            BatchEvent::NativeRefused {
+                reason: "refused".into(),
+                receipt: None,
+            },
+            now + 7_000,
+        )
+        .await
+        .unwrap();
+    store
+        .announce(
+            announce_request("payments", "k3", &["ios"], "z"),
+            now + 8_000,
+        )
+        .await
+        .unwrap();
+    let after_refusal = store
+        .seal_batch(
+            &member("agent:a"),
+            &batch_id("b3"),
+            &policy(),
+            None,
+            now + 10_000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_refusal.gaps, vec![expired_gap(1)]);
 }
 
 fn worker() -> Member {
@@ -5404,10 +5652,20 @@ async fn a_peer_batch_expires_only_once_its_last_request_is_stale() {
     let waiting = harness.service.deliveries(&query).await.unwrap().remove(0);
     assert_eq!(waiting.state.tag(), BatchStateTag::Submitting);
     assert_eq!(harness.native.submits(), submits, "no further attempt");
-    // Once the peer would refuse that request as stale, it expires.
+    // Just past the peer's window it still waits: a request issued late in
+    // a round, or read by a clock a little behind, may still be admitted.
     harness
         .clock
         .store(retried.updated_at_ms + window + 1, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let margin = harness.service.deliveries(&query).await.unwrap().remove(0);
+    assert_eq!(margin.state.tag(), BatchStateTag::Submitting);
+    // Once the window and the margin past it have run out, the peer would
+    // refuse that request as stale, and the batch expires.
+    harness.clock.store(
+        retried.updated_at_ms + window + settle + 1,
+        Ordering::SeqCst,
+    );
     harness.service.run_round().await.unwrap();
     let expired = harness.service.deliveries(&query).await.unwrap().remove(0);
     assert_eq!(expired.state, BatchState::Expired);
@@ -5694,6 +5952,144 @@ async fn a_completion_or_reset_after_the_put_ends_the_subscription_before_any_su
     }
 }
 
+/// The settlement of every announcement owed to `subscription`, by
+/// sequence.
+fn owed_settlements(harness: &Harness, subscription: &str) -> Vec<(i64, Option<String>)> {
+    let db =
+        rusqlite::Connection::open(harness._dir.path().join("mob_announcements.sqlite3")).unwrap();
+    let mut statement = db
+        .prepare(
+            "SELECT sequence, settlement FROM owed_announcements
+             WHERE subscription_id = ?1 ORDER BY sequence",
+        )
+        .unwrap();
+    statement
+        .query_map([subscription], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(std::result::Result::unwrap)
+        .collect()
+}
+
+/// A reset between a capture and the seal: the member subscribes again after
+/// it, and the next announcement is owed to both subscriptions. The seal
+/// reads the mob's log first, so the subscription the reset ended carries
+/// nothing into the batch and what was captured before the reset never
+/// reaches the member.
+#[tokio::test]
+async fn what_was_captured_before_a_reset_never_reaches_the_member_subscribed_again() {
+    let harness = harness_with(child_native());
+    subscribe_worker(&harness, "w1").await.unwrap();
+    harness
+        .service
+        .announce(announce_request(
+            "payments",
+            "before",
+            &["ios"],
+            "captured before the reset",
+        ))
+        .await
+        .unwrap();
+    harness.native.log_event("builds", "reset");
+    subscribe_worker(&harness, "w2").await.unwrap();
+    harness
+        .service
+        .announce(announce_request(
+            "payments",
+            "after",
+            &["ios"],
+            "captured after the reset",
+        ))
+        .await
+        .unwrap();
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+
+    let ended = harness
+        .service
+        .subscription(&sid("w1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ended.ended,
+        Some(SubscriptionEnd::MemberMobEnded {
+            why: "reset".into()
+        })
+    );
+    let owed = owed_settlements(&harness, "w1");
+    assert_eq!(owed.len(), 2, "{owed:?}");
+    assert!(
+        owed.iter()
+            .all(|(_, settlement)| settlement.as_deref() == Some("ended")),
+        "{owed:?}"
+    );
+    assert_eq!(harness.native.submits(), 1);
+    let batches = harness
+        .service
+        .deliveries(&worker_batches_query())
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1, "{batches:?}");
+    let delivered = &batches[0];
+    assert_eq!(delivered.state.tag(), BatchStateTag::Delivered);
+    assert!(
+        delivered
+            .items
+            .iter()
+            .all(|item| item.subscription_id == sid("w2")),
+        "{:?}",
+        delivered.items
+    );
+    assert!(delivered.body.contains("captured after the reset"));
+    assert!(!delivered.body.contains("captured before the reset"));
+}
+
+/// A mob created again under the same id ends what its members had in the
+/// old incarnation at the mob set reconcile and at the read before a
+/// delivery, not only at the next put.
+#[tokio::test]
+async fn a_mob_created_again_ends_its_members_subscriptions_at_reconcile_and_delivery() {
+    let created_again = Some(SubscriptionEnd::MemberMobEnded {
+        why: "created again".into(),
+    });
+    let harness = harness_with(child_native());
+    subscribe_worker(&harness, "w1").await.unwrap();
+    harness
+        .native
+        .incarnations
+        .lock()
+        .unwrap()
+        .insert("builds".into(), incarnation("owner-2", 20));
+    harness.service.reconcile_mobs().await.unwrap();
+    let ended = harness
+        .service
+        .subscription(&sid("w1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ended.ended, created_again);
+
+    let harness = harness_with(child_native());
+    subscribe_worker(&harness, "w1").await.unwrap();
+    harness.announce_burst(1).await;
+    harness
+        .native
+        .incarnations
+        .lock()
+        .unwrap()
+        .insert("builds".into(), incarnation("owner-2", 20));
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let ended = harness
+        .service
+        .subscription(&sid("w1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ended.ended, created_again);
+    assert_eq!(harness.native.submits(), 0, "nothing reached the member");
+}
+
 #[tokio::test]
 async fn the_member_mob_log_is_read_on_from_the_last_read() {
     let harness = harness_with(child_native());
@@ -5713,10 +6109,12 @@ async fn the_member_mob_log_is_read_on_from_the_last_read() {
     harness.clock.fetch_add(60_001, Ordering::SeqCst);
     harness.service.run_round().await.unwrap();
     assert_eq!(harness.native.submits(), 2);
+    // The log is read at each seal and before each submission; every read
+    // starts where the last one ended.
     assert_eq!(
         *harness.native.log_reads.lock().unwrap(),
-        vec![2, 4],
-        "the second read starts where the first ended"
+        vec![2, 4, 4, 5],
+        "each read starts where the last one ended"
     );
 }
 

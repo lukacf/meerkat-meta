@@ -523,6 +523,8 @@ pub struct MobNativeDelivery {
     mob_tools: Arc<meerkat_mob_mcp::MobMcpState>,
     runtime: Arc<meerkat_runtime::MeerkatMachine>,
     sessions: Arc<dyn meerkat_mob::MobSessionService>,
+    /// Hosted mob ids this store cannot hold, warned about once each.
+    unusable_ids: std::sync::Mutex<BTreeSet<String>>,
 }
 
 impl MobNativeDelivery {
@@ -539,6 +541,7 @@ impl MobNativeDelivery {
             mob_tools,
             runtime,
             sessions,
+            unusable_ids: std::sync::Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -648,7 +651,14 @@ impl MobNativeDelivery {
                 Ok(mob_id) => Some(mob_id),
                 // One id this store cannot hold leaves the others readable.
                 Err(error) => {
-                    tracing::warn!(mob = %mob_id, %error, "hosted mob id not usable here");
+                    let first = self
+                        .unusable_ids
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(mob_id.clone());
+                    if first {
+                        tracing::warn!(mob = %mob_id, %error, "hosted mob id not usable here");
+                    }
                     None
                 }
             })
@@ -761,12 +771,14 @@ impl MobNativeDelivery {
                     .map(|(_, handle)| handle.clone());
                 records.parent = Some(match parent {
                     Some(parent) => ParentRecord::Running {
-                        incarnation: if binding.mob_id == self.mob_id.as_str() {
-                            None
-                        } else {
-                            let parent_id = MobId::new(binding.mob_id.clone())
-                                .map_err(|error| unavailable(&error))?;
-                            Some(Self::incarnation_of(&parent, &parent_id).await?)
+                        // The root has no incarnation on its edges, and an id
+                        // this store cannot hold makes a record with no
+                        // parent (origin_from), so neither reads one.
+                        incarnation: match MobId::new(binding.mob_id.clone()) {
+                            Ok(parent_id) if parent_id != self.mob_id => {
+                                Some(Self::incarnation_of(&parent, &parent_id).await?)
+                            }
+                            _ => None,
                         },
                         journal: parent
                             .read_handle()

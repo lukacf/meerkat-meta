@@ -983,6 +983,8 @@ fn cancel_unwanted_sealed(db: &Connection, id: &SubscriptionId, now_ms: u64) -> 
         batch.updated_at_ms = now_ms;
         update_batch(db, &batch)?;
         settle_owed(db, &batch.id, "cancelled")?;
+        // Its gap lines reach the member's next batch instead.
+        add_gaps(db, &batch.member, &batch.gaps)?;
     }
     Ok(())
 }
@@ -1459,15 +1461,9 @@ fn seal_batch_in(
     let mut announcements = BTreeMap::new();
     let mut items = Vec::new();
     let mut bytes = 0_u64;
-    // What the member was owed and never got rides on its next batch.
-    let gaps = pending_gaps(db, member)?;
     // The encoded body is its header, its gap lines and each item's
     // encoding without the quotes: JSON escapes character by character.
-    let mut wire = wire_budget.map_or(0, |_| {
-        gaps.iter().fold(header_wire_bound(batch_id), |wire, gap| {
-            wire.saturating_add(wire_len(&render_gap(gap)).saturating_sub(2))
-        })
-    });
+    let mut wire = wire_budget.map_or(0, |_| header_wire_bound(batch_id));
     for (subscription, revision, mob_id, sequence, rendered) in candidates {
         let key = (MobId::new(mob_id)?, uint(sequence)?);
         let rendered = uint(rendered)?;
@@ -1491,12 +1487,26 @@ fn seal_batch_in(
     if owed.is_empty() {
         return Ok(None);
     }
+    // What the member was owed and never got rides on its next batch, as
+    // many gap lines as fit what the items left of the budget; the rest
+    // wait for a later batch.
+    let mut gaps = Vec::new();
+    for gap in pending_gaps(db, member)? {
+        let line = wire_len(&render_gap(&gap)).saturating_sub(2);
+        if wire_budget.is_some_and(|budget| wire.saturating_add(line) > budget) {
+            break;
+        }
+        wire = wire.saturating_add(line);
+        gaps.push(gap);
+    }
     let body = render_batch(batch_id, None, &gaps, &items);
-    db.execute(
-        "DELETE FROM announcement_gaps WHERE member = ?1",
-        params![member.key()],
-    )
-    .map_err(storage)?;
+    for gap in &gaps {
+        db.execute(
+            "DELETE FROM announcement_gaps WHERE member = ?1 AND mob_id = ?2 AND reason = ?3",
+            params![member.key(), gap.mob_id.as_str(), gap.reason.as_str()],
+        )
+        .map_err(storage)?;
+    }
     let mut batch_items = Vec::with_capacity(owed.len());
     for (subscription_id, subscription_revision, key) in owed {
         let source_key = announcements
@@ -1599,6 +1609,17 @@ fn transition_batch_in(
         // to report, from its next batch.
         let expired = batch_expired_gaps(db, &batch.id)?;
         add_gaps(db, &batch.member, &merge_gaps(&batch.gaps, &expired))?;
+    } else if matches!(
+        next.tag(),
+        BatchStateTag::Cancelled
+            | BatchStateTag::Refused
+            | BatchStateTag::Blocked
+            | BatchStateTag::Stranded
+    ) && batch.successor.is_none()
+    {
+        // A batch that reports nothing hands its gap lines to the member's
+        // next batch; a successor already carries them.
+        add_gaps(db, &batch.member, &batch.gaps)?;
     }
     if let Some(settlement) = event.settlement() {
         settle_owed(db, &batch.id, settlement.as_str())?;

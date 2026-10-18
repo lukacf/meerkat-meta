@@ -1138,16 +1138,7 @@ impl AnnouncementService {
             match policy.due_at(&backlog) {
                 Some(due) if due <= now => {
                     let id = new_batch_id()?;
-                    let sealed = match self.inner.store.member_route(&backlog.member).await {
-                        Ok(kept) => {
-                            let route = kept.map(|kept| kept.route).unwrap_or_default();
-                            self.inner
-                                .store
-                                .seal_batch(&backlog.member, &id, &policy, wire_budget(route), now)
-                                .await
-                        }
-                        Err(error) => Err(error),
-                    };
+                    let sealed = self.seal_backlog(&backlog.member, &id, &policy, now).await;
                     match sealed {
                         Ok(Some(batch)) => {
                             report.sealed += 1;
@@ -1178,6 +1169,35 @@ impl AnnouncementService {
             }
         }
         Ok(report)
+    }
+
+    /// Seal a member's due backlog into one batch on its kept route. The
+    /// log of a member's own mob, for a member of a mob a member created,
+    /// is read first: a subscription that mob's end ended carries nothing
+    /// into the batch, so a batch never mixes what was captured before a
+    /// reset with what a subscription made after it wants.
+    async fn seal_backlog(
+        &self,
+        member: &Member,
+        id: &BatchId,
+        policy: &SealingPolicy,
+        now: u64,
+    ) -> Result<Option<Batch>, AnnouncementError> {
+        let route = self
+            .inner
+            .store
+            .member_route(member)
+            .await?
+            .map(|kept| kept.route)
+            .unwrap_or_default();
+        if route == MemberRoute::Child {
+            self.member_mob_ended(member, now).await?;
+        }
+        Ok(self
+            .inner
+            .store
+            .seal_batch(member, id, policy, wire_budget(route), now)
+            .await?)
     }
 
     /// Record when a batch the round just read is read again.
@@ -1528,17 +1548,17 @@ impl AnnouncementService {
         if now.saturating_sub(batch.sealed_at_ms) < config.retention_ms {
             return Expiry::NotYet;
         }
-        if batch.route != MemberRoute::Peer
-            || now.saturating_sub(batch.updated_at_ms) > config.peer_request_window_ms
-        {
+        // A peer accepts a request while its issue time is within the
+        // window of its own clock: the wait covers this gateway's window and
+        // the slowest settle pause past it, for a request issued late in a
+        // round or read by a clock a little behind.
+        let quiet = config
+            .peer_request_window_ms
+            .saturating_add(config.settle_check_max_ms);
+        if batch.route != MemberRoute::Peer || now.saturating_sub(batch.updated_at_ms) > quiet {
             return Expiry::Now;
         }
-        Expiry::AfterQuietWindow(
-            batch
-                .updated_at_ms
-                .saturating_add(config.peer_request_window_ms)
-                .saturating_add(1),
-        )
+        Expiry::AfterQuietWindow(batch.updated_at_ms.saturating_add(quiet).saturating_add(1))
     }
 
     fn settle_pause_ms(&self, batch: &Batch, now: u64) -> u64 {
@@ -1609,7 +1629,11 @@ impl AnnouncementService {
                             return Ok(retry_at);
                         }
                     }
-                    batch = self.apply(&batch, BatchEvent::BeginSubmit, now).await?;
+                    // Stamped when the request is issued, not when the
+                    // round began: a peer's window runs from the issue.
+                    batch = self
+                        .apply(&batch, BatchEvent::BeginSubmit, self.now())
+                        .await?;
                     super::faults::after_begin_submit();
                     submitted_this_round = true;
                     match self.submit(&batch, now).await? {
@@ -1683,7 +1707,7 @@ impl AnnouncementService {
                                 }
                             }
                             batch = self
-                                .apply(&batch, BatchEvent::RetryNotCommitted, now)
+                                .apply(&batch, BatchEvent::RetryNotCommitted, self.now())
                                 .await?;
                             submitted_this_round = true;
                             match self.submit(&batch, now).await? {
