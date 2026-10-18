@@ -52,9 +52,12 @@ mod tests {
         match stop_reason {
             StopReason::EndTurn | StopReason::StopSequence => CompletionStop::Answered,
             StopReason::MaxTokens => CompletionStop::Truncated,
-            StopReason::ContentFilter | StopReason::ToolUse | StopReason::Cancelled => {
-                CompletionStop::Incomplete(stop_reason)
-            }
+            StopReason::ContentFilter
+            | StopReason::ToolUse
+            | StopReason::Cancelled
+            | StopReason::Refusal
+            | StopReason::PauseTurn
+            | StopReason::ContextWindowExceeded => CompletionStop::Incomplete(stop_reason),
         }
     }
 

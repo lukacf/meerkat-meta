@@ -32,10 +32,13 @@ impl CompletionCase {
 /// Every stop reason that ends a memory stage's completion before a complete
 /// answer, apart from the output ceiling's own `Truncated`. Each stage's tests
 /// refuse all of them.
-pub(crate) const INCOMPLETE_STOPS: [meerkat_core::StopReason; 3] = [
+pub(crate) const INCOMPLETE_STOPS: [meerkat_core::StopReason; 6] = [
     meerkat_core::StopReason::ContentFilter,
     meerkat_core::StopReason::ToolUse,
     meerkat_core::StopReason::Cancelled,
+    meerkat_core::StopReason::Refusal,
+    meerkat_core::StopReason::PauseTurn,
+    meerkat_core::StopReason::ContextWindowExceeded,
 ];
 
 /// A client whose completion streams `body` and then stops with

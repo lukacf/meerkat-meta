@@ -3487,6 +3487,184 @@ default_binding = "local"
         request["params"].clone()
     }
 
+    /// A detached `security_scan` callback tool on `runner_version` of the runner
+    /// every detached test call here uses.
+    fn detached_security_scan(runner_version: &str) -> Value {
+        json!({
+            "name": "security_scan",
+            "description": "Scan a target for known issues.",
+            "input_schema": {"type": "object", "properties": {"target": {"type": "string"}}},
+            "execution": {
+                "mode": "detached",
+                "runner": {"name": "example.security_scan", "version": runner_version},
+                "restart_class": "adoptable",
+                "idempotency_scope": "tool_call",
+                "submission_timeout_ms": 30000
+            }
+        })
+    }
+
+    fn detached_callback_test_dispatcher_declaring(
+        store: Arc<dyn meerkat::DetachedJobStore>,
+        blobs: Arc<dyn meerkat_core::BlobStore>,
+        tool: Value,
+    ) -> (
+        Arc<CallbackToolDispatcher>,
+        StdioCallbackBridge,
+        mpsc::Receiver<GatewayStdoutLine>,
+    ) {
+        let (stdout_tx, stdout_rx) = mpsc::channel::<GatewayStdoutLine>(4);
+        let bridge = StdioCallbackBridge::new(stdout_tx);
+        let dispatcher = CallbackToolDispatcher::new(
+            bridge.clone(),
+            "build-1".to_string(),
+            vec![CallbackToolSpec::parse(&tool).expect("tool spec")],
+            Some(DetachedCallbackJobRuntime::new(
+                crate::storage_provider::DEFAULT_MEERKAT_LEVEL_REALM_ID,
+                store,
+                blobs,
+            )),
+        );
+        (Arc::new(dispatcher), bridge, stdout_rx)
+    }
+
+    /// A gateway on the stores under `root` submits a detached `security_scan`
+    /// call under `tool`, and its host accepts the start. Returns the job id.
+    async fn submit_and_start_detached_under(root: &std::path::Path, tool: Value) -> String {
+        let args = serde_json::value::RawValue::from_string(r#"{"target":"build-7"}"#.to_string())
+            .expect("raw arguments");
+        let call = ToolCallView {
+            id: "tc-runner-version",
+            name: "security_scan",
+            args: &args,
+        };
+        let (store, _binary, blobs) = open_detached_callback_test_stores(root);
+        let (dispatcher, bridge, mut stdout_rx) =
+            detached_callback_test_dispatcher_declaring(store, blobs, tool);
+        let receipt = submit_detached_callback_test_call(&dispatcher, call)
+            .await
+            .expect("detached submit");
+        accept_detached_callback_start(&bridge, &mut stdout_rx).await;
+        receipt.job_id
+    }
+
+    /// A detached `security_scan` job on runner `runner_version`, admitted to the
+    /// stores under `root` and never claimed: queued, as a gateway that exits
+    /// between a submit and its first start leaves it. Returns the job id.
+    async fn queue_detached_job_on_runner(root: &std::path::Path, runner_version: &str) -> String {
+        use base64::Engine as _;
+        let (store, _binary, blobs) = open_detached_callback_test_stores(root);
+        let specification = blobs
+            .put_artifact(
+                CALLBACK_ARGUMENTS_MEDIA_TYPE,
+                &base64::engine::general_purpose::STANDARD.encode(br#"{"target":"build-8"}"#),
+            )
+            .await
+            .expect("callback arguments");
+        let spec = meerkat::JobSpec::new(
+            crate::storage_provider::DEFAULT_MEERKAT_LEVEL_REALM_ID,
+            meerkat_core::SessionId::parse("019f74fb-1907-7b21-932d-ab22c4d1f532")
+                .expect("session id"),
+            meerkat::ExecutionIntentId::from_string("intent:queued").expect("intent"),
+            meerkat::InteractionLineageId::from_string("lineage:queued").expect("lineage"),
+            meerkat::ToolIdentity::new("security_scan", runner_version).expect("tool"),
+            meerkat::RunnerIdentity::new("example.security_scan", runner_version).expect("runner"),
+            meerkat::RestartClass::Adoptable,
+            meerkat::CanonicalArgumentsHash::new(format!("sha256:{}", "b".repeat(64)))
+                .expect("arguments hash"),
+            meerkat::JobSubmissionKey::new("callback:queued").expect("submission key"),
+        )
+        .with_runner_specification_ref(
+            meerkat::RunnerSpecificationRef::new(specification.blob_id.to_string())
+                .expect("specification ref"),
+        );
+        meerkat::DetachedJobService::new(store)
+            .submit(spec)
+            .await
+            .expect("submit")
+            .job_id
+            .to_string()
+    }
+
+    /// The first callback request a gateway restarted on the stores under `root`,
+    /// declaring `tool`, sends while it reconciles and starts the detached jobs it
+    /// owns, if one comes within `wait`.
+    async fn first_callback_after_restart(
+        root: &std::path::Path,
+        tool: Value,
+        wait: Duration,
+    ) -> Option<Value> {
+        let (store, _binary, blobs) = open_detached_callback_test_stores(root);
+        let (dispatcher, _bridge, mut stdout_rx) =
+            detached_callback_test_dispatcher_declaring(store, blobs, tool);
+        let _reconcile = tokio::spawn(async move { dispatcher.reconcile_detached_jobs().await });
+        let line = tokio::time::timeout(wait, stdout_rx.recv()).await.ok()??;
+        Some(serde_json::from_str(&line).expect("callback json"))
+    }
+
+    /// A gateway takes over only the detached jobs of the runner versions it
+    /// registers, which is what lets a host change a tool safely: give it a new
+    /// runner version (the 0.9.3 Known limitation). Restarted on runner version 2,
+    /// a gateway is not offered the running attempt of a job runner version 1
+    /// started; restarted on version 1 again, it is.
+    #[tokio::test]
+    async fn a_gateway_on_another_runner_version_is_not_offered_a_running_job() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let job_id =
+            submit_and_start_detached_under(root.path(), detached_security_scan("1")).await;
+        let offer = first_callback_after_restart(
+            root.path(),
+            detached_security_scan("2"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            offer.is_none(),
+            "a gateway on runner version 2 was offered version 1's job {job_id}: {offer:?}"
+        );
+        let offer = first_callback_after_restart(
+            root.path(),
+            detached_security_scan("1"),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a gateway back on runner version 1 is offered its running job");
+        assert_eq!(offer["method"], "callback/job/reconcile");
+        assert_eq!(
+            offer["params"]["attempts"][0]["authority"]["job_id"],
+            job_id
+        );
+    }
+
+    /// The start path keeps the same rule: restarted on runner version 2, a gateway
+    /// does not start a queued job of runner version 1; restarted on version 1
+    /// again, it does.
+    #[tokio::test]
+    async fn a_gateway_on_another_runner_version_does_not_start_a_queued_job() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let job_id = queue_detached_job_on_runner(root.path(), "1").await;
+        let start = first_callback_after_restart(
+            root.path(),
+            detached_security_scan("2"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            start.is_none(),
+            "a gateway on runner version 2 started version 1's queued job {job_id}: {start:?}"
+        );
+        let start = first_callback_after_restart(
+            root.path(),
+            detached_security_scan("1"),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a gateway back on runner version 1 starts its queued job");
+        assert_eq!(start["method"], "callback/job/start");
+        assert_eq!(start["params"]["authority"]["job_id"], job_id);
+        assert_eq!(start["params"]["arguments"], json!({"target": "build-8"}));
+    }
+
     #[tokio::test]
     async fn detached_callback_array_arguments_cross_the_base64_adapter_and_replay_after_reopen() {
         let root = tempfile::tempdir().expect("temp dir");

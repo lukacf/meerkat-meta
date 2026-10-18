@@ -233,6 +233,26 @@ gateway over stdio and reaches it at `http_base_url`); only the proxy is
 published. If the proxy instead shares the gateway's network namespace, keep
 the loopback default and proxy to `http_base_url`.
 
+## Worker threads and thread limits
+
+`rpc_gateway`, `meta_gateway` and `meta_flow_editor` start one Tokio worker
+thread per available CPU, as `std::thread::available_parallelism` counts them:
+a cpuset or a cgroup CPU quota (`docker run --cpus`, a Kubernetes CPU limit)
+lowers the count, a pids limit does not. `RKAT_WORKER_THREADS=<n>` sets the
+count, as it does for the Meerkat host binaries; when it is unset, Tokio's own
+`TOKIO_WORKER_THREADS` is read in its place. A value that is not a whole
+number of at least 1 is refused at startup rather than guessed at. A Rust host
+that builds its own runtime can apply the same setting with
+`meerkat_runtime::host_stack::worker_threads_from_env()`.
+
+A container's pids limit (`docker run --pids-limit`, the cgroup's `pids.max`)
+and `RLIMIT_NPROC` count threads as well as processes. A gateway started on a
+host with more CPUs than its limit allows cannot start one worker per CPU, so
+set the worker count well below the limit, for example
+`docker run --pids-limit 256 -e RKAT_WORKER_THREADS=8 ...`. Leave headroom for
+Tokio's blocking pool, MCP stdio servers and shell commands, which count
+against the same limit.
+
 ## Resume behaviour (`meta_gateway`)
 
 The HTTP listen address and the advertised `http_public_base_url` are both

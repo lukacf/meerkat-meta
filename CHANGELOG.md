@@ -358,6 +358,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   only: Forge opens from a complete prepared product archive, and a packaged
   Forge download follows in a later release.
 
+- The attempt in a `PublicIdentityRuntime::attach_live_mcp_server` receipt
+  forwards meerkat's new stdio setup diagnostics,
+  `McpAttachmentAttempt::setup_failure` and `stderr_tail`, under the same
+  identity checks as `observe`: they answer only while the identity is still
+  on the session the server was attached to, checked before and after each
+  read, and `None` otherwise. Without the forwarding the trait's defaults
+  answered `None`, so a host attaching through the identity entry never saw
+  the typed failure or the stderr tail of a stdio server that failed its
+  launch, handshake or tool discovery. The tail stays with the host: Meta
+  does not log it or add it to any event, RPC, SDK or console payload.
+
+- `rpc_gateway`, `meta_gateway` and `meta_flow_editor` take their Tokio worker
+  count from `RKAT_WORKER_THREADS`, the variable the Meerkat 0.9.3 host
+  binaries read, then from Tokio's `TOKIO_WORKER_THREADS`, as
+  `meerkat_runtime::host_stack::worker_threads_from_env` validates them. With
+  neither set they still start one worker per available CPU. A value that is
+  not a whole number of at least 1 is refused at startup, where an invalid
+  `TOKIO_WORKER_THREADS` used to make Tokio panic. A gateway whose container
+  allows fewer threads than its CPU count can now start with fewer workers
+  (see the deployment guide).
+
 ### Changed
 
 - Flow Editor catalogs give a caller without host access each filesystem
@@ -598,21 +619,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   modified. The hook now only reports what an execute would bump and stage,
   and refuses, writing nothing, a `DRY_RUN` other than `true` or `false`.
 
-- **Agent-memory stages write nothing from an answer the model did not
-  finish.** The distiller, the hygienist and the steward refused only an
-  output-ceiling stop, so a reply that a provider's content filter cut off,
-  a cancelled response or a tool-call stop was parsed like an answer and
-  could be written as memory or applied as a transcript revision. A
-  completion is now an answer only when the model ended its turn or matched
-  a stop sequence. Any other stop fails the call as
-  `Incomplete { stop_reason }`, and the run, or that harvest, is skipped with
-  the stop named in its skip reason, as an output-ceiling stop already was
-  with `Truncated`. A completion stream that ends before its terminal event is
-  refused too. A stop reason that a later Meerkat adds is refused the same
-  way. Meerkat 0.9.2 itself reports an Anthropic refusal as an ended turn, so
-  against it a refused reply still reads as an answer; it is refused once
-  Meerkat reports refusals as their own stop.
-
 - A `MobRuntime` torn down without `UnifiedRuntime` (its root mob shut down,
   then `stand_down_child_mobs`) stops its runtime delivery owner and empties
   the composition slots that point back at it before it releases the durable
@@ -681,6 +687,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   dispatch. At startup the gateway settles, from evidence only, the unsettled
   sends among the newest console frames whose input was admitted.
 
+- **Agent-memory stages write nothing from an answer the model did not
+  finish.** The distiller, the hygienist and the steward refused only an
+  output-ceiling stop, so a reply that a provider's content filter cut off,
+  a cancelled response or a tool-call stop was parsed like an answer and
+  could be written as memory or applied as a transcript revision. A
+  completion is now an answer only when the model ended its turn or matched
+  a stop sequence. Any other stop fails the call as
+  `Incomplete { stop_reason }`, and the run, or that harvest, is skipped with
+  the stop named in its skip reason, as an output-ceiling stop already was
+  with `Truncated`. A completion stream that ends before its terminal event is
+  refused too. A stop reason that a later Meerkat adds is refused the same
+  way. With Meerkat 0.9.3 the providers' other non-answers are refused too:
+  an Anthropic refusal, `pause_turn` or `model_context_window_exceeded`
+  arrives as its own stop; a Gemini safety, recitation, blocklist,
+  prohibited-content, sensitive-data, image-safety or language finish arrives
+  as a content filter; and a Gemini `OTHER` or unknown finish reason fails the
+  call.
+
 ### Known limitations
 
 - The Flow Editor draft store is shared by every caller of a Flow Editor
@@ -699,6 +723,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the draft was deleted and created again can overwrite the new draft once
   it reaches the same revision: the etag names the draft's id and revision,
   not which draft of that id it is.
+
+- A restarted gateway, or a second gateway on the same persistent_state
+  directory and realm, takes over the detached callback jobs of any callback
+  tool its host declares with the same tool name, runner name and runner
+  version, whatever that tool now declares. Its host is offered their running
+  attempts. The gateway also starts their queued and retry-due jobs. Once a
+  running job's lease has expired, it restarts the job if its restart class
+  allows. It uses the original arguments and the credential scope names
+  recorded at submission; the host resolves the credentials as it now
+  registers that runner. Change a detached tool's runner version whenever its
+  declaration, its runner implementation or the profile it runs under changes:
+  a gateway neither offers nor starts jobs of a runner version it does not
+  register. Such jobs stay as they are until a gateway registers that version
+  again, so let a tool's jobs finish, or cancel them, before changing it.
+  Meerkat 0.9.3's own RPC server binds a detached callback job to its tool's
+  declaration; Meta's gateway adopts that binding in a later release.
 
 ### Known issues
 
