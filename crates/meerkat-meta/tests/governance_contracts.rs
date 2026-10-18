@@ -154,6 +154,52 @@ rows:
     ));
 }
 
+/// Unquoted scalars in a traceability row are text: numbers and YAML 1.1
+/// words reach the status and evidence checks as written.
+#[test]
+fn traceability_yaml_scalars_are_text() {
+    validate_traceability_statuses("rows:\n  - status: WIRED\n    evidence: [1, true, 1.10]\n")
+        .expect("numeric and boolean-looking evidence entries are text");
+
+    let err = validate_traceability_statuses("rows:\n  - status: yes\n    evidence: [x]\n")
+        .expect_err("`yes` is the status text, not a boolean");
+    assert_eq!(
+        err,
+        GovernanceValidationError::InvalidTraceabilityStatus {
+            line: 1,
+            status: "yes".to_string(),
+        }
+    );
+}
+
+/// Traceability YAML the parser refuses as a malformed row: a `<<` merge (an
+/// ordinary key, so the row has no status), a second document, and a
+/// duplicated row field.
+#[test]
+fn traceability_yaml_refuses_merges_documents_and_duplicate_fields() {
+    for (case, yaml) in [
+        (
+            "merge key",
+            "base: &b {status: TYPED, evidence: [x]}\nrows:\n  - <<: *b\n",
+        ),
+        (
+            "second document",
+            "rows:\n  - status: TYPED\n    evidence: [x]\n---\nrows: []\n",
+        ),
+        (
+            "duplicate status",
+            "rows:\n  - status: TYPED\n    status: WIRED\n    evidence: [x]\n",
+        ),
+    ] {
+        let err = validate_traceability_statuses(yaml).expect_err(case);
+        assert_eq!(
+            err,
+            GovernanceValidationError::InvalidTraceabilityRow { line: 1 },
+            "{case}"
+        );
+    }
+}
+
 #[test]
 fn governance_contracts_accepts_markdown_traceability_after_leading_prose() {
     let markdown = r#"
