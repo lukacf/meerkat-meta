@@ -625,6 +625,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   owned (`HeldUntilProcessExit`). `UnifiedRuntime`'s shutdown still stops
   the owner without joining it, once the mob stops.
 
+- A durable child-mob stand-down (`MobRuntime::stand_down_child_mobs`, run
+  by `UnifiedRuntime` shutdown) no longer waits out its deadline and keeps
+  the child root owned when its admission close reaches a mob whose actor is
+  still exiting from its shutdown. It now waits for that actor's task to end,
+  so the close is refused at once. Meerkat 0.9.3 and earlier can leave a
+  command sent into an exiting actor unanswered.
+
 - A delegate helper whose tooling inherits its parent's visible tools
   (`inherit_parent`, also the default when tooling is omitted) now sees the
   SDK callback tools its parent sees. Every `callback/build_agent` and
