@@ -785,6 +785,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a respawned or delivery-repaired session. The rebind reported the member
   under its runtime alias instead of its roster row, so the opt-in stayed
   on the old session.
+- The console access panel no longer moves its tabs while it refreshes. The
+  "Refreshing owner state" notice, the error alert, "Review and reapply" and
+  the out-of-date note rendered above the tab row, and stream events start a
+  refresh at any moment, so a tab click whose press and release straddled
+  the start of a refresh released over another element and was lost. They
+  now render below the tabs.
 
 ### Known limitations
 
