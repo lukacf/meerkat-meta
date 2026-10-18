@@ -160,7 +160,11 @@ async fn unauthenticated_and_unknown_callers_are_refused() {
     let mut table = ControlGrantTable::new();
     table.insert(
         granted_keys.pubkey_bytes(),
-        ControlGrant::new("ops-mob", ControlVerb::all(), ControlMemberScope::All),
+        ControlGrant::new(
+            "ops-mob",
+            ControlVerb::all().iter().copied(),
+            ControlMemberScope::All,
+        ),
     );
     let authorizer = Arc::new(ControlAuthorizer::with_grants(table));
 

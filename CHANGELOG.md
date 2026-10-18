@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking
+
+- The keyed inject verbs extend the cross-mob control types in
+  `runtime::cross_mob_control`: `ControlRequest` and `ControlVerb` gain
+  `InjectKeyed` and `InjectStatus`, and `ControlResponse` gains
+  `InjectReceipt`, `InjectStatus` and `InjectRefused`. The three enums are
+  now `#[non_exhaustive]`, so a match on them outside this crate needs a
+  wildcard arm, and a later variant no longer breaks it.
+  `ControlVerb::all()` returns `&'static [ControlVerb]` instead of a
+  fixed-size array, so a later verb no longer changes its type.
+  `ControlVerb::member_plane()`, what `verbs = ["*"]` expands to, is
+  unchanged.
+
 ### Added
 
 - Mob announcements. The host announces a development to a mob hosted on

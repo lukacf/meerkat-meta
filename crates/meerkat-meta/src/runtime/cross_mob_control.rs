@@ -227,6 +227,7 @@ pub const DEFAULT_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cross-mob control request. One variant per control operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ControlRequest {
     /// Wire a local member to a peer mob's member.
     Wire {
@@ -428,6 +429,7 @@ impl ControlRequest {
 /// Cross-mob control response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "result", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ControlResponse {
     /// Operation succeeded (no payload).
     Ok {
@@ -764,6 +766,7 @@ pub struct ControlCaller {
 ///   listener refuses them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ControlVerb {
     Wire,
     Unwire,
@@ -813,9 +816,10 @@ impl ControlVerb {
 
     /// Every verb this gateway knows, for tests and for exhaustive
     /// tables. NOT what `verbs = ["*"]` expands to - see
-    /// [`Self::member_plane`].
-    pub fn all() -> [Self; 8] {
-        [
+    /// [`Self::member_plane`]. A slice, so a later verb does not change
+    /// its type.
+    pub fn all() -> &'static [Self] {
+        &[
             Self::Wire,
             Self::Unwire,
             Self::Inject,
@@ -3479,7 +3483,7 @@ mod tests {
 
     #[test]
     fn control_verb_config_spellings_round_trip() {
-        for verb in ControlVerb::all() {
+        for verb in ControlVerb::all().iter().copied() {
             assert_eq!(ControlVerb::parse(verb.as_str()), Some(verb));
         }
         assert_eq!(ControlVerb::parse("delete_everything"), None);
@@ -3519,7 +3523,7 @@ mod tests {
         let keys = crate::auth::peer_keys::GatewayPeerKeys::ephemeral();
         let authorizer = ControlAuthorizer::with_grants(table_for(
             &keys,
-            &ControlVerb::all(),
+            ControlVerb::all(),
             ControlMemberScope::All,
         ));
         let denial = authorizer
@@ -3575,7 +3579,7 @@ mod tests {
         let stranger = crate::auth::peer_keys::GatewayPeerKeys::ephemeral();
         let authorizer = ControlAuthorizer::with_grants(table_for(
             &granted,
-            &ControlVerb::all(),
+            ControlVerb::all(),
             ControlMemberScope::All,
         ));
         let denial = authorizer
@@ -3618,7 +3622,7 @@ mod tests {
         let keys = crate::auth::peer_keys::GatewayPeerKeys::ephemeral();
         let authorizer = ControlAuthorizer::with_grants(table_for(
             &keys,
-            &ControlVerb::all(),
+            ControlVerb::all(),
             ControlMemberScope::All,
         ));
         let mut request = signed_as(&keys, None, inject_request("bob"));
@@ -3639,7 +3643,7 @@ mod tests {
         let attacker = crate::auth::peer_keys::GatewayPeerKeys::ephemeral();
         let authorizer = ControlAuthorizer::with_grants(table_for(
             &victim,
-            &ControlVerb::all(),
+            ControlVerb::all(),
             ControlMemberScope::All,
         ));
         let mut request = signed_as(&attacker, None, inject_request("bob"));
@@ -3662,7 +3666,7 @@ mod tests {
     fn audience_binding_refuses_a_request_minted_for_another_gateway() {
         let keys = crate::auth::peer_keys::GatewayPeerKeys::ephemeral();
         let authorizer = ControlAuthorizer::with_grants_for_audience(
-            table_for(&keys, &ControlVerb::all(), ControlMemberScope::All),
+            table_for(&keys, ControlVerb::all(), ControlMemberScope::All),
             "mob-b",
         );
         authorizer
@@ -3821,7 +3825,7 @@ mod tests {
         for verb in ControlVerb::all() {
             if verb.is_host_plane() {
                 assert!(
-                    !grant.verbs().contains(&verb),
+                    !grant.verbs().contains(verb),
                     "'*' must not grant host-plane verb {verb}"
                 );
             }
@@ -3844,7 +3848,8 @@ mod tests {
         .expect("section is present");
         let grant = table.get(&[42u8; 32]).expect("filed");
         let keyed = ControlVerb::all()
-            .into_iter()
+            .iter()
+            .copied()
             .filter(ControlVerb::is_keyed_inject_plane)
             .collect::<Vec<_>>();
         assert_eq!(
@@ -4312,7 +4317,7 @@ mod tests {
         let pinned = server_keys.pubkey_bytes();
         let authorizer = Arc::new(ControlAuthorizer::with_grants(table_for(
             &caller_keys,
-            &ControlVerb::all(),
+            ControlVerb::all(),
             ControlMemberScope::All,
         )));
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
