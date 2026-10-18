@@ -3546,7 +3546,7 @@ async fn a_clock_step_back_during_catch_up_still_runs_rounds() {
     .await;
     assert!(first_round.is_ok(), "the dispatcher started");
     clock.store(10_000_000 - 3_600_000, Ordering::SeqCst);
-    let caught_up = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+    let caught_up = tokio::time::timeout(std::time::Duration::from_mins(1), async {
         while store.prune_passes.load(Ordering::SeqCst) <= PASSES {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
