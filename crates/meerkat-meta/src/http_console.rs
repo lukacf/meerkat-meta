@@ -8679,12 +8679,9 @@ async fn handle_console_runtime_rpc_with_visibility(
             };
             match reset_result {
                 Ok(record) => {
-                    let cleanup_warning = Some(json!({
-                        "kind": "stale_member_cleanup_skipped_after_identity_reset",
-                        "identity": parsed_identity.as_str(),
-                        "agent_runtime_id": record.agent_runtime_id.as_str(),
-                        "message": "reset published the new generation through a successor transition that retired the previous live mob member; identity control calls reject stale runtime ids",
-                    }));
+                    // The reset's successor transition retired the previous
+                    // live member, so there is no cleanup to report (as for
+                    // reset_all).
                     if let Some(store) = &console_events {
                         store
                             .record_lifecycle(
@@ -8693,7 +8690,6 @@ async fn handle_console_runtime_rpc_with_visibility(
                                 json!({
                                     "generation": record.generation.get(),
                                     "checkpoint_version": record.checkpoint_version.get(),
-                                    "cleanup_warning": cleanup_warning.clone(),
                                 }),
                             )
                             .await;
@@ -8706,7 +8702,6 @@ async fn handle_console_runtime_rpc_with_visibility(
                             "session_id": record.session_id.to_string(),
                             "generation": record.generation.get(),
                             "checkpoint_version": record.checkpoint_version.get(),
-                            "cleanup_warning": cleanup_warning,
                         })),
                         None,
                     )
@@ -16400,12 +16395,11 @@ comms = true
         Ok(())
     }
 
-    /// A single identity reset answers with what its successor transition
-    /// did: the previous live member was retired, and identity control calls
-    /// reject the stale runtime id. The `identity_reset` lifecycle frame
-    /// carries the same note.
+    /// A single identity reset reports no cleanup warning: its successor
+    /// transition retired the previous live member. Neither the response nor
+    /// the `identity_reset` lifecycle frame carries one, as for `reset_all`.
     #[tokio::test]
-    async fn console_runtime_reset_notes_that_the_successor_transition_retired_the_member()
+    async fn console_runtime_reset_reports_no_cleanup_warning()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (_temp_dir, runtime) =
             build_empty_console_test_runtime("console-reset-successor-note").await?;
@@ -16450,15 +16444,21 @@ comms = true
         ))
         .await;
         assert_eq!(response["error"], Value::Null, "{response:#?}");
-        let note = json!({
-            "kind": "stale_member_cleanup_skipped_after_identity_reset",
-            "identity": "review:active",
-            "agent_runtime_id": "rt:review:active:1",
-            "message": "reset published the new generation through a successor transition \
-                        that retired the previous live mob member; identity control calls \
-                        reject stale runtime ids",
-        });
-        assert_eq!(response["result"]["cleanup_warning"], note, "{response:#?}");
+        let result = response["result"].as_object().expect("reset result");
+        let mut fields = result.keys().map(String::as_str).collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "agent_runtime_id",
+                "checkpoint_version",
+                "generation",
+                "identity",
+                "session_id"
+            ],
+            "{response:#?}"
+        );
+        assert_eq!(result["agent_runtime_id"], json!("rt:review:active:1"));
         let lifecycle = console_events
             .replay_all(None)
             .await
@@ -16467,7 +16467,14 @@ comms = true
             .iter()
             .find(|event| event.event_type == "identity_reset")
             .ok_or("the reset records an identity_reset frame")?;
-        assert_eq!(frame.data["cleanup_warning"], note, "{lifecycle:#?}");
+        assert_eq!(
+            frame.data,
+            json!({
+                "generation": result["generation"],
+                "checkpoint_version": result["checkpoint_version"],
+            }),
+            "{lifecycle:#?}"
+        );
 
         let _ = runtime.handle().stop().await;
         Ok(())

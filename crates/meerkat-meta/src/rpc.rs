@@ -4994,12 +4994,9 @@ async fn handle_unified_rpc_json_inner(
             };
             match reset_result {
                 Ok(record) => {
-                    let cleanup_warning = Some(serde_json::json!({
-                        "kind": "stale_member_cleanup_skipped_after_identity_reset",
-                        "message": "reset published the new generation through a successor transition that retired the previous live mob member; identity control calls reject stale runtime ids",
-                        "identity": identity.as_str(),
-                        "agent_runtime_id": record.agent_runtime_id.as_str(),
-                    }));
+                    // The reset's successor transition retired the previous
+                    // live member, so there is no cleanup to report (as for
+                    // reset_all).
                     runtime
                         .record_console_lifecycle(
                             identity.as_str(),
@@ -5007,7 +5004,6 @@ async fn handle_unified_rpc_json_inner(
                             serde_json::json!({
                                 "generation": record.generation.get(),
                                 "checkpoint_version": record.checkpoint_version.get(),
-                                "cleanup_warning": cleanup_warning.clone(),
                             }),
                         )
                         .await;
@@ -5020,7 +5016,6 @@ async fn handle_unified_rpc_json_inner(
                             "session_id": record.session_id.to_string(),
                             "generation": record.generation.get(),
                             "checkpoint_version": record.checkpoint_version.get(),
-                            "cleanup_warning": cleanup_warning,
                         })),
                         error: None,
                     }
@@ -8797,18 +8792,24 @@ shell = true
             0,
             "meta/reset must preserve mob_definition when installing the reset roster provider"
         );
-        // The reset's note: its successor transition retired the previous
-        // live member, and identity control calls reject the stale runtime id.
+        // The reset's successor transition retired the previous live member:
+        // the reset reports no cleanup warning, and no such field.
+        let mut fields = response["result"]
+            .as_object()
+            .expect("reset result")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
         assert_eq!(
-            response["result"]["cleanup_warning"],
-            json!({
-                "kind": "stale_member_cleanup_skipped_after_identity_reset",
-                "message": "reset published the new generation through a successor transition \
-                            that retired the previous live mob member; identity control calls \
-                            reject stale runtime ids",
-                "identity": identity.as_str(),
-                "agent_runtime_id": response["result"]["agent_runtime_id"],
-            }),
+            fields,
+            [
+                "agent_runtime_id",
+                "checkpoint_version",
+                "generation",
+                "identity",
+                "session_id"
+            ],
             "{response:#?}"
         );
         assert_eq!(
