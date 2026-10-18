@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The `complete_held_identity_members` documentation no longer says that
+  resumed members are skipped. A held identity bootstrap holds fresh members
+  only: a roster member that already has continuity refuses the whole pass
+  (`HeldBootstrapRefusal::ExistingContinuity`) before any member is held, as
+  it did before.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking
