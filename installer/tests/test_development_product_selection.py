@@ -161,28 +161,36 @@ def test_development_catalog_uses_exact_full_meta_profiles(product, meta_version
     assert json.loads(target.model_catalog.path.read_bytes()) == catalog
 
 
-@pytest.mark.parametrize("meta_version", ["0.9.0", "0.9.1"])
-def test_development_distribution_keeps_guide_and_application_owners_separate(
-        product, bundle_source, tmp_path, monkeypatch, meta_version):
+def guide_product_inputs(product, bundle_source, monkeypatch):
+    """Public source with an inert Guide client and gateway. The client is a
+    stand-in with its own complete pin: the published client wheel's pin is
+    pending until its release exists."""
     from launchkit.bootstrap import SelectedGuideRuntime
     from launchkit.connect_installer_caller import ExactFile
-    from launchkit import distribution, product_distribution, guide_sdk
+    from launchkit import guide_sdk
 
     root, _, _ = bundle_source
-    sdk = root / guide_sdk.WHEEL
-    sdk.parent.mkdir(parents=True)
-    # An inert stand-in with its own complete pin: the published client
-    # wheel's pin is pending until its release exists.
     client = b"inert guide client wheel, never install\n"
     for name, value in (("SOURCE", "c" * 40), ("TREE", "d" * 40),
             ("SHA256", hashlib.sha256(client).hexdigest()), ("SIZE", len(client))):
         monkeypatch.setattr(guide_sdk, name, value)
+    sdk = root / guide_sdk.WHEEL
+    sdk.parent.mkdir(parents=True)
     sdk.write_bytes(client)
     for name in ("LICENSE-MIT", "LICENSE-APACHE"):
         (root / name).write_text("Inert public license.\n")
     gateway = put(product.root / "guide/rpc_gateway", b"inert guide, never execute\n")
     gateway.path.chmod(0o700)
     guide = SelectedGuideRuntime(ExactFile(gateway.path, gateway.sha256), "0.9.3", "0.9.3", "a" * 40, "b" * 40)
+    return root, sdk, gateway, guide
+
+
+@pytest.mark.parametrize("meta_version", ["0.9.0", "0.9.1"])
+def test_development_distribution_keeps_guide_and_application_owners_separate(
+        product, bundle_source, tmp_path, monkeypatch, meta_version):
+    from launchkit import distribution, product_distribution, guide_sdk
+
+    root, sdk, gateway, guide = guide_product_inputs(product, bundle_source, monkeypatch)
     target, _, _ = development(product, meta_version)
     output = tmp_path / "selected-product.zip"
     result = product_distribution.package(root, target, guide, output)
@@ -206,7 +214,8 @@ def test_development_distribution_keeps_guide_and_application_owners_separate(
     # guide program runs, and the selected application bytes stay unchanged.
     manifest = extracted / distribution.MANIFEST
     original = manifest.read_bytes()
-    for field, value in (("version", "0.9.1"), ("core_version", "0.9.1"),
+    for field, value in (("version", "0.9.0"), ("version", "0.9.1"), ("version", "0.9.2"),
+            ("core_version", "0.9.0"), ("core_version", "0.9.1"), ("core_version", "0.9.2"),
             ("meta_source", "not-a-source-hash"), ("gateway", {**observed["guide"]["gateway"], "sha256": "f" * 64}),
             ("sdk", {**observed["guide"]["sdk"], "version": "0.9.0"})):
         changed = deepcopy(observed)
@@ -236,3 +245,28 @@ def test_development_distribution_keeps_guide_and_application_owners_separate(
     with pytest.raises(distribution.DistributionError, match="reviewed wheel"):
         product_distribution.package(root, target, guide, refused_output)
     assert not refused_output.exists()
+
+
+def test_a_pending_guide_client_pin_refuses_packaging_and_verification(
+        product, bundle_source, tmp_path, monkeypatch):
+    from launchkit import distribution, product_distribution, guide_sdk
+
+    root, _, _, guide = guide_product_inputs(product, bundle_source, monkeypatch)
+    target, _, _ = development(product)
+    output = tmp_path / "selected-product.zip"
+    product_distribution.package(root, target, guide, output)
+    extracted = tmp_path / "selected-product"
+    with zipfile.ZipFile(output) as archive:
+        archive.extractall(extracted)
+    product_distribution.verify(extracted)
+    # The committed pending form refuses before any product work and leaves no
+    # archive. An extracted product then neither verifies nor yields launch inputs.
+    for name in ("SOURCE", "TREE", "SHA256", "SIZE"):
+        monkeypatch.setattr(guide_sdk, name, None)
+    refused_output = tmp_path / "pending-guide-sdk.zip"
+    with pytest.raises(distribution.DistributionError, match="pending the published Meta 0.9.3 wheel"):
+        product_distribution.package(root, target, guide, refused_output)
+    assert not refused_output.exists()
+    for check in (product_distribution.verify, distribution.sdk_wheels, distribution.bootstrap_inputs):
+        with pytest.raises(distribution.DistributionError, match="pending"):
+            check(extracted)

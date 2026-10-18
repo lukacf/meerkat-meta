@@ -461,6 +461,47 @@ class InputsTests(unittest.TestCase):
         self.assertEqual(value["guide"]["meta_source"], "b275e0ed4fe61cf4ff43d16691c54efb17812919")
         self.assertEqual(value["guide"]["core_source"], "a00bafaf1d862fb41112ff1f30312b350ad05246")
 
+    def test_the_guide_093_skeleton_is_refused_until_every_pending_value_is_filled(self):
+        skeleton = json.loads((ROOT / forge.INPUTS_DIR / "forge-release-inputs-0.9.3.skeleton.json").read_text())
+        self.assertEqual(skeleton["guide"], {"version": "0.9.3", "core_version": "0.9.3", "meta_source": None,
+                                             "core_source": "d21cd3ef1d0fdefa43f826464802702149decdee"})
+        self.assertEqual(list(skeleton["targets"]), ["linux-x86_64"])
+        entry = skeleton["targets"]["linux-x86_64"]
+        self.assertEqual((list(entry["files"]), entry["selection"], entry["paths"]), ([entry["gateway"]], None, None))
+        self.assertEqual(entry["files"][entry["gateway"]]["url"],
+                         "https://github.com/lukacf/meerkat-meta/releases/download/v0.9.3/"
+                         "meta-rpc-gateway-0.9.3-x86_64-unknown-linux-gnu.tar.gz")
+        with self.assertRaisesRegex(forge.ProtocolError, "meta_source"):
+            forge.validate_inputs(skeleton)
+        # Filled with fixture values, every value the skeleton already holds is valid.
+        product = target_inputs()
+        filled = copy.deepcopy(skeleton)
+        filled["guide"]["meta_source"] = "c" * 40
+        target = filled["targets"]["linux-x86_64"]
+        target["files"][target["gateway"]].update(archive_size=len(ARCHIVE), archive_sha256=sha256(ARCHIVE),
+                                                  size=len(GATEWAY), sha256=sha256(GATEWAY))
+        target["files"].update({name: pin for name, pin in product["files"].items() if name != product["gateway"]})
+        target.update(selection=product["selection"], paths=product["paths"])
+        forge.validate_inputs(filled)
+
+        def gateway_value(key):
+            return lambda value: value["targets"]["linux-x86_64"]["files"]["guide/rpc_gateway"].__setitem__(key, None)
+
+        pending = {
+            "meta source": lambda value: value["guide"].__setitem__("meta_source", None),
+            "selection": lambda value: value["targets"]["linux-x86_64"].__setitem__("selection", None),
+            "paths": lambda value: value["targets"]["linux-x86_64"].__setitem__("paths", None),
+            "product files": lambda value: value["targets"]["linux-x86_64"].__setitem__(
+                "files", {"guide/rpc_gateway": value["targets"]["linux-x86_64"]["files"]["guide/rpc_gateway"]}),
+            **{f"gateway {key}": gateway_value(key) for key in ("archive_size", "archive_sha256", "size", "sha256")},
+        }
+        for label, reset in pending.items():
+            with self.subTest(label):
+                value = copy.deepcopy(filled)
+                reset(value)
+                with self.assertRaises(forge.ProtocolError):
+                    forge.validate_inputs(value)
+
     def test_a_complete_target_is_valid(self):
         forge.validate_inputs(inputs(("linux-x86_64", "macos-arm64")))
 
