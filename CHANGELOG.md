@@ -127,6 +127,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   send in flight during the upgrade and retried afterwards with the same key
   is admitted as a new send.
 
+- With console access rules enabled, `meta/attach_existing_session`, and
+  `meta/ensure_member` with `resume_session_id`, refuse a session that no
+  member owns, such as one created outside a mob, unless the caller is an
+  admin. The refusal is `access_denied` with reason
+  `session_owner_unknown`. Attach such a session as an admin.
+
 ### Security
 
 - The stock reference app router's documented bound on requests in flight
@@ -713,6 +719,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   prohibited-content, sensitive-data, image-safety or language finish arrives
   as a content filter; and a Gemini `OTHER` or unknown finish reason fails the
   call.
+
+- The per-agent event stream (`/agents/{id}/events`) evaluates the console
+  visibility policy for a member named by its runtime alias against that
+  identity's member, as it does for the durable identity, and answers
+  `member_not_found` for a runtime alias that names no live member. Its
+  access rules judge that member too, with the member's own labels.
+- Console access rules judge a member named by its runtime alias as that
+  member, with its identity and labels, on every console route that takes
+  a member id, as they judge its durable identity. A runtime alias that is
+  not the current incarnation of a known member is refused.
+- A console RPC whose member target fields (`identity`, `member_id`,
+  `agent_id`, `agent_identity`) name different members is refused with
+  `conflicting_member_targets`, and the console access rules judge every
+  member a request names.
+- A console access deny rule written against a runtime alias applies to
+  that alias even while it is the member's current incarnation.
+- The per-agent event stream answers `member_not_found` for a runtime alias
+  that is not current, instead of an internal error.
+- The console access rules judge the source member of `meta/fork_helper`
+  as read access to that member, and a session that
+  `meta/attach_existing_session` or `meta/ensure_member`
+  (`resume_session_id`) attaches as read and send access to the members it
+  belongs to. A session whose owner cannot be established is refused unless
+  the caller is an admin (see Breaking).
+- `meta/identity/resolved_tools`, and `resolved_tools_for_member` in Rust,
+  resolve the supplied id through `roster_member_id_for_supplied_id`, as
+  `meta/identity/routing_status` does (#366). A member named by its current
+  runtime alias (`rt:{identity}:{generation}`) or by its encoded roster id
+  now returns the same session and tools as its durable identity; it used
+  to fail with "identity has no current session". The response still echoes
+  the spelling the caller supplied, and a stale runtime alias is still
+  refused with `stale_identity_runtime_binding`.
+- Every caller-supplied member id follows one alias rule, documented in
+  `member_comms_id`. An encoded roster id is decoded rather than encoded a
+  second time. A runtime alias (`rt:{identity}:{generation}`) that the
+  identity runtime confirms is current names its durable member, and a
+  stale one is refused (`stale_identity_runtime_binding` on the RPC
+  surfaces). An action with no identity authority refuses a runtime alias
+  instead of acting on whichever incarnation is current. These surfaces
+  used to report a healthy member missing when it was named by its current
+  runtime alias, and now reach it: console `meta/get_member`; stdio
+  `meta/member_status`; the `meta/fork_helper` source on both surfaces and
+  in `fork_member_with_identity_runtime`; console
+  `meta/cross_mob/wire_local` and `unwire_local`; cross-mob control
+  lookup, inject, and wire; `mob/member_tool_declaration`; the image-input
+  check; and the console aggregator's member resolution, which console
+  inspect, send, and retire share. `mob/adopt_member_identity_declaration`,
+  `mob/apply_member_tool_declaration`, `send_message_on_mob`,
+  `UnifiedRuntime::start_member_turn`, `UnifiedRuntime::reconcile`, and
+  `fork_member_with_identity_runtime` without an identity runtime now
+  refuse a runtime alias. The declaration apply used to report success for
+  a member it never reached, and `reconcile` seated a phantom member for an
+  encoded roster id.
+- Identity-first same-process topology reaches its members: the bilateral
+  wire, unwire, and state read handed each member's runtime alias to the
+  mob, which keys no row by it, and failed with `MemberNotFound`. Wire and
+  unwire now resolve both ends to their durable roster rows under the
+  lifecycle locks they hold, as the other cross-mob operations do.
+- An identity member's idle-retire opt-in follows its continuity rebind to
+  a respawned or delivery-repaired session. The rebind reported the member
+  under its runtime alias instead of its roster row, so the opt-in stayed
+  on the old session.
 
 ### Known limitations
 

@@ -1926,8 +1926,20 @@ impl MetaConsoleAggregator {
                 {
                     continue;
                 }
+                // Member-id alias rule: a request that named a generated alias
+                // re-checks that alias under the lifecycle lock, so a generation
+                // that went stale after it was resolved retires nothing.
+                let expected_alias =
+                    namespace_match_candidates(identity, &resolved.entry.identity_namespace)
+                        .into_iter()
+                        .map(|raw| crate::member_comms_id::runtime_alias_str(&raw).into_owned())
+                        .find(|candidate| {
+                            crate::member_comms_id::durable_identity_from_runtime_alias(candidate)
+                                .is_some_and(|durable| durable == parsed_identity.as_str())
+                        })
+                        .unwrap_or_else(|| resolved.runtime_identity.clone());
                 identity_runtime
-                    .retire_member_alias_tracked(&parsed_identity, &resolved.runtime_identity)
+                    .retire_member_alias_tracked(&parsed_identity, &expected_alias)
                     .await
                     .map_err(|err| -> ConsoleLogError {
                         format!("retire failed for {identity}: {err}").into()
@@ -3404,14 +3416,34 @@ impl MetaConsoleAggregator {
         let mut exact_matches: Vec<(String, ResolvedConsoleMember)> = Vec::new();
         let mut label_matches: Vec<(String, ResolvedConsoleMember)> = Vec::new();
         for entry in entries.values() {
-            let raw_identities = namespace_match_candidates(identity, &entry.identity_namespace);
+            // Member-id alias rule: candidates are decoded first, so an encoded
+            // roster id is not encoded a second time.
+            let raw_identities = namespace_match_candidates(identity, &entry.identity_namespace)
+                .into_iter()
+                .map(|raw| crate::member_comms_id::runtime_alias_str(&raw).into_owned())
+                .collect::<Vec<_>>();
             if raw_identities.is_empty() {
                 continue;
             }
-            let mids = raw_identities
+            let mut mids = raw_identities
                 .iter()
                 .map(|raw_identity| crate::member_comms_id::mob_member_id(raw_identity.as_str()))
                 .collect::<Vec<_>>();
+            // A generated alias names the durable roster row only when the
+            // entry's identity authority confirms it is the CURRENT
+            // incarnation; a stale generation adds nothing. Retire re-checks
+            // that currency under the identity's lifecycle lock.
+            if let Some(identity_runtime) = entry.identity_runtime.as_ref() {
+                for raw_identity in &raw_identities {
+                    if let Some(durable) =
+                        current_generated_alias_identity(identity_runtime, raw_identity).await
+                    {
+                        mids.push(crate::member_comms_id::roster_member_id_for_identity(
+                            durable.as_str(),
+                        ));
+                    }
+                }
+            }
             for resolved in Box::pin(member_sources_for_entry(entry)).await {
                 let session_id = resolved
                     .handle
@@ -9368,6 +9400,23 @@ fn strip_namespace(identity: &str, namespace: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// The durable identity a generated alias names when `identity_runtime`
+/// confirms it is that identity's CURRENT incarnation; `None` for a stale
+/// generation, an unknown identity, or an id that is not a generated alias.
+async fn current_generated_alias_identity(
+    identity_runtime: &crate::identity_first::IdentityRuntime,
+    alias: &str,
+) -> Option<crate::identity_first::AgentIdentity> {
+    let durable = crate::member_comms_id::durable_identity_from_runtime_alias(alias)?;
+    let identity = crate::identity_first::AgentIdentity::parse(&durable).ok()?;
+    let current = identity_runtime
+        .status(&identity)
+        .await
+        .ok()?
+        .agent_runtime_id?;
+    (current.as_str() == alias).then_some(identity)
+}
+
 fn namespace_match_candidates(identity: &str, namespace: &str) -> Vec<String> {
     let namespace = namespace.trim().trim_matches('/');
     if namespace.is_empty() {
@@ -11923,6 +11972,147 @@ comms = true
             raw_member.status,
             meerkat_mob::MobMemberStatus::Active,
             "a bridge-less durable retire proves the aggregator did not fall through to raw Mob"
+        );
+
+        let _ = runtime.mob_handle().stop().await;
+        Ok(())
+    }
+
+    /// The aggregator resolves a CURRENT runtime alias to the durable roster
+    /// row its identity owns: the roster is keyed by the encoded durable
+    /// identity, so encoding the alias itself found nothing and the console
+    /// retire answered "no member" for a healthy one. Only the identity
+    /// authority can say which generation is current, so a stale alias still
+    /// resolves nothing. An encoded roster id is decoded, not encoded twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn current_runtime_alias_resolves_the_durable_roster_row()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const DURABLE: &str = "review:aggregator-alias";
+        let runtime = build_empty_runtime("aggregator-current-alias-test").await;
+        // Labelled as identity-first materialization labels its members: the
+        // label binds the live row to the durable record.
+        spawn_trusted_identity_projected_member(
+            &runtime,
+            SpawnMemberSpec::from_wire(
+                "worker".to_string(),
+                DURABLE.to_string(),
+                Some("You are the aggregator alias review agent.".into()),
+                None,
+                None,
+            )
+            .with_labels(BTreeMap::from([(
+                "agent_identity".to_string(),
+                DURABLE.to_string(),
+            )])),
+        )
+        .await;
+        let live_session_id = runtime
+            .mob_handle()
+            .resolve_bridge_session_id_observation(&crate::member_comms_id::mob_member_id(DURABLE))
+            .await
+            .ok_or("live member has no bridge session")?;
+        let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
+            crate::identity_first::IdentityRuntimeConfig {
+                continuity_store: Arc::new(
+                    crate::identity_first::LocalContinuityStore::in_memory()?
+                ),
+                lease_provider: Arc::new(crate::identity_first::LocalLeaseProvider::new()),
+                runtime_instance_id: "aggregator-current-alias-test".to_string(),
+                has_runtime_store: true,
+                durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
+                bridge: None,
+                default_timeout: None,
+            },
+        ));
+        let durable_identity = crate::identity_first::AgentIdentity::parse(DURABLE)?;
+        identity_runtime
+            .register(
+                crate::identity_first::DurableAgentSpec {
+                    identity: durable_identity.clone(),
+                    profile: meerkat_mob::ProfileName::from("worker"),
+                    addressability: crate::identity_first::AgentAddressability::Addressable,
+                    display_name: None,
+                    labels: BTreeMap::new(),
+                    context: None,
+                    additional_instructions: Vec::new(),
+                    initial_message: None,
+                    runtime_mode_override: None,
+                    backend: None,
+                    binding: None,
+                    placement: None,
+                },
+                crate::identity_first::IdentityLifecycleState::Active,
+                Some(crate::identity_first::ContinuityRecord {
+                    identity: durable_identity.clone(),
+                    agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(&format!(
+                        "rt:{DURABLE}:0"
+                    ))?,
+                    session_id: live_session_id,
+                    generation: crate::identity_first::ContinuityGeneration::new(0),
+                    checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
+                }),
+                Some(crate::identity_first::LeaseGrant {
+                    identity: durable_identity.clone(),
+                    fencing_token: crate::identity_first::FencingToken::new(1),
+                    ttl: Duration::from_mins(5),
+                }),
+            )
+            .await;
+        let aggregator = MetaConsoleAggregator::in_memory();
+        aggregator.register_runtime_handles_with_policy(
+            "runtime-a",
+            "",
+            runtime.mob_runtime().clone(),
+            Some(identity_runtime.clone()),
+            runtime.console_events(),
+            Arc::new(AllowAllConsoleVisibilityPolicy),
+        );
+
+        // Every spelling of the member resolves its one roster row: the
+        // durable identity, its encoded roster id, and its current runtime
+        // alias. A stale generation resolves nothing.
+        let rows_for = async |spelling: String| {
+            aggregator
+                .resolve_members(&spelling)
+                .await
+                .into_iter()
+                .map(|resolved| resolved.runtime_identity)
+                .collect::<Vec<_>>()
+        };
+        let encoded = crate::member_comms_id::mob_member_id_str(DURABLE).into_owned();
+        assert_eq!(
+            (
+                rows_for(DURABLE.to_string()).await,
+                rows_for(encoded).await,
+                rows_for(format!("rt:{DURABLE}:0")).await,
+                rows_for(format!("rt:{DURABLE}:7")).await,
+            ),
+            (
+                vec![DURABLE.to_string()],
+                vec![DURABLE.to_string()],
+                vec![DURABLE.to_string()],
+                Vec::<String>::new(),
+            ),
+            "(durable, encoded roster id, current alias, stale alias) resolved rows"
+        );
+
+        // A refusal and "no member" both mean the stale alias retired nothing.
+        let stale = matches!(
+            aggregator.retire_identity(&format!("rt:{DURABLE}:7")).await,
+            Ok(true)
+        );
+        let current = aggregator
+            .retire_identity(&format!("rt:{DURABLE}:0"))
+            .await?;
+        assert_eq!(
+            (stale, current),
+            (false, true),
+            "(stale alias retired, current alias retired)"
+        );
+        assert_eq!(
+            identity_runtime.status(&durable_identity).await?.state,
+            crate::identity_first::IdentityLifecycleState::Retiring,
+            "the current alias must retire through the durable lifecycle authority"
         );
 
         let _ = runtime.mob_handle().stop().await;

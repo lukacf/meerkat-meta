@@ -3330,6 +3330,9 @@ fn console_rpc_access_requirements(
         // action vocabulary is needed.
         "meta/reload_member" => one(ACTION_AGENT_RESPAWN, target),
         "meta/reset" | "meta/reset_all" => one(ACTION_AGENT_RESET, target),
+        // A fork's source member, and the session `meta/attach_existing_session`
+        // (or `meta/ensure_member` with `resume_session_id`) attaches, are
+        // judged in their handlers.
         "meta/ensure_member"
         | "meta/spawn_helper"
         | "meta/fork_helper"
@@ -3426,6 +3429,57 @@ fn normalized_console_rpc_string_param(params: &Value, key: &str) -> Option<Stri
         .map(str::to_string)
 }
 
+/// The member target fields a console RPC may carry, in the order the access
+/// requirements pick one. Every present field is judged, and they must all
+/// name one member.
+const CONSOLE_RPC_MEMBER_TARGET_FIELDS: [&str; 4] =
+    ["identity", "member_id", "agent_id", "agent_identity"];
+
+/// The present, non-empty member target fields of a request.
+fn console_rpc_member_targets(params: &Value) -> Vec<(&'static str, String)> {
+    CONSOLE_RPC_MEMBER_TARGET_FIELDS
+        .iter()
+        .filter_map(|field| {
+            normalized_console_rpc_string_param(params, field)
+                .filter(|value| !value.is_empty())
+                .map(|value| (*field, value))
+        })
+        .collect()
+}
+
+/// The member a target spelling names: decoded, and a runtime alias reduced
+/// to its durable identity, so every spelling of one member compares equal.
+fn console_rpc_target_member(spelling: &str) -> String {
+    let decoded = crate::member_comms_id::runtime_alias_str(spelling);
+    crate::member_comms_id::durable_identity_from_runtime_alias(&decoded)
+        .unwrap_or_else(|| decoded.into_owned())
+}
+
+/// Refuses a request whose member target fields name different members:
+/// the access rules must judge the member the handler acts on.
+fn console_rpc_member_target_conflict(params: &Value) -> Option<JsonRpcError> {
+    let targets = console_rpc_member_targets(params);
+    let first = console_rpc_target_member(&targets.first()?.1);
+    if targets
+        .iter()
+        .all(|(_, spelling)| console_rpc_target_member(spelling) == first)
+    {
+        return None;
+    }
+    let fields = targets.iter().map(|(field, _)| *field).collect::<Vec<_>>();
+    Some(JsonRpcError {
+        code: -32602,
+        message: format!(
+            "member target fields name different members: {}",
+            fields.join(", ")
+        ),
+        data: Some(json!({
+            "kind": "conflicting_member_targets",
+            "fields": fields,
+        })),
+    })
+}
+
 /// Returns the denial error when the caller's view forbids the method.
 /// Every mapped requirement must pass; the first failing one is reported.
 fn console_rpc_access_violation(
@@ -3435,10 +3489,16 @@ fn console_rpc_access_violation(
 ) -> Option<JsonRpcError> {
     let view = view.filter(|view| view.enforced())?;
     let requirements = console_rpc_access_requirements(method, params)?;
+    // Every member the request names is judged, not only the field the
+    // requirement picked: a handler may act on another target field.
+    let subjects = console_rpc_member_targets(params);
     for (action, target) in requirements {
-        let allowed = match target {
-            Some(ref identity) => view.allows_agent(action, identity),
-            None => view.allows(action),
+        let (allowed, target) = match target {
+            Some(target) => std::iter::once(target)
+                .chain(subjects.iter().map(|(_, subject)| subject.clone()))
+                .find(|subject| !view.allows_agent(action, subject))
+                .map_or((true, None), |denied| (false, Some(denied))),
+            None => (view.allows(action), None),
         };
         if !allowed {
             return Some(JsonRpcError {
@@ -6047,6 +6107,110 @@ fn console_live_only_fallback_allowed(
         })
 }
 
+/// The access-denied error for `action` on a member.
+fn member_access_denied(action: &str, resource: Option<String>) -> JsonRpcError {
+    JsonRpcError {
+        code: ACCESS_DENIED_RPC_CODE,
+        message: format!("access denied: {action}"),
+        data: Some(json!({
+            "kind": "access_denied",
+            "action": action,
+            "resource": resource,
+        })),
+    }
+}
+
+/// A fork carries its source member's conversation into the helper, so
+/// under enforced access rules the source is judged as read access to that
+/// member. Judged here rather than in the requirements map, which would
+/// also judge read access to the new helper's id.
+fn fork_source_access_violation(view: Option<&AccessView>, source: &str) -> Option<JsonRpcError> {
+    let view = view.filter(|view| view.enforced())?;
+    (!view.allows_agent(ACTION_AGENT_VIEW, source))
+        .then(|| member_access_denied(ACTION_AGENT_VIEW, Some(source.to_string())))
+}
+
+/// The members a session belongs to, by console identity: the owner the
+/// continuity store records for it and every roster member bound to it.
+/// `None` when the continuity store cannot answer.
+async fn session_member_owners(
+    handle: &MobHandle,
+    identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+    session_id: &meerkat_core::types::SessionId,
+) -> Option<Vec<String>> {
+    let mut owners = Vec::new();
+    if let Some(identity_runtime) = identity_runtime {
+        match identity_runtime
+            .continuity_store()
+            .session_owner(session_id)
+            .await
+        {
+            Ok(Some(owner)) => owners.push(owner.as_str().to_string()),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %error,
+                    "the continuity store could not read a session's owner; the console \
+                     attach treats the session as having no established owner"
+                );
+                return None;
+            }
+        }
+    }
+    for member in handle.list_members_including_retiring().await {
+        if handle
+            .resolve_bridge_session_id_observation(&member.agent_identity)
+            .await
+            .as_ref()
+            == Some(session_id)
+        {
+            owners.push(durable_identity_for_member(&member));
+        }
+    }
+    Some(owners)
+}
+
+/// A member attached to an existing session reads and continues that
+/// session's conversation, so under enforced access rules every member the
+/// session belongs to is judged for read and send access. A session whose
+/// owner cannot be established is refused unless the caller is an admin.
+/// A refusal names only the session the caller supplied: neither the owner
+/// nor the access the caller lacked.
+async fn attached_session_access_violation(
+    view: Option<&AccessView>,
+    handle: &MobHandle,
+    identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+    session_id: &meerkat_core::types::SessionId,
+) -> Option<JsonRpcError> {
+    let view = view.filter(|view| view.enforced())?;
+    let owners = session_member_owners(handle, identity_runtime, session_id)
+        .await
+        .unwrap_or_default();
+    if owners.is_empty() {
+        return (!view.is_admin()).then(|| JsonRpcError {
+            code: ACCESS_DENIED_RPC_CODE,
+            message: "access denied: the session has no established owner".to_string(),
+            data: Some(json!({
+                "kind": "access_denied",
+                "reason": "session_owner_unknown",
+                "session_id": session_id.to_string(),
+            })),
+        });
+    }
+    let refused = [ACTION_AGENT_VIEW, ACTION_AGENT_SEND]
+        .into_iter()
+        .any(|action| owners.iter().any(|owner| !view.allows_agent(action, owner)));
+    refused.then(|| JsonRpcError {
+        code: ACCESS_DENIED_RPC_CODE,
+        message: "access denied: the caller may not attach this session".to_string(),
+        data: Some(json!({
+            "kind": "access_denied",
+            "session_id": session_id.to_string(),
+        })),
+    })
+}
+
 fn durable_identity_for_member(member: &meerkat_mob::runtime::MobMemberListEntry) -> String {
     crate::member_comms_id::durable_identity_label(&member.labels)
         .map(str::to_owned)
@@ -6160,6 +6324,26 @@ pub(crate) async fn sse_member_identity_visibility(
         .iter()
         .any(|alias| runtime_alias_visible_to_console(handle, visibility_policy, alias));
     Some((identity, visible))
+}
+
+/// Resolve the member a per-agent event stream names and evaluate the
+/// console visibility policy against it. A runtime alias names its
+/// identity's durable roster row (a read under the member-id alias rule),
+/// so the policy sees the member the stream serves. `None` means no live
+/// member answers to the request.
+pub(crate) async fn sse_agent_stream_identity_visibility(
+    handle: &MobHandle,
+    visibility_policy: &dyn ConsoleVisibilityPolicy,
+    requested_identity: &str,
+) -> Option<(String, bool)> {
+    if let Some(found) =
+        sse_member_identity_visibility(handle, visibility_policy, requested_identity).await
+    {
+        return Some(found);
+    }
+    let decoded = crate::member_comms_id::runtime_alias_str(requested_identity);
+    let durable = crate::member_comms_id::durable_identity_from_runtime_alias(&decoded)?;
+    sse_member_identity_visibility(handle, visibility_policy, &durable).await
 }
 
 /// Resolve an attributed event to the exact live roster binding that emitted
@@ -6974,6 +7158,9 @@ async fn handle_console_aggregator_rpc(
     {
         return invalid_params(response_id, message);
     }
+    if let Some(conflict) = console_rpc_member_target_conflict(&request.params) {
+        return response_value(response_id, None, Some(conflict));
+    }
     let can_mutate = is_authenticated && !read_only;
     if is_console_mutating_rpc_method(request.method.as_str()) && !can_mutate {
         return console_read_only_rpc_error(response_id);
@@ -7318,6 +7505,9 @@ async fn handle_console_runtime_rpc_with_visibility(
     {
         return invalid_params(response_id, message);
     }
+    if let Some(conflict) = console_rpc_member_target_conflict(&request.params) {
+        return response_value(response_id, None, Some(conflict));
+    }
     let can_mutate = is_authenticated && !read_only;
     if is_console_mutating_rpc_method(request.method.as_str()) && !can_mutate {
         return console_read_only_rpc_error(response_id);
@@ -7329,6 +7519,9 @@ async fn handle_console_runtime_rpc_with_visibility(
     // experience endpoint first.
     if let Some(controller) = access.filter(|controller| controller.enabled()) {
         prime_access_cache_from_runtime(runtime, controller).await;
+        if let Some(identity_runtime) = identity_runtime.as_ref() {
+            prime_current_runtime_aliases(identity_runtime, controller).await;
+        }
     }
     if let Some(response) = handle_access_admin_rpc(access, access_view, &request) {
         return response;
@@ -7347,6 +7540,7 @@ async fn handle_console_runtime_rpc_with_visibility(
         let handle = runtime.handle();
         if let Some(response) = crate::rpc::mob_methods::handle_member_declaration_rpc(
             &handle,
+            identity_runtime.as_ref(),
             runtime.speaks_for_composition(),
             request.method.as_str(),
             response_id.clone(),
@@ -8246,7 +8440,9 @@ async fn handle_console_runtime_rpc_with_visibility(
                 return response_value(response_id, None, Some(error));
             }
             let handle = runtime.handle();
-            let identity = crate::member_comms_id::mob_member_id(member_id);
+            // Decode before encoding, as the stdio `meta/get_member` does: the
+            // current runtime alias names the durable roster row.
+            let identity = crate::member_comms_id::roster_member_id_for_supplied_id(member_id);
             let entries = handle.list_members_including_retiring().await;
             match entries.into_iter().find(|e| e.agent_identity == identity) {
                 Some(entry) => response_value(
@@ -9562,6 +9758,17 @@ async fn handle_console_runtime_rpc_with_visibility(
                     }
                 },
             };
+            if let Some(session_id) = resume_session_id.as_ref()
+                && let Some(error) = attached_session_access_violation(
+                    access_view,
+                    &runtime.handle(),
+                    identity_runtime.as_ref(),
+                    session_id,
+                )
+                .await
+            {
+                return response_value(response_id, None, Some(error));
+            }
             let additional_instructions = match request.params.get("additional_instructions") {
                 None | Some(Value::Null) => None,
                 Some(Value::Array(arr)) => {
@@ -10779,6 +10986,9 @@ async fn handle_console_runtime_rpc_with_visibility(
                 return invalid_params(response_id, "source_member_id required");
             };
             let source = crate::member_comms_id::runtime_alias_str(source).into_owned();
+            if let Some(error) = fork_source_access_violation(access_view, &source) {
+                return response_value(response_id, None, Some(error));
+            }
             let Some(agent_identity) = request.params.get("agent_identity").and_then(Value::as_str)
             else {
                 return invalid_params(response_id, "agent_identity required");
@@ -10826,7 +11036,6 @@ async fn handle_console_runtime_rpc_with_visibility(
                 return invalid_params(response_id, "max_text_bytes exceeds platform bounds");
             };
             let handle = runtime.handle();
-            let source_member_id = crate::member_comms_id::mob_member_id(&source);
             let helper_alias = agent_identity.to_string();
             let task = task.to_string();
             let identity_runtime_owned = identity_runtime.clone();
@@ -10836,6 +11045,16 @@ async fn handle_console_runtime_rpc_with_visibility(
                     .await
             } else {
                 Ok(None)
+            };
+            // A source the identity authority owns resolves to its durable
+            // roster row: the lifecycle target already checked that a
+            // generated alias is the current incarnation, and the tracked
+            // operation checks it again under the lock. A classic source keeps
+            // its own roster spelling.
+            let source_member_id = if matches!(authority_target, Ok(Some(_))) {
+                crate::member_comms_id::roster_member_id_for_supplied_id(&source)
+            } else {
+                crate::member_comms_id::mob_member_id(&source)
             };
             let fork_result = match authority_target {
                 Err(error) => Err(error.to_string()),
@@ -10941,6 +11160,16 @@ async fn handle_console_runtime_rpc_with_visibility(
                 Ok(s) => s,
                 Err(_) => return invalid_params(response_id, "invalid session_id format"),
             };
+            if let Some(error) = attached_session_access_violation(
+                access_view,
+                &runtime.handle(),
+                identity_runtime.as_ref(),
+                &bridge_session_id,
+            )
+            .await
+            {
+                return response_value(response_id, None, Some(error));
+            }
             let raw_reservation = match crate::member_comms_id::reserve_raw_member_target(
                 identity_runtime.as_ref(),
                 agent_identity,
@@ -11415,6 +11644,10 @@ async fn handle_console_wire_local(
     let result = match authority_target {
         Err(error) => Err(error.to_string()),
         Ok(Some(target)) => {
+            // The lifecycle target owns this alias: a generated alias was
+            // checked current and is checked again under the lock, so it
+            // names the durable roster row, not a row keyed by its own
+            // encoding.
             let operation_alias = local_alias.clone();
             crate::identity_first::IdentityRuntime::run_member_alias_targets_operation_tracked(
                 vec![target],
@@ -11422,14 +11655,18 @@ async fn handle_console_wire_local(
                     let result = if wire {
                         handle
                             .wire(
-                                crate::member_comms_id::mob_member_id(&operation_alias),
+                                crate::member_comms_id::roster_member_id_for_supplied_id(
+                                    &operation_alias,
+                                ),
                                 PeerTarget::External(spec),
                             )
                             .await
                     } else {
                         handle
                             .unwire(
-                                crate::member_comms_id::mob_member_id(&operation_alias),
+                                crate::member_comms_id::roster_member_id_for_supplied_id(
+                                    &operation_alias,
+                                ),
                                 PeerTarget::External(spec),
                             )
                             .await
@@ -12626,6 +12863,29 @@ pub(crate) async fn prime_access_cache_from_runtime(
     }
     let registered = runtime.console_identity_labels().await;
     prime_access_cache_from_handle_with_registry(&runtime.handle(), access, &registered).await;
+    if let Some(identity_runtime) = runtime.installed_identity_runtime() {
+        prime_current_runtime_aliases(&identity_runtime, access).await;
+    }
+}
+
+/// Record each identity's current runtime alias, so the access rules judge
+/// an alias as the member it names.
+pub(crate) async fn prime_current_runtime_aliases(
+    identity_runtime: &crate::identity_first::IdentityRuntime,
+    access: &AccessController,
+) {
+    if !access.enabled() {
+        return;
+    }
+    let statuses = identity_runtime.statuses().await;
+    access.record_current_runtime_aliases(statuses.into_iter().map(|status| {
+        (
+            status.identity.as_str().to_string(),
+            status
+                .agent_runtime_id
+                .map(|alias| alias.as_str().to_string()),
+        )
+    }));
 }
 
 pub(crate) async fn prime_access_cache_from_handle(handle: &MobHandle, access: &AccessController) {
@@ -18183,6 +18443,1483 @@ comms = true
         Ok(())
     }
 
+    /// The console `meta/get_member` decodes a supplied id the way the stdio
+    /// `meta/get_member` and the console `meta/member_status` do: the current
+    /// runtime alias reads the member its durable identity names. Before, it
+    /// answered "member not found" for a healthy member.
+    #[tokio::test]
+    async fn console_get_member_reads_a_member_by_its_runtime_alias()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const DURABLE: &str = "review:get-alias";
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-get-member-alias").await?;
+        runtime
+            .handle()
+            .spawn_spec(SpawnMemberSpec::from_wire(
+                "worker".to_string(),
+                crate::member_comms_id::mob_member_id_str(DURABLE).into_owned(),
+                None,
+                None,
+                None,
+            ))
+            .await?;
+        let get_member = async |member_id: &str| {
+            Box::pin(handle_console_runtime_rpc(
+                &runtime,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                rpc_request_with_params("meta/get_member", json!({ "member_id": member_id })),
+                true,
+            ))
+            .await
+        };
+
+        let durable = get_member(DURABLE).await;
+        assert_eq!(
+            durable["result"]["agent_identity"],
+            json!(DURABLE),
+            "{durable:#?}"
+        );
+        let alias = format!("rt:{DURABLE}:0");
+        let aliased = get_member(&alias).await;
+        assert_eq!(
+            aliased["result"]["agent_identity"],
+            json!(DURABLE),
+            "{alias} must read the member {DURABLE} names: {aliased:#?}"
+        );
+        Ok(())
+    }
+
+    /// A console runtime whose `worker` member is keyed by the durable
+    /// identity, plus an identity runtime that owns that identity at
+    /// generation 1 with `current_alias` as its live runtime alias.
+    async fn console_runtime_with_current_alias(
+        mob_id: &str,
+        durable: &str,
+        current_alias: &str,
+    ) -> Result<
+        (tempfile::TempDir, MobRuntime, Arc<IdentityRuntime>),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let (temp_dir, runtime) = build_empty_console_test_runtime(mob_id).await?;
+        runtime
+            .handle()
+            .spawn_spec(SpawnMemberSpec::from_wire(
+                "worker".to_string(),
+                crate::member_comms_id::mob_member_id_str(durable).into_owned(),
+                None,
+                None,
+                None,
+            ))
+            .await?;
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: mob_id.to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        let identity = AgentIdentity::parse(durable)?;
+        identity_runtime
+            .register(
+                DurableAgentSpec {
+                    identity: identity.clone(),
+                    profile: ProfileName::from("worker"),
+                    addressability: AgentAddressability::Addressable,
+                    display_name: None,
+                    labels: BTreeMap::new(),
+                    context: None,
+                    additional_instructions: Vec::new(),
+                    initial_message: None,
+                    runtime_mode_override: None,
+                    backend: None,
+                    binding: None,
+                    placement: None,
+                },
+                IdentityLifecycleState::Active,
+                Some(ContinuityRecord {
+                    identity: identity.clone(),
+                    agent_runtime_id: AgentRuntimeId::parse(current_alias)?,
+                    session_id: meerkat_core::types::SessionId::new(),
+                    generation: ContinuityGeneration::new(1),
+                    checkpoint_version: CheckpointVersion::new(0),
+                }),
+                Some(LeaseGrant {
+                    identity,
+                    fencing_token: FencingToken::new(1),
+                    ttl: Duration::from_mins(1),
+                }),
+            )
+            .await;
+        Ok((temp_dir, runtime, identity_runtime))
+    }
+
+    /// The console `meta/fork_helper` with the CURRENT runtime alias as its
+    /// source forks the member the identity authority owns. The lifecycle
+    /// target accepts the alias; the fork then has to name the durable roster
+    /// row, not the alias's own encoding, which no row has.
+    #[tokio::test]
+    async fn console_fork_helper_forks_the_source_its_current_runtime_alias_names()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let current_alias = "rt:review:console-fork:1";
+        let (_temp_dir, runtime, identity_runtime) = console_runtime_with_current_alias(
+            "console-fork-current-alias",
+            "review:console-fork",
+            current_alias,
+        )
+        .await?;
+
+        let response = Box::pin(handle_console_runtime_rpc(
+            &runtime,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(identity_runtime),
+            None,
+            None,
+            rpc_request_with_params(
+                "meta/fork_helper",
+                json!({
+                    "source_member_id": current_alias,
+                    "agent_identity": "console-fork-current-probe",
+                    "task": "answer briefly",
+                    "result_label": "console-fork-current-probe",
+                    "max_text_bytes": 4096,
+                }),
+            ),
+            true,
+        ))
+        .await;
+        assert!(
+            !response.to_string().contains("mob member not found"),
+            "a current runtime alias must fork its durable source member: {response:#?}"
+        );
+        Ok(())
+    }
+
+    /// The console `meta/cross_mob/wire_local` and `unwire_local` with the
+    /// CURRENT runtime alias as the local member act on the durable roster
+    /// row the identity authority owns, not on a row keyed by the alias's own
+    /// encoding, which no row has.
+    #[tokio::test]
+    async fn console_wire_local_acts_on_the_member_its_current_runtime_alias_names()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const DURABLE: &str = "review:console-wire";
+        let current_alias = "rt:review:console-wire:1";
+        let (_temp_dir, runtime, identity_runtime) = console_runtime_with_current_alias(
+            "console-wire-current-alias",
+            DURABLE,
+            current_alias,
+        )
+        .await?;
+        let remote_comms_name = "remote-mob/worker/peer";
+        let remote_peer_id =
+            meerkat_core::comms::PeerId::from_ed25519_pubkey(&[42_u8; 32]).to_string();
+        let wired_on_durable_row = async || -> Result<bool, meerkat_mob::MobError> {
+            Ok(runtime
+                .handle()
+                .get_member(&crate::member_comms_id::mob_member_id(DURABLE))
+                .await?
+                .is_some_and(|entry| {
+                    entry
+                        .wired_to
+                        .iter()
+                        .any(|peer| peer.as_str() == remote_comms_name)
+                }))
+        };
+
+        for (method, expect_wired) in [
+            ("meta/cross_mob/wire_local", true),
+            ("meta/cross_mob/unwire_local", false),
+        ] {
+            let response = Box::pin(handle_console_runtime_rpc(
+                &runtime,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(identity_runtime.clone()),
+                None,
+                None,
+                rpc_request_with_params(
+                    method,
+                    json!({
+                        "local_member_id": current_alias,
+                        "remote_comms_name": remote_comms_name,
+                        "remote_peer_id": remote_peer_id,
+                        "remote_address": format!("inproc://{remote_comms_name}"),
+                        // The 32-byte key [42; 32] the peer id is derived from.
+                        "remote_pubkey_b64": "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=",
+                    }),
+                ),
+                true,
+            ))
+            .await;
+            assert_eq!(
+                (response["error"].clone(), wired_on_durable_row().await?),
+                (Value::Null, expect_wired),
+                "(error, durable row wired) after {method} through {current_alias}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The per-agent event stream applies the console visibility policy to
+    /// the member a request names, in every spelling: a durable identity, or
+    /// a runtime alias, which names its identity's durable roster row. A
+    /// runtime alias that names no live member is refused, and only a
+    /// visible member's stream is opened.
+    #[tokio::test]
+    async fn agent_events_stream_applies_console_visibility_to_every_member_spelling()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        struct HideOtherTenant;
+        impl crate::console_aggregator::ConsoleVisibilityPolicy for HideOtherTenant {
+            fn member_visible(&self, member: &crate::runtime::ConsoleMember) -> bool {
+                member.labels.get("tenant").map(String::as_str) != Some("other")
+            }
+        }
+
+        const HIDDEN: &str = "review:stream-hidden";
+        const VISIBLE: &str = "review:stream-visible";
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("agent-events-stream-visibility").await?;
+        for (durable, labels) in [
+            (
+                HIDDEN,
+                BTreeMap::from([("tenant".to_string(), "other".to_string())]),
+            ),
+            (VISIBLE, BTreeMap::new()),
+        ] {
+            runtime
+                .handle()
+                .spawn_spec(
+                    SpawnMemberSpec::from_wire(
+                        "worker".to_string(),
+                        crate::member_comms_id::mob_member_id_str(durable).into_owned(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .with_labels(labels),
+                )
+                .await?;
+        }
+        let subscribed: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let recorded = Arc::clone(&subscribed);
+        let subscribe: crate::http_sse::AgentEventReplaySubscribeFn =
+            Arc::new(move |agent_id, _cursor| {
+                recorded
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(agent_id);
+                Box::pin(async move {
+                    Ok(crate::http_sse::AgentEventReplay {
+                        epoch: None,
+                        stream: Box::pin(futures::stream::iter(vec![
+                            meerkat_core::event::EventEnvelope::new(
+                                "stream-visibility",
+                                1,
+                                None,
+                                meerkat_core::AgentEvent::TextDelta {
+                                    delta: "stream-visibility-delta".to_string(),
+                                    assistant_message_id: None,
+                                },
+                            ),
+                        ])),
+                    })
+                })
+            });
+        let app = crate::http_sse::agent_events_sse_router_with_access_and_priming(
+            subscribe,
+            None,
+            None,
+            Some(runtime.clone()),
+            None,
+            Arc::new(HideOtherTenant),
+        );
+        let status =
+            async |agent_id: &str| -> Result<StatusCode, Box<dyn std::error::Error + Send + Sync>> {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/agents/{agent_id}/events"))
+                            .body(Body::empty())?,
+                    )
+                    .await?;
+                Ok(response.status())
+            };
+
+        let statuses = (
+            status(HIDDEN).await?,
+            status(&format!("rt:{HIDDEN}:1")).await?,
+            status(&format!("rt:{VISIBLE}:1")).await?,
+            status("rt:review:stream-nobody:0").await?,
+        );
+        let opened = subscribed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            (statuses, opened),
+            (
+                (
+                    StatusCode::NOT_FOUND,
+                    StatusCode::NOT_FOUND,
+                    StatusCode::OK,
+                    StatusCode::NOT_FOUND,
+                ),
+                vec![format!("rt:{VISIBLE}:1")],
+            ),
+            "((hidden durable, hidden alias, visible alias, unknown alias), streams opened)"
+        );
+        Ok(())
+    }
+
+    /// The per-agent event stream applies the access rules to the member a
+    /// request names, in every spelling: a runtime alias is judged as the
+    /// member it names, with that member's labels, as the durable identity
+    /// is, and a member the rules allow stays reachable through both
+    /// spellings.
+    #[tokio::test]
+    async fn agent_events_stream_applies_access_rules_to_every_member_spelling()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        const RESTRICTED: &str = "review:stream-restricted";
+        const OPEN: &str = "review:stream-open";
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("agent-events-stream-access").await?;
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "agent-events-stream-access".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        for (durable, labels) in [
+            (
+                RESTRICTED,
+                BTreeMap::from([("org".to_string(), "restricted".to_string())]),
+            ),
+            (OPEN, BTreeMap::new()),
+        ] {
+            runtime
+                .handle()
+                .spawn_spec(
+                    SpawnMemberSpec::from_wire(
+                        "worker".to_string(),
+                        crate::member_comms_id::mob_member_id_str(durable).into_owned(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .with_labels(labels),
+                )
+                .await?;
+            let session_id = runtime
+                .handle()
+                .resolve_bridge_session_id(&crate::member_comms_id::mob_member_id(durable))
+                .await
+                .ok_or("the spawned member must have a bridge session")?;
+            let identity = AgentIdentity::parse(durable)?;
+            identity_runtime
+                .register(
+                    DurableAgentSpec {
+                        identity: identity.clone(),
+                        profile: ProfileName::from("worker"),
+                        addressability: AgentAddressability::Addressable,
+                        display_name: None,
+                        labels: BTreeMap::new(),
+                        context: None,
+                        additional_instructions: Vec::new(),
+                        initial_message: None,
+                        runtime_mode_override: None,
+                        backend: None,
+                        binding: None,
+                        placement: None,
+                    },
+                    IdentityLifecycleState::Active,
+                    Some(ContinuityRecord {
+                        identity: identity.clone(),
+                        agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{durable}:1"))?,
+                        session_id,
+                        generation: ContinuityGeneration::new(1),
+                        checkpoint_version: CheckpointVersion::new(0),
+                    }),
+                    Some(LeaseGrant {
+                        identity,
+                        fencing_token: FencingToken::new(1),
+                        ttl: Duration::from_mins(1),
+                    }),
+                )
+                .await;
+        }
+        let controller =
+            crate::access::AccessController::new(crate::access::AccessControlConfig {
+                enabled: true,
+                admins: vec!["root@example.test".to_string()],
+                rules: vec![
+                    crate::access::AccessRule {
+                        id: "view-all".to_string(),
+                        actions: vec![crate::access::ACTION_AGENT_VIEW.to_string()],
+                        agents: vec!["*".to_string()],
+                        ..crate::access::AccessRule::default()
+                    },
+                    crate::access::AccessRule {
+                        id: "deny-restricted".to_string(),
+                        effect: crate::access::AccessEffect::Deny,
+                        actions: vec![crate::access::ACTION_AGENT_VIEW.to_string()],
+                        match_labels: BTreeMap::from([(
+                            "org".to_string(),
+                            "restricted".to_string(),
+                        )]),
+                        ..crate::access::AccessRule::default()
+                    },
+                ],
+                ..crate::access::AccessControlConfig::default()
+            })?;
+        let subscribed: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let recorded = Arc::clone(&subscribed);
+        let subscribe: crate::http_sse::AgentEventReplaySubscribeFn =
+            Arc::new(move |agent_id, _cursor| {
+                recorded
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(agent_id);
+                Box::pin(async move {
+                    Ok(crate::http_sse::AgentEventReplay {
+                        epoch: None,
+                        stream: Box::pin(futures::stream::iter(Vec::new())),
+                    })
+                })
+            });
+        let app = crate::http_sse::agent_events_sse_router_with_access_and_priming(
+            subscribe,
+            None,
+            Some(controller),
+            Some(runtime.clone()),
+            Some(identity_runtime.clone()),
+            Arc::new(crate::console_aggregator::AllowAllConsoleVisibilityPolicy),
+        );
+        let status =
+            async |agent_id: &str| -> Result<StatusCode, Box<dyn std::error::Error + Send + Sync>> {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/agents/{agent_id}/events"))
+                            .body(Body::empty())?,
+                    )
+                    .await?;
+                Ok(response.status())
+            };
+
+        let statuses = (
+            status(RESTRICTED).await?,
+            status(&format!("rt:{RESTRICTED}:1")).await?,
+            status(OPEN).await?,
+            status(&format!("rt:{OPEN}:1")).await?,
+        );
+        let opened = subscribed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            (statuses, opened),
+            (
+                (
+                    StatusCode::FORBIDDEN,
+                    StatusCode::FORBIDDEN,
+                    StatusCode::OK,
+                    StatusCode::OK,
+                ),
+                vec![OPEN.to_string(), format!("rt:{OPEN}:1")],
+            ),
+            "((restricted durable, restricted alias, open durable, open alias), streams opened)"
+        );
+        Ok(())
+    }
+
+    /// The console access rules judge a member named by its runtime alias as
+    /// the member it names, with that member's labels, as they judge its
+    /// durable identity: a label-scoped deny holds for a member read and for a
+    /// destructive member action through every spelling, and a member the
+    /// rules allow stays reachable through both spellings.
+    #[tokio::test]
+    async fn console_access_rules_judge_every_member_spelling()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const GUARDED: &str = "review:access-guarded";
+        const OPEN: &str = "review:access-open";
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-access-every-spelling").await?;
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "console-access-every-spelling".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        let mut specs = Vec::new();
+        for (durable, restricted) in [(GUARDED, true), (OPEN, false)] {
+            let mut labels = BTreeMap::from([("agent_identity".to_string(), durable.to_string())]);
+            if restricted {
+                labels.insert("org".to_string(), "restricted".to_string());
+            }
+            runtime
+                .handle()
+                .spawn_spec(
+                    SpawnMemberSpec::from_wire(
+                        "worker".to_string(),
+                        crate::member_comms_id::mob_member_id_str(durable).into_owned(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .with_labels(labels),
+                )
+                .await?;
+            let session_id = runtime
+                .handle()
+                .resolve_bridge_session_id(&crate::member_comms_id::mob_member_id(durable))
+                .await
+                .ok_or("the spawned member must have a bridge session")?;
+            let identity = AgentIdentity::parse(durable)?;
+            let spec = DurableAgentSpec {
+                identity: identity.clone(),
+                profile: ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            };
+            identity_runtime
+                .register(
+                    spec.clone(),
+                    IdentityLifecycleState::Active,
+                    Some(ContinuityRecord {
+                        identity: identity.clone(),
+                        agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{durable}:1"))?,
+                        session_id,
+                        generation: ContinuityGeneration::new(1),
+                        checkpoint_version: CheckpointVersion::new(0),
+                    }),
+                    Some(LeaseGrant {
+                        identity,
+                        fencing_token: FencingToken::new(1),
+                        ttl: Duration::from_mins(1),
+                    }),
+                )
+                .await;
+            specs.push(spec);
+        }
+        let roster = Arc::new(crate::identity_first::MutableRosterProvider::new(specs));
+        let controller =
+            crate::access::AccessController::new(crate::access::AccessControlConfig {
+                enabled: true,
+                admins: vec!["root@example.test".to_string()],
+                rules: vec![
+                    crate::access::AccessRule {
+                        id: "allow-all".to_string(),
+                        actions: vec![
+                            crate::access::ACTION_AGENT_VIEW.to_string(),
+                            crate::access::ACTION_AGENT_RETIRE.to_string(),
+                        ],
+                        agents: vec!["*".to_string()],
+                        ..crate::access::AccessRule::default()
+                    },
+                    crate::access::AccessRule {
+                        id: "deny-restricted".to_string(),
+                        effect: crate::access::AccessEffect::Deny,
+                        actions: vec![
+                            crate::access::ACTION_AGENT_VIEW.to_string(),
+                            crate::access::ACTION_AGENT_RETIRE.to_string(),
+                        ],
+                        match_labels: BTreeMap::from([(
+                            "org".to_string(),
+                            "restricted".to_string(),
+                        )]),
+                        ..crate::access::AccessRule::default()
+                    },
+                ],
+                ..crate::access::AccessControlConfig::default()
+            })?;
+        let view = controller.view_for_subject(None);
+        let call = async |method: &str, member_id: String| -> &'static str {
+            let response = Box::pin(handle_console_runtime_rpc_with_visibility(
+                &runtime,
+                None,
+                None,
+                None,
+                Some(ConsoleEventStore::new()),
+                None,
+                Some(identity_runtime.clone()),
+                None,
+                None,
+                &crate::console_aggregator::AllowAllConsoleVisibilityPolicy,
+                rpc_request_with_params(method, json!({ "member_id": member_id })),
+                true,
+                false,
+                None,
+                Some(&controller),
+                Some(&view),
+                None,
+                Some(roster.clone()),
+                None,
+                None,
+                &crate::http_console::ConsoleSendGovernance::default(),
+                &crate::topology_control::TopologyApplyScope::Anonymous,
+            ))
+            .await;
+            if response["error"]["data"]["kind"] == json!("access_denied") {
+                "denied"
+            } else if response["error"].is_null() {
+                "ok"
+            } else {
+                "other error"
+            }
+        };
+
+        let reads = (
+            call("meta/get_member", GUARDED.to_string()).await,
+            call("meta/get_member", format!("rt:{GUARDED}:1")).await,
+            call("meta/get_member", OPEN.to_string()).await,
+            call("meta/get_member", format!("rt:{OPEN}:1")).await,
+        );
+        let retires = (
+            call("meta/retire_member", format!("rt:{GUARDED}:1")).await,
+            call("meta/retire_member", format!("rt:{OPEN}:1")).await,
+        );
+        let guarded_state = identity_runtime
+            .status(&AgentIdentity::parse(GUARDED)?)
+            .await?
+            .state;
+        assert_eq!(
+            (reads, retires, guarded_state),
+            (
+                ("denied", "denied", "ok", "ok"),
+                ("denied", "ok"),
+                IdentityLifecycleState::Active,
+            ),
+            "((read guarded durable, guarded alias, open durable, open alias), \
+             (retire guarded alias, open alias), guarded identity state)"
+        );
+        Ok(())
+    }
+
+    /// The console access rules judge every member a request names, not only
+    /// the field a method's requirement picks first: a handler may act on a
+    /// different field.
+    #[test]
+    fn console_rpc_access_judges_every_member_target_field()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let both = |actions: [&str; 2]| actions.map(str::to_string).to_vec();
+        let controller =
+            crate::access::AccessController::new(crate::access::AccessControlConfig {
+                enabled: true,
+                admins: vec!["root@example.test".to_string()],
+                rules: vec![
+                    crate::access::AccessRule {
+                        id: "allow-all".to_string(),
+                        actions: both([
+                            crate::access::ACTION_AGENT_VIEW,
+                            crate::access::ACTION_AGENT_RETIRE,
+                        ]),
+                        agents: vec!["*".to_string()],
+                        ..crate::access::AccessRule::default()
+                    },
+                    crate::access::AccessRule {
+                        id: "deny-restricted".to_string(),
+                        effect: crate::access::AccessEffect::Deny,
+                        actions: both([
+                            crate::access::ACTION_AGENT_VIEW,
+                            crate::access::ACTION_AGENT_RETIRE,
+                        ]),
+                        match_labels: BTreeMap::from([(
+                            "org".to_string(),
+                            "restricted".to_string(),
+                        )]),
+                        ..crate::access::AccessRule::default()
+                    },
+                ],
+                ..crate::access::AccessControlConfig::default()
+            })?;
+        for (identity, labels) in [
+            ("review:open", BTreeMap::new()),
+            (
+                "review:guarded",
+                BTreeMap::from([("org".to_string(), "restricted".to_string())]),
+            ),
+        ] {
+            controller.record_agent_attributes(crate::access::AgentResourceAttributes {
+                identity: identity.to_string(),
+                agent_id: Some(identity.to_string()),
+                role: Some("worker".to_string()),
+                labels,
+            });
+        }
+        let view = controller.view_for_subject(None);
+        let denied = |method: &str, params: Value| {
+            crate::http_console::console_rpc_access_violation(Some(&view), method, &params).map(
+                |error| {
+                    error
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("resource"))
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                },
+            )
+        };
+        let mixed = json!({ "identity": "review:open", "member_id": "review:guarded" });
+        assert_eq!(
+            [
+                denied("meta/retire_member", mixed.clone()),
+                denied("meta/force_cancel_member", mixed.clone()),
+                denied("meta/stop_member_run", mixed.clone()),
+                denied("meta/get_member", mixed),
+                denied(
+                    crate::rpc::mob_methods::MEMBER_TOOL_DECLARATION,
+                    json!({ "identity": "review:open", "agent_identity": "review:guarded" }),
+                ),
+                denied("meta/retire_member", json!({ "member_id": "review:open" })),
+            ],
+            [
+                Some(json!("review:guarded")),
+                Some(json!("review:guarded")),
+                Some(json!("review:guarded")),
+                Some(json!("review:guarded")),
+                Some(json!("review:guarded")),
+                None,
+            ],
+            "the guarded member is judged whichever field names it"
+        );
+        Ok(())
+    }
+
+    /// A console RPC whose member target fields name different members is
+    /// refused before anything runs, so the access rules can never judge one
+    /// member while the handler acts on another. Fields that name one member,
+    /// in any spelling, still pass, and an admin is unchanged.
+    #[tokio::test]
+    async fn console_rpc_refuses_member_target_fields_naming_different_members()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const GUARDED: &str = "review:targets-guarded";
+        const OPEN: &str = "review:targets-open";
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-member-target-fields").await?;
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "console-member-target-fields".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        let mut specs = Vec::new();
+        for (durable, restricted) in [(GUARDED, true), (OPEN, false)] {
+            let mut labels = BTreeMap::from([("agent_identity".to_string(), durable.to_string())]);
+            if restricted {
+                labels.insert("org".to_string(), "restricted".to_string());
+            }
+            runtime
+                .handle()
+                .spawn_spec(
+                    SpawnMemberSpec::from_wire(
+                        "worker".to_string(),
+                        crate::member_comms_id::mob_member_id_str(durable).into_owned(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .with_labels(labels),
+                )
+                .await?;
+            let session_id = runtime
+                .handle()
+                .resolve_bridge_session_id(&crate::member_comms_id::mob_member_id(durable))
+                .await
+                .ok_or("the spawned member must have a bridge session")?;
+            let identity = AgentIdentity::parse(durable)?;
+            let spec = DurableAgentSpec {
+                identity: identity.clone(),
+                profile: ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            };
+            identity_runtime
+                .register(
+                    spec.clone(),
+                    IdentityLifecycleState::Active,
+                    Some(ContinuityRecord {
+                        identity: identity.clone(),
+                        agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{durable}:1"))?,
+                        session_id,
+                        generation: ContinuityGeneration::new(1),
+                        checkpoint_version: CheckpointVersion::new(0),
+                    }),
+                    Some(LeaseGrant {
+                        identity,
+                        fencing_token: FencingToken::new(1),
+                        ttl: Duration::from_mins(1),
+                    }),
+                )
+                .await;
+            specs.push(spec);
+        }
+        let roster = Arc::new(crate::identity_first::MutableRosterProvider::new(specs));
+        let actions = || {
+            vec![
+                crate::access::ACTION_AGENT_VIEW.to_string(),
+                crate::access::ACTION_AGENT_RETIRE.to_string(),
+                crate::access::ACTION_AGENT_RESPAWN.to_string(),
+            ]
+        };
+        let controller =
+            crate::access::AccessController::new(crate::access::AccessControlConfig {
+                enabled: true,
+                admins: vec!["root@example.test".to_string()],
+                rules: vec![
+                    crate::access::AccessRule {
+                        id: "allow-all".to_string(),
+                        actions: actions(),
+                        agents: vec!["*".to_string()],
+                        ..crate::access::AccessRule::default()
+                    },
+                    crate::access::AccessRule {
+                        id: "deny-restricted".to_string(),
+                        effect: crate::access::AccessEffect::Deny,
+                        actions: actions(),
+                        match_labels: BTreeMap::from([(
+                            "org".to_string(),
+                            "restricted".to_string(),
+                        )]),
+                        ..crate::access::AccessRule::default()
+                    },
+                ],
+                ..crate::access::AccessControlConfig::default()
+            })?;
+        let anonymous = controller.view_for_subject(None);
+        let admin = controller.view_for_subject(Some("root@example.test"));
+        let call = async |view: &crate::access::AccessView, method: &str, params: Value| {
+            let response = Box::pin(handle_console_runtime_rpc_with_visibility(
+                &runtime,
+                None,
+                None,
+                None,
+                Some(ConsoleEventStore::new()),
+                None,
+                Some(identity_runtime.clone()),
+                None,
+                None,
+                &crate::console_aggregator::AllowAllConsoleVisibilityPolicy,
+                rpc_request_with_params(method, params),
+                true,
+                false,
+                None,
+                Some(&controller),
+                Some(view),
+                None,
+                Some(roster.clone()),
+                None,
+                None,
+                &crate::http_console::ConsoleSendGovernance::default(),
+                &crate::topology_control::TopologyApplyScope::Anonymous,
+            ))
+            .await;
+            if response["error"]["data"]["kind"] == json!("conflicting_member_targets") {
+                "conflict"
+            } else if response["error"]["data"]["kind"] == json!("access_denied") {
+                "denied"
+            } else {
+                "passed"
+            }
+        };
+        let with_run = |mut params: Value| {
+            params["run_id"] = json!("01936f8b-0000-7000-8000-000000000042");
+            params["reason"] = json!("member target fields test");
+            params
+        };
+        let mixed = json!({ "identity": OPEN, "member_id": GUARDED });
+        let matching = json!({ "identity": OPEN, "member_id": OPEN });
+
+        let conflicts = (
+            call(&anonymous, "meta/get_member", mixed.clone()).await,
+            call(&anonymous, "meta/member_health", mixed.clone()).await,
+            call(&anonymous, "meta/stop_member_run", with_run(mixed.clone())).await,
+            call(&anonymous, "meta/force_cancel_member", mixed.clone()).await,
+            call(&anonymous, "meta/retire_member", mixed.clone()).await,
+        );
+        let same_member = (
+            call(&anonymous, "meta/get_member", matching.clone()).await,
+            call(
+                &anonymous,
+                "meta/get_member",
+                json!({ "identity": OPEN, "member_id": format!("rt:{OPEN}:1") }),
+            )
+            .await,
+            call(
+                &anonymous,
+                "meta/stop_member_run",
+                with_run(matching.clone()),
+            )
+            .await,
+            call(&anonymous, "meta/force_cancel_member", matching).await,
+        );
+        let single_field = (
+            call(
+                &anonymous,
+                "meta/get_member",
+                json!({ "member_id": GUARDED }),
+            )
+            .await,
+            call(&admin, "meta/get_member", json!({ "member_id": GUARDED })).await,
+            call(
+                &admin,
+                "meta/retire_member",
+                json!({ "member_id": GUARDED }),
+            )
+            .await,
+        );
+        assert_eq!(
+            (conflicts, same_member, single_field),
+            (
+                ("conflict", "conflict", "conflict", "conflict", "conflict"),
+                ("passed", "passed", "passed", "passed"),
+                ("denied", "passed", "passed"),
+            ),
+            "(conflicting fields: get, health, stop run, force cancel, retire), \
+             (one member: get, get by alias, stop run, force cancel), \
+             (single field: anonymous get guarded, admin get guarded, admin retire guarded)"
+        );
+        Ok(())
+    }
+
+    /// A helper forked from a member, and a member attached to an existing
+    /// session, carry that member's conversation: the console access rules
+    /// judge a fork source as read access to that member, and a session that
+    /// `meta/attach_existing_session` or `meta/ensure_member`
+    /// (`resume_session_id`) attaches as read and send access to the member
+    /// that owns it. A session whose owner cannot be established is refused
+    /// unless the caller is an admin.
+    ///
+    /// Outcomes are `denied` (refused by access rules), `ok` (completed), and
+    /// `refused` (any other error). The ephemeral test runtime cannot resume a
+    /// session, so an allowed attach/resume reaches the runtime and comes back
+    /// `refused`, not `ok`; the security-relevant signal is that a denied
+    /// owner is `denied` before the handler runs, while an allowed owner is
+    /// not.
+    #[tokio::test]
+    async fn console_fork_and_attach_judge_the_member_whose_context_they_carry()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const GUARDED: &str = "review:carry-guarded";
+        const OPEN: &str = "review:carry-open";
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-fork-attach-context").await?;
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "console-fork-attach-context".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        let mut specs = Vec::new();
+        let mut sessions = BTreeMap::new();
+        for (durable, restricted) in [(GUARDED, true), (OPEN, false)] {
+            let mut labels = BTreeMap::from([("agent_identity".to_string(), durable.to_string())]);
+            if restricted {
+                labels.insert("org".to_string(), "restricted".to_string());
+            }
+            runtime
+                .handle()
+                .spawn_spec(
+                    SpawnMemberSpec::from_wire(
+                        "worker".to_string(),
+                        crate::member_comms_id::mob_member_id_str(durable).into_owned(),
+                        None,
+                        Some(meerkat_mob::MobRuntimeMode::TurnDriven),
+                        None,
+                    )
+                    .with_labels(labels),
+                )
+                .await?;
+            let session_id = runtime
+                .handle()
+                .resolve_bridge_session_id(&crate::member_comms_id::mob_member_id(durable))
+                .await
+                .ok_or("the spawned member must have a bridge session")?;
+            sessions.insert(durable, session_id.to_string());
+            let identity = AgentIdentity::parse(durable)?;
+            let spec = DurableAgentSpec {
+                identity: identity.clone(),
+                profile: ProfileName::from("worker"),
+                addressability: AgentAddressability::Addressable,
+                display_name: None,
+                labels: BTreeMap::new(),
+                context: None,
+                additional_instructions: Vec::new(),
+                initial_message: None,
+                runtime_mode_override: None,
+                backend: None,
+                binding: None,
+                placement: None,
+            };
+            identity_runtime
+                .register(
+                    spec.clone(),
+                    IdentityLifecycleState::Active,
+                    Some(ContinuityRecord {
+                        identity: identity.clone(),
+                        agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{durable}:1"))?,
+                        session_id,
+                        generation: ContinuityGeneration::new(1),
+                        checkpoint_version: CheckpointVersion::new(0),
+                    }),
+                    Some(LeaseGrant {
+                        identity,
+                        fencing_token: FencingToken::new(1),
+                        ttl: Duration::from_mins(1),
+                    }),
+                )
+                .await;
+            specs.push(spec);
+        }
+        let roster = Arc::new(crate::identity_first::MutableRosterProvider::new(specs));
+        let controller =
+            crate::access::AccessController::new(crate::access::AccessControlConfig {
+                enabled: true,
+                admins: vec!["root@example.test".to_string()],
+                rules: vec![
+                    crate::access::AccessRule {
+                        id: "allow-all".to_string(),
+                        actions: vec![
+                            crate::access::ACTION_AGENT_VIEW.to_string(),
+                            crate::access::ACTION_AGENT_SEND.to_string(),
+                            crate::access::ACTION_AGENT_SPAWN.to_string(),
+                        ],
+                        agents: vec!["*".to_string()],
+                        ..crate::access::AccessRule::default()
+                    },
+                    crate::access::AccessRule {
+                        id: "deny-restricted".to_string(),
+                        effect: crate::access::AccessEffect::Deny,
+                        actions: vec![crate::access::ACTION_AGENT_VIEW.to_string()],
+                        match_labels: BTreeMap::from([(
+                            "org".to_string(),
+                            "restricted".to_string(),
+                        )]),
+                        ..crate::access::AccessRule::default()
+                    },
+                ],
+                ..crate::access::AccessControlConfig::default()
+            })?;
+        let anonymous = controller.view_for_subject(None);
+        let admin = controller.view_for_subject(Some("root@example.test"));
+        // "ok" is a completed call; "refused" is any other error.
+        let call = async |view: &crate::access::AccessView, method: &str, params: Value| {
+            let response = Box::pin(handle_console_runtime_rpc_with_visibility(
+                &runtime,
+                None,
+                None,
+                None,
+                Some(ConsoleEventStore::new()),
+                None,
+                Some(identity_runtime.clone()),
+                None,
+                None,
+                &crate::console_aggregator::AllowAllConsoleVisibilityPolicy,
+                rpc_request_with_params(method, params),
+                true,
+                false,
+                None,
+                Some(&controller),
+                Some(view),
+                None,
+                Some(roster.clone()),
+                None,
+                None,
+                &crate::http_console::ConsoleSendGovernance::default(),
+                &crate::topology_control::TopologyApplyScope::Anonymous,
+            ))
+            .await;
+            if response["error"]["data"]["kind"] == json!("access_denied") {
+                "denied"
+            } else if response["error"].is_null() {
+                "ok"
+            } else {
+                "refused"
+            }
+        };
+        let fork = |source: &str, helper: &str| {
+            json!({
+                "source_member_id": source,
+                "agent_identity": helper,
+                "task": "answer briefly",
+                "result_label": helper,
+                "max_text_bytes": 4096,
+            })
+        };
+        let attach = |session_id: &str, member: &str| json!({ "role": "worker", "agent_identity": member, "session_id": session_id });
+        let ensure_resume = |session_id: &str, member: &str| {
+            json!({
+                "role": "worker",
+                "agent_identity": member,
+                "plane": "worker",
+                "resume_session_id": session_id,
+            })
+        };
+        let unknown_session = meerkat_core::types::SessionId::new().to_string();
+
+        let outcomes = (
+            call(
+                &anonymous,
+                "meta/fork_helper",
+                fork(GUARDED, "fork-carry-a"),
+            )
+            .await,
+            call(&anonymous, "meta/fork_helper", fork(OPEN, "fork-carry-b")).await,
+            call(
+                &anonymous,
+                "meta/attach_existing_session",
+                attach(&sessions[GUARDED], "attach-carry-a"),
+            )
+            .await,
+            call(
+                &anonymous,
+                "meta/attach_existing_session",
+                attach(&sessions[OPEN], "attach-carry-b"),
+            )
+            .await,
+            call(
+                &anonymous,
+                "meta/ensure_member",
+                ensure_resume(&sessions[GUARDED], "ensure-carry-a"),
+            )
+            .await,
+            call(
+                &anonymous,
+                "meta/ensure_member",
+                ensure_resume(&sessions[OPEN], "ensure-carry-b"),
+            )
+            .await,
+            call(
+                &anonymous,
+                "meta/attach_existing_session",
+                attach(&unknown_session, "attach-carry-c"),
+            )
+            .await,
+            call(
+                &admin,
+                "meta/attach_existing_session",
+                attach(&unknown_session, "attach-carry-d"),
+            )
+            .await,
+        );
+        assert_eq!(
+            outcomes,
+            (
+                "denied", "ok", "denied", "refused", "denied", "refused", "denied", "refused"
+            ),
+            "(fork from guarded, fork from open, attach guarded session, attach open session, \
+             resume guarded session, resume open session, attach unowned session, admin attach \
+             unowned session)"
+        );
+        Ok(())
+    }
+
+    /// Attaching a session that no member owns is refused for a caller who is
+    /// not an admin with its own reason, `session_owner_unknown`, rather than
+    /// as a read denial on no member. An admin passes the owner check.
+    #[tokio::test]
+    async fn console_attach_names_a_session_without_an_established_owner()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-attach-unowned-session").await?;
+        let controller =
+            crate::access::AccessController::new(crate::access::AccessControlConfig {
+                enabled: true,
+                admins: vec!["root@example.test".to_string()],
+                rules: vec![crate::access::AccessRule {
+                    id: "allow-all".to_string(),
+                    actions: vec![
+                        crate::access::ACTION_AGENT_VIEW.to_string(),
+                        crate::access::ACTION_AGENT_SEND.to_string(),
+                        crate::access::ACTION_AGENT_SPAWN.to_string(),
+                    ],
+                    agents: vec!["*".to_string()],
+                    ..crate::access::AccessRule::default()
+                }],
+                ..crate::access::AccessControlConfig::default()
+            })?;
+        let session_id = meerkat_core::types::SessionId::new().to_string();
+        let attach = async |view: &crate::access::AccessView, member: &str| {
+            Box::pin(handle_console_runtime_rpc_with_visibility(
+                &runtime,
+                None,
+                None,
+                None,
+                Some(ConsoleEventStore::new()),
+                None,
+                None,
+                None,
+                None,
+                &crate::console_aggregator::AllowAllConsoleVisibilityPolicy,
+                rpc_request_with_params(
+                    "meta/attach_existing_session",
+                    json!({ "role": "worker", "agent_identity": member, "session_id": session_id }),
+                ),
+                true,
+                false,
+                None,
+                Some(&controller),
+                Some(view),
+                None,
+                None,
+                None,
+                None,
+                &crate::http_console::ConsoleSendGovernance::default(),
+                &crate::topology_control::TopologyApplyScope::Anonymous,
+            ))
+            .await
+        };
+        let anonymous = controller.view_for_subject(None);
+        let admin = controller.view_for_subject(Some("root@example.test"));
+
+        let refused = attach(&anonymous, "attach-unowned-a").await;
+        assert_eq!(
+            (
+                &refused["error"]["data"]["kind"],
+                &refused["error"]["data"]["reason"],
+                &refused["error"]["data"]["session_id"],
+            ),
+            (
+                &json!("access_denied"),
+                &json!("session_owner_unknown"),
+                &json!(session_id),
+            ),
+            "a caller who is not an admin is refused with the missing owner named: {refused}"
+        );
+        let admitted = attach(&admin, "attach-unowned-b").await;
+        assert_ne!(
+            admitted["error"]["data"]["kind"],
+            json!("access_denied"),
+            "an admin passes the owner check: {admitted}"
+        );
+        Ok(())
+    }
+
+    /// A refusal to attach a session whose owner the caller may not access
+    /// names only the session the caller supplied. Neither the owner nor the
+    /// access the caller lacked appears in its message or data.
+    #[tokio::test]
+    async fn console_attach_refusal_does_not_name_the_session_owner()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const OWNER: &str = "review:session-owner";
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-attach-owner-private").await?;
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "console-attach-owner-private".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        runtime
+            .handle()
+            .spawn_spec(
+                SpawnMemberSpec::from_wire(
+                    "worker".to_string(),
+                    crate::member_comms_id::mob_member_id_str(OWNER).into_owned(),
+                    None,
+                    Some(meerkat_mob::MobRuntimeMode::TurnDriven),
+                    None,
+                )
+                .with_labels(BTreeMap::from([
+                    ("agent_identity".to_string(), OWNER.to_string()),
+                    ("org".to_string(), "restricted".to_string()),
+                ])),
+            )
+            .await?;
+        let bridge_session_id = runtime
+            .handle()
+            .resolve_bridge_session_id(&crate::member_comms_id::mob_member_id(OWNER))
+            .await
+            .ok_or("the spawned member must have a bridge session")?;
+        let identity = AgentIdentity::parse(OWNER)?;
+        let spec = DurableAgentSpec {
+            identity: identity.clone(),
+            profile: ProfileName::from("worker"),
+            addressability: AgentAddressability::Addressable,
+            display_name: None,
+            labels: BTreeMap::new(),
+            context: None,
+            additional_instructions: Vec::new(),
+            initial_message: None,
+            runtime_mode_override: None,
+            backend: None,
+            binding: None,
+            placement: None,
+        };
+        identity_runtime
+            .register(
+                spec.clone(),
+                IdentityLifecycleState::Active,
+                Some(ContinuityRecord {
+                    identity: identity.clone(),
+                    agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{OWNER}:1"))?,
+                    session_id: bridge_session_id.clone(),
+                    generation: ContinuityGeneration::new(1),
+                    checkpoint_version: CheckpointVersion::new(0),
+                }),
+                Some(LeaseGrant {
+                    identity,
+                    fencing_token: FencingToken::new(1),
+                    ttl: Duration::from_mins(1),
+                }),
+            )
+            .await;
+        let roster = Arc::new(crate::identity_first::MutableRosterProvider::new(vec![
+            spec,
+        ]));
+        let controller =
+            crate::access::AccessController::new(crate::access::AccessControlConfig {
+                enabled: true,
+                admins: vec!["root@example.test".to_string()],
+                rules: vec![
+                    crate::access::AccessRule {
+                        id: "allow-all".to_string(),
+                        actions: vec![
+                            crate::access::ACTION_AGENT_VIEW.to_string(),
+                            crate::access::ACTION_AGENT_SEND.to_string(),
+                            crate::access::ACTION_AGENT_SPAWN.to_string(),
+                        ],
+                        agents: vec!["*".to_string()],
+                        ..crate::access::AccessRule::default()
+                    },
+                    crate::access::AccessRule {
+                        id: "deny-restricted".to_string(),
+                        effect: crate::access::AccessEffect::Deny,
+                        actions: vec![crate::access::ACTION_AGENT_VIEW.to_string()],
+                        match_labels: BTreeMap::from([(
+                            "org".to_string(),
+                            "restricted".to_string(),
+                        )]),
+                        ..crate::access::AccessRule::default()
+                    },
+                ],
+                ..crate::access::AccessControlConfig::default()
+            })?;
+        let anonymous = controller.view_for_subject(None);
+        let session_id = bridge_session_id.to_string();
+        let call = async |method: &str, params: Value| {
+            Box::pin(handle_console_runtime_rpc_with_visibility(
+                &runtime,
+                None,
+                None,
+                None,
+                Some(ConsoleEventStore::new()),
+                None,
+                Some(identity_runtime.clone()),
+                None,
+                None,
+                &crate::console_aggregator::AllowAllConsoleVisibilityPolicy,
+                rpc_request_with_params(method, params),
+                true,
+                false,
+                None,
+                Some(&controller),
+                Some(&anonymous),
+                None,
+                Some(roster.clone()),
+                None,
+                None,
+                &crate::http_console::ConsoleSendGovernance::default(),
+                &crate::topology_control::TopologyApplyScope::Anonymous,
+            ))
+            .await
+        };
+        let attach = call(
+            "meta/attach_existing_session",
+            json!({
+                "role": "worker",
+                "agent_identity": "attach-owner-private",
+                "session_id": session_id,
+            }),
+        )
+        .await;
+        let resume = call(
+            "meta/ensure_member",
+            json!({
+                "role": "worker",
+                "agent_identity": "ensure-owner-private",
+                "plane": "worker",
+                "resume_session_id": session_id,
+            }),
+        )
+        .await;
+
+        let expected = json!({
+            "code": crate::http_console::ACCESS_DENIED_RPC_CODE,
+            "message": "access denied: the caller may not attach this session",
+            "data": { "kind": "access_denied", "session_id": session_id },
+        });
+        assert_eq!(
+            (&attach["error"], &resume["error"]),
+            (&expected, &expected),
+            "an attach or a resume of the session is refused naming only that session"
+        );
+        let encoded_owner = crate::member_comms_id::mob_member_id_str(OWNER);
+        for refusal in [&attach["error"], &resume["error"]] {
+            let text = refusal.to_string();
+            assert!(!text.contains(OWNER), "the refusal names no owner: {text}");
+            assert!(
+                !text.contains(&*encoded_owner),
+                "the refusal names no encoded owner: {text}"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn console_runtime_identity_reads_reject_stale_runtime_aliases()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -18291,6 +20028,63 @@ comms = true
                 );
             }
         }
+
+        // #366: resolved tools decode a supplied runtime alias to its durable
+        // member, so the stale-alias refusal must still come first.
+        let resolved_tools = Box::pin(handle_console_runtime_rpc(
+            &runtime,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(identity_runtime.clone()),
+            None,
+            None,
+            rpc_request_with_params(
+                "meta/identity/resolved_tools",
+                json!({ "identity": "rt:review:singleton:0" }),
+            ),
+            true,
+        ))
+        .await;
+        assert_eq!(
+            resolved_tools["error"]["data"]["kind"],
+            json!("stale_identity_runtime_binding"),
+            "resolved_tools must refuse a stale runtime alias: {resolved_tools:#?}"
+        );
+        assert_eq!(
+            resolved_tools["error"]["data"]["registered_runtime_member_id"],
+            json!("rt:review:singleton:1")
+        );
+
+        // The member-declaration read takes the same rule: it maps a current
+        // runtime alias to the durable row, so a stale one is refused first.
+        let declaration = Box::pin(handle_console_runtime_rpc(
+            &runtime,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(identity_runtime.clone()),
+            None,
+            None,
+            rpc_request_with_params(
+                crate::rpc::mob_methods::MEMBER_TOOL_DECLARATION,
+                json!({
+                    "mob_id": runtime.handle().mob_id().to_string(),
+                    "agent_identity": "rt:review:singleton:0",
+                }),
+            ),
+            true,
+        ))
+        .await;
+        assert_eq!(
+            declaration["error"]["data"]["kind"],
+            json!("stale_identity_runtime_binding"),
+            "the declaration read must refuse a stale runtime alias: {declaration:#?}"
+        );
 
         let list_response = Box::pin(handle_console_runtime_rpc(
             &runtime,

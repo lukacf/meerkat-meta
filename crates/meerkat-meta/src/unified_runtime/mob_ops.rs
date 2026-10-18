@@ -121,7 +121,16 @@ impl UnifiedRuntime {
         options: MemberTurnOptions,
         event_tx: Option<MemberTurnEventSender>,
     ) -> Result<MemberTurnAdmission, MobRuntimeError> {
-        let identity = crate::member_comms_id::mob_member_id(member_alias);
+        // Member-id alias rule: decode first, so an encoded roster id is not
+        // encoded twice, and refuse a generated runtime alias, which this
+        // direct turn start has no identity authority to pin to a generation.
+        let alias = crate::member_comms_id::runtime_alias_str(member_alias);
+        if crate::member_comms_id::is_reserved_generated_alias(&alias) {
+            return Err(MobRuntimeError::InvalidInput(
+                "generated member alias requires identity authority",
+            ));
+        }
+        let identity = crate::member_comms_id::mob_member_id(&alias);
         let member = self.mob_handle().member(&identity).await?;
         let turn = member
             .start_turn(content, handling_mode, options, event_tx)

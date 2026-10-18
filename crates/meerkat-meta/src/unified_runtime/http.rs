@@ -125,6 +125,27 @@ impl Default for ReferenceAppRequestBound {
     }
 }
 
+/// A runtime alias that is stale, or names no identity, has no member
+/// stream to open: it answers as a missing member, not an internal error.
+fn agent_event_target_error(
+    agent_id: &str,
+    error: crate::identity_first::IdentityRuntimeError,
+) -> crate::MobRuntimeError {
+    use crate::identity_first::IdentityRuntimeError;
+    let missing = matches!(
+        error,
+        IdentityRuntimeError::StaleRuntimeAlias { .. } | IdentityRuntimeError::UnknownIdentity(_)
+    ) || (crate::member_comms_id::is_reserved_generated_alias(agent_id)
+        && matches!(error, IdentityRuntimeError::Internal(_)));
+    if missing {
+        crate::MobRuntimeError::Mob(meerkat_mob::MobError::MemberNotFound(
+            meerkat_mob::AgentIdentity::from(agent_id),
+        ))
+    } else {
+        crate::MobRuntimeError::InvalidConfig(error.to_string())
+    }
+}
+
 async fn resolve_agent_event_member_id(
     handle: &meerkat_mob::MobHandle,
     agent_id: &str,
@@ -513,9 +534,7 @@ impl UnifiedRuntime {
                                 .runtime()
                                 .member_alias_lifecycle_target(&agent_id)
                                 .await
-                                .map_err(|error| {
-                                    crate::MobRuntimeError::InvalidConfig(error.to_string())
-                                })?
+                                .map_err(|error| agent_event_target_error(&agent_id, error))?
                         } else {
                             None
                         };
@@ -593,6 +612,7 @@ impl UnifiedRuntime {
                 Some(sse_decisions_a),
                 access.clone(),
                 Some(self.mob_runtime().clone()),
+                self.identity_runtime_ref().cloned(),
                 agent_sse_visibility_policy,
             ))
             .merge(mob_events_sse_router_with_access_and_priming(
@@ -1172,6 +1192,101 @@ comms = true
             "stream opened on the prior generation must terminate after reset"
         );
 
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    /// The per-agent event stream answers member_not_found for a runtime alias
+    /// that is not the identity's current incarnation, as for any member it
+    /// cannot find, rather than an internal error.
+    #[tokio::test]
+    async fn a_stale_runtime_alias_has_no_member_event_stream() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let definition = MobDefinition::from_toml(
+            r#"
+[mob]
+id = "stale-alias-agent-events"
+
+[profiles.worker]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+
+[profiles.worker.tools]
+comms = true
+"#,
+        )
+        .expect("definition parses");
+        let identity = AgentIdentity::parse("lead").expect("identity parses");
+        let roster = Arc::new(MutableRosterProvider::new(vec![DurableAgentSpec {
+            identity: identity.clone(),
+            profile: ProfileName::from("worker"),
+            addressability: AgentAddressability::Addressable,
+            display_name: None,
+            labels: BTreeMap::new(),
+            context: None,
+            additional_instructions: Vec::new(),
+            initial_message: None,
+            runtime_mode_override: Some(MobRuntimeMode::TurnDriven),
+            backend: None,
+            binding: None,
+            placement: None,
+        }]));
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let runtime = UnifiedRuntimeBuilder::default()
+            .definition(definition)
+            .continuity_store(Arc::new(
+                LocalContinuityStore::in_memory().expect("continuity store"),
+            ))
+            .lease_provider(Arc::new(LocalLeaseProvider::new()))
+            .roster_provider(roster)
+            .scratch_dir(scratch.path())
+            .identity_runtime_instance_id("stale-alias-agent-events")
+            .default_llm_client(Arc::new(TestClient::default()))
+            .build()
+            .await
+            .expect("identity-first runtime builds");
+        let current = runtime
+            .identity_runtime()
+            .expect("identity runtime installed")
+            .status(&identity)
+            .await
+            .expect("identity active")
+            .agent_runtime_id
+            .expect("active runtime alias")
+            .as_str()
+            .to_string();
+        let decisions = crate::runtime::RuntimeDecisionState::local_console(
+            crate::ConsolePolicy {
+                require_app_auth: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let app = runtime.build_reference_app_router(decisions);
+        let status = async |agent_id: &str| {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/agents/{agent_id}/events"))
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response")
+                .status()
+        };
+
+        assert_eq!(
+            (
+                status(&current).await,
+                status("rt:lead:7").await,
+                status("rt:nobody:0").await,
+            ),
+            (StatusCode::OK, StatusCode::NOT_FOUND, StatusCode::NOT_FOUND),
+            "(current alias {current}, stale alias, alias of no identity)"
+        );
         let _ = runtime.mob_handle().stop().await;
     }
 }

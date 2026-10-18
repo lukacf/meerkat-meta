@@ -12927,6 +12927,17 @@ impl MobRuntime {
         }
     }
 
+    /// The installed identity authority, if any.
+    pub(crate) fn installed_identity_runtime(
+        &self,
+    ) -> Option<Arc<crate::identity_first::IdentityRuntime>> {
+        self.identity_runtime_slot.as_ref().and_then(|slot| {
+            slot.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+    }
+
     /// Remove the late-bound identity authority after the mob has fully
     /// quiesced. IdentityRuntime owns a MobHandle in its runtime services, so
     /// retaining the reverse Arc here would form a shutdown cycle and keep
@@ -13751,6 +13762,9 @@ pub async fn model_routing_status_for_member(
     model_routing_status_for_session(session_service, member_id, session_id).await
 }
 
+/// Resolve a supplied member id to its current session through the mob
+/// handle, then read that session's visible tools. Mirrors
+/// `model_routing_status_for_member`.
 pub async fn resolved_tools_for_member(
     handle: &MobHandle,
     session_service: Option<&Arc<dyn MobSessionService>>,
@@ -13759,7 +13773,14 @@ pub async fn resolved_tools_for_member(
     if member_id.trim().is_empty() {
         return Err(MobRuntimeError::InvalidInput("identity must not be empty"));
     }
-    let mid = crate::member_comms_id::mob_member_id(member_id);
+    // `roster_member_id_for_supplied_id`, NOT `mob_member_id`, for the same
+    // reason as the routing-status lookup (#366): the roster is keyed by the
+    // encoded DURABLE identity, so a current runtime alias
+    // (`rt:{identity}:{generation}`) handed straight to `mob_member_id` names
+    // a roster row nobody owns, and a healthy member reads as having no
+    // session. The SUPPLIED identity is still what the snapshot echoes. A
+    // stale alias is refused by the surfaces before this lookup.
+    let mid = crate::member_comms_id::roster_member_id_for_supplied_id(member_id);
     let status = handle.member_status(&mid).await?;
     let Some(session_id) = status.current_session_id else {
         return Err(MobRuntimeError::InvalidInput(
@@ -13928,9 +13949,10 @@ pub async fn assert_member_accepts_images(
     if !content_input_has_images(content) {
         return Ok(());
     }
-    // Wire member ids are public aliases; the roster id is the comms-safe
-    // encoding (meerkat 0.7 MemberCommsName).
-    let mid = crate::member_comms_id::mob_member_id(member_id);
+    // A read: resolve the supplied id the way `resolved_tools_for_member`
+    // does, so a current runtime alias or an encoded roster id reaches the
+    // durable row it names instead of "member not found".
+    let mid = crate::member_comms_id::roster_member_id_for_supplied_id(member_id);
     let Some(member) = handle
         .get_member(&mid)
         .await
@@ -14023,8 +14045,19 @@ async fn send_message_on_mob_inner(
         return Err(MobRuntimeError::InvalidInput("content must not be empty"));
     }
     // Wire member ids are public aliases; the roster id is the comms-safe
-    // encoding (meerkat 0.7 MemberCommsName).
-    let mid = crate::member_comms_id::mob_member_id(member_id);
+    // encoding (meerkat 0.7 MemberCommsName). Decode first, so an already
+    // encoded roster id is not encoded twice. A generated runtime alias names
+    // an incarnation that only the identity authority can pin, and this
+    // direct send has no authority to ask; collapsing it to the durable row
+    // could deliver an old generation's message to the current incarnation,
+    // so it is refused like the stdio send without an identity runtime.
+    let decoded = crate::member_comms_id::runtime_alias_str(member_id);
+    if crate::member_comms_id::is_reserved_generated_alias(&decoded) {
+        return Err(MobRuntimeError::InvalidInput(
+            "generated member alias requires identity authority",
+        ));
+    }
+    let mid = crate::member_comms_id::mob_member_id(&decoded);
     match interaction_id {
         None => {
             handle
@@ -15395,6 +15428,138 @@ mod tests {
             .resolve_bridge_session_id(&meerkat_mob::AgentIdentity::from(member))
             .await
             .expect("member session")
+    }
+
+    /// #366: every spelling of one member reaches the same resolved tools.
+    /// The roster is keyed by the encoded durable identity, so the lookup has
+    /// to decode a supplied id the way `model_routing_status_for_member` does.
+    /// A current runtime alias (`rt:{identity}:{generation}`) handed straight
+    /// to `mob_member_id` names a roster row nobody owns, and the healthy
+    /// member reads as having no current session. Each snapshot echoes the
+    /// spelling it was asked with.
+    #[tokio::test]
+    async fn resolved_tools_for_member_resolves_every_spelling_of_one_member() {
+        const DURABLE: &str = "review:singleton";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = bootstrap_opt_in_runtime("resolved-tools-member-alias", dir.path()).await;
+        let handle = runtime.handle();
+        let roster_id = crate::member_comms_id::mob_member_id_str(DURABLE).into_owned();
+        let session_id = seat_worker(&handle, &roster_id).await;
+
+        let durable = resolved_tools_for_member(&handle, runtime.session_service(), DURABLE)
+            .await
+            .expect("the durable identity resolves its seated member");
+        assert_eq!(durable.session_id, session_id.to_string());
+        assert!(
+            !durable.tools.is_empty(),
+            "the seated member exposes tools: {durable:?}"
+        );
+
+        for supplied in [format!("rt:{DURABLE}:0"), roster_id.clone()] {
+            let resolved = resolved_tools_for_member(&handle, runtime.session_service(), &supplied)
+                .await
+                .map_err(|error| error.to_string());
+            assert_eq!(
+                resolved,
+                Ok(ResolvedToolsSnapshot {
+                    identity: supplied.clone(),
+                    session_id: durable.session_id.clone(),
+                    tools: durable.tools.clone(),
+                }),
+                "{supplied} must resolve the member {DURABLE} names, with the same session and tools"
+            );
+        }
+        let _ = handle.shutdown().await;
+    }
+
+    /// The image-capability guard is a read: like `resolved_tools_for_member`
+    /// it reaches the member a durable identity, its current runtime alias or
+    /// its encoded roster id names. Before, the alias and the encoded id read
+    /// as "member not found" for a healthy, image-capable member.
+    #[tokio::test]
+    async fn image_guard_reads_every_spelling_of_one_member() {
+        const DURABLE: &str = "review:singleton";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = bootstrap_opt_in_runtime("image-guard-member-alias", dir.path()).await;
+        let handle = runtime.handle();
+        let roster_id = crate::member_comms_id::mob_member_id_str(DURABLE).into_owned();
+        seat_worker(&handle, &roster_id).await;
+        let image = meerkat_core::ContentInput::Blocks(vec![meerkat_core::ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: meerkat_core::types::ImageData::Inline {
+                data: "iVBORw0KGgo=".to_string(),
+            },
+        }]);
+
+        for supplied in [DURABLE.to_string(), format!("rt:{DURABLE}:0"), roster_id] {
+            let verdict =
+                assert_member_accepts_images(&handle, runtime.session_service(), &supplied, &image)
+                    .await
+                    .map_err(|error| error.to_string());
+            assert_eq!(
+                verdict,
+                Ok(()),
+                "{supplied} must reach the image-capable member {DURABLE} names"
+            );
+        }
+        let _ = handle.shutdown().await;
+    }
+
+    /// A direct send is an action with no identity authority to consult. It
+    /// decodes an encoded roster id instead of encoding it twice, and it
+    /// refuses a generated runtime alias, which only the identity authority
+    /// can pin to a generation, instead of delivering to the durable row.
+    #[tokio::test]
+    async fn direct_send_decodes_roster_ids_and_refuses_generated_aliases() {
+        const DURABLE: &str = "review:singleton";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            "[mob]\nid = \"direct-send-member-alias\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+             external_addressable = true\n\n[profiles.worker.tools]\ncomms = true\n",
+        )
+        .expect("mob definition");
+        let spec = MobBootstrapSpec::ephemeral(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            dir.path().to_path_buf(),
+            4,
+            None,
+        )
+        .expect("bootstrap spec")
+        .with_options(MobBootstrapOptions {
+            allow_ephemeral_sessions: true,
+            notify_orchestrator_on_resume: true,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        });
+        let runtime = MobRuntime::bootstrap(spec)
+            .await
+            .expect("bootstrap runtime");
+        let handle = runtime.handle();
+        let roster_id = crate::member_comms_id::mob_member_id_str(DURABLE).into_owned();
+        let session_id = seat_worker(&handle, &roster_id).await.to_string();
+
+        for supplied in [DURABLE, roster_id.as_str()] {
+            let sent = send_message_on_mob(&handle, supplied, "hello".to_string())
+                .await
+                .map_err(|error| error.to_string());
+            assert_eq!(
+                sent,
+                Ok(session_id.clone()),
+                "{supplied} must deliver to the member {DURABLE} names"
+            );
+        }
+        let refused = send_message_on_mob(&handle, &format!("rt:{DURABLE}:0"), "hello".to_string())
+            .await
+            .map_err(|error| error.to_string());
+        assert_eq!(
+            refused,
+            Err(MobRuntimeError::InvalidInput(
+                "generated member alias requires identity authority"
+            )
+            .to_string()),
+            "a direct send must not pick an incarnation for a generated alias"
+        );
+        let _ = handle.shutdown().await;
     }
 
     /// Review of #442 (hardening): a forker respawning its own child with the

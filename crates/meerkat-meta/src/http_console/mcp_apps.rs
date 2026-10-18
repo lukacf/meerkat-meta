@@ -191,6 +191,13 @@ async fn authorize_session_in_namespace(
                     },
                     namespace,
                 ));
+                access.record_current_runtime_aliases([(
+                    namespace_console_identity(identity.as_str(), namespace),
+                    status
+                        .agent_runtime_id
+                        .as_ref()
+                        .map(|alias| namespace_console_identity(alias.as_str(), namespace)),
+                )]);
             }
             if status
                 .session_id
