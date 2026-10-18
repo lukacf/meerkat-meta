@@ -82,6 +82,9 @@ platform(
         "Arch": "amd64",
         "OSFamily": "linux",
         "Pool": "meerkat-ci",
+        # Not pinned by digest: a private Artifact Registry tag that neither
+        # Renovate nor this repository's checks can read. Pin it with the
+        # digest from someone with read access to that registry.
         "container-image": "docker://europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0",
         "network": "external",
     },
