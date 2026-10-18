@@ -166,9 +166,11 @@ class CiWorkflowTests(unittest.TestCase):
 
     def test_every_container_image_is_pinned_by_digest_under_renovate(self):
         """A container tag moves when its publisher pushes; the build
-        container fixes the release binaries' glibc floor. Each image a
-        workflow names carries its digest, and renovate.json proposes new
-        digests (never automerged) for exactly those files."""
+        container fixes the release binaries' glibc floor and the Bazel
+        platforms pick the remote build image. Each image a tracked workflow
+        or Bazel file names carries its digest, renovate.json proposes new
+        digests (never automerged) for exactly those files, and the release
+        runbook compares them with Core's."""
         renovate = json.loads((ROOT / "renovate.json").read_text())
         self.assertEqual(renovate["enabledManagers"], ["custom.regex"])
         (manager,) = renovate["customManagers"]
@@ -177,19 +179,29 @@ class CiWorkflowTests(unittest.TestCase):
         (match,) = [re.compile(item.replace("(?<", "(?P<")) for item in manager["matchStrings"]]
         (rule,) = [rule for rule in renovate["packageRules"] if rule.get("matchManagers") == ["custom.regex"]]
         self.assertIs(rule["automerge"], False)
-        images = []
-        for path in sorted((ROOT / ".github").rglob("*.y*ml")):
-            relative = path.relative_to(ROOT).as_posix()
-            source = path.read_text()
-            for found in re.finditer(r"(?:docker://)?docker\.io/[a-z0-9._/-]+:[A-Za-z0-9._-]+(?:@sha256:[0-9a-f]{64})?",
-                                     source):
-                images.append(found.group(0))
-                self.assertRegex(found.group(0), r"@sha256:[0-9a-f]{64}$", f"{relative}: {found.group(0)} floats")
-                self.assertTrue(any(pattern.search(relative) for pattern in patterns),
-                                f"{relative} is not under Renovate's digest management")
-                self.assertEqual(match.fullmatch(found.group(0)).group("currentDigest"),
-                                 found.group(0).rsplit("@", 1)[1])
-        self.assertTrue(images, "no container image found; the scan is wrong")
+        tracked = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, check=True, capture_output=True,
+                                 text=True).stdout.split("\0")
+        configs = [name for name in tracked if name.endswith((".yml", ".yaml", ".bazel", ".bzl"))
+                   or Path(name).name.startswith("Dockerfile")]
+        self.assertIn(".github/workflows/release.yml", configs)
+        self.assertIn("tools/bazel/platforms/BUILD.bazel", configs)
+        images = {}
+        for relative in configs:
+            for number, line in enumerate((ROOT / relative).read_text().splitlines(), 1):
+                if line.lstrip().startswith("#"):
+                    continue
+                for found in re.finditer(r"(?:docker://)?docker\.io/[a-z0-9._/-]+:[A-Za-z0-9._-]+"
+                                         r"(?:@sha256:[0-9a-f]{64})?", line):
+                    where = f"{relative}:{number}"
+                    images[where] = found.group(0)
+                    self.assertRegex(found.group(0), r"@sha256:[0-9a-f]{64}$", f"{where}: {found.group(0)} floats")
+                    self.assertTrue(any(pattern.search(relative) for pattern in patterns),
+                                    f"{relative} is not under Renovate's digest management")
+                    self.assertEqual(match.fullmatch(found.group(0)).group("currentDigest"),
+                                     found.group(0).rsplit("@", 1)[1])
+        self.assertEqual(sorted({where.split(":")[0] for where in images}),
+                         [".github/workflows/release.yml", "tools/bazel/platforms/BUILD.bazel"], images)
+        self.assertIn("compare Meta's pinned\ncontainer digests with Core's", (ROOT / "CONTRIBUTING.md").read_text())
 
     def test_rust_cache_covers_the_wrapper_target(self):
         """rust-cache saves `<workspace>/target`; repo-cargo must build there.

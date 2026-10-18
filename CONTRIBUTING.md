@@ -160,6 +160,12 @@ reproducible without changing dependency bytes, features or recursion limits.
 All required gates still run; upgrading the pin requires qualifying CI and the
 complete candidate matrix together.
 
+Container images are pinned by digest: the release build container in
+`release.yml` and the Bazel platform images in
+`tools/bazel/platforms/BUILD.bazel`. `renovate.json` proposes new digests for
+review and never automerges them. At each release, compare Meta's pinned
+container digests with Core's.
+
 **Tag pushes validate only. They do not build or publish.** Publication requires
 an explicit selection of accepted, immutable candidate artifacts. `make release`
 still means a local optimized build; it is not a publication command.

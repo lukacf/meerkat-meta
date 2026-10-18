@@ -1,14 +1,21 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Meta keeps one dependency under Renovate: the release build container, pinned by digest (the same image and digest management as Core's release lane).",
-  "enabledManagers": ["custom.regex"],
-  "schedule": ["before 9am on Monday"],
+  "description": "Meta keeps its container images under Renovate: the release build container and the Bazel platform images, pinned by digest like Core's.",
+  "enabledManagers": [
+    "custom.regex"
+  ],
+  "schedule": [
+    "before 9am on Monday"
+  ],
   "prConcurrentLimit": 1,
   "customManagers": [
     {
       "customType": "regex",
-      "description": "The release workflow's build container, pinned by digest inside a job expression that no built-in manager reads.",
-      "managerFilePatterns": ["/^\\.github/workflows/release\\.yml$/"],
+      "description": "Container images pinned by digest where no built-in manager reads them: the release workflow's build container expression and the Bazel execution platforms.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/release\\.yml$/",
+        "/^tools/bazel/platforms/BUILD\\.bazel$/"
+      ],
       "matchStrings": [
         "(?:docker://)?(?<depName>docker\\.io/[a-z0-9._/-]+):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
       ],
@@ -17,8 +24,10 @@
   ],
   "packageRules": [
     {
-      "description": "The build container builds every Linux release binary: a new digest is proposed a week after its release, in a group of its own, and never automerged.",
-      "matchManagers": ["custom.regex"],
+      "description": "The build container builds every Linux release binary and the platform images run remote builds: a new digest is proposed a week after its release, in a group of its own, and never automerged.",
+      "matchManagers": [
+        "custom.regex"
+      ],
       "groupName": "pinned images",
       "groupSlug": "pinned-images",
       "minimumReleaseAge": "7 days",
