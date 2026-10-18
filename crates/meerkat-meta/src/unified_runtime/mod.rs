@@ -4651,6 +4651,73 @@ mod tests {
         assert_eq!(agent_id, "worker-one:0");
     }
 
+    /// The console drops an agent event by its Core event id, never by its
+    /// content. Two Core events with the same member, payload, sequence and
+    /// timestamp still carry distinct UUIDv7 ids, so both are kept; only a
+    /// redelivered copy of one of them (the same id) is dropped.
+    #[tokio::test]
+    async fn console_projection_keeps_identical_events_and_drops_a_redelivered_copy() {
+        let core_event = || {
+            let mut envelope = meerkat_core::event::EventEnvelope::new_with_source(
+                meerkat_core::event::EventSourceIdentity::runtime("test"),
+                7,
+                None,
+                AgentEvent::TextDelta {
+                    assistant_message_id: None,
+                    delta: "same words".to_string(),
+                },
+            );
+            envelope.timestamp_ms = 1;
+            let mut attributed = attributed_text_delta("worker-one", 0);
+            attributed.envelope = envelope;
+            attributed
+        };
+        let first = core_event();
+        let second = core_event();
+        assert_ne!(
+            first.envelope.event_id, second.envelope.event_id,
+            "Core mints a fresh id for every event"
+        );
+        assert_eq!(
+            serde_json::to_value(&first.envelope.payload).expect("payload serializes"),
+            serde_json::to_value(&second.envelope.payload).expect("payload serializes")
+        );
+        assert_eq!(first.envelope.seq, second.envelope.seq);
+
+        let store = console_events::ConsoleEventStore::new();
+        store
+            .register_runtime_identity("worker-one:0", "worker-one")
+            .await;
+        let first_id = format!("evt-agent-{}", first.envelope.event_id);
+        let second_id = format!("evt-agent-{}", second.envelope.event_id);
+        store
+            .project_unified_event(&attributed_event_to_unified(first.clone()))
+            .await;
+        store
+            .project_unified_event(&attributed_event_to_unified(second))
+            .await;
+        // The same Core event delivered again.
+        store
+            .project_unified_event(&attributed_event_to_unified(first))
+            .await;
+
+        let replay = store
+            .replay_all(None)
+            .await
+            .expect("all-events replay should succeed");
+        // Registration records its own console event; keep the agent events.
+        let agent_events = replay
+            .iter()
+            .filter(|event| event.event_id.starts_with("evt-agent-"))
+            .collect::<Vec<_>>();
+        let ids = agent_events
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![first_id.as_str(), second_id.as_str()]);
+        assert_eq!(agent_events[0].data, agent_events[1].data);
+    }
+
     /// Regression: the callers' outer `select!` drops and recreates the
     /// `wait()` future on every forwarded member event, so a safety deadline
     /// computed inside `wait` would reset under sustained event traffic and
