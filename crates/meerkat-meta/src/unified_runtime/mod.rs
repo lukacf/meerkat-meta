@@ -1492,10 +1492,18 @@ impl UnifiedRuntime {
     /// the installed identity view between this and
     /// [`Self::bootstrap_installed_identity_first_context`]; if it refuses,
     /// the ordinary [`Self::shutdown`] cleans up the installed context.
+    ///
+    /// Installing withdraws a bootstrap completion not yet taken (see
+    /// [`Self::take_bootstrap_completion`]): the runtime's bootstrap is then
+    /// the identity bootstrap that follows, which mints again when it
+    /// succeeds. [`Self::attach_identity_first_context`] leaves it as it is.
     pub fn install_identity_first_context(
         &mut self,
         context: Arc<crate::identity_first::IdentityFirstRuntimeContext>,
     ) {
+        // The runtime's bootstrap is now its identity bootstrap: a classic
+        // activation's completion not yet taken no longer attests it.
+        self.withdraw_bootstrap_completion();
         self.install_identity_first_context_authority(context);
     }
 
@@ -1753,9 +1761,6 @@ impl UnifiedRuntime {
         &mut self,
         context: Arc<crate::identity_first::IdentityFirstRuntimeContext>,
     ) {
-        // The runtime's bootstrap is now its identity bootstrap: a classic
-        // activation's completion not yet taken no longer attests it.
-        self.withdraw_bootstrap_completion();
         self.install_identity_first_flow_target_provisioner(&context.runtime);
         // The probe's verdict reaches the identity delivery path through the
         // identity runtime (and from there its session bridge): a send issued

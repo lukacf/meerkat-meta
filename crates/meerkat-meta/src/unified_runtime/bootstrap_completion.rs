@@ -57,6 +57,10 @@ impl RuntimeBootstrapCompleted {
     /// reenter host ownership either:
     /// - `f` is short and synchronous: a shutdown that begins meanwhile waits
     ///   for it, blocking its thread;
+    /// - `f` does not block on async work (no `block_on`, no waiting for a
+    ///   runtime-driven result): on a current-thread runtime, an `f` that runs
+    ///   off-thread and waits on runtime work deadlocks against a shutdown
+    ///   waiting at the gate;
     /// - `f` does not take the host's close boundary again;
     /// - `f` does not shut the runtime down, or wait on anything that waits
     ///   for its close: the gate is not reentrant.
@@ -77,6 +81,19 @@ impl RuntimeBootstrapCompleted {
         drop(lease);
         drop(state);
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+impl RuntimeBootstrapCompleted {
+    /// A second completion over the same gate and mob. A runtime mints one;
+    /// a test that spends it in a panicking publication needs another to
+    /// observe the gate afterwards.
+    pub(crate) fn sibling_for_test(&self) -> Self {
+        Self {
+            gate: Arc::clone(&self.gate),
+            observer: self.observer.clone(),
+        }
     }
 }
 
@@ -211,13 +228,14 @@ impl UnifiedRuntime {
     /// `bootstrap_with_*` family) return an active runtime without passing a
     /// mint site, so a host that built one calls it before taking.
     ///
-    /// Installing or attaching an identity context withdraws a completion
-    /// not yet taken: the runtime's bootstrap is then its identity bootstrap,
-    /// which mints again when it succeeds. An attached context
-    /// ([`Self::attach_identity_first_context`]) mints nothing, because this
-    /// runtime did not bootstrap its roster. A failed bootstrap mints
-    /// nothing either; it closes the runtime, and a stray completion could
-    /// not be published.
+    /// Installing an identity context ([`Self::install_identity_first_context`],
+    /// which [`Self::install_and_bootstrap_identity_first_context`] calls)
+    /// withdraws a completion not yet taken: the runtime's bootstrap is then
+    /// its identity bootstrap, which mints again when it succeeds. Attaching
+    /// one ([`Self::attach_identity_first_context`]) leaves the completion as
+    /// it is and mints nothing, because this runtime does not bootstrap an
+    /// attached roster. A failed bootstrap mints nothing; it closes the
+    /// runtime, and a stray completion could not be published.
     ///
     /// On the stdio gateway the driver takes the completion for its Ready,
     /// and this answers [`BootstrapCompletionUnavailable::AlreadyTaken`].
@@ -253,8 +271,8 @@ impl UnifiedRuntime {
         }
     }
 
-    /// Withdraw a completion not yet taken: an identity context was installed
-    /// or attached, so the bootstrap it attested is no longer the whole one.
+    /// Withdraw a completion not yet taken: an identity context was installed,
+    /// so the bootstrap it attested is no longer the whole one.
     pub(super) fn withdraw_bootstrap_completion(&self) {
         let mut slot = self
             .bootstrap_completion

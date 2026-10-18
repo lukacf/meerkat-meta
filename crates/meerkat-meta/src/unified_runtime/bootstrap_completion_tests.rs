@@ -331,6 +331,47 @@ async fn a_running_publication_keeps_the_mob_from_an_idle_close() {
     runtime.shutdown().await;
 }
 
+/// Attaching an identity context leaves a classic completion as it is: this
+/// runtime does not bootstrap an attached roster, so nothing would mint
+/// again.
+#[tokio::test]
+async fn attaching_an_identity_context_keeps_the_completion() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut runtime = activated(&temp).await;
+    let context = context(&runtime);
+    runtime.attach_identity_first_context(context);
+    assert_eq!(
+        unavailable(&runtime),
+        None,
+        "the classic completion survives an attach"
+    );
+    runtime.shutdown().await;
+}
+
+/// A publication whose `f` panics poisons the gate's lock. The panic
+/// propagates, the runtime still closes, and a later publication is still
+/// refused: both read through the poison.
+#[tokio::test]
+async fn a_panicking_publication_leaves_the_gate_working() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let runtime = activated(&temp).await;
+    let completion = runtime.take_bootstrap_completion().expect("minted");
+    let later = completion.sibling_for_test();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        completion.publish(|| panic!("f panics inside the gate"))
+    }));
+    assert!(panicked.is_err(), "the panic propagates out of publish");
+    tokio::time::timeout(runtime.shutdown_horizon(), runtime.shutdown())
+        .await
+        .expect("the shutdown passes the poisoned gate");
+    let ran = AtomicBool::new(false);
+    assert_eq!(
+        later.publish(|| ran.store(true, Ordering::SeqCst)),
+        Err(BootstrapCompletionRefused::RuntimeClosing)
+    );
+    assert!(!ran.load(Ordering::SeqCst), "f ran after the close");
+}
+
 #[test]
 fn the_completion_crosses_threads() {
     fn send<T: Send>() {}
