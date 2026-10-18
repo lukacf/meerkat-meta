@@ -351,6 +351,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `ConsoleLogStore::unsettled_send_frames` (defaulted to none) and
   `UnifiedRuntime::reconcile_interrupted_console_sends`, which both gateways
   run once at startup.
+- **Forge developer alpha (source):** `installer/` adds Meta Forge, the
+  guided setup and application authoring tool. Describe an idea in a
+  conversation, review the proposed team and behaviour, then build a
+  deployment package to review and install. This release ships the source
+  only: Forge opens from a complete prepared product archive, and a packaged
+  Forge download follows in a later release.
 
 ### Changed
 
