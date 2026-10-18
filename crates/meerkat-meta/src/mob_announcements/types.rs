@@ -547,6 +547,11 @@ pub struct MobLineage {
     /// The mob whose member created this one; `None` when the records prove
     /// no member origin, and then no member reaches this mob.
     pub parent: Option<MobId>,
+    /// The parent's incarnation when this one was derived; `None` for this
+    /// gateway's own mob, the root, which has no record. The edge holds only
+    /// while the parent's live record is of this incarnation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_incarnation: Option<MobIncarnation>,
     /// The creating member's roster id in the parent mob.
     pub creator: Option<String>,
     pub recorded_at_ms: u64,

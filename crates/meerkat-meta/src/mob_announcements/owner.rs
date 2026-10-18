@@ -356,13 +356,23 @@ const MAX_LINEAGE_DEPTH: usize = 64;
 /// cousins are not reached. Each mob is visited once, so records that loop
 /// (an id reused under a new parent) end the walk instead of repeating it.
 pub(crate) fn reach_from(records: &[MobLineage], own: &MobId) -> BTreeSet<MobId> {
+    let incarnation_of = records
+        .iter()
+        .map(|record| (&record.mob_id, &record.incarnation))
+        .collect::<BTreeMap<_, _>>();
+    // An edge holds only to the parent incarnation it was derived under: a
+    // parent created again under the same id adopts no child of the old
+    // one. The root, this gateway's own mob, has no record.
     let parent_of = records
         .iter()
         .filter_map(|record| {
-            record
-                .parent
-                .as_ref()
-                .map(|parent| (&record.mob_id, parent))
+            let parent = record.parent.as_ref()?;
+            let holds = match (&record.parent_incarnation, incarnation_of.get(parent)) {
+                (None, None) => true,
+                (Some(derived_under), Some(live)) => derived_under == *live,
+                _ => false,
+            };
+            holds.then_some((&record.mob_id, parent))
         })
         .collect::<BTreeMap<_, _>>();
     let mut children = BTreeMap::<&MobId, Vec<&MobId>>::new();
@@ -621,6 +631,10 @@ impl AnnouncementService {
         mob_id: &MobId,
         recorded: Option<&MobIncarnation>,
     ) -> Result<(), AnnouncementError> {
+        // This gateway's own mob is the root: it has no record.
+        if self.inner.native.own_mob().as_ref() == Some(mob_id) {
+            return Ok(());
+        }
         let Some(facts) = self
             .inner
             .native
@@ -633,18 +647,22 @@ impl AnnouncementService {
         if recorded == Some(&facts.incarnation) {
             return Ok(());
         }
-        let (parent, creator) = match facts.origin {
-            MobOrigin::Member { parent, creator } => (Some(parent), Some(creator)),
+        let (parent, parent_incarnation, creator) = match facts.origin {
+            MobOrigin::Member {
+                parent,
+                creator,
+                parent_incarnation,
+            } => (Some(parent), parent_incarnation, Some(creator)),
             MobOrigin::Unproven(detail) => {
                 tracing::info!(mob = %mob_id, %detail, "mob has no member origin");
-                (None, None)
+                (None, None, None)
             }
             MobOrigin::ParentNotHosted(parent) => {
                 if !self.inner.native.mobs_restored() {
                     return Ok(());
                 }
                 tracing::info!(mob = %mob_id, parent = %parent, "the mob's parent is gone");
-                (None, None)
+                (None, None, None)
             }
         };
         let now = self.now();
@@ -655,6 +673,7 @@ impl AnnouncementService {
                     mob_id: mob_id.clone(),
                     incarnation: facts.incarnation,
                     parent,
+                    parent_incarnation,
                     creator,
                     recorded_at_ms: now,
                 },

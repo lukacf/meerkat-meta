@@ -118,8 +118,14 @@ pub enum MobOrigin {
     /// A member of `parent`, roster id `creator`, created it: the mob's
     /// owner binding names a session whose own persisted member binding
     /// names that member, and the parent's member-creation journal records
-    /// the same session for the same binding.
-    Member { parent: MobId, creator: String },
+    /// the same session for the same binding. `parent_incarnation` is the
+    /// parent's incarnation then; `None` when the parent is this gateway's
+    /// own mob.
+    Member {
+        parent: MobId,
+        creator: String,
+        parent_incarnation: Option<MobIncarnation>,
+    },
     /// No member created it, or the records do not prove one: a final
     /// fact for this incarnation. The detail says which.
     Unproven(String),
@@ -151,6 +157,8 @@ pub(crate) enum ParentRecord {
     /// as the session it records and the binding it records.
     Running {
         journal: Option<(String, BindingRecord)>,
+        /// The parent's incarnation; `None` for this gateway's own mob.
+        incarnation: Option<MobIncarnation>,
     },
     /// Restored and held until its owner resolves: it may run again.
     Held,
@@ -205,9 +213,19 @@ pub(crate) fn origin_from(records: &OriginRecords) -> Result<MobOrigin, String> 
         }
         Some(OwnerMetadata::Bound(binding)) => binding,
     };
-    let parent = MobId::new(binding.mob_id.clone()).map_err(|error| error.to_string())?;
+    let parent = match MobId::new(binding.mob_id.clone()) {
+        Ok(parent) => parent,
+        Err(error) => {
+            return Ok(MobOrigin::Unproven(format!(
+                "its owner session names no valid mob: {error}"
+            )));
+        }
+    };
     match &records.parent {
-        Some(ParentRecord::Running { journal }) => {
+        Some(ParentRecord::Running {
+            journal,
+            incarnation,
+        }) => {
             let agrees = journal
                 .as_ref()
                 .is_some_and(|(session, recorded)| session == owner && recorded == binding);
@@ -215,6 +233,7 @@ pub(crate) fn origin_from(records: &OriginRecords) -> Result<MobOrigin, String> 
                 Ok(MobOrigin::Member {
                     parent,
                     creator: binding.member.clone(),
+                    parent_incarnation: incarnation.clone(),
                 })
             } else {
                 Ok(MobOrigin::Unproven(
@@ -266,6 +285,11 @@ pub trait NativeDelivery: Send + Sync {
     /// restored: from then on, a mob it does not host is gone for good.
     fn mobs_restored(&self) -> bool {
         true
+    }
+
+    /// This gateway's own mob: the root of the lineage, with no record.
+    fn own_mob(&self) -> Option<MobId> {
+        None
     }
 
     /// The incarnation of the hosted mob `mob_id` and who created it, from
@@ -519,26 +543,11 @@ impl MobNativeDelivery {
         &self,
         mobs: &BTreeSet<MobId>,
     ) -> Result<BTreeMap<MobId, MobPresence>, NativeUnavailable> {
-        let managed = self
-            .mob_tools
-            .mob_list()
-            .await
-            .map_err(|error| NativeUnavailable(error.to_string()))?
-            .into_iter()
-            .filter(|(_, state)| *state != meerkat_mob::MobState::Destroyed)
-            .map(|(mob_id, _)| mob_id.as_str().to_string())
-            .collect::<BTreeSet<_>>();
-        let held = self
-            .mob_tools
-            .held_child_mobs()
-            .await
-            .into_iter()
-            .map(|(mob_id, _)| mob_id.as_str().to_string())
-            .collect::<BTreeSet<_>>();
+        let hosted_set = self.hosted_set().await?;
         Ok(mobs
             .iter()
             .map(|mob_id| {
-                let hosted = managed.contains(mob_id.as_str()) || held.contains(mob_id.as_str());
+                let hosted = hosted_set.contains(mob_id.as_str());
                 let presence = if hosted {
                     MobPresence::Hosted
                 } else {
@@ -555,25 +564,56 @@ impl MobNativeDelivery {
     /// its restore of persisted child mobs before they answer, so a mob
     /// missing here is not one still being restored.
     pub async fn hosted_mob_ids(&self) -> Result<BTreeSet<MobId>, NativeUnavailable> {
-        let managed = self
-            .mob_tools
-            .mob_list()
-            .await
-            .map_err(|error| NativeUnavailable(error.to_string()))?
+        Ok(self
+            .hosted_set()
+            .await?
             .into_iter()
-            .filter(|(_, state)| *state != meerkat_mob::MobState::Destroyed)
-            .map(|(mob_id, _)| mob_id.as_str().to_string());
+            .filter(|mob_id| mob_id != self.mob_id.as_str())
+            .filter_map(|mob_id| match MobId::new(mob_id.clone()) {
+                Ok(mob_id) => Some(mob_id),
+                // One id this store cannot hold leaves the others readable.
+                Err(error) => {
+                    tracing::warn!(mob = %mob_id, %error, "hosted mob id not usable here");
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// Every mob hosted here, this gateway's own included: managed and not
+    /// destroyed, or restored and held until its owner resolves.
+    ///
+    /// The managed listing is read first only to finish the restore of
+    /// persisted mobs: it fails rather than answer before the restore. Held
+    /// mobs are then read before managed ones, because activation adds a
+    /// held mob to the managed ones before it drops the hold: a mob that
+    /// activates between the two reads is in one of them.
+    async fn hosted_set(&self) -> Result<BTreeSet<String>, NativeUnavailable> {
+        self.restored_listing().await?;
         let held = self
             .mob_tools
             .held_child_mobs()
             .await
             .into_iter()
+            .map(|(mob_id, _)| mob_id.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        let managed = self
+            .restored_listing()
+            .await?
+            .into_iter()
+            .filter(|(_, state)| *state != meerkat_mob::MobState::Destroyed)
             .map(|(mob_id, _)| mob_id.as_str().to_string());
-        managed
-            .chain(held)
-            .filter(|mob_id| mob_id != self.mob_id.as_str())
-            .map(|mob_id| MobId::new(mob_id).map_err(|error| NativeUnavailable(error.to_string())))
-            .collect()
+        Ok(held.into_iter().chain(managed).collect())
+    }
+
+    /// The managed mobs, once the restore of persisted mobs is finished.
+    async fn restored_listing(
+        &self,
+    ) -> Result<Vec<(meerkat_mob::MobId, meerkat_mob::MobState)>, NativeUnavailable> {
+        self.mob_tools
+            .mob_list()
+            .await
+            .map_err(|error| NativeUnavailable(error.to_string()))
     }
 
     /// The incarnation of a running hosted mob and who created it, from
@@ -586,9 +626,11 @@ impl MobNativeDelivery {
         mob_id: &MobId,
     ) -> Result<Option<MobOriginFacts>, NativeUnavailable> {
         let unavailable = |error: &dyn std::fmt::Display| NativeUnavailable(error.to_string());
-        // Held mobs are read before running ones: activation moves a held
-        // mob to the running ones, never back, so a parent in neither is
-        // not one about to run.
+        // The restore of persisted mobs is finished first. Held mobs are
+        // then read before running ones: activation moves a held mob to the
+        // running ones, never back, so a parent in neither is not one about
+        // to run.
+        self.restored_listing().await?;
         let held = self
             .mob_tools
             .held_child_mobs()
@@ -608,21 +650,10 @@ impl MobNativeDelivery {
         else {
             return Ok(None);
         };
-        let first_event_at_ms = handle
-            .events()
-            .poll(0, 1)
-            .await
-            .map_err(|error| unavailable(&error))?
-            .first()
-            .map(|event| u64::try_from(event.timestamp.timestamp_millis()).unwrap_or(0))
-            .ok_or_else(|| NativeUnavailable(format!("mob {mob_id} has no events yet")))?;
+        let incarnation = Self::incarnation_of(&handle, mob_id).await?;
         let owner = handle
             .owner_bridge_session_lifecycle_authority()
             .map(|authority| authority.bridge_session_id);
-        let incarnation = MobIncarnation {
-            owner_session: owner.as_ref().map(ToString::to_string),
-            first_event_at_ms,
-        };
         let mut records = OriginRecords {
             owner_session: owner.as_ref().map(ToString::to_string),
             ..OriginRecords::default()
@@ -655,6 +686,13 @@ impl MobNativeDelivery {
                     .map(|(_, handle)| handle.clone());
                 records.parent = Some(match parent {
                     Some(parent) => ParentRecord::Running {
+                        incarnation: if binding.mob_id == self.mob_id.as_str() {
+                            None
+                        } else {
+                            let parent_id = MobId::new(binding.mob_id.clone())
+                                .map_err(|error| unavailable(&error))?;
+                            Some(Self::incarnation_of(&parent, &parent_id).await?)
+                        },
                         journal: parent
                             .read_handle()
                             .member_creation_for_session(owner)
@@ -682,6 +720,28 @@ impl MobNativeDelivery {
             incarnation,
             origin,
         }))
+    }
+
+    /// One running mob's incarnation: its owner binding and the time of the
+    /// first event in its own log.
+    async fn incarnation_of(
+        handle: &meerkat_mob::MobHandle,
+        mob_id: &MobId,
+    ) -> Result<MobIncarnation, NativeUnavailable> {
+        let first_event_at_ms = handle
+            .events()
+            .poll(0, 1)
+            .await
+            .map_err(|error| NativeUnavailable(error.to_string()))?
+            .first()
+            .map(|event| u64::try_from(event.timestamp.timestamp_millis()).unwrap_or(0))
+            .ok_or_else(|| NativeUnavailable(format!("mob {mob_id} has no events yet")))?;
+        Ok(MobIncarnation {
+            owner_session: handle
+                .owner_bridge_session_lifecycle_authority()
+                .map(|authority| authority.bridge_session_id.to_string()),
+            first_event_at_ms,
+        })
     }
 
     /// Submit one continuation for the identity.
@@ -815,6 +875,10 @@ impl NativeDelivery for MobNativeDelivery {
         Some(self.mob_tools.mob_set_changes())
     }
 
+    fn own_mob(&self) -> Option<MobId> {
+        Some(self.mob_id.clone())
+    }
+
     async fn hosted_mob_ids(&self) -> Result<BTreeSet<MobId>, NativeUnavailable> {
         MobNativeDelivery::hosted_mob_ids(self).await
     }
@@ -942,6 +1006,10 @@ impl NativeDelivery for AnnouncementNativeDelivery {
 
     fn mob_set_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         NativeDelivery::mob_set_changes(self.local.as_ref())
+    }
+
+    fn own_mob(&self) -> Option<MobId> {
+        NativeDelivery::own_mob(self.local.as_ref())
     }
 
     async fn hosted_mob_ids(&self) -> Result<BTreeSet<MobId>, NativeUnavailable> {

@@ -205,7 +205,15 @@ restart (a child mob does not outlive its creator's respawn there).
 
 A record belongs to one incarnation: the owner session and the time of the
 first event in the mob's own log. A mob destroyed and created again under
-the same id starts a new log and gets a new record. When a mob is no longer
+the same id starts a new log and gets a new record. A record also keeps the
+incarnation of its parent, and the walk follows it only to the parent's
+record of that incarnation, so a parent created again under the same id
+adopts no mob of the old one. This gateway's own mob is the root: it has no
+record.
+
+The walk reads the live records only. A subscription naming a mob below
+another that has no record yet is refused with `unrelated_mob` until the
+next reconcile records the mob in between: it fails closed. When a mob is no longer
 hosted its record ends; ended records are removed by retention once no
 live record names the mob as parent. A mob held after a restart keeps its
 record; a held mob whose parent's record ended loses its reach upward.

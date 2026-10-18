@@ -1445,6 +1445,7 @@ fn lineage_record(
         mob_id: mob(mob_id),
         incarnation,
         parent: parent.map(mob),
+        parent_incarnation: None,
         creator: parent.map(|_| "creator".to_string()),
         recorded_at_ms: at,
     }
@@ -1636,10 +1637,21 @@ impl ScriptedNative {
         );
     }
 
-    fn created_by(parent: &str, creator: &str) -> MobOrigin {
+    /// That a member of `parent` created a mob, under the parent's scripted
+    /// incarnation, or of this gateway's own mob, which has none.
+    fn created_by(&self, parent: &str, creator: &str) -> MobOrigin {
+        let parent_incarnation = (parent != OWN_MOB).then(|| {
+            self.origins
+                .lock()
+                .unwrap()
+                .get(parent)
+                .map(|facts| facts.incarnation.clone())
+                .expect("the parent's origin is scripted first")
+        });
         MobOrigin::Member {
             parent: mob(parent),
             creator: creator.to_string(),
+            parent_incarnation,
         }
     }
 
@@ -1704,6 +1716,10 @@ impl NativeDelivery for ScriptedNative {
 
     fn mobs_restored(&self) -> bool {
         self.restored.load(Ordering::SeqCst)
+    }
+
+    fn own_mob(&self) -> Option<MobId> {
+        Some(mob(OWN_MOB))
     }
 
     async fn mob_origin(
@@ -4309,12 +4325,21 @@ async fn two_members_never_meet_under_one_name() {
 // ---------------------------------------------------------------------------
 
 /// Records for the reach walk: `(mob, parent)`.
+/// Live records for `(mob, parent)` pairs, each edge derived under its
+/// parent's incarnation; a parent without a record is the root.
 fn records(pairs: &[(&str, Option<&str>)]) -> Vec<MobLineage> {
+    let incarnation_of = |mob_id: &str| {
+        pairs
+            .iter()
+            .position(|(other, _)| *other == mob_id)
+            .map(|index| incarnation("s", index as u64))
+    };
     pairs
         .iter()
         .enumerate()
-        .map(|(index, (mob_id, parent))| {
-            lineage_record(mob_id, *parent, incarnation("s", index as u64), 1)
+        .map(|(index, (mob_id, parent))| MobLineage {
+            parent_incarnation: parent.and_then(incarnation_of),
+            ..lineage_record(mob_id, *parent, incarnation("s", index as u64), 1)
         })
         .collect()
 }
@@ -4367,6 +4392,18 @@ fn reach_is_the_own_mob_its_ancestors_and_its_descendants() {
         .collect::<Vec<_>>();
     assert_eq!(reach_from(&records(&chain), &mob("root")).len(), 65);
     assert_eq!(reach_from(&records(&chain), &mob("m99")).len(), 65);
+
+    // A parent created again under the same id adopts no child of its old
+    // incarnation: the edge holds only to the incarnation it was derived
+    // under.
+    let mut adopted = records(&[("team", Some("root")), ("task", Some("team"))]);
+    adopted[0].incarnation = incarnation("again", 99);
+    assert_eq!(names(&reach_from(&adopted, &mob("root"))), ["root", "team"]);
+    assert_eq!(names(&reach_from(&adopted, &mob("task"))), ["task"]);
+    // An edge to the root never names an incarnation.
+    let mut rooted = records(&[("team", Some("root"))]);
+    rooted[0].parent_incarnation = Some(incarnation("root", 1));
+    assert_eq!(names(&reach_from(&rooted, &mob("team"))), ["team"]);
 }
 
 #[tokio::test]
@@ -4375,12 +4412,12 @@ async fn lineage_is_derived_once_and_only_from_proofs() {
     native.set_origin(
         "events",
         incarnation("s1", 10),
-        ScriptedNative::created_by(OWN_MOB, "agent:a"),
+        native.created_by(OWN_MOB, "agent:a"),
     );
     native.set_origin(
         "builds",
         incarnation("s2", 20),
-        ScriptedNative::created_by("events", "worker"),
+        native.created_by("events", "worker"),
     );
     native.set_origin(
         "refunds",
@@ -4400,7 +4437,7 @@ async fn lineage_is_derived_once_and_only_from_proofs() {
     native.set_origin(
         "b-mob",
         incarnation("s5", 50),
-        ScriptedNative::created_by(OWN_MOB, "agent:a"),
+        native.created_by(OWN_MOB, "agent:a"),
     );
     native.restored.store(false, Ordering::SeqCst);
     let harness = harness_with(native);
@@ -4454,7 +4491,7 @@ async fn lineage_is_derived_once_and_only_from_proofs() {
     harness.native.set_origin(
         "events",
         incarnation("s1", 10),
-        ScriptedNative::created_by("refunds", "someone-else"),
+        harness.native.created_by("refunds", "someone-else"),
     );
     harness.service.reconcile_lineage().await.unwrap();
     assert!(
@@ -4468,7 +4505,7 @@ async fn lineage_is_derived_once_and_only_from_proofs() {
     harness.native.set_origin(
         "events",
         incarnation("s1", 11),
-        ScriptedNative::created_by("refunds", "someone-else"),
+        harness.native.created_by("refunds", "someone-else"),
     );
     harness.service.reconcile_lineage().await.unwrap();
     assert!(
@@ -4500,12 +4537,12 @@ async fn members_subscribe_within_their_reach_only() {
     native.set_origin(
         "events",
         incarnation("s1", 10),
-        ScriptedNative::created_by(OWN_MOB, "agent:a"),
+        native.created_by(OWN_MOB, "agent:a"),
     );
     native.set_origin(
         "builds",
         incarnation("s2", 20),
-        ScriptedNative::created_by("events", "worker"),
+        native.created_by("events", "worker"),
     );
     native.set_origin(
         "refunds",
@@ -4585,6 +4622,7 @@ fn a_member_created_a_mob_only_when_all_three_records_agree() {
         owner_metadata: Some(OwnerMetadata::Bound(binding("payments", "lead", "agent:a"))),
         parent: Some(ParentRecord::Running {
             journal: journal.map(|(session, recorded)| (session.to_string(), recorded)),
+            incarnation: Some(incarnation("parent", 7)),
         }),
     };
     assert_eq!(
@@ -4595,6 +4633,7 @@ fn a_member_created_a_mob_only_when_all_three_records_agree() {
         Ok(MobOrigin::Member {
             parent: mob("payments"),
             creator: "agent:a".to_string(),
+            parent_incarnation: Some(incarnation("parent", 7)),
         })
     );
     let unproven = [
@@ -4634,6 +4673,13 @@ fn a_member_created_a_mob_only_when_all_three_records_agree() {
         (
             "another member in the journal",
             owned(Some(("session-1", binding("payments", "lead", "agent:b")))),
+        ),
+        (
+            "a binding that names no valid mob",
+            OriginRecords {
+                owner_metadata: Some(OwnerMetadata::Bound(binding("", "lead", "agent:a"))),
+                ..owned(None)
+            },
         ),
     ];
     for (case, records) in unproven {
@@ -5130,4 +5176,53 @@ async fn a_backlog_paused_past_the_window_expires_and_the_resume_reports_it() {
     let batch = harness.only_batch().await;
     assert_eq!(batch.gaps, vec![expired_gap(3)]);
     assert_eq!(batch.items.len(), 1);
+}
+
+#[tokio::test]
+async fn this_gateways_own_mob_never_gets_a_lineage_record() {
+    let native = ScriptedNative::new();
+    native.set_origin(
+        OWN_MOB,
+        incarnation("own", 1),
+        MobOrigin::Unproven("no member created it".into()),
+    );
+    native.set_origin(
+        "refunds",
+        incarnation("s3", 30),
+        MobOrigin::Unproven("no member created it".into()),
+    );
+    let harness = harness_with(native);
+    // A member of this gateway's own mob names a mob outside its reach: the
+    // check derives what it names and the member's own mob, and refuses.
+    let refused = harness
+        .service
+        .put_member_subscription(
+            &op("r1"),
+            PutSubscription {
+                selector: Selector {
+                    topics: topics(&["ios"]),
+                    mobs: BTreeSet::from([mob("refunds")]),
+                },
+                ..put("r1", "agent:a", &["ios"], StartFrontier::Now)
+            },
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(AnnouncementError::UnrelatedMob(_))),
+        "{refused:?}"
+    );
+    harness.service.reconcile_lineage().await.unwrap();
+    let recorded = harness
+        .store
+        .lineage()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|record| record.mob_id.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded,
+        ["refunds"],
+        "the root has no record to end or leak"
+    );
 }
