@@ -262,6 +262,10 @@ and status rules of members of this gateway's own mob.
 How a member is reached (this gateway's mob, a mob hosted here, or a peer)
 is decided when it is first subscribed and kept with it, together with the
 incarnation of its mob; every batch carries the route it was sealed with.
+No route is ever assumed: a stored batch without one does not decode, the
+store refuses a subscription the owner resolved no route for, and a local
+route names the member's own mob, so a batch whose member names another mob
+is blocked rather than delivered to this gateway's member of that name.
 A member is never rerouted: a put whose route would differ from the kept
 one is refused with `ambiguous_mob`, as is a mob id that names a mob hosted
 here and a peer in the contact directory alike.

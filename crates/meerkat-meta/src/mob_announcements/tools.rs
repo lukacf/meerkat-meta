@@ -27,9 +27,9 @@ use serde_json::{Value, json};
 
 use super::owner::{AnnouncementError, AnnouncementService};
 use super::types::{
-    AnnounceRequest, Announcer, ChildMemberLimits, MAX_PAGE, Member, MemberIdentity,
-    MemberRouteRecord, MobId, OperationId, PutSubscription, Selector, SourceKey, StartFrontier,
-    Subscription, SubscriptionChange, SubscriptionId, Topic,
+    AnnounceRequest, Announcer, ChildMemberLimits, MAX_PAGE, Member, MemberIdentity, MobId,
+    OperationId, PutSubscription, Selector, SourceKey, StartFrontier, Subscription,
+    SubscriptionChange, SubscriptionId, Topic,
 };
 
 /// The name a profile lists in `tools.rust_bundles` to get the member tools.
@@ -652,7 +652,7 @@ async fn subscription(
                         selector: Selector { topics, mobs },
                         start: StartFrontier::Now,
                         expected_revision,
-                        route: MemberRouteRecord::default(),
+                        route: None,
                         member_mob_cursor: None,
                         child_limits: ChildMemberLimits::default(),
                     },

@@ -565,12 +565,11 @@ impl fmt::Display for SubscriptionEnd {
 
 /// How a member is reached. Decided when the member is first subscribed and
 /// kept: a later collision of ids never reroutes a member.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum MemberRoute {
     /// A member of this gateway's mob, through this gateway's runtime.
-    #[default]
     Local,
     /// A member of a mob a member created on this gateway, through this
     /// gateway's runtime.
@@ -591,7 +590,7 @@ impl MemberRoute {
 
 /// A member's kept route: for a member of a mob a member created, the
 /// incarnation of that mob it was subscribed in.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemberRouteRecord {
     pub route: MemberRoute,
@@ -688,9 +687,10 @@ pub struct PutSubscription {
     pub expected_revision: Option<u64>,
     /// How the member is reached. The owner fills it in from the member's
     /// own records; it is kept with the member's first subscription and is
-    /// not part of the request a caller makes.
+    /// not part of the request a caller makes. The store refuses a request
+    /// without it: no route is ever assumed.
     #[serde(skip)]
-    pub route: MemberRouteRecord,
+    pub route: Option<MemberRouteRecord>,
     /// For a member of a mob a member created: the cursor of that mob's
     /// event log when the subscription was made. The owner fills it in; it
     /// is not part of the request a caller makes.
@@ -1217,8 +1217,8 @@ pub struct Batch {
     /// delivered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gaps: Vec<BatchGap>,
-    /// How the member is reached, kept from its subscription.
-    #[serde(default)]
+    /// How the member is reached, kept from its subscription. A record
+    /// without it does not decode: no route is ever assumed.
     pub route: MemberRoute,
     pub body: String,
     pub content_digest: String,

@@ -878,8 +878,14 @@ fn put_subscription_in(
         return decode(&result);
     }
     request.selector.validate()?;
-    keep_member_route_in(db, &request.member, &request.route)?;
-    if request.route.route == MemberRoute::Child {
+    let route = request.route.as_ref().ok_or_else(|| {
+        storage(format!(
+            "a subscription for {} reached the store without its route; the owner resolves it",
+            request.member
+        ))
+    })?;
+    keep_member_route_in(db, &request.member, route)?;
+    if route.route == MemberRoute::Child {
         within_child_limits(db, request)?;
     }
     let subscription = match (

@@ -588,7 +588,7 @@ impl AnnouncementService {
         {
             return Err(member_problem(&request.member, problem));
         }
-        request.route = route;
+        request.route = Some(route);
         request.child_limits = self.inner.config.child_limits;
         let mobs = self.ensure_hosted(&request.selector.mobs).await?;
         let member_mob = request.member.mob_id.clone();
@@ -1212,13 +1212,18 @@ impl AnnouncementService {
         policy: &SealingPolicy,
         now: u64,
     ) -> Result<Option<Batch>, AnnouncementError> {
+        // Every subscription keeps its member's route, so a member with
+        // owed captures has one. Without it nothing is sealed: no route is
+        // assumed.
         let route = self
             .inner
             .store
             .member_route(member)
             .await?
             .map(|kept| kept.route)
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                AnnouncementStoreError::Storage(format!("no route is kept for member {member}"))
+            })?;
         if route == MemberRoute::Child {
             self.member_mob_ended(member, now).await?;
         }

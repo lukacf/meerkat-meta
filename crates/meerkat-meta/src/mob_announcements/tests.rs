@@ -38,6 +38,14 @@ fn op(value: &str) -> OperationId {
 /// The mob of the gateway these tests run as: its members are local.
 const OWN_MOB: &str = "payments";
 
+/// The kept route of a member of [`OWN_MOB`].
+fn local_route() -> MemberRouteRecord {
+    MemberRouteRecord {
+        route: MemberRoute::Local,
+        incarnation: None,
+    }
+}
+
 fn member(value: &str) -> Member {
     Member::new(mob(OWN_MOB), MemberIdentity::new(value).unwrap())
 }
@@ -81,7 +89,7 @@ fn put(id: &str, to: &str, topic: &[&str], start: StartFrontier) -> PutSubscript
         },
         start,
         expected_revision: None,
-        route: MemberRouteRecord::default(),
+        route: Some(local_route()),
         member_mob_cursor: None,
         child_limits: ChildMemberLimits::default(),
     }
@@ -885,10 +893,10 @@ fn put_for(id: &str, to: Member, topic: &[&str]) -> PutSubscription {
     };
     PutSubscription {
         member: to,
-        route: MemberRouteRecord {
+        route: Some(MemberRouteRecord {
             route,
             incarnation: None,
-        },
+        }),
         ..put(id, "agent:a", topic, StartFrontier::Now)
     }
 }
@@ -1790,10 +1798,10 @@ async fn child_member_subscriptions_are_bounded(store: &dyn AnnouncementStore) {
     };
     let child_put = |id: &str, identity: &str, mobs: &[&str]| PutSubscription {
         member: peer_member(identity, "builds"),
-        route: MemberRouteRecord {
+        route: Some(MemberRouteRecord {
             route: MemberRoute::Child,
             incarnation: Some(incarnation("owner-1", 10)),
-        },
+        }),
         member_mob_cursor: Some(1),
         child_limits: limits,
         selector: Selector {
@@ -1885,7 +1893,7 @@ async fn member_routes_are_kept_and_member_mob_logs_read_on(store: &dyn Announce
     };
     let child_put = |id: &str, cursor: u64| PutSubscription {
         member: worker(),
-        route: child.clone(),
+        route: Some(child.clone()),
         member_mob_cursor: Some(cursor),
         ..put(id, "agent:a", &["ios"], StartFrontier::Now)
     };
@@ -2297,7 +2305,7 @@ impl NativeDelivery for ScriptedNative {
     ) -> std::result::Result<MemberRouteRecord, MemberProblem> {
         let mob_id = member.mob_id.as_str();
         if mob_id == OWN_MOB {
-            return Ok(MemberRouteRecord::default());
+            return Ok(local_route());
         }
         if !self.hosted(&member.mob_id) {
             return Ok(MemberRouteRecord {
@@ -6915,4 +6923,98 @@ fn the_public_announcement_enums_are_non_exhaustive() {
     let expected: Vec<(&str, Option<bool>)> =
         names.iter().map(|name| (*name, Some(true))).collect();
     assert_eq!(marked, expected);
+}
+
+/// A stored batch record without its route does not decode: no route is
+/// assumed for a batch, so it is never delivered as a local one by default.
+#[tokio::test]
+async fn a_batch_record_without_a_route_does_not_decode() {
+    let (_dir, store) = temp_store();
+    store
+        .put_subscription(
+            &op("s1"),
+            put("s1", "agent:a", &["ios"], StartFrontier::Now),
+            1,
+        )
+        .await
+        .unwrap();
+    store
+        .announce(announce_request("payments", "k1", &["ios"], "one"), 2)
+        .await
+        .unwrap();
+    let batch = store
+        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), None, 1_002)
+        .await
+        .unwrap()
+        .expect("due after the delay");
+    let mut record = serde_json::to_value(&batch).unwrap();
+    let decoded =
+        serde_json::from_value::<Batch>(record.clone()).map_err(|error| error.to_string());
+    assert_eq!(decoded, Ok(batch));
+    record.as_object_mut().unwrap().remove("route");
+    let decoded = serde_json::from_value::<Batch>(record).map_err(|error| error.to_string());
+    assert_eq!(
+        decoded.map(|_| ()),
+        Err("missing field `route`".to_string())
+    );
+}
+
+/// A subscription reaches the store with the route the owner resolved for
+/// its member. A request without one is refused and keeps nothing: the
+/// store never assumes a route.
+#[tokio::test]
+async fn a_subscription_without_its_route_is_refused_by_the_store() {
+    let (_dir, store) = temp_store();
+    let refused = store
+        .put_subscription(
+            &op("s1"),
+            PutSubscription {
+                route: None,
+                ..put("s1", "agent:a", &["ios"], StartFrontier::Now)
+            },
+            1,
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(AnnouncementStoreError::Storage(detail)) if detail.contains("without its route")),
+        "{refused:?}"
+    );
+    assert_eq!(store.member_route(&member("agent:a")).await.unwrap(), None);
+    assert_eq!(store.subscription(&sid("s1")).await.unwrap(), None);
+}
+
+/// A local route names the member's own mob. A local route on a member of
+/// another mob is refused, never delivered to this gateway's member with the
+/// same identity; a member of a mob a member created keeps its plain id.
+#[test]
+fn a_local_route_names_the_members_own_mob_and_refuses_another() {
+    use super::native::{OwnerRefusal, continuation_owner};
+    let own = mob(OWN_MOB);
+    let here = member("agent:a");
+    let elsewhere = peer_member("agent:a", "builds");
+    assert_eq!(
+        continuation_owner(&own, &here, MemberRoute::Local),
+        Ok(meerkat::ContinuationOwner::Member {
+            mob_id: OWN_MOB.to_string(),
+            identity: crate::member_comms_id::roster_member_id_for_identity("agent:a").to_string(),
+        })
+    );
+    assert_eq!(
+        continuation_owner(&own, &elsewhere, MemberRoute::Local),
+        Err(OwnerRefusal::LocalRouteNamesAnotherMob {
+            member: elsewhere.clone(),
+            own: own.clone(),
+        })
+    );
+    assert_eq!(
+        continuation_owner(&own, &elsewhere, MemberRoute::Child),
+        Ok(meerkat::ContinuationOwner::Member {
+            mob_id: "builds".to_string(),
+            identity: "agent:a".to_string(),
+        })
+    );
+    assert_eq!(
+        continuation_owner(&own, &elsewhere, MemberRoute::Peer),
+        Err(OwnerRefusal::NoPeerPath)
+    );
 }

@@ -462,6 +462,61 @@ pub fn continuation_for(batch: &Batch) -> Result<meerkat::ContinuationDelivery, 
     )
 }
 
+/// Why this gateway's runtime names no continuation owner for a batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OwnerRefusal {
+    /// The member is on a peer gateway: its batches go through that peer.
+    NoPeerPath,
+    /// The batch's route is local, but its member names another mob than
+    /// this gateway's. The record contradicts itself, and no member of this
+    /// gateway's mob is delivered to in that member's place.
+    LocalRouteNamesAnotherMob { member: Member, own: MobId },
+}
+
+impl std::fmt::Display for OwnerRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPeerPath => f.write_str("this gateway has no delivery path to peer members"),
+            Self::LocalRouteNamesAnotherMob { member, own } => write!(
+                f,
+                "the batch for {member} is routed to this gateway's mob {own}, \
+                 which is not the member's"
+            ),
+        }
+    }
+}
+
+/// The continuation owner of `member` by its kept route, on the gateway
+/// whose own mob is `own`. A member of `own` is named by its roster id, a
+/// member of a mob a member created by its plain roster id, and a local
+/// route always names the member's own mob.
+pub(crate) fn continuation_owner(
+    own: &MobId,
+    member: &Member,
+    route: MemberRoute,
+) -> Result<meerkat::ContinuationOwner, OwnerRefusal> {
+    match route {
+        MemberRoute::Local if member.mob_id != *own => {
+            Err(OwnerRefusal::LocalRouteNamesAnotherMob {
+                member: member.clone(),
+                own: own.clone(),
+            })
+        }
+        MemberRoute::Local => Ok(meerkat::ContinuationOwner::Member {
+            mob_id: member.mob_id.to_string(),
+            identity: crate::member_comms_id::roster_member_id_for_identity(
+                member.identity.as_str(),
+            )
+            .to_string(),
+        }),
+        MemberRoute::Child => Ok(meerkat::ContinuationOwner::Member {
+            mob_id: member.mob_id.to_string(),
+            identity: member.identity.to_string(),
+        }),
+        MemberRoute::Peer => Err(OwnerRefusal::NoPeerPath),
+    }
+}
+
 fn native_receipt(receipt: &meerkat::ContinuationReceipt) -> NativeReceipt {
     NativeReceipt {
         delivery_id: receipt.delivery_id.clone(),
@@ -1026,23 +1081,13 @@ impl MobNativeDelivery {
         }
     }
 
-    /// The continuation owner of a member by its kept route. A member of a
-    /// mob a member created is named by its plain roster id.
+    /// The continuation owner of a member by its kept route.
     fn owner_for(
         &self,
         member: &Member,
         route: MemberRoute,
-    ) -> Result<meerkat::ContinuationOwner, String> {
-        match route {
-            MemberRoute::Local => Ok(self.owner(&member.identity)),
-            MemberRoute::Child => Ok(meerkat::ContinuationOwner::Member {
-                mob_id: member.mob_id.to_string(),
-                identity: member.identity.to_string(),
-            }),
-            MemberRoute::Peer => {
-                Err("this gateway has no delivery path to peer members".to_string())
-            }
-        }
+    ) -> Result<meerkat::ContinuationOwner, OwnerRefusal> {
+        continuation_owner(&self.mob_id, member, route)
     }
 
     /// The current cursor of a running child mob's event log.
@@ -1344,9 +1389,14 @@ impl NativeDelivery for MobNativeDelivery {
         batch: &Batch,
         committed_at_ms: u64,
     ) -> Result<NativeReceipt, NativeSubmitError> {
-        let owner = self
-            .owner_for(&batch.member, batch.route)
-            .map_err(NativeSubmitError::Unavailable)?;
+        let owner =
+            self.owner_for(&batch.member, batch.route)
+                .map_err(|refusal| match refusal {
+                    OwnerRefusal::NoPeerPath => NativeSubmitError::Unavailable(refusal.to_string()),
+                    OwnerRefusal::LocalRouteNamesAnotherMob { .. } => {
+                        NativeSubmitError::Invalid(refusal.to_string())
+                    }
+                })?;
         let delivery = continuation_for(batch).map_err(NativeSubmitError::Invalid)?;
         let receipt = self
             .submit_delivery_to(&owner, delivery, committed_at_ms)
@@ -1358,7 +1408,7 @@ impl NativeDelivery for MobNativeDelivery {
     async fn status(&self, batch: &Batch) -> Result<NativeStatus, NativeUnavailable> {
         let owner = self
             .owner_for(&batch.member, batch.route)
-            .map_err(NativeUnavailable)?;
+            .map_err(|refusal| NativeUnavailable(refusal.to_string()))?;
         self.status_at(&owner, batch.id.as_str()).await
     }
 

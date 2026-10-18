@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use super::owner::{AnnouncementError, AnnouncementService};
 use super::types::{
     AnnounceRequest, AnnouncementRef, AnnouncementStoreError, Announcer, BatchId, BatchQuery,
-    ChildMemberLimits, Member, MemberRouteRecord, MobId, OperationId, PutSubscription, Selector,
-    SourceKey, StartFrontier, SubscriptionChange, SubscriptionId, Topic,
+    ChildMemberLimits, Member, MobId, OperationId, PutSubscription, Selector, SourceKey,
+    StartFrontier, SubscriptionChange, SubscriptionId, Topic,
 };
 use crate::rpc::JsonRpcError;
 
@@ -389,7 +389,7 @@ pub async fn handle_announcement_method(
                         },
                         start: request.start,
                         expected_revision: request.expected_revision,
-                        route: MemberRouteRecord::default(),
+                        route: None,
                         member_mob_cursor: None,
                         child_limits: ChildMemberLimits::default(),
                     },
