@@ -98,13 +98,17 @@ async def real_fixture(tmp_path):
 async def wait_status(service, wanted):
     async with asyncio.timeout(12):
         while True:
+            # A read that overlaps a task's last receipt write is projected as
+            # not current, without cleanup recovery. A settled state needs a
+            # read that starts and ends with no deployment task.
+            idle = not service.tasks
             receipt = await service.status(service.guide.identity)
             # A concurrent readiness transition can conservatively project
             # running/unknown until the next stable source observation. Wait
             # for the actual checked health required by the assertions below.
             ready = (receipt.get("health") == "ready"
                 and (receipt.get("startup_console_health") or {}).get("status") == "pass")
-            if receipt["status"] == wanted and (ready if wanted == "running" else not service.tasks):
+            if receipt["status"] == wanted and (ready if wanted == "running" else idle and not service.tasks):
                 return receipt
             await asyncio.sleep(0.02)
 
@@ -158,6 +162,32 @@ async def test_real_failed_child_cleanup_stop_settings_retry_preserves_installed
         assert all(absent(pid) for pid in json.loads((target / ".mobkit/test-child.json").read_text()).values())
         assert all((target / name).read_bytes() == content for name, content in before.items())
         assert "fixture-private" not in json.dumps(final)
+    finally:
+        await service.shutdown()
+
+
+async def test_failed_wait_skips_a_status_read_spanning_the_final_cleanup_write(tmp_path, monkeypatch):
+    service, directory, target, initial = await real_fixture(tmp_path)
+    exited, guide, spanned = asyncio.subprocess.Process.wait, service._guide, []
+    async def confirm_exit_later(process):
+        # Keep the worker's failed receipt visible before the task confirms its exit.
+        code = await exited(process)
+        await asyncio.sleep(0.3)
+        return code
+    async def read_across_final_write(identity):
+        task = service.tasks.get(directory.name)
+        if not spanned and task is not None and read_receipt(directory)["status"] == "failed":
+            # Hold one status read until the task writes its exit confirmation and ends.
+            spanned.append(task)
+            await asyncio.wait({task})
+        return await guide(identity)
+    monkeypatch.setattr(asyncio.subprocess.Process, "wait", confirm_exit_later)
+    monkeypatch.setattr(service, "_guide", read_across_final_write)
+    try:
+        await service.action(service.guide.identity, initial["deployment_id"], "restart")
+        failed = await wait_status(service, "failed")
+        assert spanned and spanned[0].done()
+        assert failed["cleanup_recovery"]["available"] is True and failed["current"] is True
     finally:
         await service.shutdown()
 
