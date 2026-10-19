@@ -23,6 +23,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   incident command center example parses its scenario with four of these
   rules: YAML 1.2 booleans, `<<` as an ordinary key, and refusal of
   duplicate keys and unknown tags.
+- Behaviour-only: the console's identity routes (`meta/status_identity`,
+  `meta/inspect_identity`, `meta/retire`, `meta/respawn`, `meta/reset` and
+  `meta/delete_identity` on `/console/rpc`) refuse a generated runtime id
+  that is no longer its identity's binding, such as the predecessor's
+  `rt:<identity>:<n>` after a reset, with `-32000` and `error.data.kind`
+  `stale_identity_runtime_binding`, naming the registered runtime id and
+  session, as the member routes refuse the same id. They answered `-32602`
+  `identity not found: <id>` once no live member carried the old id. A
+  runtime id of an identity the identity runtime does not know keeps
+  `-32602` `identity not found`, and a hidden identity's runtime id answers
+  `identity_hidden_by_policy`.
+- Behaviour-only: the stdio JSON-RPC identity methods refuse the same stale
+  runtime id with the same `-32000` `stale_identity_runtime_binding` error:
+  `meta/send`, `meta/interact`, `meta/dispatch`, `meta/recover_delivery`,
+  `meta/turn_result`, `meta/wait_for_turn`, `meta/subscribe`,
+  `meta/wait_for_completion`, `meta/completion_cursor`,
+  `meta/status_identity`, `meta/inspect_identity`, `meta/retire`,
+  `meta/respawn`, `meta/reset`, `meta/delete_identity`, and the operator
+  member methods `meta/member_activate_instruction`,
+  `meta/member_instruction_activations`, `meta/compact_member` and
+  `meta/bound_member_transcript`. They answered `-32602` `invalid identity:
+  runtime identity not found: <id>`, which a runtime id of an identity the
+  identity runtime does not know keeps.
 
 ### Security
 
@@ -66,16 +89,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   console-core mirrors the marker (`UnobservedFacts`,
   `normalizeUnobservedFacts`, `IdentityStatusRow.unobserved`), and the
   console carries it on its agent rows.
-- The console's identity routes (`meta/status_identity`,
-  `meta/inspect_identity`, `meta/retire`, `meta/respawn`, `meta/reset` and
-  `meta/delete_identity`) refuse a generated runtime id that is no longer
-  its identity's binding, such as the predecessor's `rt:<identity>:<n>`
-  after a reset, with the typed `stale_identity_runtime_binding` refusal
-  (-32000) the member routes give for the same id, naming the registered
-  runtime id and session. They answered -32602 `identity not found` once no
-  live member carried the old id. A runtime id of an identity the identity
-  runtime does not know still answers `identity not found`, and a hidden
-  identity's answers `identity_hidden_by_policy`.
 
 ### Fixed
 

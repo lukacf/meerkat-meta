@@ -19,7 +19,9 @@ use crate::unified_runtime::UnifiedRuntime;
 
 use super::{JSONRPC_VERSION, JsonRpcError, JsonRpcResponse};
 
-fn identity_from_runtime_alias(alias: &str) -> Option<crate::identity_first::AgentIdentity> {
+pub(super) fn identity_from_runtime_alias(
+    alias: &str,
+) -> Option<crate::identity_first::AgentIdentity> {
     let alias = crate::member_comms_id::runtime_alias_str(alias);
     let rest = alias.strip_prefix("rt:")?;
     let (identity, generation) = rest.rsplit_once(':')?;

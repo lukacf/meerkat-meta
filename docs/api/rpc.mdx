@@ -1297,6 +1297,16 @@ change alone never refuses a send.
 
 ## Identity delivery and turn tickets
 
+Identity-addressed methods (these and the identity status, inspect and
+lifecycle methods) take the durable identity or its current generated
+runtime id, `rt:<identity>:<generation>`. A runtime id that is no longer the
+identity's binding, such as the predecessor's after a reset, is refused with
+`-32000` and `error.data.kind` `stale_identity_runtime_binding`, naming the
+current binding in `registered_runtime_member_id` and
+`registered_session_id`; the console's identity routes answer the same. A
+runtime id of an identity the runtime does not know answers `-32602`
+`invalid identity: runtime identity not found: <id>`.
+
 `meta/send`, `meta/interact` and `meta/dispatch` deliver to an identity
 and return `completion_baseline`, the identity's completion cursor read before
 delivery. That cursor is an identity-wide barrier: any completion on the

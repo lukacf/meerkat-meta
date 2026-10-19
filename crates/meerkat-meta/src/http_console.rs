@@ -15818,7 +15818,7 @@ comms = true
         .await
         .expect_err("stdio adapter must fail closed on a visible duplicate");
         assert_eq!(
-            rpc_ambiguous,
+            rpc_ambiguous.to_string(),
             "ambiguous live identity alias review:golden [via identity-control-target \
              resolver]: candidates [rt:review:golden:0, rt:review:golden:1]"
         );
@@ -15891,7 +15891,7 @@ comms = true
         .await
         .expect_err("stdio adapter must reject a member bound to another durable identity");
         assert_eq!(
-            rpc_stale,
+            rpc_stale.to_string(),
             "stale live identity alias: live console alias other:stale-golden resolves to rt:review:stale-golden:0, but identity runtime binding belongs to review:stale-golden"
         );
         let console_stale = resolve_console_identity_control_target(

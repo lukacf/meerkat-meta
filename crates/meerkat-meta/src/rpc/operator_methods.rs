@@ -173,13 +173,7 @@ async fn resolve_operator_target(
     let target = match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
     {
         Ok(target) => target,
-        Err(e) => {
-            return Err(Box::new(rpc_error(
-                response_id.clone(),
-                -32602,
-                format!("invalid identity: {e}"),
-            )));
-        }
+        Err(error) => return Err(Box::new(error.into_response(response_id.clone()))),
     };
     if let Some(response) =
         rpc_stale_live_alias_error_response(identity_rt, &target, response_id.clone()).await
