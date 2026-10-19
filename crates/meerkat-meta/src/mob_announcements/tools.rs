@@ -204,15 +204,34 @@ where
     Ok(Member::new(own_mob.clone(), identity))
 }
 
+/// The member binding Meerkat persisted with a calling session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionMemberBinding {
+    /// The mob the member belongs to.
+    pub(crate) mob_id: MobId,
+    /// The member's role in that mob.
+    pub(crate) role: meerkat_mob::ProfileName,
+    /// The member's roster id in that mob.
+    pub(crate) member: MemberIdentity,
+}
+
+/// A member's roster entry in its mob now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RosterBinding {
+    /// The session the roster binds the member to, if any.
+    pub(crate) session: Option<SessionId>,
+    /// The member's role on the roster.
+    pub(crate) role: meerkat_mob::ProfileName,
+}
+
 /// What Meerkat records for a call from a session that is not on this
 /// gateway's own mob roster.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ChildCallerRecords {
-    /// The member binding persisted with the calling session: its mob, role
-    /// and roster id.
-    pub(crate) binding: Option<(String, String, String)>,
-    /// That member's roster entry in that mob now: its session and role.
-    pub(crate) entry: Option<(Option<String>, String)>,
+    /// The member binding persisted with the calling session.
+    pub(crate) binding: Option<SessionMemberBinding>,
+    /// That member's roster entry in that mob now.
+    pub(crate) entry: Option<RosterBinding>,
 }
 
 /// Attribute a call from `session` to a member of a mob hosted here other
@@ -224,22 +243,19 @@ pub(crate) fn attribute_child(
     session: &SessionId,
     records: &ChildCallerRecords,
 ) -> Result<Member, String> {
-    let Some((mob_id, role, member)) = &records.binding else {
+    let Some(binding) = &records.binding else {
         return Err("the calling session is not a member of a mob hosted here".into());
     };
-    if mob_id == own_mob.as_str() {
+    if binding.mob_id == *own_mob {
         return Err("the calling session is not on this gateway's mob roster".into());
     }
-    let Some((entry_session, entry_role)) = &records.entry else {
+    let Some(entry) = &records.entry else {
         return Err("the calling member is not on its mob's roster".into());
     };
-    let session = session.to_string();
-    if entry_session.as_deref() != Some(session.as_str()) || entry_role != role {
+    if entry.session.as_ref() != Some(session) || entry.role != binding.role {
         return Err("the mob roster does not bind the calling session to this member".into());
     }
-    let mob_id = MobId::new(mob_id.clone()).map_err(|error| error.to_string())?;
-    let identity = MemberIdentity::new(member.clone()).map_err(|error| error.to_string())?;
-    Ok(Member::new(mob_id, identity))
+    Ok(Member::new(binding.mob_id.clone(), binding.member.clone()))
 }
 
 /// What the bundle serves from. Set once, when mob announcements are

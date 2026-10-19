@@ -1043,26 +1043,33 @@ impl MobNativeDelivery {
         let Some(binding) = binding else {
             return Ok(super::tools::ChildCallerRecords::default());
         };
-        let entry = match MobId::new(binding.mob_id.clone()) {
-            Ok(mob_id) if mob_id != self.mob_id => {
-                match self.running_child(&mob_id).await.map_err(|error| error.0)? {
-                    Some(handle) => handle
-                        .get_member(&meerkat_mob::AgentIdentity::from(binding.member.as_str()))
-                        .await
-                        .map_err(|error| error.to_string())?
-                        .map(|entry| {
-                            (
-                                entry.bridge_session_id().map(ToString::to_string),
-                                entry.role.as_str().to_string(),
-                            )
-                        }),
-                    None => None,
-                }
+        let mob_id = MobId::new(binding.mob_id).map_err(|error| {
+            format!("the calling session's member binding names no usable mob: {error}")
+        })?;
+        let member = MemberIdentity::new(binding.member).map_err(|error| {
+            format!("the calling session's member binding names no usable member: {error}")
+        })?;
+        let entry = if mob_id == self.mob_id {
+            None
+        } else {
+            match self.running_child(&mob_id).await.map_err(|error| error.0)? {
+                Some(handle) => handle
+                    .get_member(&meerkat_mob::AgentIdentity::from(member.as_str()))
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map(|entry| super::tools::RosterBinding {
+                        session: entry.bridge_session_id().cloned(),
+                        role: entry.role,
+                    }),
+                None => None,
             }
-            _ => None,
         };
         Ok(super::tools::ChildCallerRecords {
-            binding: Some((binding.mob_id, binding.role, binding.member)),
+            binding: Some(super::tools::SessionMemberBinding {
+                mob_id,
+                role: meerkat_mob::ProfileName::from(binding.role),
+                member,
+            }),
             entry,
         })
     }

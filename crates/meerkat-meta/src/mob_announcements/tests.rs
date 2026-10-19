@@ -6553,10 +6553,17 @@ fn child_members_are_attributed_only_through_their_binding_and_their_roster() {
     let session = meerkat_core::types::SessionId::new();
     let own = mob(OWN_MOB);
     let bound = |mob_id: &str, role: &str| {
-        Some((mob_id.to_string(), role.to_string(), "worker-1".to_string()))
+        Some(super::tools::SessionMemberBinding {
+            mob_id: mob(mob_id),
+            role: meerkat_mob::ProfileName::from(role),
+            member: MemberIdentity::new("worker-1").unwrap(),
+        })
     };
     let entry = |session: Option<&meerkat_core::types::SessionId>, role: &str| {
-        Some((session.map(ToString::to_string), role.to_string()))
+        Some(super::tools::RosterBinding {
+            session: session.cloned(),
+            role: meerkat_mob::ProfileName::from(role),
+        })
     };
     let records = |binding, entry| super::tools::ChildCallerRecords { binding, entry };
     assert_eq!(
