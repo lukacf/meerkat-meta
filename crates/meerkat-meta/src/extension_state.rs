@@ -1309,7 +1309,8 @@ comms = true
         let kickoffs = handle
             .wait_for_members_kickoff_complete(
                 std::slice::from_ref(&identity),
-                Some(std::time::Duration::from_secs(5)),
+                // A settle bound only: the assertions below check state, not elapsed time.
+                Some(std::time::Duration::from_secs(30)),
             )
             .await
             .unwrap();

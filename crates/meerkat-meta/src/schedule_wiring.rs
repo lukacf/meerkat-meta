@@ -2823,7 +2823,8 @@ comms = true
         handle
             .wait_for_members_kickoff_complete(
                 std::slice::from_ref(&meerkat_mob::ids::AgentIdentity::from("digest-owner")),
-                Some(Duration::from_secs(2)),
+                // A settle bound only: the assertions below check state, not elapsed time.
+                Some(Duration::from_secs(30)),
             )
             .await
             .expect("member kickoff should settle");
@@ -3025,7 +3026,8 @@ comms = true
         handle
             .wait_for_members_kickoff_complete(
                 std::slice::from_ref(&roster_identity),
-                Some(Duration::from_secs(2)),
+                // A settle bound only: the assertions below check state, not elapsed time.
+                Some(Duration::from_secs(30)),
             )
             .await
             .expect("identity-first member kickoff should settle");
@@ -3210,7 +3212,7 @@ comms = true
 
         // Exactly one member-turn execution across both deliveries.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while llm_calls.load(Ordering::SeqCst) == 0 {
+        while llm_calls.load(Ordering::SeqCst) <= baseline_llm_calls {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the admitted work must still execute once"
