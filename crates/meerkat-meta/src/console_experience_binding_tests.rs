@@ -789,6 +789,84 @@ async fn a_read_joins_with_a_walk_cut_read_after_its_own() {
     runtime.mob_handle().stop().await.unwrap();
 }
 
+/// A binding that moves while a walk runs, after the walk read its cut, is
+/// recorded on the walk, and a read the walk answers (its cut equals the
+/// read's) answers that identity pending: the walk cannot vouch for facts of
+/// a binding that moved under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_binding_that_moves_while_a_walk_runs_answers_its_row_pending() {
+    let (runtime, _scratch) = identity_first_runtime(BTreeMap::new()).await;
+    let mob_runtime = runtime.mob_runtime().clone();
+    let identity_runtime = runtime.identity_runtime().unwrap();
+    let identity_runtime = Arc::clone(identity_runtime.runtime());
+    let read_model = ConsoleSnapshotReadModel::default();
+    let keeper = AgentIdentity::parse(KEEPER).unwrap();
+    build_live_snapshot(
+        &mob_runtime,
+        &[],
+        None,
+        &AllowAllConsoleVisibilityPolicy,
+        &read_model,
+        Some(&identity_runtime),
+    )
+    .await;
+
+    // Reset (s0 to s1), so the next read needs a fresh walk, and hold every
+    // walk after its roster walk, before the cut read that closes it.
+    let walked = Arc::new(tokio::sync::Semaphore::new(0));
+    read_model.set_walked_gate(Some(Arc::clone(&walked)));
+    read_model.set_refresh_deadline(Duration::from_mins(2));
+    identity_runtime.reset(&keeper).await.unwrap();
+
+    // A read takes its cut (s1); its walk reads the same cut and walks.
+    let read = tokio::spawn({
+        let mob_runtime = mob_runtime.clone();
+        let read_model = read_model.clone();
+        let identity_runtime = Arc::clone(&identity_runtime);
+        async move {
+            build_live_snapshot(
+                &mob_runtime,
+                &[],
+                None,
+                &AllowAllConsoleVisibilityPolicy,
+                &read_model,
+                Some(&identity_runtime),
+            )
+            .await
+        }
+    });
+    // A walk held at the gate holds a clone of it.
+    let held = tokio::time::Instant::now();
+    while Arc::strong_count(&walked) < 3 {
+        assert!(
+            held.elapsed() < Duration::from_mins(1),
+            "the read never walked"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The binding moves (s1 to s2) after the walk read its cut.
+    identity_runtime.reset(&keeper).await.unwrap();
+    walked.add_permits(64);
+
+    let (_, pending) = read.await.unwrap();
+    assert!(
+        read_model
+            .inner
+            .read()
+            .await
+            .moved_during_walk
+            .contains(KEEPER),
+        "the walk records the binding that moved while it ran"
+    );
+    assert_eq!(
+        pending,
+        BTreeSet::from([KEEPER.to_string()]),
+        "the walk vouches for no fact of a binding that moved under it"
+    );
+    runtime.mob_handle().stop().await.unwrap();
+}
+
 /// A pending identity's walked state does not decide whether it is a loaded
 /// module: walked active or walked retiring, it is left out alike. Settled
 /// rows keep the rule that a retiring member is not loaded.

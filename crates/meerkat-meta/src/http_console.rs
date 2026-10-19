@@ -185,6 +185,24 @@ pub(crate) struct ConsoleSnapshotReadModel {
     /// Test hook: while set, replaces [`CONSOLE_BINDING_REFRESH_DEADLINE`].
     #[cfg(test)]
     refresh_deadline: Arc<std::sync::Mutex<Option<Duration>>>,
+    /// Passed by every walk between its roster walk and the cut read that
+    /// closes it (empty outside tests).
+    walked_hook: WalkedHook,
+}
+
+/// Test hook between a walk and the cut read after it: while its gate is
+/// set, the walk waits there. It holds nothing outside tests.
+#[derive(Clone, Default)]
+struct WalkedHook {
+    #[cfg(test)]
+    gate: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
+}
+
+impl WalkedHook {
+    async fn pass(&self) {
+        #[cfg(test)]
+        pass_console_walk_gate(&self.gate).await;
+    }
 }
 
 #[derive(Clone, Default)]
@@ -392,6 +410,7 @@ impl ConsoleSnapshotReadModel {
         let refreshed = Box::pin(collect_console_snapshot_read_model(
             runtime,
             identity_runtime.map(Arc::as_ref),
+            &self.walked_hook,
         ))
         .await;
         *self.inner.write().await = refreshed;
@@ -425,6 +444,7 @@ impl ConsoleSnapshotReadModel {
         let walked = Arc::clone(&self.walked);
         #[cfg(test)]
         let walk_gate = Arc::clone(&self.walk_gate);
+        let walked_hook = self.walked_hook.clone();
         runtime_handle.spawn(async move {
             let _guard = guard;
             #[cfg(test)]
@@ -432,6 +452,7 @@ impl ConsoleSnapshotReadModel {
             let refreshed = Box::pin(collect_console_snapshot_read_model(
                 &runtime,
                 identity_runtime.as_deref(),
+                &walked_hook,
             ))
             .await;
             *inner.write().await = refreshed;
@@ -447,6 +468,15 @@ impl ConsoleSnapshotReadModel {
     fn set_walk_gate(&self, gate: Option<Arc<tokio::sync::Semaphore>>) {
         *self
             .walk_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = gate;
+    }
+
+    #[cfg(test)]
+    fn set_walked_gate(&self, gate: Option<Arc<tokio::sync::Semaphore>>) {
+        *self
+            .walked_hook
+            .gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = gate;
     }
@@ -12243,8 +12273,10 @@ async fn join_identity_bindings(
 async fn collect_console_snapshot_read_model(
     runtime: &MobRuntime,
     identity_runtime: Option<&crate::identity_first::IdentityRuntime>,
+    walked: &WalkedHook,
 ) -> ConsoleSnapshotReadModelState {
     let mut state = Box::pin(walk_console_snapshot_read_model(runtime, identity_runtime)).await;
+    walked.pass().await;
     let after_walk = IdentityBindingCut::read(identity_runtime).await;
     state.moved_during_walk = state.identity_cut.moved_in(&after_walk);
     state
@@ -12436,8 +12468,12 @@ async fn reset_all_live_console_agents(
     // No identity runtime for this read model: reset_all compares the roster
     // it walks with the registered bindings itself, so its snapshot must stay
     // the walk as it was.
-    *read_model.inner.write().await =
-        Box::pin(collect_console_snapshot_read_model(runtime, None)).await;
+    *read_model.inner.write().await = Box::pin(collect_console_snapshot_read_model(
+        runtime,
+        None,
+        &WalkedHook::default(),
+    ))
+    .await;
     // Mark the freshly-built model primed so `build_live_snapshot` doesn't
     // try to re-prime; this is a one-shot read for the reset path.
     read_model
@@ -22384,7 +22420,9 @@ comms = true
         assert_eq!(members[0].session_id, None);
         assert!(session_owner_by_id.is_empty());
 
-        let refreshed_read_model = collect_console_snapshot_read_model(&runtime, None).await;
+        let refreshed_read_model =
+            collect_console_snapshot_read_model(&runtime, None, &super::WalkedHook::default())
+                .await;
         let (members, session_owner_by_id) = project_console_members_from_handle(
             &runtime.handle(),
             None,
