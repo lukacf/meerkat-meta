@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `.github/workflows/forge-release.yml` releases Meta Forge on its own
+  `forge-v<version>` tag, beside Meta's releases. A candidate builds each target's
+  package from public inputs pinned in `installer/release/forge-release-inputs.json`,
+  verifies and attests it, and binds the set, together with a green dispatched
+  `forge.yml` run that tested the same Forge inputs, in an attested candidate
+  manifest.
+  Publication releases those exact bytes as a prerelease that never becomes the
+  latest release. `forge.yml` can now be dispatched, and records each job's
+  toolchain. `installer/RELEASING.md` has the steps.
+
 ### Fixed
 
 - The `complete_held_identity_members` documentation no longer says that

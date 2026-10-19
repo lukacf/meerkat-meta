@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "kind": "forge-release-inputs",
+  "guide": {
+    "version": "0.9.0",
+    "core_version": "0.9.0",
+    "meta_source": "b275e0ed4fe61cf4ff43d16691c54efb17812919",
+    "core_source": "a00bafaf1d862fb41112ff1f30312b350ad05246"
+  },
+  "targets": {}
+}
