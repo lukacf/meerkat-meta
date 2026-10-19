@@ -607,6 +607,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   spawned, and the guard is finished once the attempt's open outcome and
   process end are both known. Gateway custody and defaults are unchanged; a
   composition without it installs no guards.
+- `UnifiedRuntime::take_bootstrap_completion` hands an embedding host a
+  one-use `RuntimeBootstrapCompleted`. The runtime mints it once, on its
+  bootstrap success path (the unheld identity bootstrap on `Ok`, the held one
+  on `Activated`, `activate_without_identity_context` on `Ok`), and never on
+  a failure. Its `publish(f)` runs `f` once, only while the runtime has not
+  begun to close and its mob still admits work: the runtime's shutdown begins
+  under the same gate, so a publication that has begun finishes first and a
+  later one is refused (`BootstrapCompletionRefused::RuntimeClosing`, or
+  `AdmissionClosed` once the mob's admission closed). On the stdio gateway
+  the driver takes the completion once the Ready's stdout capacity is
+  reserved, and the host gets it inside its publication boundary from
+  `GatewayBootstrapReady::take_runtime_completion`. A runtime from a legacy
+  constructor (`UnifiedRuntime::bootstrap` and the `bootstrap_with_*` family)
+  has no completion until `activate_without_identity_context` returns `Ok`.
+  Installing an identity context withdraws a completion not yet taken;
+  attaching one leaves it as it is.
 
 ### Changed
 
