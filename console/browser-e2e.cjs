@@ -3645,6 +3645,185 @@ async function runAccessTabClickDuringRefreshProof() {
   } finally {
     releaseStatusReads();
     fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP access RPC", checkpoints, errors, failure: failure || null }, null, 2));
+    // A route still fetching when the page closes must not outlive the scenario.
+    if (page) await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
+    if (browser) await browser.close();
+    await server.close();
+  }
+}
+
+// A memory refresh that fails shows its error while a tab click may be in
+// flight, and the next successful refresh clears it. The error must not move
+// the tab row under a pressed pointer, or the release lands on another
+// element and no click reaches the tab.
+async function runMemoryTabClickDuringFailedRefreshProof() {
+  const evidence = path.join(process.env.META_BROWSER_EVIDENCE || path.join(repoRoot, "output/playwright/console-acceptance"), "memory-tab-click-during-failed-refresh");
+  fs.mkdirSync(evidence, { recursive: true });
+  const replies = {
+    "meta/memory/panel/records": { records: [], realms: [] },
+    "meta/memory/panel/dreams": { runs: [] },
+    "meta/memory/panel/overview": null,
+    "meta/memory/panel/proposals": { proposals: [] },
+    "meta/memory/panel/injections": { injections: [] },
+    "meta/memory/panel/harvests": { harvests: [] },
+    "meta/memory/panel/dream_runs": { runs: [] },
+    "meta/memory/panel/audit_verdicts": { verdicts: [] },
+  };
+  let failRecordReads = false;
+  const failedReads = [], errors = [], checkpoints = [];
+  const server = await startMockConsoleServer();
+  let browser, page, failure;
+  try {
+    browser = await launchBrowser();
+    page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
+    page.setDefaultTimeout(10000);
+    page.on("pageerror", error => errors.push(String(error)));
+    await page.route("**/console/experience", async route => {
+      const response = await route.fetch(); const value = await response.json();
+      await route.fulfill({ response, json: { ...value, memory: { can_read: true, can_review_quarantine: false } } });
+    });
+    await page.route("**/console/rpc", async route => {
+      const request = route.request().postDataJSON();
+      const reply = payload => route.fulfill({ json: { jsonrpc: "2.0", id: request.id, ...payload } });
+      if (request.method === "meta/capabilities") {
+        const response = await route.fetch(); const value = await response.json();
+        value.result.methods.push(...Object.keys(replies));
+        return route.fulfill({ response, json: value });
+      }
+      if (request.method === "meta/memory/panel/records" && failRecordReads) {
+        failedReads.push(request.id);
+        return reply({ error: { code: -32000, message: "memory store unavailable" } });
+      }
+      if (Object.hasOwn(replies, request.method)) return reply({ result: replies[request.method] });
+      return route.continue();
+    });
+    await gotoConsole(page, `${server.baseUrl}/console`);
+    await page.getByText("Memory", { exact: true }).first().click();
+    await page.getByTestId("memory-panel").waitFor();
+    const memoryError = page.getByTestId("memory-error");
+    await memoryError.waitFor({ state: "detached" });
+    const tab = page.getByTestId("memory-tab:records");
+    assert.equal(await tab.evaluate(element => element.classList.contains("is-active")), false);
+    const target = await tab.boundingBox();
+    await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2);
+    await page.mouse.down();
+    // Measured while pressed, so press styling is the same in both boxes.
+    const pressed = await tab.boundingBox();
+    failRecordReads = true;
+    await page.getByTestId("memory-refresh").evaluate(button => button.click());
+    await memoryError.waitFor();
+    const erroredBox = await tab.boundingBox();
+    await page.screenshot({ path: path.join(evidence, "pressed-after-failed-refresh.png"), fullPage: true });
+    await page.mouse.up();
+    const selected = await tab.evaluate(element => element.classList.contains("is-active"));
+    checkpoints.push({ step: "released-after-failed-refresh", pressed, erroredBox, selected, failedReads: [...failedReads] });
+    failRecordReads = false;
+    assert.deepEqual(erroredBox, pressed, "a failed refresh moved the tab row under a pressed pointer");
+    assert.equal(selected, true, "a tab click that spans a failed refresh did not select the tab");
+    await page.getByTestId("memory-refresh").click();
+    await memoryError.waitFor({ state: "detached" });
+    assert.deepEqual(errors, []);
+    checkpoints.push({ step: "complete" });
+  } catch (error) {
+    failure = String(error.stack || error);
+    if (page) fs.writeFileSync(path.join(evidence, "failure-body.txt"), await page.locator("body").innerText().catch(() => "unavailable"));
+    throw error;
+  } finally {
+    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP memory RPC", checkpoints, errors, failure: failure || null }, null, 2));
+    // A route still fetching when the page closes must not outlive the scenario.
+    if (page) await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
+    if (browser) await browser.close();
+    await server.close();
+  }
+}
+
+// A WorkGraph refresh that fails shows its error while a click on a work item
+// action may be in flight, and keeps the last items on screen. The error must
+// not move those items under a pressed pointer, or the release lands on
+// another element and the action never runs.
+async function runWorkGraphActionClickDuringFailedRefreshProof() {
+  const evidence = path.join(process.env.META_BROWSER_EVIDENCE || path.join(repoRoot, "output/playwright/console-acceptance"), "workgraph-action-click-during-failed-refresh");
+  fs.mkdirSync(evidence, { recursive: true });
+  const snapshot = {
+    items: [{ id: "item-1", title: "Investigate the outage", status: "open", revision: 1, created_at: "2026-10-18T00:00:00Z" }],
+    edges: [], attention: [], captured_at: "2026-10-18T00:00:00Z", event_high_water_mark: 0,
+  };
+  const methods = ["meta/workgraph/snapshot", "meta/workgraph/events", "meta/workgraph/claim"];
+  let failSnapshotReads = false;
+  const claims = [], failedReads = [], errors = [], checkpoints = [];
+  const server = await startMockConsoleServer();
+  let browser, page, failure;
+  try {
+    browser = await launchBrowser();
+    page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
+    page.setDefaultTimeout(10000);
+    page.on("pageerror", error => errors.push(String(error)));
+    await page.route("**/console/experience", async route => {
+      const response = await route.fetch(); const value = await response.json();
+      await route.fulfill({ response, json: { ...value, workgraph: { available: true, can_view: true, can_manage: true } } });
+    });
+    await page.route("**/console/rpc", async route => {
+      const request = route.request().postDataJSON();
+      const reply = payload => route.fulfill({ json: { jsonrpc: "2.0", id: request.id, ...payload } });
+      if (request.method === "meta/capabilities") {
+        const response = await route.fetch(); const value = await response.json();
+        value.result.methods.push(...methods);
+        return route.fulfill({ response, json: value });
+      }
+      if (request.method === "meta/workgraph/snapshot") {
+        if (failSnapshotReads) {
+          failedReads.push(request.id);
+          return reply({ error: { code: -32000, message: "workgraph store unavailable" } });
+        }
+        return reply({ result: snapshot });
+      }
+      if (request.method === "meta/workgraph/events") return reply({ result: { events: [] } });
+      if (request.method === "meta/workgraph/claim") {
+        claims.push(request.params);
+        return reply({ result: { item: { ...snapshot.items[0], status: "claimed", revision: 2 } } });
+      }
+      return route.continue();
+    });
+    await gotoConsole(page, `${server.baseUrl}/console`);
+    await page.getByText("WorkGraph", { exact: true }).first().click();
+    await page.getByTestId("workgraph-panel").waitFor();
+    const refreshError = page.getByTestId("workgraph-panel").getByRole("alert");
+    const action = page.getByTestId("workgraph-panel-action:item-1:claim");
+    await action.waitFor();
+    assert.equal(await refreshError.count(), 0, "no refresh error before the held click");
+    const target = await action.boundingBox();
+    await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2);
+    await page.mouse.down();
+    // Measured while pressed, so press styling is the same in both boxes.
+    const pressed = await action.boundingBox();
+    const head = page.getByTestId("workgraph-panel").locator(".workgraph__head");
+    const headPressed = await head.boundingBox();
+    failSnapshotReads = true;
+    await page.getByTestId("workgraph-panel-refresh").evaluate(button => button.click());
+    await refreshError.waitFor();
+    const erroredBox = await action.boundingBox();
+    const headErrored = await head.boundingBox();
+    const errorBox = await refreshError.boundingBox();
+    await page.screenshot({ path: path.join(evidence, "pressed-after-failed-refresh.png"), fullPage: true });
+    failSnapshotReads = false;
+    const claimed = page.waitForRequest(request => request.url().endsWith("/console/rpc")
+      && request.method() === "POST" && request.postDataJSON()?.method === "meta/workgraph/claim", { timeout: 3000 })
+      .then(() => true, () => false);
+    await page.mouse.up();
+    const claimSent = await claimed;
+    checkpoints.push({ step: "released-after-failed-refresh", pressed, erroredBox, headPressed, headErrored, errorBox, claimSent, claims: [...claims], failedReads: [...failedReads] });
+    assert.deepEqual(erroredBox, pressed, "a failed refresh moved the work item action under a pressed pointer");
+    assert.equal(claimSent, true, "a click on a work item action that spans a failed refresh did not run the action");
+    assert.deepEqual(errors, []);
+    checkpoints.push({ step: "complete" });
+  } catch (error) {
+    failure = String(error.stack || error);
+    if (page) fs.writeFileSync(path.join(evidence, "failure-body.txt"), await page.locator("body").innerText().catch(() => "unavailable"));
+    throw error;
+  } finally {
+    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP workgraph RPC", checkpoints, errors, failure: failure || null }, null, 2));
+    // A route still fetching when the page closes must not outlive the scenario.
+    if (page) await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
     if (browser) await browser.close();
     await server.close();
   }
@@ -3653,6 +3832,8 @@ async function runAccessTabClickDuringRefreshProof() {
 const scenarios = [
   ...["conflict", "group", "unavailable"].map(mode => ({ id: `checked-save-${mode}`, family: "console", backend: "mock", run: () => runCheckedSaveBrowserProof(mode) })),
   { id: "access-tab-click-during-refresh", family: "console", backend: "mock", run: runAccessTabClickDuringRefreshProof },
+  { id: "memory-tab-click-during-failed-refresh", family: "console", backend: "mock", run: runMemoryTabClickDuringFailedRefreshProof },
+  { id: "workgraph-action-click-during-failed-refresh", family: "console", backend: "mock", run: runWorkGraphActionClickDuringFailedRefreshProof },
   { id: "authorization-feedback", family: "console", backend: "mock", run: runAuthorizationFeedbackProof },
   { id: "reference", family: "runtime", backend: "real", run: runReferenceBrowserProof },
   { id: "topology-unavailable", family: "topology", backend: "mock", run: runTopologyUnavailableBrowserProof },
