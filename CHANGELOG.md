@@ -87,6 +87,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a marker over its corner instead of an extra line. The line grew the first
   row of verdict tiles, so each refresh moved the tiles below it under a click
   in progress.
+- Meta Forge's animation diagnostics give `renderMs`, `copyMs`,
+  `parentRafAgeMs` and `deadlineOvershootMs` in whole milliseconds. Each is a
+  clock difference and could show its floating-point error, such as
+  3.0000000000000284 for a 3 ms render.
 
 ## [0.9.3] - 2026-10-18
 
