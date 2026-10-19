@@ -460,6 +460,23 @@ impl ConsoleSnapshotReadModel {
     }
 }
 
+/// The loaded modules of a mob runtime with no configured module ids: its
+/// members, without retiring ones. A pending identity's walked state does
+/// not decide its entry, so it is left out, as the profile counts leave it
+/// out.
+fn live_member_modules(members: &[ConsoleMember], pending: &BTreeSet<String>) -> Vec<String> {
+    let mut modules: Vec<String> = members
+        .iter()
+        .filter(|member| {
+            !pending.contains(console_member_console_identity(member))
+                && member.state != MEMBER_STATE_RETIRING
+        })
+        .map(|member| member.agent_identity.clone())
+        .collect();
+    modules.sort();
+    modules
+}
+
 /// Test hook: hold a walk until the gate has a permit.
 #[cfg(test)]
 async fn pass_console_walk_gate(gate: &std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>) {
@@ -12067,13 +12084,7 @@ async fn build_live_snapshot(
     // surfaces describe loaded modules, not live mob members.
     // Fall back to member IDs only for pure mob runtimes with no module config.
     let loaded_modules = if config_module_ids.is_empty() {
-        let mut mods: Vec<String> = members
-            .iter()
-            .filter(|member| member.state != MEMBER_STATE_RETIRING)
-            .map(|member| member.agent_identity.clone())
-            .collect();
-        mods.sort();
-        mods
+        live_member_modules(&members, &pending)
     } else {
         let mut mods = config_module_ids.to_vec();
         mods.sort();

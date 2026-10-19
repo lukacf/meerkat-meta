@@ -16,7 +16,8 @@ use serde_json::{Value, json};
 
 use super::{
     CONSOLE_BINDING_REFRESH_DEADLINE, ConsoleSnapshotReadModel, IdentityBinding,
-    IdentityBindingCut, build_live_snapshot, join_identity_bindings,
+    IdentityBindingCut, MEMBER_STATE_RETIRING, build_live_snapshot, join_identity_bindings,
+    live_member_modules,
 };
 use crate::access::{AccessControlConfig, AccessController, AccessEffect, AccessRule};
 use crate::console_aggregator::{AllowAllConsoleVisibilityPolicy, MetaConsoleAggregator};
@@ -739,7 +740,7 @@ async fn a_read_joins_with_a_walk_cut_read_after_its_own() {
     // for the walk this test releases.
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     read_model.set_walk_gate(Some(Arc::clone(&gate)));
-    read_model.set_refresh_deadline(Duration::from_secs(120));
+    read_model.set_refresh_deadline(Duration::from_mins(2));
     identity_runtime.reset(&keeper).await.unwrap();
 
     // A read takes its cut (s1) and waits for a walk.
@@ -764,7 +765,7 @@ async fn a_read_joins_with_a_walk_cut_read_after_its_own() {
     let held = tokio::time::Instant::now();
     while Arc::strong_count(&gate) < 3 {
         assert!(
-            held.elapsed() < Duration::from_secs(60),
+            held.elapsed() < Duration::from_mins(1),
             "the read never started its walk"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -786,6 +787,33 @@ async fn a_read_joins_with_a_walk_cut_read_after_its_own() {
         "the row joins with the walk's newer cut, never the read's own older one"
     );
     runtime.mob_handle().stop().await.unwrap();
+}
+
+/// A pending identity's walked state does not decide whether it is a loaded
+/// module: walked active or walked retiring, it is left out alike. Settled
+/// rows keep the rule that a retiring member is not loaded.
+#[test]
+fn a_pending_identity_is_left_out_of_the_live_modules_whatever_its_walked_state() {
+    let with_keeper = |state: &str| {
+        let mut keeper = row(KEEPER, Some(KEEPER), Some("s1"));
+        keeper.state = state.to_string();
+        let mut leaving = row("leaving-keeper", Some("leaving-keeper"), Some("p1"));
+        leaving.state = MEMBER_STATE_RETIRING.to_string();
+        vec![keeper, row(OTHER, Some(OTHER), Some("o1")), leaving]
+    };
+    let pending = BTreeSet::from([KEEPER.to_string()]);
+    for walked_state in ["active", MEMBER_STATE_RETIRING] {
+        assert_eq!(
+            live_member_modules(&with_keeper(walked_state), &pending),
+            vec![OTHER.to_string()],
+            "walked {walked_state}"
+        );
+    }
+    assert_eq!(
+        live_member_modules(&with_keeper("active"), &BTreeSet::new()),
+        vec![OTHER.to_string(), KEEPER.to_string()],
+        "a settled keeper is loaded; a settled retiring member is not"
+    );
 }
 
 fn member<'a>(
