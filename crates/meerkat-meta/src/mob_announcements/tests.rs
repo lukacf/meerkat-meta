@@ -6893,13 +6893,56 @@ async fn a_hosted_mob_id_this_store_cannot_hold_is_skipped_and_warned_once() {
     );
 }
 
+/// The name after each `pub mod ` in a module root: the identifier, whatever
+/// follows it, so a module declared with a trailing comment or inline is
+/// still a module to walk.
+fn declared_modules(module_root: &str) -> BTreeSet<&str> {
+    module_root
+        .lines()
+        .filter_map(|line| line.strip_prefix("pub mod "))
+        .map(|rest| {
+            let end = rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            &rest[..end]
+        })
+        .collect()
+}
+
+/// The crate modules a surface re-exports from with `pub use crate::...`.
+fn reexported_modules<'a>(sources: impl IntoIterator<Item = &'a str>) -> BTreeSet<&'a str> {
+    sources
+        .into_iter()
+        .flat_map(str::lines)
+        .filter_map(|line| line.trim_start().strip_prefix("pub use crate::"))
+        .map(|path| {
+            let path = &path[..path.find('{').unwrap_or(path.len())];
+            path.rsplit_once("::").map_or(path, |(module, _)| module)
+        })
+        .collect()
+}
+
+#[test]
+fn the_walk_parses_every_declared_module_and_reexport() {
+    assert_eq!(
+        declared_modules("pub mod a;\npub mod b; // a note\npub mod c {\nmod d;"),
+        BTreeSet::from(["a", "b", "c"])
+    );
+    assert_eq!(
+        reexported_modules([
+            "pub use crate::x::y::{A, B};\n    pub use crate::z::C;\npub use super::w::D;"
+        ]),
+        BTreeSet::from(["x::y", "z"])
+    );
+}
+
 /// Every public enum of the announcement surface is `#[non_exhaustive]`, so a
 /// later variant (a typed suspend cause, a typed end cause, a batch state) is
 /// never a breaking change for a caller that matches on it, and no mirror of
-/// one stays exhaustive. The walk reads each public module of the surface,
-/// and fails when a public module joins the surface without being walked. It
-/// is a source test rather than a compile_fail doc-test: CI runs no
-/// doc-tests.
+/// one stays exhaustive. The walk reads each public module of the surface and
+/// each crate module the surface re-exports from, and fails when either kind
+/// joins the surface without being walked. It is a source test rather than a
+/// compile_fail doc-test: CI runs no doc-tests.
 #[test]
 fn every_public_announcement_enum_is_non_exhaustive() {
     let public_modules = [
@@ -6913,20 +6956,37 @@ fn every_public_announcement_enum_is_non_exhaustive() {
         ("types", include_str!("types.rs")),
     ];
     let module_root = include_str!("mod.rs");
+    // Crate modules outside the surface whose items it re-exports, each with
+    // the reason its enums are the surface's too.
+    let reexported = [(
+        "runtime::keyed_inject",
+        include_str!("../runtime/keyed_inject.rs"),
+        "native re-exports NativeStatus from it, and its keyed inject calls are \
+         new with this surface",
+    )];
     // Public enums deliberately left closed, each with the reason. None.
     let closed: [(&str, &str); 0] = [];
-    let declared: BTreeSet<&str> = module_root
-        .lines()
-        .filter_map(|line| line.strip_prefix("pub mod "))
-        .filter_map(|rest| rest.strip_suffix(';'))
-        .collect();
     let walked: BTreeSet<&str> = public_modules.iter().map(|(name, _)| *name).collect();
     assert_eq!(
-        declared, walked,
+        declared_modules(module_root),
+        walked,
         "every public module of the surface is walked"
     );
+    assert_eq!(
+        reexported_modules(
+            std::iter::once(module_root).chain(public_modules.iter().map(|(_, source)| *source))
+        ),
+        reexported
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect::<BTreeSet<_>>(),
+        "every crate module the surface re-exports from is walked"
+    );
     let mut open = Vec::new();
-    for (module, source) in std::iter::once(("mod", module_root)).chain(public_modules) {
+    for (module, source) in std::iter::once(("mod", module_root))
+        .chain(public_modules)
+        .chain(reexported.map(|(name, source, _)| (name, source)))
+    {
         let lines: Vec<&str> = source.lines().collect();
         for (index, line) in lines.iter().enumerate() {
             let Some(rest) = line.strip_prefix("pub enum ") else {

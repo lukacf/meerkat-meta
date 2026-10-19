@@ -90,7 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   cover them). An identity-first gateway with a control listener serves
   them. Mob announcements use them to deliver to members of mobs on peer
   gateways; a gateway that predates them ends such a subscription as
-  `peer_unsupported`.
+  `peer_unsupported`. Every public enum of `runtime::keyed_inject` is
+  `#[non_exhaustive]`.
 
 - `.github/workflows/warm-deps.yml`, dispatched on a branch whose `Cargo.lock`
   changed, builds the dependency graph of each Rust CI job from that branch's

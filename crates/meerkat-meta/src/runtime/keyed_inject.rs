@@ -69,6 +69,7 @@ pub struct AdmittedInput {
 /// that the member processed anything.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum NativeStatus {
     /// The native owner holds no commit for the key.
     NotCommitted,
@@ -554,6 +555,7 @@ pub(crate) fn refusal_facts(code: &str, message: &str) -> String {
 /// Why a keyed inject call produced no signed answer. None of these is evidence
 /// about the delivery: it stays owed and the caller asks again later.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeyedInjectCallError {
     /// This gateway cannot make an authenticated keyed inject call to the peer:
     /// the contact pins no gateway key, opted out of signed control
@@ -606,6 +608,7 @@ impl std::error::Error for KeyedInjectCallError {}
 /// A keyed inject call's verified outcome: the serving gateway's signed answer or
 /// its signed refusal.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum KeyedInjectCallOutcome<T> {
     Answered(T),
     Refused { code: String, message: String },
