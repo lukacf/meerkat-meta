@@ -3873,7 +3873,10 @@ async function runMemoryBodyClickAcrossRefreshProof() {
         value.result.methods.push(...Object.keys(replies));
         return route.fulfill({ response, json: value });
       }
-      if (request.method === "meta/memory/panel/records" && failRecordReads) {
+      // Only the refresh's own unfiltered read fails. The lattice page-walk
+      // pages with a limit, and a walk failing would change the tile.
+      const plainRead = !request.params || Object.keys(request.params).length === 0;
+      if (request.method === "meta/memory/panel/records" && failRecordReads && plainRead) {
         failedReads.push(request.id);
         return reply({ error: { code: -32000, message: "memory store unavailable" } });
       }
@@ -3889,15 +3892,23 @@ async function runMemoryBodyClickAcrossRefreshProof() {
     // Presses the target, runs one refresh that fails or succeeds, and
     // releases once its error has appeared or cleared. Boxes are measured
     // while pressed, so press styling is the same in both.
+    // The pressed control's top-left and the body's box must hold. A tile's
+    // height may follow a sibling tile in its grid row (the lattice tile adds
+    // a "re-checking" line while its page-walk runs), which leaves the
+    // pointer on the same tile.
+    const placement = async target => {
+      const box = await target.boundingBox();
+      return { x: box.x, y: box.y, width: box.width };
+    };
     async function pressAcrossRefresh(step, target, failing, landedAfterRelease) {
       const box = await target.boundingBox();
       await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
       await page.mouse.down();
-      const pressed = { target: await target.boundingBox(), body: await body.boundingBox() };
+      const pressed = { target: await placement(target), body: await body.boundingBox() };
       failRecordReads = failing;
       await refresh.evaluate(button => button.click());
       await (failing ? memoryError.waitFor() : memoryError.waitFor({ state: "detached" }));
-      const settled = { target: await target.boundingBox(), body: await body.boundingBox() };
+      const settled = { target: await placement(target), body: await body.boundingBox() };
       await page.screenshot({ path: path.join(evidence, `${step}.png`), fullPage: true });
       const landed = landedAfterRelease();
       await page.mouse.up();
@@ -3906,7 +3917,13 @@ async function runMemoryBodyClickAcrossRefreshProof() {
       checkpoints.push(entry);
       if (JSON.stringify(entry.settled) !== JSON.stringify(entry.pressed)) problems.push(`${step}: the panel body moved under a pressed pointer`);
       if (!entry.landed) problems.push(`${step}: the click was lost`);
+      return entry.landed;
     }
+    // Each press starts once the lattice page-walk has settled.
+    const latticeSettled = () => page.waitForFunction(() => {
+      const tile = document.querySelector('[data-testid="memory-verdict:lattice"]');
+      return tile?.getAttribute("data-status") === "holding" && !/running|re-checking/.test(tile.textContent || "");
+    });
     const knowledgeOpened = () => page.waitForFunction(
       () => document.querySelector('[data-testid="memory-tab:knowledge"]')?.classList.contains("is-active"),
       null, { timeout: 3000 }).then(() => true, () => false);
@@ -3917,17 +3934,20 @@ async function runMemoryBodyClickAcrossRefreshProof() {
     await memoryError.waitFor({ state: "detached" });
     const tile = page.locator('[data-testid^="memory-verdict:"]').first();
     await tile.waitFor();
+    await latticeSettled();
     await pressAcrossRefresh("verdict-tile-across-failed-refresh", tile, true, knowledgeOpened);
     await page.getByTestId("memory-tab:holdings").click();
     await memoryError.waitFor();
+    await latticeSettled();
     await pressAcrossRefresh("verdict-tile-across-recovery", tile, false, knowledgeOpened);
 
     await page.getByTestId("memory-tab:records").click();
     const row = page.getByTestId("memory-record:memory-1");
     await row.waitFor();
-    await pressAcrossRefresh("record-row-across-failed-refresh", row, true, recordRequested);
-    const back = page.getByTestId("memory-detail-back");
-    if (await back.count()) await back.click();
+    if (await pressAcrossRefresh("record-row-across-failed-refresh", row, true, recordRequested)) {
+      await page.getByTestId("memory-detail").waitFor();
+      await page.getByTestId("memory-detail-back").click();
+    }
     await row.waitFor();
     // Opening a record clears the panel error, so fail one refresh again
     // before pressing across the recovery.
