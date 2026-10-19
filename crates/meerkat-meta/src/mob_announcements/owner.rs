@@ -368,8 +368,6 @@ fn min_due(current: Option<u64>, candidate: Option<u64>) -> Option<u64> {
     }
 }
 
-/// Members on a peer gateway get batches whose encoded body fits one
-/// delivery request.
 /// The longest chain of mobs a lineage walk follows, up or down.
 const MAX_LINEAGE_DEPTH: usize = 64;
 
