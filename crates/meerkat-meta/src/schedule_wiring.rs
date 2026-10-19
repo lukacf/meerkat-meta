@@ -613,8 +613,19 @@ impl meerkat_core::AgentToolDispatcher for MobIdentityScheduleToolDispatcher {
         &self,
         call: meerkat_core::types::ToolCallView<'_>,
     ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+        self.dispatch_with_context(call, &meerkat_core::ToolDispatchContext::default())
+            .await
+    }
+
+    /// The rewrite keeps the turn's dispatch context for the inner dispatcher,
+    /// rewritten or not: the trait default would drop it and call `dispatch`.
+    async fn dispatch_with_context(
+        &self,
+        call: meerkat_core::types::ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
         if call.name != "meerkat_schedule_create" && call.name != "meerkat_schedule_update" {
-            return self.inner.dispatch(call).await;
+            return self.inner.dispatch_with_context(call, context).await;
         }
 
         let args: Value = serde_json::from_str(call.args.get()).map_err(|error| {
@@ -642,11 +653,14 @@ impl meerkat_core::AgentToolDispatcher for MobIdentityScheduleToolDispatcher {
                 )
             })?;
         self.inner
-            .dispatch(meerkat_core::types::ToolCallView {
-                id: call.id,
-                name: call.name,
-                args: &rewritten_raw,
-            })
+            .dispatch_with_context(
+                meerkat_core::types::ToolCallView {
+                    id: call.id,
+                    name: call.name,
+                    args: &rewritten_raw,
+                },
+                context,
+            )
             .await
     }
 }
@@ -2123,6 +2137,144 @@ mod tests {
                     "content": "Run with explicit defaults."
                 }
             })
+        );
+    }
+
+    /// The mob-identity rewrite keeps the turn's dispatch context: a
+    /// rewritten create and a pass-through list both reach the inner
+    /// dispatcher through `dispatch_with_context` with the caller's context.
+    #[tokio::test]
+    async fn mob_identity_rewrite_forwards_the_dispatch_context() {
+        struct ContextProbe {
+            /// Tool name, objective id from the context, and arguments, per call.
+            seen: std::sync::Mutex<Vec<(String, Option<String>, String)>>,
+        }
+
+        #[async_trait]
+        impl meerkat_core::AgentToolDispatcher for ContextProbe {
+            fn tools(&self) -> Arc<[Arc<meerkat_core::types::ToolDef>]> {
+                Vec::new().into()
+            }
+
+            async fn dispatch(
+                &self,
+                call: ToolCallView<'_>,
+            ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+                Err(meerkat_core::ToolError::execution_failed(format!(
+                    "plain dispatch dropped the context for {}",
+                    call.name
+                )))
+            }
+
+            async fn dispatch_with_context(
+                &self,
+                call: ToolCallView<'_>,
+                context: &meerkat_core::ToolDispatchContext,
+            ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((
+                        call.name.to_string(),
+                        context
+                            .turn_metadata(meerkat_core::agent::TOOL_DISPATCH_OBJECTIVE_ID_KEY)
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                        call.args.get().to_string(),
+                    ));
+                Ok(meerkat_core::ToolDispatchOutcome::sync_result(
+                    meerkat_core::types::ToolResult::new(
+                        call.id.to_string(),
+                        "{}".to_string(),
+                        false,
+                    ),
+                ))
+            }
+        }
+
+        let probe = Arc::new(ContextProbe {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let dispatcher = MobIdentityScheduleToolDispatcher::new_for_test(
+            Arc::clone(&probe) as Arc<dyn meerkat_core::AgentToolDispatcher>,
+            |session_id| async move {
+                assert_eq!(session_id, "019ee0a7-a594-7670-b530-97e7c9e263b7");
+                Some(("example".to_string(), "domain:security".to_string()))
+            },
+        );
+        let objective_id = uuid::Uuid::new_v4().to_string();
+        let context =
+            meerkat_core::ToolDispatchContext::default().with_turn_metadata(BTreeMap::from([(
+                meerkat_core::agent::TOOL_DISPATCH_OBJECTIVE_ID_KEY.to_string(),
+                Value::String(objective_id.clone()),
+            )]));
+        let create_args = RawValue::from_string(
+            json!({
+                "name": "daily-digest",
+                "trigger": {
+                    "type": "interval",
+                    "start_at_utc": "2026-07-01T05:00:00Z",
+                    "every_seconds": 86400
+                },
+                "target": {
+                    "target_kind": "session",
+                    "type": "resumable_session",
+                    "session_id": "019ee0a7-a594-7670-b530-97e7c9e263b7",
+                    "action": {
+                        "type": "prompt",
+                        "prompt": "Send the morning digest."
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("create args");
+        let list_args = RawValue::from_string("{}".to_string()).expect("list args");
+        for (name, args) in [
+            ("meerkat_schedule_create", &create_args),
+            ("meerkat_schedule_list", &list_args),
+        ] {
+            dispatcher
+                .dispatch_with_context(
+                    ToolCallView {
+                        id: "call-with-context",
+                        name,
+                        args,
+                    },
+                    &context,
+                )
+                .await
+                .expect("the call reaches the context-aware inner dispatcher");
+        }
+
+        let seen = probe
+            .seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            seen.iter()
+                .map(|(name, objective, _)| (name.as_str(), objective.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("meerkat_schedule_create", Some(objective_id.as_str())),
+                ("meerkat_schedule_list", Some(objective_id.as_str())),
+            ]
+        );
+        let created: Value = serde_json::from_str(&seen[0].2).expect("rewritten create args");
+        assert_eq!(
+            created["target"],
+            json!({
+                "target_kind": "mob",
+                "type": "member",
+                "mob_id": "example",
+                "member_id": "domain:security",
+                "action": {
+                    "type": "send",
+                    "content": "Send the morning digest."
+                }
+            }),
+            "the create was rewritten to the member before it reached the inner dispatcher"
         );
     }
 
