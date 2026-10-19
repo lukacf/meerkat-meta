@@ -93,6 +93,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   to about 1.7 MB, and `/flow-editor/assets/flow-editor.css`, which grows
   from about 94 KB to about 1.5 MB. A Content-Security-Policy in front of
   either that restricts fonts must allow `font-src data:`.
+- Meta Forge's page no longer fetches DM Sans, Manrope and Newsreader from
+  Google Fonts on every session. The same woff2 files Google Fonts served
+  (DM Sans 4.004, Manrope 4.504 and Newsreader 1.003, under the SIL Open
+  Font License 1.1) ship in `installer/web/fonts/`, with their license texts
+  beside them and in `installer/THIRD_PARTY_NOTICES.md`. The build emits
+  them to `web/dist/fonts/`, which Forge serves itself, and the page fetches
+  a font only when it shows that font's characters.
 
 ### Added
 

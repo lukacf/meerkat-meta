@@ -9,6 +9,7 @@ import {
   parseConversationRichBlocks,
 } from "../../packages/console-core/src/index";
 import "../../packages/console-components/src/styles/index.css";
+import "./fonts/fonts.css";
 import "./styles.css";
 import { GuidedSetup } from "./guided.jsx";
 import { NativeBundleSelection } from "./native-bundle-selection.jsx";
