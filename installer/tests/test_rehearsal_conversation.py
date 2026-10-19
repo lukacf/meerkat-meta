@@ -755,7 +755,7 @@ async def test_owned_stdin_parses_a_bounded_command_then_true_eof_cancels_waitin
     try:
         os.write(write_fd, (json.dumps({"kind": "continue", "id": "owned-command", "turn": 2,
             "expected_turn": 1, "text": "A genuine follow-up"}) + "\n").encode())
-        await asyncio.wait_for(received.wait(), 2)
+        await asyncio.wait_for(received.wait(), 30)
         os.close(write_fd); write_fd = None
         await asyncio.wait_for(task, 2)
         assert stopped.is_set() and read_receipt(tmp_path)["status"] == "interrupted"

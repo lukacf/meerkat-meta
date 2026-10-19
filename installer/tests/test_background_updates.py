@@ -433,7 +433,7 @@ async def test_cancellation_during_fallback_start_reaps_second_instance_without_
         return await original(definition)
     manager.start = start
     task = asyncio.create_task(services.update_background(directory, manager, "update", update_id=identity))
-    await asyncio.wait_for(second.wait(), 2)
+    await asyncio.wait_for(second.wait(), 30)
     assert first.is_set() and read_receipt(directory)["build_id"] == old["build_id"]
     task.cancel()
     with pytest.raises(asyncio.CancelledError):

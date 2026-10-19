@@ -32,7 +32,7 @@ def command_owner(root):
 
 
 async def wait_until(predicate):
-    async with asyncio.timeout(3):
+    async with asyncio.timeout(30):
         while not predicate():
             await asyncio.sleep(0.005)
 

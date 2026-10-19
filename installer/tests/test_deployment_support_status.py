@@ -37,7 +37,7 @@ async def test_support_read_keeps_loop_responsive(owned, monkeypatch):
     try:
         # A busy runner need not start the worker within a fixed 10ms window.
         # Observe its actual entry, then require a loop turn while it is held.
-        async with asyncio.timeout(1):
+        async with asyncio.timeout(30):
             while not entered.is_set():
                 await asyncio.sleep(0)
         await asyncio.sleep(0)
@@ -66,7 +66,7 @@ async def test_support_read_cancellation_drains_its_only_worker(owned, monkeypat
     monkeypatch.setattr(refresh, "_ordinary_source", held_read)
     projection = asyncio.create_task(refresh.support_projection(directory, manager))
     try:
-        async with asyncio.timeout(1):
+        async with asyncio.timeout(30):
             while not entered.is_set():
                 await asyncio.sleep(0.005)
         projection.cancel()

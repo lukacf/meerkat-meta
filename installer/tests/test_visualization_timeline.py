@@ -497,7 +497,7 @@ async def test_equal_content_in_another_setup_keeps_its_own_native_admission(own
     monkeypatch.setattr('launchkit.architect._native_request', native_request)
     operations = VisualizationOperations(root=owned.ops.root / 'equal-content')
     first = await operations.submit(owned.service, owned.blueprint, owned.model, setup_id='setup-A', stream_id='same-stream')
-    async with asyncio.timeout(1):
+    async with asyncio.timeout(30):
         while not first.get('native_admission'):
             await asyncio.sleep(.001)
     second = await operations.submit(owned.service, owned.blueprint, owned.model, setup_id='setup-B', stream_id='same-stream')

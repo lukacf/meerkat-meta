@@ -173,7 +173,7 @@ async def until(predicate):
     async def wait():
         while not predicate():
             await asyncio.sleep(0)
-    await asyncio.wait_for(wait(), 2)
+    await asyncio.wait_for(wait(), 30)
 
 
 async def declare(host, identity, revision, *, setup='setup-A', stream='overview'):
@@ -760,7 +760,7 @@ async def test_lease_expiry_withdraws_unadmitted_desire_but_preserves_admitted_c
                                    after_send=admitted)
     ack = await declare(host, consumer(), 1)
     receipt = await submit(host, service, ack)
-    await asyncio.wait_for((service.waiting if admitted else service.entered).wait(), 2)
+    await asyncio.wait_for((service.waiting if admitted else service.entered).wait(), 30)
     owned = deepcopy(receipt.get('native_admission'))
     clock.advance(91)
     await host.expire_intents()

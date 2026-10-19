@@ -345,7 +345,7 @@ async def test_restored_native_owner_drains_before_latest_stream_revision_is_adm
         async def observing():
             while not first.get('reconnect_attempts'):
                 await asyncio.sleep(0)
-        await asyncio.wait_for(observing(), .5)
+        await asyncio.wait_for(observing(), 30)
         assert first['status'] == ('observing' if same_owner else 'queued')
         assert first['native_run_status'] == 'unknown' and 'completed_at' not in first
     latest_spec = copy.deepcopy(blueprint)

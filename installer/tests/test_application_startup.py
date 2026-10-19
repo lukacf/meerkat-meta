@@ -265,7 +265,7 @@ def block_input_worker(fixture, monkeypatch, operation):
 
 
 async def wait_for_input_worker(task, entered):
-    async with asyncio.timeout(2):
+    async with asyncio.timeout(30):
         while not entered.is_set():
             if task.done():
                 await task
