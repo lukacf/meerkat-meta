@@ -97,7 +97,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   review's runtime ended; two of them blocked every visual review. Visual
   reviews saved by an earlier Forge must be run again, because this release
   changes the animation renderer: opening one reports that it uses another
-  trusted bridge version.
+  trusted bridge version. A publication that already used both review
+  attempts needs a new animation version first.
 
 ## [0.9.3] - 2026-10-18
 
