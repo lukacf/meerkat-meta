@@ -3973,6 +3973,137 @@ async function runMemoryBodyClickAcrossRefreshProof() {
   }
 }
 
+// The Memory lattice tile page-walks the loaded records. A good refresh that
+// brings the same records must not walk again, and a walk that does run must
+// show its re-check without growing the tile row: either would move the tiles
+// below it, and with them a click in progress on a lower tile.
+async function runMemoryLatticeRecheckAcrossRefreshProof() {
+  const evidence = path.join(process.env.META_BROWSER_EVIDENCE || path.join(repoRoot, "output/playwright/console-acceptance"), "memory-lattice-recheck-across-refresh");
+  fs.mkdirSync(evidence, { recursive: true });
+  const record = id => ({
+    id, title: `Release checklist ${id}`, kind: "fact", trust: "agent_verified",
+    status: { status: "active" }, scope: { scope: "identity", realm: "default", identity: "router:main" },
+    updated_at_ms: 1792368000000,
+  });
+  let records = [record("memory-1")];
+  const replies = {
+    "meta/memory/panel/dreams": { runs: [] },
+    "meta/memory/panel/overview": null,
+    "meta/memory/panel/proposals": { proposals: [] },
+    "meta/memory/panel/injections": { injections: [] },
+    "meta/memory/panel/harvests": { harvests: [] },
+    "meta/memory/panel/dream_runs": { runs: [] },
+    "meta/memory/panel/audit_verdicts": { verdicts: [] },
+  };
+  const { eventually } = require("./acceptance-runtime.cjs");
+  let holdWalkReads = false;
+  const heldWalkReads = [], walkReads = [], plainReads = [], errors = [], checkpoints = [], problems = [];
+  const server = await startMockConsoleServer();
+  let browser, page, failure;
+  try {
+    browser = await launchBrowser();
+    page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
+    page.setDefaultTimeout(10000);
+    page.on("pageerror", error => errors.push(String(error)));
+    await page.route("**/console/experience", async route => {
+      const response = await route.fetch(); const value = await response.json();
+      await route.fulfill({ response, json: { ...value, memory: { can_read: true, can_review_quarantine: false } } });
+    });
+    await page.route("**/console/rpc", async route => {
+      const request = route.request().postDataJSON();
+      const reply = payload => route.fulfill({ json: { jsonrpc: "2.0", id: request.id, ...payload } });
+      if (request.method === "meta/capabilities") {
+        const response = await route.fetch(); const value = await response.json();
+        value.result.methods.push("meta/memory/panel/records", ...Object.keys(replies));
+        return route.fulfill({ response, json: value });
+      }
+      if (request.method === "meta/memory/panel/records") {
+        const params = request.params || {};
+        // The page-walk pages with a limit; the scope probes carry a scope.
+        if (params.limit !== undefined && params.scope === undefined) {
+          walkReads.push(request.id);
+          if (holdWalkReads) await new Promise(resolve => heldWalkReads.push(resolve));
+        } else if (Object.keys(params).length === 0) {
+          plainReads.push(request.id);
+        }
+        return reply({ result: { records, realms: ["default"] } });
+      }
+      if (Object.hasOwn(replies, request.method)) return reply({ result: replies[request.method] });
+      return route.continue();
+    });
+    const releaseWalkReads = () => { holdWalkReads = false; heldWalkReads.splice(0).forEach(resolve => resolve()); };
+    await gotoConsole(page, `${server.baseUrl}/console`);
+    await page.getByText("Memory", { exact: true }).first().click();
+    await page.getByTestId("memory-panel").waitFor();
+    const lattice = page.getByTestId("memory-verdict:lattice");
+    const lowerTile = page.getByTestId("memory-verdict:dreams");
+    const refresh = page.getByTestId("memory-refresh");
+    const latticeSettled = () => page.waitForFunction(() => {
+      const tile = document.querySelector('[data-testid="memory-verdict:lattice"]');
+      return tile?.getAttribute("data-status") === "holding" && !/running|re-checking/.test(tile.textContent || "");
+    });
+    const dreamsOpened = () => page.waitForFunction(
+      () => document.querySelector('[data-testid="memory-tab:dreams"]')?.classList.contains("is-active"),
+      null, { timeout: 3000 }).then(() => true, () => false);
+    // Presses the lower tile, runs one good refresh with walk reads held,
+    // measures once the refresh has landed, then releases.
+    async function pressAcrossGoodRefresh(step, afterRefresh) {
+      await page.getByTestId("memory-tab:holdings").click();
+      await latticeSettled();
+      const walkReadsBefore = walkReads.length;
+      const plainReadsBefore = plainReads.length;
+      const box = await lowerTile.boundingBox();
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await page.mouse.down();
+      const pressed = await lowerTile.boundingBox();
+      holdWalkReads = true;
+      await refresh.evaluate(button => button.click());
+      await eventually(async () => plainReads.length > plainReadsBefore, `${step}: the refresh read records`);
+      await afterRefresh();
+      const settled = await lowerTile.boundingBox();
+      const latticeText = (await lattice.innerText()).replace(/\s+/g, " ");
+      await page.screenshot({ path: path.join(evidence, `${step}.png`), fullPage: true });
+      const landed = dreamsOpened();
+      await page.mouse.up();
+      const entry = { step, pressed, settled, latticeText, walkReads: walkReads.length - walkReadsBefore, landed: await landed };
+      releaseWalkReads();
+      checkpoints.push(entry);
+      if (JSON.stringify(settled) !== JSON.stringify(pressed)) problems.push(`${step}: the lower tiles moved under a pressed pointer`);
+      if (!entry.landed) problems.push(`${step}: the click was lost`);
+      return entry;
+    }
+
+    await page.getByTestId("memory-verdict-strip").waitFor();
+    await latticeSettled();
+    // The same records again: the settled verdict already covers them.
+    const unchanged = await pressAcrossGoodRefresh("unchanged-records", () => page.waitForTimeout(400));
+    if (unchanged.walkReads !== 0) problems.push(`unchanged-records: the refresh walked the same records again (${unchanged.walkReads} walk reads)`);
+    // New records: the walk runs, held here, and shows its re-check.
+    records = [record("memory-1"), record("memory-2")];
+    const changed = await pressAcrossGoodRefresh("changed-records", async () => {
+      await eventually(async () => heldWalkReads.length > 0, "changed-records: the walk started");
+      await eventually(async () => /re-checking/.test(await lattice.innerText()), "changed-records: the re-check shows");
+    });
+    if (!/re-checking/.test(changed.latticeText)) problems.push("changed-records: the running walk showed no re-check");
+
+    assert.deepEqual(problems, [], "a good refresh moved the memory tiles under a click");
+    assert.deepEqual(errors, []);
+    checkpoints.push({ step: "complete" });
+  } catch (error) {
+    failure = String(error.stack || error);
+    if (page) fs.writeFileSync(path.join(evidence, "failure-body.txt"), await page.locator("body").innerText().catch(() => "unavailable"));
+    throw error;
+  } finally {
+    holdWalkReads = false;
+    heldWalkReads.splice(0).forEach(resolve => resolve());
+    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP memory RPC", checkpoints, problems, walkReads: walkReads.length, plainReads: plainReads.length, errors, failure: failure || null }, null, 2));
+    // A route still fetching when the page closes must not outlive the scenario.
+    if (page) await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
+    if (browser) await browser.close();
+    await server.close();
+  }
+}
+
 // At narrow widths the WorkGraph header has no room to spare. Its view toggle
 // and Refresh must stay inside the panel, a failed refresh's error and the
 // good refresh that clears it must not move them under a pressed pointer, and
@@ -4100,6 +4231,7 @@ const scenarios = [
   { id: "memory-tab-click-during-failed-refresh", family: "console", backend: "mock", run: runMemoryTabClickDuringFailedRefreshProof },
   { id: "workgraph-action-click-during-failed-refresh", family: "console", backend: "mock", run: runWorkGraphActionClickDuringFailedRefreshProof },
   { id: "memory-body-click-across-refresh", family: "console", backend: "mock", run: runMemoryBodyClickAcrossRefreshProof },
+  { id: "memory-lattice-recheck-across-refresh", family: "console", backend: "mock", run: runMemoryLatticeRecheckAcrossRefreshProof },
   ...[760, 560].map(width => ({ id: `workgraph-header-click-across-refresh-${width}`, family: "console", backend: "mock", run: () => runWorkGraphHeaderClickAcrossRefreshProof(width) })),
   { id: "authorization-feedback", family: "console", backend: "mock", run: runAuthorizationFeedbackProof },
   { id: "reference", family: "runtime", backend: "real", run: runReferenceBrowserProof },

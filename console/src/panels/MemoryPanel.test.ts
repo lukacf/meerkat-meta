@@ -546,13 +546,18 @@ test("violated lattice tile carries its evidence refs, capped with a +N more lin
   assert.ok(tile?.lines.some((line) => line === "+2 more violations"));
 });
 
-test("a settled lattice verdict is retained (with a re-checking line) during re-runs", () => {
+test("a settled lattice verdict is retained (with a re-check marker) during re-runs", () => {
   const settled = {
     checked: 10,
     complete: true,
     llmCeilingViolations: [],
     chainViolations: [],
   };
+  const idle = computeVerdictTiles({
+    ...emptyVerdictInputs,
+    lattice: settled,
+    latticeRunning: false,
+  }).find((candidate) => candidate.id === "lattice");
   const tile = computeVerdictTiles({
     ...emptyVerdictInputs,
     lattice: settled,
@@ -560,7 +565,11 @@ test("a settled lattice verdict is retained (with a re-checking line) during re-
   }).find((candidate) => candidate.id === "lattice");
   // No flicker to UNVERIFIABLE while the debounced refresh re-walks.
   assert.equal(tile?.status, "holding");
-  assert.ok(tile?.lines.some((line) => line === "re-checking…"));
+  assert.equal(tile?.rechecking, true);
+  assert.equal(idle?.rechecking, false);
+  // The re-check renders over the tile, so it adds no line that would grow
+  // the tile row and move the tiles below.
+  assert.deepEqual(tile?.lines, idle?.lines);
 
   const cold = computeVerdictTiles({
     ...emptyVerdictInputs,
