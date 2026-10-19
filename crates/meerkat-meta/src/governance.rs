@@ -172,9 +172,42 @@ fn validate_markdown_traceability_statuses(
     Ok(())
 }
 
+/// The YAML rules for traceability documents, as Meerkat Core's SKILL.md
+/// frontmatter parser applies them: YAML 1.2 booleans, `<<` an ordinary key,
+/// a duplicated key and an unrecognized tag refused, and the parser's default
+/// budget (nesting depth 64, nodes, events, alias expansion).
+fn traceability_yaml_options() -> serde_saphyr::Options {
+    let mut options = serde_saphyr::Options::default();
+    options.strict_booleans = true;
+    options.merge_keys = serde_saphyr::MergeKeyPolicy::AsOrdinary;
+    options.duplicate_keys = serde_saphyr::DuplicateKeyPolicy::Error;
+    options.reject_unsupported_tags = true;
+    options.non_finite_float_policy = serde_saphyr::NonFiniteFloatPolicy::PassThrough;
+    options.with_snippet = false;
+    options
+}
+
+/// A `...` document end marker line. A traceability document is one YAML
+/// document, and serde-saphyr 2.0.0 stops at the marker and ignores what
+/// follows it, even malformed text: upstream issue #228, fixed after 2.0.0 by
+/// <https://github.com/bourumir-wyngs/serde-saphyr/pull/230>. Remove this
+/// guard at the bump to a release with that fix, and decide then whether a
+/// marker with nothing after it stays refused (the traceability_yaml tests
+/// pin both). Lines break where YAML breaks them: at LF, CRLF and a lone CR.
+fn has_document_end_marker(yaml: &str) -> bool {
+    yaml.split(['\n', '\r']).any(|line| {
+        line.strip_prefix("...")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+    })
+}
+
 fn validate_yaml_traceability_statuses(yaml: &str) -> Result<(), GovernanceValidationError> {
-    let document: TraceabilityDocument = serde_yaml::from_str(yaml)
-        .map_err(|_| GovernanceValidationError::InvalidTraceabilityRow { line: 1 })?;
+    if has_document_end_marker(yaml) {
+        return Err(GovernanceValidationError::InvalidTraceabilityRow { line: 1 });
+    }
+    let document: TraceabilityDocument =
+        serde_saphyr::from_str_with_options(yaml, traceability_yaml_options())
+            .map_err(|_| GovernanceValidationError::InvalidTraceabilityRow { line: 1 })?;
 
     if document.rows.is_empty() {
         return Err(GovernanceValidationError::NoTraceabilityRows);

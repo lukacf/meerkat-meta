@@ -36,7 +36,7 @@ make test-python   # Python tests
 make test-all      # Rust + Python + Flow Editor
 
 # Or directly
-./scripts/repo-cargo nextest run --workspace -E 'not test(governance_contracts)' --no-fail-fast
+./scripts/repo-cargo nextest run --workspace --no-fail-fast
 
 # Python
 PYTHONPATH=sdk/python python3 -m pytest sdk/python/tests/ -v

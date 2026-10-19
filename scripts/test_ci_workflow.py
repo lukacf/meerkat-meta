@@ -231,7 +231,7 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertGreater(len(integration_tests), 100)
         self.assertEqual(split_coverage_problems(members, patterns), [])
         self.assertIn("    strategy:\n      fail-fast: false\n", block)
-        filter_ = "-E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu)'"
+        filter_ = "-E 'not test(converged_idle_gateway_consumes_near_zero_cpu)'"
         expected = {
             "test": f"scripts/repo-cargo nextest run --workspace --lib --bins {filter_} --no-fail-fast",
             "test-integration": (

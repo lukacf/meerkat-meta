@@ -181,7 +181,14 @@ pub fn scenario_path() -> Result<PathBuf> {
 pub fn load_scenario(path: &Path) -> Result<IncidentScenario> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read scenario at {}", path.display()))?;
-    let scenario = serde_yaml::from_str::<IncidentScenario>(&raw)
+    // YAML 1.2 booleans, `<<` an ordinary key, duplicate keys and unknown
+    // tags refused.
+    let mut options = serde_saphyr::Options::default();
+    options.strict_booleans = true;
+    options.merge_keys = serde_saphyr::MergeKeyPolicy::AsOrdinary;
+    options.duplicate_keys = serde_saphyr::DuplicateKeyPolicy::Error;
+    options.reject_unsupported_tags = true;
+    let scenario = serde_saphyr::from_str_with_options::<IncidentScenario>(&raw, options)
         .with_context(|| format!("failed to parse scenario at {}", path.display()))?;
     Ok(scenario)
 }
