@@ -304,3 +304,59 @@ test("normalizeAgents distinguishes explicit quiet phase from missing or invalid
   assert.equal(agents[4].response_phase, "generating");
   assert.equal(Object.hasOwn(agents[5], "response_phase"), false);
 });
+
+test("normalizeAgents carries the unobserved marker of a pending sidebar row", () => {
+  const unobserved = { reason: "refresh_pending", fields: ["state", "role", "labels"] };
+  const agents = normalizeAgents(
+    {
+      agent_sidebar: {
+        live_snapshot: {
+          agents: [
+            {
+              agent_id: "voice-keeper",
+              member_id: "voice-keeper",
+              identity: "voice-keeper",
+              label: "voice-keeper",
+              kind: "mob_agent",
+              state: "unknown",
+              session_id: "successor-session",
+              labels: { agent_identity: "voice-keeper" },
+              addressable: false,
+              affordances: { addressable: false, can_send_message: false, can_retire: false, can_respawn: true },
+              unobserved,
+            },
+            {
+              agent_id: "other-keeper",
+              member_id: "other-keeper",
+              identity: "other-keeper",
+              label: "other-keeper",
+              kind: "mob_agent",
+              state: "active",
+            },
+          ],
+        },
+      },
+      identity_status: {
+        schema_version: "1",
+        refresh: { mode: "poll", interval_ms: 5000 },
+        rows: [
+          {
+            identity: "voice-keeper",
+            state: "unknown",
+            addressability: "internal_only",
+            labels: { agent_identity: "voice-keeper" },
+            unobserved,
+          },
+        ],
+      },
+    },
+    [],
+  );
+
+  assert.equal(agents.length, 2);
+  assert.deepEqual(agents[0]?.unobserved, unobserved);
+  assert.equal(agents[0]?.session_id, "successor-session");
+  assert.equal(agents[0]?.state, "unknown");
+  assert.equal(agents[0]?.affordances?.can_send_message, false);
+  assert.equal(agents[1]?.unobserved, undefined);
+});
