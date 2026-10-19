@@ -804,7 +804,7 @@ async fn a_pending_contributor_refuses_the_governed_send_until_it_is_retained() 
         .send_governed_with_turn_ticket(&identity, None, raw_prompt(), retained.clone())
         .await
         .expect("the send is admitted once the contributors are retained");
-    assert_eq!(retained.admitted(), vec![sent.admission.clone()]);
+    assert_eq!(retained.admitted(), vec![sent.admission]);
     assert_eq!(retained.withdrawn(), 0);
 }
 

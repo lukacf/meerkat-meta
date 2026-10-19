@@ -331,7 +331,10 @@ impl RunningMobRuntimeDelivery {
             .as_ref()
             .map(meerkat::RuntimeDeliveryOwnerHandle::retire);
         if let Some(retirement) = retirement {
-            retirement.join(bound).await?;
+            // A notification registration the retirement left with the
+            // process never reads or writes the store, so the retirement is
+            // complete; the join traced its directory.
+            let _retired = retirement.join(bound).await?;
         }
         self.stop();
         Ok(())

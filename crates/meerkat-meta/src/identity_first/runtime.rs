@@ -540,7 +540,8 @@ fn admission_phase_error(
         | BridgeAdmissionError::InvalidInput(detail)
         | BridgeAdmissionError::InvariantViolation(detail)
         | BridgeAdmissionError::MobAdmissionClosed { detail, .. }
-        | BridgeAdmissionError::MobShutdownInProgress { detail, .. } => {
+        | BridgeAdmissionError::MobShutdownInProgress { detail, .. }
+        | BridgeAdmissionError::IdentityConvergenceAdmissionClosed { detail, .. } => {
             IdentityRuntimeError::AdmissionFailed { identity, detail }
         }
         BridgeAdmissionError::ActorLoopStalled {

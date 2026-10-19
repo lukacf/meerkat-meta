@@ -62,16 +62,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   observed whether the mob runs; it is never defaulted. The snapshot gains
   `unobserved: Option<UnobservedFacts>`, which `new` sets when `running` is
   `None` (serde default, skipped when `None`).
-- `BridgeError` and `BridgeAdmissionError` have two new variants, appended
+- `BridgeError` and `BridgeAdmissionError` have three new variants, appended
   last: `MobAdmissionClosed`, for a delivery Meerkat Core refused because the
-  mob's admission is closed (for any close reason), and
-  `MobShutdownInProgress`, for one it refused while a Shutdown of the mob was
-  still draining (retry later; the mob is not gone). Both carry the member
-  identity, the mob id and Core's message, and render as the `Mob` message
-  they replace. A `match` on either enum without a wildcard needs arms for
-  them. The deliver path hands both up typed and never repairs the member
-  for them (the substring repair classifier no longer sees their text); a
-  completion-bearing send still fails with
+  mob's admission is closed (for any close reason), `MobShutdownInProgress`,
+  for one it refused while a Shutdown of the mob was still draining (retry
+  later; the mob is not gone), and `IdentityConvergenceAdmissionClosed`, for
+  one it refused while the member's identity converges onto committed new
+  material (retry once the replacement is active). Each carries the member
+  identity and Core's message (the first two also the mob id), and renders as
+  the `Mob` message it replaces. A `match` on either enum without a wildcard
+  needs arms for them. The deliver path hands all three up typed and never
+  repairs the member for them (the substring repair classifier no longer sees
+  their text); a completion-bearing send still fails with
   `IdentityRuntimeError::AdmissionFailed`, whose detail is now Core's message
   without the `session bridge mob error:` prefix.
 
@@ -432,7 +434,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   text as the summary. That failure names the stop reason, so a refused
   summary reads as refused rather than as a cancel or a truncation, and a
   summary stream that ends without its terminal event is reported apart.
-
 
 ## [0.9.3] - 2026-10-18
 

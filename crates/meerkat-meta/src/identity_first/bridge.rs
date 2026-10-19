@@ -73,10 +73,14 @@ fn durable_snapshot_is_typed_absent(error: &meerkat_mob::MobError) -> bool {
 fn is_repairable_bridge_delivery(error: &BridgeError) -> bool {
     match error {
         BridgeError::MemberRuntimeDetached { .. } => true,
-        // A closed mob, or one whose Shutdown is still draining, refused the
-        // delivery before admission. No repair reopens it, and its text never
-        // reaches the classes below.
-        BridgeError::MobAdmissionClosed { .. } | BridgeError::MobShutdownInProgress { .. } => false,
+        // A closed mob, one whose Shutdown is still draining, or a member
+        // closed while its identity converges refused the delivery before
+        // admission. No repair reopens it (a repair of a converging member
+        // would retire the executor the convergence is replacing), and its
+        // text never reaches the classes below.
+        BridgeError::MobAdmissionClosed { .. }
+        | BridgeError::MobShutdownInProgress { .. }
+        | BridgeError::IdentityConvergenceAdmissionClosed { .. } => false,
         other => is_repairable_bridge_delivery_error(&other.to_string()),
     }
 }
@@ -112,9 +116,10 @@ fn is_reload_required_bridge_delivery_error(error: &str) -> bool {
 /// Type the submit-side `MobError` at the boundary instead of flattening it
 /// to [`BridgeError::Mob`] text: a durability-degraded refusal becomes
 /// [`BridgeError::ReloadRequired`] so the identity runtime can run exactly
-/// one non-destructive reload and retry, a closed or shutting-down mob is
-/// typed so no repair ever reads it, and everything else keeps the
-/// historical text form the substring repair classifier reads.
+/// one non-destructive reload and retry, a closed or shutting-down mob and a
+/// member closed for identity convergence are typed so no repair ever reads
+/// them, and everything else keeps the historical text form the substring
+/// repair classifier reads.
 fn classify_submit_mob_error(
     member_id: &MobAgentIdentity,
     error: meerkat_mob::MobError,
@@ -216,6 +221,20 @@ fn classify_submit_mob_error(
             BridgeError::MobShutdownInProgress {
                 identity: member_id.clone(),
                 mob_id,
+                detail,
+            }
+        }
+        // The member's desired material is committed and its replacement
+        // executor is not active yet: meerkat keeps the member's admission
+        // closed until the identity converges. Nothing was delivered; retry
+        // once it has converged.
+        meerkat_mob::MobError::IdentityConvergenceAdmissionClosed { member_id } => {
+            let detail = meerkat_mob::MobError::IdentityConvergenceAdmissionClosed {
+                member_id: member_id.clone(),
+            }
+            .to_string();
+            BridgeError::IdentityConvergenceAdmissionClosed {
+                identity: member_id,
                 detail,
             }
         }
@@ -949,6 +968,18 @@ pub enum BridgeError {
         mob_id: meerkat_mob::MobId,
         detail: String,
     },
+    /// meerkat refused the delivery because the member's admission is closed
+    /// while its identity converges
+    /// (`MobError::IdentityConvergenceAdmissionClosed`, read typed): its
+    /// desired material is committed and its replacement executor is not
+    /// active yet. Nothing was delivered. A retry-later refusal for this one
+    /// member: never repaired (a repair would retire the executor the
+    /// convergence is replacing) and never reloaded. `detail` is meerkat's
+    /// rendering.
+    IdentityConvergenceAdmissionClosed {
+        identity: MobAgentIdentity,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for BridgeError {
@@ -958,7 +989,8 @@ impl std::fmt::Display for BridgeError {
             Self::Mob(msg)
             | Self::UnsupportedForMode { detail: msg, .. }
             | Self::MobAdmissionClosed { detail: msg, .. }
-            | Self::MobShutdownInProgress { detail: msg, .. } => {
+            | Self::MobShutdownInProgress { detail: msg, .. }
+            | Self::IdentityConvergenceAdmissionClosed { detail: msg, .. } => {
                 write!(f, "session bridge mob error: {msg}")
             }
             Self::CompletionFailed(msg) => write!(
@@ -1182,6 +1214,13 @@ pub enum BridgeAdmissionError {
         mob_id: meerkat_mob::MobId,
         detail: String,
     },
+    /// Refused before admission: the member's admission is closed while its
+    /// identity converges (retry once it has converged). Nothing was
+    /// delivered.
+    IdentityConvergenceAdmissionClosed {
+        identity: MobAgentIdentity,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for BridgeAdmissionError {
@@ -1197,7 +1236,8 @@ impl std::fmt::Display for BridgeAdmissionError {
             Self::Mob(msg)
             | Self::UnsupportedForMode { detail: msg, .. }
             | Self::MobAdmissionClosed { detail: msg, .. }
-            | Self::MobShutdownInProgress { detail: msg, .. } => {
+            | Self::MobShutdownInProgress { detail: msg, .. }
+            | Self::IdentityConvergenceAdmissionClosed { detail: msg, .. } => {
                 write!(f, "session bridge mob error before receipt: {msg}")
             }
             Self::InvalidInput(msg) => {
@@ -1403,6 +1443,9 @@ impl From<BridgeError> for BridgeAdmissionError {
                 mob_id,
                 detail,
             },
+            BridgeError::IdentityConvergenceAdmissionClosed { identity, detail } => {
+                Self::IdentityConvergenceAdmissionClosed { identity, detail }
+            }
         }
     }
 }
@@ -1514,6 +1557,9 @@ impl From<BridgeAdmissionError> for BridgeError {
                 mob_id,
                 detail,
             },
+            BridgeAdmissionError::IdentityConvergenceAdmissionClosed { identity, detail } => {
+                Self::IdentityConvergenceAdmissionClosed { identity, detail }
+            }
         }
     }
 }
@@ -8332,12 +8378,14 @@ impl MobSessionBridge {
             // delivered: hand it up typed so a tracked delivery can fall back
             // to the ingress lane; never repair, never `Mob(String)`.
             Err(err @ BridgeError::UnsupportedForMode { .. }) => return Err(err.into()),
-            // A closed mob, or one whose Shutdown is still draining, refused
-            // the delivery before admission. Nothing is stale and nothing was
-            // delivered: hand it up typed; never repair, never `Mob(String)`.
+            // A closed mob, one whose Shutdown is still draining, or a member
+            // closed while its identity converges refused the delivery before
+            // admission. Nothing is stale and nothing was delivered: hand it
+            // up typed; never repair, never `Mob(String)`.
             Err(
                 err @ (BridgeError::MobAdmissionClosed { .. }
-                | BridgeError::MobShutdownInProgress { .. }),
+                | BridgeError::MobShutdownInProgress { .. }
+                | BridgeError::IdentityConvergenceAdmissionClosed { .. }),
             ) => return Err(err.into()),
             Err(err) if host_human_session.is_none() && is_repairable_bridge_delivery(&err) => {
                 tracing::warn!(
@@ -11659,6 +11707,52 @@ mod tests {
         assert!(matches!(
             BridgeError::from(admission),
             BridgeError::MobShutdownInProgress { .. }
+        ));
+    }
+
+    /// A member closed while its identity converges refuses the submit before
+    /// admission. The refusal is typed with the member meerkat named, keeps
+    /// meerkat's rendering exactly as the untyped mob error showed it, is
+    /// never read by the text repair classifier, and survives the
+    /// admission-error round trip.
+    #[test]
+    fn identity_convergence_refusal_classifies_typed_and_never_repairs() {
+        let deadline = ActorAdmissionDeadline::new(Duration::from_mins(10));
+        let member = MobAgentIdentity::from("rt-review-singleton-0");
+        let error = meerkat_mob::MobError::IdentityConvergenceAdmissionClosed {
+            member_id: member.clone(),
+        };
+        let rendered = error.to_string();
+        let classified = classify_submit_mob_error(&member, error, &deadline);
+        assert!(
+            matches!(
+                &classified,
+                BridgeError::IdentityConvergenceAdmissionClosed { identity, detail }
+                    if identity == &member && detail == &rendered
+            ),
+            "{classified:?}"
+        );
+        assert_eq!(
+            classified.to_string(),
+            BridgeError::Mob(rendered.clone()).to_string()
+        );
+        assert!(
+            !is_repairable_bridge_delivery(&classified),
+            "{classified:?}"
+        );
+        let admission = BridgeAdmissionError::from(classified);
+        assert!(
+            matches!(
+                &admission,
+                BridgeAdmissionError::IdentityConvergenceAdmissionClosed { identity, detail }
+                    if identity == &member && detail == &rendered
+            ),
+            "{admission:?}"
+        );
+        assert!(matches!(
+            BridgeError::from(admission),
+            BridgeError::IdentityConvergenceAdmissionClosed { identity, detail }
+                if identity == member && detail == rendered
         ));
     }
 
