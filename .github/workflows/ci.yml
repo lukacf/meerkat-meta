@@ -238,13 +238,13 @@ jobs:
       # runner class is not a valid measurement environment for the assertion.
       # The gate stays armed in local full-suite runs (exclusively scheduled
       # via .config/nextest.toml) and in the release-gate protocol.
-      # Both of the filter's tests are integration tests. This job is the only
+      # The filter's one test is an integration test. This job is the only
       # automatic run of the lib and bin tests (the pre-push unit gate is
       # manual), so its filter may leave none of those out: the listing
       # builds what the run reuses, and the check fails on any it drops.
-      - run: scripts/repo-cargo nextest list --workspace --lib --bins -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu)' --message-format json > "${RUNNER_TEMP}/unit-tests.json"
+      - run: scripts/repo-cargo nextest list --workspace --lib --bins -E 'not test(converged_idle_gateway_consumes_near_zero_cpu)' --message-format json > "${RUNNER_TEMP}/unit-tests.json"
       - run: python3 scripts/verify-unit-test-filter.py "${RUNNER_TEMP}/unit-tests.json"
-      - run: scripts/repo-cargo nextest run --workspace --lib --bins -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu)' --no-fail-fast
+      - run: scripts/repo-cargo nextest run --workspace --lib --bins -E 'not test(converged_idle_gateway_consumes_near_zero_cpu)' --no-fail-fast
       - name: Report runner disk
         if: always()
         run: df -h /
@@ -315,7 +315,7 @@ jobs:
       # runner class is not a valid measurement environment for the assertion.
       # The gate stays armed in local full-suite runs (exclusively scheduled
       # via .config/nextest.toml) and in the release-gate protocol.
-      - run: scripts/repo-cargo nextest run --workspace --test '${{ matrix.tests }}' -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu)' --no-fail-fast
+      - run: scripts/repo-cargo nextest run --workspace --test '${{ matrix.tests }}' -E 'not test(converged_idle_gateway_consumes_near_zero_cpu)' --no-fail-fast
       # cargo's default test selection also builds every example, to prove
       # it compiles and links; one integration half does that here.
       - if: matrix.examples
