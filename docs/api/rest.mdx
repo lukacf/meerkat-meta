@@ -95,6 +95,20 @@ that can answer (no live mob runtime, or an aggregator with no registered
 runtime), it is `null`, and the snapshot names it in an `unobserved` marker:
 `{"reason": "not_observed", "fields": ["running"]}`.
 
+An identity-first member's records take its session from the identity
+runtime, never from a walk made under an earlier identity binding. When the
+member's binding has moved (after a reset, retire or delete), a read collects
+the member again first and waits at most 2 s. Past that bound, the member's
+sidebar row answers with the identity runtime's session, the member's run
+`progress` and state `unknown`, and offers no send or retire. Each record of
+the member (the sidebar row, the `identity_status` and `health_overview`
+rows, and the topology node) withholds the other facts the earlier walk
+found and names them in an `unobserved` marker with reason
+`refresh_pending`, for example
+`{"reason": "refresh_pending", "fields": ["label", "role", "state", "wired_to", "addressable"]}`
+on the topology node. Access and visibility still decide on the last
+observed facts, so a label-scoped deny keeps such a member hidden.
+
 ### `GET /console/modules`
 
 Returns the configured module IDs from `RuntimeDecisionState`. This response
