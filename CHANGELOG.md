@@ -91,6 +91,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `parentRafAgeMs` and `deadlineOvershootMs` in whole milliseconds. Each is a
   clock difference and could show its floating-point error, such as
   3.0000000000000284 for a 3 ms render.
+- Meta Forge no longer strands the slot of a visual review that an earlier
+  version left running when the animation renderer changes. The first review
+  after such an update failed to start, and the slot stayed taken after that
+  review's runtime ended; two of them blocked every visual review. Visual
+  reviews saved by an earlier Forge must be run again, because this release
+  changes the animation renderer: opening one reports that it uses another
+  trusted bridge version.
 
 ## [0.9.3] - 2026-10-18
 

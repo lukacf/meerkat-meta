@@ -1003,6 +1003,28 @@ async def test_positive_owner_end_cancels_only_its_pending_observation_and_prese
 
 
 @pytest.mark.asyncio
+async def test_earlier_renderer_review_keeps_slot_custody_but_never_reuses_its_evidence(tmp_path):
+    operations = Operations()
+    review, runtime = service(operations, root=tmp_path, timeout=0.01, runtime_owner_id=lambda exact: OWNER_A)
+    runtime.release = asyncio.Event()
+    earlier = await review.submit(**source(operations))
+    await finish(review)
+    assert review.active_reviews == {earlier["id"]}
+    # A release that changes the trusted renderer bytes changes their hash.
+    renderer, upgraded_runtime = fingerprint({"renderer": "next release"}), Runtime()
+    upgraded = VisualizationReviewService(runtime=upgraded_runtime, operations=operations, root=tmp_path,
+        expected_renderer_hash=renderer, runtime_owner_id=lambda exact: OWNER_B)
+    upgraded_runtime.service = upgraded
+    current = await upgraded.submit(**{**source(operations, "B"), "renderer_hash": renderer})
+    await finish(upgraded)
+    assert upgraded.get(current["id"])["status"] == "reviewed" and upgraded.active_reviews == {earlier["id"]}
+    assert (await upgraded.confirm_runtime_terminated(OWNER_A))["released_review_ids"] == [earlier["id"]]
+    assert not upgraded.active_reviews and not json.loads((tmp_path / "active-reviews.json").read_text())["review_ids"]
+    with pytest.raises(ValueError, match="another trusted bridge version"):
+        upgraded.get(earlier["id"])
+
+
+@pytest.mark.asyncio
 async def test_real_inspect_output_teaches_valid_source_pointers_and_empty_visual_claims():
     operations = Operations()
     review, runtime = service(operations)
