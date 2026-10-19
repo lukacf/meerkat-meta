@@ -5322,17 +5322,24 @@ impl SessionStoreBackedRuntimeStore {
                                 )?;
                                 match behind {
                                     Some(chain) => {
+                                        // The prover returns the chain from the
+                                        // proving rewrite on, so it is never empty.
+                                        let Some(first) = chain.first() else {
+                                            return Err(
+                                                meerkat_runtime::store::RuntimeStoreError::WriteFailed(
+                                                    "durable-behind admission proved an empty \
+                                                     rewrite chain"
+                                                        .to_string(),
+                                                ),
+                                            );
+                                        };
                                         tracing::info!(
                                             runtime_id = %runtime_id,
                                             session_id = %successor.id(),
                                             durable_messages =
                                                 durable_predecessor.messages().len(),
-                                            parent_messages = chain
-                                                .first()
-                                                .map_or(0, |commit| commit.messages_before),
-                                            first_rewrite_generation = chain
-                                                .first()
-                                                .map_or(0, |commit| commit.rewrite_generation),
+                                            parent_messages = first.messages_before,
+                                            first_rewrite_generation = first.rewrite_generation,
                                             replayed_rewrites = chain.len(),
                                             "durable-behind admission: the durable row is a \
                                              strict digest-prefix of the first replayed \
