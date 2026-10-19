@@ -79,6 +79,7 @@ BUILD_LEGS = (
     {"runs-on": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu", "archive_ext": "tar.gz"},
     {"runs-on": "macos-15", "target": "aarch64-apple-darwin", "archive_ext": "tar.gz"},
     {"runs-on": "macos-15", "target": "x86_64-apple-darwin", "archive_ext": "tar.gz"},
+    # A GitHub-hosted label offered to public repositories only.
     {"runs-on": "windows-2025-vs2026", "target": "x86_64-pc-windows-msvc", "archive_ext": "zip"},
 )
 SLSA = "https://slsa.dev/provenance/v1"
