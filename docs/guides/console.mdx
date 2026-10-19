@@ -921,6 +921,8 @@ runtime id is refused with `-32000` and `error.data.kind`
 (`registered_runtime_member_id`, `registered_session_id`). A hidden identity's
 runtime id answers `identity_hidden_by_policy`, and a runtime id of an
 identity the runtime does not know answers `identity not found`.
+`meta/console/inspect_identity` refuses a stale runtime id the same way
+before it looks the identity up in the console aggregator.
 
 Topology management is opt-in at the runtime. With the default disabled
 policy, the stock console remains a passive topology viewer and does not show

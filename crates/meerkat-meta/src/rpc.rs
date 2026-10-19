@@ -5982,9 +5982,21 @@ fn identity_target_error_response(
 async fn rpc_stale_generated_alias_error(
     identity_rt: &crate::identity_first::IdentityRuntime,
     alias: &str,
-) -> Option<JsonRpcError> {
+) -> Option<RpcIdentityTargetError> {
     let identity = mob_methods::identity_from_runtime_alias(alias)?;
     let status = identity_rt.status(&identity).await.ok()?;
+    // A stale id names the registered binding only of an identity the
+    // stdio surface shows, by the rule its live aliases follow.
+    let profile = status
+        .profile
+        .as_ref()
+        .map(meerkat_mob::ProfileName::as_str)
+        .unwrap_or_default();
+    if !rpc_live_identity_alias_visible(profile, &status.labels) {
+        return Some(RpcIdentityTargetError::Invalid(format!(
+            "identity hidden by policy: {alias}"
+        )));
+    }
     let registered = status
         .agent_runtime_id
         .as_ref()
@@ -5992,22 +6004,15 @@ async fn rpc_stale_generated_alias_error(
     if registered == Some(alias) {
         return None;
     }
-    Some(JsonRpcError {
-        code: -32000,
-        message: format!(
-            "identity runtime binding for {} points at {}, but requested live member is {alias}",
-            identity.as_str(),
-            registered.unwrap_or("<none>"),
+    Some(RpcIdentityTargetError::StaleRuntimeBinding(Box::new(
+        crate::identity_control_target::stale_identity_runtime_binding_error(
+            "",
+            &identity,
+            Some(&status),
+            alias,
+            None,
         ),
-        data: Some(serde_json::json!({
-            "kind": "stale_identity_runtime_binding",
-            "identity": identity.as_str(),
-            "registered_runtime_member_id": registered,
-            "live_runtime_member_id": alias,
-            "registered_session_id": status.session_id.as_ref().map(ToString::to_string),
-            "live_session_id": Value::Null,
-        })),
-    })
+    )))
 }
 
 async fn resolve_rpc_identity_control_target(
@@ -6061,7 +6066,7 @@ pub(crate) async fn resolve_rpc_identity_control_target_with_handle(
                 if let Some(error) =
                     rpc_stale_generated_alias_error(identity_rt, &requested_identity).await
                 {
-                    return Err(RpcIdentityTargetError::StaleRuntimeBinding(Box::new(error)));
+                    return Err(error);
                 }
                 return Err(RpcIdentityTargetError::Invalid(format!(
                     "runtime identity not found: {requested_identity}"
@@ -6136,27 +6141,15 @@ async fn rpc_stale_live_alias_error_response(
         jsonrpc: JSONRPC_VERSION.to_string(),
         id: response_id,
         result: None,
-        error: Some(JsonRpcError {
-            code: -32000,
-            message: format!(
-                "identity runtime binding for {} points at {}, but requested live member is {}",
-                target.identity.as_str(),
-                status
-                    .agent_runtime_id
-                    .as_ref()
-                    .map(crate::identity_first::AgentRuntimeId::as_str)
-                    .unwrap_or("<none>"),
-                live.runtime_member_id
+        error: Some(
+            crate::identity_control_target::stale_identity_runtime_binding_error(
+                "",
+                &target.identity,
+                Some(&status),
+                &live.runtime_member_id,
+                live.session_id.as_deref(),
             ),
-            data: Some(serde_json::json!({
-                "kind": "stale_identity_runtime_binding",
-                "identity": target.identity.as_str(),
-                "registered_runtime_member_id": status.agent_runtime_id.as_ref().map(crate::identity_first::AgentRuntimeId::as_str),
-                "live_runtime_member_id": live.runtime_member_id,
-                "registered_session_id": status.session_id.as_ref().map(ToString::to_string),
-                "live_session_id": live.session_id,
-            })),
-        }),
+        ),
     })
 }
 
@@ -10124,6 +10117,39 @@ shell = true
             bridge: None,
             default_timeout: None,
         }));
+        // An implicit delegate member the stdio surface hides, bound at
+        // generation 1 like the singleton.
+        let hidden_identity = AgentIdentity::parse("review:delegate")?;
+        identity_runtime
+            .register(
+                DurableAgentSpec {
+                    identity: hidden_identity.clone(),
+                    profile: meerkat_mob::ProfileName::from("delegate"),
+                    addressability: AgentAddressability::Addressable,
+                    display_name: None,
+                    labels: BTreeMap::from([(
+                        "source_mob_id".to_string(),
+                        "child-mob".to_string(),
+                    )]),
+                    context: None,
+                    additional_instructions: Vec::new(),
+                    initial_message: None,
+                    runtime_mode_override: None,
+                    backend: None,
+                    binding: None,
+                    placement: None,
+                },
+                IdentityLifecycleState::Active,
+                Some(ContinuityRecord {
+                    identity: hidden_identity.clone(),
+                    agent_runtime_id: AgentRuntimeId::parse("rt:review:delegate:1")?,
+                    session_id: meerkat_core::types::SessionId::new(),
+                    generation: ContinuityGeneration::new(1),
+                    checkpoint_version: CheckpointVersion::new(0),
+                }),
+                None,
+            )
+            .await;
         let identity = AgentIdentity::parse("review:singleton")?;
         let session_id = meerkat_core::types::SessionId::new();
         identity_runtime
@@ -10164,17 +10190,25 @@ shell = true
             agent_memory_provider: None,
             mob_definition: Some(runtime.mob_handle().definition().clone()),
             transcript_edit_service: None,
-            compaction_floors: None,
+            // Wired, so meta/compact_member reaches its identity target.
+            compaction_floors: Some(Arc::new(
+                crate::identity_first::CompactionFloorRegistry::default(),
+            )),
         };
         let call = |method: &'static str, requested: &'static str| {
             let runtime = &runtime;
             let identity_ctx = &identity_ctx;
             async move {
+                let params = if method == "meta/get_member" {
+                    json!({ "member_id": requested })
+                } else {
+                    json!({ "identity": requested })
+                };
                 let request = json!({
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": method,
-                    "params": { "identity": requested },
+                    "params": params,
                 })
                 .to_string();
                 let response = handle_unified_rpc_json(
@@ -10189,6 +10223,14 @@ shell = true
             }
         };
 
+        // Every identity method the stale-binding refusal covers: the identity
+        // status, inspect and lifecycle methods, the delivery methods, and two
+        // operator member verbs (the operator path answers through its own
+        // response conversion). meta/member_activate_instruction and
+        // meta/bound_member_transcript need an activation and a wired
+        // transcript service before they resolve; the operator verb harness
+        // covers them (operator_verbs_with_preconditions_refuse_a_stale_runtime_id).
+        let operator_methods = ["meta/member_instruction_activations", "meta/compact_member"];
         for method in [
             "meta/status_identity",
             "meta/inspect_identity",
@@ -10196,6 +10238,17 @@ shell = true
             "meta/respawn",
             "meta/reset",
             "meta/delete_identity",
+            "meta/send",
+            "meta/interact",
+            "meta/dispatch",
+            "meta/recover_delivery",
+            "meta/turn_result",
+            "meta/wait_for_turn",
+            "meta/subscribe",
+            "meta/wait_for_completion",
+            "meta/completion_cursor",
+            "meta/member_instruction_activations",
+            "meta/compact_member",
         ] {
             let response = Box::pin(call(method, "rt:review:singleton:0")).await?;
             assert_eq!(
@@ -10228,7 +10281,51 @@ shell = true
                 ),
                 "{method}: {unknown:#?}"
             );
+
+            // A stale runtime id of an identity the stdio surface hides
+            // answers hidden by policy and names no binding.
+            let hidden = Box::pin(call(method, "rt:review:delegate:0")).await?;
+            assert_eq!(
+                (&hidden["error"]["code"], &hidden["error"]["message"]),
+                (
+                    &json!(-32602),
+                    &json!("invalid identity: identity hidden by policy: rt:review:delegate:0")
+                ),
+                "{method}: {hidden:#?}"
+            );
+            if !operator_methods.contains(&method) {
+                assert_eq!(
+                    hidden["error"]["data"],
+                    json!({"kind": "identity_hidden_by_policy", "identity": "rt:review:delegate:0"}),
+                    "{method}: {hidden:#?}"
+                );
+            }
+            assert!(
+                !hidden.to_string().contains("rt:review:delegate:1"),
+                "{method} names no binding of a hidden identity: {hidden}"
+            );
         }
+
+        // The stdio member methods send the same six-field data object.
+        let member = Box::pin(call("meta/get_member", "rt:review:singleton:0")).await?;
+        assert_eq!(
+            member["error"],
+            json!({
+                "code": -32000,
+                "message": "identity runtime binding for review:singleton points at \
+                            rt:review:singleton:1, but requested live member is \
+                            rt:review:singleton:0",
+                "data": {
+                    "kind": "stale_identity_runtime_binding",
+                    "identity": "review:singleton",
+                    "registered_runtime_member_id": "rt:review:singleton:1",
+                    "live_runtime_member_id": "rt:review:singleton:0",
+                    "registered_session_id": session_id.to_string(),
+                    "live_session_id": null,
+                },
+            }),
+            "{member:#?}"
+        );
         let status = identity_runtime.status(&identity).await?;
         assert_eq!(
             (

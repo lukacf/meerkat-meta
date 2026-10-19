@@ -6807,27 +6807,15 @@ async fn stale_live_alias_json_rpc_error(
     if live_alias_matches_status_runtime(Some(live_alias), &status) {
         return None;
     }
-    let registered_runtime_member_id = status
-        .agent_runtime_id
-        .as_ref()
-        .map(crate::identity_first::AgentRuntimeId::as_str);
-    Some(JsonRpcError {
-        code: -32000,
-        message: format!(
-            "{operation} failed: identity runtime binding for {} points at {}, but requested live member is {}",
-            identity.as_str(),
-            registered_runtime_member_id.unwrap_or("<none>"),
-            live_alias.runtime_member_id
+    Some(
+        crate::identity_control_target::stale_identity_runtime_binding_error(
+            &format!("{operation} failed: "),
+            identity,
+            Some(&status),
+            &live_alias.runtime_member_id,
+            live_alias.session_id.as_deref(),
         ),
-        data: Some(json!({
-            "kind": "stale_identity_runtime_binding",
-            "identity": identity.as_str(),
-            "registered_runtime_member_id": registered_runtime_member_id,
-            "live_runtime_member_id": live_alias.runtime_member_id,
-            "registered_session_id": status.session_id.as_ref().map(ToString::to_string),
-            "live_session_id": live_alias.session_id,
-        })),
-    })
+    )
 }
 
 fn identity_from_runtime_alias(alias: &str) -> Option<crate::identity_first::AgentIdentity> {
@@ -6870,23 +6858,15 @@ fn stale_runtime_alias_error_for_status(
     if registered_runtime_member_id == Some(alias) {
         return None;
     }
-    Some(JsonRpcError {
-        code: -32000,
-        message: format!(
-            "{operation} failed: identity runtime binding for {} points at {}, but requested live member is {}",
-            identity.as_str(),
-            registered_runtime_member_id.unwrap_or("<none>"),
-            alias
+    Some(
+        crate::identity_control_target::stale_identity_runtime_binding_error(
+            &format!("{operation} failed: "),
+            identity,
+            status,
+            alias,
+            None,
         ),
-        data: Some(json!({
-            "kind": "stale_identity_runtime_binding",
-            "identity": identity.as_str(),
-            "registered_runtime_member_id": registered_runtime_member_id,
-            "live_runtime_member_id": alias,
-            "registered_session_id": status.and_then(|status| status.session_id.as_ref()).map(ToString::to_string),
-            "live_session_id": Value::Null,
-        })),
-    })
+    )
 }
 
 fn reset_requires_session_bridge_json_rpc_error() -> JsonRpcError {
@@ -8502,6 +8482,21 @@ async fn handle_console_runtime_rpc_with_visibility(
             let Some(identity) = request.params.get("identity").and_then(Value::as_str) else {
                 return invalid_params(response_id, "identity required");
             };
+            // A generated runtime id that is no longer its identity's
+            // binding answers the typed stale-binding refusal the identity
+            // routes give, before the aggregator lookup that would call it
+            // unknown.
+            if let Some(identity_runtime) = &identity_runtime
+                && let Some(error) = stale_generated_alias_error(
+                    "inspect_identity",
+                    identity_runtime,
+                    visibility_policy,
+                    identity,
+                )
+                .await
+            {
+                return response_value(response_id, None, Some(error));
+            }
             let Some(aggregator) = &console_aggregator else {
                 return response_value(
                     response_id,
@@ -20755,6 +20750,72 @@ comms = true
                     &json!("identity not found: rt:review:nobody:0")
                 ),
                 "{method}: {unknown:#?}"
+            );
+        }
+        // The console-namespaced inspect answers the same refusal for a
+        // stale runtime id, before the aggregator lookup that would call it
+        // unknown.
+        let inspected = Box::pin(console_identity_rpc_under_policy(
+            &runtime_without_stale,
+            &identity_runtime,
+            &AllowAllConsoleVisibilityPolicy,
+            "meta/console/inspect_identity",
+            "rt:review:singleton:0",
+        ))
+        .await;
+        assert_eq!(
+            inspected["error"],
+            json!({
+                "code": -32000,
+                "message": "inspect_identity failed: identity runtime binding for \
+                            review:singleton points at rt:review:singleton:1, but \
+                            requested live member is rt:review:singleton:0",
+                "data": {
+                    "kind": "stale_identity_runtime_binding",
+                    "identity": "review:singleton",
+                    "registered_runtime_member_id": "rt:review:singleton:1",
+                    "live_runtime_member_id": "rt:review:singleton:0",
+                    "registered_session_id": registered
+                        .session_id
+                        .as_ref()
+                        .map(ToString::to_string),
+                    "live_session_id": null,
+                },
+            }),
+            "{inspected:#?}"
+        );
+        let hidden = Box::pin(console_identity_rpc_under_policy(
+            &runtime_without_stale,
+            &identity_runtime,
+            &HideIdentityPolicy("review:singleton"),
+            "meta/console/inspect_identity",
+            "rt:review:singleton:0",
+        ))
+        .await;
+        assert_eq!(
+            hidden["error"]["data"]["kind"],
+            json!("identity_hidden_by_policy"),
+            "{hidden:#?}"
+        );
+        assert!(
+            !hidden.to_string().contains("rt:review:singleton:1"),
+            "{hidden}"
+        );
+        // The current runtime id and an unknown one are not refused as stale:
+        // they reach the aggregator lookup (none is configured here).
+        for id in ["rt:review:singleton:1", "rt:review:nobody:0"] {
+            let answered = Box::pin(console_identity_rpc_under_policy(
+                &runtime_without_stale,
+                &identity_runtime,
+                &AllowAllConsoleVisibilityPolicy,
+                "meta/console/inspect_identity",
+                id,
+            ))
+            .await;
+            assert_eq!(
+                answered["error"]["code"],
+                json!(-32004),
+                "{id}: {answered:#?}"
             );
         }
         let after = identity_runtime

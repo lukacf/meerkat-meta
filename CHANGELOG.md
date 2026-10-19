@@ -33,7 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `identity not found: <id>` once no live member carried the old id. A
   runtime id of an identity the identity runtime does not know keeps
   `-32602` `identity not found`, and a hidden identity's runtime id answers
-  `identity_hidden_by_policy`.
+  `identity_hidden_by_policy`. `meta/console/inspect_identity` refuses the
+  same stale id the same way (`inspect_identity failed: ...`) before its
+  console aggregator lookup, which answered `-32001` `unknown identity:
+  <id>`.
 - Behaviour-only: the stdio JSON-RPC identity methods refuse the same stale
   runtime id with the same `-32000` `stale_identity_runtime_binding` error:
   `meta/send`, `meta/interact`, `meta/dispatch`, `meta/recover_delivery`,
@@ -45,7 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `meta/member_instruction_activations`, `meta/compact_member` and
   `meta/bound_member_transcript`. They answered `-32602` `invalid identity:
   runtime identity not found: <id>`, which a runtime id of an identity the
-  identity runtime does not know keeps.
+  identity runtime does not know keeps. A stale runtime id of an identity
+  the stdio surface hides (an implicit delegate member, by the rule its
+  live ids follow) answers `-32602` `invalid identity: identity hidden by
+  policy: <id>` and names no binding. The stdio member methods (for example
+  `meta/get_member`), which already refused a stale runtime id, now send
+  the same six-field `error.data`, adding `registered_session_id` and
+  `live_session_id`.
 
 ### Security
 
