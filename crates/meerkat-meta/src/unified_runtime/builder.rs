@@ -1275,10 +1275,19 @@ impl UnifiedRuntimeBuilder {
         // put the member tool bundle on the spec with the builder's own.
         let announcements = match self.mob_announcements.take() {
             Some(config) => {
-                if !has_persistent_state || !wants_identity_first {
+                // An identity-first runtime on an external substrate has no
+                // state directory to hold the announcement database.
+                if !has_persistent_state {
                     return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
-                        "mob_announcements() requires persistent_state() and an identity-first \
-                         runtime (roster_provider())"
+                        "mob_announcements() requires persistent_state(), which holds the \
+                         announcement database"
+                            .to_string(),
+                    ));
+                }
+                if !wants_identity_first {
+                    return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                        "mob_announcements() requires an identity-first runtime \
+                         (roster_provider())"
                             .to_string(),
                     ));
                 }

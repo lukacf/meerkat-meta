@@ -407,6 +407,7 @@ impl HostFactsProvider for StaticHostFacts {
 /// `mob_id`, and a runtime host has no mob. Filling that field with a host
 /// identifier would be a type-level lie about what the failure is about.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RemoteHostError {
     /// Connect / write / read / timeout against the host control channel.
     Transport {

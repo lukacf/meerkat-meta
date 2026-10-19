@@ -69,7 +69,10 @@ only from native evidence:
   to each other should use the same window: a peer with a larger one, or a
   clock behind this gateway's, may still admit such a request, and then the
   announcements are delivered and also reported as expired, a false gap,
-  never a loss.
+  never a loss. The hourly retention pass waits out the same quiet window
+  after a sealed batch's last change, for every route, so a batch owed again
+  after a refused submission is not expired while an earlier request for it
+  may still commit.
 - `expired_unverified`: settled. It was submitting, and no status read
   brought its outcome before the retention window, and, for a member on a
   peer gateway, the quiet window since its last request, had passed. It is
@@ -114,7 +117,9 @@ its member or its mobs:
 
 - `member_departed` (with its evidence): the member departed for good. A
   departure is built only from a departure fact; today that is the member's
-  peer gateway's signed `member_departed` answer.
+  peer gateway's signed `member_departed` answer. No gateway of this release
+  records a final fact that a member left (deleting an identity leaves no
+  record, and retiring one can be undone), so none answers it yet.
 - `mobs_ended`: every mob the subscription named was destroyed.
 - `member_mob_ended` (with `why`): the member's own mob, a mob hosted here
   other than this gateway's, was destroyed, created again, completed or
@@ -135,10 +140,12 @@ batch does; an unknown outcome keeps the batch `submitting` until a status
 read settles it, or until it settles as `expired_unverified`.
 
 The member checks run when a subscription is created and before every
-submission, so a subscription whose member left ends at its next delivery
-instead of retrying forever. A member without a live incarnation for a while
-(being respawned, for example) is not an end: its batch waits and is
-retried. When a subscription ends, what it captured and no batch holds
+submission. None of them ends a subscription: a member that is not
+registered, placed, governed or without a live incarnation (being
+respawned, for example) waits, and so does one that left this gateway. Its
+batch is retried, its owed batches expire after the retention window, and
+`subscriptions/cancel` ends a subscription whose member is not coming
+back. When a subscription ends, what it captured and no batch holds
 settles, and its sealed batches nothing else wants are cancelled.
 
 A destroyed mob leaves every subscription that names it, at a new revision,
@@ -468,7 +475,9 @@ whichever surface composed it; a stop is idempotent, so a gateway that stops
 it first changes nothing. The console's `/console/rpc` serves the
 `meta/mob_announcements/*` methods through the stdin surface's handler,
 reading the runtime's owner at each request, and requires `runtime.admin` for
-every one of them.
+every one of them. The runtime and the console router share the slot that
+holds the owner, so a router that outlives its runtime keeps the stopped
+owner alive until the router is dropped.
 
 ## RPC methods
 
@@ -485,10 +494,12 @@ every one of them.
 
 Every subscription mutation carries an `operation_id`: a replay returns the
 original result and the same id with another request is refused. The methods
-are reached only through the host's stdio unified RPC: the HTTP console has
-no route for them. There is no principal binding beyond the scope rules
-above: any host caller can announce, subscribe any registered identity and
-read any delivery, the same reach as `meta/send`.
+are reached through two surfaces. On the host's stdio unified RPC there is no
+principal binding beyond the scope rules above: any host caller can
+announce, subscribe any registered identity and read any delivery, the same
+reach as `meta/send`. On the console's `/console/rpc` every method, the reads
+included, needs `runtime.admin`, and a read-only console refuses the ones
+that change state.
 
 ## Limits
 
@@ -511,6 +522,16 @@ read any delivery, the same reach as `meta/send`.
   removes the roster entry and adds it back). A retired member's
   subscriptions therefore wait until its mob completes, resets, is created
   again or is destroyed, or until they are cancelled.
+- Members of this gateway's own mob and members on peer gateways: no
+  gateway of this release records a final fact that a member left, so a
+  member that left waits like one that is not registered. Its owed batches
+  expire after the retention window, and `subscriptions/cancel` ends its
+  subscriptions.
+- While a member's preparation hangs, each keyed inject that reaches its
+  deadline leaves one tracked preparation queued on that identity's
+  lifecycle lock (a sender submits again at the slowest settle pause, per
+  batch); they drain when the lock frees. Before, each such request held its
+  connection open on the same lock instead.
 - Topics match exactly. Semantic matching belongs above this layer.
 - The dispatcher's walk position and next-look times live in memory: a
   restart starts a new lap and reads every unsettled batch once.

@@ -212,9 +212,19 @@ impl RemoteMemberDelivery {
                 detail,
             },
             NativeSubmitError::Blocked { detail, .. } => match code {
+                // A code this build knows is named as known; only one it
+                // cannot read is unknown.
                 Some(code) => NativeStatusError::Unavailable {
-                    cause: SuspendCause::PeerRefusedUnknown {
-                        code: code.to_string(),
+                    cause: if crate::runtime::keyed_inject::KeyedInjectRefusalCode::parse(code)
+                        .is_some()
+                    {
+                        SuspendCause::PeerRefused {
+                            code: code.to_string(),
+                        }
+                    } else {
+                        SuspendCause::PeerRefusedUnknown {
+                            code: code.to_string(),
+                        }
                     },
                     evidence: EvidenceClass::Verified,
                     detail,

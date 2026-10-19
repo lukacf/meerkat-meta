@@ -1740,7 +1740,8 @@ fn transition_batch_in(
     batch.updated_at_ms = now_ms;
     update_batch(db, &batch)?;
     if BatchStateTag::UNCONFIRMED.contains(&batch.state.tag()) {
-        // What its delivery came to is read again from the next round on.
+        // What its delivery came to is read again, first at the end of the
+        // round that settled it.
         set_late_read(db, &batch.id, Some(now_ms))?;
     }
     Ok(batch)
@@ -1769,9 +1770,11 @@ fn expire_in(
     db: &Connection,
     now_ms: u64,
     retention_ms: u64,
+    quiet_ms: u64,
     limit: usize,
 ) -> Result<ExpiryReport> {
     let cutoff = int(now_ms.saturating_sub(retention_ms))?;
+    let quiet_cutoff = int(now_ms.saturating_sub(quiet_ms))?;
     let budget = u64::try_from(limit.max(1)).unwrap_or(u64::MAX);
     let mut report = ExpiryReport::default();
 
@@ -1824,18 +1827,23 @@ fn expire_in(
         add_gaps(db, &Member::from_key(&member)?, &member_gaps)?;
     }
 
-    // Sealed batches nothing native ever started for, sealed before the
-    // window: every item they hold is at least that old.
+    // Sealed batches nothing native holds, sealed before the window: every
+    // item they hold is at least that old. A batch owed again after a
+    // refused submission was submitted before, and an earlier request for
+    // it may still commit until the quiet window after its last request
+    // has passed, so it waits that out first.
     let mut statement = db
         .prepare(
-            "SELECT id FROM announcement_batches WHERE state = 'sealed' AND sealed_at_ms <= ?1
+            "SELECT id FROM announcement_batches
+             WHERE state = 'sealed' AND sealed_at_ms <= ?1 AND updated_at_ms <= ?3
              ORDER BY sealed_at_ms, id LIMIT ?2",
         )
         .map_err(storage)?;
     let rows = statement
-        .query_map(params![cutoff, int(budget.saturating_add(1))?], |row| {
-            row.get::<_, String>(0)
-        })
+        .query_map(
+            params![cutoff, int(budget.saturating_add(1))?, quiet_cutoff],
+            |row| row.get::<_, String>(0),
+        )
         .map_err(storage)?;
     let mut sealed = Vec::new();
     for row in rows {
@@ -2461,8 +2469,14 @@ impl AnnouncementStore for SqliteAnnouncementStore {
             .await
     }
 
-    async fn expire(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<ExpiryReport> {
-        self.run(move |db| expire_in(db, now_ms, retention_ms, limit))
+    async fn expire(
+        &self,
+        now_ms: u64,
+        retention_ms: u64,
+        quiet_ms: u64,
+        limit: usize,
+    ) -> Result<ExpiryReport> {
+        self.run(move |db| expire_in(db, now_ms, retention_ms, quiet_ms, limit))
             .await
     }
 

@@ -90,7 +90,11 @@ pub struct AnnouncementConfig {
     pub member_limits: super::tools::MemberLimits,
     /// How far a keyed inject request's issue time may be from a peer's
     /// clock: a request older than this is refused as stale, so a batch
-    /// for a peer member whose last attempt is older may expire.
+    /// for a peer member whose last attempt is older may expire. It is the
+    /// peers' window, so it should match their `control_request_window_ms`:
+    /// a smaller one shortens the quiet window before such a batch expires
+    /// (at 0, to the slowest settle pause). Every gateway sets it from the
+    /// window its own control listener serves with.
     pub peer_request_window_ms: u64,
     /// Bounds on subscriptions for members of mobs hosted here other than
     /// this gateway's own.
@@ -562,27 +566,29 @@ impl AnnouncementService {
             .cloned()
     }
 
-    /// Record why the member's deliveries wait. The same cause on the same
-    /// evidence keeps the time it was first seen.
+    /// Record why the member's deliveries wait. The same wait on the same
+    /// evidence keeps the time it was first seen and shows its latest
+    /// detail. The marker is the latest attempt's: it can outlive the wait
+    /// it names (after a cancel, or once the batch settles) until the
+    /// member's next attempt or a restart.
     fn mark(&self, member: &Member, cause: SuspendCause, evidence: EvidenceClass, now: u64) {
         let mut markers = self
             .inner
             .markers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match markers.get(member) {
-            Some(marker) if marker.cause == cause && marker.evidence == evidence => {}
-            _ => {
-                markers.insert(
-                    member.clone(),
-                    SuspendMarker {
-                        cause,
-                        evidence,
-                        since_ms: now,
-                    },
-                );
-            }
-        }
+        let since_ms = markers
+            .get(member)
+            .filter(|marker| marker.evidence == evidence && marker.cause.same_wait(&cause))
+            .map_or(now, |marker| marker.since_ms);
+        markers.insert(
+            member.clone(),
+            SuspendMarker {
+                cause,
+                evidence,
+                since_ms,
+            },
+        );
     }
 
     /// The member's deliveries move again.
@@ -1141,7 +1147,10 @@ impl AnnouncementService {
                 .await?
                 .ok_or(AnnouncementStoreError::UnknownBatch)?;
             // A batch that settled without its delivery being confirmed is
-            // read once more for what became of it.
+            // read once more for what became of it. An operator's reconcile
+            // reads it even after its own late reads ended; an answer that
+            // leaves it unknown schedules them again, one per quiet window,
+            // until retention prunes the batch.
             if BatchStateTag::UNCONFIRMED.contains(&batch.state.tag())
                 && batch.state.late().is_none_or(|late| !late.is_final())
             {
@@ -1532,11 +1541,14 @@ impl AnnouncementService {
                     };
                     if pass_due {
                         let retention_ms = service.inner.config.retention_ms;
-                        // What waited longer than the window for a delivery
-                        // that never started expires first, so the prune
-                        // after it is never held back by it.
+                        // What waited longer than the window with nothing
+                        // native holding it expires first, so the prune
+                        // after it is never held back by it. A batch owed
+                        // again waits out the quiet window after its last
+                        // request, as the drive loop's expiry does.
                         let store = &service.inner.store;
-                        match store.expire(now, retention_ms, PRUNE_LIMIT).await {
+                        let quiet_ms = service.quiet_ms();
+                        match store.expire(now, retention_ms, quiet_ms, PRUNE_LIMIT).await {
                             Ok(expired) => {
                                 match store.prune(now, retention_ms, PRUNE_LIMIT).await {
                                     Ok(report) => retention_behind = expired.more || report.more,

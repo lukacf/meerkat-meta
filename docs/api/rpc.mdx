@@ -1948,8 +1948,9 @@ continuation owner's own status (`not_submitted`, `not_committed`, `pending`,
 `applied`, `stranded`, `refused`, or `unavailable` when it could not be
 read), and `input` is the admitted input's runtime state. Admission is not
 processing: read `input` for what the runtime did with it. A batch in state
-`expired` waited longer than the retention window with nothing native ever
-holding it. One in state `expired_unverified` was submitted, and whether it
+`expired` waited longer than the retention window with nothing native
+holding it, and, once submitted and owed again after a refusal, past the
+quiet window after its last request. One in state `expired_unverified` was submitted, and whether it
 was committed was never learned: past the retention window, and past the
 quiet window since its last submission (the request window plus the slowest
 settle pause), no status read brought a status. One in state
@@ -1988,21 +1989,30 @@ contact directory files that mob with a pinned key and this gateway holds a
 signing key; otherwise it is refused with `unusable_peer`.
 
 A subscription's `state` is `active`, `paused`, `cancelled` or `ended`. It
-ends, with `ended` saying why, only on a final fact: its member departed
-(`member_departed`, with the `departure` evidence; for a member on a peer
+ends, with `ended` saying why, only on a final fact: every mob it named was
+destroyed (`mobs_ended`); for a member of another mob hosted here, that mob
+was destroyed, created again, completed or reset after the subscription was
+made (`member_mob_ended`, with `why`); or its member departed
+(`member_departed`, with the `departure` evidence: for a member on a peer
 gateway, that gateway's signed `member_departed` answer, `{"kind":
-"signed_peer_departure", "peer": "<mob id>"}`), every mob it named was
-destroyed (`mobs_ended`), or, for a member of another mob hosted here, that
-mob was destroyed, created again, completed or reset after the subscription
-was made (`member_mob_ended`, with `why`); what it captured and no batch
-holds settles. A destroyed mob leaves the subscriptions that name it at a new
-revision and is listed in their `ended_mobs`.
+"signed_peer_departure", "peer": "<mob id>"}`). No gateway of this release
+records a final fact that a member left, so none answers `member_departed`
+yet, and a member's departure ends nothing. What an ended subscription
+captured and no batch holds settles. A destroyed mob leaves the
+subscriptions that name it at a new revision and is listed in their
+`ended_mobs`.
 
 A member that is not registered, or not served, where its deliveries go
-ends nothing: it may be registered or served again. Its deliveries wait, and
-`marker` says why: the latest classified outcome of an attempt for the
-member, `{cause, evidence, since_ms}`, held in memory and rebuilt from the
-next attempt after a restart (`null`, or absent, while nothing waits).
+ends nothing: it may be registered or served again. Nor does a member that
+left this gateway, a placement, a governed runtime or a member with no live
+incarnation. Its owed batches expire after the retention window meanwhile,
+and `subscriptions/cancel` ends a subscription whose member is not coming
+back. Its deliveries wait, and `marker` says why: the latest classified
+outcome of an attempt for the member, `{cause, evidence, since_ms}`, held in
+memory and rebuilt from the next attempt after a restart (`null`, or absent,
+while nothing waits). It is the latest attempt's, so it can outlive the wait
+it names (after a cancel, or once the batch settles) until the member's next
+attempt or a restart.
 `evidence` is `verified` (a signed answer whose signature verified),
 `unverified` (an unsigned answer, one that failed verification, or none) or
 `local` (this gateway's own fact). A signed answer that nothing was
@@ -2022,13 +2032,21 @@ read settles it, and nothing is submitted again before one does.
 | `member_not_live` | verified, local | The member has no live incarnation now. |
 | `peer_native_unavailable` | verified | The peer could not read or write its native state; the status is read next. |
 | `peer_refused_unknown` | verified | A signed refusal this build cannot read for the request (`code`); the outcome stays unknown. |
+| `peer_refused` | verified | A signed refusal of a status read with a code this build knows (`code`, such as `conflict`) that settles nothing for a read; the outcome stays unknown. |
 | `local_not_authenticatable` | local | This gateway cannot call the peer authenticated; the peer was never asked. |
 | `answer_failed_verification` | unverified | An answer failed verification; the outcome is unknown. |
 | `peer_unanswered` | unverified | No signed answer; `code` is the peer's unsigned code as text, or `null`. |
 | `native_unavailable` | local | This gateway's own native owner could not be read or written now. |
 
-A cause or reason this build does not know is spelled `unknown`, in a
-marker and in a departure's evidence alike. A blocked batch's `cause` starts
+A `not_served` or `stale_request` cause this build does not know reads
+`unknown`; a peer's refusal code it does not know is kept as
+`peer_refused_unknown` with the code; and a departure's evidence has one
+kind in this release, `signed_peer_departure`. On the peer route, a peer
+answers its own blocked status (`native_key_invalid`,
+`native_inconsistent`) as `native_unavailable`, so the batch waits instead
+of blocking and the bounds on an unknown outcome settle it: a status read
+that rules a batch out blocks it on the local route only. A blocked batch's
+`cause` starts
 with its typed reason: `conflict`, `peer_invalid_request`,
 `request_oversize`, `native_invalid`, `native_inconsistent` or
 `native_key_invalid`.

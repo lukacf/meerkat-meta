@@ -1765,7 +1765,10 @@ async fn gap_lines_fit_what_the_items_leave_of_a_peer_request(store: &dyn Announ
             .await
             .unwrap();
     }
-    let report = store.expire(1_000 + WINDOW, WINDOW, 1_000).await.unwrap();
+    let report = store
+        .expire(1_000 + WINDOW, WINDOW, 0, 1_000)
+        .await
+        .unwrap();
     assert_eq!(report.captures, 150);
     // One announcement as large as a body may be: what it leaves of the
     // request holds some of the gap lines, not all.
@@ -1845,7 +1848,7 @@ async fn gaps_of_a_batch_that_reports_nothing_go_back(store: &dyn AnnouncementSt
         .announce(announce_request("payments", "old", &["ios"], "old"), 1_000)
         .await
         .unwrap();
-    store.expire(1_000 + WINDOW, WINDOW, 100).await.unwrap();
+    store.expire(1_000 + WINDOW, WINDOW, 0, 100).await.unwrap();
     let now = 1_000 + WINDOW + 10;
     store
         .announce(announce_request("events", "k1", &["ios"], "x"), now)
@@ -4120,8 +4123,16 @@ impl AnnouncementStore for FaultyStore {
         self.inner.record_late_read(id, late, next_read_at_ms).await
     }
 
-    async fn expire(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<ExpiryReport> {
-        self.inner.expire(now_ms, retention_ms, limit).await
+    async fn expire(
+        &self,
+        now_ms: u64,
+        retention_ms: u64,
+        quiet_ms: u64,
+        limit: usize,
+    ) -> Result<ExpiryReport> {
+        self.inner
+            .expire(now_ms, retention_ms, quiet_ms, limit)
+            .await
     }
 
     async fn prune(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<PruneReport> {
@@ -6451,11 +6462,14 @@ async fn expiry_settles_what_waited_past_the_window(store: &dyn AnnouncementStor
         .await
         .unwrap();
     assert_eq!(
-        store.expire(1_000 + WINDOW - 1, WINDOW, 100).await.unwrap(),
+        store
+            .expire(1_000 + WINDOW - 1, WINDOW, 0, 100)
+            .await
+            .unwrap(),
         ExpiryReport::default(),
         "inside the window nothing expires"
     );
-    let report = store.expire(1_000 + WINDOW, WINDOW, 100).await.unwrap();
+    let report = store.expire(1_000 + WINDOW, WINDOW, 0, 100).await.unwrap();
     assert_eq!(report.captures, 1, "once per member: {report:?}");
 
     let now = 1_000 + WINDOW + 10;
@@ -6517,9 +6531,9 @@ async fn expiry_settles_what_waited_past_the_window(store: &dyn AnnouncementStor
     // A sealed batch nothing native ever started for expires once it was
     // sealed before the window, and the next batch reports what it held.
     let later = now + 5_000 + WINDOW;
-    let report = store.expire(later - 1, WINDOW, 100).await.unwrap();
+    let report = store.expire(later - 1, WINDOW, 0, 100).await.unwrap();
     assert_eq!(report.batches, 0);
-    let report = store.expire(later, WINDOW, 100).await.unwrap();
+    let report = store.expire(later, WINDOW, 0, 100).await.unwrap();
     assert_eq!(report.batches, 1);
     assert_eq!(
         store.batch(&next.id).await.unwrap().unwrap().state,
@@ -6877,7 +6891,7 @@ async fn a_backlog_paused_past_the_window_expires_and_the_resume_reports_it() {
     let retention = AnnouncementConfig::default().retention_ms;
     let report = harness
         .store
-        .expire(1_000 + retention, retention, 100)
+        .expire(1_000 + retention, retention, 0, 100)
         .await
         .unwrap();
     assert_eq!(report.captures, 3);
@@ -9063,6 +9077,24 @@ async fn the_builder_refuses_mob_announcements_it_cannot_compose() {
             .await,
     );
     assert!(message.contains("requires persistent_state()"), "{message}");
+    // Identity-first on an external substrate, with no state directory to
+    // hold the announcement database.
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let message = refusal(
+        crate::UnifiedRuntimeBuilder::default()
+            .definition(definition())
+            .continuity_store(Arc::new(
+                crate::identity_first::LocalContinuityStore::in_memory()
+                    .expect("in-memory continuity store"),
+            ))
+            .lease_provider(Arc::new(crate::identity_first::LocalLeaseProvider::new()))
+            .roster_provider(Arc::new(StatusRoster))
+            .scratch_dir(scratch.path())
+            .mob_announcements(AnnouncementConfig::default())
+            .build()
+            .await,
+    );
+    assert!(message.contains("requires persistent_state()"), "{message}");
     let state = tempfile::tempdir().expect("state dir");
     let message = refusal(
         crate::UnifiedRuntimeBuilder::default()
@@ -9146,4 +9178,93 @@ fn every_constructor_refuses_the_child_mob_member_tools_grant() {
         "{:?}",
         refused.err()
     );
+}
+
+/// A batch owed again after a refused submission waits out the quiet window
+/// after its last request before the retention pass expires it: an earlier
+/// request for it may still commit until then.
+#[tokio::test]
+async fn a_batch_owed_again_waits_out_the_quiet_window_before_it_expires() {
+    const QUIET: u64 = 330_000;
+    let (_dir, store) = temp_store();
+    store
+        .put_subscription(
+            &op("o1"),
+            put("s1", "agent:a", &["ios"], StartFrontier::Now),
+            1_000,
+        )
+        .await
+        .unwrap();
+    store
+        .announce(announce_request("payments", "k1", &["ios"], "owed"), 1_000)
+        .await
+        .unwrap();
+    let batch = store
+        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), 2_000)
+        .await
+        .unwrap()
+        .expect("the announcement is due");
+    // Submitted, then refused, signed, just before the retention deadline:
+    // owed again, with its last request inside the quiet window.
+    let refused_at = 2_000 + WINDOW - 10;
+    store
+        .transition_batch(
+            &batch.id,
+            BatchStateTag::Sealed,
+            BatchEvent::BeginSubmit,
+            refused_at - 5,
+        )
+        .await
+        .unwrap();
+    store
+        .transition_batch(
+            &batch.id,
+            BatchStateTag::Submitting,
+            BatchEvent::SubmitRefused,
+            refused_at,
+        )
+        .await
+        .unwrap();
+    let report = store
+        .expire(2_000 + WINDOW, WINDOW, QUIET, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        report.batches, 0,
+        "sealed before the window, but quiet too recently"
+    );
+    let report = store
+        .expire(refused_at + QUIET - 1, WINDOW, QUIET, 100)
+        .await
+        .unwrap();
+    assert_eq!(report.batches, 0);
+    let report = store
+        .expire(refused_at + QUIET, WINDOW, QUIET, 100)
+        .await
+        .unwrap();
+    assert_eq!(report.batches, 1, "past the quiet window it expires");
+    assert_eq!(
+        store.batch(&batch.id).await.unwrap().unwrap().state,
+        BatchState::Expired
+    );
+}
+
+/// A clock skew is one wait whichever request it was read from: the marker
+/// keeps when it was first seen and shows the latest request.
+#[test]
+fn a_clock_skew_read_from_a_later_request_is_the_same_wait() {
+    let first = SuspendCause::ClockSkew {
+        issued_at_ms: 1_000,
+        window_ms: 300_000,
+    };
+    let later = SuspendCause::ClockSkew {
+        issued_at_ms: 31_000,
+        window_ms: 300_000,
+    };
+    assert!(first.same_wait(&later));
+    assert!(!first.same_wait(&SuspendCause::ClockSkew {
+        issued_at_ms: 1_000,
+        window_ms: 60_000,
+    }));
+    assert!(!first.same_wait(&SuspendCause::MemberNotLive));
 }

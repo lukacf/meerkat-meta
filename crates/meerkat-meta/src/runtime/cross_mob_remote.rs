@@ -37,6 +37,7 @@ use crate::contact_directory::{ContactEntry, MobTransport};
 
 /// Errors raised by the remote-mob proxy.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RemoteMobError {
     /// The contact directory entry uses an unsupported transport.
     UnsupportedTransport { mob_id: String, transport: String },

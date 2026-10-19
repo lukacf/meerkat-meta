@@ -116,9 +116,22 @@ pub enum SuspendCause {
     /// this build does not know. The batch is owed again. A refusal of a
     /// request outside the peer's window reads as [`Self::ClockSkew`].
     StaleRequest { cause: StaleRequestCause },
+    /// The peer refused a status read, signed, with a code this build
+    /// knows but that settles nothing for a read (`conflict`, for one); the
+    /// outcome stays unknown.
+    PeerRefused { code: String },
 }
 
 impl SuspendCause {
+    /// Whether two causes name the same wait: equal, except that a clock
+    /// skew is the same wait whichever request it was read from.
+    pub(crate) fn same_wait(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::ClockSkew { window_ms: a, .. }, Self::ClockSkew { window_ms: b, .. }) => a == b,
+            _ => self == other,
+        }
+    }
+
     /// Stable wire spelling of the kind.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -136,6 +149,7 @@ impl SuspendCause {
             Self::PeerUnanswered { .. } => "peer_unanswered",
             Self::NativeUnavailable => "native_unavailable",
             Self::StaleRequest { .. } => "stale_request",
+            Self::PeerRefused { .. } => "peer_refused",
         }
     }
 }
@@ -155,6 +169,7 @@ impl fmt::Display for SuspendCause {
                 write!(f, "member_not_served_here ({})", cause.as_str())
             }
             Self::PeerRefusedUnknown { code } => write!(f, "peer_refused_unknown ({code})"),
+            Self::PeerRefused { code } => write!(f, "peer_refused ({code})"),
             Self::PeerUnanswered { code: Some(code) } => write!(f, "peer_unanswered ({code})"),
             Self::StaleRequest { cause } => write!(f, "stale_request ({cause})"),
             other => f.write_str(other.kind()),
@@ -165,6 +180,7 @@ impl fmt::Display for SuspendCause {
 /// Why a member's deliveries wait now, and on what evidence: the latest
 /// classified outcome of an attempt for the member.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SuspendMarker {
     pub cause: SuspendCause,
     pub evidence: EvidenceClass,
@@ -184,7 +200,8 @@ pub enum DepartureEvidence {
 /// That a member left for good: the one fact about a member that ends its
 /// subscriptions. It is built only from the departure facts its
 /// constructors name, never from a miss, a refusal that can change, or a
-/// silence.
+/// silence. It derives `Deserialize` only so the owner's own store can read
+/// it back; one deserialized anywhere else is outside this contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberDeparture {
     evidence: DepartureEvidence,

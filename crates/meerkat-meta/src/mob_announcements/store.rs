@@ -212,13 +212,22 @@ pub trait AnnouncementStore: Send + Sync {
         next_read_at_ms: Option<u64>,
     ) -> Result<Batch>;
 
-    /// Settle as expired what waited longer than the retention window for
-    /// a delivery that never started, at most `limit` of each kind: owed
+    /// Settle as expired what waited longer than the retention window with
+    /// nothing native holding it, at most `limit` of each kind: owed
     /// announcements no batch holds (each once per member), and sealed
-    /// batches sealed before the window. The member's next batch reports
-    /// them as gaps. A batch the native owner may hold is never expired
-    /// here.
-    async fn expire(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<ExpiryReport>;
+    /// batches sealed before the window whose last change is older than
+    /// `quiet_ms`. A sealed batch may be owed again after a refused
+    /// submission while an earlier request for it can still commit, so it
+    /// waits out the quiet window after its last request first. The
+    /// member's next batch reports them as gaps. A batch the native owner
+    /// may hold is never expired here.
+    async fn expire(
+        &self,
+        now_ms: u64,
+        retention_ms: u64,
+        quiet_ms: u64,
+        limit: usize,
+    ) -> Result<ExpiryReport>;
 
     /// Remove what retention allows, oldest first and at most `limit` of
     /// each kind: announcements that no subscription is still owed and that

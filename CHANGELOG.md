@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Breaking
 
+- `runtime::cross_mob_remote::RemoteMobError::ControlRequestUnauthorized`,
+  `runtime::remote_host::RemoteHostError::Unauthorized` and
+  `RemoteHostError::HostPlaneUnavailable` are removed. Every unsigned control
+  or host refusal, authorization denials and `host_plane_unavailable`
+  included, is now `RemoteMobError::Rejected` or `RemoteHostError::Rejected`
+  with the peer's code as text: an unsigned answer is never evidence. Both
+  enums are now `#[non_exhaustive]`, so a match on them outside this crate
+  needs a wildcard arm, and a later variant no longer breaks it.
+
 - The keyed inject verbs extend the cross-mob control types in
   `runtime::cross_mob_control`: `ControlRequest` and `ControlVerb` gain
   `InjectKeyed` and `InjectStatus`, and `ControlResponse` gains
@@ -31,11 +40,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   its own transaction. A lost acknowledgment is reconciled from native status
   without a second submission, and a delivery stranded on a retired
   incarnation moves to a successor batch that names its predecessor. A
-  subscription ends, typed, only on a final fact: its member departed, or
-  every mob it named was destroyed; a destroyed mob leaves the subscriptions
-  that name it, and retention removes ended subscriptions and the logs of
+  subscription ends, typed, only on a final fact: every mob it named was
+  destroyed, or a peer gateway answered, signed, that its member departed
+  (no gateway of this release answers that yet, since none records a final
+  fact that a member left); a destroyed mob leaves the subscriptions that
+  name it, and retention removes ended subscriptions and the logs of
   destroyed mobs. A member that is not registered or not served where its
-  deliveries go ends nothing: its deliveries wait, and
+  deliveries go ends nothing, nor does one that left this gateway, a
+  placement, a governed runtime or a member with no live incarnation: its
+  owed batches expire after the retention window, `subscriptions/cancel`
+  ends its subscriptions, its deliveries wait, and
   `deliveries/observe` and `subscriptions/get` show why as a typed `marker`
   with the class of its evidence (`verified`, `unverified` or `local`).
   Batch bodies quote each announcement and name its mob and
@@ -118,7 +132,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `runtime_disabled`) in a signed field of the refusal. Mob announcements
   use them to deliver to members of mobs on peer gateways. A signed refusal
   says that nothing was committed, and the delivery waits with a typed
-  reason; only a signed `member_departed` ends a subscription. An unsigned
+  reason; only a signed `member_departed` ends a subscription, and no
+  gateway of this release answers it yet. An unsigned
   answer, such as one from a gateway that predates these verbs, is never
   evidence: the delivery's outcome stays unknown until a status read settles
   it. Every public enum of `runtime::keyed_inject` is `#[non_exhaustive]`.
