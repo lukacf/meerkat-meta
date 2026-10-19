@@ -1,7 +1,8 @@
 //! The composed gateway offers each member factory it constructs to its host
-//! for trusted MCP composition, before the factory is cloned or consumed and
-//! before `prepare_bootstrap`. A host that refuses fails init before any
-//! bootstrap. Each case is a separate gateway process over real stdio.
+//! for trusted MCP composition and for its operation refusal observer, before
+//! the factory is cloned or consumed and before `prepare_bootstrap`. A host
+//! that refuses either fails init before any bootstrap. Each case is a
+//! separate gateway process over real stdio.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::io::Write;
@@ -14,8 +15,8 @@ use meerkat_meta::rpc_gateway::{
 };
 use meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration;
 
-/// Set (to `persistent`, `ephemeral` or `refuse`) only in the gateway host
-/// process; `RECORD` names its record file.
+/// Set (to `persistent`, `ephemeral`, `refuse` or `refuse-observer`) only in
+/// the gateway host process; `RECORD` names its record file.
 const HOST_PROCESS: &str = "META_GATEWAY_MCP_COMPOSITION_HOST";
 const RECORD: &str = "META_GATEWAY_MCP_COMPOSITION_RECORD";
 const TEST: &str = "every_gateway_member_factory_is_offered_to_the_host_before_bootstrap";
@@ -24,6 +25,7 @@ const TEST: &str = "every_gateway_member_factory_is_offered_to_the_host_before_b
 /// Ready publication: the record is all this test needs.
 struct ComposingHost {
     refuse: bool,
+    refuse_observer: bool,
     record: std::path::PathBuf,
 }
 
@@ -94,6 +96,18 @@ impl GatewayHostComposition for ComposingHost {
             Ok(None)
         }
     }
+
+    fn operation_refusal_observer(
+        &self,
+        construction: &GatewayFactoryConstruction<'_>,
+    ) -> Result<Option<Arc<dyn meerkat_core::OperationRefusalObserver>>, GatewayHostError> {
+        self.append(&format!("observer {:?}", construction.kind()));
+        if self.refuse_observer {
+            Err(GatewayHostError::Denied)
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[test]
@@ -101,6 +115,7 @@ fn every_gateway_member_factory_is_offered_to_the_host_before_bootstrap() {
     if let Some(mode) = std::env::var_os(HOST_PROCESS) {
         let host = Arc::new(ComposingHost {
             refuse: mode == "refuse",
+            refuse_observer: mode == "refuse-observer",
             record: std::env::var_os(RECORD).expect("record path").into(),
         });
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -112,7 +127,7 @@ fn every_gateway_member_factory_is_offered_to_the_host_before_bootstrap() {
         ));
         std::process::exit(0);
     }
-    for mode in ["persistent", "ephemeral", "refuse"] {
+    for mode in ["persistent", "ephemeral", "refuse", "refuse-observer"] {
         let dir = tempfile::tempdir().unwrap();
         let record = dir.path().join("record");
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -169,6 +184,7 @@ fn every_gateway_member_factory_is_offered_to_the_host_before_bootstrap() {
                 lines,
                 [
                     "factory Persistent realm=meta account=true installation=true",
+                    "observer Persistent",
                     "bootstrap"
                 ],
                 "{mode}"
@@ -181,14 +197,37 @@ fn every_gateway_member_factory_is_offered_to_the_host_before_bootstrap() {
                     "{mode}: {lines:?}"
                 );
                 assert_eq!(lines.last(), Some(&"bootstrap"), "{mode}: {lines:?}");
+                let offers = &lines[..lines.len() - 1];
                 assert!(
-                    lines[..lines.len() - 1].iter().all(|line| {
-                        line.starts_with("factory ")
-                            && (line.ends_with("account=true installation=true")
-                                || line.ends_with("account=false installation=false"))
-                    }),
-                    "{mode}: every factory is offered before the bootstrap, with its realm MCP \
-                     administration exactly when its account facade: {lines:?}"
+                    offers.len() % 2 == 0
+                        && offers.chunks(2).all(|offer| {
+                            let kind = offer[0]
+                                .strip_prefix("factory ")
+                                .and_then(|rest| rest.split_whitespace().next());
+                            kind.is_some_and(|kind| offer[1] == format!("observer {kind}"))
+                                && (offer[0].ends_with("account=true installation=true")
+                                    || offer[0].ends_with("account=false installation=false"))
+                        }),
+                    "{mode}: every factory is offered before the bootstrap, its MCP composition \
+                     and then its observer, with its realm MCP administration exactly when its \
+                     account facade: {lines:?}"
+                );
+            }
+            "refuse-observer" => {
+                assert_eq!(
+                    lines,
+                    [
+                        "factory Persistent realm=meta account=true installation=true",
+                        "observer Persistent"
+                    ],
+                    "a refused observer reaches no bootstrap"
+                );
+                assert_eq!(
+                    init_response
+                        .as_ref()
+                        .map(|response| &response["error"]["message"]),
+                    Some(&serde_json::json!(GatewayHostError::Denied.to_string())),
+                    "the init failure is the host's own error: {init_response:?}"
                 );
             }
             _ => {

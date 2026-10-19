@@ -34,6 +34,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `GatewayHostComposition::operation_refusal_observer` lets a gateway host
+  install Core's operation refusal observer on each gateway member factory.
+  The gateway asks it with the same construction as `compose_member_factory`,
+  before either answer is installed; `Ok(None)` (the default) installs
+  nothing, and `Err` refuses init. The observer sees every agent that factory
+  builds, including spawned helpers, forks, and the child mobs and councils
+  agents create.
+- `UnifiedRuntimeBuilder::operation_refusal_observer` installs the observer
+  on every builder-owned agent factory (persistent, scratch and temp-dir
+  launches). A builder given an already-built `mob_spec()` refuses it with
+  `ConflictingConfiguration`, as it refuses an MCP call-context provider.
+  The public `MobBootstrapSpec` constructors take no observer.
 - `.github/workflows/forge-release.yml` releases Meta Forge on its own
   `forge-v<version>` tag, beside Meta's releases. A candidate builds each target's
   package from public inputs pinned in `installer/release/forge-release-inputs.json`,

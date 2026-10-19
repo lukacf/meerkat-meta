@@ -14407,6 +14407,24 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
         let _ = construction;
         Ok(None)
     }
+    /// The host's operation refusal observer for a gateway member factory.
+    /// Called once per gateway factory, synchronously, with the construction
+    /// [`Self::compose_member_factory`] is offered and before either answer
+    /// is installed, so before the factory is cloned for live or consumed by
+    /// its builder. The returned observer is installed on that factory and
+    /// sees every agent the factory builds: roster members, spawned helpers
+    /// and forks, and the child mobs and councils agents create. `Ok(None)`
+    /// (the default) installs nothing; `Err` refuses init.
+    ///
+    /// Core's contract applies: `observe` is synchronous and must not block,
+    /// and a panic in it propagates on the deciding task (the member's turn).
+    fn operation_refusal_observer(
+        &self,
+        construction: &GatewayFactoryConstruction<'_>,
+    ) -> Result<Option<Arc<dyn meerkat_core::OperationRefusalObserver>>, GatewayHostError> {
+        let _ = construction;
+        Ok(None)
+    }
 }
 
 /// An SDK-carried prepared application, as transport only: opaque bytes and
