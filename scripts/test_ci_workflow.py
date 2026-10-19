@@ -147,7 +147,9 @@ def runner_problems(root: Path) -> tuple[list[str], list[str]]:
 
 # An image reference that names its digest.
 DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
-# A `container:` or `image:` key with an inline value.
+# A `container:` or `image:` key with an inline value. The value is read
+# literally: a flow mapping (`container: {image: ...}`) or an action input
+# that happens to be named `image` is refused rather than parsed.
 IMAGE_KEY = re.compile(r"^\s*(?:-\s*)?(container|image):\s*(\S.*?)\s*$")
 # A `docker://` image reference, wherever a line names one.
 DOCKER_URL = re.compile(r"docker://[^\s\"',)]+")
@@ -168,8 +170,15 @@ UNPINNED_IMAGES = {
 # The installer's launch templates and the installer test's frozen copy of
 # them. A user builds their own app from these, so they are not CI or release
 # images and Renovate does not manage them; their FROM lines stay as written.
-# Every other tracked Dockerfile's FROM lines must name a digest.
+# Every other tracked container build file's FROM lines must name a digest.
 USER_TEMPLATE_DOCKERFILES = re.compile(r"installer/(?:tests/fixtures/[^/]+/)?launchkit/templates_[^/]+/Dockerfile")
+
+
+def is_container_build_file(name: str) -> bool:
+    """A Dockerfile or Containerfile, by any of the names builds use for one
+    (`Dockerfile.ci`, `app.Dockerfile`, `Containerfile`)."""
+    lower = name.lower()
+    return lower.startswith(("dockerfile", "containerfile")) or lower.endswith((".dockerfile", ".containerfile"))
 
 
 def without_comment(line: str) -> str:
@@ -231,8 +240,8 @@ def image_problems(root: Path) -> tuple[list[tuple[str, str]], list[str]]:
     them floats: a `container:` or `image:` value in a .github YAML file, a
     `docker://` reference on any line of a .github file (a `uses:` action or
     a run script), one in tools/bazel's BUILD, BUILD.bazel and .bzl files or
-    .bazelrc, and the FROM lines of every tracked Dockerfile except the
-    installer's launch templates (USER_TEMPLATE_DOCKERFILES). Each must carry
+    .bazelrc, and the FROM lines of every tracked Dockerfile or Containerfile
+    except the installer's launch templates (USER_TEMPLATE_DOCKERFILES). Each must carry
     an @sha256: digest or be listed in UNPINNED_IMAGES."""
     found, problems = [], []
 
@@ -267,7 +276,7 @@ def image_problems(root: Path) -> tuple[list[tuple[str, str]], list[str]]:
             for image in DOCKER_URL.findall(line):
                 check(f"{path.relative_to(root)}:{number}", image)
     for relative in tracked_files(root):
-        if not Path(relative).name.startswith("Dockerfile") or USER_TEMPLATE_DOCKERFILES.fullmatch(relative):
+        if not is_container_build_file(Path(relative).name) or USER_TEMPLATE_DOCKERFILES.fullmatch(relative):
             continue
         stages = set()
         for number, line in enumerate((root / relative).read_text().splitlines(), 1):
@@ -346,7 +355,7 @@ class CiWorkflowTests(unittest.TestCase):
         its digest, unless UNPINNED_IMAGES lists it with its reason:
         image_problems reads job and service containers, docker://
         references in .github and the Bazel platforms, and the FROM lines of
-        every tracked Dockerfile except the installer's launch templates,
+        every tracked Dockerfile or Containerfile except the installer's launch templates,
         which users build their own apps from. renovate.json proposes new
         digests (never automerged) for every pinned one, and the release
         runbook compares them with Core's."""
@@ -426,6 +435,8 @@ class CiWorkflowTests(unittest.TestCase):
                                                   "      - run: |\n          skopeo inspect docker://alpine:3.20\n"),
             "a Dockerfile outside the launch templates": ("installer/launchkit/Dockerfile",
                                                           "FROM rust:1.94-bookworm\n"),
+            "a named Dockerfile": ("ci/app.Dockerfile", "FROM rust:1.94-bookworm\n"),
+            "a Containerfile": ("ci/Containerfile", "FROM rust:1.94-bookworm\n"),
             "a matrix label that floats": (".github/workflows/matrix.yml",
                                            "jobs:\n  a:\n    runs-on: ${{ matrix.runs-on }}\n    strategy:\n"
                                            "      matrix:\n        runs-on: [ubuntu-24.04, macos-latest]\n"
