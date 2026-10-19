@@ -103,8 +103,10 @@ module.exports = {
   // div[role=button]; a VIOLATED lattice tile additionally nests per-record
   // evidence buttons (capped at 5) that open the offending Biography:
   //   `memory-verdict-evidence:${tileId}:${memoryId}`.
-  // While a re-check runs, a settled tile keeps its verdict and shows a
-  // "re-checking…" line (never flickers back to UNVERIFIABLE).
+  // While a re-check runs, a settled tile keeps its verdict (never flickers
+  // back to UNVERIFIABLE) and shows a "re-checking…" marker over its corner,
+  // `memory-verdict-recheck:${tileId}`, outside the line flow so the tile row
+  // never grows. A refresh that brings the same records does not re-check.
   verdictTile: (id) => `memory-verdict:${id}`,
   verdictEvidence: (tileId, memoryId) => `memory-verdict-evidence:${tileId}:${memoryId}`,
 

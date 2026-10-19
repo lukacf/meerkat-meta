@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   long error stays on that line, shortened, with the full text in its
   tooltip. A narrow WorkGraph panel now wraps its view toggle and Refresh onto
   the next header line instead of pushing them out of view.
+- The console Memory lattice tile no longer walks the loaded records again on
+  every refresh that brings the same records, and shows a running re-check as
+  a marker over its corner instead of an extra line. The line grew the first
+  row of verdict tiles, so each refresh moved the tiles below it under a click
+  in progress.
 
 ## [0.9.3] - 2026-10-18
 

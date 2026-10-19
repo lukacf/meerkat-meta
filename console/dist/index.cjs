@@ -52165,9 +52165,9 @@ function computeVerdictTiles(inputs) {
         violations.length > 0 ? "".concat(violations.length, " violation").concat(violations.length === 1 ? "" : "s") : "0 violations",
         walk.complete ? "checked ".concat(walk.checked, "/").concat(walk.checked) : "checked first ".concat(walk.checked, " \u2014 partial (cap ").concat(LATTICE_WALK_MAX_RECORDS, ")"),
         "invariant (b) needs ever_quarantined (surface 2)",
-        ...inputs.latticeRunning ? ["re-checking\u2026"] : [],
         ...violations.length > VERDICT_EVIDENCE_MAX ? ["+".concat(violations.length - VERDICT_EVIDENCE_MAX, " more violations")] : []
       ],
+      rechecking: inputs.latticeRunning === true,
       targetTab: "records",
       evidence: violations.slice(0, VERDICT_EVIDENCE_MAX)
     });
@@ -52817,6 +52817,7 @@ function VerdictStrip({
       },
       children: [
         /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-tile__label", children: tile.label }),
+        tile.rechecking ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-tile__recheck", "data-testid": "memory-verdict-recheck:".concat(tile.id), children: "re-checking\u2026" }) : null,
         /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-tile__status", "data-status": tile.status, children: verdictStatusLabel(tile.status) }),
         tile.lines.map((line, index2) => /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-tile__line", children: line }, "l-".concat(index2))),
         (tile.evidence || []).map((violation) => /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
@@ -52975,11 +52976,14 @@ function MemoryPanel({
     latticeRanForRef.current = fingerprint;
     setLatticeRunning(true);
     let cancelled = false;
+    let covered = false;
     void runLatticeWalk((params) => onQueryRecords(params), {
       realms,
       isCancelled: () => cancelled
     }).then((result) => {
-      if (!cancelled) setLattice(result);
+      if (cancelled) return;
+      covered = result !== null;
+      setLattice(result);
     }).catch(() => {
       if (!cancelled) setLattice(null);
     }).finally(() => {
@@ -52987,7 +52991,7 @@ function MemoryPanel({
     });
     return () => {
       cancelled = true;
-      if (latticeRanForRef.current === fingerprint) {
+      if (!covered && latticeRanForRef.current === fingerprint) {
         latticeRanForRef.current = null;
       }
     };

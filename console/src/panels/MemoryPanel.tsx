@@ -774,6 +774,9 @@ export interface VerdictTile {
   label: string;
   status: VerdictStatus;
   lines: string[];
+  /// A settled verdict whose page-walk is running again. It renders over the
+  /// tile's corner, outside the line flow.
+  rechecking?: boolean;
   /// Tiles are doors: clicking opens the tab holding the evidence.
   targetTab: MemoryTab;
   /// The rows that made the verdict red — each opens its Biography directly
@@ -855,7 +858,9 @@ export function computeVerdictTiles(inputs: VerdictInputs): VerdictTile[] {
     });
   } else {
     // A settled verdict is retained while a re-check runs — the tile must
-    // not flicker to UNVERIFIABLE on every debounced live refresh.
+    // not flicker to UNVERIFIABLE on every debounced live refresh. The
+    // re-check shows over the tile's corner rather than as another line, so
+    // it never grows the tile row and moves the tiles below.
     const walk = inputs.lattice;
     const violations = [...walk.llmCeilingViolations, ...walk.chainViolations];
     tiles.push({
@@ -870,11 +875,11 @@ export function computeVerdictTiles(inputs: VerdictInputs): VerdictTile[] {
           ? `checked ${walk.checked}/${walk.checked}`
           : `checked first ${walk.checked} — partial (cap ${LATTICE_WALK_MAX_RECORDS})`,
         "invariant (b) needs ever_quarantined (surface 2)",
-        ...(inputs.latticeRunning ? ["re-checking…"] : []),
         ...(violations.length > VERDICT_EVIDENCE_MAX
           ? [`+${violations.length - VERDICT_EVIDENCE_MAX} more violations`]
           : []),
       ],
+      rechecking: inputs.latticeRunning === true,
       targetTab: "records",
       evidence: violations.slice(0, VERDICT_EVIDENCE_MAX),
     });
@@ -1902,6 +1907,11 @@ function VerdictStrip({
           }}
         >
           <span className="memory-tile__label">{tile.label}</span>
+          {tile.rechecking ? (
+            <span className="memory-tile__recheck" data-testid={`memory-verdict-recheck:${tile.id}`}>
+              re-checking…
+            </span>
+          ) : null}
           <span className="memory-tile__status" data-status={tile.status}>
             {verdictStatusLabel(tile.status)}
           </span>
@@ -2113,6 +2123,7 @@ export function MemoryPanel({
     latticeRanForRef.current = fingerprint;
     setLatticeRunning(true);
     let cancelled = false;
+    let covered = false;
     void runLatticeWalk((params) => onQueryRecords(params), {
       realms,
       isCancelled: () => cancelled,
@@ -2120,7 +2131,11 @@ export function MemoryPanel({
       .then((result) => {
         // null means denied or cancelled; keep the prior verdict on cancel,
         // clear it on a real walk that came back denied.
-        if (!cancelled) setLattice(result);
+        if (cancelled) return;
+        // Only a settled verdict covers this content; a denied walk walks
+        // again with the next refresh, as a failed one does.
+        covered = result !== null;
+        setLattice(result);
       })
       .catch(() => {
         if (!cancelled) setLattice(null);
@@ -2130,14 +2145,15 @@ export function MemoryPanel({
       });
     return () => {
       cancelled = true;
-      // A cancelled walk never covered this fingerprint — un-mark it so the
-      // dep change that cancelled us starts a fresh walk instead of
-      // skipping. Without this, a refresh landing mid-walk (re-dock, the
-      // 250ms memory.* debounce) leaves the tile on "page-walk running…"
-      // forever: the fingerprint reads as already-checked while lattice is
-      // still null and latticeRunning was never cleared (its finally is
-      // cancellation-guarded).
-      if (latticeRanForRef.current === fingerprint) {
+      // A walk that did not settle a verdict never covered this fingerprint,
+      // so un-mark it and the dep change that cancelled us starts a fresh walk
+      // instead of skipping. Without this, a refresh landing mid-walk
+      // (re-dock, the 250ms memory.* debounce) leaves the tile on "page-walk
+      // running…" forever: the fingerprint reads as already-checked while
+      // lattice is still null and latticeRunning was never cleared (its
+      // finally is cancellation-guarded). A covered fingerprint stays marked,
+      // so a refresh that brings the same records does not walk them again.
+      if (!covered && latticeRanForRef.current === fingerprint) {
         latticeRanForRef.current = null;
       }
     };

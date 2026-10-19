@@ -12049,6 +12049,7 @@ svg[data-svg=fit],
   gap: 8px;
 }
 .memory-tile {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -12064,6 +12065,15 @@ svg[data-svg=fit],
 }
 .memory-tile:hover {
   border-color: var(--accent);
+}
+.memory-tile__recheck {
+  position: absolute;
+  top: 9px;
+  right: 10px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-faint);
+  pointer-events: none;
 }
 .memory-tile__label {
   font-family: var(--disp);
