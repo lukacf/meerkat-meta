@@ -23402,9 +23402,10 @@ function toolConfigStatus(value) {
       return false;
   }
 }
+var lifecycleBit = (value) => Object.hasOwn(value, "settled") ? value.settled : value.persisted;
 function toolConfig(value) {
   const payload = record5(value);
-  return !!payload && operation(payload.operation) && string4(payload.target) && boolean4(payload.persisted) && toolConfigStatus(payload.status_info) && optional2(payload.applied_at_turn, (value2) => ordinal(value2) && value2 <= 4294967295) && optional2(payload.domain, (value2) => oneOf(value2, ["tool_scope", "deferred_catalog"])) && optional2(payload.deferred_catalog_delta, (value2) => {
+  return !!payload && operation(payload.operation) && string4(payload.target) && boolean4(lifecycleBit(payload)) && toolConfigStatus(payload.status_info) && optional2(payload.applied_at_turn, (value2) => ordinal(value2) && value2 <= 4294967295) && optional2(payload.domain, (value2) => oneOf(value2, ["tool_scope", "deferred_catalog"])) && optional2(payload.deferred_catalog_delta, (value2) => {
     const delta = record5(value2);
     return !!delta && ["added_hidden_names", "removed_hidden_names", "pending_sources"].every((key) => defaulted(delta[key], strings));
   });
@@ -23424,7 +23425,7 @@ function noticeBlock(value) {
     case "tool_config":
       return toolConfig(block.payload);
     case "mcp":
-      return optionalStrings(block, ["server_id", "detail"]) && optional2(block.operation, operation) && optional2(block.phase, phase) && defaulted(block.persisted, boolean4) && defaulted(block.pending_sources, strings);
+      return optionalStrings(block, ["server_id", "detail"]) && optional2(block.operation, operation) && optional2(block.phase, phase) && defaulted(block.settled, boolean4) && defaulted(block.persisted, boolean4) && defaulted(block.pending_sources, strings);
     case "background_job":
       return string4(block.job_id) && oneOf(block.status, ["completed", "failed", "aborted", "cancelled", "retired", "terminated"]) && optionalStrings(block, ["display_name", "detail"]) && defaulted(block.persisted, boolean4);
     case "auth":
