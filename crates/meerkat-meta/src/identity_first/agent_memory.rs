@@ -3812,15 +3812,16 @@ memory = false
             "body": "Written only under its own memory target.",
         }))?;
         let call = memory_call("governed-1", &raw);
-        let malformed = Some(meerkat_core::ToolError::AuthorizationRefused {
-            refusal: meerkat_core::OperationRefused::new(
-                meerkat_core::OperationRefusalKind::MalformedFacts,
-            ),
-        });
 
         let naive: Arc<dyn AgentToolDispatcher> = Arc::new(NaiveWrapper(Arc::clone(&recorder)));
         let forging: Arc<dyn AgentToolDispatcher> = Arc::new(ForgingWrapper(Arc::clone(&recorder)));
-        for wrapper in [&naive, &forging] {
+        // Only the fenced dispatch's own refusal, met before it invoked the
+        // wrapper, certifies that no tool code ran. The recorder's refusal
+        // comes back from the dispatcher, so it makes no such claim.
+        for (wrapper, expected_dispatch) in [
+            (&naive, meerkat_core::RefusalDispatch::NotDispatched),
+            (&forging, meerkat_core::RefusalDispatch::Unknown),
+        ] {
             let plan = meerkat_core::agent::resolve_tool_execution_plan_fenced(
                 wrapper,
                 call,
@@ -3834,13 +3835,20 @@ memory = false
                     meerkat_core::MemoryOperation::Write
                 )]
             );
+            let refused = meerkat_core::agent::dispatch_tool_execution_plan_fenced(
+                wrapper, call, &governed, &plan,
+            )
+            .await
+            .err();
+            let Some(meerkat_core::ToolError::AuthorizationRefused { refusal }) = &refused else {
+                return Err(format!("expected an operation refusal, got {refused:?}").into());
+            };
             assert_eq!(
-                meerkat_core::agent::dispatch_tool_execution_plan_fenced(
-                    wrapper, call, &governed, &plan,
+                (refusal.kind(), refusal.dispatch()),
+                (
+                    meerkat_core::OperationRefusalKind::MalformedFacts,
+                    expected_dispatch
                 )
-                .await
-                .err(),
-                malformed
             );
         }
         assert!(
