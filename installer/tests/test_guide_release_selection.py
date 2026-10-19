@@ -118,9 +118,8 @@ def test_an_invented_complete_pin_still_refuses_the_actual_wheel(monkeypatch):
 def test_the_release_inputs_skeleton_selects_the_admitted_guide(gateway):
     guide = json.loads(SKELETON.read_text())["guide"]
     assert (guide["version"], guide["core_version"]) == (SELECTED, SELECTED)
-    core_source = guide["core_source"] or "d" * 40
-    SelectedGuideRuntime(gateway, guide["version"], guide["core_version"], "c" * 40, core_source)
-    # Meta's source is pending until its release, and the runtime refuses it.
-    with pytest.raises(GatewayInstallError):
-        SelectedGuideRuntime(gateway, guide["version"], guide["core_version"],
-            guide["meta_source"], core_source)
+    # The gateway and the client come from the same Meta release commit.
+    assert guide["meta_source"] == guide_sdk.SOURCE
+    selected = SelectedGuideRuntime(gateway, guide["version"], guide["core_version"],
+        guide["meta_source"], guide["core_source"])
+    assert (selected.meta_source, selected.core_source) == (guide["meta_source"], guide["core_source"])

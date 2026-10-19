@@ -467,23 +467,23 @@ class InputsTests(unittest.TestCase):
         selected = guide_sdk.SELECTED_VERSION
         skeleton = json.loads((ROOT / forge.INPUTS_DIR / "forge-release-inputs.skeleton.json").read_text())
         guide = skeleton["guide"]
-        self.assertEqual((guide["version"], guide["core_version"], guide["meta_source"]), (selected, selected, None))
-        self.assertTrue(guide["core_source"] is None or re.fullmatch("[0-9a-f]{40}", guide["core_source"]))
+        # The gateway and the Guide's client come from the same Meta release commit.
+        self.assertEqual((guide["version"], guide["core_version"], guide["meta_source"]),
+                         (selected, selected, guide_sdk.SOURCE))
+        self.assertTrue(re.fullmatch("[0-9a-f]{40}", guide["core_source"]))
         self.assertEqual(list(skeleton["targets"]), ["linux-x86_64"])
         entry = skeleton["targets"]["linux-x86_64"]
         self.assertEqual((list(entry["files"]), entry["selection"], entry["paths"]), ([entry["gateway"]], None, None))
         self.assertEqual(entry["files"][entry["gateway"]]["url"],
                          f"https://github.com/lukacf/meerkat-meta/releases/download/v{selected}/"
                          f"meta-rpc-gateway-{selected}-x86_64-unknown-linux-gnu.tar.gz")
-        with self.assertRaisesRegex(forge.ProtocolError, "meta_source"):
+        # Only the product owner's selection, its paths and their files are pending.
+        with self.assertRaisesRegex(forge.ProtocolError, "owner's product selection"):
             forge.validate_inputs(skeleton)
-        # Filled with fixture values, every value the skeleton already holds is valid.
+        # With a fixture owner selection, every value the skeleton already holds is valid.
         product = target_inputs()
         filled = copy.deepcopy(skeleton)
-        filled["guide"].update(meta_source="c" * 40, core_source=guide["core_source"] or "d" * 40)
         target = filled["targets"]["linux-x86_64"]
-        target["files"][target["gateway"]].update(archive_size=len(ARCHIVE), archive_sha256=sha256(ARCHIVE),
-                                                  size=len(GATEWAY), sha256=sha256(GATEWAY))
         target["files"].update({name: pin for name, pin in product["files"].items() if name != product["gateway"]})
         target.update(selection=product["selection"], paths=product["paths"])
         forge.validate_inputs(filled)
