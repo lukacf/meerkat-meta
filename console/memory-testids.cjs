@@ -109,6 +109,7 @@ module.exports = {
   // never grows. A refresh that brings the same records does not re-check.
   verdictTile: (id) => `memory-verdict:${id}`,
   verdictEvidence: (tileId, memoryId) => `memory-verdict-evidence:${tileId}:${memoryId}`,
+  verdictRecheck: (tileId) => `memory-verdict-recheck:${tileId}`,
 
   // ── Pipeline tab (quarantine folded in) ──
   PIPELINE: "memory-pipeline",
