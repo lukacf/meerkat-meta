@@ -330,8 +330,9 @@ pub enum MobTerminalShutdownOutcome {
     /// The mob actor shut down and reported each member; see
     /// [`meerkat_mob::MobShutdownReport::is_clean`].
     Completed(meerkat_mob::MobShutdownReport),
-    /// The mob actor had already shut down: its command channel was closed,
-    /// which a mob shutting down answers to every caller request.
+    /// The mob actor had already shut down: its command channel was closed.
+    /// (A teardown that meets a Shutdown still draining joins it and reports
+    /// that Shutdown's result instead.)
     AlreadyShutDown,
     /// The mob actor refused its terminal teardown; its supervisor in-proc
     /// route may stay registered until process exit.

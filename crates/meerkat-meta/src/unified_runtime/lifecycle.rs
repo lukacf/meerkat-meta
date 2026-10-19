@@ -634,8 +634,11 @@ impl UnifiedRuntime {
                 }
                 MobTerminalShutdownOutcome::Completed(report)
             }
-            // A mob shutting down answers every caller request with a closed
-            // command channel: the actor is already gone, not failing.
+            // A closed command channel means the actor task has ended: the
+            // mob is already shut down, not failing. A Shutdown sent while
+            // another one drains joins it and gets that Shutdown's result,
+            // so this call never sees `ShutdownInProgress` (meerkat answers
+            // only other requests with it during a drain).
             Err(
                 meerkat_mob::MobError::ActorCommandChannelClosed
                 | meerkat_mob::MobError::ActorReplyChannelClosed,
