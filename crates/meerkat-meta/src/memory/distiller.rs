@@ -3189,6 +3189,8 @@ mod tests {
                         summary_tokens: 10,
                         messages_before: 20,
                         messages_after: 2,
+                        summary_source: None,
+                        estimated_history_tokens_after: None,
                     },
                 ),
             );
@@ -3239,6 +3241,8 @@ mod tests {
                     summary_tokens: 10,
                     messages_before: 20,
                     messages_after: 2,
+                    summary_source: None,
+                    estimated_history_tokens_after: None,
                 },
             ),
         );
