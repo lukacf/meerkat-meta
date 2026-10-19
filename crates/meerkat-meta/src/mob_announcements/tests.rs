@@ -6842,6 +6842,17 @@ fn declared_modules(module_root: &str) -> BTreeSet<&str> {
         .collect()
 }
 
+/// A line with the attributes in front of it removed.
+fn strip_attributes(mut line: &str) -> &str {
+    while let Some(rest) = line.strip_prefix("#[") {
+        let Some(end) = rest.find(']') else {
+            return line;
+        };
+        line = rest[end + 1..].trim_start();
+    }
+    line
+}
+
 /// The crate modules a surface re-exports from with `pub use crate::...`.
 fn reexported_modules<'a>(sources: impl IntoIterator<Item = &'a str>) -> BTreeSet<&'a str> {
     sources
@@ -6867,6 +6878,11 @@ fn the_walk_parses_every_declared_module_and_reexport() {
         ]),
         BTreeSet::from(["x::y", "z"])
     );
+    assert_eq!(
+        strip_attributes("#[cfg(test)] #[allow(x)] pub mod a;"),
+        "pub mod a;"
+    );
+    assert_eq!(strip_attributes("pub enum A {"), "pub enum A {");
 }
 
 /// Every public enum of the announcement surface is `#[non_exhaustive]`, so a
@@ -6914,6 +6930,33 @@ fn every_public_announcement_enum_is_non_exhaustive() {
             .map(|(name, _, _)| *name)
             .collect::<BTreeSet<_>>(),
         "every crate module the surface re-exports from is walked"
+    );
+    // mod.rs is a child of the crate root: a `super::` re-export there
+    // leaves the surface as a `crate::` one does, so it has none.
+    assert!(
+        !module_root
+            .lines()
+            .any(|line| line.trim_start().starts_with("pub use super::")),
+        "mod.rs re-exports through super::; walk that module instead"
+    );
+    // A declaration either parser would skip, indented, inline or behind an
+    // attribute on its own line, fails here rather than escaping both sides.
+    let unparsed: Vec<String> = std::iter::once(("mod", module_root))
+        .chain(public_modules)
+        .chain(reexported.map(|(name, source, _)| (name, source)))
+        .flat_map(|(module, source)| {
+            source.lines().filter_map(move |line| {
+                let bare = strip_attributes(line.trim_start());
+                ((bare.starts_with("pub mod ") || bare.starts_with("pub enum "))
+                    && bare.len() != line.len())
+                .then(|| format!("{module}: {line}"))
+            })
+        })
+        .collect();
+    assert_eq!(
+        unparsed,
+        Vec::<String>::new(),
+        "public declarations the walk cannot parse"
     );
     let mut open = Vec::new();
     for (module, source) in std::iter::once(("mod", module_root))
