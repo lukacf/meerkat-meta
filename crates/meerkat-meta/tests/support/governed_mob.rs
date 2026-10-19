@@ -503,9 +503,7 @@ impl LlmClient for ScriptedProvider {
                 meta: None,
             }),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(StopReason::EndTurn),
             }),
         ]))
     }

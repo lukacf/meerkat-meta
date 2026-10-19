@@ -1038,7 +1038,7 @@ async fn complete_text(
             }
             LlmEvent::TextDelta { delta, meta } => assembler.on_text_delta(&delta, meta),
             LlmEvent::Done { outcome } => match outcome {
-                LlmDoneOutcome::Success { stop_reason } => {
+                LlmDoneOutcome::Success { stop_reason, .. } => {
                     // Do NOT discard stop_reason. A MaxTokens stop arrives with a
                     // partial or empty body; returning it as a short answer sends a
                     // truncation into a strict parse, which then blames the model.
@@ -2033,9 +2033,7 @@ mod tests {
                 });
                 events.push(LlmEvent::AssistantOutput { blocks });
                 events.push(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 });
                 let client = meerkat_client::TestClient::new(events);
                 assert_eq!(
@@ -2087,9 +2085,7 @@ mod tests {
         let client = meerkat_client::TestClient::new(vec![
             LlmEvent::AssistantOutput { blocks: Vec::new() },
             LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::MaxTokens,
-                },
+                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::MaxTokens),
             },
         ]);
         let profile = DistillerProfile::embedded_default();
@@ -2255,9 +2251,7 @@ mod tests {
                     meta: None,
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 }),
             ]))
         }

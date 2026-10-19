@@ -46,9 +46,7 @@ impl ObservationClient {
             }),
             match case {
                 CompletionCase::Success => Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 }),
                 CompletionCase::TerminalError => Ok(LlmEvent::Done {
                     outcome: LlmDoneOutcome::Error {
@@ -57,9 +55,7 @@ impl ObservationClient {
                 }),
                 CompletionCase::StreamError => Err(LlmError::ConnectionReset),
                 CompletionCase::Truncated => Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::MaxTokens,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::MaxTokens),
                 }),
             },
         ];

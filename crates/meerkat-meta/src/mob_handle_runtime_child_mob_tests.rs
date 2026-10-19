@@ -223,7 +223,7 @@ impl LlmClient for ScriptedModel {
                 Provider::OpenAI,
             )),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { stop_reason },
+                outcome: LlmDoneOutcome::success(stop_reason),
             }),
         ];
         Box::pin(futures::stream::iter(events))
