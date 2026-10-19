@@ -139,7 +139,7 @@ pub fn usage_then_done_with(
     [
         usage_event_with(request, client_declared, usage),
         LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success { stop_reason },
+            outcome: LlmDoneOutcome::success(stop_reason),
         },
     ]
 }

@@ -4153,9 +4153,7 @@ async fn open_loop_escalation_frames_carry_no_rationale() {
             meta: None,
         },
         LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success {
-                stop_reason: meerkat_core::StopReason::EndTurn,
-            },
+            outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
         },
     ]));
     let engine = Arc::new(

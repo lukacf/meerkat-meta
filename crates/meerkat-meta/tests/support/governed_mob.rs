@@ -28,7 +28,8 @@ pub use meerkat_authorization::policy::{
 pub use meerkat_authorization::publication::LocalAuthorizationPublication;
 pub use meerkat_authorization::work::HostAuthorizationClock;
 pub use meerkat_authorization_contracts::constraints::{
-    ActionRef, AudienceRef, ExactRestriction, ExecutionRestrictions, ProcessorRef, ResourceDomain,
+    ActionRef, AudienceRef, DomainRestriction, ExactRestriction, ExecutionRestrictions,
+    ProcessorRef, ResourceDomain,
 };
 pub use meerkat_authorization_contracts::evidence::{
     EvidenceDigest, EvidenceId, HistoricalEvidenceRef,
@@ -61,8 +62,8 @@ pub use meerkat_runtime::identifiers::LogicalRuntimeId;
 pub use meerkat_runtime::input::{Input, PromptInput};
 pub use meerkat_runtime::input_authority::{NativeAdmissionError, NativeIngressContext};
 pub use meerkat_runtime::meerkat_machine::{
-    AuthenticatedOriginal, AuthenticatedOriginalSource, MeerkatMachine, ScopedGrantComposition,
-    ScopedInvocation, ScopedMandateOwner,
+    AuthenticatedOriginal, AuthenticatedOriginalSource, MeerkatMachine, RetainedCustody,
+    ScopedGrantComposition, ScopedInvocation, ScopedMandateOwner,
 };
 pub use meerkat_runtime::service_ext::SessionServiceRuntimeExt;
 
@@ -161,7 +162,7 @@ pub fn domain() -> ResourceDomain {
 pub fn ceiling(action_name: &str) -> ExecutionRestrictions {
     let mut bounds = ExecutionRestrictions::unrestricted();
     bounds.actions = ExactRestriction::exact([action(action_name)]);
-    bounds.resource_domains = ExactRestriction::exact([domain()]);
+    bounds.resource_domains = DomainRestriction::exact([domain()]);
     bounds.processors = ExactRestriction::exact([ProcessorRef::Principal {
         principal: principal("executor"),
     }]);
@@ -304,6 +305,9 @@ pub struct Adapter {
     /// inside the admission attempt, so the third read fails with the
     /// outcome unknown.
     pub panic_at_custody_read: std::sync::atomic::AtomicUsize,
+    /// Answer the retained custody of both sources as `AdmissionPending`: the
+    /// source owner has not settled their admission yet.
+    pub sources_pending: std::sync::atomic::AtomicBool,
 }
 
 /// Holds the native admission of original `work-7` inside the adapter's
@@ -410,17 +414,25 @@ impl AuthenticatedOriginalSource for Adapter {
             }))
     }
 
-    fn retained_original(
+    fn retained_custody(
         &self,
         _namespace: &QualifiedIngressNamespace,
         original: &OriginalWorkRef,
-    ) -> Result<Option<WorkAuthorityBasis>, meerkat_core::authorization::ControllerReadinessFailure>
-    {
-        Ok(sources()
-            .contains(original)
-            .then(|| WorkAuthorityBasis::HostPolicy {
-                policy: evidence("source-policy"),
-            }))
+    ) -> Result<RetainedCustody, meerkat_core::authorization::ControllerReadinessFailure> {
+        Ok(if sources().contains(original) {
+            if self
+                .sources_pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                RetainedCustody::AdmissionPending
+            } else {
+                RetainedCustody::Retained(WorkAuthorityBasis::HostPolicy {
+                    policy: evidence("source-policy"),
+                })
+            }
+        } else {
+            RetainedCustody::NotRetained
+        })
     }
 }
 
@@ -502,9 +514,7 @@ impl LlmClient for ScriptedProvider {
                 meta: None,
             }),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(StopReason::EndTurn),
             }),
         ]))
     }
@@ -672,6 +682,7 @@ impl Fixture {
             basis: Mutex::new(None),
             gate: AdmissionGate::default(),
             panic_at_custody_read: Default::default(),
+            sources_pending: Default::default(),
         });
         let configuration = ScopedGrantComposition {
             grants: Arc::clone(&grants),

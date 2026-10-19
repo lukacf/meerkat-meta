@@ -636,13 +636,11 @@ impl LlmClient for CrossMobClient {
             ),
         }));
         events.push(Ok(LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success {
-                stop_reason: if calls.is_empty() {
-                    StopReason::EndTurn
-                } else {
-                    StopReason::ToolUse
-                },
-            },
+            outcome: LlmDoneOutcome::success(if calls.is_empty() {
+                StopReason::EndTurn
+            } else {
+                StopReason::ToolUse
+            }),
         }));
         Box::pin(futures::stream::iter(events))
     }

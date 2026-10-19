@@ -71,8 +71,14 @@ fn durable_snapshot_is_typed_absent(error: &meerkat_mob::MobError) -> bool {
 /// retrying. Typed carriers are matched on the variant; the text classes
 /// below cover meerkat refusals that are not typed yet.
 fn is_repairable_bridge_delivery(error: &BridgeError) -> bool {
-    matches!(error, BridgeError::MemberRuntimeDetached { .. })
-        || is_repairable_bridge_delivery_error(&error.to_string())
+    match error {
+        BridgeError::MemberRuntimeDetached { .. } => true,
+        // A closed mob, or one whose Shutdown is still draining, refused the
+        // delivery before admission. No repair reopens it, and its text never
+        // reaches the classes below.
+        BridgeError::MobAdmissionClosed { .. } | BridgeError::MobShutdownInProgress { .. } => false,
+        other => is_repairable_bridge_delivery_error(&other.to_string()),
+    }
 }
 
 fn is_repairable_bridge_delivery_error(error: &str) -> bool {
@@ -106,7 +112,8 @@ fn is_reload_required_bridge_delivery_error(error: &str) -> bool {
 /// Type the submit-side `MobError` at the boundary instead of flattening it
 /// to [`BridgeError::Mob`] text: a durability-degraded refusal becomes
 /// [`BridgeError::ReloadRequired`] so the identity runtime can run exactly
-/// one non-destructive reload and retry, and everything else keeps the
+/// one non-destructive reload and retry, a closed or shutting-down mob is
+/// typed so no repair ever reads it, and everything else keeps the
 /// historical text form the substring repair classifier reads.
 fn classify_submit_mob_error(
     member_id: &MobAgentIdentity,
@@ -182,6 +189,34 @@ fn classify_submit_mob_error(
                     command_kind,
                     stage,
                 }),
+            }
+        }
+        // The mob's admission is closed, for any close reason: nothing was
+        // delivered, and no repair or reload can reopen it.
+        meerkat_mob::MobError::AdmissionClosed { mob_id, reason } => {
+            let detail = meerkat_mob::MobError::AdmissionClosed {
+                mob_id: mob_id.clone(),
+                reason,
+            }
+            .to_string();
+            BridgeError::MobAdmissionClosed {
+                identity: member_id.clone(),
+                mob_id,
+                reason,
+                detail,
+            }
+        }
+        // A Shutdown of the mob is still draining: nothing was delivered, and
+        // the actor is not gone (the Shutdown can still fail), so retry later.
+        meerkat_mob::MobError::ShutdownInProgress { mob_id } => {
+            let detail = meerkat_mob::MobError::ShutdownInProgress {
+                mob_id: mob_id.clone(),
+            }
+            .to_string();
+            BridgeError::MobShutdownInProgress {
+                identity: member_id.clone(),
+                mob_id,
+                detail,
             }
         }
         other => {
@@ -890,13 +925,40 @@ pub enum BridgeError {
     /// outcome is unknown - which is precisely the false-success this seam
     /// exists to remove.
     CompletionUnsupported(String),
+    /// meerkat refused the delivery because the mob's admission is closed
+    /// (`MobError::AdmissionClosed`, read typed), for any close reason: an
+    /// idle close, the last owner's release, a stand-down, a Shutdown, a
+    /// destroy, a durability fail-stop, a lost actor or a failed dispatch.
+    /// Refused before admission, so nothing was delivered. Never repaired (a
+    /// repair cannot reopen a closed mob) and never reloaded. `detail` is
+    /// meerkat's rendering, shown exactly as the untyped mob error was.
+    MobAdmissionClosed {
+        identity: MobAgentIdentity,
+        mob_id: meerkat_mob::MobId,
+        reason: meerkat_mob::MobAdmissionCloseReason,
+        detail: String,
+    },
+    /// meerkat refused the delivery because a Shutdown of the mob is still
+    /// draining (`MobError::ShutdownInProgress`, read typed). Nothing was
+    /// delivered. The actor is not gone: the Shutdown can still fail and
+    /// leave it serving, so this is a retry-later refusal, never a terminal
+    /// claim. Never repaired and never reloaded. `detail` is meerkat's
+    /// rendering.
+    MobShutdownInProgress {
+        identity: MobAgentIdentity,
+        mob_id: meerkat_mob::MobId,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for BridgeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::HostHumanInput(error) => write!(f, "{error}"),
-            Self::Mob(msg) | Self::UnsupportedForMode { detail: msg, .. } => {
+            Self::Mob(msg)
+            | Self::UnsupportedForMode { detail: msg, .. }
+            | Self::MobAdmissionClosed { detail: msg, .. }
+            | Self::MobShutdownInProgress { detail: msg, .. } => {
                 write!(f, "session bridge mob error: {msg}")
             }
             Self::CompletionFailed(msg) => write!(
@@ -1105,6 +1167,21 @@ pub enum BridgeAdmissionError {
     /// existed. This is an implementation invariant failure, not a terminal
     /// outcome, and no turn may be claimed to have run from it.
     InvariantViolation(String),
+    /// Refused before admission: the mob's admission is closed, for any
+    /// close reason. Nothing was delivered.
+    MobAdmissionClosed {
+        identity: MobAgentIdentity,
+        mob_id: meerkat_mob::MobId,
+        reason: meerkat_mob::MobAdmissionCloseReason,
+        detail: String,
+    },
+    /// Refused before admission: a Shutdown of the mob is still draining
+    /// (retry later; the actor is not gone). Nothing was delivered.
+    MobShutdownInProgress {
+        identity: MobAgentIdentity,
+        mob_id: meerkat_mob::MobId,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for BridgeAdmissionError {
@@ -1117,7 +1194,10 @@ impl std::fmt::Display for BridgeAdmissionError {
                 "session bridge does not support completion-bearing delivery: {msg}; \
                  nothing was submitted"
             ),
-            Self::Mob(msg) | Self::UnsupportedForMode { detail: msg, .. } => {
+            Self::Mob(msg)
+            | Self::UnsupportedForMode { detail: msg, .. }
+            | Self::MobAdmissionClosed { detail: msg, .. }
+            | Self::MobShutdownInProgress { detail: msg, .. } => {
                 write!(f, "session bridge mob error before receipt: {msg}")
             }
             Self::InvalidInput(msg) => {
@@ -1303,6 +1383,26 @@ impl From<BridgeError> for BridgeAdmissionError {
                      existed: {detail}"
                 ))
             }
+            BridgeError::MobAdmissionClosed {
+                identity,
+                mob_id,
+                reason,
+                detail,
+            } => Self::MobAdmissionClosed {
+                identity,
+                mob_id,
+                reason,
+                detail,
+            },
+            BridgeError::MobShutdownInProgress {
+                identity,
+                mob_id,
+                detail,
+            } => Self::MobShutdownInProgress {
+                identity,
+                mob_id,
+                detail,
+            },
         }
     }
 }
@@ -1394,6 +1494,26 @@ impl From<BridgeAdmissionError> for BridgeError {
                 stage,
             },
             BridgeAdmissionError::InvariantViolation(detail) => Self::Mob(detail),
+            BridgeAdmissionError::MobAdmissionClosed {
+                identity,
+                mob_id,
+                reason,
+                detail,
+            } => Self::MobAdmissionClosed {
+                identity,
+                mob_id,
+                reason,
+                detail,
+            },
+            BridgeAdmissionError::MobShutdownInProgress {
+                identity,
+                mob_id,
+                detail,
+            } => Self::MobShutdownInProgress {
+                identity,
+                mob_id,
+                detail,
+            },
         }
     }
 }
@@ -8212,6 +8332,13 @@ impl MobSessionBridge {
             // delivered: hand it up typed so a tracked delivery can fall back
             // to the ingress lane; never repair, never `Mob(String)`.
             Err(err @ BridgeError::UnsupportedForMode { .. }) => return Err(err.into()),
+            // A closed mob, or one whose Shutdown is still draining, refused
+            // the delivery before admission. Nothing is stale and nothing was
+            // delivered: hand it up typed; never repair, never `Mob(String)`.
+            Err(
+                err @ (BridgeError::MobAdmissionClosed { .. }
+                | BridgeError::MobShutdownInProgress { .. }),
+            ) => return Err(err.into()),
             Err(err) if host_human_session.is_none() && is_repairable_bridge_delivery(&err) => {
                 tracing::warn!(
                     runtime_id = %runtime_id,
@@ -11434,6 +11561,104 @@ mod tests {
         assert!(matches!(
             BridgeError::from(admission),
             BridgeError::AdmissionBacklogFull { depth: 256, .. }
+        ));
+    }
+
+    /// A closed mob (for every close reason) and a mob whose Shutdown is
+    /// still draining refuse the submit before admission. Both are typed,
+    /// keep meerkat's rendering exactly as the untyped mob error showed it,
+    /// are never read by the text repair classifier, and survive the
+    /// admission-error round trip.
+    #[test]
+    fn closed_and_shutting_down_mob_refusals_classify_typed_and_never_repair() {
+        use meerkat_mob::MobAdmissionCloseReason as Reason;
+        let deadline = ActorAdmissionDeadline::new(Duration::from_mins(10));
+        let member = MobAgentIdentity::from("rt-review-singleton-0");
+        let mob_id = meerkat_mob::MobId::from("closing-mob");
+        for reason in [
+            Reason::IdleClose,
+            Reason::LastOwnerReleased,
+            Reason::StandDown,
+            Reason::Shutdown,
+            Reason::Destroyed,
+            Reason::DurabilityFailStop,
+            Reason::ActorLost,
+            Reason::DispatchFailed,
+        ] {
+            let error = meerkat_mob::MobError::AdmissionClosed {
+                mob_id: mob_id.clone(),
+                reason,
+            };
+            let rendered = error.to_string();
+            let classified = classify_submit_mob_error(&member, error, &deadline);
+            match &classified {
+                BridgeError::MobAdmissionClosed {
+                    identity,
+                    mob_id: closed,
+                    reason: why,
+                    detail,
+                } => {
+                    assert_eq!(identity, &member);
+                    assert_eq!(closed, &mob_id);
+                    assert_eq!(*why, reason);
+                    assert_eq!(detail, &rendered);
+                }
+                other => panic!("expected MobAdmissionClosed, got {other:?}"),
+            }
+            assert_eq!(
+                classified.to_string(),
+                BridgeError::Mob(rendered.clone()).to_string()
+            );
+            assert!(
+                !is_repairable_bridge_delivery(&classified),
+                "{classified:?}"
+            );
+            let admission = BridgeAdmissionError::from(classified);
+            assert!(
+                matches!(
+                    &admission,
+                    BridgeAdmissionError::MobAdmissionClosed { reason: why, .. } if *why == reason
+                ),
+                "{admission:?}"
+            );
+            assert!(matches!(
+                BridgeError::from(admission),
+                BridgeError::MobAdmissionClosed { reason: why, .. } if why == reason
+            ));
+        }
+
+        let error = meerkat_mob::MobError::ShutdownInProgress {
+            mob_id: mob_id.clone(),
+        };
+        let rendered = error.to_string();
+        let classified = classify_submit_mob_error(&member, error, &deadline);
+        assert!(
+            matches!(
+                &classified,
+                BridgeError::MobShutdownInProgress { identity, mob_id: draining, detail }
+                    if identity == &member && draining == &mob_id && detail == &rendered
+            ),
+            "{classified:?}"
+        );
+        assert_eq!(
+            classified.to_string(),
+            BridgeError::Mob(rendered).to_string()
+        );
+        assert!(
+            !is_repairable_bridge_delivery(&classified),
+            "{classified:?}"
+        );
+        let admission = BridgeAdmissionError::from(classified);
+        assert!(
+            matches!(
+                admission,
+                BridgeAdmissionError::MobShutdownInProgress { .. }
+            ),
+            "{admission:?}"
+        );
+        assert!(matches!(
+            BridgeError::from(admission),
+            BridgeError::MobShutdownInProgress { .. }
         ));
     }
 

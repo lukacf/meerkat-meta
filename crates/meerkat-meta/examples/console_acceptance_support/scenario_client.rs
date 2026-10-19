@@ -424,7 +424,7 @@ impl LlmClient for RecordingClient {
                 });
             }
             yield Ok(LlmEvent::UsageUpdate { usage });
-            yield Ok(LlmEvent::Done { outcome: LlmDoneOutcome::Success { stop_reason }});
+            yield Ok(LlmEvent::Done { outcome: LlmDoneOutcome::success(stop_reason)});
         })
     }
 
@@ -1429,7 +1429,8 @@ mod tests {
             events.last(),
             Some(Ok(LlmEvent::Done {
                 outcome: LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn
+                    stop_reason: StopReason::EndTurn,
+                    ..
                 }
             }))
         ));
