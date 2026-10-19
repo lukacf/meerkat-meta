@@ -493,6 +493,7 @@ async fn fork_off_and_councils_are_not_governed_by_the_child_policy() {
         &meerkat_runtime::mob_operator_authority::set_create_authority(&creator_authority(), false)
             .expect("no create scope"),
         &mob_id,
+        handle.incarnation(),
         "worker",
     )
     .expect("spawnable worker profile");
@@ -509,9 +510,12 @@ async fn fork_off_and_councils_are_not_governed_by_the_child_policy() {
     .await
     .expect("same-mob fork_off is untouched");
 
-    let convener_authority =
-        meerkat_runtime::mob_operator_authority::grant_manage_mob(&creator_authority(), &mob_id)
-            .expect("manage scope");
+    let convener_authority = meerkat_runtime::mob_operator_authority::grant_manage_mob(
+        &creator_authority(),
+        &mob_id,
+        handle.incarnation(),
+    )
+    .expect("manage scope");
     let convener = agent_surface(
         agent_mob_tools(&runtime),
         sessions[1].clone(),

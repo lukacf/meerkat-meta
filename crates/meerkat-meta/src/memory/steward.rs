@@ -77,6 +77,7 @@ use crate::identity_first::agent_memory::{
 use crate::memory::capabilities::{
     EvidenceRefResolver, PendingHarvest, PendingPromotion, PendingProposal, StewardStore,
 };
+use crate::memory::completion::{CompletionStop, UNTERMINATED_STREAM, completion_stop};
 use crate::memory::coordinator::DEFAULT_INSTRUCTION_HEADER;
 use crate::memory::distiller::TranscriptSource;
 use crate::memory::events::{MemoryEventSink, MemoryTimelineEvent};
@@ -184,6 +185,13 @@ pub enum StewardError {
     Truncated {
         max_output_tokens: u32,
     },
+    /// The model stopped before a complete answer for a reason other than
+    /// the output ceiling: a content filter, a cancelled response, a tool
+    /// call the stage never offers, or a stop reason Meerkat adds later.
+    /// Nothing is written from the partial body, however well it parses.
+    Incomplete {
+        stop_reason: meerkat_core::StopReason,
+    },
     Parse(String),
     Store(String),
 }
@@ -200,6 +208,11 @@ impl std::fmt::Display for StewardError {
                 "steward response hit the output ceiling of {max_output_tokens} tokens and was \
                  truncated; raise it via the steward config's max_output_tokens (models spend this \
                  same budget on thinking/reasoning tokens as well as the answer)"
+            ),
+            Self::Incomplete { stop_reason } => write!(
+                f,
+                "steward response stopped with {stop_reason:?} before a complete answer; \
+                 nothing is written from it"
             ),
             Self::Parse(msg) => write!(f, "steward parse error: {msg}"),
             Self::Store(msg) => write!(f, "steward store error: {msg}"),
@@ -502,13 +515,11 @@ pub struct StewardConfig {
     /// StopReason::MaxTokens } }` (OpenAI from `response.incomplete` +
     /// `incomplete_details.reason == "max_output_tokens"`, Anthropic from
     /// `stop_reason: "max_tokens"`, Gemini from `finishReason: "MAX_TOKENS"`).
-    /// [`complete_text`] discards that stop reason, so downstream a truncated
-    /// dream is indistinguishable from a model that had little to say: the
-    /// partial body fails the strict parse, the one repair round-trip is
-    /// re-issued against the same ceiling and truncates again, and the run
-    /// ends as a `StewardError::Parse` naming the model's JSON instead of the
-    /// budget. Raising the ceiling reduces how often that happens; it does
-    /// not make it observable. See [`complete_text`] for the seam.
+    /// [`complete_text`] fails that dream as [`StewardError::Truncated`],
+    /// naming this ceiling, instead of strict-parsing the partial body,
+    /// re-issuing the repair round-trip against the same ceiling and ending
+    /// as a `StewardError::Parse` that blames the model's JSON. Raising the
+    /// ceiling makes the truncation rarer. See [`complete_text`] for the seam.
     ///
     /// A production fleet ran a steward against the old
     /// hard-wired 4096 and committed ZERO ops across twelve consecutive runs
@@ -3940,18 +3951,20 @@ fn scope_for_realm(
 /// `supports_temperature: true`. Re-deriving that lookup here would duplicate
 /// provider-owned request shaping and could drift from it.
 ///
-/// KNOWN GAP, deliberately left as-is rather than guessed at: the `Success`
-/// arm below matches `LlmDoneOutcome::Success { .. }` and throws away
-/// `stop_reason`. A run that exhausted `max_output_tokens` arrives as
+/// The stop reason decides whether the text is an answer at all
+/// (`memory::completion`); only an ended turn or a matched stop sequence is.
+/// A run that exhausted `max_output_tokens` arrives as
 /// `Success { stop_reason: StopReason::MaxTokens }` with a partial (often
-/// empty) body, and is therefore returned to the caller as an ordinary short
-/// answer. That, not the provider, is why the four-day zero-op incident was
-/// silent: the budget signal exists on every one of meerkat's three clients
-/// and this function is where it is dropped. Surfacing it means carrying the
-/// stop reason to the parse sites - `StewardEngine::structured_call`,
-/// `distiller::extract`, and the hygienist's single call - so a truncation
-/// reports the ceiling instead of spending a repair round-trip against the
-/// same ceiling and then blaming the model's JSON.
+/// empty) body. Returned as an ordinary short answer, that truncation is what
+/// kept the four-day zero-op incident silent, so it fails as
+/// [`StewardError::Truncated`] and reports the ceiling instead of spending a
+/// repair round-trip against the same ceiling and then blaming the model's
+/// JSON. Any other stop before a complete answer (a content filter, a
+/// cancelled response, a tool call) fails as [`StewardError::Incomplete`]:
+/// nothing is written from a body the model did not finish. A stream that
+/// ends before its terminal event has no stop reason at all and fails as
+/// [`StewardError::Client`] ("the completion stream ended before its
+/// terminal event"); nothing is written from it either.
 pub async fn complete_text(
     profile: &StewardProfile,
     client: &dyn LlmClient,
@@ -3965,6 +3978,7 @@ pub async fn complete_text(
     .with_temperature(profile.params.temperature);
     let mut stream = client.stream(&request);
     let mut assembler = BlockAssembler::new();
+    let mut answered = false;
     while let Some(event) = stream.next().await {
         match event.map_err(classify_llm_error)? {
             LlmEvent::AssistantOutput { blocks } => {
@@ -3972,17 +3986,25 @@ pub async fn complete_text(
             }
             LlmEvent::TextDelta { delta, meta } => assembler.on_text_delta(&delta, meta),
             LlmEvent::Done { outcome } => match outcome {
-                LlmDoneOutcome::Success { stop_reason } => {
+                LlmDoneOutcome::Success { stop_reason } => match completion_stop(stop_reason) {
+                    CompletionStop::Answered => {
+                        answered = true;
+                        break;
+                    }
                     // Do NOT discard stop_reason. A MaxTokens stop arrives with a
                     // partial or empty body; returning it as a short answer sends a
                     // truncation into a strict parse, which then blames the model.
-                    if matches!(stop_reason, meerkat_core::StopReason::MaxTokens) {
+                    CompletionStop::Truncated => {
                         return Err(StewardError::Truncated {
                             max_output_tokens: profile.params.max_output_tokens,
                         });
                     }
-                    break;
-                }
+                    // Nor is any other unfinished body an answer, however well
+                    // it parses: nothing is written from a filtered reply.
+                    CompletionStop::Incomplete(stop_reason) => {
+                        return Err(StewardError::Incomplete { stop_reason });
+                    }
+                },
                 LlmDoneOutcome::Error { error } => return Err(classify_llm_error(error)),
             },
             LlmEvent::OperationObservationFailed {
@@ -4000,6 +4022,10 @@ pub async fn complete_text(
             | LlmEvent::UsageUpdate { .. }
             | LlmEvent::WireLiveness => {}
         }
+    }
+    // A stream that ends before its terminal event has no answer either.
+    if !answered {
+        return Err(StewardError::Client(UNTERMINATED_STREAM.to_string()));
     }
     Ok(meerkat_core::types::BlockAssistantMessage::new(
         assembler.finalize(),
@@ -4289,6 +4315,11 @@ mod tests {
                     Err(StewardError::Truncated { max_output_tokens })
                         if max_output_tokens == profile.params.max_output_tokens
                 )),
+                CompletionCase::Unterminated => assert!(
+                    matches!(result, Err(StewardError::Client(message))
+                        if message == UNTERMINATED_STREAM),
+                    "a stream with no terminal event is not an answer",
+                ),
             }
             client.assert_observed_once_without_retry(&log);
         }
@@ -4310,6 +4341,26 @@ mod tests {
             Err(StewardError::Truncated { max_output_tokens })
                 if max_output_tokens == profile.params.max_output_tokens
         ));
+    }
+
+    /// A body the model did not finish is not an answer, however well it
+    /// parses: every stop before a complete answer is typed.
+    #[tokio::test]
+    async fn complete_text_refuses_an_incomplete_stop() {
+        use crate::test_diagnostics::{INCOMPLETE_STOPS, stopping_client};
+
+        let profile = StewardProfile::embedded_default();
+        for stop in INCOMPLETE_STOPS {
+            let client = stopping_client(&empty_consolidate(), stop);
+            let result = complete_text(&profile, &client, "test".into()).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(StewardError::Incomplete { stop_reason }) if stop_reason == stop
+                ),
+                "{stop:?}: {result:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4344,6 +4395,9 @@ mod tests {
 
     struct ScriptedLlm {
         replies: StdMutex<Vec<String>>,
+        /// The stop reason each reply ends with, in reply order. A reply
+        /// past the end of this list ends its turn.
+        stops: StdMutex<Vec<meerkat_core::StopReason>>,
         prompts: StdMutex<Vec<String>>,
     }
 
@@ -4351,6 +4405,17 @@ mod tests {
         fn new(replies: Vec<String>) -> Self {
             Self {
                 replies: StdMutex::new(replies),
+                stops: StdMutex::new(Vec::new()),
+                prompts: StdMutex::new(Vec::new()),
+            }
+        }
+
+        /// Each reply ends with its own stop reason.
+        fn with_stops(replies: Vec<(String, meerkat_core::StopReason)>) -> Self {
+            let (replies, stops) = replies.into_iter().unzip();
+            Self {
+                replies: StdMutex::new(replies),
+                stops: StdMutex::new(stops),
                 prompts: StdMutex::new(Vec::new()),
             }
         }
@@ -4390,15 +4455,24 @@ mod tests {
                     replies.remove(0)
                 }
             };
+            let stop_reason = {
+                let mut stops = self
+                    .stops
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if stops.is_empty() {
+                    meerkat_core::StopReason::EndTurn
+                } else {
+                    stops.remove(0)
+                }
+            };
             Box::pin(stream::iter(vec![
                 Ok(LlmEvent::TextDelta {
                     delta: reply,
                     meta: None,
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::Success { stop_reason },
                 }),
             ]))
         }
@@ -4682,6 +4756,14 @@ mod tests {
         pending_ids: Vec<&str>,
         gate: Arc<dyn LlmWriteGate>,
     ) -> Fixture {
+        build_fixture_with_llm(ScriptedLlm::new(replies), pending_ids, gate)
+    }
+
+    fn build_fixture_with_llm(
+        llm: ScriptedLlm,
+        pending_ids: Vec<&str>,
+        gate: Arc<dyn LlmWriteGate>,
+    ) -> Fixture {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SqliteAgentMemoryStore::open(dir.path()).expect("store");
         store.set_llm_write_gate(gate);
@@ -4690,7 +4772,7 @@ mod tests {
         let events = Arc::new(CollectingEventSink::new());
         store.set_event_sink(events.clone());
         let store = Arc::new(store);
-        let llm = Arc::new(ScriptedLlm::new(replies));
+        let llm = Arc::new(llm);
         let gating = Arc::new(ScriptedGatingBridge::new(pending_ids));
         let conflicts = Arc::new(CapturingConflictBridge::default());
         let transcripts = Arc::new(ScriptedTranscripts::new());
@@ -6061,6 +6143,67 @@ mod tests {
             "fresh consolidate creates must respect llm_writes=quarantined: {:?}",
             created.status
         );
+    }
+
+    /// A consolidate reply the model did not finish commits nothing, even
+    /// one that parses into an op: the dream is skipped, and its reason and
+    /// timeline event name the stop.
+    #[tokio::test]
+    async fn dream_writes_nothing_from_an_incomplete_consolidate_reply() {
+        use crate::test_diagnostics::INCOMPLETE_STOPS;
+
+        for stop in INCOMPLETE_STOPS {
+            let fixture = build_fixture_with_llm(
+                ScriptedLlm::with_stops(vec![
+                    (empty_gather(), meerkat_core::StopReason::EndTurn),
+                    (
+                        json_reply(serde_json::json!({
+                            "ops": [{
+                                "op": "create", "kind": "fact",
+                                "scope": {"kind": "identity", "key": "identity:worker"},
+                                "title": "Unfinished steward insight",
+                                "body": "a consolidate reply the model did not finish"
+                            }],
+                            "proposal_verdicts": [], "quarantine_verdicts": [],
+                            "open_loop_escalations": [], "contradictions": [], "working_set": []
+                        })),
+                        stop,
+                    ),
+                ]),
+                vec![],
+                Arc::new(TaintedSessionGate),
+            );
+            fixture.engine.note_session_completed();
+            let outcome = fixture.engine.dream_now().await;
+            let named = format!("{stop:?}");
+            assert!(
+                matches!(&outcome, DreamOutcome::Skipped { reason } if reason.contains(&named)),
+                "{stop:?}: {outcome:?}"
+            );
+            let recent = fixture
+                .store
+                .recent_records(REALM, 8)
+                .await
+                .expect("recent");
+            assert!(
+                recent
+                    .iter()
+                    .all(|record| record.title != "Unfinished steward insight"),
+                "{stop:?}: nothing is written from an unfinished reply"
+            );
+            let events = fixture
+                .events
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    MemoryTimelineEvent::DreamSkipped { reason, .. } if reason.contains(&named)
+                )),
+                "{stop:?}: {events:?}"
+            );
+        }
     }
 
     /// Stage the gated promotion of `origin` the steward stages: a mob copy

@@ -3564,8 +3564,95 @@ async function runCheckedSaveBrowserProof(mode) {
   }
 }
 
+// Stream events refresh visible panels at any moment. A tab click whose press
+// lands before such a refresh starts and whose release lands after it must
+// still select the tab: the refresh must not move the tab row under the
+// pointer, or the release lands on another element and no click reaches the
+// tab. The status read is held open so the refresh is visibly in flight.
+async function runAccessTabClickDuringRefreshProof() {
+  const evidence = path.join(process.env.META_BROWSER_EVIDENCE || path.join(repoRoot, "output/playwright/console-acceptance"), "access-tab-click-during-refresh");
+  fs.mkdirSync(evidence, { recursive: true });
+  const config = { enabled: true, admins: ["root@example.test"], rules: [], groups: {} };
+  const metadata = { revision: 1, owner_instance: "opaque-owner:one", conditional_mutations: "checked_v1" };
+  const status = () => ({ available: true, enabled: true, can_administer: true, subject: "root@example.test", actions: ["agent.view"], ...metadata });
+  let holdStatusReads = false;
+  let releaseStatusReads;
+  const statusReadsReleased = new Promise(resolve => { releaseStatusReads = resolve; });
+  const heldReads = [], errors = [], checkpoints = [];
+  const server = await startMockConsoleServer();
+  let browser, page, failure;
+  try {
+    browser = await launchBrowser();
+    page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
+    page.setDefaultTimeout(10000);
+    page.on("pageerror", error => errors.push(String(error)));
+    await page.route("**/console/experience", async route => {
+      const response = await route.fetch(); const value = await response.json();
+      await route.fulfill({ response, json: { ...value, access: status() } });
+    });
+    await page.route("**/console/rpc", async route => {
+      const request = route.request().postDataJSON();
+      const reply = payload => route.fulfill({ json: { jsonrpc: "2.0", id: request.id, ...payload } });
+      if (request.method === "meta/capabilities") {
+        const response = await route.fetch(); const value = await response.json();
+        value.result.methods.push("meta/access/status", "meta/access/get");
+        return route.fulfill({ response, json: value });
+      }
+      if (request.method === "meta/access/status") {
+        if (holdStatusReads) {
+          heldReads.push(request.id);
+          await statusReadsReleased;
+        }
+        return reply({ result: status() });
+      }
+      if (request.method === "meta/access/get") return reply({ result: { config, ...metadata } });
+      return route.continue();
+    });
+    await gotoConsole(page, `${server.baseUrl}/console`);
+    await page.getByText("Access", { exact: true }).first().click();
+    await page.getByRole("heading", { name: "Console access", exact: true }).waitFor();
+    await page.getByTestId("access-edit-admins").waitFor();
+    const refreshing = page.getByTestId("access-panel")
+      .getByText("Refreshing owner state. Changes are temporarily unavailable.", { exact: true });
+    await refreshing.waitFor({ state: "detached" });
+    const tab = page.getByTestId("access-tab:preview");
+    const target = await tab.boundingBox();
+    await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2);
+    await page.mouse.down();
+    // Measured while pressed, so press styling is the same in both boxes.
+    const pressed = await tab.boundingBox();
+    assert.equal(await refreshing.count(), 0, "no refresh may be in flight before the held one");
+    holdStatusReads = true;
+    await page.getByTestId("access-refresh").evaluate(button => button.click());
+    await refreshing.waitFor();
+    const refreshingBox = await tab.boundingBox();
+    await page.screenshot({ path: path.join(evidence, "pressed-during-refresh.png"), fullPage: true });
+    await page.mouse.up();
+    const selected = await tab.evaluate(element => element.classList.contains("is-active"));
+    checkpoints.push({ step: "released-during-refresh", pressed, refreshingBox, selected, heldReads: [...heldReads] });
+    holdStatusReads = false;
+    releaseStatusReads();
+    await refreshing.waitFor({ state: "detached" });
+    assert.deepEqual(refreshingBox, pressed, "a refresh moved the tab row under a pressed pointer");
+    assert.equal(selected, true, "a tab click that spans the start of a refresh did not select the tab");
+    await page.getByTestId("access-preview-subject").waitFor();
+    assert.deepEqual(errors, []);
+    checkpoints.push({ step: "complete" });
+  } catch (error) {
+    failure = String(error.stack || error);
+    if (page) fs.writeFileSync(path.join(evidence, "failure-body.txt"), await page.locator("body").innerText().catch(() => "unavailable"));
+    throw error;
+  } finally {
+    releaseStatusReads();
+    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP access RPC", checkpoints, errors, failure: failure || null }, null, 2));
+    if (browser) await browser.close();
+    await server.close();
+  }
+}
+
 const scenarios = [
   ...["conflict", "group", "unavailable"].map(mode => ({ id: `checked-save-${mode}`, family: "console", backend: "mock", run: () => runCheckedSaveBrowserProof(mode) })),
+  { id: "access-tab-click-during-refresh", family: "console", backend: "mock", run: runAccessTabClickDuringRefreshProof },
   { id: "authorization-feedback", family: "console", backend: "mock", run: runAuthorizationFeedbackProof },
   { id: "reference", family: "runtime", backend: "real", run: runReferenceBrowserProof },
   { id: "topology-unavailable", family: "topology", backend: "mock", run: runTopologyUnavailableBrowserProof },

@@ -7701,7 +7701,8 @@ ${kind}` : "";
   }
   function flowRegistryRowsFromBackend(rows = []) {
     return (Array.isArray(rows) ? rows : []).map((row) => {
-      if (!row || typeof row !== "object" || !row.document) return null;
+      if (!row || typeof row !== "object") return null;
+      if (!row.document) return flowRegistryRowFromSummary(row);
       return flowRegistryRowFromDocument({
         id: row.id,
         document: row.document,
@@ -7712,6 +7713,20 @@ ${kind}` : "";
         flowRow: row
       });
     }).filter(Boolean);
+  }
+  function flowRegistryRowFromSummary(row) {
+    const id = String(row?.id || "").trim();
+    if (!id) return null;
+    return {
+      ...row,
+      id,
+      name: String(row.name || id),
+      version: String(row.version || ""),
+      stage: String(row.stage || "draft"),
+      trigger: String(row.trigger || ""),
+      source: String(row.source || ""),
+      validation: null
+    };
   }
   function blankMobpackFromCatalogs(schema) {
     const blank = schema?.blank_mobpack;
@@ -7883,6 +7898,17 @@ ${kind}` : "";
           }
         },
         fallback: null
+      };
+    }
+    if (!flowRegistryRowIsRuntimeProjection(row)) {
+      return {
+        found: true,
+        id: selectedId,
+        row,
+        hasDocument: false,
+        hydration: null,
+        fallback: null,
+        fetch: { id: selectedId }
       };
     }
     return {
@@ -14234,7 +14260,18 @@ ${JSON.stringify(document2)}`;
             hydrateMobpackDocument(selection2.hydration.result, selection2.hydration.options);
             return true;
           }
-          return false;
+          if (!selection2?.fetch) return false;
+          const draftId = selection2.fetch.id;
+          setApiBusy(true);
+          MetaFlowController.getDocument(draftId).then((result) => {
+            const fetched = MetaFlowController.flowRegistrySelectionState([result?.row], draftId);
+            if (!fetched.hydration) {
+              throw new Error(catalogs.errorView.authoringOperationMissingDocumentError);
+            }
+            setFlows((rows) => MetaFlowController.flowRegistryUpsertRowPatch(rows, result.row));
+            hydrateMobpackDocument(fetched.hydration.result, fetched.hydration.options);
+          }).catch((error) => showAuthoringFailure(error, authoringFailureHead("draft_open"))).finally(() => setApiBusy(false));
+          return true;
         };
         const bootIntentPending = React.useRef(BOOT_INTENT.kind !== "library");
         React.useEffect(() => {
@@ -14471,7 +14508,8 @@ ${JSON.stringify(document2)}`;
                 const result = await MetaFlowController.createDocument(spec);
                 const row = result?.row;
                 if (!row?.document) return;
-                setFlows(Array.isArray(result?.rows) ? result.rows : MetaFlowController.flowRegistryUpsertRowPatch(flows, row));
+                const listed = Array.isArray(result?.rows) ? MetaFlowController.flowRegistryRowsFromBackend(result.rows) : flows;
+                setFlows(MetaFlowController.flowRegistryUpsertRowPatch(listed, row));
                 hydrateMobpackDocument(
                   { document: row.document, validation: row.validation || null },
                   {

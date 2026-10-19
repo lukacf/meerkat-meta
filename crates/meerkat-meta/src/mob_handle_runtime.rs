@@ -4747,10 +4747,15 @@ impl SessionStoreBackedRuntimeStore {
 
     /// DURABLE-BEHIND ADMISSION (task #56 corpus iteration 5, a production
     /// member's true field shape; admission authored downstream and landed
-    /// here with the lane's conventions): the tear is a FAILED projection,
-    /// so the durable row never received the wedged turn's final appends -
-    /// durable is a strict digest-PREFIX of the sealed commit parent (the
-    /// exact inverse of the inverse-append shape). Proof is exact content:
+    /// here with the lane's conventions): the durable row is a strict
+    /// digest-PREFIX of a committed rewrite's parent - it lacks the parent's
+    /// last rows (the exact inverse of the inverse-append shape). The shape
+    /// says nothing about its cause: a projection that failed before the
+    /// rewrite leaves it, and so do appends inside one committed boundary
+    /// before a compaction, with no failure at all. The walk proves the
+    /// earliest such rewrite and returns the chain from it to the sealed
+    /// head, so a row several rewrites behind replays every one of them.
+    /// Proof is exact content:
     /// the materialized parent's first `durable_len` messages must
     /// digest-equal the WHOLE durable row. On proof the existing replay
     /// loop does the rest: durable head != parent revision routes through
@@ -5317,12 +5322,29 @@ impl SessionStoreBackedRuntimeStore {
                                 )?;
                                 match behind {
                                     Some(chain) => {
+                                        // The prover returns the chain from the
+                                        // proving rewrite on, so it is never empty.
+                                        let Some(first) = chain.first() else {
+                                            return Err(
+                                                meerkat_runtime::store::RuntimeStoreError::WriteFailed(
+                                                    "durable-behind admission proved an empty \
+                                                     rewrite chain"
+                                                        .to_string(),
+                                                ),
+                                            );
+                                        };
                                         tracing::info!(
                                             runtime_id = %runtime_id,
                                             session_id = %successor.id(),
+                                            durable_messages =
+                                                durable_predecessor.messages().len(),
+                                            parent_messages = first.messages_before,
+                                            first_rewrite_generation = first.rewrite_generation,
+                                            replayed_rewrites = chain.len(),
                                             "durable-behind admission: the durable row is a \
-                                             digest-prefix of the sealed commit parent (failed \
-                                             projection tear); replaying the committed rewrites"
+                                             strict digest-prefix of the first replayed \
+                                             rewrite's parent; replaying the committed \
+                                             rewrites from there to the sealed head"
                                         );
                                         Some(chain)
                                     }
@@ -12559,7 +12581,12 @@ impl MobRuntime {
     /// Stand down every durable child mob this runtime manages.
     ///
     /// Call it after the root mob has stopped; [`crate::UnifiedRuntime`]
-    /// shutdown does. It first closes the agent mob-tool state's admission
+    /// shutdown does. It is terminal: first the runtime's delivery owner is
+    /// retired and joined within the deadline, or already stopped
+    /// (`UnifiedRuntime`'s shutdown stops it, unjoined, once the mob stops),
+    /// and the composition slots that point back at this runtime are
+    /// emptied, as that shutdown does once the mob stops.
+    /// It then closes the agent mob-tool state's admission
     /// (Meerkat's `MobMcpState::close_admission`) and waits for the creates,
     /// inserts, restores and council admissions already past their check, so
     /// the child snapshot it takes next is final. Each child then gets a
@@ -12567,13 +12594,19 @@ impl MobRuntime {
     /// over the same layout restores it as it was. An unsettled child stays
     /// recorded across repeated calls; a closed actor channel is not a
     /// settlement report. A child that already shut down cleanly in the same
-    /// incarnation is not asked again.
+    /// incarnation is not asked again. A close sent while a mob's actor is
+    /// still exiting from its shutdown can go unanswered in Meerkat 0.9.3 and
+    /// earlier, so the admission close is sent again once the root's actor
+    /// task ends, and each child's actor task is waited for, within the
+    /// deadline, after its shutdown.
     ///
     /// It then stands the state down (`MobMcpState::stand_down`): it joins
     /// the work the state owns (council runs, completion custodians,
     /// teardown handoffs, live delegation deliveries) and aborts its loops.
-    /// Only when admission and that work settled, every child is clean, and
-    /// no child appeared meanwhile, is the child-root claim released
+    /// Only when admission and that work settled, the delivery owner was
+    /// joined or already stopped (unjoined, by `UnifiedRuntime`'s shutdown),
+    /// every child is clean, and no child appeared meanwhile, is the
+    /// child-root claim released
     /// ([`crate::ChildMobStandDownOutcome::Released`]), so a successor over
     /// the same layout can claim it in this process; with no child at all
     /// that is the outcome too. Otherwise the root stays owned and a
@@ -12584,6 +12617,18 @@ impl MobRuntime {
         &self,
         deadline: std::time::Instant,
     ) -> crate::child_mob_storage::ChildMobStandDownOutcome {
+        // A stand-down is terminal, as `UnifiedRuntime`'s shutdown is: the
+        // delivery owner retires and the composition slots that point back
+        // at this runtime empty before the child root can be released. A
+        // runtime torn down without `UnifiedRuntime` has nothing else that
+        // stops them, and its owner kept reconciling over the runtime store
+        // of a released root. The owner is joined, within the deadline: a
+        // pass already in blocking store work finishes before the release,
+        // and an owner still running at the deadline keeps the root owned.
+        // Both are idempotent. `UnifiedRuntime`'s shutdown stopped the owner
+        // already, without joining it, so here there is nothing left to join.
+        let delivery_retired = self.retire_runtime_delivery(deadline).await;
+        self.release_composition_slots();
         // A root already released (or never claimed) answers at once.
         if let Some(unclaimed) = self.child_mob_root.unclaimed_outcome() {
             return unclaimed;
@@ -12607,7 +12652,7 @@ impl MobRuntime {
         };
         // Admission closes before the snapshot: no caller admitted before
         // the close can add a child after it.
-        let admission = state.close_admission(deadline).await;
+        let admission = self.close_state_admission(state, deadline).await;
         let mut stood_down = std::collections::BTreeSet::new();
         let mut child_mobs = 0_usize;
         if let Err(unsettled) = self
@@ -12629,14 +12674,18 @@ impl MobRuntime {
             }
         }
         let outcome = self.child_mob_root.outcome(child_mobs);
-        if !outcome.child_actors_settled() || !admission.is_clean() || !state_stand_down.is_clean()
+        if !outcome.child_actors_settled()
+            || !admission.is_clean()
+            || !state_stand_down.is_clean()
+            || delivery_retired.is_err()
         {
             tracing::warn!(
                 ?outcome,
                 ?admission,
                 ?state_stand_down,
-                "durable child mobs or the agent mob-tool state did not all settle; the child \
-                 root stays owned"
+                ?delivery_retired,
+                "durable child mobs, the agent mob-tool state or the runtime delivery owner \
+                 did not all settle; the child root stays owned"
             );
             return outcome;
         }
@@ -12649,6 +12698,35 @@ impl MobRuntime {
             );
         }
         released
+    }
+
+    /// Close the agent mob-tool state's admission
+    /// (`MobMcpState::close_admission`), and close it again if the root mob's
+    /// actor task ends while the first close still waits.
+    ///
+    /// The root has stopped, but its actor may still be dropping its command
+    /// channel. Meerkat 0.9.3 and earlier drop it without waiting for a send
+    /// already under way, so the root's close can stay queued with no reply
+    /// and hold the stand-down to its deadline. Once the task has ended, the
+    /// channel refuses a new close at once, which the state counts as closed.
+    /// A live root answers the first close. The close is idempotent, and a
+    /// close left waiting is abandoned, not undone.
+    async fn close_state_admission(
+        &self,
+        state: &meerkat_mob_mcp::MobMcpState,
+        deadline: std::time::Instant,
+    ) -> meerkat_mob_mcp::MobStateStandDown {
+        let mut root_actor = self.handle.actor_task_watch();
+        {
+            let close = state.close_admission(deadline);
+            tokio::pin!(close);
+            tokio::select! {
+                biased;
+                admission = &mut close => return admission,
+                _ = root_actor.wait() => {}
+            }
+        }
+        state.close_admission(deadline).await
     }
 
     /// Shut down every child mob in the state's snapshot not yet in
@@ -12686,12 +12764,24 @@ impl MobRuntime {
             if self.child_mob_root.clean_in(mob_id.as_ref(), &incarnation) {
                 continue;
             }
-            let outcome = match handle
+            let shutdown = handle
                 .shutdown_with_report(
                     meerkat_mob::ShutdownOptions::default().with_deadline(deadline),
                 )
-                .await
-            {
+                .await;
+            if shutdown.is_ok() {
+                // The child's actor drops its command channel right after it
+                // answers, and the state's stand-down sends every managed
+                // child a close. Meerkat 0.9.3 and earlier can leave a
+                // command sent into that drop unanswered: wait for the task
+                // to end, so the close is refused at once.
+                let _ = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    handle.actor_task_watch().wait(),
+                )
+                .await;
+            }
+            let outcome = match shutdown {
                 Ok(report) if report.is_clean() => ChildShutdown::Clean,
                 // Only the members the native report names as not clean.
                 Ok(report) => ChildShutdown::Unsettled(format!(
@@ -12713,13 +12803,34 @@ impl MobRuntime {
         Ok(())
     }
 
-    /// Latest native delivery-owner pass, if this runtime owns delivery.
     /// Stop the native delivery owner now, even while clones of this runtime
     /// live. Teardown calls it after the mob stops; undelivered rows stay
-    /// pending in the durable inbox for the next owner.
+    /// pending in the durable inbox for the next owner. It aborts the owner's
+    /// task without joining it, so a pass already in blocking store work may
+    /// still finish after this returns.
     pub fn stop_runtime_delivery(&self) {
         if let Some(delivery) = self.runtime_delivery.as_ref() {
             delivery.stop();
+        }
+    }
+
+    /// Retire the native delivery owner and wait for it until `deadline`: no
+    /// pass starts after the request, and one already running finishes
+    /// first, so nothing it does outlives the call. `Err` when it was still
+    /// running at the deadline; a later call joins the same owner. A runtime
+    /// without delivery, or whose owner already stopped, answers `Ok` at
+    /// once (that owner is not joined).
+    pub(crate) async fn retire_runtime_delivery(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), meerkat::RuntimeDeliveryOwnerRetirementIncomplete> {
+        match self.runtime_delivery.as_ref() {
+            Some(delivery) => {
+                delivery
+                    .retire(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .await
+            }
+            None => Ok(()),
         }
     }
 
@@ -12836,6 +12947,17 @@ impl MobRuntime {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity_runtime);
         }
+    }
+
+    /// The installed identity authority, if any.
+    pub(crate) fn installed_identity_runtime(
+        &self,
+    ) -> Option<Arc<crate::identity_first::IdentityRuntime>> {
+        self.identity_runtime_slot.as_ref().and_then(|slot| {
+            slot.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
     }
 
     /// Remove the late-bound identity authority after the mob has fully
@@ -13662,6 +13784,9 @@ pub async fn model_routing_status_for_member(
     model_routing_status_for_session(session_service, member_id, session_id).await
 }
 
+/// Resolve a supplied member id to its current session through the mob
+/// handle, then read that session's visible tools. Mirrors
+/// `model_routing_status_for_member`.
 pub async fn resolved_tools_for_member(
     handle: &MobHandle,
     session_service: Option<&Arc<dyn MobSessionService>>,
@@ -13670,7 +13795,14 @@ pub async fn resolved_tools_for_member(
     if member_id.trim().is_empty() {
         return Err(MobRuntimeError::InvalidInput("identity must not be empty"));
     }
-    let mid = crate::member_comms_id::mob_member_id(member_id);
+    // `roster_member_id_for_supplied_id`, NOT `mob_member_id`, for the same
+    // reason as the routing-status lookup (#366): the roster is keyed by the
+    // encoded DURABLE identity, so a current runtime alias
+    // (`rt:{identity}:{generation}`) handed straight to `mob_member_id` names
+    // a roster row nobody owns, and a healthy member reads as having no
+    // session. The SUPPLIED identity is still what the snapshot echoes. A
+    // stale alias is refused by the surfaces before this lookup.
+    let mid = crate::member_comms_id::roster_member_id_for_supplied_id(member_id);
     let status = handle.member_status(&mid).await?;
     let Some(session_id) = status.current_session_id else {
         return Err(MobRuntimeError::InvalidInput(
@@ -13839,9 +13971,10 @@ pub async fn assert_member_accepts_images(
     if !content_input_has_images(content) {
         return Ok(());
     }
-    // Wire member ids are public aliases; the roster id is the comms-safe
-    // encoding (meerkat 0.7 MemberCommsName).
-    let mid = crate::member_comms_id::mob_member_id(member_id);
+    // A read: resolve the supplied id the way `resolved_tools_for_member`
+    // does, so a current runtime alias or an encoded roster id reaches the
+    // durable row it names instead of "member not found".
+    let mid = crate::member_comms_id::roster_member_id_for_supplied_id(member_id);
     let Some(member) = handle
         .get_member(&mid)
         .await
@@ -13934,8 +14067,19 @@ async fn send_message_on_mob_inner(
         return Err(MobRuntimeError::InvalidInput("content must not be empty"));
     }
     // Wire member ids are public aliases; the roster id is the comms-safe
-    // encoding (meerkat 0.7 MemberCommsName).
-    let mid = crate::member_comms_id::mob_member_id(member_id);
+    // encoding (meerkat 0.7 MemberCommsName). Decode first, so an already
+    // encoded roster id is not encoded twice. A generated runtime alias names
+    // an incarnation that only the identity authority can pin, and this
+    // direct send has no authority to ask; collapsing it to the durable row
+    // could deliver an old generation's message to the current incarnation,
+    // so it is refused like the stdio send without an identity runtime.
+    let decoded = crate::member_comms_id::runtime_alias_str(member_id);
+    if crate::member_comms_id::is_reserved_generated_alias(&decoded) {
+        return Err(MobRuntimeError::InvalidInput(
+            "generated member alias requires identity authority",
+        ));
+    }
+    let mid = crate::member_comms_id::mob_member_id(&decoded);
     match interaction_id {
         None => {
             handle
@@ -15306,6 +15450,138 @@ mod tests {
             .resolve_bridge_session_id(&meerkat_mob::AgentIdentity::from(member))
             .await
             .expect("member session")
+    }
+
+    /// #366: every spelling of one member reaches the same resolved tools.
+    /// The roster is keyed by the encoded durable identity, so the lookup has
+    /// to decode a supplied id the way `model_routing_status_for_member` does.
+    /// A current runtime alias (`rt:{identity}:{generation}`) handed straight
+    /// to `mob_member_id` names a roster row nobody owns, and the healthy
+    /// member reads as having no current session. Each snapshot echoes the
+    /// spelling it was asked with.
+    #[tokio::test]
+    async fn resolved_tools_for_member_resolves_every_spelling_of_one_member() {
+        const DURABLE: &str = "review:singleton";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = bootstrap_opt_in_runtime("resolved-tools-member-alias", dir.path()).await;
+        let handle = runtime.handle();
+        let roster_id = crate::member_comms_id::mob_member_id_str(DURABLE).into_owned();
+        let session_id = seat_worker(&handle, &roster_id).await;
+
+        let durable = resolved_tools_for_member(&handle, runtime.session_service(), DURABLE)
+            .await
+            .expect("the durable identity resolves its seated member");
+        assert_eq!(durable.session_id, session_id.to_string());
+        assert!(
+            !durable.tools.is_empty(),
+            "the seated member exposes tools: {durable:?}"
+        );
+
+        for supplied in [format!("rt:{DURABLE}:0"), roster_id.clone()] {
+            let resolved = resolved_tools_for_member(&handle, runtime.session_service(), &supplied)
+                .await
+                .map_err(|error| error.to_string());
+            assert_eq!(
+                resolved,
+                Ok(ResolvedToolsSnapshot {
+                    identity: supplied.clone(),
+                    session_id: durable.session_id.clone(),
+                    tools: durable.tools.clone(),
+                }),
+                "{supplied} must resolve the member {DURABLE} names, with the same session and tools"
+            );
+        }
+        let _ = handle.shutdown().await;
+    }
+
+    /// The image-capability guard is a read: like `resolved_tools_for_member`
+    /// it reaches the member a durable identity, its current runtime alias or
+    /// its encoded roster id names. Before, the alias and the encoded id read
+    /// as "member not found" for a healthy, image-capable member.
+    #[tokio::test]
+    async fn image_guard_reads_every_spelling_of_one_member() {
+        const DURABLE: &str = "review:singleton";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = bootstrap_opt_in_runtime("image-guard-member-alias", dir.path()).await;
+        let handle = runtime.handle();
+        let roster_id = crate::member_comms_id::mob_member_id_str(DURABLE).into_owned();
+        seat_worker(&handle, &roster_id).await;
+        let image = meerkat_core::ContentInput::Blocks(vec![meerkat_core::ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: meerkat_core::types::ImageData::Inline {
+                data: "iVBORw0KGgo=".to_string(),
+            },
+        }]);
+
+        for supplied in [DURABLE.to_string(), format!("rt:{DURABLE}:0"), roster_id] {
+            let verdict =
+                assert_member_accepts_images(&handle, runtime.session_service(), &supplied, &image)
+                    .await
+                    .map_err(|error| error.to_string());
+            assert_eq!(
+                verdict,
+                Ok(()),
+                "{supplied} must reach the image-capable member {DURABLE} names"
+            );
+        }
+        let _ = handle.shutdown().await;
+    }
+
+    /// A direct send is an action with no identity authority to consult. It
+    /// decodes an encoded roster id instead of encoding it twice, and it
+    /// refuses a generated runtime alias, which only the identity authority
+    /// can pin to a generation, instead of delivering to the durable row.
+    #[tokio::test]
+    async fn direct_send_decodes_roster_ids_and_refuses_generated_aliases() {
+        const DURABLE: &str = "review:singleton";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let definition = meerkat_mob::MobDefinition::from_toml(
+            "[mob]\nid = \"direct-send-member-alias\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+             external_addressable = true\n\n[profiles.worker.tools]\ncomms = true\n",
+        )
+        .expect("mob definition");
+        let spec = MobBootstrapSpec::ephemeral(
+            definition,
+            meerkat_mob::MobStorage::in_memory(),
+            dir.path().to_path_buf(),
+            4,
+            None,
+        )
+        .expect("bootstrap spec")
+        .with_options(MobBootstrapOptions {
+            allow_ephemeral_sessions: true,
+            notify_orchestrator_on_resume: true,
+            default_llm_client: Some(Arc::new(meerkat_client::TestClient::default())),
+        });
+        let runtime = MobRuntime::bootstrap(spec)
+            .await
+            .expect("bootstrap runtime");
+        let handle = runtime.handle();
+        let roster_id = crate::member_comms_id::mob_member_id_str(DURABLE).into_owned();
+        let session_id = seat_worker(&handle, &roster_id).await.to_string();
+
+        for supplied in [DURABLE, roster_id.as_str()] {
+            let sent = send_message_on_mob(&handle, supplied, "hello".to_string())
+                .await
+                .map_err(|error| error.to_string());
+            assert_eq!(
+                sent,
+                Ok(session_id.clone()),
+                "{supplied} must deliver to the member {DURABLE} names"
+            );
+        }
+        let refused = send_message_on_mob(&handle, &format!("rt:{DURABLE}:0"), "hello".to_string())
+            .await
+            .map_err(|error| error.to_string());
+        assert_eq!(
+            refused,
+            Err(MobRuntimeError::InvalidInput(
+                "generated member alias requires identity authority"
+            )
+            .to_string()),
+            "a direct send must not pick an incarnation for a generated alias"
+        );
+        let _ = handle.shutdown().await;
     }
 
     /// Review of #442 (hardening): a forker respawning its own child with the
@@ -21191,6 +21467,256 @@ comms = true
         assert!(
             refused.is_none(),
             "a divergent row must not prove the durable-behind chain"
+        );
+    }
+
+    /// Compact `session[0..end]` into one summary message as a committed
+    /// transcript rewrite.
+    fn commit_test_compaction(session: &mut meerkat_core::Session, end: usize, summary: &str) {
+        let parent_revision = session
+            .transcript_revision()
+            .unwrap_or_else(|error| panic!("{error}"));
+        session
+            .commit_transcript_rewrite(
+                meerkat_core::TranscriptRewriteSelection::MessageRange { start: 0, end },
+                vec![meerkat_core::Message::User(
+                    meerkat_core::types::UserMessage::text(summary),
+                )],
+                meerkat_core::TranscriptRewriteReason::new("wedged-turn retire compaction"),
+                Some(format!("durable-behind-{summary}")),
+                Some(parent_revision),
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    /// The durable-behind proof covers the whole chain: a durable row that
+    /// is a strict digest-prefix of the FIRST rewrite's parent, with a second
+    /// rewrite after it, proves the chain from that rewrite to the sealed
+    /// head, so both committed rewrites replay.
+    #[tokio::test]
+    async fn durable_behind_prefix_chain_spans_every_rewrite_after_the_proving_parent() {
+        let mut base = meerkat_core::Session::new();
+        for text in ["opening", "second"] {
+            base.push(meerkat_core::Message::User(
+                meerkat_core::types::UserMessage::text(text),
+            ));
+        }
+        let durable = base.clone();
+        let mut successor = base;
+        successor.push(meerkat_core::Message::User(
+            meerkat_core::types::UserMessage::text("third"),
+        ));
+        commit_test_compaction(&mut successor, 3, "first summary");
+        successor.push(meerkat_core::Message::User(
+            meerkat_core::types::UserMessage::text("after the first compaction"),
+        ));
+        commit_test_compaction(&mut successor, 2, "second summary");
+        let sealed = successor
+            .validated_transcript_history_state()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("the successor carries a sealed graph"));
+
+        let proven = SessionStoreBackedRuntimeStore::durable_behind_prefix_chain(
+            &successor, &sealed, &durable,
+        )
+        .unwrap_or_else(|error| panic!("{error}"))
+        .unwrap_or_else(|| panic!("a strict prefix of the first parent must prove the chain"));
+        assert_eq!(
+            proven
+                .iter()
+                .map(|commit| commit.rewrite_generation)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    /// The durable-behind heal with the durable row two rewrites behind: the
+    /// failed projection left it a strict digest-prefix of the first rewrite's
+    /// parent, and a second compaction followed. The repair replays both
+    /// rewrites and lands the committed head exactly, and its log names the
+    /// first replayed rewrite and how many it replays, rather than claiming
+    /// the row is a prefix of the sealed commit's parent.
+    #[tokio::test]
+    async fn parked_durable_prefix_two_rewrites_behind_heals_to_committed_head() {
+        #[derive(Clone, Default)]
+        struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let writer = CaptureWriter::default();
+        // A second registered Dispatch keeps callsite interest from being
+        // cached `never` by threads without a subscriber.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
+        let _capture = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        );
+
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let continuity: Arc<dyn crate::identity_first::ContinuityStore> = Arc::new(
+            crate::identity_first::LocalContinuityStore::open(dir.path().join("continuity.db"))
+                .unwrap_or_else(|error| panic!("{error}")),
+        );
+        let adapter = Arc::new(crate::identity_first::ContinuitySessionStoreAdapter::new(
+            Arc::clone(&continuity),
+        ));
+        let inner: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new(dir.path().join("runtime.db"))
+                .unwrap_or_else(|error| panic!("{error}")),
+        );
+
+        let mut gen0 = meerkat_core::Session::new();
+        for text in ["opening", "second", "third"] {
+            gen0.push(meerkat_core::Message::User(
+                meerkat_core::types::UserMessage::text(text),
+            ));
+        }
+        let identity = crate::identity_first::AgentIdentity::parse("domain:parked-prefix-two")
+            .unwrap_or_else(|error| panic!("{error}"));
+        crate::identity_first::ContinuityStore::upsert_continuity_record(
+            continuity.as_ref(),
+            &crate::identity_first::ContinuityRecord {
+                identity: identity.clone(),
+                agent_runtime_id: crate::identity_first::AgentRuntimeId::parse(
+                    "rt:domain:parked-prefix-two:0",
+                )
+                .unwrap_or_else(|error| panic!("{error}")),
+                session_id: gen0.id().clone(),
+                generation: crate::identity_first::ContinuityGeneration::new(0),
+                checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
+            },
+            crate::identity_first::FencingToken::new(1),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+        adapter
+            .register_session(
+                gen0.id(),
+                crate::identity_first::SessionRuntimeState {
+                    identity,
+                    generation: crate::identity_first::ContinuityGeneration::new(0),
+                    fencing_token: crate::identity_first::FencingToken::new(1),
+                    checkpoint_version: crate::identity_first::CheckpointVersion::new(0),
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        // Only the 3-message state ever projects durably.
+        meerkat::SessionStore::save(adapter.as_ref(), &gen0)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        // The runtime appended a 4th message (never projected) and compacted
+        // 4 -> 1, then appended again and compacted 2 -> 1.
+        let mut successor = gen0.clone();
+        successor.push(meerkat_core::Message::User(
+            meerkat_core::types::UserMessage::text("never projected"),
+        ));
+        commit_test_compaction(&mut successor, 4, "first compacted summary");
+        successor.push(meerkat_core::Message::User(
+            meerkat_core::types::UserMessage::text("after the first compaction"),
+        ));
+        commit_test_compaction(&mut successor, 2, "second compacted summary");
+
+        adapter
+            .unregister_session(gen0.id())
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(gen0.id());
+        inner
+            .commit_session_snapshot(
+                &runtime_id,
+                meerkat_runtime::store::SerializedSessionSnapshot {
+                    session_snapshot: Arc::new(
+                        successor
+                            .to_persisted_bytes()
+                            .unwrap_or_else(|error| panic!("{error}")),
+                    ),
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+
+        let store = Arc::new(SessionStoreBackedRuntimeStore::new(
+            Arc::clone(&inner),
+            Arc::clone(&adapter) as Arc<dyn SessionStore>,
+        ));
+        meerkat_runtime::RuntimeStore::load_committed_whole_blob_snapshot(&*store, &runtime_id)
+            .await
+            .unwrap_or_else(|error| panic!("the durable-prefix repair must converge: {error}"))
+            .unwrap_or_else(|| panic!("the committed snapshot must remain readable"));
+
+        let successor_revision = successor
+            .transcript_revision()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let channel = continuity
+            .as_incremental_sessions()
+            .unwrap_or_else(|| panic!("the local continuity store provides the delta channel"));
+        let healed_head = channel
+            .load_canonical_head(gen0.id())
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("the healed head row must exist"));
+        assert_eq!(
+            healed_head.rewrite_count, 2,
+            "both compaction rewrites must be installed on the durable head"
+        );
+        assert_eq!(
+            healed_head.head_revision, successor_revision,
+            "the healed head must land at the committed head exactly"
+        );
+        let healed = meerkat::SessionStore::load(adapter.as_ref(), gen0.id())
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("the durable row must exist"));
+        assert_eq!(
+            healed
+                .transcript_revision()
+                .unwrap_or_else(|error| panic!("{error}")),
+            successor_revision,
+            "the healed row must match the committed successor exactly"
+        );
+
+        let captured = String::from_utf8_lossy(
+            &writer
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned();
+        let admission = captured
+            .lines()
+            .find(|line| line.contains("durable-behind admission"))
+            .unwrap_or_else(|| panic!("the admission must be logged: {captured}"));
+        assert!(
+            admission.contains("durable_messages=3")
+                && admission.contains("parent_messages=4")
+                && admission.contains("first_rewrite_generation=1")
+                && admission.contains("replayed_rewrites=2"),
+            "the admission log must name the row counts, the first replayed rewrite and the count: \
+             {admission}"
+        );
+        assert!(
+            !admission.contains("tear"),
+            "the admission log states the observed shape, not a presumed cause: {admission}"
         );
     }
 

@@ -13,7 +13,7 @@ use crate::unified_runtime::types::meerkat_reconcile_report_to_wire;
 
 use super::edge_types::{DesiredPeerEdge, EdgeMemberView, EdgeReconcileFailure};
 use super::types::{
-    UnifiedRuntimeReconcileEdgesReport, UnifiedRuntimeReconcileError,
+    ErrorEvent, UnifiedRuntimeReconcileEdgesReport, UnifiedRuntimeReconcileError,
     UnifiedRuntimeReconcileReport, UnifiedRuntimeReconcileRoutingReport,
 };
 use super::{
@@ -121,6 +121,25 @@ impl UnifiedRuntime {
                 ),
             ));
         }
+        // Member-id alias rule: decode every spec id first, so an encoded
+        // roster id is not encoded twice into a phantom member, and refuse a
+        // generated runtime alias, which only the identity authority owns, as
+        // spawn does. The baseline then holds the public aliases.
+        let mut decoded_specs = Vec::with_capacity(desired_specs.len());
+        for mut spec in desired_specs {
+            let alias =
+                crate::member_comms_id::runtime_alias_str(spec.identity.as_str()).into_owned();
+            if crate::member_comms_id::is_reserved_generated_alias(&alias) {
+                return Err(UnifiedRuntimeReconcileError::Mob(
+                    crate::mob_handle_runtime::MobRuntimeError::InvalidConfig(format!(
+                        "generated member alias requires identity authority: {alias}"
+                    )),
+                ));
+            }
+            spec.identity = meerkat_mob::AgentIdentity::from(alias.as_str());
+            decoded_specs.push(spec);
+        }
+        let desired_specs = decoded_specs;
         self.mob_runtime
             .set_baseline_member_specs(desired_specs.clone())
             .await;
@@ -196,11 +215,17 @@ impl UnifiedRuntime {
     /// desired vs managed edges, and calls wire/unwire as needed.
     pub async fn reconcile_edges(&self) -> UnifiedRuntimeReconcileEdgesReport {
         let report = self.topology_runtime_handle().reconcile().await;
-        if !report.is_complete() {
-            self.fire_error(super::types::ErrorEvent::ReconcileIncomplete {
-                failures: report.failures.len(),
-                skipped: report.skipped_missing_members.len(),
-            });
+        if let Some(alert) = reconcile_incomplete_alert(&report) {
+            self.fire_error(alert);
+        } else if !report.skipped_missing_members.is_empty() {
+            // INFO, not WARN: lazy identity bootstrap leaves an edge pending
+            // until both endpoints are members, so a boot skips such edges by
+            // design and a warning would fire on every boot.
+            tracing::info!(
+                skipped = report.skipped_missing_members.len(),
+                "edge reconcile left edges pending until both endpoints are members; \
+                 nothing failed"
+            );
         }
         report
     }
@@ -638,4 +663,62 @@ pub(crate) async fn reconcile_edges_over_members(
     }
 
     report
+}
+
+/// The alert an edge reconcile pages: only when an edge operation failed,
+/// with `skipped` counting the edges skipped beside the failures. An edge
+/// skipped because an endpoint is not a member yet failed nothing: lazy
+/// identity bootstrap leaves it pending until both endpoints materialize.
+fn reconcile_incomplete_alert(report: &UnifiedRuntimeReconcileEdgesReport) -> Option<ErrorEvent> {
+    if report.failures.is_empty() {
+        return None;
+    }
+    Some(ErrorEvent::ReconcileIncomplete {
+        failures: report.failures.len(),
+        skipped: report.skipped_missing_members.len(),
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod reconcile_incomplete_alert_tests {
+    use super::*;
+
+    fn edge(a: &str, b: &str) -> DesiredPeerEdge {
+        DesiredPeerEdge::new(a, b).expect("desired peer edge")
+    }
+
+    #[test]
+    fn a_failed_edge_pages_with_the_skipped_count_beside_it() {
+        let report = UnifiedRuntimeReconcileEdgesReport {
+            skipped_missing_members: vec![edge("a", "b")],
+            failures: vec![EdgeReconcileFailure {
+                edge: edge("c", "d"),
+                operation: "wire".to_string(),
+                error: "refused".to_string(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            reconcile_incomplete_alert(&report),
+            Some(ErrorEvent::ReconcileIncomplete {
+                failures: 1,
+                skipped: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn skipped_edges_alone_do_not_page() {
+        let report = UnifiedRuntimeReconcileEdgesReport {
+            skipped_missing_members: vec![edge("a", "b"), edge("a", "c")],
+            ..Default::default()
+        };
+        assert!(!report.is_complete(), "the topology is still incomplete");
+        assert_eq!(reconcile_incomplete_alert(&report), None);
+        assert_eq!(
+            reconcile_incomplete_alert(&UnifiedRuntimeReconcileEdgesReport::default()),
+            None
+        );
+    }
 }

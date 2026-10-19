@@ -4,6 +4,44 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+## 0.9.3
+
+- Breaking: the draft results of `meta/mobpacks/list`, `create`, `save`,
+  `undo`, `redo` and `delete` type `rows` as the new `MobpackDraftSummary`
+  (id, name, version, stage, trigger, source, description, revision, etag,
+  `updated_at_unix_ms`, `can_undo` and `can_redo`): Meta lists drafts
+  without their documents. A write's `row` is still a whole
+  `MobpackDraftRow`; `meta/mobpacks/get` returns a draft's document.
+- `MobpackDraftSaveResult`, `MobpackDraftHistoryResult` and
+  `MobpackDraftDeleteResult` carry `durability_warning`, set when Meta wrote
+  the draft store but could not sync its directory: the write took effect
+  and may not survive a crash.
+- `MobHandle.spawn_helper` and `MobHandle.fork_helper` take
+  `transport_timeout` (seconds): how long the call waits for the helper's
+  result. It defaults to the transport's request timeout (60 seconds) and is
+  not sent to the gateway. When it runs out the helper's outcome is unknown
+  and it may still be running: reconcile it before any retry. A retry under a
+  fresh `agent_identity` starts another helper (it neither cancels nor
+  deduplicates the first); one under the same identity queues behind the
+  first on identity-first gateways.
+- Test doubles that replace the private `MetaRuntime._rpc` must accept the
+  `transport_timeout` keyword: `spawn_helper` and `fork_helper` now always
+  pass it (`None` when unset).
+
+### Fixed
+
+- A gateway whose stdout closes while `meta/init` is in flight (it exits, or
+  writes a fail-closed init refusal and exits) no longer leaves asyncio
+  logging "Future exception was never retrieved" with a
+  `TransportReaderFailedError`. Closing the init watch retires its
+  settlement future on the host loop; the caller's typed error is unchanged.
+- A request timeout longer than `threading.TIMEOUT_MAX` is refused before the
+  request is written: the call raises `ValueError`, and `connect()` with such a
+  `gateway_init_timeout` raises `TransportError` caused by it, sending no
+  `meta/init`. The transport used to write the request and only then fail its
+  wait with `OverflowError`, so the gateway ran the call with nobody waiting
+  for the reply.
+
 ## 0.9.2
 
 - No SDK API changes; released with Meta 0.9.2 on Meerkat 0.9.2.

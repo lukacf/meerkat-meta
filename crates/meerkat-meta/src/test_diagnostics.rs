@@ -15,15 +15,47 @@ pub(crate) enum CompletionCase {
     TerminalError,
     StreamError,
     Truncated,
+    /// The stream ends with no terminal event and no error.
+    Unterminated,
 }
 
 impl CompletionCase {
-    pub(crate) const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::Success,
         Self::TerminalError,
         Self::StreamError,
         Self::Truncated,
+        Self::Unterminated,
     ];
+}
+
+/// Every stop reason that ends a memory stage's completion before a complete
+/// answer, apart from the output ceiling's own `Truncated`. Each stage's tests
+/// refuse all of them.
+pub(crate) const INCOMPLETE_STOPS: [meerkat_core::StopReason; 6] = [
+    meerkat_core::StopReason::ContentFilter,
+    meerkat_core::StopReason::ToolUse,
+    meerkat_core::StopReason::Cancelled,
+    meerkat_core::StopReason::Refusal,
+    meerkat_core::StopReason::PauseTurn,
+    meerkat_core::StopReason::ContextWindowExceeded,
+];
+
+/// A client whose completion streams `body` and then stops with
+/// `stop_reason`.
+pub(crate) fn stopping_client(
+    body: &str,
+    stop_reason: meerkat_core::StopReason,
+) -> meerkat_client::TestClient {
+    meerkat_client::TestClient::new(vec![
+        LlmEvent::TextDelta {
+            delta: body.to_string(),
+            meta: None,
+        },
+        LlmEvent::Done {
+            outcome: LlmDoneOutcome::Success { stop_reason },
+        },
+    ])
 }
 
 pub(crate) struct ObservationClient {
@@ -35,7 +67,7 @@ pub(crate) struct ObservationClient {
 impl ObservationClient {
     pub(crate) fn new(case: CompletionCase) -> Self {
         let operation_id = meerkat_core::OperationId::new();
-        let events = vec![
+        let mut events = vec![
             Ok(LlmEvent::TextDelta {
                 delta: PHYSICAL_TEXT.into(),
                 meta: None,
@@ -44,25 +76,26 @@ impl ObservationClient {
                 operation_id: operation_id.clone(),
                 phase: meerkat_core::authorization::OperationObservationPhase::Outcome,
             }),
-            match case {
-                CompletionCase::Success => Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
-                }),
-                CompletionCase::TerminalError => Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Error {
-                        error: LlmError::ConnectionReset,
-                    },
-                }),
-                CompletionCase::StreamError => Err(LlmError::ConnectionReset),
-                CompletionCase::Truncated => Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::MaxTokens,
-                    },
-                }),
-            },
         ];
+        events.extend(match case {
+            CompletionCase::Success => Some(Ok(LlmEvent::Done {
+                outcome: LlmDoneOutcome::Success {
+                    stop_reason: meerkat_core::StopReason::EndTurn,
+                },
+            })),
+            CompletionCase::TerminalError => Some(Ok(LlmEvent::Done {
+                outcome: LlmDoneOutcome::Error {
+                    error: LlmError::ConnectionReset,
+                },
+            })),
+            CompletionCase::StreamError => Some(Err(LlmError::ConnectionReset)),
+            CompletionCase::Truncated => Some(Ok(LlmEvent::Done {
+                outcome: LlmDoneOutcome::Success {
+                    stop_reason: meerkat_core::StopReason::MaxTokens,
+                },
+            })),
+            CompletionCase::Unterminated => None,
+        });
         Self {
             events,
             calls: AtomicUsize::new(0),

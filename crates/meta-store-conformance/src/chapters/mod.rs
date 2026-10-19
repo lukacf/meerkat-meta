@@ -20,6 +20,8 @@
 //! | [`agent_memory`]                    | every `AgentMemoryProvider` |
 //! | [`legacy_continuity_database`]      | the bundled `LocalContinuityStore` only (fabricates its schema) |
 //! | [`legacy_memory_database`]          | the bundled `SqliteAgentMemoryStore` only (fabricates its schema) |
+//! | [`mob_references`]                  | every `ExtensionDocumentStore` a host supplies (`meta-extension-state`) |
+//! | [`mob_id_holders`]                  | every `ExtensionDocumentStore` a host supplies (`meta-extension-state`) |
 
 mod agent_memory;
 mod blobs;
@@ -29,6 +31,7 @@ mod continuity_adapter;
 mod continuity_incremental;
 mod continuity_wrapper;
 mod event_log;
+mod extension_documents;
 mod legacy_data;
 
 pub use agent_memory::agent_memory;
@@ -41,4 +44,5 @@ pub use continuity_adapter::continuity_session_adapter;
 pub use continuity_incremental::continuity_incremental;
 pub use continuity_wrapper::continuity_wrapper_preserves_incremental_channel;
 pub use event_log::event_log;
+pub use extension_documents::{mob_id_holders, mob_references};
 pub use legacy_data::{legacy_continuity_database, legacy_memory_database};

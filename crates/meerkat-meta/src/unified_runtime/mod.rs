@@ -2843,9 +2843,14 @@ fn attach_member_event_stream(
 /// on every wake indefinitely and floods the log (observed: ~49k "failed to
 /// subscribe" warnings over 3.4h on a single wedged-retiring alias). Both
 /// retry transient failures with exponential backoff; only the independent
-/// health monitor hands persistent loss to identity repair.
+/// health monitor hands persistent loss to identity repair. A failure while
+/// the member's mob is stopping or stopped is its teardown, not a transient
+/// failure: it parks the member instead ([`mob_is_stopping_or_stopped`]).
 struct SubscribeBackoff {
-    next_attempt: tokio::time::Instant,
+    /// When the next subscribe may be attempted. `None` parks the member
+    /// while its mob is stopping or stopped: no deadline ends that, only the
+    /// mob running again, so no retry is scheduled for it.
+    next_attempt: Option<tokio::time::Instant>,
     consecutive_failures: u32,
 }
 
@@ -3015,7 +3020,7 @@ fn earliest_backoff_attempt(
 ) -> Option<tokio::time::Instant> {
     subscribe_failures
         .values()
-        .map(|backoff| backoff.next_attempt)
+        .filter_map(|backoff| backoff.next_attempt)
         .min()
 }
 
@@ -3031,6 +3036,28 @@ fn subscribe_backoff_delay(consecutive_failures: u32) -> Duration {
 /// (which can still carry stale binding atoms) fails every reconcile tick.
 fn forwarder_should_subscribe(status: MobMemberStatus) -> bool {
     matches!(status, MobMemberStatus::Active)
+}
+
+/// Whether `handle`'s mob is stopping or stopped, so a member subscribe that
+/// failed is the mob tearing its members down rather than a spawn or resume
+/// race: the mob's admission is closed (it never reopens), or its last
+/// published phase is Stopped, Completed or Destroyed. Each teardown Meta
+/// drives says so before the members' sessions end: its shutdown stops the
+/// mob before the terminal teardown (Meerkat's own `MobHandle::shutdown`
+/// publishes Stopped only at its end), its child stand-down closes each
+/// child's admission first, and a destroy publishes Destroyed when its
+/// durable destroy marker is written, before the members are disposed. A
+/// destroy also marks every member Retiring, and the forwarder subscribes
+/// only Active members ([`forwarder_should_subscribe`]). What the actor
+/// answered does not count: an actor that refuses with a closed channel
+/// while its mob runs and admits died, and its members keep the warning,
+/// the backoff and the repair count.
+fn mob_is_stopping_or_stopped(handle: &MobHandle) -> bool {
+    handle.admission_closed().borrow().is_some()
+        || matches!(
+            handle.status_observation_snapshot(),
+            MobState::Stopped | MobState::Completed | MobState::Destroyed
+        )
 }
 
 fn durable_identity_label(labels: &BTreeMap<String, String>) -> Option<String> {
@@ -3763,11 +3790,17 @@ async fn reconcile_agent_event_streams(
 
             // Back off an Active member that keeps failing to subscribe (a
             // genuinely stuck injector), so even that case can't spin the log.
+            // A member parked by its mob's teardown waits for the mob to run
+            // again.
             let now = tokio::time::Instant::now();
-            if let Some(backoff) = subscribe_failures.get(&tracked_key)
-                && now < backoff.next_attempt
-            {
-                continue;
+            if let Some(backoff) = subscribe_failures.get(&tracked_key) {
+                let held = match backoff.next_attempt {
+                    Some(next_attempt) => now < next_attempt,
+                    None => mob_is_stopping_or_stopped(handle),
+                };
+                if held {
+                    continue;
+                }
             }
 
             let role = entry.role.clone();
@@ -3801,6 +3834,30 @@ async fn reconcile_agent_event_streams(
                     tracked.current.insert(tracked_key, attachment);
                 }
                 Err(error) => {
+                    // The member's mob is tearing its members down (a
+                    // shutdown stops the mob, then ends their sessions and
+                    // its actor): the failure is the teardown. Park the
+                    // member with no retry and nothing above debug until the
+                    // mob runs again; identity repair does not count it.
+                    if mob_is_stopping_or_stopped(handle) {
+                        if identity_runtime.is_none() {
+                            tracing::debug!(
+                                mob_id = %mob_id,
+                                identity = %identity,
+                                error = %error,
+                                "meta agent event forwarder: subscribe failed while the member's \
+                                 mob is stopping or stopped; not retrying until it runs again"
+                            );
+                        }
+                        subscribe_failures
+                            .entry(tracked_key)
+                            .and_modify(|backoff| backoff.next_attempt = None)
+                            .or_insert(SubscribeBackoff {
+                                next_attempt: None,
+                                consecutive_failures: 0,
+                            });
+                        continue;
+                    }
                     // Usually a short-lived spawn/resume race while Meerkat
                     // finishes installing the session event injector. Retry
                     // with exponential backoff and warn only on the first
@@ -3812,27 +3869,37 @@ async fn reconcile_agent_event_streams(
                         subscribe_failures
                             .entry(tracked_key)
                             .or_insert(SubscribeBackoff {
-                                next_attempt: now,
+                                next_attempt: Some(now),
                                 consecutive_failures: 0,
                             });
-                    if identity_runtime.is_none() && backoff.consecutive_failures == 0 {
+                    // The identity health monitor runs this pass too: a
+                    // member it cannot watch is logged like one the console
+                    // forwarder cannot.
+                    let watcher = if identity_runtime.is_some() {
+                        "identity_health_monitor"
+                    } else {
+                        "console_forwarder"
+                    };
+                    if backoff.consecutive_failures == 0 {
                         tracing::warn!(
                             mob_id = %mob_id,
                             identity = %identity,
+                            watcher,
                             error = %error,
                             "meta agent event forwarder: failed to subscribe; will retry with backoff"
                         );
-                    } else if identity_runtime.is_none() {
+                    } else {
                         tracing::debug!(
                             mob_id = %mob_id,
                             identity = %identity,
+                            watcher,
                             error = %error,
                             consecutive_failures = backoff.consecutive_failures,
                             "meta agent event forwarder: subscribe still failing; backing off"
                         );
                     }
                     backoff.next_attempt =
-                        now + subscribe_backoff_delay(backoff.consecutive_failures);
+                        Some(now + subscribe_backoff_delay(backoff.consecutive_failures));
                     backoff.consecutive_failures = backoff.consecutive_failures.saturating_add(1);
                     let stream_is_permanently_lost =
                         backoff.consecutive_failures >= PERMANENT_STREAM_FAILURE_THRESHOLD;
@@ -3885,6 +3952,12 @@ async fn observe_bound_session(
     (bound && after.as_ref() == Some(&before)).then_some(before)
 }
 
+/// A mob whose member event subscriptions fail, for the tests of a
+/// subscription that cannot attach.
+#[cfg(test)]
+static FAIL_MEMBER_EVENT_SUBSCRIPTIONS_OF_MOB: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
 async fn subscribe_agent_events_for_console_forwarder(
     handle: &MobHandle,
     identity: &AgentIdentity,
@@ -3898,6 +3971,17 @@ async fn subscribe_agent_events_for_console_forwarder(
     ),
     meerkat_mob::MobError,
 > {
+    #[cfg(test)]
+    if FAIL_MEMBER_EVENT_SUBSCRIPTIONS_OF_MOB
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_deref()
+        == Some(handle.mob_id().as_str())
+    {
+        return Err(meerkat_mob::MobError::Internal(
+            "member event subscription failed (test)".to_string(),
+        ));
+    }
     // Keep the console forwarder on the same authoritative subscription path
     // as `/agents/{id}/events`. The observation shortcut can lag the actor's
     // runtime-member projection in identity-first/runtime-backed packs, which
@@ -4294,10 +4378,44 @@ async fn run_actor_loop_probe<P, F>(
 /// Project a forwarded member event for the drain: the wire envelope plus
 /// any drain-side alert extracted while the member event is still typed.
 fn forwarded_member_event(attributed: AttributedEvent) -> ForwardedMemberEvent {
-    ForwardedMemberEvent {
-        alert: compaction_rejection_alert(&attributed),
-        envelope: attributed_event_to_unified(attributed),
-    }
+    let compaction_rejection = compaction_rejection_alert(&attributed);
+    let failed_run_pages = run_failure_pages(&attributed.envelope.payload);
+    let envelope = attributed_event_to_unified(attributed);
+    let alert = match compaction_rejection {
+        Some(alert) => Some(alert),
+        None if failed_run_pages => host_loop_crash_alert(&envelope),
+        None => None,
+    };
+    ForwardedMemberEvent { envelope, alert }
+}
+
+/// Whether a member event is a run failure that pages as `HostLoopCrash`: a
+/// `RunFailed` whose typed failure class is anything but `Cancelled`. A
+/// cancelled run ended because it was asked to (an interrupt, a mob stop, a
+/// shutdown cancelling in-flight work), not because the member's loop
+/// failed; its `run_failed` event still reaches the console and event log.
+fn run_failure_pages(payload: &AgentEvent) -> bool {
+    matches!(
+        payload,
+        AgentEvent::RunFailed { error_report, .. }
+            if error_report.class != meerkat_core::event::AgentErrorClass::Cancelled
+    )
+}
+
+/// The `HostLoopCrash` alert for a failed member run, named by the event id
+/// and member alias the console and event log key the run by, with the
+/// failure the projected payload carries.
+fn host_loop_crash_alert(envelope: &EventEnvelope<UnifiedEvent>) -> Option<ErrorEvent> {
+    let UnifiedEvent::Agent {
+        agent_id, payload, ..
+    } = &envelope.event
+    else {
+        return None;
+    };
+    Some(ErrorEvent::HostLoopCrash {
+        member_id: agent_id.clone(),
+        error: lifecycle::run_failed_crash_error(&envelope.event_id, payload.as_ref()),
+    })
 }
 
 /// Compaction persistence rejections must page rather than pass as ordinary
@@ -4533,6 +4651,73 @@ mod tests {
         assert_eq!(agent_id, "worker-one:0");
     }
 
+    /// The console drops an agent event by its Core event id, never by its
+    /// content. Two Core events with the same member, payload, sequence and
+    /// timestamp still carry distinct UUIDv7 ids, so both are kept; only a
+    /// redelivered copy of one of them (the same id) is dropped.
+    #[tokio::test]
+    async fn console_projection_keeps_identical_events_and_drops_a_redelivered_copy() {
+        let core_event = || {
+            let mut envelope = meerkat_core::event::EventEnvelope::new_with_source(
+                meerkat_core::event::EventSourceIdentity::runtime("test"),
+                7,
+                None,
+                AgentEvent::TextDelta {
+                    assistant_message_id: None,
+                    delta: "same words".to_string(),
+                },
+            );
+            envelope.timestamp_ms = 1;
+            let mut attributed = attributed_text_delta("worker-one", 0);
+            attributed.envelope = envelope;
+            attributed
+        };
+        let first = core_event();
+        let second = core_event();
+        assert_ne!(
+            first.envelope.event_id, second.envelope.event_id,
+            "Core mints a fresh id for every event"
+        );
+        assert_eq!(
+            serde_json::to_value(&first.envelope.payload).expect("payload serializes"),
+            serde_json::to_value(&second.envelope.payload).expect("payload serializes")
+        );
+        assert_eq!(first.envelope.seq, second.envelope.seq);
+
+        let store = console_events::ConsoleEventStore::new();
+        store
+            .register_runtime_identity("worker-one:0", "worker-one")
+            .await;
+        let first_id = format!("evt-agent-{}", first.envelope.event_id);
+        let second_id = format!("evt-agent-{}", second.envelope.event_id);
+        store
+            .project_unified_event(&attributed_event_to_unified(first.clone()))
+            .await;
+        store
+            .project_unified_event(&attributed_event_to_unified(second))
+            .await;
+        // The same Core event delivered again.
+        store
+            .project_unified_event(&attributed_event_to_unified(first))
+            .await;
+
+        let replay = store
+            .replay_all(None)
+            .await
+            .expect("all-events replay should succeed");
+        // Registration records its own console event; keep the agent events.
+        let agent_events = replay
+            .iter()
+            .filter(|event| event.event_id.starts_with("evt-agent-"))
+            .collect::<Vec<_>>();
+        let ids = agent_events
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![first_id.as_str(), second_id.as_str()]);
+        assert_eq!(agent_events[0].data, agent_events[1].data);
+    }
+
     /// Regression: the callers' outer `select!` drops and recreates the
     /// `wait()` future on every forwarded member event, so a safety deadline
     /// computed inside `wait` would reset under sustained event traffic and
@@ -4618,15 +4803,12 @@ mod tests {
             meerkat::build_ephemeral_service(factory, meerkat::Config::default(), 16),
         );
 
-        let definition = meerkat_mob::MobDefinition::from_toml(
-            r#"
-[mob]
-id = "compaction-alert-mob"
-
-[profiles.worker]
-model = "gpt-5.5"
-"#,
-        )
+        // A mob id per call: it names process-wide comms participants, and
+        // the suite runs the tests that bootstrap this runtime concurrently.
+        let definition = meerkat_mob::MobDefinition::from_toml(&format!(
+            "[mob]\nid = \"alert-mob-{}\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n",
+            uuid::Uuid::new_v4().simple()
+        ))
         .expect("parse mob definition");
         let mob_spec = MobBootstrapSpec::new(
             definition,
@@ -4807,6 +4989,125 @@ model = "gpt-5.5"
         assert!(
             typed_error.contains("runtime epoch rotated under the coordinator"),
             "error must keep the human rendering: {typed_error}"
+        );
+    }
+
+    /// Push one member `RunFailed` event per `(class, message)` through the
+    /// real drain path and return the alerts the error hook received by the
+    /// time the last event's alert arrived. `#[tokio::test]` runs one thread,
+    /// so the detached hook tasks run in the order the drain fired them: once
+    /// the last event's alert is in, every earlier one is in too.
+    async fn run_failure_alerts_through_drain(
+        failures: Vec<(meerkat_core::event::AgentErrorClass, &str)>,
+    ) -> Vec<ErrorEvent> {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = bootstrap_minimal_runtime(&temp_dir).await;
+
+        let captured: Arc<tokio::sync::Mutex<Vec<ErrorEvent>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let hook_captured = captured.clone();
+        let hook: ErrorHook = Arc::new(move |event| {
+            let hook_captured = hook_captured.clone();
+            Box::pin(async move {
+                hook_captured.lock().await.push(event);
+            })
+        });
+        runtime.set_error_hook(hook);
+
+        let event_tx = runtime.install_test_event_ingress().await;
+        let session_id = meerkat_core::types::SessionId::new();
+        let last_message = failures
+            .last()
+            .map(|(_, message)| (*message).to_string())
+            .expect("at least one failed run");
+        for (seq, (class, message)) in failures.into_iter().enumerate() {
+            let attributed = AttributedEvent {
+                source: AgentRuntimeId::new(AgentIdentity::from("run-worker"), Generation::new(0)),
+                source_fence_token: FenceToken::new(1),
+                role: ProfileName::from("worker"),
+                envelope: meerkat_core::event::EventEnvelope {
+                    event_id: Default::default(),
+                    source: meerkat_core::event::EventSourceIdentity::session(session_id.clone()),
+                    seq: seq as u64,
+                    mob_id: None,
+                    timestamp_ms: 9,
+                    payload: AgentEvent::RunFailed {
+                        session_id: session_id.clone(),
+                        identity: Default::default(),
+                        error_report: meerkat_core::event::AgentErrorReport {
+                            class,
+                            reason: None,
+                            message: message.to_string(),
+                        },
+                        terminal_cause_kind: None,
+                    },
+                },
+            };
+            event_tx
+                .send(forwarded_member_event(attributed))
+                .await
+                .expect("send forwarded event");
+        }
+        runtime
+            .drain_mob_agent_events()
+            .await
+            .expect("drain member events");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let last_paged = captured.lock().await.iter().any(|alert| {
+                matches!(
+                    alert,
+                    ErrorEvent::HostLoopCrash { error, .. } if error.contains(&last_message)
+                )
+            });
+            if last_paged {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the last failed run did not page: {:?}",
+                captured.lock().await
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let alerts = captured.lock().await.clone();
+        runtime.shutdown().await;
+        alerts
+    }
+
+    /// A cancelled member run is not a host loop crash: an interrupt, a stop
+    /// or a shutdown cancels in-flight work on purpose. Only a run that
+    /// failed pages `HostLoopCrash`, decided on the typed failure class.
+    #[tokio::test]
+    async fn a_cancelled_member_run_does_not_page_as_a_host_loop_crash() {
+        use meerkat_core::event::AgentErrorClass;
+
+        let alerts = run_failure_alerts_through_drain(vec![
+            (AgentErrorClass::Cancelled, "Run was cancelled"),
+            (
+                AgentErrorClass::Llm,
+                "LLM error: authentication failed (401)",
+            ),
+        ])
+        .await;
+
+        let crashes: Vec<(&str, &str)> = alerts
+            .iter()
+            .filter_map(|alert| match alert {
+                ErrorEvent::HostLoopCrash { member_id, error } => {
+                    Some((member_id.as_str(), error.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(crashes.len(), 1, "only the failed run pages: {alerts:?}");
+        let (member_id, error) = crashes[0];
+        assert_eq!(member_id, "run-worker:0");
+        assert!(
+            error.starts_with("agent run failed (event_id: evt-agent-")
+                && error.ends_with("class=llm: LLM error: authentication failed (401)"),
+            "the alert keeps its detail: {error}"
         );
     }
 
@@ -5831,7 +6132,7 @@ model = "gpt-5.5"
         let mut subscribe_failures = HashMap::from([(
             key.clone(),
             SubscribeBackoff {
-                next_attempt: tokio::time::Instant::now(),
+                next_attempt: Some(tokio::time::Instant::now()),
                 consecutive_failures: 1,
             },
         )]);
@@ -5957,6 +6258,197 @@ model = "gpt-5.5"
 
         drop(streams);
         let _ = handle.shutdown().await;
+    }
+
+    /// A member whose mob is shutting down is neither retried nor warned
+    /// about: its stream closing and its re-subscribe failing are the
+    /// teardown, not a spawn race. The closed stream re-runs the pass, as in
+    /// the forwarder task; the failed subscribe parks the member with no
+    /// retry deadline, a later pass does not try again, and nothing is
+    /// logged above debug.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_neither_retries_nor_warns_for_a_member_of_a_mob_shutting_down() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (mob_runtime, _session_id) =
+            mob_with_idle_worker("console-teardown-member", &temp_dir).await;
+        let handle = mob_runtime.handle();
+        let mut forwarder = DrivenForwarder::new();
+        forwarder.reconcile(&handle, &None).await;
+        assert_eq!(
+            forwarder.tracked.current.len(),
+            1,
+            "the worker's stream attached"
+        );
+
+        // The teardown the runtime's shutdown drives: Stop, then the mob's
+        // terminal shutdown, which ends the worker's session and its stream.
+        handle.stop().await.expect("stop the mob");
+        let shutdown_handle = handle.clone();
+        let shutdown = tokio::spawn(async move { shutdown_handle.shutdown().await });
+        let (closed_key, generation) = loop {
+            if let ForwardedAgentEvent::Closed(key, generation) = forwarder.next().await {
+                break (key, generation);
+            }
+        };
+        assert!(forwarder.tracked.close(&closed_key, generation));
+
+        let writer = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        // A second registered dispatcher keeps callsite interest computed for
+        // every dispatcher, so a callsite another test's thread reached first
+        // still records here.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
+        let guard = tracing::subscriber::set_default(subscriber);
+        forwarder.reconcile(&handle, &None).await;
+        let parked_after_first_pass = forwarder.subscribe_failures.contains_key(&closed_key);
+        forwarder.reconcile(&handle, &None).await;
+        drop(guard);
+        let logged = writer.contents();
+        let _ = shutdown.await;
+
+        let retry = earliest_backoff_attempt(&forwarder.subscribe_failures);
+        assert!(
+            retry.is_none() && !logged.contains("will retry with backoff"),
+            "a member of a mob shutting down is neither retried (next attempt \
+             {retry:?}) nor warned about: {logged}"
+        );
+        assert!(
+            forwarder.tracked.current.is_empty(),
+            "nothing attaches to a member being torn down"
+        );
+        assert!(
+            parked_after_first_pass,
+            "the failed subscribe parks the member: {logged}"
+        );
+        assert_eq!(
+            logged.matches("not retrying").count(),
+            1,
+            "one debug line, and the second pass does not try again: {logged}"
+        );
+    }
+
+    /// A member parked by its mob's teardown is tried again once the mob
+    /// runs: the park holds only while the mob is stopping or stopped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_tries_a_parked_member_again_once_its_mob_runs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (mob_runtime, _session_id) =
+            mob_with_idle_worker("console-parked-member", &temp_dir).await;
+        let handle = mob_runtime.handle();
+        let entry = handle
+            .list_members_including_retiring()
+            .await
+            .into_iter()
+            .find(|entry| entry.agent_identity == IDLE_WORKER)
+            .expect("worker roster entry");
+        let (runtime_id, fence_token) = entry.binding_atoms().expect("worker binding atoms");
+        let key = TrackedAgentEventStream {
+            mob_id: handle.mob_id().to_string(),
+            durable_identity: durable_identity_label(&entry.labels),
+            member_identity: entry.agent_identity.clone(),
+            runtime_id,
+            identity_fencing_token: None,
+            fence_token,
+        };
+        let mut forwarder = DrivenForwarder::new();
+        forwarder.subscribe_failures.insert(
+            key.clone(),
+            SubscribeBackoff {
+                next_attempt: None,
+                consecutive_failures: 0,
+            },
+        );
+        assert_eq!(
+            earliest_backoff_attempt(&forwarder.subscribe_failures),
+            None,
+            "a parked member schedules no retry"
+        );
+
+        forwarder.reconcile(&handle, &None).await;
+
+        assert!(
+            forwarder.tracked.current.contains_key(&key),
+            "the running mob's member attached"
+        );
+        assert!(forwarder.subscribe_failures.is_empty());
+        drop(forwarder);
+        let _ = handle.shutdown().await;
+    }
+
+    /// Only a mob that says it stops parks its members: a closed admission,
+    /// or a Stopped, Completed or Destroyed phase. A mob that runs and admits
+    /// is no teardown, whatever its actor answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn only_a_mob_that_stops_or_closes_admission_parks_its_members() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (standing_down, _) = mob_with_idle_worker("console-park-stand-down", &temp_dir).await;
+        let handle = standing_down.handle();
+        assert!(
+            !mob_is_stopping_or_stopped(&handle),
+            "a mob that runs and admits"
+        );
+        handle
+            .close_admission(meerkat_mob::MobAdmissionCloseReason::StandDown)
+            .await
+            .expect("close admission");
+        assert!(mob_is_stopping_or_stopped(&handle), "a mob standing down");
+        let _ = handle.shutdown().await;
+
+        let other_dir = tempfile::tempdir().expect("temp dir");
+        let (stopped, _) = mob_with_idle_worker("console-park-stopped", &other_dir).await;
+        let handle = stopped.handle();
+        handle.stop().await.expect("stop the mob");
+        assert!(mob_is_stopping_or_stopped(&handle), "a stopped mob");
+        let _ = handle.shutdown().await;
+    }
+
+    /// A member of a destroyed mob leaves the subscribe bookkeeping once the
+    /// roster drops it: the pass prunes every entry whose member it no
+    /// longer lists, a parked one included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_prunes_a_destroyed_mobs_parked_member() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (mob_runtime, _session_id) =
+            mob_with_idle_worker("console-destroyed-member", &temp_dir).await;
+        let handle = mob_runtime.handle();
+        let entry = handle
+            .list_members_including_retiring()
+            .await
+            .into_iter()
+            .find(|entry| entry.agent_identity == IDLE_WORKER)
+            .expect("worker roster entry");
+        let (runtime_id, fence_token) = entry.binding_atoms().expect("worker binding atoms");
+        let key = TrackedAgentEventStream {
+            mob_id: handle.mob_id().to_string(),
+            durable_identity: durable_identity_label(&entry.labels),
+            member_identity: entry.agent_identity.clone(),
+            runtime_id,
+            identity_fencing_token: None,
+            fence_token,
+        };
+        let mut forwarder = DrivenForwarder::new();
+        forwarder.subscribe_failures.insert(
+            key,
+            SubscribeBackoff {
+                next_attempt: None,
+                consecutive_failures: 0,
+            },
+        );
+
+        handle.destroy().await.expect("destroy the mob");
+        assert_eq!(handle.status_observation_snapshot(), MobState::Destroyed);
+        forwarder.reconcile(&handle, &None).await;
+
+        assert!(
+            forwarder.subscribe_failures.is_empty(),
+            "the destroyed mob's member was pruned ({} entries left)",
+            forwarder.subscribe_failures.len()
+        );
+        assert!(forwarder.tracked.current.is_empty());
     }
 
     const RESTART_MEMBER: &str = "lead-1";
@@ -6651,6 +7143,54 @@ model = "gpt-5.5"
         runtime.shutdown().await;
     }
 
+    /// The identity health monitor logs a member it fails to subscribe to,
+    /// as the console forwarder does: a warning on the first failure, then
+    /// debug while it keeps failing. Both were skipped for the monitor, so a
+    /// member it could not watch, and whose turns it then could not count,
+    /// left no trace until the stream repair.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_identity_health_monitor_logs_a_failed_subscription() {
+        let mob_id = "identity-health-subscribe-log";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (runtime, identity_runtime, _ledger, _identity) = health_restart(mob_id, &temp).await;
+        let slot = Arc::new(std::sync::RwLock::new(Some(identity_runtime.clone())));
+        let handle = runtime.mob_handle();
+        let mut tracked = AttachedStreams::default();
+        let mut failures = HashMap::new();
+        let mut streams = SelectAll::new();
+        *FAIL_MEMBER_EVENT_SUBSCRIPTIONS_OF_MOB
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(mob_id.to_string());
+        // A second registered dispatch keeps the capture's interest in the
+        // warning when another thread reached its callsite first.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
+        let (_, log) =
+            crate::test_diagnostics::capture_warnings(Box::pin(reconcile_agent_event_streams(
+                &handle,
+                &None,
+                &mut tracked,
+                &mut failures,
+                &mut streams,
+                Some(&slot),
+            )))
+            .await;
+        *FAIL_MEMBER_EVENT_SUBSCRIPTIONS_OF_MOB
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        assert_eq!(
+            (
+                tracked.current.len(),
+                failures.len(),
+                log.matches("failed to subscribe; will retry with backoff")
+                    .count(),
+                log.contains("identity_health_monitor"),
+            ),
+            (0, 1, 1, true),
+            "{log}"
+        );
+        runtime.shutdown().await;
+    }
+
     async fn console_timeline_after_restart(mob_id: &str, shape: RestartShape) {
         let temp = tempfile::tempdir().expect("temp dir");
         let mob_path = temp.path().join("mob.sqlite3");
@@ -7024,14 +7564,20 @@ model = "gpt-5.5"
             forwarder.tracked.current.is_empty(),
             "no actor to attach to yet"
         );
+        // The restored mob stays Stopped until activation resumes it, so the
+        // failed subscription parks the member: no retry deadline, no count.
+        assert_eq!(handle.status_observation_snapshot(), MobState::Stopped);
         let backoff = forwarder
             .subscribe_failures
             .get_mut(&key)
-            .expect("the failed subscription parked the member in backoff");
-        assert_eq!(backoff.consecutive_failures, 1);
+            .expect("the failed subscription parked the member");
+        assert_eq!(
+            (backoff.next_attempt, backoff.consecutive_failures),
+            (None, 0)
+        );
         // Keep the member parked until its run finished unobserved,
         // whatever the scheduling.
-        backoff.next_attempt = tokio::time::Instant::now() + Duration::from_hours(1);
+        backoff.next_attempt = Some(tokio::time::Instant::now() + Duration::from_hours(1));
 
         let identity_runtime = boot.identity_runtime.clone();
         let runtime = boot.activate().await;
@@ -7057,7 +7603,7 @@ model = "gpt-5.5"
             .subscribe_failures
             .get_mut(&key)
             .expect("parked member")
-            .next_attempt = tokio::time::Instant::now();
+            .next_attempt = Some(tokio::time::Instant::now());
         forwarder.reconcile(&handle, &None).await;
         assert!(
             forwarder
@@ -7222,12 +7768,17 @@ model = "gpt-5.5"
     }
 
     fn live_only_attachment() -> meerkat_core::mcp_attachment::LiveMcpAttachment {
-        let server = meerkat_core::mcp_config::McpServerConfig::stdio(
+        live_only_attachment_of(meerkat_core::mcp_config::McpServerConfig::stdio(
             "member-attached",
             "/bin/true",
             Vec::new(),
             std::collections::HashMap::new(),
-        );
+        ))
+    }
+
+    fn live_only_attachment_of(
+        server: meerkat_core::mcp_config::McpServerConfig,
+    ) -> meerkat_core::mcp_attachment::LiveMcpAttachment {
         meerkat_core::mcp_attachment::LiveMcpAttachment {
             control: Arc::new(LiveOnlyControl(server.clone())),
             server,
@@ -7566,6 +8117,350 @@ model = "gpt-5.5"
         assert_eq!(answer, McpAttachmentReadiness::Pending);
         let _ = release_tx.send(());
         drop(runtime);
+    }
+
+    fn diagnosed_setup_failure() -> meerkat_core::mcp_attachment::McpStdioSetupFailure {
+        meerkat_core::mcp_attachment::McpStdioSetupFailure::new(
+            "tools",
+            3,
+            meerkat_core::mcp_attachment::McpStdioSetupPhase::Initialize,
+            meerkat_core::mcp_attachment::McpStdioSetupFailureClass::Closed { exit: None },
+            true,
+        )
+    }
+
+    fn diagnosed_stderr_tail() -> meerkat_core::mcp_attachment::McpStdioStderrTail {
+        meerkat_core::mcp_attachment::McpStdioStderrTail::new(
+            "server stderr\n".to_string(),
+            14,
+            false,
+            true,
+        )
+    }
+
+    /// An attempt that failed its stdio setup: always the same typed failure
+    /// and stderr tail. With `leaving`, that identity leaves the identity
+    /// runtime while either diagnostic is read.
+    struct DiagnosedFailure {
+        leaving: Option<(
+            Arc<crate::identity_first::IdentityRuntime>,
+            crate::identity_first::AgentIdentity,
+        )>,
+    }
+
+    impl DiagnosedFailure {
+        fn readiness() -> meerkat_core::mcp_attachment::McpAttachmentReadiness {
+            meerkat_core::mcp_attachment::McpAttachmentReadiness::Failed {
+                detail: "the server closed during setup".to_string(),
+            }
+        }
+
+        async fn read(&self) {
+            if let Some((runtime, identity)) = &self.leaving {
+                let _ = runtime.remove(identity).await;
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::mcp_attachment::McpAttachmentAttemptObserver for DiagnosedFailure {
+        async fn observe(
+            &self,
+            _tool: &str,
+        ) -> meerkat_core::mcp_attachment::McpAttachmentReadiness {
+            Self::readiness()
+        }
+
+        async fn wait(
+            &self,
+            _tool: &str,
+            _timeout: Duration,
+        ) -> meerkat_core::mcp_attachment::McpAttachmentReadiness {
+            Self::readiness()
+        }
+
+        async fn setup_failure(
+            &self,
+        ) -> Option<meerkat_core::mcp_attachment::McpStdioSetupFailure> {
+            self.read().await;
+            Some(diagnosed_setup_failure())
+        }
+
+        async fn stderr_tail(&self) -> Option<meerkat_core::mcp_attachment::McpStdioStderrTail> {
+            self.read().await;
+            Some(diagnosed_stderr_tail())
+        }
+    }
+
+    /// The public entry's attempt forwards its stdio setup diagnostics, the
+    /// typed failure and the host-only stderr tail, only while its identity
+    /// is still on the attached session: another session, an unknown
+    /// identity or a released identity runtime gets `None`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_identity_bound_attempt_forwards_setup_diagnostics_only_for_the_attached_session() {
+        use crate::identity_first::IdentityBoundAttempt;
+        use meerkat_core::mcp_attachment::McpAttachmentAttemptObserver;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (runtime, identity_runtime) = boot_identity_first_persistent(
+            "identity-bound-diagnostics",
+            &temp.path().join("mob.sqlite3"),
+            &temp.path().join("state"),
+        )
+        .await;
+        let session_id = commit_restart_member_turn(&identity_runtime, "attached").await;
+        let member = crate::identity_first::AgentIdentity::parse(RESTART_MEMBER).expect("identity");
+        let bound = |runtime: std::sync::Weak<crate::identity_first::IdentityRuntime>,
+                     identity: crate::identity_first::AgentIdentity,
+                     session: meerkat_core::types::SessionId| {
+            IdentityBoundAttempt::new(
+                runtime,
+                identity,
+                session,
+                Arc::new(DiagnosedFailure { leaving: None }),
+            )
+        };
+        let weak = Arc::downgrade(&identity_runtime);
+
+        let attached = bound(weak.clone(), member.clone(), session_id.clone());
+        assert_eq!(
+            attached.setup_failure().await,
+            Some(diagnosed_setup_failure())
+        );
+        assert_eq!(attached.stderr_tail().await, Some(diagnosed_stderr_tail()));
+
+        let unknown =
+            crate::identity_first::AgentIdentity::parse("unknown:diagnostics").expect("identity");
+        for stale in [
+            bound(
+                weak.clone(),
+                member.clone(),
+                meerkat_core::types::SessionId::new(),
+            ),
+            bound(weak, unknown, session_id.clone()),
+            bound(std::sync::Weak::new(), member, session_id),
+        ] {
+            assert_eq!(stale.setup_failure().await, None);
+            assert_eq!(stale.stderr_tail().await, None);
+        }
+        drop(runtime);
+    }
+
+    /// An identity that leaves its runtime while a diagnostic is read gets
+    /// `None`: the identity check after the read catches it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_identity_leaving_during_a_diagnostic_read_gets_none() {
+        use crate::identity_first::IdentityBoundAttempt;
+        use meerkat_core::mcp_attachment::McpAttachmentAttemptObserver;
+        for read_tail in [false, true] {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let (runtime, identity_runtime) = boot_identity_first_persistent(
+                if read_tail {
+                    "identity-leaves-tail-read"
+                } else {
+                    "identity-leaves-failure-read"
+                },
+                &temp.path().join("mob.sqlite3"),
+                &temp.path().join("state"),
+            )
+            .await;
+            let session_id = commit_restart_member_turn(&identity_runtime, "attached").await;
+            let member =
+                crate::identity_first::AgentIdentity::parse(RESTART_MEMBER).expect("identity");
+            let leaving = IdentityBoundAttempt::new(
+                Arc::downgrade(&identity_runtime),
+                member.clone(),
+                session_id,
+                Arc::new(DiagnosedFailure {
+                    leaving: Some((Arc::clone(&identity_runtime), member.clone())),
+                }),
+            );
+            if read_tail {
+                assert_eq!(leaving.stderr_tail().await, None);
+            } else {
+                assert_eq!(leaving.setup_failure().await, None);
+            }
+            assert!(
+                !identity_runtime.contains(&member).await,
+                "the identity left during the read"
+            );
+            drop(runtime);
+        }
+    }
+
+    /// What the failing stdio server below writes to its stderr: it reaches
+    /// the host in the attempt's tail and nothing else.
+    const STDERR_SENTINEL: &str = "META-STDERR-SENTINEL-4b9d";
+
+    /// A stdio MCP server that writes [`STDERR_SENTINEL`] to its stderr and
+    /// exits before it answers `initialize`.
+    fn exits_during_initialize(name: &str) -> meerkat_core::mcp_config::McpServerConfig {
+        meerkat_core::mcp_config::McpServerConfig::stdio(
+            name,
+            "/bin/sh",
+            vec![
+                "-c".to_string(),
+                format!("printf 'setup failed: %s\\n' '{STDERR_SENTINEL}' >&2\nexit 3\n"),
+            ],
+            std::collections::HashMap::new(),
+        )
+    }
+
+    /// A governed identity's live stdio server that exits during
+    /// `initialize` reports its typed setup failure and its stderr tail to
+    /// the host through the public identity entry's attempt. The tail stays
+    /// with the host: the receipt, the readiness, the failure and the tail's
+    /// own `Debug` never show the server's stderr, nor does any event of the
+    /// member or the mob. A retired identity's attempt forwards neither.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_identity_attempt_reports_its_failed_stdio_setup_to_the_host_only() {
+        use meerkat_core::mcp_attachment::{
+            McpAttachmentReadiness, McpStdioSetupFailureClass, McpStdioSetupPhase,
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime =
+            super::held_identity_test_support::governed_runtime(&dir, "identity-mcp-diagnostics")
+                .await;
+        let identity =
+            crate::identity_first::AgentIdentity::parse("mcp-diagnostics").expect("identity");
+        let roster = vec![super::held_identity_test_support::member(&identity)];
+        let sessions = Arc::clone(
+            runtime
+                .mob_runtime()
+                .session_service()
+                .expect("the governed runtime has a session service"),
+        );
+        // As the gateways wire it: the identity bridge reaches the session
+        // owner's live attachment entry.
+        let identity_runtime = Arc::new(crate::identity_first::IdentityRuntime::new(
+            crate::identity_first::IdentityRuntimeConfig {
+                continuity_store: Arc::new(
+                    crate::identity_first::LocalContinuityStore::in_memory()
+                        .expect("continuity store"),
+                ),
+                lease_provider: Arc::new(crate::identity_first::LocalLeaseProvider::new()),
+                runtime_instance_id: "identity-mcp-diagnostics".to_string(),
+                has_runtime_store: true,
+                durability_policy: crate::identity_first::DurabilityPolicy::SyncWriteThrough,
+                bridge: Some(Arc::new(
+                    crate::identity_first::MobSessionBridge::with_session_service(
+                        crate::gateway_wiring::identity_mob_handle(&runtime),
+                        Arc::clone(&sessions),
+                    )
+                    .with_controller_pin_source(
+                        runtime
+                            .mob_runtime()
+                            .controller_pin_source()
+                            .expect("the governed runtime records its session owner"),
+                    ),
+                )),
+                default_timeout: None,
+            },
+        ));
+        super::held_identity_test_support::install_roster(&mut runtime, identity_runtime, &roster);
+        runtime
+            .bootstrap_installed_identity_first_context(&roster)
+            .await
+            .expect("the governed member is created");
+        let view = runtime.identity_runtime().expect("identity runtime export");
+        let session_id = view
+            .status(&identity)
+            .await
+            .expect("identity status")
+            .session_id
+            .expect("the member's session");
+        let mut mob_events = runtime.subscribe_mob_events();
+
+        let (view_entry, member) = (&view, &identity);
+        let receipt = attach_between_turns(sessions.as_ref(), &session_id, move || {
+            view_entry.attach_live_mcp_server(
+                member,
+                live_only_attachment_of(exits_during_initialize("exits-during-initialize")),
+            )
+        })
+        .await
+        .expect("the governed member attaches");
+        let readiness = receipt.attempt.wait("any", Duration::from_secs(40)).await;
+        assert!(
+            matches!(readiness, McpAttachmentReadiness::Failed { .. }),
+            "{readiness:?}"
+        );
+        let failure = receipt
+            .attempt
+            .setup_failure()
+            .await
+            .expect("the attempt's typed setup failure reaches the host");
+        assert_eq!(failure.server, "exits-during-initialize");
+        assert_eq!(failure.phase, McpStdioSetupPhase::Initialize);
+        assert!(
+            matches!(failure.class, McpStdioSetupFailureClass::Closed { .. }),
+            "{failure:?}"
+        );
+        assert!(failure.stderr_tail_retained, "{failure:?}");
+        // The drain of the server's stderr can trail the attempt's failure.
+        let tail = tokio::time::timeout(crate::test_wait::STRUCTURAL_BACKSTOP, async {
+            loop {
+                if let Some(tail) = receipt.attempt.stderr_tail().await
+                    && tail.text.contains(STDERR_SENTINEL)
+                {
+                    return tail;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the attempt's stderr tail reaches the host");
+
+        let mut rendered = vec![
+            format!("{receipt:?}"),
+            format!("{readiness:?}"),
+            format!("{:?}", receipt.attempt.observe("any").await),
+            format!("{failure:?}"),
+            format!("{tail:?}"),
+        ];
+        let mut member_events = runtime
+            .mob_handle()
+            .subscribe_agent_events_from(
+                &crate::member_comms_id::mob_member_id(identity.as_str()),
+                meerkat_core::comms::SessionEventCursor::Earliest,
+            )
+            .await
+            .expect("the member's retained events")
+            .stream;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(500), member_events.next()).await
+        {
+            rendered.push(serde_json::to_string(&event).expect("member event json"));
+            rendered.push(format!("{event:?}"));
+        }
+        loop {
+            match mob_events.try_recv() {
+                Ok(event) => {
+                    rendered.push(serde_json::to_string(&event).expect("mob event json"));
+                    rendered.push(format!("{event:?}"));
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        for event in runtime
+            .query_mob_events(&EventQuery::default())
+            .await
+            .expect("the mob event ledger")
+        {
+            rendered.push(serde_json::to_string(&event).expect("ledger event json"));
+        }
+        for text in &rendered {
+            assert!(
+                !text.contains(STDERR_SENTINEL),
+                "the server's stderr escaped the host-only tail: {text}"
+            );
+        }
+
+        view.retire(&identity).await.expect("the identity retires");
+        assert_eq!(receipt.attempt.setup_failure().await, None);
+        assert_eq!(receipt.attempt.stderr_tail().await, None);
+        drop(view);
+        let _ = runtime.shutdown().await;
     }
 
     /// A session owner that records each live attachment and answers
@@ -8071,6 +8966,64 @@ model = "gpt-5.5"
         runtime.shutdown().await;
     }
 
+    /// A member of a running, admitting mob whose subscribe fails keeps the
+    /// transient handling: the first-failure warning, a retry deadline, and
+    /// the failure counted toward identity repair.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_keeps_the_warning_backoff_and_count_for_a_running_mobs_member() {
+        let mob_id = "console-running-failure";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mob_path = temp.path().join("mob.sqlite3");
+        let state_root = temp.path().join("state");
+        let (first, first_identity) =
+            boot_identity_first_persistent(mob_id, &mob_path, &state_root).await;
+        let session_id = commit_restart_member_turn(&first_identity, "before restart").await;
+        first.shutdown().await;
+
+        let boot = boot_persistent_before_activation(mob_id, &mob_path, &state_root).await;
+        let _ingress = boot.runtime.install_test_event_ingress().await;
+        let identity_runtime = boot.identity_runtime.clone();
+        let runtime = boot.activate().await;
+        let handle = runtime.mob_handle();
+        let key = restart_member_key(&restart_member_entry(&handle).await, mob_id);
+        commit_restart_member_turn(&identity_runtime, "revoked run").await;
+        discard_restart_member_actor(&runtime, &session_id).await;
+        assert_eq!(handle.status_observation_snapshot(), MobState::Running);
+        assert!(handle.admission_closed().borrow().is_none());
+
+        let writer = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        // A second registered dispatcher keeps callsite interest computed for
+        // every dispatcher, so a callsite another test's thread reached first
+        // still records here.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
+        let guard = tracing::subscriber::set_default(subscriber);
+        let mut forwarder = DrivenForwarder::new();
+        forwarder.reconcile(&handle, &None).await;
+        drop(guard);
+        let logged = writer.contents();
+
+        let backoff = forwarder
+            .subscribe_failures
+            .get(&key)
+            .expect("the failed subscription is held");
+        assert!(backoff.next_attempt.is_some(), "a retry is scheduled");
+        assert_eq!(
+            backoff.consecutive_failures, 1,
+            "the failure counts toward identity repair"
+        );
+        assert!(
+            logged.contains("failed to subscribe; will retry with backoff"),
+            "{logged}"
+        );
+
+        runtime.shutdown().await;
+    }
+
     /// An actor discarded before the forwarder attached is never attached:
     /// no stream is attributed to the member from a revoked actor. The
     /// successor actor's stream attaches next, from its own first event.
@@ -8108,7 +9061,7 @@ model = "gpt-5.5"
             .subscribe_failures
             .get_mut(&key)
             .expect("parked member")
-            .next_attempt = tokio::time::Instant::now();
+            .next_attempt = Some(tokio::time::Instant::now());
         forwarder.reconcile(&handle, &None).await;
         assert!(
             forwarder

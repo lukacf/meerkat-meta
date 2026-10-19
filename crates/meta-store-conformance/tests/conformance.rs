@@ -16,10 +16,16 @@ use meerkat_meta::identity_first as contracts;
 use meerkat_meta::identity_first::{AgentMemoryProvider, ContinuityStore, LocalContinuityStore};
 use meerkat_meta::memory::SqliteAgentMemoryStore;
 use meerkat_meta::unified_runtime::EventLogStore;
+use meta_extension_state::{
+    Document, DocumentId, DocumentPage, DocumentScope, ExtensionDocumentStore, HostAccessContext,
+    ListRequest, Mutation, MutationOutcome, MutationReceipt, RequestIdentity,
+    SqliteExtensionDocumentStore,
+};
 use meta_store_conformance::{
     AgentMemoryProviderFactory, BinaryBlobStoreFactory, CompatRollbackContinuityStore,
     ConformanceFailure, ConsoleLogStoreFactory, ContinuityStoreFactory, EventLogStoreFactory,
-    ReferenceEventLogStore, ReferenceInMemoryAgentMemoryStore, chapters,
+    ExtensionDocumentStoreFactory, ReferenceEventLogStore, ReferenceInMemoryAgentMemoryStore,
+    chapters,
 };
 
 // ---------------------------------------------------------------------------
@@ -538,4 +544,125 @@ async fn legacy_memory_database_upgrades_preserving_rows_and_sentinel() {
     chapters::legacy_memory_database(dir.path())
         .await
         .expect("a pre-column memory database must upgrade preserving rows and the sentinel");
+}
+
+// ---------------------------------------------------------------------------
+// Extension documents: the host-facing mob id contract
+// ---------------------------------------------------------------------------
+
+/// File-backed `SqliteExtensionDocumentStore`: each open is a NEW handle over
+/// the same database file (models a process restart).
+struct SqliteExtensionDocumentFactory {
+    path: PathBuf,
+}
+
+#[async_trait]
+impl ExtensionDocumentStoreFactory for SqliteExtensionDocumentFactory {
+    async fn open(&self) -> Result<Arc<dyn ExtensionDocumentStore>, ConformanceFailure> {
+        let store = SqliteExtensionDocumentStore::open(&self.path)
+            .map_err(|error| ConformanceFailure::new("factory", "open", error.to_string()))?;
+        Ok(Arc::new(store))
+    }
+}
+
+/// A store a host wrote against 0.9.2: every required method, and the
+/// trait's default holder methods.
+struct DefaultHolderMethods(SqliteExtensionDocumentStore);
+
+#[async_trait]
+impl ExtensionDocumentStore for DefaultHolderMethods {
+    async fn get(
+        &self,
+        scope: &DocumentScope,
+        caller: &HostAccessContext,
+        id: &DocumentId,
+    ) -> meta_extension_state::Result<Document> {
+        self.0.get(scope, caller, id).await
+    }
+    async fn list(
+        &self,
+        scope: &DocumentScope,
+        caller: &HostAccessContext,
+        request: ListRequest,
+    ) -> meta_extension_state::Result<DocumentPage> {
+        self.0.list(scope, caller, request).await
+    }
+    async fn lookup_receipt(
+        &self,
+        scope: &DocumentScope,
+        caller: &HostAccessContext,
+        request: &RequestIdentity,
+    ) -> meta_extension_state::Result<Option<MutationReceipt>> {
+        self.0.lookup_receipt(scope, caller, request).await
+    }
+    async fn mutate(
+        &self,
+        scope: &DocumentScope,
+        caller: &HostAccessContext,
+        request: &RequestIdentity,
+        mutation: Mutation,
+    ) -> meta_extension_state::Result<MutationOutcome> {
+        self.0.mutate(scope, caller, request, mutation).await
+    }
+    async fn references_mob(
+        &self,
+        realm: &str,
+        mob_id: &str,
+    ) -> meta_extension_state::Result<bool> {
+        self.0.references_mob(realm, mob_id).await
+    }
+}
+
+struct DefaultHolderMethodsFactory {
+    path: PathBuf,
+}
+
+#[async_trait]
+impl ExtensionDocumentStoreFactory for DefaultHolderMethodsFactory {
+    async fn open(&self) -> Result<Arc<dyn ExtensionDocumentStore>, ConformanceFailure> {
+        let store = SqliteExtensionDocumentStore::open(&self.path)
+            .map_err(|error| ConformanceFailure::new("factory", "open", error.to_string()))?;
+        Ok(Arc::new(DefaultHolderMethods(store)))
+    }
+}
+
+#[tokio::test]
+async fn sqlite_extension_document_store_passes_the_mob_id_profile() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    chapters::mob_references(&SqliteExtensionDocumentFactory {
+        path: dir.path().join("references.sqlite3"),
+    })
+    .await
+    .expect("SqliteExtensionDocumentStore must answer which documents name a mob");
+    chapters::mob_id_holders(&SqliteExtensionDocumentFactory {
+        path: dir.path().join("holders.sqlite3"),
+    })
+    .await
+    .expect("SqliteExtensionDocumentStore must record which mob holds an id");
+}
+
+/// The suite flags a store that keeps the trait's default holder methods:
+/// a host treats their error as a quarantine of every restored mob whose id
+/// documents name.
+#[tokio::test]
+async fn a_store_keeping_the_default_holder_methods_fails_the_holder_profile() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    chapters::mob_references(&DefaultHolderMethodsFactory {
+        path: dir.path().join("references.sqlite3"),
+    })
+    .await
+    .expect("the references profile needs no holder methods");
+    let failure = chapters::mob_id_holders(&DefaultHolderMethodsFactory {
+        path: dir.path().join("holders.sqlite3"),
+    })
+    .await
+    .expect_err("the default holder methods answer an error");
+    assert_eq!(
+        (failure.chapter(), failure.step()),
+        (
+            "extension_documents::mob_id_holders",
+            "unrecorded_id_has_no_holder"
+        ),
+        "{failure:?}"
+    );
 }

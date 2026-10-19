@@ -216,6 +216,38 @@ pub(crate) fn evaluate_access_lineage(
     }
 }
 
+/// The first deny rule that matches `resource` for this principal and
+/// action, ignoring allow rules. An admin matches none, as in
+/// [`evaluate_access_lineage`].
+pub(crate) fn matching_deny_rule<'c>(
+    config: &'c AccessControlConfig,
+    principal: &AccessPrincipal,
+    action: &str,
+    resource: &AccessResource<'_>,
+) -> Option<&'c str> {
+    if !config.enabled {
+        return None;
+    }
+    if let Some(subject) = principal.subject.as_deref()
+        && config.admins.iter().any(|admin| admin == subject)
+    {
+        return None;
+    }
+    config
+        .rules
+        .iter()
+        .find(|rule| {
+            matches!(rule.effect, AccessEffect::Deny)
+                && rule
+                    .actions
+                    .iter()
+                    .any(|pattern| action_matches(pattern, action))
+                && subject_matches(rule, principal)
+                && resource_matches(rule, resource)
+        })
+        .map(|rule| rule.id.as_str())
+}
+
 /// True when the principal could perform `action` against at least one
 /// resource — i.e. some allow rule matches the principal (by subject/group)
 /// and names the action. Ignores resource selectors and deny rules, so it is

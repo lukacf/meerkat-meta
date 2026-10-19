@@ -41,7 +41,7 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.2",
+        "CARGO_PKG_VERSION": "0.9.3",
         "CARGO_MANIFEST_DIR": "./crates/meta-store-conformance",
     },
     proc_macro_deps = all_crate_deps(
@@ -50,6 +50,7 @@ rust_library(
     ),
     deps = [
         "//crates/meerkat-meta:meerkat_meta",
+        "//crates/meta-extension-state:meta_extension_state",
     ] + all_crate_deps(
         package_name = "crates/meta-store-conformance",
         normal = True,
@@ -75,7 +76,7 @@ rust_test(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.2",
+        "CARGO_PKG_VERSION": "0.9.3",
         "CARGO_MANIFEST_DIR": "./crates/meta-store-conformance",
     },
     tags = [
@@ -96,6 +97,7 @@ rust_test(
     ),
     deps = [
         "//crates/meerkat-meta:meerkat_meta",
+        "//crates/meta-extension-state:meta_extension_state",
     ] + all_crate_deps(
         package_name = "crates/meta-store-conformance",
         normal = True,
@@ -124,7 +126,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.2",
+        "CARGO_PKG_VERSION": "0.9.3",
         "CARGO_BIN_NAME": "conformance",
         "CARGO_MANIFEST_DIR": "./crates/meta-store-conformance",
     },
@@ -143,6 +145,7 @@ rust_test(
     ),
     deps = [
         "//crates/meerkat-meta:meerkat_meta",
+        "//crates/meta-extension-state:meta_extension_state",
         "//crates/meta-store-conformance:meta_store_conformance",
     ] + all_crate_deps(
         package_name = "crates/meta-store-conformance",
@@ -172,7 +175,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.2",
+        "CARGO_PKG_VERSION": "0.9.3",
         "CARGO_BIN_NAME": "json_console_store",
         "CARGO_MANIFEST_DIR": "./crates/meta-store-conformance",
     },
@@ -191,6 +194,7 @@ rust_test(
     ),
     deps = [
         "//crates/meerkat-meta:meerkat_meta",
+        "//crates/meta-extension-state:meta_extension_state",
         "//crates/meta-store-conformance:meta_store_conformance",
     ] + all_crate_deps(
         package_name = "crates/meta-store-conformance",
@@ -220,7 +224,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.9.2",
+        "CARGO_PKG_VERSION": "0.9.3",
         "CARGO_BIN_NAME": "one_remote_bundle",
         "CARGO_MANIFEST_DIR": "./crates/meta-store-conformance",
     },
@@ -239,6 +243,7 @@ rust_test(
     ),
     deps = [
         "//crates/meerkat-meta:meerkat_meta",
+        "//crates/meta-extension-state:meta_extension_state",
         "//crates/meta-store-conformance:meta_store_conformance",
     ] + all_crate_deps(
         package_name = "crates/meta-store-conformance",

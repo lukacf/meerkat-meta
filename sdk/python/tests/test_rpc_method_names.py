@@ -14,14 +14,20 @@ from meerkat_meta.errors import NotConnectedError, RpcError
 
 
 def make_mock_mob_handle(rpc_responses=None):
-    """Create a MobHandle with a mocked RPC transport."""
+    """Create a MobHandle with a mocked RPC transport.
+
+    ``handle._runtime.transport_timeouts`` records each call's per-call
+    transport wait (``None`` is the transport's default).
+    """
     from meerkat_meta.runtime import MobHandle
 
     runtime = MagicMock()
     calls = []
+    runtime.transport_timeouts = []
 
-    async def mock_rpc(method, params=None):
+    async def mock_rpc(method, params=None, *, transport_timeout=None):
         calls.append((method, params))
+        runtime.transport_timeouts.append(transport_timeout)
         if rpc_responses and method in rpc_responses:
             return rpc_responses[method]
         return {}
@@ -1082,6 +1088,37 @@ async def test_fork_helper_rpc_name_and_params():
     assert calls[0][1]["max_text_bytes"] == 32768
     assert calls[0][1]["fork_context"] == {"type": "last_messages", "count": 10}
     assert calls[0][1]["options"]["runtime_mode"] == "turn_driven"
+
+
+@pytest.mark.asyncio
+async def test_helper_transport_timeout_sets_only_the_client_wait():
+    """``transport_timeout`` reaches the RPC's transport wait and nothing
+    else: the request params are the same with and without it, and an omitted
+    value leaves the transport's default wait."""
+    handle, calls = make_mock_mob_handle()
+    spawn = dict(result_label="helper-result", max_text_bytes=65536, role="worker")
+    fork = dict(
+        result_label="fork-result",
+        max_text_bytes=32768,
+        fork_context={"type": "last_messages", "count": 10},
+    )
+
+    await handle.spawn_helper("h1", "do stuff", **spawn)
+    await handle.spawn_helper("h1", "do stuff", **spawn, transport_timeout=180.0)
+    await handle.fork_helper("lead", "fork-1", "review this", **fork)
+    await handle.fork_helper(
+        "lead", "fork-1", "review this", **fork, transport_timeout=180.0
+    )
+
+    assert [method for method, _ in calls] == [
+        "meta/spawn_helper",
+        "meta/spawn_helper",
+        "meta/fork_helper",
+        "meta/fork_helper",
+    ]
+    assert calls[1][1] == calls[0][1]
+    assert calls[3][1] == calls[2][1]
+    assert handle._runtime.transport_timeouts == [None, 180.0, None, 180.0]
 
 
 @pytest.mark.asyncio

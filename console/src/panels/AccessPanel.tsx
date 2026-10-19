@@ -338,10 +338,6 @@ export function AccessPanel({
           {status?.subject ? <> · you are {status.subject}</> : null}
         </p>
       </div>
-      {loading ? <p role="status">Refreshing owner state. Changes are temporarily unavailable.</p> : null}
-      {error || saveFailure ? <div className="gating__empty" role="alert" data-testid="access-error">{error || (saveFailure ? accessSaveNotice(saveFailure) : null)}</div> : null}
-      {requiresReview && canReview ? <button onClick={reviewAndReapply}>Review and reapply</button> : null}
-      {error ? <p style={{ padding: "0 24px" }}>Last loaded configuration may be out of date. Refresh before making changes.</p> : null}
       {readOnly ? <p role="status">This connection is read-only.</p> : null}
       <div className="gating__tabs">
         {(["overview", "groups", "rules", "preview"] as Tab[]).map((candidate) => (
@@ -363,6 +359,13 @@ export function AccessPanel({
           Refresh
         </button>
       </div>
+      {/* Owner-state feedback comes and goes with every refresh, and stream
+          events start refreshes at any moment. It renders below the tabs so a
+          refresh never moves them under a click in progress. */}
+      {loading ? <p role="status">Refreshing owner state. Changes are temporarily unavailable.</p> : null}
+      {error || saveFailure ? <div className="gating__empty" role="alert" data-testid="access-error">{error || (saveFailure ? accessSaveNotice(saveFailure) : null)}</div> : null}
+      {requiresReview && canReview ? <button onClick={reviewAndReapply}>Review and reapply</button> : null}
+      {error ? <p style={{ padding: "0 24px" }}>Last loaded configuration may be out of date. Refresh before making changes.</p> : null}
       <fieldset className="gating__list access-panel__body" disabled={tab === "preview" ? !current : tab === "groups" ? !current || saving : !canEdit} style={{ border: 0, margin: 0, minWidth: 0 }}>
         {tab === "overview" ? (
           <div className="gating__policies">

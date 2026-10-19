@@ -307,7 +307,37 @@ impl RunningMobRuntimeDelivery {
         drop(handle);
     }
 
-    fn is_stopped(&self) -> bool {
+    /// Whether the native owner's task has ended: its pass channel closes
+    /// with it.
+    #[cfg(test)]
+    pub(super) fn owner_task_ended(&self) -> bool {
+        self.passes.has_changed().is_err()
+    }
+
+    /// Retire the native owner and wait for its task, at most `bound`: no
+    /// pass starts after the request, and one already running (blocking
+    /// store work included) finishes first. Once the task ended, the handle
+    /// goes as [`Self::stop`] drops it; an owner still running at the bound
+    /// keeps its handle, so a later retirement joins the same task. An owner
+    /// already stopped (its handle gone) answers `Ok` at once, unjoined.
+    pub(super) async fn retire(
+        &self,
+        bound: std::time::Duration,
+    ) -> Result<(), meerkat::RuntimeDeliveryOwnerRetirementIncomplete> {
+        let retirement = self
+            .handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(meerkat::RuntimeDeliveryOwnerHandle::retire);
+        if let Some(retirement) = retirement {
+            retirement.join(bound).await?;
+        }
+        self.stop();
+        Ok(())
+    }
+
+    pub(super) fn is_stopped(&self) -> bool {
         self.handle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -720,6 +750,54 @@ mod tests {
             "the last observed pass stays readable after the stop"
         );
         retained.handle().shutdown().await.expect("shutdown");
+    }
+
+    /// A retirement whose bound passes keeps the owner's handle, and a later
+    /// one joins that same task. The owner runs on its own single-threaded
+    /// runtime, which nothing drives while the first retirement waits, so
+    /// that zero bound always passes first. On the owner's runtime the stop
+    /// request would wake the owner, which would end before the timer fired.
+    #[test]
+    fn a_retirement_past_its_bound_keeps_the_owner_for_the_next() {
+        let owner_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("owner runtime");
+        let waiter_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("waiter runtime");
+        let _owner_context = owner_runtime.enter();
+        let dir = tempfile::tempdir().expect("temp");
+        let fixture = memory_fixture(dir.path());
+        let runtime = owner_runtime
+            .block_on(MobRuntime::bootstrap(fixture.spec))
+            .expect("first boot");
+        owner_runtime.block_on(first_pass(&fixture.delivery));
+        let running = runtime.runtime_delivery.as_ref().expect("armed delivery");
+
+        let first = waiter_runtime.block_on(running.retire(std::time::Duration::ZERO));
+        assert_eq!(
+            (
+                first.map_err(|incomplete| incomplete.bound),
+                running.is_stopped()
+            ),
+            (Err(std::time::Duration::ZERO), false),
+            "a retirement past its bound keeps the owner's handle"
+        );
+        let second = owner_runtime.block_on(running.retire(std::time::Duration::from_secs(10)));
+        assert_eq!(
+            (
+                second.map_err(|incomplete| incomplete.bound),
+                running.is_stopped(),
+                running.owner_task_ended()
+            ),
+            (Ok(()), true, true),
+            "a later retirement joins the same owner"
+        );
+        owner_runtime
+            .block_on(runtime.handle().shutdown())
+            .expect("shutdown");
     }
 
     #[tokio::test]

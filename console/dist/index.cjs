@@ -24444,6 +24444,7 @@ function latestRoutableFrameIsTerminal(frames) {
 var CONSOLE_RPC_METHODS = {
   capabilities: "meta/capabilities",
   send: "meta/console/send",
+  recoverSend: "meta/console/recover_send",
   listIdentities: "meta/console/list_identities",
   inspectIdentity: "meta/console/inspect_identity",
   queryTimeline: "meta/console/query_timeline",
@@ -43677,6 +43678,7 @@ var CONSOLE_REST_PATHS2 = {
   timelineStream: "/console/timeline/stream",
   identityTimelineStreamTemplate: "/console/identity/{identity}/stream",
   legacySend: "/console/send",
+  sendRecover: "/console/send/recover",
   mcpAppsResolve: "/console/mcp-apps/resolve",
   mcpAppsReadResource: "/console/mcp-apps/read-resource",
   mcpAppsCallTool: "/console/mcp-apps/call-tool"
@@ -43688,6 +43690,7 @@ var CONSOLE_RPC_PATHS2 = {
 var CONSOLE_RPC_METHODS2 = {
   capabilities: "meta/capabilities",
   send: "meta/console/send",
+  recoverSend: "meta/console/recover_send",
   listIdentities: "meta/console/list_identities",
   inspectIdentity: "meta/console/inspect_identity",
   queryTimeline: "meta/console/query_timeline",
@@ -51218,10 +51221,6 @@ function AccessPanel({
         ] }) : null
       ] })
     ] }),
-    loading ? /* @__PURE__ */ (0, import_jsx_runtime46.jsx)("p", { role: "status", children: "Refreshing owner state. Changes are temporarily unavailable." }) : null,
-    error48 || saveFailure ? /* @__PURE__ */ (0, import_jsx_runtime46.jsx)("div", { className: "gating__empty", role: "alert", "data-testid": "access-error", children: error48 || (saveFailure ? accessSaveNotice(saveFailure) : null) }) : null,
-    requiresReview && canReview ? /* @__PURE__ */ (0, import_jsx_runtime46.jsx)("button", { onClick: reviewAndReapply, children: "Review and reapply" }) : null,
-    error48 ? /* @__PURE__ */ (0, import_jsx_runtime46.jsx)("p", { style: { padding: "0 24px" }, children: "Last loaded configuration may be out of date. Refresh before making changes." }) : null,
     readOnly ? /* @__PURE__ */ (0, import_jsx_runtime46.jsx)("p", { role: "status", children: "This connection is read-only." }) : null,
     /* @__PURE__ */ (0, import_jsx_runtime46.jsxs)("div", { className: "gating__tabs", children: [
       ["overview", "groups", "rules", "preview"].map((candidate) => /* @__PURE__ */ (0, import_jsx_runtime46.jsxs)(
@@ -51240,6 +51239,10 @@ function AccessPanel({
       )),
       /* @__PURE__ */ (0, import_jsx_runtime46.jsx)("button", { className: "gating__tab", onClick: onRefresh, "data-testid": "access-refresh", children: "Refresh" })
     ] }),
+    loading ? /* @__PURE__ */ (0, import_jsx_runtime46.jsx)("p", { role: "status", children: "Refreshing owner state. Changes are temporarily unavailable." }) : null,
+    error48 || saveFailure ? /* @__PURE__ */ (0, import_jsx_runtime46.jsx)("div", { className: "gating__empty", role: "alert", "data-testid": "access-error", children: error48 || (saveFailure ? accessSaveNotice(saveFailure) : null) }) : null,
+    requiresReview && canReview ? /* @__PURE__ */ (0, import_jsx_runtime46.jsx)("button", { onClick: reviewAndReapply, children: "Review and reapply" }) : null,
+    error48 ? /* @__PURE__ */ (0, import_jsx_runtime46.jsx)("p", { style: { padding: "0 24px" }, children: "Last loaded configuration may be out of date. Refresh before making changes." }) : null,
     /* @__PURE__ */ (0, import_jsx_runtime46.jsxs)("fieldset", { className: "gating__list access-panel__body", disabled: tab2 === "preview" ? !current : tab2 === "groups" ? !current || saving : !canEdit, style: { border: 0, margin: 0, minWidth: 0 }, children: [
       tab2 === "overview" ? /* @__PURE__ */ (0, import_jsx_runtime46.jsxs)("div", { className: "gating__policies", children: [
         /* @__PURE__ */ (0, import_jsx_runtime46.jsxs)("div", { className: "gpolicy", "data-state": enabled ? "active" : "paused", children: [

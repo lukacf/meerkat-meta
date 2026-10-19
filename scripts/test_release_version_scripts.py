@@ -92,9 +92,15 @@ class ReleaseVersionScriptsTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_command(self, *args, check=True):
+    def run_command(self, *args, check=True, extra_env=None):
         env = os.environ.copy()
         env["CARGO_TARGET_DIR"] = str(self.root / "target")
+        # A None value removes the variable.
+        for key, value in (extra_env or {}).items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
         result = subprocess.run(
             args,
             cwd=self.root,
@@ -110,7 +116,9 @@ class ReleaseVersionScriptsTests(unittest.TestCase):
         return result
 
     def test_release_hook_bumps_and_stages_bazel_module_version(self):
-        self.run_command("scripts/release-hook.sh", "0.8.1")
+        self.run_command(
+            "scripts/release-hook.sh", "0.8.1", extra_env={"DRY_RUN": "false"}
+        )
 
         module = (self.root / "MODULE.bazel").read_text()
         self.assertIn('version = "0.8.1"', module)
@@ -147,6 +155,60 @@ class ReleaseVersionScriptsTests(unittest.TestCase):
         )
 
         self.run_command("scripts/verify-version-parity.sh")
+
+    def test_release_hook_writes_nothing_in_a_dry_run(self):
+        # cargo-release runs the pre-release hook in its dry run too, with
+        # DRY_RUN=true (and DRY_RUN=false on --execute). The 0.9.2 cut's dry
+        # run bumped the version files, then failed the parity check against
+        # the unbumped Cargo version and left them modified.
+        def worktree():
+            return self.run_command(
+                "git", "status", "--porcelain", "--ignored", "--untracked-files=all"
+            ).stdout
+
+        before = worktree()
+        dry = self.run_command(
+            "scripts/release-hook.sh", "0.8.1", extra_env={"DRY_RUN": "true"}
+        )
+        self.assertEqual(worktree(), before)
+        self.assertEqual(
+            self.run_command("git", "diff", "--cached", "--name-only").stdout, ""
+        )
+        self.assertFalse((self.root / ".release-hook-done").exists())
+        self.assertIn('version = "0.8.0"', (self.root / "MODULE.bazel").read_text())
+        self.assertIn("dry run", dry.stdout)
+
+        # An execute still bumps and stages.
+        self.run_command(
+            "scripts/release-hook.sh", "0.8.1", extra_env={"DRY_RUN": "false"}
+        )
+        self.assertIn('version = "0.8.1"', (self.root / "MODULE.bazel").read_text())
+        self.assertIn(
+            "MODULE.bazel",
+            self.run_command("git", "diff", "--cached", "--name-only").stdout.split(),
+        )
+
+    def test_release_hook_refuses_an_unset_or_unknown_dry_run(self):
+        # cargo-release always passes DRY_RUN=true or DRY_RUN=false; anything
+        # else (an unpinned tool, a direct run) is refused before any write.
+        def worktree():
+            return self.run_command(
+                "git", "status", "--porcelain", "--ignored", "--untracked-files=all"
+            ).stdout
+
+        before = worktree()
+        for value in (None, "", "yes", "TRUE", "1"):
+            with self.subTest(dry_run=value):
+                result = self.run_command(
+                    "scripts/release-hook.sh",
+                    "0.8.1",
+                    check=False,
+                    extra_env={"DRY_RUN": value},
+                )
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("DRY_RUN must be true or false", result.stderr)
+                self.assertEqual(worktree(), before)
+                self.assertFalse((self.root / ".release-hook-done").exists())
 
     def test_version_parity_rejects_unparsable_bazel_module_version(self):
         self.run_command("scripts/bump-sdk-versions.sh", "0.8.1")
