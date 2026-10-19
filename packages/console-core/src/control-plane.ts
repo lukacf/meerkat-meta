@@ -65,8 +65,10 @@ export function identityStateLabel(row: { state: string; session_repair?: Identi
  * tolerate values you don't recognize. `refresh_pending`: the identity
  * binding behind the record moved and the projection had not re-collected
  * it yet, so the record withholds the facts it walked before.
+ * `not_observed`: nothing has observed the fact yet, so there is no answer
+ * to report.
  */
-export type UnobservedReason = "refresh_pending" | (string & {});
+export type UnobservedReason = "refresh_pending" | "not_observed" | (string & {});
 
 /**
  * Facts a console record holds no current observation of. `fields` names
