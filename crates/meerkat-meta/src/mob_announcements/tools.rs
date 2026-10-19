@@ -272,11 +272,20 @@ pub type ToolSlot = Arc<OnceLock<ToolBackend>>;
 
 type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
+/// Milliseconds on a monotonic clock, for the announce windows: a wall-clock
+/// step back never moves them.
+fn monotonic_clock() -> u64 {
+    static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
+    let origin = *ORIGIN.get_or_init(std::time::Instant::now);
+    u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// The member tool bundle.
 pub struct MobAnnouncementTools {
     backend: ToolSlot,
-    /// Each member's recent announcements: (time, body bytes). Admission
-    /// bookkeeping of this bundle only; a restart starts every window anew.
+    /// Each member's recent announcements: (time on a monotonic clock, body
+    /// bytes). Admission bookkeeping of this bundle only; a restart starts
+    /// every window anew.
     recent: Mutex<BTreeMap<Member, VecDeque<(u64, u64)>>>,
     defs: Arc<[Arc<ToolDef>]>,
     clock: Clock,
@@ -284,7 +293,7 @@ pub struct MobAnnouncementTools {
 
 impl MobAnnouncementTools {
     pub fn new(backend: ToolSlot) -> Self {
-        Self::with_clock(backend, Arc::new(super::remote::system_clock))
+        Self::with_clock(backend, Arc::new(monotonic_clock))
     }
 
     pub(crate) fn with_clock(backend: ToolSlot, clock: Clock) -> Self {
@@ -304,13 +313,14 @@ impl MobAnnouncementTools {
             .recent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Every window drops what the last minute no longer holds, and an
-        // empty window goes: only members that announced within the last
-        // minute are kept.
+        // When an announcement is admitted, every window drops what the last
+        // minute no longer holds, and an empty window goes: only members that
+        // announced within the last minute are kept. Nothing lies ahead of a
+        // monotonic now, so nothing is dropped for that.
         recent.retain(|_, window| {
             while window
                 .front()
-                .is_some_and(|(at, _)| now.saturating_sub(*at) >= LIMIT_WINDOW_MS || *at > now)
+                .is_some_and(|(at, _)| now.saturating_sub(*at) >= LIMIT_WINDOW_MS)
             {
                 window.pop_front();
             }

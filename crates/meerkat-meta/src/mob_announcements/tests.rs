@@ -7584,3 +7584,43 @@ fn the_version_one_schema_is_pinned() {
          after it, add version 2 with its migration instead"
     );
 }
+
+/// The announce windows run on a monotonic clock, so nothing in them lies
+/// ahead of now: a clock that steps back clears no member's limit, the
+/// caller's or anyone else's.
+#[tokio::test]
+async fn a_clock_step_back_clears_no_members_limit() {
+    let tools = tool_harness(super::tools::MemberLimits {
+        announcements_per_minute: 1,
+        announcement_bytes_per_minute: 100,
+        subscriptions: 1,
+        topics_per_subscription: 2,
+    });
+    let announce = |key: &str| serde_json::json!({ "topics": ["ios"], "body": "x", "key": key });
+    tools.harness.clock.store(100_000, Ordering::SeqCst);
+    let (failed, result) = tools
+        .call(
+            Some("agent:b"),
+            super::tools::ANNOUNCE_TOOL,
+            announce("k-b1"),
+        )
+        .await;
+    assert!(!failed, "{result}");
+    tools.harness.clock.store(70_000, Ordering::SeqCst);
+    let (failed, result) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::ANNOUNCE_TOOL,
+            announce("k-a1"),
+        )
+        .await;
+    assert!(!failed, "{result}");
+    let (failed, result) = tools
+        .call(
+            Some("agent:b"),
+            super::tools::ANNOUNCE_TOOL,
+            announce("k-b2"),
+        )
+        .await;
+    assert!(failed, "agent:b's limit still holds: {result}");
+}
