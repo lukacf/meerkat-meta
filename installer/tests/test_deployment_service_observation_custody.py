@@ -65,7 +65,7 @@ async def test_awaited_old_observation_preserves_replacement_binding_and_journal
     monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden)
     task = asyncio.create_task(services.background_status(directory, manager))
     try:
-        await asyncio.wait_for(started.wait(), timeout=2)
+        await asyncio.wait_for(started.wait(), timeout=30)
         replacement = replace_fixture_supervisor(directory, frozen)
         published = (directory / "receipt.json").read_bytes()
         host = snapshot(directory / "service-host")

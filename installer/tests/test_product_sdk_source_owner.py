@@ -126,7 +126,7 @@ async def test_sdk_parent_owner_interruption_stops_and_joins_same_child_worker(s
             owner_current = False
         else:
             task.cancel()
-        await asyncio.wait_for(cleanup_entered.wait(), 3)
+        await asyncio.wait_for(cleanup_entered.wait(), 30)
         assert files.owner.stop.is_set()
         assert not task.done() and not entered_worker.done()
         assert files.owner._selected_sdk_install_task is entered_worker

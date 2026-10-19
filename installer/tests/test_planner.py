@@ -4,7 +4,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from launchkit import bootstrap, planner
+from launchkit import bootstrap, guide_sdk, planner
 from launchkit.planner import parse_design, planner_capability, starter_design
 from launchkit.schema import DesignRequest, DeploymentSpec
 
@@ -73,7 +73,7 @@ def test_package_selection_does_not_fall_back_to_retained_legacy_cache(tmp_path,
     assert planner.gateway_path() is None, "A cached executable is not a selected Meta runtime."
     selected = bootstrap.SelectedGuideRuntime(
         ExactFile(current, hashlib.sha256(current.read_bytes()).hexdigest()),
-        "0.9.0", "0.9.0", "a" * 40, "b" * 40)
+        guide_sdk.SELECTED_VERSION, guide_sdk.SELECTED_VERSION, "a" * 40, "b" * 40)
     monkeypatch.setattr(bootstrap, "_selected_guide_runtime", selected)
     assert planner.gateway_path() == current
     assert legacy.read_bytes() == b"Retained legacy runtime, never executed."

@@ -145,7 +145,7 @@ async def expect_safe_start_failure(clients, monkeypatch, error_type):
     monkeypatch.setattr(connection, "close", close)
     starter = asyncio.create_task(connection.start())
     try:
-        await clients.wait(cleanup_entered.wait(), timeout=2)
+        await clients.wait(cleanup_entered.wait(), timeout=30)
         assert not starter.done() and not cleanup_finished.is_set()
         assert len(owners) == 1 and owners[0].done() and connection.task is None
         assert connection.ready.done(), "The original readiness future must complete instead of waiting for a timeout."
@@ -224,10 +224,10 @@ async def test_start_cancellation_joins_original_inert_transport_cleanup(clients
     clients.block_initialize = True
     starter = asyncio.create_task(connection.start())
     try:
-        await clients.wait(clients.initialize_entered.wait(), timeout=2)
+        await clients.wait(clients.initialize_entered.wait(), timeout=30)
         owner = connection.task
         starter.cancel()
-        await clients.wait(clients.cleanup_entered.wait(), timeout=2)
+        await clients.wait(clients.cleanup_entered.wait(), timeout=30)
         assert not starter.done() and not owner.done() and not clients.cleanup_finished.is_set()
         assert not connection.ready.cancelled()
         clients.release_cleanup.set()

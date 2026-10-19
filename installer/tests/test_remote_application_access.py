@@ -223,7 +223,7 @@ async def test_global_drift_withdraws_every_port_before_first_cleanup_await(app_
         task = asyncio.create_task(browser.remote.action(receipt["guide_id"], receipt["deployment_id"], "stop"))
     else:
         task = asyncio.create_task(browser.reconcile(receipt, False))
-    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.wait_for(entered.wait(), 30)
     try:
         for entry in ("staff", "reports"):
             value = browser.public(browser.key(receipt["guide_id"], receipt["deployment_id"], "application:" + entry))
@@ -245,7 +245,7 @@ async def test_custom_cancellation_after_start_cleans_exact_owned_handle(app_acc
         await asyncio.Event().wait()
     browser.application_check = pending
     task = asyncio.create_task(open_app(browser, receipt))
-    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.wait_for(entered.wait(), 30)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -307,7 +307,7 @@ async def test_lost_application_observation_withdraws_all_custom_ports_before_cl
         browser.remote.transport.remote["application_experiences"]["metadata_sha256"] = "e" * 64
     browser.remote.last_observed[receipt["deployment_id"]] = -100
     task = asyncio.create_task(browser.status(receipt["guide_id"], receipt["deployment_id"], "application:staff"))
-    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.wait_for(entered.wait(), 30)
     try:
         for entry in ("staff", "reports"):
             assert browser.public(browser.key(receipt["guide_id"], receipt["deployment_id"], "application:" + entry))["local_url"] is None

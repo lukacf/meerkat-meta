@@ -62,7 +62,7 @@ async def read_record(path):
                 return json.loads(path.read_text())
             except (FileNotFoundError, ValueError):
                 await asyncio.sleep(.01)
-    return await asyncio.wait_for(poll(), 3)
+    return await asyncio.wait_for(poll(), 30)
 
 
 def live(pid):

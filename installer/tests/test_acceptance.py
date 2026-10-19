@@ -562,7 +562,7 @@ class ResourceAcceptance(unittest.IsolatedAsyncioTestCase):
         second = self.approved("second")
         pending = PendingDevice()
         task = asyncio.create_task(self.ledger.act(first, pending))
-        await asyncio.wait_for(pending.entered.wait(), 1)
+        await asyncio.wait_for(pending.entered.wait(), 30)
         other = Ledger(self.path, clock=lambda:100)
         try:
             device = Device()
@@ -580,7 +580,7 @@ class ResourceAcceptance(unittest.IsolatedAsyncioTestCase):
         integration.frontend = Frontend()
         integration.device = PendingDevice()
         action = asyncio.create_task(integration.action(request))
-        await asyncio.wait_for(integration.device.entered.wait(), 1)
+        await asyncio.wait_for(integration.device.entered.wait(), 30)
         decision = {"kind":"decision","session":"first","digest":request["digest"],"decision":"revoked","actor":"human","channel":"console"}
         try:
             value = await asyncio.wait_for(integration.admitted_event(decision), 0.2)

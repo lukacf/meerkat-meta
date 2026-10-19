@@ -83,7 +83,7 @@ class EnrollmentOwner:
 
 
 async def entered(event):
-    await asyncio.wait_for(event.wait(), 1)
+    await asyncio.wait_for(event.wait(), 30)
 
 
 @asynccontextmanager

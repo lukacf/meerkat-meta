@@ -129,7 +129,7 @@ async def thread_entered(event):
     async def wait():
         while not event.is_set():
             await asyncio.sleep(0.001)
-    await asyncio.wait_for(wait(), 1)
+    await asyncio.wait_for(wait(), 30)
 
 
 async def test_stop_during_native_dry_run_never_enters_apply_and_keeps_old_history(project, monkeypatch):

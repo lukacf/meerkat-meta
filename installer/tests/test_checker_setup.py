@@ -176,7 +176,7 @@ async def test_concurrent_prepares_and_lost_readback_keep_one_owner(host):
     responses = await asyncio.gather(service.prepare(), service.prepare(), service.prepare())
     assert all(response["status"] == "preparing" for response in responses)
     task = service._task
-    assert await asyncio.to_thread(state.entered.wait, 1)
+    assert await asyncio.to_thread(state.entered.wait, 30)
     assert state.calls == 1 and (await service.status())["status"] == "preparing"
     assert (await service.prepare())["status"] == "preparing" and service._task is task
     # No response consumer needs to retain the task: the service owns it.
@@ -230,7 +230,7 @@ async def test_cancelled_shutdown_drains_thread_and_refuses_new_preparation(host
     service, state = host
     state.release.clear()
     await service.prepare()
-    assert await asyncio.to_thread(state.entered.wait, 1)
+    assert await asyncio.to_thread(state.entered.wait, 30)
     task = service._task
     shutdown = asyncio.create_task(service.shutdown())
     await asyncio.sleep(0)

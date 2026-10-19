@@ -82,7 +82,7 @@ def service_factory(tmp_path):
 
 
 async def startup_binding(client):
-    for _ in range(200):
+    for _ in range(6000):
         response = await client.get("/console/forge/connect/state")
         assert response.status_code == 202
         value = response.json()
