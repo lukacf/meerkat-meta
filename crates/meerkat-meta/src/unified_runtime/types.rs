@@ -1145,9 +1145,24 @@ mod tests {
         report.drain.timed_out = false;
         report.child_mob_stand_down =
             crate::child_mob_storage::ChildMobStandDownOutcome::Retained {
-                unsettled: vec!["child: unsettled".to_string()],
+                unsettled: vec![crate::child_mob_storage::RetainedChildMob {
+                    mob_id: "child".to_string(),
+                    kind: crate::child_mob_storage::RetainedChildMobKind::PendingUnregister,
+                    detail: "unsettled".to_string(),
+                }],
             };
+        assert!(!report.child_mob_stand_down.child_actors_settled());
         assert!(!report.cleanup_completed());
+        assert!(!report.cleanup_retained_until_process_exit());
+        // Children that could not be listed: incomplete, and not the
+        // process-exit retention class.
+        report.child_mob_stand_down =
+            crate::child_mob_storage::ChildMobStandDownOutcome::EnumerationFailed {
+                detail: "child mobs could not be enumerated".to_string(),
+            };
+        assert!(!report.child_mob_stand_down.child_actors_settled());
+        assert!(!report.cleanup_completed());
+        assert!(!report.cleanup_retained_until_process_exit());
     }
 
     #[test]

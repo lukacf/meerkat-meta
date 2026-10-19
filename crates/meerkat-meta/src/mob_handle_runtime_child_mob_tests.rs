@@ -1367,7 +1367,7 @@ async fn a_child_destroyed_through_its_own_handle_is_still_stood_down() {
     let accounted = match &outcome {
         crate::child_mob_storage::ChildMobStandDownOutcome::Retained { unsettled } => unsettled
             .iter()
-            .any(|unsettled| unsettled.contains(child_id.as_str())),
+            .any(|entry| entry.mob_id == child_id.as_str()),
         crate::child_mob_storage::ChildMobStandDownOutcome::Released { child_mobs }
         | crate::child_mob_storage::ChildMobStandDownOutcome::HeldUntilProcessExit { child_mobs } => {
             *child_mobs == 1
@@ -1433,10 +1433,15 @@ async fn a_pending_unregister_admission_releases_the_root_once_it_settles() {
         panic!("one child with debt expected: {unsettled:?}");
     };
     // The entry comes from the native shutdown report, not from a closed
-    // channel or a failed request.
+    // channel or a failed request, and a later stand-down can clear it.
+    assert_eq!(
+        debt.kind,
+        crate::child_mob_storage::RetainedChildMobKind::PendingUnregister,
+        "{debt:?}"
+    );
     assert!(
-        debt.contains(": members not settled: "),
-        "the debt must come from the native shutdown report: {debt}"
+        debt.detail.starts_with("members not settled: "),
+        "the debt must come from the native shutdown report: {debt:?}"
     );
     // The held member is pending exactly at its registration admission. Its
     // free sibling's unregister usually settles first; when it is still
@@ -1445,13 +1450,14 @@ async fn a_pending_unregister_admission_releases_the_root_once_it_settles() {
     // never otherwise. The control after this test holds that sibling's
     // unregister deliberately.
     assert!(
-        member_debt(debt, CHILD_WORKERS[0]).is_some_and(|entry| entry.contains(ADMISSION_PENDING)),
-        "the held member is pending exactly at its registration admission: {debt}"
+        member_debt(&debt.detail, CHILD_WORKERS[0])
+            .is_some_and(|entry| entry.contains(ADMISSION_PENDING)),
+        "the held member is pending exactly at its registration admission: {debt:?}"
     );
-    if let Some(sibling) = member_debt(debt, CHILD_WORKERS[1]) {
+    if let Some(sibling) = member_debt(&debt.detail, CHILD_WORKERS[1]) {
         assert!(
             sibling.contains(UNREGISTER_PENDING) && !sibling.contains(ADMISSION_PENDING),
-            "the free member may only be pending at its runtime unregister: {debt}"
+            "the free member may only be pending at its runtime unregister: {debt:?}"
         );
     }
     assert_root_owned(dir.path());
@@ -1549,9 +1555,14 @@ async fn a_pending_runtime_unregister_releases_the_root_once_it_settles() {
     let [debt] = unsettled.as_slice() else {
         panic!("one child with debt expected: {unsettled:?}");
     };
+    assert_eq!(
+        debt.kind,
+        crate::child_mob_storage::RetainedChildMobKind::PendingUnregister,
+        "{debt:?}"
+    );
     assert!(
-        debt.contains(UNREGISTER_PENDING) && !debt.contains(ADMISSION_PENDING),
-        "the held member is pending at its runtime unregister: {debt}"
+        debt.detail.contains(UNREGISTER_PENDING) && !debt.detail.contains(ADMISSION_PENDING),
+        "the held member is pending at its runtime unregister: {debt:?}"
     );
     assert_root_owned(dir.path());
     tokio::time::timeout(Duration::from_secs(5), entered)
@@ -1581,9 +1592,9 @@ async fn a_pending_runtime_unregister_releases_the_root_once_it_settles() {
     .expect("the released root is claimable in the same process");
 }
 
-/// The native report's entry for `worker` within one child's debt line
-/// (`<child>: members not settled: [(<identity>, <outcome>), ...]`): from its
-/// name up to the next worker's entry.
+/// The native report's entry for `worker` within one child's debt detail
+/// (`members not settled: [(<identity>, <outcome>), ...]`): from its name up
+/// to the next worker's entry.
 fn member_debt<'a>(debt: &'a str, worker: &str) -> Option<&'a str> {
     let start = debt.find(worker)?;
     let end = CHILD_WORKERS
@@ -1647,13 +1658,20 @@ async fn a_held_sibling_unregister_is_reported_pending_and_then_settles_independ
     let [debt] = unsettled.as_slice() else {
         panic!("one child with debt expected: {unsettled:?}");
     };
-    assert!(
-        member_debt(debt, CHILD_WORKERS[0]).is_some_and(|entry| entry.contains(ADMISSION_PENDING)),
-        "the held member is pending exactly at its registration admission: {debt}"
+    assert_eq!(
+        debt.kind,
+        crate::child_mob_storage::RetainedChildMobKind::PendingUnregister,
+        "{debt:?}"
     );
     assert!(
-        member_debt(debt, CHILD_WORKERS[1]).is_some_and(|entry| entry.contains(UNREGISTER_PENDING)),
-        "the sibling with a held saga is pending at its runtime unregister: {debt}"
+        member_debt(&debt.detail, CHILD_WORKERS[0])
+            .is_some_and(|entry| entry.contains(ADMISSION_PENDING)),
+        "the held member is pending exactly at its registration admission: {debt:?}"
+    );
+    assert!(
+        member_debt(&debt.detail, CHILD_WORKERS[1])
+            .is_some_and(|entry| entry.contains(UNREGISTER_PENDING)),
+        "the sibling with a held saga is pending at its runtime unregister: {debt:?}"
     );
     tokio::time::timeout(Duration::from_secs(5), entered)
         .await
@@ -1681,6 +1699,150 @@ async fn a_held_sibling_unregister_is_reported_pending_and_then_settles_independ
         "the held member is still registered: the sibling settled on its own"
     );
     drop(guard);
+}
+
+/// A later owner of a child member's registration keeps it, and a later
+/// incarnation of the child is asked at the next stand-down instead of being
+/// skipped as clean.
+///
+/// The first incarnation's stand-down leaves a member's unregister waiting
+/// for admission (its registration transaction is held) at the deadline: a
+/// pending unregister owed by that incarnation. That stand-down asks the
+/// children directly, as a retry does, so the agent mob-tool state's
+/// admission stays open. The child is then created again under the same id
+/// (a new incarnation the state manages in place of the stopped one), and,
+/// once the transaction is free, a later owner reuses the held member's
+/// registration in place. The next stand-down asks the new incarnation and
+/// follows the old debt only after that: the earlier incarnation's
+/// settlement finds the registration handed over, which settles its debt
+/// without unregistering it, and the root is released. The control is
+/// `a_pending_unregister_admission_releases_the_root_once_it_settles`: with
+/// no later owner, the settlement unregisters the member itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_earlier_incarnations_pending_unregister_leaves_a_later_owners_registration() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let host = Host::new();
+    let adapter = Arc::new(Mutex::new(None));
+    let captured = Arc::clone(&adapter);
+    let runtime = lifetime(dir.path(), &unique("handover-root"), &host, |spec| {
+        *captured.lock().expect("adapter slot") = spec.runtime_adapter.clone();
+        spec.with_child_mob_storage(durable(dir.path()))
+    })
+    .await
+    .expect("lifetime");
+    let adapter = adapter
+        .lock()
+        .expect("adapter slot")
+        .clone()
+        .expect("the persistent composition carries its runtime adapter");
+    let coordinator = coordinator_session(&runtime).await;
+    let child_id = MobId::from(unique("handover-child").as_str());
+    let first = create_child(&runtime, &child_id, coordinator).await;
+    let sessions = worker_sessions(&first).await;
+    let state = runtime.agent_mob_mcp_state().expect("agent mob-tool state");
+
+    let guard = adapter
+        .hold_session_registration_transaction_for_test(&sessions[0])
+        .await;
+    runtime
+        .handle()
+        .shutdown()
+        .await
+        .expect("root mob shutdown");
+    let (mut seen, mut child_mobs) = (std::collections::BTreeSet::new(), 0);
+    runtime
+        .stand_down_new_children(
+            &state,
+            std::time::Instant::now() + Duration::from_secs(3),
+            &mut seen,
+            &mut child_mobs,
+        )
+        .await
+        .expect("enumerate the children");
+    let earlier = crate::child_mob_storage::ChildIncarnation::of(&first);
+    assert!(
+        runtime
+            .child_mob_root
+            .pending_in(child_id.as_str(), &earlier),
+        "the first incarnation owes a pending unregister: {:?}",
+        runtime.child_mob_root.outcome(child_mobs)
+    );
+
+    // The first incarnation's actor exits; its member's registration stays
+    // current, since only its settlement would unregister it.
+    drop(guard);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !matches!(
+            first
+                .shutdown_with_report(meerkat_mob::ShutdownOptions::default())
+                .await,
+            Err(MobError::ActorCommandChannelClosed | MobError::ActorReplyChannelClosed)
+        ) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the first incarnation's actor exits after its shutdown");
+    let registration = adapter
+        .current_session_registration_witness(&sessions[0])
+        .await
+        .expect("the held member's registration is still current");
+
+    // The child again under the same id: a new incarnation, which the state
+    // now manages in place of the stopped one.
+    let model: Arc<dyn LlmClient> = host.model.clone();
+    let later = MobBuilder::new(child_definition(&child_id), MobStorage::in_memory())
+        .with_session_service(
+            runtime
+                .session_service()
+                .expect("the runtime's session service")
+                .clone(),
+        )
+        .with_default_llm_client(model)
+        .create()
+        .await
+        .expect("the later incarnation");
+    state
+        .try_mob_insert_handle(child_id.clone(), later.clone())
+        .await
+        .expect("the state manages the later incarnation");
+    // A later owner reuses the held member's registration in place.
+    adapter
+        .register_session(sessions[0].clone())
+        .await
+        .expect("a later owner reuses the registration");
+    assert_eq!(
+        adapter
+            .current_session_registration_witness(&sessions[0])
+            .await
+            .as_ref(),
+        Some(&registration),
+        "the reuse keeps the exact registration"
+    );
+
+    let second = runtime.stand_down_child_mobs(release_deadline()).await;
+    assert_eq!(
+        second,
+        crate::child_mob_storage::ChildMobStandDownOutcome::Released { child_mobs: 1 },
+        "the earlier incarnation's debt settles as handed over, and the later incarnation \
+         shut down cleanly"
+    );
+    let status = later.status_observation_snapshot();
+    assert!(
+        !matches!(
+            status,
+            meerkat_mob::MobState::Creating | meerkat_mob::MobState::Running
+        ),
+        "the later incarnation was asked, not skipped as clean: {status:?}"
+    );
+    assert_eq!(
+        adapter
+            .current_session_registration_witness(&sessions[0])
+            .await
+            .as_ref(),
+        Some(&registration),
+        "the earlier incarnation's debt never unregisters the later owner's registration"
+    );
 }
 
 /// Unrelated ingress: worker-b's input while worker-a's cleanup is held.

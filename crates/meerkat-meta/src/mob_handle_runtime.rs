@@ -12572,7 +12572,11 @@ impl MobRuntime {
     /// over the same layout restores it as it was. An unsettled child stays
     /// recorded across repeated calls; a closed actor channel is not a
     /// settlement report. A child that already shut down cleanly in the same
-    /// incarnation is not asked again. A close sent while a mob's actor is
+    /// incarnation is not asked again. A member's runtime unregister an
+    /// earlier stand-down left running is followed only after every child
+    /// incarnation hosted now was asked; when admission or the state did not
+    /// settle, so that is not known, a later call follows it. A close sent
+    /// while a mob's actor is
     /// still exiting from its shutdown can go unanswered in Meerkat 0.9.3 and
     /// earlier, so the admission close is sent again once the root's actor
     /// task ends, and each child's actor task is waited for, within the
@@ -12624,11 +12628,6 @@ impl MobRuntime {
         if let Some(unclaimed) = self.child_mob_root.unclaimed_outcome() {
             return unclaimed;
         }
-        // A member unregister an earlier stand-down left running may have
-        // settled since: its debt clears before the children are asked.
-        self.child_mob_root
-            .settle_pending_unregisters(deadline)
-            .await;
         let Some(state) = self.agent_mob_mcp_state.as_ref() else {
             // A claim is only taken for an installed agent mob-tool state.
             return self.child_mob_root.outcome(0);
@@ -12655,6 +12654,21 @@ impl MobRuntime {
             {
                 return unsettled;
             }
+        }
+        // A member unregister an earlier stand-down left running may have
+        // settled since. It is followed only once every child incarnation
+        // hosted now was asked: admission closed with nothing admitted still
+        // running, and the state sealed, so both passes saw the final set.
+        // An earlier incarnation's settlement then never runs while a later
+        // incarnation of the same child may still hold that member's
+        // registration; otherwise it is left for a later call. Meerkat's
+        // settlement already leaves a registration a later owner took over
+        // alone (it reports it handed over); this order does not rely on
+        // that alone.
+        if admission.is_clean() && state_stand_down.is_clean() {
+            self.child_mob_root
+                .settle_pending_unregisters(deadline)
+                .await;
         }
         let outcome = self.child_mob_root.outcome(child_mobs);
         if !outcome.child_actors_settled()
@@ -12725,8 +12739,8 @@ impl MobRuntime {
     ) -> Result<(), crate::child_mob_storage::ChildMobStandDownOutcome> {
         use crate::child_mob_storage::{ChildIncarnation, ChildMobStandDownOutcome, ChildShutdown};
         let root_mob_id = self.handle.definition().id.clone();
-        let enumeration_failed = |error: MobError| ChildMobStandDownOutcome::Retained {
-            unsettled: vec![format!("child mobs could not be enumerated: {error}")],
+        let enumeration_failed = |error: MobError| ChildMobStandDownOutcome::EnumerationFailed {
+            detail: format!("child mobs could not be enumerated: {error}"),
         };
         // Every managed child, a destroyed one still managed included (the
         // retry anchor of a destroy whose native part is incomplete): its
@@ -13471,9 +13485,10 @@ impl MobRuntime {
 /// A child's shutdown report that names unsettled members. When every one is
 /// a runtime unregister still running at Shutdown's deadline, their
 /// settlements are followed until `deadline` (this stand-down's own): all
-/// settled is a clean shutdown, a failed one is specific debt, and any still
-/// running is a pending unregister a later stand-down follows. Any other
-/// unsettled member is specific debt.
+/// settled is a clean shutdown (a registration a later owner took over
+/// counts as settled, see `PendingUnregisters::of`), a failed one is
+/// specific debt, and any still running is a pending unregister a later
+/// stand-down follows. Any other unsettled member is specific debt.
 async fn unsettled_child_report(
     report: &meerkat_mob::MobShutdownReport,
     deadline: std::time::Instant,
