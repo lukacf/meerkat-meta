@@ -53067,7 +53067,6 @@ function MemoryPanel({
         realms.length > 1 ? " \xB7 ".concat(realms.length, " realms") : ""
       ] })
     ] }),
-    error48 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "gating__empty", "data-testid": "memory-error", children: error48 }) : null,
     /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "gating__tabs", children: [
       MEMORY_TABS.map((candidate) => /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
         "button",
@@ -53096,6 +53095,7 @@ function MemoryPanel({
       ),
       /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("button", { className: "gating__tab", onClick: onRefresh, "data-testid": "memory-refresh", children: "Refresh" })
     ] }),
+    error48 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "gating__empty", "data-testid": "memory-error", children: error48 }) : null,
     /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "gating__list memory-panel__body", children: [
       tab2 === "holdings" ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-groups", "data-testid": "memory-holdings", children: [
         /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
@@ -54795,6 +54795,7 @@ function WorkGraphPanel({
         "as of ",
         capturedAt
       ] }) : null,
+      data.error ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { className: "workgraph__error", role: "alert", title: data.error, children: data.error }) : null,
       /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { className: "workgraph__spacer" }),
       /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("div", { className: "workgraph__view-toggle", role: "group", "aria-label": "WorkGraph view mode", children: [
         /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
@@ -54831,7 +54832,6 @@ function WorkGraphPanel({
         }
       )
     ] }),
-    data.error ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "workgraph__error", role: "alert", children: data.error }) : null,
     data.denied ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "workgraph__empty", "data-testid": "workgraph-panel-denied", children: "You do not have a grant to view WorkGraph state." }) : /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)(import_jsx_runtime50.Fragment, { children: [
       /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("div", { className: "workgraph__section", children: [
         /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "workgraph__sec-label", children: "Work items" }),

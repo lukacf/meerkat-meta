@@ -2253,11 +2253,6 @@ export function MemoryPanel({
           {realms.length > 1 ? ` · ${realms.length} realms` : ""}
         </p>
       </div>
-      {error ? (
-        <div className="gating__empty" data-testid="memory-error">
-          {error}
-        </div>
-      ) : null}
       <div className="gating__tabs">
         {MEMORY_TABS.map((candidate) => (
           <button
@@ -2291,6 +2286,14 @@ export function MemoryPanel({
           Refresh
         </button>
       </div>
+      {/* A failed refresh sets the error and the next good one clears it, and
+          stream events start refreshes at any moment. It renders below the
+          tabs so it never moves them under a click in progress. */}
+      {error ? (
+        <div className="gating__empty" data-testid="memory-error">
+          {error}
+        </div>
+      ) : null}
 
       <div className="gating__list memory-panel__body">
         {tab === "holdings" ? (

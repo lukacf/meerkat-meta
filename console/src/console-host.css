@@ -3899,17 +3899,26 @@ svg[data-svg="fit"],
 }
 .workgraph__head h3 { margin: 0; font-size: 13px; }
 .workgraph__captured {
+  flex: none;
+  white-space: nowrap;
   font-family: var(--mono);
   font-size: 10.5px;
   color: var(--ink-faint);
 }
 .workgraph__spacer { flex: 1 1 auto; }
 .workgraph__error {
-  padding: 6px 10px;
+  /* Shares the header line with the actions and keeps their box metrics, so
+     showing or clearing it never changes the header height. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  padding: 2px 9px;
   border: 1px solid var(--err, #d4564e);
   border-radius: var(--r-sm);
   color: var(--err, #d4564e);
-  font-size: 11.5px;
+  font-size: 10.5px;
 }
 .workgraph__section {
   border: 1px solid var(--line);

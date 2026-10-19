@@ -405,6 +405,10 @@ export function WorkGraphPanel({
         {capturedAt ? (
           <span className="workgraph__captured">as of {capturedAt}</span>
         ) : null}
+        {/* A failed refresh keeps the last items on screen, and stream events
+            start refreshes at any moment. The error stays on this header line
+            so it never moves those items under a click in progress. */}
+        {data.error ? <span className="workgraph__error" role="alert" title={data.error}>{data.error}</span> : null}
         <span className="workgraph__spacer" />
         <div className="workgraph__view-toggle" role="group" aria-label="WorkGraph view mode">
           <button
@@ -435,7 +439,6 @@ export function WorkGraphPanel({
           Refresh
         </button>
       </div>
-      {data.error ? <div className="workgraph__error" role="alert">{data.error}</div> : null}
       {data.denied ? (
         <div className="workgraph__empty" data-testid="workgraph-panel-denied">
           You do not have a grant to view WorkGraph state.
