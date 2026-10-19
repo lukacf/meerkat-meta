@@ -182,6 +182,9 @@ pub(crate) struct ConsoleSnapshotReadModel {
     /// Test hook: while set, every walk waits for a permit before it reads.
     #[cfg(test)]
     walk_gate: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
+    /// Test hook: while set, replaces [`CONSOLE_BINDING_REFRESH_DEADLINE`].
+    #[cfg(test)]
+    refresh_deadline: Arc<std::sync::Mutex<Option<Duration>>>,
 }
 
 #[derive(Clone, Default)]
@@ -324,7 +327,7 @@ impl ConsoleSnapshotReadModel {
         identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
         cut: &IdentityBindingCut,
     ) -> (ConsoleSnapshotReadModelState, bool) {
-        let deadline = tokio::time::Instant::now() + CONSOLE_BINDING_REFRESH_DEADLINE;
+        let deadline = tokio::time::Instant::now() + self.refresh_deadline();
         loop {
             let walked = self.walked.notified();
             tokio::pin!(walked);
@@ -338,6 +341,19 @@ impl ConsoleSnapshotReadModel {
                 return (self.inner.read().await.clone(), false);
             }
         }
+    }
+
+    /// [`CONSOLE_BINDING_REFRESH_DEADLINE`], unless a test replaced it.
+    fn refresh_deadline(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(deadline) = *self
+            .refresh_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return deadline;
+        }
+        CONSOLE_BINDING_REFRESH_DEADLINE
     }
 
     /// Cold-cache priming. Acquires `refresh_lock` via the awaiting
@@ -433,6 +449,14 @@ impl ConsoleSnapshotReadModel {
             .walk_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = gate;
+    }
+
+    #[cfg(test)]
+    fn set_refresh_deadline(&self, deadline: Duration) {
+        *self
+            .refresh_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(deadline);
     }
 }
 

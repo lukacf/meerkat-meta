@@ -104,10 +104,11 @@ fn fallback_progress() -> Value {
 
 #[tokio::test]
 async fn the_join_binds_identity_first_rows_to_the_owner_session_and_leaves_plain_members() {
-    let walked = cut(&[(KEEPER, Some("s0"), IdentityLifecycleState::Active)]);
-    let current = cut(&[(KEEPER, Some("s1"), IdentityLifecycleState::Active)]);
+    // An answering walk joins with bindings equal to its own. The walk read
+    // the keeper's binding (s1) but its roster copy names no session.
+    let bindings = cut(&[(KEEPER, Some("s1"), IdentityLifecycleState::Active)]);
     let mut members = vec![
-        row(KEEPER, Some(KEEPER), Some("s0")),
+        row(KEEPER, Some(KEEPER), None),
         // A plain mob member: the identity runtime never knew it.
         row("worker-1", None, Some("p0")),
         // A row whose label names the keeper but whose roster id is another
@@ -118,8 +119,8 @@ async fn the_join_binds_identity_first_rows_to_the_owner_session_and_leaves_plai
 
     let pending = join_identity_bindings(
         &mut members,
-        &walked,
-        &current,
+        &bindings,
+        &bindings,
         true,
         &BTreeSet::new(),
         None,
@@ -127,11 +128,15 @@ async fn the_join_binds_identity_first_rows_to_the_owner_session_and_leaves_plai
     .await;
 
     assert!(pending.is_empty(), "the walk answers: nothing is pending");
-    assert_eq!(members[0].session_id.as_deref(), Some("s1"));
+    assert_eq!(
+        members[0].session_id.as_deref(),
+        Some("s1"),
+        "the owner's session, never the walk's copy"
+    );
     assert_eq!(
         members[0].progress,
         Some(fallback_progress()),
-        "progress observed for s0 is never shown beside s1"
+        "progress the walk observed for no session is never shown beside s1"
     );
     assert_eq!(members[0].state, "active", "state stays the walk's");
     assert_eq!(&members[1..], untouched.as_slice());
@@ -711,6 +716,78 @@ async fn a_binding_change_past_the_refresh_deadline_answers_pending_without_pred
     runtime.mob_handle().stop().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_joins_with_a_walk_cut_read_after_its_own() {
+    let (runtime, _scratch) = identity_first_runtime(BTreeMap::new()).await;
+    let mob_runtime = runtime.mob_runtime().clone();
+    let identity_runtime = runtime.identity_runtime().unwrap();
+    let identity_runtime = Arc::clone(identity_runtime.runtime());
+    let read_model = ConsoleSnapshotReadModel::default();
+    let keeper = AgentIdentity::parse(KEEPER).unwrap();
+    build_live_snapshot(
+        &mob_runtime,
+        &[],
+        None,
+        &AllowAllConsoleVisibilityPolicy,
+        &read_model,
+        Some(&identity_runtime),
+    )
+    .await;
+
+    // Hold the walks and reset (s0 to s1). The deadline is pinned by its
+    // own test; here it outlasts any host load, so the read always waits
+    // for the walk this test releases.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    read_model.set_walk_gate(Some(Arc::clone(&gate)));
+    read_model.set_refresh_deadline(Duration::from_secs(120));
+    identity_runtime.reset(&keeper).await.unwrap();
+
+    // A read takes its cut (s1) and waits for a walk.
+    let read = tokio::spawn({
+        let mob_runtime = mob_runtime.clone();
+        let read_model = read_model.clone();
+        let identity_runtime = Arc::clone(&identity_runtime);
+        async move {
+            build_live_snapshot(
+                &mob_runtime,
+                &[],
+                None,
+                &AllowAllConsoleVisibilityPolicy,
+                &read_model,
+                Some(&identity_runtime),
+            )
+            .await
+        }
+    });
+    // A walk held at the gate holds a clone of it, and only the read
+    // starts one: once it is there, the read has taken its cut.
+    let held = tokio::time::Instant::now();
+    while Arc::strong_count(&gate) < 3 {
+        assert!(
+            held.elapsed() < Duration::from_secs(60),
+            "the read never started its walk"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Reset again (s1 to s2), then release the walk: its cut reads s2,
+    // after the read's.
+    let successor = identity_runtime.reset(&keeper).await.unwrap();
+    gate.add_permits(64);
+
+    let (snapshot, pending) = read.await.unwrap();
+    assert!(
+        pending.is_empty(),
+        "the walk read after the request answers it"
+    );
+    assert_eq!(
+        member(&snapshot, KEEPER).unwrap().session_id.as_deref(),
+        Some(successor.session_id.to_string().as_str()),
+        "the row joins with the walk's newer cut, never the read's own older one"
+    );
+    runtime.mob_handle().stop().await.unwrap();
+}
+
 fn member<'a>(
     snapshot: &'a crate::runtime::ConsoleLiveSnapshot,
     roster_id: &str,
@@ -875,6 +952,10 @@ async fn the_join_binds_the_runtimes_own_identities_under_a_namespaced_aggregato
     )
     .await;
 
+    // Every walk from here on waits for the gate, so the read below answers
+    // from the predecessor's walk and only the join can name the successor.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    read_model.set_walk_gate(Some(Arc::clone(&gate)));
     let successor = identity_runtime
         .reset(&AgentIdentity::parse(KEEPER).unwrap())
         .await
@@ -897,11 +978,12 @@ async fn the_join_binds_the_runtimes_own_identities_under_a_namespaced_aggregato
         Some(identity_runtime),
     )
     .await;
-    assert!(pending.is_empty());
+    assert_eq!(pending, BTreeSet::from([KEEPER.to_string()]));
     assert_eq!(
         member(&snapshot, KEEPER).unwrap().session_id.as_deref(),
         Some(successor.session_id.to_string().as_str()),
         "the experience binds its bare row to the same session"
     );
+    gate.add_permits(64);
     runtime.mob_handle().stop().await.unwrap();
 }
