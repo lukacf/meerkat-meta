@@ -7,8 +7,9 @@
 /* The console's own copies of the faces it used to import from Google Fonts:
    the same woff2 files, weights and unicode-range subsets Google Fonts served
    for Inter Tight 400-700 (version 3.004, one variable font per subset) and
-   IBM Plex Mono 400-600 (version 2.3). The console build inlines them into
-   its stylesheet, so the console requests no font from another origin. */
+   IBM Plex Mono 400-600 (version 2.3). The console and flow editor builds
+   inline them into their stylesheets, so neither requests a font from
+   another origin. */
 
 /* cyrillic-ext */
 @font-face {

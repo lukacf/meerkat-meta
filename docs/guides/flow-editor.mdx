@@ -313,7 +313,7 @@ The editor frontend is split across three workspaces:
 - `packages/flow-editor-core/` — the headless controller plane (`@flow-editor-core`): framework-free projection/transition logic plus `createMetaFlowController`, which assembles the `window.MetaFlowController` facade the views call.
 - `packages/flow-editor-components/` — the React views (`@flow-editor-components`).
 
-`build.cjs` resolves the `@flow-editor-core` / `@flow-editor-components` aliases to the package sources and bundles `app.tsx` into a single `flow-editor.js` IIFE (React stays external, provided by `react-globals.js` as window globals). `npm run build` regenerates both `flow-editor/dist` and `crates/meerkat-meta/flow-editor-dist`, which the Rust crate embeds via `include_str!`; `node build.cjs --check` fails when the embedded dist is stale.
+`build.cjs` resolves the `@flow-editor-core` / `@flow-editor-components` aliases to the package sources and bundles `app.tsx` into a single `flow-editor.js` IIFE (React stays external, provided by `react-globals.js` as window globals). `npm run build` regenerates both `flow-editor/dist` and `crates/meerkat-meta/flow-editor-dist`, which the Rust crate embeds via `include_str!`; `node build.cjs --check` fails when the embedded dist is stale. The build writes `flow-editor.css` from `src/tokens.css` and `src/styles.css`, and puts the console's own Inter Tight and IBM Plex Mono fonts (`console/src/fonts`, inlined as `data:` URLs) where `tokens.css` imports them from Google Fonts, so the editor requests no font from another origin. A Content-Security-Policy in front of it that restricts fonts must allow `font-src data:`.
 
 ```bash
 cd flow-editor
