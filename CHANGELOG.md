@@ -95,7 +95,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`{"reason": "refresh_pending", "fields": [...]}`) on every record the
   experience builds for it: the sidebar row, the identity_status and
   health_overview rows, and the topology node. The profile capability
-  hints leave its walked role out. Access and visibility still decide on
+  hints leave its walked role out, and with no configured module ids
+  health's `loaded_modules` and `loaded_module_count` leave it out
+  whatever its walked state. Access and visibility still decide on
   the last observed facts, so a label-scoped deny keeps a pending member
   hidden. console-core mirrors the marker (`UnobservedFacts`,
   `normalizeUnobservedFacts`, `IdentityStatusRow.unobserved`,
