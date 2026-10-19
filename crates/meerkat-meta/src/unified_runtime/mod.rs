@@ -8246,7 +8246,7 @@ mod tests {
 
         async fn read(&self) {
             if let Some((runtime, identity)) = &self.leaving {
-                let _ = runtime.remove(identity).await;
+                let _ = runtime.remove_unrecorded_for_test(identity).await;
             }
         }
     }
