@@ -470,7 +470,7 @@ enum ChildDebt {
     /// ([`ChildMobRootOwnership::settle_pending_unregisters`]).
     PendingUnregister {
         detail: String,
-        incarnation: ChildIncarnation,
+        incarnation: Box<ChildIncarnation>,
         settlements: Vec<meerkat_mob::MemberUnregisterSettlement>,
     },
 }
@@ -702,7 +702,7 @@ impl ChildMobRootOwnership {
             match settled {
                 PendingUnregisters::Settled => {
                     state.debt_seen.remove(&mob_id);
-                    state.clean.insert(mob_id, incarnation);
+                    state.clean.insert(mob_id, *incarnation);
                 }
                 PendingUnregisters::Failed(failure) => {
                     state
@@ -750,7 +750,7 @@ impl ChildMobRootOwnership {
                 settlements,
             } => ChildDebt::PendingUnregister {
                 detail,
-                incarnation,
+                incarnation: Box::new(incarnation),
                 settlements,
             },
         };
