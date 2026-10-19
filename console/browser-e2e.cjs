@@ -3285,11 +3285,11 @@ async function runAuthorizationFeedbackProof() {
     frame("interaction-done", "interaction_complete", { result: "I continued with the permitted calendar read." }, 17),
   ];
   const server = await startMockConsoleServer({ timelineFramesByIdentity: { "identity:luka": frames } });
-  let browser;
+  let browser, page;
   let finishPreview;
   try {
     browser = await launchBrowser();
-    const page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
+    page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
     const errors = [];
     page.on("pageerror", error => errors.push(String(error)));
     let gatingDecisions = 0;
@@ -3424,6 +3424,8 @@ async function runAuthorizationFeedbackProof() {
     process.stdout.write("authorization feedback browser contract passed (mock backend)\n");
   } finally {
     finishPreview?.();
+    // A route still fetching when the page closes must not outlive the scenario.
+    if (page) await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
     if (browser) await browser.close();
     await server.close();
   }
@@ -3571,6 +3573,8 @@ async function runCheckedSaveBrowserProof(mode) {
     throw error;
   } finally {
     fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ mode, backend: "mock HTTP access RPC", nativeAuthorizationInstalled: false, state, writes, reads, checkpoints, errors, failure: failure || null }, null, 2));
+    // A route still fetching when the page closes must not outlive the scenario.
+    if (page) await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
     if (browser) await browser.close();
     await server.close();
   }
