@@ -20,7 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   follows one), nesting deeper than 64 levels, or 100 or more aliases that
   outnumber their anchors more than ten to one (the parser's default budget).
   `yes`, `on` and `off` stay text, and `<<` stays an ordinary key. The
-  incident command center example reads its scenario under the same rules.
+  incident command center example parses its scenario with four of these
+  rules: YAML 1.2 booleans, `<<` as an ordinary key, and refusal of
+  duplicate keys and unknown tags.
 
 ### Security
 
