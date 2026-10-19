@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from launchkit import bootstrap, guide_runtime
+from launchkit import bootstrap, guide_runtime, guide_sdk
 from launchkit.connect_installer_caller import ExactFile
 from meerkat_meta.errors import GatewayStartupCleanupError
 
@@ -18,7 +18,7 @@ def selected(tmp_path, monkeypatch):
     gateway.chmod(0o700)
     selection = bootstrap.SelectedGuideRuntime(
         ExactFile(gateway, hashlib.sha256(gateway.read_bytes()).hexdigest()),
-        "0.9.0", "0.9.0", "a" * 40, "b" * 40,
+        guide_sdk.SELECTED_VERSION, guide_sdk.SELECTED_VERSION, "a" * 40, "b" * 40,
         {"provider": "openai", "model": "gpt-6.1-sol", "auth_binding": "fixture-host-route"},
     )
     monkeypatch.setattr(bootstrap, "_selected_guide_runtime", selection)

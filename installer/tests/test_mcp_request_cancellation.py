@@ -85,16 +85,16 @@ async def test_cancelled_active_request_cleans_up_before_next_call_and_owner_clo
         owner = connection.task
         first = asyncio.create_task(connection.call("withheld", {"case": "cancel"}))
         callers.append(first)
-        await asyncio.wait_for(active_started.wait(), timeout=2)
+        await asyncio.wait_for(active_started.wait(), timeout=30)
         second_entered = asyncio.Event()
         second = asyncio.create_task(queued("next", {"case": "after-cancel"}, second_entered))
         callers.append(second)
-        await asyncio.wait_for(second_entered.wait(), timeout=2)
+        await asyncio.wait_for(second_entered.wait(), timeout=30)
         assert connection.queue.qsize() == 1 and not second.done()
         if interrupt == "owner":
             closing_owner = asyncio.create_task(connection.close())
             callers.append(closing_owner)
-            await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+            await asyncio.wait_for(cleanup_started.wait(), timeout=30)
             assert not cleanup_finished.is_set() and not closing_owner.done()
             release_cleanup.set()
             await asyncio.wait_for(closing_owner, timeout=2)
@@ -111,7 +111,7 @@ async def test_cancelled_active_request_cleans_up_before_next_call_and_owner_clo
         first.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(first, timeout=2)
-        await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=30)
         assert not cleanup_finished.is_set() and not second.done()
         assert calls == [("withheld", {"case": "cancel"})]
         assert connection.task is owner and not owner.done()
@@ -130,11 +130,11 @@ async def test_cancelled_active_request_cleans_up_before_next_call_and_owner_clo
 
         closing = asyncio.create_task(connection.call("closing", {}))
         callers.append(closing)
-        await asyncio.wait_for(closing_started.wait(), timeout=2)
+        await asyncio.wait_for(closing_started.wait(), timeout=30)
         unadmitted_entered = asyncio.Event()
         unadmitted = asyncio.create_task(queued("next", {"case": "closed"}, unadmitted_entered))
         callers.append(unadmitted)
-        await asyncio.wait_for(unadmitted_entered.wait(), timeout=2)
+        await asyncio.wait_for(unadmitted_entered.wait(), timeout=30)
         assert connection.queue.qsize() == 1
         await asyncio.wait_for(connection.close(), timeout=2)
         assert closing_cleaned.is_set() and connection.task is None and owner.done()

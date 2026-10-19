@@ -29,6 +29,16 @@ packager reads, per target (`linux-x86_64`, `macos-arm64`):
 Inputs must be public, and they must not carry private paths, user names or
 host details. A target without pins is not built.
 
+`installer/release/inputs/forge-release-inputs.skeleton.json` holds the
+`linux-x86_64` inputs of the Guide's selected Meta release (`SELECTED_VERSION`
+in `launchkit/guide_sdk.py`), filled from that published release: the guide
+versions, the Meta and Core release commits, and the gateway's release URL,
+archive and member sizes and SHA-256 values. `null` marks what only the product
+owner supplies: its selection and paths, whose files are not listed yet. The
+release protocol never reads the skeleton, and the inputs schema refuses it
+until every value is filled. Add the owner's selection, its paths and their
+pinned files, then replace `forge-release-inputs.json` with it.
+
 ## Forge CI evidence
 
 A candidate does not rerun Forge's own suite. Instead it binds a green

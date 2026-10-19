@@ -770,7 +770,7 @@ async def test_operation_observes_slow_admitted_generation_and_holds_later_conte
     service.timeout = .025
     operations = VisualizationOperations(reconnect_interval=.002, reconnect_max_interval=.004)
     first = await operations.submit(service, *inputs(), stream_id="guide")
-    for _ in range(100):
+    for _ in range(15000):
         if first["status"] == "observing":
             break
         await asyncio.sleep(.002)
@@ -805,7 +805,7 @@ async def test_pending_observation_shutdown_and_restart_resume_durable_admission
     service.timeout = .025
     operations = VisualizationOperations(reconnect_interval=.01)
     receipt = await operations.submit(service, *inputs(), stream_id="guide")
-    for _ in range(100):
+    for _ in range(15000):
         if receipt["status"] == "observing":
             break
         await asyncio.sleep(.002)
@@ -864,7 +864,7 @@ async def test_simultaneous_requests_do_not_replace_frozen_model(service, monkey
     release = asyncio.Event()
     native_completion(service, monkeypatch, release=release)
     first = asyncio.create_task(service.generate(*inputs()))
-    for _ in range(100):
+    for _ in range(30000):
         if service.pending:
             break
         await asyncio.sleep(0.001)

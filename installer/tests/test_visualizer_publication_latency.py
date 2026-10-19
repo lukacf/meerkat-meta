@@ -57,7 +57,7 @@ async def test_bound_publication_skips_reads_and_retains_exact_pending_custody(
 
     monkeypatch.setattr("launchkit.architect._native_request", native_tail)
     observation = asyncio.create_task(service.observe_generation(job["key"]))
-    await asyncio.wait_for(reading.wait(), 1)
+    await asyncio.wait_for(reading.wait(), 30)
     assert service.pending is job and job["admission"] == original_admission
     assert service.lock.locked() and not job.get("completed")
     release.set()

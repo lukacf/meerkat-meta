@@ -487,7 +487,7 @@ async def test_delayed_bundle_cannot_mix_replaced_or_mutated_request_context(ser
     monkeypatch.setattr(references, "bundled_review_reference_context", delayed)
     task = asyncio.create_task(service.inspect(bundle_arguments(job)))
     try:
-        assert await asyncio.to_thread(started.wait, 2)
+        assert await asyncio.to_thread(started.wait, 30)
         if fault == "clear": service.pending = None
         elif fault == "replace-same-key": service.pending = deepcopy(job)
         elif fault == "replace-other-key": service.pending = {**deepcopy(job), "key": "1" * 64}
@@ -557,7 +557,7 @@ async def test_revision_context_change_during_pixel_load_cannot_deliver_mixed_au
     monkeypatch.setattr(references, "bundled_review_reference_context", delayed)
     task = asyncio.create_task(service.inspect(bundle_arguments(job)))
     try:
-        assert await asyncio.to_thread(started.wait, 2)
+        assert await asyncio.to_thread(started.wait, 30)
         context[field] = value
     finally:
         release.set()

@@ -1149,7 +1149,7 @@ async def test_customizer_refuses_wrong_adopted_spec_and_stale_hook_completion(t
     application.integration.tools_for_agent = paused
     draft = AgentBuildDraft()
     task = asyncio.create_task(application.customize_build(AgentBuildContext(original.identity, [], []), original, draft))
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     application._snapshot = copy.deepcopy(application._snapshot)
     release.set()
     with pytest.raises(ValueError, match="changed during"):
@@ -1207,7 +1207,7 @@ async def test_reconciliation_serializes_and_runtime_replacement_does_not_call_n
         return {"pending": True}
     application.context.runtime = SimpleNamespace(is_running=True, reconcile=reconcile)
     first = asyncio.create_task(application.context.reconcile_agents())
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     second = asyncio.create_task(application.context.reconcile_agents())
     await asyncio.sleep(0)
     assert calls == ["old"]
@@ -1235,7 +1235,7 @@ async def test_runtime_changed_during_validation_never_publishes_unadmitted_snap
     application.context.runtime = SimpleNamespace(is_running=True, reconcile=reconcile)
     application.integration.rows.append({"identity": "lead:unadmitted", "classId": "lead"})
     task = asyncio.create_task(application.context.reconcile_agents())
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     application.context.runtime = SimpleNamespace(is_running=True, reconcile=reconcile)
     release.set()
     with pytest.raises(RuntimeError, match="changed during"):

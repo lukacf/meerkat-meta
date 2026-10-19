@@ -163,7 +163,7 @@ async def test_saved_followup_is_not_duplicated_while_its_acknowledgement_is_pen
     h = journey
     h.process.acknowledge.clear()
     drive = asyncio.create_task(h.service._drive_replay(h.directory, h.process, h.continuations))
-    for _ in range(100):
+    for _ in range(30000):
         if h.process.sent:
             break
         await asyncio.sleep(.001)

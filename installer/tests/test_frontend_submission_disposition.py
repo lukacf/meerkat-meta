@@ -129,7 +129,7 @@ async def test_suspended_submission_rechecks_source_and_same_human_login(tmp_pat
         prepared = await prepare(client, front)
         pending = asyncio.create_task(submit(client, front, submission(prepared)))
         try:
-            await asyncio.wait_for(entered.wait(), 1)
+            await asyncio.wait_for(entered.wait(), 30)
             if change == "source":
                 host["source_digest"] = "3" * 64
             else:

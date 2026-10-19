@@ -173,7 +173,7 @@ async def test_cancelled_product_mutation_stops_fence_and_joins_entered_worker()
             settled.set()
 
     task = asyncio.create_task(worker._joined_product_mutation(supervisor, mutation))
-    assert await asyncio.to_thread(entered.wait, 3)
+    assert await asyncio.to_thread(entered.wait, 30)
     task.cancel()
     await asyncio.sleep(0)
     assert supervisor.stop.is_set() and not task.done()

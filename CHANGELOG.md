@@ -46,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Meta Forge's Guide runs exactly Meta 0.9.3 with Core 0.9.3 instead of 0.9.0,
+  and refuses any other version. Its Python client is the published
+  `meerkat-meta` 0.9.3 wheel, pinned by release commit, `sdk/python` tree, size
+  and SHA-256, in place of the 0.9.2 development build.
+  `installer/release/inputs/forge-release-inputs.skeleton.json` holds the
+  Guide's Linux release inputs; only the product owner's selection is still to
+  be filled.
+
 - The console Access panel keeps edits available while it re-reads the
   access configuration in the background. Live run events, layout changes
   and gating decisions start these reads, and each one disabled every edit

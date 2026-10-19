@@ -32,7 +32,7 @@
     "phase1:targets": "mkdir -p .tmp && ./node_modules/.bin/esbuild ../packages/console-core/src/targets.test.ts --bundle --platform=node --external:@modelcontextprotocol/* --format=esm --outfile=.tmp/targets.test.mjs && ./node_modules/.bin/esbuild ../packages/console-core/src/browser-dock-target.test.ts --bundle --platform=node --external:@modelcontextprotocol/* --format=esm --outfile=.tmp/browser-dock-target.test.mjs && ./node_modules/.bin/esbuild src/lib/phase1-targets.test.ts --bundle --platform=node --external:@modelcontextprotocol/* --format=esm --outfile=.tmp/phase1-targets.test.mjs --alias:@console-core=../packages/console-core/src/index.ts && node --test .tmp/targets.test.mjs .tmp/browser-dock-target.test.mjs .tmp/phase1-targets.test.mjs",
     "e2e:browser:run": "node browser-e2e.cjs",
     "e2e:browser:list": "node browser-e2e.cjs --list",
-    "test:scenario-registry": "node --test fixture-ready.test.cjs scenario-registry.test.cjs scenarios/real-durable-steer.test.cjs scenarios/quote-ingress-proof.test.cjs recovery-scope-oracle.test.cjs sidebar-activity-oracle.test.cjs scenarios/real-routine-negative.test.cjs scenarios/browser-failure-monitor.test.cjs voice-e2e.test.cjs",
+    "test:scenario-registry": "node --test fixture-ready.test.cjs scenario-registry.test.cjs scenarios/real-durable-steer.test.cjs scenarios/quote-ingress-proof.test.cjs recovery-scope-oracle.test.cjs sidebar-activity-oracle.test.cjs scenarios/real-routine-negative.test.cjs scenarios/browser-failure-monitor.test.cjs scenarios/route-guard.test.cjs voice-e2e.test.cjs",
     "e2e:api": "node api-e2e.cjs",
     "e2e:api:list": "node api-e2e.cjs --list",
     "build:acceptance": "node build-acceptance.cjs",

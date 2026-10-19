@@ -4,6 +4,7 @@ import os
 
 import pytest
 
+from launchkit import guide_sdk
 from launchkit.bootstrap import SelectedGuideRuntime
 from launchkit.connect_installer_caller import CustodyError, ExactFile
 from launchkit.guide_runtime import configure_builder
@@ -23,7 +24,8 @@ def selected(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ExactFile, 'verify', verify)
     pin = ExactFile(path, hashlib.sha256(path.read_bytes()).hexdigest())
-    runtime = SelectedGuideRuntime(pin, '0.9.0', '0.9.0', 'a' * 40, 'b' * 40,
+    selected = guide_sdk.SELECTED_VERSION
+    runtime = SelectedGuideRuntime(pin, selected, selected, 'a' * 40, 'b' * 40,
         _model_route={'provider': 'openai', 'model': 'gpt-6.1-sol'})
     return runtime, path, reads
 

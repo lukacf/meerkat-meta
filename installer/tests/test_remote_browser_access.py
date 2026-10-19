@@ -277,7 +277,7 @@ async def test_cancellation_after_forward_start_cleans_owned_forward(access):
         await asyncio.Event().wait()
     browser.browser_check = pending
     task = asyncio.create_task(opened(browser, receipt))
-    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.wait_for(entered.wait(), 30)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

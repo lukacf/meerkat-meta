@@ -9,6 +9,7 @@ const { setTimeout: sleep } = require("node:timers/promises");
 const { chromium } = require("playwright");
 const { exampleBackendSpec } = require("./example-backend.cjs");
 const { LOOPBACK_ANY_PORT, awaitFixtureReady } = require("./fixture-ready.cjs");
+const { routeGuard } = require("./scenarios/route-guard.cjs");
 
 const repoRoot = path.resolve(__dirname, "..");
 
@@ -58,6 +59,13 @@ async function waitForHttpOk(url, timeoutMs = 300_000) {
     await sleep(500);
   }
   throw new Error(`timed out waiting for ${url}`);
+}
+
+// The runner reports a scenario's error only after the scenario's finally
+// block has closed the browser. Print it first, so that nothing failing
+// during the close can hide it.
+function printScenarioError(label, error) {
+  process.stderr.write(`scenario:error ${label}: ${error?.stack || error}\n`);
 }
 
 async function launchBrowser() {
@@ -3285,13 +3293,14 @@ async function runAuthorizationFeedbackProof() {
     frame("interaction-done", "interaction_complete", { result: "I continued with the permitted calendar read." }, 17),
   ];
   const server = await startMockConsoleServer({ timelineFramesByIdentity: { "identity:luka": frames } });
-  let browser;
+  let browser, routes;
   let finishPreview;
   try {
     browser = await launchBrowser();
     const page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
     const errors = [];
     page.on("pageerror", error => errors.push(String(error)));
+    routes = routeGuard(page, "authorization-feedback");
     let gatingDecisions = 0;
     let gatingPendingReads = 0;
     let admin = true;
@@ -3301,12 +3310,12 @@ async function runAuthorizationFeedbackProof() {
     const previewRequest = new Promise(resolve => { previewStarted = resolve; });
     const metadata = () => ({ owner_instance: "opaque-owner:authorization-feedback", revision, conditional_mutations: "checked_v1" });
     const status = () => ({ available: true, enabled: true, can_administer: admin, subject: "admin@example.test", ...metadata(), actions: ["agent.view", "agent.send"] });
-    await page.route("**/console/experience", async route => {
+    await routes.route("**/console/experience", async route => {
       const response = await route.fetch();
       const value = await response.json();
       await route.fulfill({ response, json: { ...value, access: status() } });
     });
-    await page.route("**/console/rpc", async route => {
+    await routes.route("**/console/rpc", async route => {
       const request = route.request().postDataJSON();
       const reply = result => route.fulfill({ json: { jsonrpc: "2.0", id: request.id, result } });
       if (request.method === "meta/gating/decide") gatingDecisions += 1;
@@ -3418,12 +3427,18 @@ async function runAuthorizationFeedbackProof() {
     assert.doesNotMatch(await page.locator("body").innerText(), /admin@example.test|draft-survives/);
     assert.equal(errors.length, 0, errors.join("\n"));
     await page.screenshot({ path: path.join(evidence, "console-access-revoked.png"), fullPage: true });
+    await routes.settle();
+    routes.check();
     assert.equal(gatingDecisions, 0);
     assert(gatingPendingReads > 0, "the current Meta pending owner must supply the empty actionable-approval set");
     fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "local mock HTTP", nativeAuthorizationInstalled: false, browser: browser.version(), cases: ["typed local refusal", "native human-consent reference without actions", "review unavailable is distinct from denial", "already-consumed result stays uncertain", "result/completed twins deduplicated", "private diagnostics absent", "permitted sibling result and final answer retained", "no inferred gating decision", "separate audit outcome", "permitted follow-up", "stale preview discarded", "failed draft retained", "revoked data hidden"], approvalId, gatingDecisions, gatingPendingReads, followUpSendCount: followUpRequests.length, mutations, errors }, null, 2));
     process.stdout.write("authorization feedback browser contract passed (mock backend)\n");
+  } catch (error) {
+    printScenarioError("authorization-feedback", error);
+    throw error;
   } finally {
     finishPreview?.();
+    await routes?.settle();
     if (browser) await browser.close();
     await server.close();
   }
@@ -3444,17 +3459,18 @@ async function runCheckedSaveBrowserProof(mode) {
   const metadata = () => ({ revision: state.revision, owner_instance: state.owner, conditional_mutations: "checked_v1" });
   const status = () => ({ available: true, enabled: true, can_administer: true, subject: "root@example.test", actions: ["agent.view"], ...metadata() });
   const server = await startMockConsoleServer();
-  let browser, page, failure;
+  let browser, page, routes, failure;
   try {
     browser = await launchBrowser();
     page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
     page.setDefaultTimeout(10000);
     page.on("pageerror", error => errors.push(String(error)));
-    await page.route("**/console/experience", async route => {
+    routes = routeGuard(page, `checked-save-${mode}`);
+    await routes.route("**/console/experience", async route => {
       const response = await route.fetch(); const value = await response.json();
       await route.fulfill({ response, json: { ...value, access: status() } });
     });
-    await page.route("**/console/rpc", async route => {
+    await routes.route("**/console/rpc", async route => {
       const request = route.request().postDataJSON();
       const reply = payload => route.fulfill({ json: { jsonrpc: "2.0", id: request.id, ...payload } });
       if (request.method === "meta/capabilities") {
@@ -3503,6 +3519,8 @@ async function runCheckedSaveBrowserProof(mode) {
       await draft.fill("carol@example.test");
       state.config = { ...state.config, groups: { ops: newerGroup } }; state.revision = 11;
       const refreshed = page.waitForResponse(response => response.url().endsWith("/console/rpc") && response.request().postDataJSON()?.method === "meta/access/get");
+      // Closing the page rejects a wait never awaited after an earlier failure.
+      refreshed.catch(() => {});
       await page.getByTestId("access-refresh").click();
       await refreshed;
       await save.click({ trial: true });
@@ -3534,8 +3552,17 @@ async function runCheckedSaveBrowserProof(mode) {
     if (mode === "unavailable") {
       assert.equal(notice, "Changes were not saved. Checked access saves are unavailable; your draft is retained.", "typed mutation unavailable must have finite unavailable feedback");
       assert(disabled, "typed mutation unavailable must block repeated Save despite valid read metadata");
+      // Save is disabled while any read is in flight, so check the panel only
+      // after the refresh landed: its config read answered and the banner
+      // that marks a read in flight is gone.
+      const readsBeforeRefresh = reads.length;
+      const refreshed = page.waitForResponse(response => response.url().endsWith("/console/rpc") && response.request().postDataJSON()?.method === "meta/access/get");
+      refreshed.catch(() => {});
       await page.getByTestId("access-refresh").click();
-      await page.getByTestId("access-error").waitFor();
+      await refreshed;
+      await page.getByTestId("access-panel").getByText("Refreshing owner state. Changes are temporarily unavailable.", { exact: true }).waitFor({ state: "detached" });
+      assert.deepEqual(reads.slice(readsBeforeRefresh).map(read => read.method), ["meta/access/status", "meta/access/get"], "Refresh must read the owner state again");
+      assert.equal(await page.getByTestId("access-error").innerText(), notice, "an ordinary refresh must keep the unavailable notice");
       assert.equal(await draft.inputValue(), draftText);
       assert(await save.isDisabled(), "ordinary refresh must not silently reapply the draft");
       assert.equal(writes.length, 1);
@@ -3563,14 +3590,18 @@ async function runCheckedSaveBrowserProof(mode) {
       else assert.deepEqual(state.config, lastPayload.config);
       await page.screenshot({ path: path.join(evidence, "explicit-second-save.png"), fullPage: true });
     }
+    await routes.settle();
+    routes.check();
     assert.deepEqual(errors, []);
     checkpoints.push({ step: "complete", writes: writes.length, applied: state.applied, revision: state.revision });
   } catch (error) {
+    printScenarioError(`checked-save-${mode}`, error);
     failure = String(error.stack || error);
     if (page) fs.writeFileSync(path.join(evidence, "failure-body.txt"), await page.locator("body").innerText().catch(() => "unavailable"));
     throw error;
   } finally {
-    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ mode, backend: "mock HTTP access RPC", nativeAuthorizationInstalled: false, state, writes, reads, checkpoints, errors, failure: failure || null }, null, 2));
+    await routes?.settle();
+    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ mode, backend: "mock HTTP access RPC", nativeAuthorizationInstalled: false, state, writes, reads, checkpoints, errors, routeFailures: routes?.failures || [], failure: failure || null }, null, 2));
     if (browser) await browser.close();
     await server.close();
   }
@@ -3592,17 +3623,18 @@ async function runAccessTabClickDuringRefreshProof() {
   const statusReadsReleased = new Promise(resolve => { releaseStatusReads = resolve; });
   const heldReads = [], errors = [], checkpoints = [];
   const server = await startMockConsoleServer();
-  let browser, page, failure;
+  let browser, page, routes, failure;
   try {
     browser = await launchBrowser();
     page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
     page.setDefaultTimeout(10000);
     page.on("pageerror", error => errors.push(String(error)));
-    await page.route("**/console/experience", async route => {
+    routes = routeGuard(page, "access-tab-click-during-refresh");
+    await routes.route("**/console/experience", async route => {
       const response = await route.fetch(); const value = await response.json();
       await route.fulfill({ response, json: { ...value, access: status() } });
     });
-    await page.route("**/console/rpc", async route => {
+    await routes.route("**/console/rpc", async route => {
       const request = route.request().postDataJSON();
       const reply = payload => route.fulfill({ json: { jsonrpc: "2.0", id: request.id, ...payload } });
       if (request.method === "meta/capabilities") {
@@ -3648,17 +3680,19 @@ async function runAccessTabClickDuringRefreshProof() {
     assert.deepEqual(refreshingBox, pressed, "a refresh moved the tab row under a pressed pointer");
     assert.equal(selected, true, "a tab click that spans the start of a refresh did not select the tab");
     await page.getByTestId("access-preview-subject").waitFor();
+    await routes.settle();
+    routes.check();
     assert.deepEqual(errors, []);
     checkpoints.push({ step: "complete" });
   } catch (error) {
+    printScenarioError("access-tab-click-during-refresh", error);
     failure = String(error.stack || error);
     if (page) fs.writeFileSync(path.join(evidence, "failure-body.txt"), await page.locator("body").innerText().catch(() => "unavailable"));
     throw error;
   } finally {
     releaseStatusReads();
-    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP access RPC", checkpoints, errors, failure: failure || null }, null, 2));
-    // A route still fetching when the page closes must not outlive the scenario.
-    if (page) await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
+    await routes?.settle();
+    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP access RPC", checkpoints, errors, routeFailures: routes?.failures || [], failure: failure || null }, null, 2));
     if (browser) await browser.close();
     await server.close();
   }
@@ -3786,17 +3820,18 @@ async function runMemoryTabClickDuringFailedRefreshProof() {
   let failRecordReads = false;
   const failedReads = [], errors = [], checkpoints = [];
   const server = await startMockConsoleServer();
-  let browser, page, failure;
+  let browser, page, routes, failure;
   try {
     browser = await launchBrowser();
     page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
     page.setDefaultTimeout(10000);
     page.on("pageerror", error => errors.push(String(error)));
-    await page.route("**/console/experience", async route => {
+    routes = routeGuard(page, "memory-tab-click-during-failed-refresh");
+    await routes.route("**/console/experience", async route => {
       const response = await route.fetch(); const value = await response.json();
       await route.fulfill({ response, json: { ...value, memory: { can_read: true, can_review_quarantine: false } } });
     });
-    await page.route("**/console/rpc", async route => {
+    await routes.route("**/console/rpc", async route => {
       const request = route.request().postDataJSON();
       const reply = payload => route.fulfill({ json: { jsonrpc: "2.0", id: request.id, ...payload } });
       if (request.method === "meta/capabilities") {
@@ -3836,16 +3871,18 @@ async function runMemoryTabClickDuringFailedRefreshProof() {
     assert.equal(selected, true, "a tab click that spans a failed refresh did not select the tab");
     await page.getByTestId("memory-refresh").click();
     await memoryError.waitFor({ state: "detached" });
+    await routes.settle();
+    routes.check();
     assert.deepEqual(errors, []);
     checkpoints.push({ step: "complete" });
   } catch (error) {
+    printScenarioError("memory-tab-click-during-failed-refresh", error);
     failure = String(error.stack || error);
     if (page) fs.writeFileSync(path.join(evidence, "failure-body.txt"), await page.locator("body").innerText().catch(() => "unavailable"));
     throw error;
   } finally {
-    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP memory RPC", checkpoints, errors, failure: failure || null }, null, 2));
-    // A route still fetching when the page closes must not outlive the scenario.
-    if (page) await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
+    await routes?.settle();
+    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP memory RPC", checkpoints, errors, routeFailures: routes?.failures || [], failure: failure || null }, null, 2));
     if (browser) await browser.close();
     await server.close();
   }
@@ -3866,17 +3903,18 @@ async function runWorkGraphActionClickDuringFailedRefreshProof() {
   let failSnapshotReads = false;
   const claims = [], failedReads = [], errors = [], checkpoints = [];
   const server = await startMockConsoleServer();
-  let browser, page, failure;
+  let browser, page, routes, failure;
   try {
     browser = await launchBrowser();
     page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
     page.setDefaultTimeout(10000);
     page.on("pageerror", error => errors.push(String(error)));
-    await page.route("**/console/experience", async route => {
+    routes = routeGuard(page, "workgraph-action-click-during-failed-refresh");
+    await routes.route("**/console/experience", async route => {
       const response = await route.fetch(); const value = await response.json();
       await route.fulfill({ response, json: { ...value, workgraph: { available: true, can_view: true, can_manage: true } } });
     });
-    await page.route("**/console/rpc", async route => {
+    await routes.route("**/console/rpc", async route => {
       const request = route.request().postDataJSON();
       const reply = payload => route.fulfill({ json: { jsonrpc: "2.0", id: request.id, ...payload } });
       if (request.method === "meta/capabilities") {
@@ -3928,16 +3966,18 @@ async function runWorkGraphActionClickDuringFailedRefreshProof() {
     checkpoints.push({ step: "released-after-failed-refresh", pressed, erroredBox, headPressed, headErrored, errorBox, claimSent, claims: [...claims], failedReads: [...failedReads] });
     assert.deepEqual(erroredBox, pressed, "a failed refresh moved the work item action under a pressed pointer");
     assert.equal(claimSent, true, "a click on a work item action that spans a failed refresh did not run the action");
+    await routes.settle();
+    routes.check();
     assert.deepEqual(errors, []);
     checkpoints.push({ step: "complete" });
   } catch (error) {
+    printScenarioError("workgraph-action-click-during-failed-refresh", error);
     failure = String(error.stack || error);
     if (page) fs.writeFileSync(path.join(evidence, "failure-body.txt"), await page.locator("body").innerText().catch(() => "unavailable"));
     throw error;
   } finally {
-    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP workgraph RPC", checkpoints, errors, failure: failure || null }, null, 2));
-    // A route still fetching when the page closes must not outlive the scenario.
-    if (page) await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
+    await routes?.settle();
+    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP workgraph RPC", checkpoints, errors, routeFailures: routes?.failures || [], failure: failure || null }, null, 2));
     if (browser) await browser.close();
     await server.close();
   }
@@ -3969,17 +4009,18 @@ async function runMemoryBodyClickAcrossRefreshProof() {
   let failRecordReads = false;
   const failedReads = [], errors = [], checkpoints = [], problems = [];
   const server = await startMockConsoleServer();
-  let browser, page, failure;
+  let browser, page, routes, failure;
   try {
     browser = await launchBrowser();
     page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
     page.setDefaultTimeout(10000);
     page.on("pageerror", error => errors.push(String(error)));
-    await page.route("**/console/experience", async route => {
+    routes = routeGuard(page, "memory-body-click-across-refresh");
+    await routes.route("**/console/experience", async route => {
       const response = await route.fetch(); const value = await response.json();
       await route.fulfill({ response, json: { ...value, memory: { can_read: true, can_review_quarantine: false } } });
     });
-    await page.route("**/console/rpc", async route => {
+    await routes.route("**/console/rpc", async route => {
       const request = route.request().postDataJSON();
       const reply = payload => route.fulfill({ json: { jsonrpc: "2.0", id: request.id, ...payload } });
       if (request.method === "meta/capabilities") {
@@ -4072,16 +4113,18 @@ async function runMemoryBodyClickAcrossRefreshProof() {
     await pressAcrossRefresh("record-row-across-recovery", row, false, recordRequested);
 
     assert.deepEqual(problems, [], "a refresh that failed or recovered moved the memory body under a click");
+    await routes.settle();
+    routes.check();
     assert.deepEqual(errors, []);
     checkpoints.push({ step: "complete" });
   } catch (error) {
+    printScenarioError("memory-body-click-across-refresh", error);
     failure = String(error.stack || error);
     if (page) fs.writeFileSync(path.join(evidence, "failure-body.txt"), await page.locator("body").innerText().catch(() => "unavailable"));
     throw error;
   } finally {
-    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP memory RPC", checkpoints, problems, failedReads, errors, failure: failure || null }, null, 2));
-    // A route still fetching when the page closes must not outlive the scenario.
-    if (page) await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
+    await routes?.settle();
+    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP memory RPC", checkpoints, problems, failedReads, errors, routeFailures: routes?.failures || [], failure: failure || null }, null, 2));
     if (browser) await browser.close();
     await server.close();
   }
@@ -4113,17 +4156,18 @@ async function runMemoryLatticeRecheckAcrossRefreshProof() {
   let holdWalkReads = false;
   const heldWalkReads = [], walkReads = [], plainReads = [], errors = [], checkpoints = [], problems = [];
   const server = await startMockConsoleServer();
-  let browser, page, failure;
+  let browser, page, routes, failure;
   try {
     browser = await launchBrowser();
     page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
     page.setDefaultTimeout(10000);
     page.on("pageerror", error => errors.push(String(error)));
-    await page.route("**/console/experience", async route => {
+    routes = routeGuard(page, "memory-lattice-recheck-across-refresh");
+    await routes.route("**/console/experience", async route => {
       const response = await route.fetch(); const value = await response.json();
       await route.fulfill({ response, json: { ...value, memory: { can_read: true, can_review_quarantine: false } } });
     });
-    await page.route("**/console/rpc", async route => {
+    await routes.route("**/console/rpc", async route => {
       const request = route.request().postDataJSON();
       const reply = payload => route.fulfill({ json: { jsonrpc: "2.0", id: request.id, ...payload } });
       if (request.method === "meta/capabilities") {
@@ -4201,18 +4245,20 @@ async function runMemoryLatticeRecheckAcrossRefreshProof() {
     if (!/re-checking/.test(changed.latticeText)) problems.push("changed-records: the running walk showed no re-check");
 
     assert.deepEqual(problems, [], "a good refresh moved the memory tiles under a click");
+    await routes.settle();
+    routes.check();
     assert.deepEqual(errors, []);
     checkpoints.push({ step: "complete" });
   } catch (error) {
+    printScenarioError("memory-lattice-recheck-across-refresh", error);
     failure = String(error.stack || error);
     if (page) fs.writeFileSync(path.join(evidence, "failure-body.txt"), await page.locator("body").innerText().catch(() => "unavailable"));
     throw error;
   } finally {
     holdWalkReads = false;
     heldWalkReads.splice(0).forEach(resolve => resolve());
-    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP memory RPC", checkpoints, problems, walkReads: walkReads.length, plainReads: plainReads.length, errors, failure: failure || null }, null, 2));
-    // A route still fetching when the page closes must not outlive the scenario.
-    if (page) await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
+    await routes?.settle();
+    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP memory RPC", checkpoints, problems, walkReads: walkReads.length, plainReads: plainReads.length, errors, routeFailures: routes?.failures || [], failure: failure || null }, null, 2));
     if (browser) await browser.close();
     await server.close();
   }
@@ -4235,17 +4281,18 @@ async function runWorkGraphHeaderClickAcrossRefreshProof(width) {
   let failSnapshotReads = false;
   const failedReads = [], errors = [], checkpoints = [], problems = [];
   const server = await startMockConsoleServer();
-  let browser, page, failure;
+  let browser, page, routes, failure;
   try {
     browser = await launchBrowser();
     page = await browser.newPage({ viewport: { width, height: 900 } });
     page.setDefaultTimeout(10000);
     page.on("pageerror", error => errors.push(String(error)));
-    await page.route("**/console/experience", async route => {
+    routes = routeGuard(page, `workgraph-header-click-across-refresh-${width}`);
+    await routes.route("**/console/experience", async route => {
       const response = await route.fetch(); const value = await response.json();
       await route.fulfill({ response, json: { ...value, workgraph: { available: true, can_view: true, can_manage: true } } });
     });
-    await page.route("**/console/rpc", async route => {
+    await routes.route("**/console/rpc", async route => {
       const request = route.request().postDataJSON();
       const reply = payload => route.fulfill({ json: { jsonrpc: "2.0", id: request.id, ...payload } });
       if (request.method === "meta/capabilities") {
@@ -4324,16 +4371,18 @@ async function runWorkGraphHeaderClickAcrossRefreshProof(width) {
     await pressAcrossRefresh("tree-toggle-across-recovery", tree, false);
 
     assert.deepEqual(problems, [], `a refresh that failed or recovered moved the WorkGraph header controls at ${width} px`);
+    await routes.settle();
+    routes.check();
     assert.deepEqual(errors, []);
     checkpoints.push({ step: "complete" });
   } catch (error) {
+    printScenarioError(`workgraph-header-click-across-refresh-${width}`, error);
     failure = String(error.stack || error);
     if (page) fs.writeFileSync(path.join(evidence, "failure-body.txt"), await page.locator("body").innerText().catch(() => "unavailable"));
     throw error;
   } finally {
-    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP workgraph RPC", width, checkpoints, problems, failedReads, errors, failure: failure || null }, null, 2));
-    // A route still fetching when the page closes must not outlive the scenario.
-    if (page) await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
+    await routes?.settle();
+    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP workgraph RPC", width, checkpoints, problems, failedReads, errors, routeFailures: routes?.failures || [], failure: failure || null }, null, 2));
     if (browser) await browser.close();
     await server.close();
   }
