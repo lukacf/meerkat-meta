@@ -1,8 +1,12 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Meta keeps its container images under Renovate: the release build container and the Bazel platform images, pinned by digest like Core's.",
+  "description": "Meta keeps its container images and its GitHub Actions under Renovate, pinned like Core's: the release build container and the Bazel platform images by digest, every action by commit SHA.",
+  "extends": [
+    "helpers:pinGitHubActionDigests"
+  ],
   "enabledManagers": [
-    "custom.regex"
+    "custom.regex",
+    "github-actions"
   ],
   "schedule": [
     "before 9am on Monday"
@@ -30,6 +34,26 @@
       ],
       "groupName": "pinned images",
       "groupSlug": "pinned-images",
+      "minimumReleaseAge": "7 days",
+      "automerge": false
+    },
+    {
+      "description": "A digest update of a pinned action (its tag now names another commit) waits for approval on the dependency dashboard: minimumReleaseAge holds back new versions only, and a moved tag keeps its original date.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "digest"
+      ],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "GitHub Actions run with the workflow token, OIDC and release secrets: pinned to commit SHAs (helpers:pinGitHubActionDigests; the CI workflow tests check these rules), new versions proposed a week after their release, in a group of their own, and never automerged. Keep this rule last.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "github actions",
+      "groupSlug": "github-actions",
       "minimumReleaseAge": "7 days",
       "automerge": false
     }

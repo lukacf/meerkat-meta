@@ -446,6 +446,27 @@ class CiWorkflowTests(unittest.TestCase):
                 problems = problems_of({**clean, relative: text})
                 self.assertTrue(any(problem.startswith(relative) for problem in problems), problems)
 
+    def test_renovate_proposes_action_updates_like_core(self):
+        """Actions run with the workflow token, OIDC and release secrets.
+        Renovate keeps them pinned to commit SHAs
+        (helpers:pinGitHubActionDigests), proposes a new version a week after
+        its release, asks for approval before moving a pin whose tag now names
+        another commit, and never automerges one: Core's github-actions rules,
+        with the github-actions rule last so no later rule overrides it."""
+        renovate = json.loads((ROOT / "renovate.json").read_text())
+        self.assertIn("helpers:pinGitHubActionDigests", renovate.get("extends", []))
+        self.assertEqual(sorted(renovate.get("enabledManagers", [])), ["custom.regex", "github-actions"])
+        rules = renovate["packageRules"]
+        last = rules[-1]
+        self.assertEqual(last["matchManagers"], ["github-actions"])
+        self.assertEqual(last["minimumReleaseAge"], "7 days")
+        self.assertIs(last["automerge"], False)
+        (digest,) = [rule for rule in rules if rule.get("matchManagers") == ["github-actions"]
+                     and rule.get("matchUpdateTypes") == ["digest"]]
+        self.assertIs(digest["dependencyDashboardApproval"], True)
+        self.assertFalse([rule for rule in rules if rule.get("automerge") is True])
+        self.assertNotIn("automerge", renovate)
+
     def test_rust_cache_covers_the_wrapper_target(self):
         """rust-cache saves `<workspace>/target`; repo-cargo must build there.
 
