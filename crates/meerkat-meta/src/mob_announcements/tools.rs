@@ -288,28 +288,50 @@ impl MobAnnouncementTools {
             .recent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let window = recent.entry(member.clone()).or_default();
-        while window
-            .front()
-            .is_some_and(|(at, _)| now.saturating_sub(*at) >= LIMIT_WINDOW_MS || *at > now)
-        {
-            window.pop_front();
-        }
-        if window.len() >= limits.announcements_per_minute as usize {
+        // Every window drops what the last minute no longer holds, and an
+        // empty window goes: only members that announced within the last
+        // minute are kept.
+        recent.retain(|_, window| {
+            while window
+                .front()
+                .is_some_and(|(at, _)| now.saturating_sub(*at) >= LIMIT_WINDOW_MS || *at > now)
+            {
+                window.pop_front();
+            }
+            !window.is_empty()
+        });
+        let (count, written) = recent.get(member).map_or((0, 0), |window| {
+            (
+                window.len(),
+                window.iter().map(|(_, bytes)| *bytes).sum::<u64>(),
+            )
+        });
+        if count >= limits.announcements_per_minute as usize {
             return Err(format!(
                 "limit reached: at most {} announcements a minute",
                 limits.announcements_per_minute
             ));
         }
-        let written = window.iter().map(|(_, bytes)| *bytes).sum::<u64>();
         if written.saturating_add(bytes) > limits.announcement_bytes_per_minute {
             return Err(format!(
                 "limit reached: at most {} bytes of announcements a minute",
                 limits.announcement_bytes_per_minute
             ));
         }
-        window.push_back((now, bytes));
+        recent
+            .entry(member.clone())
+            .or_default()
+            .push_back((now, bytes));
         Ok(())
+    }
+
+    /// How many members' announcement windows are kept.
+    #[cfg(test)]
+    pub(crate) fn tracked_members(&self) -> usize {
+        self.recent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     async fn serve(&self, call: ToolCallView<'_>, context: &ToolDispatchContext) -> Answer {

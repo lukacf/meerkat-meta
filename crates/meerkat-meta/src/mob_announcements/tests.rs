@@ -7430,3 +7430,56 @@ fn the_ledger_owns_every_object_the_schema_creates() {
         .collect();
     assert_eq!(created, owned);
 }
+
+/// A member's announcement window is kept only while it holds an
+/// announcement of the last minute: an emptied window is evicted, and a
+/// refused announcement leaves no window behind, so the windows stay bounded
+/// by the members announcing now.
+#[tokio::test]
+async fn announce_windows_are_evicted_once_empty() {
+    let tools = tool_harness(super::tools::MemberLimits {
+        announcements_per_minute: 5,
+        announcement_bytes_per_minute: 100,
+        subscriptions: 1,
+        topics_per_subscription: 2,
+    });
+    let announce = |key: &str, body: String| serde_json::json!({ "topics": ["ios"], "body": body, "key": key });
+    for who in ["agent:a", "agent:b"] {
+        let (failed, result) = tools
+            .call(
+                Some(who),
+                super::tools::ANNOUNCE_TOOL,
+                announce(&format!("k-{who}"), "x".to_string()),
+            )
+            .await;
+        assert!(!failed, "{who}: {result}");
+    }
+    assert_eq!(tools.tools.tracked_members(), 2);
+    tools.harness.clock.fetch_add(60_000, Ordering::SeqCst);
+    let (failed, result) = tools
+        .call(
+            Some("agent:a"),
+            super::tools::ANNOUNCE_TOOL,
+            announce("k-again", "x".to_string()),
+        )
+        .await;
+    assert!(!failed, "{result}");
+    assert_eq!(
+        tools.tools.tracked_members(),
+        1,
+        "agent:b's emptied window is gone"
+    );
+    let (failed, result) = tools
+        .call(
+            Some("agent:b"),
+            super::tools::ANNOUNCE_TOOL,
+            announce("k-big", "x".repeat(101)),
+        )
+        .await;
+    assert!(failed, "past the byte limit: {result}");
+    assert_eq!(
+        tools.tools.tracked_members(),
+        1,
+        "a refused announcement leaves no window"
+    );
+}
