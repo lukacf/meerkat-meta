@@ -32,6 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   serde_yaml in until Meta pins a Core release that parses SKILL.md with
   serde-saphyr.
 
+### Added
+
+- `.github/workflows/forge-release.yml` releases Meta Forge on its own
+  `forge-v<version>` tag, beside Meta's releases. A candidate builds each target's
+  package from public inputs pinned in `installer/release/forge-release-inputs.json`,
+  verifies and attests it, and binds the set, together with a green dispatched
+  `forge.yml` run that tested the same Forge inputs, in an attested candidate
+  manifest.
+  Publication releases those exact bytes as a prerelease that never becomes the
+  latest release. `forge.yml` can now be dispatched, and records each job's
+  toolchain. `installer/RELEASING.md` has the steps.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking
@@ -810,6 +822,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a respawned or delivery-repaired session. The rebind reported the member
   under its runtime alias instead of its roster row, so the opt-in stayed
   on the old session.
+- The console access panel no longer moves its tabs while it refreshes. The
+  "Refreshing owner state" notice, the error alert, "Review and reapply" and
+  the out-of-date note rendered above the tab row, and stream events start a
+  refresh at any moment, so a tab click whose press and release straddled
+  the start of a refresh released over another element and was lost. They
+  now render below the tabs.
 
 ### Known limitations
 
