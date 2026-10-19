@@ -31,10 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   its own transaction. A lost acknowledgment is reconciled from native status
   without a second submission, and a delivery stranded on a retired
   incarnation moves to a successor batch that names its predecessor. A
-  subscription ends, typed, when its member is no longer registered or every
-  mob it named was destroyed; a destroyed mob leaves the subscriptions that
-  name it, and retention removes ended subscriptions and the logs of
-  destroyed mobs. Batch bodies quote each announcement and name its mob and
+  subscription ends, typed, only on a final fact: its member departed, or
+  every mob it named was destroyed; a destroyed mob leaves the subscriptions
+  that name it, and retention removes ended subscriptions and the logs of
+  destroyed mobs. A member that is not registered or not served where its
+  deliveries go ends nothing: its deliveries wait, and
+  `deliveries/observe` and `subscriptions/get` show why as a typed `marker`
+  with the class of its evidence (`verified`, `unverified` or `local`). Batch bodies quote each announcement and name its mob and
   announcer. New methods `meta/mob_announcements/{announce, get,
   subscriptions/{put,pause,resume,cancel,get,list},
   deliveries/{list,observe,reconcile}}`, with typed errors `-32044` to
@@ -95,9 +98,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `UnifiedRuntimeBuilder::keyed_inject_plane(KeyedInjectPlane::Disabled)`),
   answers `not_served` with its typed cause (`not_identity_first`,
   `runtime_disabled`) in a signed field of the refusal. Mob announcements
-  use them to deliver to members of mobs on peer gateways; a gateway that
-  predates them ends such a subscription as `peer_unsupported`. Every
-  public enum of `runtime::keyed_inject` is `#[non_exhaustive]`.
+  use them to deliver to members of mobs on peer gateways. A signed refusal
+  says that nothing was committed, and the delivery waits with a typed
+  reason; only a signed `member_departed` ends a subscription. An unsigned
+  answer, such as one from a gateway that predates these verbs, is never
+  evidence: the delivery's outcome stays unknown until a status read settles
+  it. Every public enum of `runtime::keyed_inject` is `#[non_exhaustive]`.
 
 - `.github/workflows/warm-deps.yml`, dispatched on a branch whose `Cargo.lock`
   changed, builds the dependency graph of each Rust CI job from that branch's

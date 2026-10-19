@@ -35,6 +35,7 @@
 //! `max_delay_ms`, or a paused subscription resumes. No model call happens
 //! per announcement.
 
+pub mod availability;
 mod faults;
 pub mod native;
 pub mod owner;
@@ -55,11 +56,15 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
+pub use availability::{
+    BlockCause, DepartureEvidence, EvidenceClass, MemberDeparture, NotServedHereCause,
+    SuspendCause, SuspendMarker,
+};
 pub use native::{
     ANNOUNCEMENT_CONTINUATION_NAMESPACE, AnnouncementNativeDelivery, IdentityService, MemberMobEnd,
     MemberMobScan, MemberProblem, MemberRoute, MobNativeDelivery, MobPresence, NativeDelivery,
-    NativeStatus, NativeSubmitError, NativeUnavailable, PrepareError, batch_summary,
-    continuation_delivery, continuation_for,
+    NativeStatus, NativeStatusError, NativeSubmitError, NativeUnavailable, PrepareError,
+    batch_summary, continuation_delivery, continuation_for,
 };
 pub use owner::{
     AdmittedInput, AnnouncementConfig, AnnouncementError, AnnouncementService,
@@ -249,9 +254,10 @@ pub(crate) fn compose_for_runtime(
         .map_err(|error| format!("mob announcement database: {error}"))?;
     let store = storage::open_disk_store(path)
         .map_err(|error| format!("mob announcement database: {error}"))?;
+    let window_ms = config.peer_request_window_ms;
     let remote = runtime
         .peer_delivery_access()
-        .map(|(contacts, keys)| Arc::new(RemoteMemberDelivery::new(contacts, keys)));
+        .map(|(contacts, keys)| Arc::new(RemoteMemberDelivery::new(contacts, keys, window_ms)));
     // Callers in mobs members created are attributed through this
     // gateway's runtime only when they can be offered the tools.
     let children = config

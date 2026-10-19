@@ -1641,6 +1641,8 @@ fn a_retired_member_waits_until_its_destroyed_mob_ends_the_subscription() {
             "body": "outage-2: the payment provider is degraded"
         }),
     );
+    // An attempt for it commits nothing: the batch is owed again, and the
+    // member's marker says why. Waiting ends nothing.
     let start = Instant::now();
     let waiting = loop {
         if start.elapsed() > SETTLE_TIMEOUT {
@@ -1649,15 +1651,15 @@ fn a_retired_member_waits_until_its_destroyed_mob_ends_the_subscription() {
                 json!({ "member": child_member() }),
             );
             panic!(
-                "no batch was submitted for the retired member; retire answered \
-                 {answer}; deliveries {listed}\n{}",
+                "the retired member's batch never waited on member_not_live; retire \
+                 answered {answer}; deliveries {listed}\n{}",
                 gateway.stderr_tail()
             );
         }
         if child_subscription(&mut gateway, "child-from-root")["state"] == json!("ended") {
             break None;
         }
-        let submitting = gateway.call(
+        let owed = gateway.call(
             "meta/mob_announcements/deliveries/list",
             json!({ "member": child_member() }),
         )["deliveries"]
@@ -1666,13 +1668,21 @@ fn a_retired_member_waits_until_its_destroyed_mob_ends_the_subscription() {
             .unwrap_or_default()
             .into_iter()
             .find(|batch| {
-                batch["state"]["state"] == json!("submitting")
-                    && batch["body"]
-                        .as_str()
-                        .is_some_and(|body| body.contains("outage-2"))
+                batch["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("outage-2"))
             });
-        if let Some(batch) = submitting {
-            break Some(batch);
+        if let Some(batch) = owed {
+            let observed = gateway.call(
+                "meta/mob_announcements/deliveries/observe",
+                json!({ "batch_id": batch["id"] }),
+            );
+            if observed["batch"]["state"]["state"] == json!("sealed")
+                && observed["marker"]["cause"]["kind"] == json!("member_not_live")
+                && observed["marker"]["evidence"] == json!("local")
+            {
+                break Some(batch);
+            }
         }
         thread::sleep(Duration::from_millis(100));
     };

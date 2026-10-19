@@ -478,11 +478,17 @@ own keys only. Both need:
   `runtime_disabled`, in a field of the signed refusal.
 
 Every answer is signed with the serving gateway's key, and the caller treats
-only an answer its pinned key verifies as evidence. A signed `unknown_member`
-or `unusable_member` (a member placed on a host, or bound to an external
-runtime) ends the caller's subscriptions for that member. A gateway that
-predates these verbs cannot decode them and answers so unsigned; the caller
-ends the subscription as `peer_unsupported` rather than retrying forever.
+only an answer its pinned key verifies as evidence. A signed refusal says
+that nothing was committed for that attempt, and the caller's delivery waits
+with a typed reason: a member that is unknown or not served there (placed
+on a host, or bound to an external runtime), a governed runtime, a member
+with no live incarnation, a stale request or a gateway that does not serve
+keyed injects are states that can change, so none of them ends a
+subscription. Only a signed `member_departed` ends the caller's
+subscriptions for that member. An unsigned answer, such as a `decode` error
+from a gateway that predates these verbs, is never evidence: the outcome
+stays unknown, and the caller reads the delivery's status before it submits
+again.
 
 Three limits worth stating plainly:
 

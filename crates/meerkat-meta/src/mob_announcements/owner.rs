@@ -18,10 +18,12 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify};
 
+use super::availability::{EvidenceClass, SuspendCause, SuspendMarker};
 pub use super::native::AdmittedInput;
 use super::native::{
     MemberMobScan, MemberProblem, MemberRoute, MobOrigin, MobPresence, NativeDelivery,
-    NativeStatus, NativeSubmitError, OwnerRefusal, PrepareError, route_contradiction,
+    NativeStatus, NativeStatusError, NativeSubmitError, OwnerRefusal, PrepareError,
+    route_contradiction,
 };
 use super::store::AnnouncementStore;
 use super::types::{
@@ -225,14 +227,16 @@ pub enum NativeObservation {
 }
 
 /// Everything known about one delivery: the immutable batch with its owner
-/// state, the native owner's live status, and, once admitted, the native
-/// input's own state.
+/// state, the native owner's live status, once admitted the native input's
+/// own state, and why the member's deliveries wait, if they do.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DeliveryObservation {
     pub batch: Batch,
     pub native: NativeObservation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marker: Option<SuspendMarker>,
 }
 
 /// What one dispatcher round did.
@@ -337,8 +341,45 @@ struct Inner {
     wake: Arc<Notify>,
     /// Held for a whole round; it owns the walk over unsettled batches.
     round: Mutex<Walk>,
+    /// Why each member's deliveries wait now: the latest classified outcome
+    /// of an attempt for it. A projection for operators, rebuilt from the
+    /// next attempt after a restart; nothing reads it to decide a
+    /// transition.
+    markers: std::sync::Mutex<BTreeMap<Member, SuspendMarker>>,
     clock: Clock,
     stopped: AtomicBool,
+}
+
+/// What a submission left to do.
+enum SubmitStep {
+    /// The batch moved: drive it on.
+    Moved(Box<Batch>),
+    /// Whether it was committed is not known: read its status next, at the
+    /// settle pace.
+    ReadStatus,
+    /// Nothing was committed and the batch is owed again: submit it again at
+    /// the slowest settle pace.
+    Owed,
+}
+
+/// Why a member was not made ready for a submission.
+enum PrepareStep {
+    /// A final fact ended its subscriptions.
+    Ended,
+    /// It cannot take a delivery now, for a typed reason: look again at the
+    /// slowest settle pace.
+    Waits,
+    /// A read it needs could not be made now: look again at the settle pace.
+    NotYet,
+}
+
+/// What a status read left to do.
+enum StatusStep {
+    Status(NativeStatus),
+    /// No status now: look again at the settle pace.
+    Wait,
+    /// The read moved the batch.
+    Moved(Box<Batch>),
 }
 
 impl Drop for Inner {
@@ -470,6 +511,7 @@ impl AnnouncementService {
                 config,
                 wake: Arc::new(Notify::new()),
                 round: Mutex::new(Walk::default()),
+                markers: std::sync::Mutex::new(BTreeMap::new()),
                 clock,
                 stopped: AtomicBool::new(false),
             }),
@@ -478,6 +520,49 @@ impl AnnouncementService {
 
     pub fn config(&self) -> &AnnouncementConfig {
         &self.inner.config
+    }
+
+    /// Why the member's deliveries wait now, if they do: the latest
+    /// classified outcome of an attempt for it.
+    pub fn suspend_marker(&self, member: &Member) -> Option<SuspendMarker> {
+        self.inner
+            .markers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(member)
+            .cloned()
+    }
+
+    /// Record why the member's deliveries wait. The same cause on the same
+    /// evidence keeps the time it was first seen.
+    fn mark(&self, member: &Member, cause: SuspendCause, evidence: EvidenceClass, now: u64) {
+        let mut markers = self
+            .inner
+            .markers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match markers.get(member) {
+            Some(marker) if marker.cause == cause && marker.evidence == evidence => {}
+            _ => {
+                markers.insert(
+                    member.clone(),
+                    SuspendMarker {
+                        cause,
+                        evidence,
+                        since_ms: now,
+                    },
+                );
+            }
+        }
+    }
+
+    /// The member's deliveries move again.
+    fn unmark(&self, member: &Member) {
+        self.inner
+            .markers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(member);
     }
 
     fn now(&self) -> u64 {
@@ -926,6 +1011,7 @@ impl AnnouncementService {
 
     /// End every live subscription of a member that is gone for good.
     async fn end_member(&self, member: &Member, end: SubscriptionEnd, now: u64) {
+        self.unmark(member);
         match self.inner.store.end_member(member, end.clone(), now).await {
             Ok(ended) if !ended.is_empty() => {
                 tracing::info!(
@@ -1026,11 +1112,13 @@ impl AnnouncementService {
     }
 
     async fn observe(&self, batch: Batch) -> Result<DeliveryObservation, AnnouncementError> {
+        let marker = self.suspend_marker(&batch.member);
         if batch.state.tag() == BatchStateTag::Sealed {
             return Ok(DeliveryObservation {
                 batch,
                 native: NativeObservation::NotSubmitted,
                 input: None,
+                marker,
             });
         }
         // Nothing is read for a batch whose route contradicts its member,
@@ -1042,10 +1130,13 @@ impl AnnouncementService {
                     detail: refusal.to_string(),
                 },
                 input: None,
+                marker,
             });
         }
         let native = match self.inner.native.status(&batch).await {
-            Err(error) => NativeObservation::Unavailable { detail: error.0 },
+            Err(error) => NativeObservation::Unavailable {
+                detail: error.to_string(),
+            },
             Ok(status) => Self::native_observation(status),
         };
         let input = match &native {
@@ -1063,6 +1154,7 @@ impl AnnouncementService {
             batch,
             native,
             input,
+            marker,
         })
     }
 
@@ -1585,9 +1677,10 @@ impl AnnouncementService {
         Ok(presence.get(&member.mob_id) == Some(&MobPresence::Gone))
     }
 
-    /// Whether a batch the native owner reads as not committed expires:
-    /// once it was sealed before the retention window, every item it holds
-    /// is at least that old. For a member on a peer gateway its last
+    /// Whether a batch nothing native holds expires (one still sealed or owed
+    /// again, or one the native owner reads as not committed): once it was
+    /// sealed before the retention window, every item it holds is at least
+    /// that old. For a member on a peer gateway its last
     /// submission must also be older than the peer's request window, so a
     /// request still in flight is refused as stale instead of landing after
     /// the expiry; until then nothing is submitted again.
@@ -1650,18 +1743,35 @@ impl AnnouncementService {
             return Ok(None);
         }
         let mut submitted_this_round = false;
+        // A batch owed again after an answer that nothing was committed is
+        // tried again at the slowest settle pace.
+        let owed_at = Some(now.saturating_add(self.inner.config.settle_check_max_ms));
         for _ in 0..8 {
             let retry_at = Some(now.saturating_add(self.settle_pause_ms(&batch, now)));
             match batch.state.clone() {
                 BatchState::Sealed => {
-                    match self.interest(&batch).await? {
-                        Interest::None => {
-                            batch = self.apply(&batch, BatchEvent::Cancel, now).await?;
+                    let interest = self.interest(&batch).await?;
+                    if interest == Interest::None {
+                        batch = self.apply(&batch, BatchEvent::Cancel, now).await?;
+                        continue;
+                    }
+                    // Nothing native holds a sealed batch: one owed past the
+                    // retention window expires, paused or not, and the next
+                    // batch reports its announcements.
+                    match self.expiry(&batch, now) {
+                        Expiry::NotYet => {}
+                        Expiry::Now => {
+                            batch = self.apply(&batch, BatchEvent::Expire, now).await?;
                             continue;
                         }
-                        // A resume wakes the dispatcher; no timer needed.
-                        Interest::Paused => return Ok(None),
-                        Interest::Active => {}
+                        Expiry::AfterQuietWindow(due) => return Ok(Some(due)),
+                    }
+                    // A resume wakes the dispatcher; no timer needed.
+                    if interest == Interest::Paused {
+                        return Ok(None);
+                    }
+                    if submitted_this_round {
+                        return Ok(owed_at);
                     }
                     if batch.route == MemberRoute::Child
                         && self.member_mob_ended(&batch.member, now).await?
@@ -1669,29 +1779,14 @@ impl AnnouncementService {
                         batch = self.reload(&batch).await?;
                         continue;
                     }
-                    match self
-                        .inner
-                        .native
-                        .prepare_member(&batch.member, batch.route)
-                        .await
-                    {
+                    match self.prepare(&batch, now).await {
                         Ok(()) => {}
-                        // Nothing native exists yet: the member's
-                        // subscriptions end and this batch is cancelled.
-                        Err(PrepareError::Gone(end)) => {
-                            self.end_member(&batch.member, end, now).await;
+                        Err(PrepareStep::Ended) => {
                             batch = self.reload(&batch).await?;
                             continue;
                         }
-                        Err(PrepareError::Unavailable(error)) => {
-                            tracing::warn!(
-                                batch = %batch.id,
-                                member = %batch.member,
-                                error = %error,
-                                "announcement member is not resolvable yet; the batch stays sealed"
-                            );
-                            return Ok(retry_at);
-                        }
+                        Err(PrepareStep::Waits) => return Ok(owed_at),
+                        Err(PrepareStep::NotYet) => return Ok(retry_at),
                     }
                     // Stamped when the request is issued, not when the
                     // round began: a peer's window runs from the issue.
@@ -1701,13 +1796,19 @@ impl AnnouncementService {
                     super::faults::after_begin_submit();
                     submitted_this_round = true;
                     match self.submit(&batch, now).await? {
-                        Some(next) => batch = next,
-                        None => return Ok(retry_at),
+                        SubmitStep::Moved(next) => batch = *next,
+                        SubmitStep::ReadStatus => return Ok(retry_at),
+                        SubmitStep::Owed => return Ok(owed_at),
                     }
                 }
                 BatchState::Submitting { .. } => {
-                    let Some(status) = self.status(&batch).await else {
-                        return Ok(retry_at);
+                    let status = match self.read_status(&batch, now).await? {
+                        StatusStep::Status(status) => status,
+                        StatusStep::Wait => return Ok(retry_at),
+                        StatusStep::Moved(next) => {
+                            batch = *next;
+                            continue;
+                        }
                     };
                     match status {
                         NativeStatus::NotCommitted => {
@@ -1746,45 +1847,36 @@ impl AnnouncementService {
                                 batch = self.reload(&batch).await?;
                                 continue;
                             }
-                            match self
-                                .inner
-                                .native
-                                .prepare_member(&batch.member, batch.route)
-                                .await
-                            {
+                            match self.prepare(&batch, now).await {
                                 Ok(()) => {}
-                                // Read "not committed": the member's
-                                // subscriptions end and the batch is
-                                // cancelled.
-                                Err(PrepareError::Gone(end)) => {
-                                    self.end_member(&batch.member, end, now).await;
+                                Err(PrepareStep::Ended) => {
                                     batch = self.reload(&batch).await?;
                                     continue;
                                 }
-                                Err(PrepareError::Unavailable(error)) => {
-                                    tracing::warn!(
-                                        batch = %batch.id,
-                                        error = %error,
-                                        "announcement member is not resolvable yet"
-                                    );
-                                    return Ok(retry_at);
-                                }
+                                Err(PrepareStep::Waits) => return Ok(owed_at),
+                                Err(PrepareStep::NotYet) => return Ok(retry_at),
                             }
                             batch = self
                                 .apply(&batch, BatchEvent::RetryNotCommitted, self.now())
                                 .await?;
                             submitted_this_round = true;
                             match self.submit(&batch, now).await? {
-                                Some(next) => batch = next,
-                                None => return Ok(retry_at),
+                                SubmitStep::Moved(next) => batch = *next,
+                                SubmitStep::ReadStatus => return Ok(retry_at),
+                                SubmitStep::Owed => return Ok(owed_at),
                             }
                         }
                         status => batch = self.settle_from(&batch, status, now).await?,
                     }
                 }
                 BatchState::Committed { .. } => {
-                    let Some(status) = self.status(&batch).await else {
-                        return Ok(retry_at);
+                    let status = match self.read_status(&batch, now).await? {
+                        StatusStep::Status(status) => status,
+                        StatusStep::Wait => return Ok(retry_at),
+                        StatusStep::Moved(next) => {
+                            batch = *next;
+                            continue;
+                        }
                     };
                     match status {
                         // Evidence about another delivery never settles this
@@ -1886,12 +1978,90 @@ impl AnnouncementService {
             .ok_or(AnnouncementStoreError::UnknownBatch)?)
     }
 
-    async fn status(&self, batch: &Batch) -> Option<NativeStatus> {
+    /// Read the batch's native status. No status leaves the batch as it
+    /// was, with the reason marked; only a read that rules the batch out
+    /// blocks it, and only the member's departure ends anything.
+    async fn read_status(&self, batch: &Batch, now: u64) -> Result<StatusStep, AnnouncementError> {
         match self.inner.native.status(batch).await {
-            Ok(status) => Some(status),
-            Err(error) => {
-                tracing::warn!(batch = %batch.id, error = %error, "announcement native status unavailable");
-                None
+            // An answered read ends the wait it marked; what it says decides
+            // the batch.
+            Ok(status) => {
+                self.unmark(&batch.member);
+                Ok(StatusStep::Status(status))
+            }
+            Err(NativeStatusError::Unavailable {
+                cause,
+                evidence,
+                detail,
+            }) => {
+                tracing::warn!(
+                    batch = %batch.id,
+                    cause = %cause,
+                    evidence = evidence.as_str(),
+                    detail = %detail,
+                    "announcement native status unavailable"
+                );
+                self.mark(&batch.member, cause, evidence, now);
+                Ok(StatusStep::Wait)
+            }
+            Err(NativeStatusError::Blocked { cause, detail }) => Ok(StatusStep::Moved(Box::new(
+                self.apply(
+                    batch,
+                    BatchEvent::Block {
+                        cause: cause.with_detail(&detail),
+                    },
+                    now,
+                )
+                .await?,
+            ))),
+            // The member departed for good: its subscriptions end. The
+            // batch's own outcome stays as unknown as it was.
+            Err(NativeStatusError::MemberGone(departure)) => {
+                self.end_member(
+                    &batch.member,
+                    SubscriptionEnd::MemberDeparted { departure },
+                    now,
+                )
+                .await;
+                Ok(StatusStep::Wait)
+            }
+        }
+    }
+
+    /// Make the batch's member ready for a submission.
+    async fn prepare(&self, batch: &Batch, now: u64) -> Result<(), PrepareStep> {
+        match self
+            .inner
+            .native
+            .prepare_member(&batch.member, batch.route)
+            .await
+        {
+            Ok(()) => Ok(()),
+            // A final fact: the member's subscriptions end and the batch is
+            // cancelled.
+            Err(PrepareError::Gone(end)) => {
+                self.end_member(&batch.member, end, now).await;
+                Err(PrepareStep::Ended)
+            }
+            // The member cannot take a delivery now; nothing ends.
+            Err(PrepareError::Suspended { cause, evidence }) => {
+                tracing::warn!(
+                    batch = %batch.id,
+                    member = %batch.member,
+                    cause = %cause,
+                    "announcement member cannot take a delivery now; the batch waits"
+                );
+                self.mark(&batch.member, cause, evidence, now);
+                Err(PrepareStep::Waits)
+            }
+            Err(PrepareError::Unavailable(error)) => {
+                tracing::warn!(
+                    batch = %batch.id,
+                    member = %batch.member,
+                    error = %error,
+                    "announcement member is not resolvable yet; the batch waits"
+                );
+                Err(PrepareStep::NotYet)
             }
         }
     }
@@ -1933,35 +2103,50 @@ impl AnnouncementService {
         self.apply(batch, event, now).await
     }
 
-    /// Submit the batch's exact continuation. Returns the advanced batch, or
-    /// `None` when the outcome is unknown or nothing was committed and a
-    /// later round must read the native status first.
-    async fn submit(&self, batch: &Batch, now: u64) -> Result<Option<Batch>, AnnouncementError> {
+    /// Submit the batch's exact continuation, and read what the answer says
+    /// about the commit: committed, nothing committed (the batch is owed
+    /// again), unknown (its status settles it), ruled out, or the member
+    /// gone for good.
+    async fn submit(&self, batch: &Batch, now: u64) -> Result<SubmitStep, AnnouncementError> {
         let event = match self.inner.native.submit(batch, now).await {
-            Ok(receipt) => BatchEvent::NativeCommitted { receipt },
-            Err(NativeSubmitError::Unavailable(detail)) => {
-                tracing::warn!(
-                    batch = %batch.id,
-                    detail = %detail,
-                    "announcement submission outcome unknown; the native status will settle it"
-                );
-                return Ok(None);
+            Ok(receipt) => {
+                self.unmark(&batch.member);
+                BatchEvent::NativeCommitted { receipt }
             }
-            Err(NativeSubmitError::OwnerRetired) => {
+            Err(NativeSubmitError::NotCommitted { cause, evidence }) => {
                 tracing::warn!(
                     batch = %batch.id,
                     member = %batch.member,
-                    "announcement member has no live incarnation; nothing was committed"
+                    cause = %cause,
+                    evidence = evidence.as_str(),
+                    "announcement submission committed nothing; the batch is owed again"
                 );
-                return Ok(None);
+                self.mark(&batch.member, cause, evidence, now);
+                self.apply(batch, BatchEvent::SubmitRefused, now).await?;
+                return Ok(SubmitStep::Owed);
             }
-            Err(NativeSubmitError::Governed) => BatchEvent::NativeRefused {
-                reason: "governed_runtime".into(),
-                receipt: None,
+            Err(NativeSubmitError::OutcomeUnknown {
+                cause,
+                evidence,
+                detail,
+            }) => {
+                tracing::warn!(
+                    batch = %batch.id,
+                    cause = %cause,
+                    evidence = evidence.as_str(),
+                    detail = %detail,
+                    "announcement submission outcome unknown; the native status will settle it"
+                );
+                self.mark(&batch.member, cause, evidence, now);
+                return Ok(SubmitStep::ReadStatus);
+            }
+            Err(NativeSubmitError::Blocked { cause, detail }) => BatchEvent::Block {
+                cause: cause.with_detail(&detail),
             },
-            // A final answer that nothing was committed: the batch settles
-            // as refused and the member's subscriptions end.
-            Err(NativeSubmitError::MemberGone(end)) => {
+            // The member departed for good: nothing was committed, the batch
+            // settles as refused and the member's subscriptions end.
+            Err(NativeSubmitError::MemberGone(departure)) => {
+                let end = SubscriptionEnd::MemberDeparted { departure };
                 let refused = self
                     .apply(
                         batch,
@@ -1973,12 +2158,11 @@ impl AnnouncementService {
                     )
                     .await?;
                 self.end_member(&batch.member, end, now).await;
-                return Ok(Some(refused));
-            }
-            Err(NativeSubmitError::Conflict(cause) | NativeSubmitError::Invalid(cause)) => {
-                BatchEvent::Block { cause }
+                return Ok(SubmitStep::Moved(Box::new(refused)));
             }
         };
-        self.apply(batch, event, now).await.map(Some)
+        self.apply(batch, event, now)
+            .await
+            .map(|next| SubmitStep::Moved(Box::new(next)))
     }
 }

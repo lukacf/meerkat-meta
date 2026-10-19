@@ -426,7 +426,15 @@ pub async fn handle_announcement_method(
                 .subscription(&request.subscription_id)
                 .await
                 .map_err(rpc_error)?;
-            Ok(json!({ "subscription": to_value(subscription)? }))
+            // Why the member's deliveries wait now, if they do: a
+            // projection of the owner's latest attempt, never stored.
+            let marker = subscription
+                .as_ref()
+                .and_then(|subscription| service.suspend_marker(&subscription.member));
+            Ok(json!({
+                "subscription": to_value(subscription)?,
+                "marker": to_value(marker)?,
+            }))
         }
         "meta/mob_announcements/subscriptions/list" => {
             let request: ListSubscriptionsParams = params(raw)?;

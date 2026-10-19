@@ -16,6 +16,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+use super::availability::{
+    BlockCause, EvidenceClass, MemberDeparture, NotServedHereCause, SuspendCause,
+};
 use super::remote::RemoteMemberDelivery;
 pub use super::types::MemberRoute;
 use super::types::{
@@ -40,26 +43,97 @@ impl std::fmt::Display for NativeUnavailable {
     }
 }
 
-/// Why a submission returned no receipt.
+/// Why a submission returned no receipt, by what is known about the
+/// commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NativeSubmitError {
-    /// The member has no live incarnation now; nothing was committed. Not
-    /// final: a member being respawned has none for a while.
-    OwnerRetired,
-    /// A final answer that nothing was committed and the member will never
-    /// take a delivery: its subscriptions end for this reason.
-    MemberGone(SubscriptionEnd),
-    /// The member's runtime admits work only through a native work
-    /// authorization host, which refuses host continuations.
-    Governed,
-    /// The batch id is bound to other content.
-    Conflict(String),
+    /// Nothing was committed for this attempt, on this evidence. The batch
+    /// is owed again and a later attempt may submit it: the cause is an
+    /// availability state that can change, and it ends nothing.
+    NotCommitted {
+        cause: SuspendCause,
+        evidence: EvidenceClass,
+    },
+    /// Whether it was committed is not known: only a status read settles
+    /// it, and nothing is submitted again before one does.
+    OutcomeUnknown {
+        cause: SuspendCause,
+        evidence: EvidenceClass,
+        detail: String,
+    },
     /// The delivery can never be submitted as it is.
-    Invalid(String),
-    /// The submission could not be made or its answer was lost. The commit
-    /// may or may not have happened: only a status read settles it.
-    Unavailable(String),
+    Blocked { cause: BlockCause, detail: String },
+    /// The member departed for good: nothing was committed, and its
+    /// subscriptions end.
+    MemberGone(MemberDeparture),
+}
+
+impl std::fmt::Display for NativeSubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCommitted { cause, evidence } => {
+                write!(f, "nothing was committed: {cause} ({})", evidence.as_str())
+            }
+            Self::OutcomeUnknown {
+                cause,
+                evidence,
+                detail,
+            } => write!(
+                f,
+                "the outcome is unknown: {cause} ({}): {detail}",
+                evidence.as_str()
+            ),
+            Self::Blocked { cause, detail } => f.write_str(&cause.with_detail(detail)),
+            Self::MemberGone(departure) => write!(f, "the member departed: {departure}"),
+        }
+    }
+}
+
+/// Why a native status read gave no status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NativeStatusError {
+    /// Not readable now, for this cause and on this evidence. Nothing is
+    /// implied: the batch keeps waiting for a status.
+    Unavailable {
+        cause: SuspendCause,
+        evidence: EvidenceClass,
+        detail: String,
+    },
+    /// The read rules out any later attempt for the batch.
+    Blocked { cause: BlockCause, detail: String },
+    /// The member departed for good.
+    MemberGone(MemberDeparture),
+}
+
+impl NativeStatusError {
+    /// This gateway's own native owner could not be read now.
+    pub(crate) fn local(detail: impl Into<String>) -> Self {
+        Self::Unavailable {
+            cause: SuspendCause::NativeUnavailable,
+            evidence: EvidenceClass::Local,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for NativeStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable {
+                cause,
+                evidence,
+                detail,
+            } => write!(
+                f,
+                "the status is unavailable: {cause} ({}): {detail}",
+                evidence.as_str()
+            ),
+            Self::Blocked { cause, detail } => f.write_str(&cause.with_detail(detail)),
+            Self::MemberGone(departure) => write!(f, "the member departed: {departure}"),
+        }
+    }
 }
 
 /// Why a member cannot be subscribed.
@@ -87,8 +161,15 @@ pub enum MemberProblem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PrepareError {
-    /// A final fact about the member: its subscriptions end for this reason.
+    /// A final fact: its subscriptions end for this reason. Built only from
+    /// final facts, never from a registry miss or a placement.
     Gone(SubscriptionEnd),
+    /// The member cannot take a delivery now, for this cause and on this
+    /// evidence. Not final: the batch waits.
+    Suspended {
+        cause: SuspendCause,
+        evidence: EvidenceClass,
+    },
     /// Not now. Never evidence of anything.
     Unavailable(String),
 }
@@ -97,6 +178,9 @@ impl std::fmt::Display for PrepareError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Gone(end) => write!(f, "the member is gone: {end}"),
+            Self::Suspended { cause, evidence } => {
+                write!(f, "the member waits: {cause} ({})", evidence.as_str())
+            }
             Self::Unavailable(detail) => f.write_str(detail),
         }
     }
@@ -371,7 +455,7 @@ pub trait NativeDelivery: Send + Sync {
 
     /// The authoritative status of the batch's key, read from its
     /// member's continuation owner. Serves nothing.
-    async fn status(&self, batch: &Batch) -> Result<NativeStatus, NativeUnavailable>;
+    async fn status(&self, batch: &Batch) -> Result<NativeStatus, NativeStatusError>;
 
     /// The native state of an input admitted for the batch's member, as
     /// that member's runtime reports it.
@@ -527,15 +611,40 @@ pub(crate) fn route_contradiction(
 }
 
 impl OwnerRefusal {
-    /// What a submission meets for this refusal: a member on a peer is not
-    /// this seam's to reach now, and a self-contradicting route is never
-    /// deliverable.
+    /// Whether the refusal rules the batch out: a self-contradicting route is
+    /// never deliverable, while a member on a peer is only not this seam's to
+    /// reach now. The one reading a submission, a status read and a put use.
+    fn rules_out(&self) -> bool {
+        matches!(
+            self,
+            Self::LocalRouteNamesAnotherMob { .. } | Self::LocalRouteWithoutOwnMob { .. }
+        )
+    }
+
+    /// What a submission meets for this refusal. Nothing was submitted.
     pub(crate) fn submit_error(&self) -> NativeSubmitError {
-        match self {
-            Self::NoPeerPath => NativeSubmitError::Unavailable(self.to_string()),
-            Self::LocalRouteNamesAnotherMob { .. } | Self::LocalRouteWithoutOwnMob { .. } => {
-                NativeSubmitError::Invalid(self.to_string())
+        if self.rules_out() {
+            NativeSubmitError::Blocked {
+                cause: BlockCause::NativeInvalid,
+                detail: self.to_string(),
             }
+        } else {
+            NativeSubmitError::NotCommitted {
+                cause: SuspendCause::NativeUnavailable,
+                evidence: EvidenceClass::Local,
+            }
+        }
+    }
+
+    /// What a status read meets for this refusal. Nothing was read.
+    pub(crate) fn status_error(&self) -> NativeStatusError {
+        if self.rules_out() {
+            NativeStatusError::Blocked {
+                cause: BlockCause::NativeInvalid,
+                detail: self.to_string(),
+            }
+        } else {
+            NativeStatusError::local(self.to_string())
         }
     }
 
@@ -543,11 +652,10 @@ impl OwnerRefusal {
     /// it could never be delivered to, and a member on a peer is not this
     /// seam's to reach.
     pub(crate) fn member_problem(&self) -> MemberProblem {
-        match self {
-            Self::NoPeerPath => MemberProblem::UnusablePeer(self.to_string()),
-            Self::LocalRouteNamesAnotherMob { .. } | Self::LocalRouteWithoutOwnMob { .. } => {
-                MemberProblem::Unusable(self.to_string())
-            }
+        if self.rules_out() {
+            MemberProblem::Unusable(self.to_string())
+        } else {
+            MemberProblem::UnusablePeer(self.to_string())
         }
     }
 }
@@ -829,7 +937,12 @@ impl MobNativeDelivery {
         let identity = Self::agent_identity(identity)?;
         match self.identities.not_served_here(&identity).await {
             Ok(None) => Ok(IdentityService::Local),
-            Ok(Some(detail)) => Ok(IdentityService::Elsewhere(detail)),
+            Ok(Some(crate::identity_first::NotServedHere::PlacedOnHost)) => {
+                Ok(IdentityService::Elsewhere(NotServedHereCause::PlacedOnHost))
+            }
+            Ok(Some(crate::identity_first::NotServedHere::ExternalBinding)) => Ok(
+                IdentityService::Elsewhere(NotServedHereCause::ExternalBinding),
+            ),
             Err(crate::identity_first::IdentityRuntimeError::UnknownIdentity(_)) => {
                 Ok(IdentityService::Unknown)
             }
@@ -837,8 +950,9 @@ impl MobNativeDelivery {
         }
     }
 
-    /// Make the identity's current incarnation resolvable, or report that
-    /// it is gone for good: no longer registered, or not served here.
+    /// Make the identity's current incarnation resolvable. An identity not
+    /// registered here, or one this runtime does not serve, waits: a miss or
+    /// a placement can change, so neither ends anything.
     pub async fn prepare_identity(&self, identity: &MemberIdentity) -> Result<(), PrepareError> {
         match self
             .identity_service(identity)
@@ -846,12 +960,16 @@ impl MobNativeDelivery {
             .map_err(|error| PrepareError::Unavailable(error.0))?
         {
             IdentityService::Unknown => {
-                return Err(PrepareError::Gone(SubscriptionEnd::MemberLeft));
+                return Err(PrepareError::Suspended {
+                    cause: SuspendCause::MemberUnknown,
+                    evidence: EvidenceClass::Local,
+                });
             }
-            IdentityService::Elsewhere(detail) => {
-                return Err(PrepareError::Gone(SubscriptionEnd::MemberUnusable {
-                    detail,
-                }));
+            IdentityService::Elsewhere(cause) => {
+                return Err(PrepareError::Suspended {
+                    cause: SuspendCause::MemberNotServedHere { cause: Some(cause) },
+                    evidence: EvidenceClass::Local,
+                });
             }
             IdentityService::Local => {}
         }
@@ -1261,30 +1379,48 @@ impl MobNativeDelivery {
         delivery: meerkat::ContinuationDelivery,
         committed_at_ms: u64,
     ) -> Result<NativeReceipt, NativeSubmitError> {
+        // The service is not composed yet: nothing was submitted.
         let service = self
             .service()
-            .map_err(|error| NativeSubmitError::Unavailable(error.0))?;
+            .map_err(|_| NativeSubmitError::NotCommitted {
+                cause: SuspendCause::NativeUnavailable,
+                evidence: EvidenceClass::Local,
+            })?;
         service
             .submit(owner, delivery, committed_at_ms)
             .await
             .map(|receipt| native_receipt(&receipt))
             .map_err(|error| match error {
                 meerkat::ContinuationSubmitError::Unavailable(detail) => {
-                    NativeSubmitError::Unavailable(detail)
+                    NativeSubmitError::OutcomeUnknown {
+                        cause: SuspendCause::NativeUnavailable,
+                        evidence: EvidenceClass::Local,
+                        detail,
+                    }
                 }
-                meerkat::ContinuationSubmitError::OwnerRetired => NativeSubmitError::OwnerRetired,
+                meerkat::ContinuationSubmitError::OwnerRetired => NativeSubmitError::NotCommitted {
+                    cause: SuspendCause::MemberNotLive,
+                    evidence: EvidenceClass::Local,
+                },
                 meerkat::ContinuationSubmitError::NoAdmissibleWorkBinding => {
-                    NativeSubmitError::Governed
+                    NativeSubmitError::NotCommitted {
+                        cause: SuspendCause::Governed,
+                        evidence: EvidenceClass::Local,
+                    }
                 }
                 meerkat::ContinuationSubmitError::Conflict { existing } => {
-                    NativeSubmitError::Conflict(format!(
-                        "the native key {} is bound to other content",
-                        existing.key.as_str()
-                    ))
+                    NativeSubmitError::Blocked {
+                        cause: BlockCause::Conflict,
+                        detail: format!(
+                            "the native key {} is bound to other content",
+                            existing.key.as_str()
+                        ),
+                    }
                 }
-                meerkat::ContinuationSubmitError::Invalid(detail) => {
-                    NativeSubmitError::Invalid(detail)
-                }
+                meerkat::ContinuationSubmitError::Invalid(detail) => NativeSubmitError::Blocked {
+                    cause: BlockCause::NativeInvalid,
+                    detail,
+                },
             })
     }
 
@@ -1293,7 +1429,7 @@ impl MobNativeDelivery {
         &self,
         identity: &MemberIdentity,
         key: &str,
-    ) -> Result<NativeStatus, NativeUnavailable> {
+    ) -> Result<NativeStatus, NativeStatusError> {
         self.status_at(&self.owner(identity), key).await
     }
 
@@ -1302,14 +1438,26 @@ impl MobNativeDelivery {
         &self,
         owner: &meerkat::ContinuationOwner,
         key: &str,
-    ) -> Result<NativeStatus, NativeUnavailable> {
-        let key = meerkat::ContinuationKey::new(key)
-            .map_err(|error| NativeUnavailable(error.to_string()))?;
-        self.service()?
+    ) -> Result<NativeStatus, NativeStatusError> {
+        let key =
+            meerkat::ContinuationKey::new(key).map_err(|error| NativeStatusError::Blocked {
+                cause: BlockCause::NativeKeyInvalid,
+                detail: error.to_string(),
+            })?;
+        self.service()
+            .map_err(|error| NativeStatusError::local(error.0))?
             .continuation_status(owner, &key)
             .await
             .map(native_status)
-            .map_err(|error| NativeUnavailable(error.to_string()))
+            .map_err(|error| match error {
+                meerkat::ContinuationStatusError::Inconsistent(detail) => {
+                    NativeStatusError::Blocked {
+                        cause: BlockCause::NativeInconsistent,
+                        detail,
+                    }
+                }
+                other => NativeStatusError::local(other.to_string()),
+            })
     }
 
     /// The runtime's own state of an admitted input.
@@ -1362,9 +1510,21 @@ pub enum IdentityService {
     Unknown,
     /// Served by this gateway's runtime: a local session-backed member.
     Local,
-    /// Registered, but its session is not this runtime's to serve (placed
-    /// on a host, or bound to an external runtime).
-    Elsewhere(String),
+    /// Registered, but its session is not this runtime's to serve.
+    Elsewhere(NotServedHereCause),
+}
+
+/// What an operator reads for a member this runtime does not serve.
+pub(crate) fn not_served_here_detail(
+    identity: &MemberIdentity,
+    cause: NotServedHereCause,
+) -> String {
+    match cause {
+        NotServedHereCause::PlacedOnHost => format!("{identity} is placed on a host"),
+        NotServedHereCause::ExternalBinding => {
+            format!("{identity} is bound to an external runtime")
+        }
+    }
 }
 
 /// Members of this gateway's mob, and of mobs its members created, are
@@ -1433,7 +1593,9 @@ impl NativeDelivery for MobNativeDelivery {
             MemberRoute::Local => match self.identity_service(&member.identity).await {
                 Ok(IdentityService::Local) => Ok(()),
                 Ok(IdentityService::Unknown) => Err(MemberProblem::Unknown),
-                Ok(IdentityService::Elsewhere(detail)) => Err(MemberProblem::Unusable(detail)),
+                Ok(IdentityService::Elsewhere(cause)) => Err(MemberProblem::Unusable(
+                    not_served_here_detail(&member.identity, cause),
+                )),
                 Err(error) => Err(MemberProblem::Unavailable(error.0)),
             },
             MemberRoute::Child => self.check_child_member(member).await,
@@ -1466,7 +1628,10 @@ impl NativeDelivery for MobNativeDelivery {
         let owner = self
             .owner_for(&batch.member, batch.route)
             .map_err(|refusal| refusal.submit_error())?;
-        let delivery = continuation_for(batch).map_err(NativeSubmitError::Invalid)?;
+        let delivery = continuation_for(batch).map_err(|detail| NativeSubmitError::Blocked {
+            cause: BlockCause::NativeInvalid,
+            detail,
+        })?;
         let receipt = self
             .submit_delivery_to(&owner, delivery, committed_at_ms)
             .await?;
@@ -1477,12 +1642,11 @@ impl NativeDelivery for MobNativeDelivery {
     /// No owner path reads a batch whose route contradicts its member: the
     /// owner's one route guard blocks it before any drive step and observes
     /// it without a read. A direct call is refused by the same guard before
-    /// anything is read; until a status read has a terminal error class, it
-    /// answers that refusal as `NativeUnavailable`.
-    async fn status(&self, batch: &Batch) -> Result<NativeStatus, NativeUnavailable> {
+    /// anything is read, as blocked.
+    async fn status(&self, batch: &Batch) -> Result<NativeStatus, NativeStatusError> {
         let owner = self
             .owner_for(&batch.member, batch.route)
-            .map_err(|refusal| NativeUnavailable(refusal.to_string()))?;
+            .map_err(|refusal| refusal.status_error())?;
         self.status_at(&owner, batch.id.as_str()).await
     }
 
@@ -1625,23 +1789,31 @@ impl NativeDelivery for AnnouncementNativeDelivery {
             MemberRoute::Local | MemberRoute::Child => {
                 NativeDelivery::submit(self.local.as_ref(), batch, committed_at_ms).await
             }
+            // Without a contact directory and key the peer is never asked.
             MemberRoute::Peer => {
                 self.remote()
-                    .map_err(NativeSubmitError::Unavailable)?
+                    .map_err(|_| NativeSubmitError::NotCommitted {
+                        cause: SuspendCause::LocalNotAuthenticatable,
+                        evidence: EvidenceClass::Local,
+                    })?
                     .submit(batch)
                     .await
             }
         }
     }
 
-    async fn status(&self, batch: &Batch) -> Result<NativeStatus, NativeUnavailable> {
+    async fn status(&self, batch: &Batch) -> Result<NativeStatus, NativeStatusError> {
         match batch.route {
             MemberRoute::Local | MemberRoute::Child => {
                 NativeDelivery::status(self.local.as_ref(), batch).await
             }
             MemberRoute::Peer => {
                 self.remote()
-                    .map_err(NativeUnavailable)?
+                    .map_err(|detail| NativeStatusError::Unavailable {
+                        cause: SuspendCause::LocalNotAuthenticatable,
+                        evidence: EvidenceClass::Local,
+                        detail,
+                    })?
                     .status(batch)
                     .await
             }

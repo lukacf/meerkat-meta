@@ -263,7 +263,7 @@ async fn configured_listener_without_grants_refuses_every_caller() {
     assert!(
         matches!(
             error,
-            RemoteMobError::ControlRequestUnauthorized { ref code, .. }
+            RemoteMobError::Rejected { ref code, .. }
                 if code == "caller_not_granted"
         ),
         "unexpected deny-all result: {error:?}"

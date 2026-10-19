@@ -12,6 +12,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub use super::availability::MemberDeparture;
+
 pub type Result<T> = std::result::Result<T, AnnouncementStoreError>;
 
 /// Longest identifier (mob, topic, subscription, batch, operation, member),
@@ -559,14 +561,8 @@ impl SubscriptionState {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum SubscriptionEnd {
-    /// The member left its mob: its identity is no longer registered, or
-    /// its peer gateway answered, signed, that it has no such member.
-    MemberLeft,
-    /// The member's runtime is not served where a delivery could reach it
-    /// (placed on a host, or bound to an external runtime).
-    MemberUnusable { detail: String },
-    /// The member's peer gateway does not serve keyed delivery.
-    PeerUnsupported,
+    /// The member departed for good, as its [`MemberDeparture`] says.
+    MemberDeparted { departure: MemberDeparture },
     /// Every mob the subscription named was destroyed.
     MobsEnded,
     /// The member's own mob, a mob a member created, ended after the
@@ -578,13 +574,7 @@ pub enum SubscriptionEnd {
 impl fmt::Display for SubscriptionEnd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MemberLeft => f.write_str("the member left its mob"),
-            Self::MemberUnusable { detail } => {
-                write!(f, "the member cannot take a delivery: {detail}")
-            }
-            Self::PeerUnsupported => {
-                f.write_str("the member's gateway does not serve keyed delivery")
-            }
+            Self::MemberDeparted { departure } => write!(f, "the member departed: {departure}"),
             Self::MobsEnded => f.write_str("every mob it named was destroyed"),
             Self::MemberMobEnded { why } => write!(f, "the member's mob ended: {why}"),
         }
@@ -695,8 +685,12 @@ impl Subscription {
     pub fn terminal_refusal(&self) -> Option<AnnouncementStoreError> {
         match self.state {
             SubscriptionState::Cancelled => Some(AnnouncementStoreError::SubscriptionCancelled),
-            SubscriptionState::Ended => Some(AnnouncementStoreError::SubscriptionEnded {
-                end: self.ended.clone().unwrap_or(SubscriptionEnd::MemberLeft),
+            SubscriptionState::Ended => Some(match &self.ended {
+                Some(end) => AnnouncementStoreError::SubscriptionEnded { end: end.clone() },
+                None => AnnouncementStoreError::Storage(format!(
+                    "subscription {} is ended without its end",
+                    self.id
+                )),
             }),
             SubscriptionState::Active | SubscriptionState::Paused => None,
         }
@@ -799,7 +793,8 @@ pub use crate::runtime::keyed_inject::NativeReceipt;
 #[serde(tag = "state", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum BatchState {
-    /// Sealed and persisted; no native submission has started.
+    /// Sealed and persisted, and nothing native holds it: no submission has
+    /// started, or every one was answered that nothing was committed.
     Sealed,
     /// A native submission may have started. Only native evidence settles
     /// it: a retry resubmits the identical delivery.
@@ -1012,6 +1007,9 @@ pub enum BatchEvent {
     /// Native status reads "not committed" for a batch that waited longer
     /// than the retention window: its announcements expire.
     ExpireNotCommitted,
+    /// A submission was answered that nothing was committed: the batch is
+    /// owed again, and a later attempt submits it.
+    SubmitRefused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1029,6 +1027,7 @@ pub enum BatchEventTag {
     Block,
     Expire,
     ExpireNotCommitted,
+    SubmitRefused,
 }
 
 impl fmt::Display for BatchEventTag {
@@ -1045,6 +1044,7 @@ impl fmt::Display for BatchEventTag {
             Self::Block => "block",
             Self::Expire => "expire",
             Self::ExpireNotCommitted => "expire_not_committed",
+            Self::SubmitRefused => "submit_refused",
         })
     }
 }
@@ -1063,6 +1063,7 @@ impl BatchEvent {
             Self::Block { .. } => BatchEventTag::Block,
             Self::Expire => BatchEventTag::Expire,
             Self::ExpireNotCommitted => BatchEventTag::ExpireNotCommitted,
+            Self::SubmitRefused => BatchEventTag::SubmitRefused,
         }
     }
 
@@ -1080,6 +1081,7 @@ impl BatchEvent {
             } => Some(Settlement::Stranded),
             Self::BeginSubmit
             | Self::RetryNotCommitted
+            | Self::SubmitRefused
             | Self::NativeCommitted { .. }
             | Self::NativeStranded {
                 successor: Some(_), ..
@@ -1167,6 +1169,7 @@ impl BatchState {
                 attempt: attempt.saturating_add(1),
             }),
             (Self::Submitting { .. }, BatchEvent::CancelNotCommitted) => Ok(Self::Cancelled),
+            (Self::Submitting { .. }, BatchEvent::SubmitRefused) => Ok(Self::Sealed),
             (Self::Sealed, BatchEvent::Expire)
             | (Self::Submitting { .. }, BatchEvent::ExpireNotCommitted) => Ok(Self::Expired),
             (Self::Submitting { .. }, BatchEvent::NativeCommitted { receipt }) => {

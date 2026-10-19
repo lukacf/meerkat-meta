@@ -48,9 +48,11 @@ pub enum RemoteMobError {
         endpoint: String,
         operation: &'static str,
     },
-    /// The peer rejected our request with an error response. Carries the
-    /// peer's stable `code` (e.g. `unknown_member`, `mob_error`) and a
-    /// human-readable message.
+    /// The peer answered with an error response. Error responses are never
+    /// signed, so this is never evidence of anything: `code` (for example
+    /// `unknown_member`, `member_not_granted` or `mob_error`) and `message`
+    /// are the peer's words, kept as text for operators, and no caller
+    /// branches on them.
     Rejected {
         mob_id: String,
         endpoint: String,
@@ -72,18 +74,6 @@ pub enum RemoteMobError {
         mob_id: String,
         endpoint: String,
         reason: String,
-    },
-    /// The peer's control listener enforces scoped caller grants and this
-    /// gateway's identity is not granted the requested verb / member.
-    /// Split out of [`Self::Rejected`] because the remedy is entirely
-    /// different: nothing about the request is malformed and retrying will
-    /// not help - the peer operator has to widen the grant (or this
-    /// gateway has to install the keypair the grant names).
-    ControlRequestUnauthorized {
-        mob_id: String,
-        endpoint: String,
-        code: String,
-        message: String,
     },
 }
 
@@ -162,20 +152,6 @@ impl std::fmt::Display for RemoteMobError {
                      keys installed), fix the pinned pubkey, or set \
                      require_signed_control = false on this contact to accept unsigned \
                      responses"
-                )
-            }
-            Self::ControlRequestUnauthorized {
-                mob_id,
-                endpoint,
-                code,
-                message,
-            } => {
-                write!(
-                    f,
-                    "remote mob '{mob_id}' control channel ({endpoint}) refused this gateway \
-                     [{code}]: {message}. The peer enforces scoped control grants: ask its \
-                     operator to file this gateway's pubkey (meta/peer_pubkey) under \
-                     [control_grants] with the verb and member scope you need"
                 )
             }
         }
@@ -320,17 +296,9 @@ impl RemoteMobProxy {
         Some(uuid::Uuid::new_v4().simple().to_string())
     }
 
-    /// Classify a peer `Err` response. Authorization refusals get their
-    /// own typed variant so callers do not have to string-match codes.
+    /// A peer `Err` response. It is unsigned, so its code is kept as text
+    /// and never classified: one unverified class for every code.
     fn rejected(&self, code: String, message: String) -> RemoteMobError {
-        if super::cross_mob_control::ControlAuthzDenial::is_denial_code(&code) {
-            return RemoteMobError::ControlRequestUnauthorized {
-                mob_id: self.mob_id.clone(),
-                endpoint: self.endpoint.comms_address(),
-                code,
-                message,
-            };
-        }
         RemoteMobError::Rejected {
             mob_id: self.mob_id.clone(),
             endpoint: self.endpoint.comms_address(),

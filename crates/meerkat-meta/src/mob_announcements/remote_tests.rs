@@ -17,7 +17,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use base64::Engine as _;
 use ed25519_dalek::Signer as _;
 
-use super::native::{NativeStatus, NativeSubmitError};
+use super::availability::{
+    BlockCause, DepartureEvidence, EvidenceClass, MemberDeparture, SuspendCause,
+};
+use super::native::{NativeStatus, NativeStatusError, NativeSubmitError};
 use super::remote::{Clock, RemoteMemberDelivery, validate_delivery};
 use super::types::*;
 use crate::auth::peer_keys::GatewayPeerKeys;
@@ -30,9 +33,10 @@ use crate::runtime::cross_mob_control::{
     sign_control_request_as_caller, verify_control_response,
 };
 use crate::runtime::keyed_inject::{
-    KeyedInject, KeyedInjectCallerScope, KeyedInjectFuture, KeyedInjectReceiver,
-    KeyedInjectRefusal, KeyedInjectRefusalCode, KeyedInjectServing, KeyedInjectSlot,
-    KeyedInjectStatusAnswer, NativeReceipt, answer_keyed_inject_request,
+    KeyedInject, KeyedInjectCallError, KeyedInjectCallerScope, KeyedInjectFuture,
+    KeyedInjectReceiver, KeyedInjectRefusal, KeyedInjectRefusalCode, KeyedInjectServing,
+    KeyedInjectSlot, KeyedInjectStatusAnswer, NativeReceipt, NotServedCause,
+    answer_keyed_inject_request,
 };
 
 const PEER: &str = "mob-b";
@@ -236,7 +240,20 @@ fn caller(
     clock_ms: Arc<AtomicU64>,
 ) -> RemoteMemberDelivery {
     let clock: Clock = Arc::new(move || clock_ms.load(Ordering::SeqCst));
-    RemoteMemberDelivery::with_clock(directory, signer(keys), clock)
+    RemoteMemberDelivery::with_clock(directory, signer(keys), WINDOW_MS, clock)
+}
+
+/// Whether a submission's outcome is unknown because the peer answered
+/// unsigned, with this code kept as text.
+fn unsigned(outcome: &std::result::Result<NativeReceipt, NativeSubmitError>, code: &str) -> bool {
+    matches!(
+        outcome,
+        Err(NativeSubmitError::OutcomeUnknown {
+            cause: SuspendCause::PeerUnanswered { code: Some(answered) },
+            evidence: EvidenceClass::Unverified,
+            ..
+        }) if answered == code
+    )
 }
 
 fn remote_batch(id: &str, body_text: &str) -> Batch {
@@ -322,7 +339,10 @@ async fn a_remote_batch_commits_once_and_every_replay_returns_the_original_recei
     changed.state = BatchState::Submitting { attempt: 2 };
     assert!(matches!(
         delivery.submit(&changed).await,
-        Err(NativeSubmitError::Conflict(_))
+        Err(NativeSubmitError::Blocked {
+            cause: BlockCause::Conflict,
+            ..
+        })
     ));
     assert_eq!(peer.receiver.commits(), 1);
 }
@@ -351,8 +371,12 @@ async fn an_answer_signed_by_any_key_but_the_pinned_one_is_not_evidence() {
     );
     let batch = remote_batch("batch-1", "card declined");
     match delivery.submit(&batch).await {
-        Err(NativeSubmitError::Unavailable(detail)) => {
-            assert!(detail.contains("not authenticated"), "{detail}");
+        Err(NativeSubmitError::OutcomeUnknown {
+            cause: SuspendCause::AnswerFailedVerification,
+            evidence: EvidenceClass::Unverified,
+            detail,
+        }) => {
+            assert!(detail.contains("does not verify"), "{detail}");
         }
         other => panic!("an unverifiable receipt must leave the outcome unknown: {other:?}"),
     }
@@ -433,12 +457,11 @@ async fn a_request_minted_for_another_audience_is_refused() {
         MobId::new("mob-c").unwrap(),
         MemberIdentity::new(MEMBER).unwrap(),
     );
-    match delivery.submit(&batch).await {
-        Err(NativeSubmitError::Unavailable(detail)) => {
-            assert!(detail.contains("audience_mismatch"), "{detail}");
-        }
-        other => panic!("expected an audience refusal: {other:?}"),
-    }
+    let outcome = delivery.submit(&batch).await;
+    assert!(
+        unsigned(&outcome, "audience_mismatch"),
+        "expected an audience refusal: {outcome:?}"
+    );
     assert_eq!(peer.receiver.submits(), 0, "nothing reached the owner");
 }
 
@@ -465,12 +488,11 @@ async fn keyed_inject_verbs_need_a_grant_that_names_them() {
         &caller_keys,
         Arc::new(AtomicU64::new(NOW_MS)),
     );
-    match delivery.submit(&batch).await {
-        Err(NativeSubmitError::Unavailable(detail)) => {
-            assert!(detail.contains("verb_not_granted"), "{detail}");
-        }
-        other => panic!("a * grant must not cover keyed inject verbs: {other:?}"),
-    }
+    let outcome = delivery.submit(&batch).await;
+    assert!(
+        unsigned(&outcome, "verb_not_granted"),
+        "a * grant must not cover keyed inject verbs: {outcome:?}"
+    );
     assert_eq!(peer.receiver.submits(), 0);
 
     // An open listener authorizes nothing, so it refuses them outright.
@@ -480,12 +502,11 @@ async fn keyed_inject_verbs_need_a_grant_that_names_them() {
         &caller_keys,
         Arc::new(AtomicU64::new(NOW_MS)),
     );
-    match delivery.submit(&batch).await {
-        Err(NativeSubmitError::Unavailable(detail)) => {
-            assert!(detail.contains("grants_required"), "{detail}");
-        }
-        other => panic!("an open listener must refuse keyed inject verbs: {other:?}"),
-    }
+    let outcome = delivery.submit(&batch).await;
+    assert!(
+        unsigned(&outcome, "grants_required"),
+        "an open listener must refuse keyed inject verbs: {outcome:?}"
+    );
     assert_eq!(open.receiver.submits(), 0);
 
     // Member scope applies: a grant for another member does not reach
@@ -509,12 +530,11 @@ async fn keyed_inject_verbs_need_a_grant_that_names_them() {
         &caller_keys,
         Arc::new(AtomicU64::new(NOW_MS)),
     );
-    match delivery.submit(&batch).await {
-        Err(NativeSubmitError::Unavailable(detail)) => {
-            assert!(detail.contains("member_not_granted"), "{detail}");
-        }
-        other => panic!("expected a member-scope refusal: {other:?}"),
-    }
+    let outcome = delivery.submit(&batch).await;
+    assert!(
+        unsigned(&outcome, "member_not_granted"),
+        "expected a member-scope refusal: {outcome:?}"
+    );
 }
 
 #[tokio::test]
@@ -533,12 +553,17 @@ async fn the_freshness_window_admits_its_edges_and_nothing_beyond() {
         if fresh {
             assert!(outcome.is_ok(), "{id}: {outcome:?}");
         } else {
-            match outcome {
-                Err(NativeSubmitError::Unavailable(detail)) => {
-                    assert!(detail.starts_with("stale_request"), "{id}: {detail}");
-                }
-                other => panic!("{id}: a stale request must be refused: {other:?}"),
-            }
+            assert_eq!(
+                outcome,
+                Err(NativeSubmitError::NotCommitted {
+                    cause: SuspendCause::ClockSkew {
+                        issued_at_ms: issued_at,
+                        window_ms: WINDOW_MS,
+                    },
+                    evidence: EvidenceClass::Verified,
+                }),
+                "{id}: a stale request is refused, typed with this gateway's own values"
+            );
         }
     }
     assert_eq!(
@@ -548,41 +573,209 @@ async fn the_freshness_window_admits_its_edges_and_nothing_beyond() {
     );
 }
 
+/// Every signed code a peer answers, through the one reading, to its class:
+/// "nothing was committed" waits, an unknown outcome reads the status next,
+/// a request the peer rules invalid or a conflict blocks the batch, and only
+/// `member_departed` ends anything.
 #[tokio::test]
-async fn only_signed_refusals_settle_a_batch_or_end_its_member() {
+async fn every_signed_refusal_reads_as_its_class_and_only_a_departure_ends() {
     let (peer, delivery, _clock) = granted_pair().await;
     let batch = remote_batch("batch-1", "card declined");
-    let cases = [
-        (KeyedInjectRefusalCode::Conflict, "conflict"),
-        (KeyedInjectRefusalCode::InvalidRequest, "invalid"),
-        (KeyedInjectRefusalCode::Governed, "governed"),
-        (KeyedInjectRefusalCode::OwnerRetired, "owner_retired"),
-        (KeyedInjectRefusalCode::UnknownMember, "member_left"),
-        (KeyedInjectRefusalCode::UnusableMember, "member_unusable"),
-        (KeyedInjectRefusalCode::NativeUnavailable, "unavailable"),
-        (KeyedInjectRefusalCode::Unavailable, "unavailable"),
-        (KeyedInjectRefusalCode::StaleRequest, "unavailable"),
-    ];
-    for (code, expected) in cases {
+    let verified = |cause| {
+        Err(NativeSubmitError::NotCommitted {
+            cause,
+            evidence: EvidenceClass::Verified,
+        })
+    };
+    for code in KeyedInjectRefusalCode::ALL {
+        let expected: std::result::Result<NativeReceipt, NativeSubmitError> = match code {
+            KeyedInjectRefusalCode::Unavailable => verified(SuspendCause::PeerComposing),
+            KeyedInjectRefusalCode::StaleRequest => verified(SuspendCause::ClockSkew {
+                issued_at_ms: NOW_MS,
+                window_ms: WINDOW_MS,
+            }),
+            KeyedInjectRefusalCode::InvalidRequest => Err(NativeSubmitError::Blocked {
+                cause: BlockCause::PeerInvalidRequest,
+                detail: "scripted".into(),
+            }),
+            KeyedInjectRefusalCode::UnknownMember => verified(SuspendCause::MemberUnknown),
+            KeyedInjectRefusalCode::UnusableMember => {
+                verified(SuspendCause::MemberNotServedHere { cause: None })
+            }
+            KeyedInjectRefusalCode::Governed => verified(SuspendCause::Governed),
+            KeyedInjectRefusalCode::Conflict => Err(NativeSubmitError::Blocked {
+                cause: BlockCause::Conflict,
+                detail: "scripted".into(),
+            }),
+            KeyedInjectRefusalCode::OwnerRetired => verified(SuspendCause::MemberNotLive),
+            KeyedInjectRefusalCode::NativeUnavailable => Err(NativeSubmitError::OutcomeUnknown {
+                cause: SuspendCause::PeerNativeUnavailable,
+                evidence: EvidenceClass::Verified,
+                detail: "scripted".into(),
+            }),
+            KeyedInjectRefusalCode::NotServed => verified(SuspendCause::PeerNotServing {
+                cause: NotServedCause::Unknown,
+            }),
+            KeyedInjectRefusalCode::MemberDeparted => Err(NativeSubmitError::MemberGone(
+                MemberDeparture::from_signed_departure(MobId::new(PEER).unwrap()),
+            )),
+        };
         *peer.receiver.refuse_next.lock().unwrap() =
             Some(KeyedInjectRefusal::new(code, "scripted"));
         let outcome = delivery.submit(&batch).await;
-        let kind = match &outcome {
-            Err(NativeSubmitError::Conflict(_)) => "conflict",
-            Err(NativeSubmitError::Invalid(_)) => "invalid",
-            Err(NativeSubmitError::Governed) => "governed",
-            Err(NativeSubmitError::OwnerRetired) => "owner_retired",
-            Err(NativeSubmitError::MemberGone(SubscriptionEnd::MemberLeft)) => "member_left",
-            Err(NativeSubmitError::MemberGone(SubscriptionEnd::MemberUnusable { .. })) => {
-                "member_unusable"
-            }
-            Err(NativeSubmitError::MemberGone(_)) => "other_end",
-            Err(NativeSubmitError::Unavailable(_)) => "unavailable",
-            Ok(_) => "receipt",
-        };
-        assert_eq!(kind, expected, "{code}: {outcome:?}");
+        assert_eq!(outcome, expected, "{code}");
+        let ends = matches!(outcome, Err(NativeSubmitError::MemberGone(_)));
+        assert_eq!(
+            ends,
+            code == KeyedInjectRefusalCode::MemberDeparted,
+            "{code}: only member_departed ends anything"
+        );
     }
     assert_eq!(peer.receiver.commits(), 0);
+}
+
+/// A signed code this build cannot read leaves the outcome unknown and ends
+/// nothing; `not_served`'s cause is read from its signed field even when its
+/// message names another, and an absent cause reads as `unknown`.
+#[test]
+fn a_refusal_is_read_from_its_typed_fields_never_its_message() {
+    let peer = MobId::new(PEER).unwrap();
+    assert_eq!(
+        RemoteMemberDelivery::submit_refusal(&peer, 7, 9, "brand_new_code", "m".into(), None),
+        NativeSubmitError::OutcomeUnknown {
+            cause: SuspendCause::PeerRefusedUnknown {
+                code: "brand_new_code".into()
+            },
+            evidence: EvidenceClass::Verified,
+            detail: "m".into(),
+        }
+    );
+    assert_eq!(
+        RemoteMemberDelivery::submit_refusal(
+            &peer,
+            7,
+            9,
+            "not_served",
+            "this gateway does not serve keyed injects (runtime_disabled)".into(),
+            Some("not_identity_first"),
+        ),
+        NativeSubmitError::NotCommitted {
+            cause: SuspendCause::PeerNotServing {
+                cause: NotServedCause::NotIdentityFirst
+            },
+            evidence: EvidenceClass::Verified,
+        }
+    );
+    assert_eq!(
+        RemoteMemberDelivery::submit_refusal(
+            &peer,
+            7,
+            9,
+            "not_served",
+            "runtime_disabled".into(),
+            None
+        ),
+        NativeSubmitError::NotCommitted {
+            cause: SuspendCause::PeerNotServing {
+                cause: NotServedCause::Unknown
+            },
+            evidence: EvidenceClass::Verified,
+        }
+    );
+    match RemoteMemberDelivery::submit_refusal(&peer, 7, 9, "member_departed", "gone".into(), None)
+    {
+        NativeSubmitError::MemberGone(departure) => assert_eq!(
+            departure.evidence(),
+            &DepartureEvidence::SignedPeerDeparture { peer: peer.clone() }
+        ),
+        other => panic!("expected the departure, got {other:?}"),
+    }
+}
+
+/// Every call that brought no signed answer, through the one reading: only
+/// the local failures say the peer was never asked; everything else leaves
+/// the outcome unknown, with an unsigned code kept as text.
+#[test]
+fn every_call_error_reads_as_its_class() {
+    let cases = [
+        (
+            KeyedInjectCallError::Oversize { bytes: 9 },
+            "blocked:request_oversize",
+        ),
+        (
+            KeyedInjectCallError::NotAuthenticatable("no key".into()),
+            "not_committed:local_not_authenticatable:local",
+        ),
+        (
+            KeyedInjectCallError::Unauthenticated("bad signature".into()),
+            "unknown:answer_failed_verification:unverified",
+        ),
+        (
+            KeyedInjectCallError::Rejected {
+                code: "member_departed".into(),
+                message: "spoofed".into(),
+            },
+            "unknown:peer_unanswered:unverified",
+        ),
+        (
+            KeyedInjectCallError::Unexpected("garbled".into()),
+            "unknown:peer_unanswered:unverified",
+        ),
+        (
+            KeyedInjectCallError::Transport("refused".into()),
+            "unknown:peer_unanswered:unverified",
+        ),
+    ];
+    for (error, expected) in cases {
+        let read = match RemoteMemberDelivery::call_error(error.clone()) {
+            NativeSubmitError::Blocked { cause, .. } => format!("blocked:{}", cause.as_str()),
+            NativeSubmitError::NotCommitted { cause, evidence } => {
+                format!("not_committed:{}:{}", cause.kind(), evidence.as_str())
+            }
+            NativeSubmitError::OutcomeUnknown {
+                cause, evidence, ..
+            } => format!("unknown:{}:{}", cause.kind(), evidence.as_str()),
+            NativeSubmitError::MemberGone(_) => "ended".to_string(),
+        };
+        assert_eq!(read, expected, "{error}");
+    }
+}
+
+/// A status read that brings no status keeps the batch waiting, except a
+/// signed `invalid_request`, which blocks it, and a signed `member_departed`.
+#[test]
+fn a_status_read_without_a_status_waits_unless_ruled_out() {
+    let peer = MobId::new(PEER).unwrap();
+    let read = |code: &str| {
+        RemoteMemberDelivery::status_error(
+            RemoteMemberDelivery::submit_refusal(&peer, 1, 2, code, "m".into(), None),
+            Some(code),
+        )
+    };
+    assert!(matches!(
+        read("invalid_request"),
+        NativeStatusError::Blocked {
+            cause: BlockCause::PeerInvalidRequest,
+            ..
+        }
+    ));
+    assert!(matches!(
+        read("member_departed"),
+        NativeStatusError::MemberGone(_)
+    ));
+    for code in [
+        "conflict",
+        "unknown_member",
+        "not_served",
+        "governed",
+        "native_unavailable",
+        "brand_new_code",
+    ] {
+        assert!(
+            matches!(read(code), NativeStatusError::Unavailable { .. }),
+            "{code}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -618,6 +811,7 @@ async fn an_unusable_contact_is_refused_before_anything_is_sent() {
     let keyless = RemoteMemberDelivery::with_clock(
         contacts(PEER, "tcp://127.0.0.1:9", &peer_keys),
         Arc::new(RwLock::new(None)),
+        WINDOW_MS,
         Arc::new(|| NOW_MS),
     );
     assert!(matches!(
@@ -734,21 +928,29 @@ async fn an_unreachable_peer_fails_fast_for_a_moment_and_is_tried_again() {
         Arc::clone(&clock),
     );
     let batch = remote_batch("batch-1", "card declined");
+    let unanswered = |outcome: &std::result::Result<NativeReceipt, NativeSubmitError>,
+                      fast: bool| {
+        matches!(
+            outcome,
+            Err(NativeSubmitError::OutcomeUnknown {
+                cause: SuspendCause::PeerUnanswered { code: None },
+                evidence: EvidenceClass::Unverified,
+                detail,
+            }) if detail.contains("moments ago") == fast
+        )
+    };
     let first = delivery.submit(&batch).await;
-    assert!(
-        matches!(&first, Err(NativeSubmitError::Unavailable(detail)) if !detail.contains("moments ago")),
-        "{first:?}"
-    );
+    assert!(unanswered(&first, false), "{first:?}");
     let second = delivery.submit(&batch).await;
     assert!(
-        matches!(&second, Err(NativeSubmitError::Unavailable(detail)) if detail.contains("moments ago")),
+        unanswered(&second, true),
         "a call inside the window fails without dialing: {second:?}"
     );
     assert!(delivery.status(&batch).await.is_err());
     clock.fetch_add(super::remote::PEER_BACKOFF_MS, Ordering::SeqCst);
     let third = delivery.submit(&batch).await;
     assert!(
-        matches!(&third, Err(NativeSubmitError::Unavailable(detail)) if !detail.contains("moments ago")),
+        unanswered(&third, false),
         "after the window the peer is dialed again: {third:?}"
     );
 }
@@ -781,12 +983,14 @@ async fn a_gateway_that_serves_no_keyed_inject_answers_a_signed_unavailable() {
         Arc::new(AtomicU64::new(NOW_MS)),
     );
     let batch = remote_batch("batch-1", "card declined");
-    match delivery.submit(&batch).await {
-        Err(NativeSubmitError::Unavailable(detail)) => {
-            assert!(detail.starts_with("keyed_inject_unavailable"), "{detail}");
-        }
-        other => panic!("expected a signed unavailable refusal: {other:?}"),
-    }
+    assert_eq!(
+        delivery.submit(&batch).await,
+        Err(NativeSubmitError::NotCommitted {
+            cause: SuspendCause::PeerComposing,
+            evidence: EvidenceClass::Verified,
+        }),
+        "a starting peer's signed refusal: nothing committed, and nothing ends"
+    );
 }
 
 /// Two gateways granted on one member: neither can commit under the other's
@@ -889,12 +1093,16 @@ async fn a_request_issued_before_the_serving_process_started_is_stale() {
     peer.receiver.started_at.store(NOW_MS, Ordering::SeqCst);
     clock.store(NOW_MS - 1, Ordering::SeqCst);
     let batch = remote_batch("batch-before-start", "an announcement");
-    match delivery.submit(&batch).await {
-        Err(NativeSubmitError::Unavailable(detail)) => {
-            assert!(detail.contains("stale_request"), "{detail}");
-        }
-        other => panic!("expected a stale refusal, got {other:?}"),
-    }
+    assert_eq!(
+        delivery.submit(&batch).await,
+        Err(NativeSubmitError::NotCommitted {
+            cause: SuspendCause::ClockSkew {
+                issued_at_ms: NOW_MS - 1,
+                window_ms: WINDOW_MS,
+            },
+            evidence: EvidenceClass::Verified,
+        })
+    );
     assert_eq!(peer.receiver.submits(), 0);
     clock.store(NOW_MS, Ordering::SeqCst);
     delivery.submit(&batch).await.unwrap();
@@ -931,10 +1139,10 @@ async fn a_keyed_inject_verb_without_an_admitting_caller_is_refused() {
 }
 
 /// A gateway that predates keyed inject cannot decode the request, and its
-/// listener says so unsigned. That gateway never will serve it, so the
-/// member's subscriptions end typed instead of retrying forever.
+/// listener says so unsigned. An unsigned answer is never evidence, and an
+/// on-path party could fabricate it: the outcome stays unknown and nothing ends.
 #[tokio::test]
-async fn a_gateway_that_predates_keyed_inject_ends_the_subscription_typed() {
+async fn an_unsigned_decode_from_an_old_gateway_ends_nothing() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let peer_keys = Arc::new(GatewayPeerKeys::ephemeral());
     let caller_keys = Arc::new(GatewayPeerKeys::ephemeral());
@@ -963,13 +1171,9 @@ async fn a_gateway_that_predates_keyed_inject_ends_the_subscription_typed() {
         &caller_keys,
         Arc::new(AtomicU64::new(NOW_MS)),
     );
-    assert_eq!(
-        delivery
-            .submit(&remote_batch("batch-1", "card declined"))
-            .await,
-        Err(NativeSubmitError::MemberGone(
-            SubscriptionEnd::PeerUnsupported
-        ))
-    );
+    let outcome = delivery
+        .submit(&remote_batch("batch-1", "card declined"))
+        .await;
+    assert!(unsigned(&outcome, "decode"), "{outcome:?}");
     old_peer.await.unwrap();
 }

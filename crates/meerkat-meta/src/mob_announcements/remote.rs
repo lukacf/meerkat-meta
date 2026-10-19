@@ -13,19 +13,19 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
+use super::availability::{BlockCause, EvidenceClass, MemberDeparture, SuspendCause};
 use super::native::{
     IdentityService, MemberProblem, MobNativeDelivery, NativeReceipt, NativeStatus,
-    NativeSubmitError, NativeUnavailable, PrepareError, batch_summary, continuation_delivery,
+    NativeStatusError, NativeSubmitError, NativeUnavailable, PrepareError, batch_summary,
+    continuation_delivery, not_served_here_detail,
 };
-use super::types::{
-    Batch, BatchId, MAX_ID_BYTES, Member, MemberIdentity, MobId, SubscriptionEnd, content_digest,
-};
+use super::types::{Batch, BatchId, MAX_ID_BYTES, Member, MemberIdentity, MobId, content_digest};
 use crate::runtime::cross_mob_control::ControlSignerSlot;
 use crate::runtime::cross_mob_remote::RemoteMobProxy;
 use crate::runtime::keyed_inject::{
     KeyedInject, KeyedInjectCallError, KeyedInjectCallOutcome, KeyedInjectCallerScope,
     KeyedInjectFuture, KeyedInjectReceiver, KeyedInjectRefusal, KeyedInjectRefusalCode,
-    KeyedInjectStatusAnswer,
+    KeyedInjectStatusAnswer, NotServedCause,
 };
 
 pub(crate) type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -50,6 +50,9 @@ pub struct RemoteMemberDelivery {
     contacts: crate::contact_directory::ContactDirectory,
     keys: ControlSignerSlot,
     clock: Clock,
+    /// This gateway's configured request window, which a peer's
+    /// `stale_request` is read against: the refusal's text never is.
+    window_ms: u64,
     unreachable_until: Mutex<BTreeMap<MobId, u64>>,
 }
 
@@ -57,8 +60,9 @@ impl RemoteMemberDelivery {
     pub(crate) fn new(
         contacts: crate::contact_directory::ContactDirectory,
         keys: ControlSignerSlot,
+        window_ms: u64,
     ) -> Self {
-        Self::with_clock(contacts, keys, Arc::new(system_clock))
+        Self::with_clock(contacts, keys, window_ms, Arc::new(system_clock))
     }
 
     /// `clock` stamps each request's issue time: this gateway's wall clock,
@@ -66,13 +70,153 @@ impl RemoteMemberDelivery {
     pub(crate) fn with_clock(
         contacts: crate::contact_directory::ContactDirectory,
         keys: ControlSignerSlot,
+        window_ms: u64,
         clock: Clock,
     ) -> Self {
         Self {
             contacts,
             keys,
             clock,
+            window_ms,
             unreachable_until: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// The one reading of a peer's signed refusal of a submission, over
+    /// every code this build knows and any it does not. Each signed "nothing
+    /// was committed" is an availability state that can change; only
+    /// `member_departed` ends anything, and a code this build cannot read
+    /// leaves the outcome unknown. The cause of `not_served` is read from the
+    /// refusal's own signed field, never from its message.
+    pub(super) fn submit_refusal(
+        peer: &MobId,
+        issued_at_ms: u64,
+        window_ms: u64,
+        code: &str,
+        message: String,
+        cause: Option<&str>,
+    ) -> NativeSubmitError {
+        use KeyedInjectRefusalCode as Code;
+        let signed = |cause| NativeSubmitError::NotCommitted {
+            cause,
+            evidence: EvidenceClass::Verified,
+        };
+        let Some(known) = Code::parse(code) else {
+            return NativeSubmitError::OutcomeUnknown {
+                cause: SuspendCause::PeerRefusedUnknown {
+                    code: code.to_string(),
+                },
+                evidence: EvidenceClass::Verified,
+                detail: message,
+            };
+        };
+        match known {
+            Code::Unavailable => signed(SuspendCause::PeerComposing),
+            Code::NotServed => signed(SuspendCause::PeerNotServing {
+                cause: NotServedCause::read(cause),
+            }),
+            Code::StaleRequest => signed(SuspendCause::ClockSkew {
+                issued_at_ms,
+                window_ms,
+            }),
+            Code::InvalidRequest => NativeSubmitError::Blocked {
+                cause: BlockCause::PeerInvalidRequest,
+                detail: message,
+            },
+            Code::UnknownMember => signed(SuspendCause::MemberUnknown),
+            Code::UnusableMember => signed(SuspendCause::MemberNotServedHere { cause: None }),
+            Code::Governed => signed(SuspendCause::Governed),
+            Code::Conflict => NativeSubmitError::Blocked {
+                cause: BlockCause::Conflict,
+                detail: message,
+            },
+            Code::OwnerRetired => signed(SuspendCause::MemberNotLive),
+            Code::NativeUnavailable => NativeSubmitError::OutcomeUnknown {
+                cause: SuspendCause::PeerNativeUnavailable,
+                evidence: EvidenceClass::Verified,
+                detail: message,
+            },
+            Code::MemberDeparted => {
+                NativeSubmitError::MemberGone(MemberDeparture::from_signed_departure(peer.clone()))
+            }
+        }
+    }
+
+    /// The one reading of a call that brought no signed answer. Nothing in
+    /// an unsigned answer is evidence: its code is kept as text and never
+    /// branched on. Only the local failures say that the peer was never
+    /// asked.
+    pub(super) fn call_error(error: KeyedInjectCallError) -> NativeSubmitError {
+        match error {
+            KeyedInjectCallError::Oversize { bytes } => NativeSubmitError::Blocked {
+                cause: BlockCause::RequestOversize,
+                detail: format!(
+                    "the delivery request is {bytes} bytes, more than one control frame"
+                ),
+            },
+            KeyedInjectCallError::NotAuthenticatable(_) => NativeSubmitError::NotCommitted {
+                cause: SuspendCause::LocalNotAuthenticatable,
+                evidence: EvidenceClass::Local,
+            },
+            KeyedInjectCallError::Unauthenticated(detail) => NativeSubmitError::OutcomeUnknown {
+                cause: SuspendCause::AnswerFailedVerification,
+                evidence: EvidenceClass::Unverified,
+                detail,
+            },
+            KeyedInjectCallError::Rejected { code, message } => NativeSubmitError::OutcomeUnknown {
+                cause: SuspendCause::PeerUnanswered { code: Some(code) },
+                evidence: EvidenceClass::Unverified,
+                detail: message,
+            },
+            KeyedInjectCallError::Unexpected(detail) | KeyedInjectCallError::Transport(detail) => {
+                NativeSubmitError::OutcomeUnknown {
+                    cause: SuspendCause::PeerUnanswered { code: None },
+                    evidence: EvidenceClass::Unverified,
+                    detail,
+                }
+            }
+        }
+    }
+
+    /// What a read that brought no status leaves: the batch's outcome is as
+    /// unknown as it was, and it keeps waiting with the reason. Only a
+    /// signed `invalid_request` rules the batch out, and only a signed
+    /// `member_departed` is final; a conflict rules out a submission, never
+    /// a read.
+    pub(super) fn status_error(answer: NativeSubmitError, code: Option<&str>) -> NativeStatusError {
+        match answer {
+            NativeSubmitError::NotCommitted { cause, evidence } => NativeStatusError::Unavailable {
+                cause,
+                evidence,
+                detail: String::new(),
+            },
+            NativeSubmitError::OutcomeUnknown {
+                cause,
+                evidence,
+                detail,
+            } => NativeStatusError::Unavailable {
+                cause,
+                evidence,
+                detail,
+            },
+            NativeSubmitError::Blocked {
+                cause: BlockCause::PeerInvalidRequest,
+                detail,
+            } => NativeStatusError::Blocked {
+                cause: BlockCause::PeerInvalidRequest,
+                detail,
+            },
+            NativeSubmitError::Blocked { detail, .. } => match code {
+                Some(code) => NativeStatusError::Unavailable {
+                    cause: SuspendCause::PeerRefusedUnknown {
+                        code: code.to_string(),
+                    },
+                    evidence: EvidenceClass::Verified,
+                    detail,
+                },
+                None => NativeStatusError::local(detail),
+            },
+            NativeSubmitError::MemberGone(departure) => NativeStatusError::MemberGone(departure),
         }
     }
 
@@ -158,63 +302,46 @@ impl RemoteMemberDelivery {
     }
 
     /// Deliver the batch to its peer. Only the peer's signed answer is
-    /// evidence; everything else leaves the outcome unknown.
+    /// evidence about its member; a call that brought none leaves the
+    /// outcome unknown, except where this gateway never asked.
     pub(crate) async fn submit(&self, batch: &Batch) -> Result<NativeReceipt, NativeSubmitError> {
-        let unavailable =
-            |error: KeyedInjectCallError| NativeSubmitError::Unavailable(error.to_string());
         let peer = Self::peer_of(&batch.member);
-        self.reachable(peer).map_err(unavailable)?;
-        let proxy = self.proxy(peer).map_err(unavailable)?;
-        let summary = batch_summary(batch);
-        let outcome = proxy
-            .inject_keyed(
-                KeyedInject {
-                    member: batch.member.identity.as_str(),
-                    delivery_key: batch.id.as_str(),
-                    content_digest: &batch.content_digest,
-                    summary: &summary,
-                    body: &batch.body,
-                },
-                (self.clock)(),
-            )
-            .await;
-        self.note(peer, &outcome);
+        let issued_at_ms = (self.clock)();
+        let outcome = match self.reachable(peer).and_then(|()| self.proxy(peer)) {
+            Ok(proxy) => {
+                let summary = batch_summary(batch);
+                let outcome = proxy
+                    .inject_keyed(
+                        KeyedInject {
+                            member: batch.member.identity.as_str(),
+                            delivery_key: batch.id.as_str(),
+                            content_digest: &batch.content_digest,
+                            summary: &summary,
+                            body: &batch.body,
+                        },
+                        issued_at_ms,
+                    )
+                    .await;
+                self.note(peer, &outcome);
+                outcome
+            }
+            Err(error) => Err(error),
+        };
         match outcome {
             Ok(KeyedInjectCallOutcome::Answered(receipt)) => Ok(receipt),
-            // A signed refusal is the peer's own word about its member.
-            Ok(KeyedInjectCallOutcome::Refused { code, message, .. }) => {
-                Err(match KeyedInjectRefusalCode::parse(&code) {
-                    Some(KeyedInjectRefusalCode::Conflict) => NativeSubmitError::Conflict(message),
-                    Some(KeyedInjectRefusalCode::InvalidRequest) => {
-                        NativeSubmitError::Invalid(message)
-                    }
-                    Some(KeyedInjectRefusalCode::Governed) => NativeSubmitError::Governed,
-                    Some(KeyedInjectRefusalCode::OwnerRetired) => NativeSubmitError::OwnerRetired,
-                    Some(KeyedInjectRefusalCode::UnknownMember) => {
-                        NativeSubmitError::MemberGone(SubscriptionEnd::MemberLeft)
-                    }
-                    Some(KeyedInjectRefusalCode::UnusableMember) => {
-                        NativeSubmitError::MemberGone(SubscriptionEnd::MemberUnusable {
-                            detail: message,
-                        })
-                    }
-                    _ => NativeSubmitError::Unavailable(format!("{code}: {message}")),
-                })
-            }
-            // A gateway that predates keyed inject cannot decode the request
-            // and says so, unsigned. It never will serve it: the
-            // subscription ends instead of retrying forever. Being
-            // unsigned, this decides availability only, which an on-path
-            // party could deny anyway.
-            Err(KeyedInjectCallError::Rejected { code, .. }) if code == "decode" => Err(
-                NativeSubmitError::MemberGone(SubscriptionEnd::PeerUnsupported),
-            ),
-            // A request this gateway built too large can never be sent; it
-            // is the one failure the batch itself causes.
-            Err(KeyedInjectCallError::Oversize { bytes }) => Err(NativeSubmitError::Invalid(
-                format!("the delivery request is {bytes} bytes, more than one control frame"),
+            Ok(KeyedInjectCallOutcome::Refused {
+                code,
+                message,
+                cause,
+            }) => Err(Self::submit_refusal(
+                peer,
+                issued_at_ms,
+                self.window_ms,
+                &code,
+                message,
+                cause.as_deref(),
             )),
-            Err(error) => Err(unavailable(error)),
+            Err(error) => Err(Self::call_error(error)),
         }
     }
 
@@ -222,34 +349,48 @@ impl RemoteMemberDelivery {
         &self,
         batch: &Batch,
         with_input: bool,
-    ) -> Result<KeyedInjectStatusAnswer, String> {
+    ) -> Result<KeyedInjectStatusAnswer, NativeStatusError> {
         let peer = Self::peer_of(&batch.member);
-        self.reachable(peer).map_err(|error| error.to_string())?;
-        let proxy = self.proxy(peer).map_err(|error| error.to_string())?;
-        let outcome = proxy
-            .inject_status(
-                batch.member.identity.as_str(),
-                batch.id.as_str(),
-                with_input,
-                (self.clock)(),
-            )
-            .await;
-        self.note(peer, &outcome);
+        let issued_at_ms = (self.clock)();
+        let outcome = match self.reachable(peer).and_then(|()| self.proxy(peer)) {
+            Ok(proxy) => {
+                let outcome = proxy
+                    .inject_status(
+                        batch.member.identity.as_str(),
+                        batch.id.as_str(),
+                        with_input,
+                        issued_at_ms,
+                    )
+                    .await;
+                self.note(peer, &outcome);
+                outcome
+            }
+            Err(error) => Err(error),
+        };
         match outcome {
             Ok(KeyedInjectCallOutcome::Answered(answer)) => Ok(answer),
-            Ok(KeyedInjectCallOutcome::Refused { code, message, .. }) => {
-                Err(format!("{code}: {message}"))
-            }
-            Err(error) => Err(error.to_string()),
+            Ok(KeyedInjectCallOutcome::Refused {
+                code,
+                message,
+                cause,
+            }) => Err(Self::status_error(
+                Self::submit_refusal(
+                    peer,
+                    issued_at_ms,
+                    self.window_ms,
+                    &code,
+                    message,
+                    cause.as_deref(),
+                ),
+                Some(&code),
+            )),
+            Err(error) => Err(Self::status_error(Self::call_error(error), None)),
         }
     }
 
     /// The batch's native status on its peer.
-    pub(crate) async fn status(&self, batch: &Batch) -> Result<NativeStatus, NativeUnavailable> {
-        self.read(batch, false)
-            .await
-            .map(|answer| answer.status)
-            .map_err(NativeUnavailable)
+    pub(crate) async fn status(&self, batch: &Batch) -> Result<NativeStatus, NativeStatusError> {
+        self.read(batch, false).await.map(|answer| answer.status)
     }
 
     /// The admitted input's state on the batch's peer.
@@ -257,7 +398,7 @@ impl RemoteMemberDelivery {
         self.read(batch, true)
             .await
             .map(|answer| answer.input)
-            .map_err(NativeUnavailable)
+            .map_err(|error| NativeUnavailable(error.to_string()))
     }
 }
 
@@ -294,6 +435,38 @@ fn invalid(detail: impl std::fmt::Display) -> KeyedInjectRefusal {
 
 fn native_unavailable(error: NativeUnavailable) -> KeyedInjectRefusal {
     KeyedInjectRefusal::new(KeyedInjectRefusalCode::NativeUnavailable, error.0)
+}
+
+/// The signed answer for a member this gateway cannot deliver to now. Each
+/// is "nothing was committed"; the caller's batch waits.
+fn waiting_refusal(identity: &MemberIdentity, cause: &SuspendCause) -> KeyedInjectRefusal {
+    match cause {
+        SuspendCause::MemberUnknown => KeyedInjectRefusal::new(
+            KeyedInjectRefusalCode::UnknownMember,
+            format!("{identity} is not an identity registered with this gateway"),
+        ),
+        SuspendCause::MemberNotServedHere { cause: Some(cause) } => KeyedInjectRefusal::new(
+            KeyedInjectRefusalCode::UnusableMember,
+            not_served_here_detail(identity, *cause),
+        ),
+        SuspendCause::MemberNotServedHere { cause: None } => KeyedInjectRefusal::new(
+            KeyedInjectRefusalCode::UnusableMember,
+            format!("{identity} is not served by this gateway's runtime"),
+        ),
+        SuspendCause::Governed => KeyedInjectRefusal::new(
+            KeyedInjectRefusalCode::Governed,
+            "the member's runtime refuses host continuations",
+        ),
+        SuspendCause::MemberNotLive => KeyedInjectRefusal::new(
+            KeyedInjectRefusalCode::OwnerRetired,
+            format!("{identity} has no live incarnation; nothing was committed"),
+        ),
+        // Every other wait is this gateway's own native state: nothing is
+        // implied, and the caller reads the status next.
+        other => {
+            KeyedInjectRefusal::new(KeyedInjectRefusalCode::NativeUnavailable, other.to_string())
+        }
+    }
 }
 
 fn hosted_identity(member: &str) -> Result<MemberIdentity, KeyedInjectRefusal> {
@@ -364,10 +537,10 @@ impl KeyedInjectReceiver for KeyedInjectServer {
                         format!("{identity} is not an identity registered with this gateway"),
                     ));
                 }
-                IdentityService::Elsewhere(detail) => {
+                IdentityService::Elsewhere(cause) => {
                     return Err(KeyedInjectRefusal::new(
                         KeyedInjectRefusalCode::UnusableMember,
-                        detail,
+                        not_served_here_detail(&identity, cause),
                     ));
                 }
             }
@@ -375,11 +548,11 @@ impl KeyedInjectReceiver for KeyedInjectServer {
                 .prepare_identity(&identity)
                 .await
                 .map_err(|error| match error {
-                    PrepareError::Gone(SubscriptionEnd::MemberUnusable { detail }) => {
-                        KeyedInjectRefusal::new(KeyedInjectRefusalCode::UnusableMember, detail)
-                    }
+                    PrepareError::Suspended { cause, .. } => waiting_refusal(&identity, &cause),
+                    // A member of this gateway's own mob has no final fact
+                    // before its departure is recorded; nothing is implied.
                     PrepareError::Gone(end) => KeyedInjectRefusal::new(
-                        KeyedInjectRefusalCode::UnknownMember,
+                        KeyedInjectRefusalCode::NativeUnavailable,
                         end.to_string(),
                     ),
                     PrepareError::Unavailable(detail) => {
@@ -403,26 +576,27 @@ impl KeyedInjectReceiver for KeyedInjectServer {
                     super::faults::after_remote_commit();
                     Ok(receipt)
                 }
-                Err(NativeSubmitError::OwnerRetired) => Err(KeyedInjectRefusal::new(
-                    KeyedInjectRefusalCode::OwnerRetired,
-                    format!("{identity} has no live incarnation; nothing was committed"),
-                )),
-                Err(NativeSubmitError::Governed) => Err(KeyedInjectRefusal::new(
-                    KeyedInjectRefusalCode::Governed,
-                    "the member's runtime refuses host continuations",
-                )),
-                Err(NativeSubmitError::Conflict(detail)) => Err(KeyedInjectRefusal::new(
+                Err(NativeSubmitError::NotCommitted { cause, .. }) => {
+                    Err(waiting_refusal(&identity, &cause))
+                }
+                Err(NativeSubmitError::OutcomeUnknown { detail, .. }) => Err(
+                    KeyedInjectRefusal::new(KeyedInjectRefusalCode::NativeUnavailable, detail),
+                ),
+                Err(NativeSubmitError::Blocked {
+                    cause: BlockCause::Conflict,
+                    detail,
+                }) => Err(KeyedInjectRefusal::new(
                     KeyedInjectRefusalCode::Conflict,
                     detail,
                 )),
-                Err(NativeSubmitError::Invalid(detail)) => Err(invalid(detail)),
-                Err(NativeSubmitError::Unavailable(detail)) => Err(KeyedInjectRefusal::new(
-                    KeyedInjectRefusalCode::NativeUnavailable,
-                    detail,
-                )),
-                Err(NativeSubmitError::MemberGone(end)) => Err(KeyedInjectRefusal::new(
-                    KeyedInjectRefusalCode::UnknownMember,
-                    end.to_string(),
+                Err(NativeSubmitError::Blocked { cause, detail }) => {
+                    Err(invalid(cause.with_detail(&detail)))
+                }
+                // Only this gateway's own record of the member's departure
+                // answers `member_departed`.
+                Err(NativeSubmitError::MemberGone(departure)) => Err(KeyedInjectRefusal::new(
+                    KeyedInjectRefusalCode::MemberDeparted,
+                    departure.to_string(),
                 )),
             }
         })
@@ -442,7 +616,16 @@ impl KeyedInjectReceiver for KeyedInjectServer {
                 .native
                 .status_of(&identity, &scope.native_key(delivery_key))
                 .await
-                .map_err(native_unavailable)?;
+                .map_err(|error| match error {
+                    NativeStatusError::MemberGone(departure) => KeyedInjectRefusal::new(
+                        KeyedInjectRefusalCode::MemberDeparted,
+                        departure.to_string(),
+                    ),
+                    other => KeyedInjectRefusal::new(
+                        KeyedInjectRefusalCode::NativeUnavailable,
+                        other.to_string(),
+                    ),
+                })?;
             let input = match (&status, with_input) {
                 (
                     NativeStatus::Applied {

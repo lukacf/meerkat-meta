@@ -71,8 +71,8 @@ use meerkat_contracts::{
 };
 
 use super::cross_mob_control::{
-    ControlAuthzDenial, ControlRequest, ControlResponse, DEFAULT_CONTROL_TIMEOUT,
-    RemoteControlClient, push_signed_field, sha256_hex, verify_control_response,
+    ControlRequest, ControlResponse, DEFAULT_CONTROL_TIMEOUT, RemoteControlClient,
+    push_signed_field, sha256_hex, verify_control_response,
 };
 use super::cross_mob_remote::{RemoteEndpoint, RemoteMobError};
 
@@ -422,15 +422,11 @@ pub enum RemoteHostError {
     /// unsigned, malformed signature, signed by a different key, or facts
     /// claiming an identity other than the signer.
     Unauthenticated { endpoint: String, reason: String },
-    /// The host's control listener refused this caller's grant.
-    Unauthorized {
-        endpoint: String,
-        code: String,
-        message: String,
-    },
-    /// The peer is reachable and authenticated but serves no host facts.
-    HostPlaneUnavailable { endpoint: String, message: String },
-    /// Any other typed refusal from the host.
+    /// The host answered with an error response. Error responses are never
+    /// signed, so this is never evidence of anything: `code` (for example
+    /// `caller_not_granted` or `host_plane_unavailable`) and `message` are
+    /// the host's words, kept as text for operators, and no caller branches
+    /// on them.
     Rejected {
         endpoint: String,
         code: String,
@@ -459,18 +455,6 @@ impl std::fmt::Display for RemoteHostError {
                 f,
                 "host response from {endpoint} could not be attributed to the pinned host key: \
                  {reason}"
-            ),
-            Self::Unauthorized {
-                endpoint,
-                code,
-                message,
-            } => write!(
-                f,
-                "runtime host at {endpoint} refused this gateway's credential ({code}): {message}"
-            ),
-            Self::HostPlaneUnavailable { endpoint, message } => write!(
-                f,
-                "peer at {endpoint} serves no runtime-host facts: {message}"
             ),
             Self::Rejected {
                 endpoint,
@@ -734,21 +718,7 @@ impl RemoteHostClient {
     fn unexpected(&self, response: &ControlResponse, expected: &str) -> RemoteHostError {
         let endpoint = self.endpoint.comms_address();
         match response {
-            ControlResponse::Err { code, message }
-                if code.as_str() == HOST_PLANE_UNAVAILABLE_CODE =>
-            {
-                RemoteHostError::HostPlaneUnavailable {
-                    endpoint,
-                    message: message.clone(),
-                }
-            }
-            ControlResponse::Err { code, message } if ControlAuthzDenial::is_denial_code(code) => {
-                RemoteHostError::Unauthorized {
-                    endpoint,
-                    code: code.clone(),
-                    message: message.clone(),
-                }
-            }
+            // Unsigned: one unverified class for every code.
             ControlResponse::Err { code, message } => RemoteHostError::Rejected {
                 endpoint,
                 code: code.clone(),

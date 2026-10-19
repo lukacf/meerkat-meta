@@ -178,7 +178,8 @@ impl std::fmt::Display for KeyedInjectRefusalCode {
 }
 
 /// Why a gateway does not serve keyed injects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum NotServedCause {
     /// The gateway is not identity-first, so it has no durable identities to
@@ -186,6 +187,9 @@ pub enum NotServedCause {
     NotIdentityFirst,
     /// The gateway's configuration turns keyed inject serving off.
     RuntimeDisabled,
+    /// How a caller reads a `not_served` refusal that carries no cause, or a
+    /// cause this build does not know. A gateway never answers it.
+    Unknown,
 }
 
 impl NotServedCause {
@@ -197,12 +201,21 @@ impl NotServedCause {
         match self {
             Self::NotIdentityFirst => "not_identity_first",
             Self::RuntimeDisabled => "runtime_disabled",
+            Self::Unknown => "unknown",
         }
     }
 
-    /// Parse a wire spelling. `None` for a cause this gateway does not know.
+    /// Parse a wire spelling. `None` for a cause this gateway does not
+    /// answer.
     pub fn parse(value: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|cause| cause.as_str() == value)
+    }
+
+    /// Read the cause a signed `not_served` refusal carries in its own
+    /// field: [`Self::Unknown`] when it carries none, or one this build does
+    /// not know. Never read from the refusal's message.
+    pub fn read(value: Option<&str>) -> Self {
+        value.and_then(Self::parse).unwrap_or(Self::Unknown)
     }
 }
 

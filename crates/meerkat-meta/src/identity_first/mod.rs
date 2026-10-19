@@ -62,6 +62,7 @@ pub use orchestrator::{
     ReconcileAction, RestoreFlowResult, RestoreOutcome, compute_reconcile_actions,
     lazy_register_flow, restore_flow,
 };
+pub(crate) use runtime::NotServedHere;
 pub use runtime::{
     ContinuityRepairPolicy, ContinuityRepairRequestOutcome, ContinuityRepairTrigger,
     GovernedSendOutcome, IdentityFirstRuntimeContext, IdentityRuntime, IdentityRuntimeConfig,

@@ -3131,6 +3131,15 @@ impl IdentityEdgeOwnership {
 pub(crate) type HeldFreshnessHook =
     Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
 
+/// Why this gateway's runtime does not serve a member it has registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotServedHere {
+    /// The member is placed on a host.
+    PlacedOnHost,
+    /// The member is bound to an external runtime.
+    ExternalBinding,
+}
+
 pub struct IdentityRuntime {
     entries: IdentityEntries,
     event_channels: RwLock<BTreeMap<AgentIdentity, broadcast::Sender<IdentityEvent>>>,
@@ -11449,15 +11458,15 @@ impl IdentityRuntime {
     pub(crate) async fn not_served_here(
         &self,
         identity: &AgentIdentity,
-    ) -> Result<Option<String>, IdentityRuntimeError> {
+    ) -> Result<Option<NotServedHere>, IdentityRuntimeError> {
         let entries = self.entries.read().await;
         let entry = entries
             .get(identity)
             .ok_or_else(|| IdentityRuntimeError::UnknownIdentity(identity.clone()))?;
         Ok(if entry.spec.placement.is_some() {
-            Some(format!("{identity} is placed on a host"))
+            Some(NotServedHere::PlacedOnHost)
         } else if durable_spec_uses_external_binding(&entry.spec) {
-            Some(format!("{identity} is bound to an external runtime"))
+            Some(NotServedHere::ExternalBinding)
         } else {
             None
         })

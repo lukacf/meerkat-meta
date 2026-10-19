@@ -15,10 +15,13 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
+use super::availability::{
+    BlockCause, EvidenceClass, MemberDeparture, NotServedHereCause, SuspendCause,
+};
 use super::native::{
     MemberMobEnd, MemberMobScan, MemberProblem, MemberRoute, MobOrigin, MobOriginFacts,
-    MobPresence, NativeDelivery, NativeStatus, NativeSubmitError, NativeUnavailable, PrepareError,
-    continuation_for,
+    MobPresence, NativeDelivery, NativeStatus, NativeStatusError, NativeSubmitError,
+    NativeUnavailable, PrepareError, continuation_for,
 };
 use super::owner::{
     AnnouncementConfig, AnnouncementError, AnnouncementService, NativeObservation, RoundReport,
@@ -33,6 +36,13 @@ fn sid(value: &str) -> SubscriptionId {
 
 fn op(value: &str) -> OperationId {
     OperationId::new(value).unwrap()
+}
+
+/// A member departure, as a peer's signed answer gives it.
+fn departed() -> SubscriptionEnd {
+    SubscriptionEnd::MemberDeparted {
+        departure: MemberDeparture::from_signed_departure(MobId::new("mob-b").unwrap()),
+    }
 }
 
 /// The mob of the gateway these tests run as: its members are local.
@@ -1052,13 +1062,13 @@ async fn lifecycle_ends_subscriptions_on_final_facts(store: &dyn AnnouncementSto
         .await
         .unwrap();
     let ended = store
-        .end_member(&member("agent:a"), SubscriptionEnd::MemberLeft, 4)
+        .end_member(&member("agent:a"), departed(), 4)
         .await
         .unwrap();
     assert_eq!(ended, vec![sid("s1")]);
     let s1 = store.subscription(&sid("s1")).await.unwrap().unwrap();
     assert_eq!(s1.state, SubscriptionState::Ended);
-    assert_eq!(s1.ended, Some(SubscriptionEnd::MemberLeft));
+    assert_eq!(s1.ended, Some(departed()));
     assert_eq!(s1.revision, 2, "ending is a change at a new revision");
     assert_eq!(
         store
@@ -1091,9 +1101,7 @@ async fn lifecycle_ends_subscriptions_on_final_facts(store: &dyn AnnouncementSto
         vec![sid("s2")],
         "an ended subscription captures nothing"
     );
-    let ended_refusal = AnnouncementStoreError::SubscriptionEnded {
-        end: SubscriptionEnd::MemberLeft,
-    };
+    let ended_refusal = AnnouncementStoreError::SubscriptionEnded { end: departed() };
     assert_eq!(
         store
             .change_subscription(&op("o3"), &sid("s1"), 2, SubscriptionChange::Resume, 6)
@@ -1112,7 +1120,7 @@ async fn lifecycle_ends_subscriptions_on_final_facts(store: &dyn AnnouncementSto
     );
     assert!(
         store
-            .end_member(&member("agent:a"), SubscriptionEnd::MemberLeft, 7)
+            .end_member(&member("agent:a"), departed(), 7)
             .await
             .unwrap()
             .is_empty(),
@@ -2080,6 +2088,11 @@ struct Ledger {
     refuse_owner_retired: bool,
     /// Every submission meets no live incarnation until this is cleared.
     retired: bool,
+    /// Every submission is answered that nothing was committed, for this
+    /// cause and on this evidence, until this is cleared.
+    refuse: Option<(SuspendCause, EvidenceClass)>,
+    /// Every status read gives this error until it is cleared.
+    status_error: Option<NativeStatusError>,
     strand: BTreeSet<String>,
     /// Native status reads, for pacing checks.
     status_reads: u64,
@@ -2099,12 +2112,12 @@ struct ScriptedNative {
     peers: BTreeSet<String>,
     /// Mobs the mob owner records as destroyed.
     destroyed: Mutex<BTreeSet<String>>,
-    /// Members whose owner reports them gone for good, and why.
-    gone: Mutex<BTreeMap<String, SubscriptionEnd>>,
+    /// Members that cannot take a delivery now, and why.
+    waiting: Mutex<BTreeMap<String, SuspendCause>>,
     /// Identities a member preparation was asked for, in order.
     prepared: Mutex<Vec<String>>,
-    /// The next submission's final answer that its member is gone.
-    submit_gone: Mutex<Option<SubscriptionEnd>>,
+    /// The next submission's final answer that its member departed.
+    submit_gone: Mutex<Option<MemberDeparture>>,
     apply_on_commit: bool,
     /// What Meerkat's records say about the mobs members created, by mob.
     origins: Mutex<BTreeMap<String, MobOriginFacts>>,
@@ -2137,7 +2150,7 @@ impl ScriptedNative {
             unusable: BTreeSet::new(),
             peers: ["mob-b".to_string()].into(),
             destroyed: Mutex::new(BTreeSet::new()),
-            gone: Mutex::new(BTreeMap::new()),
+            waiting: Mutex::new(BTreeMap::new()),
             prepared: Mutex::new(Vec::new()),
             submit_gone: Mutex::new(None),
             apply_on_commit: true,
@@ -2377,8 +2390,11 @@ impl NativeDelivery for ScriptedNative {
                 }));
             }
         }
-        match self.gone.lock().unwrap().get(member.identity.as_str()) {
-            Some(end) => Err(PrepareError::Gone(end.clone())),
+        match self.waiting.lock().unwrap().get(member.identity.as_str()) {
+            Some(cause) => Err(PrepareError::Suspended {
+                cause: cause.clone(),
+                evidence: EvidenceClass::Local,
+            }),
             None => Ok(()),
         }
     }
@@ -2453,12 +2469,18 @@ impl NativeDelivery for ScriptedNative {
     ) -> std::result::Result<NativeReceipt, NativeSubmitError> {
         let mut ledger = self.ledger.lock().unwrap();
         ledger.submits += 1;
-        if let Some(end) = self.submit_gone.lock().unwrap().take() {
-            return Err(NativeSubmitError::MemberGone(end));
+        if let Some(departure) = self.submit_gone.lock().unwrap().take() {
+            return Err(NativeSubmitError::MemberGone(departure));
+        }
+        if let Some((cause, evidence)) = ledger.refuse.clone() {
+            return Err(NativeSubmitError::NotCommitted { cause, evidence });
         }
         if ledger.refuse_owner_retired || ledger.retired {
             ledger.refuse_owner_retired = false;
-            return Err(NativeSubmitError::OwnerRetired);
+            return Err(NativeSubmitError::NotCommitted {
+                cause: SuspendCause::MemberNotLive,
+                evidence: EvidenceClass::Local,
+            });
         }
         let exact = serde_json::to_string(&continuation_for(batch).unwrap()).unwrap();
         let key = batch.id.to_string();
@@ -2466,9 +2488,10 @@ impl NativeDelivery for ScriptedNative {
             if *bound == exact {
                 return Ok(receipt.clone());
             }
-            return Err(NativeSubmitError::Conflict(format!(
-                "the native key {key} is bound to other content"
-            )));
+            return Err(NativeSubmitError::Blocked {
+                cause: BlockCause::Conflict,
+                detail: format!("the native key {key} is bound to other content"),
+            });
         }
         let receipt = NativeReceipt {
             delivery_id: format!("continuation:{key}"),
@@ -2481,14 +2504,21 @@ impl NativeDelivery for ScriptedNative {
             .insert(key, (exact, receipt.clone(), self.apply_on_commit));
         if ledger.lose_next_ack {
             ledger.lose_next_ack = false;
-            return Err(NativeSubmitError::Unavailable("the answer was lost".into()));
+            return Err(NativeSubmitError::OutcomeUnknown {
+                cause: SuspendCause::NativeUnavailable,
+                evidence: EvidenceClass::Local,
+                detail: "the answer was lost".into(),
+            });
         }
         Ok(receipt)
     }
 
-    async fn status(&self, batch: &Batch) -> std::result::Result<NativeStatus, NativeUnavailable> {
+    async fn status(&self, batch: &Batch) -> std::result::Result<NativeStatus, NativeStatusError> {
         let mut ledger = self.ledger.lock().unwrap();
         ledger.status_reads += 1;
+        if let Some(error) = ledger.status_error.clone() {
+            return Err(error);
+        }
         let Some((_, receipt, applied)) = ledger.bindings.get(batch.id.as_str()) else {
             return Ok(NativeStatus::NotCommitted);
         };
@@ -2782,7 +2812,11 @@ async fn a_member_without_an_incarnation_keeps_its_batch_owed() {
         "a refused attempt is looked at again"
     );
     let batch = harness.only_batch().await;
-    assert_eq!(batch.state, BatchState::Submitting { attempt: 1 });
+    assert_eq!(
+        batch.state,
+        BatchState::Sealed,
+        "nothing was committed: the batch is owed again"
+    );
     harness.clock.store(10_100_000, Ordering::SeqCst);
     harness.service.run_round().await.unwrap();
     let batch = harness.only_batch().await;
@@ -4073,12 +4107,18 @@ async fn the_rpc_surface_is_strict_and_typed() {
     );
 }
 
+/// A member that is not registered here, or not served by this gateway's
+/// runtime, may be registered or served again: its deliveries wait, typed,
+/// and nothing ends. Once it is served again it is delivered to.
 #[tokio::test]
-async fn a_member_gone_for_good_ends_its_subscriptions_instead_of_retrying() {
-    for end in [
-        SubscriptionEnd::MemberLeft,
-        SubscriptionEnd::MemberUnusable {
-            detail: "agent:a is placed on a host".into(),
+async fn a_registry_miss_or_a_placement_waits_and_ends_nothing() {
+    for cause in [
+        SuspendCause::MemberUnknown,
+        SuspendCause::MemberNotServedHere {
+            cause: Some(NotServedHereCause::PlacedOnHost),
+        },
+        SuspendCause::MemberNotServedHere {
+            cause: Some(NotServedHereCause::ExternalBinding),
         },
     ] {
         let harness = harness_with(ScriptedNative::new());
@@ -4086,40 +4126,153 @@ async fn a_member_gone_for_good_ends_its_subscriptions_instead_of_retrying() {
         harness.announce_burst(3).await;
         harness
             .native
-            .gone
+            .waiting
             .lock()
             .unwrap()
-            .insert("agent:a".into(), end.clone());
+            .insert("agent:a".into(), cause.clone());
         harness.clock.store(10_000_000, Ordering::SeqCst);
         let report = harness.service.run_round().await.unwrap();
         assert_eq!(report.sealed, 1);
         assert_eq!(
             harness.only_batch().await.state,
-            BatchState::Cancelled,
-            "nothing native existed, so the batch is cancelled"
+            BatchState::Sealed,
+            "nothing was submitted, and the batch waits"
         );
         assert_eq!(harness.native.submits(), 0);
-        assert_eq!(
-            harness.service.walk_entries().await,
-            (0, 0),
-            "nothing is left to retry"
-        );
         let subscription = harness
             .service
             .subscription(&sid("s1"))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(subscription.state, SubscriptionState::Ended);
-        assert_eq!(subscription.ended, Some(end));
-        let later = harness
+        assert_eq!(subscription.state, SubscriptionState::Active, "{cause}");
+        assert_eq!(subscription.ended, None);
+        let marker = harness
             .service
-            .announce(announce_request("payments", "later", &["ios"], "x"))
-            .await
-            .unwrap();
-        assert!(later.captured_for.is_empty());
+            .suspend_marker(&member("agent:a"))
+            .expect("the wait is marked");
+        assert_eq!(marker.cause, cause);
+        assert_eq!(marker.evidence, EvidenceClass::Local);
+        // Served again: the member is delivered to.
+        harness.native.waiting.lock().unwrap().clear();
         harness.round_after_pause().await;
-        assert_eq!(harness.native.submits(), 0);
+        assert_eq!(harness.native.submits(), 1);
+        assert!(matches!(
+            harness.only_batch().await.state,
+            BatchState::Committed { .. } | BatchState::Delivered { .. }
+        ));
+        assert_eq!(harness.service.suspend_marker(&member("agent:a")), None);
+    }
+}
+
+/// A submission answered that nothing was committed returns the batch to
+/// owed, marked with the typed reason and its evidence, and ends nothing.
+/// A later attempt submits it again; past the retention window it expires
+/// as an owed batch does, never as an unconfirmed delivery.
+#[tokio::test]
+async fn a_signed_answer_that_nothing_was_committed_leaves_the_batch_owed() {
+    let harness = harness_with(ScriptedNative::new());
+    harness.subscribe("s1").await;
+    harness.announce_burst(2).await;
+    let cause = SuspendCause::PeerNotServing {
+        cause: crate::runtime::keyed_inject::NotServedCause::RuntimeDisabled,
+    };
+    harness.native.ledger.lock().unwrap().refuse = Some((cause.clone(), EvidenceClass::Verified));
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    assert_eq!(harness.native.submits(), 1);
+    assert_eq!(harness.only_batch().await.state, BatchState::Sealed);
+    let marker = harness
+        .service
+        .suspend_marker(&member("agent:a"))
+        .expect("the refusal is marked");
+    assert_eq!(marker.cause, cause);
+    assert_eq!(marker.evidence, EvidenceClass::Verified);
+    let subscription = harness
+        .service
+        .subscription(&sid("s1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(subscription.state, SubscriptionState::Active);
+    // A later attempt submits it again.
+    harness.round_after_pause().await;
+    assert_eq!(harness.native.submits(), 2);
+    assert_eq!(harness.only_batch().await.state, BatchState::Sealed);
+    // Past the retention window, the owed batch expires.
+    let retention = harness.service.config().retention_ms;
+    harness
+        .clock
+        .fetch_add(retention.saturating_mul(2), Ordering::SeqCst);
+    harness.round_after_pause().await;
+    assert_eq!(harness.only_batch().await.state, BatchState::Expired);
+}
+
+/// A runtime that governs work authority refuses host continuations; that
+/// is configuration that can change, so the batch waits and is delivered
+/// once the runtime no longer refuses.
+#[tokio::test]
+async fn a_governed_local_runtime_waits_and_delivers_once_it_no_longer_refuses() {
+    let harness = harness_with(ScriptedNative::new());
+    harness.subscribe("s1").await;
+    harness.announce_burst(1).await;
+    harness.native.ledger.lock().unwrap().refuse =
+        Some((SuspendCause::Governed, EvidenceClass::Local));
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    assert_eq!(harness.only_batch().await.state, BatchState::Sealed);
+    assert_eq!(
+        harness
+            .service
+            .suspend_marker(&member("agent:a"))
+            .map(|marker| marker.cause),
+        Some(SuspendCause::Governed)
+    );
+    harness.native.ledger.lock().unwrap().refuse = None;
+    harness.round_after_pause().await;
+    assert!(matches!(
+        harness.only_batch().await.state,
+        BatchState::Committed { .. } | BatchState::Delivered { .. }
+    ));
+}
+
+/// A status read the native owner answers as inconsistent blocks the batch,
+/// typed; one it cannot answer now leaves the batch as it was, marked.
+#[tokio::test]
+async fn a_status_read_blocks_only_on_typed_evidence() {
+    let harness = harness_with(ScriptedNative::new());
+    harness.subscribe("s1").await;
+    harness.announce_burst(1).await;
+    harness.native.ledger.lock().unwrap().lose_next_ack = true;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    assert!(matches!(
+        harness.only_batch().await.state,
+        BatchState::Submitting { .. }
+    ));
+    harness.native.ledger.lock().unwrap().status_error = Some(NativeStatusError::Unavailable {
+        cause: SuspendCause::NativeUnavailable,
+        evidence: EvidenceClass::Local,
+        detail: "not now".into(),
+    });
+    harness.round_after_pause().await;
+    assert!(
+        matches!(
+            harness.only_batch().await.state,
+            BatchState::Submitting { .. }
+        ),
+        "an unreadable status implies nothing"
+    );
+    harness.native.ledger.lock().unwrap().status_error = Some(NativeStatusError::Blocked {
+        cause: BlockCause::NativeInconsistent,
+        detail: "two bindings".into(),
+    });
+    harness.round_after_pause().await;
+    match harness.only_batch().await.state {
+        BatchState::Blocked { cause } => {
+            assert!(cause.starts_with("native_inconsistent"), "{cause}");
+        }
+        other => panic!("expected a typed block, got {other:?}"),
     }
 }
 
@@ -4133,7 +4286,8 @@ async fn a_final_refusal_from_the_member_owner_ends_its_subscriptions() {
         .await
         .unwrap();
     harness.announce_burst(2).await;
-    *harness.native.submit_gone.lock().unwrap() = Some(SubscriptionEnd::PeerUnsupported);
+    let departure = MemberDeparture::from_signed_departure(mob("mob-b"));
+    *harness.native.submit_gone.lock().unwrap() = Some(departure.clone());
     harness.clock.store(10_000_000, Ordering::SeqCst);
     harness.service.run_round().await.unwrap();
     let batches = harness
@@ -4158,7 +4312,10 @@ async fn a_final_refusal_from_the_member_owner_ends_its_subscriptions() {
         .unwrap()
         .unwrap();
     assert_eq!(subscription.state, SubscriptionState::Ended);
-    assert_eq!(subscription.ended, Some(SubscriptionEnd::PeerUnsupported));
+    assert_eq!(
+        subscription.ended,
+        Some(SubscriptionEnd::MemberDeparted { departure })
+    );
     harness.round_after_pause().await;
     assert_eq!(harness.native.submits(), 1, "a final answer is not retried");
 }
@@ -5664,17 +5821,17 @@ async fn a_member_without_an_incarnation_does_not_hold_retention_past_the_window
     harness.clock.store(10_000_000, Ordering::SeqCst);
     harness.service.run_round().await.unwrap();
     let batch = harness.only_batch().await;
-    assert_eq!(batch.state.tag(), BatchStateTag::Submitting);
+    assert_eq!(batch.state.tag(), BatchStateTag::Sealed);
     let retention = AnnouncementConfig::default().retention_ms;
 
-    // Still inside the window from its sealing: it waits.
+    // Still inside the window from its sealing: it stays owed.
     harness
         .clock
         .store(batch.sealed_at_ms + retention - 1, Ordering::SeqCst);
     harness.service.run_round().await.unwrap();
     assert_eq!(
         harness.only_batch().await.state.tag(),
-        BatchStateTag::Submitting
+        BatchStateTag::Sealed
     );
 
     // Past it (and past its next look), nothing native holds it: it expires
@@ -5769,7 +5926,7 @@ async fn a_peer_batch_expires_only_once_its_last_request_is_stale() {
         .store(retried.updated_at_ms + settle + 1, Ordering::SeqCst);
     harness.service.run_round().await.unwrap();
     let waiting = harness.service.deliveries(&query).await.unwrap().remove(0);
-    assert_eq!(waiting.state.tag(), BatchStateTag::Submitting);
+    assert_eq!(waiting.state.tag(), BatchStateTag::Sealed);
     assert_eq!(harness.native.submits(), submits, "no further attempt");
     // Just past the peer's window it still waits: a request issued late in
     // a round, or read by a clock a little behind, may still be admitted.
@@ -5778,7 +5935,7 @@ async fn a_peer_batch_expires_only_once_its_last_request_is_stale() {
         .store(retried.updated_at_ms + window + 1, Ordering::SeqCst);
     harness.service.run_round().await.unwrap();
     let margin = harness.service.deliveries(&query).await.unwrap().remove(0);
-    assert_eq!(margin.state.tag(), BatchStateTag::Submitting);
+    assert_eq!(margin.state.tag(), BatchStateTag::Sealed);
     // Once the window and the margin past it have run out, the peer would
     // refuse that request as stale, and the batch expires.
     harness.clock.store(
@@ -6904,6 +7061,7 @@ fn the_walk_parses_every_declared_module_and_reexport() {
 #[test]
 fn every_public_announcement_enum_is_non_exhaustive() {
     let public_modules = [
+        ("availability", include_str!("availability.rs")),
         ("native", include_str!("native.rs")),
         ("owner", include_str!("owner.rs")),
         ("remote", include_str!("remote.rs")),
@@ -7101,14 +7259,14 @@ fn a_local_route_names_the_members_own_mob_and_refuses_another() {
 #[tokio::test]
 async fn a_local_route_for_another_mobs_member_is_blocked_before_anything_is_touched() {
     let harness = harness_with(ScriptedNative::new());
-    // This gateway's member of that name is gone: preparing it would end
-    // subscriptions, falsely.
+    // This gateway's member of that name cannot take a delivery now:
+    // preparing it would suspend deliveries for the wrong member.
     harness
         .native
-        .gone
+        .waiting
         .lock()
         .unwrap()
-        .insert("agent:a".into(), SubscriptionEnd::MemberLeft);
+        .insert("agent:a".into(), SuspendCause::MemberUnknown);
     let other = Member::new(mob("checkout"), MemberIdentity::new("agent:a").unwrap());
     let mut request = put_for("s1", other.clone(), &["ios"]);
     request.route = Some(local_route());
@@ -7350,10 +7508,11 @@ async fn a_member_without_its_kept_route_is_not_sealed_and_others_still_are() {
     assert_eq!(batches_of("agent:b").await, 1, "another member still seals");
 }
 
-/// A self-contradicting route is never deliverable: a submission meets it
-/// as invalid and a put as an unusable member, and a member on a peer is
-/// unavailable now. A gateway that names no mob of its own holds no local
-/// route.
+/// A self-contradicting route is never deliverable: a submission and a
+/// status read both meet it as blocked and a put as an unusable member, by
+/// the one classifier, and a member on a peer as not reachable from here now,
+/// with nothing committed. A gateway that names no mob of its own holds no
+/// local route.
 #[test]
 fn a_self_contradicting_route_is_invalid_to_a_submission() {
     let refusal = super::native::route_contradiction(
@@ -7364,11 +7523,25 @@ fn a_self_contradicting_route_is_invalid_to_a_submission() {
     .expect("a local route for another mob's member contradicts itself");
     assert!(matches!(
         refusal.submit_error(),
-        NativeSubmitError::Invalid(_)
+        NativeSubmitError::Blocked {
+            cause: BlockCause::NativeInvalid,
+            ..
+        }
+    ));
+    assert!(matches!(
+        refusal.status_error(),
+        super::native::NativeStatusError::Blocked {
+            cause: BlockCause::NativeInvalid,
+            ..
+        }
     ));
     assert!(matches!(
         super::native::OwnerRefusal::NoPeerPath.submit_error(),
-        NativeSubmitError::Unavailable(_)
+        NativeSubmitError::NotCommitted { .. }
+    ));
+    assert!(matches!(
+        super::native::OwnerRefusal::NoPeerPath.status_error(),
+        super::native::NativeStatusError::Unavailable { .. }
     ));
     assert_eq!(
         super::native::route_contradiction(
@@ -7393,7 +7566,17 @@ fn a_self_contradicting_route_is_invalid_to_a_submission() {
     );
     assert!(matches!(
         without_own.submit_error(),
-        NativeSubmitError::Invalid(_)
+        NativeSubmitError::Blocked {
+            cause: BlockCause::NativeInvalid,
+            ..
+        }
+    ));
+    assert!(matches!(
+        without_own.status_error(),
+        super::native::NativeStatusError::Blocked {
+            cause: BlockCause::NativeInvalid,
+            ..
+        }
     ));
     assert_eq!(
         without_own.member_problem(),
@@ -7664,4 +7847,152 @@ fn the_parked_self_subscription_process_test_runs_again_before_release() {
         "version {} would ship with the child mob self-subscription process test parked",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+/// The identity-first roster of the gateway the direct status read runs on.
+struct StatusRoster;
+
+#[async_trait]
+impl crate::identity_first::contracts::RosterProvider for StatusRoster {
+    async fn roster(
+        &self,
+        _context: &crate::identity_first::RosterContext,
+    ) -> std::result::Result<
+        Vec<crate::identity_first::DurableAgentSpec>,
+        crate::identity_first::RosterError,
+    > {
+        Ok(vec![crate::identity_first::DurableAgentSpec {
+            identity: crate::identity_first::AgentIdentity::parse("agent:a")
+                .expect("parse identity"),
+            profile: meerkat_mob::ProfileName::from("personal"),
+            addressability: crate::identity_first::AgentAddressability::Addressable,
+            display_name: None,
+            labels: BTreeMap::new(),
+            context: None,
+            additional_instructions: Vec::new(),
+            initial_message: None,
+            runtime_mode_override: None,
+            backend: None,
+            binding: None,
+            placement: None,
+        }])
+    }
+}
+
+/// An identity-first gateway runtime whose own mob is `mob_id`, with
+/// agent:a on its roster, for tests of its own native seam. Each test
+/// names its own mob: the comms names a runtime registers are
+/// process-wide, so two runtimes of one mob in parallel tests collide.
+async fn identity_first_test_runtime(
+    state: &std::path::Path,
+    mob_id: &str,
+) -> crate::UnifiedRuntime {
+    Box::pin(
+        crate::UnifiedRuntimeBuilder::default()
+            .definition(
+                meerkat_mob::MobDefinition::from_toml(&format!(
+                    r#"
+[mob]
+id = "{mob_id}"
+
+[profiles.personal]
+model = "gpt-5.5"
+external_addressable = true
+runtime_mode = "turn_driven"
+
+[profiles.personal.tools]
+comms = true
+"#
+                ))
+                .expect("definition"),
+            )
+            .persistent_state(state)
+            .continuity_from_state_dir(state)
+            .await
+            .expect("open the state-dir identity substrate")
+            .roster_provider(Arc::new(StatusRoster))
+            .identity_bootstrap_mode(crate::identity_first::IdentityBootstrapMode::LazyMaterialize)
+            .identity_runtime_instance_id(mob_id)
+            .comms(true)
+            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .build(),
+    )
+    .await
+    .expect("build the identity-first runtime")
+}
+
+/// No drive path reads a batch whose route contradicts its member: the
+/// owner's guard runs first. A direct status read of one is terminal too:
+/// the gateway's own native seam refuses it as blocked before anything is
+/// read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_direct_status_read_of_a_contradicting_route_is_blocked() {
+    let state = tempfile::tempdir().expect("state dir");
+    let runtime = identity_first_test_runtime(state.path(), "mob-k-status").await;
+    let delivery = super::local_delivery(&runtime).expect("the gateway's native seam");
+    // A member of another mob with a kept local route: this gateway's own
+    // mob is mob-k-status.
+    let id = batch_id("b-contradicting");
+    let body = render_batch(
+        &id,
+        None,
+        &[],
+        &["- [ios] payments #1 key=k\n  one\n".to_string()],
+    );
+    let batch = Batch {
+        member: Member::new(mob("checkout"), MemberIdentity::new("agent:a").unwrap()),
+        items: vec![BatchItem {
+            subscription_id: sid("s1"),
+            subscription_revision: 1,
+            mob_id: mob("payments"),
+            sequence: 1,
+            source_key: SourceKey::new("k").unwrap(),
+        }],
+        gaps: Vec::new(),
+        route: MemberRoute::Local,
+        content_digest: content_digest(&body),
+        body,
+        id,
+        predecessor: None,
+        successor: None,
+        state: BatchState::Submitting { attempt: 1 },
+        sealed_at_ms: 1,
+        updated_at_ms: 1,
+    };
+    let outcome = super::native::NativeDelivery::status(&delivery, &batch).await;
+    assert!(
+        matches!(
+            outcome,
+            Err(super::native::NativeStatusError::Blocked {
+                cause: BlockCause::NativeInvalid,
+                ..
+            })
+        ),
+        "{outcome:?}"
+    );
+    runtime.shutdown().await;
+}
+
+/// A member this gateway's identity registry does not know may be
+/// registered later: the gateway's own native seam has it wait, typed and
+/// local, and ends nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registry_miss_on_the_gateways_native_seam_waits_typed() {
+    let state = tempfile::tempdir().expect("state dir");
+    let runtime = identity_first_test_runtime(state.path(), "mob-k-registry").await;
+    let delivery = super::local_delivery(&runtime).expect("the gateway's native seam");
+    let outcome = delivery
+        .prepare_identity(&MemberIdentity::new("agent:absent").unwrap())
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(super::native::PrepareError::Suspended {
+                cause: SuspendCause::MemberUnknown,
+                evidence: EvidenceClass::Local,
+            })
+        ),
+        "{outcome:?}"
+    );
+    runtime.shutdown().await;
 }

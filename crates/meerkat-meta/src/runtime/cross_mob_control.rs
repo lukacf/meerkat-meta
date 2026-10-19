@@ -4241,7 +4241,7 @@ mod tests {
         assert!(
             matches!(
                 member_denied,
-                RemoteMobError::ControlRequestUnauthorized { ref code, .. }
+                RemoteMobError::Rejected { ref code, .. }
                     if code == "member_not_granted"
             ),
             "got {member_denied:?}"
@@ -4254,7 +4254,7 @@ mod tests {
         assert!(
             matches!(
                 verb_denied,
-                RemoteMobError::ControlRequestUnauthorized { ref code, .. }
+                RemoteMobError::Rejected { ref code, .. }
                     if code == "verb_not_granted"
             ),
             "got {verb_denied:?}"
@@ -4271,7 +4271,7 @@ mod tests {
         assert!(
             matches!(
                 anonymous_denied,
-                RemoteMobError::ControlRequestUnauthorized { ref code, .. }
+                RemoteMobError::Rejected { ref code, .. }
                     if code == "unauthenticated_caller"
             ),
             "got {anonymous_denied:?}"

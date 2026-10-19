@@ -87,19 +87,27 @@ A subscription is `active`, `paused`, `cancelled` (by a caller) or `ended`.
 It ends, with a typed reason, only on a final fact read from the owner of
 its member or its mobs:
 
-- `member_left`: the member's identity is no longer registered with this
-  gateway.
-- `member_unusable`: the member's runtime is not served here (it is placed on
-  a host, or bound to an external runtime), so a delivery could never be
-  admitted.
+- `member_departed` (with its evidence): the member departed for good. A
+  departure is built only from a departure fact; today that is the member's
+  peer gateway's signed `member_departed` answer.
 - `mobs_ended`: every mob the subscription named was destroyed.
-- `peer_unsupported`: the member's peer gateway predates keyed inject.
 - `member_mob_ended` (with `why`): the member's own mob, a mob hosted here
   other than this gateway's, was destroyed, created again, completed or
   reset after the subscription was made.
 
-A peer gateway's signed `unknown_member` or `unusable_member` answer ends
-the subscription as `member_left` or `member_unusable`.
+Everything else is a state that can change, so it suspends and ends
+nothing: a member not registered where it is served, a member placed on a
+host or bound to an external runtime, a governed runtime, a member with no
+live incarnation, a peer that is starting, does not serve keyed inject,
+skews its clock or does not answer. Each is classified once, with the class
+of its evidence (verified, unverified or local), and the owner keeps the
+latest per member as a marker for `deliveries/observe` and
+`subscriptions/get`. The marker is a projection: it is rebuilt from the next
+attempt after a restart, and no transition reads it. A signed "nothing was
+committed" returns the batch to `sealed`, to be submitted again at the
+slowest settle pace and to expire after the retention window as any owed
+batch does; an unknown outcome keeps the batch `submitting` until a status
+read settles it.
 
 The member checks run when a subscription is created and before every
 submission, so a subscription whose member left ends at its next delivery
@@ -426,7 +434,10 @@ read any delivery, the same reach as `meta/send`.
 
 - A runtime with a native work authorization host refuses host
   continuations, so subscriptions there are refused with a typed
-  `governed_runtime` error.
+  `governed_runtime` error. A member whose runtime becomes governed after it
+  was subscribed, here or on a peer, waits with the marker `governed` until
+  its runtime no longer is; its owed batches expire after the retention
+  window meanwhile.
 - A sealed batch whose subscriptions are all paused waits for a resume, and
   while it waits the member gets no other batch.
 - A paused subscription, or one whose member keeps a batch unsettled, keeps
