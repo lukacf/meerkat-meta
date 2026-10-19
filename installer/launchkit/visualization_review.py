@@ -556,7 +556,7 @@ class VisualizationReviewService:
             # A crash after the terminal receipt write but before releasing its
             # slot can be reconciled from those exact retained owners.
             for active_id in tuple(self.active_reviews):
-                active = self._load(active_id)
+                active = self._load_receipt(active_id)
                 if active is not None and (active["helper_state"] in {"returned", "not_dispatched"} or self._confirmed_end(active)):
                     self.active_reviews.discard(active_id)
             self._write_index("active-reviews.json", self.active_reviews)
@@ -579,7 +579,7 @@ class VisualizationReviewService:
                 self.terminated_owners[owner_id] = confirmation
             released = []
             for review_id in tuple(self.active_reviews):
-                receipt = self._load(review_id)
+                receipt = self._load_receipt(review_id)
                 if receipt is not None and receipt.get("dispatch_owner_id") == owner_id and receipt["dispatch_started"]:
                     # Keep unknown/inconclusive and any checked report unchanged.
                     if receipt["helper_state"] == "attempted":
@@ -624,6 +624,15 @@ class VisualizationReviewService:
         self._write_index("active-reviews.json", self.active_reviews)
 
     def _load(self, review_id):
+        # Reused review evidence must come from this exact trusted renderer.
+        receipt = self._load_receipt(review_id)
+        if receipt is not None and receipt["snapshot"]["renderer_hash"] != self.expected_renderer_hash:
+            raise ValueError("Saved review uses another trusted bridge version.")
+        return receipt
+
+    def _load_receipt(self, review_id):
+        # Only slot custody reads receipts from any renderer: a review saved
+        # before a renderer change can still hold a slot that its owner's end frees.
         checked_hash(review_id)
         if review_id in self.receipts:
             return self.receipts[review_id]
@@ -669,8 +678,6 @@ class VisualizationReviewService:
                                              require_single_presentation=snapshot.get("presentation_scope") == PRESENTATION_SCOPE)
         if digest != review_id or receipt["id"] != digest or checked != snapshot:
             raise ValueError("Saved review evidence changed.")
-        if snapshot["renderer_hash"] != self.expected_renderer_hash:
-            raise ValueError("Saved review uses another trusted bridge version.")
         if receipt.get("report") is not None:
             authority = receipt.get("report_binding")
             references = {image["id"] for image in snapshot["reference_context"].get("images", [])}

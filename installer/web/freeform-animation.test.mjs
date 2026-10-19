@@ -3,9 +3,9 @@ import test from 'node:test';
 import vm from 'node:vm';
 import { FreeformAnimation, animationFrameDocument, animationFailureDetail, ANIMATION_CAPTURE_LIMITS } from './freeform-animation.mjs';
 
-function host(t, callbacks={}, {observeResize=true}={}) {
+function host(t, callbacks={}, {observeResize=true,clock=performance.now()}={}) {
   const listeners=new Map(),documentListeners=new Map(),timers=new Map(),frames=new Map(),messages=[],resizeObservers=[];
-  let next=0,removed=0,now=performance.now();
+  let next=0,removed=0,now=clock;
   const rect={width:600,height:340};
   const frame={style:{},contentWindow:{postMessage:message=>messages.push(message)},getBoundingClientRect:()=>rect,remove(){removed++;}};
   class ResizeObserver {
@@ -33,7 +33,8 @@ function host(t, callbacks={}, {observeResize=true}={}) {
     {code:'return {};',model:{nodes:[{id:'lead'}]},blueprint:{},...callbacks});
   const emit=(data,source=frame.contentWindow)=>listeners.get('message')?.({source,data:{token:instance.token,...data}});
   const tick=(milliseconds=16)=>{const [id,callback]=frames.entries().next().value;frames.delete(id);now+=milliseconds;callback(now);};
-  const timeout=delay=>{for(const [id,timer] of timers){if(timer.delay===delay){timers.delete(id);now+=delay;timer.fn();return;}}throw Error(`No ${delay}ms timer`);};
+  // A resumed watchdog's delay is the remaining visible time, a clock difference with float error.
+  const timeout=delay=>{for(const [id,timer] of timers){if(Math.abs(timer.delay-delay)<1e-9){timers.delete(id);now+=delay;timer.fn();return;}}throw Error(`No ${delay}ms timer`);};
   const visibility=hidden=>{replacements.document.hidden=hidden;documentListeners.get('visibilitychange')?.();};
   return {instance,emit,tick,timeout,visibility,advance:milliseconds=>{now+=milliseconds;},now:()=>now,messages,timers,listeners,documentListeners,
     rect,resizeObservers,document:replacements.document,removed:()=>removed};
@@ -135,7 +136,7 @@ test('an in-flight draw resumes only its remaining visible time after a hidden i
   const errors=[],h=host(t,{onError:failure=>errors.push(failure)});readyPaused(h);
   h.instance.seek(4);h.tick();h.advance(600);h.visibility(true);
   h.advance(20000);h.tick();assert.equal(h.timers.size,0);assert.deepEqual(errors,[]);
-  h.visibility(false);assert.equal([...h.timers.values()][0].delay,1400);
+  h.visibility(false);assert.ok(Math.abs([...h.timers.values()][0].delay-1400)<1e-9);
   expireDraw(h,1400);assert.equal(errors.length,1);const {diagnostics,...detail}=errors[0];assert.deepEqual(detail,{kind:'timeout',phase:'draw'});
   assert.equal(errors[0].diagnostics.frameId,draws(h).at(-1).frameId);assert.equal(errors[0].diagnostics.parentVisibility,'visible');
   assert.equal(errors[0].diagnostics.deadlineOvershootMs,0);
@@ -162,7 +163,7 @@ test('queued timeout callbacks cannot fail a hidden, acknowledged or newer draw'
   h.tick(600);
   // The timer can be queued before the browser delivers visibilitychange.
   h.document.hidden=true;h.advance(5000);h.timers.delete(oldId);old.fn();assert.deepEqual(errors,[]);
-  h.visibility(false);assert.equal([...h.timers.values()].at(-1).delay,1400);
+  h.visibility(false);assert.ok(Math.abs([...h.timers.values()].at(-1).delay-1400)<1e-9);
   h.emit({drawn:true,frameId:draws(h).at(-1).frameId});
   h.instance.seek(6);h.tick();old.fn();assert.deepEqual(errors,[]);
   expireDraw(h);assert.equal(errors.length,1);assert.equal(errors[0].kind,'timeout');assert.equal(errors[0].phase,'draw');
@@ -343,10 +344,10 @@ function pngBytes(width,height,marks=0) {
 // Execute the production candidate host, srcdoc, and emitted worker wrapper.
 // Fake Canvas/ImageBitmap/PNG bytes verify their coupling and protocol only.
 // These fixtures do not establish browser pixels, layout, or visual quality.
-async function bitmapPath(t,{code=pointerProbeCode,initialFailure=false,renderCostMs=0,copyCostMs=0}={}) {
-  const inspected=[],captions=[],errors=[],queue=[],workers=[],canvasHandlers={},iframeHandlers={},iframeTimers=new Map(),revoked=[],encodes=[],copies=[];
+async function bitmapPath(t,{code=pointerProbeCode,initialFailure=false,renderCostMs=0,copyCostMs=0,clock}={}) {
+  const inspected=[],captions=[],errors=[],queue=[],workers=[],canvasHandlers={},iframeHandlers={},iframeTimers=new Map(),revoked=[],encodes=[],copies=[],workerClock=[];
   const h=host(t,{code,model:{nodes:[{id:'lead'},{id:'worker:200'}]},
-    onInspect:id=>inspected.push(id),onCaption:value=>captions.push(value),onError:failure=>errors.push(failure)});
+    onInspect:id=>inspected.push(id),onCaption:value=>captions.push(value),onError:failure=>errors.push(failure)},{clock});
   h.instance.paused=true;globalThis.devicePixelRatio=2;
   const rect={left:17,top:23,width:h.rect.width,height:h.rect.height};
   let holdCopies=false,failCopies=false,holdPixels=false,holdPaintAcks=false,holdRenderings=false,nextTimer=0,workerSource;
@@ -386,7 +387,7 @@ async function bitmapPath(t,{code=pointerProbeCode,initialFailure=false,renderCo
   class Worker {
     constructor(){
       this.messages=[];this.terminations=0;this.closed=false;workers.push(this);
-      const context={OffscreenCanvas:Canvas,performance:{now:()=>h.now()},
+      const context={OffscreenCanvas:Canvas,performance:{now:()=>{const value=h.now();workerClock.push(value);return value;}},
         createImageBitmap:source=>{if(failCopies)return Promise.reject(new Error('Do not disclose pixel-copy error text'));
           h.advance(copyCostMs);
           const bitmap=new ImageBitmap(source);copies.push(bitmap);return holdCopies
@@ -426,7 +427,7 @@ async function bitmapPath(t,{code=pointerProbeCode,initialFailure=false,renderCo
   };
   await flush();if(!initialFailure){assert.equal(h.instance.ready,true);assert.equal(errors.length,0);}
   const stop=async()=>{h.instance.destroy();await flushStop();};
-  return {h,inspected,captions,errors,rect,canvas,workers,iframeTimers,revoked,click,flush,flushStop,sendFromParent,encodes,encode,copies,stop,
+  return {h,inspected,captions,errors,rect,canvas,workers,workerClock,iframeTimers,revoked,click,flush,flushStop,sendFromParent,encodes,encode,copies,stop,
     resize:()=>iframeHandlers.resize?.(),
     makeBitmap:(width,height)=>new ImageBitmap(new Canvas(width,height)),
     holdPixels:()=>{holdPixels=true;},releasePixels:async()=>{holdPixels=false;queue.push(...heldPixels.splice(0));await flush();},
@@ -657,6 +658,13 @@ test('a delayed visible watchdog records parent scheduler age and overshoot for 
     parentRafAgeMs:81100,deadlineOvershootMs:79000,parentVisibility:'visible'}});
 });
 
+test('parent scheduler diagnostics are whole milliseconds when a plain clock difference is not',t=>{
+  const errors=[],h=host(t,{onError:value=>errors.push(value)},{clock:1000.1});readyPaused(h);
+  h.instance.seek(2);h.tick();h.advance(79000.4);expireDraw(h);
+  assert.equal(errors.length,1);const {parentRafAgeMs,deadlineOvershootMs}=errors[0].diagnostics;
+  assert.deepEqual([parentRafAgeMs,deadlineOvershootMs],[81100,79000]);
+});
+
 test('actual worker reports distinguish a completed nonzero render from an unresolved bitmap copy',async t=>{
   const p=await bitmapPath(t,{renderCostMs:3,copyCostMs:5});p.hold();p.h.instance.seek(2);p.h.tick();await p.flush();
   const pending=draws(p.h).at(-1);expireDraw(p.h);
@@ -688,6 +696,26 @@ test('completed bitmap-copy reports do not attest iframe receipt or extend its p
   assert.equal(diagnostic.renderMs,3);assert.equal(diagnostic.copyMs,5);
   assert.equal(diagnostic.receivedPixelWidth,undefined);assert.equal(diagnostic.workerTimingSource,'untrusted-worker-report');
   await p.releasePixels();await p.stop();
+});
+
+test('worker render and copy reports are whole milliseconds when a plain clock difference is not',async t=>{
+  // The first two clocks start the timed render or copy within its cost below 256. The sum needs
+  // one more integer bit and drops the clock's last bit, so the plain difference misses the cost.
+  // The third case costs fractions of a millisecond.
+  const cases=[
+    {name:'render crosses 256',clock:227.1,costs:[3,5],plain:[3.0000000000000284,5],reported:[3,5]},
+    {name:'copy crosses 256',clock:223.1,costs:[3,5],plain:[3,5.000000000000028],reported:[3,5]},
+    {name:'sub-millisecond costs',clock:1000.1,costs:[2.6,4.4],plain:[2.599999999999909,4.400000000000091],reported:[3,4]},
+  ];
+  for(const {name,clock,costs:[renderCostMs,copyCostMs],plain,reported} of cases)await t.test(name,async t=>{
+    const p=await bitmapPath(t,{renderCostMs,copyCostMs,clock});p.holdPixels();p.h.instance.seek(4);p.h.tick();await p.flush();
+    const [renderStarted,rendered,copyStarted,copied]=p.workerClock.slice(-4);
+    assert.deepEqual([rendered-renderStarted,copied-copyStarted],plain,'Plain differences of the worker clock');
+    expireDraw(p.h);assert.equal(p.errors.length,1);
+    const {lastStage,renderMs,copyMs}=p.errors[0].diagnostics;
+    assert.deepEqual([lastStage,renderMs,copyMs],['worker-copied',...reported]);
+    await p.releasePixels();await p.stop();
+  });
 });
 
 test('matching malformed bitmap dimensions fail explicitly while preserving expected and received geometry',async t=>{

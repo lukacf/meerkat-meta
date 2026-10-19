@@ -104,10 +104,12 @@ export class FreeformAnimation {
     const fail=detail=>{
       if(!this.alive)return;
       updateDiagnostics(detail?.diagnostics);
+      // Timing diagnostics, here and in the worker, are whole milliseconds. A plain clock
+      // difference carries floating-point error, such as 81099.99999999999 for 81100 ms.
       const diagnostics=busy && drawDiagnostics ? {...drawDiagnostics,
-        parentRafAgeMs:Math.max(0,performance.now()-lastRaf),parentVisibility:document.hidden?'hidden':'visible',
+        parentRafAgeMs:Math.round(Math.max(0,performance.now()-lastRaf)),parentVisibility:document.hidden?'hidden':'visible',
         ...(detail?.kind==='timeout' && watchdog?.started!==null && watchdog?.started!==undefined
-          ? {deadlineOvershootMs:(watchdog.expiredOvershootMs || 0)+Math.max(0,performance.now()-watchdog.started-watchdog.remaining)}:{})}:null;
+          ? {deadlineOvershootMs:Math.round((watchdog.expiredOvershootMs || 0)+Math.max(0,performance.now()-watchdog.started-watchdog.remaining))}:{})}:null;
       this.destroy();onError?.(animationFailureDetail({...detail,...(diagnostics ? {diagnostics}:{})}));
     };
     const clearWatchdog=()=>{if(watchdog)clearTimeout(watchdog.timer);watchdog=null;};
@@ -325,13 +327,13 @@ self.onmessage=async event=>{let failure={kind:'runtime',phase:'worker'};try{
     const renderStarted=performance.now();
     postMessage({diagnostic:true,frameId:frame.frameId,lastStage:'worker-render-started'});
     failure={kind:'program',phase:'render'};program.render({...frame,ctx});
-    const renderMs=Math.max(0,performance.now()-renderStarted);
+    const renderMs=Math.round(Math.max(0,performance.now()-renderStarted));
     postMessage({diagnostic:true,frameId:frame.frameId,lastStage:'worker-rendered',renderMs});
     failure={kind:'presentation',phase:'copy'};
     const copyStarted=performance.now();
     const bitmap=await copyPixels(canvas);
     if(stopping){bitmap.close();return;}
-    const copyMs=Math.max(0,performance.now()-copyStarted);
+    const copyMs=Math.round(Math.max(0,performance.now()-copyStarted));
     postMessage({diagnostic:true,frameId:frame.frameId,lastStage:'worker-copied',renderMs,copyMs});
     postMessage({pixels:bitmap,frameId:frame.frameId,renderMs,copyMs},[bitmap]);
   }
