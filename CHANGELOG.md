@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `admission_possible: false`). Before, it was reported as `Uncertain`
   (`scoped_delivery_uncertain`), so a caller recovered a delivery that was
   never admitted.
+- A `WeakPublicIdentityRuntime` (from `PublicIdentityRuntime::downgrade`)
+  no longer upgrades after the runtime's `shutdown`, even while the identity
+  runtime itself is still held, as D67 documents ("`None` once it closed"):
+  Meerkat 0.9.4 closes the mob's admission when it admits the Shutdown.
+  Against Meerkat 0.9.3 the weak link still upgraded after a shutdown.
 
 ## [0.9.3] - 2026-10-18
 
