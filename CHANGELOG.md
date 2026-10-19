@@ -300,6 +300,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   text as the summary. That failure names the stop reason, so a refused
   summary reads as refused rather than as a cancel or a truncation, and a
   summary stream that ends without its terminal event is reported apart.
+- A persistent Meta gateway without a roster no longer stops accepting work
+  for a member after its fifth compaction. Each turn's commit reads the
+  member session's head, and Meerkat Core refused to derive one for a session
+  whose transcript history had retired its oldest compaction (it keeps 4 by
+  default), so every later turn failed and asked for a runtime reload that
+  failed the same way. Meerkat Core 0.9.4 derives that head.
 
 
 ## [0.9.3] - 2026-10-18
