@@ -7555,3 +7555,32 @@ async fn a_seal_takes_its_wire_budget_from_the_route_it_seals_with() {
         wire_len(&batch.body)
     );
 }
+
+/// Version 1 of the announcement schema freezes with the release that ships
+/// it: after that, a change is a new version with its migration. The pin makes
+/// a change to version 1 fail here instead of at a user's store open.
+#[test]
+fn the_version_one_schema_is_pinned() {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let domain = &super::storage::ANNOUNCEMENT_SCHEMA_DOMAIN;
+    assert_eq!(
+        domain
+            .migrations
+            .iter()
+            .map(|migration| migration.version)
+            .max(),
+        Some(1)
+    );
+    let digest = Sha256::digest(super::sqlite::SCHEMA.as_bytes())
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+    assert_eq!(
+        digest, "c75c5b59f564d93f3051cf86516a23eade8f48e22cb6816206c212fb483cb6f5",
+        "the version 1 schema changed: before the release that ships it, update this pin; \
+         after it, add version 2 with its migration instead"
+    );
+}
