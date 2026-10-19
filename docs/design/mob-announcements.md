@@ -300,6 +300,10 @@ records:
   restored every mob it hosts. The mob set reconcile ends the member's
   subscriptions, as does the next delivery.
 
+No public surface completes or resets a mob a member created: the agent
+mob tools have no lifecycle verb. The `completed` and `reset` ends are covered
+by the owner's tests against a scripted native owner, not by a process test.
+
 Subscriptions for these members are bounded, whoever makes them:
 `child_member_limits.subscriptions` live ones on the gateway (1024 by
 default), and `child_member_limits.per_mob` live ones naming any one mob
@@ -431,10 +435,11 @@ read any delivery, the same reach as `meta/send`.
   those announcements; a shorter pause gets everything, and after a resume
   the backlog drains at `max_count` per wake interval (100 a minute by
   default).
-- Members of other mobs hosted here (child mobs) cannot subscribe yet:
-  Meerkat records no final fact that such a member left its mob (a respawn
-  removes the roster entry and adds it back), so their subscriptions could
-  not end safely.
+- Members of other mobs hosted here (child mobs) subscribe, but Meerkat
+  records no final fact yet that such a member left its mob (a respawn
+  removes the roster entry and adds it back). A retired member's
+  subscriptions therefore wait until its mob completes, resets, is created
+  again or is destroyed, or until they are cancelled.
 - Topics match exactly. Semantic matching belongs above this layer.
 - The dispatcher's walk position and next-look times live in memory: a
   restart starts a new lap and reads every unsettled batch once.

@@ -6131,6 +6131,11 @@ async fn a_member_of_a_mob_a_member_created_is_delivered_on_its_kept_route() {
     ));
 }
 
+/// A completion or reset of the member's mob after the put ends the
+/// subscription before any submission. No public surface completes or
+/// resets a mob a member created (the agent mob tools have no lifecycle
+/// verb), so these paths are covered here, against the scripted native
+/// owner, and not by a process test.
 #[tokio::test]
 async fn a_completion_or_reset_after_the_put_ends_the_subscription_before_any_submission() {
     for kind in ["completed", "reset"] {
