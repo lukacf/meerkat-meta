@@ -10,12 +10,19 @@ member subscription that names that mob and one of the announcement's topics
 captures it, and each subscriber receives what it is owed in bounded batches.
 Each batch is one Meerkat host continuation keyed by its batch id.
 
-Mob announcements are optional. A persistent, identity-first `rpc_gateway`
-enables them with `runtime_options.mob_announcements = {"enabled": true}`; the
-batch, retention and limit options are in
-[Configuration](/reference/configuration). Without it, nothing opens the
-announcement database (`mob_announcements.sqlite3`), and the methods answer
-`mob_announcements_unavailable`.
+Mob announcements are optional, and a persistent, identity-first host
+enables them the same way on every surface: `rpc_gateway` with
+`runtime_options.mob_announcements = {"enabled": true}`, `meta_gateway` with
+its `mob_announcements` init param, and a Rust host with
+`UnifiedRuntimeBuilder::mob_announcements`. Each refuses a configuration it
+cannot compose before it builds anything. The batch, retention and limit
+options are in [Configuration](/reference/configuration). Without them,
+nothing opens the announcement database (`mob_announcements.sqlite3`), and
+the methods answer `mob_announcements_unavailable`.
+
+The console serves the same methods on `/console/rpc`. Every one of them,
+the reads included, needs the `runtime.admin` grant, and a read-only console
+refuses the ones that change state.
 
 ## Announcements
 
