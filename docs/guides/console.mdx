@@ -312,6 +312,14 @@ Each agent row shows:
 
 Non-addressable agents (e.g., Gate, Health Monitor) appear dimmed and cannot be messaged.
 
+An identity-first agent whose identity binding moved (after a reset, retire or
+delete), and that the console could not collect again within 2 s, has state
+unknown and offers no send or retire until a later read collects it. Its
+records carry an `unobserved` marker with reason `refresh_pending` (see
+[`GET /console/experience`](/api/rest#get-%2Fconsole%2Fexperience)). The
+topbar shows the mob as unknown, with an amber dot, when the health snapshot
+does not say whether the mob runs; a stopped mob's dot is red.
+
 ### Approvals
 
 Open **Approvals** from the sidebar or **Needs you** to inspect current requests.
