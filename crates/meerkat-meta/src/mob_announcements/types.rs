@@ -338,6 +338,7 @@ pub struct AnnouncementRef {
 /// Who made an announcement: the host, or a member of the mob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum Announcer {
     Host,
     Member { identity: MemberIdentity },
@@ -483,6 +484,7 @@ impl Selector {
 /// Where a new subscription starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum StartFrontier {
     /// Only announcements committed after the subscription.
     Now,
@@ -496,6 +498,7 @@ pub enum StartFrontier {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SubscriptionState {
     /// Captures and delivers.
     Active,
@@ -735,6 +738,7 @@ impl ChildMemberLimits {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SubscriptionChange {
     Pause,
     Resume,
@@ -804,6 +808,7 @@ pub enum BatchState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum BatchStateTag {
     Sealed,
     Submitting,
@@ -941,6 +946,7 @@ pub fn merge_gaps(gaps: &[BatchGap], more: &[BatchGap]) -> Vec<BatchGap> {
 
 /// The facts that move a batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BatchEvent {
     /// The owner persists its intent before the first native submission.
     BeginSubmit,
@@ -985,6 +991,7 @@ pub enum BatchEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum BatchEventTag {
     BeginSubmit,
     RetryNotCommitted,

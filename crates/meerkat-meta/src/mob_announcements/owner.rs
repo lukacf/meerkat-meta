@@ -112,6 +112,7 @@ impl Default for AnnouncementConfig {
 
 /// Announcement refusals and failures, as callers see them.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AnnouncementError {
     Store(AnnouncementStoreError),
     /// This host's runtime admits work only through a native work
@@ -193,6 +194,7 @@ impl From<AnnouncementStoreError> for AnnouncementError {
 /// owner's own status; none implies that the member processed anything.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum NativeObservation {
     /// No native submission has started for this batch.
     NotSubmitted,

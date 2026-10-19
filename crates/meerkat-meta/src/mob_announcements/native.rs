@@ -42,6 +42,7 @@ impl std::fmt::Display for NativeUnavailable {
 
 /// Why a submission returned no receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NativeSubmitError {
     /// The member has no live incarnation now; nothing was committed. Not
     /// final: a member being respawned has none for a while.
@@ -63,6 +64,7 @@ pub enum NativeSubmitError {
 
 /// Why a member cannot be subscribed.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MemberProblem {
     /// Not an identity registered with this gateway.
     Unknown,
@@ -82,6 +84,7 @@ pub enum MemberProblem {
 
 /// Why a member could not be made ready for a delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PrepareError {
     /// A final fact about the member: its subscriptions end for this reason.
     Gone(SubscriptionEnd),
@@ -129,6 +132,7 @@ impl MemberMobEnd {
 /// What a member's own mob, a mob a member created, did after a cursor of its
 /// event log.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MemberMobScan {
     /// It ended.
     Ended(MemberMobEnd),
@@ -139,6 +143,7 @@ pub enum MemberMobScan {
 
 /// Whether a mob named by an announcement or a subscription is hosted here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MobPresence {
     /// Managed by this gateway and not destroyed, or restored and held
     /// until its owner resolves.
@@ -150,6 +155,7 @@ pub enum MobPresence {
 
 /// Who created a hosted mob, as Meerkat's durable records say.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MobOrigin {
     /// A member of `parent`, roster id `creator`, created it: the mob's
     /// owner binding names a session whose own persisted member binding
@@ -1286,6 +1292,7 @@ impl MobNativeDelivery {
 /// Whether an identity of this gateway's mob is registered, and whether this
 /// gateway's runtime serves it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IdentityService {
     /// Not registered with this gateway.
     Unknown,

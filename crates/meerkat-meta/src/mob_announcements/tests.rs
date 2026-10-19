@@ -6883,46 +6883,64 @@ async fn a_hosted_mob_id_this_store_cannot_hold_is_skipped_and_warned_once() {
     );
 }
 
-/// The attributes directly above `pub enum {name}` in `source`, or `None`
-/// when `source` declares no such enum.
-fn enum_attributes<'a>(source: &'a str, name: &str) -> Option<Vec<&'a str>> {
-    let at = source.find(&format!("\npub enum {name} {{"))?;
-    Some(
-        source[..at]
-            .lines()
-            .rev()
-            .take_while(|line| line.starts_with("#["))
-            .collect(),
-    )
-}
-
-/// The public enums of the announcement surface are new in this release.
-/// Each is `#[non_exhaustive]`, so a later variant (a typed suspend cause, a
-/// typed end cause) is not a breaking change for callers that match on it.
+/// Every public enum of the announcement surface is `#[non_exhaustive]`, so a
+/// later variant (a typed suspend cause, a typed end cause, a batch state) is
+/// never a breaking change for a caller that matches on it, and no mirror of
+/// one stays exhaustive. The walk reads each public module of the surface,
+/// and fails when a public module joins the surface without being walked. It
+/// is a source test rather than a compile_fail doc-test: CI runs no
+/// doc-tests.
 #[test]
-fn the_public_announcement_enums_are_non_exhaustive() {
-    let source = include_str!("types.rs");
-    let names = [
-        "AnnouncementStoreError",
-        "SubscriptionEnd",
-        "MemberRoute",
-        "BatchState",
-        "GapReason",
-        "Settlement",
+fn every_public_announcement_enum_is_non_exhaustive() {
+    let public_modules = [
+        ("native", include_str!("native.rs")),
+        ("owner", include_str!("owner.rs")),
+        ("remote", include_str!("remote.rs")),
+        ("rpc", include_str!("rpc.rs")),
+        ("sqlite", include_str!("sqlite.rs")),
+        ("store", include_str!("store.rs")),
+        ("tools", include_str!("tools.rs")),
+        ("types", include_str!("types.rs")),
     ];
-    let marked: Vec<(&str, Option<bool>)> = names
-        .iter()
-        .map(|name| {
-            let attributes = enum_attributes(source, name);
-            (
-                *name,
-                attributes.map(|attributes| attributes.contains(&"#[non_exhaustive]")),
-            )
-        })
+    let module_root = include_str!("mod.rs");
+    // Public enums deliberately left closed, each with the reason. None.
+    let closed: [(&str, &str); 0] = [];
+    let declared: BTreeSet<&str> = module_root
+        .lines()
+        .filter_map(|line| line.strip_prefix("pub mod "))
+        .filter_map(|rest| rest.strip_suffix(';'))
         .collect();
-    let expected: Vec<(&str, Option<bool>)> =
-        names.iter().map(|name| (*name, Some(true))).collect();
-    assert_eq!(marked, expected);
+    let walked: BTreeSet<&str> = public_modules.iter().map(|(name, _)| *name).collect();
+    assert_eq!(
+        declared, walked,
+        "every public module of the surface is walked"
+    );
+    let mut open = Vec::new();
+    for (module, source) in std::iter::once(("mod", module_root)).chain(public_modules) {
+        let lines: Vec<&str> = source.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let Some(rest) = line.strip_prefix("pub enum ") else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            let marked = lines[..index]
+                .iter()
+                .rev()
+                .take_while(|line| line.starts_with("#["))
+                .any(|line| *line == "#[non_exhaustive]");
+            if !marked && !closed.iter().any(|(exempt, _)| *exempt == name) {
+                open.push(format!("{module}::{name}"));
+            }
+        }
+    }
+    assert_eq!(
+        open,
+        Vec::<String>::new(),
+        "public enums without #[non_exhaustive]"
+    );
 }
 
 /// A stored batch record without its route does not decode: no route is
