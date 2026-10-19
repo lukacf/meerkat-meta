@@ -56,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Meta Forge's local knowledge service setup no longer stops at fetching its
+  source. The pinned commit could not be fetched from the source repository,
+  so `knowledge/manage.py up` failed before building. Forge now pins commit
+  `d0493b6e9ba6e61ecea24e50b5f8748e3ffe8f6c` of
+  `https://github.com/lukacf/meerkat-recall`, the repository's canonical
+  address, and the bundled Dockerfile builds that source's `meerkat-recall-bin`
+  package. The image keeps the former command name as a link, so the generated
+  Compose services are unchanged. Projects compiled earlier keep their recorded
+  source; a newly compiled application source uses the new pin.
 - The `complete_held_identity_members` documentation no longer says that
   resumed members are skipped. A held identity bootstrap holds fresh members
   only: a roster member that already has continuity refuses the whole pass

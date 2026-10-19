@@ -8,8 +8,8 @@ from urllib.parse import urlsplit
 
 from .schema import DEFAULT_MODELS
 
-ELEPHANT_REPOSITORY = "https://github.com/lukacf/elephant"
-ELEPHANT_REVISION = "98307999503609abde1b06861154c1fef5b113e5"
+ELEPHANT_REPOSITORY = "https://github.com/lukacf/meerkat-recall"
+ELEPHANT_REVISION = "d0493b6e9ba6e61ecea24e50b5f8748e3ffe8f6c"
 TEMPLATES = Path(__file__).with_name("templates_elephant")
 
 

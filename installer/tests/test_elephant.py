@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 from types import ModuleType, SimpleNamespace
@@ -48,9 +49,21 @@ def test_local_compose_is_private_persistent_and_bootstraps_native_schema():
     assert "knowledge-data" in compose["volumes"]
     settings = json.loads(files["knowledge/settings.json"])
     assert settings["source_revision"] == ELEPHANT_REVISION
+    assert settings["source_repository"] == "https://github.com/lukacf/meerkat-recall"
     assert "rust:1.94-bookworm" in files["knowledge/Dockerfile"]
     assert "--locked" in files["knowledge/Dockerfile"]
     assert "Dockerfile.dockerignore" in " ".join(files)
+
+
+def test_local_image_provides_every_command_the_stack_runs():
+    files = generate_elephant_files(config(), "test-project")
+    dockerfile = files["knowledge/Dockerfile"]
+    assert "cargo build --locked --release -p meerkat-recall-bin " in dockerfile
+    provided = set(re.findall(r"/usr/local/bin/([\w.-]+)$", dockerfile, re.M))
+    image_command = json.loads(re.search(r"^CMD (.+)$", dockerfile, re.M).group(1))
+    services = json.loads(files["knowledge/compose.json"])["services"]
+    commands = {service.get("command", image_command)[0] for service in services.values() if "build" in service}
+    assert commands and commands <= provided
 
 
 def test_remote_mode_exports_verification_without_local_service():
