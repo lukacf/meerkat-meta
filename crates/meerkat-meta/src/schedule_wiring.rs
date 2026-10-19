@@ -3212,7 +3212,7 @@ comms = true
 
         // Exactly one member-turn execution across both deliveries.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while llm_calls.load(Ordering::SeqCst) == 0 {
+        while llm_calls.load(Ordering::SeqCst) <= baseline_llm_calls {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the admitted work must still execute once"
