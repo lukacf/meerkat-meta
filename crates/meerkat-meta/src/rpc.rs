@@ -11946,7 +11946,7 @@ comms = true
         assert!(target.live.is_some(), "the race requires a live projection");
 
         identity_rt
-            .remove(&identity)
+            .remove_unrecorded_for_test(&identity)
             .await
             .expect("simulate a concurrent durable delete after resolution");
         assert!(matches!(

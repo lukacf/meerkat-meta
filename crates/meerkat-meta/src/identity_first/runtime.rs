@@ -9628,9 +9628,15 @@ impl IdentityRuntime {
         Ok(())
     }
 
-    /// Remove an identity from the runtime.
-    #[allow(dead_code)]
-    pub(crate) async fn remove(&self, identity: &AgentIdentity) -> Option<IdentityEntry> {
+    /// Test only: drops an identity's entry and event channel without
+    /// recording anything, the way a concurrent durable delete leaves the
+    /// table. Outside tests an identity leaves only through its recorded
+    /// retire and delete paths.
+    #[cfg(test)]
+    pub(crate) async fn remove_unrecorded_for_test(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Option<IdentityEntry> {
         self.event_channels.write().await.remove(identity);
         self.entries.write().await.remove(identity)
     }
