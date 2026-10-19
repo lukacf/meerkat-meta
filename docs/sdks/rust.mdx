@@ -256,6 +256,44 @@ stdout capacity for its Ready line is reserved, so the runtime then answers
 `GatewayBootstrapReady::take_runtime_completion` and publishes it inside the
 same boundary as the Ready. A Ready published without taking it drops it.
 
+### Operation refusal observer
+
+A governed operation that Meerkat refuses reaches the model only as uniform
+feedback. A host sees which typed refusal Meerkat met, and what it did with
+it, through Meerkat's `OperationRefusalObserver` (see
+[Observe refusal dispositions](https://docs.rkat.ai/rust/native-authorization#observe-refusal-dispositions)).
+Install it with the builder:
+
+```rust
+use meerkat_meta::UnifiedRuntime;
+use std::sync::Arc;
+
+let runtime = UnifiedRuntime::builder()
+    .definition_path("config/mob.toml")
+    .operation_refusal_observer(Arc::new(refusal_log)) // impl OperationRefusalObserver
+    .build()
+    .await?;
+```
+
+The builder installs it on every agent factory it owns, for persistent,
+scratch and temp-dir launches. Nothing of it reaches the event stream, a wire
+type or the model. A builder given an already-built `mob_spec(...)` refuses
+the observer with `UnifiedRuntimeBuilderError::ConflictingConfiguration`, and
+the public `MobBootstrapSpec` constructors take none: a host that builds its
+own spec installs the observer on its own agent factory and passes a session
+service built on that factory to `MobBootstrapSpec::new`.
+
+A host composing the stdio gateway answers
+`GatewayHostComposition::operation_refusal_observer`. The gateway asks once
+per member factory, with the construction it offers `compose_member_factory`,
+before either answer is installed. `Ok(None)` (the default) installs nothing,
+and `Err` refuses init. The observer sees every agent that factory builds:
+roster members, spawned helpers and forks, and the child mobs and councils
+agents create.
+
+`observe` is synchronous and must not block, and a panic in it propagates on
+the deciding task (the member's turn).
+
 ## Module routing
 
 ### `route_module_call`
