@@ -3714,17 +3714,18 @@ async function runAccessEditDuringBackgroundRefreshProof() {
   const configReadsReleased = new Promise(resolve => { releaseConfigReads = resolve; });
   const heldReads = [], answeredReads = [], errors = [], checkpoints = [];
   const server = await startMockConsoleServer({ holdTimelineStream: true });
-  let browser, page, failure;
+  let browser, page, routes, failure;
   try {
     browser = await launchBrowser();
     page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
     page.setDefaultTimeout(10000);
     page.on("pageerror", error => errors.push(String(error)));
-    await page.route("**/console/experience", async route => {
+    routes = routeGuard(page, "access-edit-during-background-refresh");
+    await routes.route("**/console/experience", async route => {
       const response = await route.fetch(); const value = await response.json();
       await route.fulfill({ response, json: { ...value, access: status() } });
     });
-    await page.route("**/console/rpc", async route => {
+    await routes.route("**/console/rpc", async route => {
       const request = route.request().postDataJSON();
       const reply = payload => route.fulfill({ json: { jsonrpc: "2.0", id: request.id, ...payload } });
       if (request.method === "meta/capabilities") {
@@ -3784,17 +3785,19 @@ async function runAccessEditDuringBackgroundRefreshProof() {
     await page.waitForTimeout(250);
     assert.equal(await page.getByTestId("access-admins-input").count(), 1, "the landed background read closed the open draft");
     assert.equal(await refreshing.count(), 0);
+    await routes.settle();
+    routes.check();
     assert.deepEqual(errors, []);
     checkpoints.push({ step: "complete" });
   } catch (error) {
+    printScenarioError("access-edit-during-background-refresh", error);
     failure = String(error.stack || error);
     if (page) fs.writeFileSync(path.join(evidence, "failure-body.txt"), await page.locator("body").innerText().catch(() => "unavailable"));
     throw error;
   } finally {
     releaseConfigReads();
-    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP access RPC", checkpoints, errors, failure: failure || null }, null, 2));
-    // A route still fetching when the page closes must not outlive the scenario.
-    if (page) await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
+    await routes?.settle();
+    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP access RPC", checkpoints, errors, routeFailures: routes?.failures || [], failure: failure || null }, null, 2));
     if (browser) await browser.close();
     await server.close();
   }
