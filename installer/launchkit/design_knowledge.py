@@ -158,10 +158,10 @@ delivery receipt can establish native admission without establishing a completed
 agent turn or domain work. Observe the actual destination turn, application
 callback and authoritative outcome/readback separately.
 
-Identity memory, shared local notes and Elephant serve different needs. Memory
-preserves an owner's history; notes are shared team artifacts; Elephant is a
-separate provenance-aware knowledge service. Choose knowledge from what should
-be remembered, shared, corrected and retrieved. An Elephant read grant does not
+Identity memory, shared local notes and the knowledge service serve different needs. Memory
+preserves an owner's history; notes are shared team artifacts; the knowledge service is a
+separate provenance-aware service. Choose knowledge from what should
+be remembered, shared, corrected and retrieved. A knowledge-service read grant does not
 ingest sources or authorize fact writes. Internal notes can be writable while
 outside actions stay read-only. Prompts cannot enforce approval or tenant isolation.
 A verified MCP grant supplies tools, not inbound Slack/Telegram chat, recurring
@@ -188,7 +188,7 @@ this declaration can retain a persisted gate; it does not prove unrestricted acc
 """
 
 PATTERNS = {
-    "personal_domains": """HomeCore: personal agents retain each person's preferences,
+    "personal_domains": """Home-automation host: personal agents retain each person's preferences,
 priorities and conversation. Domain agents retain calendar/school/finance/network
 expertise and domain state. A personal agent carries relevant person context to
 the expert; the expert performs domain work and returns it to that conversation
@@ -199,7 +199,7 @@ event triage has a separate ongoing responsibility; ingress adapters are code.
 Apply the ownership principle, not the example's roster size or policy choices.
 The person count alone does not determine the useful specialties. Multiple
 channels can reach the same conversation owner, and a console can coexist with chat.""",
-    "entity_review": """OB3: an initiative identity retains that initiative's history,
+    "entity_review": """Console application: an initiative identity retains that initiative's history,
 corrections and ongoing responsibilities. A personal/channel identity knows its
 recipient and delivers the relevant result. Subscriptions create meaningful
 initiative-to-recipient relationships. Quality review and deep investigation own
@@ -255,7 +255,7 @@ CAPABILITIES = {
         "Per-profile model/provider, memory, shell, builtin, WorkGraph and scheduling tool flags. tools.read_only compiles the native read-only execution policy while retaining category grants; it does not establish private egress or autonomous callback capability.",
         "Workspace UTF-8 text reads, shared local SQLite notes, exact-name MCP allowlists.",
         "Official MCP SDK stdio/HTTP connections discovered from registry metadata or supplied configuration.",
-        "Optional existing or source-built local Elephant; agent endpoint is read-only and space-scoped. The generated knowledge/manage.py helper supports operator-led file ingestion with a separate operator token and live semantic-readiness verification; ingest can complete asynchronously.",
+        "Optional existing or source-built local knowledge service; agent endpoint is read-only and space-scoped. The generated knowledge/manage.py helper supports operator-led file ingestion with a separate operator token and live semantic-readiness verification; ingest can complete asynchronously.",
         "Mac/Linux package, service files, GCP VM deployment script, private local credentials and persistent SQLite state.",
     ],
     "requires_extension": [
@@ -264,20 +264,20 @@ CAPABILITIES = {
         "Application-owned registry discovery, entity membership/subscriptions and automatic population-change policies using the supported desired-roster hooks. The compiler supplies the validated native reconciliation seam, not these business rules or access/privacy policy.",
         "Ephemeral worker profiles, elastic worker fleets and runtime spawn policy in generated deployments.",
         "Preconfigured recurring triggers: the compiler supports per-class native scheduling access, not installed recurrence. On pinned MobKit 0.8.42, a granted agent can author current_session prompt recurrence; MobKit persists the stable mob-member target and each firing is an agent turn. Registered host-runnable callbacks do not create a schedule, and the advertised native authoring schema omits host_runnable targets. Preserve unresolved installation and destination delivery checks.",
-        "Automatic Elephant ingestion/write pipeline, arbitrary PDF/Office extraction and document synchronization. Operator-led ingestion of individual files is supported separately.",
+        "Automatic knowledge-service ingestion/write pipeline, arbitrary PDF/Office extraction and document synchronization. Operator-led ingestion of individual files is supported separately.",
         "A generic external-action approval gate. Exact tool scopes or an actual connector's review mechanism are required.",
     ],
     "design_rule": "Never silently drop an explicitly requested feature. Explain its concrete extension requirement, offer a supported first version, and obtain the user's choice before treating that requirement as satisfied.",
 }
 
 SOURCES = [
-    {"project": "HomeCore", "path": "src/homecore/discovery.py", "lines": "144-187,239+", "lesson": "Durable conversation ownership, bounded helpers, explicit peer replies and per-person roster context."},
-    {"project": "HomeCore", "path": "skills/identity/SKILL.md", "lines": "101-122", "lesson": "Personal context stays with its owner; domain experts receive context for domain actions and return results."},
-    {"project": "HomeCore", "path": "src/homecore/plugins/registry.py", "lines": "1631+", "lesson": "Role-specific callback tool grants and effect classification."},
-    {"project": "ob3_validator", "path": "src/meerkat/roster.rs", "lines": "32-174", "lesson": "Desired entity/person/channel identities are application data."},
-    {"project": "ob3_validator", "path": "src/meerkat/topology.rs", "lines": "38-116", "lesson": "Subscription-based relationship edges, not universal mesh."},
-    {"project": "ob3_validator", "path": "config/ob3-mob.toml", "lines": "6-28,119-267", "lesson": "Chatter suppression and separate durable versus ephemeral profiles."},
-    {"project": "ob3_validator", "path": "skills/ob3-review/SKILL.md", "lines": "151-187", "lesson": "Initiative owners retain history and deliver to subscribers; bounded review workers apply an explicit evidence rubric."},
+    {"project": "home-automation host", "path": "discovery module", "lines": "144-187,239+", "lesson": "Durable conversation ownership, bounded helpers, explicit peer replies and per-person roster context."},
+    {"project": "home-automation host", "path": "skills/identity/SKILL.md", "lines": "101-122", "lesson": "Personal context stays with its owner; domain experts receive context for domain actions and return results."},
+    {"project": "home-automation host", "path": "plugin registry", "lines": "1631+", "lesson": "Role-specific callback tool grants and effect classification."},
+    {"project": "console application validator", "path": "src/meerkat/roster.rs", "lines": "32-174", "lesson": "Desired entity/person/channel identities are application data."},
+    {"project": "console application validator", "path": "src/meerkat/topology.rs", "lines": "38-116", "lesson": "Subscription-based relationship edges, not universal mesh."},
+    {"project": "console application validator", "path": "mob configuration", "lines": "6-28,119-267", "lesson": "Chatter suppression and separate durable versus ephemeral profiles."},
+    {"project": "console application validator", "path": "review skill", "lines": "151-187", "lesson": "Initiative owners retain history and deliver to subscribers; bounded review workers apply an explicit evidence rubric."},
     {"project": "MobKit", "path": "installer/launchkit/compiler.py", "lesson": "Exact generated profile, roster, topology and flow semantics."},
     {"project": "MobKit", "path": "installer/launchkit/templates_v2/app.py", "lesson": "Shipping host adapters, persistent runtime and lifecycle."},
     {"project": "MobKit v0.8.42", "path": "crates/meerkat-mobkit/src/schedule_wiring.rs", "lines": "573-649,784-807,867-930", "lesson": "Native persistent schedule store, current-session authoring rewritten to stable mob-member delivery, and native occurrence delivery identity."},

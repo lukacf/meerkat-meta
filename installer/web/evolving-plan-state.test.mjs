@@ -186,7 +186,7 @@ test("draft defaults do not become user decisions before the relevant answers", 
   assert.equal(next.find((fact) => fact.label === "Runs on").pending, true);
   assert.equal(
     next.find((fact) => fact.label === "Knowledge").value,
-    "Existing Elephant service",
+    "Existing knowledge service",
   );
   assert.equal(
     next.find((fact) => fact.label === "Your preference").value,
@@ -233,8 +233,8 @@ test("confirmed canonical knowledge choices do not require legacy stage bookkeep
     agent.tools = { notes: "none", memory: false, knowledge: false };
   for (const [mode, value] of [
     ["none", "No shared knowledge service"],
-    ["local", "New Elephant service"],
-    ["remote", "Existing Elephant service"],
+    ["local", "New knowledge service"],
+    ["remote", "Existing knowledge service"],
   ]) {
     proposal.knowledge.mode = mode;
     const state = { proposal, brief: { facts: { knowledge: {

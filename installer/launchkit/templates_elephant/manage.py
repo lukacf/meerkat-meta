@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Operator-only Elephant setup and schema-first verification for this project."""
+"""Operator-only knowledge service setup and schema-first verification for this project."""
 from __future__ import annotations
 
 import argparse
@@ -273,27 +273,27 @@ def environment():
 
 
 def check_space(token, expected):
-    # This preflight only decodes claims. Authentication is verified by Elephant.
+    # This preflight only decodes claims. Authentication is verified by the knowledge service.
     if token.count(".") != 2:
         return
     try:
         body = token.split(".")[1]
         claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
     except (ValueError, json.JSONDecodeError):
-        raise ValueError("The Elephant JWT could not be decoded.") from None
+        raise ValueError("The knowledge service JWT could not be decoded.") from None
     if claims.get("space_id") != expected:
-        raise ValueError("Elephant JWT space does not match the configured project space.")
+        raise ValueError("Knowledge service JWT space does not match the configured project space.")
     if claims.get("exp", 0) <= time.time():
-        raise ValueError("Elephant token has expired. Run renew for a local service or ask its operator for a new token.")
+        raise ValueError("Knowledge service token has expired. Run renew for a local service or ask its operator for a new token.")
 
 
 def result_data(result):
     if getattr(result, "isError", False):
-        raise ValueError("Elephant rejected the operation; verify the token, profile, scopes, and runtime readiness.")
+        raise ValueError("The knowledge service rejected the operation; verify the token, profile, scopes, and runtime readiness.")
     structured = getattr(result, "structuredContent", None)
     if structured is not None:
         if isinstance(structured, dict) and structured.get("ok") is False:
-            raise ValueError("Elephant denied or failed the tool operation. Check the principal scopes and native service diagnostics.")
+            raise ValueError("The knowledge service denied or failed the tool operation. Check the principal scopes and native service diagnostics.")
         return structured
     content = []
     for block in getattr(result, "content", []):
@@ -303,7 +303,7 @@ def result_data(result):
             except json.JSONDecodeError:
                 content.append(block.text)
     if any(isinstance(item, dict) and item.get("ok") is False for item in content):
-        raise ValueError("Elephant denied or failed the tool operation. Check the principal scopes and native service diagnostics.")
+        raise ValueError("The knowledge service denied or failed the tool operation. Check the principal scopes and native service diagnostics.")
     return content[0] if len(content) == 1 else content
 
 
@@ -335,7 +335,7 @@ async def mcp_operation(settings, operation, *, query=None, path=None, title=Non
                 required_tools.append("get_capabilities")
             for required in required_tools:
                 if required not in by_name:
-                    raise ValueError(f"Elephant did not expose {required}; check profile and read scopes.")
+                    raise ValueError(f"The knowledge service did not expose {required}; check profile and read scopes.")
             health = result_data(await session.call_tool("get_health", {})) if "get_health" in by_name else {"scope": "project", "detail": "Global health is unavailable to this space-scoped principal; authenticated runtime status and capabilities follow."}
             capabilities = result_data(await session.call_tool("get_capabilities", {})) if "get_capabilities" in by_name else {"tools": sorted(by_name)}
             runtime = result_data(await session.call_tool("get_runtime_status", {}))
@@ -349,10 +349,10 @@ async def mcp_operation(settings, operation, *, query=None, path=None, title=Non
                 return result_data(await session.call_tool("search_all", {"query": query}))
             status = unwrap(runtime)
             if not isinstance(status, dict) or status.get("semantic_ingest_ready") is not True:
-                raise ValueError("Elephant's semantic pipeline is not ready. Run verify and resolve the native readiness issues before ingesting.")
+                raise ValueError("The knowledge service's semantic pipeline is not ready. Run verify and resolve the native readiness issues before ingesting.")
             tool = by_name.get("ingest_doc_simple")
             if tool is None or not {"title", "text", "metadata"}.issubset(tool.inputSchema.get("properties", {})):
-                raise ValueError("The live ingest_doc_simple schema does not match this helper. Inspect it with the Elephant operator tools.")
+                raise ValueError("The live ingest_doc_simple schema does not match this helper. Inspect it with the knowledge service operator tools.")
             source = Path(path).resolve(strict=True)
             if not source.is_file() or source.stat().st_size > 2_000_000:
                 raise ValueError("Choose a UTF-8 text file of at most 2 MB for this ingestion helper.")

@@ -15,7 +15,7 @@ async def test_guided_plan_separates_vm_creation_from_private_application_instal
     assert "VM terminal" not in json.dumps(plan)
     assert "separate installation action" in json.dumps(plan["mutations"])
     assert "Python" in json.dumps(plan["mutations"])
-    assert "Local Elephant" in json.dumps(plan["limitations"])
+    assert "local knowledge service" in json.dumps(plan["limitations"])
     assert value["provisioning_verified"] is False
     assert value["guided_access"]["private_settings_on_host_form"] is True
     ordinary = await service.check(local.state["id"], local.state["version"], local.build_id, ACCOUNT, PROJECT)

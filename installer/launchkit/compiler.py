@@ -243,8 +243,8 @@ def environment_fields(spec):
     if any(item.tools.workspace for item in spec.agent_classes):
         add("FILES_ROOT", "Connected folder (blank uses ./workspace)", secret=False, required=False)
     if spec.knowledge.mode != "none":
-        add(spec.knowledge.token_env, "Elephant agent JWT", required=any(item.tools.knowledge for item in spec.agent_classes))
-        add(spec.knowledge.space_env, "Elephant space ID (must match token scope)", secret=False, required=any(item.tools.knowledge for item in spec.agent_classes))
+        add(spec.knowledge.token_env, "Knowledge service agent JWT", required=any(item.tools.knowledge for item in spec.agent_classes))
+        add(spec.knowledge.space_env, "Knowledge service space ID (must match token scope)", secret=False, required=any(item.tools.knowledge for item in spec.agent_classes))
     return list(fields.values())
 
 
@@ -253,7 +253,7 @@ def _runtime(spec, *, native_version=None):
     agents = _fixed_agents(spec, identities=resolved["identities"])
     connections = [item.model_dump() for item in spec.connections]
     if spec.knowledge.mode != "none":
-        connections.append({"id": "elephant", "name": "Elephant knowledge", "transport": "http", "url": spec.knowledge.url,
+        connections.append({"id": "elephant", "name": "Knowledge service", "transport": "http", "url": spec.knowledge.url,
                             "headers": {"Authorization": f"Bearer ${{{spec.knowledge.token_env}}}"}})
     return {"schemaVersion": 2, "mobkitVersion": native_version or MOBKIT_VERSION, "name": spec.project.name,
             "slug": spec.project.slug, "description": spec.project.description, "target": spec.target,
@@ -364,8 +364,8 @@ def _readme(spec, *, native_version=None, candidate=False, product=False):
     if spec.knowledge.mode == "local":
         install += ["Install Docker with Compose and Git on the deployment machine. Start the selected knowledge service with `.venv/bin/python knowledge/manage.py up`, then run `.venv/bin/python knowledge/manage.py verify`. Review `knowledge/README.md` for source access and semantic ingestion prerequisites."]
     elif spec.knowledge.mode != "none":
-        install += ["Verify the existing Elephant endpoint, token and space with `.venv/bin/python knowledge/manage.py verify`."]
-    install += ["Run `bash start.sh --doctor`. For selected MCPs or Elephant, run `bash start.sh --connections-check` to perform real handshakes and validate selected tool names."]
+        install += ["Verify the existing knowledge service endpoint, token and space with `.venv/bin/python knowledge/manage.py verify`."]
+    install += ["Run `bash start.sh --doctor`. For selected MCPs or the knowledge service, run `bash start.sh --connections-check` to perform real handshakes and validate selected tool names."]
     install += ["On the VM, run `bash deploy/install-service.sh`. Back on your computer, run `bash deploy/tunnel-gcp.sh` and keep that tunnel open." if spec.target == "gcp" else "Run `bash start.sh` and keep the terminal open. Stop with Control-C.",
                 (f"With the tunnel open, open [the native MobKit console](http://127.0.0.1:{spec.advanced.port}/console) on your computer. "
                 "This is the configured default browser address. The generated tunnel forwards to the VM's configured default port. "
@@ -549,9 +549,9 @@ MCP tool names are mapped to provider-safe aliases with a stable digest; their d
 
 ## Connections and knowledge
 
-Inspect `config/connections.json` for exact MCP commands/endpoints and source provenance. Only local `${{ENV_NAME}}` references belong in exported configuration. Elephant access requires both the expected space ID and a JWT carrying the same `space_id` claim and a future expiry. Startup checks those claims before opening any MCP connection; Elephant verifies the signature and permissions. Opaque tokens cannot provide the required scope evidence and are refused. Install the executable needed by a stdio connector (for example Node/npm for `npx`, `uv` for `uvx`, or Docker) before connecting it. The studio records source metadata; installing third-party packages executes those publishers' code.
+Inspect `config/connections.json` for exact MCP commands/endpoints and source provenance. Only local `${{ENV_NAME}}` references belong in exported configuration. Knowledge service access requires both the expected space ID and a JWT carrying the same `space_id` claim and a future expiry. Startup checks those claims before opening any MCP connection; the knowledge service verifies the signature and permissions. Opaque tokens cannot provide the required scope evidence and are refused. Install the executable needed by a stdio connector (for example Node/npm for `npx`, `uv` for `uvx`, or Docker) before connecting it. The studio records source metadata; installing third-party packages executes those publishers' code.
 
-{'Elephant setup and token-scope verification are documented in `knowledge/README.md`.' if spec.knowledge.mode != 'none' else 'No Elephant knowledge service was selected. Add one in Forge and grant knowledge access to the desired classes.'}
+{'Knowledge service setup and token-scope verification are documented in `knowledge/README.md`.' if spec.knowledge.mode != 'none' else 'No knowledge service was selected. Add one in Forge and grant knowledge access to the desired classes.'}
 
 ## Local service and Google Cloud
 

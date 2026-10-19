@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import time
 import uuid
 import zipfile
 
@@ -72,7 +73,7 @@ class Implementation:
         with zipfile.ZipFile(result, "w") as archive:
             for path, content in {"deployment.json": json.dumps(self.definition), "implementation-report.json": json.dumps(report),
                 "app.py": "print('native test fixture')\n", "install.sh": self.install_script, "application/__init__.py": ""}.items():
-                archive.writestr(path, content)
+                archive.writestr(zipfile.ZipInfo(path), content)
             if self.application_configuration is not None:
                 archive.writestr(zipfile.ZipInfo("application/configuration.json"), json.dumps(self.application_configuration))
             for path, content in self.extra_files.items():
@@ -303,6 +304,28 @@ async def test_rejected_settings_preserve_selected_owned_deployment_and_private_
     assert len(list(directory.parent.glob("*/receipt.json"))) == 1
     assert reuse_destination or not target.exists()
     assert not service.tasks
+
+
+async def test_owned_destination_reuse_does_not_depend_on_the_package_clock(service, tmp_path, monkeypatch):
+    # The same build packaged a second later must stay the same package, or
+    # reusing its owned destination is refused as a foreign non-empty folder.
+    original = tmp_path / "installed"
+    await submit(service, original)
+    materialize(service._directory(service.guide.identity))
+    await service.shutdown()
+    update_receipt(service._directory(service.guide.identity), status="stopped",
+        interactive_lifecycle_id=None, interactive_cleanup=None)
+
+    class LaterClock:
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        def time(self):
+            return time.time() + 2
+
+    monkeypatch.setattr(zipfile, "time", LaterClock())
+    with pytest.raises(ValueError, match="Console port"):
+        await submit(service, original, settings={"OPENAI_API_KEY": "replacement-private-value", "MOBKIT_PORT": "0"})
 
 
 @pytest.mark.parametrize("has_previous", [False, True])

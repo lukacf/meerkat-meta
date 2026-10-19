@@ -23,7 +23,7 @@ def complete_brief(source):
         'ownership': 'One assistant owns the comparison and follow-up questions.',
         'inputs': 'Two UTF-8 proposal files placed in the workspace.',
         'workflow': 'The user launches each comparison manually.',
-        'knowledge': 'Identity memory and internal notes; no Elephant service.',
+        'knowledge': 'Identity memory and internal notes; no knowledge service.',
         'authority': 'Internal notes may be written; no outside actions.',
         'destination': 'Local Mac.',
     }
@@ -1439,7 +1439,7 @@ def test_acceptance_confirms_visible_proposed_defaults(guide_client):
     client, agent, _ = guide_client
     def defaults(context, blueprint):
         result = review_reply(context, blueprint)
-        result['guide']['brief']['facts']['knowledge'] = fact('Internal notes without Elephant.', None, 'proposed')
+        result['guide']['brief']['facts']['knowledge'] = fact('Internal notes without a knowledge service.', None, 'proposed')
         return result
     agent.reply = defaults
     state = answer(client, start(client), text='A complete brief with memory left to your recommendation.')

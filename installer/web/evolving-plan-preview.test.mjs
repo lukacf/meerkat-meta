@@ -171,15 +171,15 @@ test('mounted checked draft knowledge stays proposed while manual and saved cont
     const knowledge=()=>[...document.querySelectorAll('.ep-facts > div')]
       .find(row=>row.querySelector('dt').textContent==='Knowledge').querySelector('dd');
     await render(state);
-    assert.equal(knowledge().textContent,'Proposed: New Elephant service');
+    assert.equal(knowledge().textContent,'Proposed: New knowledge service');
     assert.equal(knowledge().classList.contains('is-undecided'),true);
     await render(state,{plan:structuredClone(state.live_design.blueprint),pending:true});
-    assert.equal(knowledge().textContent,'New Elephant service');
+    assert.equal(knowledge().textContent,'New knowledge service');
     assert.equal(knowledge().classList.contains('is-undecided'),false);
     const completed={...state,version:5,proposal:state.live_design.blueprint,brief:state.live_design.brief,
       operation:{...state.operation,status:'completed'}};
     await render(completed);
-    assert.equal(knowledge().textContent,'Proposed: New Elephant service');
+    assert.equal(knowledge().textContent,'Proposed: New knowledge service');
     assert.equal(knowledge().classList.contains('is-undecided'),true);
     assert.deepEqual(state,untouched);
   });

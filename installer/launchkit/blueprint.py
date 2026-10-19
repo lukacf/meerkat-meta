@@ -192,7 +192,7 @@ class Connection(StrictModel):
     @model_validator(mode="after")
     def connection_valid(self):
         if self.id == "elephant":
-            raise ValueError("The elephant connection ID is reserved for the knowledge configuration.")
+            raise ValueError("The `elephant` connection ID is reserved for the knowledge configuration.")
         if self.transport == "stdio":
             if not self.command or "\x00" in self.command or self.url or self.headers:
                 raise ValueError("Stdio connections need a command, arguments and optional environment only.")
@@ -273,9 +273,9 @@ class Knowledge(StrictModel):
             validate_url(self.url)
             parsed = urlsplit(self.url)
             if parsed.path.rstrip("/") != "/mcp/agent" or parsed.query:
-                raise ValueError("Knowledge grants use Elephant read-only /mcp/agent with no query parameters.")
+                raise ValueError("Knowledge grants use the knowledge service's read-only /mcp/agent with no query parameters.")
             if self.mode == "local" and (parsed.hostname not in ("localhost", "127.0.0.1") or parsed.scheme != "http" or not parsed.port or not 1024 <= parsed.port <= 65535):
-                raise ValueError("Local Elephant needs a loopback HTTP endpoint with a port from 1024 to 65535.")
+                raise ValueError("A local knowledge service needs a loopback HTTP endpoint with a port from 1024 to 65535.")
         return self
 
 
@@ -417,7 +417,7 @@ class Blueprint(StrictModel):
             if any(grant.connection_id not in connection_ids for grant in item.tools.mcp):
                 raise ValueError(f"Class {item.id} grants an unknown MCP connection.")
             if item.tools.knowledge and self.knowledge.mode == "none":
-                raise ValueError("Configure Elephant before granting knowledge access.")
+                raise ValueError("Configure the knowledge service before granting knowledge access.")
         if len({flow.id for flow in self.flows}) != len(self.flows):
             raise ValueError("Flow IDs must be unique.")
         for flow in self.flows:
@@ -439,7 +439,7 @@ class Blueprint(StrictModel):
                 complete |= ready
         if self.target == "gcp":
             if self.knowledge.mode == "local" and (self.gcp.machine_type not in ("e2-standard-8", "e2-standard-16") or self.gcp.disk_gb < 100):
-                raise ValueError("Building local Elephant on GCP requires an e2-standard-8 or larger VM and at least 100 GB disk. Use remote knowledge for a smaller VM.")
+                raise ValueError("Building the local knowledge service on GCP requires an e2-standard-8 or larger VM and at least 100 GB disk. Use remote knowledge for a smaller VM.")
             if self.gcp.project != "" and not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", self.gcp.project):
                 raise ValueError("Enter a valid Google Cloud project ID.")
             if not self.gcp.zone.startswith(self.gcp.region + "-"):

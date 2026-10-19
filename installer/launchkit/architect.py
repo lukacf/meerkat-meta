@@ -86,7 +86,8 @@ possible edge for a complete-looking provisional graph. Broad shared access is
 appropriate when justified by the work.
 
 Read inspect_blueprint and read_design_reference to ground your current proposal
-in the actual contract, native MobKit, and source-derived HomeCore/OB3 examples.
+in the actual contract, native MobKit, and source-derived home-automation host and
+console application examples.
 Use those examples as precedents, not team templates. Propose a useful provisional
 architecture as soon as the job is concrete, and revise it as context changes.
 Missing implementation details can remain visible gaps while design progresses.
@@ -1549,7 +1550,7 @@ class ArchitectService:
                             service.startup_callback_progress["build_profiles"]["visualizer"] = "returned"
                             return
                         draft.register_tool("inspect_blueprint", service.inspect, description="Read the complete current blueprint, brief and guided context without schemas or the model catalogue by default. Set include_schema:true for exact authoring contracts or include_model_choices:true for the full current native model catalogue. Model choices also remain in read_design_reference topic:all or capabilities.", input_schema=_schema({"include_schema": {"type": "boolean"}, "include_model_choices": {"type": "boolean"}}))
-                        draft.register_tool("read_design_reference", service.read_design_reference, description="Read source-grounded MobKit design principles, HomeCore and OB3 patterns, comms protocol, exact compiler limits, and current pinned native model choices with separately labelled compiler supplements. Read all before designing; unknown catalog availability does not prove provider access.", input_schema=_schema({"topic": {"type": "string", "enum": ["all", "foundations", "patterns", "capabilities", "comms"]}}))
+                        draft.register_tool("read_design_reference", service.read_design_reference, description="Read source-grounded MobKit design principles, home-automation host and console application patterns, comms protocol, exact compiler limits, and current pinned native model choices with separately labelled compiler supplements. Read all before designing; unknown catalog availability does not prove provider access.", input_schema=_schema({"topic": {"type": "string", "enum": ["all", "foundations", "patterns", "capabilities", "comms"]}}))
                         draft.register_tool("search_mcp_registry", service.search_registry, description="Search the official online MCP Registry and retrieve actual connection configurations and provenance.", input_schema=_schema({"query": {"type": "string", "minLength": 1, "maxLength": 200}}, ["query"]))
                         draft.register_tool("inspect_mcp_capabilities", service.inspect_capabilities, description="Read exact tool names and descriptions from a retrieved connection's publisher documentation. No credentials, package installation or server execution. Returns capability evidence and the updated connection. Use path/ref to select another documented source file.", input_schema=_schema({"connection_id": {"type": "string"}, "path": {"type": "string"}, "ref": {"type": "string"}}, ["connection_id"]))
                         if service.toolkit_setup.status()['available']:

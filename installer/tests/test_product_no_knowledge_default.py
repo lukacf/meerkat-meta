@@ -50,7 +50,7 @@ def test_real_default_blueprint_compiler_has_no_elephant_inputs_connection_or_fi
         for row in environment)
     assert all(row["id"] != "elephant" for row in definition["mcpConnections"])
     assert all(not name.startswith("knowledge/") for name in files)
-    assert "No Elephant knowledge service was selected." in files["README.md"]
+    assert "No knowledge service was selected." in files["README.md"]
 
 
 async def test_original_selected_install_prepare_and_reopen_need_no_optional_knowledge_state(

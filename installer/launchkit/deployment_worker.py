@@ -791,7 +791,7 @@ class Supervisor:
         if definition["knowledge"]["mode"] == "local":
             await self.prepare_knowledge(definition)
             checks.append({"name": "Local knowledge service", "status": "pass",
-                           "detail": "The generated Elephant manager started the service and completed its authenticated MCP verification."})
+                           "detail": "The generated knowledge service manager started the service and completed its authenticated MCP verification."})
             update_receipt(self.directory, checks=checks, knowledge_managed=True)
         for name, flag in [("Local prerequisites", "--doctor"), ("Application contract", "--application-check")]:
             journal(self.directory, f"Checking {name.lower()}.", status="checking", phase="check")
@@ -954,7 +954,7 @@ class Supervisor:
             await self.knowledge_preflight(**({"settle_command": settle_command}
                 if settle_command is not None else {}))
             current()
-            journal(self.directory, "Preparing the owned local Elephant service with its saved project credentials.",
+            journal(self.directory, "Preparing the owned local knowledge service with its saved project credentials.",
                     **({"status": "checking", "phase": "knowledge"} if project_lease is None else {}))
             current()
             await self.command([str(self.destination / ".venv/bin/python"), "knowledge/manage.py", "setup"],

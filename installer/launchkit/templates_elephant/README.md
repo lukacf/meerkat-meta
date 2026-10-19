@@ -1,8 +1,8 @@
-# Elephant knowledge
+# Knowledge service
 
-This project can use Elephant for shared, governed knowledge with source provenance. It is separate from each MobKit agent's conversational memory and the project's SQLite notes.
+This project can use a knowledge service for shared, governed knowledge with source provenance. It is separate from each MobKit agent's conversational memory and the project's SQLite notes.
 
-Agent classes granted knowledge access use `/mcp/agent`, Elephant's read-only profile. Read-only JWT scopes are minted for local setups. The space belongs to the JWT principal; the space environment variable is a local verification expectation, not a replacement authorization header.
+Agent classes granted knowledge access use `/mcp/agent`, the knowledge service's read-only profile. Read-only JWT scopes are minted for local setups. The space belongs to the JWT principal; the space environment variable is a local verification expectation, not a replacement authorization header.
 
 ## Local service
 
@@ -24,7 +24,7 @@ If you operate the exported package yourself, keep the application stopped after
 
 `up` checks out the full pinned Git commit into `knowledge/.source`, builds the included Dockerfile, and starts a project-specific Compose stack. Existing source modifications or a mismatched revision stop setup. The bundled Dockerfile uses the source's declared Rust 1.94 toolchain and `cargo build --locked`; it does not use the upstream Dockerfile's older compiler. The full Git revision and settings are reviewable before execution.
 
-The native `elephant migrate` command initializes the database before either API starts. SurrealDB stores knowledge in a persistent private Docker volume. Only Elephant's API is published, on loopback. A private reader sidecar serves the same project space to Elephant's internal extractor without exposing a host port. The primary API enforces JWT authentication and never receives a global `MCP_BEARER_TOKEN`, because this source revision prefers that variable over incoming client tokens. No source patches are applied. Automated identity merges are disabled; extraction and native truth maintenance remain available. Do not attach untrusted containers to this Compose network.
+The native `elephant migrate` command initializes the database before either API starts. SurrealDB stores knowledge in a persistent private Docker volume. Only the knowledge service's API is published, on loopback. A private reader sidecar serves the same project space to the knowledge service's internal extractor without exposing a host port. The primary API enforces JWT authentication and never receives a global `MCP_BEARER_TOKEN`, because this source revision prefers that variable over incoming client tokens. No source patches are applied. Automated identity merges are disabled; extraction and native truth maintenance remain available. Do not attach untrusted containers to this Compose network.
 
 For semantic ingestion, `verify` must report `semantic_ingest_ready: true`. Starting a process or connecting a read-only agent does not prove extraction is ready. Extraction and embeddings use the selected providers and can incur model costs when you ingest material.
 
@@ -45,7 +45,7 @@ This uses `docker compose stop`; it never removes volumes. Back up the complete 
 
 ## Existing remote service
 
-Set the token and expected space variables named in `settings.json` in the deployment's local `.env`, then run `knowledge/manage.py verify`. The endpoint must be HTTPS unless it is loopback. Obtain a read-only JWT from that service's administrator for the intended space. Locally decoding a JWT can detect a space mismatch but does not verify its signature; the actual MCP request proves server acceptance. Elephant intentionally hides global `get_health` from space-scoped principals. The helper respects that boundary and reports authenticated runtime status and capabilities instead of requesting global access.
+Set the token and expected space variables named in `settings.json` in the deployment's local `.env`, then run `knowledge/manage.py verify`. The endpoint must be HTTPS unless it is loopback. Obtain a read-only JWT from that service's administrator for the intended space. Locally decoding a JWT can detect a space mismatch but does not verify its signature; the actual MCP request proves server acceptance. The knowledge service intentionally hides global `get_health` from space-scoped principals. The helper respects that boundary and reports authenticated runtime status and capabilities instead of requesting global access.
 
 `knowledge/manage.py ingest` on a remote service requires `ELEPHANT_OPERATOR_TOKEN` supplied locally. It never reuses the agent's read-only credential to escalate access.
 

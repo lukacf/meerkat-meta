@@ -696,7 +696,7 @@ This review does not install a connector, authenticate an account or grant tools
 
 The software setup handoff above does not register a Forge-generated application
 as a Connect frontend host. The existing concrete frontend selection and
-change-management path target HomeCore. Forge now has reviewed private source for
+change-management path target a home-automation host. Forge now has reviewed private source for
 an application-host path: exact native installer receipts, selected-member policy
 input and protected controller-review presentation. These pieces are not activated
 in generated applications. A prepared change or operator review request is not
@@ -706,7 +706,7 @@ The selected application path uses Toolkit's same-runtime preparation and native
 adoption, followed by Restore of the retained installed selection. Integration
 still needs the exact qualified Core/Meta/Toolkit gateway and SDK artifacts, plus
 the application's original admission, principal, audience, conversation, delivery
-and lifecycle owners. A HomeCore-only selection does not select a Forge host.
+and lifecycle owners. Selecting only the home-automation host does not select a Forge host.
 
 The public guided installer currently supports selected Meta/Toolkit setup on
 local Mac or Linux hosts. A trusted Build owner can compile an unchanged GCP
@@ -775,7 +775,7 @@ Forge already has application composition and lifetime hooks in
 `launchkit/templates_v2/app.py`: `build(context)`, per-identity callbacks, native
 runtime startup, authenticated Console input and ordered shutdown. Integrate the
 supported contract through those hooks and the compiler, preserving native
-ownership and recovery. Do not substitute a Forge URL into HomeCore's fixed routes
+ownership and recovery. Do not substitute a Forge URL into the home-automation host's fixed routes
 or represent an inbound frontend as an MCP connection. Acceptance requires a
 useful operation through the selected frontend on the actual generated application,
 then supported restart with its original conversation and state. Source inspection,
@@ -1244,8 +1244,8 @@ these links only from verified installed source and a currently available native
 runtime. The panel labels them as declared application UI: a link does not prove
 reachability, login or a completed workflow. Missing or malformed metadata cannot
 disable installation controls. Remote interfaces need explicit authenticated
-tunnel mappings; Forge does not infer a public endpoint. For selected local
-Elephant, ordinary installation attempts to start the knowledge service and
+tunnel mappings; Forge does not infer a public endpoint. For a selected local
+knowledge service, ordinary installation attempts to start the knowledge service and
 verify authenticated access after its Docker Compose, Git, source-access and
 credential prerequisites pass. A Meta/Toolkit product installation stays stopped;
 after saving private settings, **Prepare application setup** attempts this work.
@@ -1388,8 +1388,8 @@ private journey record does not establish its review support.
 - **Workflows:** exact identity targets, prompts, dependencies, parallel branches,
   and timeouts. Validated DAGs compile into native Meerkat flow definitions. The
   native engine owns dispatch, predecessor outputs, parameters, and run outcomes.
-- **Knowledge:** connect an existing Elephant `/mcp/agent` endpoint or export an
-  isolated local Elephant deployment with persistent SurrealDB storage, scoped JWT
+- **Knowledge:** connect an existing knowledge service `/mcp/agent` endpoint or export an
+  isolated local knowledge service deployment with persistent SurrealDB storage, scoped JWT
   credentials, ingestion helpers, and verification commands.
 - **Deployments:** macOS, Linux user services, and GCP VM scripts with IAP access.
   Inspect every file before downloading the executable package.
@@ -1413,7 +1413,8 @@ conversations, tools, and memory. The four-role setup runtime uses
 `architect-runtime`. Saved wizard conversations and proposals keep their existing store.
 
 The team can inspect the current blueprint/schema, search the live registry,
-read a maintained MobKit design reference grounded in HomeCore and OB3, inspect
+read a maintained MobKit design reference grounded in a home-automation host and a
+console application, inspect
 publisher tool evidence, validate a complete design, and publish a proposal. Only
 the architect publishes plan and interview changes; its peers provide specialist help. Applying that proposal changes
 the design. It does not deploy infrastructure. New executable MCP configurations
@@ -1505,7 +1506,7 @@ npm/npx or pinned uv/uvx when those commands are granted by the exact accepted
 package. Official archives or wheels are checked against fixed SHA-256 hashes
 before installation. This does not install or authenticate the selected MCP
 servers; their real connection checks still run after private setup. Unknown
-commands and local Elephant's Docker, Compose and Git prerequisites remain
+commands and the local knowledge service's Docker, Compose and Git prerequisites remain
 explicit destination checks. Existing cloud requests retain their original
 bootstrap script and do not silently acquire new guest dependencies on resume.
 
@@ -1624,13 +1625,13 @@ Use the [first-job walkthrough](GETTING_STARTED.md#5-complete-one-useful-job) to
 check useful installed work separately from source tests.
 Registry metadata is evidence about configuration, not a certification of a
 publisher or successful authentication. OAuth-only services need an authenticated
-bridge or supported client setup. Local Elephant source builds need Docker,
+bridge or supported client setup. Local knowledge service source builds need Docker,
 repository access, and the configured pipeline provider/embedding credentials.
 
 ## Current scope
 
 Generated applications support static durable identities, native flows and Console,
-scoped tools, local notes and optional Elephant. Installation depends on the
+scoped tools, local notes and an optional knowledge service. Installation depends on the
 selected runtime and destination. The source includes Mac/Linux service controls
 and SSH/GCP transport paths. A prepared Meta preview names its supported platform
 in its generated manifest and README; remote startup needs its own original native
@@ -1641,7 +1642,7 @@ are application extensions that the implementation agent can build as ordinary
 code. Unknown external contracts and destination verification stay visible in the
 checked package; code generation does not mark the guide's open requirements as
 installed. Operator-led
-Elephant ingestion is available through the generated knowledge helper.
+knowledge service ingestion is available through the generated knowledge helper.
 
 ## Design reference
 

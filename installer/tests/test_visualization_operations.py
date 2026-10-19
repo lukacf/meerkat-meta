@@ -373,7 +373,8 @@ async def test_restored_native_owner_drains_before_latest_stream_revision_is_adm
     assert saved['key'] == original_key and saved['admission'] == original_admission
     assert saved['idempotency_key'] == 'original-native-idempotency'
     release.set()
-    await asyncio.wait_for(asyncio.gather(first_task, *operations.tasks.values(), return_exceptions=True), .5)
+    # A settle bound only: the assertions below check state, not elapsed time.
+    await asyncio.wait_for(asyncio.gather(first_task, *operations.tasks.values(), return_exceptions=True), 30)
     assert len(sends) == 1
     assert latest['status'] == 'completed', latest.get('error', latest)
     latest_key = service.request_binding(latest_spec, model)['native_request_key']

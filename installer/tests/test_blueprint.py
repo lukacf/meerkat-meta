@@ -158,5 +158,5 @@ def test_local_knowledge_cloud_capacity_is_explicit(machine, disk, allowed):
     if allowed:
         assert Blueprint.model_validate(data).gcp.disk_gb == disk
     else:
-        with pytest.raises(ValidationError, match="Building local Elephant"):
+        with pytest.raises(ValidationError, match="Building the local knowledge service"):
             Blueprint.model_validate(data)

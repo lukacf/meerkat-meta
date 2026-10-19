@@ -54,6 +54,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Guide's Linux release inputs; only the product owner's selection is still to
   be filled.
 
+- The console Access panel keeps edits available while it re-reads the
+  access configuration in the background. Live run events, layout changes
+  and gating decisions start these reads, and each one disabled every edit
+  control and showed "Refreshing owner state" until it landed, so a click
+  made during a read was lost. A background read now changes the panel only
+  when it lands. The first read after opening Access or changing connection
+  or subject, a Refresh, and the read after a save still disable edits until
+  they land, and a failed read still disables them until a read succeeds. A
+  save still carries the draft's edit token, which the owner checks, so a
+  draft is never rebased onto a newer configuration.
+
 ### Fixed
 
 - The `complete_held_identity_members` documentation no longer says that
@@ -87,6 +98,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a marker over its corner instead of an extra line. The line grew the first
   row of verdict tiles, so each refresh moved the tiles below it under a click
   in progress.
+- Meta Forge's animation diagnostics give `renderMs`, `copyMs`,
+  `parentRafAgeMs` and `deadlineOvershootMs` in whole milliseconds. Each is a
+  clock difference and could show its floating-point error, such as
+  3.0000000000000284 for a 3 ms render.
+- Meta Forge no longer strands the slot of a visual review that an earlier
+  version left running when the animation renderer changes. The first review
+  after such an update failed to start, and the slot stayed taken after that
+  review's runtime ended; two of them blocked every visual review. Visual
+  reviews saved by an earlier Forge must be run again, because this release
+  changes the animation renderer: opening one reports that it uses another
+  trusted bridge version. A publication that already used both review
+  attempts needs a new animation version first.
 
 ## [0.9.3] - 2026-10-18
 

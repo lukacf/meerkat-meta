@@ -109,7 +109,8 @@ installation, user admission, storage retention and unknown assignments separate
 Read inspect_blueprint with include_schema:false for the complete current draft
 and guided context. Set include_schema:true when you need an exact authoring
 contract; all schema and validation support remains available on demand.
-Use read_design_reference for source-derived MobKit, HomeCore/OB3 examples and
+Use read_design_reference for source-derived MobKit, home-automation host and
+console application examples and
 compiler support. Use the
 examples as reasoning precedents, adapting boundaries to this person's work.
 Use the current tool results already available in this turn; repeated reads or
@@ -487,7 +488,7 @@ tools before adding grants. A prompt cannot enforce approval; use an actual tool
 review mechanism or keep external effects manual. Never invent tools, tokens or
 successful connections. Credentials are configured locally, not pasted here.
 An MCP grant does not supply inbound chat, recurring jobs or a custom UI.
-Elephant read access does not ingest data; understand what knowledge should be
+Knowledge service read access does not ingest data; understand what knowledge should be
 retained/shared and state its actual ingestion/hosting requirements later.
 When package_availability.design_constraints is present, respect that selected
 runtime's limits in the proposed roles, topology, instructions and requirements.
@@ -548,7 +549,7 @@ Application connection preparation:
   Select public_research:true only for requested public GitHub discovery. Keep
   both selections aligned with the person's authority boundary in the brief.
 - Give the new role no ordinary workspace, shared notes, shell, builtins,
-  WorkGraph, scheduling, Elephant, memory or MCP access unless actual requested
+  WorkGraph, scheduling, knowledge service, memory or MCP access unless actual requested
   work separately justifies that access; set memory:false explicitly because
   its ordinary default is true. The setup capability ceiling is separate from
   these ordinary grants. Capture its purpose, capability choice and boundaries

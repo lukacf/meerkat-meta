@@ -413,17 +413,17 @@ export function installSteps(plan) {
     });
   if (localKnowledge)
     steps.push({
-      title: "Start and verify Elephant",
+      title: "Start and verify the knowledge service",
       commands: [
         ".venv/bin/python knowledge/manage.py up",
         ".venv/bin/python knowledge/manage.py verify",
       ],
       detail:
-        "Install Docker first. Setup has already prepared this deployment's private Elephant space and credentials.",
+        "Install Docker first. Setup has already prepared this deployment's private knowledge space and credentials.",
     });
   else if (anyKnowledge)
     steps.push({
-      title: "Verify your existing Elephant connection",
+      title: "Verify your existing knowledge service connection",
       commands: [".venv/bin/python knowledge/manage.py verify"],
       detail: "The configured endpoint, token, and space must match.",
     });
