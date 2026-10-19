@@ -218,6 +218,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   changes the animation renderer: opening one reports that it uses another
   trusted bridge version. A publication that already used both review
   attempts needs a new animation version first.
+- A scope-bound delivery that meerkat refuses because the mob's admission
+  is closed (`MobError::AdmissionClosed`, whatever closed it: an idle close,
+  the last owner's release, a stand-down, a shutdown, a destroy or an actor
+  exit) or because the member is closed for identity convergence
+  (`MobError::IdentityConvergenceAdmissionClosed`) is reported as
+  `ScopedDeliveryError::Rejected` (wire kind `scoped_delivery_rejected`,
+  `admission_possible: false`). Before, it was reported as `Uncertain`
+  (`scoped_delivery_uncertain`), so a caller recovered a delivery that was
+  never admitted.
+- A `WeakPublicIdentityRuntime` (from `PublicIdentityRuntime::downgrade`)
+  no longer upgrades after the runtime's `shutdown`, even while the identity
+  runtime itself is still held, as D67 documents ("`None` once it closed"):
+  Meerkat 0.9.4 closes the mob's admission when it admits the Shutdown.
+  Against Meerkat 0.9.3 the weak link still upgraded after a shutdown.
 
 ## [0.9.3] - 2026-10-18
 

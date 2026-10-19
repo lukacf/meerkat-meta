@@ -8714,6 +8714,45 @@ mod tests {
         );
     }
 
+    /// D67: `shutdown` shuts the mob down, and a shut-down mob admits no
+    /// public owner, so a weak identity runtime link that outlives the
+    /// shutdown upgrades to `None` ("`None` once it closed"), even while the
+    /// identity runtime itself is still held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_weak_identity_runtime_does_not_upgrade_after_shutdown() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (runtime, identity_runtime) = boot_identity_first_persistent(
+            "weak-identity-after-shutdown",
+            &temp.path().join("mob.sqlite3"),
+            &temp.path().join("state"),
+        )
+        .await;
+        let weak = runtime
+            .identity_runtime()
+            .expect("identity runtime export")
+            .downgrade();
+        assert!(
+            weak.upgrade().is_some(),
+            "upgrades while the mob admits owners"
+        );
+        let closed = runtime.mob_handle().observer().admission_closed();
+
+        runtime.shutdown().await;
+        assert!(
+            weak.runtime_strong_count() > 0,
+            "the identity runtime is still held, so only the mob decides"
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "a shut-down mob grants the weak link no public owner"
+        );
+        assert!(
+            closed.borrow().is_some(),
+            "the shutdown closed the mob's admission"
+        );
+        drop(identity_runtime);
+    }
+
     /// D67: the session bridge exported from an identity runtime view is a
     /// public owner. Kept after dropping the view and the runtime, it keeps
     /// the mob owned and stays usable; releasing it lets the idle mob close.
