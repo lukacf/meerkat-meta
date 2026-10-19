@@ -640,6 +640,9 @@ mod tests {
             .with_writer(writer.clone())
             .with_max_level(tracing::Level::WARN)
             .finish();
+        // A second registered Dispatch keeps callsite interest from being
+        // cached `never` by threads without a subscriber.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
         let incremental = tracing::subscriber::with_default(subscriber, || {
             probe_session_store_incremental(store, store_kind)
         });

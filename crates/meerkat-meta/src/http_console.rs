@@ -1142,6 +1142,9 @@ mod voice_readiness_budget_tests {
             .with_ansi(false)
             .with_max_level(tracing::Level::INFO)
             .finish();
+        // A second registered Dispatch keeps callsite interest from being
+        // cached `never` by threads without a subscriber.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
         tracing::subscriber::with_default(subscriber, || {
             log_voice_readiness("agent-a", 2, answer);
         });
