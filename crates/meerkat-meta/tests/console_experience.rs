@@ -118,14 +118,14 @@ fn console_voice_is_unavailable_without_an_authenticated_voice_host() {
                     email: "alice@example.com".to_string(),
                 }),
             },
-            Some(&ConsoleLiveSnapshot {
-                runtime_id: Some("voice-test".to_string()),
-                running: true,
-                loaded_modules: vec![],
-                agents: vec![],
-                members: vec![],
-                has_mob_runtime: true,
-            }),
+            Some(&ConsoleLiveSnapshot::new(
+                Some("voice-test".to_string()),
+                true,
+                vec![],
+                vec![],
+                Vec::new(),
+                true,
+            )),
         );
         assert_eq!(response.status, 200);
         assert_eq!(

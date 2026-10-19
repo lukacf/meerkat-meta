@@ -95,6 +95,7 @@ pub mod tool_compose;
 pub mod topology_control;
 pub mod types;
 pub mod unified_runtime;
+pub mod unobserved;
 pub mod workgraph_admission;
 pub mod workgraph_events;
 pub mod workgraph_realm;
@@ -336,6 +337,7 @@ pub use unified_runtime::{
     UnifiedRuntimeReconcileReport, UnifiedRuntimeReconcileRoutingReport, UnifiedRuntimeRunReport,
     UnifiedRuntimeShutdownReport, discovery_spec_to_spawn_spec,
 };
+pub use unobserved::{UnobservedFacts, UnobservedReason};
 pub use workgraph_realm::{
     AttentionTargetRealm, MigratedMemberBinding, WorkGraphRealmMigrationMode,
     WorkGraphRealmMigrationOutcome, WorkGraphRealmMigrationReport,

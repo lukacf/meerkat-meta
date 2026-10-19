@@ -3,6 +3,7 @@
 use super::*;
 use crate::access::{AccessController, AccessResource, AccessView, AgentResourceAttributes};
 use crate::rpc::META_CONTRACT_VERSION;
+use crate::unobserved::{UnobservedFacts, UnobservedReason};
 
 /// Console-facing view of a single mob member.
 ///
@@ -103,6 +104,7 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ConsoleLiveSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<String>,
@@ -581,19 +583,9 @@ fn default_console_live_snapshot(decisions: &RuntimeDecisionState) -> ConsoleLiv
     )
 }
 
-/// Why facts of a console record are unobserved: one wire shape for every
-/// record that names facts the console holds no current observation of,
-/// `"unobserved": {"reason": ..., "fields": [...]}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum UnobservedReason {
-    /// The identity binding behind the record moved, and the read model had
-    /// not re-collected it by the console's binding refresh deadline.
-    RefreshPending,
-}
-
+/// The `unobserved` marker of a console record (see [`crate::unobserved`]).
 fn unobserved_marker(reason: UnobservedReason, fields: &[&str]) -> Value {
-    serde_json::json!({ "reason": reason, "fields": fields })
+    UnobservedFacts::new(reason, fields).to_value()
 }
 
 /// Sidebar facts a pending row withholds.

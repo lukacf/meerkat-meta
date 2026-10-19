@@ -55,6 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `meta/get_member`), which already refused a stale runtime id, now send
   the same six-field `error.data`, adding `registered_session_id` and
   `live_session_id`.
+- `ConsoleLiveSnapshot` is `#[non_exhaustive]`: build it with
+  `ConsoleLiveSnapshot::new`, so a later field is not a breaking change.
 
 ### Security
 
@@ -75,6 +77,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Publication releases those exact bytes as a prerelease that never becomes the
   latest release. `forge.yml` can now be dispatched, and records each job's
   toolchain. `installer/RELEASING.md` has the steps.
+- `meerkat_meta::unobserved`: `UnobservedFacts` (built with
+  `UnobservedFacts::new`) and `UnobservedReason` (`RefreshPending`,
+  `NotObserved`), both `#[non_exhaustive]`. They are the shape of the
+  `"unobserved": {"reason": ..., "fields": [...]}` marker the console
+  experience puts on a fact it holds no observation for.
 
 ### Changed
 
