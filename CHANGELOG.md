@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `.github/workflows/forge-release.yml` releases Meta Forge on its own
+  `forge-v<version>` tag, beside Meta's releases. A candidate builds each target's
+  package from public inputs pinned in `installer/release/forge-release-inputs.json`,
+  verifies and attests it, and binds the set, together with a green dispatched
+  `forge.yml` run that tested the same Forge inputs, in an attested candidate
+  manifest.
+  Publication releases those exact bytes as a prerelease that never becomes the
+  latest release. `forge.yml` can now be dispatched, and records each job's
+  toolchain. `installer/RELEASING.md` has the steps.
+
 ### Changed
 
 - `/console/experience` takes an identity-first member's session from the
@@ -29,6 +41,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   console-core mirrors the marker (`UnobservedFacts`,
   `normalizeUnobservedFacts`, `IdentityStatusRow.unobserved`), and the
   console carries it on its agent rows.
+
+### Fixed
+
+- The `complete_held_identity_members` documentation no longer says that
+  resumed members are skipped. A held identity bootstrap holds fresh members
+  only: a roster member that already has continuity refuses the whole pass
+  (`HeldBootstrapRefusal::ExistingContinuity`) before any member is held, as
+  it did before.
+- The durable-behind repair's INFO log names the durable and parent row
+  counts (`durable_messages`, `parent_messages`), the first committed rewrite
+  it replays (`first_rewrite_generation`) and how many it replays
+  (`replayed_rewrites`), and states the shape it observed without presuming
+  a failed projection: appends inside one committed boundary before a
+  compaction leave the same shape. It said the durable row was a prefix of
+  the sealed commit's parent, which is wrong when the row is several
+  rewrites behind: the repair proves the earliest rewrite whose parent the
+  row is a prefix of and replays every rewrite from there to the sealed
+  head.
 
 ## [0.9.3] - 2026-10-18
 
