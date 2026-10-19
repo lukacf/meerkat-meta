@@ -91,9 +91,13 @@ function toolConfigStatus(value: unknown): boolean {
   }
 }
 
+// Core 0.9.4 writes the tool-config lifecycle bit as `settled`; rows that 0.9.3
+// and earlier stored keep their `persisted` and are served back as stored.
+const lifecycleBit = (value: RecordValue) => Object.hasOwn(value, "settled") ? value.settled : value.persisted;
+
 function toolConfig(value: unknown): boolean {
   const payload = record(value);
-  return !!payload && operation(payload.operation) && string(payload.target) && boolean(payload.persisted)
+  return !!payload && operation(payload.operation) && string(payload.target) && boolean(lifecycleBit(payload))
     && toolConfigStatus(payload.status_info)
     && optional(payload.applied_at_turn, value => ordinal(value) && value <= 0xffff_ffff)
     && optional(payload.domain, value => oneOf(value, ["tool_scope", "deferred_catalog"]))
@@ -122,7 +126,8 @@ function noticeBlock(value: unknown): boolean {
     case "tool_config": return toolConfig(block.payload);
     case "mcp": return optionalStrings(block, ["server_id", "detail"])
       && optional(block.operation, operation) && optional(block.phase, phase)
-      && defaulted(block.persisted, boolean) && defaulted(block.pending_sources, strings);
+      && defaulted(block.settled, boolean) && defaulted(block.persisted, boolean)
+      && defaulted(block.pending_sources, strings);
     case "background_job": return string(block.job_id)
       && oneOf(block.status, ["completed", "failed", "aborted", "cancelled", "retired", "terminated"])
       && optionalStrings(block, ["display_name", "detail"]) && defaulted(block.persisted, boolean);
