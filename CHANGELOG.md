@@ -23,6 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   incident command center example parses its scenario with four of these
   rules: YAML 1.2 booleans, `<<` as an ordinary key, and refusal of
   duplicate keys and unknown tags.
+- `BridgeError` and `BridgeAdmissionError` have two new variants, appended
+  last: `MobAdmissionClosed`, for a delivery Meerkat Core refused because the
+  mob's admission is closed (for any close reason), and
+  `MobShutdownInProgress`, for one it refused while a Shutdown of the mob was
+  still draining (retry later; the mob is not gone). Both carry the member
+  identity, the mob id and Core's message, and render as the `Mob` message
+  they replace. A `match` on either enum without a wildcard needs arms for
+  them. The deliver path hands both up typed and never repairs the member
+  for them (the substring repair classifier no longer sees their text); a
+  completion-bearing send still fails with
+  `IdentityRuntimeError::AdmissionFailed`, whose detail is now Core's message
+  without the `session bridge mob error:` prefix.
 
 ### Security
 
