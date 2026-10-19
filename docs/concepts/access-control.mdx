@@ -213,7 +213,11 @@ request.
    review step binds the intended edit to the current configuration; it does not
    itself write. Refreshing alone never silently rebases or retries the draft.
 
-A loading or failed protected read disables edits until a current read succeeds.
+The first read after opening Access or changing connection or subject, a Refresh,
+and the read after a save disable edits until they succeed; so does a failed read.
+Reads the console starts in the background keep the last successful read in use
+and never rebase a draft; the owner still checks the draft's edit token when you
+save.
 Missing or unknown checked-save capability also disables edits while permitted
 reads remain available. Losing administrator access or switching connection or
 subject must not expose the previous scope's draft. Server-side read-only mode

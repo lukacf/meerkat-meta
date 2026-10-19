@@ -832,7 +832,7 @@ function startMockConsoleServer(options = {}) {
         res.on("close", () => {
           streamClients.delete(res);
         });
-        if (Object.keys(timelineStreamFramesDuringSendByIdentity).length > 0) {
+        if (Object.keys(timelineStreamFramesDuringSendByIdentity).length > 0 || options.holdTimelineStream === true) {
           res.write([
             "id: timeline-ready-1",
             "event: keep-alive",
@@ -887,6 +887,18 @@ function startMockConsoleServer(options = {}) {
       resolve({
         baseUrl: `http://127.0.0.1:${server.address().port}`,
         requests,
+        // Writes frames to every open timeline stream; returns how many
+        // streams received them.
+        emitTimelineStreamFrames: (frames, label = "pushed") => {
+          let index = 0;
+          for (const res of streamClients) {
+            for (const frame of frames) {
+              index += 1;
+              writeTimelineStreamFrame(res, frame, `${label}-${index}`);
+            }
+          }
+          return streamClients.size;
+        },
         close: () => new Promise((done, closeError) => {
           server.close((error) => error ? closeError(error) : done());
         }),
@@ -3652,6 +3664,108 @@ async function runAccessTabClickDuringRefreshProof() {
   }
 }
 
+// A stream event refreshes a settled Access panel in the background. While
+// that read is in flight the panel keeps its edits: no "Refreshing owner
+// state" notice, and a press and release on Edit admins opens the editor. The
+// configuration read is held open so the background read is visibly in
+// flight; the owner's edit token, not a disabled form, protects a save.
+async function runAccessEditDuringBackgroundRefreshProof() {
+  const evidence = path.join(process.env.META_BROWSER_EVIDENCE || path.join(repoRoot, "output/playwright/console-acceptance"), "access-edit-during-background-refresh");
+  fs.mkdirSync(evidence, { recursive: true });
+  const config = { enabled: true, admins: ["root@example.test"], rules: [], groups: {} };
+  const metadata = { revision: 1, owner_instance: "opaque-owner:one", conditional_mutations: "checked_v1" };
+  const status = () => ({ available: true, enabled: true, can_administer: true, subject: "root@example.test", actions: ["agent.view"], ...metadata });
+  let holdConfigReads = false;
+  let releaseConfigReads;
+  const configReadsReleased = new Promise(resolve => { releaseConfigReads = resolve; });
+  const heldReads = [], answeredReads = [], errors = [], checkpoints = [];
+  const server = await startMockConsoleServer({ holdTimelineStream: true });
+  let browser, page, failure;
+  try {
+    browser = await launchBrowser();
+    page = await browser.newPage({ viewport: { width: 1280, height: 960 } });
+    page.setDefaultTimeout(10000);
+    page.on("pageerror", error => errors.push(String(error)));
+    await page.route("**/console/experience", async route => {
+      const response = await route.fetch(); const value = await response.json();
+      await route.fulfill({ response, json: { ...value, access: status() } });
+    });
+    await page.route("**/console/rpc", async route => {
+      const request = route.request().postDataJSON();
+      const reply = payload => route.fulfill({ json: { jsonrpc: "2.0", id: request.id, ...payload } });
+      if (request.method === "meta/capabilities") {
+        const response = await route.fetch(); const value = await response.json();
+        value.result.methods.push("meta/access/status", "meta/access/get");
+        return route.fulfill({ response, json: value });
+      }
+      if (request.method === "meta/access/status") return reply({ result: status() });
+      if (request.method === "meta/access/get") {
+        if (holdConfigReads) {
+          heldReads.push(request.id);
+          await configReadsReleased;
+        }
+        await reply({ result: { config, ...metadata } });
+        answeredReads.push(request.id);
+        return;
+      }
+      return route.continue();
+    });
+    await gotoConsole(page, `${server.baseUrl}/console`);
+    await page.getByText("Access", { exact: true }).first().click();
+    await page.getByRole("heading", { name: "Console access", exact: true }).waitFor();
+    const edit = page.getByTestId("access-edit-admins");
+    await edit.waitFor();
+    const refreshing = page.getByTestId("access-panel")
+      .getByText("Refreshing owner state. Changes are temporarily unavailable.", { exact: true });
+    // The first read of the scope is not a background read: it shows the notice
+    // until it lands.
+    await refreshing.waitFor({ state: "detached" });
+    holdConfigReads = true;
+    const streams = server.emitTimelineStreamFrames([{
+      id: "background-tool-call-1", kind: "tool_call", identity: "identity:luka",
+      timestamp_ms: Date.now(), cursor: "console:background-tool-call:1",
+      payload: { id: "call-background-1", name: "noop", arguments: {} },
+    }], "background-tool-call");
+    assert.ok(streams > 0, "no timeline stream was open for the tool call");
+    for (let wait = 0; heldReads.length === 0; wait += 1) {
+      assert.ok(wait < 200, "the tool call did not start a background configuration read");
+      await page.waitForTimeout(25);
+    }
+    await page.screenshot({ path: path.join(evidence, "background-read-in-flight.png"), fullPage: true });
+    assert.equal(await refreshing.count(), 0, "a background read showed the refresh notice");
+    assert.equal(await edit.isEnabled(), true, "a background read disabled Edit admins");
+    const target = await edit.boundingBox();
+    await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2);
+    await page.mouse.down();
+    await page.mouse.up();
+    await page.getByTestId("access-admins-input").waitFor();
+    checkpoints.push({ step: "edited-during-background-read", heldReads: [...heldReads], refreshing: await refreshing.count() });
+    holdConfigReads = false;
+    releaseConfigReads();
+    // The background read lands with the same revision: the open draft stays.
+    for (let wait = 0; !answeredReads.includes(heldReads[0]); wait += 1) {
+      assert.ok(wait < 200, "the held background read was never answered");
+      await page.waitForTimeout(25);
+    }
+    await page.waitForTimeout(250);
+    assert.equal(await page.getByTestId("access-admins-input").count(), 1, "the landed background read closed the open draft");
+    assert.equal(await refreshing.count(), 0);
+    assert.deepEqual(errors, []);
+    checkpoints.push({ step: "complete" });
+  } catch (error) {
+    failure = String(error.stack || error);
+    if (page) fs.writeFileSync(path.join(evidence, "failure-body.txt"), await page.locator("body").innerText().catch(() => "unavailable"));
+    throw error;
+  } finally {
+    releaseConfigReads();
+    fs.writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ backend: "mock HTTP access RPC", checkpoints, errors, failure: failure || null }, null, 2));
+    // A route still fetching when the page closes must not outlive the scenario.
+    if (page) await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
+    if (browser) await browser.close();
+    await server.close();
+  }
+}
+
 // A memory refresh that fails shows its error while a tab click may be in
 // flight, and the next successful refresh clears it. The error must not move
 // the tab row under a pressed pointer, or the release lands on another
@@ -4228,6 +4342,7 @@ async function runWorkGraphHeaderClickAcrossRefreshProof(width) {
 const scenarios = [
   ...["conflict", "group", "unavailable"].map(mode => ({ id: `checked-save-${mode}`, family: "console", backend: "mock", run: () => runCheckedSaveBrowserProof(mode) })),
   { id: "access-tab-click-during-refresh", family: "console", backend: "mock", run: runAccessTabClickDuringRefreshProof },
+  { id: "access-edit-during-background-refresh", family: "console", backend: "mock", run: runAccessEditDuringBackgroundRefreshProof },
   { id: "memory-tab-click-during-failed-refresh", family: "console", backend: "mock", run: runMemoryTabClickDuringFailedRefreshProof },
   { id: "workgraph-action-click-during-failed-refresh", family: "console", backend: "mock", run: runWorkGraphActionClickDuringFailedRefreshProof },
   { id: "memory-body-click-across-refresh", family: "console", backend: "mock", run: runMemoryBodyClickAcrossRefreshProof },

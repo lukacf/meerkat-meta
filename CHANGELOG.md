@@ -44,6 +44,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   latest release. `forge.yml` can now be dispatched, and records each job's
   toolchain. `installer/RELEASING.md` has the steps.
 
+### Changed
+
+- The console Access panel keeps edits available while it re-reads the
+  access configuration in the background. Live run events, layout changes
+  and gating decisions start these reads, and each one disabled every edit
+  control and showed "Refreshing owner state" until it landed, so a click
+  made during a read was lost. A background read now changes the panel only
+  when it lands. The first read after opening Access or changing connection
+  or subject, a Refresh, and the read after a save still disable edits until
+  they land, and a failed read still disables them until a read succeeds. A
+  save still carries the draft's edit token, which the owner checks, so a
+  draft is never rebased onto a newer configuration.
+
 ### Fixed
 
 - The `complete_held_identity_members` documentation no longer says that
