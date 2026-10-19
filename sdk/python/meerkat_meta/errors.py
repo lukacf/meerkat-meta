@@ -40,6 +40,12 @@ INIT_IN_PROGRESS_CODE: int = -32018
 # launch. The error data carries the refusal's ``kind`` and, where it has
 # them, the diverged ``fields``.
 COMPOSITION_PROVENANCE_CODE: int = -32019
+# meerkat's typed refusal for a member whose runtime registration must be
+# reloaded before it accepts work (`meta/force_cancel_member`). The error
+# data carries ``kind = MEMBER_RELOAD_REQUIRED_KIND`` and names the member
+# and the repair, ``required_action = "reload_member_registration"``.
+MEMBER_RELOAD_REQUIRED_CODE: int = -32029
+MEMBER_RELOAD_REQUIRED_KIND: str = "mob_member_reload_required"
 # WorkGraph service not configured on the runtime.
 WORKGRAPH_UNAVAILABLE_CODE: int = -32041
 # WorkGraph CAS/revision conflict on a mutation (stale `expected_revision`).
@@ -496,6 +502,45 @@ class CompositionProvenanceError(RpcError):
             [field for field in fields if isinstance(field, str)]
             if isinstance(fields, list)
             else []
+        )
+
+
+class MemberReloadRequiredError(RpcError):
+    """Raised when a member needs a runtime reload before it accepts work.
+
+    ``meta/force_cancel_member`` answers meerkat's typed refusal (code
+    ``-32029``, data ``kind`` ``"mob_member_reload_required"``) for a member
+    whose runtime registration cannot serve work. Both must match; any other
+    ``-32029`` answer stays a plain :class:`RpcError`.
+    ``member_id`` and ``reason`` come from the refusal's data, and
+    ``required_action`` names meerkat's repair,
+    ``"reload_member_registration"``. Each is ``None`` when the gateway sent
+    no such field; the full refusal stays available as ``data``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str = "",
+        method: str = "",
+        data: Any | None = None,
+    ):
+        super().__init__(
+            MEMBER_RELOAD_REQUIRED_CODE,
+            message,
+            request_id=request_id,
+            method=method,
+            data=data,
+        )
+        refusal = data if isinstance(data, dict) else {}
+        member_id = refusal.get("member_id")
+        self.member_id: str | None = member_id if isinstance(member_id, str) else None
+        reason = refusal.get("reason")
+        self.reason: str | None = reason if isinstance(reason, str) else None
+        required_action = refusal.get("required_action")
+        self.required_action: str | None = (
+            required_action if isinstance(required_action, str) else None
         )
 
 

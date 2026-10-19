@@ -2482,7 +2482,13 @@ pub(super) async fn handle_force_cancel_member(
             {
                 return response;
             }
-            let result = if let Some(identity_rt) = identity_runtime
+            // The meerkat verb's typed `MobError` is carried out of the
+            // identity operation intact, as `meta/stop_member_run` carries
+            // it: a member that needs a runtime reload, an unknown member and
+            // every other mob refusal keep meerkat's typed code and
+            // structured data.
+            let result: Result<Result<(), meerkat_mob::MobError>, String> = if let Some(identity_rt) =
+                identity_runtime
                 && let Some(identity) = identity_rt.identity_for_member_mutation(&mid).await
             {
                 let handle = runtime.mob_handle();
@@ -2491,10 +2497,7 @@ pub(super) async fn handle_force_cancel_member(
                 let member_id = crate::member_comms_id::roster_member_id_for_supplied_id(&mid);
                 identity_rt
                     .run_member_alias_operation_tracked(&identity, &mid, move || async move {
-                        handle
-                            .force_cancel_member(member_id)
-                            .await
-                            .map_err(|error| error.to_string())
+                        Ok(handle.force_cancel_member(member_id).await)
                     })
                     .await
                     .map_err(|error| error.to_string())
@@ -2503,19 +2506,19 @@ pub(super) async fn handle_force_cancel_member(
                     "generated member alias requires current identity authority: {mid}"
                 ))
             } else {
-                runtime
+                Ok(runtime
                     .mob_handle()
                     .force_cancel_member(crate::member_comms_id::mob_member_id(&mid))
-                    .await
-                    .map_err(|error| error.to_string())
+                    .await)
             };
             match result {
-                Ok(()) => JsonRpcResponse {
+                Ok(Ok(())) => JsonRpcResponse {
                     jsonrpc: JSONRPC_VERSION.to_string(),
                     id: response_id,
                     result: Some(serde_json::json!({"accepted": true})),
                     error: None,
                 },
+                Ok(Err(mob_error)) => mob_declaration_error(response_id, &mob_error),
                 Err(err) => JsonRpcResponse {
                     jsonrpc: JSONRPC_VERSION.to_string(),
                     id: response_id,
@@ -3830,6 +3833,36 @@ mod member_declaration_error_parity_tests {
         assert_ne!(
             ErrorCode::StaleFence.jsonrpc_code(),
             ErrorCode::StaleCursor.jsonrpc_code()
+        );
+    }
+
+    /// A member that needs a runtime reload keeps meerkat's own code and the
+    /// named repair, so a caller of `meta/force_cancel_member` can tell it
+    /// apart from every other refusal and reload the member's registration.
+    #[test]
+    fn a_member_that_needs_a_reload_keeps_its_code_and_named_repair() {
+        let (code, data) = error_for(&meerkat_mob::MobError::MemberReloadRequired {
+            member_id: meerkat_mob::AgentIdentity::from("worker"),
+            reason: "runtime registration is degraded".to_string(),
+        });
+        assert_eq!(
+            code,
+            i64::from(ErrorCode::MemberReloadRequired.jsonrpc_code()),
+            "the reload-required code must survive, or a caller cannot branch on it"
+        );
+        let data = data.expect("reload-required data names the member and the repair");
+        assert_eq!(
+            data["kind"],
+            serde_json::json!("mob_member_reload_required")
+        );
+        assert_eq!(data["member_id"], serde_json::json!("worker"));
+        assert_eq!(
+            data["reason"],
+            serde_json::json!("runtime registration is degraded")
+        );
+        assert_eq!(
+            data["required_action"],
+            serde_json::json!("reload_member_registration")
         );
     }
 

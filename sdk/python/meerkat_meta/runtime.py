@@ -35,10 +35,13 @@ from .errors import (
     STORAGE_RESOLUTION_CODE,
     INIT_IN_PROGRESS_CODE,
     COMPOSITION_PROVENANCE_CODE,
+    MEMBER_RELOAD_REQUIRED_CODE,
+    MEMBER_RELOAD_REQUIRED_KIND,
     WORKGRAPH_CONFLICT_CODE,
     WORKGRAPH_UNAVAILABLE_CODE,
     CapabilityUnavailableError,
     CompositionProvenanceError,
+    MemberReloadRequiredError,
     CONSOLE_TIMELINE_REPLAY_UNAVAILABLE_CODE,
     ConsoleTimelineReplayUnavailableError,
     LeaseLostError,
@@ -274,6 +277,17 @@ def _rpc_error_from_payload(
         )
     if code == COMPOSITION_PROVENANCE_CODE:
         return CompositionProvenanceError(
+            message,
+            request_id=request_id,
+            method=method,
+            data=data,
+        )
+    if (
+        code == MEMBER_RELOAD_REQUIRED_CODE
+        and isinstance(data, dict)
+        and data.get("kind") == MEMBER_RELOAD_REQUIRED_KIND
+    ):
+        return MemberReloadRequiredError(
             message,
             request_id=request_id,
             method=method,
@@ -4701,7 +4715,12 @@ class MobHandle:
         return IdentityRoutingStatusResult.from_dict(raw)
 
     async def force_cancel_member(self, member_id: str) -> None:
-        """Force-cancel a running member immediately."""
+        """Force-cancel a running member immediately.
+
+        A mob refusal raises with meerkat's typed code and data; a member
+        whose runtime registration must be reloaded first raises
+        :class:`MemberReloadRequiredError`.
+        """
         await self._runtime._rpc("meta/force_cancel_member", {"member_id": member_id})
 
     async def stop_member_run(

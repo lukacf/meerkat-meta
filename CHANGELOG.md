@@ -55,6 +55,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `meta/get_member`), which already refused a stale runtime id, now send
   the same six-field `error.data`, adding `registered_session_id` and
   `live_session_id`.
+- Behaviour-only: `meta/force_cancel_member` answers a mob refusal with
+  meerkat's typed code and structured data on stdio and on `/console/rpc`,
+  as `meta/stop_member_run` does, instead of `-32000` with the refusal in
+  its message (`force_cancel_member failed: ...`). A member whose runtime
+  registration must be reloaded before it accepts work answers meerkat's
+  `-32029` with `error.data.kind` `mob_member_reload_required`, the
+  `member_id`, the `reason` and `required_action`
+  `reload_member_registration`, the same refusal rkat-rpc sends. An unknown
+  member answers `-32602` `mob member not found: <id>`. A generated alias
+  without identity authority and an identity-runtime failure keep `-32000`.
 
 ### Security
 
@@ -75,6 +85,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Publication releases those exact bytes as a prerelease that never becomes the
   latest release. `forge.yml` can now be dispatched, and records each job's
   toolchain. `installer/RELEASING.md` has the steps.
+- Python SDK `MemberReloadRequiredError` and TypeScript SDK
+  `MemberReloadRequiredError` (with `MEMBER_RELOAD_REQUIRED_CODE`, `-32029`,
+  and `MEMBER_RELOAD_REQUIRED_KIND`, `mob_member_reload_required`):
+  `force_cancel_member` / `forceCancelMember` raise it for a member whose
+  runtime registration must be reloaded, when the refusal carries both the
+  code and the kind, with `member_id`/`memberId`, `reason` and
+  `required_action`/`requiredAction`. Any other `-32029` stays a plain
+  `RpcError`.
 
 ### Changed
 
