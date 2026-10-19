@@ -71,7 +71,8 @@ pub enum MemberProblem {
     /// Not a durable identity in its public form.
     Invalid(String),
     /// A member this gateway's runtime does not serve (placed on a host, or
-    /// bound to an external runtime), so a delivery could never be admitted.
+    /// bound to an external runtime), or whose route contradicts it, so a
+    /// delivery could never be admitted.
     Unusable(String),
     /// The peer gateway cannot be called authenticated.
     UnusablePeer(String),
@@ -477,6 +478,10 @@ pub(crate) enum OwnerRefusal {
     /// this gateway's. The record contradicts itself, and no member of this
     /// gateway's mob is delivered to in that member's place.
     LocalRouteNamesAnotherMob { member: Member, own: MobId },
+    /// The batch's route is local, but this gateway names no mob of its
+    /// own, so the route cannot be shown to name the member's mob: it is
+    /// refused as one that contradicts itself.
+    LocalRouteWithoutOwnMob { member: Member },
 }
 
 impl std::fmt::Display for OwnerRefusal {
@@ -488,25 +493,37 @@ impl std::fmt::Display for OwnerRefusal {
                 "the batch for {member} is routed to this gateway's mob {own}, \
                  which is not the member's"
             ),
+            Self::LocalRouteWithoutOwnMob { member } => write!(
+                f,
+                "the batch for {member} is routed to this gateway, which names no mob of its own"
+            ),
         }
     }
 }
 
 /// The one guard on a member's kept route: a local route names a member of
-/// this gateway's own mob. Run before anything is prepared, ended, submitted
-/// or read for the member, so no member of this gateway's mob is touched in
-/// another mob's member's place.
+/// this gateway's own mob, `own`. Run before anything is prepared, ended,
+/// submitted or read for the member, so no member of this gateway's mob is
+/// touched in another mob's member's place. A gateway that names no mob of
+/// its own has no local route that holds: the guard fails closed.
 pub(crate) fn route_contradiction(
-    own: &MobId,
+    own: Option<&MobId>,
     member: &Member,
     route: MemberRoute,
 ) -> Option<OwnerRefusal> {
-    (route == MemberRoute::Local && member.mob_id != *own).then(|| {
-        OwnerRefusal::LocalRouteNamesAnotherMob {
+    if route != MemberRoute::Local {
+        return None;
+    }
+    match own {
+        Some(own) if member.mob_id == *own => None,
+        Some(own) => Some(OwnerRefusal::LocalRouteNamesAnotherMob {
             member: member.clone(),
             own: own.clone(),
-        }
-    })
+        }),
+        None => Some(OwnerRefusal::LocalRouteWithoutOwnMob {
+            member: member.clone(),
+        }),
+    }
 }
 
 impl OwnerRefusal {
@@ -516,7 +533,21 @@ impl OwnerRefusal {
     pub(crate) fn submit_error(&self) -> NativeSubmitError {
         match self {
             Self::NoPeerPath => NativeSubmitError::Unavailable(self.to_string()),
-            Self::LocalRouteNamesAnotherMob { .. } => NativeSubmitError::Invalid(self.to_string()),
+            Self::LocalRouteNamesAnotherMob { .. } | Self::LocalRouteWithoutOwnMob { .. } => {
+                NativeSubmitError::Invalid(self.to_string())
+            }
+        }
+    }
+
+    /// What a put meets for this refusal: a member whose route contradicts
+    /// it could never be delivered to, and a member on a peer is not this
+    /// seam's to reach.
+    pub(crate) fn member_problem(&self) -> MemberProblem {
+        match self {
+            Self::NoPeerPath => MemberProblem::UnusablePeer(self.to_string()),
+            Self::LocalRouteNamesAnotherMob { .. } | Self::LocalRouteWithoutOwnMob { .. } => {
+                MemberProblem::Unusable(self.to_string())
+            }
         }
     }
 }
@@ -530,7 +561,7 @@ pub(crate) fn continuation_owner(
     member: &Member,
     route: MemberRoute,
 ) -> Result<meerkat::ContinuationOwner, OwnerRefusal> {
-    if let Some(refusal) = route_contradiction(own, member, route) {
+    if let Some(refusal) = route_contradiction(Some(own), member, route) {
         return Err(refusal);
     }
     match route {
@@ -1395,8 +1426,8 @@ impl NativeDelivery for MobNativeDelivery {
     }
 
     async fn check_member(&self, member: &Member, route: MemberRoute) -> Result<(), MemberProblem> {
-        if let Some(refusal) = route_contradiction(&self.mob_id, member, route) {
-            return Err(MemberProblem::Ambiguous(refusal.to_string()));
+        if let Some(refusal) = route_contradiction(Some(&self.mob_id), member, route) {
+            return Err(refusal.member_problem());
         }
         match route {
             MemberRoute::Local => match self.identity_service(&member.identity).await {

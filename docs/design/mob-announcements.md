@@ -264,7 +264,8 @@ is decided when it is first subscribed and kept with it, together with the
 incarnation of its mob; every batch carries the route it was sealed with.
 No route is ever assumed: a stored batch without one does not decode, the
 store refuses a subscription the owner resolved no route for, a member with
-no kept route is not sealed, and a local route names the member's own mob.
+no kept route is not sealed, and a local route names the member's own mob;
+on a gateway that names no mob of its own, no local route holds.
 The owner checks a batch's route against its member before anything else,
 on every path, so a batch whose member names another mob is blocked: nothing
 is prepared, ended, submitted or read for this gateway's member of that

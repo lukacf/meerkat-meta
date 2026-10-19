@@ -2156,6 +2156,8 @@ struct Ledger {
 
 struct ScriptedNative {
     ledger: Mutex<Ledger>,
+    /// The mob this gateway names as its own, if any.
+    own: Option<MobId>,
     governed: bool,
     known: BTreeSet<String>,
     /// Registered identities this gateway's runtime does not serve.
@@ -2196,6 +2198,7 @@ impl ScriptedNative {
     fn new() -> Self {
         Self {
             ledger: Mutex::new(Ledger::default()),
+            own: Some(mob(OWN_MOB)),
             governed: false,
             known: ["agent:a".to_string()].into(),
             unusable: BTreeSet::new(),
@@ -2363,7 +2366,7 @@ impl NativeDelivery for ScriptedNative {
     }
 
     fn own_mob(&self) -> Option<MobId> {
-        Some(mob(OWN_MOB))
+        self.own.clone()
     }
 
     async fn mob_origin(
@@ -7312,8 +7315,8 @@ async fn a_committed_batch_with_a_contradicting_route_is_blocked_unread() {
 }
 
 /// A member whose kept route is gone under an active subscription is not
-/// sealed, typed, and no route is assumed for it; another member's backlog
-/// still seals.
+/// sealed: the store, which keeps the route and seals on it, refuses typed,
+/// and no route is assumed for it; another member's backlog still seals.
 #[tokio::test]
 async fn a_member_without_its_kept_route_is_not_sealed_and_others_still_are() {
     let mut native = ScriptedNative::new();
@@ -7390,11 +7393,13 @@ async fn a_member_without_its_kept_route_is_not_sealed_and_others_still_are() {
 }
 
 /// A self-contradicting route is never deliverable: a submission meets it
-/// as invalid, and a member on a peer as unavailable now.
+/// as invalid and a put as an unusable member, and a member on a peer is
+/// unavailable now. A gateway that names no mob of its own holds no local
+/// route.
 #[test]
 fn a_self_contradicting_route_is_invalid_to_a_submission() {
     let refusal = super::native::route_contradiction(
-        &mob(OWN_MOB),
+        Some(&mob(OWN_MOB)),
         &Member::new(mob("checkout"), MemberIdentity::new("agent:a").unwrap()),
         MemberRoute::Local,
     )
@@ -7408,9 +7413,80 @@ fn a_self_contradicting_route_is_invalid_to_a_submission() {
         NativeSubmitError::Unavailable(_)
     ));
     assert_eq!(
-        super::native::route_contradiction(&mob(OWN_MOB), &member("agent:a"), MemberRoute::Local),
+        super::native::route_contradiction(
+            Some(&mob(OWN_MOB)),
+            &member("agent:a"),
+            MemberRoute::Local
+        ),
         None
     );
+    assert_eq!(
+        refusal.member_problem(),
+        MemberProblem::Unusable(refusal.to_string())
+    );
+    let without_own =
+        super::native::route_contradiction(None, &member("agent:a"), MemberRoute::Local)
+            .expect("no local route holds without an own mob");
+    assert_eq!(
+        without_own,
+        super::native::OwnerRefusal::LocalRouteWithoutOwnMob {
+            member: member("agent:a")
+        }
+    );
+    assert!(matches!(
+        without_own.submit_error(),
+        NativeSubmitError::Invalid(_)
+    ));
+    assert_eq!(
+        without_own.member_problem(),
+        MemberProblem::Unusable(without_own.to_string())
+    );
+    assert_eq!(
+        super::native::route_contradiction(None, &member("agent:a"), MemberRoute::Child),
+        None
+    );
+}
+
+/// A gateway whose native seam names no mob of its own cannot show that a
+/// local route names the member's mob: the guard fails closed, and the batch
+/// is blocked, typed, before anything is prepared, submitted or read.
+#[tokio::test]
+async fn a_local_route_on_a_gateway_without_its_own_mob_is_blocked_unread() {
+    let mut native = ScriptedNative::new();
+    native.own = None;
+    let harness = harness_with(native);
+    harness
+        .store
+        .put_subscription(
+            &op("o1"),
+            put("s1", "agent:a", &["ios"], StartFrontier::Now),
+            1,
+        )
+        .await
+        .unwrap();
+    harness
+        .service
+        .announce(announce_request("payments", "k1", &["ios"], "one"))
+        .await
+        .unwrap();
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let batch = harness.only_batch().await;
+    assert_eq!(
+        batch.state,
+        BatchState::Blocked {
+            cause: super::native::OwnerRefusal::LocalRouteWithoutOwnMob {
+                member: member("agent:a")
+            }
+            .to_string()
+        }
+    );
+    assert_eq!(
+        native_calls(&harness),
+        (0, 0, 0),
+        "nothing is read or submitted"
+    );
+    assert!(harness.native.prepared.lock().unwrap().is_empty());
 }
 
 /// The ledger owns every table and index the schema creates, so drift or

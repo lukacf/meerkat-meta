@@ -1225,25 +1225,23 @@ impl AnnouncementService {
         policy: &SealingPolicy,
         now: u64,
     ) -> Result<Option<Batch>, AnnouncementError> {
-        // Every subscription keeps its member's route, so a member with
-        // owed captures has one. Without it nothing is sealed: no route is
-        // assumed.
+        // The store seals on the route it keeps and refuses a member without
+        // one: no route is assumed. Here the kept route only says whether a
+        // child member's mob log is read first, and whether the batch must
+        // fit one peer request.
         let route = self
             .inner
             .store
             .member_route(member)
             .await?
-            .map(|kept| kept.route)
-            .ok_or_else(|| AnnouncementStoreError::RouteNotKept {
-                member: member.clone(),
-            })?;
-        if route == MemberRoute::Child {
+            .map(|kept| kept.route);
+        if route == Some(MemberRoute::Child) {
             self.member_mob_ended(member, now).await?;
         }
         Ok(self
             .inner
             .store
-            .seal_batch(member, id, policy, wire_budget(route), now)
+            .seal_batch(member, id, policy, route.and_then(wire_budget), now)
             .await?)
     }
 
@@ -1880,10 +1878,14 @@ impl AnnouncementService {
     }
 
     /// Whether the batch's kept route contradicts its member, by the one
-    /// guard the native seam runs too.
+    /// guard the native seam runs too. A native seam that names no own mob
+    /// leaves no local route standing.
     fn route_refusal(&self, batch: &Batch) -> Option<OwnerRefusal> {
-        let own = self.inner.native.own_mob()?;
-        route_contradiction(&own, &batch.member, batch.route)
+        route_contradiction(
+            self.inner.native.own_mob().as_ref(),
+            &batch.member,
+            batch.route,
+        )
     }
 
     /// The batch as the store holds it now.
