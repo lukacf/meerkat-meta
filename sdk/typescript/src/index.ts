@@ -162,6 +162,7 @@ export {
   MetaError,
   TransportError,
   TransportReaderFailedError,
+  GatewayChildEndedError,
   GatewayRestartRefusedError,
   GatewayStartupCleanupError,
   InitOutcomeUnknownError,

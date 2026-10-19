@@ -258,6 +258,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   runtime itself is still held, as D67 documents ("`None` once it closed"):
   Meerkat 0.9.4 closes the mob's admission when it admits the Shutdown.
   Against Meerkat 0.9.3 the weak link still upgraded after a shutdown.
+- Python and TypeScript SDKs: a request waiting on a gateway process that
+  exits while a process it started still holds the gateway's stdout now fails
+  with `GatewayChildEndedError` about a second after the exit, instead of
+  waiting out its request timeout (60 seconds by default) or, for the
+  shutdown handshake, the gateway's whole shutdown horizon. The transports
+  failed waiting requests only when that stdout closed, and a descendant that
+  inherited it keeps it open until it exits itself. A gateway whose stdout
+  closes with its exit is unaffected: its waiters still fail with
+  `TransportReaderFailedError` as the stdout closes. The TypeScript
+  `GatewayChildEndedError` is new: it extends `TransportReaderFailedError`
+  and carries the exit as `exitCode` and `signal`, and the transport then
+  lets go of the held stdout, so it no longer keeps the host's Node.js
+  process running. The Python error carries `exit_code`.
 
 ## [0.9.3] - 2026-10-18
 

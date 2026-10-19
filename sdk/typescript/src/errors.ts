@@ -79,6 +79,26 @@ export class TransportReaderFailedError extends TransportError {
 }
 
 /**
+ * The gateway process exited while a process it started still held its
+ * stdout, so the reader never saw that stdout end.
+ *
+ * Rejects every request still waiting once a short grace after the exit has
+ * passed, instead of leaving it to its request timeout. `exitCode` and
+ * `signal` are the exit as Node reported it. As with any reader failure, a
+ * request written before the exit may still have been executed.
+ */
+export class GatewayChildEndedError extends TransportReaderFailedError {
+  constructor(
+    reason: string,
+    readonly exitCode: number | null,
+    readonly signal: string | null,
+  ) {
+    super(reason);
+    this.name = "GatewayChildEndedError";
+  }
+}
+
+/**
  * A host-composed gateway transport refused to respawn its gateway process.
  *
  * A transport built by a gateway transport factory, or one with its own
