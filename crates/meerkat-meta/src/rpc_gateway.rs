@@ -7725,7 +7725,11 @@ comms = true
             (2, {
                 let mut report = clean_report();
                 report.child_mob_stand_down = crate::ChildMobStandDownOutcome::Retained {
-                    unsettled: vec!["child: unsettled".to_string()],
+                    unsettled: vec![crate::RetainedChildMob {
+                        mob_id: "child".to_string(),
+                        kind: crate::RetainedChildMobKind::Specific,
+                        detail: "unsettled".to_string(),
+                    }],
                 };
                 report
             }),
@@ -11002,6 +11006,11 @@ fn gateway_shutdown_diagnostics(runtime_shutdown: Option<&UnifiedRuntimeShutdown
             }
             crate::ChildMobStandDownOutcome::InProgress => {
                 json!({ "outcome": "in_progress" })
+            }
+            // The wire keeps its 0.9.3 shape: a failed listing was reported
+            // as one retained entry.
+            crate::ChildMobStandDownOutcome::EnumerationFailed { .. } => {
+                json!({ "outcome": "retained", "unsettled_count": 1 })
             }
         },
         // Gates cleanup_completed(): the members' MCP servers, counted by

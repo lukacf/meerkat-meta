@@ -290,6 +290,34 @@ async fn harness_with_client(
 fn worker(id: &str) -> SpawnMemberSpec {
     SpawnMemberSpec::host_root("worker", AgentIdentity::from(id))
 }
+
+/// Shuts `runtime` down before a reopen over the same state in this process.
+/// The shutdown stands the durable child root down within its terminal
+/// window; a loaded host can outrun that window, and the root then stays
+/// claimed until a later stand-down releases it, so a reopen here would be
+/// refused with `AlreadyClaimed`. Stand down again, bounded, until the root
+/// is released; a stand-down that never releases fails here with its outcome.
+async fn shut_down_for_reopen(runtime: &UnifiedRuntime) {
+    let mut outcome = runtime.shutdown().await.child_mob_stand_down;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !child_root_released(&outcome) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        outcome = runtime.mob_runtime().stand_down_child_mobs(deadline).await;
+    }
+    assert!(
+        child_root_released(&outcome),
+        "the durable child root is released before the reopen: {outcome:?}"
+    );
+}
+
+fn child_root_released(outcome: &meerkat_meta::ChildMobStandDownOutcome) -> bool {
+    matches!(
+        outcome,
+        meerkat_meta::ChildMobStandDownOutcome::Released { .. }
+            | meerkat_meta::ChildMobStandDownOutcome::NotConfigured
+    )
+}
+
 async fn member_session(
     runtime: &UnifiedRuntime,
     identity: &AgentIdentity,
@@ -508,7 +536,7 @@ async fn extension_native_dispatch_private_fork_spawn_revocation_and_restart() {
             .await
             .is_ok()
     );
-    runtime.shutdown().await;
+    shut_down_for_reopen(&runtime).await;
     drop(runtime);
     drop(context);
     let (reopened, context, _) = harness(dir.path(), None).await;
@@ -997,7 +1025,7 @@ async fn extension_native_first_turn_creation_has_stable_owner_after_reset_and_r
             .await
             .is_ok()
     );
-    runtime.shutdown().await;
+    shut_down_for_reopen(&runtime).await;
     drop(runtime);
     drop(context);
     let (runtime, context, _) = stable_harness(path.path(), access).await;
@@ -1708,7 +1736,7 @@ async fn extension_authority_registry_releases_a_restored_child_mob_storage() {
     let owned = OwnedChild::create(&runtime, &context, dir.path()).await;
     let child = owned.child.clone();
     drop(owned);
-    runtime.shutdown().await;
+    shut_down_for_reopen(&runtime).await;
     drop(runtime);
     drop(context);
 
@@ -1845,7 +1873,7 @@ async fn extension_mob_id_reuse_is_refused_while_documents_name_it() {
     assert_refused_with_remedy(&refused, &owned.child);
     let child = owned.child.clone();
     drop(owned);
-    runtime.shutdown().await;
+    shut_down_for_reopen(&runtime).await;
     drop(runtime);
     drop(context);
 
@@ -1998,7 +2026,7 @@ async fn extension_mob_id_reuse_keeps_the_sessions_implicit_mob_and_checks_counc
     assert!(created);
     assert_eq!(recreated, implicit);
     drop(state);
-    runtime.shutdown().await;
+    shut_down_for_reopen(&runtime).await;
     drop(runtime);
     drop(context);
 
@@ -2444,7 +2472,7 @@ async fn extension_restored_mob_under_a_reused_id_is_quarantined() {
     let child = owned.child.clone();
     let first_owner = owned.owner_session.clone();
     drop(owned);
-    runtime.shutdown().await;
+    shut_down_for_reopen(&runtime).await;
     drop(runtime);
     drop(context);
 
@@ -2457,7 +2485,7 @@ async fn extension_restored_mob_under_a_reused_id_is_quarantined() {
         .await
         .expect("without the extension no create check runs");
     drop(state);
-    uncomposed.shutdown().await;
+    shut_down_for_reopen(&uncomposed).await;
     drop(uncomposed);
 
     let (reopened, context, _) = harness(dir.path(), None).await;
@@ -2523,7 +2551,7 @@ async fn extension_restored_mob_under_a_reused_id_is_quarantined() {
         "a quarantined mob's member resolves no document caller: {member:?}"
     );
     drop(state);
-    reopened.shutdown().await;
+    shut_down_for_reopen(&reopened).await;
     drop(reopened);
     drop(context);
 
@@ -2616,7 +2644,7 @@ async fn extension_whole_state_generation_restore_keeps_its_mobs_bound() {
     let child = owned.child.clone();
     let child_owner = owned.owner_session.clone();
     drop(owned);
-    runtime.shutdown().await;
+    shut_down_for_reopen(&runtime).await;
     drop(runtime);
     drop(context);
     copy_state(&state, &generation);
@@ -2689,7 +2717,7 @@ async fn extension_whole_state_generation_restore_keeps_its_mobs_bound() {
         Some(session_holder(&other_session))
     );
     drop(mob_state);
-    restored.shutdown().await;
+    shut_down_for_reopen(&restored).await;
     drop(restored);
     drop(context);
 
@@ -2744,7 +2772,7 @@ async fn extension_restore_adopts_an_id_with_no_holder_record() {
     let child = owned.child.clone();
     let child_owner = owned.owner_session.clone();
     drop(owned);
-    runtime.shutdown().await;
+    shut_down_for_reopen(&runtime).await;
     drop(runtime);
     drop(context);
     rusqlite::Connection::open(dir.path().join("extension_state.sqlite3"))
@@ -2789,7 +2817,7 @@ async fn extension_an_unreadable_holder_quarantines_without_failing_the_restore(
     let child = owned.child.clone();
     let child_owner = owned.owner_session.clone();
     drop(owned);
-    runtime.shutdown().await;
+    shut_down_for_reopen(&runtime).await;
     drop(runtime);
     drop(context);
     rusqlite::Connection::open(dir.path().join("extension_state.sqlite3"))

@@ -12628,7 +12628,11 @@ impl MobRuntime {
     /// over the same layout restores it as it was. An unsettled child stays
     /// recorded across repeated calls; a closed actor channel is not a
     /// settlement report. A child that already shut down cleanly in the same
-    /// incarnation is not asked again. A close sent while a mob's actor is
+    /// incarnation is not asked again. A member's runtime unregister an
+    /// earlier stand-down left running is followed only after every child
+    /// incarnation hosted now was asked; when admission or the state did not
+    /// settle, so that is not known, a later call follows it. A close sent
+    /// while a mob's actor is
     /// still exiting from its shutdown can go unanswered in Meerkat 0.9.3 and
     /// earlier, so the admission close is sent again once the root's actor
     /// task ends, and each child's actor task is waited for, within the
@@ -12707,6 +12711,21 @@ impl MobRuntime {
                 return unsettled;
             }
         }
+        // A member unregister an earlier stand-down left running may have
+        // settled since. It is followed only once every child incarnation
+        // hosted now was asked: admission closed with nothing admitted still
+        // running, and the state sealed, so both passes saw the final set.
+        // An earlier incarnation's settlement then never runs while a later
+        // incarnation of the same child may still hold that member's
+        // registration; otherwise it is left for a later call. Meerkat's
+        // settlement already leaves a registration a later owner took over
+        // alone (it reports it handed over); this order does not rely on
+        // that alone.
+        if admission.is_clean() && state_stand_down.is_clean() {
+            self.child_mob_root
+                .settle_pending_unregisters(deadline)
+                .await;
+        }
         let outcome = self.child_mob_root.outcome(child_mobs);
         if !outcome.child_actors_settled()
             || !admission.is_clean()
@@ -12764,8 +12783,9 @@ impl MobRuntime {
     }
 
     /// Shut down every child mob in the state's snapshot not yet in
-    /// `stood_down`, recording each answer. A child already clean in the
-    /// same incarnation is counted without being asked again.
+    /// `stood_down`, recording each answer. A child already clean, or owing
+    /// a pending unregister, in the same incarnation is counted without being
+    /// asked again.
     async fn stand_down_new_children(
         &self,
         state: &meerkat_mob_mcp::MobMcpState,
@@ -12775,8 +12795,8 @@ impl MobRuntime {
     ) -> Result<(), crate::child_mob_storage::ChildMobStandDownOutcome> {
         use crate::child_mob_storage::{ChildIncarnation, ChildMobStandDownOutcome, ChildShutdown};
         let root_mob_id = self.handle.definition().id.clone();
-        let enumeration_failed = |error: MobError| ChildMobStandDownOutcome::Retained {
-            unsettled: vec![format!("child mobs could not be enumerated: {error}")],
+        let enumeration_failed = |error: MobError| ChildMobStandDownOutcome::EnumerationFailed {
+            detail: format!("child mobs could not be enumerated: {error}"),
         };
         // Every managed child, a destroyed one still managed included (the
         // retry anchor of a destroy whose native part is incomplete): its
@@ -12795,7 +12815,11 @@ impl MobRuntime {
             };
             *child_mobs += 1;
             let incarnation = ChildIncarnation::of(&handle);
-            if self.child_mob_root.clean_in(mob_id.as_ref(), &incarnation) {
+            if self.child_mob_root.clean_in(mob_id.as_ref(), &incarnation)
+                || self
+                    .child_mob_root
+                    .pending_in(mob_id.as_ref(), &incarnation)
+            {
                 continue;
             }
             let shutdown = handle
@@ -12817,15 +12841,7 @@ impl MobRuntime {
             }
             let outcome = match shutdown {
                 Ok(report) if report.is_clean() => ChildShutdown::Clean,
-                // Only the members the native report names as not clean.
-                Ok(report) => ChildShutdown::Unsettled(format!(
-                    "members not settled: {:?}",
-                    report
-                        .members
-                        .iter()
-                        .filter(|(_, outcome)| !outcome.is_clean())
-                        .collect::<Vec<_>>()
-                )),
+                Ok(report) => unsettled_child_report(&report, deadline).await,
                 Err(MobError::ActorCommandChannelClosed | MobError::ActorReplyChannelClosed) => {
                     ChildShutdown::ChannelClosed
                 }
@@ -13519,6 +13535,55 @@ impl MobRuntime {
     /// declare it (see [`MobBootstrapSpec::resolved_storage`]).
     pub fn resolved_storage(&self) -> Option<ResolvedStorageSummary> {
         self.resolved_storage.clone()
+    }
+}
+
+/// A child's shutdown report that names unsettled members. When every one is
+/// a runtime unregister still running at Shutdown's deadline, their
+/// settlements are followed until `deadline` (this stand-down's own): all
+/// settled is a clean shutdown (a registration a later owner took over
+/// counts as settled, see `PendingUnregisters::of`), a failed one is
+/// specific debt, and any still running is a pending unregister a later
+/// stand-down follows. Any other unsettled member is specific debt.
+async fn unsettled_child_report(
+    report: &meerkat_mob::MobShutdownReport,
+    deadline: std::time::Instant,
+) -> crate::child_mob_storage::ChildShutdown {
+    use crate::child_mob_storage::{ChildShutdown, PendingUnregisters};
+    // Only the members the native report names as not clean.
+    let detail = format!(
+        "members not settled: {:?}",
+        report
+            .members
+            .iter()
+            .filter(|(_, outcome)| !outcome.is_clean())
+            .collect::<Vec<_>>()
+    );
+    let mut settlements = Vec::new();
+    for outcome in report.members.values() {
+        match outcome {
+            outcome if outcome.is_clean() => {}
+            meerkat_mob::MemberShutdownOutcome::UnregisterPending { settlement, .. } => {
+                settlements.push(settlement.clone());
+            }
+            _ => return ChildShutdown::Unsettled(detail),
+        }
+    }
+    let states = futures::future::join_all(
+        settlements
+            .iter_mut()
+            .map(|settlement| settlement.settle_within(deadline)),
+    )
+    .await;
+    match PendingUnregisters::of(&states) {
+        PendingUnregisters::Settled => ChildShutdown::Clean,
+        PendingUnregisters::Failed(failure) => {
+            ChildShutdown::Unsettled(format!("{detail}; {failure}"))
+        }
+        PendingUnregisters::Pending => ChildShutdown::UnregisterPending {
+            detail,
+            settlements,
+        },
     }
 }
 

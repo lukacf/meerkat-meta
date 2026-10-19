@@ -74,6 +74,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   completion-bearing send still fails with
   `IdentityRuntimeError::AdmissionFailed`, whose detail is now Core's message
   without the `session bridge mob error:` prefix.
+- `ChildMobStandDownOutcome::Retained { unsettled }` holds one typed
+  `RetainedChildMob { mob_id, kind, detail }` per child mob instead of a
+  `"<mob_id>: <detail>"` string. Its `RetainedChildMobKind` says whether a
+  later stand-down in the same process can clear the debt:
+  `PendingUnregister` (member runtime unregisters still running at the
+  deadline) can clear; `Specific` keeps the child root claimed until the
+  process exits. Both types are `#[non_exhaustive]`. A failure to list or
+  look up the child mobs is its own outcome,
+  `ChildMobStandDownOutcome::EnumerationFailed { detail }`, instead of a
+  `Retained` entry; the gateway's shutdown diagnostics still report it as
+  `retained` with one unsettled entry.
 
 ### Security
 
@@ -317,6 +328,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   text as the summary. That failure names the stop reason, so a refused
   summary reads as refused rather than as a cancel or a truncation, and a
   summary stream that ends without its terminal event is reported apart.
+- A durable child mob whose member's runtime unregister was still running at
+  the stand-down deadline no longer keeps the child root claimed for the rest
+  of the process. The stand-down records that member's pending unregister and
+  follows its exact registration through Meerkat's
+  `MemberUnregisterSettlement`. A later stand-down in the same process clears
+  the debt once the unregister settles, without asking the exited child actor
+  again, and releases the root. Other debt (a stuck or interrupted
+  retirement, an effect whose custody is retained, a failed unregister or
+  request, or an actor that exited before its report was read) still keeps
+  the root claimed for the rest of the process. A member registration that a
+  later owner took over after the child's Shutdown returned (Meerkat's
+  `MemberUnregisterState::HandedOver`) settles that pending unregister
+  without unregistering it. Each child incarnation's pending unregisters are
+  followed and cleared on their own: settling them vouches for that
+  incarnation only, never for a later incarnation of the same child, and a
+  stand-down follows them only after it asked every child incarnation
+  hosted now.
 
 
 ## [0.9.3] - 2026-10-18
