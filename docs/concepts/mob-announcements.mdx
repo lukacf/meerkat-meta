@@ -80,16 +80,20 @@ attributed to exactly one member or refused, within per-member limits.
 
 A subscription ends, with a typed reason, only on a final fact:
 
-- its member departed (for a member on a peer gateway, that gateway's signed
-  answer that the member departed);
 - every mob it named was destroyed;
 - for a member of another mob hosted here, that mob was destroyed, created
-  again, completed or reset after the subscription was made.
+  again, completed or reset after the subscription was made;
+- a peer gateway answered, signed, that its member departed. No gateway of
+  this release records a final fact that a member left, so none gives that
+  answer yet.
 
 A member that is not registered, or not served where its deliveries go, ends
-nothing: it may be registered or served again. Its deliveries wait, and the
-subscription's `marker` says why and on what evidence (a verified signed
-answer, an unverified one, or this gateway's own fact).
+nothing: it may be registered or served again. Neither does a member that
+left this gateway, is governed, or has no live incarnation. Its deliveries
+wait, and the subscription's `marker` says why and on what evidence (a
+verified signed answer, an unverified one, or this gateway's own fact). Its
+owed batches expire after the retention window, and `subscriptions/cancel`
+ends a subscription whose member is not coming back.
 
 ## See also
 
