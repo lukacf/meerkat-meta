@@ -12,6 +12,10 @@ fn initialize_schema(tx: &rusqlite::Transaction<'_>) -> std::result::Result<(), 
     tx.execute_batch(SCHEMA)
 }
 
+/// The announcement store's ledgered schema. `owned_objects` is every table
+/// and index [`SCHEMA`] creates, so drift or absence in any of them is caught
+/// when the store opens. Version 1 freezes with the release that ships it;
+/// any later change is a new version with its migration.
 pub(crate) const ANNOUNCEMENT_SCHEMA_DOMAIN: meerkat_sqlite::SchemaDomain =
     meerkat_sqlite::SchemaDomain {
         name: "meta-mob-announcements",
@@ -70,6 +74,18 @@ pub(crate) const ANNOUNCEMENT_SCHEMA_DOMAIN: meerkat_sqlite::SchemaDomain =
                 name: "announcement_operations",
             },
             meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Table,
+                name: "mob_lineage",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Table,
+                name: "announcement_gaps",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Table,
+                name: "member_routes",
+            },
+            meerkat_sqlite::SchemaObject {
                 kind: meerkat_sqlite::SchemaObjectKind::Index,
                 name: "member_subscriptions_by_member",
             },
@@ -96,6 +112,18 @@ pub(crate) const ANNOUNCEMENT_SCHEMA_DOMAIN: meerkat_sqlite::SchemaDomain =
             meerkat_sqlite::SchemaObject {
                 kind: meerkat_sqlite::SchemaObjectKind::Index,
                 name: "announcement_batches_by_member",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Index,
+                name: "mob_lineage_live",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Index,
+                name: "mob_lineage_by_parent",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Index,
+                name: "member_routes_by_route",
             },
         ],
         retired_objects: &[],

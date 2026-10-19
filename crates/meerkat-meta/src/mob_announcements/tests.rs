@@ -7400,3 +7400,33 @@ fn a_self_contradicting_route_is_invalid_to_a_submission() {
         None
     );
 }
+
+/// The ledger owns every table and index the schema creates, so drift or
+/// absence in any of them is caught when the store opens.
+#[test]
+fn the_ledger_owns_every_object_the_schema_creates() {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    connection.execute_batch(super::sqlite::SCHEMA).unwrap();
+    let mut statement = connection
+        .prepare("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
+        .unwrap();
+    let created: BTreeSet<(String, String)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    let owned: BTreeSet<(String, String)> = super::storage::ANNOUNCEMENT_SCHEMA_DOMAIN
+        .owned_objects
+        .iter()
+        .map(|object| {
+            let kind = match object.kind {
+                meerkat_sqlite::SchemaObjectKind::Table => "table",
+                meerkat_sqlite::SchemaObjectKind::Index => "index",
+                meerkat_sqlite::SchemaObjectKind::Trigger => "trigger",
+                meerkat_sqlite::SchemaObjectKind::View => "view",
+            };
+            (kind.to_string(), object.name.to_string())
+        })
+        .collect();
+    assert_eq!(created, owned);
+}
