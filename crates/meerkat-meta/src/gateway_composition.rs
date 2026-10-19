@@ -2389,6 +2389,9 @@ default_binding = "local"
             .finish();
         let current = std::thread::current();
         let this_thread = current.name().unwrap_or("<unnamed>").to_string();
+        // A second registered Dispatch keeps callsite interest from being
+        // cached `never` by threads without a subscriber.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
         let outcomes = tracing::subscriber::with_default(subscriber, || {
             // A formatted message carries a `String` payload, a literal
             // carries a `&str`; both downcasts must render the text.

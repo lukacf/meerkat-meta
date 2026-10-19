@@ -2949,6 +2949,9 @@ mod tests {
             meerkat_meta::gateway_composition::default_tracing_filter(GATEWAY_TRACING_TARGET),
         )?;
         let subscriber = tracing_subscriber::registry().with(filter);
+        // A second registered Dispatch keeps callsite interest from being
+        // cached `never` by threads without a subscriber.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
         tracing::subscriber::with_default(subscriber, || {
             assert!(
                 tracing::enabled!(

@@ -4128,6 +4128,9 @@ schedule = true
             .with_ansi(false)
             .without_time()
             .finish();
+        // A second registered Dispatch keeps callsite interest from being
+        // cached `never` by threads without a subscriber.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
         let probe = async {
             let config = ScheduleClaimWatchdogConfig::default();
             let probe =
@@ -4531,6 +4534,9 @@ schedule = true
             .with_ansi(false)
             .without_time()
             .finish();
+        // A second registered Dispatch keeps callsite interest from being
+        // cached `never` by threads without a subscriber.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
         tracing::subscriber::with_default(subscriber, || {
             let config = ScheduleClaimWatchdogConfig::default();
             let mut state = ScheduleClaimWatchdogState::default();

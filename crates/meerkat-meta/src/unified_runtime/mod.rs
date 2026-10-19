@@ -5164,6 +5164,9 @@ mod tests {
             // string that is never literally present.
             .with_ansi(false)
             .finish();
+        // A second registered Dispatch keeps callsite interest from being
+        // cached `never` by threads without a subscriber.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
         let value = tracing::subscriber::with_default(subscriber, body);
         (value, writer.contents())
     }
