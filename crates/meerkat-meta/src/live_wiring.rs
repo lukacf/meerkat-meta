@@ -5475,7 +5475,8 @@ mod tests {
         let mut builder = meerkat::FactoryAgentBuilder::new(factory.clone(), Config::default());
         builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
         let (service, machine) =
-            meerkat::surface::build_runtime_backed_service(builder, 4, persistence);
+            meerkat::surface::build_runtime_backed_service(builder, 4, persistence)
+                .expect("compose the runtime-backed service");
         let service = Arc::new(service);
         let ctx = attach_live(
             Arc::clone(&service),
@@ -6595,7 +6596,8 @@ mod tests {
         let mut builder = meerkat::FactoryAgentBuilder::new(factory.clone(), Config::default());
         builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
         let (service, machine) =
-            meerkat::surface::build_runtime_backed_service(builder, 4, persistence);
+            meerkat::surface::build_runtime_backed_service(builder, 4, persistence)
+                .expect("compose the runtime-backed service");
         let service = Arc::new(service);
         let ctx = Arc::new(attach_live(
             Arc::clone(&service),
