@@ -116,7 +116,15 @@ async fn the_join_binds_identity_first_rows_to_the_owner_session_and_leaves_plai
     ];
     let untouched = members[1..].to_vec();
 
-    let pending = join_identity_bindings(&mut members, &walked, &current, true, None).await;
+    let pending = join_identity_bindings(
+        &mut members,
+        &walked,
+        &current,
+        true,
+        &BTreeSet::new(),
+        None,
+    )
+    .await;
 
     assert!(pending.is_empty(), "the walk answers: nothing is pending");
     assert_eq!(members[0].session_id.as_deref(), Some("s1"));
@@ -145,7 +153,8 @@ async fn the_join_names_a_moved_binding_pending_only_when_the_walk_does_not_answ
         (KEEPER, Some("s1"), IdentityLifecycleState::Active),
         (OTHER, Some("o0"), IdentityLifecycleState::Active),
     ]);
-    let pending = join_identity_bindings(&mut members, &walked, &reset, false, None).await;
+    let pending =
+        join_identity_bindings(&mut members, &walked, &reset, false, &BTreeSet::new(), None).await;
     assert_eq!(pending, BTreeSet::from([KEEPER.to_string()]));
     assert_eq!(members[0].session_id.as_deref(), Some("s1"));
     assert_eq!(members[0].progress, Some(fallback_progress()));
@@ -161,7 +170,15 @@ async fn the_join_names_a_moved_binding_pending_only_when_the_walk_does_not_answ
         (KEEPER, Some("s0"), IdentityLifecycleState::Retiring),
         (OTHER, Some("o0"), IdentityLifecycleState::Active),
     ]);
-    let pending = join_identity_bindings(&mut members, &walked, &retire, false, None).await;
+    let pending = join_identity_bindings(
+        &mut members,
+        &walked,
+        &retire,
+        false,
+        &BTreeSet::new(),
+        None,
+    )
+    .await;
     assert_eq!(pending, BTreeSet::from([KEEPER.to_string()]));
     assert_eq!(members[0].session_id.as_deref(), Some("s0"));
     assert_eq!(members[0].progress, Some(fallback_progress()));
@@ -169,41 +186,53 @@ async fn the_join_names_a_moved_binding_pending_only_when_the_walk_does_not_answ
     // A delete: the identity runtime no longer knows the identity.
     let mut members = vec![row(KEEPER, Some(KEEPER), Some("s0"))];
     let delete = cut(&[(OTHER, Some("o0"), IdentityLifecycleState::Active)]);
-    let pending = join_identity_bindings(&mut members, &walked, &delete, false, None).await;
+    let pending = join_identity_bindings(
+        &mut members,
+        &walked,
+        &delete,
+        false,
+        &BTreeSet::new(),
+        None,
+    )
+    .await;
     assert_eq!(pending, BTreeSet::from([KEEPER.to_string()]));
     assert_eq!(members[0].session_id, None);
 
     // The same moves with a walk that answers are joined, never pending.
     for current in [&reset, &retire, &delete] {
         let mut members = vec![row(KEEPER, Some(KEEPER), Some("s0"))];
-        let pending = join_identity_bindings(&mut members, &walked, current, true, None).await;
+        let pending =
+            join_identity_bindings(&mut members, &walked, current, true, &BTreeSet::new(), None)
+                .await;
         assert!(pending.is_empty());
     }
 }
 
+/// A cut whose read held positions `started` and `started + 1` on the one
+/// read counter.
 fn cut_read_at(
     bindings: &[(&str, Option<&str>, IdentityLifecycleState)],
-    started: tokio::time::Instant,
+    started: u64,
 ) -> IdentityBindingCut {
     IdentityBindingCut {
-        read_started_at: started,
-        read_completed_at: started + Duration::from_millis(1),
+        read_started: started,
+        read_completed: started + 1,
         ..cut(bindings)
     }
 }
 
 #[test]
 fn a_walk_answers_for_the_same_bindings_or_a_cut_read_after_the_request() {
-    let base = tokio::time::Instant::now();
     let successor = [(KEEPER, Some("s1"), IdentityLifecycleState::Active)];
     let predecessor = [(KEEPER, Some("s0"), IdentityLifecycleState::Active)];
-    let request = cut_read_at(&successor, base + Duration::from_millis(10));
+    // The request's read held positions 10 and 11.
+    let request = cut_read_at(&successor, 10);
 
-    let older_same = cut_read_at(&successor, base);
+    let older_same = cut_read_at(&successor, 2);
     assert!(older_same.answers_for(&request), "the same bindings answer");
     assert!(std::ptr::eq(older_same.newer(&request), &raw const request));
 
-    let older_moved = cut_read_at(&predecessor, base);
+    let older_moved = cut_read_at(&predecessor, 2);
     assert!(
         !older_moved.answers_for(&request),
         "a walk read before the binding moved never answers"
@@ -213,7 +242,7 @@ fn a_walk_answers_for_the_same_bindings_or_a_cut_read_after_the_request() {
         &raw const request
     ));
 
-    let newer_moved = cut_read_at(&predecessor, base + Duration::from_millis(20));
+    let newer_moved = cut_read_at(&predecessor, 12);
     assert!(
         newer_moved.answers_for(&request),
         "a walk whose cut was read after the request's answers for it"
@@ -223,10 +252,105 @@ fn a_walk_answers_for_the_same_bindings_or_a_cut_read_after_the_request() {
         "the request joins with the newer cut"
     );
 
-    let overlapping = cut_read_at(&predecessor, base + Duration::from_millis(10));
+    let overlapping = cut_read_at(&predecessor, 9);
     assert!(
         !overlapping.answers_for(&request),
         "a cut read while the request was reading is not after it"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn binding_reads_order_exactly_where_the_clock_stands_still() {
+    let first = IdentityBindingCut {
+        bindings: cut(&[(KEEPER, Some("s0"), IdentityLifecycleState::Active)]).bindings,
+        ..IdentityBindingCut::read(None).await
+    };
+    let second = IdentityBindingCut {
+        bindings: cut(&[(KEEPER, Some("s1"), IdentityLifecycleState::Active)]).bindings,
+        ..IdentityBindingCut::read(None).await
+    };
+    assert!(
+        second.answers_for(&first),
+        "a read that started after the other completed answers for it"
+    );
+    assert!(
+        !first.answers_for(&second),
+        "an earlier read never answers for a later one, though the paused clock reads the same"
+    );
+    assert!(std::ptr::eq(second.newer(&first), &raw const second));
+    assert!(std::ptr::eq(first.newer(&second), &raw const second));
+}
+
+#[tokio::test]
+async fn a_suspended_or_moving_binding_vouches_for_no_walked_fact() {
+    // A reset holds the keeper Suspended while it swaps the member: a walk
+    // whose cut read (s1, Suspended) may already hold s2's rows, and a request
+    // that read the same bindings takes that walk as answering.
+    let suspended = cut(&[(KEEPER, Some("s1"), IdentityLifecycleState::Suspended)]);
+    let mut members = vec![row(KEEPER, Some(KEEPER), Some("s2"))];
+    let pending = join_identity_bindings(
+        &mut members,
+        &suspended,
+        &suspended,
+        true,
+        &BTreeSet::new(),
+        None,
+    )
+    .await;
+    assert_eq!(pending, BTreeSet::from([KEEPER.to_string()]));
+    assert_eq!(
+        members[0].session_id.as_deref(),
+        Some("s1"),
+        "the owner's session"
+    );
+    assert_eq!(
+        members[0].progress,
+        Some(fallback_progress()),
+        "the bounded run state for that session"
+    );
+
+    // Control: an Active binding with the walked session answers from the walk.
+    let active = cut(&[(KEEPER, Some("s1"), IdentityLifecycleState::Active)]);
+    let mut members = vec![row(KEEPER, Some(KEEPER), Some("s1"))];
+    let pending =
+        join_identity_bindings(&mut members, &active, &active, true, &BTreeSet::new(), None).await;
+    assert!(pending.is_empty());
+    assert_eq!(members[0], row(KEEPER, Some(KEEPER), Some("s1")));
+
+    // A binding that moved while the walk ran (read again after it).
+    let moved = BTreeSet::from([KEEPER.to_string()]);
+    let mut members = vec![row(KEEPER, Some(KEEPER), Some("s1"))];
+    let pending = join_identity_bindings(&mut members, &active, &active, true, &moved, None).await;
+    assert_eq!(pending, BTreeSet::from([KEEPER.to_string()]));
+}
+
+#[test]
+fn a_walk_records_the_bindings_that_moved_while_it_ran() {
+    let before = cut(&[
+        (KEEPER, Some("s1"), IdentityLifecycleState::Active),
+        (OTHER, Some("o0"), IdentityLifecycleState::Active),
+    ]);
+    assert!(before.moved_in(&before).is_empty(), "nothing moved");
+    let reset = cut(&[
+        (KEEPER, Some("s2"), IdentityLifecycleState::Active),
+        (OTHER, Some("o0"), IdentityLifecycleState::Active),
+    ]);
+    assert_eq!(
+        before.moved_in(&reset),
+        BTreeSet::from([KEEPER.to_string()])
+    );
+    let mid_reset = cut(&[
+        (KEEPER, Some("s1"), IdentityLifecycleState::Suspended),
+        (OTHER, Some("o0"), IdentityLifecycleState::Active),
+    ]);
+    assert_eq!(
+        before.moved_in(&mid_reset),
+        BTreeSet::from([KEEPER.to_string()])
+    );
+    let deleted = cut(&[(OTHER, Some("o0"), IdentityLifecycleState::Active)]);
+    assert_eq!(
+        before.moved_in(&deleted),
+        BTreeSet::from([KEEPER.to_string()])
     );
 }
 

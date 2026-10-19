@@ -190,6 +190,10 @@ struct ConsoleSnapshotReadModelState {
     /// The identity runtime's cut this walk read just before it walked the
     /// roster: every fact below was collected under these bindings.
     identity_cut: IdentityBindingCut,
+    /// Identities whose binding moved while this walk ran (the bindings
+    /// read again after the walk differ from `identity_cut`): the walk
+    /// vouches for none of the facts it collected for them.
+    moved_during_walk: BTreeSet<String>,
     session_id_by_identity: BTreeMap<String, String>,
     session_owner_by_id: BTreeMap<String, String>,
     /// Pre-projected primary-mob console members. The background refresh
@@ -208,11 +212,25 @@ struct ConsoleSnapshotReadModelState {
 /// session it binds and the lifecycle state it is in. The identity runtime
 /// owns both facts, and `/console/identities` reads them from it too; the
 /// console only reads them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct IdentityBindingCut {
     bindings: BTreeMap<String, IdentityBinding>,
-    read_started_at: tokio::time::Instant,
-    read_completed_at: tokio::time::Instant,
+    /// Positions of the read's start and completion on
+    /// [`IDENTITY_BINDING_CUT_SEQUENCE`]. The empty cut of an unprimed read
+    /// model holds 0 for both, before every read.
+    read_started: u64,
+    read_completed: u64,
+}
+
+/// One counter orders every identity binding read: a read takes a
+/// position before it starts and another after it completes, so whether
+/// one read started after another completed is exact, where two clock
+/// instants can compare equal.
+static IDENTITY_BINDING_CUT_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn next_identity_binding_cut_position() -> u64 {
+    IDENTITY_BINDING_CUT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
 }
 
 /// What a cut records for one identity. A retire moves no session, so the
@@ -223,20 +241,9 @@ struct IdentityBinding {
     state: crate::identity_first::IdentityLifecycleState,
 }
 
-impl Default for IdentityBindingCut {
-    fn default() -> Self {
-        let now = tokio::time::Instant::now();
-        Self {
-            bindings: BTreeMap::new(),
-            read_started_at: now,
-            read_completed_at: now,
-        }
-    }
-}
-
 impl IdentityBindingCut {
     async fn read(identity_runtime: Option<&crate::identity_first::IdentityRuntime>) -> Self {
-        let read_started_at = tokio::time::Instant::now();
+        let read_started = next_identity_binding_cut_position();
         let mut bindings = BTreeMap::new();
         if let Some(identity_runtime) = identity_runtime {
             for status in identity_runtime.statuses().await {
@@ -251,8 +258,8 @@ impl IdentityBindingCut {
         }
         Self {
             bindings,
-            read_started_at,
-            read_completed_at: tokio::time::Instant::now(),
+            read_started,
+            read_completed: next_identity_binding_cut_position(),
         }
     }
 
@@ -260,13 +267,23 @@ impl IdentityBindingCut {
     /// `request`: the bindings are the same, or this cut was read after the
     /// request's, so no fact it walked can belong to an earlier binding.
     fn answers_for(&self, request: &Self) -> bool {
-        self.bindings == request.bindings || self.read_started_at >= request.read_completed_at
+        self.bindings == request.bindings || self.read_started > request.read_completed
+    }
+
+    /// The identities whose binding differs in `after_walk`, the cut read
+    /// once the walk that recorded this cut completed.
+    fn moved_in(&self, after_walk: &Self) -> BTreeSet<String> {
+        self.bindings
+            .iter()
+            .filter(|(identity, binding)| after_walk.bindings.get(*identity) != Some(*binding))
+            .map(|(identity, _)| identity.clone())
+            .collect()
     }
 
     /// The newer of two cuts. A request joins with it, so a row never pairs
     /// an older session with facts walked under a newer binding.
     fn newer<'a>(&'a self, other: &'a Self) -> &'a Self {
-        if self.read_started_at >= other.read_completed_at {
+        if self.read_started > other.read_completed {
             self
         } else {
             other
@@ -11999,6 +12016,7 @@ async fn build_live_snapshot(
         &read_model_state.identity_cut,
         cut,
         walk_answers,
+        &read_model_state.moved_during_walk,
         runtime_machine.as_deref(),
     )
     .await;
@@ -12109,7 +12127,12 @@ async fn build_live_snapshot(
 /// binding in `cut`, the identity runtime's answer: the row's session is
 /// never the walk's copy. Returns the identities whose rows are pending: the
 /// walk does not answer for the request (`walk_answers` false) and the
-/// identity's binding moved since the walk.
+/// identity's binding moved since the walk, or the walk vouches for none of
+/// the identity's facts. That is so when the walk read its binding
+/// Suspended (a reset, respawn or rebind holds the identity there while it
+/// swaps the member, so the walk may hold either side's rows, or one side's
+/// session index beside the other's members) or when the binding moved
+/// while the walk ran (`moved_during_walk`).
 ///
 /// A row is identity-first when the walk's own cut held its identity (the
 /// identity runtime knew it when the row was walked) and its decoded roster
@@ -12131,6 +12154,7 @@ async fn join_identity_bindings(
     walked_cut: &IdentityBindingCut,
     cut: &IdentityBindingCut,
     walk_answers: bool,
+    moved_during_walk: &BTreeSet<String>,
     runtime_machine: Option<&meerkat_runtime::MeerkatMachine>,
 ) -> BTreeSet<String> {
     use futures::StreamExt as _;
@@ -12147,7 +12171,9 @@ async fn join_identity_bindings(
         }
         let current = cut.bindings.get(&identity);
         let session_id = current.and_then(|binding| binding.session_id.clone());
-        let is_pending = !walk_answers && current != Some(walked);
+        let walk_vouches = walked.state != crate::identity_first::IdentityLifecycleState::Suspended
+            && !moved_during_walk.contains(&identity);
+        let is_pending = !walk_vouches || (!walk_answers && current != Some(walked));
         if is_pending || member.session_id != session_id {
             rereads.push((
                 index,
@@ -12180,7 +12206,21 @@ async fn join_identity_bindings(
     pending
 }
 
+/// One walk of the console's read model. The identity runtime's bindings
+/// are read before it (the walk's cut) and again after it, and an identity
+/// whose binding moved between the two reads lands in
+/// `moved_during_walk`: the walk vouches for none of its facts.
 async fn collect_console_snapshot_read_model(
+    runtime: &MobRuntime,
+    identity_runtime: Option<&crate::identity_first::IdentityRuntime>,
+) -> ConsoleSnapshotReadModelState {
+    let mut state = Box::pin(walk_console_snapshot_read_model(runtime, identity_runtime)).await;
+    let after_walk = IdentityBindingCut::read(identity_runtime).await;
+    state.moved_during_walk = state.identity_cut.moved_in(&after_walk);
+    state
+}
+
+async fn walk_console_snapshot_read_model(
     runtime: &MobRuntime,
     identity_runtime: Option<&crate::identity_first::IdentityRuntime>,
 ) -> ConsoleSnapshotReadModelState {
