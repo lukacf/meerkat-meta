@@ -16,7 +16,10 @@
 //!   verb: `verbs = ["*"]` never covers it, and a listener that enforces no
 //!   grants refuses it. It refuses a request issued outside its freshness
 //!   window, or before the serving process started, as stale, and otherwise
-//!   submits or reads through its own continuation owner.
+//!   submits or reads through its own continuation owner. A delivery it
+//!   admitted has a deadline, its issue time plus the window: one it cannot
+//!   commit by then is refused as stale too, and nothing is committed. Every
+//!   stale refusal carries its typed [`StaleRequestCause`].
 //! * Every delivery is scoped to the caller the grant admitted: its
 //!   continuation key is the delivery key under the caller's scope, a digest
 //!   of the grant's label ([`KeyedInjectCallerScope`]). A caller reaches only
@@ -225,6 +228,64 @@ impl std::fmt::Display for NotServedCause {
     }
 }
 
+/// Why a gateway refused a keyed inject request as stale. Each says that
+/// nothing was committed for the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StaleRequestCause {
+    /// The request's issue time lies further from this gateway's clock than
+    /// its window: the two gateways' clocks disagree.
+    OutsideWindow,
+    /// The request was issued before this gateway's serving process
+    /// started: it restarted while the request was on its way.
+    IssuedBeforeStart,
+    /// This gateway admitted the delivery but could not commit it by its
+    /// deadline, the request's issue time plus the window.
+    DeadlinePassed,
+    /// How a caller reads a `stale_request` refusal that carries no cause, or
+    /// a cause this build does not know. A gateway never answers it.
+    Unknown,
+}
+
+impl StaleRequestCause {
+    /// Every cause this gateway answers.
+    pub const ALL: [Self; 3] = [
+        Self::OutsideWindow,
+        Self::IssuedBeforeStart,
+        Self::DeadlinePassed,
+    ];
+
+    /// Stable wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OutsideWindow => "outside_window",
+            Self::IssuedBeforeStart => "issued_before_start",
+            Self::DeadlinePassed => "deadline_passed",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Parse a wire spelling. `None` for a cause this gateway does not
+    /// answer.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|cause| cause.as_str() == value)
+    }
+
+    /// Read the cause a signed `stale_request` refusal carries in its own
+    /// field: [`Self::Unknown`] when it carries none, or one this build does
+    /// not know. Never read from the refusal's message.
+    pub fn read(value: Option<&str>) -> Self {
+        value.and_then(Self::parse).unwrap_or(Self::Unknown)
+    }
+}
+
+impl std::fmt::Display for StaleRequestCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The typed cause a refusal carries next to its code, inside the signed
 /// facts, for the codes that have one. A caller reads it from this field and
 /// never from the message.
@@ -234,6 +295,9 @@ pub enum KeyedInjectRefusalCause {
     /// Why a gateway answering [`KeyedInjectRefusalCode::NotServed`] does not
     /// serve keyed injects.
     NotServed(NotServedCause),
+    /// Why a gateway answering [`KeyedInjectRefusalCode::StaleRequest`]
+    /// refused the request as stale.
+    Stale(StaleRequestCause),
 }
 
 impl KeyedInjectRefusalCause {
@@ -241,6 +305,7 @@ impl KeyedInjectRefusalCause {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NotServed(cause) => cause.as_str(),
+            Self::Stale(cause) => cause.as_str(),
         }
     }
 
@@ -250,6 +315,9 @@ impl KeyedInjectRefusalCause {
     pub fn parse(code: KeyedInjectRefusalCode, value: &str) -> Option<Self> {
         match code {
             KeyedInjectRefusalCode::NotServed => NotServedCause::parse(value).map(Self::NotServed),
+            KeyedInjectRefusalCode::StaleRequest => {
+                StaleRequestCause::parse(value).map(Self::Stale)
+            }
             _ => None,
         }
     }
@@ -281,6 +349,29 @@ impl KeyedInjectRefusal {
             cause: Some(KeyedInjectRefusalCause::NotServed(cause)),
         }
     }
+
+    /// The refusal of a request this gateway will not serve for its timing.
+    /// Nothing was committed for it.
+    pub fn stale(cause: StaleRequestCause, message: impl Into<String>) -> Self {
+        Self {
+            code: KeyedInjectRefusalCode::StaleRequest,
+            message: message.into(),
+            cause: Some(KeyedInjectRefusalCause::Stale(cause)),
+        }
+    }
+}
+
+/// The refusal of a delivery this gateway admitted but did not commit by
+/// `deadline_ms`, its issue time plus the window, when its clock read
+/// `now_ms`. Nothing was committed.
+pub fn deadline_passed(deadline_ms: u64, now_ms: u64) -> KeyedInjectRefusal {
+    KeyedInjectRefusal::stale(
+        StaleRequestCause::DeadlinePassed,
+        format!(
+            "the delivery was not committed by its deadline at {deadline_ms} ms, and this \
+             gateway's clock reads {now_ms} ms; nothing was committed"
+        ),
+    )
 }
 
 impl std::fmt::Display for KeyedInjectRefusal {
@@ -339,7 +430,8 @@ pub type KeyedInjectFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>
 ///
 /// The control handler checks the freshness window and the member's form
 /// before it calls [`Self::deliver`] or [`Self::status`]; a receiver never
-/// sees a stale request.
+/// sees a request issued outside the window. Each delivery reaches it with
+/// its deadline, which the receiver honours.
 pub trait KeyedInjectReceiver: Send + Sync {
     /// How far a request's issue time may lie from [`Self::now_ms`], in
     /// either direction, in milliseconds.
@@ -357,11 +449,17 @@ pub trait KeyedInjectReceiver: Send + Sync {
     }
 
     /// Submit one delivery to the member's continuation owner, under the
-    /// caller's scope.
+    /// caller's scope, by `deadline_ms` on [`Self::now_ms`]'s clock: the
+    /// request's issue time plus the window. Whatever must happen before the
+    /// commit is bounded by the time left, and the deadline is checked again
+    /// right before the commit; once it has passed the receiver answers
+    /// [`deadline_passed`] and commits nothing. The commit itself is never
+    /// cut short.
     fn deliver<'a>(
         &'a self,
         scope: &'a KeyedInjectCallerScope,
         delivery: KeyedInject<'a>,
+        deadline_ms: u64,
     ) -> KeyedInjectFuture<'a, Result<NativeReceipt, KeyedInjectRefusal>>;
 
     /// Read the native status of a delivery's key, under the caller's scope,
@@ -472,8 +570,8 @@ pub fn check_freshness(
     if now_ms.abs_diff(issued_at_ms) <= window_ms {
         return Ok(());
     }
-    Err(KeyedInjectRefusal::new(
-        KeyedInjectRefusalCode::StaleRequest,
+    Err(KeyedInjectRefusal::stale(
+        StaleRequestCause::OutsideWindow,
         format!(
             "the request was issued at {issued_at_ms} ms and this gateway's clock reads \
              {now_ms} ms, more than the {window_ms} ms window apart; check both gateways' \
@@ -534,8 +632,8 @@ fn admit(
     check_freshness(issued_at_ms, receiver.now_ms(), receiver.window_ms())?;
     let started_at_ms = receiver.started_at_ms();
     if issued_at_ms < started_at_ms {
-        return Err(KeyedInjectRefusal::new(
-            KeyedInjectRefusalCode::StaleRequest,
+        return Err(KeyedInjectRefusal::stale(
+            StaleRequestCause::IssuedBeforeStart,
             format!(
                 "the request was issued at {issued_at_ms} ms, before this gateway started at \
                  {started_at_ms} ms"
@@ -624,7 +722,8 @@ async fn answer_deliver(
         Ok(admitted) => admitted,
         Err(refusal) => return refused(refusal),
     };
-    match receiver.deliver(&scope, delivery).await {
+    let deadline_ms = issued_at_ms.saturating_add(receiver.window_ms());
+    match receiver.deliver(&scope, delivery, deadline_ms).await {
         Ok(receipt) => ControlResponse::InjectReceipt {
             receipt,
             sig_b64: None,
@@ -870,6 +969,98 @@ mod tests {
             );
         }
         assert_eq!(NotServedCause::parse("built_without_feature"), None);
+        for cause in StaleRequestCause::ALL {
+            assert_eq!(StaleRequestCause::parse(cause.as_str()), Some(cause));
+            assert_eq!(StaleRequestCause::read(Some(cause.as_str())), cause);
+            assert_eq!(
+                KeyedInjectRefusalCause::parse(
+                    KeyedInjectRefusalCode::StaleRequest,
+                    cause.as_str()
+                ),
+                Some(KeyedInjectRefusalCause::Stale(cause))
+            );
+            assert_eq!(
+                KeyedInjectRefusalCause::parse(KeyedInjectRefusalCode::NotServed, cause.as_str()),
+                None,
+                "a cause belongs to its code"
+            );
+        }
+        assert_eq!(StaleRequestCause::read(None), StaleRequestCause::Unknown);
+        assert_eq!(
+            StaleRequestCause::read(Some("clock_drift")),
+            StaleRequestCause::Unknown,
+            "a cause this build does not know is unknown, never another one"
+        );
+        assert_eq!(StaleRequestCause::parse("unknown"), None);
+    }
+
+    /// Every stale refusal says why, in its own typed field: a request
+    /// outside the window, one issued before the serving process started,
+    /// and a delivery past its deadline each carry their cause.
+    #[tokio::test]
+    async fn every_stale_refusal_carries_its_typed_cause() {
+        let outside = check_freshness(1, 1_000_000, 300_000).unwrap_err();
+        assert_eq!(outside.code, KeyedInjectRefusalCode::StaleRequest);
+        assert_eq!(
+            outside.cause,
+            Some(KeyedInjectRefusalCause::Stale(
+                StaleRequestCause::OutsideWindow
+            ))
+        );
+        let late = deadline_passed(1_000, 1_001);
+        assert_eq!(late.code, KeyedInjectRefusalCode::StaleRequest);
+        assert_eq!(
+            late.cause,
+            Some(KeyedInjectRefusalCause::Stale(
+                StaleRequestCause::DeadlinePassed
+            ))
+        );
+        let receiver = Arc::new(CountingReceiver {
+            started_at_ms: 1_000_001,
+            ..CountingReceiver::default()
+        });
+        let slot = pending_keyed_inject_slot();
+        seal_keyed_inject_slot(
+            &slot,
+            KeyedInjectServing::Serving(Arc::clone(&receiver) as Arc<dyn KeyedInjectReceiver>),
+        )
+        .unwrap();
+        for request in [keyed_request("n1"), status_request("n2")] {
+            match answer_keyed_inject_request(&slot, request, Some(&granted())).await {
+                ControlResponse::InjectRefused { code, cause, .. } => {
+                    assert_eq!(code, KeyedInjectRefusalCode::StaleRequest.as_str());
+                    assert_eq!(
+                        cause.as_deref(),
+                        Some(StaleRequestCause::IssuedBeforeStart.as_str())
+                    );
+                }
+                other => panic!("expected stale_request, got {other:?}"),
+            }
+        }
+        assert_eq!(receiver.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A delivery reaches its receiver with its deadline: the request's issue
+    /// time plus the receiver's window.
+    #[tokio::test]
+    async fn a_delivery_reaches_its_receiver_with_its_deadline() {
+        let receiver = Arc::new(CountingReceiver::default());
+        let slot = pending_keyed_inject_slot();
+        seal_keyed_inject_slot(
+            &slot,
+            KeyedInjectServing::Serving(Arc::clone(&receiver) as Arc<dyn KeyedInjectReceiver>),
+        )
+        .unwrap();
+        assert!(matches!(
+            answer_keyed_inject_request(&slot, keyed_request("n1"), Some(&granted())).await,
+            ControlResponse::InjectReceipt { .. }
+        ));
+        assert_eq!(
+            receiver
+                .deadline_ms
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1_000_000 + 300_000
+        );
     }
 
     fn keyed_request(nonce: &str) -> ControlRequest {
@@ -1015,6 +1206,9 @@ mod tests {
     #[derive(Default)]
     struct CountingReceiver {
         calls: std::sync::atomic::AtomicUsize,
+        started_at_ms: u64,
+        /// The deadline the last delivery reached it with.
+        deadline_ms: std::sync::atomic::AtomicU64,
     }
 
     impl KeyedInjectReceiver for CountingReceiver {
@@ -1026,12 +1220,19 @@ mod tests {
             1_000_000
         }
 
+        fn started_at_ms(&self) -> u64 {
+            self.started_at_ms
+        }
+
         fn deliver<'a>(
             &'a self,
             _scope: &'a KeyedInjectCallerScope,
             _delivery: KeyedInject<'a>,
+            deadline_ms: u64,
         ) -> KeyedInjectFuture<'a, Result<NativeReceipt, KeyedInjectRefusal>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.deadline_ms
+                .store(deadline_ms, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async { Ok(receipt()) })
         }
 

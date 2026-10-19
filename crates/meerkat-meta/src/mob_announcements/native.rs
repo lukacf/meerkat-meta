@@ -975,8 +975,12 @@ impl MobNativeDelivery {
         }
         let identity =
             Self::agent_identity(identity).map_err(|error| PrepareError::Unavailable(error.0))?;
+        // Tracked, so a caller that stops waiting (a keyed inject past its
+        // deadline) drops only the wait: the materialization runs to its end
+        // under the identity runtime's foreground owner, and the member is
+        // ready for the next attempt.
         self.identities
-            .materialize(&identity)
+            .materialize_tracked(&identity)
             .await
             .map(|_| ())
             .map_err(|error| PrepareError::Unavailable(error.to_string()))

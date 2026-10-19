@@ -25,7 +25,7 @@ use crate::runtime::cross_mob_remote::RemoteMobProxy;
 use crate::runtime::keyed_inject::{
     KeyedInject, KeyedInjectCallError, KeyedInjectCallOutcome, KeyedInjectCallerScope,
     KeyedInjectFuture, KeyedInjectReceiver, KeyedInjectRefusal, KeyedInjectRefusalCode,
-    KeyedInjectStatusAnswer, NotServedCause,
+    KeyedInjectStatusAnswer, NotServedCause, StaleRequestCause, deadline_passed,
 };
 
 pub(crate) type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -86,8 +86,10 @@ impl RemoteMemberDelivery {
     /// every code this build knows and any it does not. Each signed "nothing
     /// was committed" is an availability state that can change; only
     /// `member_departed` ends anything, and a code this build cannot read
-    /// leaves the outcome unknown. The cause of `not_served` is read from the
-    /// refusal's own signed field, never from its message.
+    /// leaves the outcome unknown. The causes of `not_served` and
+    /// `stale_request` are read from the refusal's own signed field, never
+    /// from its message: only a request outside the peer's window is clock
+    /// skew.
     pub(super) fn submit_refusal(
         peer: &MobId,
         issued_at_ms: u64,
@@ -115,10 +117,13 @@ impl RemoteMemberDelivery {
             Code::NotServed => signed(SuspendCause::PeerNotServing {
                 cause: NotServedCause::read(cause),
             }),
-            Code::StaleRequest => signed(SuspendCause::ClockSkew {
-                issued_at_ms,
-                window_ms,
-            }),
+            Code::StaleRequest => match StaleRequestCause::read(cause) {
+                StaleRequestCause::OutsideWindow => signed(SuspendCause::ClockSkew {
+                    issued_at_ms,
+                    window_ms,
+                }),
+                cause => signed(SuspendCause::StaleRequest { cause }),
+            },
             Code::InvalidRequest => NativeSubmitError::Blocked {
                 cause: BlockCause::PeerInvalidRequest,
                 detail: message,
@@ -469,6 +474,26 @@ fn waiting_refusal(identity: &MemberIdentity, cause: &SuspendCause) -> KeyedInje
     }
 }
 
+/// Run what must happen before a delivery's commit within the time left
+/// before `deadline_ms` on `clock`, then check the deadline once more: what
+/// follows is the commit, which is never cut short. A deadline that passes
+/// first is refused as stale (`deadline_passed`), and nothing is committed.
+pub(super) async fn within_deadline<T>(
+    deadline_ms: u64,
+    clock: &Clock,
+    before_commit: impl std::future::Future<Output = Result<T, KeyedInjectRefusal>>,
+) -> Result<T, KeyedInjectRefusal> {
+    let left = deadline_ms.saturating_sub(clock());
+    let ready = tokio::time::timeout(std::time::Duration::from_millis(left), before_commit)
+        .await
+        .map_err(|_| deadline_passed(deadline_ms, clock()))??;
+    let now = clock();
+    if now > deadline_ms {
+        return Err(deadline_passed(deadline_ms, now));
+    }
+    Ok(ready)
+}
+
 fn hosted_identity(member: &str) -> Result<MemberIdentity, KeyedInjectRefusal> {
     let identity = MemberIdentity::new(member).map_err(invalid)?;
     crate::identity_first::AgentIdentity::parse(identity.as_str()).map_err(invalid)?;
@@ -493,6 +518,65 @@ pub(crate) fn validate_delivery(
     Ok(identity)
 }
 
+impl KeyedInjectServer {
+    /// Make the member ready for a delivery: a runtime that admits work only
+    /// through a native work authorization host refuses it, the member must
+    /// be served here, and its preparation must succeed.
+    ///
+    /// The governed check and the identity service lookup only read, so a
+    /// deadline that drops this future between them leaves nothing behind.
+    /// The preparation runs under the identity runtime's own task: the
+    /// deadline drops only the wait for it.
+    async fn ready(&self, identity: &MemberIdentity) -> Result<(), KeyedInjectRefusal> {
+        match self.native.governs_work_authority() {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(KeyedInjectRefusal::new(
+                    KeyedInjectRefusalCode::Governed,
+                    "this gateway's runtime admits work only through a native work \
+                     authorization host, which refuses host continuations",
+                ));
+            }
+            Err(error) => return Err(native_unavailable(error)),
+        }
+        match self
+            .native
+            .identity_service(identity)
+            .await
+            .map_err(native_unavailable)?
+        {
+            IdentityService::Local => {}
+            IdentityService::Unknown => {
+                return Err(KeyedInjectRefusal::new(
+                    KeyedInjectRefusalCode::UnknownMember,
+                    format!("{identity} is not an identity registered with this gateway"),
+                ));
+            }
+            IdentityService::Elsewhere(cause) => {
+                return Err(KeyedInjectRefusal::new(
+                    KeyedInjectRefusalCode::UnusableMember,
+                    not_served_here_detail(identity, cause),
+                ));
+            }
+        }
+        self.native
+            .prepare_identity(identity)
+            .await
+            .map_err(|error| match error {
+                PrepareError::Suspended { cause, .. } => waiting_refusal(identity, &cause),
+                // A member of this gateway's own mob has no final fact
+                // before its departure is recorded; nothing is implied.
+                PrepareError::Gone(end) => KeyedInjectRefusal::new(
+                    KeyedInjectRefusalCode::NativeUnavailable,
+                    end.to_string(),
+                ),
+                PrepareError::Unavailable(detail) => {
+                    KeyedInjectRefusal::new(KeyedInjectRefusalCode::NativeUnavailable, detail)
+                }
+            })
+    }
+}
+
 impl KeyedInjectReceiver for KeyedInjectServer {
     fn window_ms(&self) -> u64 {
         self.window_ms
@@ -510,55 +594,10 @@ impl KeyedInjectReceiver for KeyedInjectServer {
         &'a self,
         scope: &'a KeyedInjectCallerScope,
         delivery: KeyedInject<'a>,
+        deadline_ms: u64,
     ) -> KeyedInjectFuture<'a, Result<NativeReceipt, KeyedInjectRefusal>> {
         Box::pin(async move {
             let identity = validate_delivery(&delivery)?;
-            match self.native.governs_work_authority() {
-                Ok(false) => {}
-                Ok(true) => {
-                    return Err(KeyedInjectRefusal::new(
-                        KeyedInjectRefusalCode::Governed,
-                        "this gateway's runtime admits work only through a native work \
-                         authorization host, which refuses host continuations",
-                    ));
-                }
-                Err(error) => return Err(native_unavailable(error)),
-            }
-            match self
-                .native
-                .identity_service(&identity)
-                .await
-                .map_err(native_unavailable)?
-            {
-                IdentityService::Local => {}
-                IdentityService::Unknown => {
-                    return Err(KeyedInjectRefusal::new(
-                        KeyedInjectRefusalCode::UnknownMember,
-                        format!("{identity} is not an identity registered with this gateway"),
-                    ));
-                }
-                IdentityService::Elsewhere(cause) => {
-                    return Err(KeyedInjectRefusal::new(
-                        KeyedInjectRefusalCode::UnusableMember,
-                        not_served_here_detail(&identity, cause),
-                    ));
-                }
-            }
-            self.native
-                .prepare_identity(&identity)
-                .await
-                .map_err(|error| match error {
-                    PrepareError::Suspended { cause, .. } => waiting_refusal(&identity, &cause),
-                    // A member of this gateway's own mob has no final fact
-                    // before its departure is recorded; nothing is implied.
-                    PrepareError::Gone(end) => KeyedInjectRefusal::new(
-                        KeyedInjectRefusalCode::NativeUnavailable,
-                        end.to_string(),
-                    ),
-                    PrepareError::Unavailable(detail) => {
-                        KeyedInjectRefusal::new(KeyedInjectRefusalCode::NativeUnavailable, detail)
-                    }
-                })?;
             let continuation = continuation_delivery(
                 &scope.native_key(delivery.delivery_key),
                 delivery.delivery_key,
@@ -567,6 +606,12 @@ impl KeyedInjectReceiver for KeyedInjectServer {
                 delivery.body,
             )
             .map_err(invalid)?;
+            // The member checks and its preparation, which can wait on a
+            // member that is not running yet, are bounded by the request's
+            // deadline, and the deadline is checked once more just before the
+            // commit: a delivery committed after it could land behind later
+            // ones its caller already moved on to.
+            within_deadline(deadline_ms, &self.clock, self.ready(&identity)).await?;
             match self
                 .native
                 .submit_delivery(&identity, continuation, self.now_ms())

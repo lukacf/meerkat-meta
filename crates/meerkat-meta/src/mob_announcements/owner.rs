@@ -29,10 +29,10 @@ use super::store::AnnouncementStore;
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
     BatchGap, BatchId, BatchPosition, BatchQuery, BatchState, BatchStateTag, ChildMemberLimits,
-    GapReason, Member, MemberRouteRecord, MobId, MobIncarnation, MobLineage, NativeReceipt,
-    OperationId, PutSubscription, SealingPolicy, SourceKey, Subscription, SubscriptionChange,
-    SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId, SubscriptionState, SuccessorBatch,
-    merge_gaps, render_item, successor_batch, wire_budget,
+    GapReason, LateOutcome, Member, MemberRouteRecord, MobId, MobIncarnation, MobLineage,
+    NativeReceipt, OperationId, PutSubscription, SealingPolicy, SourceKey, Subscription,
+    SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
+    SubscriptionState, SuccessorBatch, merge_gaps, render_item, successor_batch, wire_budget,
 };
 
 /// The owner's error for a member a put cannot subscribe.
@@ -56,6 +56,9 @@ pub const MIN_RETENTION_MS: u64 = 60 * 60 * 1_000;
 pub(super) const ROUND_BATCHES: usize = 64;
 /// Members the dispatcher considers for sealing per round.
 pub(super) const ROUND_MEMBERS: usize = 64;
+/// Batches that settled without their delivery being confirmed, read again
+/// per round.
+const ROUND_LATE_READS: usize = 16;
 /// Longest the dispatcher sleeps without a signal, in ms.
 const MAX_IDLE_MS: u64 = 5 * 60 * 1_000;
 /// How often retention runs.
@@ -1099,11 +1102,26 @@ impl AnnouncementService {
             // The walk paces its next look at the batch from this read; a
             // batch this settled leaves the walk.
             walk.read(position, due);
-            self.inner
+            let batch = self
+                .inner
                 .store
                 .batch(id)
                 .await?
-                .ok_or(AnnouncementStoreError::UnknownBatch)?
+                .ok_or(AnnouncementStoreError::UnknownBatch)?;
+            // A batch that settled without its delivery being confirmed is
+            // read once more for what became of it.
+            if BatchStateTag::UNCONFIRMED.contains(&batch.state.tag())
+                && batch.state.late().is_none_or(|late| !late.is_final())
+            {
+                self.read_late_one(&batch, now).await?;
+                self.inner
+                    .store
+                    .batch(id)
+                    .await?
+                    .ok_or(AnnouncementStoreError::UnknownBatch)?
+            } else {
+                batch
+            }
         };
         // A batch this settled frees its member for the next one now,
         // not at the dispatcher's next timer.
@@ -1241,6 +1259,12 @@ impl AnnouncementService {
                 }
                 Err(error) => self.retry_later(walk, &mut report, position, now, &error),
             }
+        }
+        // What became of a delivery that was not confirmed in time is read
+        // again at the quiet window's pace; a failing read waits for the
+        // next round and holds back nothing else.
+        if let Err(error) = self.read_late(now).await {
+            tracing::warn!(%error, "announcement late reads failed this round");
         }
         let policy = config.policy;
         let backlogs = self.inner.store.backlogs(ROUND_MEMBERS).await?;
@@ -1677,29 +1701,115 @@ impl AnnouncementService {
         Ok(presence.get(&member.mob_id) == Some(&MobPresence::Gone))
     }
 
-    /// Whether a batch nothing native holds expires (one still sealed or owed
-    /// again, or one the native owner reads as not committed): once it was
-    /// sealed before the retention window, every item it holds is at least
-    /// that old. For a member on a peer gateway its last
-    /// submission must also be older than the peer's request window, so a
-    /// request still in flight is refused as stale instead of landing after
-    /// the expiry; until then nothing is submitted again.
+    /// Whether a batch whose submission is not settled by native evidence
+    /// expires: one nothing native holds (still sealed or owed again, or one
+    /// the native owner reads as not committed), or one whose outcome no
+    /// status read has brought. Once it was sealed before the retention
+    /// window, every item it holds is at least that old. For a member on a
+    /// peer gateway its last submission must also be older than the quiet
+    /// window, so a request still in flight is refused as stale instead of
+    /// landing after the expiry; until then nothing is submitted again.
     fn expiry(&self, batch: &Batch, now: u64) -> Expiry {
         let config = &self.inner.config;
         if now.saturating_sub(batch.sealed_at_ms) < config.retention_ms {
             return Expiry::NotYet;
         }
-        // A peer accepts a request while its issue time is within the
-        // window of its own clock: the wait covers this gateway's window and
-        // the slowest settle pause past it, for a request issued late in a
-        // round or read by a clock a little behind.
-        let quiet = config
-            .peer_request_window_ms
-            .saturating_add(config.settle_check_max_ms);
+        let quiet = self.quiet_ms();
         if batch.route != MemberRoute::Peer || now.saturating_sub(batch.updated_at_ms) > quiet {
             return Expiry::Now;
         }
         Expiry::AfterQuietWindow(batch.updated_at_ms.saturating_add(quiet).saturating_add(1))
+    }
+
+    /// The quiet window after a submission to a peer. A peer accepts a
+    /// request while its issue time is within the window of its own clock,
+    /// and commits it by that deadline or not at all: the wait covers this
+    /// gateway's window and the slowest settle pause past it, for a request
+    /// issued late in a round or read by a clock a little behind.
+    fn quiet_ms(&self) -> u64 {
+        let config = &self.inner.config;
+        config
+            .peer_request_window_ms
+            .saturating_add(config.settle_check_max_ms)
+    }
+
+    /// Whether a committed batch settles with its admission not confirmed:
+    /// the retention window has passed since its commit (when nothing moved
+    /// it since, its last update) and a verified status still reads it as
+    /// pending (`read`), or no status could be read for the quiet window
+    /// after that too. Any verified status after the retention window
+    /// settles the batch, so then none lies in that last quiet window.
+    fn admission_unconfirmed(&self, batch: &Batch, now: u64, read: bool) -> bool {
+        let mut bound = self.inner.config.retention_ms;
+        if !read {
+            bound = bound.saturating_add(self.quiet_ms());
+        }
+        now.saturating_sub(batch.updated_at_ms) >= bound
+    }
+
+    /// Read again the batches that settled without their delivery being
+    /// confirmed whose next read is due, and keep on each what a read finds
+    /// that it does not already state. A batch is read once per quiet window
+    /// until what it keeps is final or retention removes it; it never
+    /// reopens, and the member's later batches go on as they were.
+    async fn read_late(&self, now: u64) -> Result<(), AnnouncementError> {
+        for batch in self
+            .inner
+            .store
+            .late_reads_due(now, ROUND_LATE_READS)
+            .await?
+        {
+            self.read_late_one(&batch, now).await?;
+        }
+        Ok(())
+    }
+
+    async fn read_late_one(&self, batch: &Batch, now: u64) -> Result<(), AnnouncementError> {
+        // A route that contradicts its member is never read.
+        if self.route_refusal(batch).is_some() {
+            self.inner
+                .store
+                .record_late_read(&batch.id, None, None)
+                .await?;
+            return Ok(());
+        }
+        let again = Some(now.saturating_add(self.quiet_ms()));
+        let (late, next) = match self.inner.native.status(batch).await {
+            Ok(status) => {
+                // A status about another delivery contradicts the batch: it
+                // is kept as it was read, and nothing more is read.
+                let contradicts = batch.state.late_names_other_delivery(&status);
+                let late = batch
+                    .state
+                    .late_news(status)
+                    .map(|status| LateOutcome { status, at_ms: now });
+                let done = contradicts
+                    || late
+                        .as_ref()
+                        .or(batch.state.late())
+                        .is_some_and(LateOutcome::is_final);
+                (late, if done { None } else { again })
+            }
+            Err(NativeStatusError::Unavailable { .. }) => (None, again),
+            // The member departed for good: its subscriptions end, and
+            // nothing more is read for the batch.
+            Err(NativeStatusError::MemberGone(departure)) => {
+                self.end_member(
+                    &batch.member,
+                    SubscriptionEnd::MemberDeparted { departure },
+                    now,
+                )
+                .await;
+                (None, None)
+            }
+            // The read rules out any later one.
+            Err(NativeStatusError::Blocked { .. }) => (None, None),
+        };
+        self.inner
+            .store
+            .record_late_read(&batch.id, late, next)
+            .await?;
+        Ok(())
     }
 
     fn settle_pause_ms(&self, batch: &Batch, now: u64) -> u64 {
@@ -1804,7 +1914,21 @@ impl AnnouncementService {
                 BatchState::Submitting { .. } => {
                     let status = match self.read_status(&batch, now).await? {
                         StatusStep::Status(status) => status,
-                        StatusStep::Wait => return Ok(retry_at),
+                        // The outcome stays unknown. Past the retention
+                        // window, and past the quiet window since its last
+                        // submission for a member on a peer, it is not
+                        // learned in time: the batch settles as not
+                        // confirmed, is never submitted again, and the
+                        // member's next batch goes on.
+                        StatusStep::Wait => match self.expiry(&batch, now) {
+                            Expiry::Now => {
+                                batch = self
+                                    .apply(&batch, BatchEvent::ExpireUnverified, now)
+                                    .await?;
+                                continue;
+                            }
+                            Expiry::NotYet | Expiry::AfterQuietWindow(_) => return Ok(retry_at),
+                        },
                         StatusStep::Moved(next) => {
                             batch = *next;
                             continue;
@@ -1872,6 +1996,17 @@ impl AnnouncementService {
                 BatchState::Committed { .. } => {
                     let status = match self.read_status(&batch, now).await? {
                         StatusStep::Status(status) => status,
+                        // No status can be read, past the retention window
+                        // and the quiet window after it since the commit:
+                        // the admission is not confirmed in time. The member's
+                        // inbox committed the batch, so the next one goes on
+                        // without passing it.
+                        StatusStep::Wait if self.admission_unconfirmed(&batch, now, false) => {
+                            batch = self
+                                .apply(&batch, BatchEvent::ExpireUnconfirmed, now)
+                                .await?;
+                            continue;
+                        }
                         StatusStep::Wait => return Ok(retry_at),
                         StatusStep::Moved(next) => {
                             batch = *next;
@@ -1897,6 +2032,18 @@ impl AnnouncementService {
                                     if batch.route != MemberRoute::Child
                                         || !self.member_mob_destroyed(&batch.member).await?
                                     {
+                                        // Still pending past the retention
+                                        // window since the commit: the
+                                        // admission is not confirmed in
+                                        // time, and an admission or a
+                                        // stranding after this is kept as
+                                        // its late outcome.
+                                        if self.admission_unconfirmed(&batch, now, true) {
+                                            batch = self
+                                                .apply(&batch, BatchEvent::ExpireUnconfirmed, now)
+                                                .await?;
+                                            continue;
+                                        }
                                         return Ok(retry_at);
                                     }
                                     self.inner
@@ -1949,7 +2096,9 @@ impl AnnouncementService {
                 | BatchState::Refused { .. }
                 | BatchState::Cancelled
                 | BatchState::Expired
-                | BatchState::Blocked { .. } => return Ok(None),
+                | BatchState::Blocked { .. }
+                | BatchState::ExpiredUnverified { .. }
+                | BatchState::CommittedUnconfirmed { .. } => return Ok(None),
             }
         }
         Ok(Some(

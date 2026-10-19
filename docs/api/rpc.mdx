@@ -1941,9 +1941,28 @@ continuation owner's own status (`not_submitted`, `not_committed`, `pending`,
 read), and `input` is the admitted input's runtime state. Admission is not
 processing: read `input` for what the runtime did with it. A batch in state
 `expired` waited longer than the retention window with nothing native ever
-holding it; the member's next batch lists what it did not get in `gaps`
-(`[{mob_id, count, reason}]`, reason `expired` or `not_retained`) and in a
-gap line of its body.
+holding it. One in state `expired_unverified` was submitted, and whether it
+was committed was never learned: past the retention window, and past the
+quiet window since its last submission (the request window plus the slowest
+settle pause), no status read brought a status. One in state
+`committed_unconfirmed` was committed to the member's inbox, with its
+`receipt` kept, and its admission was never confirmed: past the retention
+window since the commit it was still pending, or no status could be read for
+the quiet window after that. Neither is ever submitted again. The member's
+next batch lists what it did not get in `gaps` (`[{mob_id, count, reason}]`,
+reason `expired`, `not_retained`, `delivery_not_confirmed` or
+`admission_not_confirmed`) and in a gap line of its body. A delivery that was
+not confirmed can still arrive later, after later announcements: neither its
+arrival nor its absence was confirmed. A batch that settles so hands its own
+gap lines to the member's next batch too: a member reads them at least once,
+and may read them twice.
+
+What a status read finds after such a batch settled is kept on it as `late`:
+the native status in its own shape (`status` is `not_committed`, `pending`,
+`applied`, `stranded` or `refused`, with its `receipt`), and `at_ms`, when it
+was read. It never reopens the batch, and the member's next batch goes on as
+it was. Such a batch is read again once per quiet window until what it keeps
+is final (anything but `pending`) or retention removes it.
 
 `member` is `{"mob_id": "<mob id>", "identity": "<identity>"}`: an identity
 is unique only within its mob. A member of this gateway's mob must be a
@@ -1987,7 +2006,8 @@ read settles it, and nothing is submitted again before one does.
 |---|---|---|
 | `peer_composing` | verified | The peer's keyed inject plane is still starting. |
 | `peer_not_serving` | verified | The peer does not serve keyed inject; `cause` is `not_identity_first`, `runtime_disabled` or `unknown` (none given, or one this build does not know). |
-| `clock_skew` | verified | The peer refused the request as stale; `issued_at_ms` and `window_ms` are this gateway's own. |
+| `clock_skew` | verified | The peer refused the request as issued outside its window (`outside_window`); `issued_at_ms` and `window_ms` are this gateway's own. |
+| `stale_request` | verified | The peer refused the request for its timing and committed nothing; `cause` is `issued_before_start` (issued before the peer's serving process started), `deadline_passed` (the peer could not commit it by its deadline, the request's issue time plus the window) or `unknown`. |
 | `member_unknown` | verified, local | The member is not registered where it is served. |
 | `member_not_served_here` | verified, local | The member is placed on a host (`placed_on_host`) or bound to an external runtime (`external_binding`); `cause` is `null` from a peer, which does not say which. |
 | `governed` | verified, local | The member's runtime refuses host continuations. |

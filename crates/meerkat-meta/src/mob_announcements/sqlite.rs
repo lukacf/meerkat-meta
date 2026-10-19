@@ -19,12 +19,12 @@ use super::store::AnnouncementStore;
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
     BatchGap, BatchId, BatchItem, BatchPosition, BatchQuery, BatchState, BatchStateTag,
-    ExpiryReport, GapReason, MAX_BACKFILL, MAX_ITEM_WIRE_BYTES, MAX_PAGE, Member, MemberBacklog,
-    MemberRoute, MemberRouteRecord, MobId, MobLineage, OperationId, PruneReport, PutSubscription,
-    Result, SealingPolicy, SourceKey, StartFrontier, Subscription, SubscriptionChange,
-    SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId, SubscriptionState, Topic,
-    content_digest, header_wire_bound, merge_gaps, render_batch, render_gap, render_item,
-    request_fingerprint, wire_budget, wire_len,
+    ExpiryReport, GapReason, LateOutcome, MAX_BACKFILL, MAX_ITEM_WIRE_BYTES, MAX_PAGE, Member,
+    MemberBacklog, MemberRoute, MemberRouteRecord, MobId, MobLineage, OperationId, PruneReport,
+    PutSubscription, Result, SealingPolicy, SourceKey, StartFrontier, Subscription,
+    SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
+    SubscriptionState, Topic, content_digest, header_wire_bound, merge_gaps, render_batch,
+    render_gap, render_item, request_fingerprint, wire_budget, wire_len,
 };
 
 /// The mob announcement store's tables. A provider applies this through its own
@@ -71,11 +71,14 @@ CREATE TABLE IF NOT EXISTS announcement_members (
  member TEXT PRIMARY KEY, last_sealed_at_ms INTEGER, flush_requested_at_ms INTEGER);
 CREATE TABLE IF NOT EXISTS announcement_batches (
  id TEXT PRIMARY KEY, member TEXT NOT NULL, state TEXT NOT NULL,
- sealed_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, record TEXT NOT NULL);
+ sealed_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, record TEXT NOT NULL,
+ late_read_at_ms INTEGER);
 CREATE INDEX IF NOT EXISTS announcement_batches_by_state
  ON announcement_batches (state, sealed_at_ms, id);
 CREATE INDEX IF NOT EXISTS announcement_batches_by_member
  ON announcement_batches (member, sealed_at_ms, id);
+CREATE INDEX IF NOT EXISTS announcement_batches_late_reads
+ ON announcement_batches (late_read_at_ms, id) WHERE late_read_at_ms IS NOT NULL;
 CREATE TABLE IF NOT EXISTS announcement_batch_subscriptions (
  subscription_id TEXT NOT NULL, batch_id TEXT NOT NULL,
  PRIMARY KEY (subscription_id, batch_id));
@@ -542,10 +545,10 @@ fn pending_gaps(db: &Connection, member: &Member) -> Result<Vec<BatchGap>> {
     Ok(gaps)
 }
 
-/// What the unsettled owed announcements of `batch` amount to as expired
-/// gaps: distinct announcements per mob, so one held for two of the
+/// What the unsettled owed announcements of `batch` amount to as gaps for
+/// `reason`: distinct announcements per mob, so one held for two of the
 /// member's subscriptions counts once.
-fn batch_expired_gaps(db: &Connection, batch: &BatchId) -> Result<Vec<BatchGap>> {
+fn batch_gaps(db: &Connection, batch: &BatchId, reason: GapReason) -> Result<Vec<BatchGap>> {
     let mut statement = db
         .prepare(
             "SELECT mob_id, COUNT(DISTINCT sequence) FROM owed_announcements
@@ -563,10 +566,47 @@ fn batch_expired_gaps(db: &Connection, batch: &BatchId) -> Result<Vec<BatchGap>>
         gaps.push(BatchGap {
             mob_id: MobId::new(mob_id)?,
             count: uint(count)?,
-            reason: GapReason::Expired,
+            reason,
         });
     }
     Ok(gaps)
+}
+
+/// When the late outcome of an unconfirmed batch is read next, or never.
+fn set_late_read(db: &Connection, id: &BatchId, at_ms: Option<u64>) -> Result<()> {
+    db.execute(
+        "UPDATE announcement_batches SET late_read_at_ms = ?2 WHERE id = ?1",
+        params![id.as_str(), at_ms.map(int).transpose()?],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+fn record_late_read_in(
+    db: &Connection,
+    id: &BatchId,
+    late: Option<LateOutcome>,
+    next_read_at_ms: Option<u64>,
+) -> Result<Batch> {
+    let mut batch = load_batch(db, id)?.ok_or(AnnouncementStoreError::UnknownBatch)?;
+    if !BatchStateTag::UNCONFIRMED.contains(&batch.state.tag()) {
+        return Err(AnnouncementStoreError::Invalid(format!(
+            "a {} batch keeps no late outcome",
+            batch.state.tag()
+        )));
+    }
+    if let Some(late) = late {
+        batch.state = batch.state.with_late(late)?;
+        // The batch stays settled when it settled: retention counts from
+        // then, not from a late read.
+        db.execute(
+            "UPDATE announcement_batches SET record = ?2 WHERE id = ?1",
+            params![id.as_str(), encode(&batch)?],
+        )
+        .map_err(storage)?;
+    }
+    set_late_read(db, id, next_read_at_ms)?;
+    Ok(batch)
 }
 
 fn mark_sealed(db: &Connection, member: &Member, now_ms: u64) -> Result<()> {
@@ -1668,11 +1708,19 @@ fn transition_batch_in(
         add_gaps(db, &batch.member, &successor.deferred)?;
         batch.successor = Some(successor.id.clone());
     }
-    if matches!(event, BatchEvent::Expire | BatchEvent::ExpireNotCommitted) {
-        // The member learns of what expired, and of the gaps this batch was
-        // to report, from its next batch.
-        let expired = batch_expired_gaps(db, &batch.id)?;
-        add_gaps(db, &batch.member, &merge_gaps(&batch.gaps, &expired))?;
+    let held_as = match event {
+        BatchEvent::Expire | BatchEvent::ExpireNotCommitted => Some(GapReason::Expired),
+        BatchEvent::ExpireUnverified => Some(GapReason::DeliveryNotConfirmed),
+        BatchEvent::ExpireUnconfirmed => Some(GapReason::AdmissionNotConfirmed),
+        _ => None,
+    };
+    if let Some(reason) = held_as {
+        // The member learns of what this batch held, and of the gaps it was
+        // to report, from its next batch: a batch whose delivery was not
+        // confirmed may still have reached the member, so those lines may
+        // reach it twice, never not at all.
+        let held = batch_gaps(db, &batch.id, reason)?;
+        add_gaps(db, &batch.member, &merge_gaps(&batch.gaps, &held))?;
     } else if matches!(
         next.tag(),
         BatchStateTag::Cancelled
@@ -1691,6 +1739,10 @@ fn transition_batch_in(
     batch.state = next;
     batch.updated_at_ms = now_ms;
     update_batch(db, &batch)?;
+    if BatchStateTag::UNCONFIRMED.contains(&batch.state.tag()) {
+        // What its delivery came to is read again from the next round on.
+        set_late_read(db, &batch.id, Some(now_ms))?;
+    }
     Ok(batch)
 }
 
@@ -2381,6 +2433,31 @@ impl AnnouncementStore for SqliteAnnouncementStore {
     ) -> Result<Batch> {
         let id = id.clone();
         self.run(move |db| transition_batch_in(db, &id, expected, &event, now_ms))
+            .await
+    }
+
+    async fn late_reads_due(&self, now_ms: u64, limit: usize) -> Result<Vec<Batch>> {
+        self.run(move |db| {
+            let mut statement = db
+                .prepare_cached(
+                    "SELECT record FROM announcement_batches
+                     WHERE late_read_at_ms IS NOT NULL AND late_read_at_ms <= ?1
+                     ORDER BY late_read_at_ms, id LIMIT ?2",
+                )
+                .map_err(storage)?;
+            batches_from(&mut statement, params![int(now_ms)?, page(limit)?])
+        })
+        .await
+    }
+
+    async fn record_late_read(
+        &self,
+        id: &BatchId,
+        late: Option<LateOutcome>,
+        next_read_at_ms: Option<u64>,
+    ) -> Result<Batch> {
+        let id = id.clone();
+        self.run(move |db| record_late_read_in(db, &id, late, next_read_at_ms))
             .await
     }
 

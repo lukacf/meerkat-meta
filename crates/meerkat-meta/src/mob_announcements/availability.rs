@@ -15,7 +15,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::types::MobId;
-use crate::runtime::keyed_inject::NotServedCause;
+use crate::runtime::keyed_inject::{NotServedCause, StaleRequestCause};
 
 /// How strong the evidence behind an outcome is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -110,6 +110,12 @@ pub enum SuspendCause {
     PeerUnanswered { code: Option<String> },
     /// This gateway's own native owner could not be read or written now.
     NativeUnavailable,
+    /// The peer refused the request for its timing, signed, and committed
+    /// nothing: it was issued before the peer's serving process started, or
+    /// the peer could not commit it before its deadline, or the cause is one
+    /// this build does not know. The batch is owed again. A refusal of a
+    /// request outside the peer's window reads as [`Self::ClockSkew`].
+    StaleRequest { cause: StaleRequestCause },
 }
 
 impl SuspendCause {
@@ -129,6 +135,7 @@ impl SuspendCause {
             Self::AnswerFailedVerification => "answer_failed_verification",
             Self::PeerUnanswered { .. } => "peer_unanswered",
             Self::NativeUnavailable => "native_unavailable",
+            Self::StaleRequest { .. } => "stale_request",
         }
     }
 }
@@ -149,6 +156,7 @@ impl fmt::Display for SuspendCause {
             }
             Self::PeerRefusedUnknown { code } => write!(f, "peer_refused_unknown ({code})"),
             Self::PeerUnanswered { code: Some(code) } => write!(f, "peer_unanswered ({code})"),
+            Self::StaleRequest { cause } => write!(f, "stale_request ({cause})"),
             other => f.write_str(other.kind()),
         }
     }

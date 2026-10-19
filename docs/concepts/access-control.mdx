@@ -466,7 +466,17 @@ own keys only. Both need:
   authorizer refuses them);
 - a request issued within the serving gateway's freshness window of its own
   clock (`runtime_options.control_request_window_ms`, five minutes by
-  default) and not before the serving process started;
+  default) and not before the serving process started. A delivery the
+  gateway admitted has a deadline, its issue time plus the window: the
+  gateway prepares the member within it, checks it again just before the
+  commit, and refuses a delivery it cannot commit in time; a member
+  preparation it stopped waiting for still finishes, so the next attempt
+  finds the member ready. The deadline uses the serving gateway's own
+  window, so gateways that deliver to each other should configure the same
+  `control_request_window_ms`. Each stale refusal carries its typed cause in
+  a field of the signed refusal: `outside_window`, `issued_before_start`
+  (a request issued before the serving process started, as when it
+  restarted while the request was on its way) or `deadline_passed`;
 - an identity-first serving gateway that serves keyed injects. Every gateway
   that binds a control listener (`rpc_gateway`, `meta_gateway`, and a
   runtime the builder composes) seals what the plane serves once its runtime

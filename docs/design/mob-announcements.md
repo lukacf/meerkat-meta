@@ -70,16 +70,41 @@ only from native evidence:
   clock behind this gateway's, may still admit such a request, and then the
   announcements are delivered and also reported as expired, a false gap,
   never a loss.
+- `expired_unverified`: settled. It was submitting, and no status read
+  brought its outcome before the retention window, and, for a member on a
+  peer gateway, the quiet window since its last request, had passed. It is
+  never submitted again, and its announcements are reported as
+  `delivery_not_confirmed`: neither delivered nor lost. A peer commits a
+  delivery it admitted only by the request's deadline, its issue time plus
+  the window: it bounds the member's preparation by the time left and checks
+  the deadline again just before the commit. So a commit after the batch
+  settled is left to one already under way at the deadline, or to a peer
+  whose clock or window differs; that delivery then arrives after later
+  announcements, and order is not kept across this state.
+- `committed_unconfirmed`: settled. The member's inbox committed it, its
+  receipt is kept, and its admission was never confirmed: past the retention
+  window since the commit a verified status still read it as pending (a
+  gateway keeps a delivery waiting for a member of a mob it does not host),
+  or no status could be read for the quiet window after that. It is never
+  submitted again, and its announcements are reported as
+  `admission_not_confirmed`. The member's next batch goes on without passing
+  it: it was committed first.
+- Of a batch in either state, what a status read finds later is kept on it
+  as its `late` outcome, read once per quiet window until it is final or
+  retention removes the batch. It never reopens the batch.
 
 What a member was owed and never got is reported, never dropped silently:
 the member's next batch opens with a gap line per mob saying how many
-announcements it did not receive and why (`expired` or `not_retained`), and
+announcements it did not receive and why (`expired`, `not_retained`,
+`delivery_not_confirmed` or `admission_not_confirmed`), and
 the batch's `gaps` field carries the same counts. A batch for a member on a
 peer gateway carries as many gap lines as fit what its items leave of one
 request; the rest wait for the next batch. A successor does the same, since
 a gap line can be longer than the item it stands for. A batch that ends without
 delivering (cancelled, refused, blocked, or stranded with no successor)
-hands its gap lines to the member's next batch.
+hands its gap lines to the member's next batch, and so does one that settles
+with its delivery not confirmed: a member may then read those lines twice,
+never not at all.
 
 ## Subscription lifecycle
 
@@ -99,7 +124,7 @@ Everything else is a state that can change, so it suspends and ends
 nothing: a member not registered where it is served, a member placed on a
 host or bound to an external runtime, a governed runtime, a member with no
 live incarnation, a peer that is starting, does not serve keyed inject,
-skews its clock or does not answer. Each is classified once, with the class
+skews its clock, refuses a request for its timing or does not answer. Each is classified once, with the class
 of its evidence (verified, unverified or local), and the owner keeps the
 latest per member as a marker for `deliveries/observe` and
 `subscriptions/get`. The marker is a projection: it is rebuilt from the next
@@ -107,7 +132,7 @@ attempt after a restart, and no transition reads it. A signed "nothing was
 committed" returns the batch to `sealed`, to be submitted again at the
 slowest settle pace and to expire after the retention window as any owed
 batch does; an unknown outcome keeps the batch `submitting` until a status
-read settles it.
+read settles it, or until it settles as `expired_unverified`.
 
 The member checks run when a subscription is created and before every
 submission, so a subscription whose member left ends at its next delivery

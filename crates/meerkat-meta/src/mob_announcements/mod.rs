@@ -76,8 +76,8 @@ pub use store::AnnouncementStore;
 pub use types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementRef, AnnouncementStoreError,
     Announcer, Batch, BatchEvent, BatchEventTag, BatchId, BatchItem, BatchQuery, BatchState,
-    BatchStateTag, ChildMemberLimits, MAX_ITEM_WIRE_BYTES, MAX_REMOTE_BODY_WIRE_BYTES, Member,
-    MemberBacklog, MemberIdentity, MemberRouteRecord, MobId, NativeReceipt, OperationId,
+    BatchStateTag, ChildMemberLimits, LateOutcome, MAX_ITEM_WIRE_BYTES, MAX_REMOTE_BODY_WIRE_BYTES,
+    Member, MemberBacklog, MemberIdentity, MemberRouteRecord, MobId, NativeReceipt, OperationId,
     PruneReport, PutSubscription, SealingPolicy, Selector, Settlement, SourceKey, StartFrontier,
     Subscription, SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
     SubscriptionState, SuccessorBatch, Topic,

@@ -1064,6 +1064,11 @@ fn a_remote_specialist_gets_each_batch_once_through_lost_answers_and_crashes() {
     let stale = send_frame_blocking(&format!("127.0.0.1:{port_b}"), &frame);
     assert_eq!(stale["result"], json!("inject_refused"), "{stale}");
     assert_eq!(stale["code"], json!("stale_request"), "{stale}");
+    assert_eq!(
+        stale["cause"],
+        json!("outside_window"),
+        "a stale refusal says why, in its own signed field: {stale}"
+    );
     assert!(stale["sig_b64"].is_string(), "refusals are signed: {stale}");
     assert!(
         proxy.any_record("inject_keyed", "upstream_down").is_some(),

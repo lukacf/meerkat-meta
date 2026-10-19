@@ -21,7 +21,7 @@ use super::availability::{
     BlockCause, DepartureEvidence, EvidenceClass, MemberDeparture, SuspendCause,
 };
 use super::native::{NativeStatus, NativeStatusError, NativeSubmitError};
-use super::remote::{Clock, RemoteMemberDelivery, validate_delivery};
+use super::remote::{Clock, RemoteMemberDelivery, validate_delivery, within_deadline};
 use super::types::*;
 use crate::auth::peer_keys::GatewayPeerKeys;
 use crate::contact_directory::ContactDirectory;
@@ -35,7 +35,7 @@ use crate::runtime::cross_mob_control::{
 use crate::runtime::keyed_inject::{
     KeyedInject, KeyedInjectCallError, KeyedInjectCallerScope, KeyedInjectFuture,
     KeyedInjectReceiver, KeyedInjectRefusal, KeyedInjectRefusalCode, KeyedInjectServing,
-    KeyedInjectSlot, KeyedInjectStatusAnswer, NativeReceipt, NotServedCause,
+    KeyedInjectSlot, KeyedInjectStatusAnswer, NativeReceipt, NotServedCause, StaleRequestCause,
     answer_keyed_inject_request,
 };
 
@@ -97,6 +97,7 @@ impl KeyedInjectReceiver for ScriptedReceiver {
         &'a self,
         scope: &'a KeyedInjectCallerScope,
         delivery: KeyedInject<'a>,
+        _deadline_ms: u64,
     ) -> KeyedInjectFuture<'a, std::result::Result<NativeReceipt, KeyedInjectRefusal>> {
         Box::pin(async move {
             if let Some(refusal) = self.refuse_next.lock().unwrap().take() {
@@ -590,9 +591,10 @@ async fn every_signed_refusal_reads_as_its_class_and_only_a_departure_ends() {
     for code in KeyedInjectRefusalCode::ALL {
         let expected: std::result::Result<NativeReceipt, NativeSubmitError> = match code {
             KeyedInjectRefusalCode::Unavailable => verified(SuspendCause::PeerComposing),
-            KeyedInjectRefusalCode::StaleRequest => verified(SuspendCause::ClockSkew {
-                issued_at_ms: NOW_MS,
-                window_ms: WINDOW_MS,
+            // A stale refusal that carries no cause says nothing about the
+            // clocks: it is not read as skew.
+            KeyedInjectRefusalCode::StaleRequest => verified(SuspendCause::StaleRequest {
+                cause: StaleRequestCause::Unknown,
             }),
             KeyedInjectRefusalCode::InvalidRequest => Err(NativeSubmitError::Blocked {
                 cause: BlockCause::PeerInvalidRequest,
@@ -682,6 +684,48 @@ fn a_refusal_is_read_from_its_typed_fields_never_its_message() {
             evidence: EvidenceClass::Verified,
         }
     );
+    // A stale request is read from its signed cause too: only one outside
+    // the peer's window is clock skew, with this gateway's own issue time
+    // and window, and a deadline the peer could not meet is not, whatever
+    // the message says.
+    let stale = |cause: Option<&str>| {
+        RemoteMemberDelivery::submit_refusal(
+            &peer,
+            7,
+            9,
+            "stale_request",
+            "check both gateways' clocks".into(),
+            cause,
+        )
+    };
+    assert_eq!(
+        stale(Some("outside_window")),
+        NativeSubmitError::NotCommitted {
+            cause: SuspendCause::ClockSkew {
+                issued_at_ms: 7,
+                window_ms: 9
+            },
+            evidence: EvidenceClass::Verified,
+        }
+    );
+    for (field, cause) in [
+        (Some("deadline_passed"), StaleRequestCause::DeadlinePassed),
+        (
+            Some("issued_before_start"),
+            StaleRequestCause::IssuedBeforeStart,
+        ),
+        (Some("clock_drift"), StaleRequestCause::Unknown),
+        (None, StaleRequestCause::Unknown),
+    ] {
+        assert_eq!(
+            stale(field),
+            NativeSubmitError::NotCommitted {
+                cause: SuspendCause::StaleRequest { cause },
+                evidence: EvidenceClass::Verified,
+            },
+            "{field:?}"
+        );
+    }
     match RemoteMemberDelivery::submit_refusal(&peer, 7, 9, "member_departed", "gone".into(), None)
     {
         NativeSubmitError::MemberGone(departure) => assert_eq!(
@@ -1096,17 +1140,79 @@ async fn a_request_issued_before_the_serving_process_started_is_stale() {
     assert_eq!(
         delivery.submit(&batch).await,
         Err(NativeSubmitError::NotCommitted {
-            cause: SuspendCause::ClockSkew {
-                issued_at_ms: NOW_MS - 1,
-                window_ms: WINDOW_MS,
+            cause: SuspendCause::StaleRequest {
+                cause: StaleRequestCause::IssuedBeforeStart,
             },
             evidence: EvidenceClass::Verified,
-        })
+        }),
+        "a request that predates the peer's start is not clock skew"
     );
     assert_eq!(peer.receiver.submits(), 0);
     clock.store(NOW_MS, Ordering::SeqCst);
     delivery.submit(&batch).await.unwrap();
     assert_eq!(peer.receiver.commits(), 1);
+}
+
+/// What must happen before a delivery's commit is bounded by the request's
+/// deadline: a member preparation that outlasts it is cut off, refused as
+/// stale (`deadline_passed`), and the commit never runs.
+#[tokio::test]
+async fn a_preparation_that_outlasts_the_deadline_commits_nothing() {
+    let clock: Clock = Arc::new(super::remote::system_clock);
+    let deadline = clock().saturating_add(50);
+    let committed = std::sync::atomic::AtomicBool::new(false);
+    let outcome = within_deadline(deadline, &clock, async {
+        std::future::pending::<()>().await;
+        Ok(())
+    })
+    .await
+    .map(|()| committed.store(true, Ordering::SeqCst));
+    let refusal = outcome.unwrap_err();
+    assert_eq!(refusal.code, KeyedInjectRefusalCode::StaleRequest);
+    assert_eq!(
+        refusal.cause,
+        Some(
+            crate::runtime::keyed_inject::KeyedInjectRefusalCause::Stale(
+                StaleRequestCause::DeadlinePassed
+            )
+        )
+    );
+    assert!(!committed.load(Ordering::SeqCst), "nothing was committed");
+}
+
+/// The deadline is checked once more right before the commit: a preparation
+/// that returns after it passed commits nothing either, and one that returns
+/// in time goes on to the commit.
+#[tokio::test]
+async fn a_deadline_that_passes_during_preparation_is_checked_before_the_commit() {
+    let now = Arc::new(AtomicU64::new(NOW_MS));
+    let reader = Arc::clone(&now);
+    let clock: Clock = Arc::new(move || reader.load(Ordering::SeqCst));
+    let late = within_deadline(NOW_MS + WINDOW_MS, &clock, async {
+        now.store(NOW_MS + WINDOW_MS + 1, Ordering::SeqCst);
+        Ok(())
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(
+        late.cause,
+        Some(
+            crate::runtime::keyed_inject::KeyedInjectRefusalCause::Stale(
+                StaleRequestCause::DeadlinePassed
+            )
+        )
+    );
+    now.store(NOW_MS, Ordering::SeqCst);
+    let on_time = within_deadline(NOW_MS + WINDOW_MS, &clock, async {
+        now.store(NOW_MS + WINDOW_MS, Ordering::SeqCst);
+        Ok("prepared")
+    })
+    .await;
+    assert_eq!(
+        on_time,
+        Ok("prepared"),
+        "a preparation done exactly at the deadline is in time"
+    );
 }
 
 /// A keyed inject verb reaching the dispatch without an admitting caller is never

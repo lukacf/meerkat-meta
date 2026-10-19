@@ -1444,6 +1444,197 @@ async fn sqlite_store_conforms() {
         gap_lines_a_successor_defers_reach_the_next_batch(store.as_ref()).await;
     })
     .await;
+    run_conformance("unconfirmed batches", |store| async move {
+        unconfirmed_batches_settle_what_they_held_and_keep_a_late_outcome(store.as_ref()).await;
+    })
+    .await;
+}
+
+/// A batch whose delivery was not confirmed in time settles what it held,
+/// as not confirmed, and hands that and its own gap lines to the member's
+/// next batch. Its late reads stay due until one names no next read, and
+/// what a late read finds is kept on it without moving it.
+async fn unconfirmed_batches_settle_what_they_held_and_keep_a_late_outcome(
+    store: &dyn AnnouncementStore,
+) {
+    store
+        .put_subscription(
+            &op("o1"),
+            put("s1", "agent:a", &["ios"], StartFrontier::Now),
+            1,
+        )
+        .await
+        .unwrap();
+    let agent = member("agent:a");
+    store
+        .announce(announce_request("payments", "k1", &["ios"], "x"), 2)
+        .await
+        .unwrap();
+    store
+        .seal_batch(&agent, &batch_id("b1"), &policy(), 2_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let b1 = batch_id("b1");
+    store
+        .transition_batch(&b1, BatchStateTag::Sealed, BatchEvent::BeginSubmit, 3)
+        .await
+        .unwrap();
+    let unverified = store
+        .transition_batch(
+            &b1,
+            BatchStateTag::Submitting,
+            BatchEvent::ExpireUnverified,
+            4,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        unverified.state,
+        BatchState::ExpiredUnverified { late: None }
+    );
+    assert!(store.unsettled_batches(None, 10).await.unwrap().is_empty());
+    assert_eq!(
+        store
+            .late_reads_due(4, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|batch| batch.id)
+            .collect::<Vec<_>>(),
+        vec![b1.clone()]
+    );
+    assert!(store.late_reads_due(3, 10).await.unwrap().is_empty());
+
+    store
+        .announce(announce_request("payments", "k2", &["ios"], "y"), 5)
+        .await
+        .unwrap();
+    let b2 = store
+        .seal_batch(&agent, &batch_id("b2"), &policy(), 4_000)
+        .await
+        .unwrap()
+        .expect("the member's next batch seals");
+    assert_eq!(
+        b2.gaps,
+        vec![BatchGap {
+            mob_id: mob("payments"),
+            count: 1,
+            reason: GapReason::DeliveryNotConfirmed,
+        }]
+    );
+    assert!(
+        b2.body.contains("neither confirmed nor ruled out"),
+        "{}",
+        b2.body
+    );
+    store
+        .transition_batch(&b2.id, BatchStateTag::Sealed, BatchEvent::BeginSubmit, 6)
+        .await
+        .unwrap();
+    store
+        .transition_batch(
+            &b2.id,
+            BatchStateTag::Submitting,
+            BatchEvent::NativeCommitted {
+                receipt: receipt("b2"),
+            },
+            7,
+        )
+        .await
+        .unwrap();
+    let unconfirmed = store
+        .transition_batch(
+            &b2.id,
+            BatchStateTag::Committed,
+            BatchEvent::ExpireUnconfirmed,
+            8,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        unconfirmed.state,
+        BatchState::CommittedUnconfirmed {
+            receipt: receipt("b2"),
+            late: None,
+        },
+        "the receipt is kept"
+    );
+
+    let applied = LateOutcome {
+        status: NativeStatus::Applied {
+            receipt: receipt("b1"),
+            session_id: "session".into(),
+            input_id: "input".into(),
+        },
+        at_ms: 9,
+    };
+    let kept = store
+        .record_late_read(&b1, Some(applied.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        kept.state,
+        BatchState::ExpiredUnverified {
+            late: Some(applied.clone())
+        }
+    );
+    assert_eq!(kept.updated_at_ms, 4, "a late read moves nothing");
+    assert_eq!(store.batch(&b1).await.unwrap(), Some(kept));
+    store
+        .record_late_read(&b2.id, None, Some(20))
+        .await
+        .unwrap();
+    assert!(
+        store.late_reads_due(19, 10).await.unwrap().is_empty(),
+        "a read that names no next one ends the reads; the next is due when named"
+    );
+    assert_eq!(store.late_reads_due(20, 10).await.unwrap().len(), 1);
+
+    store
+        .announce(announce_request("payments", "k3", &["ios"], "z"), 10)
+        .await
+        .unwrap();
+    let b3 = store
+        .seal_batch(&agent, &batch_id("b3"), &policy(), 6_000)
+        .await
+        .unwrap()
+        .expect("the member's next batch seals");
+    assert_eq!(
+        b3.gaps,
+        vec![
+            BatchGap {
+                mob_id: mob("payments"),
+                count: 1,
+                reason: GapReason::AdmissionNotConfirmed,
+            },
+            BatchGap {
+                mob_id: mob("payments"),
+                count: 1,
+                reason: GapReason::DeliveryNotConfirmed,
+            },
+        ],
+        "what b2 held, and the gap line it carried, which may not have been read"
+    );
+    assert!(matches!(
+        store.record_late_read(&b3.id, Some(applied), None).await,
+        Err(AnnouncementStoreError::Invalid(_))
+    ));
+    assert!(
+        matches!(
+            store.record_late_read(&b3.id, None, Some(30)).await,
+            Err(AnnouncementStoreError::Invalid(_))
+        ),
+        "no late read is scheduled for a batch that keeps no late outcome"
+    );
+    assert!(
+        store
+            .late_reads_due(u64::from(u32::MAX), 10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|batch| batch.id != b3.id)
+    );
 }
 
 async fn gap_lines_a_successor_defers_reach_the_next_batch(store: &dyn AnnouncementStore) {
@@ -2098,6 +2289,9 @@ struct Ledger {
     status_reads: u64,
     /// Native input reads.
     input_reads: u64,
+    /// Every submission brings no answer that can be verified, and commits
+    /// nothing: the peer predates keyed inject, or its answers are lost.
+    unanswered: bool,
 }
 
 struct ScriptedNative {
@@ -2472,6 +2666,15 @@ impl NativeDelivery for ScriptedNative {
         if let Some(departure) = self.submit_gone.lock().unwrap().take() {
             return Err(NativeSubmitError::MemberGone(departure));
         }
+        if ledger.unanswered {
+            return Err(NativeSubmitError::OutcomeUnknown {
+                cause: SuspendCause::PeerUnanswered {
+                    code: Some("unsigned".into()),
+                },
+                evidence: EvidenceClass::Unverified,
+                detail: "an unsigned answer".into(),
+            });
+        }
         if let Some((cause, evidence)) = ledger.refuse.clone() {
             return Err(NativeSubmitError::NotCommitted { cause, evidence });
         }
@@ -2718,6 +2921,621 @@ async fn a_lost_acknowledgment_is_reconciled_without_a_second_submission() {
         "committed but not yet admitted is reported as such: {:?}",
         observed.native
     );
+}
+
+/// What a status read of a peer that answers nothing it can verify brings:
+/// no status, and no evidence about the delivery.
+fn unanswered_status() -> NativeStatusError {
+    NativeStatusError::Unavailable {
+        cause: SuspendCause::PeerUnanswered {
+            code: Some("unsigned".into()),
+        },
+        evidence: EvidenceClass::Unverified,
+        detail: "an unsigned answer".into(),
+    }
+}
+
+/// The pause before a batch this old is looked at again: the slowest one.
+fn settle_pace() -> u64 {
+    AnnouncementConfig::default().settle_check_max_ms
+}
+
+/// The harness's retention window, and its quiet window after a submission.
+fn retention_and_quiet() -> (u64, u64) {
+    let config = AnnouncementConfig::default();
+    (
+        config.retention_ms,
+        config.peer_request_window_ms + config.settle_check_max_ms,
+    )
+}
+
+async fn batches_of(harness: &Harness, member: &Member) -> Vec<Batch> {
+    harness
+        .service
+        .deliveries(&BatchQuery {
+            member: Some(member.clone()),
+            limit: 10,
+            ..BatchQuery::default()
+        })
+        .await
+        .unwrap()
+}
+
+/// Announce one more and let the member's backlog fall due.
+async fn announce_next(harness: &Harness, key: &str) {
+    harness
+        .service
+        .announce(announce_request(
+            "payments",
+            key,
+            &["ios"],
+            "checkout recovered",
+        ))
+        .await
+        .unwrap();
+    harness.clock.fetch_add(60_001, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+}
+
+/// A submission whose outcome no status read ever brings settles as not
+/// confirmed once the retention window, and the quiet window since its last
+/// submission, have passed. It is never submitted again, its announcements
+/// reach the member's next batch as not confirmed, and that batch goes on.
+/// A status read later is kept on it and reopens nothing.
+#[tokio::test]
+async fn an_outcome_never_learned_settles_unverified_and_the_next_batch_goes_on() {
+    let native = ScriptedNative::new();
+    {
+        let mut ledger = native.ledger.lock().unwrap();
+        ledger.unanswered = true;
+        ledger.status_error = Some(unanswered_status());
+    }
+    let harness = harness_with(native);
+    let remote = peer_member("agent:x", "mob-b");
+    harness
+        .service
+        .put_subscription(&op("o1"), put_for("s1", remote.clone(), &["ios"]))
+        .await
+        .unwrap();
+    harness.announce_burst(2).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let first = batches_of(&harness, &remote).await.remove(0);
+    assert_eq!(first.state, BatchState::Submitting { attempt: 1 });
+    let (retention, quiet) = retention_and_quiet();
+    harness
+        .clock
+        .store(first.sealed_at_ms + retention - 1, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    assert_eq!(
+        batches_of(&harness, &remote).await[0].state.tag(),
+        BatchStateTag::Submitting,
+        "inside the retention window it waits for a status"
+    );
+    harness
+        .clock
+        .store(first.sealed_at_ms + retention + quiet + 1, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let settled = batches_of(&harness, &remote).await.remove(0);
+    assert_eq!(settled.state, BatchState::ExpiredUnverified { late: None });
+    assert_eq!(harness.native.submits(), 1, "it is never submitted again");
+
+    announce_next(&harness, "after").await;
+    let all = batches_of(&harness, &remote).await;
+    assert_eq!(all.len(), 2, "the member's next batch seals: {all:?}");
+    assert_eq!(
+        all[1].gaps,
+        vec![BatchGap {
+            mob_id: mob("payments"),
+            count: 2,
+            reason: GapReason::DeliveryNotConfirmed,
+        }]
+    );
+
+    // The peer later answers, signed, that the first batch was applied: the
+    // answer is kept on it, which stays settled as it was.
+    {
+        let mut ledger = harness.native.ledger.lock().unwrap();
+        ledger.status_error = None;
+        ledger.bindings.insert(
+            first.id.to_string(),
+            ("late".into(), receipt(first.id.as_str()), true),
+        );
+    }
+    harness.clock.fetch_add(quiet + 1, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let kept = harness
+        .service
+        .observe_delivery(&first.id)
+        .await
+        .unwrap()
+        .batch;
+    assert_eq!(kept.state.tag(), BatchStateTag::ExpiredUnverified);
+    let late = kept.state.late().expect("the late status is kept");
+    assert!(
+        matches!(late.status, NativeStatus::Applied { .. }),
+        "{late:?}"
+    );
+    assert_eq!(
+        kept.updated_at_ms, settled.updated_at_ms,
+        "it stays settled when it settled"
+    );
+    let long_after = harness.clock.load(Ordering::SeqCst) + 100 * quiet;
+    assert!(
+        harness
+            .store
+            .late_reads_due(long_after, 10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|batch| batch.id != first.id),
+        "a final late status ends its reads"
+    );
+}
+
+/// A committed batch whose status can no longer be read settles with its
+/// admission not confirmed at its first look once the retention window, and
+/// the quiet window after it, have passed since the commit: its receipt is
+/// kept, it is never submitted again, and the member's next batch reports it
+/// and goes on.
+async fn an_unreadable_commit_settles_unconfirmed(to: Member, unreadable: NativeStatusError) {
+    let mut native = ScriptedNative::new();
+    native.apply_on_commit = false;
+    let harness = harness_with(native);
+    harness
+        .service
+        .put_subscription(&op("o1"), put_for("s1", to.clone(), &["ios"]))
+        .await
+        .unwrap();
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let committed = batches_of(&harness, &to).await.remove(0);
+    let BatchState::Committed { receipt } = committed.state.clone() else {
+        panic!("expected a committed batch, got {:?}", committed.state);
+    };
+    harness.native.ledger.lock().unwrap().status_error = Some(unreadable);
+    let (retention, quiet) = retention_and_quiet();
+    harness.clock.store(
+        committed.updated_at_ms + retention + quiet - 1,
+        Ordering::SeqCst,
+    );
+    harness.service.run_round().await.unwrap();
+    assert_eq!(
+        batches_of(&harness, &to).await[0].state.tag(),
+        BatchStateTag::Committed,
+        "inside the quiet window after the retention window it waits"
+    );
+    // Its next look, one settle pace later, is past that window.
+    harness.clock.store(
+        committed.updated_at_ms + retention + quiet - 1 + settle_pace(),
+        Ordering::SeqCst,
+    );
+    harness.service.run_round().await.unwrap();
+    assert_eq!(
+        batches_of(&harness, &to).await[0].state,
+        BatchState::CommittedUnconfirmed {
+            receipt,
+            late: None
+        }
+    );
+    assert_eq!(harness.native.submits(), 1, "it is never submitted again");
+    announce_next(&harness, "after").await;
+    let all = batches_of(&harness, &to).await;
+    assert_eq!(all.len(), 2, "the member's next batch seals: {all:?}");
+    assert_eq!(
+        all[1].gaps,
+        vec![BatchGap {
+            mob_id: mob("payments"),
+            count: 1,
+            reason: GapReason::AdmissionNotConfirmed,
+        }]
+    );
+}
+
+/// A peer that committed the batch, then restarted with keyed inject
+/// serving turned off, answers every status read with a signed `not_served`
+/// (`runtime_disabled`): no status, so the batch settles unconfirmed.
+#[tokio::test]
+async fn a_commit_whose_peer_stops_serving_settles_unconfirmed() {
+    an_unreadable_commit_settles_unconfirmed(
+        peer_member("agent:x", "mob-b"),
+        NativeStatusError::Unavailable {
+            cause: SuspendCause::PeerNotServing {
+                cause: crate::runtime::keyed_inject::NotServedCause::RuntimeDisabled,
+            },
+            evidence: EvidenceClass::Verified,
+            detail: "this gateway does not serve keyed injects (runtime_disabled)".into(),
+        },
+    )
+    .await;
+}
+
+/// This gateway's own native owner that can no longer read a committed
+/// batch's status leaves it unconfirmed the same way.
+#[tokio::test]
+async fn a_commit_whose_status_cannot_be_read_settles_unconfirmed() {
+    an_unreadable_commit_settles_unconfirmed(
+        member("agent:a"),
+        NativeStatusError::local("the runtime store is not reachable"),
+    )
+    .await;
+}
+
+/// "No status" is any read that leaves the outcome unknown, a peer's signed
+/// refusal of every status read included: the batch settles unverified.
+#[tokio::test]
+async fn a_signed_refusal_of_every_status_read_also_settles_unverified() {
+    let native = ScriptedNative::new();
+    {
+        let mut ledger = native.ledger.lock().unwrap();
+        ledger.unanswered = true;
+        ledger.status_error = Some(NativeStatusError::Unavailable {
+            cause: SuspendCause::PeerComposing,
+            evidence: EvidenceClass::Verified,
+            detail: "keyed_inject_unavailable".into(),
+        });
+    }
+    let harness = harness_with(native);
+    let remote = peer_member("agent:x", "mob-b");
+    harness
+        .service
+        .put_subscription(&op("o1"), put_for("s1", remote.clone(), &["ios"]))
+        .await
+        .unwrap();
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let first = batches_of(&harness, &remote).await.remove(0);
+    assert_eq!(first.state, BatchState::Submitting { attempt: 1 });
+    let (retention, quiet) = retention_and_quiet();
+    harness
+        .clock
+        .store(first.sealed_at_ms + retention + quiet + 1, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    assert_eq!(
+        batches_of(&harness, &remote).await[0].state,
+        BatchState::ExpiredUnverified { late: None }
+    );
+    assert_eq!(harness.native.submits(), 1);
+}
+
+/// A committed batch a verified status still reads as pending past the
+/// retention window since its commit settles with its admission not
+/// confirmed: the member's next batch seals and goes on, and the admission
+/// that comes later is kept on the first batch as its late outcome, with
+/// that batch delivered once.
+#[tokio::test]
+async fn a_commit_still_pending_past_retention_settles_unconfirmed_and_keeps_its_admission() {
+    let mut native = ScriptedNative::new();
+    native.apply_on_commit = false;
+    let harness = harness_with(native);
+    harness.subscribe("s1").await;
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let committed = harness.only_batch().await;
+    let BatchState::Committed { receipt } = committed.state.clone() else {
+        panic!("expected a committed batch, got {:?}", committed.state);
+    };
+    let (retention, quiet) = retention_and_quiet();
+    harness
+        .clock
+        .store(committed.updated_at_ms + retention - 1, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    assert_eq!(
+        harness.only_batch().await.state.tag(),
+        BatchStateTag::Committed,
+        "inside the retention window a pending delivery waits"
+    );
+    // Its next look, one settle pace later, is past the window.
+    harness.clock.store(
+        committed.updated_at_ms + retention - 1 + settle_pace(),
+        Ordering::SeqCst,
+    );
+    harness.service.run_round().await.unwrap();
+    assert_eq!(
+        harness.only_batch().await.state,
+        BatchState::CommittedUnconfirmed {
+            receipt: receipt.clone(),
+            late: None
+        }
+    );
+    announce_next(&harness, "after").await;
+    let all = batches_of(&harness, &member("agent:a")).await;
+    assert_eq!(all.len(), 2, "the member's next batch seals: {all:?}");
+    assert_eq!(all[1].gaps[0].reason, GapReason::AdmissionNotConfirmed);
+
+    // The member's runtime admits the first batch later.
+    harness
+        .native
+        .ledger
+        .lock()
+        .unwrap()
+        .bindings
+        .get_mut(committed.id.as_str())
+        .expect("the first batch's commit")
+        .2 = true;
+    harness.clock.fetch_add(quiet + 1, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let kept = harness
+        .service
+        .observe_delivery(&committed.id)
+        .await
+        .unwrap()
+        .batch;
+    assert_eq!(kept.state.tag(), BatchStateTag::CommittedUnconfirmed);
+    let late = kept.state.late().expect("the admission is kept");
+    assert!(
+        matches!(&late.status, NativeStatus::Applied { receipt: applied, .. } if *applied == receipt),
+        "{late:?}"
+    );
+    assert_eq!(
+        harness.native.submits(),
+        2,
+        "one submission per batch: the first is delivered once"
+    );
+}
+
+/// A late status naming another delivery contradicts an unconfirmed batch:
+/// it is kept as it was read, and nothing more is read for the batch, though
+/// a pending status would otherwise be read again.
+#[tokio::test]
+async fn a_late_status_naming_another_delivery_is_kept_and_ends_the_reads() {
+    let mut native = ScriptedNative::new();
+    native.apply_on_commit = false;
+    let harness = harness_with(native);
+    harness.subscribe("s1").await;
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let committed = harness.only_batch().await;
+    let (retention, quiet) = retention_and_quiet();
+    harness.clock.store(
+        committed.updated_at_ms + retention - 1 + settle_pace(),
+        Ordering::SeqCst,
+    );
+    harness.service.run_round().await.unwrap();
+    assert_eq!(
+        harness.only_batch().await.state.tag(),
+        BatchStateTag::CommittedUnconfirmed
+    );
+    // The member's native key now holds a pending commit of another delivery.
+    let other = receipt("another-delivery");
+    harness
+        .native
+        .ledger
+        .lock()
+        .unwrap()
+        .bindings
+        .get_mut(committed.id.as_str())
+        .expect("the first batch's commit")
+        .1 = other.clone();
+    harness.clock.fetch_add(quiet + 1, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let kept = harness.only_batch().await;
+    let late = kept.state.late().expect("the contradicting status is kept");
+    assert!(
+        matches!(&late.status, NativeStatus::Pending { receipt, .. } if *receipt == other),
+        "{late:?}"
+    );
+    let reads = harness.native.ledger.lock().unwrap().status_reads;
+    harness.clock.fetch_add(10 * quiet, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    assert_eq!(
+        harness.native.ledger.lock().unwrap().status_reads,
+        reads,
+        "nothing more is read for a contradicted batch"
+    );
+}
+
+/// A batch whose admission was not confirmed is read again once per quiet
+/// window, not once per round.
+#[tokio::test]
+async fn an_unconfirmed_batch_is_read_again_once_per_quiet_window() {
+    let mut native = ScriptedNative::new();
+    native.apply_on_commit = false;
+    let harness = harness_with(native);
+    harness.subscribe("s1").await;
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let committed = harness.only_batch().await;
+    let (retention, quiet) = retention_and_quiet();
+    harness.clock.store(
+        committed.updated_at_ms + retention - 1 + settle_pace(),
+        Ordering::SeqCst,
+    );
+    harness.service.run_round().await.unwrap();
+    assert_eq!(
+        harness.only_batch().await.state.tag(),
+        BatchStateTag::CommittedUnconfirmed
+    );
+    let reads = || harness.native.ledger.lock().unwrap().status_reads;
+    let settled = reads();
+    for _ in 0..3 {
+        harness.clock.fetch_add(quiet / 4, Ordering::SeqCst);
+        harness.service.run_round().await.unwrap();
+    }
+    assert_eq!(
+        reads(),
+        settled,
+        "inside the quiet window nothing is read again"
+    );
+    harness.clock.fetch_add(quiet / 4 + 1, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    assert_eq!(
+        reads(),
+        settled + 1,
+        "one quiet window later it is read once"
+    );
+}
+
+/// At most 16 batches whose delivery was not confirmed are read again in one
+/// round; the rest are read in the next.
+#[tokio::test]
+async fn late_reads_are_bounded_per_round() {
+    let harness = harness_with(ScriptedNative::new());
+    harness.subscribe("s1").await;
+    let agent = member("agent:a");
+    for index in 0..17_u64 {
+        harness
+            .service
+            .announce(announce_request(
+                "payments",
+                &format!("k{index}"),
+                &["ios"],
+                "x",
+            ))
+            .await
+            .unwrap();
+        let id = batch_id(&format!("late-{index:02}"));
+        harness
+            .store
+            .seal_batch(&agent, &id, &policy(), 2_000 + index)
+            .await
+            .unwrap()
+            .expect("the member's next batch seals");
+        harness
+            .store
+            .transition_batch(&id, BatchStateTag::Sealed, BatchEvent::BeginSubmit, 3_000)
+            .await
+            .unwrap();
+        harness
+            .store
+            .transition_batch(
+                &id,
+                BatchStateTag::Submitting,
+                BatchEvent::ExpireUnverified,
+                4_000,
+            )
+            .await
+            .unwrap();
+    }
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    let reads = || harness.native.ledger.lock().unwrap().status_reads;
+    harness.service.run_round().await.unwrap();
+    assert_eq!(reads(), 16, "one round reads at most 16");
+    harness.service.run_round().await.unwrap();
+    assert_eq!(reads(), 17, "the next round reads the rest");
+}
+
+/// A batch every answer to which was a signed "nothing was committed"
+/// expires as expired once the retention window has passed, never as not
+/// confirmed: nothing native ever held it.
+#[tokio::test]
+async fn a_batch_every_answer_refused_expires_as_expired() {
+    let native = ScriptedNative::new();
+    native.ledger.lock().unwrap().refuse = Some((
+        SuspendCause::PeerNotServing {
+            cause: crate::runtime::keyed_inject::NotServedCause::RuntimeDisabled,
+        },
+        EvidenceClass::Verified,
+    ));
+    let harness = harness_with(native);
+    harness.subscribe("s1").await;
+    harness.announce_burst(1).await;
+    harness.clock.store(10_000_000, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    let owed = harness.only_batch().await;
+    assert_eq!(owed.state, BatchState::Sealed);
+    let (retention, _) = retention_and_quiet();
+    harness
+        .clock
+        .store(owed.sealed_at_ms + retention, Ordering::SeqCst);
+    harness.service.run_round().await.unwrap();
+    assert_eq!(harness.only_batch().await.state, BatchState::Expired);
+    harness.native.ledger.lock().unwrap().refuse = None;
+    announce_next(&harness, "after").await;
+    let all = batches_of(&harness, &member("agent:a")).await;
+    assert_eq!(all[1].gaps[0].reason, GapReason::Expired);
+}
+
+/// Only what a batch whose delivery was not confirmed does not already
+/// state is news: any status for one whose outcome was never learned; for a
+/// committed one, not its pending delivery and nothing about another
+/// delivery. A status already kept is not news again.
+#[test]
+fn late_news_is_what_an_unconfirmed_batch_does_not_already_state() {
+    let ours = receipt("b1");
+    let applied = |receipt: NativeReceipt| NativeStatus::Applied {
+        receipt,
+        session_id: "session".into(),
+        input_id: "input".into(),
+    };
+    let pending = NativeStatus::Pending {
+        receipt: ours.clone(),
+        admitted: None,
+    };
+    let unverified = BatchState::ExpiredUnverified { late: None };
+    for status in [
+        NativeStatus::NotCommitted,
+        pending.clone(),
+        applied(ours.clone()),
+    ] {
+        assert_eq!(unverified.late_news(status.clone()), Some(status));
+    }
+    let seen = unverified
+        .with_late(LateOutcome {
+            status: pending.clone(),
+            at_ms: 1,
+        })
+        .unwrap();
+    assert_eq!(seen.late_news(pending.clone()), None, "already kept");
+    assert!(seen.late_news(applied(ours.clone())).is_some());
+    let unconfirmed = BatchState::CommittedUnconfirmed {
+        receipt: ours.clone(),
+        late: None,
+    };
+    assert_eq!(unconfirmed.late_news(pending), None, "what it states");
+    let elsewhere = applied(receipt("other"));
+    assert_eq!(
+        unconfirmed.late_news(elsewhere.clone()),
+        Some(elsewhere.clone()),
+        "a status about another delivery is kept, never dropped"
+    );
+    assert!(unconfirmed.late_names_other_delivery(&elsewhere));
+    assert!(!unconfirmed.late_names_other_delivery(&applied(ours.clone())));
+    assert!(!unverified.late_names_other_delivery(&elsewhere));
+    assert!(unconfirmed.late_news(applied(ours.clone())).is_some());
+    assert!(unconfirmed.late_news(NativeStatus::NotCommitted).is_some());
+    let committed = BatchState::Committed { receipt: ours };
+    assert_eq!(committed.late_news(NativeStatus::NotCommitted), None);
+    assert!(
+        committed
+            .with_late(LateOutcome {
+                status: NativeStatus::NotCommitted,
+                at_ms: 1,
+            })
+            .is_err()
+    );
+}
+
+/// A late outcome keeps the native status's own wire shape, with the time it
+/// was read next to it, and reads back as written.
+#[test]
+fn a_late_outcome_keeps_the_native_status_shape() {
+    let late = LateOutcome {
+        status: NativeStatus::Applied {
+            receipt: receipt("b1"),
+            session_id: "session".into(),
+            input_id: "input".into(),
+        },
+        at_ms: 9,
+    };
+    let wire = serde_json::to_value(&late).unwrap();
+    assert_eq!(wire["status"], "applied");
+    assert_eq!(wire["session_id"], "session");
+    assert_eq!(wire["at_ms"], 9);
+    assert_eq!(serde_json::from_value::<LateOutcome>(wire).unwrap(), late);
+    let state = BatchState::CommittedUnconfirmed {
+        receipt: receipt("b1"),
+        late: Some(late),
+    };
+    let wire = serde_json::to_value(&state).unwrap();
+    assert_eq!(wire["state"], "committed_unconfirmed");
+    assert_eq!(wire["late"]["status"], "applied");
+    assert_eq!(serde_json::from_value::<BatchState>(wire).unwrap(), state);
 }
 
 #[tokio::test]
@@ -3287,6 +4105,19 @@ impl AnnouncementStore for FaultyStore {
         self.inner
             .transition_batch(id, expected, event, now_ms)
             .await
+    }
+
+    async fn late_reads_due(&self, now_ms: u64, limit: usize) -> Result<Vec<Batch>> {
+        self.inner.late_reads_due(now_ms, limit).await
+    }
+
+    async fn record_late_read(
+        &self,
+        id: &BatchId,
+        late: Option<LateOutcome>,
+        next_read_at_ms: Option<u64>,
+    ) -> Result<Batch> {
+        self.inner.record_late_read(id, late, next_read_at_ms).await
     }
 
     async fn expire(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<ExpiryReport> {
@@ -7771,7 +8602,7 @@ fn the_version_one_schema_is_pinned() {
             hex
         });
     assert_eq!(
-        digest, "c75c5b59f564d93f3051cf86516a23eade8f48e22cb6816206c212fb483cb6f5",
+        digest, "df9370bbddd52625335712536c533900998e667d483edc9dfa8f58003cb18695",
         "the version 1 schema changed: before the release that ships it, update this pin; \
          after it, add version 2 with its migration instead"
     );
@@ -7993,6 +8824,99 @@ async fn a_registry_miss_on_the_gateways_native_seam_waits_typed() {
             })
         ),
         "{outcome:?}"
+    );
+    runtime.shutdown().await;
+}
+
+/// A delivery that reaches its commit after its deadline commits nothing:
+/// the gateway's own receiver refuses it as stale (`deadline_passed`), and
+/// the delivery's native key holds no commit. The member's preparation the
+/// deadline cut off is not lost: it runs to its end on its own, so the
+/// member is ready without another request, and the retry commits once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delivery_reaching_its_commit_after_its_deadline_commits_nothing() {
+    use crate::identity_first::{AgentIdentity, IdentityLifecycleState};
+    use crate::runtime::keyed_inject::{
+        KeyedInject, KeyedInjectCallerScope, KeyedInjectReceiver, KeyedInjectRefusalCause,
+        KeyedInjectRefusalCode, StaleRequestCause,
+    };
+    let state = tempfile::tempdir().expect("state dir");
+    let runtime = identity_first_test_runtime(state.path(), "mob-k-deadline").await;
+    let identities = runtime
+        .identity_runtime_ref()
+        .expect("an identity-first runtime");
+    let agent = AgentIdentity::parse("agent:a").expect("identity");
+    assert_ne!(
+        identities.status(&agent).await.expect("a status").state,
+        IdentityLifecycleState::Active,
+        "the member is not prepared before the first delivery"
+    );
+    let local = Arc::new(super::local_delivery(&runtime).expect("the gateway's native seam"));
+    let now = 1_800_000_000_000_u64;
+    let server =
+        super::remote::KeyedInjectServer::with_clock(local, 300_000, Arc::new(move || now));
+    let scope = KeyedInjectCallerScope::for_grant_label("first-gateway");
+    let body = "an announcement";
+    let digest = content_digest(body);
+    let delivery = KeyedInject {
+        member: "agent:a",
+        delivery_key: "batch-late",
+        content_digest: &digest,
+        summary: "1 announcement",
+        body,
+    };
+    let refusal = server
+        .deliver(&scope, delivery, now - 1)
+        .await
+        .expect_err("a passed deadline is refused");
+    assert_eq!(refusal.code, KeyedInjectRefusalCode::StaleRequest);
+    assert_eq!(
+        refusal.cause,
+        Some(KeyedInjectRefusalCause::Stale(
+            StaleRequestCause::DeadlinePassed
+        ))
+    );
+    let status = server
+        .status(&scope, "agent:a", "batch-late", false)
+        .await
+        .expect("a status");
+    assert_eq!(status.status, NativeStatus::NotCommitted);
+
+    // The preparation the deadline cut off finishes without another request.
+    let ready_by = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let state = identities.status(&agent).await.expect("a status").state;
+        if state == IdentityLifecycleState::Active {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < ready_by,
+            "the cut-off preparation never finished: {state:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // The retry commits once: a replay answers the same receipt.
+    let receipt = server
+        .deliver(&scope, delivery, now + 300_000)
+        .await
+        .expect("the retry commits");
+    let replay = server
+        .deliver(&scope, delivery, now + 300_000)
+        .await
+        .expect("the replay answers");
+    assert_eq!(replay, receipt);
+    let status = server
+        .status(&scope, "agent:a", "batch-late", false)
+        .await
+        .expect("a status");
+    assert!(
+        matches!(
+            &status.status,
+            NativeStatus::Pending { receipt: held, .. } | NativeStatus::Applied { receipt: held, .. }
+                if *held == receipt
+        ),
+        "{:?}",
+        status.status
     );
     runtime.shutdown().await;
 }

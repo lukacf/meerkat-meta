@@ -115,6 +115,10 @@ pub(crate) const ANNOUNCEMENT_SCHEMA_DOMAIN: meerkat_sqlite::SchemaDomain =
             },
             meerkat_sqlite::SchemaObject {
                 kind: meerkat_sqlite::SchemaObjectKind::Index,
+                name: "announcement_batches_late_reads",
+            },
+            meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Index,
                 name: "mob_lineage_live",
             },
             meerkat_sqlite::SchemaObject {

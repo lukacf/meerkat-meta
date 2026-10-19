@@ -824,6 +824,48 @@ pub enum BatchState {
     /// Waited longer than the retention window with nothing native ever
     /// holding it. Terminal; the member's next batch reports the gap.
     Expired,
+    /// Whether a submission was committed was never learned: past the
+    /// retention window, and past the quiet window since its last
+    /// submission, no status read brought a status. Terminal, and never
+    /// submitted again; the member's next batch reports its announcements as
+    /// not confirmed and goes on. A status read later is kept in `late`.
+    ExpiredUnverified {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        late: Option<LateOutcome>,
+    },
+    /// The member's runtime inbox committed it, with this receipt, and its
+    /// admission was never confirmed: past the retention window since the
+    /// commit it was still pending, or no status could be read. Terminal,
+    /// and never submitted again; the member's next batch reports its
+    /// announcements as admission not confirmed and goes on. A status read
+    /// later is kept in `late`.
+    CommittedUnconfirmed {
+        receipt: NativeReceipt,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        late: Option<LateOutcome>,
+    },
+}
+
+/// What a status read found about a batch's delivery after the batch
+/// settled without its delivery being confirmed: the native status, and
+/// when it was read. It is kept on the batch and never reopens it; the
+/// member's later batches go on as they were.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LateOutcome {
+    #[serde(flatten)]
+    pub status: crate::runtime::keyed_inject::NativeStatus,
+    pub at_ms: u64,
+}
+
+impl LateOutcome {
+    /// Whether nothing later can change it: anything but a pending
+    /// delivery.
+    pub fn is_final(&self) -> bool {
+        !matches!(
+            self.status,
+            crate::runtime::keyed_inject::NativeStatus::Pending { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -839,10 +881,16 @@ pub enum BatchStateTag {
     Cancelled,
     Blocked,
     Expired,
+    ExpiredUnverified,
+    CommittedUnconfirmed,
 }
 
 impl BatchStateTag {
     pub const UNSETTLED: [Self; 3] = [Self::Sealed, Self::Submitting, Self::Committed];
+
+    /// Settled without their delivery being confirmed: what a status read
+    /// finds later is still kept on them.
+    pub const UNCONFIRMED: [Self; 2] = [Self::ExpiredUnverified, Self::CommittedUnconfirmed];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -855,6 +903,8 @@ impl BatchStateTag {
             Self::Cancelled => "cancelled",
             Self::Blocked => "blocked",
             Self::Expired => "expired",
+            Self::ExpiredUnverified => "expired_unverified",
+            Self::CommittedUnconfirmed => "committed_unconfirmed",
         }
     }
 
@@ -869,6 +919,8 @@ impl BatchStateTag {
             "cancelled" => Self::Cancelled,
             "blocked" => Self::Blocked,
             "expired" => Self::Expired,
+            "expired_unverified" => Self::ExpiredUnverified,
+            "committed_unconfirmed" => Self::CommittedUnconfirmed,
             other => {
                 return Err(AnnouncementStoreError::Storage(format!(
                     "unknown batch state {other}"
@@ -915,6 +967,13 @@ pub enum GapReason {
     /// Their content was no longer retained when a stranded delivery was
     /// handed on to a successor.
     NotRetained,
+    /// Their delivery was neither confirmed nor ruled out: whether it was
+    /// committed was never learned. It may still arrive, after later
+    /// announcements.
+    DeliveryNotConfirmed,
+    /// Their delivery was committed to the member's inbox, and its admission
+    /// was never confirmed.
+    AdmissionNotConfirmed,
 }
 
 impl GapReason {
@@ -922,6 +981,8 @@ impl GapReason {
         match self {
             Self::Expired => "expired",
             Self::NotRetained => "not_retained",
+            Self::DeliveryNotConfirmed => "delivery_not_confirmed",
+            Self::AdmissionNotConfirmed => "admission_not_confirmed",
         }
     }
 
@@ -929,6 +990,8 @@ impl GapReason {
         match value {
             "expired" => Ok(Self::Expired),
             "not_retained" => Ok(Self::NotRetained),
+            "delivery_not_confirmed" => Ok(Self::DeliveryNotConfirmed),
+            "admission_not_confirmed" => Ok(Self::AdmissionNotConfirmed),
             other => Err(AnnouncementStoreError::Storage(format!(
                 "unknown gap reason {other}"
             ))),
@@ -1010,6 +1073,14 @@ pub enum BatchEvent {
     /// A submission was answered that nothing was committed: the batch is
     /// owed again, and a later attempt submits it.
     SubmitRefused,
+    /// No status read brought a status for a submitting batch past the
+    /// retention window and the quiet window since its last submission:
+    /// whether it was committed is never learned in time.
+    ExpireUnverified,
+    /// A committed batch's admission was not confirmed in time: past the
+    /// retention window since its commit it was still pending, or no status
+    /// could be read past the quiet window after that.
+    ExpireUnconfirmed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1028,6 +1099,8 @@ pub enum BatchEventTag {
     Expire,
     ExpireNotCommitted,
     SubmitRefused,
+    ExpireUnverified,
+    ExpireUnconfirmed,
 }
 
 impl fmt::Display for BatchEventTag {
@@ -1045,6 +1118,8 @@ impl fmt::Display for BatchEventTag {
             Self::Expire => "expire",
             Self::ExpireNotCommitted => "expire_not_committed",
             Self::SubmitRefused => "submit_refused",
+            Self::ExpireUnverified => "expire_unverified",
+            Self::ExpireUnconfirmed => "expire_unconfirmed",
         })
     }
 }
@@ -1064,6 +1139,8 @@ impl BatchEvent {
             Self::Expire => BatchEventTag::Expire,
             Self::ExpireNotCommitted => BatchEventTag::ExpireNotCommitted,
             Self::SubmitRefused => BatchEventTag::SubmitRefused,
+            Self::ExpireUnverified => BatchEventTag::ExpireUnverified,
+            Self::ExpireUnconfirmed => BatchEventTag::ExpireUnconfirmed,
         }
     }
 
@@ -1076,6 +1153,8 @@ impl BatchEvent {
             Self::CancelNotCommitted | Self::Cancel => Some(Settlement::Cancelled),
             Self::Block { .. } => Some(Settlement::Blocked),
             Self::Expire | Self::ExpireNotCommitted => Some(Settlement::Expired),
+            Self::ExpireUnverified => Some(Settlement::DeliveryNotConfirmed),
+            Self::ExpireUnconfirmed => Some(Settlement::AdmissionNotConfirmed),
             Self::NativeStranded {
                 successor: None, ..
             } => Some(Settlement::Stranded),
@@ -1103,6 +1182,12 @@ pub enum Settlement {
     /// Owed longer than the retention window without a delivery that ever
     /// started: the member learns of it as a gap.
     Expired,
+    /// Held by a batch whose delivery was neither confirmed nor ruled out in
+    /// time: the member learns of it as a gap.
+    DeliveryNotConfirmed,
+    /// Held by a batch the member's inbox committed and whose admission was
+    /// not confirmed in time: the member learns of it as a gap.
+    AdmissionNotConfirmed,
 }
 
 impl Settlement {
@@ -1114,6 +1199,8 @@ impl Settlement {
             Self::Stranded => "stranded",
             Self::Blocked => "blocked",
             Self::Expired => "expired",
+            Self::DeliveryNotConfirmed => "delivery_not_confirmed",
+            Self::AdmissionNotConfirmed => "admission_not_confirmed",
         }
     }
 }
@@ -1130,6 +1217,83 @@ impl BatchState {
             Self::Cancelled => BatchStateTag::Cancelled,
             Self::Blocked { .. } => BatchStateTag::Blocked,
             Self::Expired => BatchStateTag::Expired,
+            Self::ExpiredUnverified { .. } => BatchStateTag::ExpiredUnverified,
+            Self::CommittedUnconfirmed { .. } => BatchStateTag::CommittedUnconfirmed,
+        }
+    }
+
+    /// The late outcome kept on a batch that settled without its delivery
+    /// being confirmed.
+    pub fn late(&self) -> Option<&LateOutcome> {
+        match self {
+            Self::ExpiredUnverified { late } | Self::CommittedUnconfirmed { late, .. } => {
+                late.as_ref()
+            }
+            _ => None,
+        }
+    }
+
+    /// What a status read found that this unconfirmed batch does not already
+    /// state, or `None`. For a batch whose outcome was never learned, any
+    /// status is news. For a committed batch, its own pending delivery is
+    /// what it states; anything else is news, a status naming another
+    /// delivery included ([`Self::late_names_other_delivery`]).
+    pub fn late_news(
+        &self,
+        status: crate::runtime::keyed_inject::NativeStatus,
+    ) -> Option<crate::runtime::keyed_inject::NativeStatus> {
+        use crate::runtime::keyed_inject::NativeStatus;
+        match self {
+            Self::ExpiredUnverified { .. } => {}
+            Self::CommittedUnconfirmed { receipt, .. } => {
+                if let NativeStatus::Pending {
+                    receipt: pending, ..
+                } = &status
+                    && same_delivery(receipt, pending)
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        (self.late().map(|late| &late.status) != Some(&status)).then_some(status)
+    }
+
+    /// Whether `status` names a delivery other than the one this committed,
+    /// unconfirmed batch holds the receipt of. Such a status contradicts the
+    /// batch; it is kept as its late outcome as it was read, and nothing
+    /// more is read for the batch.
+    pub fn late_names_other_delivery(
+        &self,
+        status: &crate::runtime::keyed_inject::NativeStatus,
+    ) -> bool {
+        use crate::runtime::keyed_inject::NativeStatus;
+        let Self::CommittedUnconfirmed { receipt, .. } = self else {
+            return false;
+        };
+        match status {
+            NativeStatus::NotCommitted => false,
+            NativeStatus::Pending { receipt: other, .. }
+            | NativeStatus::Applied { receipt: other, .. }
+            | NativeStatus::Stranded { receipt: other }
+            | NativeStatus::Refused { receipt: other, .. } => !same_delivery(receipt, other),
+        }
+    }
+
+    /// This unconfirmed batch with `late` kept on it; any other state is
+    /// refused, since only a batch whose delivery was not confirmed keeps a
+    /// late outcome.
+    pub fn with_late(&self, late: LateOutcome) -> Result<Self> {
+        match self {
+            Self::ExpiredUnverified { .. } => Ok(Self::ExpiredUnverified { late: Some(late) }),
+            Self::CommittedUnconfirmed { receipt, .. } => Ok(Self::CommittedUnconfirmed {
+                receipt: receipt.clone(),
+                late: Some(late),
+            }),
+            other => Err(AnnouncementStoreError::Invalid(format!(
+                "a {} batch keeps no late outcome",
+                other.tag()
+            ))),
         }
     }
 
@@ -1148,13 +1312,19 @@ impl BatchState {
     /// The batch owner's transition table.
     ///
     /// Sealed batches may start a submission or be cancelled. A submitting
-    /// batch settles only from native evidence: committed, applied, refused
-    /// or stranded, or "not committed" (retry the identical delivery, or
-    /// cancel it when nothing wants it). A committed batch settles from
-    /// native evidence alone, and only from evidence about its own delivery:
-    /// a status whose receipt names another delivery blocks it. Any
+    /// batch settles from native evidence: committed, applied, refused or
+    /// stranded, or "not committed" (retry the identical delivery, or cancel
+    /// it when nothing wants it); or as unverified, never submitted again,
+    /// once its outcome was not learned in time. A committed batch settles
+    /// only from evidence about its own delivery, where a status whose
+    /// receipt names another delivery blocks it; or as unconfirmed, keeping
+    /// its receipt, once its admission was not confirmed in time. Any
     /// unsettled batch the native evidence contradicts is blocked. Settled
     /// batches take no event.
+    ///
+    /// Nothing moves a committed batch but an event that settles or blocks
+    /// it, so a committed batch's last update is when it was committed, on
+    /// this gateway's clock: the bound on its admission counts from there.
     pub fn apply(&self, event: &BatchEvent) -> Result<Self> {
         let refuse = || {
             Err(AnnouncementStoreError::IllegalTransition {
@@ -1172,6 +1342,15 @@ impl BatchState {
             (Self::Submitting { .. }, BatchEvent::SubmitRefused) => Ok(Self::Sealed),
             (Self::Sealed, BatchEvent::Expire)
             | (Self::Submitting { .. }, BatchEvent::ExpireNotCommitted) => Ok(Self::Expired),
+            (Self::Submitting { .. }, BatchEvent::ExpireUnverified) => {
+                Ok(Self::ExpiredUnverified { late: None })
+            }
+            (Self::Committed { receipt }, BatchEvent::ExpireUnconfirmed) => {
+                Ok(Self::CommittedUnconfirmed {
+                    receipt: receipt.clone(),
+                    late: None,
+                })
+            }
             (Self::Submitting { .. }, BatchEvent::NativeCommitted { receipt }) => {
                 Ok(Self::Committed {
                     receipt: receipt.clone(),
@@ -1463,6 +1642,13 @@ pub fn render_gap(gap: &BatchGap) -> String {
     let why = match gap.reason {
         GapReason::Expired => "they waited longer than the retention window for a delivery",
         GapReason::NotRetained => "they were no longer retained when this delivery was handed on",
+        GapReason::DeliveryNotConfirmed => {
+            "their delivery was neither confirmed nor ruled out, and they may still arrive, \
+             after later announcements"
+        }
+        GapReason::AdmissionNotConfirmed => {
+            "they were committed to your inbox, and their admission was never confirmed"
+        }
     };
     format!(
         "- Not delivered: {count} announcement{plural} in mob {mob_id}; {why}.\n",

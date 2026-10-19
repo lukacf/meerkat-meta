@@ -193,6 +193,33 @@ pub trait AnnouncementStore: Send + Sync {
         now_ms: u64,
     ) -> Result<Batch>;
 
+    /// Batches that settled without their delivery being confirmed and
+    /// whose next late read is due at `now_ms`, the longest due first. A
+    /// batch enters this set when it settles so, and leaves it when
+    /// [`Self::record_late_read`] names no next read or retention removes
+    /// it.
+    async fn late_reads_due(&self, now_ms: u64, limit: usize) -> Result<Vec<Batch>>;
+
+    /// Record a late read of a batch that settled without its delivery being
+    /// confirmed: the outcome it found, if any, is kept on the batch, which
+    /// is otherwise left as it is (its state, and when it settled), and the
+    /// next read is due at `next_read_at_ms`, or never when `None`. Any
+    /// other batch is refused.
+    async fn record_late_read(
+        &self,
+        id: &BatchId,
+        late: Option<super::types::LateOutcome>,
+        next_read_at_ms: Option<u64>,
+    ) -> Result<Batch>;
+
+    /// Settle as expired what waited longer than the retention window for
+    /// a delivery that never started, at most `limit` of each kind: owed
+    /// announcements no batch holds (each once per member), and sealed
+    /// batches sealed before the window. The member's next batch reports
+    /// them as gaps. A batch the native owner may hold is never expired
+    /// here.
+    async fn expire(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<ExpiryReport>;
+
     /// Remove what retention allows, oldest first and at most `limit` of
     /// each kind: announcements that no subscription is still owed and that
     /// are older than the window, across mobs, each mob stopping at its
@@ -204,13 +231,5 @@ pub trait AnnouncementStore: Send + Sync {
     /// nothing and that no subscription names; and lineage records that
     /// ended before the window and that no live record names as parent.
     /// [`PruneReport::more`] says whether another pass has work.
-    /// Settle as expired what waited longer than the retention window for
-    /// a delivery that never started, at most `limit` of each kind: owed
-    /// announcements no batch holds (each once per member), and sealed
-    /// batches sealed before the window. The member's next batch reports
-    /// them as gaps. A batch the native owner may hold is never expired
-    /// here.
-    async fn expire(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<ExpiryReport>;
-
     async fn prune(&self, now_ms: u64, retention_ms: u64, limit: usize) -> Result<PruneReport>;
 }

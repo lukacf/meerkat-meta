@@ -37,7 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   destroyed mobs. A member that is not registered or not served where its
   deliveries go ends nothing: its deliveries wait, and
   `deliveries/observe` and `subscriptions/get` show why as a typed `marker`
-  with the class of its evidence (`verified`, `unverified` or `local`). Batch bodies quote each announcement and name its mob and
+  with the class of its evidence (`verified`, `unverified` or `local`).
+  Batch bodies quote each announcement and name its mob and
   announcer. New methods `meta/mob_announcements/{announce, get,
   subscriptions/{put,pause,resume,cancel,get,list},
   deliveries/{list,observe,reconcile}}`, with typed errors `-32044` to
@@ -47,7 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   maintenance in every build) and the methods answer
   `mob_announcements_unavailable`. Nothing holds retention much past the
   window: what waited longer for a delivery that never started expires, and
-  the member's next batch reports it as a gap. Every public enum of the
+  the member's next batch reports it as a gap. A submission whose outcome is
+  not learned in time settles `expired_unverified`, and a committed batch
+  whose admission is not confirmed in time settles `committed_unconfirmed`
+  with its receipt kept: neither is submitted again, the member's next batch
+  reports their announcements as `delivery_not_confirmed` or
+  `admission_not_confirmed` and goes on, and what a status read finds later
+  is kept on the batch as its `late` outcome. Every public enum of the
   Rust surface is `#[non_exhaustive]`. See
   `docs/design/mob-announcements.md`.
 
@@ -88,8 +95,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   gateway's mob, once per key and scoped to the calling grant, and read it
   back. Requests and answers are signed, requests must be issued within
   `runtime_options.control_request_window_ms` (five minutes by default) of
-  the serving gateway's clock, and a grant must name the verbs (`*` does not
-  cover them). Every gateway that binds a control listener (`rpc_gateway`,
+  the serving gateway's clock, a delivery is committed by its deadline (its
+  issue time plus the window) or refused, and every stale refusal carries its
+  typed cause (`outside_window`, `issued_before_start`, `deadline_passed`) in
+  a signed field. A grant must name the verbs (`*` does not cover them).
+  Every gateway that binds a control listener (`rpc_gateway`,
   `meta_gateway`, and a runtime the builder composes) seals what the keyed
   inject plane serves once its runtime is composed: an identity-first
   gateway serves them, and until then both verbs answer
