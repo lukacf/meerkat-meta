@@ -436,12 +436,14 @@ impl GatewayMcpComposition {
 
 /// Offer a freshly constructed gateway member factory to the host. This is
 /// the only place the gateway sets a member factory's MCP composer,
-/// call-context provider or attempt guards, and the gateway sets none of them
-/// (nor a connector authority) on these factories before it, so a host
-/// selection replaces no existing choice. Every factory adopts its MCP
-/// adapters into the gateway's `custody` at its ownership seam, before any
-/// server is staged, whatever the host answers. No host, or a host answering
-/// `None`, leaves the factory otherwise exactly as constructed.
+/// call-context provider, attempt guards or operation refusal observer, and
+/// the gateway sets none of them (nor a connector authority) on these
+/// factories before it, so a host selection replaces no existing choice. The
+/// host answers both questions about the same construction before either
+/// answer is installed. Every factory adopts its MCP adapters into the
+/// gateway's `custody` at its ownership seam, before any server is staged,
+/// whatever the host answers. No host, or a host answering `None` to both,
+/// leaves the factory otherwise exactly as constructed.
 pub(crate) fn compose_gateway_member_factory(
     host: Option<&Arc<dyn GatewayHostComposition>>,
     kind: GatewayFactoryKind,
@@ -454,11 +456,15 @@ pub(crate) fn compose_gateway_member_factory(
     let Some(host) = host else {
         return Ok(factory);
     };
-    let composition = host.compose_member_factory(&GatewayFactoryConstruction::new(
-        kind, &factory, runtime, storage,
-    ))?;
-    Ok(match composition {
+    let construction = GatewayFactoryConstruction::new(kind, &factory, runtime, storage);
+    let composition = host.compose_member_factory(&construction)?;
+    let observer = host.operation_refusal_observer(&construction)?;
+    let factory = match composition {
         Some(composition) => composition.install(factory),
+        None => factory,
+    };
+    Ok(match observer {
+        Some(observer) => factory.with_operation_refusal_observer(observer),
         None => factory,
     })
 }
@@ -507,13 +513,29 @@ mod tests {
         answer: Answer,
         seen: Mutex<Vec<(GatewayFactoryKind, String, bool)>>,
         installations: Mutex<Vec<GatewayRealmMcpInstallation>>,
+        /// What the host answers when asked for its refusal observer.
+        observer: ObserverAnswer,
+        /// The construction kind of each observer offer, in order.
+        observer_offers: Mutex<Vec<GatewayFactoryKind>>,
+    }
+
+    enum ObserverAnswer {
+        Install(Arc<RecordingObserver>),
+        Ordinary,
+        Refuse,
     }
 
     fn composing_host(answer: Answer) -> Arc<ComposingHost> {
+        observing_host(answer, ObserverAnswer::Ordinary)
+    }
+
+    fn observing_host(answer: Answer, observer: ObserverAnswer) -> Arc<ComposingHost> {
         Arc::new(ComposingHost {
             answer,
             seen: Mutex::new(Vec::new()),
             installations: Mutex::new(Vec::new()),
+            observer,
+            observer_offers: Mutex::new(Vec::new()),
         })
     }
 
@@ -581,6 +603,23 @@ mod tests {
                 }
                 Answer::Ordinary => Ok(None),
                 Answer::Refuse => Err(GatewayHostError::Denied),
+            }
+        }
+        fn operation_refusal_observer(
+            &self,
+            construction: &GatewayFactoryConstruction<'_>,
+        ) -> Result<Option<Arc<dyn meerkat_core::OperationRefusalObserver>>, GatewayHostError>
+        {
+            self.observer_offers
+                .lock()
+                .unwrap()
+                .push(construction.kind());
+            match &self.observer {
+                ObserverAnswer::Install(observer) => Ok(Some(
+                    Arc::clone(observer) as Arc<dyn meerkat_core::OperationRefusalObserver>
+                )),
+                ObserverAnswer::Ordinary => Ok(None),
+                ObserverAnswer::Refuse => Err(GatewayHostError::Unavailable),
             }
         }
     }
@@ -757,6 +796,266 @@ mod tests {
             )
             .err(),
             Some(GatewayHostError::Denied)
+        );
+    }
+
+    /// Every operation refusal observation a host receives, in order.
+    #[derive(Default)]
+    struct RecordingObserver(Mutex<Vec<meerkat_core::OperationRefusalObservation>>);
+
+    impl meerkat_core::OperationRefusalObserver for RecordingObserver {
+        fn observe(&self, observation: &meerkat_core::OperationRefusalObservation) {
+            self.0.lock().unwrap().push(observation.clone());
+        }
+    }
+
+    impl RecordingObserver {
+        /// Session, surface, outcome and disposition of each observation.
+        fn observed(
+            &self,
+        ) -> Vec<(
+            SessionId,
+            meerkat_core::OperationRefusalSurface,
+            meerkat_core::OperationRefusalOutcome,
+            meerkat_core::OperationRefusalDisposition,
+        )> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|observation| {
+                    (
+                        observation.session_id().clone(),
+                        observation.surface().clone(),
+                        observation.outcome(),
+                        observation.disposition(),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    const REFUSED_TOOL: &str = "refused_probe";
+    const REFUSED_CALL: &str = "refused-call";
+
+    /// One tool whose owner refuses every call.
+    struct RefusingTool;
+
+    #[async_trait]
+    impl AgentToolDispatcher for RefusingTool {
+        fn tools(&self) -> Arc<[Arc<meerkat_core::types::ToolDef>]> {
+            vec![Arc::new(meerkat_core::types::ToolDef::new(
+                REFUSED_TOOL,
+                "A tool whose owner refuses every call.",
+                serde_json::json!({"type": "object", "properties": {}}),
+            ))]
+            .into()
+        }
+
+        async fn dispatch(
+            &self,
+            _call: meerkat_core::types::ToolCallView<'_>,
+        ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+            Err(meerkat_core::ToolError::AuthorizationRefused {
+                refusal: meerkat_core::OperationRefused::new(
+                    meerkat_core::OperationRefusalKind::Denied,
+                ),
+            })
+        }
+    }
+
+    /// Calls the refused tool on its first request and ends the turn on the
+    /// next.
+    #[derive(Default)]
+    struct RefusedCallClient(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl LlmClient for RefusedCallClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(&'a self, _request: &'a LlmRequest) -> LlmStream<'a> {
+            let first = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            let events = if first {
+                vec![
+                    meerkat_client::LlmEvent::ToolCallComplete {
+                        id: REFUSED_CALL.to_string(),
+                        name: REFUSED_TOOL.to_string(),
+                        args: serde_json::json!({}),
+                        meta: None,
+                    },
+                    meerkat_client::LlmEvent::Done {
+                        outcome: meerkat_client::LlmDoneOutcome::success(
+                            meerkat_core::StopReason::ToolUse,
+                        ),
+                    },
+                ]
+            } else {
+                vec![
+                    meerkat_client::LlmEvent::TextDelta {
+                        delta: "done".to_string(),
+                        meta: None,
+                    },
+                    meerkat_client::LlmEvent::Done {
+                        outcome: meerkat_client::LlmDoneOutcome::success(
+                            meerkat_core::StopReason::EndTurn,
+                        ),
+                    },
+                ]
+            };
+            Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
+        }
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::OpenAI
+        }
+        async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
+            Ok(())
+        }
+    }
+
+    /// `kind`'s gateway factory, offered to `host`.
+    fn composed_kind(
+        host: &Arc<ComposingHost>,
+        kind: GatewayFactoryKind,
+        dir: &std::path::Path,
+        machine: &MeerkatMachine,
+    ) -> Result<AgentFactory, GatewayHostError> {
+        let host: Arc<dyn GatewayHostComposition> = host.clone();
+        compose_gateway_member_factory(
+            Some(&host),
+            kind,
+            AgentFactory::new(dir).builtins(false),
+            machine,
+            &storage(dir),
+            &crate::member_mcp_custody::MemberMcpCustody::new(),
+        )
+    }
+
+    /// Runs one turn of an agent `factory` builds. Its model calls the
+    /// refused tool once; returns the turn's session.
+    async fn run_refused_call(factory: AgentFactory) -> SessionId {
+        let mut builder = FactoryAgentBuilder::new(factory, meerkat::Config::default());
+        builder.default_llm_client = Some(Arc::new(RefusedCallClient::default()));
+        builder.default_tool_dispatcher = Some(Arc::new(RefusingTool));
+        let service = meerkat::EphemeralSessionService::new(builder, 2);
+        let request = meerkat_core::service::CreateSessionRequest {
+            initial_turn: meerkat_core::service::InitialTurnPolicy::RunImmediately,
+            prompt: meerkat_core::ContentInput::Text("call the tool".to_string()),
+            build: None,
+            ..request_with(Vec::new())
+        };
+        meerkat_core::service::SessionService::create_session(&service, request)
+            .await
+            .unwrap_or_else(|error| panic!("the turn completes: {error}"))
+            .session_id
+    }
+
+    /// Each gateway factory kind installs the host's observer: an agent it
+    /// builds whose tool owner refuses a call reports exactly that refusal,
+    /// for its own session. The host is asked once per factory, with that
+    /// factory's construction.
+    #[tokio::test]
+    async fn every_gateway_factory_kind_installs_the_host_refusal_observer() {
+        for kind in [
+            GatewayFactoryKind::Persistent,
+            GatewayFactoryKind::ProcessLocal,
+            GatewayFactoryKind::ContinuityBacked,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let machine = runtime_machine();
+            let observer = Arc::new(RecordingObserver::default());
+            let host = observing_host(
+                Answer::Ordinary,
+                ObserverAnswer::Install(Arc::clone(&observer)),
+            );
+            let factory = composed_kind(&host, kind, dir.path(), &machine).expect("composed");
+            assert_eq!(*host.observer_offers.lock().unwrap(), [kind]);
+            assert_eq!(
+                host.seen.lock().unwrap().len(),
+                1,
+                "{kind:?}: the MCP composition is still offered"
+            );
+            let session = run_refused_call(factory).await;
+            assert_eq!(
+                observer.observed(),
+                [(
+                    session,
+                    meerkat_core::OperationRefusalSurface::ToolCall {
+                        tool_use_id: REFUSED_CALL.to_string(),
+                    },
+                    meerkat_core::OperationRefusalOutcome::Refused {
+                        kind: meerkat_core::OperationRefusalKind::Denied,
+                        dispatch: meerkat_core::RefusalDispatch::Unknown,
+                    },
+                    meerkat_core::OperationRefusalDisposition::ToolResult,
+                )],
+                "{kind:?}: exactly the refused call, as its tool result"
+            );
+        }
+    }
+
+    /// No host, or a host answering `None`, installs no observer: the factory
+    /// stays as constructed. A host refusing the observer refuses the factory.
+    #[tokio::test]
+    async fn without_a_host_observer_the_factory_is_left_as_constructed() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = runtime_machine();
+        let installed = |factory: &AgentFactory| {
+            format!("{factory:?}").contains("operation_refusal_observer: true")
+        };
+        let bare = compose_gateway_member_factory(
+            None,
+            GatewayFactoryKind::Persistent,
+            AgentFactory::new(dir.path()),
+            &machine,
+            &storage(dir.path()),
+            &crate::member_mcp_custody::MemberMcpCustody::new(),
+        )
+        .expect("no host");
+        assert!(format!("{bare:?}").contains("operation_refusal_observer: false"));
+        let ordinary = observing_host(Answer::Ordinary, ObserverAnswer::Ordinary);
+        let factory = composed_kind(
+            &ordinary,
+            GatewayFactoryKind::Persistent,
+            dir.path(),
+            &machine,
+        )
+        .expect("ordinary");
+        assert!(
+            !installed(&factory),
+            "a host answering None installs nothing"
+        );
+        assert_eq!(ordinary.observer_offers.lock().unwrap().len(), 1);
+        let observing = observing_host(
+            Answer::Ordinary,
+            ObserverAnswer::Install(Arc::new(RecordingObserver::default())),
+        );
+        let factory = composed_kind(
+            &observing,
+            GatewayFactoryKind::Persistent,
+            dir.path(),
+            &machine,
+        )
+        .expect("observing");
+        assert!(
+            installed(&factory),
+            "the control: the same check sees an install"
+        );
+        let refusing = observing_host(Answer::Ordinary, ObserverAnswer::Refuse);
+        assert_eq!(
+            composed_kind(
+                &refusing,
+                GatewayFactoryKind::Persistent,
+                dir.path(),
+                &machine,
+            )
+            .err(),
+            Some(GatewayHostError::Unavailable),
+            "a host that cannot provide its observer refuses the factory"
         );
     }
 

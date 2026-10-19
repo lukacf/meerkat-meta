@@ -72,6 +72,9 @@ pub struct UnifiedRuntimeBuilder {
     custom_session_store: Option<Arc<dyn meerkat::SessionStore>>,
     meerkat_config: Option<meerkat::Config>,
     mcp_call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
+    /// The host's operation refusal observer, installed on every
+    /// builder-owned agent factory.
+    operation_refusal_observer: Option<Arc<dyn meerkat_core::OperationRefusalObserver>>,
     /// Host-level compaction policy composed over `meerkat_config`'s
     /// compaction slot at spec-resolve time. Separate from `meerkat_config`
     /// so tuning compaction does not require an embedder to author a whole
@@ -545,6 +548,20 @@ impl UnifiedRuntimeBuilder {
         provider: Arc<dyn meerkat_mcp::McpCallContextProvider>,
     ) -> Self {
         self.mcp_call_context_provider = Some(provider);
+        self
+    }
+
+    /// Install the host's operation refusal observer on every builder-owned
+    /// agent factory: it receives each refusal disposition the agents of
+    /// those factories decide for a governed operation (see
+    /// `meerkat::AgentFactory::with_operation_refusal_observer`). Nothing of
+    /// it reaches the event stream, a wire type or the model. A supplied,
+    /// already-erased mob_spec cannot accept this override.
+    pub fn operation_refusal_observer(
+        mut self,
+        observer: Arc<dyn meerkat_core::OperationRefusalObserver>,
+    ) -> Self {
+        self.operation_refusal_observer = Some(observer);
         self
     }
 
@@ -1109,6 +1126,12 @@ impl UnifiedRuntimeBuilder {
         if self.mob_spec.is_some() && self.effective_mcp_call_context_provider().is_some() {
             return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
                 "MCP context provider and document bindings require builder-owned session services; mob_spec() is already erased".into(),
+            ));
+        }
+
+        if self.mob_spec.is_some() && self.operation_refusal_observer.is_some() {
+            return Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(
+                "an operation refusal observer requires builder-owned session services; mob_spec() is already erased".into(),
             ));
         }
 
@@ -2648,6 +2671,7 @@ impl UnifiedRuntimeBuilder {
                 meerkat_realm,
                 self.take_grant_configuration(),
                 self.effective_mcp_call_context_provider(),
+                self.operation_refusal_observer.clone(),
                 wait_for_document_mcp,
             )
             .map_err(storage_resolution_builder_error)?
@@ -2676,6 +2700,7 @@ impl UnifiedRuntimeBuilder {
                 self.provider_meerkat_stores.clone(),
                 self.take_grant_configuration(),
                 self.effective_mcp_call_context_provider(),
+                self.operation_refusal_observer.clone(),
                 wait_for_document_mcp,
             )
             .map_err(storage_resolution_builder_error)?
@@ -2703,6 +2728,7 @@ impl UnifiedRuntimeBuilder {
                 None,
                 self.take_grant_configuration(),
                 self.effective_mcp_call_context_provider(),
+                self.operation_refusal_observer.clone(),
                 wait_for_document_mcp,
             )
             .map_err(storage_resolution_builder_error)?;
@@ -2973,6 +2999,34 @@ mod tests {
         assert!(matches!(result,
             Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(detail))
                 if detail.contains("mob_spec() is already erased")));
+    }
+
+    /// A supplied, already-erased spec cannot take the refusal observer: the
+    /// builder refuses the pair instead of running unobserved.
+    #[tokio::test]
+    async fn supplied_erased_spec_refuses_refusal_observer_before_bootstrap() {
+        struct Observer;
+        impl meerkat_core::OperationRefusalObserver for Observer {
+            fn observe(&self, _: &meerkat_core::OperationRefusalObservation) {
+                panic!("an erased spec override must refuse before any agent runs")
+            }
+        }
+        let definition = MobDefinition::from_toml("[mob]\nid = \"observer-override\"\n")
+            .expect("fixture definition");
+        let spec = UnifiedRuntimeBuilder::default()
+            .definition(definition)
+            .resolve_mob_spec()
+            .await
+            .expect("empty fixture spec");
+        let result = UnifiedRuntimeBuilder::default()
+            .mob_spec(spec)
+            .operation_refusal_observer(Arc::new(Observer))
+            .build()
+            .await;
+        assert!(matches!(result,
+            Err(UnifiedRuntimeBuilderError::ConflictingConfiguration(detail))
+                if detail.contains("refusal observer")
+                    && detail.contains("mob_spec() is already erased")));
     }
 
     #[cfg(feature = "extension-state")]

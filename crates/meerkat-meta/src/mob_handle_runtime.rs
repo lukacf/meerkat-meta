@@ -10284,6 +10284,12 @@ impl MobBootstrapSpec {
     /// If `session_store` is provided, it is set on the `FactoryAgentBuilder` so
     /// that agents use the given store instead of falling back to JSONL.
     ///
+    /// It takes no host factory options (an MCP call-context provider or an
+    /// operation refusal observer). A host that needs them uses
+    /// [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder), or builds a
+    /// session service on its own factory and passes it to
+    /// [`MobBootstrapSpec::new`].
+    ///
     /// # Errors
     ///
     /// The runtime machine or the agent mob tools could not acquire their
@@ -10312,6 +10318,12 @@ impl MobBootstrapSpec {
     /// Like [`ephemeral`](Self::ephemeral), but with a pre-build hook that is
     /// called before each agent is constructed. Use this to inject external
     /// tools, augment system prompts, or set per-agent labels.
+    ///
+    /// It takes no host factory options (an MCP call-context provider or an
+    /// operation refusal observer). A host that needs them uses
+    /// [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder), or builds a
+    /// session service on its own factory and passes it to
+    /// [`MobBootstrapSpec::new`].
     ///
     /// # Errors
     ///
@@ -10522,6 +10534,12 @@ impl MobBootstrapSpec {
     /// 2. Adapted via `StoreAdapter` and set on `FactoryAgentBuilder.default_session_store`
     ///    so that agents use it directly instead of falling back to JSONL.
     ///
+    /// It takes no host factory options (an MCP call-context provider or an
+    /// operation refusal observer). A host that needs them uses
+    /// [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder), or builds a
+    /// session service on its own factory and passes it to
+    /// [`MobBootstrapSpec::new`].
+    ///
     /// # Errors
     ///
     /// Fails closed when the local blob directory or the runtime store under
@@ -10556,6 +10574,12 @@ impl MobBootstrapSpec {
     /// Like [`persistent`](Self::persistent), but with a pre-build hook that
     /// is called before each agent is constructed. Use this to inject external
     /// tools, augment system prompts, or set per-agent labels.
+    ///
+    /// It takes no host factory options (an MCP call-context provider or an
+    /// operation refusal observer). A host that needs them uses
+    /// [`UnifiedRuntimeBuilder`](crate::UnifiedRuntimeBuilder), or builds a
+    /// session service on its own factory and passes it to
+    /// [`MobBootstrapSpec::new`].
     ///
     /// # Errors
     ///
@@ -10641,6 +10665,7 @@ impl MobBootstrapSpec {
             meerkat_realm,
             None,
             None,
+            None,
             false,
         )
     }
@@ -10671,6 +10696,7 @@ impl MobBootstrapSpec {
         meerkat_realm: meerkat_core::RealmId,
         grant_configuration: Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
         mcp_call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
+        operation_refusal_observer: Option<Arc<dyn meerkat_core::OperationRefusalObserver>>,
         wait_for_document_mcp: bool,
     ) -> Result<Self, StorageResolutionError> {
         caps.image_generation |= mob_definition_may_use_image_generation(&definition);
@@ -10817,6 +10843,9 @@ impl MobBootstrapSpec {
             .mcp_apps(caps.mcp_apps);
         if let Some(provider) = mcp_call_context_provider {
             factory = factory.mcp_call_context_provider(provider);
+        }
+        if let Some(observer) = operation_refusal_observer {
+            factory = factory.with_operation_refusal_observer(observer);
         }
         if caps.image_generation {
             factory = factory
@@ -11102,6 +11131,7 @@ impl MobBootstrapSpec {
             None,
             None,
             None,
+            None,
             false,
         )
     }
@@ -11127,6 +11157,7 @@ impl MobBootstrapSpec {
         provider_meerkat_stores: Option<crate::storage_provider::ProviderMeerkatStores>,
         grant_configuration: Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
         mcp_call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
+        operation_refusal_observer: Option<Arc<dyn meerkat_core::OperationRefusalObserver>>,
         wait_for_document_mcp: bool,
     ) -> Result<Self, StorageResolutionError> {
         caps.image_generation |= mob_definition_may_use_image_generation(&definition);
@@ -11214,6 +11245,9 @@ impl MobBootstrapSpec {
             .mcp_apps(caps.mcp_apps);
         if let Some(provider) = mcp_call_context_provider {
             factory = factory.mcp_call_context_provider(provider);
+        }
+        if let Some(observer) = operation_refusal_observer {
+            factory = factory.with_operation_refusal_observer(observer);
         }
         if caps.image_generation {
             factory = factory
@@ -24511,6 +24545,7 @@ comms = true
                 crate::storage_provider::default_meerkat_level_realm(),
                 None,
                 None,
+                None,
                 false,
             )
             .expect("persistent constructor")
@@ -24530,6 +24565,7 @@ comms = true
                 None,
                 None,
                 provider,
+                None,
                 None,
                 None,
                 false,
