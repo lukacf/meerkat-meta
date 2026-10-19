@@ -57,6 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `live_session_id`.
 - `ConsoleLiveSnapshot` is `#[non_exhaustive]`: build it with
   `ConsoleLiveSnapshot::new`, so a later field is not a breaking change.
+- `ConsoleLiveSnapshot.running` is an `Option<bool>` (was `bool`), and
+  `ConsoleLiveSnapshot::new` takes the same. `None` means that nothing
+  observed whether the mob runs; it is never defaulted. The snapshot gains
+  `unobserved: Option<UnobservedFacts>`, which `new` sets when `running` is
+  `None` (serde default, skipped when `None`).
 
 ### Security
 
@@ -120,6 +125,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `/console/experience` reports `health_overview.live_snapshot.running` as
+  the mob's owner answers when the experience is read, as `meta/status`
+  does. It came from the console's cached roster walk, and was `true` when
+  no walk had answered yet, so a mob stopped since the last walk read as
+  running. A console with no live runtime reports `running: null` and names
+  it unobserved (`"unobserved": {"reason": "not_observed", "fields":
+  ["running"]}` on the health snapshot); it reported `true` whenever a
+  module was configured.
 - The `complete_held_identity_members` documentation no longer says that
   resumed members are skipped. A held identity bootstrap holds fresh members
   only: a roster member that already has continuity refuses the whole pass

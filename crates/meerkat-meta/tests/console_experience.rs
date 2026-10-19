@@ -120,7 +120,7 @@ fn console_voice_is_unavailable_without_an_authenticated_voice_host() {
             },
             Some(&ConsoleLiveSnapshot::new(
                 Some("voice-test".to_string()),
-                true,
+                Some(true),
                 vec![],
                 vec![],
                 Vec::new(),
@@ -385,7 +385,7 @@ fn console_experience_projects_durable_identity_for_runtime_member_rows() {
     let state = decision_state(false);
     let runtime_snapshot = ConsoleLiveSnapshot::new(
         Some("ops".to_string()),
-        true,
+        Some(true),
         vec!["rt:review:singleton:0".to_string()],
         vec![],
         vec![meerkat_meta::runtime::ConsoleMember {
@@ -449,7 +449,7 @@ fn phase8_console_live_snapshot_prefers_runtime_state_over_config_modules() {
     let state = decision_state(false);
     let runtime_snapshot = ConsoleLiveSnapshot::new(
         None,
-        false,
+        Some(false),
         vec!["router".to_string()],
         vec![],
         Vec::new(),
@@ -491,12 +491,40 @@ fn phase8_console_live_snapshot_prefers_runtime_state_over_config_modules() {
     );
 }
 
+/// A console with no live runtime has no answer for whether a mob runs: the
+/// experience reports `running` as null and names it unobserved. The configured
+/// modules say what could run, not that anything does.
+#[test]
+fn a_console_without_a_live_runtime_reports_running_unobserved() {
+    let response = handle_console_rest_json_route(
+        &decision_state(false),
+        &ConsoleRestJsonRequest {
+            method: "GET".to_string(),
+            path: "/console/experience".to_string(),
+            auth: None,
+        },
+    );
+    assert_eq!(response.status, 200, "{}", response.body);
+    let live = &response.body["health_overview"]["live_snapshot"];
+    assert_eq!(
+        live["loaded_modules"],
+        json!(["router", "delivery"]),
+        "{live}"
+    );
+    assert_eq!(live["running"], serde_json::Value::Null, "{live}");
+    assert_eq!(
+        live["unobserved"],
+        json!({"reason": "not_observed", "fields": ["running"]}),
+        "{live}"
+    );
+}
+
 #[test]
 fn phase0_contract_010_console_experience_preserves_watch_and_degraded_fields() {
     let state = decision_state(false);
     let runtime_snapshot = ConsoleLiveSnapshot::new(
         Some("runtime-1".to_string()),
-        true,
+        Some(true),
         vec!["router".to_string()],
         vec![meerkat_meta::ConsoleAgentLiveSnapshot {
             agent_id: "identity:luka".to_string(),
@@ -819,7 +847,7 @@ fn console_experience_preserves_known_quiet_and_unknown_response_phases() {
             };
             let snapshot = ConsoleLiveSnapshot::new(
                 Some("runtime".into()),
-                true,
+                Some(true),
                 vec![],
                 vec![agent],
                 members,

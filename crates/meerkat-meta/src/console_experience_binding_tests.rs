@@ -377,7 +377,7 @@ fn pending_route_snapshot() -> crate::runtime::ConsoleLiveSnapshot {
     other.wired_to = vec![KEEPER.to_string()];
     crate::runtime::ConsoleLiveSnapshot::new(
         Some("console-binding".to_string()),
-        true,
+        Some(true),
         vec![],
         vec![],
         vec![keeper, other],
@@ -865,6 +865,37 @@ async fn a_binding_that_moves_while_a_walk_runs_answers_its_row_pending() {
         "the walk vouches for no fact of a binding that moved under it"
     );
     runtime.mob_handle().stop().await.unwrap();
+}
+
+/// Whether the mob runs is its owner's answer when the snapshot is read: a mob
+/// that stopped after the cached walk reads stopped, never the walk's running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_live_snapshot_answers_the_mob_owners_running_state_not_the_cached_walks() {
+    let (runtime, _scratch) = identity_first_runtime(BTreeMap::new()).await;
+    let mob_runtime = runtime.mob_runtime().clone();
+    let read_model = ConsoleSnapshotReadModel::default();
+    let policy = AllowAllConsoleVisibilityPolicy;
+
+    // A primed read model while the mob runs.
+    let (snapshot, _) =
+        build_live_snapshot(&mob_runtime, &[], None, &policy, &read_model, None).await;
+    assert_eq!(snapshot.running, Some(true));
+    assert_eq!(snapshot.unobserved, None);
+
+    // Every later walk waits for the gate, so only the owner can know the
+    // mob stopped.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    read_model.set_walk_gate(Some(Arc::clone(&gate)));
+    runtime.mob_handle().stop().await.unwrap();
+
+    let (snapshot, _) =
+        build_live_snapshot(&mob_runtime, &[], None, &policy, &read_model, None).await;
+    assert_eq!(
+        snapshot.running,
+        Some(false),
+        "the mob stopped after the walk; the owner says so, the cached walk does not"
+    );
+    gate.add_permits(64);
 }
 
 /// A pending identity's walked state does not decide whether it is a loaded
