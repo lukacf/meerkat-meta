@@ -124,6 +124,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Meta Forge's local knowledge service starts and becomes ready for semantic
+  ingestion. `knowledge/manage.py up` used to stop before the service started:
+  the pinned source commit could not be fetched, and every available revision
+  of the source refuses the stock SurrealDB server the stack ran. Forge now
+  pins commit `d0493b6e9ba6e61ecea24e50b5f8748e3ffe8f6c` of
+  `https://github.com/lukacf/meerkat-recall` and runs a single knowledge
+  service process with its store embedded (RocksDB files in the private
+  knowledge volume), with no database server or reader service. After the
+  service is healthy, `up` creates the project space with its security policy
+  and processing approvals through a short-lived bootstrap token that is never
+  saved, gives the service's extractor a dedicated read-only token and grant,
+  and waits for `semantic_ingest_ready`. A later `up` only reads the space and
+  grant back, and in a knowledge folder prepared before the extractor token
+  existed it adds only that token. The image lets its service user read the
+  bundled migrations and extraction skills even when the source was checked
+  out under a private umask, and the service's runtime status reports the
+  project space's budget instead of the budget of a space named `default`. A
+  project that still records the old default pin builds the new default; an
+  explicitly chosen pin is kept. The exported knowledge README states the
+  licences of the embedded storage engine and names the source's notes on its
+  patches to it.
 - The `complete_held_identity_members` documentation no longer says that
   resumed members are skipped. A held identity bootstrap holds fresh members
   only: a roster member that already has continuity refuses the whole pass

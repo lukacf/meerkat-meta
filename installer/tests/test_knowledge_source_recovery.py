@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from test_elephant import manager
+from test_elephant import claims_of, manager
 
 
 SETTINGS = {"mode": "local", "source_repository": "https://example.invalid/knowledge.git",
@@ -271,14 +271,27 @@ def test_replaced_stage_is_neither_published_nor_removed(checkout, when):
 def test_up_fetch_retry_reaches_compose_only_after_valid_checkout(checkout, monkeypatch):
     manager = checkout.manager
     events = []
-    expected_settings = {**SETTINGS, "token_env": "ELEPHANT_TOKEN", "space_env": "ELEPHANT_SPACE_ID"}
+    expected_settings = {**SETTINGS, "token_env": "ELEPHANT_TOKEN", "space_env": "ELEPHANT_SPACE_ID",
+                         "project": "test-project"}
     monkeypatch.setattr(manager, "load_settings", lambda: expected_settings)
     monkeypatch.setattr(manager, "local_preflight", lambda: events.append("preflight"))
     monkeypatch.setattr(manager, "setup", lambda *_: pytest.fail("Existing private credentials must remain."))
 
     def compose(*args):
         assert (manager.ROOT / ".source/Cargo.toml").is_file()
+        # The service interpolates the extractor token, so it exists before the stack starts.
+        assert manager.read_env(manager.ROOT / ".env").get("MCP_BEARER_TOKEN")
         events.append(("compose", args))
+
+    def provision(settings, values):
+        assert settings is expected_settings and values.get("MCP_BEARER_TOKEN")
+        events.append("provision")
+        return {"space": settings["project"]}
+
+    def space_status(settings, *, wait=0):
+        assert settings is expected_settings and wait == manager.READY_TIMEOUT
+        events.append("status")
+        return {"semantic_ingest_ready": True}
 
     async def verify(settings, operation):
         assert settings is expected_settings and operation == "verify"
@@ -286,14 +299,25 @@ def test_up_fetch_retry_reaches_compose_only_after_valid_checkout(checkout, monk
         return {"fixture_verified": True}
 
     monkeypatch.setattr(manager, "compose", compose)
+    monkeypatch.setattr(manager, "provision", provision)
+    monkeypatch.setattr(manager, "space_status", space_status)
     monkeypatch.setattr(manager, "mcp_operation", verify)
     monkeypatch.setattr(sys, "argv", ["manage.py", "up"])
     checkout.failure = subprocess.CalledProcessError(128, ["inert-git-fetch"])
     with pytest.raises(subprocess.CalledProcessError):
         manager.main()
     assert events == ["preflight"] and not (manager.ROOT / ".source").exists()
+    # The folder predates the extractor token, and the failed fetch still changed no private file.
+    preserved(checkout)
     checkout.failure = None
     manager.main()
     assert events == ["preflight", "preflight",
-        ("compose", ("up", "--build", "--detach", "--wait", "--wait-timeout", "180")), "verify"]
-    preserved(checkout)
+        ("compose", ("up", "--build", "--detach", "--wait", "--wait-timeout", "180")), "provision", "status", "verify"]
+    # The retry adds only the extractor token; the other private files keep their bytes and inode.
+    knowledge_env = manager.ROOT / ".env"
+    added = manager.read_env(knowledge_env)
+    assert claims_of(added.pop("MCP_BEARER_TOKEN"))["sub"] == manager.WORKER_SUBJECT
+    original = checkout.before[knowledge_env][0].decode()
+    assert added == dict(line.split("=", 1) for line in original.splitlines())
+    assert all(path.read_bytes() == data and path.stat().st_ino == inode
+               for path, (data, inode) in checkout.before.items() if path != knowledge_env)

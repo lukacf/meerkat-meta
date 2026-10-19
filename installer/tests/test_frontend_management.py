@@ -189,10 +189,11 @@ async def test_declared_private_fields_allow_references_and_refuse_secret_litera
         assert native == []
 
 
-@pytest.mark.parametrize("raw", [b'{"configuration":{},"expected_revision":1,"expected_revision":2}',
-                                  b'{"configuration":{"bad":NaN},"expected_revision":1}',
-                                  b'{"configuration":{},"expected_revision":1,"principal":"forged"}',
-                                  b'{"configuration":{"secret":"' + b'x' * (256 * 1024) + b'"},"expected_revision":1}'])
+@pytest.mark.parametrize("raw", [
+    pytest.param(b'{"configuration":{},"expected_revision":1,"expected_revision":2}', id="duplicate-key"),
+    pytest.param(b'{"configuration":{"bad":NaN},"expected_revision":1}', id="non-finite-number"),
+    pytest.param(b'{"configuration":{},"expected_revision":1,"principal":"forged"}', id="forged-principal"),
+    pytest.param(b'{"configuration":{"secret":"' + b'x' * (256 * 1024) + b'"},"expected_revision":1}', id="oversize-256KiB")])
 async def test_invalid_or_oversize_commands_do_not_invoke_owner(tmp_path, raw):
     owner = Owner()
     async with boundary(tmp_path, owner) as (client, front, native):

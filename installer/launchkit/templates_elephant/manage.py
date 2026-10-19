@@ -22,10 +22,29 @@ import subprocess
 import sys
 import time
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 
 ROOT = Path(__file__).resolve().parent
 READ_SCOPES = ["read:assertion", "read:audit", "read:doc", "read:doc:metadata", "read:doc:raw", "read:entity", "read:event", "read:predicate", "read:relationship", "read:source", "read:source:raw", "read:space_config", "read:system", "read:system_event", "read:work_item"]
+# The knowledge service's documented extractor identity: a read-only token for
+# this space whose subject also holds an active grant with the same scopes.
+WORKER_SUBJECT = "recall-extractor"
+WORKER_SCOPES = ["read:assertion", "read:doc:metadata", "read:doc:raw", "read:entity", "read:predicate", "read:source"]
+# Space and grant administration only; never stored.
+BOOTSTRAP_SCOPES = ["manage:grant", "manage:provider", "read:space_config", "write:space_config"]
+BOOTSTRAP_LIFETIME = 900
+SPACE_SECURITY = {"policy_id": "default", "level": 0, "labels": [], "handling": []}
+CLEARANCES = [{"policy_id": "default", "max_level": 0, "labels": [], "handling_allow": []}]
+APPROVED_OPERATIONS = ["query_embedding", "document_embedding", "extraction", "support_verification"]
+PROVIDER_KEYS = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY", "gemini": "GEMINI_API_KEY"}
+PROVIDER_ENDPOINTS = {"openai": "https://api.openai.com/v1", "anthropic": "https://api.anthropic.com",
+                      "gemini": "https://generativelanguage.googleapis.com"}
 PREREQUISITE_TIMEOUT = 10
+REQUEST_TIMEOUT = 15
+READY_TIMEOUT = 120
+MAX_RESPONSE = 1024 * 1024
 
 
 def load_settings():
@@ -74,15 +93,40 @@ def write_env(path, values, *, compose=True):
             os.unlink(temporary)
 
 
-def jwt_token(secret, space, *, operator=False, now=None):
-    now = int(time.time()) if now is None else now
-    claims = {"sub": f"mobkit-launch:{space}:" + ("operator" if operator else "agents"), "iat": now, "exp": now + 90 * 86400,
-              "iss": "mobkit-launch", "aud": [space], "space_id": space, "scopes": ["*"] if operator else READ_SCOPES,
-              "security_level": 100, "security_labels": [], "purpose": ["project-knowledge"]}
+def sign(secret, claims):
     encode = lambda value: base64.urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode()).decode().rstrip("=")
     body = encode({"alg": "HS256", "typ": "JWT"}) + "." + encode(claims)
     signature = base64.urlsafe_b64encode(hmac.new(secret.encode(), body.encode(), hashlib.sha256).digest()).decode().rstrip("=")
     return body + "." + signature
+
+
+def jwt_token(secret, space, *, operator=False, now=None):
+    now = int(time.time()) if now is None else now
+    return sign(secret, {"sub": f"mobkit-launch:{space}:" + ("operator" if operator else "agents"), "iat": now, "exp": now + 90 * 86400,
+                         "iss": "mobkit-launch", "aud": [space], "space_id": space, "scopes": ["*"] if operator else READ_SCOPES,
+                         "security_level": 100, "security_labels": [], "purpose": ["project-knowledge"]})
+
+
+def worker_token(secret, space, *, now=None):
+    # Naming the space in `spaces` makes the service check the subject's grant.
+    now = int(time.time()) if now is None else now
+    return sign(secret, {"sub": WORKER_SUBJECT, "iat": now, "exp": now + 90 * 86400, "iss": "mobkit-launch", "aud": [space],
+                         "space_id": space, "spaces": [space], "scopes": WORKER_SCOPES, "clearances": CLEARANCES})
+
+
+def bootstrap_token(secret, space, *, now=None):
+    now = int(time.time()) if now is None else now
+    return sign(secret, {"sub": f"mobkit-launch:{space}:bootstrap", "iat": now, "exp": now + BOOTSTRAP_LIFETIME,
+                         "iss": "mobkit-launch", "aud": [space], "space_id": space, "spaces": [space],
+                         "bootstrap_space": space, "scopes": BOOTSTRAP_SCOPES, "clearances": CLEARANCES})
+
+
+def add_missing_worker_token(settings):
+    """Give a folder prepared before the extractor token existed that token alone."""
+    values = read_env(ROOT / ".env")
+    if not values.get("MCP_BEARER_TOKEN"):
+        values["MCP_BEARER_TOKEN"] = worker_token(values["JWT_SECRET"], settings["project"])
+        write_env(ROOT / ".env", values)
 
 
 def require_retained_secrets(settings, values, project_values, *, renew=False):
@@ -119,12 +163,13 @@ def setup(settings, renew=False):
     token_name, space_name = settings["token_env"], settings["space_env"]
     values[token_name] = jwt_token(values["JWT_SECRET"], settings["project"])
     values["ELEPHANT_OPERATOR_TOKEN"] = jwt_token(values["JWT_SECRET"], settings["project"], operator=True)
+    values["MCP_BEARER_TOKEN"] = worker_token(values["JWT_SECRET"], settings["project"])
     values[space_name] = settings["project"]
     project_values[token_name] = values[token_name]
     project_values[space_name] = values[space_name]
     write_env(ROOT / ".env", values)
     write_env(ROOT.parent / ".env", project_values, compose=False)
-    print("Knowledge credentials saved locally. Agent token is read-only; the operator token stays in knowledge/.env. Tokens expire in 90 days.")
+    print("Knowledge credentials saved locally. Agent token is read-only; the operator and extractor tokens stay in knowledge/.env. Tokens expire in 90 days.")
 
 
 def command(args, *, capture=False, timeout=None):
@@ -272,6 +317,124 @@ def environment():
     return {**read_env(ROOT.parent / ".env"), **read_env(ROOT / ".env"), **os.environ}
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
+# Local administration never follows a redirect or an environment proxy with its bearer.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+
+
+def api_request(settings, method, path, token, *, body=None):
+    """One bounded JSON request to the local knowledge service, selecting the project space."""
+    parsed = urllib.parse.urlsplit(settings["url"])
+    headers = {"Authorization": "Bearer " + token, "X-Space-Id": settings["project"], "Accept": "application/json"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(f"{parsed.scheme}://{parsed.netloc}{path}", data=data, method=method, headers=headers)
+    try:
+        with _OPENER.open(request, timeout=REQUEST_TIMEOUT) as response:
+            status, raw = response.status, response.read(MAX_RESPONSE + 1)
+    except urllib.error.HTTPError as error:
+        with error:
+            status, raw = error.code, error.read(MAX_RESPONSE + 1)
+    except (urllib.error.URLError, OSError):
+        raise ValueError("The local knowledge service is unreachable. Check `docker compose ps` for the knowledge project.") from None
+    if len(raw) > MAX_RESPONSE:
+        raise ValueError("The knowledge service returned an oversized response.")
+    try:
+        return status, json.loads(raw) if raw else None
+    except (UnicodeError, ValueError):
+        return status, None
+
+
+def refusal(action, status, data):
+    code = data.get("error_code") if isinstance(data, dict) else None
+    return ValueError(f"The knowledge service refused to {action} (HTTP {status}" + (f", {code}" if isinstance(code, str) else "") + ").")
+
+
+def space_request(settings):
+    """Create the project space with Recall's documented processing approvals."""
+    space, provider, model = settings["project"], settings["provider"], settings["model"]
+    service = json.loads((ROOT / "compose.json").read_text())["services"]["elephant"]["environment"]
+    embedding_model, dimensions = service["PIPELINE_EMBED_MODEL"], int(service["PIPELINE_EMBED_DIMS"])
+    connection = lambda name, kind: {"id": name, "provider": kind, "account_id": space, "endpoint": PROVIDER_ENDPOINTS[kind],
+                                     "credential_ref": PROVIDER_KEYS[kind], "credential_generation": 1, "revoked": False}
+    connections = {"embedding": connection("embedding", "openai")}
+    if provider != "openai":
+        connections["generation"] = connection("generation", provider)
+    profiles = {
+        "embedding-v1": {"id": "embedding-v1", "connection_id": "embedding", "model": embedding_model,
+                         "model_version": embedding_model, "dimensions": dimensions, "preprocessing": "text-v1"},
+        "generation-v1": {"id": "generation-v1", "connection_id": "generation" if provider != "openai" else "embedding",
+                          "model": model, "model_version": model, "dimensions": None, "preprocessing": "text-v1"},
+    }
+    bindings = {operation: {"id": f"{operation}-v1", "revoked": False,
+                            "profile_id": "embedding-v1" if operation.endswith("_embedding") else "generation-v1"}
+                for operation in APPROVED_OPERATIONS}
+    return {"name": space, "security": SPACE_SECURITY, "embedding_provider": "openai",
+            "embedding_model": embedding_model, "embedding_dims": dimensions,
+            "processing": {"generation": 1, "index_generation": 0, "policy_id": "mobkit-launch", "connections": connections,
+                           "profiles": profiles, "bindings": bindings, "active_embedding_profile_id": "embedding-v1",
+                           "pending_reindex": None}}
+
+
+def provision(settings, values):
+    """Create the project space and the extractor grant once; later runs only read them back.
+
+    A short-lived bootstrap token does the administration. It is never stored.
+    """
+    space = settings["project"]
+    token = bootstrap_token(values["JWT_SECRET"], space)
+    status, config = api_request(settings, "GET", f"/v1/spaces/{space}", token)
+    if status == 404:
+        status, created = api_request(settings, "POST", "/v1/spaces", token, body=space_request(settings))
+        if status not in (201, 409):
+            raise refusal("create the project space", status, created)
+        status, config = api_request(settings, "GET", f"/v1/spaces/{space}", token)
+    if status != 200 or not isinstance(config, dict):
+        raise refusal("read the project space", status, config)
+    processing = config.get("processing") or {}
+    missing = [operation for operation in APPROVED_OPERATIONS if operation not in (processing.get("bindings") or {})]
+    if missing:
+        raise ValueError("The project space exists without approved " + ", ".join(missing)
+                         + " processing. Approve them with the knowledge service's space administration, then run up again.")
+    grant_path = f"/v1/spaces/{space}/grants/{WORKER_SUBJECT}"
+    status, grant = api_request(settings, "GET", grant_path, token)
+    if status == 404:
+        # The grant write is compare-and-swap, so it is made only when absent.
+        status, written = api_request(settings, "PUT", grant_path, token,
+                                      body={"active": True, "scopes": WORKER_SCOPES, "expected_generation": None})
+        if status != 200:
+            raise refusal("grant the extractor read access", status, written)
+        status, grant = api_request(settings, "GET", grant_path, token)
+    if (status != 200 or not isinstance(grant, dict) or grant.get("active") is not True
+            or not set(WORKER_SCOPES) <= set(grant.get("scopes") or [])):
+        raise ValueError(f"The {WORKER_SUBJECT} grant for this space is missing, inactive or narrower than the extractor's "
+                         "read scopes. Restore it with the knowledge service's grant administration, then run up again.")
+    return {"space": space, "processing_generation": processing.get("generation"),
+            "extractor_grant": {"subject": WORKER_SUBJECT, "generation": grant.get("generation"),
+                                "scopes": sorted(grant.get("scopes") or [])}}
+
+
+def space_status(settings, *, wait=0):
+    """Read the project space's semantic readiness, waiting up to `wait` seconds for it."""
+    token = environment().get("ELEPHANT_OPERATOR_TOKEN", "")
+    if not token:
+        raise ValueError("Configure ELEPHANT_OPERATOR_TOKEN locally before reading the project space status.")
+    deadline = time.monotonic() + wait
+    while True:
+        status, data = api_request(settings, "GET", f"/v1/spaces/{settings['project']}/status", token)
+        if status not in (200, 503) or not isinstance(data, dict):
+            raise refusal("report the project space status", status, data)
+        if data.get("semantic_ingest_ready") is True or time.monotonic() >= deadline:
+            return data
+        time.sleep(2)
+
+
 def check_space(token, expected):
     # This preflight only decodes claims. Authentication is verified by the knowledge service.
     if token.count(".") != 2:
@@ -390,11 +553,18 @@ def main():
             if missing_secrets:
                 setup(settings)
             source_checkout(settings)
+            # Only after a valid checkout, so a failed fetch leaves every private file as it was.
+            add_missing_worker_token(settings)
             compose("up", "--build", "--detach", "--wait", "--wait-timeout", "180")
+            values = read_env(ROOT / ".env")
+            provisioned = provision(settings, values)
+            readiness = space_status(settings, wait=READY_TIMEOUT)
             result = asyncio.run(asyncio.wait_for(mcp_operation(settings, "verify"), timeout=60))
-            print(json.dumps(result, indent=2))
+            print(json.dumps({**result, "provisioning": provisioned, "space_status": readiness}, indent=2))
     else:
         result = asyncio.run(asyncio.wait_for(mcp_operation(settings, args.command, query=getattr(args, "query", None), path=getattr(args, "path", None), title=getattr(args, "title", None)), timeout=90))
+        if args.command == "verify" and settings["mode"] == "local":
+            result["space_status"] = space_status(settings)
         print(json.dumps(result, indent=2))
 
 
