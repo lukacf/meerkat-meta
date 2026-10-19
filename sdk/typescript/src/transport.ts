@@ -621,6 +621,7 @@ export class PersistentTransport {
 
     // Background reader on stdout
     let readerClosed = child.stdout == null;
+    let exitFailed = false;
     let exitGrace: ReturnType<typeof setTimeout> | undefined;
     if (child.stdout) {
       const rl = createInterface({ input: child.stdout });
@@ -628,6 +629,9 @@ export class PersistentTransport {
       rl.on("close", () => {
         readerClosed = true;
         clearTimeout(exitGrace);
+        // The exit grace below already failed this child with its exit and
+        // let go of stdout: keep that failure.
+        if (exitFailed) return;
         this._onReaderClosed("the gateway closed its stdout", child);
       });
     }
@@ -638,6 +642,7 @@ export class PersistentTransport {
     child.once("exit", (code, signal) => {
       if (readerClosed) return;
       exitGrace = setTimeout(() => {
+        exitFailed = true;
         this._failExitedChildWaiters(
           child,
           new GatewayChildEndedError(
@@ -647,6 +652,8 @@ export class PersistentTransport {
             signal,
           ),
         );
+        // A reply still unread here (the event loop was blocked for the whole
+        // grace) is dropped; its waiter already has the exit.
         child.stdout?.destroy();
       }, CHILD_EXIT_STDOUT_GRACE_MS);
     });

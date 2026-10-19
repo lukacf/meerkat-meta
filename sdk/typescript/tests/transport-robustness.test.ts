@@ -240,6 +240,14 @@ if (process.argv.includes("--hold-stdout")) {
       // The transport let go of the stdout the holder keeps, so the child's
       // streams close while the holder still runs.
       await closed;
+      // Letting go of stdout does not relabel the child's failure: an init
+      // watch opened now fails at once with the same exit.
+      const watch = transport.openInitWatch("after-exit");
+      await assert.rejects(
+        watch.settlement(1000),
+        (failure: unknown) => failure instanceof GatewayChildEndedError && failure.exitCode === 7,
+      );
+      transport.closeInitWatch(watch);
     } finally {
       try { process.kill(Number(readFileSync(holderPid, "utf8")), "SIGTERM"); } catch {}
       await transport.stop();

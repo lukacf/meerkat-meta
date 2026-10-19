@@ -758,6 +758,10 @@ class PersistentTransport:
         stdout and hold it open; its waiters would then wait out their
         timeouts, the shutdown handshake its whole horizon. After a short
         grace they fail with the child's ``GatewayChildEndedError`` instead.
+        If the reader thread does not run for that whole second (a loaded
+        host), a reply already in the pipe fails with the exit instead of
+        being delivered: as with any reader failure, that request's outcome
+        is then unknown.
         """
         try:
             process.wait()
