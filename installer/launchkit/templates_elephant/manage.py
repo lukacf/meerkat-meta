@@ -552,9 +552,9 @@ def main():
             local_preflight()
             if missing_secrets:
                 setup(settings)
-            else:
-                add_missing_worker_token(settings)
             source_checkout(settings)
+            # Only after a valid checkout, so a failed fetch leaves every private file as it was.
+            add_missing_worker_token(settings)
             compose("up", "--build", "--detach", "--wait", "--wait-timeout", "180")
             values = read_env(ROOT / ".env")
             provisioned = provision(settings, values)

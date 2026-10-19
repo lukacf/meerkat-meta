@@ -202,13 +202,15 @@ def test_up_gives_an_older_folder_only_its_missing_extractor_token(manager, monk
     monkeypatch.setattr(manager, "local_preflight", lambda: None)
     monkeypatch.setattr(manager, "setup", lambda *_, **__: pytest.fail("up re-ran setup for a folder that keeps its secrets"))
     monkeypatch.setattr(manager.getpass, "getpass", lambda _: pytest.fail("up asked for a provider key"))
+    expected = claims_of(manager.worker_token(older["JWT_SECRET"], "test-project"))
     minted = []
     for name in ("jwt_token", "worker_token"):
         monkeypatch.setattr(manager, name, lambda *args, _name=name, _mint=getattr(manager, name), **kwargs:
                             minted.append(_name) or _mint(*args, **kwargs))
     calls = []
     monkeypatch.setattr(manager, "source_checkout", lambda _: calls.append("source"))
-    monkeypatch.setattr(manager, "compose", lambda *args: calls.append(args[0]))
+    # Compose interpolates the token, so it must exist when the stack starts.
+    monkeypatch.setattr(manager, "compose", lambda *args: calls.append((args[0], "MCP_BEARER_TOKEN" in manager.read_env(path))))
     monkeypatch.setattr(manager, "provision", lambda _, values: calls.append(("provision", "MCP_BEARER_TOKEN" in values)) or {})
     monkeypatch.setattr(manager, "space_status", lambda *_, **__: {})
     async def verify(*_args, **_kwargs):
@@ -217,10 +219,16 @@ def test_up_gives_an_older_folder_only_its_missing_extractor_token(manager, monk
     monkeypatch.setattr(sys, "argv", ["manage.py", "up"])
     manager.main()
     current = manager.read_env(path)
-    assert claims_of(current.pop("MCP_BEARER_TOKEN"))["sub"] == "recall-extractor"
+    token = current.pop("MCP_BEARER_TOKEN")
+    # Signed with the retained secret, for this project's space, with the extractor's claims.
+    header, body, signature = token.split(".")
+    decode = lambda value: base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    assert hmac.compare_digest(decode(signature), hmac.new(older["JWT_SECRET"].encode(), f"{header}.{body}".encode(), hashlib.sha256).digest())
+    unstamped = lambda claims: {key: value for key, value in claims.items() if key not in {"iat", "exp"}}
+    assert unstamped(claims_of(token)) == unstamped(expected)
     assert current == older
     assert (manager.ROOT.parent / ".env").read_bytes() == project
-    assert calls == ["source", "up", ("provision", True)]
+    assert calls == ["source", ("up", True), ("provision", True)]
     assert minted == ["worker_token"]
     # A folder that has the token keeps it.
     before = path.read_bytes()
