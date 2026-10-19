@@ -6,8 +6,11 @@
 //! makes, and the observer receives exactly that refusal as the call's tool
 //! result.
 //!
-//! Waiting for the observation is a typed watch on the observation count,
-//! bounded only by a named failure timeout.
+//! Each test reads the observations once the model is asked again with
+//! the refused call's result, a typed watch the test client sets, bounded
+//! only by a named failure timeout. Core reports a call's refusal before
+//! that result returns to the model, so the read sees every observation of
+//! the call, and a duplicate fails the exact comparison.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::BTreeMap;
@@ -77,7 +80,17 @@ impl AgentToolDispatcher for RefusingBundle {
 }
 
 /// Calls the refused tool, then ends the turn once the call has a result.
-struct RefusedCallClient;
+/// It marks `answered` when the model is asked again with that result.
+struct RefusedCallClient {
+    answered: tokio::sync::watch::Sender<bool>,
+}
+
+impl RefusedCallClient {
+    fn new() -> (Arc<Self>, tokio::sync::watch::Receiver<bool>) {
+        let (answered, seen) = tokio::sync::watch::channel(false);
+        (Arc::new(Self { answered }), seen)
+    }
+}
 
 #[async_trait::async_trait]
 impl LlmClient for RefusedCallClient {
@@ -87,6 +100,9 @@ impl LlmClient for RefusedCallClient {
 
     fn stream<'a>(&'a self, request: &'a LlmRequest) -> meerkat_client::types::LlmStream<'a> {
         let after_tool = matches!(request.messages.last(), Some(Message::ToolResults { .. }));
+        if after_tool {
+            self.answered.send_replace(true);
+        }
         let (event, stop_reason) = if after_tool {
             (
                 LlmEvent::TextDelta {
@@ -123,34 +139,35 @@ impl LlmClient for RefusedCallClient {
     }
 }
 
-/// Records every observation, with a count to wait on.
+/// Records every observation.
 struct RecordingObserver {
     observed: Mutex<Vec<OperationRefusalObservation>>,
-    count: tokio::sync::watch::Sender<usize>,
 }
 
 impl RecordingObserver {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             observed: Mutex::new(Vec::new()),
-            count: tokio::sync::watch::channel(0).0,
         })
     }
 
-    /// Surface, outcome and disposition of every observation, once at least
-    /// one exists.
+    /// Surface, outcome and disposition of every observation, read once the
+    /// model has been asked again with the call's result.
     async fn observed(
         &self,
+        mut answered: tokio::sync::watch::Receiver<bool>,
     ) -> Vec<(
         OperationRefusalSurface,
         OperationRefusalOutcome,
         OperationRefusalDisposition,
     )> {
-        let mut count = self.count.subscribe();
-        tokio::time::timeout(OBSERVATION_FAILURE_BOUND, count.wait_for(|seen| *seen >= 1))
-            .await
-            .expect("the member's refused call reached the observer within the failure bound")
-            .expect("observer alive");
+        tokio::time::timeout(
+            OBSERVATION_FAILURE_BOUND,
+            answered.wait_for(|answered| *answered),
+        )
+        .await
+        .expect("the model got the refused call's result within the failure bound")
+        .expect("the test client is alive");
         self.observed
             .lock()
             .unwrap()
@@ -168,12 +185,7 @@ impl RecordingObserver {
 
 impl OperationRefusalObserver for RecordingObserver {
     fn observe(&self, observation: &OperationRefusalObservation) {
-        let seen = {
-            let mut observed = self.observed.lock().unwrap();
-            observed.push(observation.clone());
-            observed.len()
-        };
-        self.count.send_replace(seen);
+        self.observed.lock().unwrap().push(observation.clone());
     }
 }
 
@@ -219,11 +231,12 @@ async fn spawn_and_send(runtime: &UnifiedRuntime) {
 async fn a_persistent_member_reports_its_refused_call_to_the_host_observer() {
     let state = tempfile::tempdir().unwrap();
     let observer = RecordingObserver::new();
+    let (client, answered) = RefusedCallClient::new();
     let runtime = Box::pin(
         UnifiedRuntime::builder()
             .definition(definition("refusal-observer-persistent"))
             .persistent_state(state.path().join("state"))
-            .default_llm_client(Arc::new(RefusedCallClient))
+            .default_llm_client(client)
             .register_tool_bundle("refusing", Arc::new(RefusingBundle))
             .operation_refusal_observer(observer.clone())
             .build(),
@@ -231,7 +244,7 @@ async fn a_persistent_member_reports_its_refused_call_to_the_host_observer() {
     .await
     .expect("runtime builds");
     spawn_and_send(&runtime).await;
-    assert_eq!(observer.observed().await, refused_call());
+    assert_eq!(observer.observed(answered).await, refused_call());
     runtime.shutdown().await;
 }
 
@@ -240,10 +253,11 @@ async fn a_persistent_member_reports_its_refused_call_to_the_host_observer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_temp_dir_member_reports_its_refused_call_to_the_host_observer() {
     let observer = RecordingObserver::new();
+    let (client, answered) = RefusedCallClient::new();
     let runtime = Box::pin(
         UnifiedRuntime::builder()
             .definition(definition("refusal-observer-temp-dir"))
-            .default_llm_client(Arc::new(RefusedCallClient))
+            .default_llm_client(client)
             .register_tool_bundle("refusing", Arc::new(RefusingBundle))
             .operation_refusal_observer(observer.clone())
             .build(),
@@ -251,7 +265,7 @@ async fn a_temp_dir_member_reports_its_refused_call_to_the_host_observer() {
     .await
     .expect("runtime builds");
     spawn_and_send(&runtime).await;
-    assert_eq!(observer.observed().await, refused_call());
+    assert_eq!(observer.observed(answered).await, refused_call());
     runtime.shutdown().await;
 }
 
@@ -262,6 +276,7 @@ async fn a_temp_dir_member_reports_its_refused_call_to_the_host_observer() {
 async fn a_scratch_member_reports_its_refused_call_to_the_host_observer() {
     let scratch = tempfile::tempdir().unwrap();
     let observer = RecordingObserver::new();
+    let (client, answered) = RefusedCallClient::new();
     let identity = AgentIdentity::parse(MEMBER).unwrap();
     let roster = Arc::new(MutableRosterProvider::new(vec![DurableAgentSpec {
         identity: identity.clone(),
@@ -285,7 +300,7 @@ async fn a_scratch_member_reports_its_refused_call_to_the_host_observer() {
             .roster_provider(roster)
             .scratch_dir(scratch.path())
             .identity_runtime_instance_id("refusal-observer-scratch")
-            .default_llm_client(Arc::new(RefusedCallClient))
+            .default_llm_client(client)
             .register_tool_bundle("refusing", Arc::new(RefusingBundle))
             .operation_refusal_observer(observer.clone())
             .build(),
@@ -293,7 +308,7 @@ async fn a_scratch_member_reports_its_refused_call_to_the_host_observer() {
     .await
     .expect("runtime builds");
     run_host_turn(&runtime, &identity).await;
-    assert_eq!(observer.observed().await, refused_call());
+    assert_eq!(observer.observed(answered).await, refused_call());
     runtime.mob_handle().stop().await.unwrap();
 }
 

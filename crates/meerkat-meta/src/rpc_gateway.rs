@@ -16454,8 +16454,9 @@ external_addressable = true
         if let Some(root) = gateway_options.session_identity_config_root.as_ref() {
             factory = factory.user_config_root(root.clone());
         }
-        // The host composes this factory's MCP constructions before it is
-        // cloned for live or consumed by its builder.
+        // The host composes this factory's MCP constructions, and installs its
+        // operation refusal observer, before it is cloned for live or consumed
+        // by its builder.
         let factory = crate::gateway_mcp_composition::compose_gateway_member_factory(
             host,
             crate::gateway_mcp_composition::GatewayFactoryKind::Persistent,
@@ -16910,8 +16911,9 @@ external_addressable = true
         if let Some(root) = gateway_options.session_identity_config_root.as_ref() {
             factory = factory.user_config_root(root.clone());
         }
-        // The host composes this factory's MCP constructions before it is
-        // cloned for live or consumed by its builder.
+        // The host composes this factory's MCP constructions, and installs its
+        // operation refusal observer, before it is cloned for live or consumed
+        // by its builder.
         let factory = crate::gateway_mcp_composition::compose_gateway_member_factory(
             host,
             crate::gateway_mcp_composition::GatewayFactoryKind::ProcessLocal,
@@ -17066,8 +17068,9 @@ external_addressable = true
                 if let Some(root) = gateway_options.session_identity_config_root.as_ref() {
                     factory = factory.user_config_root(root.clone());
                 }
-                // The host composes this factory's MCP constructions before it is
-                // cloned for live or consumed by its builder.
+                // The host composes this factory's MCP constructions, and installs its
+                // operation refusal observer, before it is cloned for live or consumed
+                // by its builder.
                 let factory = crate::gateway_mcp_composition::compose_gateway_member_factory(
                     host,
                     crate::gateway_mcp_composition::GatewayFactoryKind::ContinuityBacked,
