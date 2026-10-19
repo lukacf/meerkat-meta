@@ -1,10 +1,13 @@
-"""The Guide's one exact selected release: runtime admission, the pending
-client pin and the release inputs skeleton. Every accepted and refused version
-derives from guide_sdk.SELECTED_VERSION. Inert files only; nothing runs."""
+"""The Guide's one exact selected release: runtime admission, the client pin
+and the release inputs skeleton. Every accepted and refused version derives
+from guide_sdk.SELECTED_VERSION. Inert files only; nothing runs."""
 import hashlib
+import io
 import json
 from pathlib import Path
 import re
+import tomllib
+import zipfile
 
 import pytest
 
@@ -13,7 +16,8 @@ from launchkit.bootstrap import GatewayInstallError, SelectedGuideRuntime
 from launchkit.connect_installer_caller import ExactFile
 
 SELECTED = guide_sdk.SELECTED_VERSION
-SKELETON = Path(__file__).parents[1] / "release/inputs/forge-release-inputs.skeleton.json"
+INSTALLER = Path(__file__).parents[1]
+SKELETON = INSTALLER / "release/inputs/forge-release-inputs.skeleton.json"
 PIN = ("SOURCE", "TREE", "SHA256", "SIZE")
 CLIENT = b"inert guide client wheel, never install\n"
 
@@ -59,14 +63,26 @@ def test_the_guide_refuses_every_other_runtime_version(gateway, version, core_ve
         SelectedGuideRuntime(gateway, version, core_version, "a" * 40, "b" * 40)
 
 
-def test_the_committed_guide_client_pin_is_pending_until_the_selected_release_publishes():
-    """The published wheel's bytes cannot exist before its release. Filling the
-    pin replaces this test with one that checks the vendored wheel against it."""
+def test_the_committed_guide_client_pin_admits_exactly_the_vendored_published_wheel():
+    """The selected release's published wheel is the only wheel beside the
+    Guide. The pin, its bytes, its version and both installer pins agree."""
     assert guide_sdk.WHEEL == f"vendor/guide/meerkat_meta-{SELECTED}-py3-none-any.whl"
-    assert [getattr(guide_sdk, name) for name in PIN] == [None] * len(PIN)
-    for use in (guide_sdk.require_pinned, guide_sdk.selection, lambda: guide_sdk.verify(CLIENT)):
-        with pytest.raises(ValueError, match=re.escape(f"pending the published Meta {SELECTED} wheel")):
-            use()
+    wheel = INSTALLER / guide_sdk.WHEEL
+    assert sorted(path.name for path in wheel.parent.glob("*.whl")) == [wheel.name]
+    content = wheel.read_bytes()
+    guide_sdk.verify(content)
+    assert guide_sdk.selection() == {"path": guide_sdk.WHEEL, "version": SELECTED, "source": guide_sdk.SOURCE,
+        "tree": guide_sdk.TREE, "sha256": hashlib.sha256(content).hexdigest(), "bytes": len(content)}
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        metadata = archive.read(f"meerkat_meta-{SELECTED}.dist-info/METADATA").decode()
+    assert f"\nVersion: {SELECTED}\n" in metadata
+    with pytest.raises(ValueError, match="differs from its reviewed wheel"):
+        guide_sdk.verify(content[:-1] + bytes([content[-1] ^ 1]))
+    requirements = (INSTALLER / "requirements-guide-sdk.txt").read_text().splitlines()
+    assert [line for line in requirements if not line.startswith("#")] == [
+        f"meerkat-meta=={SELECTED} --hash=sha256:{guide_sdk.SHA256}"]
+    dependencies = tomllib.loads((INSTALLER / "pyproject.toml").read_text())["project"]["dependencies"]
+    assert [value for value in dependencies if value.startswith("meerkat-meta")] == [f"meerkat-meta=={SELECTED}"]
 
 
 def complete_pin(monkeypatch, content=CLIENT):

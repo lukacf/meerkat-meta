@@ -22,15 +22,13 @@ if an earlier Console dependency installation used different permissions.
 The build graph check bundles the actual application, including the shared chat,
 and rejects browser dependencies resolved from a sibling installation.
 
-The Python project selects the reviewed development client
-`meerkat-meta==0.9.2+meta.0bc6b4fa` for the Guide. Its hash-pinned wheel and
-rebuild provenance are in `vendor/guide/`. This pure Python client adds the
-public helper transport-wait option. The Guide runs one exact selected Meta
-release, `SELECTED_VERSION` in `launchkit/guide_sdk.py`, with the Core release
-of the same version: the runtime admission, the product verifier and the client
-pin all require that value exactly. Packaged products carry that release's
-published client wheel instead. Its pin stays pending, and packaging refuses,
-until the release publishes.
+The Guide runs one exact selected Meta release, `SELECTED_VERSION` in
+`launchkit/guide_sdk.py`, with the Core release of the same version: the runtime
+admission, the product verifier and the client pin all require that value
+exactly. The Python project selects that release's published client,
+`meerkat-meta==0.9.3`, for the Guide, and packaged products carry the same
+wheel. Its hash-pinned bytes and provenance are in `vendor/guide/`. This pure
+Python client includes the public helper transport-wait option.
 This is separate from the repository's current Meta release version and from
 each application's selected runtime. Updating repository source does not upgrade
 an installed application, choose its gateway, or qualify a new SDK/native pair.

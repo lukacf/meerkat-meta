@@ -1,51 +1,38 @@
-# Reviewed Guide client SDK
+# Guide client SDK
 
-This directory carries a temporary, pure Python development wheel for Forge's
-Guide. It is not a published Meta release, contains no gateway and does not
-replace the application's separately selected SDK or native runtime.
+This directory carries the Guide's Python client: the published `meerkat-meta`
+wheel of the Meta release the Guide runs (`SELECTED_VERSION` in
+`launchkit/guide_sdk.py`). It is pure Python, contains no gateway and does not
+replace an application's separately selected SDK or native runtime.
 
-- Repository: https://github.com/lukacf/meerkat-meta
-- Reviewed branch: `fix/093-py-helper-transport-timeout`
-- Exact commit: `0bc6b4fa48051353c4f63517cde6d42fccb6a21a`
-- Base: `1791c8e6c`
-- `sdk/python` tree: `c6f97032aa934dee2077f4976199f405aacbfec9`
-- Local package version: `0.9.2+meta.0bc6b4fa`
-- Wheel bytes: 166311
-- Wheel SHA-256: `b4a3ad249ca833eb44f086676d34d9504e9f9a503261124b8f5c4025d2101918`
-- Sorted member-list SHA-256: `2efbd0105e70b6ea0e6c6df2df671f557503585ef1a66c96c374c10e546be379`
+- Release: Meta `v0.9.3`, https://github.com/lukacf/meerkat-meta/releases/tag/v0.9.3
+- Release commit (the tag peels to it): `3b0073a834b93725c20cfa97bbd6db099348ece6`
+- `sdk/python` tree at that commit: `d41781b733c506ed0355bd7aad4323dc77ebcda6`
+- Package version: `0.9.3`
+- Published file: https://files.pythonhosted.org/packages/bc/21/ce4e7167e06ab90efde50d3447b2127f14699bab9107d254ddf0c838a886/meerkat_meta-0.9.3-py3-none-any.whl
+- Wheel bytes: 166988
+- Wheel SHA-256: `3e87446e560b94ab6d9d0b3dfac5868b2603db7739316e251aefb5e3b4b4d610`
+- Sorted member-list SHA-256: `90c99483dcd8f67fda4b91cbaee9d20fa0702eaf7f18f9a05b53a2cedba87121`
 
-Build from `git archive <exact-commit>:sdk/python` in a fresh directory. In the
-build copy only, replace the single `version = "0.9.2"` line in `pyproject.toml`
-with `version = "0.9.2+meta.0bc6b4fa"`. With Python 3.12, build 1.6.1 and setuptools
-84.0.0 installed in a private virtual environment, run:
+These are the bytes PyPI serves for the release, with the size and SHA-256 that
+PyPI reports. Each of the 24 `meerkat_meta/` members equals the same path under
+`sdk/python` at the release commit, and the wheel's `RECORD` matches every
+member. To compute the member-list digest, hash each non-directory member, sort
+by path, concatenate `sha256`, two spaces, path and a newline for every member,
+then hash that UTF-8 list.
 
-```sh
-python -m build --no-isolation --wheel --outdir dist /absolute/path/to/build-copy
-```
+`launchkit/guide_sdk.py` pins the release commit, the tree, the SHA-256 and the
+size; packaging and product verification refuse any other bytes.
+`requirements-guide-sdk.txt` pins the same SHA-256 for the development
+environment and the Forge workflow, which install this file with
+`--require-hashes`, so the suite imports the installed wheel, not SDK source.
 
-ZIP timestamps can change the outer wheel hash. The 28 member payloads match
-the independent producer's reference exactly. To compare rebuilds, hash each
-non-directory member, sort by path, concatenate `sha256`, two spaces, path and
-a newline for every member, then hash that UTF-8 list. The result must match the
-member-list digest above. Select new outer bytes explicitly before changing a
-pin; the launcher always checks the committed wheel's exact hash.
-
-The change adds public client transport waits to `spawn_helper` and
-`fork_helper`, refusing invalid values before writing a request. It does not
+The release includes the public client transport waits for `spawn_helper` and
+`fork_helper`, which refuse invalid values before writing a request. They do not
 send a native timeout option. Forge uses the remaining total review window.
 Timeout leaves the native outcome unknown and does not authorize a retry.
 
-Qualification imports this installed wheel, not SDK source. It covers the
-SDK's helper-wait/RPC-method controls and Forge's callback, ownership and late
-correction controls. The runtime owner also exercised ephemeral demo helpers
-against the published Linux 0.9.0 and accepted-candidate 0.9.1 gateways. Those
-checks do not establish installed application usefulness, persisted-state
-compatibility, or a real native helper running past 60 seconds. The wheel does
-not carry the separate r3 InitWatch EOF fix.
-
-The Guide's native selection is now one exact Meta release, `SELECTED_VERSION`
-in `launchkit/guide_sdk.py`. This wheel stays the development environment's
-client; packaged products carry that release's published client wheel, whose
-pin in the same module stays pending until the release publishes. Generated
+Selecting another Meta release replaces this wheel with that release's
+published wheel and fills the four pin fields together. Until that release
+publishes, the pin stays empty and every use of it refuses. Generated
 applications keep the exact SDK/native pair in their own selected product.
-Never upload this development wheel to a registry serving published 0.9.2.

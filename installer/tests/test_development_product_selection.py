@@ -165,8 +165,8 @@ def test_development_catalog_uses_exact_full_meta_profiles(product, meta_version
 
 def guide_product_inputs(product, bundle_source, monkeypatch):
     """Public source with an inert Guide client and gateway. The client is a
-    stand-in with its own complete pin: the published client wheel's pin is
-    pending until its release exists."""
+    stand-in with its own complete pin, so packaging never reads the vendored
+    published wheel; test_guide_release_selection checks that wheel's pin."""
     from launchkit.bootstrap import SelectedGuideRuntime
     from launchkit.connect_installer_caller import ExactFile
     from launchkit import guide_sdk
@@ -263,8 +263,9 @@ def test_a_pending_guide_client_pin_refuses_packaging_and_verification(
     with zipfile.ZipFile(output) as archive:
         archive.extractall(extracted)
     product_distribution.verify(extracted)
-    # The committed pending form refuses before any product work and leaves no
-    # archive. An extracted product then neither verifies nor yields launch inputs.
+    # The pending form, kept until a selected release publishes, refuses before
+    # any product work and leaves no archive. An extracted product then neither
+    # verifies nor yields launch inputs.
     for name in ("SOURCE", "TREE", "SHA256", "SIZE"):
         monkeypatch.setattr(guide_sdk, name, None)
     refused_output = tmp_path / "pending-guide-sdk.zip"
