@@ -4960,12 +4960,11 @@ async fn handle_unified_rpc_json_inner(
             };
             match reset_result {
                 Ok(record) => {
-                    let cleanup_warning = Some(serde_json::json!({
-                        "kind": "stale_member_cleanup_skipped_after_identity_reset",
-                        "message": "reset published the new generation without retiring stale live mob members; identity control calls reject stale runtime ids",
-                        "identity": identity.as_str(),
-                        "agent_runtime_id": record.agent_runtime_id.as_str(),
-                    }));
+                    // The reset's successor transition retired the previous
+                    // live member, so there is no cleanup to report (as for
+                    // reset_all). Keep the legacy warning field, always null,
+                    // for wire compatibility, as respawn does.
+                    let cleanup_warning: Option<Value> = None;
                     runtime
                         .record_console_lifecycle(
                             identity.as_str(),
@@ -8852,6 +8851,51 @@ shell = true
             roster_provider.missing_definition_calls(),
             0,
             "meta/reset must preserve mob_definition when installing the reset roster provider"
+        );
+        // The reset's successor transition retired the previous live member:
+        // the reset reports no cleanup warning. The field stays, always null.
+        let mut fields = response["result"]
+            .as_object()
+            .expect("reset result")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "agent_runtime_id",
+                "checkpoint_version",
+                "cleanup_warning",
+                "generation",
+                "identity",
+                "session_id"
+            ],
+            "{response:#?}"
+        );
+        assert_eq!(
+            response["result"]["cleanup_warning"],
+            Value::Null,
+            "{response:#?}"
+        );
+        // The identity_reset lifecycle frame carries the same null field.
+        let lifecycle = runtime
+            .console_events()
+            .replay_all(None)
+            .await
+            .map_err(|err| format!("replay_all: {}", err.error))?;
+        let frame = lifecycle
+            .iter()
+            .find(|event| event.event_type == "identity_reset")
+            .ok_or("the reset records an identity_reset frame")?;
+        assert_eq!(
+            frame.data,
+            json!({
+                "generation": response["result"]["generation"],
+                "checkpoint_version": response["result"]["checkpoint_version"],
+                "cleanup_warning": null,
+            }),
+            "{lifecycle:#?}"
         );
         assert_eq!(
             bridge
