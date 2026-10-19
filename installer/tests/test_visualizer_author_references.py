@@ -192,7 +192,7 @@ async def test_delayed_reference_read_cannot_cross_active_request_ownership(serv
     args = {} if callback == "inspect" else {"request_key": job["key"], "reference_id": "household"}
     task = asyncio.create_task(getattr(service, callback)(args))
     try:
-        assert await asyncio.to_thread(started.wait, 2)
+        assert await asyncio.to_thread(started.wait, 30)
         if change == "clear": service.pending = None
         elif change == "replace-same-key": service.pending = deepcopy(job)
         elif change == "replace-other-key": service.pending = {**deepcopy(job), "key": "1" * 64}

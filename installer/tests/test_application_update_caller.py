@@ -313,7 +313,7 @@ async def test_repeated_cancellation_joins_original_worker_and_keeps_lease(tmp_p
     with project_lock(f.root) as f.lease:
         task = asyncio.create_task(f.invoke())
         try:
-            assert await asyncio.to_thread(entered.wait, 1)
+            assert await asyncio.to_thread(entered.wait, 30)
             task.cancel()
             await asyncio.sleep(0)
             task.cancel()

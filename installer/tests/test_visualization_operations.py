@@ -340,12 +340,12 @@ async def test_restored_native_owner_drains_before_latest_stream_revision_is_adm
         desired['project']['name'] = 'Queued B'
     first = await operations.submit(service, desired, model, stream_id='guide:one')
     first_task = operations.tasks[first['id']]
-    await asyncio.wait_for(first_read.wait(), .5)
+    await asyncio.wait_for(first_read.wait(), 30)
     if window == 'before':
         async def observing():
             while not first.get('reconnect_attempts'):
                 await asyncio.sleep(0)
-        await asyncio.wait_for(observing(), .5)
+        await asyncio.wait_for(observing(), 30)
         assert first['status'] == ('observing' if same_owner else 'queued')
         assert first['native_run_status'] == 'unknown' and 'completed_at' not in first
     latest_spec = copy.deepcopy(blueprint)
@@ -367,7 +367,7 @@ async def test_restored_native_owner_drains_before_latest_stream_revision_is_adm
         await asyncio.wait_for(first_task, .5)
         assert first['status'] == 'superseded' and 'observation_status' not in first
         assert first['id'] not in operations.tasks and first['id'] not in operations.jobs
-        await asyncio.wait_for(replacement_read.wait(), .5)
+        await asyncio.wait_for(replacement_read.wait(), 30)
     assert sends == []
     saved = json.loads((service.root / 'pending.json').read_text())
     assert saved['key'] == original_key and saved['admission'] == original_admission

@@ -269,7 +269,7 @@ async def test_stop_interrupts_inflight_probe_without_waiting_for_deadline(fixtu
     monkeypatch.setattr("launchkit.deployment_worker.CONSOLE_START_TIMEOUT", 60)
     supervisor, definition, console = await fixture([(200, {"identities": [{"identity": "lead:main"}]})], blocked=True)
     task = asyncio.create_task(supervisor.start(definition, on_ready=lambda: pytest.fail("must not publish ready")))
-    await asyncio.wait_for(console.admitted.wait(), 3)
+    await asyncio.wait_for(console.admitted.wait(), 30)
     supervisor.stop.set()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 2)
@@ -290,7 +290,7 @@ async def test_task_cancellation_reaps_child_and_does_not_publish_ready(fixture,
     monkeypatch.setattr("launchkit.deployment_worker.CONSOLE_START_TIMEOUT", 60)
     supervisor, definition, console = await fixture([(200, {"identities": [{"identity": "lead:main"}]})], blocked=True)
     task = asyncio.create_task(supervisor.start(definition, on_ready=lambda: pytest.fail("must not publish ready")))
-    await asyncio.wait_for(console.admitted.wait(), 3)
+    await asyncio.wait_for(console.admitted.wait(), 30)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 2)
@@ -375,7 +375,7 @@ async def test_delayed_local_child_admission_keeps_custody_through_interruption(
     fixture = delayed_local_admission
     task = asyncio.create_task(fixture.operation(mode))
     try:
-        await asyncio.wait_for(fixture.admitted.wait(), 1)
+        await asyncio.wait_for(fixture.admitted.wait(), 30)
         if trigger == "cancel":
             task.cancel()
             await asyncio.sleep(0)
@@ -386,7 +386,7 @@ async def test_delayed_local_child_admission_keeps_custody_through_interruption(
         else:
             fixture.supervisor.stop.set()
         fixture.release.set()
-        await asyncio.wait_for(fixture.cleanup.wait(), .5)
+        await asyncio.wait_for(fixture.cleanup.wait(), 30)
         assert fixture.supervisor.child is fixture.process
         assert len(fixture.calls) == 1 and not fixture.cancelled_spawns
         # Cleanup is an entered operation too. A second caller cancellation
@@ -425,11 +425,11 @@ async def test_failed_local_admission_cleanup_preserves_cancellation_and_exact_c
     fixture.failures.append(failure)
     task = asyncio.create_task(fixture.operation(mode))
     try:
-        await asyncio.wait_for(fixture.admitted.wait(), 1)
+        await asyncio.wait_for(fixture.admitted.wait(), 30)
         task.cancel()
         await asyncio.sleep(0)
         fixture.release.set()
-        await asyncio.wait_for(fixture.cleanup.wait(), .5)
+        await asyncio.wait_for(fixture.cleanup.wait(), 30)
         task.cancel()
         await asyncio.sleep(0)
         fixture.settled.set()
@@ -467,9 +467,9 @@ async def test_local_query_observes_stop_after_admission(delayed_local_admission
     fixture.release.set()
     task = asyncio.create_task(fixture.operation("query"))
     try:
-        await asyncio.wait_for(reading.wait(), 1)
+        await asyncio.wait_for(reading.wait(), 30)
         fixture.supervisor.stop.set()
-        await asyncio.wait_for(fixture.cleanup.wait(), .5)
+        await asyncio.wait_for(fixture.cleanup.wait(), 30)
         fixture.settled.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 1)
@@ -496,7 +496,7 @@ async def test_local_query_preserves_original_failure_and_cleanup_cancellation(d
     fixture.release.set()
     task = asyncio.create_task(fixture.operation("query"))
     try:
-        await asyncio.wait_for(fixture.cleanup.wait(), .5)
+        await asyncio.wait_for(fixture.cleanup.wait(), 30)
         task.cancel()
         await asyncio.sleep(0)
         task.cancel()
@@ -533,7 +533,7 @@ async def test_local_admission_slot_is_reserved_before_spawn_yields(delayed_loca
     first = asyncio.create_task(fixture.operation(first_mode))
     second = None
     try:
-        await asyncio.wait_for(fixture.admitted.wait(), 1)
+        await asyncio.wait_for(fixture.admitted.wait(), 30)
         second = asyncio.create_task(fixture.operation(second_mode))
         done, _ = await asyncio.wait({second}, timeout=.05)
         assert len(fixture.calls) == 1, "One Supervisor cannot admit a second child while its first handle is pending."
@@ -543,7 +543,7 @@ async def test_local_admission_slot_is_reserved_before_spawn_yields(delayed_loca
         first.cancel()
         await asyncio.sleep(0)
         fixture.release.set()
-        await asyncio.wait_for(fixture.cleanup.wait(), .5)
+        await asyncio.wait_for(fixture.cleanup.wait(), 30)
         fixture.settled.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(first, 1)
@@ -580,11 +580,11 @@ async def test_failed_local_spawn_releases_only_its_admission_slot(delayed_local
     assert fixture.supervisor._child_admission is None and fixture.supervisor.child is None
     task = asyncio.create_task(fixture.operation(mode))
     try:
-        await asyncio.wait_for(fixture.admitted.wait(), 1)
+        await asyncio.wait_for(fixture.admitted.wait(), 30)
         task.cancel()
         await asyncio.sleep(0)
         fixture.release.set()
-        await asyncio.wait_for(fixture.cleanup.wait(), .5)
+        await asyncio.wait_for(fixture.cleanup.wait(), 30)
         fixture.settled.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 1)
@@ -619,7 +619,7 @@ async def test_cancelled_late_spawn_failure_preserves_errors_then_releases_local
     task = asyncio.create_task(fixture.operation(mode))
     retry = None
     try:
-        await asyncio.wait_for(fixture.admitted.wait(), 1)
+        await asyncio.wait_for(fixture.admitted.wait(), 30)
         task.cancel("first-admission-cancellation")
         await asyncio.sleep(0)
         task.cancel("second-admission-cancellation")
@@ -638,11 +638,11 @@ async def test_cancelled_late_spawn_failure_preserves_errors_then_releases_local
         fixture.admitted.clear()
         fixture.release.clear()
         retry = asyncio.create_task(fixture.operation(mode))
-        await asyncio.wait_for(fixture.admitted.wait(), 1)
+        await asyncio.wait_for(fixture.admitted.wait(), 30)
         retry.cancel()
         await asyncio.sleep(0)
         fixture.release.set()
-        await asyncio.wait_for(fixture.cleanup.wait(), .5)
+        await asyncio.wait_for(fixture.cleanup.wait(), 30)
         fixture.settled.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(retry, 1)

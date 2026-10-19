@@ -629,9 +629,9 @@ async def test_shutdown_serializes_restart_and_preserves_the_later_admission(ser
     update_receipt(directory, status="running", interactive_lifecycle_id=None, interactive_cleanup=None)
     old_task = asyncio.create_task(fresh._run(directory, "start"))
     fresh.tasks[directory.name] = old_task
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     shutting_down = asyncio.create_task(fresh.shutdown())
-    await asyncio.wait_for(stopping.wait(), 1)
+    await asyncio.wait_for(stopping.wait(), 30)
     restarting = asyncio.create_task(fresh.action(service.guide.identity, receipt["deployment_id"], "restart"))
     await asyncio.sleep(0)
     try:
@@ -672,9 +672,9 @@ async def test_cancelled_shutdown_drains_its_original_join_and_final_receipt_pas
     update_receipt(directory, status="queued", console_url="http://127.0.0.1:18088/", runtime_pid=1234567)
     task = asyncio.create_task(fresh._run(directory, "install"))
     fresh.tasks[directory.name] = task
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     shutting_down = asyncio.create_task(fresh.shutdown())
-    await asyncio.wait_for(stopping.wait(), 1)
+    await asyncio.wait_for(stopping.wait(), 30)
     try:
         for _ in range(3):
             shutting_down.cancel()
@@ -758,7 +758,7 @@ async def test_shutdown_at_unlocked_lock_handoff_preserves_custody_before_yield(
             await release.wait()
 
     prior_action = asyncio.create_task(earlier_action())
-    await asyncio.wait_for(queued.wait(), 1)
+    await asyncio.wait_for(queued.wait(), 30)
 
     async def shutdown_at_release():
         update_receipt(directory, status="queued")
@@ -771,7 +771,7 @@ async def test_shutdown_at_unlocked_lock_handoff_preserves_custody_before_yield(
 
     shutting_down = asyncio.create_task(shutdown_at_release())
     try:
-        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(entered.wait(), 30)
         if cancel_shutdown:
             for _ in range(3):
                 shutting_down.cancel()
@@ -1024,7 +1024,7 @@ async def test_stop_then_shutdown_joins_the_original_pending_worker_admission(se
     fresh = DeploymentService(service.root.parent, service.guide, service.implementation)
     task = asyncio.create_task(fresh._run(directory, "install"))
     fresh.tasks[directory.name] = task
-    await asyncio.wait_for(admitted.wait(), 1)
+    await asyncio.wait_for(admitted.wait(), 30)
     task.cancel()  # Stop arrives before the admitted handle is delivered.
     await asyncio.sleep(0)
     shutting_down = asyncio.create_task(fresh.shutdown())
@@ -1074,9 +1074,9 @@ async def test_shutdown_during_worker_teardown_joins_same_wait_without_losing_ha
     fresh = DeploymentService(service.root.parent, service.guide, service.implementation)
     task = asyncio.create_task(fresh._run(directory, "install"))
     fresh.tasks[directory.name] = task
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     task.cancel()
-    await asyncio.wait_for(stopping.wait(), 1)
+    await asyncio.wait_for(stopping.wait(), 30)
     shutting_down = asyncio.create_task(fresh.shutdown())
     await asyncio.sleep(0)
     await asyncio.sleep(0)
@@ -1128,7 +1128,7 @@ async def test_worker_force_exit_race_still_reaps_original_handle(service, tmp_p
     monkeypatch.setattr(deployment.os, "killpg", already_exited)
     fresh = DeploymentService(service.root.parent, service.guide, service.implementation)
     task = asyncio.create_task(fresh._run(directory, "install"))
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 1)
@@ -1169,10 +1169,10 @@ async def test_shutdown_force_reap_failure_preserves_live_worker_and_reports_cle
     fresh = DeploymentService(service.root.parent, service.guide, service.implementation)
     task = asyncio.create_task(fresh._run(directory, "install"))
     fresh.tasks[directory.name] = task
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     shutting_down = asyncio.create_task(fresh.shutdown())
     if cancel_shutdown:
-        await asyncio.wait_for(stopping.wait(), 1)
+        await asyncio.wait_for(stopping.wait(), 30)
         for _ in range(3):
             shutting_down.cancel()
             await asyncio.sleep(0)

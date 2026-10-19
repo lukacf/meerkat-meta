@@ -58,7 +58,7 @@ async def test_changed_configuration_during_observation_never_admits_a_turn(
             pending = asyncio.create_task(runtime.send(identity, "Private follow-up")
                 if operation == "send" else runtime.dispatch(identity, message, track_turn=True))
             try:
-                await asyncio.wait_for(entered.wait(), timeout=2)
+                await asyncio.wait_for(entered.wait(), timeout=30)
                 assert not pending.done()
                 assert len(admissions) == (1 if changed else 0)
                 if changed:

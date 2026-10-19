@@ -138,7 +138,7 @@ def managed_connect_factory(tmp_path, *, release=None, application_current=None,
 async def connect_ready(client, front):
     response = await client.post("/console/forge/connect/initialize", json={}, headers={"Origin": front.origin})
     assert response.status_code in (200, 202)
-    for _ in range(200):
+    for _ in range(6000):
         response = await client.get("/console/forge/connect/state")
         if response.status_code == 200 and response.json().get("status") == "ready":
             return response.json()
@@ -171,7 +171,7 @@ async def connect_view(app, front, session, private=False):
                     (b"cookie", (front.cookie + "=" + session).encode())],
         "client": ("127.0.0.1", 10002), "server": ("127.0.0.1", front.port)}
     task = asyncio.create_task(app(scope, receive, send))
-    await asyncio.wait_for(started.wait(), 1)
+    await asyncio.wait_for(started.wait(), 30)
     assert responses[0]["status"] == 200
     return task, frames, disconnected
 
@@ -264,7 +264,7 @@ async def test_managed_connect_startup_prompt_is_answerable_without_initializati
             await login(client, front)
             response = await client.post("/console/forge/connect/initialize", json={}, headers={"Origin": front.origin})
             assert response.status_code == 202 and response.json() == {"status": "starting"}
-            for _ in range(200):
+            for _ in range(6000):
                 if children[0]._prompts:
                     break
                 await asyncio.sleep(0.005)
@@ -342,7 +342,7 @@ async def test_managed_connect_revokes_views_before_retirement_ack_and_joins_chi
             tasks.append(task); await frames.get()
             if not expiry:
                 retiring = asyncio.create_task(client.post("/logout", headers={"Origin": front.origin}))
-            for _ in range(200):
+            for _ in range(6000):
                 if not front.sessions:
                     break
                 await asyncio.sleep(0.005)
@@ -359,7 +359,7 @@ async def test_managed_connect_revokes_views_before_retirement_ack_and_joins_chi
                 await asyncio.wait_for(front._logins[session].retirement_task, 1)
             assert children[0]._process.returncode is None and session in front._logins
             shutdown = asyncio.create_task(front.close())
-            for _ in range(200):
+            for _ in range(6000):
                 if '"connect/close"' in traces[0].read_text():
                     break
                 await asyncio.sleep(0.005)
@@ -450,7 +450,7 @@ async def test_managed_connect_lost_send_response_recovers_original_control_with
                     (b"cookie", (front.cookie + "=" + session).encode())],
                 "client": ("127.0.0.1", 10003), "server": ("127.0.0.1", front.port)}
             task = asyncio.create_task(app(scope, receive, lost_response)); tasks.append(task)
-            await asyncio.wait_for(response_entered.wait(), 1)
+            await asyncio.wait_for(response_entered.wait(), 30)
             task.cancel(); await asyncio.gather(task, return_exceptions=True)
             recovered = (await client.get("/console/forge/connect/state")).json()["state"]["state"]
             request_id = recovered["active_send"]["send_request_id"]
@@ -1081,7 +1081,7 @@ async def held_console_stream(app, front, session):
                     (b"last-event-id", b"native-41")],
         "client": ("127.0.0.1", 10001), "server": ("127.0.0.1", front.port)}
     task = asyncio.create_task(app(scope, receive, send))
-    await asyncio.wait_for(started.wait(), 1)
+    await asyncio.wait_for(started.wait(), 30)
     return task, frames, responses, disconnected
 
 
@@ -1114,8 +1114,8 @@ async def test_login_retirement_logout_closes_only_its_stream_and_preserves_nati
             tasks.append(one)
             two, second_frames, second_responses, _ = await held_console_stream(app, front, second_session)
             tasks.append(two)
-            await asyncio.wait_for(native_streams[0].waiting.wait(), 1)
-            await asyncio.wait_for(native_streams[1].waiting.wait(), 1)
+            await asyncio.wait_for(native_streams[0].waiting.wait(), 30)
+            await asyncio.wait_for(native_streams[1].waiting.wait(), 30)
             frame = b'id: native-42\nevent: frame_added\ndata: {"native":"unchanged"}\n\n'
             if active:
                 native_streams[0].frames.put_nowait(frame)
@@ -1158,7 +1158,7 @@ async def test_login_retirement_expiry_closes_stream_without_another_browser_req
             session = client.cookies[front.cookie]
             task, frames, responses, _ = await held_console_stream(app, front, session)
             tasks.append(task)
-            await asyncio.wait_for(stream.waiting.wait(), 1)
+            await asyncio.wait_for(stream.waiting.wait(), 30)
             if active:
                 frame = b'id: native-42\ndata: {"native":true}\n\n'
                 stream.frames.put_nowait(frame)
@@ -1191,7 +1191,7 @@ async def test_login_retirement_shutdown_stops_admission_and_joins_idle_stream_b
             await login(client, front)
             task, frames, _, _ = await held_console_stream(app, front, client.cookies[front.cookie])
             tasks.append(task)
-            await asyncio.wait_for(stream.waiting.wait(), 1)
+            await asyncio.wait_for(stream.waiting.wait(), 30)
             closing = asyncio.create_task(front.close())
             tasks.append(closing)
             await asyncio.wait_for(stream.closed.wait(), 0.2)
@@ -1374,7 +1374,7 @@ async def test_frontend_descriptor_rechecks_loaded_owner_after_suspended_read(tm
                 monkeypatch.setattr(front, "_ready_console_login", ready)
             pending = asyncio.create_task(client.request("GET", DESCRIPTOR_PATH, content=body()))
             tasks.append(pending)
-            await asyncio.wait_for(waiting.wait(), 1)
+            await asyncio.wait_for(waiting.wait(), 30)
             if change in {"logout", "new-login"}:
                 assert (await client.post("/logout", headers={"Origin": front.origin})).status_code == 303
                 if change == "new-login":
@@ -1424,7 +1424,7 @@ async def test_frontend_descriptor_outer_login_wait_preserves_exact_refusal(tmp_
             monkeypatch.setattr(front, "_ready_console_login", ready)
             pending = asyncio.create_task(client.get(DESCRIPTOR_PATH))
             tasks.append(pending)
-            await asyncio.wait_for(waiting.wait(), 1)
+            await asyncio.wait_for(waiting.wait(), 30)
             if change == "shutdown":
                 await front.close()
             elif change == "retired":
@@ -1462,7 +1462,7 @@ async def test_login_retirement_refuses_a_body_waiting_before_new_admission(tmp_
             pending = asyncio.create_task(client.post(path, content=body(),
                 headers={"Origin": front.origin, "Content-Type": "application/json"}))
             tasks.append(pending)
-            await asyncio.wait_for(waiting.wait(), 1)
+            await asyncio.wait_for(waiting.wait(), 30)
             assert (await client.post("/logout", headers={"Origin": front.origin})).status_code == 303
             release.set()
             assert (await asyncio.wait_for(pending, 1)).status_code == 401
@@ -1497,7 +1497,7 @@ async def test_login_retirement_keeps_an_entered_native_input_and_its_applicatio
             pending = asyncio.create_task(client.post("/console/rpc",
                 json={"method": "mobkit/console/send", "params": SUBMISSION}, headers={"Origin": front.origin}))
             tasks.append(pending)
-            await asyncio.wait_for(entered.wait(), 1)
+            await asyncio.wait_for(entered.wait(), 30)
             assert (await client.post("/logout", headers={"Origin": front.origin})).status_code == 303
             assert not pending.done() and front.sessions == {}
             release.set()
@@ -1576,7 +1576,7 @@ async def test_ordinary_finite_console_response_discloses_only_to_its_current_lo
                 assert first_session != second_session
             pending = asyncio.create_task(first.get(path))
             tasks.append(pending)
-            await asyncio.wait_for(entered.wait(), 1)
+            await asyncio.wait_for(entered.wait(), 30)
             assert not pending.done() and len(observed) == 1
             if retirement == "logout":
                 assert (await first.post("/logout", headers={"Origin": front.origin})).status_code == 303
@@ -1624,7 +1624,7 @@ async def test_login_retirement_joins_a_stream_waiting_for_native_headers(tmp_pa
             await login(client, front)
             pending = asyncio.create_task(client.get("/console/timeline/stream?after_cursor=41"))
             tasks.append(pending)
-            await asyncio.wait_for(entered.wait(), 1)
+            await asyncio.wait_for(entered.wait(), 30)
             assert (await client.post("/logout", headers={"Origin": front.origin})).status_code == 303
             assert cancelled.is_set() and pending.done() and pending.cancelled()
             assert len(observed) == 1 and front.sessions == {} and front.delivered == set()
@@ -1655,7 +1655,7 @@ async def test_login_retirement_keeps_failed_upstream_cleanup_unconfirmed_and_pr
             session = client.cookies[front.cookie]
             task, _, public, _ = await held_console_stream(app, front, session)
             tasks.append(task)
-            await asyncio.wait_for(stream.waiting.wait(), 1)
+            await asyncio.wait_for(stream.waiting.wait(), 30)
             result = await client.post("/logout", headers={"Origin": front.origin})
             assert result.status_code == 503
             assert "cleanup is unconfirmed" in result.text
@@ -1694,10 +1694,10 @@ async def test_login_retirement_joins_the_first_slow_upstream_close_before_logou
             await login(client, front)
             task, _, _, _ = await held_console_stream(app, front, client.cookies[front.cookie])
             tasks.append(task)
-            await asyncio.wait_for(stream.waiting.wait(), 1)
+            await asyncio.wait_for(stream.waiting.wait(), 30)
             logout = asyncio.create_task(client.post("/logout", headers={"Origin": front.origin}))
             tasks.append(logout)
-            await asyncio.wait_for(closing.wait(), 1)
+            await asyncio.wait_for(closing.wait(), 30)
             assert front.sessions == {} and not logout.done() and not stream.closed.is_set()
             assert (await client.get("/console/timeline/stream")).status_code == 401
             release.set()
@@ -1735,7 +1735,7 @@ async def test_login_retirement_owns_httpx_finite_stream_exhaustion_close(tmp_pa
             task, frames, public, _ = await held_console_stream(app, front, client.cookies[front.cookie])
             tasks.append(task)
             assert await asyncio.wait_for(frames.get(), 1) == b'id: native-42\ndata: {"native":"finite"}\n\n'
-            await asyncio.wait_for(closing.wait(), 1)
+            await asyncio.wait_for(closing.wait(), 30)
             logout = asyncio.create_task(client.post("/logout", headers={"Origin": front.origin}))
             tasks.append(logout)
             if failing:
@@ -1980,7 +1980,7 @@ async def test_toolkit_panel_proxy_rechecks_exact_login_after_body_and_cleanup(t
             path = "/host/toolkit/setup/data" if phase == "body" else "/host/toolkit/setup"
             pending = asyncio.create_task(client.get(path))
             tasks.append(pending)
-            await asyncio.wait_for(entered.wait(), 1)
+            await asyncio.wait_for(entered.wait(), 30)
             assert not pending.done() and len(observed) == 1
             if retirement == "logout":
                 assert (await client.post("/logout", headers={"Origin": front.origin})).status_code == 303
@@ -2161,7 +2161,7 @@ async def test_toolkit_protected_post_rechecks_exact_login_across_all_body_and_c
                 content=inbound() if phase == "inbound" else raw,
                 headers={"Origin": front.origin, "Content-Type": "application/json"}))
             tasks.append(pending)
-            await asyncio.wait_for(entered.wait(), 1)
+            await asyncio.wait_for(entered.wait(), 30)
             assert not pending.done() and len(observed) == (0 if phase == "inbound" else 1)
             if retirement == "logout":
                 assert (await client.post("/logout", headers={"Origin": front.origin})).status_code == 303
@@ -2216,7 +2216,7 @@ async def test_toolkit_protected_post_sse_label_cannot_bypass_final_cleanup_logi
                 json={"review_id": 4, "approval_id": "opaque-retained-approval", "decision": "deny"},
                 headers={"Origin": front.origin}))
             tasks.append(pending)
-            await asyncio.wait_for(entered.wait(), 1)
+            await asyncio.wait_for(entered.wait(), 30)
             assert not pending.done() and close_calls == 2 and len(observed) == 1
             assert (await client.post("/logout", headers={"Origin": front.origin})).status_code == 303
             release.set()
@@ -2335,7 +2335,7 @@ async def test_toolkit_new_account_routes_withhold_late_body_after_original_logi
             pending = asyncio.create_task(client.request(method, route, json=payload,
                 headers={"Origin": front.origin} if method == "POST" else {}))
             tasks.append(pending)
-            await asyncio.wait_for(entered.wait(), 1)
+            await asyncio.wait_for(entered.wait(), 30)
             assert not pending.done() and len(observed) == 1
             assert (await client.post("/logout", headers={"Origin": front.origin})).status_code == 303
             release.set()

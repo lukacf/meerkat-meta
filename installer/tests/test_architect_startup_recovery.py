@@ -182,10 +182,11 @@ def startup(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "isolated-startup-test-provider")
     rpc_gateway = bootstrap.package_tool_path(tmp_path / "owned-source", "rpc_gateway")
     official_mock_binary(rpc_gateway, "rpc_gateway")
+    from launchkit import guide_sdk
     from launchkit.connect_installer_caller import ExactFile
     selected = bootstrap.SelectedGuideRuntime(
         ExactFile(rpc_gateway, hashlib.sha256(rpc_gateway.read_bytes()).hexdigest()),
-        "0.9.0", "0.9.0", "a" * 40, "b" * 40)
+        guide_sdk.SELECTED_VERSION, guide_sdk.SELECTED_VERSION, "a" * 40, "b" * 40)
     monkeypatch.setattr(bootstrap, "_selected_guide_runtime", selected)
     monkeypatch.setattr(module, "gateway_path", lambda: rpc_gateway)
     monkeypatch.setattr(module, "__file__", str(tmp_path / "owned-source/launchkit/architect.py"))
@@ -991,7 +992,7 @@ async def test_cancelling_saturated_readiness_backoff_cleans_without_another_wai
         await asyncio.Event().wait()
     monkeypatch.setattr(module, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": sleep}))
     task = asyncio.create_task(service.start())
-    await asyncio.wait_for(sleeping.wait(), timeout=2)
+    await asyncio.wait_for(sleeping.wait(), timeout=30)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

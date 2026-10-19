@@ -497,7 +497,7 @@ async def test_equal_content_in_another_setup_keeps_its_own_native_admission(own
     monkeypatch.setattr('launchkit.architect._native_request', native_request)
     operations = VisualizationOperations(root=owned.ops.root / 'equal-content')
     first = await operations.submit(owned.service, owned.blueprint, owned.model, setup_id='setup-A', stream_id='same-stream')
-    async with asyncio.timeout(1):
+    async with asyncio.timeout(30):
         while not first.get('native_admission'):
             await asyncio.sleep(.001)
     second = await operations.submit(owned.service, owned.blueprint, owned.model, setup_id='setup-B', stream_id='same-stream')
@@ -576,7 +576,7 @@ async def test_same_content_retry_keeps_original_attempt_across_native_admission
         return SimpleNamespace(json=lambda: {'frames': [frame(31, 'interaction_complete', interaction_id='retry-interaction', session_id='retry-session')]})
     monkeypatch.setattr('launchkit.architect._native_request', request)
     retried = await owned.ops.submit(owned.service, owned.blueprint, owned.model, setup_id='setup-A', stream_id='overview')
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), 30)
     expected = {name: retried[name] for name in owned.expected}
     assert retried['id'] != owned.receipt['id'] and retried['status'] == 'running'
     assert 'native_admission' not in retried

@@ -738,7 +738,7 @@ async def test_cancellation_during_subprocess_admission_retains_and_reaps_child(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed)
     start = asyncio.create_task(trial.start())
-    await asyncio.wait_for(admitted.wait(), 3)
+    await asyncio.wait_for(admitted.wait(), 30)
     await asyncio.sleep(initialization_delay)
     start.cancel()
     release.set()

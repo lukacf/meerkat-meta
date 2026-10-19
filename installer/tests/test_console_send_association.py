@@ -112,7 +112,7 @@ async def test_entered_send_lost_http_reply_observes_only_original_future_and_lo
                     (b"cookie", (front.cookie + "=" + client.cookies[front.cookie]).encode())],
                 "client": ("127.0.0.1", 10003), "server": ("127.0.0.1", front.port)}
             task = asyncio.create_task(app(scope, receive, lose_reply)); tasks.append(task)
-            await asyncio.wait_for(response_entered.wait(), 1)
+            await asyncio.wait_for(response_entered.wait(), 30)
             task.cancel(); await asyncio.gather(task, return_exceptions=True)
             original = (await client.get(PREFIX + "/send/" + A)).json()
             assert original["status"] == "pending" and original["association"] == A

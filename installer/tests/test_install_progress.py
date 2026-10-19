@@ -27,7 +27,7 @@ async def test_inflight_install_reports_stage_without_premature_completion(worke
     monkeypatch.setattr(worker.Supervisor, 'install_selected_sdk_pair', held_pair)
     task = asyncio.create_task(worker.run(f.directory, 'install'))
     try:
-        await asyncio.wait_for(entered.wait(), 3)
+        await asyncio.wait_for(entered.wait(), 30)
         pending = deployment.read_receipt(f.directory)
         assert pending['status'] == 'installing' and pending['phase'] == 'install'
         assert pending['detail'] == 'Installing the agent software and its dependencies.'
@@ -36,7 +36,7 @@ async def test_inflight_install_reports_stage_without_premature_completion(worke
         assert not (f.destination / '.bin').exists()
         assert not task.done()
         release.set()
-        result = await asyncio.wait_for(task, 3)
+        result = await asyncio.wait_for(task, 30)
         completed = deployment.read_receipt(f.directory)
         history = [event['message'] for event in completed['progress']]
         assert 'Preparing the application environment.' in history

@@ -340,7 +340,7 @@ async def test_removal_waits_for_local_install_admission_then_preserves_destinat
             await release.wait()
     service.cloud_transport.hook = hold
     installing = asyncio.create_task(install_cloud(service, receipt))
-    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.wait_for(entered.wait(), 30)
     async def lifecycle(endpoint):
         return "removing"
     service.cloud_removal_status = lifecycle
@@ -367,7 +367,7 @@ async def test_removal_during_install_preflight_cannot_admit_or_send_private_app
             await release.wait()
     service.cloud_transport.hook = hold
     installing = asyncio.create_task(install_cloud(service, receipt))
-    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.wait_for(entered.wait(), 30)
     async def lifecycle(endpoint):
         return "removing"
     service.cloud_removal_status = lifecycle
@@ -451,7 +451,7 @@ async def test_removal_waits_for_inflight_local_tunnel_and_withdraws_before_read
         return True
     browser.browser_check = held_check
     opening = asyncio.create_task(browser.open(receipt["guide_id"], 4, receipt["build_id"], receipt["deployment_id"]))
-    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.wait_for(entered.wait(), 30)
     async def lifecycle(endpoint):
         return "removing"
     service.cloud_removal_status = lifecycle

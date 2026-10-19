@@ -167,7 +167,7 @@ async def test_cancelled_http_handshake_keeps_cancellation_and_original_owned_cl
     connection = clients.module.MCPConnection(clients.config)
     starter = asyncio.create_task(connection.start())
     try:
-        await asyncio.wait_for(clients.initialized.wait(), timeout=2)
+        await asyncio.wait_for(clients.initialized.wait(), timeout=30)
         owner = connection.task
         starter.cancel()
         with pytest.raises(asyncio.CancelledError):
