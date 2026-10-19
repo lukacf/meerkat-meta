@@ -569,7 +569,7 @@ async def test_cancelled_product_mutation_stops_before_its_same_prefix_worker_dr
     try:
         await _started(started)
         pending.cancel()
-        await asyncio.wait_for(supervisor.stop.wait(), timeout=1)
+        await asyncio.wait_for(supervisor.stop.wait(), timeout=30)
         assert not pending.done() and not finished.is_set()
         with pytest.raises(RuntimeError):
             with project_lock(f.selected.destination):

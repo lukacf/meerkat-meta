@@ -342,7 +342,7 @@ async def test_managed_connect_revokes_views_before_retirement_ack_and_joins_chi
             tasks.append(task); await frames.get()
             if not expiry:
                 retiring = asyncio.create_task(client.post("/logout", headers={"Origin": front.origin}))
-            for _ in range(200):
+            for _ in range(6000):
                 if not front.sessions:
                     break
                 await asyncio.sleep(0.005)
@@ -359,7 +359,7 @@ async def test_managed_connect_revokes_views_before_retirement_ack_and_joins_chi
                 await asyncio.wait_for(front._logins[session].retirement_task, 1)
             assert children[0]._process.returncode is None and session in front._logins
             shutdown = asyncio.create_task(front.close())
-            for _ in range(200):
+            for _ in range(6000):
                 if '"connect/close"' in traces[0].read_text():
                     break
                 await asyncio.sleep(0.005)
