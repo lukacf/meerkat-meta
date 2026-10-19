@@ -975,7 +975,7 @@ class Supervisor:
             if ({key: value for key, value in saved_project.items() if key not in generated}
                     != {key: value for key, value in project_values.items() if key not in generated}):
                 raise DraftConflict("Project settings changed during knowledge setup. The application remains stopped; reload its settings.")
-            allowed = generated | selected_keys | {"ELEPHANT_OPERATOR_TOKEN"} | {
+            allowed = generated | selected_keys | {"ELEPHANT_OPERATOR_TOKEN", "MCP_BEARER_TOKEN"} | {
                 key for key in ("JWT_SECRET", "SURREALDB_PASS") if key not in knowledge_values}
             if ({key: value for key, value in saved_knowledge.items() if key not in allowed}
                     != {key: value for key, value in knowledge_values.items() if key not in allowed}):

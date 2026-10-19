@@ -56,15 +56,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- Meta Forge's local knowledge service setup no longer stops at fetching its
-  source. The pinned commit could not be fetched from the source repository,
-  so `knowledge/manage.py up` failed before building. Forge now pins commit
-  `d0493b6e9ba6e61ecea24e50b5f8748e3ffe8f6c` of
-  `https://github.com/lukacf/meerkat-recall`, the repository's canonical
-  address, and the bundled Dockerfile builds that source's `meerkat-recall-bin`
-  package. The image keeps the former command name as a link, so the generated
-  Compose services are unchanged. Projects compiled earlier keep their recorded
-  source; a newly compiled application source uses the new pin.
+- Meta Forge's local knowledge service starts and becomes ready for semantic
+  ingestion. `knowledge/manage.py up` used to stop before the service started:
+  the pinned source commit could not be fetched, and every available revision
+  of the source refuses the stock SurrealDB server the stack ran. Forge now
+  pins commit `d0493b6e9ba6e61ecea24e50b5f8748e3ffe8f6c` of
+  `https://github.com/lukacf/meerkat-recall` and runs a single knowledge
+  service process with its store embedded (RocksDB files in the private
+  knowledge volume), with no database server or reader service. After the
+  service is healthy, `up` creates the project space with its security policy
+  and processing approvals through a short-lived bootstrap token that is never
+  saved, gives the service's extractor a dedicated read-only token and grant,
+  and waits for `semantic_ingest_ready`. A later `up` only reads the space and
+  grant back. A project that still records the old default pin builds the new
+  default; an explicitly chosen pin is kept. The exported knowledge README
+  states the licences of the embedded storage engine.
 - The `complete_held_identity_members` documentation no longer says that
   resumed members are skipped. A held identity bootstrap holds fresh members
   only: a roster member that already has continuity refuses the whole pass
