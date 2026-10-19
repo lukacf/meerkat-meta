@@ -1611,7 +1611,7 @@ class LinuxReleaseContainerTests(unittest.TestCase):
             with self.subTest(target=target):
                 image = render_template(self.container_expression(), matrix_target=target)
                 if target.endswith("-unknown-linux-gnu"):
-                    self.assertEqual(image, "docker.io/library/buildpack-deps:bullseye")
+                    self.assertRegex(image, r"^docker\.io/library/buildpack-deps:bullseye@sha256:[0-9a-f]{64}$")
                 else:
                     # macOS and Windows legs cannot run a Linux container; an
                     # empty string is how the expression opts them out.
@@ -1620,7 +1620,7 @@ class LinuxReleaseContainerTests(unittest.TestCase):
     def test_the_declared_floor_matches_the_container_image(self):
         # The floor is a fact about the image; the two are declared in two
         # files and this is the only thing that holds them together.
-        codename = self.linux_image().rsplit(":", 1)[1]
+        codename = self.linux_image().split("@", 1)[0].rsplit(":", 1)[1]
         self.assertIn(
             codename, CONTAINER_GLIBC,
             f"unknown Debian codename {codename!r}: extend CONTAINER_GLIBC and decide the floor",

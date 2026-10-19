@@ -12,6 +12,8 @@ import re
 import tomllib
 from pathlib import Path
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
@@ -92,6 +94,202 @@ def job_block(name: str) -> str:
     return "\n".join(lines[start:])
 
 
+# A runner label that names its image. A -latest label moves to a new image on
+# GitHub's schedule (ubuntu-latest left 24.04 on 2026-10-19), and with it the
+# toolchains, glibc and preinstalled tools every job reads.
+PINNED_RUNNER = re.compile(r"^(ubuntu-\d\d\.\d\d(-arm)?|macos-\d+|windows-\d{4}(-vs\d{4})?)$")
+# The one runs-on expression a job may use, and the one matrix it may take the
+# labels from without naming them inline: the release build legs, which
+# test_the_release_build_legs_run_on_pinned_runner_images reads.
+MATRIX_RUNS_ON = "${{ matrix.runs-on }}"
+RELEASE_BUILD_MATRIX = "${{ fromJSON(needs.resolve_release.outputs.build_matrix) }}"
+
+
+def runner_problems(root: Path) -> tuple[list[str], list[str]]:
+    """Every workflow job's runner labels, read as YAML, and why any of them
+    floats or cannot be read. A runs-on that is not one inline label (a block
+    list, a flow list or a mapping) is refused, never skipped."""
+    labels, problems = [], []
+    for path in sorted((root / ".github" / "workflows").glob("*.y*ml")):
+        workflow = yaml.safe_load(path.read_text()) or {}
+        for name, job in (workflow.get("jobs") or {}).items():
+            if not isinstance(job, dict) or "runs-on" not in job:
+                continue
+            where = f"{path.relative_to(root)} job {name}"
+            value = job["runs-on"]
+            if not isinstance(value, str):
+                problems.append(f"{where}: runs-on is a {type(value).__name__} this check cannot read; "
+                                "name one pinned label inline")
+                continue
+            if value == MATRIX_RUNS_ON:
+                matrix = (job.get("strategy") or {}).get("matrix")
+                if matrix == RELEASE_BUILD_MATRIX:
+                    continue
+                values = []
+                if isinstance(matrix, dict):
+                    axis = matrix.get("runs-on")
+                    values += axis if isinstance(axis, list) else ([] if axis is None else [axis])
+                    values += [entry["runs-on"] for entry in matrix.get("include") or []
+                               if isinstance(entry, dict) and "runs-on" in entry]
+                if not values:
+                    problems.append(f"{where}: runs-on {value} names no matrix label this check can read")
+            elif "${{" in value:
+                problems.append(f"{where}: runs-on {value} is an expression this check cannot read")
+                continue
+            else:
+                values = [value]
+            for label in values:
+                labels.append(label)
+                if not isinstance(label, str) or "latest" in label or not PINNED_RUNNER.match(label):
+                    problems.append(f"{where}: runs-on {label} does not name a pinned runner image")
+    return labels, problems
+
+
+# An image reference that names its digest.
+DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
+# A `container:` or `image:` key with an inline value. The value is read
+# literally: a flow mapping (`container: {image: ...}`) or an action input
+# that happens to be named `image` is refused rather than parsed.
+IMAGE_KEY = re.compile(r"^\s*(?:-\s*)?(container|image):\s*(\S.*?)\s*$")
+# A `docker://` image reference, wherever a line names one.
+DOCKER_URL = re.compile(r"docker://[^\s\"',)]+")
+# A key whose value is a block scalar (`run: |`, `description: >-`).
+BLOCK_SCALAR = re.compile(r"^(\s*)(-\s+)?[^\s#-][^#]*?:\s*[|>][-+0-9]*\s*$")
+# A Dockerfile FROM line's image, after any --platform style flags.
+FROM_LINE = re.compile(r"^\s*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?\s*$", re.IGNORECASE)
+# Image references accepted without a digest, and why. The self-hosted CI
+# platform image lives in a private Artifact Registry repository that neither
+# Renovate nor this check can read; it is matched by registry, repository and
+# tag (any project).
+UNPINNED_IMAGES = {
+    re.compile(r"docker://europe-west1-docker\.pkg\.dev/[^/]+/meerkat-ci/meerkat-ci-rust:1\.94\.0"): (
+        "a private registry neither Renovate nor this check can read: its digest comes from someone "
+        "with read access to that registry"
+    ),
+}
+# The installer's launch templates and the installer test's frozen copy of
+# them. A user builds their own app from these, so they are not CI or release
+# images and Renovate does not manage them; their FROM lines stay as written.
+# Every other tracked container build file's FROM lines must name a digest.
+USER_TEMPLATE_DOCKERFILES = re.compile(r"installer/(?:tests/fixtures/[^/]+/)?launchkit/templates_[^/]+/Dockerfile")
+
+
+def is_container_build_file(name: str) -> bool:
+    """A Dockerfile or Containerfile, by any of the names builds use for one
+    (`Dockerfile.ci`, `app.Dockerfile`, `Containerfile`)."""
+    lower = name.lower()
+    return lower.startswith(("dockerfile", "containerfile")) or lower.endswith((".dockerfile", ".containerfile"))
+
+
+def without_comment(line: str) -> str:
+    """The line before a YAML comment, outside quotes."""
+    quote = None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if quote == '"' and char == "\\":
+                index += 1
+            elif char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1].isspace()):
+            return line[:index]
+        index += 1
+    return line
+
+
+def yaml_lines(text: str):
+    """(number, line) for every line that is not a block scalar's text."""
+    block_key_indent = -1
+    for number, line in enumerate(text.split("\n"), 1):
+        indent = len(line) - len(line.lstrip())
+        if block_key_indent >= 0:
+            if not line.strip() or indent > block_key_indent:
+                continue
+            block_key_indent = -1
+        yield number, line
+        block = BLOCK_SCALAR.match(without_comment(line).rstrip())
+        if block:
+            block_key_indent = len(block.group(1)) + len(block.group(2) or "")
+
+
+def image_references(value: str) -> list[str] | None:
+    """The images a `container:` or `image:` value names: the value itself, or
+    the quoted literals of an expression that look like one; None when an
+    expression names none this check can read."""
+    unquoted = re.sub(r"^['\"]|['\"]$", "", value)
+    if "${{" not in unquoted:
+        return [unquoted]
+    images = [literal for literal in re.findall(r"'([^']*)'", unquoted)
+              if literal and not re.search(r"\s", literal) and re.search(r"[/:]", literal)]
+    return images or None
+
+
+def tracked_files(root: Path) -> list[str]:
+    """The repository's tracked files, or every file of a tree with no git."""
+    if (root / ".git").exists():
+        listed = subprocess.run(["git", "ls-files", "-z"], cwd=root, check=True, capture_output=True, text=True)
+        return [name for name in listed.stdout.split("\0") if name]
+    return sorted(str(path.relative_to(root)) for path in root.rglob("*") if path.is_file())
+
+
+def image_problems(root: Path) -> tuple[list[tuple[str, str]], list[str]]:
+    """Every container image CI names, with where it is named, and why any of
+    them floats: a `container:` or `image:` value in a .github YAML file, a
+    `docker://` reference on any line of a .github file (a `uses:` action or
+    a run script), one in tools/bazel's BUILD, BUILD.bazel and .bzl files or
+    .bazelrc, and the FROM lines of every tracked Dockerfile or Containerfile
+    except the installer's launch templates (USER_TEMPLATE_DOCKERFILES). Each must carry
+    an @sha256: digest or be listed in UNPINNED_IMAGES."""
+    found, problems = [], []
+
+    def check(where: str, image: str) -> None:
+        found.append((where, image))
+        if not DIGEST.search(image) and not any(pattern.fullmatch(image) for pattern in UNPINNED_IMAGES):
+            problems.append(f"{where}: {image} names its image without an @sha256: digest")
+
+    for path in sorted(path for path in (root / ".github").rglob("*") if path.is_file()):
+        text = path.read_text()
+        if path.suffix in (".yml", ".yaml"):
+            for number, line in yaml_lines(text):
+                key = IMAGE_KEY.match(without_comment(line))
+                if not key:
+                    continue
+                where = f"{path.relative_to(root)}:{number}"
+                images = image_references(key.group(2))
+                if images is None:
+                    problems.append(f"{where}: a {key.group(1)} this check cannot read; "
+                                    "name the image and its @sha256: digest literally")
+                for image in images or []:
+                    check(where, image)
+        for number, line in enumerate(text.split("\n"), 1):
+            for image in DOCKER_URL.findall(without_comment(line)):
+                check(f"{path.relative_to(root)}:{number}", image)
+    bazel = sorted(path for path in (root / "tools" / "bazel").rglob("*")
+                   if path.name in ("BUILD.bazel", "BUILD") or path.suffix == ".bzl")
+    if (root / ".bazelrc").is_file():
+        bazel.append(root / ".bazelrc")
+    for path in bazel:
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            for image in DOCKER_URL.findall(line):
+                check(f"{path.relative_to(root)}:{number}", image)
+    for relative in tracked_files(root):
+        if not is_container_build_file(Path(relative).name) or USER_TEMPLATE_DOCKERFILES.fullmatch(relative):
+            continue
+        stages = set()
+        for number, line in enumerate((root / relative).read_text().splitlines(), 1):
+            match = FROM_LINE.match(line)
+            if not match:
+                continue
+            if match.group(1).lower() != "scratch" and match.group(1) not in stages:
+                check(f"{relative}:{number}", match.group(1))
+            if match.group(2):
+                stages.add(match.group(2))
+    return found, problems
+
+
 class CiWorkflowTests(unittest.TestCase):
     def test_ci_and_release_use_the_repository_toolchain(self):
         toolchain = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]
@@ -123,6 +321,162 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertTrue(pins)
         for (action, ref), shas in sorted(pins.items()):
             self.assertEqual(len(shas), 1, f"{action} {ref} is pinned to {sorted(shas)}")
+
+    def test_every_job_runs_on_a_pinned_runner_image(self):
+        """Each workflow job names its runner image, read as YAML: a job's
+        inline label, or every label of the inline matrix it takes runs-on
+        from; the release build legs are checked below. A runs-on this check
+        cannot read is refused rather than skipped."""
+        labels, problems = runner_problems(ROOT)
+        self.assertEqual(problems, [])
+        self.assertGreater(len(labels), 20)
+
+    def test_the_release_build_legs_run_on_pinned_runner_images(self):
+        """build_binaries takes runs-on from matrix data: the resolver's
+        build_matrix, made of release-candidate.py BUILD_LEGS. A floating
+        label there reaches the job without ever appearing in a workflow."""
+        release = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertEqual(release.count(f"runs-on: {MATRIX_RUNS_ON}"), 1)
+        self.assertEqual(release.count(f"matrix: {RELEASE_BUILD_MATRIX}"), 1)
+        spec = importlib.util.spec_from_file_location("release_candidate_legs", ROOT / "scripts/release-candidate.py")
+        candidate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(candidate)
+        legs = [leg["runs-on"] for leg in candidate.BUILD_LEGS]
+        emitted = [leg["runs-on"] for tier in ("core", "trailing") for leg in candidate.build_matrix(tier)["include"]]
+        self.assertEqual(sorted(emitted), sorted(legs))
+        for label in legs:
+            self.assertNotIn("latest", label, f"BUILD_LEGS runs-on {label} floats")
+            self.assertRegex(label, PINNED_RUNNER)
+
+    def test_every_container_image_is_pinned_by_digest_under_renovate(self):
+        """A container tag moves when its publisher pushes; the build
+        container fixes the release binaries' glibc floor and the Bazel
+        platforms pick the remote build image. Every image CI names carries
+        its digest, unless UNPINNED_IMAGES lists it with its reason:
+        image_problems reads job and service containers, docker://
+        references in .github and the Bazel platforms, and the FROM lines of
+        every tracked Dockerfile or Containerfile except the installer's launch templates,
+        which users build their own apps from. renovate.json proposes new
+        digests (never automerged) for every pinned one, and the release
+        runbook compares them with Core's."""
+        found, problems = image_problems(ROOT)
+        self.assertEqual(problems, [])
+        renovate = json.loads((ROOT / "renovate.json").read_text())
+        (manager,) = renovate["customManagers"]
+        self.assertEqual(manager["datasourceTemplate"], "docker")
+        patterns = [re.compile(item.strip("/")) for item in manager["managerFilePatterns"]]
+        (match,) = [re.compile(item.replace("(?<", "(?P<")) for item in manager["matchStrings"]]
+        (rule,) = [rule for rule in renovate["packageRules"] if rule.get("matchManagers") == ["custom.regex"]]
+        self.assertIs(rule["automerge"], False)
+        pinned = [(where, image) for where, image in found if DIGEST.search(image)]
+        for where, image in pinned:
+            relative = where.rsplit(":", 1)[0]
+            self.assertTrue(any(pattern.search(relative) for pattern in patterns),
+                            f"{relative} is not under Renovate's digest management")
+            proposal = match.fullmatch(image)
+            self.assertIsNotNone(proposal, f"{where}: Renovate's digest manager cannot read {image}")
+            self.assertEqual(proposal.group("currentDigest"), image.rsplit("@", 1)[1])
+        self.assertEqual(sorted({where.rsplit(":", 1)[0] for where, _ in pinned}),
+                         [".github/workflows/release.yml", "tools/bazel/platforms/BUILD.bazel"], pinned)
+        # Every exception still names an image CI uses, so a stale one fails.
+        for pattern in UNPINNED_IMAGES:
+            self.assertTrue(any(pattern.fullmatch(image) for _, image in found), pattern.pattern)
+        self.assertIn("compare Meta's pinned\ncontainer digests with Core's", (ROOT / "CONTRIBUTING.md").read_text())
+
+    def test_the_pin_checks_refuse_each_floating_form(self):
+        """The runner and image checks on planted trees: a clean tree passes,
+        and each floating or unreadable form of a runner label or an image
+        reference fails on the file it is planted in. The installer's launch
+        templates are the only Dockerfiles left out."""
+        # The run script's `image:` line is shell text, not a key.
+        workflow = ("jobs:\n  build:\n    runs-on: ubuntu-24.04\n"
+                    "    container: docker.io/library/rust:1@sha256:" + "a" * 64 + "\n    steps:\n"
+                    "      - run: |\n          cat > values.yaml <<'VALUES'\n          image: example/app:1\n"
+                    "          VALUES\n")
+        bazel = ('platform(\n    exec_properties = {\n        "container-image": "docker://docker.io/library/'
+                 'buildpack-deps:22.04@sha256:' + "b" * 64 + '",\n    },\n)\n'
+                 'platform(\n    exec_properties = {\n        "container-image": "docker://europe-west1-docker.'
+                 'pkg.dev/example-project/meerkat-ci/meerkat-ci-rust:1.94.0",\n    },\n)\n')
+        template = "FROM rust:1.94-bookworm AS build\nFROM debian:bookworm-slim\n"
+        clean = {
+            ".github/workflows/ci.yml": workflow,
+            "tools/bazel/platforms/BUILD.bazel": bazel,
+            "installer/launchkit/templates_app/Dockerfile": template,
+            "installer/tests/fixtures/history_v1/launchkit/templates_app/Dockerfile": template,
+            "ci/Dockerfile": "FROM docker.io/library/rust:1@sha256:" + "c" * 64 + " AS base\nFROM base\nFROM scratch\n",
+        }
+        planted = {
+            "G1 a job container by tag": (".github/workflows/g1.yml",
+                                          "jobs:\n  a:\n    runs-on: ubuntu-24.04\n"
+                                          "    container: ghcr.io/example/builder:1\n    steps: []\n"),
+            "G2 a service image by tag": (".github/workflows/g2.yml",
+                                          "jobs:\n  a:\n    runs-on: ubuntu-24.04\n    services:\n"
+                                          "      db:\n        image: postgres:16\n    steps: []\n"),
+            "G3 runs-on as a block list": (".github/workflows/g3.yml",
+                                           "jobs:\n  a:\n    runs-on:\n      - ubuntu-latest\n    steps: []\n"),
+            "G4 a docker:// action by tag": (".github/workflows/g4.yml",
+                                             "jobs:\n  a:\n    runs-on: ubuntu-24.04\n    steps:\n"
+                                             "      - uses: docker://alpine:3.20\n"),
+            "G5 a Bazel platform by tag beside a pinned one": (
+                "tools/bazel/platforms/BUILD.bazel",
+                bazel + '"container-image": "docker://quay.io/example/rbe:22.04",\n'),
+            "a floating runner label": (".github/workflows/latest.yml",
+                                        "jobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: []\n"),
+            "runs-on as a mapping": (".github/workflows/mapping.yml",
+                                     "jobs:\n  a:\n    runs-on:\n      group: large\n    steps: []\n"),
+            "an unreadable container expression": (".github/workflows/expr.yml",
+                                                   "jobs:\n  a:\n    runs-on: ubuntu-24.04\n"
+                                                   "    container: ${{ inputs.image }}\n    steps: []\n"),
+            "a composite action's docker:// step": (".github/actions/x/action.yml",
+                                                    "runs:\n  using: composite\n  steps:\n"
+                                                    "    - uses: docker://alpine:3.20\n"),
+            "a docker:// image in a run script": (".github/workflows/script.yml",
+                                                  "jobs:\n  a:\n    runs-on: ubuntu-24.04\n    steps:\n"
+                                                  "      - run: |\n          skopeo inspect docker://alpine:3.20\n"),
+            "a Dockerfile outside the launch templates": ("installer/launchkit/Dockerfile",
+                                                          "FROM rust:1.94-bookworm\n"),
+            "a named Dockerfile": ("ci/app.Dockerfile", "FROM rust:1.94-bookworm\n"),
+            "a Containerfile": ("ci/Containerfile", "FROM rust:1.94-bookworm\n"),
+            "a matrix label that floats": (".github/workflows/matrix.yml",
+                                           "jobs:\n  a:\n    runs-on: ${{ matrix.runs-on }}\n    strategy:\n"
+                                           "      matrix:\n        runs-on: [ubuntu-24.04, macos-latest]\n"
+                                           "    steps: []\n"),
+        }
+
+        def problems_of(files: dict[str, str]) -> list[str]:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for relative, text in files.items():
+                    (root / relative).parent.mkdir(parents=True, exist_ok=True)
+                    (root / relative).write_text(text)
+                return runner_problems(root)[1] + image_problems(root)[1]
+
+        self.assertEqual(problems_of(clean), [])
+        for case, (relative, text) in planted.items():
+            with self.subTest(case=case):
+                problems = problems_of({**clean, relative: text})
+                self.assertTrue(any(problem.startswith(relative) for problem in problems), problems)
+
+    def test_renovate_proposes_action_updates_like_core(self):
+        """Actions run with the workflow token, OIDC and release secrets.
+        Renovate keeps them pinned to commit SHAs
+        (helpers:pinGitHubActionDigests), proposes a new version a week after
+        its release, asks for approval before moving a pin whose tag now names
+        another commit, and never automerges one: Core's github-actions rules,
+        with the github-actions rule last so no later rule overrides it."""
+        renovate = json.loads((ROOT / "renovate.json").read_text())
+        self.assertIn("helpers:pinGitHubActionDigests", renovate.get("extends", []))
+        self.assertEqual(sorted(renovate.get("enabledManagers", [])), ["custom.regex", "github-actions"])
+        rules = renovate["packageRules"]
+        last = rules[-1]
+        self.assertEqual(last["matchManagers"], ["github-actions"])
+        self.assertEqual(last["minimumReleaseAge"], "7 days")
+        self.assertIs(last["automerge"], False)
+        (digest,) = [rule for rule in rules if rule.get("matchManagers") == ["github-actions"]
+                     and rule.get("matchUpdateTypes") == ["digest"]]
+        self.assertIs(digest["dependencyDashboardApproval"], True)
+        self.assertFalse([rule for rule in rules if rule.get("automerge") is True])
+        self.assertNotIn("automerge", renovate)
 
     def test_rust_cache_covers_the_wrapper_target(self):
         """rust-cache saves `<workspace>/target`; repo-cargo must build there.
