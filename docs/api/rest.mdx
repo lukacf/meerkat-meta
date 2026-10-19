@@ -88,8 +88,11 @@ Returns experience metadata describing the current runtime state. This is the pr
 When a Meerkat mob runtime is configured, the response includes live agent data from the mob. Without a mob runtime, only module-level information is returned. When console UI config is loaded, the response includes `console_config`, the view-level contract consumed by the bundled console.
 
 `health_overview.live_snapshot.running` is the mob owner's answer when the
-experience is read. Without a runtime that can answer (no live mob runtime),
-it is `null`, and the snapshot names it in an `unobserved` marker:
+experience is read. A console served from the console aggregator answers for
+its registered runtimes: `true` only while every registered runtime's mob is
+creating or running, and `false` when at least one is not. Without a runtime
+that can answer (no live mob runtime, or an aggregator with no registered
+runtime), it is `null`, and the snapshot names it in an `unobserved` marker:
 `{"reason": "not_observed", "fields": ["running"]}`.
 
 ### `GET /console/modules`

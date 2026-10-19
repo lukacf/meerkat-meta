@@ -16,8 +16,8 @@ use serde_json::{Value, json};
 
 use super::{
     CONSOLE_BINDING_REFRESH_DEADLINE, ConsoleSnapshotReadModel, IdentityBinding,
-    IdentityBindingCut, MEMBER_STATE_RETIRING, build_live_snapshot, join_identity_bindings,
-    live_member_modules,
+    IdentityBindingCut, MEMBER_STATE_RETIRING, build_aggregator_live_snapshot, build_live_snapshot,
+    join_identity_bindings, live_member_modules,
 };
 use crate::access::{AccessControlConfig, AccessController, AccessEffect, AccessRule};
 use crate::console_aggregator::{AllowAllConsoleVisibilityPolicy, MetaConsoleAggregator};
@@ -27,6 +27,7 @@ use crate::identity_first::{
 };
 use crate::runtime::{ConsoleMember, ConsoleModelCapabilities, ConsoleRestJsonRequest};
 use crate::unified_runtime::UnifiedRuntime;
+use crate::unobserved::{UnobservedFacts, UnobservedReason};
 
 const KEEPER: &str = "voice-keeper";
 const OTHER: &str = "other-keeper";
@@ -896,6 +897,59 @@ async fn the_live_snapshot_answers_the_mob_owners_running_state_not_the_cached_w
         "the mob stopped after the walk; the owner says so, the cached walk does not"
     );
     gate.add_permits(64);
+}
+
+/// A console aggregator with no registered runtime has no owner to answer
+/// whether a mob runs: running is null and named unobserved.
+#[tokio::test]
+async fn an_aggregator_without_a_registered_runtime_reports_running_unobserved() {
+    let aggregator = MetaConsoleAggregator::in_memory();
+    let snapshot = build_aggregator_live_snapshot(&aggregator, &[])
+        .await
+        .unwrap();
+    assert_eq!(snapshot.running, None);
+    assert_eq!(
+        snapshot.unobserved,
+        Some(UnobservedFacts::new(
+            UnobservedReason::NotObserved,
+            &["running"]
+        ))
+    );
+}
+
+/// An aggregator's running is its registered runtimes' owners' answer: true
+/// while every registered mob runs, false once any one of them stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_aggregator_runs_only_while_every_registered_runtime_runs() {
+    let (first, _first_scratch) = identity_first_runtime(BTreeMap::new()).await;
+    let (second, _second_scratch) = identity_first_runtime(BTreeMap::new()).await;
+    let aggregator = MetaConsoleAggregator::in_memory();
+    for (key, runtime) in [("first", &first), ("second", &second)] {
+        aggregator.register_runtime_handles_with_policy(
+            key,
+            key,
+            runtime.mob_runtime().clone(),
+            None,
+            runtime.console_events(),
+            Arc::new(AllowAllConsoleVisibilityPolicy),
+        );
+    }
+    let snapshot = build_aggregator_live_snapshot(&aggregator, &[])
+        .await
+        .unwrap();
+    assert_eq!(snapshot.running, Some(true));
+    assert_eq!(snapshot.unobserved, None);
+
+    second.mob_handle().stop().await.unwrap();
+    let snapshot = build_aggregator_live_snapshot(&aggregator, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.running,
+        Some(false),
+        "one registered runtime stopped, so the aggregate does not run"
+    );
+    first.mob_handle().stop().await.unwrap();
 }
 
 /// A pending identity's walked state does not decide whether it is a loaded

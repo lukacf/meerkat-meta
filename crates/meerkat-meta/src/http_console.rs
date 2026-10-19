@@ -13876,7 +13876,7 @@ async fn build_aggregator_live_snapshot(
     };
     Ok(ConsoleLiveSnapshot::new(
         Some("console-aggregator".to_string()),
-        Some(true),
+        aggregator.registered_runtimes_running(),
         loaded_modules,
         agents,
         members,

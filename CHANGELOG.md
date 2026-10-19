@@ -133,6 +133,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it unobserved (`"unobserved": {"reason": "not_observed", "fields":
   ["running"]}` on the health snapshot); it reported `true` whenever a
   module was configured.
+- A console served from the console aggregator reports `running` from its
+  registered runtimes' owners: `true` only while every registered runtime's
+  mob is creating or running, `false` when at least one is not, and `null`
+  with the `not_observed` marker when no runtime is registered. It reported
+  `true` whatever its runtimes did.
 - The `complete_held_identity_members` documentation no longer says that
   resumed members are skipped. A held identity bootstrap holds fresh members
   only: a roster member that already has continuity refuses the whole pass
