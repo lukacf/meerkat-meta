@@ -69,37 +69,12 @@ feature-depth = 1
 #db-urls = ["https://github.com/rustsec/advisory-db"]
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
-# RUSTSEC-2026-0049: webpki CRL Distribution Point matching — low impact,
-# requires compromised CA. Transitive via rustls; awaiting upstream patch.
 # RUSTSEC-2025-0141: bincode 1.3.3 unmaintained (team ceased development;
 # 1.3.3 declared complete/final by its authors). Transitive via
 # meerkat-memory -> hnsw_rs; no vulnerability, no safe upgrade exists.
-# RUSTSEC-2026-0189: rmcp Streamable HTTP server transport host-header
-# validation. Transitive via meerkat-mcp 0.7.x, whose latest published patch
-# still requires rmcp 0.14; Meta enables client transports, not the affected
-# transport-streamable-http-server feature. Remove when Meerkat lifts to
-# rmcp >= 1.4.0.
-# RUSTSEC-2026-0150: audiopus_sys 0.2.2 unmaintained. Transitive and ONLY
-# under `openai-live` (and therefore `experimental-gpt-live`):
-#     audiopus_sys 0.2.2 <- opus 0.3.1 <- meerkat-live <- meerkat <- meta
-# The advisory is `informational = "unmaintained"` with `patched = []`, i.e. NO
-# vulnerability and no patched release; crates.io's latest audiopus_sys IS
-# 0.2.2, so "no safe upgrade" is a fact about the registry, not a deferral.
-# NOTE THE ACTUAL RISK IS BUILD-TIME, NOT SECURITY: the crate pins CMake
-# versions that CMake 4.0 is not backwards compatible with, so a build host
-# that moves to CMake 4 will fail to compile meerkat-live rather than be
-# exposed to anything. Upstream is unreachable - last commit 5 years ago, a
-# maintainer contact in June 2025 and a community PR both unanswered.
-# SCOPE, corroborated by a default-feature embedder rather than only derived
-# from our own tree: a production embedder ships meerkat-live and its production lock contains
-# ZERO opus / audiopus_sys / webrtc, with live cargo-deny passing. So this is
-# confined to the OPTIONAL realtime audio/WebRTC path; an embedder that does
-# not enable `openai-live` never acquires the dependency and is not
-# waiving anything.
-# 0.8.31 FOLLOW-UP: migrate to a maintained fork - `vnrit-audiopus-sys` 0.2.3
-# carries the build fix - or vendor the CMake correction. Remove this waiver
-# then. Re-evaluate sooner if any build host adopts CMake 4, because at that
-# point this stops being informational and starts breaking builds.
+# audiopus_sys 0.2.2 (RUSTSEC-2026-0150, unmaintained, a CMake 4 build risk)
+# comes in only with `openai-live`, outside the default-feature graph this
+# check reads, so it needs no ignore here.
 # RUSTSEC-2024-0449: unsafe-libyaml 0.2.11 is archived and unmaintained.
 # Meta's own YAML parsing (governance traceability, the incident example)
 # moved to serde-saphyr; serde_yaml 0.9.34+deprecated still arrives through
@@ -109,12 +84,12 @@ feature-depth = 1
 # when Meta pins the Core release whose meerkat-skills parses SKILL.md with
 # serde-saphyr, after a resolved-graph audit shows unsafe-libyaml absent.
 # Reassess immediately if a concrete vulnerability is reported.
+# An ignore whose advisory no longer occurs in the graph fails the check, so
+# the change that pins that Core release cannot keep this entry.
+unused-ignored-advisory = "deny"
 ignore = [
     { id = "RUSTSEC-2024-0449", reason = "Temporary acceptance of archived unsafe-libyaml that Meerkat Core 0.9.3's meerkat-skills brings in through serde_yaml (Meta's own YAML parsing uses serde-saphyr); no patched release is listed. Remove this exception at the Core pin whose meerkat-skills uses serde-saphyr, once the audited graph no longer contains unsafe-libyaml; reassess immediately on a concrete vulnerability." },
-    "RUSTSEC-2026-0049",
     "RUSTSEC-2025-0141",
-    "RUSTSEC-2026-0189",
-    "RUSTSEC-2026-0150",
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
