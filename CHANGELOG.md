@@ -138,6 +138,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   mob is creating or running, `false` when at least one is not, and `null`
   with the `not_observed` marker when no runtime is registered. It reported
   `true` whatever its runtimes did.
+- The console's topbar shows the mob as unknown, with an amber dot, when the
+  health snapshot does not say whether it runs; it showed running. A stopped
+  mob's dot is red; the dot was green whatever the status. console-core's
+  `consoleMobStatus` derives the status, and `ConsoleHealthSnapshot` carries
+  `running: boolean | null` and the `unobserved` marker.
 - The `complete_held_identity_members` documentation no longer says that
   resumed members are skipped. A held identity bootstrap holds fresh members
   only: a roster member that already has continuity refuses the whole pass

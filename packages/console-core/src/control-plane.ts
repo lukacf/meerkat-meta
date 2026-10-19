@@ -444,6 +444,32 @@ export function normalizeUnobservedFacts(value: unknown): UnobservedFacts | null
   return { reason, fields };
 }
 
+/** The mob's run state as the console shows it. */
+export type ConsoleMobStatus = "running" | "stopped" | "unknown";
+
+/**
+ * Whether the mob runs, as a health snapshot reports it. Only an observed
+ * `true` is running and only an observed `false` is stopped: `null`, an
+ * absent value, or an `unobserved` marker that names `running` is unknown,
+ * never one of the two.
+ */
+export function consoleMobStatus(snapshot: unknown): ConsoleMobStatus {
+  const record = snapshot && typeof snapshot === "object" ? snapshot as Record<string, unknown> : null;
+  if (!record) {
+    return "unknown";
+  }
+  if (normalizeUnobservedFacts(record.unobserved)?.fields.includes("running")) {
+    return "unknown";
+  }
+  if (record.running === true) {
+    return "running";
+  }
+  if (record.running === false) {
+    return "stopped";
+  }
+  return "unknown";
+}
+
 export function normalizeIdentityInspectViewState(value: unknown): IdentityInspectViewState | null {
   const record = value && typeof value === "object" ? value as Record<string, unknown> : null;
   const statusRow = normalizeIdentityStatusRow(value);
