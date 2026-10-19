@@ -122,6 +122,6 @@ promised remote round-trip test must exist, and the "Phase 1" docs must be finis
 Cross-mob comms and remote mobs must work.
 
 Method lesson recorded: a "no consumer" verdict is only as good as the consumer census.
-The downstream questions went to the two fleets on the bus; consumers not on the bus
-(desktop products) were invisible. Future capability-cut proposals must enumerate
+The downstream questions reached only the two consumer teams already in the review channel;
+consumers outside that channel (desktop products) were invisible. Future capability-cut proposals must enumerate
 consumers from the OWNER, not only from the operators the auditor already knows.
