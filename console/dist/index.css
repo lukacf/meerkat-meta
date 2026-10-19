@@ -9279,6 +9279,27 @@ svg[data-svg=fit],
   font-size: 12.5px;
   font-family: var(--mono);
 }
+.panel-status-row {
+  flex: none;
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: 24px;
+  min-width: 0;
+  overflow: hidden;
+}
+.gating > .panel-status-row {
+  padding: 0 24px;
+}
+.panel-status-row__error {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--crit);
+  font-family: var(--mono);
+  font-size: 11px;
+}
 .gating__policies {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
@@ -12028,6 +12049,7 @@ svg[data-svg=fit],
   gap: 8px;
 }
 .memory-tile {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -12043,6 +12065,15 @@ svg[data-svg=fit],
 }
 .memory-tile:hover {
   border-color: var(--accent);
+}
+.memory-tile__recheck {
+  position: absolute;
+  top: 9px;
+  right: 10px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-faint);
+  pointer-events: none;
 }
 .memory-tile__label {
   font-family: var(--disp);
@@ -12255,8 +12286,9 @@ svg[data-svg=fit],
 }
 .workgraph__head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 6px 10px;
 }
 .workgraph__head h3 {
   margin: 0;
@@ -12269,13 +12301,6 @@ svg[data-svg=fit],
 }
 .workgraph__spacer {
   flex: 1 1 auto;
-}
-.workgraph__error {
-  padding: 6px 10px;
-  border: 1px solid var(--err, #d4564e);
-  border-radius: var(--r-sm);
-  color: var(--err, #d4564e);
-  font-size: 11.5px;
 }
 .workgraph__section {
   border: 1px solid var(--line);

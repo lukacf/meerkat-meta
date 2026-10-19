@@ -28568,11 +28568,11 @@ function addChildren(props, children) {
     }
   }
 }
-function productionCreate(_2, jsx61, jsxs55) {
+function productionCreate(_2, jsx62, jsxs55) {
   return create2;
   function create2(_3, type, props, key) {
     const isStaticChildren = Array.isArray(props.children);
-    const fn = isStaticChildren ? jsxs55 : jsx61;
+    const fn = isStaticChildren ? jsxs55 : jsx62;
     return key ? fn(type, props, key) : fn(type, props);
   }
 }
@@ -51675,7 +51675,18 @@ function AccessPanel({
 
 // src/panels/MemoryPanel.tsx
 var import_react33 = __toESM(require("react"));
+
+// src/panels/PanelStatusRow.tsx
 var import_jsx_runtime47 = require("react/jsx-runtime");
+function PanelStatusRow({
+  error: error48,
+  testId
+}) {
+  return /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "panel-status-row", children: error48 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "panel-status-row__error", role: "alert", title: error48, "data-testid": testId, children: error48 }) : null });
+}
+
+// src/panels/MemoryPanel.tsx
+var import_jsx_runtime48 = require("react/jsx-runtime");
 var MEMORY_TABS = [
   "holdings",
   "records",
@@ -52154,9 +52165,9 @@ function computeVerdictTiles(inputs) {
         violations.length > 0 ? "".concat(violations.length, " violation").concat(violations.length === 1 ? "" : "s") : "0 violations",
         walk.complete ? "checked ".concat(walk.checked, "/").concat(walk.checked) : "checked first ".concat(walk.checked, " \u2014 partial (cap ").concat(LATTICE_WALK_MAX_RECORDS, ")"),
         "invariant (b) needs ever_quarantined (surface 2)",
-        ...inputs.latticeRunning ? ["re-checking\u2026"] : [],
         ...violations.length > VERDICT_EVIDENCE_MAX ? ["+".concat(violations.length - VERDICT_EVIDENCE_MAX, " more violations")] : []
       ],
+      rechecking: inputs.latticeRunning === true,
       targetTab: "records",
       evidence: violations.slice(0, VERDICT_EVIDENCE_MAX)
     });
@@ -52538,13 +52549,13 @@ function quarantineDecisionErrorText(error48) {
   return errorMessage(error48);
 }
 function Chip({ label, tone }) {
-  return /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "chip memory-chip", "data-tone": tone || "neutral", children: label });
+  return /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "chip memory-chip", "data-tone": tone || "neutral", children: label });
 }
 function SectionNote({
   children,
   testid
 }) {
-  return /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-note", "data-testid": testid, children });
+  return /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-note", "data-testid": testid, children });
 }
 function RecordRow({
   record: record8,
@@ -52552,7 +52563,7 @@ function RecordRow({
   onSelect
 }) {
   const utility = utilityMode ? recordUtility(record8) : null;
-  return /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+  return /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
     "button",
     {
       type: "button",
@@ -52560,15 +52571,15 @@ function RecordRow({
       "data-testid": "memory-record:".concat(record8.id),
       onClick: onSelect,
       children: [
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__title", children: record8.title || record8.id }),
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__meta", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: record8.kind }),
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: trustLabel(record8.trust), tone: trustTone(record8.trust) }),
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: statusLabel(record8.status), tone: statusTone(record8.status) }),
-          utility?.dead ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: "DEAD", tone: "warning" }) : null,
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__age", children: relativeAge(record8.updated_at_ms) })
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__title", children: record8.title || record8.id }),
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__meta", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: record8.kind }),
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: trustLabel(record8.trust), tone: trustTone(record8.trust) }),
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: statusLabel(record8.status), tone: statusTone(record8.status) }),
+          utility?.dead ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: "DEAD", tone: "warning" }) : null,
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__age", children: relativeAge(record8.updated_at_ms) })
         ] }),
-        utility ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__meta memory-row__utility", children: utilityLine(record8) }) : null
+        utility ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__meta memory-row__utility", children: utilityLine(record8) }) : null
       ]
     }
   );
@@ -52599,9 +52610,9 @@ function QuarantineDecisionBlock({
       setPending(null);
     }
   }
-  return /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-detail__section", "data-testid": "memory-quarantine-decide", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-detail__label", children: "Review" }),
-    /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-detail__line", children: [
+  return /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-detail__section", "data-testid": "memory-quarantine-decide", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-detail__label", children: "Review" }),
+    /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-detail__line", children: [
       "Release makes this an active agent_observed record of",
       " ",
       record8.scope.scope === "identity" ? record8.scope.identity : "this scope",
@@ -52609,7 +52620,7 @@ function QuarantineDecisionBlock({
       realm,
       "); it stays capped below verified trust because it was quarantined. Tombstone discards it."
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+    /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
       "input",
       {
         className: "memory-filterbar__input",
@@ -52620,8 +52631,8 @@ function QuarantineDecisionBlock({
         onChange: (event) => setRationale(event.target.value)
       }
     ),
-    /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-detail__line", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+    /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-detail__line", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
         "button",
         {
           type: "button",
@@ -52633,7 +52644,7 @@ function QuarantineDecisionBlock({
         }
       ),
       " ",
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
         "button",
         {
           type: "button",
@@ -52645,7 +52656,7 @@ function QuarantineDecisionBlock({
         }
       )
     ] }),
-    notice ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", "data-testid": "memory-quarantine-error", children: notice }) : null
+    notice ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", "data-testid": "memory-quarantine-error", children: notice }) : null
   ] });
 }
 function BiographyView({
@@ -52681,16 +52692,16 @@ function BiographyView({
       lines
     });
   }
-  return /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-detail", "data-testid": "memory-detail", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-detail__head", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("button", { type: "button", className: "memory-back", onClick: onBack, "data-testid": "memory-detail-back", children: "\u2190 Back" }),
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("h3", { children: record8.title || record8.id }),
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-detail__chips", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: record8.kind }),
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: trustLabel(record8.trust), tone: trustTone(record8.trust) }),
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: statusLabel(record8.status), tone: statusTone(record8.status) })
+  return /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-detail", "data-testid": "memory-detail", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-detail__head", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("button", { type: "button", className: "memory-back", onClick: onBack, "data-testid": "memory-detail-back", children: "\u2190 Back" }),
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("h3", { children: record8.title || record8.id }),
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-detail__chips", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: record8.kind }),
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: trustLabel(record8.trust), tone: trustTone(record8.trust) }),
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: statusLabel(record8.status), tone: statusTone(record8.status) })
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
         CopyButton,
         {
           text: JSON.stringify(record8, null, 2),
@@ -52699,10 +52710,10 @@ function BiographyView({
         }
       )
     ] }),
-    record8.description ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("p", { className: "memory-detail__description", children: record8.description }) : null,
-    /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("pre", { className: "memory-detail__body", "data-testid": "memory-detail-body", children: record8.body }),
-    decisionNotice ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-note", "data-testid": "memory-quarantine-outcome", children: decisionNotice }) : null,
-    onDecideQuarantine && canDecideQuarantinedRecord(record8) ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+    record8.description ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("p", { className: "memory-detail__description", children: record8.description }) : null,
+    /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("pre", { className: "memory-detail__body", "data-testid": "memory-detail-body", children: record8.body }),
+    decisionNotice ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-note", "data-testid": "memory-quarantine-outcome", children: decisionNotice }) : null,
+    onDecideQuarantine && canDecideQuarantinedRecord(record8) ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
       QuarantineDecisionBlock,
       {
         realm: detail.realm,
@@ -52711,11 +52722,11 @@ function BiographyView({
       },
       record8.id
     ) : null,
-    record8.tags && record8.tags.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__tags", children: record8.tags.map((tag) => /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: tag, tone: "muted" }, tag)) }) : null,
-    /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-detail__section", "data-testid": "memory-detail-born", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-detail__label", children: "Born" }),
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: authorLine(provenance?.author) }),
-      evidence.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-evidence", children: evidence.map((ref, index2) => /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+    record8.tags && record8.tags.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__tags", children: record8.tags.map((tag) => /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: tag, tone: "muted" }, tag)) }) : null,
+    /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-detail__section", "data-testid": "memory-detail-born", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-detail__label", children: "Born" }),
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: authorLine(provenance?.author) }),
+      evidence.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-evidence", children: evidence.map((ref, index2) => /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
         "button",
         {
           type: "button",
@@ -52728,21 +52739,21 @@ function BiographyView({
         },
         "ev-".concat(index2)
       )) }) : null,
-      evidenceState ? evidenceState.status === "loading" ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "Loading transcript\u2026" }) : evidenceState.status === "not-found" ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", "data-testid": "memory-evidence-degraded", children: "Session not found in the recent timeline window \u2014 evidence reference retained as label only." }) : evidenceState.status === "empty-range" ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", "data-testid": "memory-evidence-empty", children: "Session found, but no message entries in the evidence range \u2014 the window is approximate against the console timeline." }) : /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-excerpt", "data-testid": "memory-evidence-excerpt", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line memory-excerpt__note", children: "Approximate window against the console timeline (evidence indexes a session generation)." }),
-        evidenceState.lines.map((line) => /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-excerpt__line", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-excerpt__speaker", children: line.speaker }),
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-excerpt__text", children: line.text })
+      evidenceState ? evidenceState.status === "loading" ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "Loading transcript\u2026" }) : evidenceState.status === "not-found" ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", "data-testid": "memory-evidence-degraded", children: "Session not found in the recent timeline window \u2014 evidence reference retained as label only." }) : evidenceState.status === "empty-range" ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", "data-testid": "memory-evidence-empty", children: "Session found, but no message entries in the evidence range \u2014 the window is approximate against the console timeline." }) : /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-excerpt", "data-testid": "memory-evidence-excerpt", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line memory-excerpt__note", children: "Approximate window against the console timeline (evidence indexes a session generation)." }),
+        evidenceState.lines.map((line) => /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-excerpt__line", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-excerpt__speaker", children: line.speaker }),
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-excerpt__text", children: line.text })
         ] }, line.id))
       ] }) : null,
-      verification?.checked ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-detail__line memory-detail__verification", children: [
+      verification?.checked ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-detail__line memory-detail__verification", children: [
         "verified: ",
         verification.checked
       ] }) : null
     ] }),
-    lane.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-detail__section", "data-testid": "memory-detail-lineage", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-detail__label", children: "Lineage" }),
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-chain", children: lane.map(({ record: entry, current }) => /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+    lane.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-detail__section", "data-testid": "memory-detail-lineage", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-detail__label", children: "Lineage" }),
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-chain", children: lane.map(({ record: entry, current }) => /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
         "button",
         {
           type: "button",
@@ -52754,18 +52765,18 @@ function BiographyView({
             if (!current) onSelectRecord(realmOfRecord(entry), entry.id);
           },
           children: [
-            /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-chain__marker", children: current ? "\u25CF" : "\u25CB" }),
-            /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-chain__title", children: entry.title || entry.id }),
-            /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: trustLabel(entry.trust), tone: trustTone(entry.trust) }),
-            /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: statusLabel(entry.status), tone: statusTone(entry.status) })
+            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-chain__marker", children: current ? "\u25CF" : "\u25CB" }),
+            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-chain__title", children: entry.title || entry.id }),
+            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: trustLabel(entry.trust), tone: trustTone(entry.trust) }),
+            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: statusLabel(entry.status), tone: statusTone(entry.status) })
           ]
         },
         entry.id
       )) })
     ] }) : null,
-    /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-detail__section", "data-testid": "memory-detail-life", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-detail__label", children: "Life" }),
-      usage ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-detail__line", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-detail__section", "data-testid": "memory-detail-life", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-detail__label", children: "Life" }),
+      usage ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-detail__line", children: [
         "injected ",
         usage.injected_count ?? 0,
         " \xB7 recalled ",
@@ -52773,17 +52784,17 @@ function BiographyView({
         " \xB7 judged useful ",
         usage.judged_useful_count ?? 0,
         usage.last_injected_at_ms ? " \xB7 last injected ".concat(relativeAge(usage.last_injected_at_ms)) : ""
-      ] }) : /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "no usage recorded" }),
-      injections.length > 0 ? injections.map((injection, index2) => /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: injectionLine(injection) }, "inj-".concat(index2))) : /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "no injections recorded for this record" })
+      ] }) : /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "no usage recorded" }),
+      injections.length > 0 ? injections.map((injection, index2) => /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: injectionLine(injection) }, "inj-".concat(index2))) : /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "no injections recorded for this record" })
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-detail__section", "data-testid": "memory-detail-dreams", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-detail__label", children: "Dreams" }),
-      touchingRuns.length > 0 ? touchingRuns.map((run) => /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-detail__line", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-detail__section", "data-testid": "memory-detail-dreams", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-detail__label", children: "Dreams" }),
+      touchingRuns.length > 0 ? touchingRuns.map((run) => /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-detail__line", children: [
         run.run_id,
         " \xB7 ",
         dreamTimeRange(run),
         run.quarantined_ops ? " \xB7 \u26A0 ".concat(run.quarantined_ops, " quarantined") : ""
-      ] }, run.run_id)) : /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "no sampled dream runs reference this record (sample is \u226412 ids per run \u2014 exact history needs the record history[] surface)" })
+      ] }, run.run_id)) : /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "no sampled dream runs reference this record (sample is \u226412 ids per run \u2014 exact history needs the record history[] surface)" })
     ] })
   ] });
 }
@@ -52792,7 +52803,7 @@ function VerdictStrip({
   onOpen,
   onOpenRecord
 }) {
-  return /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-tiles", "data-testid": "memory-verdict-strip", children: tiles.map((tile) => /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+  return /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-tiles", "data-testid": "memory-verdict-strip", children: tiles.map((tile) => /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
     "div",
     {
       className: "memory-tile",
@@ -52805,10 +52816,11 @@ function VerdictStrip({
         if (event.key === "Enter" || event.key === " ") onOpen(tile);
       },
       children: [
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-tile__label", children: tile.label }),
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-tile__status", "data-status": tile.status, children: verdictStatusLabel(tile.status) }),
-        tile.lines.map((line, index2) => /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-tile__line", children: line }, "l-".concat(index2))),
-        (tile.evidence || []).map((violation) => /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-tile__label", children: tile.label }),
+        tile.rechecking ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-tile__recheck", "data-testid": "memory-verdict-recheck:".concat(tile.id), children: "re-checking\u2026" }) : null,
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-tile__status", "data-status": tile.status, children: verdictStatusLabel(tile.status) }),
+        tile.lines.map((line, index2) => /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-tile__line", children: line }, "l-".concat(index2))),
+        (tile.evidence || []).map((violation) => /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
           "button",
           {
             type: "button",
@@ -52849,10 +52861,10 @@ function MemoryLiveStrip({
     setFrozen(null);
     listRef.current?.scrollTo?.({ top: 0 });
   }
-  return /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-group memory-live", "data-testid": "memory-live-strip", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-group__label", children: [
+  return /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-group memory-live", "data-testid": "memory-live-strip", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-group__label", children: [
       "Live memory events (in-memory ring \u2014 lossy)",
-      behind > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+      behind > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
         "button",
         {
           type: "button",
@@ -52866,14 +52878,14 @@ function MemoryLiveStrip({
         }
       ) : null
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-live__list", ref: listRef, onScroll: handleScroll, children: [
-      shown.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "No memory events in the ring." }) : shown.map((frame) => {
+    /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-live__list", ref: listRef, onScroll: handleScroll, children: [
+      shown.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "No memory events in the ring." }) : shown.map((frame) => {
         const data = frame.data && typeof frame.data === "object" ? frame.data : {};
         const pivot = memoryFramePivot(frame);
-        return /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-live__row", "data-testid": "memory-live-row:".concat(frame.id), children: [
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__age", children: relativeAge(frame.timestampMs) }),
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-live__text", children: describeMemoryTimelineEvent2(frame.event, data) }),
-          pivot ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+        return /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-live__row", "data-testid": "memory-live-row:".concat(frame.id), children: [
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__age", children: relativeAge(frame.timestampMs) }),
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-live__text", children: describeMemoryTimelineEvent2(frame.event, data) }),
+          pivot ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
             "button",
             {
               type: "button",
@@ -52885,7 +52897,7 @@ function MemoryLiveStrip({
           ) : null
         ] }, frame.id);
       }),
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-live__seam", "data-testid": "memory-live-seam", children: "\u2014 ring history starts here \u2014" })
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-live__seam", "data-testid": "memory-live-seam", children: "\u2014 ring history starts here \u2014" })
     ] })
   ] });
 }
@@ -52964,11 +52976,14 @@ function MemoryPanel({
     latticeRanForRef.current = fingerprint;
     setLatticeRunning(true);
     let cancelled = false;
+    let covered = false;
     void runLatticeWalk((params) => onQueryRecords(params), {
       realms,
       isCancelled: () => cancelled
     }).then((result) => {
-      if (!cancelled) setLattice(result);
+      if (cancelled) return;
+      covered = result !== null;
+      setLattice(result);
     }).catch(() => {
       if (!cancelled) setLattice(null);
     }).finally(() => {
@@ -52976,7 +52991,7 @@ function MemoryPanel({
     });
     return () => {
       cancelled = true;
-      if (latticeRanForRef.current === fingerprint) {
+      if (!covered && latticeRanForRef.current === fingerprint) {
         latticeRanForRef.current = null;
       }
     };
@@ -53045,9 +53060,9 @@ function MemoryPanel({
     setTab(tile.targetTab);
   }
   if (unavailable) {
-    return /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "gating memory-panel", "data-testid": "memory-panel", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "gating__head", children: /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("h2", { children: "Memory" }) }),
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "gating__empty", "data-testid": "memory-unavailable", children: "The memory panel is not configured on this runtime." })
+    return /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "gating memory-panel", "data-testid": "memory-panel", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "gating__head", children: /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("h2", { children: "Memory" }) }),
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "gating__empty", "data-testid": "memory-unavailable", children: "The memory panel is not configured on this runtime." })
     ] });
   }
   const listView = buildRecordsListView({
@@ -53058,18 +53073,17 @@ function MemoryPanel({
     sortMode
   });
   const quarantineCount = quarantineRecords.length + pendingPromotions.length;
-  return /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "gating memory-panel", "data-testid": "memory-panel", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "gating__head", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("h2", { children: "Memory" }),
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("p", { children: [
+  return /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "gating memory-panel", "data-testid": "memory-panel", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "gating__head", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("h2", { children: "Memory" }),
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("p", { children: [
         records.length,
         " records",
         realms.length > 1 ? " \xB7 ".concat(realms.length, " realms") : ""
       ] })
     ] }),
-    error48 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "gating__empty", "data-testid": "memory-error", children: error48 }) : null,
-    /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "gating__tabs", children: [
-      MEMORY_TABS.map((candidate) => /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+    /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "gating__tabs", children: [
+      MEMORY_TABS.map((candidate) => /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
         "button",
         {
           className: "gating__tab ".concat(tab2 === candidate ? "is-active" : ""),
@@ -53077,13 +53091,13 @@ function MemoryPanel({
           "data-testid": "memory-tab:".concat(candidate),
           children: [
             memoryTabLabel(candidate),
-            candidate === "pipeline" && quarantineCount > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "n", children: quarantineCount }) : null,
-            candidate === "dreams" && dreams.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "n", children: dreams.length }) : null
+            candidate === "pipeline" && quarantineCount > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "n", children: quarantineCount }) : null,
+            candidate === "dreams" && dreams.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "n", children: dreams.length }) : null
           ]
         },
         candidate
       )),
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
         "button",
         {
           className: "gating__tab memory-tab-alias",
@@ -53094,11 +53108,12 @@ function MemoryPanel({
           children: "Quarantine"
         }
       ),
-      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("button", { className: "gating__tab", onClick: onRefresh, "data-testid": "memory-refresh", children: "Refresh" })
+      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("button", { className: "gating__tab", onClick: onRefresh, "data-testid": "memory-refresh", children: "Refresh" })
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "gating__list memory-panel__body", children: [
-      tab2 === "holdings" ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-groups", "data-testid": "memory-holdings", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+    /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(PanelStatusRow, { error: error48, testId: "memory-error" }),
+    /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "gating__list memory-panel__body", children: [
+      tab2 === "holdings" ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-groups", "data-testid": "memory-holdings", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
           VerdictStrip,
           {
             tiles,
@@ -53106,11 +53121,11 @@ function MemoryPanel({
             onOpenRecord: (realm, memoryId) => onSelectRecord(realm, memoryId)
           }
         ),
-        recordsDenied ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(SectionNote, { testid: "memory-holdings-denied", children: "Records are not readable by this principal (access denied)." }) : /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-group", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-group__label", children: overviewScopes ? "Scopes \u2014 store totals (panel/overview)".concat(overview?.floors ? " \xB7 floors ".concat(overview.floors.records ?? "?", " records / ").concat(typeof overview.floors.bytes === "number" ? formatBytes(overview.floors.bytes) : "?", " per scope") : "") : "Scopes \u2014 counts over the ".concat(records.length, " loaded records (full totals need panel/overview)") }),
-          overviewScopes ? overviewScopes.length === 0 && !operatorScopeDenied && !mobScopeDenied ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "gating__empty", children: "No memory records yet." }) : overviewScopes.map((scope) => {
+        recordsDenied ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(SectionNote, { testid: "memory-holdings-denied", children: "Records are not readable by this principal (access denied)." }) : /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-group", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-group__label", children: overviewScopes ? "Scopes \u2014 store totals (panel/overview)".concat(overview?.floors ? " \xB7 floors ".concat(overview.floors.records ?? "?", " records / ").concat(typeof overview.floors.bytes === "number" ? formatBytes(overview.floors.bytes) : "?", " per scope") : "") : "Scopes \u2014 counts over the ".concat(records.length, " loaded records (full totals need panel/overview)") }),
+          overviewScopes ? overviewScopes.length === 0 && !operatorScopeDenied && !mobScopeDenied ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "gating__empty", children: "No memory records yet." }) : overviewScopes.map((scope) => {
             const key = overviewScopeKey(scope);
-            return /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+            return /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
               "button",
               {
                 type: "button",
@@ -53118,20 +53133,20 @@ function MemoryPanel({
                 "data-testid": "memory-holdings-scope:".concat(key),
                 onClick: () => openRecordsFiltered(filterForOverviewScope(scope)),
                 children: [
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__title", children: overviewScopeLabel(scope) }),
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__meta", children: [
-                    /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: "".concat(scope.active ?? 0, " active"), tone: "positive" }),
-                    (scope.quarantined ?? 0) > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: "".concat(scope.quarantined, " quarantined"), tone: "warning" }) : null,
-                    (scope.superseded ?? 0) > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: "".concat(scope.superseded, " superseded"), tone: "muted" }) : null,
-                    (scope.tombstoned ?? 0) > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: "".concat(scope.tombstoned, " tombstoned"), tone: "muted" }) : null,
-                    scope.floor_pressure ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { "data-testid": "memory-holdings-floor:".concat(key), children: /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: "FLOOR PRESSURE", tone: "warning" }) }) : null,
-                    /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__age", children: formatBytes(scope.body_bytes ?? 0) })
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__title", children: overviewScopeLabel(scope) }),
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__meta", children: [
+                    /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: "".concat(scope.active ?? 0, " active"), tone: "positive" }),
+                    (scope.quarantined ?? 0) > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: "".concat(scope.quarantined, " quarantined"), tone: "warning" }) : null,
+                    (scope.superseded ?? 0) > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: "".concat(scope.superseded, " superseded"), tone: "muted" }) : null,
+                    (scope.tombstoned ?? 0) > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: "".concat(scope.tombstoned, " tombstoned"), tone: "muted" }) : null,
+                    scope.floor_pressure ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { "data-testid": "memory-holdings-floor:".concat(key), children: /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: "FLOOR PRESSURE", tone: "warning" }) }) : null,
+                    /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__age", children: formatBytes(scope.body_bytes ?? 0) })
                   ] })
                 ]
               },
               key
             );
-          }) : overviewRows.length === 0 && !operatorScopeDenied && !mobScopeDenied ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "gating__empty", children: "No memory records yet." }) : overviewRows.map((row) => /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+          }) : overviewRows.length === 0 && !operatorScopeDenied && !mobScopeDenied ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "gating__empty", children: "No memory records yet." }) : overviewRows.map((row) => /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
             "button",
             {
               type: "button",
@@ -53139,71 +53154,71 @@ function MemoryPanel({
               "data-testid": "memory-holdings-scope:".concat(row.key),
               onClick: () => openRecordsFiltered(filterForScope(row.scope)),
               children: [
-                /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__title", children: row.label }),
-                /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__meta", children: [
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: "".concat(row.active, " active"), tone: "positive" }),
-                  row.quarantined > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: "".concat(row.quarantined, " quarantined"), tone: "warning" }) : null,
-                  row.superseded > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: "".concat(row.superseded, " superseded"), tone: "muted" }) : null,
-                  row.tombstoned > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: "".concat(row.tombstoned, " tombstoned"), tone: "muted" }) : null,
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__age", children: formatBytes(row.bytes) })
+                /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__title", children: row.label }),
+                /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__meta", children: [
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: "".concat(row.active, " active"), tone: "positive" }),
+                  row.quarantined > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: "".concat(row.quarantined, " quarantined"), tone: "warning" }) : null,
+                  row.superseded > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: "".concat(row.superseded, " superseded"), tone: "muted" }) : null,
+                  row.tombstoned > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: "".concat(row.tombstoned, " tombstoned"), tone: "muted" }) : null,
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__age", children: formatBytes(row.bytes) })
                 ] }),
-                row.trustMix ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__meta memory-row__reason", children: row.trustMix }) : null
+                row.trustMix ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__meta memory-row__reason", children: row.trustMix }) : null
               ]
             },
             row.key
           )),
-          mobScopeDenied ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+          mobScopeDenied ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
             "div",
             {
               className: "memory-row memory-row--static memory-scope-row",
               "data-testid": "memory-holdings-scope-denied:mob",
               children: [
-                /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__title", children: "Mob scopes" }),
-                /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__meta", children: [
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: "no grant", tone: "warning" }),
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__reason", children: "requires mob.memory.read" })
+                /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__title", children: "Mob scopes" }),
+                /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__meta", children: [
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: "no grant", tone: "warning" }),
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__reason", children: "requires mob.memory.read" })
                 ] })
               ]
             }
           ) : null,
-          operatorScopeDenied ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+          operatorScopeDenied ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
             "div",
             {
               className: "memory-row memory-row--static memory-scope-row",
               "data-testid": "memory-holdings-scope-denied:operator",
               children: [
-                /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__title", children: "Operator scope" }),
-                /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__meta", children: [
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: "no grant", tone: "warning" }),
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__reason", children: "requires operator.memory.read" })
+                /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__title", children: "Operator scope" }),
+                /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__meta", children: [
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: "no grant", tone: "warning" }),
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__reason", children: "requires operator.memory.read" })
                 ] })
               ]
             }
           ) : null
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-group", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-group__label", children: "In transit" }),
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: dreams.length > 0 ? "Last dream ".concat(dreamTimeRange(dreams[0]), " \xB7 ").concat(dreams[0].ops ?? "\u2014", " ops") : dreamsDenied ? "Dream audit: no grant" : "No dream runs recorded yet" }),
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: canReviewQuarantine ? "Quarantine queue ".concat(quarantineRecords.length, " \xB7 pending gate ").concat(pendingPromotions.length) : "Quarantine queue: requires memory.quarantine.review" }),
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: proposalsDenied ? "Proposals: no grant" : "Proposals: ".concat(proposals.length, " pending").concat(proposals.filter((proposal) => proposal.tainted).length > 0 ? " \xB7 ".concat(proposals.filter((proposal) => proposal.tainted).length, " held (taint)") : "") }),
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "Health (taint \xB7 budgets \xB7 cursors): needs meta/memory/panel/health (surface 8)" })
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-group", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-group__label", children: "In transit" }),
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: dreams.length > 0 ? "Last dream ".concat(dreamTimeRange(dreams[0]), " \xB7 ").concat(dreams[0].ops ?? "\u2014", " ops") : dreamsDenied ? "Dream audit: no grant" : "No dream runs recorded yet" }),
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: canReviewQuarantine ? "Quarantine queue ".concat(quarantineRecords.length, " \xB7 pending gate ").concat(pendingPromotions.length) : "Quarantine queue: requires memory.quarantine.review" }),
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: proposalsDenied ? "Proposals: no grant" : "Proposals: ".concat(proposals.length, " pending").concat(proposals.filter((proposal) => proposal.tainted).length > 0 ? " \xB7 ".concat(proposals.filter((proposal) => proposal.tainted).length, " held (taint)") : "") }),
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "Health (taint \xB7 budgets \xB7 cursors): needs meta/memory/panel/health (surface 8)" })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-group", "data-testid": "memory-harvests", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-group__label", children: "Harvest queue \u2014 retired identities awaiting the exit-interview dream" }),
-          harvestsDenied ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "Harvest queue: no grant." }) : harvests.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "No pending harvests." }) : harvests.map((harvest, index2) => /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-group", "data-testid": "memory-harvests", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-group__label", children: "Harvest queue \u2014 retired identities awaiting the exit-interview dream" }),
+          harvestsDenied ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "Harvest queue: no grant." }) : harvests.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "No pending harvests." }) : harvests.map((harvest, index2) => /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
             "div",
             {
               className: "memory-row memory-row--static",
               "data-testid": "memory-harvest:".concat(harvest.identity),
               children: [
-                /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__title", children: harvest.identity }),
-                /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__meta", children: [
-                  harvest.cause ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: harvest.cause, tone: "muted" }) : null,
-                  harvest.session_key ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__reason", children: [
+                /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__title", children: harvest.identity }),
+                /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__meta", children: [
+                  harvest.cause ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: harvest.cause, tone: "muted" }) : null,
+                  harvest.session_key ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__reason", children: [
                     "session ",
                     harvest.session_key
                   ] }) : null,
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__age", children: [
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__age", children: [
                     "retired ",
                     relativeAge(harvest.retired_at_ms)
                   ] })
@@ -53214,7 +53229,7 @@ function MemoryPanel({
           ))
         ] })
       ] }) : null,
-      tab2 === "records" ? detail ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+      tab2 === "records" ? detail ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
         BiographyView,
         {
           detail,
@@ -53231,11 +53246,11 @@ function MemoryPanel({
           onDecideQuarantine: decideQuarantine,
           decisionNotice
         }
-      ) : detailLoading ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "gating__empty", children: "Loading record\u2026" }) : /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-groups", children: [
-        onQueryRecords ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-filterbar", "data-testid": "memory-filter", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("label", { children: [
+      ) : detailLoading ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "gating__empty", children: "Loading record\u2026" }) : /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-groups", children: [
+        onQueryRecords ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-filterbar", "data-testid": "memory-filter", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("label", { children: [
             "scope",
-            /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+            /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
               "select",
               {
                 value: filter.scope || "",
@@ -53245,18 +53260,18 @@ function MemoryPanel({
                   scope: event.target.value || void 0
                 }),
                 children: [
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("option", { value: "", children: "all" }),
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("option", { value: "identity", children: "identity" }),
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("option", { value: "mob", children: "mob" }),
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("option", { value: "operator", children: "operator" }),
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("option", { value: "realm", children: "realm" })
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("option", { value: "", children: "all" }),
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("option", { value: "identity", children: "identity" }),
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("option", { value: "mob", children: "mob" }),
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("option", { value: "operator", children: "operator" }),
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("option", { value: "realm", children: "realm" })
                 ]
               }
             )
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("label", { children: [
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("label", { children: [
             "identity / key",
-            /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
               "input",
               {
                 value: filter.key || "",
@@ -53272,9 +53287,9 @@ function MemoryPanel({
               }
             )
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("label", { children: [
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("label", { children: [
             "status",
-            /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+            /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
               "select",
               {
                 value: filter.status || "",
@@ -53284,18 +53299,18 @@ function MemoryPanel({
                   status: event.target.value || void 0
                 }),
                 children: [
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("option", { value: "", children: "all" }),
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("option", { value: "active", children: "active" }),
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("option", { value: "quarantined", children: "quarantined" }),
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("option", { value: "superseded", children: "superseded" }),
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("option", { value: "tombstoned", children: "tombstoned" })
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("option", { value: "", children: "all" }),
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("option", { value: "active", children: "active" }),
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("option", { value: "quarantined", children: "quarantined" }),
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("option", { value: "superseded", children: "superseded" }),
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("option", { value: "tombstoned", children: "tombstoned" })
                 ]
               }
             )
           ] }),
-          realms.length > 1 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("label", { children: [
+          realms.length > 1 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("label", { children: [
             "realm",
-            /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+            /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
               "select",
               {
                 value: filter.realm || "",
@@ -53305,28 +53320,28 @@ function MemoryPanel({
                   realm: event.target.value || void 0
                 }),
                 children: [
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("option", { value: "", children: "all (merged page)" }),
-                  realms.map((realm) => /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("option", { value: realm, children: realm }, realm))
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("option", { value: "", children: "all (merged page)" }),
+                  realms.map((realm) => /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("option", { value: realm, children: realm }, realm))
                 ]
               }
             )
           ] }) : null,
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("label", { children: [
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("label", { children: [
             "sort",
-            /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+            /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
               "select",
               {
                 value: sortMode,
                 "data-testid": "memory-sort",
                 onChange: (event) => setSortMode(event.target.value === "utility" ? "utility" : "recency"),
                 children: [
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("option", { value: "recency", children: "recency" }),
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("option", { value: "utility", children: "utility" })
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("option", { value: "recency", children: "recency" }),
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("option", { value: "utility", children: "utility" })
                 ]
               }
             )
           ] }),
-          hasActiveFilter(filter) ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+          hasActiveFilter(filter) ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
             "button",
             {
               type: "button",
@@ -53337,16 +53352,16 @@ function MemoryPanel({
             }
           ) : null
         ] }) : null,
-        sortMode === "utility" ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(SectionNote, { testid: "memory-utility-note", children: [
+        sortMode === "utility" ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(SectionNote, { testid: "memory-utility-note", children: [
           "Utility mode \u2014 bytes-spent is approximated as injected_count \xD7 body_bytes until panel/injections lands. DEAD = injected \u2265 ",
           DEAD_INJECTION_THRESHOLD,
           ", never judged useful."
         ] }) : null,
-        realms.length > 1 && !filter.realm?.trim() ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(SectionNote, { testid: "memory-multi-realm-note", children: "Multi-realm view is a single merged page (keyset paging is per-realm) \u2014 pick a realm above to page through its records." }) : null,
-        pageLoading ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "gating__empty", children: "Loading records\u2026" }) : null,
-        !pageLoading && listView.records.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "gating__empty", "data-testid": "memory-records-empty", children: recordsDenied || listView.denied ? "Records: no grant." : "No memory records yet." }) : null,
-        !pageLoading && listView.denied && listView.records.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(SectionNote, { testid: "memory-records-denied-note", children: "Further pages: no grant \u2014 the continuation of this query was denied for this principal." }) : null,
-        !pageLoading && listView.records.length > 0 ? listView.mode === "flat" ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-group", children: listView.records.map((record8) => /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+        realms.length > 1 && !filter.realm?.trim() ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(SectionNote, { testid: "memory-multi-realm-note", children: "Multi-realm view is a single merged page (keyset paging is per-realm) \u2014 pick a realm above to page through its records." }) : null,
+        pageLoading ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "gating__empty", children: "Loading records\u2026" }) : null,
+        !pageLoading && listView.records.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "gating__empty", "data-testid": "memory-records-empty", children: recordsDenied || listView.denied ? "Records: no grant." : "No memory records yet." }) : null,
+        !pageLoading && listView.denied && listView.records.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(SectionNote, { testid: "memory-records-denied-note", children: "Further pages: no grant \u2014 the continuation of this query was denied for this principal." }) : null,
+        !pageLoading && listView.records.length > 0 ? listView.mode === "flat" ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-group", children: listView.records.map((record8) => /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
           RecordRow,
           {
             record: record8,
@@ -53354,9 +53369,9 @@ function MemoryPanel({
             onSelect: () => onSelectRecord(realmOfRecord(record8), record8.id)
           },
           record8.id
-        )) }) : listView.groups.map((group) => /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-group", "data-testid": "memory-group:".concat(group.key), children: [
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-group__label", children: group.label }),
-          group.records.map((record8) => /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+        )) }) : listView.groups.map((group) => /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-group", "data-testid": "memory-group:".concat(group.key), children: [
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-group__label", children: group.label }),
+          group.records.map((record8) => /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
             RecordRow,
             {
               record: record8,
@@ -53365,7 +53380,7 @@ function MemoryPanel({
             record8.id
           ))
         ] }, group.key)) : null,
-        listView.cursor && onQueryRecords ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+        listView.cursor && onQueryRecords ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
           "button",
           {
             type: "button",
@@ -53377,23 +53392,23 @@ function MemoryPanel({
           }
         ) : null
       ] }) : null,
-      tab2 === "knowledge" ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-groups", "data-testid": "memory-knowledge", children: [
-        identities.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "gating__empty", children: recordsDenied ? "Records: no grant." : "No identity-scoped records loaded yet." }) : /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(import_jsx_runtime47.Fragment, { children: [
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-filterbar", children: /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("label", { children: [
+      tab2 === "knowledge" ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-groups", "data-testid": "memory-knowledge", children: [
+        identities.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "gating__empty", children: recordsDenied ? "Records: no grant." : "No identity-scoped records loaded yet." }) : /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(import_jsx_runtime48.Fragment, { children: [
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-filterbar", children: /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("label", { children: [
             "identity",
-            /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
               "select",
               {
                 value: selectedIdentity,
                 "data-testid": "memory-knowledge-identity",
                 onChange: (event) => setKnowledgeIdentity(event.target.value),
-                children: identities.map((identity) => /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("option", { value: identity, children: identity }, identity))
+                children: identities.map((identity) => /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("option", { value: identity, children: identity }, identity))
               }
             )
           ] }) }),
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-group", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-group__label", children: "Composition (scope union over loaded records)" }),
-            knowledgeComposition(records, selectedIdentity).map((segment) => /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-group", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-group__label", children: "Composition (scope union over loaded records)" }),
+            knowledgeComposition(records, selectedIdentity).map((segment) => /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
               "button",
               {
                 type: "button",
@@ -53401,10 +53416,10 @@ function MemoryPanel({
                 "data-testid": "memory-knowledge-segment:".concat(segment.label),
                 onClick: () => openRecordsFiltered(segment.filter),
                 children: [
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__title", children: segment.label }),
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__meta", children: [
-                    /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: "".concat(segment.count, " records") }),
-                    segment.approximate ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__reason", children: [
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__title", children: segment.label }),
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__meta", children: [
+                    /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: "".concat(segment.count, " records") }),
+                    segment.approximate ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__reason", children: [
                       "all ",
                       segment.label.split(" ")[0],
                       "-scope rows \u2014 membership resolution needs panel/context (surface 10)"
@@ -53416,16 +53431,16 @@ function MemoryPanel({
             ))
           ] })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(SectionNote, { testid: "memory-knowledge-as-injected", children: "AS-INJECTED is unverifiable in phase 1 \u2014 the composed injection block requires meta/memory/panel/context (surface 10)." }),
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-group", "data-testid": "memory-knowledge-history", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-group__label", children: "Injection history (durable ledger, newest first)" }),
-          injectionsDenied ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "Injection history: no grant." }) : annotatedInjections.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "No injection-ledger rows yet." }) : annotatedInjections.map(({ entry, dup }, index2) => /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(SectionNote, { testid: "memory-knowledge-as-injected", children: "AS-INJECTED is unverifiable in phase 1 \u2014 the composed injection block requires meta/memory/panel/context (surface 10)." }),
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-group", "data-testid": "memory-knowledge-history", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-group__label", children: "Injection history (durable ledger, newest first)" }),
+          injectionsDenied ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "Injection history: no grant." }) : annotatedInjections.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "No injection-ledger rows yet." }) : annotatedInjections.map(({ entry, dup }, index2) => /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
             "div",
             {
               className: "memory-row memory-row--static",
               "data-testid": "memory-injection:".concat(index2),
               children: [
-                /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+                /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
                   "button",
                   {
                     type: "button",
@@ -53435,24 +53450,24 @@ function MemoryPanel({
                     children: entry.record_id
                   }
                 ),
-                /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__meta", children: [
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: entry.surface, tone: "muted" }),
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__reason", children: [
+                /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__meta", children: [
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: entry.surface, tone: "muted" }),
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__reason", children: [
                     entry.identity,
                     entry.session_key ? " \xB7 session ".concat(entry.session_key) : ""
                   ] }),
-                  dup ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { "data-testid": "memory-injection-dup:".concat(index2), children: /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: "DUP", tone: "warning" }) }) : null,
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__age", children: relativeAge(entry.at_ms) })
+                  dup ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { "data-testid": "memory-injection-dup:".concat(index2), children: /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: "DUP", tone: "warning" }) }) : null,
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__age", children: relativeAge(entry.at_ms) })
                 ] })
               ]
             },
             "inj-".concat(index2)
           )),
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(SectionNote, { testid: "memory-knowledge-budget", children: "Session budget gauge requires panel/health (deferred to the distinct-affordance design)." })
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(SectionNote, { testid: "memory-knowledge-budget", children: "Session budget gauge requires panel/health (deferred to the distinct-affordance design)." })
         ] })
       ] }) : null,
-      tab2 === "pipeline" ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-quarantine", "data-testid": "memory-pipeline", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-detail__line memory-pipeline__stages", "data-testid": "memory-pipeline-stages", children: [
+      tab2 === "pipeline" ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-quarantine", "data-testid": "memory-pipeline", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-detail__line memory-pipeline__stages", "data-testid": "memory-pipeline-stages", children: [
           "PROPOSED (",
           proposalsDenied ? "no grant" : proposals.length,
           ") \u2500\u25B6 PENDING GATE (",
@@ -53461,63 +53476,63 @@ function MemoryPanel({
           canReviewQuarantine ? quarantineRecords.length : "no grant",
           ")"
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-note", "data-testid": "memory-quarantine-note", children: onDecideQuarantine ? "Open a quarantined record to release or tombstone it. Gated promotions are decided in the Gating inbox; the memory steward's dream decides the rest." : "Read-only here. Verdicts come from the memory steward's dream, the gating flow, and reviewers who hold the quarantine review and memory write grants." }),
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-group", "data-testid": "memory-pipeline-proposals", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-group__label", children: "Proposed \u2014 awaiting a dream verdict (taint captured at propose time)" }),
-          proposalsDenied ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "Proposals: no grant." }) : proposals.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "No pending proposals." }) : proposals.map((proposal) => /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-note", "data-testid": "memory-quarantine-note", children: onDecideQuarantine ? "Open a quarantined record to release or tombstone it. Gated promotions are decided in the Gating inbox; the memory steward's dream decides the rest." : "Read-only here. Verdicts come from the memory steward's dream, the gating flow, and reviewers who hold the quarantine review and memory write grants." }),
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-group", "data-testid": "memory-pipeline-proposals", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-group__label", children: "Proposed \u2014 awaiting a dream verdict (taint captured at propose time)" }),
+          proposalsDenied ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "Proposals: no grant." }) : proposals.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "No pending proposals." }) : proposals.map((proposal) => /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
             "div",
             {
               className: "memory-row memory-row--static",
               "data-testid": "memory-proposal:".concat(proposal.proposal_id),
               children: [
-                /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__title", children: proposal.title || proposal.proposal_id }),
-                /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__meta", children: [
-                  proposal.kind ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: proposal.kind }) : null,
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+                /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__title", children: proposal.title || proposal.proposal_id }),
+                /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__meta", children: [
+                  proposal.kind ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: proposal.kind }) : null,
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
                     Chip,
                     {
                       label: "\u2192 ".concat(proposal.scope_kind).concat(proposal.scope_key ? ":".concat(proposal.scope_key) : ""),
                       tone: "muted"
                     }
                   ),
-                  proposal.tainted ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { "data-testid": "memory-proposal-taint:".concat(proposal.proposal_id), children: /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: "tainted", tone: "warning" }) }) : null,
-                  proposal.status ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+                  proposal.tainted ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { "data-testid": "memory-proposal-taint:".concat(proposal.proposal_id), children: /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: "tainted", tone: "warning" }) }) : null,
+                  proposal.status ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
                     Chip,
                     {
                       label: proposal.status,
                       tone: proposal.status === "held" ? "warning" : "muted"
                     }
                   ) : null,
-                  proposal.author ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__reason", children: proposal.author }) : null,
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__age", children: relativeAge(proposal.created_at_ms) })
+                  proposal.author ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__reason", children: proposal.author }) : null,
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__age", children: relativeAge(proposal.created_at_ms) })
                 ] })
               ]
             },
             "".concat(proposal.realm, ":").concat(proposal.proposal_id)
           ))
         ] }),
-        canReviewQuarantine ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(import_jsx_runtime47.Fragment, { children: [
-          quarantineRecords.length === 0 && pendingPromotions.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "gating__empty", children: "Quarantine queue is empty." }) : null,
-          pendingPromotions.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-group", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-group__label", children: "Pending gated promotions" }),
-            pendingPromotions.map((pending) => /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+        canReviewQuarantine ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(import_jsx_runtime48.Fragment, { children: [
+          quarantineRecords.length === 0 && pendingPromotions.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "gating__empty", children: "Quarantine queue is empty." }) : null,
+          pendingPromotions.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-group", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-group__label", children: "Pending gated promotions" }),
+            pendingPromotions.map((pending) => /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
               "div",
               {
                 className: "memory-row memory-row--static",
                 "data-testid": "memory-pending:".concat(pending.pending_id),
                 children: [
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__title", children: [
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__title", children: [
                     pending.record_id,
                     " \u2192 ",
                     pending.scope_kind,
                     ":",
                     pending.scope_key
                   ] }),
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__meta", children: [
-                    pending.rationale ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__reason", children: pending.rationale }) : null,
-                    pending.status ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: pending.status, tone: "muted" }) : null,
-                    /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__age", children: relativeAge(pending.created_at_ms) }),
-                    onOpenGating ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__meta", children: [
+                    pending.rationale ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__reason", children: pending.rationale }) : null,
+                    pending.status ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: pending.status, tone: "muted" }) : null,
+                    /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__age", children: relativeAge(pending.created_at_ms) }),
+                    onOpenGating ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
                       "button",
                       {
                         type: "button",
@@ -53533,11 +53548,11 @@ function MemoryPanel({
               pending.pending_id
             ))
           ] }) : null,
-          quarantineRecords.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-group", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-group__label", children: "Quarantined records" }),
+          quarantineRecords.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-group", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-group__label", children: "Quarantined records" }),
             quarantineRecords.map((record8) => {
               const reason = record8.status.status === "quarantined" ? record8.status.reason : void 0;
-              return /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+              return /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
                 "button",
                 {
                   type: "button",
@@ -53545,11 +53560,11 @@ function MemoryPanel({
                   "data-testid": "memory-quarantine-record:".concat(record8.id),
                   onClick: () => onSelectRecord(realmOfRecord(record8), record8.id),
                   children: [
-                    /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__title", children: record8.title || record8.id }),
-                    /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__meta", children: [
-                      reason ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__reason", children: reason }) : null,
-                      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: trustLabel(record8.trust), tone: trustTone(record8.trust) }),
-                      /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__age", children: relativeAge(record8.created_at_ms) })
+                    /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__title", children: record8.title || record8.id }),
+                    /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__meta", children: [
+                      reason ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__reason", children: reason }) : null,
+                      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: trustLabel(record8.trust), tone: trustTone(record8.trust) }),
+                      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__age", children: relativeAge(record8.created_at_ms) })
                     ] })
                   ]
                 },
@@ -53557,16 +53572,16 @@ function MemoryPanel({
               );
             })
           ] }) : null
-        ] }) : /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(SectionNote, { testid: "memory-pipeline-no-grant", children: "Quarantine queue: no grant \u2014 rows require memory.quarantine.review." }),
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-group", "data-testid": "memory-review-queue", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-group__label", children: "Review queue \u2014 memories you might want to correct" }),
-          auditVerdictsDenied ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "Review queue: no grant." }) : auditVerdicts.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "Review queue is empty." }) : auditVerdicts.map((verdict) => /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+        ] }) : /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(SectionNote, { testid: "memory-pipeline-no-grant", children: "Quarantine queue: no grant \u2014 rows require memory.quarantine.review." }),
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-group", "data-testid": "memory-review-queue", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-group__label", children: "Review queue \u2014 memories you might want to correct" }),
+          auditVerdictsDenied ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "Review queue: no grant." }) : auditVerdicts.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "Review queue is empty." }) : auditVerdicts.map((verdict) => /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
             "div",
             {
               className: "memory-row memory-row--static",
               "data-testid": "memory-review:".concat(verdict.run_id, ":").concat(verdict.record_id),
               children: [
-                /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+                /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
                   "button",
                   {
                     type: "button",
@@ -53576,19 +53591,19 @@ function MemoryPanel({
                     children: verdict.record_id
                   }
                 ),
-                /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__meta", children: [
-                  verdict.verdict ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: verdict.verdict, tone: "warning" }) : null,
-                  verdict.rationale ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__reason", children: verdict.rationale }) : null,
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__reason", children: verdict.run_id }),
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__age", children: relativeAge(verdict.created_at_ms) })
+                /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__meta", children: [
+                  verdict.verdict ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: verdict.verdict, tone: "warning" }) : null,
+                  verdict.rationale ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__reason", children: verdict.rationale }) : null,
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__reason", children: verdict.run_id }),
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__age", children: relativeAge(verdict.created_at_ms) })
                 ] })
               ]
             },
             "".concat(verdict.realm, ":").concat(verdict.run_id, ":").concat(verdict.record_id)
           )),
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-note", children: "Read-only \u2014 the correction affordance ships with the write-path design." })
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-note", children: "Read-only \u2014 the correction affordance ships with the write-path design." })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
           MemoryLiveStrip,
           {
             frames: memoryFrames,
@@ -53596,19 +53611,19 @@ function MemoryPanel({
           }
         )
       ] }) : null,
-      tab2 === "dreams" ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-dreams", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-group", "data-testid": "memory-dream-runs", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-group__label", children: "Durable verdict sheets (dream_runs \u2014 survive restarts)" }),
-          dreamRunsDenied ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "Verdict sheets: no grant." }) : dreamSheets.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "No persisted dream runs yet \u2014 runs before the dream_runs table land only in the audit reconstruction below." }) : dreamSheets.map((run) => {
+      tab2 === "dreams" ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-dreams", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-group", "data-testid": "memory-dream-runs", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-group__label", children: "Durable verdict sheets (dream_runs \u2014 survive restarts)" }),
+          dreamRunsDenied ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "Verdict sheets: no grant." }) : dreamSheets.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "No persisted dream runs yet \u2014 runs before the dream_runs table land only in the audit reconstruction below." }) : dreamSheets.map((run) => {
             const expanded = expandedRuns[run.run_id] === true;
             const detail2 = normalizeDreamRunDetail(run.detail);
-            return /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+            return /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
               "div",
               {
                 className: "gpolicy memory-dream-run",
                 "data-testid": "memory-dream-run:".concat(run.run_id),
                 children: [
-                  /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+                  /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
                     "button",
                     {
                       type: "button",
@@ -53619,43 +53634,43 @@ function MemoryPanel({
                         [run.run_id]: !expanded
                       })),
                       children: [
-                        /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__title", children: [
+                        /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__title", children: [
                           expanded ? "\u25BE" : "\u25B8",
                           " ",
                           run.run_id
                         ] }),
-                        /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__meta", children: [
-                          run.partition ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: run.partition, tone: "muted" }) : null,
-                          /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("span", { className: "memory-row__reason", children: [
+                        /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__meta", children: [
+                          run.partition ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: run.partition, tone: "muted" }) : null,
+                          /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "memory-row__reason", children: [
                             dreamRunDuration(run),
                             " \xB7",
                             " ",
                             typeof run.ops_committed === "number" ? "".concat(run.ops_committed, " ops") : "\u2014 ops"
                           ] }),
-                          /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "memory-row__age", children: relativeAge(run.completed_at_ms || run.started_at_ms) })
+                          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "memory-row__age", children: relativeAge(run.completed_at_ms || run.started_at_ms) })
                         ] })
                       ]
                     }
                   ),
-                  expanded ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+                  expanded ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
                     "div",
                     {
                       className: "memory-dream-run__detail",
                       "data-testid": "memory-dream-run-detail:".concat(run.run_id),
-                      children: detail2.raw !== null ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-detail__line", children: [
+                      children: detail2.raw !== null ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-detail__line", children: [
                         "unparsed detail: ",
                         detail2.raw
-                      ] }) : /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(import_jsx_runtime47.Fragment, { children: [
-                        detail2.phases.length > 0 ? detail2.phases.map(([name2, note], index2) => /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-detail__line", children: [
+                      ] }) : /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(import_jsx_runtime48.Fragment, { children: [
+                        detail2.phases.length > 0 ? detail2.phases.map(([name2, note], index2) => /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-detail__line", children: [
                           name2,
                           note ? " \u2014 ".concat(note) : ""
-                        ] }, "ph-".concat(index2))) : /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-detail__line", children: "no phases recorded" }),
-                        /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-detail__line", children: [
+                        ] }, "ph-".concat(index2))) : /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-detail__line", children: "no phases recorded" }),
+                        /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-detail__line", children: [
                           "verdicts:",
                           " ",
                           detail2.verdicts.length > 0 ? detail2.verdicts.map(([name2, count]) => "".concat(count, " ").concat(name2)).join(" \xB7 ") : "all counters zero"
                         ] }),
-                        detail2.skips.map((skip, index2) => /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)(
+                        detail2.skips.map((skip, index2) => /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
                           "div",
                           {
                             className: "memory-detail__line memory-dream__rationale",
@@ -53675,22 +53690,22 @@ function MemoryPanel({
             );
           })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-group__label", children: "Reconstructed from audit rows" }),
-        dreams.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "gating__empty", children: dreamsDenied ? "Dream audit: no grant." : "No dream runs recorded yet." }) : dreams.map((run) => {
+        /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-group__label", children: "Reconstructed from audit rows" }),
+        dreams.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "gating__empty", children: dreamsDenied ? "Dream audit: no grant." : "No dream runs recorded yet." }) : dreams.map((run) => {
           const summary = dreamOpKindsSummary(run.op_kinds);
-          return /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "gpolicy memory-dream", "data-testid": "memory-dream:".concat(run.run_id), children: [
-            /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "gpolicy__head", children: [
-              /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("span", { className: "gpolicy__action", children: run.run_id }),
-              run.quarantined_ops && run.quarantined_ops > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(Chip, { label: "".concat(run.quarantined_ops, " quarantined"), tone: "warning" }) : null
+          return /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "gpolicy memory-dream", "data-testid": "memory-dream:".concat(run.run_id), children: [
+            /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "gpolicy__head", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "gpolicy__action", children: run.run_id }),
+              run.quarantined_ops && run.quarantined_ops > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(Chip, { label: "".concat(run.quarantined_ops, " quarantined"), tone: "warning" }) : null
             ] }),
-            /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "gpolicy__meta", children: dreamTimeRange(run) }),
-            /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "gpolicy__meta", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "gpolicy__meta", children: dreamTimeRange(run) }),
+            /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "gpolicy__meta", children: [
               typeof run.ops === "number" ? "".concat(run.ops, " ops") : "\u2014",
               summary ? " \xB7 ".concat(summary) : ""
             ] }),
-            (run.memory_ids || []).length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime47.jsxs)("div", { className: "memory-dream__touched", children: [
+            (run.memory_ids || []).length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "memory-dream__touched", children: [
               "touched:",
-              (run.memory_ids || []).map((memoryId) => /* @__PURE__ */ (0, import_jsx_runtime47.jsx)(
+              (run.memory_ids || []).map((memoryId) => /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
                 "button",
                 {
                   type: "button",
@@ -53702,7 +53717,7 @@ function MemoryPanel({
                 memoryId
               ))
             ] }) : null,
-            (run.rationales || []).map((rationale, index2) => /* @__PURE__ */ (0, import_jsx_runtime47.jsx)("div", { className: "memory-dream__rationale", children: rationale }, "r-".concat(index2)))
+            (run.rationales || []).map((rationale, index2) => /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "memory-dream__rationale", children: rationale }, "r-".concat(index2)))
           ] }, run.run_id);
         })
       ] }) : null
@@ -53712,7 +53727,7 @@ function MemoryPanel({
 
 // src/panels/RosterPanel.tsx
 var import_react34 = __toESM(require("react"));
-var import_jsx_runtime48 = require("react/jsx-runtime");
+var import_jsx_runtime49 = require("react/jsx-runtime");
 var ROLE_BUCKETS = ["all", "personal", "coordinator", "domain", "internal"];
 function roleOf(a) {
   const p2 = (a.role || a.kind || "").toLowerCase();
@@ -53762,17 +53777,17 @@ function RosterPanel({
   const active = rows.find((r2) => r2.member_id === sel) || rows[0];
   const activeIdentity = active?.identity || active?.member_id || "";
   const activePeers = (active?.wired_to || []).map(displayPeer).filter(Boolean);
-  return /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "view roster", "data-testid": "roster-panel", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "view__head", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("h2", { children: "Roster" }),
-      /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "view__sub", children: [
+  return /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("div", { className: "view roster", "data-testid": "roster-panel", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("div", { className: "view__head", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("h2", { children: "Roster" }),
+      /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("span", { className: "view__sub", children: [
         rows.length,
         " of ",
         agents.length,
         " agents"
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "view__spacer" }),
-      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
+      /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { className: "view__spacer" }),
+      /* @__PURE__ */ (0, import_jsx_runtime49.jsx)(
         "input",
         {
           className: "view__search",
@@ -53781,22 +53796,22 @@ function RosterPanel({
           onChange: (e) => setQ(e.target.value)
         }
       ),
-      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "view__segs", children: ROLE_BUCKETS.map((r2) => /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("button", { className: role === r2 ? "is-active" : "", onClick: () => setRole(r2), children: r2 }, r2)) })
+      /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("div", { className: "view__segs", children: ROLE_BUCKETS.map((r2) => /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("button", { className: role === r2 ? "is-active" : "", onClick: () => setRole(r2), children: r2 }, r2)) })
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "roster__body", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "roster__table", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "roster__row roster__row--head", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { children: "Name" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { children: "Role" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { children: "State" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { children: "Profile" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { children: "Gen" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { children: "Chk" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { children: "Lease" })
+    /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("div", { className: "roster__body", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("div", { className: "roster__table", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("div", { className: "roster__row roster__row--head", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { children: "Name" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { children: "Role" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { children: "State" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { children: "Profile" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { children: "Gen" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { children: "Chk" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { children: "Lease" })
         ] }),
         rows.map((r2) => {
           const isSel = active && r2.member_id === active.member_id;
-          return /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(
+          return /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)(
             "div",
             {
               className: "roster__row ".concat(isSel ? "is-selected" : ""),
@@ -53808,55 +53823,55 @@ function RosterPanel({
               },
               "data-testid": "roster-row:".concat(r2.member_id),
               children: [
-                /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { className: "roster__name", children: [
-                  /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "roster__dot" }),
-                  /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("span", { children: [
-                    /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { children: r2.label }),
-                    /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "roster__id", children: r2.identity || r2.member_id })
+                /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("span", { className: "roster__name", children: [
+                  /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { className: "roster__dot" }),
+                  /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("span", { children: [
+                    /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("div", { children: r2.label }),
+                    /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("div", { className: "roster__id", children: r2.identity || r2.member_id })
                   ] })
                 ] }),
-                /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { children: roleOf(r2) }),
-                /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "roster__state", children: stateLabel(r2.state) }),
-                /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "mono dim", children: r2.role || "\u2014" }),
-                /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "mono", children: r2.generation ?? "\u2014" }),
-                /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "mono", children: r2.checkpoint_version ?? "\u2014" }),
-                /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "mono dim", children: r2.lease_healthy === false ? "unhealthy" : "ok" })
+                /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { children: roleOf(r2) }),
+                /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { className: "roster__state", children: stateLabel(r2.state) }),
+                /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { className: "mono dim", children: r2.role || "\u2014" }),
+                /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { className: "mono", children: r2.generation ?? "\u2014" }),
+                /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { className: "mono", children: r2.checkpoint_version ?? "\u2014" }),
+                /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { className: "mono dim", children: r2.lease_healthy === false ? "unhealthy" : "ok" })
               ]
             },
             r2.member_id
           );
         })
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("aside", { className: "roster__detail", children: active && /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(import_jsx_runtime48.Fragment, { children: [
-        /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "rd__head", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "rd__title", children: active.label }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "rd__id", children: active.identity || active.member_id }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("div", { className: "rd__tags", children: [active.role, active.kind, roleOf(active)].filter(Boolean).map((t) => /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "chip", children: String(t) }, String(t))) })
+      /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("aside", { className: "roster__detail", children: active && /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)(import_jsx_runtime49.Fragment, { children: [
+        /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("div", { className: "rd__head", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("div", { className: "rd__title", children: active.label }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("div", { className: "rd__id", children: active.identity || active.member_id }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("div", { className: "rd__tags", children: [active.role, active.kind, roleOf(active)].filter(Boolean).map((t) => /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { className: "chip", children: String(t) }, String(t))) })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("dl", { className: "rd__grid", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dt", { children: "Profile" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dd", { children: active.role || "\u2014" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dt", { children: "Kind" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dd", { children: active.kind || "\u2014" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dt", { children: "Role" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dd", { children: roleOf(active) }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dt", { children: "State" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dd", { children: /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "roster__state", children: stateLabel(active.state) }) }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dt", { children: "Member" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dd", { className: "mono", children: active.member_id }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dt", { children: "Identity" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dd", { className: "mono", children: active.identity || "\u2014" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dt", { children: "Session" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dd", { className: "mono", children: active.session_id || "\u2014" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dt", { children: "Generation" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dd", { className: "mono", children: active.generation ?? "\u2014" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dt", { children: "Checkpoint" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dd", { className: "mono", children: active.checkpoint_version ?? "\u2014" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dt", { children: "Lease" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dd", { className: "mono", children: active.lease_healthy === false ? "unhealthy" : "ok" }),
-          active.progress && /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)(import_jsx_runtime48.Fragment, { children: [
-            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dt", { children: "Health" }),
-            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dd", { children: /* @__PURE__ */ (0, import_jsx_runtime48.jsx)(
+        /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("dl", { className: "rd__grid", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "Profile" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { children: active.role || "\u2014" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "Kind" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { children: active.kind || "\u2014" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "Role" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { children: roleOf(active) }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "State" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { children: /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { className: "roster__state", children: stateLabel(active.state) }) }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "Member" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { className: "mono", children: active.member_id }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "Identity" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { className: "mono", children: active.identity || "\u2014" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "Session" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { className: "mono", children: active.session_id || "\u2014" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "Generation" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { className: "mono", children: active.generation ?? "\u2014" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "Checkpoint" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { className: "mono", children: active.checkpoint_version ?? "\u2014" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "Lease" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { className: "mono", children: active.lease_healthy === false ? "unhealthy" : "ok" }),
+          active.progress && /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)(import_jsx_runtime49.Fragment, { children: [
+            /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "Health" }),
+            /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { children: /* @__PURE__ */ (0, import_jsx_runtime49.jsx)(
               "span",
               {
                 className: "roster__state",
@@ -53864,22 +53879,22 @@ function RosterPanel({
                 children: active.progress.health
               }
             ) }),
-            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dt", { children: "Run state" }),
-            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dd", { className: "mono", children: active.progress.run_state }),
-            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dt", { children: "In flight" }),
-            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dd", { className: "mono", children: active.progress.in_flight_work }),
-            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dt", { children: "Last progress" }),
-            /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dd", { className: "mono dim", children: active.progress.last_progress_at_ms > 0 ? "".concat(new Date(active.progress.last_progress_at_ms).toLocaleTimeString(), " (").concat(active.progress.last_progress_event, ")") : active.progress.last_progress_event })
+            /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "Run state" }),
+            /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { className: "mono", children: active.progress.run_state }),
+            /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "In flight" }),
+            /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { className: "mono", children: active.progress.in_flight_work }),
+            /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "Last progress" }),
+            /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { className: "mono dim", children: active.progress.last_progress_at_ms > 0 ? "".concat(new Date(active.progress.last_progress_at_ms).toLocaleTimeString(), " (").concat(active.progress.last_progress_event, ")") : active.progress.last_progress_event })
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dt", { children: "Wired" }),
-          /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("dd", { children: activePeers.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "rd__peers", children: activePeers.map((peer) => /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "chip", children: peer }, peer)) }) : /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("span", { className: "mono dim", children: "none" }) })
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "Wired" }),
+          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { children: activePeers.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { className: "rd__peers", children: activePeers.map((peer) => /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { className: "chip", children: peer }, peer)) }) : /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { className: "mono dim", children: "none" }) })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime48.jsxs)("div", { className: "rd__actions", children: [
-          actionVisibility?.inspect !== false ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("button", { onClick: () => onDetails(active), children: actionLabels?.inspect || "Details" }) : null,
-          actionVisibility?.chat !== false ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("button", { onClick: () => onChat(active), children: actionLabels?.chat || "Open chat" }) : null,
-          actionVisibility?.respawn !== false && active.affordances?.can_respawn ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("button", { onClick: () => onLifecycle(activeIdentity, "meta/respawn"), children: actionLabels?.respawn || "Respawn" }) : null,
-          actionVisibility?.reset !== false && canResetLifecycle ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("button", { onClick: () => onLifecycle(activeIdentity, "meta/reset"), children: actionLabels?.reset || "Reset" }) : null,
-          actionVisibility?.retire !== false && active.affordances?.can_retire ? /* @__PURE__ */ (0, import_jsx_runtime48.jsx)("button", { className: "danger", onClick: () => onLifecycle(activeIdentity, "meta/retire"), children: actionLabels?.retire || "Retire" }) : null
+        /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("div", { className: "rd__actions", children: [
+          actionVisibility?.inspect !== false ? /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("button", { onClick: () => onDetails(active), children: actionLabels?.inspect || "Details" }) : null,
+          actionVisibility?.chat !== false ? /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("button", { onClick: () => onChat(active), children: actionLabels?.chat || "Open chat" }) : null,
+          actionVisibility?.respawn !== false && active.affordances?.can_respawn ? /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("button", { onClick: () => onLifecycle(activeIdentity, "meta/respawn"), children: actionLabels?.respawn || "Respawn" }) : null,
+          actionVisibility?.reset !== false && canResetLifecycle ? /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("button", { onClick: () => onLifecycle(activeIdentity, "meta/reset"), children: actionLabels?.reset || "Reset" }) : null,
+          actionVisibility?.retire !== false && active.affordances?.can_retire ? /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("button", { className: "danger", onClick: () => onLifecycle(activeIdentity, "meta/retire"), children: actionLabels?.retire || "Retire" }) : null
         ] })
       ] }) })
     ] })
@@ -54176,7 +54191,7 @@ function viewportTransform(v) {
 }
 
 // src/panels/WorkGraphGraphView.tsx
-var import_jsx_runtime49 = require("react/jsx-runtime");
+var import_jsx_runtime50 = require("react/jsx-runtime");
 var TITLE_MAX_CHARS = 21;
 var META_MAX_CHARS = 24;
 var LABEL_X = 26;
@@ -54300,39 +54315,39 @@ function nodeHoverText(node2, item) {
   return lines.join("\n");
 }
 function ItemCopyIcon({ name: name2 }) {
-  return /* @__PURE__ */ (0, import_jsx_runtime49.jsx)(CopyGlyph, { state: name2 === "i-check" ? "copied" : "idle" });
+  return /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(CopyGlyph, { state: name2 === "i-check" ? "copied" : "idle" });
 }
 function WorkItemDetails({ itemId: itemId2, item, hasAttention }) {
   const owner = item ? workGraphItemOwnerLabel(item) : "";
   const status = item?.status?.replaceAll("_", " ");
-  return /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)(import_jsx_runtime49.Fragment, { children: [
-    /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("div", { className: "workgraph-graph__detail-heading", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("h4", { className: "workgraph-graph__detail-title", children: item?.title || (item ? "Untitled work item" : "Work item unavailable in this snapshot") }),
-      status ? /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("span", { className: "workgraph-graph__detail-status", "data-status": item?.status, children: [
-        /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { className: "workgraph__dot is-".concat(item?.status), "aria-hidden": "true" }),
+  return /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)(import_jsx_runtime50.Fragment, { children: [
+    /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("div", { className: "workgraph-graph__detail-heading", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("h4", { className: "workgraph-graph__detail-title", children: item?.title || (item ? "Untitled work item" : "Work item unavailable in this snapshot") }),
+      status ? /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("span", { className: "workgraph-graph__detail-status", "data-status": item?.status, children: [
+        /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { className: "workgraph__dot is-".concat(item?.status), "aria-hidden": "true" }),
         status[0].toUpperCase() + status.slice(1)
       ] }) : null
     ] }),
-    item?.description ? /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("p", { className: "workgraph-graph__detail-description", children: item.description }) : null,
-    owner ? /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("p", { className: "workgraph-graph__detail-owner", children: [
+    item?.description ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("p", { className: "workgraph-graph__detail-description", children: item.description }) : null,
+    owner ? /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("p", { className: "workgraph-graph__detail-owner", children: [
       "Owner ",
-      /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { children: owner })
+      /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { children: owner })
     ] }) : null,
-    /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("details", { className: "workgraph-graph__metadata", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("summary", { children: "Item details" }),
-      /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("dl", { children: [
-        /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "ID" }),
-        /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("dd", { className: "workgraph-graph__detail-id", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("code", { children: itemId2 }),
-          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)(CopyButton, { text: itemId2, label: "Copy work item ID", copiedLabel: "Work item ID copied", Icon: ItemCopyIcon })
+    /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("details", { className: "workgraph-graph__metadata", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("summary", { children: "Item details" }),
+      /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("dl", { children: [
+        /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("dt", { children: "ID" }),
+        /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("dd", { className: "workgraph-graph__detail-id", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("code", { children: itemId2 }),
+          /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(CopyButton, { text: itemId2, label: "Copy work item ID", copiedLabel: "Work item ID copied", Icon: ItemCopyIcon })
         ] }),
-        item?.labels?.length ? /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)(import_jsx_runtime49.Fragment, { children: [
-          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "Labels" }),
-          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { children: item.labels.join(", ") })
+        item?.labels?.length ? /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)(import_jsx_runtime50.Fragment, { children: [
+          /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("dt", { children: "Labels" }),
+          /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("dd", { children: item.labels.join(", ") })
         ] }) : null,
-        hasAttention ? /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)(import_jsx_runtime49.Fragment, { children: [
-          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dt", { children: "Attention" }),
-          /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("dd", { children: "Bound to this item" })
+        hasAttention ? /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)(import_jsx_runtime50.Fragment, { children: [
+          /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("dt", { children: "Attention" }),
+          /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("dd", { children: "Bound to this item" })
         ] }) : null
       ] })
     ] })
@@ -54378,11 +54393,11 @@ function WorkGraphGraphView({
     return bound;
   }, [attention2]);
   if (layout.nodes.length === 0) {
-    return /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("div", { className: "workgraph__empty", children: "No work items to draw." });
+    return /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "workgraph__empty", children: "No work items to draw." });
   }
-  return /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("div", { className: "workgraph-graph", "data-testid": "workgraph-graph-frame", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("div", { className: "workgraph-graph__toolbar", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime49.jsx)(
+  return /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("div", { className: "workgraph-graph", "data-testid": "workgraph-graph-frame", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("div", { className: "workgraph-graph__toolbar", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
         "button",
         {
           type: "button",
@@ -54392,21 +54407,21 @@ function WorkGraphGraphView({
           children: "Fit"
         }
       ),
-      /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("span", { className: "workgraph-graph__stats", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("span", { className: "workgraph-graph__stats", children: [
         layout.nodes.length,
         " items \xB7 ",
         layout.edges.length,
         " edges"
       ] }),
-      layout.overflowCount > 0 ? /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("span", { className: "workgraph-graph__overflow", "data-testid": "workgraph-graph-overflow", children: [
+      layout.overflowCount > 0 ? /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("span", { className: "workgraph-graph__overflow", "data-testid": "workgraph-graph-overflow", children: [
         "+",
         layout.overflowCount,
         " more items not drawn"
       ] }) : null,
-      /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { className: "workgraph__spacer" }),
-      /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("span", { className: "workgraph-graph__hint", children: "drag to pan \xB7 wheel to zoom" })
+      /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { className: "workgraph__spacer" }),
+      /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { className: "workgraph-graph__hint", children: "drag to pan \xB7 wheel to zoom" })
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)(
+    /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)(
       "svg",
       {
         "data-testid": "workgraph-graph",
@@ -54422,8 +54437,8 @@ function WorkGraphGraphView({
         onPointerUp: zoom.onPointerUp,
         onPointerCancel: zoom.onPointerUp,
         children: [
-          /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("defs", { children: [
-            /* @__PURE__ */ (0, import_jsx_runtime49.jsx)(
+          /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("defs", { children: [
+            /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
               "marker",
               {
                 id: "workgraph-graph-arrow",
@@ -54434,10 +54449,10 @@ function WorkGraphGraphView({
                 markerWidth: "7",
                 markerHeight: "7",
                 orient: "auto-start-reverse",
-                children: /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("path", { d: "M0,0 L8,4 L0,8 z" })
+                children: /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("path", { d: "M0,0 L8,4 L0,8 z" })
               }
             ),
-            /* @__PURE__ */ (0, import_jsx_runtime49.jsx)(
+            /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
               "marker",
               {
                 id: "workgraph-graph-arrow-blocks",
@@ -54448,14 +54463,14 @@ function WorkGraphGraphView({
                 markerWidth: "7",
                 markerHeight: "7",
                 orient: "auto-start-reverse",
-                children: /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("path", { d: "M0,0 L8,4 L0,8 z" })
+                children: /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("path", { d: "M0,0 L8,4 L0,8 z" })
               }
             )
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)("g", { "data-testid": "workgraph-graph-viewport", transform: viewportTransform(zoom.viewport), children: [
+          /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("g", { "data-testid": "workgraph-graph-viewport", transform: viewportTransform(zoom.viewport), children: [
             layout.edges.map((edge, index2) => {
               const marker = edge.kind === "blocks" ? "url(#workgraph-graph-arrow-blocks)" : "url(#workgraph-graph-arrow)";
-              return /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("g", { children: /* @__PURE__ */ (0, import_jsx_runtime49.jsx)(
+              return /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("g", { children: /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
                 "path",
                 {
                   "data-testid": "workgraph-graph-edge",
@@ -54472,7 +54487,7 @@ function WorkGraphGraphView({
               const meta3 = metaText ? fitLabel(metaText, labelWidth, measure?.meta ?? null, META_MAX_CHARS) : "";
               const title = fitLabel(node2.title, labelWidth, measure?.title ?? null, TITLE_MAX_CHARS);
               const selected = node2.itemId === selectedId;
-              return /* @__PURE__ */ (0, import_jsx_runtime49.jsxs)(
+              return /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)(
                 "g",
                 {
                   "data-testid": "workgraph-graph-node",
@@ -54485,10 +54500,10 @@ function WorkGraphGraphView({
                     onSelect?.(node2.itemId);
                   },
                   children: [
-                    /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("title", { children: nodeHoverText(node2, itemById.get(node2.itemId)) }),
-                    /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("rect", { className: "workgraph-graph__node-box", width: node2.w, height: node2.h, rx: 8 }),
-                    /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("circle", { className: "workgraph-graph__node-dot", cx: 14, cy: meta3 ? 15 : node2.h / 2, r: 3.5 }),
-                    boundItemIds.has(node2.itemId) ? /* @__PURE__ */ (0, import_jsx_runtime49.jsx)(
+                    /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("title", { children: nodeHoverText(node2, itemById.get(node2.itemId)) }),
+                    /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("rect", { className: "workgraph-graph__node-box", width: node2.w, height: node2.h, rx: 8 }),
+                    /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("circle", { className: "workgraph-graph__node-dot", cx: 14, cy: meta3 ? 15 : node2.h / 2, r: 3.5 }),
+                    boundItemIds.has(node2.itemId) ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
                       "circle",
                       {
                         className: "workgraph-graph__node-goal-ring",
@@ -54497,7 +54512,7 @@ function WorkGraphGraphView({
                         r: 6.5
                       }
                     ) : null,
-                    /* @__PURE__ */ (0, import_jsx_runtime49.jsx)(
+                    /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
                       "text",
                       {
                         className: "workgraph-graph__node-title",
@@ -54506,7 +54521,7 @@ function WorkGraphGraphView({
                         children: title
                       }
                     ),
-                    meta3 ? /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("text", { className: "workgraph-graph__node-meta", x: LABEL_X, y: 34, children: meta3 }) : null
+                    meta3 ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("text", { className: "workgraph-graph__node-meta", x: LABEL_X, y: 34, children: meta3 }) : null
                   ]
                 },
                 node2.itemId
@@ -54515,7 +54530,7 @@ function WorkGraphGraphView({
             layout.edges.map((edge, index2) => {
               if (edge.kind === "parent") return null;
               const label = edgeLabelPlacement(edge);
-              return /* @__PURE__ */ (0, import_jsx_runtime49.jsx)(
+              return /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
                 "text",
                 {
                   className: "workgraph-graph__edge-label",
@@ -54533,12 +54548,12 @@ function WorkGraphGraphView({
         ]
       }
     ),
-    /* @__PURE__ */ (0, import_jsx_runtime49.jsx)("div", { className: "workgraph-graph__detail", "data-testid": "workgraph-graph-detail", children: selectedId ? /* @__PURE__ */ (0, import_jsx_runtime49.jsx)(WorkItemDetails, { itemId: selectedId, item: itemById.get(selectedId), hasAttention: boundItemIds.has(selectedId) }, selectedId) : "Click a node to inspect it." })
+    /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "workgraph-graph__detail", "data-testid": "workgraph-graph-detail", children: selectedId ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(WorkItemDetails, { itemId: selectedId, item: itemById.get(selectedId), hasAttention: boundItemIds.has(selectedId) }, selectedId) : "Click a node to inspect it." })
   ] });
 }
 
 // src/panels/WorkGraphPanel.tsx
-var import_jsx_runtime50 = require("react/jsx-runtime");
+var import_jsx_runtime51 = require("react/jsx-runtime");
 var workGraphViewModeMemory = "tree";
 function buildWorkGraphPanelTree(items, edges) {
   const byId = /* @__PURE__ */ new Map();
@@ -54651,19 +54666,19 @@ function ItemRow2({
   const revision = typeof item.revision === "number" ? item.revision : void 0;
   const terminal = status === "completed" || status === "cancelled" || status === "failed";
   const owner = workGraphOwnerLabelOf(item);
-  return /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)(
+  return /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)(
     "div",
     {
       className: "workgraph__item",
       "data-testid": "workgraph-panel-item:".concat(itemId2),
       style: { paddingLeft: "".concat(depth * 16, "px") },
       children: [
-        /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { className: statusDotClass(status), "aria-hidden": "true" }),
-        /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { className: "workgraph__item-title", title: item.description || item.title, children: item.title || itemId2 }),
-        item.priority && item.priority !== "medium" ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { className: "workgraph__chip is-priority-".concat(item.priority), children: item.priority }) : null,
-        owner ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { className: "workgraph__chip", children: owner }) : null,
-        /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { className: "workgraph__item-status", children: status.replace(/_/g, " ") }),
-        canManage && onClaim && status === "open" && !owner ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
+        /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: statusDotClass(status), "aria-hidden": "true" }),
+        /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "workgraph__item-title", title: item.description || item.title, children: item.title || itemId2 }),
+        item.priority && item.priority !== "medium" ? /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "workgraph__chip is-priority-".concat(item.priority), children: item.priority }) : null,
+        owner ? /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "workgraph__chip", children: owner }) : null,
+        /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "workgraph__item-status", children: status.replace(/_/g, " ") }),
+        canManage && onClaim && status === "open" && !owner ? /* @__PURE__ */ (0, import_jsx_runtime51.jsx)(
           "button",
           {
             type: "button",
@@ -54673,7 +54688,7 @@ function ItemRow2({
             children: "Claim"
           }
         ) : null,
-        canManage && onClose && !terminal && status !== "blocked" ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
+        canManage && onClose && !terminal && status !== "blocked" ? /* @__PURE__ */ (0, import_jsx_runtime51.jsx)(
           "button",
           {
             type: "button",
@@ -54710,18 +54725,18 @@ function AttentionRow2({
   const bindingInput = { bindingId, revision };
   const goalInput = { bindingId, revision: goalRevision };
   if (!bindingId) return null;
-  return /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("div", { className: "workgraph__binding", "data-testid": "workgraph-panel-binding:".concat(bindingId), children: [
-    /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("div", { className: "workgraph__binding-line", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { className: "workgraph__mode is-".concat(binding.mode || "pursue"), children: binding.mode || "pursue" }),
-      /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { className: "workgraph__binding-status", children: statusLabel2 }),
-      targetLabel ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { className: "workgraph__binding-target", children: targetLabel }) : null,
-      binding.work_ref?.item_id ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { className: "workgraph__chip", title: "Bound work item", children: binding.work_ref.item_id }) : null,
-      /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { className: "workgraph__spacer" }),
-      canManage && onAttentionPause && isActive ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("button", { type: "button", className: "workgraph__action", onClick: () => onAttentionPause(bindingInput), children: "Pause" }) : null,
-      canManage && onAttentionResume && isPaused ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("button", { type: "button", className: "workgraph__action", onClick: () => onAttentionResume(bindingInput), children: "Resume" }) : null,
-      canManage && onGoalConfirm && live ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("button", { type: "button", className: "workgraph__action", onClick: () => onGoalConfirm(goalInput), children: "Confirm" }) : null,
-      canManage && onGoalRequestClose && live ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("button", { type: "button", className: "workgraph__action", onClick: () => onGoalRequestClose(goalInput), children: "Request close" }) : null,
-      canManage && onAttentionReassign && canReassign ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
+  return /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "workgraph__binding", "data-testid": "workgraph-panel-binding:".concat(bindingId), children: [
+    /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "workgraph__binding-line", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "workgraph__mode is-".concat(binding.mode || "pursue"), children: binding.mode || "pursue" }),
+      /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "workgraph__binding-status", children: statusLabel2 }),
+      targetLabel ? /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "workgraph__binding-target", children: targetLabel }) : null,
+      binding.work_ref?.item_id ? /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "workgraph__chip", title: "Bound work item", children: binding.work_ref.item_id }) : null,
+      /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "workgraph__spacer" }),
+      canManage && onAttentionPause && isActive ? /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("button", { type: "button", className: "workgraph__action", onClick: () => onAttentionPause(bindingInput), children: "Pause" }) : null,
+      canManage && onAttentionResume && isPaused ? /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("button", { type: "button", className: "workgraph__action", onClick: () => onAttentionResume(bindingInput), children: "Resume" }) : null,
+      canManage && onGoalConfirm && live ? /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("button", { type: "button", className: "workgraph__action", onClick: () => onGoalConfirm(goalInput), children: "Confirm" }) : null,
+      canManage && onGoalRequestClose && live ? /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("button", { type: "button", className: "workgraph__action", onClick: () => onGoalRequestClose(goalInput), children: "Request close" }) : null,
+      canManage && onAttentionReassign && canReassign ? /* @__PURE__ */ (0, import_jsx_runtime51.jsx)(
         "button",
         {
           type: "button",
@@ -54732,8 +54747,8 @@ function AttentionRow2({
         }
       ) : null
     ] }),
-    reassignOpen && canManage && onAttentionReassign && canReassign ? /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("div", { className: "workgraph__reassign", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
+    reassignOpen && canManage && onAttentionReassign && canReassign ? /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "workgraph__reassign", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime51.jsx)(
         "input",
         {
           placeholder: "Target agent identity\u2026",
@@ -54742,7 +54757,7 @@ function AttentionRow2({
           "data-testid": "workgraph-panel-reassign-input:".concat(bindingId)
         }
       ),
-      /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
+      /* @__PURE__ */ (0, import_jsx_runtime51.jsx)(
         "button",
         {
           type: "button",
@@ -54786,18 +54801,18 @@ function WorkGraphPanel({
     setViewModeState(mode);
   };
   if (data.unavailable) {
-    return /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "console-panel workgraph", "data-testid": "workgraph-panel", children: /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "workgraph__empty", children: "WorkGraph is not configured on this runtime." }) });
+    return /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "console-panel workgraph", "data-testid": "workgraph-panel", children: /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "workgraph__empty", children: "WorkGraph is not configured on this runtime." }) });
   }
-  return /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("div", { className: "console-panel workgraph", "data-testid": "workgraph-panel", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("div", { className: "workgraph__head", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("h3", { children: "WorkGraph" }),
-      capturedAt ? /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("span", { className: "workgraph__captured", children: [
+  return /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "console-panel workgraph", "data-testid": "workgraph-panel", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "workgraph__head", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("h3", { children: "WorkGraph" }),
+      capturedAt ? /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("span", { className: "workgraph__captured", children: [
         "as of ",
         capturedAt
       ] }) : null,
-      /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("span", { className: "workgraph__spacer" }),
-      /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("div", { className: "workgraph__view-toggle", role: "group", "aria-label": "WorkGraph view mode", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
+      /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "workgraph__spacer" }),
+      /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "workgraph__view-toggle", role: "group", "aria-label": "WorkGraph view mode", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime51.jsx)(
           "button",
           {
             type: "button",
@@ -54808,7 +54823,7 @@ function WorkGraphPanel({
             children: "Tree"
           }
         ),
-        /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
+        /* @__PURE__ */ (0, import_jsx_runtime51.jsx)(
           "button",
           {
             type: "button",
@@ -54820,7 +54835,7 @@ function WorkGraphPanel({
           }
         )
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
+      /* @__PURE__ */ (0, import_jsx_runtime51.jsx)(
         "button",
         {
           type: "button",
@@ -54831,11 +54846,11 @@ function WorkGraphPanel({
         }
       )
     ] }),
-    data.error ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "workgraph__error", role: "alert", children: data.error }) : null,
-    data.denied ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "workgraph__empty", "data-testid": "workgraph-panel-denied", children: "You do not have a grant to view WorkGraph state." }) : /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)(import_jsx_runtime50.Fragment, { children: [
-      /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("div", { className: "workgraph__section", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "workgraph__sec-label", children: "Work items" }),
-        viewMode === "graph" ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
+    /* @__PURE__ */ (0, import_jsx_runtime51.jsx)(PanelStatusRow, { error: data.error }),
+    data.denied ? /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "workgraph__empty", "data-testid": "workgraph-panel-denied", children: "You do not have a grant to view WorkGraph state." }) : /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)(import_jsx_runtime51.Fragment, { children: [
+      /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "workgraph__section", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "workgraph__sec-label", children: "Work items" }),
+        viewMode === "graph" ? /* @__PURE__ */ (0, import_jsx_runtime51.jsx)(
           WorkGraphGraphView,
           {
             items: data.items,
@@ -54844,8 +54859,8 @@ function WorkGraphPanel({
             selectedId: selectedGraphItem ?? void 0,
             onSelect: setSelectedGraphItem
           }
-        ) : rows.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "workgraph__empty", children: "No work items." }) : /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)(import_jsx_runtime50.Fragment, { children: [
-          visibleRows.map((row) => /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
+        ) : rows.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "workgraph__empty", children: "No work items." }) : /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)(import_jsx_runtime51.Fragment, { children: [
+          visibleRows.map((row) => /* @__PURE__ */ (0, import_jsx_runtime51.jsx)(
             ItemRow2,
             {
               row,
@@ -54855,16 +54870,16 @@ function WorkGraphPanel({
             },
             row.itemId
           )),
-          treeOverflowCount > 0 ? /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("div", { className: "workgraph__empty", "data-testid": "workgraph-panel-overflow", children: [
+          treeOverflowCount > 0 ? /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "workgraph__empty", "data-testid": "workgraph-panel-overflow", children: [
             "+",
             treeOverflowCount,
             " more items not shown"
           ] }) : null
         ] })
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("div", { className: "workgraph__section", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "workgraph__sec-label", children: "Attention" }),
-        data.attention.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "workgraph__empty", children: "No attention bindings." }) : data.attention.map((binding, index2) => /* @__PURE__ */ (0, import_jsx_runtime50.jsx)(
+      /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "workgraph__section", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "workgraph__sec-label", children: "Attention" }),
+        data.attention.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "workgraph__empty", children: "No attention bindings." }) : data.attention.map((binding, index2) => /* @__PURE__ */ (0, import_jsx_runtime51.jsx)(
           AttentionRow2,
           {
             binding,
@@ -54879,9 +54894,9 @@ function WorkGraphPanel({
           binding.binding_id || "binding-".concat(index2)
         ))
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime50.jsxs)("div", { className: "workgraph__section", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "workgraph__sec-label", children: "Recent events" }),
-        data.events.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "workgraph__empty", children: "No events." }) : /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "workgraph__events", children: data.events.map((event, index2) => /* @__PURE__ */ (0, import_jsx_runtime50.jsx)("div", { className: "workgraph__event", children: workGraphEventLine(event) }, "".concat(event.seq ?? index2))) })
+      /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "workgraph__section", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "workgraph__sec-label", children: "Recent events" }),
+        data.events.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "workgraph__empty", children: "No events." }) : /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "workgraph__events", children: data.events.map((event, index2) => /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "workgraph__event", children: workGraphEventLine(event) }, "".concat(event.seq ?? index2))) })
       ] })
     ] })
   ] });
@@ -54889,7 +54904,7 @@ function WorkGraphPanel({
 
 // src/panels/RoutingPanel.tsx
 var import_react38 = __toESM(require("react"));
-var import_jsx_runtime51 = require("react/jsx-runtime");
+var import_jsx_runtime52 = require("react/jsx-runtime");
 function RoutingPanel({ data }) {
   const routes = data.routes || [];
   const deliveries = data.deliveries || [];
@@ -54905,17 +54920,17 @@ function RoutingPanel({ data }) {
   const active = rows.find((r2) => r2.route_key === sel) || rows[0];
   const recentDeliveries = deliveries.slice(0, 40);
   const trafficForRoute = (routeKey) => deliveries.filter((d2) => d2.route_id === routeKey).length;
-  return /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "view routing", "data-testid": "routing-panel", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "view__head", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("h2", { children: "Routing" }),
-      /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("span", { className: "view__sub", children: [
+  return /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { className: "view routing", "data-testid": "routing-panel", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { className: "view__head", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("h2", { children: "Routing" }),
+      /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("span", { className: "view__sub", children: [
         rows.length,
         " routes \xB7 ",
         deliveries.length,
         " deliveries (recent)"
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "view__spacer" }),
-      /* @__PURE__ */ (0, import_jsx_runtime51.jsx)(
+      /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "view__spacer" }),
+      /* @__PURE__ */ (0, import_jsx_runtime52.jsx)(
         "input",
         {
           className: "view__search",
@@ -54925,89 +54940,89 @@ function RoutingPanel({ data }) {
         }
       )
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "routing__body", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "routing__table", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "routing__row routing__row--head", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { children: "Route" }),
-          /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { children: "Channel" }),
-          /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { children: "Recipient" }),
-          /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { children: "Sink" }),
-          /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { children: "Module" }),
-          /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { children: "24h" })
+    /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { className: "routing__body", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { className: "routing__table", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { className: "routing__row routing__row--head", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { children: "Route" }),
+          /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { children: "Channel" }),
+          /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { children: "Recipient" }),
+          /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { children: "Sink" }),
+          /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { children: "Module" }),
+          /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { children: "24h" })
         ] }),
         rows.map((r2) => {
           const isSel = active && r2.route_key === active.route_key;
-          return /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)(
+          return /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)(
             "div",
             {
               className: "routing__row ".concat(isSel ? "is-selected" : ""),
               onClick: () => setSel(r2.route_key),
               "data-testid": "routing-route:".concat(r2.route_key),
               children: [
-                /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "routing__intent mono", children: r2.route_key }),
-                /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "mono dim", children: r2.channel || "\u2014" }),
-                /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "mono", children: r2.recipient }),
-                /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "dim", children: r2.sink }),
-                /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "mono dim", children: r2.target_module }),
-                /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "mono", children: trafficForRoute(r2.route_key) })
+                /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "routing__intent mono", children: r2.route_key }),
+                /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "mono dim", children: r2.channel || "\u2014" }),
+                /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "mono", children: r2.recipient }),
+                /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "dim", children: r2.sink }),
+                /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "mono dim", children: r2.target_module }),
+                /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "mono", children: trafficForRoute(r2.route_key) })
               ]
             },
             r2.route_key
           );
         }),
-        rows.length === 0 && /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { style: { padding: 24, color: "var(--ink-dim)", fontFamily: "var(--mono)", fontSize: 12 }, children: "No routes configured." })
+        rows.length === 0 && /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("div", { style: { padding: 24, color: "var(--ink-dim)", fontFamily: "var(--mono)", fontSize: 12 }, children: "No routes configured." })
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("aside", { className: "routing__flow", children: active && /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)(import_jsx_runtime51.Fragment, { children: [
-        /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "rf__title", children: "Flow" }),
-        /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "rf__diagram", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "rf__node rf__node--intent", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "rf__lbl", children: "Route" }),
-            /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "rf__val mono", children: active.route_key })
+      /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("aside", { className: "routing__flow", children: active && /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)(import_jsx_runtime52.Fragment, { children: [
+        /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("div", { className: "rf__title", children: "Flow" }),
+        /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { className: "rf__diagram", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { className: "rf__node rf__node--intent", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("div", { className: "rf__lbl", children: "Route" }),
+            /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("div", { className: "rf__val mono", children: active.route_key })
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("svg", { className: "rf__arrow", viewBox: "0 0 40 12", children: /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("path", { d: "M0 6 H 34 M 28 2 L 34 6 L 28 10", stroke: "currentColor", fill: "none", strokeWidth: "1" }) }),
-          /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "rf__node rf__node--handler", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "rf__lbl", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("svg", { className: "rf__arrow", viewBox: "0 0 40 12", children: /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("path", { d: "M0 6 H 34 M 28 2 L 34 6 L 28 10", stroke: "currentColor", fill: "none", strokeWidth: "1" }) }),
+          /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { className: "rf__node rf__node--handler", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { className: "rf__lbl", children: [
               "via ",
               active.sink
             ] }),
-            /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "rf__val mono", children: active.recipient })
+            /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("div", { className: "rf__val mono", children: active.recipient })
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("svg", { className: "rf__arrow rf__arrow--drop", viewBox: "0 0 12 40", children: /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("path", { d: "M6 0 V 34 M 2 28 L 6 34 L 10 28", stroke: "currentColor", fill: "none", strokeWidth: "1" }) }),
-          /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "rf__node rf__node--gate", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "rf__lbl", children: "Module" }),
-            /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "rf__val mono", children: active.target_module })
+          /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("svg", { className: "rf__arrow rf__arrow--drop", viewBox: "0 0 12 40", children: /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("path", { d: "M6 0 V 34 M 2 28 L 6 34 L 10 28", stroke: "currentColor", fill: "none", strokeWidth: "1" }) }),
+          /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { className: "rf__node rf__node--gate", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("div", { className: "rf__lbl", children: "Module" }),
+            /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("div", { className: "rf__val mono", children: active.target_module })
           ] })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { className: "rf__stats", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { children: [
-            /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("dt", { children: "Retry max" }),
-            /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("dd", { children: active.retry_max ?? "\u2014" })
+        /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { className: "rf__stats", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { children: [
+            /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("dt", { children: "Retry max" }),
+            /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("dd", { children: active.retry_max ?? "\u2014" })
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { children: [
-            /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("dt", { children: "Backoff" }),
-            /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("dd", { children: active.backoff_ms ? "".concat(active.backoff_ms, " ms") : "\u2014" })
+          /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { children: [
+            /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("dt", { children: "Backoff" }),
+            /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("dd", { children: active.backoff_ms ? "".concat(active.backoff_ms, " ms") : "\u2014" })
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { children: [
-            /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("dt", { children: "Rate limit" }),
-            /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("dd", { children: active.rate_limit_per_minute ? "".concat(active.rate_limit_per_minute, "/m") : "\u2014" })
+          /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { children: [
+            /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("dt", { children: "Rate limit" }),
+            /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("dd", { children: active.rate_limit_per_minute ? "".concat(active.rate_limit_per_minute, "/m") : "\u2014" })
           ] })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("div", { className: "rf__title", style: { marginTop: 12 }, children: "Recent deliveries" }),
-        /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { style: { display: "flex", flexDirection: "column", gap: 4, fontFamily: "var(--mono)", fontSize: 11, color: "var(--ink-muted)" }, children: [
-          recentDeliveries.filter((d2) => d2.route_id === active.route_key).slice(0, 8).map((d2) => /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("div", { "data-testid": "routing-delivery:".concat(d2.delivery_id), children: [
-            /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { style: { color: d2.status === "delivered" ? "var(--ok)" : d2.status === "failed" ? "var(--crit)" : "var(--warn)" }, children: d2.status }),
+        /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("div", { className: "rf__title", style: { marginTop: 12 }, children: "Recent deliveries" }),
+        /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { style: { display: "flex", flexDirection: "column", gap: 4, fontFamily: "var(--mono)", fontSize: 11, color: "var(--ink-muted)" }, children: [
+          recentDeliveries.filter((d2) => d2.route_id === active.route_key).slice(0, 8).map((d2) => /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { "data-testid": "routing-delivery:".concat(d2.delivery_id), children: [
+            /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { style: { color: d2.status === "delivered" ? "var(--ok)" : d2.status === "failed" ? "var(--crit)" : "var(--warn)" }, children: d2.status }),
             " ",
-            /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("span", { className: "dim", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("span", { className: "dim", children: [
               "\xB7 ",
               d2.delivery_id.slice(0, 8)
             ] }),
             " ",
-            /* @__PURE__ */ (0, import_jsx_runtime51.jsxs)("span", { children: [
+            /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("span", { children: [
               "\u2192 ",
               d2.recipient
             ] })
           ] }, d2.delivery_id)),
-          recentDeliveries.filter((d2) => d2.route_id === active.route_key).length === 0 && /* @__PURE__ */ (0, import_jsx_runtime51.jsx)("span", { className: "dim", children: "No recent deliveries." })
+          recentDeliveries.filter((d2) => d2.route_id === active.route_key).length === 0 && /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "dim", children: "No recent deliveries." })
         ] })
       ] }) })
     ] })
@@ -55016,7 +55031,7 @@ function RoutingPanel({ data }) {
 
 // src/panels/LogsPanel.tsx
 var import_react39 = __toESM(require("react"));
-var import_jsx_runtime52 = require("react/jsx-runtime");
+var import_jsx_runtime53 = require("react/jsx-runtime");
 var INTERNAL_LOG_EVENTS = /* @__PURE__ */ new Set([
   "keep-alive",
   "snapshot_complete",
@@ -55177,17 +55192,17 @@ function LogsPanel({ frames }) {
     return c;
   }, [frames]);
   const visibleTotal = counts.info + counts.warn + counts.error;
-  return /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { className: "view logs", "data-testid": "logs-panel", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { className: "view__head", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("h2", { children: "Logs" }),
-      /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("span", { className: "view__sub", children: [
+  return /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)("div", { className: "view logs", "data-testid": "logs-panel", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)("div", { className: "view__head", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("h2", { children: "Logs" }),
+      /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)("span", { className: "view__sub", children: [
         rows.length,
         " of ",
         visibleTotal,
         " events \xB7 live"
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "view__spacer" }),
-      /* @__PURE__ */ (0, import_jsx_runtime52.jsx)(
+      /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { className: "view__spacer" }),
+      /* @__PURE__ */ (0, import_jsx_runtime53.jsx)(
         "input",
         {
           className: "view__search",
@@ -55196,37 +55211,37 @@ function LogsPanel({ frames }) {
           onChange: (e) => setQ(e.target.value)
         }
       ),
-      /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { className: "view__segs", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("button", { className: lvl === "all" ? "is-active" : "", onClick: () => setLvl("all"), children: [
+      /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)("div", { className: "view__segs", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)("button", { className: lvl === "all" ? "is-active" : "", onClick: () => setLvl("all"), children: [
           "all ",
-          /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "n", children: visibleTotal })
+          /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { className: "n", children: visibleTotal })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("button", { className: lvl === "info" ? "is-active" : "", onClick: () => setLvl("info"), children: [
+        /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)("button", { className: lvl === "info" ? "is-active" : "", onClick: () => setLvl("info"), children: [
           "info ",
-          /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "n", children: counts.info })
+          /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { className: "n", children: counts.info })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("button", { className: "warn ".concat(lvl === "warn" ? "is-active" : ""), onClick: () => setLvl("warn"), children: [
+        /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)("button", { className: "warn ".concat(lvl === "warn" ? "is-active" : ""), onClick: () => setLvl("warn"), children: [
           "warn ",
-          /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "n", children: counts.warn })
+          /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { className: "n", children: counts.warn })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("button", { className: "bad ".concat(lvl === "error" ? "is-active" : ""), onClick: () => setLvl("error"), children: [
+        /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)("button", { className: "bad ".concat(lvl === "error" ? "is-active" : ""), onClick: () => setLvl("error"), children: [
           "err ",
-          /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "n", children: counts.error })
+          /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { className: "n", children: counts.error })
         ] })
       ] })
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("div", { className: "logs__body", children: /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)("div", { className: "logs__stream", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("div", { className: "logs__body", children: /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)("div", { className: "logs__stream", children: [
       rows.map(({ f: f2, level }, i2) => {
         const key = f2.id || "".concat(f2.event, ":").concat(f2.timestampMs, ":").concat(i2);
         const isOpen = expanded.has(key);
         const hasStructured = hasStructuredOutput(f2);
-        return /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)(
+        return /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)(
           "div",
           {
             className: "logline logline--".concat(level).concat(isOpen ? " is-open" : ""),
             "data-testid": "log-line:".concat(f2.id || i2),
             children: [
-              /* @__PURE__ */ (0, import_jsx_runtime52.jsxs)(
+              /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)(
                 "button",
                 {
                   type: "button",
@@ -55235,46 +55250,46 @@ function LogsPanel({ frames }) {
                   "aria-expanded": isOpen,
                   "data-testid": "log-line:".concat(f2.id || i2, ":toggle"),
                   children: [
-                    /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "logline__chevron", children: isOpen ? "\u25BE" : "\u25B8" }),
-                    /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "logline__t", children: formatTime2(f2.timestampMs) }),
-                    /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "logline__lvl logline__lvl--".concat(level), children: level.toUpperCase() }),
-                    /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "logline__src", children: f2.identity || "_system" }),
-                    /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "logline__evt", children: f2.event }),
-                    /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "logline__ctx dim", children: f2.interactionId ? "int=".concat(f2.interactionId.slice(0, 8)) : "" }),
-                    /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "logline__msg", children: summarizeLogFrame(f2) }),
-                    hasStructured && /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("span", { className: "logline__badge", title: "Carries structured_output", children: "\u21B3 struct" })
+                    /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { className: "logline__chevron", children: isOpen ? "\u25BE" : "\u25B8" }),
+                    /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { className: "logline__t", children: formatTime2(f2.timestampMs) }),
+                    /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { className: "logline__lvl logline__lvl--".concat(level), children: level.toUpperCase() }),
+                    /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { className: "logline__src", children: f2.identity || "_system" }),
+                    /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { className: "logline__evt", children: f2.event }),
+                    /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { className: "logline__ctx dim", children: f2.interactionId ? "int=".concat(f2.interactionId.slice(0, 8)) : "" }),
+                    /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { className: "logline__msg", children: summarizeLogFrame(f2) }),
+                    hasStructured && /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { className: "logline__badge", title: "Carries structured_output", children: "\u21B3 struct" })
                   ]
                 }
               ),
-              isOpen && /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("pre", { className: "logline__detail", "data-testid": "log-line:".concat(f2.id || i2, ":detail"), children: formatFrameData(f2) })
+              isOpen && /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("pre", { className: "logline__detail", "data-testid": "log-line:".concat(f2.id || i2, ":detail"), children: formatFrameData(f2) })
             ]
           },
           key
         );
       }),
-      rows.length === 0 && /* @__PURE__ */ (0, import_jsx_runtime52.jsx)("div", { style: { padding: 24, color: "var(--ink-dim)", fontFamily: "var(--mono)", fontSize: 12 }, children: "No matching events." })
+      rows.length === 0 && /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("div", { style: { padding: 24, color: "var(--ink-dim)", fontFamily: "var(--mono)", fontSize: 12 }, children: "No matching events." })
     ] }) })
   ] });
 }
 
 // src/panels/Topbar.tsx
-var import_jsx_runtime53 = require("react/jsx-runtime");
+var import_jsx_runtime54 = require("react/jsx-runtime");
 function PanelGlyph({ side, open }) {
   const dividerLeft = side === "left";
   const cx = dividerLeft ? 16.5 : 7.5;
   const point4 = open ? dividerLeft ? 1 : -1 : dividerLeft ? -1 : 1;
   const x1 = cx + point4 * 1.6;
   const x2 = cx - point4 * 1.6;
-  return /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)(
+  return /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)(
     "svg",
     {
       viewBox: "0 0 24 24",
       "aria-hidden": "true",
       focusable: "false",
       children: [
-        /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("rect", { x: "3", y: "5", width: "18", height: "14", rx: "1.5" }),
-        /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("path", { d: dividerLeft ? "M9 5 L9 19" : "M15 5 L15 19" }),
-        /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("path", { d: "M".concat(x1, " 9.5 L").concat(x2, " 12 L").concat(x1, " 14.5") })
+        /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("rect", { x: "3", y: "5", width: "18", height: "14", rx: "1.5" }),
+        /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("path", { d: dividerLeft ? "M9 5 L9 19" : "M15 5 L15 19" }),
+        /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("path", { d: "M".concat(x1, " 9.5 L").concat(x2, " 12 L").concat(x1, " 14.5") })
       ]
     }
   );
@@ -55295,8 +55310,8 @@ function Topbar({
   onToggleSidebar,
   onToggleRail
 }) {
-  return /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)("div", { className: "meta-topbar", "data-testid": "meta-topbar", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime53.jsx)(
+  return /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("div", { className: "meta-topbar", "data-testid": "meta-topbar", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(
       "button",
       {
         type: "button",
@@ -55306,28 +55321,28 @@ function Topbar({
         "aria-label": sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar",
         title: sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar",
         "data-testid": "sidebar-collapse-toggle",
-        children: /* @__PURE__ */ (0, import_jsx_runtime53.jsx)(PanelGlyph, { side: "left", open: !sidebarCollapsed })
+        children: /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(PanelGlyph, { side: "left", open: !sidebarCollapsed })
       }
     ),
-    /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)("div", { className: "meta-topbar__brand", children: [
-      brandLogoUrl ? /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("img", { className: "meta-topbar__brand-logo", src: brandLogoUrl, alt: brandLogoAlt || brandLabel }) : /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { className: "meta-topbar__brand-mark" }),
-      /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { children: brandLabel })
+    /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("div", { className: "meta-topbar__brand", children: [
+      brandLogoUrl ? /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("img", { className: "meta-topbar__brand-logo", src: brandLogoUrl, alt: brandLogoAlt || brandLabel }) : /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "meta-topbar__brand-mark" }),
+      /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { children: brandLabel })
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)("div", { className: "meta-topbar__mob", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { className: "meta-topbar__mob-status", title: mobStatus }),
-      /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { children: mobName }),
-      /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)("span", { className: "dim", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("div", { className: "meta-topbar__mob", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "meta-topbar__mob-status", title: mobStatus }),
+      /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { children: mobName }),
+      /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("span", { className: "dim", children: [
         "\xB7 ",
         mobStatus
       ] })
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime53.jsxs)("div", { className: "meta-topbar__mob", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { children: "env:" }),
-      /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("span", { children: environment })
+    /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("div", { className: "meta-topbar__mob", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { children: "env:" }),
+      /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { children: environment })
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("div", { className: "meta-topbar__spacer" }),
+    /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("div", { className: "meta-topbar__spacer" }),
     connectionStatus,
-    /* @__PURE__ */ (0, import_jsx_runtime53.jsx)("div", { className: "meta-topbar__util", children: /* @__PURE__ */ (0, import_jsx_runtime53.jsx)(
+    /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("div", { className: "meta-topbar__util", children: /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(
       "button",
       {
         type: "button",
@@ -55337,7 +55352,7 @@ function Topbar({
         children: theme === "dark" ? "\u263E dark" : "\u2600 light"
       }
     ) }),
-    railVisible ? /* @__PURE__ */ (0, import_jsx_runtime53.jsx)(
+    railVisible ? /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(
       "button",
       {
         type: "button",
@@ -55347,7 +55362,7 @@ function Topbar({
         "aria-label": railCollapsed ? "Expand signals rail" : "Collapse signals rail",
         title: railCollapsed ? "Expand signals rail" : "Collapse signals rail",
         "data-testid": "signals-rail-collapse-toggle",
-        children: /* @__PURE__ */ (0, import_jsx_runtime53.jsx)(PanelGlyph, { side: "right", open: !railCollapsed })
+        children: /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(PanelGlyph, { side: "right", open: !railCollapsed })
       }
     ) : null
   ] });
@@ -55377,7 +55392,7 @@ function useConsoleVariant() {
 
 // src/panels/Sidebar.tsx
 var import_react41 = __toESM(require("react"));
-var import_jsx_runtime54 = require("react/jsx-runtime");
+var import_jsx_runtime55 = require("react/jsx-runtime");
 var ALL_NAV = ["topology", "timeline", "gating", "roster", "routing", "logs", "health", "access", "memory", "workgraph"];
 var NAV_LABEL = {
   topology: "Topology",
@@ -56125,40 +56140,40 @@ function sidebarDragPreviewRows(rows, item) {
 function renderSidebarDragPreviewRows(rows) {
   return rows.map((row) => {
     if (row.kind === "section") {
-      return /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)(
+      return /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)(
         "div",
         {
           className: "sidebar__drag-preview-section",
           "data-pinned": row.pinned ? "true" : void 0,
           children: [
-            /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "sidebar__sec-label", children: row.bucket }),
-            /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "sidebar__sec-spacer" }),
-            /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "sidebar__sec-count", children: row.count })
+            /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "sidebar__sec-label", children: row.bucket }),
+            /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "sidebar__sec-spacer" }),
+            /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "sidebar__sec-count", children: row.count })
           ]
         },
         "preview:".concat(row.key)
       );
     }
     if (row.kind === "subgroup") {
-      return /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("div", { className: "sidebar__drag-preview-subgroup", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { children: row.label }),
-        /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "sidebar__sec-spacer" }),
-        /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "sidebar__sec-count", children: row.count })
+      return /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("div", { className: "sidebar__drag-preview-subgroup", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { children: row.label }),
+        /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "sidebar__sec-spacer" }),
+        /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "sidebar__sec-count", children: row.count })
       ] }, "preview:".concat(row.key));
     }
     if (row.kind === "empty") {
-      return /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("div", { className: "sidebar__drag-preview-empty", children: row.sectionConfig?.empty_title || row.sectionConfig?.empty_text || "No agents" }, "preview:".concat(row.key));
+      return /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("div", { className: "sidebar__drag-preview-empty", children: row.sectionConfig?.empty_title || row.sectionConfig?.empty_text || "No agents" }, "preview:".concat(row.key));
     }
-    return /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)(
+    return /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)(
       "div",
       {
         className: "sidebar__drag-preview-agent ".concat(row.row.childOfHost ? "sidebar__drag-preview-agent--child" : ""),
         "data-depth": row.row.childOfHost ? String(Math.min(row.row.depth, 3)) : void 0,
         children: [
-          /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "agent__dot" }),
-          /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("span", { className: "sidebar__drag-preview-agent-body", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "agent__name", children: row.row.agent.label }),
-            /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "agent__id", children: row.row.agent.identity || row.row.agent.member_id })
+          /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "agent__dot" }),
+          /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("span", { className: "sidebar__drag-preview-agent-body", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "agent__name", children: row.row.agent.label }),
+            /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "agent__id", children: row.row.agent.identity || row.row.agent.member_id })
           ] })
         ]
       },
@@ -56233,7 +56248,7 @@ function renderAgentRow(row, selectedMemberId, recentActivity, grouping, pinnedA
   const inbox = inboxCount(agent);
   const badges = configuredAgentBadges(agent, grouping);
   const pinned = isAgentPinned2(agent, pinnedAgentIds);
-  return /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)(
+  return /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)(
     "div",
     {
       className: "agent ".concat(childOfHost ? "agent--child" : "", " ").concat(agent.member_id === selectedMemberId ? "is-active" : ""),
@@ -56251,25 +56266,25 @@ function renderAgentRow(row, selectedMemberId, recentActivity, grouping, pinnedA
       role: "button",
       tabIndex: 0,
       children: [
-        /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "agent__dot" }),
-        /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("span", { className: "agent__body", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "agent__name", children: agent.label }),
-          /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "agent__id", children: agent.identity || agent.member_id }),
-          badges.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "agent__badges", children: badges.map((badge) => /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)(
+        /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "agent__dot" }),
+        /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("span", { className: "agent__body", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "agent__name", children: agent.label }),
+          /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "agent__id", children: agent.identity || agent.member_id }),
+          badges.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "agent__badges", children: badges.map((badge) => /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)(
             "span",
             {
               className: "agent__badge",
               "data-tone": badge.tone || "neutral",
               title: "".concat(badge.label, ": ").concat(badge.value),
               children: [
-                /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { children: badge.label }),
-                /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("strong", { children: badge.value })
+                /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { children: badge.label }),
+                /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("strong", { children: badge.value })
               ]
             },
             badge.id
           )) }) : null
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "agent__actions", children: onTogglePinnedAgent ? /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(
+        /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "agent__actions", children: onTogglePinnedAgent ? /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(
           "button",
           {
             type: "button",
@@ -56284,12 +56299,12 @@ function renderAgentRow(row, selectedMemberId, recentActivity, grouping, pinnedA
               event.stopPropagation();
               onTogglePinnedAgent(agent, familyPinIds);
             },
-            children: /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(Icon, { name: "i-pin", className: "agent__pin-icon" })
+            children: /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(Icon, { name: "i-pin", className: "agent__pin-icon" })
           }
         ) : null }),
-        /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("span", { className: "agent__meta", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "agent__pulse", children: pulse.map((v, i2) => /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { style: { height: "".concat(Math.max(1, Math.min(12, v * 2 + 1)), "px") } }, i2)) }),
-          inbox > 0 && /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "agent__inbox", children: inbox })
+        /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("span", { className: "agent__meta", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "agent__pulse", children: pulse.map((v, i2) => /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { style: { height: "".concat(Math.max(1, Math.min(12, v * 2 + 1)), "px") } }, i2)) }),
+          inbox > 0 && /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "agent__inbox", children: inbox })
         ] })
       ]
     }
@@ -56601,18 +56616,18 @@ var Sidebar = import_react41.default.memo(function Sidebar2({
     [virtualRows, draggingOrder]
   );
   if (collapsed) {
-    return /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(
+    return /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(
       "aside",
       {
         className: "sidebar sidebar--collapsed",
         "data-collapsed": "true",
         "data-testid": "sidebar-root",
-        children: /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("i", { className: "sidebar__grip", "aria-hidden": "true" })
+        children: /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("i", { className: "sidebar__grip", "aria-hidden": "true" })
       }
     );
   }
-  return /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("aside", { className: "sidebar", "data-testid": "sidebar-root", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(
+  return /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("aside", { className: "sidebar", "data-testid": "sidebar-root", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(
       "div",
       {
         "aria-live": "polite",
@@ -56631,16 +56646,16 @@ var Sidebar = import_react41.default.memo(function Sidebar2({
         children: orderAnnouncement
       }
     ),
-    approvals ? /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(ApprovalAttention, { snapshot: approvals, onOpen: onOpenApproval || (() => onOpenControl("gating")) }) : null,
-    /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("div", { className: "sidebar__mast", children: /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("div", { children: [
-      /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("div", { className: "sidebar__mast-title", children: "Roster" }),
-      /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("div", { className: "sidebar__mast-sub", children: [
+    approvals ? /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(ApprovalAttention, { snapshot: approvals, onOpen: onOpenApproval || (() => onOpenControl("gating")) }) : null,
+    /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("div", { className: "sidebar__mast", children: /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("div", { children: [
+      /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("div", { className: "sidebar__mast-title", children: "Roster" }),
+      /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("div", { className: "sidebar__mast-sub", children: [
         agents.length,
         " agents"
       ] })
     ] }) }),
-    /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("div", { className: "sidebar__search", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(
+    /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("div", { className: "sidebar__search", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(
         "input",
         {
           placeholder: "Search roster...",
@@ -56649,7 +56664,7 @@ var Sidebar = import_react41.default.memo(function Sidebar2({
           "data-testid": "sidebar-search"
         }
       ),
-      /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("div", { className: "sidebar__activity-filters", role: "group", "aria-label": "Agent activity", children: ["all", "working", "quiet", "unknown"].map((filter) => /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(
+      /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("div", { className: "sidebar__activity-filters", role: "group", "aria-label": "Agent activity", children: ["all", "working", "quiet", "unknown"].map((filter) => /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(
         "button",
         {
           type: "button",
@@ -56660,10 +56675,10 @@ var Sidebar = import_react41.default.memo(function Sidebar2({
         filter
       )) })
     ] }),
-    (navKinds.length > 0 || customSidebarButtons.length > 0 || customPanels.length > 0) && /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("div", { className: "sidebar__section sidebar__section--nav", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("div", { className: "sidebar__sec-head", children: /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "sidebar__sec-label", children: "Workbench" }) }),
-      /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("div", { className: "sidebar__navgrid", children: [
-        navKinds.map((kind) => /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(
+    (navKinds.length > 0 || customSidebarButtons.length > 0 || customPanels.length > 0) && /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("div", { className: "sidebar__section sidebar__section--nav", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("div", { className: "sidebar__sec-head", children: /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "sidebar__sec-label", children: "Workbench" }) }),
+      /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("div", { className: "sidebar__navgrid", children: [
+        navKinds.map((kind) => /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(
           "button",
           {
             className: "sidebar__navitem",
@@ -56673,7 +56688,7 @@ var Sidebar = import_react41.default.memo(function Sidebar2({
           },
           kind
         )),
-        customPanels.map((panel) => /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(
+        customPanels.map((panel) => /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(
           "button",
           {
             className: "sidebar__navitem",
@@ -56686,7 +56701,7 @@ var Sidebar = import_react41.default.memo(function Sidebar2({
         customSidebarButtons.map((button) => {
           if (button.panel) {
             if (!operatorPanelPath(button.panel) || !onOpenOperatorPanel) return null;
-            return /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(
+            return /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(
               "button",
               {
                 className: "sidebar__navitem",
@@ -56700,7 +56715,7 @@ var Sidebar = import_react41.default.memo(function Sidebar2({
           }
           const control = normalizeNavKind(button.control);
           if (control) {
-            return /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(
+            return /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(
               "button",
               {
                 className: "sidebar__navitem",
@@ -56719,7 +56734,7 @@ var Sidebar = import_react41.default.memo(function Sidebar2({
             }
             const target = button.target || void 0;
             const rel = target === "_blank" ? "noopener noreferrer" : void 0;
-            return /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(
+            return /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(
               "a",
               {
                 className: "sidebar__navitem",
@@ -56737,7 +56752,7 @@ var Sidebar = import_react41.default.memo(function Sidebar2({
         })
       ] })
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)(
+    /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)(
       "div",
       {
         className: "sidebar__virtual-list",
@@ -56745,24 +56760,24 @@ var Sidebar = import_react41.default.memo(function Sidebar2({
         onScroll: (event) => setScrollTop(event.currentTarget.scrollTop),
         "data-testid": "sidebar-agent-list",
         children: [
-          filtered.length === 0 && (q2 || activityFilter !== "all") ? /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("div", { className: "sidebar__empty", role: "status", children: "No matching agents." }) : null,
-          /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("div", { className: "sidebar__virtual-space", style: { height: "".concat(virtualOffsets.total, "px") }, children: visibleRows.map((row, index2) => {
+          filtered.length === 0 && (q2 || activityFilter !== "all") ? /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("div", { className: "sidebar__empty", role: "status", children: "No matching agents." }) : null,
+          /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("div", { className: "sidebar__virtual-space", style: { height: "".concat(virtualOffsets.total, "px") }, children: visibleRows.map((row, index2) => {
             const rowIndex = visibleRange.start + index2;
             const top = virtualOffsets.offsets[rowIndex] || 0;
             const height = virtualRowHeight(row);
-            return /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(
+            return /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(
               "div",
               {
                 className: "sidebar__virtual-row sidebar__virtual-row--".concat(row.kind),
                 style: { transform: "translateY(".concat(top, "px)"), height: "".concat(height, "px") },
-                children: row.kind === "section" ? /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(
+                children: row.kind === "section" ? /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(
                   "div",
                   {
                     className: "sidebar__section",
                     "data-collapsed": row.collapsed ? "true" : void 0,
                     "data-pinned": row.pinned ? "true" : void 0,
                     "data-drag-over": dragOverOrder?.kind === "section" && dragOverOrder.id === row.bucket ? dragOverOrder.where : void 0,
-                    children: /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)(
+                    children: /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)(
                       "button",
                       {
                         type: "button",
@@ -56785,17 +56800,17 @@ var Sidebar = import_react41.default.memo(function Sidebar2({
                         },
                         "data-testid": "sidebar-section-toggle:".concat(row.bucket),
                         children: [
-                          /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "sidebar__sec-label", children: row.bucket }),
-                          /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "sidebar__sec-spacer" }),
-                          /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "sidebar__sec-count", children: row.count })
+                          /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "sidebar__sec-label", children: row.bucket }),
+                          /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "sidebar__sec-spacer" }),
+                          /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "sidebar__sec-count", children: row.count })
                         ]
                       }
                     )
                   }
-                ) : row.kind === "empty" ? /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("div", { className: "sidebar__empty", "data-testid": "sidebar-section-empty:".concat(row.bucket), children: [
-                  row.sectionConfig?.empty_title ? /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "sidebar__empty-title", children: row.sectionConfig.empty_title }) : null,
-                  /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { children: row.sectionConfig?.empty_text || "No agents in this section." })
-                ] }) : row.kind === "subgroup" ? /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)(
+                ) : row.kind === "empty" ? /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("div", { className: "sidebar__empty", "data-testid": "sidebar-section-empty:".concat(row.bucket), children: [
+                  row.sectionConfig?.empty_title ? /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "sidebar__empty-title", children: row.sectionConfig.empty_title }) : null,
+                  /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { children: row.sectionConfig?.empty_text || "No agents in this section." })
+                ] }) : row.kind === "subgroup" ? /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)(
                   "button",
                   {
                     type: "button",
@@ -56821,9 +56836,9 @@ var Sidebar = import_react41.default.memo(function Sidebar2({
                       });
                     },
                     children: [
-                      /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { children: row.label }),
-                      /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "sidebar__sec-spacer" }),
-                      /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "sidebar__sec-count", children: row.count })
+                      /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { children: row.label }),
+                      /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "sidebar__sec-spacer" }),
+                      /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "sidebar__sec-count", children: row.count })
                     ]
                   }
                 ) : renderAgentRow(
@@ -56843,7 +56858,7 @@ var Sidebar = import_react41.default.memo(function Sidebar2({
         ]
       }
     ),
-    dragPreview && dragPreviewRows.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime54.jsx)(
+    dragPreview && dragPreviewRows.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(
       "div",
       {
         className: "sidebar__drag-preview",
@@ -56861,7 +56876,7 @@ var Sidebar = import_react41.default.memo(function Sidebar2({
 
 // src/panels/SignalsRail.tsx
 var import_react42 = __toESM(require("react"));
-var import_jsx_runtime55 = require("react/jsx-runtime");
+var import_jsx_runtime56 = require("react/jsx-runtime");
 var DEFAULT_FILTER_PRESETS = [
   { id: "all", label: "All" },
   { id: "warning", label: "Attn", alertLevels: ["warning", "critical"] },
@@ -57276,25 +57291,25 @@ var SignalsRail = import_react42.default.memo(function SignalsRail2({
     });
   }
   if (collapsed) {
-    return /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(
+    return /* @__PURE__ */ (0, import_jsx_runtime56.jsx)(
       "aside",
       {
         className: "rail rail--collapsed",
         "data-collapsed": "true",
         "data-testid": "signals-rail",
-        children: /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("i", { className: "rail__grip", "aria-hidden": "true" })
+        children: /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("i", { className: "rail__grip", "aria-hidden": "true" })
       }
     );
   }
-  return /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("aside", { className: "rail", "data-testid": "signals-rail", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("div", { className: "rail__head", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "rail__title", children: "Signals" }),
-      /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("span", { className: "rail__sub", children: [
+  return /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)("aside", { className: "rail", "data-testid": "signals-rail", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)("div", { className: "rail__head", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { className: "rail__title", children: "Signals" }),
+      /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)("span", { className: "rail__sub", children: [
         recent15m,
         " in 15m"
       ] })
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("div", { className: "rail__filters", children: presets.map((preset) => /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)(
+    /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("div", { className: "rail__filters", children: presets.map((preset) => /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)(
       "button",
       {
         className: "rail__filter ".concat(filter === preset.id ? "is-active" : ""),
@@ -57306,16 +57321,16 @@ var SignalsRail = import_react42.default.memo(function SignalsRail2({
         children: [
           preset.label,
           " ",
-          /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "rail__filter-count", children: counts.get(preset.id) || 0 })
+          /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { className: "rail__filter-count", children: counts.get(preset.id) || 0 })
         ]
       },
       preset.id
     )) }),
-    /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("div", { className: "rail__list", children: [
-      shown.length === 0 && /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("div", { className: "rail__empty", children: emptyText || "No meaningful signals yet." }),
+    /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)("div", { className: "rail__list", children: [
+      shown.length === 0 && /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("div", { className: "rail__empty", children: emptyText || "No meaningful signals yet." }),
       shown.map((s) => {
         const expanded = expandedGroups.has(s.id);
-        return /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)(
+        return /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)(
           "div",
           {
             className: "signal",
@@ -57326,16 +57341,16 @@ var SignalsRail = import_react42.default.memo(function SignalsRail2({
             role: "button",
             tabIndex: 0,
             children: [
-              /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "signal__bar" }),
-              /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("span", { className: "signal__body", children: [
-                /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)("span", { className: "signal__label", children: [
-                  s.items.length > 1 && /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "signal__chevron", children: expanded ? "\u25BE" : "\u25B8" }),
+              /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { className: "signal__bar" }),
+              /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)("span", { className: "signal__body", children: [
+                /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)("span", { className: "signal__label", children: [
+                  s.items.length > 1 && /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { className: "signal__chevron", children: expanded ? "\u25BE" : "\u25B8" }),
                   s.title,
-                  s.items.length > 1 && /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "signal__count", children: s.items.length })
+                  s.items.length > 1 && /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { className: "signal__count", children: s.items.length })
                 ] }),
-                /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "signal__detail", children: s.detail }),
-                /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "signal__agent", children: s.agent }),
-                s.items.length === 1 && s.items[0].raw.event.startsWith("memory.") && onSelect ? /* @__PURE__ */ (0, import_jsx_runtime55.jsx)(
+                /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { className: "signal__detail", children: s.detail }),
+                /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { className: "signal__agent", children: s.agent }),
+                s.items.length === 1 && s.items[0].raw.event.startsWith("memory.") && onSelect ? /* @__PURE__ */ (0, import_jsx_runtime56.jsx)(
                   "button",
                   {
                     type: "button",
@@ -57348,7 +57363,7 @@ var SignalsRail = import_react42.default.memo(function SignalsRail2({
                     children: "state here"
                   }
                 ) : null,
-                s.items.length > 1 && expanded && /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "signal__events", children: s.items.map((item) => /* @__PURE__ */ (0, import_jsx_runtime55.jsxs)(
+                s.items.length > 1 && expanded && /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { className: "signal__events", children: s.items.map((item) => /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)(
                   "button",
                   {
                     className: "signal__event",
@@ -57358,14 +57373,14 @@ var SignalsRail = import_react42.default.memo(function SignalsRail2({
                       onSelect?.(item.raw);
                     },
                     children: [
-                      /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "signal__event-label", children: item.label }),
-                      /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "signal__event-detail", children: item.detail })
+                      /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { className: "signal__event-label", children: item.label }),
+                      /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { className: "signal__event-detail", children: item.detail })
                     ]
                   },
                   item.id
                 )) })
               ] }),
-              /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "signal__meta", children: /* @__PURE__ */ (0, import_jsx_runtime55.jsx)("span", { className: "signal__time", children: s.at }) })
+              /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { className: "signal__meta", children: /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { className: "signal__time", children: s.at }) })
             ]
           },
           s.id
@@ -57440,7 +57455,7 @@ function voiceContextFailureMessage(reason) {
 }
 
 // src/panels/VoiceBar.tsx
-var import_jsx_runtime56 = require("react/jsx-runtime");
+var import_jsx_runtime57 = require("react/jsx-runtime");
 var TALK_READY_STATUS = "Listening, you can talk";
 var CONTEXT_STAGE_TITLES = {
   capturing: "being read",
@@ -57448,7 +57463,7 @@ var CONTEXT_STAGE_TITLES = {
   delivering: "being sent to the voice model"
 };
 function Glyph({ name: name2 }) {
-  return /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { className: "voice-glyph", "aria-hidden": "true", children: /* @__PURE__ */ (0, import_jsx_runtime56.jsx)(Icon, { name: name2 }) });
+  return /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "voice-glyph", "aria-hidden": "true", children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(Icon, { name: name2 }) });
 }
 function VoiceButton({
   agentLabel,
@@ -57458,7 +57473,7 @@ function VoiceButton({
   onClick
 }) {
   const label = active ? "End voice with ".concat(agentLabel) : checking ? "Start voice with ".concat(agentLabel, " (checking availability)") : "Start voice with ".concat(agentLabel);
-  return /* @__PURE__ */ (0, import_jsx_runtime56.jsx)(
+  return /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
     "button",
     {
       type: "button",
@@ -57471,7 +57486,7 @@ function VoiceButton({
       onClick,
       "data-testid": "voice-start",
       "data-readiness": checking ? "checking" : "confirmed",
-      children: /* @__PURE__ */ (0, import_jsx_runtime56.jsx)(Glyph, { name: "i-voice" })
+      children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(Glyph, { name: "i-voice" })
     }
   );
 }
@@ -57540,7 +57555,7 @@ function AudioWaveform({
       observer.disconnect();
     };
   }, [active, sampleWaveform, source]);
-  return /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("canvas", { className: "voice-waveform voice-waveform--".concat(source), ref: canvasRef, "aria-hidden": "true" });
+  return /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("canvas", { className: "voice-waveform voice-waveform--".concat(source), ref: canvasRef, "aria-hidden": "true" });
 }
 var VoiceBar = import_react43.default.memo(function VoiceBar2({
   state,
@@ -57560,7 +57575,7 @@ var VoiceBar = import_react43.default.memo(function VoiceBar2({
   const contextLabel = contextState === null ? null : contextState === "status_unavailable" ? "Context status unavailable" : contextState === "checking" || contextState === "preparing" ? "Context arriving" : contextState === "provider_acknowledged" ? "Context supplied" : contextState === "not_requested" ? "No summary pending" : "Context unavailable";
   const contextTitle = contextState === "checking" ? "Checking whether the agent's context is on its way. You can talk now." : contextState === "preparing" ? "The agent's context is ".concat(CONTEXT_STAGE_TITLES[preparation.stage], ". You can talk now; the model receives it as it arrives.") : contextState === "provider_acknowledged" ? "The voice provider acknowledged the initial context. This does not confirm recall or speech completion." : contextState === "not_requested" ? "No concurrent context preparation was requested for this call." : void 0;
   const contextMessage = !active ? null : state.contextStatusError ?? (preparation?.phase === "failed" ? voiceContextFailureMessage(preparation.reason) : null);
-  return /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)(
+  return /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(
     "section",
     {
       className: "voice-bar",
@@ -57568,17 +57583,17 @@ var VoiceBar = import_react43.default.memo(function VoiceBar2({
       "data-testid": "voice-bar",
       "data-phase": state.phase,
       children: [
-        /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)("div", { className: "voice-bar__header", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)("div", { className: "voice-bar__heading", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { className: "voice-bar__indicator", "aria-hidden": "true" }),
-            /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)("div", { className: "voice-bar__titles", children: [
-              /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { className: "voice-bar__name", title: state.target?.label, children: state.target ? /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)(import_jsx_runtime56.Fragment, { children: [
+        /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "voice-bar__header", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "voice-bar__heading", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "voice-bar__indicator", "aria-hidden": "true" }),
+            /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "voice-bar__titles", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "voice-bar__name", title: state.target?.label, children: state.target ? /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(import_jsx_runtime57.Fragment, { children: [
                 "Voice with ",
-                /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("strong", { children: state.target.label })
+                /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("strong", { children: state.target.label })
               ] }) : "Voice" }),
-              /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)("span", { className: "voice-bar__status", role: "status", "data-testid": "voice-status", "data-talk-ready": talkReady || void 0, children: [
-                /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { children: status }),
-                contextLabel && /* @__PURE__ */ (0, import_jsx_runtime56.jsx)(
+              /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("span", { className: "voice-bar__status", role: "status", "data-testid": "voice-status", "data-talk-ready": talkReady || void 0, children: [
+                /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: status }),
+                contextLabel && /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
                   "span",
                   {
                     className: "voice-bar__context",
@@ -57591,8 +57606,8 @@ var VoiceBar = import_react43.default.memo(function VoiceBar2({
               ] })
             ] })
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)("div", { className: "voice-bar__controls", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime56.jsx)(
+          /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "voice-bar__controls", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
               "button",
               {
                 className: "voice-bar__control",
@@ -57602,10 +57617,10 @@ var VoiceBar = import_react43.default.memo(function VoiceBar2({
                 "aria-pressed": state.microphoneMuted,
                 disabled: !active,
                 onClick: onToggleMicrophone,
-                children: /* @__PURE__ */ (0, import_jsx_runtime56.jsx)(Glyph, { name: state.microphoneMuted ? "i-mic-off" : "i-mic" })
+                children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(Glyph, { name: state.microphoneMuted ? "i-mic-off" : "i-mic" })
               }
             ),
-            /* @__PURE__ */ (0, import_jsx_runtime56.jsx)(
+            /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
               "button",
               {
                 className: "voice-bar__control",
@@ -57615,11 +57630,11 @@ var VoiceBar = import_react43.default.memo(function VoiceBar2({
                 "aria-pressed": state.speakerMuted,
                 disabled: !active,
                 onClick: onToggleSpeaker,
-                children: /* @__PURE__ */ (0, import_jsx_runtime56.jsx)(Glyph, { name: state.speakerMuted ? "i-speaker-off" : "i-speaker" })
+                children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(Glyph, { name: state.speakerMuted ? "i-speaker-off" : "i-speaker" })
               }
             ),
-            /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { className: "voice-bar__separator", "aria-hidden": "true" }),
-            /* @__PURE__ */ (0, import_jsx_runtime56.jsx)(
+            /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "voice-bar__separator", "aria-hidden": "true" }),
+            /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
               "button",
               {
                 className: "voice-bar__control voice-bar__control--close",
@@ -57628,30 +57643,30 @@ var VoiceBar = import_react43.default.memo(function VoiceBar2({
                 title: active || transitioning ? "End voice conversation" : "Dismiss voice",
                 onClick: onClose,
                 disabled: state.phase === "closing",
-                children: /* @__PURE__ */ (0, import_jsx_runtime56.jsx)(Glyph, { name: "i-close" })
+                children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(Glyph, { name: "i-close" })
               }
             )
           ] })
         ] }),
-        (active || transitioning) && /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)("div", { className: "voice-bar__channels", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)("div", { className: "voice-bar__channel", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)("div", { className: "voice-bar__channel-label", children: [
-              /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { children: "You" }),
-              /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { children: state.microphoneMuted ? "Muted" : "Microphone" })
+        (active || transitioning) && /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "voice-bar__channels", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "voice-bar__channel", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "voice-bar__channel-label", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: "You" }),
+              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: state.microphoneMuted ? "Muted" : "Microphone" })
             ] }),
-            /* @__PURE__ */ (0, import_jsx_runtime56.jsx)(AudioWaveform, { source: "microphone", sampleWaveform, active: active && !state.microphoneMuted })
+            /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(AudioWaveform, { source: "microphone", sampleWaveform, active: active && !state.microphoneMuted })
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)("div", { className: "voice-bar__channel", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime56.jsxs)("div", { className: "voice-bar__channel-label", children: [
-              /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { children: "Agent" }),
-              /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("span", { children: state.speakerMuted ? "Speakers muted" : "Live audio" })
+          /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "voice-bar__channel", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "voice-bar__channel-label", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: "Agent" }),
+              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: state.speakerMuted ? "Speakers muted" : "Live audio" })
             ] }),
-            /* @__PURE__ */ (0, import_jsx_runtime56.jsx)(AudioWaveform, { source: "speaker", sampleWaveform, active })
+            /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(AudioWaveform, { source: "speaker", sampleWaveform, active })
           ] })
         ] }),
-        state.error && /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("p", { className: "voice-bar__message voice-bar__message--error", role: "alert", children: state.error }),
-        contextMessage && /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("p", { className: "voice-bar__message voice-bar__message--error", role: "alert", children: contextMessage }),
-        state.notice && /* @__PURE__ */ (0, import_jsx_runtime56.jsx)("p", { className: "voice-bar__message", role: "status", children: state.notice })
+        state.error && /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("p", { className: "voice-bar__message voice-bar__message--error", role: "alert", children: state.error }),
+        contextMessage && /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("p", { className: "voice-bar__message voice-bar__message--error", role: "alert", children: contextMessage }),
+        state.notice && /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("p", { className: "voice-bar__message", role: "status", children: state.notice })
       ]
     }
   );
@@ -58010,7 +58025,7 @@ function useTurnWindow(bodyRef, turns, enabled, renderKey, actionable = NO_ACTIO
 }
 
 // src/panels/ChatPane.tsx
-var import_jsx_runtime57 = require("react/jsx-runtime");
+var import_jsx_runtime58 = require("react/jsx-runtime");
 var NO_TURN_IDS = /* @__PURE__ */ new Set();
 function transcriptWindowingDefault() {
   return globalThis.__consoleTranscriptWindowing !== false;
@@ -58197,8 +58212,8 @@ function TranscriptFindBar({
     if (!matches.length) return;
     setCurrent((index2) => ((index2 < 0 ? 0 : index2) + delta + matches.length) % matches.length);
   };
-  return /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "conv__find", role: "search", "aria-label": "Find in transcript", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+  return /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "conv__find", role: "search", "aria-label": "Find in transcript", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
       "input",
       {
         "aria-label": "Find in transcript",
@@ -58220,10 +58235,10 @@ function TranscriptFindBar({
         value: query
       }
     ),
-    /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { "aria-live": "polite", className: "conv__find-count", "data-testid": "chat-find-count:".concat(identity), children: query.trim() ? matches.length ? "".concat(current + 1, " of ").concat(matches.length) : "No matches" : "" }),
-    /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("button", { "aria-label": "Previous match", disabled: !matches.length, onClick: () => step(-1), type: "button", children: "\u2191" }),
-    /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("button", { "aria-label": "Next match", disabled: !matches.length, onClick: () => step(1), type: "button", children: "\u2193" }),
-    /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("button", { "aria-label": "Close find", onClick: onClose, type: "button", children: "\xD7" })
+    /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { "aria-live": "polite", className: "conv__find-count", "data-testid": "chat-find-count:".concat(identity), children: query.trim() ? matches.length ? "".concat(current + 1, " of ").concat(matches.length) : "No matches" : "" }),
+    /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("button", { "aria-label": "Previous match", disabled: !matches.length, onClick: () => step(-1), type: "button", children: "\u2191" }),
+    /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("button", { "aria-label": "Next match", disabled: !matches.length, onClick: () => step(1), type: "button", children: "\u2193" }),
+    /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("button", { "aria-label": "Close find", onClick: onClose, type: "button", children: "\xD7" })
   ] });
 }
 function transcriptCopyText(messages) {
@@ -58600,7 +58615,7 @@ function CopyInlineButton({
     resetTimer.current = setTimeout(() => setOutcome("idle"), 1400);
   }
   const title = outcome === "copied" ? "Copied" : outcome === "failed" ? "Copy failed" : label;
-  return /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+  return /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
     "button",
     {
       "aria-label": title,
@@ -58614,7 +58629,7 @@ function CopyInlineButton({
       },
       title,
       type: "button",
-      children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(CopyGlyph, { state: outcome })
+      children: /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(CopyGlyph, { state: outcome })
     }
   );
 }
@@ -58702,7 +58717,7 @@ function messageRowPropsEqual(prev, next) {
   return prev.suppressWorked === next.suppressWorked && prev.workGraphActions === next.workGraphActions && prev.markdownUrlPolicy === next.markdownUrlPolicy && (prev.message === next.message || msgSignature(prev.message) === msgSignature(next.message));
 }
 function UntrustedBadge() {
-  return /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+  return /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
     "span",
     {
       "aria-label": "Untrusted source. ".concat(UNTRUSTED_SOURCE_DESCRIPTION),
@@ -58717,7 +58732,7 @@ function UntrustedBadge() {
 }
 function MessageTime({ message }) {
   if (!message.time) return null;
-  return /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("time", { className: "msg__time", dateTime: message.createdAt, title: formatFullTimestamp(message.createdAt), children: message.time });
+  return /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("time", { className: "msg__time", dateTime: message.createdAt, title: formatFullTimestamp(message.createdAt), children: message.time });
 }
 function runtimeEventJson(payload) {
   try {
@@ -58728,11 +58743,11 @@ function runtimeEventJson(payload) {
 }
 function EventRow({ message: m2 }) {
   if (m2.operationFeedback) {
-    return /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { "data-conversation-row-id": m2.scrollRowId ?? m2.id, children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(OperationFeedbackView, { feedback: m2.operationFeedback, createdAt: m2.createdAt }) });
+    return /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { "data-conversation-row-id": m2.scrollRowId ?? m2.id, children: /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(OperationFeedbackView, { feedback: m2.operationFeedback, createdAt: m2.createdAt }) });
   }
   const sentence = m2.source?.sentence || m2.text || "";
   const payloadJson = m2.runtimeEvent ? runtimeEventJson(m2.runtimeEvent.payload) : "";
-  return /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+  return /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
     "div",
     {
       "aria-label": m2.source?.label,
@@ -58740,16 +58755,16 @@ function EventRow({ message: m2 }) {
       "data-source-kind": m2.source?.kind,
       "data-conversation-row-id": m2.scrollRowId ?? m2.id,
       "data-testid": m2.kind === "event" ? "chat-event:".concat(m2.runtimeEvent?.eventType ?? "") : void 0,
-      children: /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "msg__bubble", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "msg__event-line", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { "aria-hidden": "true", className: "msg__event-mark" }),
-          /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "msg__event-text", children: sentence }),
-          m2.source?.untrusted ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(UntrustedBadge, {}) : null,
-          /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(MessageTime, { message: m2 })
+      children: /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "msg__bubble", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "msg__event-line", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { "aria-hidden": "true", className: "msg__event-mark" }),
+          /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "msg__event-text", children: sentence }),
+          m2.source?.untrusted ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(UntrustedBadge, {}) : null,
+          /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(MessageTime, { message: m2 })
         ] }),
-        payloadJson ? /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(RowDetails, { part: "event-details", className: "msg__event-details", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("summary", { children: "Event details" }),
-          /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("pre", { children: payloadJson })
+        payloadJson ? /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(RowDetails, { part: "event-details", className: "msg__event-details", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("summary", { children: "Event details" }),
+          /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("pre", { children: payloadJson })
         ] }) : null
       ] })
     }
@@ -58758,12 +58773,12 @@ function EventRow({ message: m2 }) {
 function MessageHeader({ message: m2, copyLabel }) {
   const source = m2.source;
   if (!source) return null;
-  return /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "msg__head", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "msg__source", children: source.label }),
-    source.detail ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "msg__source-detail", children: source.detail }) : null,
-    source.untrusted ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(UntrustedBadge, {}) : null,
-    /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(MessageTime, { message: m2 }),
-    copyLabel ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(CopyInlineButton, { className: "msg__copy--head", label: copyLabel, text: msgCopyText(m2) }) : null
+  return /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "msg__head", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "msg__source", children: source.label }),
+    source.detail ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "msg__source-detail", children: source.detail }) : null,
+    source.untrusted ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(UntrustedBadge, {}) : null,
+    /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(MessageTime, { message: m2 }),
+    copyLabel ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(CopyInlineButton, { className: "msg__copy--head", label: copyLabel, text: msgCopyText(m2) }) : null
   ] });
 }
 var MessageRow = import_react44.default.memo(function MessageRow2({
@@ -58773,7 +58788,7 @@ var MessageRow = import_react44.default.memo(function MessageRow2({
   markdownUrlPolicy
 }) {
   countRender("MessageRow");
-  return /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(ConversationRowStateScope, { rowId: m2.scrollRowId ?? m2.id, children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(MessageRowBody, { message: m2, suppressWorked, workGraphActions, markdownUrlPolicy }) });
+  return /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(ConversationRowStateScope, { rowId: m2.scrollRowId ?? m2.id, children: /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(MessageRowBody, { message: m2, suppressWorked, workGraphActions, markdownUrlPolicy }) });
 }, messageRowPropsEqual);
 function MessageRowBody({
   message: m2,
@@ -58781,24 +58796,24 @@ function MessageRowBody({
   workGraphActions,
   markdownUrlPolicy
 }) {
-  if (m2.mcpAppEntry?.mcpApp) return /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(ConsoleMcpAppView, { locator: { ...m2.mcpAppEntry.mcpApp, identity: m2.mcpAppEntry.identity.id }, fallback: m2.text ?? "Tool result" });
+  if (m2.mcpAppEntry?.mcpApp) return /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(ConsoleMcpAppView, { locator: { ...m2.mcpAppEntry.mcpApp, identity: m2.mcpAppEntry.identity.id }, fallback: m2.text ?? "Tool result" });
   if (m2.kind === "event" || m2.kind === "origin") {
-    return /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(EventRow, { message: m2 });
+    return /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(EventRow, { message: m2 });
   }
   const copyLabel = m2.kind === "user" || m2.kind === "agent" ? "Copy ".concat(m2.kind === "user" ? "message" : "reply") : null;
   const header = m2.showHeader && m2.source;
-  return /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "msg msg--".concat(m2.kind), "data-source-kind": m2.source?.kind, "data-conversation-row-id": m2.scrollRowId ?? m2.id, children: [
-    header ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(MessageHeader, { copyLabel, message: m2 }) : null,
-    /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "msg__bubble", children: [
-      !header && copyLabel && /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(CopyInlineButton, { label: copyLabel, text: msgCopyText(m2) }),
+  return /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "msg msg--".concat(m2.kind), "data-source-kind": m2.source?.kind, "data-conversation-row-id": m2.scrollRowId ?? m2.id, children: [
+    header ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(MessageHeader, { copyLabel, message: m2 }) : null,
+    /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "msg__bubble", children: [
+      !header && copyLabel && /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(CopyInlineButton, { label: copyLabel, text: msgCopyText(m2) }),
       m2.kind === "council" && m2.councilEntry ? (
         // No actions prop: council participants are destroyed
         // before the tool returns, so the card is observational
         // by construction.
-        /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(CouncilCard, { entry: m2.councilEntry })
+        /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(CouncilCard, { entry: m2.councilEntry })
       ) : null,
-      /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { "data-quote-message-id": m2.kind === "user" || m2.kind === "agent" ? m2.sourceEntryId ?? m2.id : void 0, "data-quote-source": m2.kind === "user" || m2.kind === "agent" ? msgCopyText(m2) : void 0, children: m2.kind === "workgraph" && m2.workGraphEntry ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(WorkGraphCard, { entry: m2.workGraphEntry, actions: workGraphActions }) : m2.contextMessage ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(DeliveredContextMessage, { message: m2.contextMessage }) : m2.blocks && m2.blocks.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(ConversationRichContent, { blocks: m2.blocks, displayNormalization: false, markdownUrlPolicy }) : m2.text && /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "msg__text", children: m2.text }) }),
-      m2.workedFor && !suppressWorked && /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "msg__worked", children: /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("span", { children: [
+      /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { "data-quote-message-id": m2.kind === "user" || m2.kind === "agent" ? m2.sourceEntryId ?? m2.id : void 0, "data-quote-source": m2.kind === "user" || m2.kind === "agent" ? msgCopyText(m2) : void 0, children: m2.kind === "workgraph" && m2.workGraphEntry ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(WorkGraphCard, { entry: m2.workGraphEntry, actions: workGraphActions }) : m2.contextMessage ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(DeliveredContextMessage, { message: m2.contextMessage }) : m2.blocks && m2.blocks.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(ConversationRichContent, { blocks: m2.blocks, displayNormalization: false, markdownUrlPolicy }) : m2.text && /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "msg__text", children: m2.text }) }),
+      m2.workedFor && !suppressWorked && /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "msg__worked", children: /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("span", { children: [
         "Worked for ",
         m2.workedFor
       ] }) })
@@ -58842,19 +58857,19 @@ var TranscriptTurn = import_react44.default.memo(function TranscriptTurn2({
     if (!next || next === day) return null;
     day = next;
     const label = transcriptDayLabel(next, dayLabelNow);
-    return /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+    return /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
       "div",
       {
         "aria-label": label,
         className: "conv__day",
         "data-testid": "chat-day:".concat(identity, ":").concat(next),
         role: "separator",
-        children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: label })
+        children: /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: label })
       },
       "day:".concat(next, ":").concat(message.renderKey ?? message.id)
     );
   };
-  return /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(
+  return /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(
     "div",
     {
       "aria-label": "Turn ".concat(turnIndex + 1),
@@ -58869,13 +58884,13 @@ var TranscriptTurn = import_react44.default.memo(function TranscriptTurn2({
       tabIndex: -1,
       children: [
         groupRoutineToolRows(turn.messages, (message) => message.kind === "tool" ? message.blocks : void 0).map((run) => {
-          const rows = run.rows.map((m2) => /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(import_react44.default.Fragment, { children: [
+          const rows = run.rows.map((m2) => /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(import_react44.default.Fragment, { children: [
             daySeparator(m2),
-            /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(MessageRow, { message: m2, suppressWorked: m2.id === suppressWorkedId, workGraphActions, markdownUrlPolicy })
+            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(MessageRow, { message: m2, suppressWorked: m2.id === suppressWorkedId, workGraphActions, markdownUrlPolicy })
           ] }, m2.scrollRowId ?? m2.id));
-          return /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(import_react44.default.Fragment, { children: run.tools.length >= 2 ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(CompletedToolDisclosure, { blocks: run.tools, children: rows }) : rows }, run.rows[0].scrollRowId ?? run.rows[0].id);
+          return /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(import_react44.default.Fragment, { children: run.tools.length >= 2 ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(CompletedToolDisclosure, { blocks: run.tools, children: rows }) : rows }, run.rows[0].scrollRowId ?? run.rows[0].id);
         }),
-        /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(ConversationRowStateScope, { rowId: "approvals:".concat(turn.id), children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(ConversationApprovals, { approvalSnapshot, approvalIdentity: identity, onApprovalDecision, conversationId, interactionIds: approvalInteractionIds }) })
+        /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(ConversationRowStateScope, { rowId: "approvals:".concat(turn.id), children: /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(ConversationApprovals, { approvalSnapshot, approvalIdentity: identity, onApprovalDecision, conversationId, interactionIds: approvalInteractionIds }) })
       ]
     }
   );
@@ -58938,7 +58953,7 @@ var TranscriptView = import_react44.default.memo(function TranscriptView2({
   const setSize = windowStart > 0 || hasOlderHistory ? -1 : turns.length;
   const renderTurn = (offset, parkedHeight) => {
     const turn = windowedTurns[offset];
-    return turn ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+    return turn ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
       TranscriptTurn,
       {
         turn,
@@ -58959,7 +58974,7 @@ var TranscriptView = import_react44.default.memo(function TranscriptView2({
       turn.id
     ) : null;
   };
-  return /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(
+  return /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(
     "div",
     {
       "aria-busy": isLoadingHistory || loadingOlderHistory,
@@ -58971,8 +58986,8 @@ var TranscriptView = import_react44.default.memo(function TranscriptView2({
       role: "feed",
       tabIndex: 0,
       children: [
-        /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "conv__tools", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+        /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "conv__tools", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
             "button",
             {
               "aria-label": "Find in transcript",
@@ -58981,10 +58996,10 @@ var TranscriptView = import_react44.default.memo(function TranscriptView2({
               onClick: onOpenFind,
               title: "Find in transcript (Ctrl+Shift+F)",
               type: "button",
-              children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(Icon, { name: "i-search" })
+              children: /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(Icon, { name: "i-search" })
             }
           ),
-          /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+          /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
             CopyInlineButton,
             {
               label: "Copy transcript",
@@ -58992,7 +59007,7 @@ var TranscriptView = import_react44.default.memo(function TranscriptView2({
             }
           )
         ] }),
-        windowStart > 0 ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+        windowStart > 0 ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
           "button",
           {
             className: "conv__history",
@@ -59001,7 +59016,7 @@ var TranscriptView = import_react44.default.memo(function TranscriptView2({
             type: "button",
             children: "Show earlier messages"
           }
-        ) : hasOlderHistory && /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+        ) : hasOlderHistory && /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
           "button",
           {
             className: "conv__history",
@@ -59011,31 +59026,31 @@ var TranscriptView = import_react44.default.memo(function TranscriptView2({
             children: loadingOlderHistory ? "Loading history" : "Load older history"
           }
         ),
-        messages.length === 0 && isLoadingHistory && /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+        messages.length === 0 && isLoadingHistory && /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
           "div",
           {
             className: "msg msg--origin",
             "data-testid": "chat-loading-history:".concat(identity),
             "aria-live": "polite",
             "aria-busy": "true",
-            children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "msg__bubble", children: /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("span", { className: "msg__typing", children: [
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("span", { className: "msg__typing-dots", "aria-hidden": "true", children: [
-                /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", {}),
-                /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", {}),
-                /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", {})
+            children: /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "msg__bubble", children: /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("span", { className: "msg__typing", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("span", { className: "msg__typing-dots", "aria-hidden": "true", children: [
+                /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", {}),
+                /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", {}),
+                /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", {})
               ] }),
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "msg__typing-label", children: "Loading conversation\u2026" })
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "msg__typing-label", children: "Loading conversation\u2026" })
             ] }) })
           }
         ),
-        messages.length === 0 && !isLoadingHistory && /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "msg msg--origin", children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "msg__bubble", children: /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("span", { className: "msg__text", children: [
+        messages.length === 0 && !isLoadingHistory && /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "msg msg--origin", children: /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "msg__bubble", children: /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("span", { className: "msg__text", children: [
           "No messages yet. Say hello to ",
           agentLabel,
           "."
         ] }) }) }),
         turnWindow.slots.map((slot) => slot.kind === "spacer" ? (
           // Stands for unmounted turns at their measured height (see transcript-window).
-          /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+          /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
             "div",
             {
               "aria-hidden": "true",
@@ -59046,45 +59061,45 @@ var TranscriptView = import_react44.default.memo(function TranscriptView2({
             "spacer:".concat(windowedTurns[slot.from].id)
           )
         ) : renderTurn(slot.index, slot.kind === "parked" ? slot.height : void 0)),
-        /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(ConversationApprovals, { approvalSnapshot, approvalIdentity: identity, onApprovalDecision, conversationId }),
-        liveSpeech && liveSpeech.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+        /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(ConversationApprovals, { approvalSnapshot, approvalIdentity: identity, onApprovalDecision, conversationId }),
+        liveSpeech && liveSpeech.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
           "div",
           {
             "aria-label": "Live speech",
             className: "conv-turn conv-turn--live",
             "data-testid": "chat-live-speech:".concat(identity),
-            children: liveSpeech.map((item) => /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(
+            children: liveSpeech.map((item) => /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(
               "div",
               {
                 className: "msg msg--live msg--live-".concat(item.speaker),
                 "data-live-final": item.final ? "true" : "false",
                 "data-testid": "chat-live-row:".concat(identity, ":").concat(item.itemId),
                 children: [
-                  /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "msg__head", children: [
-                    /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "msg__source", children: item.speaker === "user" ? "Operator (voice)" : "Assistant (voice)" }),
-                    /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "msg__live-label", children: "live" })
+                  /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "msg__head", children: [
+                    /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "msg__source", children: item.speaker === "user" ? "Operator (voice)" : "Assistant (voice)" }),
+                    /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "msg__live-label", children: "live" })
                   ] }),
-                  /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "msg__bubble", children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "msg__text", children: item.text }) })
+                  /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "msg__bubble", children: /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "msg__text", children: item.text }) })
                 ]
               },
               "".concat(item.speaker, ":").concat(item.itemId)
             ))
           }
         ),
-        phase2 && /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+        phase2 && /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
           "div",
           {
             className: "msg msg--typing",
             "data-testid": "chat-typing:".concat(identity),
             "aria-live": "polite",
             "aria-label": "".concat(agentLabel, " is ").concat(phaseLabel(phase2)),
-            children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "msg__bubble", children: /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("span", { className: "msg__typing", children: [
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("span", { className: "msg__typing-dots", "aria-hidden": "true", children: [
-                /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", {}),
-                /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", {}),
-                /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", {})
+            children: /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "msg__bubble", children: /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("span", { className: "msg__typing", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("span", { className: "msg__typing-dots", "aria-hidden": "true", children: [
+                /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", {}),
+                /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", {}),
+                /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", {})
               ] }),
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "msg__typing-label", children: phaseLabel(phase2) })
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "msg__typing-label", children: phaseLabel(phase2) })
             ] }) })
           }
         )
@@ -59119,8 +59134,8 @@ var ComposerTextarea = import_react44.default.memo(function ComposerTextarea2({
     setAppliedExternal(externalValue.at);
     setValue(externalValue.value);
   }
-  return /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(import_jsx_runtime57.Fragment, { children: [
-    /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "composer__input", children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+  return /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(import_jsx_runtime58.Fragment, { children: [
+    /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "composer__input", children: /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
       "textarea",
       {
         placeholder: readOnly ? "View-only console" : sendWithheld ? "You can view ".concat(agentLabel, " but not message it") : voiceActive ? "Message ".concat(agentLabel, " (background agent)\u2026") : "Message ".concat(agentLabel, "\u2026"),
@@ -59142,10 +59157,10 @@ var ComposerTextarea = import_react44.default.memo(function ComposerTextarea2({
         "data-testid": "chat-composer:".concat(identity)
       }
     ) }),
-    /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "composer__row", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "composer__chip mono", children: agentRole || "agent" }),
-      /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "composer__spacer" }),
-      onVoiceToggle && !readOnly && !sendWithheld && /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+    /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "composer__row", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "composer__chip mono", children: agentRole || "agent" }),
+      /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "composer__spacer" }),
+      onVoiceToggle && !readOnly && !sendWithheld && /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
         VoiceButton,
         {
           agentLabel,
@@ -59155,7 +59170,7 @@ var ComposerTextarea = import_react44.default.memo(function ComposerTextarea2({
           onClick: onVoiceToggle
         }
       ),
-      /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(
+      /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(
         "button",
         {
           className: "composer__send",
@@ -59586,16 +59601,16 @@ function ChatPane({
     return () => observer.disconnect();
   }, [messages, visibleLiveSpeech, phase2]);
   const railWindow = windowTurnRail(turns.length, railHeight);
-  const turnRail = turns.length > 1 ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+  const turnRail = turns.length > 1 ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
     "nav",
     {
       className: "conv-turn-rail",
       "aria-label": "Conversation turns",
       "data-overflowing": transcriptOverflows === false ? "false" : void 0,
       ref: railRef,
-      children: /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("ol", { className: "conv-turn-rail__list", children: [
-        railWindow.overflow > 0 && /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("li", { className: "conv-turn-rail__item", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+      children: /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("ol", { className: "conv-turn-rail__list", children: [
+        railWindow.overflow > 0 && /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("li", { className: "conv-turn-rail__item", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
             "button",
             {
               "aria-label": "Jump to the ".concat(railWindow.overflow, " earlier turns"),
@@ -59608,7 +59623,7 @@ function ChatPane({
                 }
               },
               type: "button",
-              children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+              children: /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
                 "span",
                 {
                   className: "conv-turn-rail__tick conv-turn-rail__tick--overflow",
@@ -59617,20 +59632,20 @@ function ChatPane({
               )
             }
           ),
-          /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "conv-turn-preview", role: "presentation", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "conv-turn-preview__title", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "conv-turn-preview", role: "presentation", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "conv-turn-preview__title", children: [
               railWindow.overflow,
               " earlier turns"
             ] }),
-            /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "conv-turn-preview__body", children: "Jump to the start of the visible history." })
+            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "conv-turn-preview__body", children: "Jump to the start of the visible history." })
           ] })
         ] }, "rail-overflow"),
         turns.slice(railWindow.start).map((turn, railIndex) => {
           const turnIndex = railWindow.start + railIndex;
           const preview = chatTurnPreview(turn);
           const isVisibleTurn = visibleTurnIndexes.includes(turnIndex);
-          return /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("li", { className: "conv-turn-rail__item", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+          return /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("li", { className: "conv-turn-rail__item", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
               "button",
               {
                 "aria-current": isVisibleTurn ? "true" : void 0,
@@ -59644,12 +59659,12 @@ function ChatPane({
                   }
                 },
                 type: "button",
-                children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "conv-turn-rail__tick", "aria-hidden": "true" })
+                children: /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "conv-turn-rail__tick", "aria-hidden": "true" })
               }
             ),
-            /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "conv-turn-preview", role: "presentation", children: [
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "conv-turn-preview__title", children: preview.title }),
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "conv-turn-preview__body", children: preview.body })
+            /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "conv-turn-preview", role: "presentation", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "conv-turn-preview__title", children: preview.title }),
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "conv-turn-preview__body", children: preview.body })
             ] })
           ] }, turn.id);
         })
@@ -59796,7 +59811,7 @@ function ChatPane({
       publishDraft();
     }
   };
-  return /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(ConversationPresentationProvider, { labels: presentationLabels, viewportKey, autoFold: scroll.mode === "following-end", children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(ConversationBlobReaderProvider, { reader: blobReader, children: /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(
+  return /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(ConversationPresentationProvider, { labels: presentationLabels, viewportKey, autoFold: scroll.mode === "following-end", children: /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(ConversationBlobReaderProvider, { reader: blobReader, children: /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(
     "div",
     {
       className: "conv",
@@ -59808,21 +59823,21 @@ function ChatPane({
         }
       },
       children: [
-        /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "conv__head-frame", children: /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "conv__head".concat(headerVariant === "compact" ? " conv__head--compact" : ""), children: [
-          /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "conv__avatar", children: initial }),
-          /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "conv__target", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "conv__title", title: identity, children: agentLabel }),
-            headerVariant === "full" ? /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "conv__identity", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "conv__head-frame", children: /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "conv__head".concat(headerVariant === "compact" ? " conv__head--compact" : ""), children: [
+          /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "conv__avatar", children: initial }),
+          /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "conv__target", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "conv__title", title: identity, children: agentLabel }),
+            headerVariant === "full" ? /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "conv__identity", children: [
               identity,
               agent?.role ? " \xB7 ".concat(agent.role) : ""
             ] }) : null
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "conv__actions", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "conv__actions", children: [
             { id: "details", label: inspectLabel, icon: "i-info", onClick: onInspect },
             { id: "stop-run", label: stopRunLabel, icon: "i-stop", onClick: onStopRun },
             { id: "respawn", label: respawnLabel, icon: "i-refresh", onClick: agent?.affordances?.can_respawn ? onRespawn : void 0 },
             { id: "retire", label: retireLabel, icon: "i-archive", onClick: agent?.affordances?.can_retire ? onRetire : void 0 }
-          ].filter((action) => action.onClick).map((action) => /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(
+          ].filter((action) => action.onClick).map((action) => /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(
             "button",
             {
               type: "button",
@@ -59832,15 +59847,15 @@ function ChatPane({
               title: "".concat(action.label, " - ").concat(identity),
               "data-testid": "conv-action:".concat(action.id),
               children: [
-                /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "conv__action-icon", "aria-hidden": "true", children: /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(Icon, { name: action.icon }) }),
-                /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "conv__action-label", children: action.label })
+                /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "conv__action-icon", "aria-hidden": "true", children: /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(Icon, { name: action.icon }) }),
+                /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "conv__action-label", children: action.label })
               ]
             },
             action.id
           )) })
         ] }) }),
-        runStopNotice ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "conv__notice", role: "status", "data-testid": "run-stop-notice:".concat(identity), children: runStopNotice }) : null,
-        /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+        runStopNotice ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "conv__notice", role: "status", "data-testid": "run-stop-notice:".concat(identity), children: runStopNotice }) : null,
+        /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
           TranscriptView,
           {
             identity,
@@ -59868,7 +59883,7 @@ function ChatPane({
             onOpenFind: openFind
           }
         ),
-        findOpen ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+        findOpen ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
           TranscriptFindBar,
           {
             identity,
@@ -59879,16 +59894,16 @@ function ChatPane({
           }
         ) : null,
         turnRail,
-        scroll.revealingAnchor ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "conv__history-status", role: "status", children: "Restoring earlier position..." }) : null,
-        scroll.missingAnchor ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "conv__history-status", role: "status", children: "Earlier position is unavailable. Load older history to see more." }) : null,
-        onQuoteSelection ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(QuoteSelectionAction, { viewportRef: bodyRef, onQuote: onQuoteSelection, onError: setQuoteError, disabled: readOnly }, "".concat(identity, ":").concat(conversationId ?? "", ":").concat(viewportKey?.authority ?? "")) : null,
-        scroll.awayFromEnd ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(JumpToLatest, { onClick: scroll.jumpToLatest, working: phase2 !== null }) : null,
+        scroll.revealingAnchor ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "conv__history-status", role: "status", children: "Restoring earlier position..." }) : null,
+        scroll.missingAnchor ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "conv__history-status", role: "status", children: "Earlier position is unavailable. Load older history to see more." }) : null,
+        onQuoteSelection ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(QuoteSelectionAction, { viewportRef: bodyRef, onQuote: onQuoteSelection, onError: setQuoteError, disabled: readOnly }, "".concat(identity, ":").concat(conversationId ?? "", ":").concat(viewportKey?.authority ?? "")) : null,
+        scroll.awayFromEnd ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(JumpToLatest, { onClick: scroll.jumpToLatest, working: phase2 !== null }) : null,
         stackSlot,
-        /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "composer", children: [
-          quoteError ? /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("p", { role: "alert", children: quoteError }) : null,
+        /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "composer", children: [
+          quoteError ? /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("p", { role: "alert", children: quoteError }) : null,
           contextSlot,
           voiceSlot,
-          /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(
+          /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(
             "div",
             {
               className: "composer__shell".concat(dragActive && canAttachImages ? " is-drag-active" : ""),
@@ -59926,11 +59941,11 @@ function ChatPane({
                 }
               },
               children: [
-                staged.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("div", { className: "composer__attachments", children: staged.map((item) => /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "composer__attachment", children: [
-                  /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("img", { alt: "", src: item.previewUrl }),
-                  /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("button", { "aria-label": "Remove attachment", onClick: () => removeAttachment(item.id), type: "button", children: "\xD7" })
+                staged.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "composer__attachments", children: staged.map((item) => /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "composer__attachment", children: [
+                  /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("img", { alt: "", src: item.previewUrl }),
+                  /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("button", { "aria-label": "Remove attachment", onClick: () => removeAttachment(item.id), type: "button", children: "\xD7" })
                 ] }, item.id)) }),
-                /* @__PURE__ */ (0, import_jsx_runtime57.jsx)(
+                /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
                   ComposerTextarea,
                   {
                     identity,
@@ -59956,42 +59971,42 @@ function ChatPane({
               ]
             }
           ),
-          /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("div", { className: "composer__footer", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)("span", { children: [
+          /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "composer__footer", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("span", { children: [
               "To: ",
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("b", { style: { color: "var(--ink-muted)" }, children: agentLabel })
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("b", { style: { color: "var(--ink-muted)" }, children: agentLabel })
             ] }),
-            voiceActive && /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: "\xB7 text to background agent" }),
-            /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: "\xB7" }),
-            /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "mono", children: identity }),
-            agent?.role && /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(import_jsx_runtime57.Fragment, { children: [
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: "\xB7" }),
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: agent.role })
+            voiceActive && /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: "\xB7 text to background agent" }),
+            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: "\xB7" }),
+            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "mono", children: identity }),
+            agent?.role && /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(import_jsx_runtime58.Fragment, { children: [
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: "\xB7" }),
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: agent.role })
             ] }),
-            /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: "\xB7" }),
-            /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { className: "dot", style: {
+            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: "\xB7" }),
+            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "dot", style: {
               background: state === "active" || state === "running" ? "var(--ok)" : state.includes("degrade") ? "var(--warn)" : state === "retired" ? "var(--ink-faint)" : "var(--ink-dim)"
             } }),
-            /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: state }),
-            phase2 && /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(import_jsx_runtime57.Fragment, { children: [
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: "\xB7" }),
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { style: { color: "var(--accent)" }, children: phase2 })
+            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: state }),
+            phase2 && /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(import_jsx_runtime58.Fragment, { children: [
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: "\xB7" }),
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { style: { color: "var(--accent)" }, children: phase2 })
             ] }),
-            readOnly && /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(import_jsx_runtime57.Fragment, { children: [
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: "\xB7" }),
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: "view only" })
+            readOnly && /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(import_jsx_runtime58.Fragment, { children: [
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: "\xB7" }),
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: "view only" })
             ] }),
-            !readOnly && sendWithheld && /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(import_jsx_runtime57.Fragment, { children: [
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: "\xB7" }),
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: "send not permitted" })
+            !readOnly && sendWithheld && /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(import_jsx_runtime58.Fragment, { children: [
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: "\xB7" }),
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: "send not permitted" })
             ] }),
-            !readOnly && !canAttachImages && /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(import_jsx_runtime57.Fragment, { children: [
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: "\xB7" }),
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: "model cannot see images" })
+            !readOnly && !canAttachImages && /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(import_jsx_runtime58.Fragment, { children: [
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: "\xB7" }),
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: "model cannot see images" })
             ] }),
-            attachmentError && /* @__PURE__ */ (0, import_jsx_runtime57.jsxs)(import_jsx_runtime57.Fragment, { children: [
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { children: "\xB7" }),
-              /* @__PURE__ */ (0, import_jsx_runtime57.jsx)("span", { style: { color: "var(--bad)" }, children: attachmentError })
+            attachmentError && /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(import_jsx_runtime58.Fragment, { children: [
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: "\xB7" }),
+              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { style: { color: "var(--bad)" }, children: attachmentError })
             ] })
           ] })
         ] })
@@ -60002,7 +60017,7 @@ function ChatPane({
 
 // src/panels/MetaDock.tsx
 var import_react45 = __toESM(require("react"));
-var import_jsx_runtime58 = require("react/jsx-runtime");
+var import_jsx_runtime59 = require("react/jsx-runtime");
 function tabPanelCount(node2) {
   if (!node2) return 0;
   if (node2.kind === "panel") return 1;
@@ -60059,22 +60074,22 @@ function MetaDock({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [viewState, onSplitPanel, onClosePanel, onCreateTab, onSelectTab]);
-  return /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "mkdock", "data-testid": "mkdock", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "wstabs", children: [
+  return /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("div", { className: "mkdock", "data-testid": "mkdock", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("div", { className: "wstabs", children: [
       viewState.tabs.map((t) => {
         const isActive = t.id === activeTab?.id;
         const count = tabPanelCount(t.layout);
-        return /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(
+        return /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)(
           "div",
           {
             className: "wstab ".concat(isActive ? "is-active" : ""),
             onClick: () => onSelectTab(t.id),
             "data-testid": "wstab:".concat(t.id),
             children: [
-              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "wstab__mark" }),
-              /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "wstab__name", children: t.title || "untitled" }),
-              count > 1 && /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "wstab__count", children: count }),
-              viewState.tabs.length > 1 && /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
+              /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "wstab__mark" }),
+              /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "wstab__name", children: t.title || "untitled" }),
+              count > 1 && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "wstab__count", children: count }),
+              viewState.tabs.length > 1 && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
                 "button",
                 {
                   className: "wstab__close",
@@ -60092,7 +60107,7 @@ function MetaDock({
           t.id
         );
       }),
-      /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
+      /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
         "button",
         {
           className: "wstab__add",
@@ -60104,7 +60119,7 @@ function MetaDock({
         }
       )
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "dock", children: activeTab && /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
+    /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("div", { className: "dock", children: activeTab && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
       DockLayout,
       {
         node: activeTab.layout,
@@ -60125,9 +60140,9 @@ function MetaDock({
 function DockLayout(props) {
   const { node: node2 } = props;
   if (node2.kind === "panel") {
-    return /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(PaneView, { panelId: node2.panelId, ...props });
+    return /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(PaneView, { panelId: node2.panelId, ...props });
   }
-  return /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(SplitView, { node: node2, ...props });
+  return /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(SplitView, { node: node2, ...props });
 }
 function SplitView(props) {
   const { node: node2 } = props;
@@ -60155,15 +60170,15 @@ function SplitView(props) {
     window.addEventListener("pointerup", end);
     window.addEventListener("pointercancel", end);
   }
-  return /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(
+  return /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)(
     "div",
     {
       ref: hostRef,
       className: "split split--".concat(direction === "horizontal" ? "h" : "v"),
       style,
       children: [
-        /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(DockLayout, { ...props, node: node2.first }),
-        /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
+        /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(DockLayout, { ...props, node: node2.first }),
+        /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
           "div",
           {
             className: "split__handle split__handle--".concat(direction === "horizontal" ? "h" : "v"),
@@ -60171,7 +60186,7 @@ function SplitView(props) {
             "data-testid": "split-handle:".concat(node2.id)
           }
         ),
-        /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(DockLayout, { ...props, node: node2.second })
+        /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(DockLayout, { ...props, node: node2.second })
       ]
     }
   );
@@ -60195,15 +60210,15 @@ function PaneView({
   const target = panel.target;
   const subId = target?.kind === "agent-chat" ? target.identity || target.memberId : target?.kind === "identity-inspect" ? target.identity : void 0;
   const [menuOpen, setMenuOpen] = import_react45.default.useState(false);
-  return /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(
+  return /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)(
     "div",
     {
       className: "pane ".concat(isFocused ? "is-focused" : ""),
       onMouseDown: () => onFocusPanel(panelId),
       "data-testid": "pane:".concat(panelId),
       children: [
-        /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "pane__bar", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(
+        /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("div", { className: "pane__bar", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)(
             "button",
             {
               className: "pane__title",
@@ -60215,14 +60230,14 @@ function PaneView({
               "data-testid": "pane-title:".concat(panelId),
               title: "Retarget pane",
               children: [
-                /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "pane__title-text", children: title }),
-                /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "pane__caret", children: "\u25BE" })
+                /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "pane__title-text", children: title }),
+                /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "pane__caret", children: "\u25BE" })
               ]
             }
           ),
-          subId && /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "pane__id", children: subId }),
-          /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "pane__spacer" }),
-          /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
+          subId && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "pane__id", children: subId }),
+          /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "pane__spacer" }),
+          /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
             "button",
             {
               className: "pane__btn",
@@ -60235,7 +60250,7 @@ function PaneView({
               children: "\u25E8"
             }
           ),
-          /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
+          /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
             "button",
             {
               className: "pane__btn",
@@ -60248,7 +60263,7 @@ function PaneView({
               children: "\u2B13"
             }
           ),
-          /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
+          /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
             "button",
             {
               className: "pane__btn pane__close",
@@ -60261,7 +60276,7 @@ function PaneView({
               children: "\xD7"
             }
           ),
-          menuOpen && /* @__PURE__ */ (0, import_jsx_runtime58.jsx)(
+          menuOpen && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
             PaneMenu,
             {
               agents,
@@ -60275,7 +60290,7 @@ function PaneView({
             }
           )
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "pane__body", children: renderPanelBody({ id: panelId, target }) })
+        /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("div", { className: "pane__body", children: renderPanelBody({ id: panelId, target }) })
       ]
     }
   );
@@ -60290,41 +60305,41 @@ function PaneMenu({ agents, visibleControls, customPanels = [], onClose, onPick 
     ["logs", "Logs"],
     ["health", "Health"]
   ].filter(([kind]) => !visibleControls || visibleControls.includes(kind));
-  return /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(import_jsx_runtime58.Fragment, { children: [
-    /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "pane-menu__scrim", onMouseDown: onClose }),
-    /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)("div", { className: "pane-menu", onMouseDown: (e) => e.stopPropagation(), children: [
-      /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "pane-menu__label", children: "Views" }),
-      controls.map(([kind, label]) => /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(
+  return /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)(import_jsx_runtime59.Fragment, { children: [
+    /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("div", { className: "pane-menu__scrim", onMouseDown: onClose }),
+    /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("div", { className: "pane-menu", onMouseDown: (e) => e.stopPropagation(), children: [
+      /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("div", { className: "pane-menu__label", children: "Views" }),
+      controls.map(([kind, label]) => /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)(
         "button",
         {
           className: "pane-menu__item",
           onClick: () => onPick(buildControlTarget2(kind)),
           "data-testid": "pane-menu-view:".concat(kind),
           children: [
-            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", {}),
-            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: label }),
-            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "pane-menu__id", children: "view" })
+            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", {}),
+            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { children: label }),
+            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "pane-menu__id", children: "view" })
           ]
         },
         kind
       )),
-      customPanels.map((panel) => /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(
+      customPanels.map((panel) => /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)(
         "button",
         {
           className: "pane-menu__item",
           onClick: () => onPick(consoleCustomPanelTarget(panel)),
           "data-testid": "pane-menu-custom-panel:".concat(panel.id),
           children: [
-            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", {}),
-            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: panel.title }),
-            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "pane-menu__id", children: "view" })
+            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", {}),
+            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { children: panel.title }),
+            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "pane-menu__id", children: "view" })
           ]
         },
         panel.id
       )),
-      /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "pane-menu__sep" }),
-      /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("div", { className: "pane-menu__label", children: "Agents" }),
-      agents.slice(0, 14).map((a) => /* @__PURE__ */ (0, import_jsx_runtime58.jsxs)(
+      /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("div", { className: "pane-menu__sep" }),
+      /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("div", { className: "pane-menu__label", children: "Agents" }),
+      agents.slice(0, 14).map((a) => /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)(
         "button",
         {
           className: "pane-menu__item",
@@ -60332,9 +60347,9 @@ function PaneMenu({ agents, visibleControls, customPanels = [], onClose, onPick 
           onClick: () => onPick(buildDockTarget2(a)),
           "data-testid": "pane-menu-agent:".concat(a.member_id),
           children: [
-            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "agent__dot" }),
-            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { children: a.label }),
-            /* @__PURE__ */ (0, import_jsx_runtime58.jsx)("span", { className: "pane-menu__id", children: a.identity || a.member_id })
+            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "agent__dot" }),
+            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { children: a.label }),
+            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "pane-menu__id", children: a.identity || a.member_id })
           ]
         },
         a.member_id
@@ -60345,7 +60360,7 @@ function PaneMenu({ agents, visibleControls, customPanels = [], onClose, onPick 
 
 // src/panels/PendingStack.tsx
 var import_react46 = __toESM(require("react"));
-var import_jsx_runtime59 = require("react/jsx-runtime");
+var import_jsx_runtime60 = require("react/jsx-runtime");
 var ACCEPTANCE_NOTICE_GRACE_MS = 2e3;
 function acceptanceGraceDeadlines(items, firstSeenAttempting, now, directSendIds = /* @__PURE__ */ new Set()) {
   const live = new Set(items.map((item) => item.id));
@@ -60373,8 +60388,8 @@ function StackHead({
   onToggleCollapsed,
   onClear
 }) {
-  return /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("div", { className: "stack__head", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
+  return /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("div", { className: "stack__head", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
       "button",
       {
         type: "button",
@@ -60383,18 +60398,18 @@ function StackHead({
         "aria-expanded": !collapsed,
         "aria-label": collapsed ? "Expand pending queue" : "Collapse pending queue",
         title: collapsed ? "Expand queue" : "Collapse queue",
-        children: /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stack__head-chev", children: collapsed ? "\u25B8" : "\u25BE" })
+        children: /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stack__head-chev", children: collapsed ? "\u25B8" : "\u25BE" })
       }
     ),
-    /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { children: "Queue" }),
-    /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stack__head-count", children: count }),
-    !collapsed && count > 1 && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stack__head-hint", children: "\xB7 drains top \u2192 bottom" }),
-    /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stack__head-spacer" }),
-    /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("span", { className: "stack__head-phase ".concat(agentBusy ? "" : "is-idle"), children: [
-      /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("b", {}),
+    /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { children: "Queue" }),
+    /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stack__head-count", children: count }),
+    !collapsed && count > 1 && /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stack__head-hint", children: "\xB7 drains top \u2192 bottom" }),
+    /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stack__head-spacer" }),
+    /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("span", { className: "stack__head-phase ".concat(agentBusy ? "" : "is-idle"), children: [
+      /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("b", {}),
       agentBusy ? "Agent busy" : "Agent idle"
     ] }),
-    count > 0 && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
+    count > 0 && /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
       "button",
       {
         type: "button",
@@ -60486,7 +60501,7 @@ function StackItem({
     dropHint === "below" ? "drop-target drop-below" : ""
   ].filter(Boolean).join(" ");
   const longText = item.contexts.length > 0 || item.text.length > 90 || /\n/.test(item.text);
-  return /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)(
+  return /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)(
     "li",
     {
       className: cls,
@@ -60508,19 +60523,19 @@ function StackItem({
         }
       },
       children: [
-        /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("div", { className: "stk-item__lead", children: [
-          isDraft && /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("span", { className: "stk-item__grip", "aria-label": "Drag to reorder", title: "Drag to reorder", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", {}),
-            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", {}),
-            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", {}),
-            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", {}),
-            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", {}),
-            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", {})
+        /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("div", { className: "stk-item__lead", children: [
+          isDraft && /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("span", { className: "stk-item__grip", "aria-label": "Drag to reorder", title: "Drag to reorder", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", {}),
+            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", {}),
+            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", {}),
+            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", {}),
+            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", {}),
+            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", {})
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stk-item__queue-glyph", "aria-hidden": "true", children: /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(Icon, { name: settledFailure ? "i-info" : "i-clock" }) })
+          /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stk-item__queue-glyph", "aria-hidden": "true", children: /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(Icon, { name: settledFailure ? "i-info" : "i-clock" }) })
         ] }),
-        item.editing ? /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("div", { className: "stk-item__edit", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
+        item.editing ? /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("div", { className: "stk-item__edit", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
             "textarea",
             {
               ref: taRef,
@@ -60536,19 +60551,19 @@ function StackItem({
               "data-testid": "pending-item-edit:".concat(item.id)
             }
           ),
-          /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("div", { className: "stk-item__edit-row", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("span", { children: [
-              /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stk-kbd", children: "Esc" }),
+          /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("div", { className: "stk-item__edit-row", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("span", { children: [
+              /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stk-kbd", children: "Esc" }),
               " cancel"
             ] }),
-            /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("span", { children: [
-              /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stk-kbd", children: "\u21B5" }),
+            /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("span", { children: [
+              /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stk-kbd", children: "\u21B5" }),
               " save \xB7 ",
-              /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stk-kbd", children: "\u21E7\u21B5" }),
+              /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stk-kbd", children: "\u21E7\u21B5" }),
               " newline"
             ] }),
-            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stk-item__edit-spacer" }),
-            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
+            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stk-item__edit-spacer" }),
+            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
               "button",
               {
                 type: "button",
@@ -60557,7 +60572,7 @@ function StackItem({
                 children: "Cancel"
               }
             ),
-            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
+            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
               "button",
               {
                 type: "button",
@@ -60567,19 +60582,19 @@ function StackItem({
               }
             )
           ] })
-        ] }) : /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("div", { className: "stk-item__body", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("div", { className: "stk-item__meta", children: [
-            isHead && isDraft && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stk-item__head-tag", children: "Next" }),
-            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stk-item__state", role: needsAcceptance ? "status" : void 0, children: copy.label }),
-            item.contexts.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("span", { children: [
+        ] }) : /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("div", { className: "stk-item__body", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("div", { className: "stk-item__meta", children: [
+            isHead && isDraft && /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stk-item__head-tag", children: "Next" }),
+            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stk-item__state", role: needsAcceptance ? "status" : void 0, children: copy.label }),
+            item.contexts.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("span", { children: [
               item.contexts.length,
               " ",
               item.contexts.length === 1 ? "quote" : "quotes"
             ] }),
-            /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stk-item__age", children: timeAgo(item.addedAt) }),
-            item.status === "promoting" && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stk-item__sending", children: "Sending..." })
+            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stk-item__age", children: timeAgo(item.addedAt) }),
+            item.status === "promoting" && /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stk-item__sending", children: "Sending..." })
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
+          /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
             "div",
             {
               id: previewId,
@@ -60590,7 +60605,7 @@ function StackItem({
               children: item.text
             }
           ),
-          item.expanded && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
+          item.expanded && /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
             QuoteContextChips,
             {
               records: item.contexts,
@@ -60600,15 +60615,15 @@ function StackItem({
               onReorder: item.state === "draft" ? (contextId, direction) => onReorderContext(item.id, contextId, direction) : void 0
             }
           ),
-          copy.title && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("p", { className: "stk-item__title", "data-testid": "pending-title:".concat(item.id), children: copy.title }),
-          copy.detail && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("p", { className: "stk-item__explanation", "data-testid": "pending-explanation:".concat(item.id), children: copy.detail }),
-          check2 && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("p", { className: "stk-item__explanation stk-item__check", role: "status", "data-testid": "pending-check:".concat(item.id), children: check2.phase === "checking" ? "Checking..." : check2.text })
+          copy.title && /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("p", { className: "stk-item__title", "data-testid": "pending-title:".concat(item.id), children: copy.title }),
+          copy.detail && /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("p", { className: "stk-item__explanation", "data-testid": "pending-explanation:".concat(item.id), children: copy.detail }),
+          check2 && /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("p", { className: "stk-item__explanation stk-item__check", role: "status", "data-testid": "pending-check:".concat(item.id), children: check2.phase === "checking" ? "Checking..." : check2.text })
         ] }),
-        !item.editing && /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("div", { className: "stk-item__actions", children: [
-          needsAcceptance && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("button", { type: "button", className: "stk-btn stk-btn--primary", disabled: checking, onClick: () => onReconcile(item.id), children: "Check" }),
-          canResend && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("button", { type: "button", className: "stk-btn", disabled: checking, onClick: () => onRetry(item.id), children: "Send again" }),
-          longText && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("button", { type: "button", className: "stk-btn stk-btn--expand", "aria-expanded": Boolean(item.expanded), "aria-controls": previewId, onClick: () => onToggleExpand(item.id), children: item.expanded ? "Hide saved message" : "Show saved message" }),
-          isDraft && /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)(
+        !item.editing && /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("div", { className: "stk-item__actions", children: [
+          needsAcceptance && /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("button", { type: "button", className: "stk-btn stk-btn--primary", disabled: checking, onClick: () => onReconcile(item.id), children: "Check" }),
+          canResend && /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("button", { type: "button", className: "stk-btn", disabled: checking, onClick: () => onRetry(item.id), children: "Send again" }),
+          longText && /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("button", { type: "button", className: "stk-btn stk-btn--expand", "aria-expanded": Boolean(item.expanded), "aria-controls": previewId, onClick: () => onToggleExpand(item.id), children: item.expanded ? "Hide saved message" : "Show saved message" }),
+          isDraft && /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)(
             "button",
             {
               type: "button",
@@ -60618,12 +60633,12 @@ function StackItem({
               title: "Send now and interrupt at the next cooperative pause",
               "data-testid": "pending-steer:".concat(item.id),
               children: [
-                /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stk-btn__glyph", "aria-hidden": "true", children: /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(Icon, { name: "i-bolt" }) }),
+                /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stk-btn__glyph", "aria-hidden": "true", children: /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(Icon, { name: "i-bolt" }) }),
                 " Steer"
               ]
             }
           ),
-          isDraft && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
+          isDraft && /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
             "button",
             {
               type: "button",
@@ -60632,10 +60647,10 @@ function StackItem({
               "aria-label": "Edit message",
               title: "Edit message",
               "data-testid": "pending-edit:".concat(item.id),
-              children: /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stk-btn__glyph", "aria-hidden": "true", children: /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(Icon, { name: "i-compose" }) })
+              children: /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stk-btn__glyph", "aria-hidden": "true", children: /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(Icon, { name: "i-compose" }) })
             }
           ),
-          isDraft ? /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
+          isDraft ? /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
             "button",
             {
               type: "button",
@@ -60644,9 +60659,9 @@ function StackItem({
               "aria-label": "Remove from queue",
               title: "Remove from queue",
               "data-testid": "pending-trash:".concat(item.id),
-              children: /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stk-btn__glyph", "aria-hidden": "true", children: /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(Icon, { name: "i-close" }) })
+              children: /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stk-btn__glyph", "aria-hidden": "true", children: /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(Icon, { name: "i-close" }) })
             }
-          ) : /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
+          ) : /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
             "button",
             {
               type: "button",
@@ -60747,14 +60762,14 @@ function PendingStack3({
     setDragId(null);
     setDropTarget({ id: null, where: null });
   };
-  return /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)(
+  return /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)(
     "section",
     {
       className: "stack stack--console ".concat(collapsed ? "is-collapsed" : "", " ").concat(reducedMotion ? "reduced-motion" : ""),
       "aria-label": "Pending message queue",
       "data-testid": "pending-stack",
       children: [
-        visibleItems.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
+        visibleItems.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
           StackHead,
           {
             count: visibleItems.length,
@@ -60764,11 +60779,11 @@ function PendingStack3({
             onClear: onClearAll
           }
         ),
-        notices.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("ul", { className: "stack__delivered", "aria-label": "Delivered messages", children: notices.map((notice) => /* @__PURE__ */ (0, import_jsx_runtime59.jsxs)("li", { className: "stack__delivered-item", role: "status", "data-testid": "pending-delivered:".concat(notice.id), children: [
+        notices.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("ul", { className: "stack__delivered", "aria-label": "Delivered messages", children: notices.map((notice) => /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("li", { className: "stack__delivered-item", role: "status", "data-testid": "pending-delivered:".concat(notice.id), children: [
           notice.text,
-          onDismissDelivered && /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("button", { type: "button", className: "stk-btn stk-btn--icon", "aria-label": "Dismiss", onClick: () => onDismissDelivered(notice.id), children: /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("span", { className: "stk-btn__glyph", "aria-hidden": "true", children: /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(Icon, { name: "i-close" }) }) })
+          onDismissDelivered && /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("button", { type: "button", className: "stk-btn stk-btn--icon", "aria-label": "Dismiss", onClick: () => onDismissDelivered(notice.id), children: /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "stk-btn__glyph", "aria-hidden": "true", children: /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(Icon, { name: "i-close" }) }) })
         ] }, notice.id)) }),
-        /* @__PURE__ */ (0, import_jsx_runtime59.jsx)("ol", { className: "stack__list", role: "list", children: visibleItems.map((item, i2) => /* @__PURE__ */ (0, import_jsx_runtime59.jsx)(
+        /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("ol", { className: "stack__list", role: "list", children: visibleItems.map((item, i2) => /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
           StackItem,
           {
             item,
@@ -62561,7 +62576,7 @@ function useVoiceReadiness(baseUrl, focusedIdentity, voiceIdentity, enabled) {
 }
 
 // src/ConsoleApp.tsx
-var import_jsx_runtime60 = require("react/jsx-runtime");
+var import_jsx_runtime61 = require("react/jsx-runtime");
 var MAX_IDENTITY_LOG_EVENTS = 5e3;
 var IDENTITY_LOG_TRIM_SLACK = 500;
 var HIDDEN_TAB_FLUSH_MS = 250;
@@ -62811,7 +62826,7 @@ var ACTIVITY_SKIP_EVENTS = /* @__PURE__ */ new Set([
 ]);
 function ConsoleApp(props) {
   const instanceKey = import_react49.default.useMemo(() => createConsoleId("console-instance"), [props.baseUrl, props.transport, props.storageNamespace, props.panelService, props.mcpAppsHost]);
-  return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(ConsoleAppAuthority, { ...props }, instanceKey);
+  return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(ConsoleAppAuthority, { ...props }, instanceKey);
 }
 function ConsoleAppAuthority(props) {
   const observedScope = import_react49.default.useRef(null);
@@ -62825,7 +62840,7 @@ function ConsoleAppAuthority(props) {
     }
     return true;
   }, []);
-  return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(ConsoleAppInstance, { ...props, observeScope }, generation);
+  return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(ConsoleAppInstance, { ...props, observeScope }, generation);
 }
 function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlPolicy, customPanels: suppliedPanels, panelService, mcpAppsHost, observeScope }) {
   countRender("ConsoleApp");
@@ -65852,7 +65867,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     [agents]
   );
   if (loading)
-    return /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)(
+    return /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)(
       "div",
       {
         "data-testid": "console-loading",
@@ -65866,16 +65881,16 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           minHeight: "100vh"
         },
         children: [
-          /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("span", { className: "msg__typing-dots", "aria-hidden": "true", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", {}),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", {}),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", {})
+          /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)("span", { className: "msg__typing-dots", "aria-hidden": "true", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("span", {}),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("span", {}),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("span", {})
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { children: "Loading console\u2026" })
+          /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("span", { children: "Loading console\u2026" })
         ]
       }
     );
-  if (error48) return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("div", { "data-testid": "console-error", children: error48 });
+  if (error48) return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("div", { "data-testid": "console-error", children: error48 });
   const focusedMemberId = dock.focusedTarget?.kind === "agent-chat" ? dock.focusedTarget.memberId : selectedRosterMemberId;
   const actionConfig = experience?.console_config?.actions;
   const configuredActionLabels = {
@@ -65893,7 +65908,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     retire: actionVisible(actionConfig, "show_retire"),
     reset: actionVisible(actionConfig, "show_reset")
   };
-  const voiceBar = /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+  const voiceBar = /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
     VoiceBar,
     {
       state: voiceState,
@@ -65952,16 +65967,16 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     } catch {
     }
     const agentBusy = isIdentityBusy(identity);
-    const stackSlot = /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)(import_jsx_runtime60.Fragment, { children: [
-      stackItems.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("small", { className: "queue-storage-note", role: "status", children: persistentSendScopeRef.current ? "Saved in this browser until sent" : "Not saved: these messages are lost if you reload" }) : null,
-      pendingStorageErrorRef.current[identity] && /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("p", { role: "alert", children: pendingStorageErrorRef.current[identity] }),
-      hasLegacyQueue && /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("div", { className: "queue-import", role: "group", "aria-label": "Older queued messages", "data-testid": "legacy-queue-import", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "queue-import__icon", "aria-hidden": "true", children: /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(Icon, { name: "i-clock" }) }),
-        /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("span", { className: "queue-import__text", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { className: "queue-import__title", children: "Older queued messages" }),
-          /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { children: "Resume them with this agent in this account." })
+    const stackSlot = /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)(import_jsx_runtime61.Fragment, { children: [
+      stackItems.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("small", { className: "queue-storage-note", role: "status", children: persistentSendScopeRef.current ? "Saved in this browser until sent" : "Not saved: these messages are lost if you reload" }) : null,
+      pendingStorageErrorRef.current[identity] && /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("p", { role: "alert", children: pendingStorageErrorRef.current[identity] }),
+      hasLegacyQueue && /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)("div", { className: "queue-import", role: "group", "aria-label": "Older queued messages", "data-testid": "legacy-queue-import", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("span", { className: "queue-import__icon", "aria-hidden": "true", children: /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(Icon, { name: "i-clock" }) }),
+        /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)("span", { className: "queue-import__text", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("span", { className: "queue-import__title", children: "Older queued messages" }),
+          /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("span", { children: "Resume them with this agent in this account." })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+        /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
           "button",
           {
             type: "button",
@@ -65972,7 +65987,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
           }
         )
       ] }),
-      stackItems.length > 0 || (deliveredNotices[identity]?.length ?? 0) > 0 ? /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+      stackItems.length > 0 || (deliveredNotices[identity]?.length ?? 0) > 0 ? /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
         PendingStack3,
         {
           items: stackItems,
@@ -66026,7 +66041,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         setActionError(errorMessage(error49));
       }
     };
-    return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+    return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
       ChatPane,
       {
         agent,
@@ -66042,7 +66057,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         viewportKey: { authority: sendScope, identity, conversation: identity, pane: panel.id },
         submittedRowId,
         onQuoteSelection: addQuote,
-        contextSlot: /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(QuoteContextChips, { records: quotedContexts, destinationLabel: target.title || agent?.label || identity, onEdit: (id, quote) => {
+        contextSlot: /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(QuoteContextChips, { records: quotedContexts, destinationLabel: target.title || agent?.label || identity, onEdit: (id, quote) => {
           if (sendScope !== sendScopeRef.current || !lifetimeRef.current.active) throw new Error("This draft is no longer active.");
           const latest = storedComposerDraft(identity, panelKey);
           const next = editConsoleContextQuote(latest.contexts, id, quote);
@@ -66115,16 +66130,16 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     const canRespawn = !consoleReadOnly && configuredActionVisibility.respawn && agent?.affordances?.can_respawn === true;
     const canRetire = !consoleReadOnly && configuredActionVisibility.retire && agent?.affordances?.can_retire === true;
     const canReset = !consoleReadOnly && configuredActionVisibility.reset && experience?.runtime_capabilities?.can_retire_members === true;
-    return /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)(
+    return /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)(
       "div",
       {
         className: "console-panel",
         "data-testid": "inspect-panel:".concat(target.identity),
         children: [
-          /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("div", { className: "console-panel__header", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("h3", { children: target.identity }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("div", { className: "console-panel__actions", children: [
-              canRespawn ? /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+          /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)("div", { className: "console-panel__header", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("h3", { children: target.identity }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)("div", { className: "console-panel__actions", children: [
+              canRespawn ? /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
                 "button",
                 {
                   "data-testid": "inspect-action:".concat(target.identity, ":respawn"),
@@ -66133,7 +66148,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
                   children: configuredActionLabels.respawn
                 }
               ) : null,
-              canReset ? /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+              canReset ? /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
                 "button",
                 {
                   "data-testid": "inspect-action:".concat(target.identity, ":reset"),
@@ -66142,7 +66157,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
                   children: configuredActionLabels.reset
                 }
               ) : null,
-              canRetire ? /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+              canRetire ? /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
                 "button",
                 {
                   "data-testid": "inspect-action:".concat(target.identity, ":retire"),
@@ -66153,43 +66168,43 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
               ) : null
             ] })
           ] }),
-          !inspect ? /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("p", { children: "Loading identity details\u2026" }) : /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("dl", { className: "console-panel__grid", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dt", { children: "State" }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dd", { "data-testid": "inspect-state:".concat(target.identity), children: identityStateLabel(inspect) }),
-            inspect.session_repair ? /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)(import_jsx_runtime60.Fragment, { children: [
-              /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dt", { children: "Repair" }),
-              /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("dd", { "data-testid": "inspect-session-repair:".concat(target.identity), children: [
-                /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("p", { children: "The durable session is intact but refused until it is repaired. Run the diagnose command, then the repair command, then reload the member (meta/reload_member)." }),
-                /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("code", { "data-testid": "inspect-session-repair-diagnose", children: inspect.session_repair.diagnose_command }),
-                /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("code", { "data-testid": "inspect-session-repair-apply", children: inspect.session_repair.apply_command })
+          !inspect ? /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("p", { children: "Loading identity details\u2026" }) : /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)("dl", { className: "console-panel__grid", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dt", { children: "State" }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dd", { "data-testid": "inspect-state:".concat(target.identity), children: identityStateLabel(inspect) }),
+            inspect.session_repair ? /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)(import_jsx_runtime61.Fragment, { children: [
+              /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dt", { children: "Repair" }),
+              /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)("dd", { "data-testid": "inspect-session-repair:".concat(target.identity), children: [
+                /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("p", { children: "The durable session is intact but refused until it is repaired. Run the diagnose command, then the repair command, then reload the member (meta/reload_member)." }),
+                /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("code", { "data-testid": "inspect-session-repair-diagnose", children: inspect.session_repair.diagnose_command }),
+                /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("code", { "data-testid": "inspect-session-repair-apply", children: inspect.session_repair.apply_command })
               ] })
             ] }) : null,
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dt", { children: "Role" }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dd", { children: inspect.role || "n/a" }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dt", { children: "Addressability" }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dd", { children: inspect.addressability }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dt", { children: "Generation" }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dd", { children: inspect.continuity?.generation ?? "n/a" }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dt", { children: "Checkpoint" }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dd", { children: inspect.continuity?.checkpoint_version ?? "n/a" }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dt", { children: "Session" }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dd", { children: inspect.continuity?.session_id || "n/a" }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dt", { children: "Runtime" }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dd", { children: inspect.continuity?.agent_runtime_id || "n/a" }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dt", { children: "Lease Healthy" }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dd", { children: String(inspect.lease_healthy ?? inspect.lease?.healthy ?? false) }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dt", { children: "Peers" }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dd", { children: inspect.topology_peers?.join(", ") || "none" }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dt", { children: "Output Preview" }),
-            /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("dd", { children: inspect.output_preview || "n/a" })
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dt", { children: "Role" }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dd", { children: inspect.role || "n/a" }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dt", { children: "Addressability" }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dd", { children: inspect.addressability }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dt", { children: "Generation" }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dd", { children: inspect.continuity?.generation ?? "n/a" }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dt", { children: "Checkpoint" }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dd", { children: inspect.continuity?.checkpoint_version ?? "n/a" }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dt", { children: "Session" }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dd", { children: inspect.continuity?.session_id || "n/a" }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dt", { children: "Runtime" }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dd", { children: inspect.continuity?.agent_runtime_id || "n/a" }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dt", { children: "Lease Healthy" }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dd", { children: String(inspect.lease_healthy ?? inspect.lease?.healthy ?? false) }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dt", { children: "Peers" }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dd", { children: inspect.topology_peers?.join(", ") || "none" }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dt", { children: "Output Preview" }),
+            /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("dd", { children: inspect.output_preview || "n/a" })
           ] })
         ]
       }
     );
   }
   function renderHealthPanel(identities) {
-    return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("div", { className: "console-panel", "data-testid": "health-panel", children: /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("ul", { className: "console-panel__list", children: identities.map((r2) => /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("li", { "data-testid": "health-identity:".concat(r2.identity), children: [
-      /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("strong", { children: r2.display_name || r2.identity }),
+    return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("div", { className: "console-panel", "data-testid": "health-panel", children: /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("ul", { className: "console-panel__list", children: identities.map((r2) => /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)("li", { "data-testid": "health-identity:".concat(r2.identity), children: [
+      /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("strong", { children: r2.display_name || r2.identity }),
       " \xB7 ",
       identityStateLabel(r2),
       " \xB7",
@@ -66227,21 +66242,21 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   }
   function renderPanelBody(panel) {
     const target = panel.target;
-    if (!target) return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("div", { className: "console-panel", children: "No panel target" });
-    if (target.kind === "custom/panel") return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(ConsoleCustomPanel, { target, focused: dock.viewState.focusedPanelId === panel.id });
+    if (!target) return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("div", { className: "console-panel", children: "No panel target" });
+    if (target.kind === "custom/panel") return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(ConsoleCustomPanel, { target, focused: dock.viewState.focusedPanelId === panel.id });
     if (target.kind === "agent-chat") return renderChatPanel(panel);
     if (target.kind === "operator-panel") {
-      return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(OperatorPanel, { buttonId: target.buttonId, buttons: experience?.console_config?.sidebar?.buttons });
+      return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(OperatorPanel, { buttonId: target.buttonId, buttons: experience?.console_config?.sidebar?.buttons });
     }
     if (target.kind === "identity-inspect") {
       return renderInspectPanel(target);
     }
     if ((target.kind === "routing" || target.kind === "gating" || target.kind === "gates" || target.kind === "workgraph") && !hasMobControlSurface) {
-      return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("div", { className: "console-panel", children: "This view requires a mob runtime control surface." });
+      return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("div", { className: "console-panel", children: "This view requires a mob runtime control surface." });
     }
-    if (target.kind === "routing") return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(RoutingPanel, { data: routingData });
+    if (target.kind === "routing") return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(RoutingPanel, { data: routingData });
     if (target.kind === "gating")
-      return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+      return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
         GatingInboxPanel,
         {
           pending: activeApprovals?.requests.map((request) => request.raw) || [],
@@ -66254,7 +66269,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         }
       );
     if (target.kind === "topology")
-      return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+      return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
         TopologyPanel,
         {
           nodes: normalizedTopology?.nodes || experience?.topology?.live_snapshot?.nodes || [],
@@ -66272,9 +66287,9 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         experience?.health_overview?.live_snapshot?.identities || []
       );
     if (target.kind === "timeline")
-      return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(TimelinePanel, { frames: activityRef.current });
+      return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(TimelinePanel, { frames: activityRef.current });
     if (target.kind === "roster")
-      return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+      return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
         RosterPanel,
         {
           agents,
@@ -66294,7 +66309,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         }
       );
     if (target.kind === "gates")
-      return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+      return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
         GatingInboxPanel,
         {
           pending: activeApprovals?.requests.map((request) => request.raw) || [],
@@ -66307,9 +66322,9 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         }
       );
     if (target.kind === "logs")
-      return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(LogsPanel, { frames: activityRef.current });
+      return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(LogsPanel, { frames: activityRef.current });
     if (target.kind === "access")
-      return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+      return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
         AccessPanel,
         {
           status: experience?.access?.can_administer === true ? visibleAccessData?.status ?? null : null,
@@ -66337,7 +66352,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         accessScope
       );
     if (target.kind === "memory")
-      return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+      return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
         MemoryPanel,
         {
           records: memoryData.records,
@@ -66384,7 +66399,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       );
     if (target.kind === "workgraph") {
       const workGraphPanelHandlers = makeWorkGraphOperatorHandlers();
-      return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+      return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
         WorkGraphPanel,
         {
           data: workGraphData,
@@ -66400,9 +66415,9 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         }
       );
     }
-    return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("div", { className: "console-panel", children: "Unsupported panel" });
+    return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("div", { className: "console-panel", children: "Unsupported panel" });
   }
-  return /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(ConsoleMcpAppsProvider, { value: effectiveMcpAppsHost ? { host: effectiveMcpAppsHost, authority: sendScope, readOnly: consoleReadOnly } : null, children: /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(ConsolePanelsProvider, { value: panelProvider, children: /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)(
+  return /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(ConsoleMcpAppsProvider, { value: effectiveMcpAppsHost ? { host: effectiveMcpAppsHost, authority: sendScope, readOnly: consoleReadOnly } : null, children: /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(ConsolePanelsProvider, { value: panelProvider, children: /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)(
     "div",
     {
       className: "cc-theme-scope meta-shell",
@@ -66410,14 +66425,14 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
       "data-cc-variant": variant,
       "data-testid": "meerkat-console",
       children: [
-        /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(SpriteSheet, {}),
-        panelState.errors.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("div", { className: "meta-action-error", role: "alert", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(SpriteSheet, {}),
+        panelState.errors.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)("div", { className: "meta-action-error", role: "alert", children: [
           "Custom panels could not load: ",
           panelState.errors.join("; ")
         ] }) : null,
-        actionError && /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("div", { className: "meta-action-error", "data-testid": "console-action-error", role: "alert", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime60.jsx)("span", { children: actionError }),
-          /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+        actionError && /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)("div", { className: "meta-action-error", "data-testid": "console-action-error", role: "alert", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime61.jsx)("span", { children: actionError }),
+          /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
             "button",
             {
               "aria-label": "Dismiss error",
@@ -66428,10 +66443,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
             }
           )
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+        /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
           Topbar,
           {
-            connectionStatus: /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(ConsoleTransportStatus, { state: transportState, onRetry: () => setTransportRetry((value) => value + 1) }),
+            connectionStatus: /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(ConsoleTransportStatus, { state: transportState, onRetry: () => setTransportRetry((value) => value + 1) }),
             mobName,
             brandLabel: brand?.label,
             brandLogoUrl: brand?.logo_url,
@@ -66447,7 +66462,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
             onToggleRail: toggleRailCollapsed
           }
         ),
-        /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)(
+        /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)(
           "div",
           {
             className: "shell",
@@ -66455,7 +66470,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
             "data-sidebar-collapsed": sidebarCollapsed ? "true" : "false",
             "data-rail-collapsed": railCollapsed ? "true" : "false",
             children: [
-              /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+              /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
                 Sidebar,
                 {
                   agents,
@@ -66477,7 +66492,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
                   onOpenApproval: openApproval
                 }
               ),
-              /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+              /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
                 "div",
                 {
                   className: "pane-resizer",
@@ -66486,8 +66501,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
                   onPointerDown: handleSidebarResize
                 }
               ),
-              /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)("div", { className: "main", children: [
-                /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+              /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)("div", { className: "main", children: [
+                /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
                   MetaDock,
                   {
                     viewState: dock.viewState,
@@ -66513,8 +66528,8 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
                 ),
                 dock.focusedTarget?.kind !== "agent-chat" ? voiceBar : null
               ] }),
-              railVisible ? /* @__PURE__ */ (0, import_jsx_runtime60.jsxs)(import_jsx_runtime60.Fragment, { children: [
-                /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+              railVisible ? /* @__PURE__ */ (0, import_jsx_runtime61.jsxs)(import_jsx_runtime61.Fragment, { children: [
+                /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
                   "div",
                   {
                     className: "pane-resizer pane-resizer--activity",
@@ -66523,7 +66538,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
                     onPointerDown: handleActivityResize
                   }
                 ),
-                /* @__PURE__ */ (0, import_jsx_runtime60.jsx)(
+                /* @__PURE__ */ (0, import_jsx_runtime61.jsx)(
                   SignalsRail,
                   {
                     frames: activityRef.current,
@@ -66546,14 +66561,14 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
 }
 
 // src/index.tsx
-var import_jsx_runtime61 = require("react/jsx-runtime");
+var import_jsx_runtime62 = require("react/jsx-runtime");
 function createConsoleApp(target, options = {}) {
   if (!target) {
     throw new Error("target element is required");
   }
   const baseUrl = options.baseUrl || "";
   const root4 = (0, import_client2.createRoot)(target);
-  root4.render(/* @__PURE__ */ (0, import_jsx_runtime61.jsx)(ConsoleApp, { mcpAppsHost: options.mcpAppsHost, customPanels: options.customPanels, panelService: options.panelService, baseUrl, storageNamespace: options.storageNamespace, markdownUrlPolicy: options.markdownUrlPolicy }));
+  root4.render(/* @__PURE__ */ (0, import_jsx_runtime62.jsx)(ConsoleApp, { mcpAppsHost: options.mcpAppsHost, customPanels: options.customPanels, panelService: options.panelService, baseUrl, storageNamespace: options.storageNamespace, markdownUrlPolicy: options.markdownUrlPolicy }));
   return {
     unmount() {
       root4.unmount();
