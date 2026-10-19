@@ -40,7 +40,7 @@ All Rust commands go through `scripts/repo-cargo`, which isolates `CARGO_HOME` a
 ```bash
 # Rust (via wrapper)
 ./scripts/repo-cargo check --workspace
-./scripts/repo-cargo nextest run --workspace -E 'not test(governance_contracts)' --no-fail-fast
+./scripts/repo-cargo nextest run --workspace --no-fail-fast
 
 # Or via Makefile (preferred)
 make check

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only: the traceability YAML that `validate_traceability_statuses`,
+  `validate_governance_contracts` and the `governance_check` binary read is
+  parsed with serde-saphyr 2.0 (pure Rust, no `unsafe`) instead of serde_yaml
+  0.9, and refused as a malformed row (`InvalidTraceabilityRow`) when it has
+  a custom tag (serde_yaml dropped the tag and kept the text), a key given
+  twice in a row or at the top level (serde_yaml kept the last), a null where
+  text is expected (serde_yaml stored `~` or an empty string, and `~` counted
+  as evidence), a `...` document end marker (serde-saphyr 2.0.0 ignores what
+  follows one), nesting deeper than 64 levels, or 100 or more aliases that
+  outnumber their anchors more than ten to one (the parser's default budget).
+  `yes`, `on` and `off` stay text, and `<<` stays an ordinary key. The
+  incident command center example parses its scenario with four of these
+  rules: YAML 1.2 booleans, `<<` as an ordinary key, and refusal of
+  duplicate keys and unknown tags.
+
+### Security
+
+- Meta's own YAML parsing no longer uses serde_yaml 0.9 (deprecated) and its
+  archived unsafe-libyaml (RUSTSEC-2024-0449, unmaintained). `deny.toml`
+  still ignores that advisory: Meerkat Core 0.9.3's meerkat-skills brings
+  serde_yaml in until Meta pins a Core release that parses SKILL.md with
+  serde-saphyr.
+
 ### Added
 
 - `.github/workflows/forge-release.yml` releases Meta Forge on its own
