@@ -71,7 +71,7 @@ use crate::runtime::{
     ConsoleAgentLiveSnapshot, ConsoleLiveSnapshot, ConsoleMember, ConsoleModelCapabilities,
     ConsoleRestJsonRequest, DeliveryHistoryRequest, GatingDecideRequest, GatingDecision,
     RuntimeDecisionState, extract_bearer_token_from_header,
-    handle_console_rest_json_route_with_snapshot_access_memory_and_workgraph,
+    handle_console_rest_json_route_with_pending_rows,
 };
 use crate::runtime::{RuntimeMetadataTable, labels_to_json_value};
 use crate::unified_runtime::console_events::{
@@ -957,7 +957,7 @@ pub async fn console_json_handler(
         snapshot
     });
 
-    let mut response = handle_console_rest_json_route_with_snapshot_access_memory_and_workgraph(
+    let mut response = handle_console_rest_json_route_with_pending_rows(
         &state.decisions,
         &ConsoleRestJsonRequest {
             method: "GET".to_string(),
@@ -968,6 +968,7 @@ pub async fn console_json_handler(
         state.access.as_ref(),
         state.memory_panel.is_some(),
         state.workgraph.is_some(),
+        &pending_identities,
     );
     if response.status == 200
         && uri.path() == "/console/experience"
@@ -977,7 +978,6 @@ pub async fn console_json_handler(
     }
     if response.status == 200 && uri.path() == "/console/experience" {
         attach_console_send_dedupe(&mut response.body, state.console_aggregator.as_ref());
-        withhold_pending_experience_rows(&mut response.body, &pending_identities);
     }
     if response.status == 200
         && uri.path() == "/console/experience"
@@ -1010,173 +1010,6 @@ fn attach_console_send_dedupe(experience: &mut Value, aggregator: Option<&MetaCo
             "send_dedupe".to_string(),
             json!({ "durable": aggregator.send_dedupe_durability().is_durable() }),
         );
-    }
-}
-
-/// Why facts of a console record are unobserved: one wire shape for every
-/// record that names facts the console holds no current observation of,
-/// `"unobserved": {"reason": ..., "fields": [...]}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-enum UnobservedReason {
-    /// The identity binding behind the record moved, and the read model had
-    /// not re-collected it by [`CONSOLE_BINDING_REFRESH_DEADLINE`].
-    RefreshPending,
-}
-
-fn unobserved_marker(reason: UnobservedReason, fields: &[&str]) -> Value {
-    json!({ "reason": reason, "fields": fields })
-}
-
-/// Sidebar facts a pending row withholds.
-const PENDING_SIDEBAR_WITHHELD_FIELDS: &[&str] = &[
-    "state",
-    "role",
-    "label",
-    "group",
-    "labels",
-    "wired_to",
-    "model_capabilities",
-    "addressable",
-    "watched",
-    "alertLevel",
-    "degraded",
-    "degradedReason",
-];
-
-/// identity_status facts a pending row withholds.
-const PENDING_IDENTITY_STATUS_WITHHELD_FIELDS: &[&str] = &[
-    "state",
-    "role",
-    "display_name",
-    "labels",
-    "addressability",
-    "model_capabilities",
-];
-
-/// Withhold, on the wire, every walked fact of the rows this read answers
-/// pending: their identity binding moved and the read model had not
-/// re-collected them by [`CONSOLE_BINDING_REFRESH_DEADLINE`]. Visibility and
-/// access already decided on the last observed facts, so a policy that
-/// matches them still applies; the client sees only what the owners answer
-/// now (the identity runtime's session and the runtime machine's bounded run
-/// state), the identity, and the typed marker. State is "unknown", and the
-/// affordances fail closed: no send, no retire (a respawn resolves its
-/// target live). Profile capability hints are recounted without the pending
-/// rows' walked roles.
-fn withhold_pending_experience_rows(experience: &mut Value, pending: &BTreeSet<String>) {
-    if pending.is_empty() {
-        return;
-    }
-    if let Some(agents) = experience
-        .pointer_mut("/agent_sidebar/live_snapshot/agents")
-        .and_then(Value::as_array_mut)
-    {
-        let mut profiles: BTreeMap<String, (usize, bool, bool)> = BTreeMap::new();
-        let mut recount = false;
-        for agent in agents.iter_mut() {
-            let identity = agent
-                .get("identity")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let Some(identity) = identity.filter(|identity| pending.contains(identity)) else {
-                if let Some(role) = agent.get("role").and_then(Value::as_str) {
-                    let entry = profiles.entry(role.to_string()).or_insert((0, true, false));
-                    entry.0 += 1;
-                    entry.1 = entry.1
-                        && agent
-                            .pointer("/labels/addressable")
-                            .and_then(Value::as_str)
-                            .is_none_or(|value| value != "false");
-                    entry.2 = entry.2
-                        || agent
-                            .get("wired_to")
-                            .and_then(Value::as_array)
-                            .is_some_and(|peers| !peers.is_empty());
-                }
-                continue;
-            };
-            recount = true;
-            let Some(record) = agent.as_object_mut() else {
-                continue;
-            };
-            for field in [
-                "role",
-                "group",
-                "model_capabilities",
-                "watched",
-                "alertLevel",
-                "degraded",
-                "degradedReason",
-            ] {
-                record.remove(field);
-            }
-            record.insert("state".to_string(), json!("unknown"));
-            record.insert("label".to_string(), json!(identity));
-            record.insert("labels".to_string(), json!({ "agent_identity": identity }));
-            record.insert("wired_to".to_string(), json!([]));
-            record.insert("addressable".to_string(), json!(false));
-            if let Some(affordances) = record.get_mut("affordances").and_then(Value::as_object_mut)
-            {
-                affordances.insert("addressable".to_string(), json!(false));
-                affordances.insert("can_send_message".to_string(), json!(false));
-                affordances.insert("can_retire".to_string(), json!(false));
-            }
-            record.insert(
-                "unobserved".to_string(),
-                unobserved_marker(
-                    UnobservedReason::RefreshPending,
-                    PENDING_SIDEBAR_WITHHELD_FIELDS,
-                ),
-            );
-        }
-        if recount
-            && let Some(capabilities) = experience
-                .pointer_mut("/runtime_capabilities/profile_capabilities")
-                .and_then(Value::as_object_mut)
-        {
-            capabilities.clear();
-            for (profile, (count, addressable, has_wiring)) in profiles {
-                capabilities.insert(
-                    profile,
-                    json!({
-                        "instance_count": count,
-                        "addressable": addressable,
-                        "has_wiring": has_wiring,
-                    }),
-                );
-            }
-        }
-    }
-    if let Some(rows) = experience
-        .pointer_mut("/identity_status/rows")
-        .and_then(Value::as_array_mut)
-    {
-        for row in rows.iter_mut() {
-            let identity = row
-                .get("identity")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let Some(identity) = identity.filter(|identity| pending.contains(identity)) else {
-                continue;
-            };
-            let Some(record) = row.as_object_mut() else {
-                continue;
-            };
-            for field in ["role", "display_name", "model_capabilities"] {
-                record.remove(field);
-            }
-            record.insert("state".to_string(), json!("unknown"));
-            record.insert("addressability".to_string(), json!("internal_only"));
-            record.insert("labels".to_string(), json!({ "agent_identity": identity }));
-            record.insert(
-                "unobserved".to_string(),
-                unobserved_marker(
-                    UnobservedReason::RefreshPending,
-                    PENDING_IDENTITY_STATUS_WITHHELD_FIELDS,
-                ),
-            );
-        }
     }
 }
 
@@ -12127,7 +11960,8 @@ async fn handle_console_wire_local(
 }
 
 /// The console's live snapshot, and the identities whose rows it answers
-/// pending (see [`withhold_pending_experience_rows`]).
+/// pending (the experience renders them withheld, see
+/// [`handle_console_rest_json_route_with_pending_rows`]).
 ///
 /// With an identity runtime, the snapshot reads it once per request
 /// ([`IdentityBindingCut`]) and never serves a fact walked under an earlier
@@ -12290,8 +12124,8 @@ async fn build_live_snapshot(
 /// pending, carries the runtime machine's bounded run state for the session
 /// it now names instead (one wave, [`CONSOLE_PROGRESS_READ_CONCURRENCY`] at a
 /// time) until the walk lands. Its other facts stay as walked: visibility
-/// and access decide on them, and the experience withholds a pending row's
-/// facts on the wire.
+/// and access decide on them, and the experience renders every record of a
+/// pending row in its withheld shape.
 async fn join_identity_bindings(
     members: &mut [ConsoleMember],
     walked_cut: &IdentityBindingCut,

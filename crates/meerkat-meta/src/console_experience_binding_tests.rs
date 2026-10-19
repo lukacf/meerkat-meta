@@ -17,7 +17,6 @@ use serde_json::{Value, json};
 use super::{
     CONSOLE_BINDING_REFRESH_DEADLINE, ConsoleSnapshotReadModel, IdentityBinding,
     IdentityBindingCut, build_live_snapshot, join_identity_bindings,
-    withhold_pending_experience_rows,
 };
 use crate::access::{AccessControlConfig, AccessController, AccessEffect, AccessRule};
 use crate::console_aggregator::{AllowAllConsoleVisibilityPolicy, MetaConsoleAggregator};
@@ -231,105 +230,152 @@ fn a_walk_answers_for_the_same_bindings_or_a_cut_read_after_the_request() {
     );
 }
 
-fn experience_with_rows() -> Value {
-    let keeper_agent = json!({
-        "agent_id": KEEPER,
-        "member_id": KEEPER,
-        "identity": KEEPER,
-        "label": "Keeper",
-        "kind": "mob_agent",
-        "role": "worker",
-        "state": "active",
-        "progress": fallback_progress(),
-        "model_capabilities": {"image_input": true},
-        "session_id": "s1",
-        "wired_to": [OTHER],
-        "labels": {"agent_identity": KEEPER, "tier": "restricted", "display_name": "Keeper"},
-        "group": "keepers",
-        "addressable": true,
-        "watched": true,
-        "alertLevel": "critical",
-        "degraded": false,
-        "degradedReason": null,
-        "affordances": {
-            "addressable": true,
-            "can_send_message": true,
-            "can_retire": true,
-            "can_respawn": true,
-            "runtime_mode": "mob_agent",
-        },
-    });
-    let mut other_agent = keeper_agent.clone();
-    other_agent["agent_id"] = json!(OTHER);
-    other_agent["member_id"] = json!(OTHER);
-    other_agent["identity"] = json!(OTHER);
-    other_agent["labels"] = json!({"agent_identity": OTHER});
-    other_agent["wired_to"] = json!([]);
-    json!({
-        "runtime_capabilities": {
-            "profile_capabilities": {
-                "worker": {"instance_count": 2, "addressable": true, "has_wiring": true},
-            },
-        },
-        "agent_sidebar": {"live_snapshot": {"agents": [keeper_agent, other_agent]}},
-        "identity_status": {"rows": [
+/// A pending keeper whose walked facts are sentinels, beside a plain peer
+/// wired to it.
+fn pending_route_snapshot() -> crate::runtime::ConsoleLiveSnapshot {
+    let mut keeper = row(KEEPER, Some(KEEPER), Some("s1"));
+    keeper.role = "sentinel-role".to_string();
+    keeper.wired_to = vec![OTHER.to_string()];
+    keeper.model_capabilities = ConsoleModelCapabilities { image_input: true };
+    keeper.labels.extend([
+        ("tier".to_string(), "restricted-sentinel".to_string()),
+        ("display_name".to_string(), "Keeper Sentinel".to_string()),
+        ("group".to_string(), "group-sentinel".to_string()),
+    ]);
+    keeper.progress = Some(fallback_progress());
+    let mut other = row(OTHER, Some(OTHER), Some("o0"));
+    other.wired_to = vec![KEEPER.to_string()];
+    crate::runtime::ConsoleLiveSnapshot::new(
+        Some("console-binding".to_string()),
+        true,
+        vec![],
+        vec![],
+        vec![keeper, other],
+        true,
+    )
+}
+
+const WALKED_SENTINELS: &[&str] = &[
+    "sentinel-role",
+    "restricted-sentinel",
+    "Keeper Sentinel",
+    "group-sentinel",
+];
+
+/// Every object in `value` that names `identity` (as identity, agent_id or
+/// member_id).
+fn records_naming<'a>(value: &'a Value, identity: &str, found: &mut Vec<&'a Value>) {
+    match value {
+        Value::Object(object) => {
+            if ["identity", "agent_id", "member_id"]
+                .iter()
+                .any(|key| object.get(*key).and_then(Value::as_str) == Some(identity))
             {
-                "identity": KEEPER,
-                "state": "active",
-                "addressability": "addressable",
-                "labels": {"agent_identity": KEEPER, "tier": "restricted"},
-                "display_name": "Keeper",
-                "role": "worker",
-                "progress": fallback_progress(),
-                "model_capabilities": {"image_input": true},
-                "session_id": "s1",
-            },
-            {
-                "identity": OTHER,
-                "state": "active",
-                "addressability": "addressable",
-                "labels": {"agent_identity": OTHER},
-                "role": "worker",
-                "session_id": "o0",
-            },
-        ]},
-    })
+                found.push(value);
+            }
+            for child in object.values() {
+                records_naming(child, identity, found);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                records_naming(item, identity, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The whole body carries none of the pending keeper's walked facts: no
+/// sentinel anywhere, and every record naming it (sidebar row, identity
+/// status row, health row, topology node) holds the withheld shape and the
+/// marker.
+fn assert_pending_keeper_withheld_everywhere(body: &Value) {
+    let text = body.to_string();
+    for sentinel in WALKED_SENTINELS {
+        assert!(
+            !text.contains(sentinel),
+            "the walked fact {sentinel:?} is served for the pending keeper: {body:#}"
+        );
+    }
+    let mut records = Vec::new();
+    records_naming(body, KEEPER, &mut records);
+    assert_eq!(
+        records.len(),
+        4,
+        "sidebar, identity status, health and topology each name the keeper: {records:#?}"
+    );
+    for record in records {
+        assert_eq!(
+            record["unobserved"]["reason"], "refresh_pending",
+            "{record:#}"
+        );
+        assert_eq!(record["state"], "unknown", "{record:#}");
+        for withheld in ["role", "model_capabilities", "display_name", "group"] {
+            assert!(
+                record.get(withheld).is_none(),
+                "{withheld} served: {record:#}"
+            );
+        }
+        if let Some(wired_to) = record.get("wired_to") {
+            assert_eq!(wired_to, &json!([]), "{record:#}");
+        }
+        if let Some(labels) = record.get("labels") {
+            assert_eq!(labels, &json!({"agent_identity": KEEPER}), "{record:#}");
+        }
+        if let Some(label) = record.get("label") {
+            assert_eq!(label, KEEPER, "{record:#}");
+        }
+    }
+}
+
+/// The experience body the console route builds for `snapshot`, with
+/// `pending` identities answered pending.
+fn experience_body(
+    snapshot: &crate::runtime::ConsoleLiveSnapshot,
+    pending: &BTreeSet<String>,
+    access: Option<&AccessController>,
+) -> Value {
+    let response = crate::runtime::handle_console_rest_json_route_with_pending_rows(
+        &open_console_decisions(),
+        &ConsoleRestJsonRequest {
+            method: "GET".to_string(),
+            path: "/console/experience".to_string(),
+            auth: None,
+        },
+        Some(snapshot),
+        access,
+        false,
+        false,
+        pending,
+    );
+    assert_eq!(response.status, 200, "{}", response.body);
+    response.body
+}
+
+/// The record naming `identity` in the array at `pointer`.
+fn record_at<'a>(body: &'a Value, pointer: &str, identity: &str) -> &'a Value {
+    body.pointer(pointer)
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.iter().find(|row| row["identity"] == identity))
+        .unwrap_or_else(|| panic!("{pointer} names {identity}: {body:#}"))
 }
 
 #[test]
-fn a_pending_row_withholds_its_walked_facts_on_the_wire_and_fails_affordances_closed() {
-    let mut experience = experience_with_rows();
-    let untouched_other = experience["agent_sidebar"]["live_snapshot"]["agents"][1].clone();
-    let untouched_other_status = experience["identity_status"]["rows"][1].clone();
+fn a_pending_row_withholds_its_walked_facts_in_every_panel_and_fails_affordances_closed() {
+    let snapshot = pending_route_snapshot();
+    let pending = BTreeSet::from([KEEPER.to_string()]);
+    let body = experience_body(&snapshot, &pending, None);
+    assert_pending_keeper_withheld_everywhere(&body);
 
-    withhold_pending_experience_rows(&mut experience, &BTreeSet::from([KEEPER.to_string()]));
-
-    let keeper = &experience["agent_sidebar"]["live_snapshot"]["agents"][0];
+    let keeper = record_at(&body, "/agent_sidebar/live_snapshot/agents", KEEPER);
     assert_eq!(keeper["session_id"], "s1", "the owner's session stays");
     assert_eq!(
         keeper["progress"],
         fallback_progress(),
         "the bounded run state stays"
     );
-    assert_eq!(keeper["state"], "unknown");
-    assert_eq!(keeper["label"], KEEPER);
-    assert_eq!(keeper["labels"], json!({"agent_identity": KEEPER}));
-    assert_eq!(keeper["wired_to"], json!([]));
     assert_eq!(keeper["addressable"], false);
-    for withheld in [
-        "role",
-        "group",
-        "model_capabilities",
-        "watched",
-        "alertLevel",
-        "degraded",
-        "degradedReason",
-    ] {
-        assert!(
-            keeper.get(withheld).is_none(),
-            "{withheld} is withheld: {keeper}"
-        );
-    }
     assert_eq!(keeper["affordances"]["addressable"], false);
     assert_eq!(keeper["affordances"]["can_send_message"], false);
     assert_eq!(keeper["affordances"]["can_retire"], false);
@@ -337,45 +383,57 @@ fn a_pending_row_withholds_its_walked_facts_on_the_wire_and_fails_affordances_cl
         keeper["affordances"]["can_respawn"], true,
         "respawn resolves its target live"
     );
-    assert_eq!(keeper["unobserved"]["reason"], "refresh_pending");
     assert!(
         keeper["unobserved"]["fields"]
             .as_array()
             .unwrap()
             .contains(&json!("labels"))
     );
-
-    let keeper_status = &experience["identity_status"]["rows"][0];
+    let keeper_status = record_at(&body, "/identity_status/rows", KEEPER);
     assert_eq!(keeper_status["session_id"], "s1");
-    assert_eq!(keeper_status["state"], "unknown");
     assert_eq!(keeper_status["addressability"], "internal_only");
-    assert_eq!(keeper_status["labels"], json!({"agent_identity": KEEPER}));
-    for withheld in ["role", "display_name", "model_capabilities"] {
-        assert!(
-            keeper_status.get(withheld).is_none(),
-            "{withheld} is withheld: {keeper_status}"
+    assert_eq!(
+        body["health_overview"]["live_snapshot"]["identities"], body["identity_status"]["rows"],
+        "health lists the same rows"
+    );
+    let node = record_at(&body, "/topology/live_snapshot/nodes", KEEPER);
+    assert_eq!(node["addressable"], false);
+
+    // The peer's records stay as walked, and the profile hints count only
+    // the rows the walk answers for.
+    let answered = experience_body(&snapshot, &BTreeSet::new(), None);
+    for pointer in [
+        "/agent_sidebar/live_snapshot/agents",
+        "/identity_status/rows",
+        "/topology/live_snapshot/nodes",
+    ] {
+        assert_eq!(
+            record_at(&body, pointer, OTHER),
+            record_at(&answered, pointer, OTHER),
+            "{pointer}"
         );
     }
-    assert_eq!(keeper_status["unobserved"]["reason"], "refresh_pending");
-
     assert_eq!(
-        experience["agent_sidebar"]["live_snapshot"]["agents"][1],
-        untouched_other
-    );
-    assert_eq!(
-        experience["identity_status"]["rows"][1],
-        untouched_other_status
-    );
-    assert_eq!(
-        experience["runtime_capabilities"]["profile_capabilities"],
-        json!({"worker": {"instance_count": 1, "addressable": true, "has_wiring": false}}),
+        body["runtime_capabilities"]["profile_capabilities"],
+        json!({"worker": {"instance_count": 1, "addressable": true, "has_wiring": true}}),
         "the pending row's walked profile no longer counts"
     );
 
-    // Nothing pending: the experience is untouched.
-    let mut unchanged = experience_with_rows();
-    withhold_pending_experience_rows(&mut unchanged, &BTreeSet::new());
-    assert_eq!(unchanged, experience_with_rows());
+    // Nothing pending: the body is the public route's, unchanged.
+    let public =
+        crate::runtime::handle_console_rest_json_route_with_snapshot_access_memory_and_workgraph(
+            &open_console_decisions(),
+            &ConsoleRestJsonRequest {
+                method: "GET".to_string(),
+                path: "/console/experience".to_string(),
+                auth: None,
+            },
+            Some(&snapshot),
+            None,
+            false,
+            false,
+        );
+    assert_eq!(public.body, answered);
 }
 
 fn spec(identity: &str, labels: BTreeMap<String, String>) -> DurableAgentSpec {
@@ -571,23 +629,12 @@ fn open_console_decisions() -> crate::RuntimeDecisionState {
 
 fn experience_identities(
     snapshot: &crate::runtime::ConsoleLiveSnapshot,
+    pending: &BTreeSet<String>,
     controller: &AccessController,
 ) -> (Vec<String>, Vec<String>) {
-    let response = crate::runtime::handle_console_rest_json_route_with_snapshot_and_access(
-        &open_console_decisions(),
-        &ConsoleRestJsonRequest {
-            method: "GET".to_string(),
-            path: "/console/experience".to_string(),
-            auth: None,
-        },
-        Some(snapshot),
-        Some(controller),
-    );
-    assert_eq!(response.status, 200, "{}", response.body);
+    let body = experience_body(snapshot, pending, Some(controller));
     let names = |pointer: &str| {
-        response
-            .body
-            .pointer(pointer)
+        body.pointer(pointer)
             .and_then(Value::as_array)
             .map(|rows| {
                 rows.iter()
@@ -636,7 +683,7 @@ async fn a_label_scoped_deny_still_hides_a_member_answered_pending() {
     })
     .expect("access controller");
 
-    let (snapshot, _) = build_live_snapshot(
+    let (snapshot, pending) = build_live_snapshot(
         &mob_runtime,
         &[],
         None,
@@ -645,8 +692,9 @@ async fn a_label_scoped_deny_still_hides_a_member_answered_pending() {
         Some(identity_runtime),
     )
     .await;
+    assert!(pending.is_empty());
     assert_eq!(
-        experience_identities(&snapshot, &controller),
+        experience_identities(&snapshot, &pending, &controller),
         (vec![OTHER.to_string()], vec![OTHER.to_string()]),
         "the deny hides the restricted keeper before the reset"
     );
@@ -668,7 +716,7 @@ async fn a_label_scoped_deny_still_hides_a_member_answered_pending() {
     .await;
     assert_eq!(pending, BTreeSet::from([KEEPER.to_string()]));
     assert_eq!(
-        experience_identities(&snapshot, &controller),
+        experience_identities(&snapshot, &pending, &controller),
         (vec![OTHER.to_string()], vec![OTHER.to_string()]),
         "access decides on the last observed labels while the row is pending"
     );

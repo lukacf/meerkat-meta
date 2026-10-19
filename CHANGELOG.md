@@ -83,12 +83,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   session, the runtime machine's bounded run state and state `unknown`,
   withholds its other walked facts with fail-closed affordances (no send,
   no retire), and carries a new `unobserved` marker
-  (`{"reason": "refresh_pending", "fields": [...]}`) on the sidebar row and
-  the identity_status row. Access and visibility still decide on the last
-  observed facts, so a label-scoped deny keeps a pending member hidden.
-  console-core mirrors the marker (`UnobservedFacts`,
-  `normalizeUnobservedFacts`, `IdentityStatusRow.unobserved`), and the
-  console carries it on its agent rows.
+  (`{"reason": "refresh_pending", "fields": [...]}`) on every record the
+  experience builds for it: the sidebar row, the identity_status and
+  health_overview rows, and the topology node. The profile capability
+  hints leave its walked role out. Access and visibility still decide on
+  the last observed facts, so a label-scoped deny keeps a pending member
+  hidden. console-core mirrors the marker (`UnobservedFacts`,
+  `normalizeUnobservedFacts`, `IdentityStatusRow.unobserved`,
+  `ConsoleTopologyNode.unobserved`), and the console carries it on its
+  agent rows.
 
 ### Fixed
 

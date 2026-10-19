@@ -237,6 +237,7 @@ export interface ConsoleTopologyNode {
   group?: string;
   subgroup?: string;
   addressable?: boolean;
+  unobserved?: UnobservedFacts;
 }
 
 export interface ConsoleHealthSnapshot {

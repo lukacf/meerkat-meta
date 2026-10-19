@@ -238,6 +238,7 @@ export interface ConsoleTopologyNode {
   group?: string;
   subgroup?: string;
   addressable?: boolean;
+  unobserved?: IdentityStatusRow["unobserved"];
 }
 
 export interface ConsoleHealthSnapshot {
