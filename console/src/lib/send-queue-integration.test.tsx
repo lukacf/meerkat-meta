@@ -2041,6 +2041,14 @@ describe("checked access saves", () => {
       fireEvent.click(screen.getByTestId("access-tab:rules"));
       await act(async () => { fireEvent.click(screen.getByTestId("access-refresh")); });
       expect(refreshNotice()).not.toBeNull();
+      // A background trigger after the Refresh replaces its trailing run, so
+      // the read that ends the notice is a background one. The trigger has
+      // run once the experience load it starts with has been asked for.
+      let experienceLoads = 0;
+      const loadExperience = fake.loadExperience;
+      fake.loadExperience = async () => { experienceLoads += 1; return loadExperience(); };
+      await toolCall();
+      await waitFor(() => expect(experienceLoads).toBeGreaterThan(0));
       await act(async () => { reads.held[0].release(); });
       await waitFor(() => expect(reads.held).toHaveLength(2));
       expect(refreshNotice()).not.toBeNull();

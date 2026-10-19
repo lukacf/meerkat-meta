@@ -2711,6 +2711,10 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   // older lands after it. The first read of a scope disables edits from its
   // request too. A background read in a settled scope changes nothing until
   // it lands; the owner still checks the draft's edit token on every save.
+  // The single flight keeps only the latest task for its trailing run, so a
+  // background trigger can replace an explicit request's trailing read. That
+  // is safe because both modes complete the same way and the explicit request
+  // applied its effects when it was made.
   const refreshAccessData = React.useCallback((mode: "explicit" | "background" = "explicit") => {
     if (accessScope === accessScopeRef.current && (mode === "explicit" || accessSettledScope.current !== accessScope)) {
       if (mode === "explicit") accessRefreshVersion.current += 1;
