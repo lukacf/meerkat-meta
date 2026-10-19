@@ -4,6 +4,17 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+- `MemberReloadRequiredError` (an `RpcError`), with
+  `MEMBER_RELOAD_REQUIRED_CODE` (`-32029`) and `MEMBER_RELOAD_REQUIRED_KIND`
+  (`"mob_member_reload_required"`): `MobHandle.force_cancel_member` raises it
+  for a member whose runtime registration must be reloaded, when the refusal
+  carries both the code and the kind. It has `member_id`, `reason` and
+  `required_action` (`"reload_member_registration"`), each `None` when the
+  gateway sent no such field. Any other `-32029` stays a plain `RpcError`.
+- `MobHandle.force_cancel_member` raises meerkat's typed mob refusal: an
+  unknown member now arrives as an `RpcError` with code `-32602` (`mob member
+  not found: <id>`) instead of `-32000`.
+
 ## 0.9.3
 
 - Breaking: the draft results of `meta/mobpacks/list`, `create`, `save`,
