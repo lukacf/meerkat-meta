@@ -55,6 +55,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `meta/get_member`), which already refused a stale runtime id, now send
   the same six-field `error.data`, adding `registered_session_id` and
   `live_session_id`.
+- `ConsoleLiveSnapshot` is `#[non_exhaustive]`: build it with
+  `ConsoleLiveSnapshot::new`, so a later field is not a breaking change.
+- `ConsoleLiveSnapshot.running` is an `Option<bool>` (was `bool`), and
+  `ConsoleLiveSnapshot::new` takes the same. `None` means that nothing
+  observed whether the mob runs; it is never defaulted. The snapshot gains
+  `unobserved: Option<UnobservedFacts>`, which `new` sets when `running` is
+  `None` (serde default, skipped when `None`).
 
 ### Security
 
@@ -75,6 +82,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Publication releases those exact bytes as a prerelease that never becomes the
   latest release. `forge.yml` can now be dispatched, and records each job's
   toolchain. `installer/RELEASING.md` has the steps.
+- `meerkat_meta::unobserved`: `UnobservedFacts` (built with
+  `UnobservedFacts::new`) and `UnobservedReason` (`RefreshPending`,
+  `NotObserved`), both `#[non_exhaustive]`. They are the shape of the
+  `"unobserved": {"reason": ..., "fields": [...]}` marker the console
+  experience puts on a fact it holds no observation for.
 
 ### Changed
 
@@ -145,6 +157,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   explicitly chosen pin is kept. The exported knowledge README states the
   licences of the embedded storage engine and names the source's notes on its
   patches to it.
+- `/console/experience` reports `health_overview.live_snapshot.running` as
+  the mob's owner answers when the experience is read, as `meta/status`
+  does. It came from the console's cached roster walk, and was `true` when
+  no walk had answered yet, so a mob stopped since the last walk read as
+  running. A console with no live runtime reports `running: null` and names
+  it unobserved (`"unobserved": {"reason": "not_observed", "fields":
+  ["running"]}` on the health snapshot); it reported `true` whenever a
+  module was configured.
+- A console served from the console aggregator reports `running` from its
+  registered runtimes' owners: `true` only while every registered runtime's
+  mob is creating or running, `false` when at least one is not, and `null`
+  with the `not_observed` marker when no runtime is registered. It reported
+  `true` whatever its runtimes did.
+- The console's topbar shows the mob as unknown, with an amber dot, when the
+  health snapshot does not say whether it runs; it showed running. A stopped
+  mob's dot is red; the dot was green whatever the status. console-core's
+  `consoleMobStatus` derives the status, and `ConsoleHealthSnapshot` carries
+  `running: boolean | null` and the `unobserved` marker.
 - The `complete_held_identity_members` documentation no longer says that
   resumed members are skipped. A held identity bootstrap holds fresh members
   only: a roster member that already has continuity refuses the whole pass

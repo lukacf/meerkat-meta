@@ -30,6 +30,7 @@ export type {
   ToolCallAccumulatorState,
   UnobservedFacts,
   UnobservedReason,
+  ConsoleMobStatus,
 } from "./control-plane";
 export {
   normalizeActivityFilterPreset,
@@ -50,6 +51,7 @@ export {
   normalizeSidebarWatchFields,
   normalizeToolCallAccumulatorState,
   normalizeUnobservedFacts,
+  consoleMobStatus,
 } from "./control-plane";
 
 export type {

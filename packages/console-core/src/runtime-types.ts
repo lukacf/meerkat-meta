@@ -243,8 +243,10 @@ export interface ConsoleTopologyNode {
 export interface ConsoleHealthSnapshot {
   loaded_modules?: unknown[];
   loaded_module_count?: number;
-  running?: boolean;
+  /** `null` when nothing observed whether the mob runs; `unobserved` names it. */
+  running?: boolean | null;
   identities?: IdentityStatusRow[];
+  unobserved?: UnobservedFacts;
 }
 
 type ConsoleExperienceSection<T> = T & Partial<ExperienceSectionMeta>;

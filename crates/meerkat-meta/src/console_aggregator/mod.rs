@@ -1352,6 +1352,28 @@ impl MetaConsoleAggregator {
         }
     }
 
+    /// Whether the registered runtimes run, as their mob owners answer now:
+    /// `Some(true)` while at least one runtime is registered and every
+    /// registered mob is creating or running, `Some(false)` when at least one
+    /// registered mob is not running, and `None` when no runtime is
+    /// registered, so nothing answers.
+    pub(crate) fn registered_runtimes_running(&self) -> Option<bool> {
+        let runtimes = self
+            .inner
+            .runtimes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if runtimes.is_empty() {
+            return None;
+        }
+        Some(runtimes.values().all(|entry| {
+            matches!(
+                entry.runtime.handle().status_observation_snapshot(),
+                meerkat_mob::MobState::Creating | meerkat_mob::MobState::Running
+            )
+        }))
+    }
+
     pub async fn list_identities(&self) -> ConsoleLogResult<Vec<ConsoleIdentityRecord>> {
         if let Some(identities) = Box::pin(self.inner.identity_read_model.refresh_now_if_idle(
             self.inner.clone(),

@@ -3,6 +3,7 @@
 use super::*;
 use crate::access::{AccessController, AccessResource, AccessView, AgentResourceAttributes};
 use crate::rpc::META_CONTRACT_VERSION;
+use crate::unobserved::{UnobservedFacts, UnobservedReason};
 
 /// Console-facing view of a single mob member.
 ///
@@ -103,15 +104,23 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ConsoleLiveSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<String>,
-    pub running: bool,
+    /// Whether the mob runs, as its owner answered for this snapshot;
+    /// `None` when nothing observed it (`unobserved` names it). Never
+    /// defaulted: an absent answer is not a running mob.
+    pub running: Option<bool>,
     pub loaded_modules: Vec<String>,
     #[serde(default)]
     pub agents: Vec<ConsoleAgentLiveSnapshot>,
     pub members: Vec<ConsoleMember>,
     pub has_mob_runtime: bool,
+    /// The snapshot's facts that hold no observation
+    /// ([`crate::unobserved`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unobserved: Option<UnobservedFacts>,
 }
 
 fn console_member_console_identity(member: &ConsoleMember) -> &str {
@@ -122,7 +131,7 @@ fn console_member_console_identity(member: &ConsoleMember) -> &str {
 impl ConsoleLiveSnapshot {
     pub fn new(
         runtime_id: Option<String>,
-        running: bool,
+        running: Option<bool>,
         loaded_modules: Vec<String>,
         agents: Vec<ConsoleAgentLiveSnapshot>,
         members: Vec<ConsoleMember>,
@@ -149,6 +158,9 @@ impl ConsoleLiveSnapshot {
             agents: deduped_agents,
             members,
             has_mob_runtime,
+            unobserved: running
+                .is_none()
+                .then(|| UnobservedFacts::new(UnobservedReason::NotObserved, &["running"])),
         }
     }
 }
@@ -571,29 +583,14 @@ fn default_console_live_snapshot(decisions: &RuntimeDecisionState) -> ConsoleLiv
             degraded_reason: None,
         })
         .collect::<Vec<_>>();
-    ConsoleLiveSnapshot::new(
-        None,
-        !decisions.modules.is_empty(),
-        loaded_modules,
-        agents,
-        Vec::new(),
-        false,
-    )
+    // No live runtime answers for this snapshot: whether a mob runs is
+    // unobserved, not inferred from the configured modules.
+    ConsoleLiveSnapshot::new(None, None, loaded_modules, agents, Vec::new(), false)
 }
 
-/// Why facts of a console record are unobserved: one wire shape for every
-/// record that names facts the console holds no current observation of,
-/// `"unobserved": {"reason": ..., "fields": [...]}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum UnobservedReason {
-    /// The identity binding behind the record moved, and the read model had
-    /// not re-collected it by the console's binding refresh deadline.
-    RefreshPending,
-}
-
+/// The `unobserved` marker of a console record (see [`crate::unobserved`]).
 fn unobserved_marker(reason: UnobservedReason, fields: &[&str]) -> Value {
-    serde_json::json!({ "reason": reason, "fields": fields })
+    UnobservedFacts::new(reason, fields).to_value()
 }
 
 /// Sidebar facts a pending row withholds.
@@ -1219,6 +1216,9 @@ fn build_console_experience_contract(
             })
         }
     });
+    if let Some(unobserved) = &live_snapshot.unobserved {
+        body["health_overview"]["live_snapshot"]["unobserved"] = unobserved.to_value();
+    }
     if let Some(fetch_timeout_ms) = console_policy.fetch_timeout_ms {
         body["console_policy"] = serde_json::json!({
             "fetch_timeout_ms": fetch_timeout_ms,

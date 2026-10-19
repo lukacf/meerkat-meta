@@ -207,7 +207,6 @@ impl WalkedHook {
 
 #[derive(Clone, Default)]
 struct ConsoleSnapshotReadModelState {
-    running: Option<bool>,
     /// The identity runtime's cut this walk read just before it walked the
     /// roster: every fact below was collected under these bindings.
     identity_cut: IdentityBindingCut,
@@ -12066,7 +12065,12 @@ async fn build_live_snapshot(
     let (read_model_state, walk_answers) =
         Box::pin(read_model.snapshot_for_cut(runtime, identity_runtime, &request_cut)).await;
     let cut = read_model_state.identity_cut.newer(&request_cut);
-    let running = read_model_state.running.unwrap_or(true);
+    // Whether the mob runs is its owner's answer now, as `meta/status`
+    // reads it: a cached walk can predate a stop.
+    let running = Some(matches!(
+        runtime.handle().status_observation_snapshot(),
+        MobState::Creating | MobState::Running
+    ));
     // Hot path: clone the pre-projected members from the cached read
     // model. NO `handle.*` async calls happen here — the background
     // refresh task is the only thing that walks the mob roster, so
@@ -12292,10 +12296,6 @@ async fn walk_console_snapshot_read_model(
     let identity_cut = IdentityBindingCut::read(identity_runtime).await;
     let handle = runtime.handle();
     let mut state = ConsoleSnapshotReadModelState {
-        running: Some(matches!(
-            handle.status_observation_snapshot(),
-            MobState::Creating | MobState::Running
-        )),
         identity_cut,
         ..ConsoleSnapshotReadModelState::default()
     };
@@ -13876,7 +13876,7 @@ async fn build_aggregator_live_snapshot(
     };
     Ok(ConsoleLiveSnapshot::new(
         Some("console-aggregator".to_string()),
-        true,
+        aggregator.registered_runtimes_running(),
         loaded_modules,
         agents,
         members,
@@ -22271,7 +22271,7 @@ comms = true
     fn console_visibility_policy_hides_implicit_delegate_members_from_snapshot() {
         let mut snapshot = ConsoleLiveSnapshot::new(
             Some("runtime".to_string()),
-            true,
+            Some(true),
             vec!["incident-commander".to_string(), "qa-child".to_string()],
             vec![
                 ConsoleAgentLiveSnapshot {

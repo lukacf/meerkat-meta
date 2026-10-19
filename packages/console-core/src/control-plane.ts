@@ -65,8 +65,10 @@ export function identityStateLabel(row: { state: string; session_repair?: Identi
  * tolerate values you don't recognize. `refresh_pending`: the identity
  * binding behind the record moved and the projection had not re-collected
  * it yet, so the record withholds the facts it walked before.
+ * `not_observed`: nothing has observed the fact yet, so there is no answer
+ * to report.
  */
-export type UnobservedReason = "refresh_pending" | (string & {});
+export type UnobservedReason = "refresh_pending" | "not_observed" | (string & {});
 
 /**
  * Facts a console record holds no current observation of. `fields` names
@@ -442,6 +444,32 @@ export function normalizeUnobservedFacts(value: unknown): UnobservedFacts | null
       .filter((field): field is string => Boolean(field))
     : [];
   return { reason, fields };
+}
+
+/** The mob's run state as the console shows it. */
+export type ConsoleMobStatus = "running" | "stopped" | "unknown";
+
+/**
+ * Whether the mob runs, as a health snapshot reports it. Only an observed
+ * `true` is running and only an observed `false` is stopped: `null`, an
+ * absent value, or an `unobserved` marker that names `running` is unknown,
+ * never one of the two.
+ */
+export function consoleMobStatus(snapshot: unknown): ConsoleMobStatus {
+  const record = snapshot && typeof snapshot === "object" ? snapshot as Record<string, unknown> : null;
+  if (!record) {
+    return "unknown";
+  }
+  if (normalizeUnobservedFacts(record.unobserved)?.fields.includes("running")) {
+    return "unknown";
+  }
+  if (record.running === true) {
+    return "running";
+  }
+  if (record.running === false) {
+    return "stopped";
+  }
+  return "unknown";
 }
 
 export function normalizeIdentityInspectViewState(value: unknown): IdentityInspectViewState | null {

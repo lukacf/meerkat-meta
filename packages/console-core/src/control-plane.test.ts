@@ -17,6 +17,7 @@ import {
   normalizeSidebarWatchFields,
   normalizeToolCallAccumulatorState,
   normalizeUnobservedFacts,
+  consoleMobStatus,
 } from "./control-plane";
 import { normalizeConsoleSidebarViewState } from "./sidebar";
 
@@ -562,5 +563,36 @@ test("normalizeIdentityStatusRow carries the unobserved marker of a pending row"
     })?.unobserved,
     undefined,
     "an observed row carries no marker",
+  );
+});
+
+test("consoleMobStatus is running or stopped only on an observed answer", () => {
+  assert.equal(consoleMobStatus({ running: true }), "running");
+  assert.equal(consoleMobStatus({ running: false }), "stopped");
+  assert.equal(consoleMobStatus({ running: null }), "unknown", "null is no answer");
+  assert.equal(consoleMobStatus({}), "unknown", "absence is no answer either");
+  assert.equal(consoleMobStatus(undefined), "unknown");
+  assert.equal(
+    consoleMobStatus({
+      running: null,
+      unobserved: { reason: "not_observed", fields: ["running"] },
+    }),
+    "unknown",
+  );
+  assert.equal(
+    consoleMobStatus({
+      running: false,
+      unobserved: { reason: "not_observed", fields: ["running"] },
+    }),
+    "unknown",
+    "a marker naming running outranks any value beside it",
+  );
+  assert.equal(
+    consoleMobStatus({
+      running: true,
+      unobserved: { reason: "refresh_pending", fields: ["state"] },
+    }),
+    "running",
+    "a marker on other facts leaves running answered",
   );
 });
