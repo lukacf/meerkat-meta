@@ -66,7 +66,8 @@ platform(
     exec_properties = {
         "Arch": "amd64",
         "OSFamily": "linux",
-        "container-image": "docker://docker.io/library/buildpack-deps:22.04",
+        # Pinned by digest; renovate.json proposes a new digest for review.
+        "container-image": "docker://docker.io/library/buildpack-deps:22.04@sha256:b28e7724fdddd120588c097871f740efb9ca340cfc4dbc1ef9be5f0065474198",
     },
     parents = ["@toolchains_buildbuddy//platforms:linux_x86_64"],
 )
@@ -81,6 +82,9 @@ platform(
         "Arch": "amd64",
         "OSFamily": "linux",
         "Pool": "meerkat-ci",
+        # Not pinned by digest: a private Artifact Registry tag that neither
+        # Renovate nor this repository's checks can read. Pin it with the
+        # digest from someone with read access to that registry.
         "container-image": "docker://europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0",
         "network": "external",
     },
@@ -100,7 +104,8 @@ platform(
         # too-small default slot and stall inside rustc instead of failing fast.
         "EstimatedComputeUnits": "8",
         "OSFamily": "linux",
-        "container-image": "docker://docker.io/library/buildpack-deps:22.04",
+        # Pinned by digest; renovate.json proposes a new digest for review.
+        "container-image": "docker://docker.io/library/buildpack-deps:22.04@sha256:b28e7724fdddd120588c097871f740efb9ca340cfc4dbc1ef9be5f0065474198",
     },
     parents = ["@toolchains_buildbuddy//platforms:linux_arm64"],
 )

@@ -72,13 +72,15 @@ RELEASE_NOTES = (
 )
 SCHEMAS = (1, 2)
 # Every release build leg. A schema 2 candidate run builds one tier's legs;
-# the resolver emits them as the build_binaries matrix.
+# the resolver emits them as the build_binaries matrix. Each leg names its
+# runner image (scripts/test_ci_workflow.py refuses a -latest label).
 BUILD_LEGS = (
     {"runs-on": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu", "archive_ext": "tar.gz"},
     {"runs-on": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu", "archive_ext": "tar.gz"},
     {"runs-on": "macos-15", "target": "aarch64-apple-darwin", "archive_ext": "tar.gz"},
     {"runs-on": "macos-15", "target": "x86_64-apple-darwin", "archive_ext": "tar.gz"},
-    {"runs-on": "windows-latest", "target": "x86_64-pc-windows-msvc", "archive_ext": "zip"},
+    # A GitHub-hosted label offered to public repositories only.
+    {"runs-on": "windows-2025-vs2026", "target": "x86_64-pc-windows-msvc", "archive_ext": "zip"},
 )
 SLSA = "https://slsa.dev/provenance/v1"
 BINARY_NAMES = dict(zip(assets.ARCHIVE_PREFIXES, ("meta_gateway", "rpc_gateway", "meta_repair")))
