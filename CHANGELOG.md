@@ -87,6 +87,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `NotObserved`), both `#[non_exhaustive]`. They are the shape of the
   `"unobserved": {"reason": ..., "fields": [...]}` marker the console
   experience puts on a fact it holds no observation for.
+- `UnifiedRuntime::take_bootstrap_completion` hands an embedding host a
+  one-use `RuntimeBootstrapCompleted`. The runtime mints it once, on its
+  bootstrap success path (the unheld identity bootstrap on `Ok`, the held one
+  on `Activated`, `activate_without_identity_context` on `Ok`), and never on
+  a failure. Its `publish(f)` runs `f` once, only while the runtime has not
+  begun to close and its mob still admits work: the runtime's shutdown begins
+  under the same gate, so a publication that has begun finishes first and a
+  later one is refused (`BootstrapCompletionRefused::RuntimeClosing`, or
+  `AdmissionClosed` once the mob's admission closed). On the stdio gateway
+  the driver takes the completion once the Ready's stdout capacity is
+  reserved, and the host gets it inside its publication boundary from
+  `GatewayBootstrapReady::take_runtime_completion`. A runtime from a legacy
+  constructor (`UnifiedRuntime::bootstrap` and the `bootstrap_with_*` family)
+  has no completion until `activate_without_identity_context` returns `Ok`.
+  Installing an identity context withdraws a completion not yet taken;
+  attaching one leaves it as it is.
 
 ### Changed
 
@@ -133,6 +149,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   they land, and a failed read still disables them until a read succeeds. A
   save still carries the draft's edit token, which the owner checks, so a
   draft is never rebased onto a newer configuration.
+- `meta/reset` of one identity, on the SDK gateway and the console, no
+  longer reports a cleanup warning: its `cleanup_warning` is now always
+  `null`, in the response and in the `identity_reset` lifecycle frame. It
+  used to report `stale_member_cleanup_skipped_after_identity_reset`, saying
+  the reset published the new generation without retiring stale live
+  members, which is not true: the reset's successor transition is
+  meerkat's respawn, which retires the previous live member. The field
+  stays for wire compatibility, as `meta/respawn` keeps its retired
+  warnings; `meta/reset_all` dropped the same warning for the same reason.
+  Identity control calls still reject a stale runtime id.
 
 ### Fixed
 
@@ -621,22 +647,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   spawned, and the guard is finished once the attempt's open outcome and
   process end are both known. Gateway custody and defaults are unchanged; a
   composition without it installs no guards.
-- `UnifiedRuntime::take_bootstrap_completion` hands an embedding host a
-  one-use `RuntimeBootstrapCompleted`. The runtime mints it once, on its
-  bootstrap success path (the unheld identity bootstrap on `Ok`, the held one
-  on `Activated`, `activate_without_identity_context` on `Ok`), and never on
-  a failure. Its `publish(f)` runs `f` once, only while the runtime has not
-  begun to close and its mob still admits work: the runtime's shutdown begins
-  under the same gate, so a publication that has begun finishes first and a
-  later one is refused (`BootstrapCompletionRefused::RuntimeClosing`, or
-  `AdmissionClosed` once the mob's admission closed). On the stdio gateway
-  the driver takes the completion once the Ready's stdout capacity is
-  reserved, and the host gets it inside its publication boundary from
-  `GatewayBootstrapReady::take_runtime_completion`. A runtime from a legacy
-  constructor (`UnifiedRuntime::bootstrap` and the `bootstrap_with_*` family)
-  has no completion until `activate_without_identity_context` returns `Ok`.
-  Installing an identity context withdraws a completion not yet taken;
-  attaching one leaves it as it is.
 
 ### Changed
 
@@ -694,16 +704,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - CI's unit test job, now the only automatic run of the lib and bin tests,
   lists them with its own filter before running them and fails if the
   filter leaves any out.
-- `meta/reset` of one identity, on the SDK gateway and the console, no
-  longer reports a cleanup warning: its `cleanup_warning` is now always
-  `null`, in the response and in the `identity_reset` lifecycle frame. It
-  used to report `stale_member_cleanup_skipped_after_identity_reset`, saying
-  the reset published the new generation without retiring stale live
-  members, which is not true: the reset's successor transition is
-  meerkat's respawn, which retires the previous live member. The field
-  stays for wire compatibility, as `meta/respawn` keeps its retired
-  warnings; `meta/reset_all` dropped the same warning for the same reason.
-  Identity control calls still reject a stale runtime id.
 
 - Console sends are deduplicated per caller: the dedupe keys of
   `meta/console/send` and `/console/send` are scoped to the authenticated
