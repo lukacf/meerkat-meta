@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `meta/skills/catalog`: a filesystem skill entry carries `skill_refusal`
+  when meerkat's skill parser refuses its `SKILL.md`, with `kind`
+  `invalid_skill_slug` (the directory name is not a skill slug) or
+  `skill_document_refused` (the document), and meerkat's `error`. The field
+  is absent for a skill the parser accepts. The editor can show that
+  meerkat's skill sources would not load such a skill.
 - `.github/workflows/forge-release.yml` releases Meta Forge on its own
   `forge-v<version>` tag, beside Meta's releases. A candidate builds each target's
   package from public inputs pinned in `installer/release/forge-release-inputs.json`,
@@ -62,6 +68,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The skills catalog (`meta/skills/catalog`) reads each filesystem
+  `SKILL.md` with meerkat's own skill parser, keyed by its directory slug as
+  meerkat's skill sources load it, instead of its own line splitter. A
+  block-scalar description shows its text instead of `|`, and capabilities
+  are meerkat's typed ids. A skill the parser refuses (no frontmatter, a key
+  given twice, a null description, an unknown tag, a `...` line, a name
+  that is not its directory slug, or a directory name that is not a slug)
+  stays listed and deployable, since a mobpack hands a packed skill's text
+  to the member unparsed, with an empty description and no capabilities,
+  and names the refusal in its new `skill_refusal` field (see Added).
 - The `complete_held_identity_members` documentation no longer says that
   resumed members are skipped. A held identity bootstrap holds fresh members
   only: a roster member that already has continuity refuses the whole pass

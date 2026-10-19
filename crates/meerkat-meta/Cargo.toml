@@ -112,6 +112,8 @@ meerkat-sqlite = { version = "=0.9.3" }
 # `memory` is the parked-delta backend for pre-registration incremental
 # writes in the continuity adapter (nothing parked is ever durable).
 meerkat-store = { version = "=0.9.3", features = ["sqlite", "memory"] }
+# The skills catalog judges each SKILL.md with meerkat's own skill parser.
+meerkat-skills = { version = "=0.9.3" }
 meerkat-tools = { version = "=0.9.3" }
 tempfile = "3"
 async-trait = "0.1"
