@@ -298,9 +298,10 @@ async fn the_first_experience_read_after_a_console_reset_names_the_successor_ses
         "/console/identities names the successor"
     );
 
-    // The predecessor's runtime id stays refused as a control target, with
-    // the refusal it has today, and refusing it changes nothing. (A control
-    // call never reads the console read model, so this does not refresh it.)
+    // The predecessor's runtime id is refused as a control target with the
+    // typed stale-binding refusal, naming the successor binding, and refusing
+    // it changes nothing. (A control call never reads the console read model,
+    // so this does not refresh it.)
     let stale = fixture
         .rpc("meta/reset", json!({ "identity": "rt:voice-keeper:0" }))
         .await;
@@ -308,9 +309,21 @@ async fn the_first_experience_read_after_a_console_reset_names_the_successor_ses
         stale.get("result").is_none_or(Value::is_null),
         "a reset naming the predecessor's runtime id is refused: {stale}"
     );
-    assert_eq!(stale["error"]["code"], -32602, "{stale}");
     assert_eq!(
-        stale["error"]["message"], "identity not found: rt:voice-keeper:0",
+        stale["error"],
+        json!({
+            "code": -32000,
+            "message": "reset failed: identity runtime binding for voice-keeper points at \
+                        rt:voice-keeper:1, but requested live member is rt:voice-keeper:0",
+            "data": {
+                "kind": "stale_identity_runtime_binding",
+                "identity": "voice-keeper",
+                "registered_runtime_member_id": "rt:voice-keeper:1",
+                "live_runtime_member_id": "rt:voice-keeper:0",
+                "registered_session_id": successor,
+                "live_session_id": null,
+            },
+        }),
         "{stale}"
     );
     assert_eq!(fixture.bound_session().await, successor);

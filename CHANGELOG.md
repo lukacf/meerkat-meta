@@ -41,6 +41,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   console-core mirrors the marker (`UnobservedFacts`,
   `normalizeUnobservedFacts`, `IdentityStatusRow.unobserved`), and the
   console carries it on its agent rows.
+- The console's identity routes (`meta/status_identity`,
+  `meta/inspect_identity`, `meta/retire`, `meta/respawn`, `meta/reset` and
+  `meta/delete_identity`) refuse a generated runtime id that is no longer
+  its identity's binding, such as the predecessor's `rt:<identity>:<n>`
+  after a reset, with the typed `stale_identity_runtime_binding` refusal
+  (-32000) the member routes give for the same id, naming the registered
+  runtime id and session. They answered -32602 `identity not found` once no
+  live member carried the old id. A runtime id of an identity the identity
+  runtime does not know still answers `identity not found`, and a hidden
+  identity's answers `identity_hidden_by_policy`.
 
 ### Fixed
 

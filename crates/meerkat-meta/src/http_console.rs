@@ -6786,7 +6786,11 @@ fn ambiguous_live_identity_alias_error(
     }
 }
 
+/// Resolve a console identity-control target through the shared
+/// identity-control resolver. `operation` names the route in a stale-binding
+/// refusal (see [`stale_generated_alias_error`]).
 async fn resolve_console_identity_control_target(
+    operation: &str,
     handle: &MobHandle,
     identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
     visibility_policy: &dyn ConsoleVisibilityPolicy,
@@ -6846,8 +6850,45 @@ async fn resolve_console_identity_control_target(
             let target = *target;
             Ok(Some((target.identity, target.was_registered, target.live)))
         }
+        IdentityControlResolution::Unresolved {
+            requested_identity,
+            generated_runtime_alias: true,
+            ..
+        } => match identity_runtime {
+            Some(identity_runtime) => stale_generated_alias_error(
+                operation,
+                identity_runtime,
+                visibility_policy,
+                &requested_identity,
+            )
+            .await
+            .map_or(Ok(None), Err),
+            None => Ok(None),
+        },
         IdentityControlResolution::Unresolved { .. } => Ok(None),
     }
+}
+
+/// The refusal of a generated runtime id the shared resolver left
+/// unresolved: no identity is bound to it and no live member carries it. When
+/// it names an identity the identity runtime still knows, that identity's
+/// binding moved on (a reset published a new generation and rebound its one
+/// roster row), so it answers the typed stale-binding refusal the member
+/// routes give for the same id, naming the registered binding. A hidden
+/// identity answers hidden by policy and names no binding. An identity the
+/// identity runtime does not know keeps "identity not found" (`None`).
+async fn stale_generated_alias_error(
+    operation: &str,
+    identity_runtime: &crate::identity_first::IdentityRuntime,
+    visibility_policy: &dyn ConsoleVisibilityPolicy,
+    alias: &str,
+) -> Option<JsonRpcError> {
+    let identity = identity_from_runtime_alias(alias)?;
+    let status = identity_runtime.status(&identity).await.ok()?;
+    if !identity_status_visible_to_console(visibility_policy, &status) {
+        return Some(identity_hidden_by_policy_error(alias));
+    }
+    stale_runtime_alias_error_for_status(operation, &identity, Some(&status), alias)
 }
 
 fn live_alias_matches_status_runtime(
@@ -6937,11 +6978,22 @@ async fn stale_runtime_alias_json_rpc_error(
     let alias = crate::member_comms_id::runtime_alias_str(alias).into_owned();
     let identity = identity_from_runtime_alias(&alias)?;
     let status = identity_runtime.status(&identity).await.ok();
+    stale_runtime_alias_error_for_status(operation, &identity, status.as_ref(), &alias)
+}
+
+/// The typed refusal of runtime id `alias` when it is not `identity`'s
+/// registered binding (`status`, `None` when the identity runtime does not
+/// know the identity); `None` when it is.
+fn stale_runtime_alias_error_for_status(
+    operation: &str,
+    identity: &crate::identity_first::AgentIdentity,
+    status: Option<&crate::identity_first::IdentityStatus>,
+    alias: &str,
+) -> Option<JsonRpcError> {
     let registered_runtime_member_id = status
-        .as_ref()
         .and_then(|status| status.agent_runtime_id.as_ref())
         .map(crate::identity_first::AgentRuntimeId::as_str);
-    if registered_runtime_member_id == Some(alias.as_str()) {
+    if registered_runtime_member_id == Some(alias) {
         return None;
     }
     Some(JsonRpcError {
@@ -6957,7 +7009,7 @@ async fn stale_runtime_alias_json_rpc_error(
             "identity": identity.as_str(),
             "registered_runtime_member_id": registered_runtime_member_id,
             "live_runtime_member_id": alias,
-            "registered_session_id": status.as_ref().and_then(|status| status.session_id.as_ref()).map(ToString::to_string),
+            "registered_session_id": status.and_then(|status| status.session_id.as_ref()).map(ToString::to_string),
             "live_session_id": Value::Null,
         })),
     })
@@ -8858,6 +8910,7 @@ async fn handle_console_runtime_rpc_with_visibility(
             if let Some(identity_runtime) = &identity_runtime {
                 let (parsed_identity, _was_registered, live_alias) =
                     match resolve_console_identity_control_target(
+                        "status_identity",
                         &handle,
                         Some(identity_runtime),
                         visibility_policy,
@@ -8993,6 +9046,7 @@ async fn handle_console_runtime_rpc_with_visibility(
             if let Some(identity_runtime) = &identity_runtime {
                 let (parsed_identity, _was_registered, live_alias) =
                     match resolve_console_identity_control_target(
+                        "inspect_identity",
                         &handle,
                         Some(identity_runtime),
                         visibility_policy,
@@ -9130,6 +9184,7 @@ async fn handle_console_runtime_rpc_with_visibility(
             if let Some(identity_runtime) = &identity_runtime {
                 let (parsed_identity, was_registered, live_alias) =
                     match resolve_console_identity_control_target(
+                        "retire",
                         &handle,
                         Some(identity_runtime),
                         visibility_policy,
@@ -9352,6 +9407,7 @@ async fn handle_console_runtime_rpc_with_visibility(
             if let Some(identity_runtime) = &identity_runtime {
                 let (parsed_identity, was_registered, live_alias) =
                     match resolve_console_identity_control_target(
+                        "respawn",
                         &handle,
                         Some(identity_runtime),
                         visibility_policy,
@@ -9523,6 +9579,7 @@ async fn handle_console_runtime_rpc_with_visibility(
             };
             let (parsed_identity, was_registered, live_alias) =
                 match resolve_console_identity_control_target(
+                    "reset",
                     &handle,
                     Some(identity_runtime),
                     visibility_policy,
@@ -9648,6 +9705,7 @@ async fn handle_console_runtime_rpc_with_visibility(
             };
             let (parsed_identity, was_registered, live_alias) =
                 match resolve_console_identity_control_target(
+                    "delete_identity",
                     &handle,
                     Some(identity_runtime),
                     visibility_policy,
@@ -15699,6 +15757,7 @@ comms = true
             )
             .await?;
             let console = resolve_console_identity_control_target(
+                "status_identity",
                 &handle,
                 Some(&identity_runtime),
                 &visibility,
@@ -15764,6 +15823,7 @@ comms = true
              resolver]: candidates [rt:review:golden:0, rt:review:golden:1]"
         );
         let console_ambiguous = resolve_console_identity_control_target(
+            "status_identity",
             &ambiguous_handle,
             Some(&ambiguous_identity_runtime),
             &AllowAllConsoleVisibilityPolicy,
@@ -15783,6 +15843,7 @@ comms = true
 
         let visibility = HideMemberPolicy("rt:review:golden:0");
         let visible_target = resolve_console_identity_control_target(
+            "status_identity",
             &ambiguous_handle,
             Some(&ambiguous_identity_runtime),
             &visibility,
@@ -15834,6 +15895,7 @@ comms = true
             "stale live identity alias: live console alias other:stale-golden resolves to rt:review:stale-golden:0, but identity runtime binding belongs to review:stale-golden"
         );
         let console_stale = resolve_console_identity_control_target(
+            "status_identity",
             &stale_handle,
             Some(&stale_identity_runtime),
             &AllowAllConsoleVisibilityPolicy,
@@ -16549,6 +16611,41 @@ comms = true
 
         let _ = runtime.handle().stop().await;
         Ok(())
+    }
+
+    /// One console identity RPC under `policy`, as the gateway dispatches it.
+    async fn console_identity_rpc_under_policy(
+        runtime: &MobRuntime,
+        identity_runtime: &Arc<IdentityRuntime>,
+        policy: &dyn ConsoleVisibilityPolicy,
+        method: &str,
+        identity: &str,
+    ) -> Value {
+        Box::pin(handle_console_runtime_rpc_with_visibility(
+            runtime,
+            None,
+            None,
+            None,
+            Some(ConsoleEventStore::new()),
+            None,
+            Some(identity_runtime.clone()),
+            None,
+            None,
+            policy,
+            rpc_request_with_params(method, json!({ "identity": identity })),
+            true,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
+        ))
+        .await
     }
 
     #[derive(Debug)]
@@ -20666,43 +20763,110 @@ comms = true
             );
         }
 
+        // No live member carries the stale runtime id any more, as after a
+        // reset, which rebinds the identity's one roster row. Every identity
+        // route answers the typed stale-binding refusal the member routes
+        // give, naming the registered binding, and acts on nothing.
         let (_temp_dir_without_stale, runtime_without_stale) =
             build_empty_console_test_runtime("console-identity-no-live-stale-alias").await?;
-
-        for method in [
-            "meta/status_identity",
-            "meta/inspect_identity",
-            "meta/retire",
-            "meta/respawn",
-            "meta/reset",
+        let registered = identity_runtime
+            .status(&AgentIdentity::parse("review:singleton")?)
+            .await?;
+        let binding = |status: &crate::identity_first::IdentityStatus| {
+            (
+                status.state,
+                status.agent_runtime_id.clone(),
+                status.session_id.clone(),
+                status.generation,
+            )
+        };
+        for (method, operation) in [
+            ("meta/status_identity", "status_identity"),
+            ("meta/inspect_identity", "inspect_identity"),
+            ("meta/retire", "retire"),
+            ("meta/respawn", "respawn"),
+            ("meta/reset", "reset"),
+            ("meta/delete_identity", "delete_identity"),
         ] {
-            let response = Box::pin(handle_console_runtime_rpc(
+            let response = Box::pin(console_identity_rpc_under_policy(
                 &runtime_without_stale,
-                None,
-                None,
-                None,
-                Some(ConsoleEventStore::new()),
-                None,
-                Some(identity_runtime.clone()),
-                None,
-                None,
-                rpc_request_with_params(method, json!({ "identity": "rt:review:singleton:0" })),
-                true,
+                &identity_runtime,
+                &AllowAllConsoleVisibilityPolicy,
+                method,
+                "rt:review:singleton:0",
             ))
             .await;
-            assert_ne!(
+            assert_eq!(
                 response["error"],
-                Value::Null,
-                "{method} must reject stale synthetic runtime alias"
+                json!({
+                    "code": -32000,
+                    "message": format!(
+                        "{operation} failed: identity runtime binding for review:singleton \
+                         points at rt:review:singleton:1, but requested live member is \
+                         rt:review:singleton:0"
+                    ),
+                    "data": {
+                        "kind": "stale_identity_runtime_binding",
+                        "identity": "review:singleton",
+                        "registered_runtime_member_id": "rt:review:singleton:1",
+                        "live_runtime_member_id": "rt:review:singleton:0",
+                        "registered_session_id": registered
+                            .session_id
+                            .as_ref()
+                            .map(ToString::to_string),
+                        "live_session_id": null,
+                    },
+                }),
+                "{method} answers a stale runtime id with the typed stale-binding refusal: \
+                 {response:#?}"
+            );
+
+            // A hidden identity's stale runtime id names no binding.
+            let hidden = Box::pin(console_identity_rpc_under_policy(
+                &runtime_without_stale,
+                &identity_runtime,
+                &HideIdentityPolicy("review:singleton"),
+                method,
+                "rt:review:singleton:0",
+            ))
+            .await;
+            assert_eq!(
+                hidden["error"]["data"]["kind"],
+                json!("identity_hidden_by_policy"),
+                "{method}: {hidden:#?}"
             );
             assert!(
-                response["error"]["message"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("identity not found: rt:review:singleton:0"),
-                "unexpected no-live stale-alias response for {method}: {response:#?}"
+                !hidden.to_string().contains("rt:review:singleton:1"),
+                "{method} names no binding of a hidden identity: {hidden}"
+            );
+
+            // A runtime id of an identity the identity runtime does not know
+            // stays not found.
+            let unknown = Box::pin(console_identity_rpc_under_policy(
+                &runtime_without_stale,
+                &identity_runtime,
+                &AllowAllConsoleVisibilityPolicy,
+                method,
+                "rt:review:nobody:0",
+            ))
+            .await;
+            assert_eq!(
+                (&unknown["error"]["code"], &unknown["error"]["message"]),
+                (
+                    &json!(-32602),
+                    &json!("identity not found: rt:review:nobody:0")
+                ),
+                "{method}: {unknown:#?}"
             );
         }
+        let after = identity_runtime
+            .status(&AgentIdentity::parse("review:singleton")?)
+            .await?;
+        assert_eq!(
+            binding(&after),
+            binding(&registered),
+            "refusing a stale runtime id changes nothing"
+        );
         let _ = runtime_without_stale.handle().stop().await;
 
         let _ = runtime.handle().stop().await;

@@ -157,7 +157,10 @@ async fn authorize_session_in_namespace(
         .await;
     }
     let handle = runtime.handle();
+    // Every resolver refusal denies the session, so a stale runtime id (a
+    // typed refusal) is denied exactly as when it resolved to nothing.
     let resolved = resolve_console_identity_control_target(
+        "mcp_app_session",
         &handle,
         state
             .identity_runtime
