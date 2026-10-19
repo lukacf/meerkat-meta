@@ -27,10 +27,10 @@ use super::store::AnnouncementStore;
 use super::types::{
     AnnounceOutcome, AnnounceRequest, Announcement, AnnouncementStoreError, Batch, BatchEvent,
     BatchGap, BatchId, BatchPosition, BatchQuery, BatchState, BatchStateTag, ChildMemberLimits,
-    GapReason, MAX_REMOTE_BODY_WIRE_BYTES, Member, MemberRouteRecord, MobId, MobIncarnation,
-    MobLineage, NativeReceipt, OperationId, PutSubscription, SealingPolicy, SourceKey,
-    Subscription, SubscriptionChange, SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId,
-    SubscriptionState, SuccessorBatch, merge_gaps, render_item, successor_batch,
+    GapReason, Member, MemberRouteRecord, MobId, MobIncarnation, MobLineage, NativeReceipt,
+    OperationId, PutSubscription, SealingPolicy, SourceKey, Subscription, SubscriptionChange,
+    SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId, SubscriptionState, SuccessorBatch,
+    merge_gaps, render_item, successor_batch, wire_budget,
 };
 
 /// The owner's error for a member a put cannot subscribe.
@@ -370,13 +370,6 @@ fn min_due(current: Option<u64>, candidate: Option<u64>) -> Option<u64> {
 
 /// Members on a peer gateway get batches whose encoded body fits one
 /// delivery request.
-fn wire_budget(route: MemberRoute) -> Option<u64> {
-    match route {
-        MemberRoute::Local | MemberRoute::Child => None,
-        MemberRoute::Peer => Some(MAX_REMOTE_BODY_WIRE_BYTES),
-    }
-}
-
 /// The longest chain of mobs a lineage walk follows, up or down.
 const MAX_LINEAGE_DEPTH: usize = 64;
 
@@ -1225,10 +1218,10 @@ impl AnnouncementService {
         policy: &SealingPolicy,
         now: u64,
     ) -> Result<Option<Batch>, AnnouncementError> {
-        // The store seals on the route it keeps and refuses a member without
-        // one: no route is assumed. Here the kept route only says whether a
-        // child member's mob log is read first, and whether the batch must
-        // fit one peer request.
+        // The store seals on the route it keeps, in its own transaction, and
+        // takes the batch's wire budget from it; it refuses a member without
+        // one, since no route is assumed. Here the kept route only says
+        // whether a child member's mob log is read first.
         let route = self
             .inner
             .store
@@ -1238,11 +1231,7 @@ impl AnnouncementService {
         if route == Some(MemberRoute::Child) {
             self.member_mob_ended(member, now).await?;
         }
-        Ok(self
-            .inner
-            .store
-            .seal_batch(member, id, policy, route.and_then(wire_budget), now)
-            .await?)
+        Ok(self.inner.store.seal_batch(member, id, policy, now).await?)
     }
 
     /// Record when a batch the round just read is read again.

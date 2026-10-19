@@ -462,13 +462,7 @@ async fn paused_subscriptions_capture_and_hold(store: &dyn AnnouncementStore) {
     );
     assert_eq!(
         store
-            .seal_batch(
-                &member("agent:a"),
-                &batch_id("b1"),
-                &policy(),
-                None,
-                1_000_000
-            )
+            .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), 1_000_000)
             .await
             .unwrap(),
         None
@@ -496,14 +490,14 @@ async fn sealing_binds_exact_members_once(store: &dyn AnnouncementStore) {
         .unwrap();
     assert_eq!(
         store
-            .seal_batch(&member("agent:a"), &batch_id("b0"), &policy(), None, 500)
+            .seal_batch(&member("agent:a"), &batch_id("b0"), &policy(), 500)
             .await
             .unwrap(),
         None,
         "not due before the delay"
     );
     let batch = store
-        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), None, 1_002)
+        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), 1_002)
         .await
         .unwrap()
         .expect("due after the delay");
@@ -534,13 +528,7 @@ async fn sealing_binds_exact_members_once(store: &dyn AnnouncementStore) {
     );
     assert_eq!(
         store
-            .seal_batch(
-                &member("agent:a"),
-                &batch_id("b2"),
-                &policy(),
-                None,
-                9_999_999
-            )
+            .seal_batch(&member("agent:a"), &batch_id("b2"), &policy(), 9_999_999)
             .await
             .unwrap(),
         None
@@ -562,7 +550,7 @@ async fn transitions_settle_owed_announcements(store: &dyn AnnouncementStore) {
         .await
         .unwrap();
     store
-        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), None, 2_000)
+        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), 2_000)
         .await
         .unwrap()
         .unwrap();
@@ -629,7 +617,7 @@ async fn stranded_batches_hand_over_to_a_successor(store: &dyn AnnouncementStore
         .unwrap();
     let id = batch_id("b1");
     store
-        .seal_batch(&member("agent:a"), &id, &policy(), None, 2_000)
+        .seal_batch(&member("agent:a"), &id, &policy(), 2_000)
         .await
         .unwrap()
         .unwrap();
@@ -694,13 +682,7 @@ async fn cancellation_settles_what_was_never_dispatched(store: &dyn Announcement
         .await
         .unwrap();
     store
-        .seal_batch(
-            &member("agent:a"),
-            &batch_id("sealed"),
-            &policy(),
-            None,
-            2_000,
-        )
+        .seal_batch(&member("agent:a"), &batch_id("sealed"), &policy(), 2_000)
         .await
         .unwrap()
         .unwrap();
@@ -743,7 +725,7 @@ async fn cancellation_settles_what_was_never_dispatched(store: &dyn Announcement
         .unwrap();
     let id = batch_id("dispatching");
     store
-        .seal_batch(&member("agent:a"), &id, &policy(), None, 2_000)
+        .seal_batch(&member("agent:a"), &id, &policy(), 2_000)
         .await
         .unwrap()
         .unwrap();
@@ -851,7 +833,7 @@ async fn retention_passes_report_when_more_work_is_left(store: &dyn Announcement
     for (index, agent) in ["agent:a", "agent:b", "agent:c"].iter().enumerate() {
         let id = batch_id(&format!("b{index}"));
         store
-            .seal_batch(&member(agent), &id, &policy(), None, 2_000)
+            .seal_batch(&member(agent), &id, &policy(), 2_000)
             .await
             .unwrap()
             .unwrap();
@@ -928,13 +910,7 @@ async fn remote_batches_fit_one_delivery_request(store: &dyn AnnouncementStore) 
             .unwrap();
     }
     let batch = store
-        .seal_batch(
-            &remote,
-            &batch_id("b1"),
-            &policy(),
-            Some(MAX_REMOTE_BODY_WIRE_BYTES),
-            1_000_000,
-        )
+        .seal_batch(&remote, &batch_id("b1"), &policy(), 1_000_000)
         .await
         .unwrap()
         .unwrap();
@@ -960,13 +936,7 @@ async fn remote_batches_fit_one_delivery_request(store: &dyn AnnouncementStore) 
     assert!(wire_len(&successor) <= MAX_REMOTE_BODY_WIRE_BYTES);
     // A local member's batch is bounded by its byte cap alone.
     let local = store
-        .seal_batch(
-            &member("agent:c"),
-            &batch_id("b2"),
-            &policy(),
-            None,
-            1_000_000,
-        )
+        .seal_batch(&member("agent:c"), &batch_id("b2"), &policy(), 1_000_000)
         .await
         .unwrap()
         .unwrap();
@@ -1013,7 +983,6 @@ async fn the_unsettled_walk_resumes_after_a_position(store: &dyn AnnouncementSto
                 &member(agent),
                 &batch_id(&format!("b{index}")),
                 &policy(),
-                None,
                 2_000 + index as u64,
             )
             .await
@@ -1074,13 +1043,7 @@ async fn lifecycle_ends_subscriptions_on_final_facts(store: &dyn AnnouncementSto
         .await
         .unwrap();
     store
-        .seal_batch(
-            &member("agent:a"),
-            &batch_id("sealed"),
-            &policy(),
-            None,
-            2_000,
-        )
+        .seal_batch(&member("agent:a"), &batch_id("sealed"), &policy(), 2_000)
         .await
         .unwrap()
         .unwrap();
@@ -1489,7 +1452,7 @@ async fn gap_lines_a_successor_defers_reach_the_next_batch(store: &dyn Announcem
         .await
         .unwrap();
     store
-        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), None, 2_000)
+        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), 2_000)
         .await
         .unwrap()
         .unwrap();
@@ -1547,7 +1510,7 @@ async fn gap_lines_a_successor_defers_reach_the_next_batch(store: &dyn Announcem
         .await
         .unwrap();
     let next = store
-        .seal_batch(&member("agent:a"), &batch_id("b3"), &policy(), None, 7_000)
+        .seal_batch(&member("agent:a"), &batch_id("b3"), &policy(), 7_000)
         .await
         .unwrap()
         .unwrap();
@@ -1616,13 +1579,7 @@ async fn gap_lines_fit_what_the_items_leave_of_a_peer_request(store: &dyn Announ
         .await
         .unwrap();
     let first = store
-        .seal_batch(
-            &peer,
-            &batch_id("b1"),
-            &policy(),
-            Some(MAX_REMOTE_BODY_WIRE_BYTES),
-            now + 1_000,
-        )
+        .seal_batch(&peer, &batch_id("b1"), &policy(), now + 1_000)
         .await
         .unwrap()
         .unwrap();
@@ -1660,13 +1617,7 @@ async fn gap_lines_fit_what_the_items_leave_of_a_peer_request(store: &dyn Announ
         .await
         .unwrap();
     let second = store
-        .seal_batch(
-            &peer,
-            &batch_id("b2"),
-            &policy(),
-            Some(MAX_REMOTE_BODY_WIRE_BYTES),
-            now + 5_000,
-        )
+        .seal_batch(&peer, &batch_id("b2"), &policy(), now + 5_000)
         .await
         .unwrap()
         .unwrap();
@@ -1702,13 +1653,7 @@ async fn gaps_of_a_batch_that_reports_nothing_go_back(store: &dyn AnnouncementSt
         .await
         .unwrap();
     let carrier = store
-        .seal_batch(
-            &member("agent:a"),
-            &batch_id("b1"),
-            &policy(),
-            None,
-            now + 1_000,
-        )
+        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), now + 1_000)
         .await
         .unwrap()
         .unwrap();
@@ -1737,13 +1682,7 @@ async fn gaps_of_a_batch_that_reports_nothing_go_back(store: &dyn AnnouncementSt
         .await
         .unwrap();
     let next = store
-        .seal_batch(
-            &member("agent:a"),
-            &batch_id("b2"),
-            &policy(),
-            None,
-            now + 5_000,
-        )
+        .seal_batch(&member("agent:a"), &batch_id("b2"), &policy(), now + 5_000)
         .await
         .unwrap()
         .unwrap();
@@ -1778,13 +1717,7 @@ async fn gaps_of_a_batch_that_reports_nothing_go_back(store: &dyn AnnouncementSt
         .await
         .unwrap();
     let after_refusal = store
-        .seal_batch(
-            &member("agent:a"),
-            &batch_id("b3"),
-            &policy(),
-            None,
-            now + 10_000,
-        )
+        .seal_batch(&member("agent:a"), &batch_id("b3"), &policy(), now + 10_000)
         .await
         .unwrap()
         .unwrap();
@@ -1988,7 +1921,7 @@ async fn member_routes_are_kept_and_member_mob_logs_read_on(store: &dyn Announce
         .await
         .unwrap();
     let batch = store
-        .seal_batch(&worker(), &batch_id("b1"), &policy(), None, 2_000)
+        .seal_batch(&worker(), &batch_id("b1"), &policy(), 2_000)
         .await
         .unwrap()
         .unwrap();
@@ -2080,7 +2013,7 @@ async fn the_sqlite_store_survives_reopening() {
             .await
             .unwrap();
         store
-            .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), None, 2_000)
+            .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), 2_000)
             .await
             .unwrap()
             .unwrap();
@@ -2769,7 +2702,6 @@ async fn an_attempt_that_never_reached_the_native_owner_is_resubmitted_identical
             &member("agent:a"),
             &id,
             &harness.service.config().policy,
-            None,
             10_000_000,
         )
         .await
@@ -3273,11 +3205,10 @@ impl AnnouncementStore for FaultyStore {
         member: &Member,
         batch_id: &BatchId,
         policy: &SealingPolicy,
-        wire_budget: Option<u64>,
         now_ms: u64,
     ) -> Result<Option<Batch>> {
         self.inner
-            .seal_batch(member, batch_id, policy, wire_budget, now_ms)
+            .seal_batch(member, batch_id, policy, now_ms)
             .await
     }
 
@@ -5545,13 +5476,7 @@ async fn expiry_settles_what_waited_past_the_window(store: &dyn AnnouncementStor
         .await
         .unwrap();
     let batch = store
-        .seal_batch(
-            &member("agent:a"),
-            &batch_id("b1"),
-            &policy(),
-            None,
-            now + 1_000,
-        )
+        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), now + 1_000)
         .await
         .unwrap()
         .expect("the new announcement is due");
@@ -5595,13 +5520,7 @@ async fn expiry_settles_what_waited_past_the_window(store: &dyn AnnouncementStor
         .await
         .unwrap();
     let next = store
-        .seal_batch(
-            &member("agent:a"),
-            &batch_id("b2"),
-            &policy(),
-            None,
-            now + 5_000,
-        )
+        .seal_batch(&member("agent:a"), &batch_id("b2"), &policy(), now + 5_000)
         .await
         .unwrap()
         .unwrap();
@@ -5627,7 +5546,6 @@ async fn expiry_settles_what_waited_past_the_window(store: &dyn AnnouncementStor
             &member("agent:a"),
             &batch_id("b3"),
             &policy(),
-            None,
             later + 1_000,
         )
         .await
@@ -5665,7 +5583,7 @@ async fn retention_drops_bodies_a_native_held_batch_carries(store: &dyn Announce
         .await
         .unwrap();
     let held = store
-        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), None, 3_000)
+        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), 3_000)
         .await
         .unwrap()
         .unwrap();
@@ -5690,7 +5608,7 @@ async fn retention_drops_bodies_a_native_held_batch_carries(store: &dyn Announce
         .await
         .unwrap();
     store
-        .seal_batch(&member("agent:b"), &batch_id("b2"), &policy(), None, 3_000)
+        .seal_batch(&member("agent:b"), &batch_id("b2"), &policy(), 3_000)
         .await
         .unwrap()
         .unwrap();
@@ -7046,7 +6964,7 @@ async fn a_batch_record_without_a_route_does_not_decode() {
         .await
         .unwrap();
     let batch = store
-        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), None, 1_002)
+        .seal_batch(&member("agent:a"), &batch_id("b1"), &policy(), 1_002)
         .await
         .unwrap()
         .expect("due after the delay");
@@ -7213,13 +7131,7 @@ async fn contradicting_batch_left_in(state: BatchStateTag) -> (Harness, BatchId,
     let id = batch_id("b-earlier");
     harness
         .store
-        .seal_batch(
-            &other,
-            &id,
-            &harness.service.config().policy,
-            None,
-            10_000_000,
-        )
+        .seal_batch(&other, &id, &harness.service.config().policy, 10_000_000)
         .await
         .unwrap()
         .expect("a backlog to seal");
@@ -7343,13 +7255,7 @@ async fn a_member_without_its_kept_route_is_not_sealed_and_others_still_are() {
     assert_eq!(
         harness
             .store
-            .seal_batch(
-                &member("agent:a"),
-                &batch_id("b9"),
-                &policy(),
-                None,
-                10_000_000
-            )
+            .seal_batch(&member("agent:a"), &batch_id("b9"), &policy(), 10_000_000)
             .await
             .map(|_| ()),
         Err(AnnouncementStoreError::RouteNotKept {
@@ -7569,5 +7475,40 @@ async fn announce_windows_are_evicted_once_empty() {
         tools.tools.tracked_members(),
         1,
         "a refused announcement leaves no window"
+    );
+}
+
+/// A seal takes its wire budget from the route it seals with, in the store's
+/// own transaction: a member kept on a peer is sealed within one delivery
+/// request whatever its caller read before, so a member re-keyed to a peer
+/// after that read is never sealed without the peer's budget.
+#[tokio::test]
+async fn a_seal_takes_its_wire_budget_from_the_route_it_seals_with() {
+    let (_dir, store) = temp_store();
+    let remote = peer_member("agent:a", "mob-b");
+    store
+        .put_subscription(&op("o1"), put_for("s1", remote.clone(), &["ios"]), 1)
+        .await
+        .unwrap();
+    let body = "x".repeat(2_000);
+    for index in 0..40_u64 {
+        store
+            .announce(
+                announce_request("payments", &format!("k{index}"), &["ios"], &body),
+                2 + index,
+            )
+            .await
+            .unwrap();
+    }
+    let batch = store
+        .seal_batch(&remote, &batch_id("b1"), &policy(), 1_000_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.route, MemberRoute::Peer);
+    assert!(
+        wire_len(&batch.body) <= MAX_REMOTE_BODY_WIRE_BYTES,
+        "{}",
+        wire_len(&batch.body)
     );
 }

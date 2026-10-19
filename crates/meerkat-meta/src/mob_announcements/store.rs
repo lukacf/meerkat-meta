@@ -155,18 +155,18 @@ pub trait AnnouncementStore: Send + Sync {
     async fn backlogs(&self, limit: usize) -> Result<Vec<MemberBacklog>>;
 
     /// Seal the member's deliverable backlog into one batch if the policy
-    /// says it is due at `now_ms`; `None` when it is not. With a wire budget
-    /// the batch also stops where its JSON-encoded body, counted with
-    /// [`super::types::header_wire_bound`], would exceed the budget. The
-    /// batch carries the member's kept route; a member without one is
-    /// refused with [`AnnouncementStoreError::RouteNotKept`] and nothing is
-    /// sealed, since no route is assumed.
+    /// says it is due at `now_ms`; `None` when it is not. The batch carries
+    /// the member's kept route, read in the same transaction; a member
+    /// without one is refused with [`AnnouncementStoreError::RouteNotKept`]
+    /// and nothing is sealed, since no route is assumed. A batch on a peer
+    /// route also stops where its JSON-encoded body, counted with
+    /// [`super::types::header_wire_bound`], would exceed one peer request
+    /// ([`super::types::MAX_REMOTE_BODY_WIRE_BYTES`]).
     async fn seal_batch(
         &self,
         member: &Member,
         batch_id: &BatchId,
         policy: &SealingPolicy,
-        wire_budget: Option<u64>,
         now_ms: u64,
     ) -> Result<Option<Batch>>;
 

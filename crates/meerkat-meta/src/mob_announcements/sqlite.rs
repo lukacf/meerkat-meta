@@ -24,7 +24,7 @@ use super::types::{
     Result, SealingPolicy, SourceKey, StartFrontier, Subscription, SubscriptionChange,
     SubscriptionChangeOutcome, SubscriptionEnd, SubscriptionId, SubscriptionState, Topic,
     content_digest, header_wire_bound, merge_gaps, render_batch, render_gap, render_item,
-    request_fingerprint, wire_len,
+    request_fingerprint, wire_budget, wire_len,
 };
 
 /// The mob announcement store's tables. A provider applies this through its own
@@ -1474,7 +1474,6 @@ fn seal_batch_in(
     member: &Member,
     batch_id: &BatchId,
     policy: &SealingPolicy,
-    wire_budget: Option<u64>,
     now_ms: u64,
 ) -> Result<Option<Batch>> {
     policy.validate()?;
@@ -1489,6 +1488,15 @@ fn seal_batch_in(
             "batch id {batch_id} is already used"
         )));
     }
+    // Every subscription keeps its member's route, so a member with owed
+    // captures has one; none is assumed when it is gone. The batch is sealed
+    // on this route, and its wire budget comes from it, in this transaction.
+    let route = member_route_in(db, member)?
+        .ok_or_else(|| AnnouncementStoreError::RouteNotKept {
+            member: member.clone(),
+        })?
+        .route;
+    let wire_budget = wire_budget(route);
     let mut statement = db
         .prepare(
             "SELECT o.subscription_id, o.subscription_revision, o.mob_id, o.sequence,
@@ -1591,13 +1599,6 @@ fn seal_batch_in(
             source_key,
         });
     }
-    // Every subscription keeps its member's route, so a member with owed
-    // captures has one; none is assumed when it is gone.
-    let route = member_route_in(db, member)?
-        .ok_or_else(|| AnnouncementStoreError::RouteNotKept {
-            member: member.clone(),
-        })?
-        .route;
     let batch = Batch {
         id: batch_id.clone(),
         member: member.clone(),
@@ -2247,11 +2248,10 @@ impl AnnouncementStore for SqliteAnnouncementStore {
         member: &Member,
         batch_id: &BatchId,
         policy: &SealingPolicy,
-        wire_budget: Option<u64>,
         now_ms: u64,
     ) -> Result<Option<Batch>> {
         let (member, batch_id, policy) = (member.clone(), batch_id.clone(), *policy);
-        self.run(move |db| seal_batch_in(db, &member, &batch_id, &policy, wire_budget, now_ms))
+        self.run(move |db| seal_batch_in(db, &member, &batch_id, &policy, now_ms))
             .await
     }
 

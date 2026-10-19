@@ -42,6 +42,15 @@ pub const MAX_ITEM_WIRE_BYTES: u64 = 24 * 1024;
 /// in bytes: the delivery request has to fit one control frame.
 pub const MAX_REMOTE_BODY_WIRE_BYTES: u64 = 56 * 1024;
 
+/// The wire budget a batch on `route` has to fit: one peer request for a
+/// member on a peer gateway, none for a member delivered here.
+pub(crate) fn wire_budget(route: MemberRoute) -> Option<u64> {
+    match route {
+        MemberRoute::Local | MemberRoute::Child => None,
+        MemberRoute::Peer => Some(MAX_REMOTE_BODY_WIRE_BYTES),
+    }
+}
+
 /// Typed store outcomes. Every refusal leaves the store unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
