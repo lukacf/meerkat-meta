@@ -128,7 +128,7 @@ def main():
         validate_console_configuration_values(fields, values)
     save_values(path, values, original)
     if local_knowledge:
-        print("Preparing the local Elephant credentials and project space...")
+        print("Preparing the local knowledge service credentials and project space...")
         subprocess.run([sys.executable, str(ROOT / "knowledge/manage.py"), "setup"], check=True)
         print("Start the isolated knowledge service: .venv/bin/python knowledge/manage.py up")
     print("Saved. Run bash start.sh --doctor, then bash start.sh.")

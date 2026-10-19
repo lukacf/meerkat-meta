@@ -280,11 +280,11 @@ def default_question(stage: str, answers: list[dict] | None = None):
         },
         "knowledge": {
             "title": "What should your team remember together?",
-            "description": "Conversation memory, working notes, and an Elephant knowledge base serve different purposes.",
+            "description": "Conversation memory, working notes, and a knowledge service serve different purposes.",
             "options": [
                 ("simple", "Memory and shared notes", "Keep useful context and local work without another service."),
-                ("existing", "An existing Elephant service", "Connect a knowledge service you already run."),
-                ("new", "A new shared knowledge base", "Prepare Elephant for lasting, connected facts with their sources."),
+                ("existing", "An existing knowledge service", "Connect a knowledge service you already run."),
+                ("new", "A new shared knowledge base", "Prepare a knowledge service for lasting, connected facts with their sources."),
             ],
         },
         "autonomy": {

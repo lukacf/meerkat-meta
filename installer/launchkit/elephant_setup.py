@@ -1,4 +1,4 @@
-"""Export an isolated Elephant knowledge service using verified source contracts."""
+"""Export an isolated knowledge service using verified source contracts."""
 from __future__ import annotations
 
 import json
@@ -19,11 +19,11 @@ def validate_environment_names(token_env: str, space_env: str):
                 "USER", "SHELL", "TMPDIR", "TEMP", "SYSTEMROOT", "PYTHONPATH", "VIRTUAL_ENV"}
     for name in (token_env, space_env):
         if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name):
-            raise ValueError("Invalid Elephant environment name.")
+            raise ValueError("Invalid knowledge service environment name.")
         if name in reserved or name.startswith(("LD_", "DYLD_", "MOBKIT_")):
-            raise ValueError("Use dedicated Elephant token and space environment names, separate from provider keys and runtime settings.")
+            raise ValueError("Use dedicated knowledge-service token and space environment names, separate from provider keys and runtime settings.")
     if token_env == space_env:
-        raise ValueError("Elephant token and space need separate environment names.")
+        raise ValueError("Knowledge service token and space need separate environment names.")
 
 
 def elephant_capability() -> dict:
@@ -53,19 +53,19 @@ def generate_elephant_files(knowledge: dict, project_slug: str, provider: str = 
     url = knowledge.get("url", "http://127.0.0.1:8091/mcp/agent")
     parsed = urlsplit(url)
     if parsed.scheme not in {"https", "http"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ValueError("Elephant needs an HTTP MCP URL without embedded credentials or query parameters.")
+        raise ValueError("The knowledge service needs an HTTP MCP URL without embedded credentials or query parameters.")
     if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
-        raise ValueError("Remote Elephant connections require HTTPS.")
+        raise ValueError("Remote knowledge service connections require HTTPS.")
     if parsed.path.rstrip("/") != "/mcp/agent":
-        raise ValueError("Knowledge access for agent classes uses Elephant's read-only /mcp/agent profile.")
+        raise ValueError("Knowledge access for agent classes uses the knowledge service's read-only /mcp/agent profile.")
     token_env, space_env = knowledge.get("token_env", "ELEPHANT_TOKEN"), knowledge.get("space_env", "ELEPHANT_SPACE_ID")
     validate_environment_names(token_env, space_env)
     source = knowledge.get("source_repository") or ELEPHANT_REPOSITORY
     revision = knowledge.get("source_revision") or ELEPHANT_REVISION
     if not re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?", source):
-        raise ValueError("Use an HTTPS GitHub source repository for local Elephant builds.")
+        raise ValueError("Use an HTTPS GitHub source repository for local knowledge service builds.")
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
-        raise ValueError("Pin local Elephant source to a full 40-character Git commit.")
+        raise ValueError("Pin the local knowledge service source to a full 40-character Git commit.")
     settings = {"mode": mode, "url": url, "project": project_slug, "token_env": token_env, "space_env": space_env, "source_repository": source, "source_revision": revision, "provider": provider, "model": model}
     files = {
         "knowledge/settings.json": json.dumps(settings, indent=2) + "\n",
@@ -76,7 +76,7 @@ def generate_elephant_files(knowledge: dict, project_slug: str, provider: str = 
     if mode == "remote":
         return files
     if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"} or not parsed.port or not 1024 <= parsed.port <= 65535:
-        raise ValueError("Local Elephant needs http://127.0.0.1:PORT/mcp/agent with a port from 1024 to 65535.")
+        raise ValueError("A local knowledge service needs http://127.0.0.1:PORT/mcp/agent with a port from 1024 to 65535.")
     shared = {
         "ELEPHANT_DB": "surreal-db", "ELEPHANT_HOST": "0.0.0.0", "ELEPHANT_PORT": "3000",
         "SURREALDB_URL": "ws://surrealdb:8000", "SURREALDB_NAMESPACE": "elephant", "SURREALDB_DATABASE": project_slug.replace("-", "_"),

@@ -182,7 +182,7 @@ def test_missing_project_does_not_relax_other_cloud_constraints(changes, reason)
 def test_local_elephant_still_needs_capacity_before_project_choice():
     plan = cloud_plan()
     plan["knowledge"]["mode"] = "local"
-    with pytest.raises(ValidationError, match="Building local Elephant on GCP"):
+    with pytest.raises(ValidationError, match="Building the local knowledge service on GCP"):
         Blueprint.model_validate(plan)
     plan["gcp"].update(machine_type="e2-standard-8", disk_gb=100)
     assert compiler.package_availability(Blueprint.model_validate(plan))["status"] == "pending-configuration"

@@ -59,7 +59,7 @@ def configured_transport(config):
 
 
 def validate_knowledge_scope(spec):
-    """Match local intent to JWT claims before transport; Elephant authenticates."""
+    """Match local intent to JWT claims before transport; the knowledge service authenticates."""
     if not any(item["tools"]["knowledge"] for item in spec["classes"]):
         return
     knowledge = spec.get("knowledge", {})
@@ -68,22 +68,22 @@ def validate_knowledge_scope(spec):
     token = os.environ.get(token_key, "").strip()
     expected = os.environ.get(space_key, "").strip()
     if not token or not expected:
-        raise RuntimeError(f"Configure {token_key} and {space_key} locally before connecting Elephant.")
+        raise RuntimeError(f"Configure {token_key} and {space_key} locally before connecting the knowledge service.")
     if len(token) > 32768 or token.count(".") != 2:
-        raise RuntimeError("Elephant requires a scoped JWT for this deployment. Opaque tokens cannot verify the configured space.")
+        raise RuntimeError("The knowledge service requires a scoped JWT for this deployment. Opaque tokens cannot verify the configured space.")
     try:
         encoded = token.split(".")[1]
         claims = json.loads(base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True))
     except (ValueError, UnicodeError, binascii.Error):
-        raise RuntimeError("The Elephant JWT claims could not be decoded.") from None
+        raise RuntimeError("The knowledge service JWT claims could not be decoded.") from None
     if not isinstance(claims, dict) or claims.get("space_id") != expected:
-        raise RuntimeError("Elephant JWT space does not match the configured project space. Request a token for the selected space.")
+        raise RuntimeError("Knowledge service JWT space does not match the configured project space. Request a token for the selected space.")
     expires = claims.get("exp")
     if isinstance(expires, bool) or not isinstance(expires, (int, float)) or not expires > time.time():
-        raise RuntimeError("Elephant JWT is expired or has no valid expiry. Renew the token before connecting.")
+        raise RuntimeError("Knowledge service JWT is expired or has no valid expiry. Renew the token before connecting.")
     not_before = claims.get("nbf")
     if not_before is not None and (isinstance(not_before, bool) or not isinstance(not_before, (int, float)) or not_before > time.time()):
-        raise RuntimeError("Elephant JWT is not yet valid or has an invalid activation time.")
+        raise RuntimeError("Knowledge service JWT is not yet valid or has an invalid activation time.")
 
 
 def tool_alias(connection_id, name):

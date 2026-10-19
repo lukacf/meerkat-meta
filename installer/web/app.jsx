@@ -1874,11 +1874,11 @@ function ClassInspector({
             <Toggle
               value={c.tools.knowledge}
               onChange={(v) => toolChange({ knowledge: v })}
-              title="Elephant knowledge"
+              title="Knowledge service"
               description={
                 bp.knowledge.mode === "none"
                   ? "Configure a knowledge base to enable this."
-                  : "Access the configured Elephant knowledge space."
+                  : "Access the configured knowledge space."
               }
               disabled={bp.knowledge.mode === "none" && !c.tools.knowledge}
             />
@@ -2821,14 +2821,14 @@ function Knowledge({ bp, update }) {
       <SectionHeading
         eyebrow="KNOWLEDGE THAT OUTLIVES A CONVERSATION"
         title="A shared understanding of your world."
-        description="Add Elephant for structured, persistent knowledge. Choose an existing space or a private deployment alongside your agents."
+        description="Add a knowledge service for structured, persistent knowledge. Choose an existing space or a private deployment alongside your agents."
       />
       <div className="knowledge-hero">
         <div className="elephant-mark">
           <Icon name="database" size={38} />
         </div>
         <div>
-          <Badge tone="purple">ELEPHANT KNOWLEDGE</Badge>
+          <Badge tone="purple">KNOWLEDGE SERVICE</Badge>
           <h2>
             Connect the dots.
             <br />
@@ -2856,14 +2856,14 @@ function Knowledge({ bp, update }) {
           },
           {
             id: "remote",
-            title: "Connect to Elephant",
-            description: "Use an existing Elephant MCP endpoint and space.",
+            title: "Connect to a knowledge service",
+            description: "Use an existing knowledge service MCP endpoint and space.",
             icon: "globe",
           },
           {
             id: "local",
             title: "Deploy your own",
-            description: "Create a private Elephant + SurrealDB service.",
+            description: "Create a private knowledge service with SurrealDB.",
             icon: "database",
           },
         ].map((mode) => (
@@ -2929,7 +2929,7 @@ function Knowledge({ bp, update }) {
                   <Icon name="lock" />
                   <span>
                     The package provisions an isolated, persistent database and
-                    a loopback-only API. Existing Elephant services are
+                    a loopback-only API. Existing knowledge services are
                     untouched.
                   </span>
                 </div>
@@ -2966,7 +2966,7 @@ function Knowledge({ bp, update }) {
           <div className="knowledge-grants">
             <span className="eyebrow">KNOWLEDGE ACCESS</span>
             <h3>Who can use this space?</h3>
-            <p>Only the classes you select receive the Elephant connection.</p>
+            <p>Only the classes you select receive the knowledge connection.</p>
             {bp.agent_classes.map((c) => (
               <Toggle
                 key={c.id}
@@ -3150,7 +3150,7 @@ function Deployment({
               </Field>
               {bp.knowledge.mode === "local" && (
                 <div className="notice">
-                  The local Elephant build requires at least e2-standard-8 and
+                  The local knowledge service build requires at least e2-standard-8 and
                   100 GB. These have been selected for this package.
                 </div>
               )}
@@ -3179,9 +3179,9 @@ function Deployment({
             [
               bp.knowledge.mode === "none"
                 ? "Persistent local memory"
-                : "Elephant knowledge",
+                : "Knowledge service",
               bp.knowledge.mode === "local"
-                ? "Isolated Elephant + SurrealDB deployment"
+                ? "Isolated knowledge service + SurrealDB deployment"
                 : "Shared SQLite notes and agent continuity",
             ],
             [

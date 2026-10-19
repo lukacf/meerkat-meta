@@ -840,8 +840,8 @@ export function DeploymentPanel({ state, plan, build, designBusy, pendingManual,
         } : undefined} />
       <p className="deployment-private">Configuration values go directly to this computer's private .env. They do not enter guide messages, agent prompts, or exported packages.</p>
       {formIntent !== "settings" && privateFormOptions?.knowledge_mode === "local" && <p className="deployment-warning">{deploymentFreshInstallNeedsSetup(privateFormOptions)
-        ? "This application uses a local Elephant knowledge service. Docker must already be available."
-        : "Install and start also creates the proposed local Elephant knowledge service using Docker. Forge generates its private project credentials and verifies authenticated access. Docker must already be available."}</p>}
+        ? "This application uses a local knowledge service. Docker must already be available."
+        : "Install and start also creates the proposed local knowledge service using Docker. Forge generates its private project credentials and verifies authenticated access. Docker must already be available."}</p>}
       {formIntent !== "settings" && <DeploymentInstallDescription nativeTeam={nativeTeam} options={privateFormOptions} />}
       {busy && busyOperation.current?.settingsPresentation?.guideId === state.id &&
         busyOperation.current.settingsPresentation.selectionToken === selectionToken && <p role="status">The save is waiting for a response. If the wait continues, open <strong>Your setups</strong> and select this setup again to check the installation status. The original save may still finish; reopening does not send it again.</p>}

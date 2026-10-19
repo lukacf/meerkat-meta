@@ -660,12 +660,12 @@ class GcpPreflightService:
                         "Application source transfer, private configuration and service startup require the separate installation action.",
                         "Stopping the application does not delete cloud resources or stop VM and disk charges."],
                     limitations=["Cloud authorizes every actual operation. Permissions and quotas are observations; no capacity is reserved.",
-                        "The fixed guest bootstrap prepares Python and user services. Local Elephant and additional connector executables may require further host preparation; application installation is blocked until its prerequisite checks pass.",
+                        "The fixed guest bootstrap prepares Python and user services. A local knowledge service and additional connector executables may require further host preparation; application installation is blocked until its prerequisite checks pass.",
                         "A verified VM is not an installed or healthy application. Native startup and a useful application result are checked later.",
                         "Retain the original setup request for ownership-checked recovery after an interrupted creation."])
                 if local_knowledge:
                     result["plan"]["mutations"].append(
-                        "For selected local Elephant knowledge, install Git, Docker Engine and the Compose/build plugins from Docker's official Debian repository. Grant the mobkit installation user Docker-group access, which grants root-equivalent control of this VM. Apply this access to that user's service manager, starting it if absent or restarting it only when its observed groups lack Docker access.")
+                        "For a selected local knowledge service, install Git, Docker Engine and the Compose/build plugins from Docker's official Debian repository. Grant the mobkit installation user Docker-group access, which grants root-equivalent control of this VM. Apply this access to that user's service manager, starting it if absent or restarting it only when its observed groups lack Docker access.")
                     result["plan"]["limitations"][1] = (
                         "The guest bootstrap prepares the selected local knowledge tools. Docker access, Compose wait support and Git are checked before installation. Repository access, credentials, the source build and actual knowledge health remain installation checks; no knowledge service is started by VM preparation.")
         return result

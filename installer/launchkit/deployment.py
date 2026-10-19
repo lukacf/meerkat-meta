@@ -452,7 +452,7 @@ def deployment_handoff(definition, files, proposal, guide_id, build_id):
     if knowledge.get("mode") != "none" and "knowledge/manage.py" in files:
         commands = ([".venv/bin/python knowledge/manage.py up"] if knowledge.get("mode") == "local" else [])
         steps.append({"title": "Check the selected knowledge service", "where": "VM SSH session" if target == "gcp" else "destination computer",
-                      "description": "Local Elephant requires Docker with Compose and Git on the destination. The verification command checks actual authenticated service access.",
+                      "description": "A local knowledge service requires Docker with Compose and Git on the destination. The verification command checks actual authenticated service access.",
                       "commands": [*commands, ".venv/bin/python knowledge/manage.py verify"]})
     checks = ["bash start.sh --doctor", "bash start.sh --application-check"]
     if definition.get("mcpConnections"):

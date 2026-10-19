@@ -278,14 +278,14 @@ export function createSimulation(plan, flowId, interfaceFact, designBrief, visua
         member,
         {
           id: "resource:knowledge:elephant",
-          name: "Elephant knowledge",
+          name: "Knowledge service",
           kind: "knowledge",
           role:
             plan.knowledge.mode === "local"
               ? "Local knowledge service"
               : "Existing knowledge service",
           instructions:
-            "Read-only access to the configured Elephant space. Content needs separate operator-led ingestion or an implemented ingestion pipeline. This preview does not ingest data or verify the service is ready.",
+            "Read-only access to the configured knowledge space. Content needs separate operator-led ingestion or an implemented ingestion pipeline. This preview does not ingest data or verify the service is ready.",
         },
         "Read configured knowledge space",
         { capability: "knowledge", access: "read" },

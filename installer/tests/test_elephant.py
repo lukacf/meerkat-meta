@@ -313,7 +313,7 @@ def test_native_tool_error_cannot_be_reported_as_success(manager, structured):
 @pytest.mark.parametrize("field,name", [("token_env", "OPENAI_API_KEY"), ("space_env", "JWT_SECRET"), ("token_env", "ELEPHANT_OPERATOR_TOKEN"), ("space_env", "PATH")])
 def test_knowledge_cannot_overwrite_provider_or_runtime_environment(field, name):
     from launchkit.blueprint import Knowledge
-    with pytest.raises(ValueError, match="dedicated Elephant"):
+    with pytest.raises(ValueError, match="dedicated knowledge-service"):
         Knowledge(mode="local", **{field: name})
-    with pytest.raises(ValueError, match="dedicated Elephant"):
+    with pytest.raises(ValueError, match="dedicated knowledge-service"):
         generate_elephant_files({"mode": "local", field: name}, "research-lab")

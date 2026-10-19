@@ -749,7 +749,7 @@ async def test_elephant_scope_refusal_precedes_all_mcp_connections(monkeypatch, 
             touched.append(config)
             raise AssertionError("No MCP may open before scope validation")
     monkeypatch.setattr(module, "MCPConnection", ForbiddenConnection)
-    spec = {"classes": [{"tools": {"knowledge": True, "mcp": []}}], "knowledge": {"token_env": "ELEPHANT_TOKEN", "space_env": "ELEPHANT_SPACE_ID"}, "mcpConnections": [{"id": "elephant", "name": "Elephant"}]}
+    spec = {"classes": [{"tools": {"knowledge": True, "mcp": []}}], "knowledge": {"token_env": "ELEPHANT_TOKEN", "space_env": "ELEPHANT_SPACE_ID"}, "mcpConnections": [{"id": "elephant", "name": "Knowledge service"}]}
     pool = module.MCPPool(spec)
     with pytest.raises(RuntimeError, match=error):
         await pool.start()
@@ -815,7 +815,7 @@ for installing and operating the exported package yourself.
 1. Extract the ZIP into a new empty folder you own. Open the project folder containing `install.sh` and `start.sh`; if the ZIP created an inner `atlas-operations` folder, use that folder. Open a terminal there for the commands below. The project folder must not allow group or other write access. If the installer reports that permission problem, run `chmod go-w .` here, then retry the same install command. This repair changes only this folder's permissions; keep `.venv`, `.env`, `workspace`, `data` and `.mobkit` in place.
 2. Run `bash install.sh` with Python 3.11+ available. This installs pinned Meerkat/MobKit 0.8.48 and the official MCP Python SDK 1.30.0, then verifies native gateway downloads using published SHA-256 checksums. If dependencies fail to install, correct the reported cause and use the printed retry command in the same project folder; keep `.venv`, `.env`, `workspace`, `data` and `.mobkit`, and continue after installation succeeds.
 3. Enter provider keys and connector values when the local interview asks. Values stay in a mode-600 `.env` on the deployment machine. The workbench never receives them.
-4. Run `bash start.sh --doctor`. For selected MCPs or Elephant, run `bash start.sh --connections-check` to perform real handshakes and validate selected tool names.
+4. Run `bash start.sh --doctor`. For selected MCPs or the knowledge service, run `bash start.sh --connections-check` to perform real handshakes and validate selected tool names.
 5. Run `bash start.sh` and keep the terminal open. Stop with Control-C.
 6. After startup succeeds, open the Console URL printed in the terminal. The configured default is [http://127.0.0.1:4110/console](http://127.0.0.1:4110/console); private `MOBKIT_PORT` settings may change it.
 

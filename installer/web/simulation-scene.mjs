@@ -387,7 +387,7 @@ export function createSimulationScene(model, plan) {
       y: 478,
       r: 6,
       label: node.name,
-      sub: node.kind === "knowledge" ? "Read-only Elephant" : "Local SQLite",
+      sub: node.kind === "knowledge" ? "Read-only knowledge service" : "Local SQLite",
       name: node.name,
       role: node.role,
     }),

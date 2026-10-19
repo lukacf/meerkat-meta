@@ -47,7 +47,7 @@ export function toolSummary(tools = {}) {
   if (tools.notes && tools.notes !== "none")
     items.push(tools.notes === "write" ? "Shared notes" : "Read shared notes");
   if (tools.memory) items.push("Conversation memory");
-  if (tools.knowledge) items.push("Elephant knowledge");
+  if (tools.knowledge) items.push("Knowledge service");
   if (tools.builtins) items.push("Built-in tools");
   if (tools.shell) items.push("Shell access");
   if (tools.workgraph) items.push("Shared work graph");
@@ -108,9 +108,9 @@ export function setupFacts(state, plan = guidePlan(state)) {
     : hasDecision(state, "knowledge");
   const knowledgeValue =
     knowledge === "local"
-      ? "New Elephant service"
+      ? "New knowledge service"
       : knowledge === "remote"
-        ? "Existing Elephant service"
+        ? "Existing knowledge service"
         : [notes && "Shared notes", memory && "Agent memory"]
             .filter(Boolean)
             .join(" + ") || "No shared knowledge service";
@@ -267,7 +267,7 @@ export function planGraph(plan) {
   if (hasKnowledge)
     externals.push({
       id: "knowledge:elephant",
-      label: "Elephant",
+      label: "Knowledge service",
       kind: "knowledge",
       subtitle: "Knowledge",
     });

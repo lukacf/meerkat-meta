@@ -394,7 +394,7 @@ async def test_guided_plan_discloses_selected_knowledge_privileges_without_claim
         assert result["destination"]["disk_gb"] == 100
     else:
         assert "root-equivalent" not in mutations and "service manager" not in mutations
-        assert "Local Elephant and additional connector executables" in json.dumps(plan["limitations"])
+        assert "A local knowledge service and additional connector executables" in json.dumps(plan["limitations"])
     assert "local_knowledge" not in result
     assert "transient-private-token" not in json.dumps(result)
 
