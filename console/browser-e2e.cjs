@@ -3659,6 +3659,10 @@ async function runAccessTabClickDuringRefreshProof() {
     const refreshing = page.getByTestId("access-panel")
       .getByText("Refreshing owner state. Changes are temporarily unavailable.", { exact: true });
     await refreshing.waitFor({ state: "detached" });
+    // A web font that finishes loading between the two measurements changes the
+    // tab labels' metrics and moves the row by a fraction of a pixel; settle the
+    // fonts first so both boxes are measured with the same faces.
+    await page.evaluate(() => document.fonts.ready);
     const tab = page.getByTestId("access-tab:preview");
     const target = await tab.boundingBox();
     await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2);
