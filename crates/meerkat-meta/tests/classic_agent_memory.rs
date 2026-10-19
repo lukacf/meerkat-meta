@@ -149,9 +149,7 @@ impl LlmClient for CaptureClient {
                 meta: None,
             });
             yield Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(StopReason::EndTurn),
             });
         })
     }

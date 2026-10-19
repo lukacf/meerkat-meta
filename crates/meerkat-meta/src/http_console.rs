@@ -71,7 +71,7 @@ use crate::runtime::{
     ConsoleAgentLiveSnapshot, ConsoleLiveSnapshot, ConsoleMember, ConsoleModelCapabilities,
     ConsoleRestJsonRequest, DeliveryHistoryRequest, GatingDecideRequest, GatingDecision,
     RuntimeDecisionState, extract_bearer_token_from_header,
-    handle_console_rest_json_route_with_snapshot_access_memory_and_workgraph,
+    handle_console_rest_json_route_with_pending_rows,
 };
 use crate::runtime::{RuntimeMetadataTable, labels_to_json_value};
 use crate::unified_runtime::console_events::{
@@ -175,11 +175,45 @@ pub(crate) struct ConsoleSnapshotReadModel {
     /// real data. Snapshot reads gate on this so a cold cache never
     /// returns an empty member list to the first request.
     primed: Arc<std::sync::atomic::AtomicBool>,
+    /// Woken after every walk lands. Requests that wait for a walk to
+    /// answer for their identity cut share the walks in flight instead of
+    /// starting one each (see `snapshot_for_cut`).
+    walked: Arc<tokio::sync::Notify>,
+    /// Test hook: while set, every walk waits for a permit before it reads.
+    #[cfg(test)]
+    walk_gate: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
+    /// Test hook: while set, replaces [`CONSOLE_BINDING_REFRESH_DEADLINE`].
+    #[cfg(test)]
+    refresh_deadline: Arc<std::sync::Mutex<Option<Duration>>>,
+    /// Passed by every walk between its roster walk and the cut read that
+    /// closes it (empty outside tests).
+    walked_hook: WalkedHook,
+}
+
+/// Test hook between a walk and the cut read after it: while its gate is
+/// set, the walk waits there. It holds nothing outside tests.
+#[derive(Clone, Default)]
+struct WalkedHook {
+    #[cfg(test)]
+    gate: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
+}
+
+impl WalkedHook {
+    async fn pass(&self) {
+        #[cfg(test)]
+        pass_console_walk_gate(&self.gate).await;
+    }
 }
 
 #[derive(Clone, Default)]
 struct ConsoleSnapshotReadModelState {
-    running: Option<bool>,
+    /// The identity runtime's cut this walk read just before it walked the
+    /// roster: every fact below was collected under these bindings.
+    identity_cut: IdentityBindingCut,
+    /// Identities whose binding moved while this walk ran (the bindings
+    /// read again after the walk differ from `identity_cut`): the walk
+    /// vouches for none of the facts it collected for them.
+    moved_during_walk: BTreeSet<String>,
     session_id_by_identity: BTreeMap<String, String>,
     session_owner_by_id: BTreeMap<String, String>,
     /// Pre-projected primary-mob console members. The background refresh
@@ -194,6 +228,89 @@ struct ConsoleSnapshotReadModelState {
     delegate_member_groups: Vec<Vec<ConsoleMember>>,
 }
 
+/// One read of the identity runtime for every identity it knows: the
+/// session it binds and the lifecycle state it is in. The identity runtime
+/// owns both facts, and `/console/identities` reads them from it too; the
+/// console only reads them.
+#[derive(Clone, Debug, Default)]
+struct IdentityBindingCut {
+    bindings: BTreeMap<String, IdentityBinding>,
+    /// Positions of the read's start and completion on
+    /// [`IDENTITY_BINDING_CUT_SEQUENCE`]. The empty cut of an unprimed read
+    /// model holds 0 for both, before every read.
+    read_started: u64,
+    read_completed: u64,
+}
+
+/// One counter orders every identity binding read: a read takes a
+/// position before it starts and another after it completes, so whether
+/// one read started after another completed is exact, where two clock
+/// instants can compare equal.
+static IDENTITY_BINDING_CUT_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn next_identity_binding_cut_position() -> u64 {
+    IDENTITY_BINDING_CUT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// What a cut records for one identity. A retire moves no session, so the
+/// lifecycle state is part of the binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IdentityBinding {
+    session_id: Option<String>,
+    state: crate::identity_first::IdentityLifecycleState,
+}
+
+impl IdentityBindingCut {
+    async fn read(identity_runtime: Option<&crate::identity_first::IdentityRuntime>) -> Self {
+        let read_started = next_identity_binding_cut_position();
+        let mut bindings = BTreeMap::new();
+        if let Some(identity_runtime) = identity_runtime {
+            for status in identity_runtime.statuses().await {
+                bindings.insert(
+                    status.identity.as_str().to_string(),
+                    IdentityBinding {
+                        session_id: status.session_id.as_ref().map(ToString::to_string),
+                        state: status.state,
+                    },
+                );
+            }
+        }
+        Self {
+            bindings,
+            read_started,
+            read_completed: next_identity_binding_cut_position(),
+        }
+    }
+
+    /// Whether a walk that recorded this cut may answer a request that read
+    /// `request`: the bindings are the same, or this cut was read after the
+    /// request's, so no fact it walked can belong to an earlier binding.
+    fn answers_for(&self, request: &Self) -> bool {
+        self.bindings == request.bindings || self.read_started > request.read_completed
+    }
+
+    /// The identities whose binding differs in `after_walk`, the cut read
+    /// once the walk that recorded this cut completed.
+    fn moved_in(&self, after_walk: &Self) -> BTreeSet<String> {
+        self.bindings
+            .iter()
+            .filter(|(identity, binding)| after_walk.bindings.get(*identity) != Some(*binding))
+            .map(|(identity, _)| identity.clone())
+            .collect()
+    }
+
+    /// The newer of two cuts. A request joins with it, so a row never pairs
+    /// an older session with facts walked under a newer binding.
+    fn newer<'a>(&'a self, other: &'a Self) -> &'a Self {
+        if self.read_started > other.read_completed {
+            self
+        } else {
+            other
+        }
+    }
+}
+
 impl ConsoleSnapshotReadModel {
     /// Returns the current cached snapshot. On a cold cache (no
     /// refresh has completed yet) the request thread drives the
@@ -201,11 +318,59 @@ impl ConsoleSnapshotReadModel {
     /// holds the lock, waits for it to finish before reading.
     /// Either way, snapshot endpoints never see an empty member
     /// list before the read model has been populated.
-    async fn snapshot(&self, runtime: &MobRuntime) -> ConsoleSnapshotReadModelState {
+    async fn snapshot(
+        &self,
+        runtime: &MobRuntime,
+        identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+    ) -> ConsoleSnapshotReadModelState {
         if !self.primed.load(std::sync::atomic::Ordering::Acquire) {
-            Box::pin(self.prime_now(runtime)).await;
+            Box::pin(self.prime_now(runtime, identity_runtime)).await;
         }
         self.inner.read().await.clone()
+    }
+
+    /// The cached walk when it may answer for the identity cut `cut` (see
+    /// [`IdentityBindingCut::answers_for`]); otherwise the walk that may,
+    /// waited for at most [`CONSOLE_BINDING_REFRESH_DEADLINE`] in total,
+    /// in-flight walk and fresh walk alike. Walks stay one at a time on
+    /// `refresh_lock`, and every waiter re-checks after each one lands, so
+    /// concurrent requests after one binding change share the walk in
+    /// flight and at most one fresh walk. The flag is false when the
+    /// deadline passed first: the state is then the latest walk, which does
+    /// not answer for `cut`, and the walk keeps running in the background.
+    async fn snapshot_for_cut(
+        &self,
+        runtime: &MobRuntime,
+        identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+        cut: &IdentityBindingCut,
+    ) -> (ConsoleSnapshotReadModelState, bool) {
+        let deadline = tokio::time::Instant::now() + self.refresh_deadline();
+        loop {
+            let walked = self.walked.notified();
+            tokio::pin!(walked);
+            walked.as_mut().enable();
+            let state = Box::pin(self.snapshot(runtime, identity_runtime)).await;
+            if state.identity_cut.answers_for(cut) {
+                return (state, true);
+            }
+            self.refresh_soon(runtime.clone(), identity_runtime.cloned());
+            if tokio::time::timeout_at(deadline, walked).await.is_err() {
+                return (self.inner.read().await.clone(), false);
+            }
+        }
+    }
+
+    /// [`CONSOLE_BINDING_REFRESH_DEADLINE`], unless a test replaced it.
+    fn refresh_deadline(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(deadline) = *self
+            .refresh_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return deadline;
+        }
+        CONSOLE_BINDING_REFRESH_DEADLINE
     }
 
     /// Cold-cache priming. Acquires `refresh_lock` via the awaiting
@@ -223,11 +388,15 @@ impl ConsoleSnapshotReadModel {
     ///   populated and the second `primed` check returns early
     ///   without redoing the work.
     ///
-    /// No `Notify` is involved, so there's no lost-wake race to
-    /// reason about: the lock release is the signal, and `tokio`'s
-    /// Mutex enforces FIFO acquisition fairness so a `try_lock`
-    /// caller can't barge past a queued `lock_owned` waiter.
-    async fn prime_now(&self, runtime: &MobRuntime) {
+    /// The lock release is the signal here, and `tokio`'s Mutex
+    /// enforces FIFO acquisition fairness so a `try_lock` caller can't
+    /// barge past a queued `lock_owned` waiter. (`walked` only wakes
+    /// requests waiting in `snapshot_for_cut`.)
+    async fn prime_now(
+        &self,
+        runtime: &MobRuntime,
+        identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+    ) {
         if self.primed.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
@@ -235,10 +404,18 @@ impl ConsoleSnapshotReadModel {
         if self.primed.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        let refreshed = Box::pin(collect_console_snapshot_read_model(runtime)).await;
+        #[cfg(test)]
+        pass_console_walk_gate(&self.walk_gate).await;
+        let refreshed = Box::pin(collect_console_snapshot_read_model(
+            runtime,
+            identity_runtime.map(Arc::as_ref),
+            &self.walked_hook,
+        ))
+        .await;
         *self.inner.write().await = refreshed;
         self.primed
             .store(true, std::sync::atomic::Ordering::Release);
+        self.walked.notify_waiters();
         // _guard drops here, releasing the lock and waking the next
         // queued cold-cache waiter (if any). They'll see `primed`
         // true after acquiring and return early.
@@ -250,7 +427,11 @@ impl ConsoleSnapshotReadModel {
     /// through `prime_now` on cold cache so it always gets a
     /// populated snapshot. `refresh_soon` exists to keep a hot
     /// cache fresh over time without blocking response requests.
-    fn refresh_soon(&self, runtime: MobRuntime) {
+    fn refresh_soon(
+        &self,
+        runtime: MobRuntime,
+        identity_runtime: Option<Arc<crate::identity_first::IdentityRuntime>>,
+    ) {
         let Ok(runtime_handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -259,17 +440,89 @@ impl ConsoleSnapshotReadModel {
         };
         let inner = Arc::clone(&self.inner);
         let primed = Arc::clone(&self.primed);
+        let walked = Arc::clone(&self.walked);
+        #[cfg(test)]
+        let walk_gate = Arc::clone(&self.walk_gate);
+        let walked_hook = self.walked_hook.clone();
         runtime_handle.spawn(async move {
             let _guard = guard;
-            let refreshed = Box::pin(collect_console_snapshot_read_model(&runtime)).await;
+            #[cfg(test)]
+            pass_console_walk_gate(&walk_gate).await;
+            let refreshed = Box::pin(collect_console_snapshot_read_model(
+                &runtime,
+                identity_runtime.as_deref(),
+                &walked_hook,
+            ))
+            .await;
             *inner.write().await = refreshed;
             primed.store(true, std::sync::atomic::Ordering::Release);
+            walked.notify_waiters();
             // _guard drops; cold-cache waiters parked on
             // `lock_owned().await` in `prime_now` wake here and
             // observe `primed = true` after acquiring.
         });
     }
+
+    #[cfg(test)]
+    fn set_walk_gate(&self, gate: Option<Arc<tokio::sync::Semaphore>>) {
+        *self
+            .walk_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = gate;
+    }
+
+    #[cfg(test)]
+    fn set_walked_gate(&self, gate: Option<Arc<tokio::sync::Semaphore>>) {
+        *self
+            .walked_hook
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = gate;
+    }
+
+    #[cfg(test)]
+    fn set_refresh_deadline(&self, deadline: Duration) {
+        *self
+            .refresh_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(deadline);
+    }
 }
+
+/// The loaded modules of a mob runtime with no configured module ids: its
+/// members, without retiring ones. A pending identity's walked state does
+/// not decide its entry, so it is left out, as the profile counts leave it
+/// out.
+fn live_member_modules(members: &[ConsoleMember], pending: &BTreeSet<String>) -> Vec<String> {
+    let mut modules: Vec<String> = members
+        .iter()
+        .filter(|member| {
+            !pending.contains(console_member_console_identity(member))
+                && member.state != MEMBER_STATE_RETIRING
+        })
+        .map(|member| member.agent_identity.clone())
+        .collect();
+    modules.sort();
+    modules
+}
+
+/// Test hook: hold a walk until the gate has a permit.
+#[cfg(test)]
+async fn pass_console_walk_gate(gate: &std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>) {
+    let gate = gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(gate) = gate {
+        let _permit = gate.acquire().await;
+    }
+}
+
+/// How long an experience read waits for the read model to catch up with
+/// an identity binding change (a reset, retire, delete or rebind) before it
+/// answers the changed rows pending. The console's own member-status read
+/// bound, well inside the sidebar's 5 s poll.
+const CONSOLE_BINDING_REFRESH_DEADLINE: Duration = CONSOLE_MEMBER_STATUS_TIMEOUT;
 
 const CONSOLE_FRONTEND_INDEX_HTML: &str = include_str!("../console-dist/index.html");
 const CONSOLE_FRONTEND_APP_JS: &str = include_str!("../console-dist/console-app.js");
@@ -454,7 +707,12 @@ pub(crate) fn console_json_router_with_runtime_events_and_policy(
         })
     });
     let snapshot_read_model = ConsoleSnapshotReadModel::default();
-    snapshot_read_model.refresh_soon(runtime.clone());
+    snapshot_read_model.refresh_soon(
+        runtime.clone(),
+        identity_runtime
+            .as_ref()
+            .map(|identity_runtime| Arc::clone(identity_runtime.runtime())),
+    );
     // Fall back to the mob runtime's bootstrap-time service so routers built
     // through the thinner constructors still expose workgraph.
     let workgraph = workgraph.or_else(|| runtime.workgraph_service());
@@ -747,19 +1005,29 @@ pub async fn console_json_handler(
         .iter()
         .map(|m| m.id.clone())
         .collect();
+    // Identities whose rows this read answers pending: their binding moved
+    // and the read model had not re-collected them by the refresh deadline.
+    let mut pending_identities = BTreeSet::new();
     let live_snapshot = match &state.runtime {
         Some(runtime) => {
-            state.snapshot_read_model.refresh_soon(runtime.clone());
-            Some(
-                Box::pin(build_live_snapshot(
-                    runtime,
-                    &config_module_ids,
-                    state.console_events.as_ref(),
-                    state.visibility_policy.as_ref(),
-                    &state.snapshot_read_model,
-                ))
-                .await,
-            )
+            let identity_runtime = state
+                .identity_runtime
+                .as_ref()
+                .map(crate::identity_first::PublicIdentityRuntime::runtime);
+            state
+                .snapshot_read_model
+                .refresh_soon(runtime.clone(), identity_runtime.cloned());
+            let (snapshot, pending) = Box::pin(build_live_snapshot(
+                runtime,
+                &config_module_ids,
+                state.console_events.as_ref(),
+                state.visibility_policy.as_ref(),
+                &state.snapshot_read_model,
+                identity_runtime,
+            ))
+            .await;
+            pending_identities = pending;
+            Some(snapshot)
         }
         None => match &state.console_aggregator {
             Some(aggregator) => Box::pin(build_aggregator_live_snapshot(
@@ -776,7 +1044,7 @@ pub async fn console_json_handler(
         snapshot
     });
 
-    let mut response = handle_console_rest_json_route_with_snapshot_access_memory_and_workgraph(
+    let mut response = handle_console_rest_json_route_with_pending_rows(
         &state.decisions,
         &ConsoleRestJsonRequest {
             method: "GET".to_string(),
@@ -787,6 +1055,7 @@ pub async fn console_json_handler(
         state.access.as_ref(),
         state.memory_panel.is_some(),
         state.workgraph.is_some(),
+        &pending_identities,
     );
     if response.status == 200
         && uri.path() == "/console/experience"
@@ -1142,6 +1411,9 @@ mod voice_readiness_budget_tests {
             .with_ansi(false)
             .with_max_level(tracing::Level::INFO)
             .finish();
+        // A second registered Dispatch keeps callsite interest from being
+        // cached `never` by threads without a subscriber.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
         tracing::subscriber::with_default(subscriber, || {
             log_voice_readiness("agent-a", 2, answer);
         });
@@ -2264,6 +2536,10 @@ mod console_human_input_tests;
 #[cfg(test)]
 #[path = "console_human_governed_bind_tests.rs"]
 mod console_human_governed_bind_tests;
+
+#[cfg(test)]
+#[path = "console_experience_binding_tests.rs"]
+mod console_experience_binding_tests;
 
 #[cfg(test)]
 async fn console_send_identity_first(
@@ -6433,7 +6709,11 @@ fn ambiguous_live_identity_alias_error(
     }
 }
 
+/// Resolve a console identity-control target through the shared
+/// identity-control resolver. `operation` names the route in a stale-binding
+/// refusal (see [`stale_generated_alias_error`]).
 async fn resolve_console_identity_control_target(
+    operation: &str,
     handle: &MobHandle,
     identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
     visibility_policy: &dyn ConsoleVisibilityPolicy,
@@ -6493,8 +6773,45 @@ async fn resolve_console_identity_control_target(
             let target = *target;
             Ok(Some((target.identity, target.was_registered, target.live)))
         }
+        IdentityControlResolution::Unresolved {
+            requested_identity,
+            generated_runtime_alias: true,
+            ..
+        } => match identity_runtime {
+            Some(identity_runtime) => stale_generated_alias_error(
+                operation,
+                identity_runtime,
+                visibility_policy,
+                &requested_identity,
+            )
+            .await
+            .map_or(Ok(None), Err),
+            None => Ok(None),
+        },
         IdentityControlResolution::Unresolved { .. } => Ok(None),
     }
+}
+
+/// The refusal of a generated runtime id the shared resolver left
+/// unresolved: no identity is bound to it and no live member carries it. When
+/// it names an identity the identity runtime still knows, that identity's
+/// binding moved on (a reset published a new generation and rebound its one
+/// roster row), so it answers the typed stale-binding refusal the member
+/// routes give for the same id, naming the registered binding. A hidden
+/// identity answers hidden by policy and names no binding. An identity the
+/// identity runtime does not know keeps "identity not found" (`None`).
+async fn stale_generated_alias_error(
+    operation: &str,
+    identity_runtime: &crate::identity_first::IdentityRuntime,
+    visibility_policy: &dyn ConsoleVisibilityPolicy,
+    alias: &str,
+) -> Option<JsonRpcError> {
+    let identity = identity_from_runtime_alias(alias)?;
+    let status = identity_runtime.status(&identity).await.ok()?;
+    if !identity_status_visible_to_console(visibility_policy, &status) {
+        return Some(identity_hidden_by_policy_error(alias));
+    }
+    stale_runtime_alias_error_for_status(operation, &identity, Some(&status), alias)
 }
 
 fn live_alias_matches_status_runtime(
@@ -6539,27 +6856,15 @@ async fn stale_live_alias_json_rpc_error(
     if live_alias_matches_status_runtime(Some(live_alias), &status) {
         return None;
     }
-    let registered_runtime_member_id = status
-        .agent_runtime_id
-        .as_ref()
-        .map(crate::identity_first::AgentRuntimeId::as_str);
-    Some(JsonRpcError {
-        code: -32000,
-        message: format!(
-            "{operation} failed: identity runtime binding for {} points at {}, but requested live member is {}",
-            identity.as_str(),
-            registered_runtime_member_id.unwrap_or("<none>"),
-            live_alias.runtime_member_id
+    Some(
+        crate::identity_control_target::stale_identity_runtime_binding_error(
+            &format!("{operation} failed: "),
+            identity,
+            Some(&status),
+            &live_alias.runtime_member_id,
+            live_alias.session_id.as_deref(),
         ),
-        data: Some(json!({
-            "kind": "stale_identity_runtime_binding",
-            "identity": identity.as_str(),
-            "registered_runtime_member_id": registered_runtime_member_id,
-            "live_runtime_member_id": live_alias.runtime_member_id,
-            "registered_session_id": status.session_id.as_ref().map(ToString::to_string),
-            "live_session_id": live_alias.session_id,
-        })),
-    })
+    )
 }
 
 fn identity_from_runtime_alias(alias: &str) -> Option<crate::identity_first::AgentIdentity> {
@@ -6584,30 +6889,33 @@ async fn stale_runtime_alias_json_rpc_error(
     let alias = crate::member_comms_id::runtime_alias_str(alias).into_owned();
     let identity = identity_from_runtime_alias(&alias)?;
     let status = identity_runtime.status(&identity).await.ok();
+    stale_runtime_alias_error_for_status(operation, &identity, status.as_ref(), &alias)
+}
+
+/// The typed refusal of runtime id `alias` when it is not `identity`'s
+/// registered binding (`status`, `None` when the identity runtime does not
+/// know the identity); `None` when it is.
+fn stale_runtime_alias_error_for_status(
+    operation: &str,
+    identity: &crate::identity_first::AgentIdentity,
+    status: Option<&crate::identity_first::IdentityStatus>,
+    alias: &str,
+) -> Option<JsonRpcError> {
     let registered_runtime_member_id = status
-        .as_ref()
         .and_then(|status| status.agent_runtime_id.as_ref())
         .map(crate::identity_first::AgentRuntimeId::as_str);
-    if registered_runtime_member_id == Some(alias.as_str()) {
+    if registered_runtime_member_id == Some(alias) {
         return None;
     }
-    Some(JsonRpcError {
-        code: -32000,
-        message: format!(
-            "{operation} failed: identity runtime binding for {} points at {}, but requested live member is {}",
-            identity.as_str(),
-            registered_runtime_member_id.unwrap_or("<none>"),
-            alias
+    Some(
+        crate::identity_control_target::stale_identity_runtime_binding_error(
+            &format!("{operation} failed: "),
+            identity,
+            status,
+            alias,
+            None,
         ),
-        data: Some(json!({
-            "kind": "stale_identity_runtime_binding",
-            "identity": identity.as_str(),
-            "registered_runtime_member_id": registered_runtime_member_id,
-            "live_runtime_member_id": alias,
-            "registered_session_id": status.as_ref().and_then(|status| status.session_id.as_ref()).map(ToString::to_string),
-            "live_session_id": Value::Null,
-        })),
-    })
+    )
 }
 
 fn reset_requires_session_bridge_json_rpc_error() -> JsonRpcError {
@@ -8223,6 +8531,21 @@ async fn handle_console_runtime_rpc_with_visibility(
             let Some(identity) = request.params.get("identity").and_then(Value::as_str) else {
                 return invalid_params(response_id, "identity required");
             };
+            // A generated runtime id that is no longer its identity's
+            // binding answers the typed stale-binding refusal the identity
+            // routes give, before the aggregator lookup that would call it
+            // unknown.
+            if let Some(identity_runtime) = &identity_runtime
+                && let Some(error) = stale_generated_alias_error(
+                    "inspect_identity",
+                    identity_runtime,
+                    visibility_policy,
+                    identity,
+                )
+                .await
+            {
+                return response_value(response_id, None, Some(error));
+            }
             let Some(aggregator) = &console_aggregator else {
                 return response_value(
                     response_id,
@@ -8505,6 +8828,7 @@ async fn handle_console_runtime_rpc_with_visibility(
             if let Some(identity_runtime) = &identity_runtime {
                 let (parsed_identity, _was_registered, live_alias) =
                     match resolve_console_identity_control_target(
+                        "status_identity",
                         &handle,
                         Some(identity_runtime),
                         visibility_policy,
@@ -8640,6 +8964,7 @@ async fn handle_console_runtime_rpc_with_visibility(
             if let Some(identity_runtime) = &identity_runtime {
                 let (parsed_identity, _was_registered, live_alias) =
                     match resolve_console_identity_control_target(
+                        "inspect_identity",
                         &handle,
                         Some(identity_runtime),
                         visibility_policy,
@@ -8777,6 +9102,7 @@ async fn handle_console_runtime_rpc_with_visibility(
             if let Some(identity_runtime) = &identity_runtime {
                 let (parsed_identity, was_registered, live_alias) =
                     match resolve_console_identity_control_target(
+                        "retire",
                         &handle,
                         Some(identity_runtime),
                         visibility_policy,
@@ -8999,6 +9325,7 @@ async fn handle_console_runtime_rpc_with_visibility(
             if let Some(identity_runtime) = &identity_runtime {
                 let (parsed_identity, was_registered, live_alias) =
                     match resolve_console_identity_control_target(
+                        "respawn",
                         &handle,
                         Some(identity_runtime),
                         visibility_policy,
@@ -9170,6 +9497,7 @@ async fn handle_console_runtime_rpc_with_visibility(
             };
             let (parsed_identity, was_registered, live_alias) =
                 match resolve_console_identity_control_target(
+                    "reset",
                     &handle,
                     Some(identity_runtime),
                     visibility_policy,
@@ -9243,12 +9571,11 @@ async fn handle_console_runtime_rpc_with_visibility(
             };
             match reset_result {
                 Ok(record) => {
-                    let cleanup_warning = Some(json!({
-                        "kind": "stale_member_cleanup_skipped_after_identity_reset",
-                        "identity": parsed_identity.as_str(),
-                        "agent_runtime_id": record.agent_runtime_id.as_str(),
-                        "message": "reset published the new generation without retiring stale live mob members; identity control calls reject stale runtime ids",
-                    }));
+                    // The reset's successor transition retired the previous
+                    // live member, so there is no cleanup to report (as for
+                    // reset_all). Keep the legacy warning field, always null,
+                    // for wire compatibility, as respawn does.
+                    let cleanup_warning: Option<Value> = None;
                     if let Some(store) = &console_events {
                         store
                             .record_lifecycle(
@@ -9295,6 +9622,7 @@ async fn handle_console_runtime_rpc_with_visibility(
             };
             let (parsed_identity, was_registered, live_alias) =
                 match resolve_console_identity_control_target(
+                    "delete_identity",
                     &handle,
                     Some(identity_runtime),
                     visibility_policy,
@@ -11715,15 +12043,36 @@ async fn handle_console_wire_local(
     }
 }
 
+/// The console's live snapshot, and the identities whose rows it answers
+/// pending (the experience renders them withheld, see
+/// [`handle_console_rest_json_route_with_pending_rows`]).
+///
+/// With an identity runtime, the snapshot reads it once per request
+/// ([`IdentityBindingCut`]) and never serves a fact walked under an earlier
+/// binding: an identity-first row takes its session from the identity
+/// runtime, and a walk recorded before the identity runtime moved is
+/// re-collected first, waited for at most
+/// [`CONSOLE_BINDING_REFRESH_DEADLINE`]. Without one (plain runtimes, and
+/// reset_all's own one-shot read model, which compares the roster with the
+/// registered bindings itself) the snapshot is the walk as it was.
 async fn build_live_snapshot(
     runtime: &MobRuntime,
     config_module_ids: &[String],
     console_events: Option<&ConsoleEventStore>,
     visibility_policy: &dyn ConsoleVisibilityPolicy,
     read_model: &ConsoleSnapshotReadModel,
-) -> ConsoleLiveSnapshot {
-    let read_model_state = Box::pin(read_model.snapshot(runtime)).await;
-    let running = read_model_state.running.unwrap_or(true);
+    identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+) -> (ConsoleLiveSnapshot, BTreeSet<String>) {
+    let request_cut = IdentityBindingCut::read(identity_runtime.map(Arc::as_ref)).await;
+    let (read_model_state, walk_answers) =
+        Box::pin(read_model.snapshot_for_cut(runtime, identity_runtime, &request_cut)).await;
+    let cut = read_model_state.identity_cut.newer(&request_cut);
+    // Whether the mob runs is its owner's answer now, as `meta/status`
+    // reads it: a cached walk can predate a stop.
+    let running = Some(matches!(
+        runtime.handle().status_observation_snapshot(),
+        MobState::Creating | MobState::Running
+    ));
     // Hot path: clone the pre-projected members from the cached read
     // model. NO `handle.*` async calls happen here — the background
     // refresh task is the only thing that walks the mob roster, so
@@ -11731,9 +12080,33 @@ async fn build_live_snapshot(
     // First request on a cold cache pays one synchronous refresh via
     // `snapshot(runtime).await` above; subsequent requests just clone.
     let mut members = read_model_state.primary_members.clone();
+    let runtime_machine = runtime
+        .session_service()
+        .and_then(|service| crate::mob_handle_runtime::observed_runtime_adapter(service.as_ref()));
+    let pending = join_identity_bindings(
+        &mut members,
+        &read_model_state.identity_cut,
+        cut,
+        walk_answers,
+        &read_model_state.moved_during_walk,
+        runtime_machine.as_deref(),
+    )
+    .await;
     if visibility_policy.include_implicit_delegate_members() {
         for group in &read_model_state.delegate_member_groups {
-            members.extend(group.iter().cloned());
+            // A pending identity's implicit delegates were walked under its
+            // superseded binding: they are withheld until the walk lands.
+            members.extend(
+                group
+                    .iter()
+                    .filter(|member| {
+                        !member
+                            .labels
+                            .get("delegate_host_identity")
+                            .is_some_and(|host| pending.contains(host))
+                    })
+                    .cloned(),
+            );
         }
     }
     dedupe_console_members_by_identity(&mut members);
@@ -11747,13 +12120,7 @@ async fn build_live_snapshot(
     // surfaces describe loaded modules, not live mob members.
     // Fall back to member IDs only for pure mob runtimes with no module config.
     let loaded_modules = if config_module_ids.is_empty() {
-        let mut mods: Vec<String> = members
-            .iter()
-            .filter(|member| member.state != MEMBER_STATE_RETIRING)
-            .map(|member| member.agent_identity.clone())
-            .collect();
-        mods.sort();
-        mods
+        live_member_modules(&members, &pending)
     } else {
         let mut mods = config_module_ids.to_vec();
         mods.sort();
@@ -11809,25 +12176,129 @@ async fn build_live_snapshot(
         })
         .collect::<Vec<_>>();
     agents.sort_by(|left, right| left.label.cmp(&right.label));
-    ConsoleLiveSnapshot::new(
-        Some(runtime.handle().mob_id().to_string()),
-        running,
-        loaded_modules,
-        agents,
-        members,
-        true,
+    (
+        ConsoleLiveSnapshot::new(
+            Some(runtime.handle().mob_id().to_string()),
+            running,
+            loaded_modules,
+            agents,
+            members,
+            true,
+        ),
+        pending,
     )
 }
 
+/// Join every identity-first row of the primary mob to its identity's
+/// binding in `cut`, the identity runtime's answer: the row's session is
+/// never the walk's copy. Returns the identities whose rows are pending: the
+/// walk does not answer for the request (`walk_answers` false) and the
+/// identity's binding moved since the walk, or the walk vouches for none of
+/// the identity's facts. That is so when the walk read its binding
+/// Suspended (a reset, respawn or rebind holds the identity there while it
+/// swaps the member, so the walk may hold either side's rows, or one side's
+/// session index beside the other's members) or when the binding moved
+/// while the walk ran (`moved_during_walk`).
+///
+/// A row is identity-first when the walk's own cut held its identity (the
+/// identity runtime knew it when the row was walked) and its decoded roster
+/// id is that identity (`member_comms_id::live_member_is_identity`, the
+/// predicate the identity records use). A plain mob member is never in the
+/// identity runtime's cut, so it is never touched. An identity the identity
+/// runtime no longer knows has no session. Both sides are this runtime's
+/// own un-namespaced identities; aggregator namespaces only prefix records
+/// listed across runtimes.
+///
+/// A row whose progress was observed for another session, or that is
+/// pending, carries the runtime machine's bounded run state for the session
+/// it now names instead (one wave, [`CONSOLE_PROGRESS_READ_CONCURRENCY`] at a
+/// time) until the walk lands. Its other facts stay as walked: visibility
+/// and access decide on them, and the experience renders every record of a
+/// pending row in its withheld shape.
+async fn join_identity_bindings(
+    members: &mut [ConsoleMember],
+    walked_cut: &IdentityBindingCut,
+    cut: &IdentityBindingCut,
+    walk_answers: bool,
+    moved_during_walk: &BTreeSet<String>,
+    runtime_machine: Option<&meerkat_runtime::MeerkatMachine>,
+) -> BTreeSet<String> {
+    use futures::StreamExt as _;
+
+    let mut pending = BTreeSet::new();
+    let mut rereads = Vec::new();
+    for (index, member) in members.iter_mut().enumerate() {
+        let identity = console_member_console_identity(member).to_string();
+        let Some(walked) = walked_cut.bindings.get(&identity) else {
+            continue;
+        };
+        if !crate::member_comms_id::live_member_is_identity(&member.agent_identity, &identity) {
+            continue;
+        }
+        let current = cut.bindings.get(&identity);
+        let session_id = current.and_then(|binding| binding.session_id.clone());
+        let walk_vouches = walked.state != crate::identity_first::IdentityLifecycleState::Suspended
+            && !moved_during_walk.contains(&identity);
+        let is_pending = !walk_vouches || (!walk_answers && current != Some(walked));
+        if is_pending || member.session_id != session_id {
+            rereads.push((
+                index,
+                session_id
+                    .as_deref()
+                    .and_then(|session| meerkat_core::types::SessionId::parse(session).ok()),
+            ));
+        }
+        if is_pending {
+            pending.insert(identity);
+        }
+        member.session_id = session_id;
+    }
+    let run_states: Vec<(usize, meerkat_mob::MemberRunState)> =
+        futures::stream::iter(rereads.into_iter().map(|(index, session)| async move {
+            (
+                index,
+                console_member_run_state(runtime_machine, session.as_ref()).await,
+            )
+        }))
+        .buffer_unordered(CONSOLE_PROGRESS_READ_CONCURRENCY)
+        .collect()
+        .await;
+    for (index, run_state) in run_states {
+        if let Some(member) = members.get_mut(index) {
+            member.progress =
+                serde_json::to_value(ConsoleMemberProgress::from_run_state(run_state)).ok();
+        }
+    }
+    pending
+}
+
+/// One walk of the console's read model. The identity runtime's bindings
+/// are read before it (the walk's cut) and again after it, and an identity
+/// whose binding moved between the two reads lands in
+/// `moved_during_walk`: the walk vouches for none of its facts.
 async fn collect_console_snapshot_read_model(
     runtime: &MobRuntime,
+    identity_runtime: Option<&crate::identity_first::IdentityRuntime>,
+    walked: &WalkedHook,
 ) -> ConsoleSnapshotReadModelState {
+    let mut state = Box::pin(walk_console_snapshot_read_model(runtime, identity_runtime)).await;
+    walked.pass().await;
+    let after_walk = IdentityBindingCut::read(identity_runtime).await;
+    state.moved_during_walk = state.identity_cut.moved_in(&after_walk);
+    state
+}
+
+async fn walk_console_snapshot_read_model(
+    runtime: &MobRuntime,
+    identity_runtime: Option<&crate::identity_first::IdentityRuntime>,
+) -> ConsoleSnapshotReadModelState {
+    // The identity runtime's cut is read BEFORE the roster walk, so a binding
+    // change that lands during the walk shows as a moved cut on the next
+    // read, and that read re-collects instead of serving this walk for it.
+    let identity_cut = IdentityBindingCut::read(identity_runtime).await;
     let handle = runtime.handle();
     let mut state = ConsoleSnapshotReadModelState {
-        running: Some(matches!(
-            handle.status_observation_snapshot(),
-            MobState::Creating | MobState::Running
-        )),
+        identity_cut,
         ..ConsoleSnapshotReadModelState::default()
     };
     collect_console_session_index_for_handle(&handle, &mut state).await;
@@ -11996,26 +12467,36 @@ async fn reset_all_live_console_agents(
     visibility_policy: &dyn ConsoleVisibilityPolicy,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let read_model = ConsoleSnapshotReadModel::default();
-    *read_model.inner.write().await = Box::pin(collect_console_snapshot_read_model(runtime)).await;
+    // No identity runtime for this read model: reset_all compares the roster
+    // it walks with the registered bindings itself, so its snapshot must stay
+    // the walk as it was.
+    *read_model.inner.write().await = Box::pin(collect_console_snapshot_read_model(
+        runtime,
+        None,
+        &WalkedHook::default(),
+    ))
+    .await;
     // Mark the freshly-built model primed so `build_live_snapshot` doesn't
     // try to re-prime; this is a one-shot read for the reset path.
     read_model
         .primed
         .store(true, std::sync::atomic::Ordering::Release);
-    let snapshot = Box::pin(build_live_snapshot(
+    let (snapshot, _) = Box::pin(build_live_snapshot(
         runtime,
         &[],
         console_events,
         visibility_policy,
         &read_model,
+        None,
     ))
     .await;
-    let raw_snapshot = Box::pin(build_live_snapshot(
+    let (raw_snapshot, _) = Box::pin(build_live_snapshot(
         runtime,
         &[],
         console_events,
         &crate::console_aggregator::AllowAllConsoleVisibilityPolicy,
         &read_model,
+        None,
     ))
     .await;
     let identity_runtime_statuses = if let Some(identity_runtime) = identity_runtime {
@@ -13397,7 +13878,7 @@ async fn build_aggregator_live_snapshot(
     };
     Ok(ConsoleLiveSnapshot::new(
         Some("console-aggregator".to_string()),
-        true,
+        aggregator.registered_runtimes_running(),
         loaded_modules,
         agents,
         members,
@@ -15218,6 +15699,7 @@ comms = true
             )
             .await?;
             let console = resolve_console_identity_control_target(
+                "status_identity",
                 &handle,
                 Some(&identity_runtime),
                 &visibility,
@@ -15278,11 +15760,12 @@ comms = true
         .await
         .expect_err("stdio adapter must fail closed on a visible duplicate");
         assert_eq!(
-            rpc_ambiguous,
+            rpc_ambiguous.to_string(),
             "ambiguous live identity alias review:golden [via identity-control-target \
              resolver]: candidates [rt:review:golden:0, rt:review:golden:1]"
         );
         let console_ambiguous = resolve_console_identity_control_target(
+            "status_identity",
             &ambiguous_handle,
             Some(&ambiguous_identity_runtime),
             &AllowAllConsoleVisibilityPolicy,
@@ -15302,6 +15785,7 @@ comms = true
 
         let visibility = HideMemberPolicy("rt:review:golden:0");
         let visible_target = resolve_console_identity_control_target(
+            "status_identity",
             &ambiguous_handle,
             Some(&ambiguous_identity_runtime),
             &visibility,
@@ -15349,10 +15833,11 @@ comms = true
         .await
         .expect_err("stdio adapter must reject a member bound to another durable identity");
         assert_eq!(
-            rpc_stale,
+            rpc_stale.to_string(),
             "stale live identity alias: live console alias other:stale-golden resolves to rt:review:stale-golden:0, but identity runtime binding belongs to review:stale-golden"
         );
         let console_stale = resolve_console_identity_control_target(
+            "status_identity",
             &stale_handle,
             Some(&stale_identity_runtime),
             &AllowAllConsoleVisibilityPolicy,
@@ -16068,6 +16553,41 @@ comms = true
 
         let _ = runtime.handle().stop().await;
         Ok(())
+    }
+
+    /// One console identity RPC under `policy`, as the gateway dispatches it.
+    async fn console_identity_rpc_under_policy(
+        runtime: &MobRuntime,
+        identity_runtime: &Arc<IdentityRuntime>,
+        policy: &dyn ConsoleVisibilityPolicy,
+        method: &str,
+        identity: &str,
+    ) -> Value {
+        Box::pin(handle_console_runtime_rpc_with_visibility(
+            runtime,
+            None,
+            None,
+            None,
+            Some(ConsoleEventStore::new()),
+            None,
+            Some(identity_runtime.clone()),
+            None,
+            None,
+            policy,
+            rpc_request_with_params(method, json!({ "identity": identity })),
+            true,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &crate::http_console::ConsoleSendGovernance::default(),
+            &crate::topology_control::TopologyApplyScope::Anonymous,
+        ))
+        .await
     }
 
     #[derive(Debug)]
@@ -17000,10 +17520,31 @@ comms = true
         runtime_instance_id: &str,
         identity: &AgentIdentity,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        register_leased_active_identity_on_session(
+            identity_runtime,
+            store,
+            lease_provider,
+            runtime_instance_id,
+            identity,
+            meerkat_core::types::SessionId::new(),
+        )
+        .await
+    }
+
+    /// [`register_leased_active_identity`] bound to `session_id`, the
+    /// session the identity's live member runs.
+    async fn register_leased_active_identity_on_session(
+        identity_runtime: &IdentityRuntime,
+        store: &LocalContinuityStore,
+        lease_provider: &LocalLeaseProvider,
+        runtime_instance_id: &str,
+        identity: &AgentIdentity,
+        session_id: meerkat_core::types::SessionId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let record = ContinuityRecord {
             identity: identity.clone(),
             agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{identity}:0"))?,
-            session_id: meerkat_core::types::SessionId::new(),
+            session_id,
             generation: ContinuityGeneration::new(0),
             checkpoint_version: CheckpointVersion::new(0),
         };
@@ -17151,6 +17692,95 @@ comms = true
                 .iter()
                 .all(|event| event.event_type != "identity_retired"),
             "reset_all retires nothing here: {lifecycle:#?}"
+        );
+
+        let _ = runtime.handle().stop().await;
+        Ok(())
+    }
+
+    /// A single identity reset reports no cleanup warning: its successor
+    /// transition retired the previous live member. The response and the
+    /// `identity_reset` lifecycle frame keep the field, always null, for wire
+    /// compatibility (as respawn keeps its retired warnings).
+    #[tokio::test]
+    async fn console_runtime_reset_reports_no_cleanup_warning()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (_temp_dir, runtime) =
+            build_empty_console_test_runtime("console-reset-successor-note").await?;
+        spawn_identity_control_test_member(&runtime, "review:active", "review:active").await?;
+        let store = Arc::new(LocalContinuityStore::in_memory()?);
+        let lease_provider = Arc::new(LocalLeaseProvider::new());
+        let identity_runtime =
+            reset_all_test_identity_runtime(&store, &lease_provider, "test-runtime");
+        let identity = AgentIdentity::parse("review:active")?;
+        // The registered binding names the live member's own session, so
+        // the reset passes the console's live-binding check.
+        let live_session = runtime
+            .handle()
+            .resolve_bridge_session_id_observation(&crate::member_comms_id::mob_member_id(
+                "review:active",
+            ))
+            .await
+            .expect("spawned member has a bridge session");
+        register_leased_active_identity_on_session(
+            &identity_runtime,
+            &store,
+            &lease_provider,
+            "test-runtime",
+            &identity,
+            live_session,
+        )
+        .await?;
+
+        let console_events = ConsoleEventStore::new();
+        let response = Box::pin(handle_console_runtime_rpc(
+            &runtime,
+            None,
+            None,
+            None,
+            Some(console_events.clone()),
+            None,
+            Some(identity_runtime.clone()),
+            None,
+            None,
+            rpc_request_with_params("meta/reset", json!({ "identity": "review:active" })),
+            true,
+        ))
+        .await;
+        assert_eq!(response["error"], Value::Null, "{response:#?}");
+        let result = response["result"].as_object().expect("reset result");
+        let mut fields = result.keys().map(String::as_str).collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "agent_runtime_id",
+                "checkpoint_version",
+                "cleanup_warning",
+                "generation",
+                "identity",
+                "session_id"
+            ],
+            "{response:#?}"
+        );
+        assert_eq!(result["cleanup_warning"], Value::Null, "{response:#?}");
+        assert_eq!(result["agent_runtime_id"], json!("rt:review:active:1"));
+        let lifecycle = console_events
+            .replay_all(None)
+            .await
+            .map_err(|err| format!("replay_all: {}", err.error))?;
+        let frame = lifecycle
+            .iter()
+            .find(|event| event.event_type == "identity_reset")
+            .ok_or("the reset records an identity_reset frame")?;
+        assert_eq!(
+            frame.data,
+            json!({
+                "generation": result["generation"],
+                "checkpoint_version": result["checkpoint_version"],
+                "cleanup_warning": null,
+            }),
+            "{lifecycle:#?}"
         );
 
         let _ = runtime.handle().stop().await;
@@ -20185,43 +20815,176 @@ comms = true
             );
         }
 
+        // No live member carries the stale runtime id any more, as after a
+        // reset, which rebinds the identity's one roster row. Every identity
+        // route answers the typed stale-binding refusal the member routes
+        // give, naming the registered binding, and acts on nothing.
         let (_temp_dir_without_stale, runtime_without_stale) =
             build_empty_console_test_runtime("console-identity-no-live-stale-alias").await?;
-
-        for method in [
-            "meta/status_identity",
-            "meta/inspect_identity",
-            "meta/retire",
-            "meta/respawn",
-            "meta/reset",
+        let registered = identity_runtime
+            .status(&AgentIdentity::parse("review:singleton")?)
+            .await?;
+        let binding = |status: &crate::identity_first::IdentityStatus| {
+            (
+                status.state,
+                status.agent_runtime_id.clone(),
+                status.session_id.clone(),
+                status.generation,
+            )
+        };
+        for (method, operation) in [
+            ("meta/status_identity", "status_identity"),
+            ("meta/inspect_identity", "inspect_identity"),
+            ("meta/retire", "retire"),
+            ("meta/respawn", "respawn"),
+            ("meta/reset", "reset"),
+            ("meta/delete_identity", "delete_identity"),
         ] {
-            let response = Box::pin(handle_console_runtime_rpc(
+            let response = Box::pin(console_identity_rpc_under_policy(
                 &runtime_without_stale,
-                None,
-                None,
-                None,
-                Some(ConsoleEventStore::new()),
-                None,
-                Some(identity_runtime.clone()),
-                None,
-                None,
-                rpc_request_with_params(method, json!({ "identity": "rt:review:singleton:0" })),
-                true,
+                &identity_runtime,
+                &AllowAllConsoleVisibilityPolicy,
+                method,
+                "rt:review:singleton:0",
             ))
             .await;
-            assert_ne!(
+            assert_eq!(
                 response["error"],
-                Value::Null,
-                "{method} must reject stale synthetic runtime alias"
+                json!({
+                    "code": -32000,
+                    "message": format!(
+                        "{operation} failed: identity runtime binding for review:singleton \
+                         points at rt:review:singleton:1, but requested live member is \
+                         rt:review:singleton:0"
+                    ),
+                    "data": {
+                        "kind": "stale_identity_runtime_binding",
+                        "identity": "review:singleton",
+                        "registered_runtime_member_id": "rt:review:singleton:1",
+                        "live_runtime_member_id": "rt:review:singleton:0",
+                        "registered_session_id": registered
+                            .session_id
+                            .as_ref()
+                            .map(ToString::to_string),
+                        "live_session_id": null,
+                    },
+                }),
+                "{method} answers a stale runtime id with the typed stale-binding refusal: \
+                 {response:#?}"
+            );
+
+            // A hidden identity's stale runtime id names no binding.
+            let hidden = Box::pin(console_identity_rpc_under_policy(
+                &runtime_without_stale,
+                &identity_runtime,
+                &HideIdentityPolicy("review:singleton"),
+                method,
+                "rt:review:singleton:0",
+            ))
+            .await;
+            assert_eq!(
+                hidden["error"]["data"]["kind"],
+                json!("identity_hidden_by_policy"),
+                "{method}: {hidden:#?}"
             );
             assert!(
-                response["error"]["message"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("identity not found: rt:review:singleton:0"),
-                "unexpected no-live stale-alias response for {method}: {response:#?}"
+                !hidden.to_string().contains("rt:review:singleton:1"),
+                "{method} names no binding of a hidden identity: {hidden}"
+            );
+
+            // A runtime id of an identity the identity runtime does not know
+            // stays not found.
+            let unknown = Box::pin(console_identity_rpc_under_policy(
+                &runtime_without_stale,
+                &identity_runtime,
+                &AllowAllConsoleVisibilityPolicy,
+                method,
+                "rt:review:nobody:0",
+            ))
+            .await;
+            assert_eq!(
+                (&unknown["error"]["code"], &unknown["error"]["message"]),
+                (
+                    &json!(-32602),
+                    &json!("identity not found: rt:review:nobody:0")
+                ),
+                "{method}: {unknown:#?}"
             );
         }
+        // The console-namespaced inspect answers the same refusal for a
+        // stale runtime id, before the aggregator lookup that would call it
+        // unknown.
+        let inspected = Box::pin(console_identity_rpc_under_policy(
+            &runtime_without_stale,
+            &identity_runtime,
+            &AllowAllConsoleVisibilityPolicy,
+            "meta/console/inspect_identity",
+            "rt:review:singleton:0",
+        ))
+        .await;
+        assert_eq!(
+            inspected["error"],
+            json!({
+                "code": -32000,
+                "message": "inspect_identity failed: identity runtime binding for \
+                            review:singleton points at rt:review:singleton:1, but \
+                            requested live member is rt:review:singleton:0",
+                "data": {
+                    "kind": "stale_identity_runtime_binding",
+                    "identity": "review:singleton",
+                    "registered_runtime_member_id": "rt:review:singleton:1",
+                    "live_runtime_member_id": "rt:review:singleton:0",
+                    "registered_session_id": registered
+                        .session_id
+                        .as_ref()
+                        .map(ToString::to_string),
+                    "live_session_id": null,
+                },
+            }),
+            "{inspected:#?}"
+        );
+        let hidden = Box::pin(console_identity_rpc_under_policy(
+            &runtime_without_stale,
+            &identity_runtime,
+            &HideIdentityPolicy("review:singleton"),
+            "meta/console/inspect_identity",
+            "rt:review:singleton:0",
+        ))
+        .await;
+        assert_eq!(
+            hidden["error"]["data"]["kind"],
+            json!("identity_hidden_by_policy"),
+            "{hidden:#?}"
+        );
+        assert!(
+            !hidden.to_string().contains("rt:review:singleton:1"),
+            "{hidden}"
+        );
+        // The current runtime id and an unknown one are not refused as stale:
+        // they reach the aggregator lookup (none is configured here).
+        for id in ["rt:review:singleton:1", "rt:review:nobody:0"] {
+            let answered = Box::pin(console_identity_rpc_under_policy(
+                &runtime_without_stale,
+                &identity_runtime,
+                &AllowAllConsoleVisibilityPolicy,
+                "meta/console/inspect_identity",
+                id,
+            ))
+            .await;
+            assert_eq!(
+                answered["error"]["code"],
+                json!(-32004),
+                "{id}: {answered:#?}"
+            );
+        }
+        let after = identity_runtime
+            .status(&AgentIdentity::parse("review:singleton")?)
+            .await?;
+        assert_eq!(
+            binding(&after),
+            binding(&registered),
+            "refusing a stale runtime id changes nothing"
+        );
         let _ = runtime_without_stale.handle().stop().await;
 
         let _ = runtime.handle().stop().await;
@@ -21620,7 +22383,7 @@ comms = true
     fn console_visibility_policy_hides_implicit_delegate_members_from_snapshot() {
         let mut snapshot = ConsoleLiveSnapshot::new(
             Some("runtime".to_string()),
-            true,
+            Some(true),
             vec!["incident-commander".to_string(), "qa-child".to_string()],
             vec![
                 ConsoleAgentLiveSnapshot {
@@ -21769,7 +22532,9 @@ comms = true
         assert_eq!(members[0].session_id, None);
         assert!(session_owner_by_id.is_empty());
 
-        let refreshed_read_model = collect_console_snapshot_read_model(&runtime).await;
+        let refreshed_read_model =
+            collect_console_snapshot_read_model(&runtime, None, &super::WalkedHook::default())
+                .await;
         let (members, session_owner_by_id) = project_console_members_from_handle(
             &runtime.handle(),
             None,

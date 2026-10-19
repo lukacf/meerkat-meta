@@ -252,6 +252,9 @@ impl UnifiedRuntime {
     }
 
     pub async fn shutdown(&self) -> UnifiedRuntimeShutdownReport {
+        // The close begins under the bootstrap completion's gate: a running
+        // publication finishes first, and every later one is refused.
+        self.close_gate.close();
         self.shutting_down.store(true, Ordering::SeqCst);
         // The liveness probe is observation only. Abort it before anything
         // can quiesce the mob actor so an intentional shutdown stall cannot
@@ -634,8 +637,11 @@ impl UnifiedRuntime {
                 }
                 MobTerminalShutdownOutcome::Completed(report)
             }
-            // A mob shutting down answers every caller request with a closed
-            // command channel: the actor is already gone, not failing.
+            // A closed command channel means the actor task has ended: the
+            // mob is already shut down, not failing. A Shutdown sent while
+            // another one drains joins it and gets that Shutdown's result,
+            // so this call never sees `ShutdownInProgress` (meerkat answers
+            // only other requests with it during a drain).
             Err(
                 meerkat_mob::MobError::ActorCommandChannelClosed
                 | meerkat_mob::MobError::ActorReplyChannelClosed,

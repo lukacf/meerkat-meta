@@ -3,6 +3,7 @@
 use super::*;
 use crate::access::{AccessController, AccessResource, AccessView, AgentResourceAttributes};
 use crate::rpc::META_CONTRACT_VERSION;
+use crate::unobserved::{UnobservedFacts, UnobservedReason};
 
 /// Console-facing view of a single mob member.
 ///
@@ -103,15 +104,23 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ConsoleLiveSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<String>,
-    pub running: bool,
+    /// Whether the mob runs, as its owner answered for this snapshot;
+    /// `None` when nothing observed it (`unobserved` names it). Never
+    /// defaulted: an absent answer is not a running mob.
+    pub running: Option<bool>,
     pub loaded_modules: Vec<String>,
     #[serde(default)]
     pub agents: Vec<ConsoleAgentLiveSnapshot>,
     pub members: Vec<ConsoleMember>,
     pub has_mob_runtime: bool,
+    /// The snapshot's facts that hold no observation
+    /// ([`crate::unobserved`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unobserved: Option<UnobservedFacts>,
 }
 
 fn console_member_console_identity(member: &ConsoleMember) -> &str {
@@ -122,7 +131,7 @@ fn console_member_console_identity(member: &ConsoleMember) -> &str {
 impl ConsoleLiveSnapshot {
     pub fn new(
         runtime_id: Option<String>,
-        running: bool,
+        running: Option<bool>,
         loaded_modules: Vec<String>,
         agents: Vec<ConsoleAgentLiveSnapshot>,
         members: Vec<ConsoleMember>,
@@ -149,6 +158,9 @@ impl ConsoleLiveSnapshot {
             agents: deduped_agents,
             members,
             has_mob_runtime,
+            unobserved: running
+                .is_none()
+                .then(|| UnobservedFacts::new(UnobservedReason::NotObserved, &["running"])),
         }
     }
 }
@@ -221,6 +233,31 @@ pub fn handle_console_rest_json_route_with_snapshot_access_memory_and_workgraph(
     access: Option<&AccessController>,
     memory_panel_available: bool,
     workgraph_available: bool,
+) -> ConsoleRestJsonResponse {
+    handle_console_rest_json_route_with_pending_rows(
+        decisions,
+        request,
+        live_snapshot,
+        access,
+        memory_panel_available,
+        workgraph_available,
+        &BTreeSet::new(),
+    )
+}
+
+/// [`handle_console_rest_json_route_with_snapshot_access_memory_and_workgraph`]
+/// for a snapshot whose `pending` identities were walked under an identity
+/// binding that has since moved. Access and visibility decide on the
+/// walked facts; the experience then renders every record of a pending
+/// identity, in every panel, in its withheld shape.
+pub(crate) fn handle_console_rest_json_route_with_pending_rows(
+    decisions: &RuntimeDecisionState,
+    request: &ConsoleRestJsonRequest,
+    live_snapshot: Option<&ConsoleLiveSnapshot>,
+    access: Option<&AccessController>,
+    memory_panel_available: bool,
+    workgraph_available: bool,
+    pending: &BTreeSet<String>,
 ) -> ConsoleRestJsonResponse {
     let (base_path, query_params) = split_path_and_query(&request.path);
     if request.method != "GET"
@@ -303,7 +340,7 @@ pub fn handle_console_rest_json_route_with_snapshot_access_memory_and_workgraph(
         filter_snapshot_for_access(&mut live_snapshot, view);
     }
     let mut body = if base_path == CONSOLE_EXPERIENCE_ROUTE {
-        build_console_experience_contract(&modules, &live_snapshot, &decisions.console)
+        build_console_experience_contract(&modules, &live_snapshot, &decisions.console, pending)
     } else {
         serde_json::json!({
             "contract_version": META_CONTRACT_VERSION,
@@ -546,20 +583,112 @@ fn default_console_live_snapshot(decisions: &RuntimeDecisionState) -> ConsoleLiv
             degraded_reason: None,
         })
         .collect::<Vec<_>>();
-    ConsoleLiveSnapshot::new(
-        None,
-        !decisions.modules.is_empty(),
-        loaded_modules,
-        agents,
-        Vec::new(),
-        false,
-    )
+    // No live runtime answers for this snapshot: whether a mob runs is
+    // unobserved, not inferred from the configured modules.
+    ConsoleLiveSnapshot::new(None, None, loaded_modules, agents, Vec::new(), false)
+}
+
+/// The `unobserved` marker of a console record (see [`crate::unobserved`]).
+fn unobserved_marker(reason: UnobservedReason, fields: &[&str]) -> Value {
+    UnobservedFacts::new(reason, fields).to_value()
+}
+
+/// Sidebar facts a pending row withholds.
+const PENDING_SIDEBAR_WITHHELD_FIELDS: &[&str] = &[
+    "state",
+    "role",
+    "label",
+    "group",
+    "labels",
+    "wired_to",
+    "model_capabilities",
+    "addressable",
+    "watched",
+    "alertLevel",
+    "degraded",
+    "degradedReason",
+];
+
+/// identity_status and health_overview facts a pending row withholds.
+const PENDING_IDENTITY_STATUS_WITHHELD_FIELDS: &[&str] = &[
+    "state",
+    "role",
+    "display_name",
+    "labels",
+    "addressability",
+    "model_capabilities",
+];
+
+/// Topology facts a pending node withholds.
+const PENDING_TOPOLOGY_WITHHELD_FIELDS: &[&str] =
+    &["label", "role", "state", "wired_to", "addressable"];
+
+/// The sidebar row of an identity answered pending: its identity binding
+/// moved and the read model had not re-collected it by the refresh deadline.
+/// It carries only what the owners answer now (the identity runtime's
+/// session and the runtime machine's bounded run state), the identity and
+/// the typed marker: state "unknown", fail-closed affordances (no send, no
+/// retire; a respawn resolves its target live). Visibility and access
+/// already decided on the walked facts, so a policy that matches them still
+/// applies.
+fn pending_sidebar_record(
+    member: &ConsoleMember,
+    console_identity: &str,
+    response_phase: Option<&Option<String>>,
+    is_read_only: bool,
+    is_aggregate_console: bool,
+) -> Value {
+    let mut record = serde_json::json!({
+        "agent_id": member.agent_identity,
+        "member_id": member.agent_identity,
+        "identity": console_identity,
+        "label": console_identity,
+        "kind": "mob_agent",
+        "state": "unknown",
+        "progress": member.progress,
+        "session_id": member.session_id,
+        "wired_to": [],
+        "labels": { "agent_identity": console_identity },
+        "addressable": false,
+        "affordances": {
+            "addressable": false,
+            "can_send_message": false,
+            "can_retire": false,
+            "can_respawn": !is_read_only && !is_aggregate_console,
+            "runtime_mode": if is_aggregate_console { "console_aggregator" } else { "mob_agent" },
+        },
+        "unobserved": unobserved_marker(
+            UnobservedReason::RefreshPending,
+            PENDING_SIDEBAR_WITHHELD_FIELDS,
+        ),
+    });
+    if let Some(phase) = response_phase {
+        record["response_phase"] = serde_json::json!(phase);
+    }
+    record
+}
+
+/// The topology node of an identity answered pending: its key, state
+/// "unknown" and the marker, never its walked label, role or wiring.
+fn pending_topology_node(member: &ConsoleMember) -> Value {
+    serde_json::json!({
+        "identity": member.agent_identity,
+        "label": member.agent_identity,
+        "state": "unknown",
+        "wired_to": [],
+        "addressable": false,
+        "unobserved": unobserved_marker(
+            UnobservedReason::RefreshPending,
+            PENDING_TOPOLOGY_WITHHELD_FIELDS,
+        ),
+    })
 }
 
 fn build_console_experience_contract(
     modules: &[String],
     live_snapshot: &ConsoleLiveSnapshot,
     console_policy: &ConsolePolicy,
+    pending: &BTreeSet<String>,
 ) -> Value {
     let console_config = &console_policy.ui;
     let is_read_only = console_policy.read_only;
@@ -621,6 +750,15 @@ fn build_console_experience_contract(
                 .iter()
                 .map(|member| {
                     let console_identity = console_member_console_identity(member);
+                    if pending.contains(console_identity) {
+                        return pending_sidebar_record(
+                            member,
+                            console_identity,
+                            response_phases.get(console_identity).copied(),
+                            is_read_only,
+                            is_aggregate_console,
+                        );
+                    }
                     let label = member
                         .labels
                         .get("display_name")
@@ -786,12 +924,17 @@ fn build_console_experience_contract(
     let can_spawn_members = !is_read_only && has_mob && !is_aggregate_console;
     let can_wire_members = !is_read_only && has_mob && !is_aggregate_console;
     let can_retire_members = !is_read_only && has_mob && !is_aggregate_console;
-    let identity_status_rows = build_identity_status_rows(&sidebar_agents);
+    let identity_status_rows = build_identity_status_rows(&sidebar_agents, pending);
 
     // P3: Build per-profile capability hints from roster data.
     let profile_capabilities: BTreeMap<String, Value> = {
         let mut profiles: BTreeMap<String, (usize, bool, bool)> = BTreeMap::new();
-        for member in &live_snapshot.members {
+        // A pending identity's role was walked under its moved binding.
+        for member in live_snapshot
+            .members
+            .iter()
+            .filter(|member| !pending.contains(console_member_console_identity(member)))
+        {
             let entry = profiles
                 .entry(member.role.clone())
                 .or_insert((0, true, false));
@@ -984,6 +1127,9 @@ fn build_console_experience_contract(
                 // Mob runtime: identity-native topology from members.
                 serde_json::json!({
                     "nodes": live_snapshot.members.iter().map(|member| {
+                        if pending.contains(console_member_console_identity(member)) {
+                            return pending_topology_node(member);
+                        }
                         let addressable = member.state == "active" && member
                             .labels
                             .get("addressable")
@@ -1070,6 +1216,9 @@ fn build_console_experience_contract(
             })
         }
     });
+    if let Some(unobserved) = &live_snapshot.unobserved {
+        body["health_overview"]["live_snapshot"]["unobserved"] = unobserved.to_value();
+    }
     if let Some(fetch_timeout_ms) = console_policy.fetch_timeout_ms {
         body["console_policy"] = serde_json::json!({
             "fetch_timeout_ms": fetch_timeout_ms,
@@ -1084,7 +1233,7 @@ fn build_console_experience_contract(
     body
 }
 
-fn build_identity_status_rows(sidebar_agents: &[Value]) -> Vec<Value> {
+fn build_identity_status_rows(sidebar_agents: &[Value], pending: &BTreeSet<String>) -> Vec<Value> {
     sidebar_agents
         .iter()
         .map(|agent| {
@@ -1150,6 +1299,12 @@ fn build_identity_status_rows(sidebar_agents: &[Value]) -> Vec<Value> {
             }
             if let Some(session_id) = agent.get("session_id").and_then(Value::as_str) {
                 row["session_id"] = Value::String(session_id.to_string());
+            }
+            if pending.contains(identity) {
+                row["unobserved"] = unobserved_marker(
+                    UnobservedReason::RefreshPending,
+                    PENDING_IDENTITY_STATUS_WITHHELD_FIELDS,
+                );
             }
             row
         })

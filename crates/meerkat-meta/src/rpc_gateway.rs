@@ -940,6 +940,9 @@ mod tests {
         )
         .expect("default filter must parse");
         let subscriber = tracing_subscriber::registry().with(filter);
+        // A second registered Dispatch keeps callsite interest from being
+        // cached `never` by threads without a subscriber.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
         tracing::subscriber::with_default(subscriber, || {
             assert!(
                 tracing::enabled!(
@@ -2947,6 +2950,9 @@ default_binding = "local"
             .with_writer(writer.clone())
             .with_max_level(tracing::Level::WARN)
             .finish();
+        // A second registered Dispatch keeps callsite interest from being
+        // cached `never` by threads without a subscriber.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
         let _guard = tracing::subscriber::set_default(subscriber);
 
         for tick in 0..5 {
@@ -5977,6 +5983,8 @@ comms = true
             summary_tokens: 10,
             messages_before: 20,
             messages_after: 2,
+            summary_source: None,
+            estimated_history_tokens_after: None,
         };
 
         use crate::MemberAgentEventSink as _;
@@ -14330,6 +14338,9 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
     /// Publish the exact SDK Ready response and start its HTTP surface while
     /// serialized against the native owner's actual close transition. The
     /// one-use publication is synchronous and cannot wait for queue capacity.
+    /// It also carries the runtime's bootstrap completion
+    /// ([`GatewayBootstrapReady::take_runtime_completion`]), to publish
+    /// inside this same boundary.
     fn publish_bootstrap_ready(
         &self,
         publication: GatewayBootstrapReady<'_>,
@@ -14705,9 +14716,23 @@ pub struct GatewayBootstrapReady<'a> {
     http_binding: crate::gateway_composition::GatewayHttpBinding,
     app: axum::Router,
     server: &'a mut Option<crate::gateway_composition::GatewayHttpServer>,
+    runtime_completion: Option<crate::unified_runtime::RuntimeBootstrapCompleted>,
 }
 
 impl GatewayBootstrapReady<'_> {
+    /// The runtime's bootstrap completion this Ready carries, once. The
+    /// driver took it from the runtime
+    /// ([`UnifiedRuntime::take_bootstrap_completion`]) after reserving this
+    /// Ready's stdout capacity, so an in-process host's
+    /// `take_bootstrap_completion` answers `AlreadyTaken`. Publish it here,
+    /// inside the same close boundary, with the same publication the host's
+    /// in-process path uses. A Ready published without taking it drops it.
+    pub fn take_runtime_completion(
+        &mut self,
+    ) -> Option<crate::unified_runtime::RuntimeBootstrapCompleted> {
+        self.runtime_completion.take()
+    }
+
     /// Called synchronously inside the actual host close owner's publication
     /// boundary. Capacity was reserved before entry; this never waits or calls
     /// model/tool code and cannot reenter host ownership.
@@ -14717,6 +14742,12 @@ impl GatewayBootstrapReady<'_> {
     }
 }
 
+/// `runtime` gives up its bootstrap completion to the Ready only once the
+/// Ready's stdout capacity is reserved: an earlier close leaves it untaken.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the driver's one Ready publication step and its inputs"
+)]
 async fn publish_native_bootstrap_ready(
     host: &Arc<dyn GatewayHostComposition>,
     stdout: mpsc::Sender<GatewayStdoutLine>,
@@ -14725,6 +14756,7 @@ async fn publish_native_bootstrap_ready(
     app: axum::Router,
     server: &mut Option<crate::gateway_composition::GatewayHttpServer>,
     stdio: &mut Option<GatewayStdioObservation>,
+    runtime: Option<&UnifiedRuntime>,
 ) -> Result<(), GatewayRunError> {
     let stdout = tokio::select! {
         biased;
@@ -14732,12 +14764,14 @@ async fn publish_native_bootstrap_ready(
         _ = host.wait_closed() => return Err(GatewayRunError::HostClosed),
         permit = stdout.reserve_owned() => permit.map_err(|_| GatewayRunError::Input("stdout closed before Ready".into()))?,
     };
+    let runtime_completion = runtime.and_then(|runtime| runtime.take_bootstrap_completion().ok());
     host.publish_bootstrap_ready(GatewayBootstrapReady {
         stdout,
         line,
         http_binding,
         app,
         server,
+        runtime_completion,
     })
     .map_err(GatewayRunError::Host)
 }
@@ -18680,6 +18714,7 @@ external_addressable = true
                 app,
                 &mut resources.http_server,
                 &mut resources.stdio,
+                Some(runtime.as_ref()),
             )
             .await?;
         }
@@ -19102,7 +19137,7 @@ mod native_host_cleanup_tests {
         }
         fn publish_bootstrap_ready(
             &self,
-            publication: GatewayBootstrapReady<'_>,
+            mut publication: GatewayBootstrapReady<'_>,
         ) -> Result<(), GatewayHostError> {
             let mut events = self.events.lock().unwrap();
             if events.iter().any(|event| {
@@ -19112,6 +19147,13 @@ mod native_host_cleanup_tests {
                 )
             }) {
                 return Err(GatewayHostError::Denied);
+            }
+            // The runtime's completion, published inside the same boundary.
+            if let Some(completion) = publication.take_runtime_completion() {
+                events.push(match completion.publish(|| ()) {
+                    Ok(()) => "completion_published",
+                    Err(_) => "completion_refused",
+                });
             }
             publication.publish();
             events.push("ready");
@@ -19645,6 +19687,67 @@ mod native_host_cleanup_tests {
             ["caller_cancelled", "disconnected", "join"]
         );
     }
+    /// The driver takes the runtime's bootstrap completion only once the
+    /// Ready's stdout capacity is reserved, so a close before that leaves it
+    /// with the runtime. The Ready then carries it, and the host publishes it
+    /// inside its own publication boundary.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_ready_carries_the_runtime_bootstrap_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = crate::unified_runtime::held_identity_test_support::governed_runtime(
+            &dir,
+            "ready-completion",
+        )
+        .await;
+        let owner = probe(Ok(()), Ok(()));
+        let host: Arc<dyn GatewayHostComposition> = owner.clone();
+        let mut server = None;
+
+        let (stdout, output) = mpsc::channel(1);
+        drop(output);
+        let early = publish_native_bootstrap_ready(
+            &host,
+            stdout,
+            GatewayStdoutLine::plain("Ready".into()),
+            crate::gateway_composition::GatewayHttpBinding::bind_loopback()
+                .await
+                .unwrap(),
+            axum::Router::new(),
+            &mut server,
+            &mut None,
+            Some(&runtime),
+        )
+        .await;
+        assert!(matches!(early, Err(GatewayRunError::Input(_))), "{early:?}");
+        assert!(owner.events.lock().unwrap().is_empty());
+
+        let (stdout, mut output) = mpsc::channel(1);
+        publish_native_bootstrap_ready(
+            &host,
+            stdout,
+            GatewayStdoutLine::plain("Ready".into()),
+            crate::gateway_composition::GatewayHttpBinding::bind_loopback()
+                .await
+                .unwrap(),
+            axum::Router::new(),
+            &mut server,
+            &mut None,
+            Some(&runtime),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *owner.events.lock().unwrap(),
+            ["completion_published", "ready"]
+        );
+        assert!(output.try_recv().is_ok(), "the Ready line was sent");
+        assert_eq!(
+            runtime.take_bootstrap_completion().err(),
+            Some(crate::BootstrapCompletionUnavailable::AlreadyTaken)
+        );
+        server.take().unwrap().shutdown().await;
+        runtime.shutdown().await;
+    }
     #[tokio::test]
     async fn constructor_completing_after_host_loss_publishes_no_ready_or_http_server() {
         let owner = probe(Ok(()), Ok(()));
@@ -19667,6 +19770,7 @@ mod native_host_cleanup_tests {
                 axum::Router::new(),
                 &mut server,
                 &mut None,
+                None,
             )
             .await;
             assert!(server.is_none());
@@ -19736,6 +19840,7 @@ mod native_host_cleanup_tests {
                         axum::Router::new(),
                         &mut resources.http_server,
                         &mut resources.stdio,
+                        None,
                     )
                     .await;
                     assert!(resources.http_server.is_none());
@@ -19929,7 +20034,7 @@ mod native_host_cleanup_tests {
             };
             let ready = publish_native_bootstrap_ready(
                 &host, stdout, GatewayStdoutLine::plain("Ready".into()), binding,
-                axum::Router::new(), &mut resources.http_server, &mut resources.stdio,
+                axum::Router::new(), &mut resources.http_server, &mut resources.stdio, None,
             ).await;
             assert!(resources.http_server.is_none());
             assert!(resources.finish(Some(&host), ready).await.is_err());
@@ -19994,6 +20099,7 @@ mod native_host_cleanup_tests {
                 axum::Router::new(),
                 &mut resources.http_server,
                 &mut resources.stdio,
+                None,
             )
             .await;
             assert!(resources.http_server.is_none());
@@ -20034,6 +20140,7 @@ mod native_host_cleanup_tests {
                     axum::Router::new(),
                     &mut resources.http_server,
                     &mut resources.stdio,
+                    None,
                 )
                 .await
                 .unwrap();

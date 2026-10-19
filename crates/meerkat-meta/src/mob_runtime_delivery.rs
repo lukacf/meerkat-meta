@@ -348,9 +348,11 @@ impl RunningMobRuntimeDelivery {
 
 /// Tells a runtime's continuation delivery that the custody its bound
 /// continuation sources read may have changed. A host calls it once it has
-/// restored that custody, after the facts are readable through the bound
-/// source. The delivery owner subscribed to the same bindings then retries
-/// the rows it holds blocked (see
+/// restored that custody, and once its source owner settled an original a
+/// retained resume may wait on (it promoted or withdrew a candidate whose
+/// retained custody read `AdmissionPending`), after the facts are readable
+/// through the bound source. The delivery owner subscribed to the same
+/// bindings then retries the rows it holds blocked (see
 /// [`meerkat::ContinuationHostBindings::source_custody_changed`]).
 ///
 /// It is a hint, not a fact. It grants nothing, asserts nothing and carries

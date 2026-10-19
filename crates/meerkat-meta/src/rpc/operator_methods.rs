@@ -173,13 +173,7 @@ async fn resolve_operator_target(
     let target = match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
     {
         Ok(target) => target,
-        Err(e) => {
-            return Err(Box::new(rpc_error(
-                response_id.clone(),
-                -32602,
-                format!("invalid identity: {e}"),
-            )));
-        }
+        Err(error) => return Err(Box::new(error.into_response(response_id.clone()))),
     };
     if let Some(response) =
         rpc_stale_live_alias_error_response(identity_rt, &target, response_id.clone()).await
@@ -1930,7 +1924,8 @@ comms = true
         handle
             .wait_for_members_kickoff_complete(
                 std::slice::from_ref(&roster_identity),
-                Some(Duration::from_secs(5)),
+                // A settle bound only: the assertions below check state, not elapsed time.
+                Some(Duration::from_secs(30)),
             )
             .await
             .expect("member kickoff settled");
@@ -3071,6 +3066,68 @@ comms = true
             .iter()
             .map(|message| serde_json::to_value(message).expect("message json"))
             .collect()
+    }
+
+    /// The two operator verbs that check an activation or a wired transcript
+    /// service before they resolve their target refuse a generated id that
+    /// is not the member's registered binding with the typed stale-binding
+    /// refusal, through the operator response path, as the stdio identity
+    /// methods do.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn operator_verbs_with_preconditions_refuse_a_stale_runtime_id() {
+        let harness = operator_verb_harness("worker:main", "operator-stale-runtime-id").await;
+        let registered = harness
+            .identity_runtime
+            .status(&harness.identity)
+            .await
+            .expect("identity status");
+        assert_eq!(
+            registered
+                .agent_runtime_id
+                .as_ref()
+                .map(crate::identity_first::AgentRuntimeId::as_str),
+            Some("rt:worker:main:0"),
+            "the harness binds generation 0"
+        );
+        let expected = serde_json::json!({
+            "code": -32000,
+            "message": "identity runtime binding for worker:main points at \
+                        rt:worker:main:0, but requested live member is rt:worker:main:1",
+            "data": {
+                "kind": "stale_identity_runtime_binding",
+                "identity": "worker:main",
+                "registered_runtime_member_id": "rt:worker:main:0",
+                "live_runtime_member_id": "rt:worker:main:1",
+                "registered_session_id": registered
+                    .session_id
+                    .as_ref()
+                    .map(ToString::to_string),
+                "live_session_id": null,
+            },
+        });
+        for (method, params) in [
+            (
+                "meta/member_activate_instruction",
+                serde_json::json!({
+                    "identity": "rt:worker:main:1",
+                    "activation": instruction_activation(
+                        "r1",
+                        "a1",
+                        serde_json::json!({"kind": "absent"}),
+                        None,
+                        "Use the tools you were granted.",
+                    ),
+                }),
+            ),
+            (
+                "meta/bound_member_transcript",
+                serde_json::json!({"identity": "rt:worker:main:1"}),
+            ),
+        ] {
+            let response = rpc(&harness, method, params).await;
+            assert_eq!(response["error"], expected, "{method}: {response:#?}");
+        }
+        harness.teardown().await;
     }
 
     /// `meta/member_activate_instruction` appends forward: the transcript

@@ -6,13 +6,17 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from launchkit.elephant_setup import ELEPHANT_REVISION, generate_elephant_files
+from launchkit.elephant_setup import ELEPHANT_REPOSITORY, ELEPHANT_REVISION, generate_elephant_files
+
+# The default pin that earlier versions recorded; no repository serves it now.
+RETIRED_DEFAULT_REVISION = "98307999503609abde1b06861154c1fef5b113e5"
 
 
 @pytest.fixture
@@ -32,25 +36,78 @@ def config(**overrides):
     return {"mode": "local", "url": "http://127.0.0.1:8091/mcp/agent", "token_env": "ELEPHANT_TOKEN", "space_env": "ELEPHANT_SPACE_ID", **overrides}
 
 
-def test_local_compose_is_private_persistent_and_bootstraps_native_schema():
+def test_local_compose_is_one_embedded_service_with_a_private_volume():
     files = generate_elephant_files(config(), "test-project")
     compose = json.loads(files["knowledge/compose.json"])
-    services = compose["services"]
-    assert services["surrealdb"]["image"] == "surrealdb/surrealdb:v2.4.1"
-    assert "ports" not in services["surrealdb"]
-    assert "ports" not in services["reader"]
-    assert services["elephant"]["ports"] == ["127.0.0.1:8091:3000"]
-    assert services["elephant"]["environment"]["SKIP_AUTH"] == "false"
-    assert "MCP_BEARER_TOKEN" not in services["elephant"]["environment"]
-    assert services["elephant"]["environment"]["PIPELINE_AGENTIC_MCP_URL"] == "http://reader:3000/mcp/agent"
-    assert services["migrate"]["command"] == ["elephant", "migrate"]
-    assert services["reader"]["depends_on"]["migrate"]["condition"] == "service_completed_successfully"
-    assert "knowledge-data" in compose["volumes"]
+    assert list(compose["services"]) == ["elephant"]
+    service = compose["services"]["elephant"]
+    environment = service["environment"]
+    assert service["ports"] == ["127.0.0.1:8091:3000"]
+    assert service["command"] == ["sh", "-c", "elephant migrate && exec elephant serve"]
+    assert "--server-only" not in " ".join(service["command"])
+    assert environment["ELEPHANT_DB"] == "surreal-db"
+    assert environment["SURREALDB_URL"] == "rocksdb:///data/store"
+    assert environment["ELEPHANT_DURABILITY_PATH"].startswith("/data/")
+    assert service["volumes"][0] == "knowledge-data:/data" and set(compose["volumes"]) == {"knowledge-data", "knowledge-assets"}
+    assert environment["SKIP_AUTH"] == "false"
+    # The extractor reaches this space through the service's own listener.
+    assert environment["PIPELINE_AGENTIC_MCP_URL"] == "http://127.0.0.1:3000/mcp/agent"
+    assert environment["PIPELINE_AGENTIC_MCP_SPACE_ID"] == environment["MCP_SPACE_ID"] == "test-project"
+    assert environment["MCP_BEARER_TOKEN"] == "${MCP_BEARER_TOKEN:?Run knowledge/manage.py setup}"
+    assert not any("SURREALDB_PASS" in value or "SURREALDB_USER" in key for key, value in environment.items())
     settings = json.loads(files["knowledge/settings.json"])
     assert settings["source_revision"] == ELEPHANT_REVISION
-    assert "rust:1.94-bookworm" in files["knowledge/Dockerfile"]
-    assert "--locked" in files["knowledge/Dockerfile"]
+    assert settings["source_repository"] == "https://github.com/lukacf/meerkat-recall"
+    dockerfile = files["knowledge/Dockerfile"]
+    assert "rust:1.94-bookworm" in dockerfile
+    assert "--features meerkat-extraction,rocksdb" in dockerfile
+    assert "clang libclang-dev cmake" in dockerfile
     assert "Dockerfile.dockerignore" in " ".join(files)
+
+
+def test_local_image_provides_every_command_the_stack_runs():
+    files = generate_elephant_files(config(), "test-project")
+    dockerfile = files["knowledge/Dockerfile"]
+    assert "cargo build --locked --release -p meerkat-recall-bin " in dockerfile
+    provided = set(re.findall(r"/usr/local/bin/([\w.-]+)$", dockerfile, re.M))
+    image_command = json.loads(re.search(r"^CMD (.+)$", dockerfile, re.M).group(1))
+    services = json.loads(files["knowledge/compose.json"])["services"]
+    commands = [service.get("command", image_command) for service in services.values() if "build" in service]
+    assert commands and all(command == image_command for command in commands)
+    programs = set()
+    for command in commands:
+        assert command[:2] == ["sh", "-c"]
+        programs |= {step.split()[1] if step.split()[0] == "exec" else step.split()[0] for step in command[2].split("&&")}
+    assert programs == {"elephant"} and programs <= provided
+
+
+def test_local_image_lets_its_service_user_read_the_copied_source_files():
+    dockerfile = generate_elephant_files(config(), "test-project")["knowledge/Dockerfile"]
+    runtime = dockerfile.rsplit("\nFROM ", 1)[1].splitlines()
+    user = next(index for index, line in enumerate(runtime) if line.startswith("USER "))
+    # Copied files keep the checkout's modes, so a private umask would hide them from the service user.
+    copies = {index: line.split()[-1].rstrip("/") for index, line in enumerate(runtime[:user])
+              if line.startswith("COPY --from=build ") and line.endswith("/")}
+    assert sorted(copies.values()) == ["/app/migrations", "/app/skills"]
+    for index, target in copies.items():
+        assert any(line.startswith("RUN chmod -R a+rX ") and target in line.split()[4:] for line in runtime[index + 1:user])
+
+
+@pytest.mark.parametrize("repository", ["https://github.com/lukacf/elephant", "https://github.com/lukacf/elephant.git", ELEPHANT_REPOSITORY])
+def test_recompiled_retired_default_pin_builds_the_current_default(repository):
+    files = generate_elephant_files(config(source_repository=repository, source_revision=RETIRED_DEFAULT_REVISION), "test-project")
+    settings = json.loads(files["knowledge/settings.json"])
+    assert (settings["source_repository"], settings["source_revision"]) == (ELEPHANT_REPOSITORY, ELEPHANT_REVISION)
+    assert json.loads(files["knowledge/compose.json"])["services"]["elephant"]["image"] == f"mobkit-launch-elephant:{ELEPHANT_REVISION[:12]}"
+
+
+def test_explicit_source_pin_is_kept():
+    pin = {"source_repository": "https://github.com/example/knowledge-fork", "source_revision": "a" * 40}
+    settings = json.loads(generate_elephant_files(config(**pin), "test-project")["knowledge/settings.json"])
+    assert (settings["source_repository"], settings["source_revision"]) == (pin["source_repository"], pin["source_revision"])
+    other = json.loads(generate_elephant_files(config(source_revision=RETIRED_DEFAULT_REVISION,
+        source_repository="https://github.com/example/knowledge-fork"), "test-project")["knowledge/settings.json"])
+    assert other["source_revision"] == RETIRED_DEFAULT_REVISION
 
 
 def test_remote_mode_exports_verification_without_local_service():
@@ -87,6 +144,35 @@ def test_token_is_signed_scoped_and_read_only(manager):
     assert hmac.compare_digest(decode(signature), hmac.new(b"secret", f"{header}.{body}".encode(), hashlib.sha256).digest())
 
 
+def claims_of(token):
+    body = token.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+
+
+def test_extractor_token_is_read_only_and_names_one_granted_space(manager):
+    token = manager.worker_token("secret", "test-project", now=1000)
+    claims = claims_of(token)
+    # The five scopes the readiness check requires, plus the documented read:assertion.
+    assert sorted(claims["scopes"]) == ["read:assertion", "read:doc:metadata", "read:doc:raw", "read:entity", "read:predicate", "read:source"]
+    assert claims["sub"] == manager.WORKER_SUBJECT == "recall-extractor"
+    assert claims["space_id"] == "test-project" and claims["spaces"] == ["test-project"]
+    assert "bootstrap_space" not in claims
+    assert claims["clearances"] == [{"policy_id": "default", "max_level": 0, "labels": [], "handling_allow": []}]
+    assert (claims["iss"], claims["aud"]) == ("mobkit-launch", ["test-project"])
+    header, body, signature = token.split(".")
+    decode = lambda value: base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    assert hmac.compare_digest(decode(signature), hmac.new(b"secret", f"{header}.{body}".encode(), hashlib.sha256).digest())
+
+
+def test_bootstrap_token_only_administers_its_own_space_briefly(manager):
+    claims = claims_of(manager.bootstrap_token("secret", "test-project", now=1000))
+    assert claims["bootstrap_space"] == claims["space_id"] == "test-project" and claims["spaces"] == ["test-project"]
+    assert 1 <= claims["exp"] - claims["iat"] <= 3600
+    assert set(claims["scopes"]) == {"read:space_config", "write:space_config", "manage:grant", "manage:provider"}
+    assert claims["clearances"] and not {"security_labels", "subject_allowlist", "purpose"} & set(claims)
+    assert claims.get("security_level", 0) == 0
+
+
 def test_setup_keeps_operator_credentials_out_of_project_env(manager, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-openai-value")
     settings = {**config(), "provider": "openai", "project": "test-project"}
@@ -98,9 +184,56 @@ def test_setup_keeps_operator_credentials_out_of_project_env(manager, monkeypatc
     assert local["ELEPHANT_OPERATOR_TOKEN"] != project["ELEPHANT_TOKEN"]
     assert (manager.ROOT / ".env").stat().st_mode & 0o777 == 0o600
     assert (manager.ROOT.parent / ".env").stat().st_mode & 0o777 == 0o600
+    assert claims_of(local["MCP_BEARER_TOKEN"])["sub"] == "recall-extractor"
     old_secret = local["JWT_SECRET"]
     manager.setup(settings, renew=True)
     assert manager.read_env(manager.ROOT / ".env")["JWT_SECRET"] == old_secret
+
+
+def test_up_gives_an_older_folder_only_its_missing_extractor_token(manager, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-value")
+    settings = {**config(), "provider": "openai", "project": "test-project"}
+    manager.setup(settings)
+    path = manager.ROOT / ".env"
+    older = {key: value for key, value in manager.read_env(path).items() if key != "MCP_BEARER_TOKEN"}
+    manager.write_env(path, older)
+    project = (manager.ROOT.parent / ".env").read_bytes()
+    monkeypatch.setattr(manager, "load_settings", lambda: settings)
+    monkeypatch.setattr(manager, "local_preflight", lambda: None)
+    monkeypatch.setattr(manager, "setup", lambda *_, **__: pytest.fail("up re-ran setup for a folder that keeps its secrets"))
+    monkeypatch.setattr(manager.getpass, "getpass", lambda _: pytest.fail("up asked for a provider key"))
+    expected = claims_of(manager.worker_token(older["JWT_SECRET"], "test-project"))
+    minted = []
+    for name in ("jwt_token", "worker_token"):
+        monkeypatch.setattr(manager, name, lambda *args, _name=name, _mint=getattr(manager, name), **kwargs:
+                            minted.append(_name) or _mint(*args, **kwargs))
+    calls = []
+    monkeypatch.setattr(manager, "source_checkout", lambda _: calls.append("source"))
+    # Compose interpolates the token, so it must exist when the stack starts.
+    monkeypatch.setattr(manager, "compose", lambda *args: calls.append((args[0], "MCP_BEARER_TOKEN" in manager.read_env(path))))
+    monkeypatch.setattr(manager, "provision", lambda _, values: calls.append(("provision", "MCP_BEARER_TOKEN" in values)) or {})
+    monkeypatch.setattr(manager, "space_status", lambda *_, **__: {})
+    async def verify(*_args, **_kwargs):
+        return {"connected": True}
+    monkeypatch.setattr(manager, "mcp_operation", verify)
+    monkeypatch.setattr(sys, "argv", ["manage.py", "up"])
+    manager.main()
+    current = manager.read_env(path)
+    token = current.pop("MCP_BEARER_TOKEN")
+    # Signed with the retained secret, for this project's space, with the extractor's claims.
+    header, body, signature = token.split(".")
+    decode = lambda value: base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    assert hmac.compare_digest(decode(signature), hmac.new(older["JWT_SECRET"].encode(), f"{header}.{body}".encode(), hashlib.sha256).digest())
+    unstamped = lambda claims: {key: value for key, value in claims.items() if key not in {"iat", "exp"}}
+    assert unstamped(claims_of(token)) == unstamped(expected)
+    assert current == older
+    assert (manager.ROOT.parent / ".env").read_bytes() == project
+    assert calls == ["source", ("up", True), ("provision", True)]
+    assert minted == ["worker_token"]
+    # A folder that has the token keeps it.
+    before = path.read_bytes()
+    manager.main()
+    assert path.read_bytes() == before and minted == ["worker_token"]
 
 
 def test_bad_env_value_does_not_truncate_existing_configuration(manager):
@@ -317,3 +450,100 @@ def test_knowledge_cannot_overwrite_provider_or_runtime_environment(field, name)
         Knowledge(mode="local", **{field: name})
     with pytest.raises(ValueError, match="dedicated knowledge-service"):
         generate_elephant_files({"mode": "local", field: name}, "research-lab")
+
+
+class FakeKnowledgeService:
+    """The space and grant administration routes, as the knowledge service answers them."""
+
+    def __init__(self, *, space=None, grant=None):
+        self.space, self.grant, self.calls = space, grant, []
+
+    def __call__(self, settings, method, path, token, *, body=None):
+        self.calls.append((method, path, token, body))
+        if path == f"/v1/spaces/{settings['project']}":
+            return (200, self.space) if self.space else (404, {"error_code": "unknown_space"})
+        if (method, path) == ("POST", "/v1/spaces"):
+            self.space = {**body, "id": "space-config-1"}
+            return 201, self.space
+        if path == f"/v1/spaces/{settings['project']}/grants/recall-extractor":
+            if method == "GET":
+                return (200, self.grant) if self.grant else (404, {"error_code": "not_found"})
+            assert body["expected_generation"] is None and self.grant is None
+            self.grant = {"subject": "recall-extractor", "active": body["active"], "scopes": sorted(body["scopes"]), "generation": "grant-1"}
+            return 200, self.grant
+        raise AssertionError(f"unexpected {method} {path}")
+
+
+def provisioned_project(manager, provider="openai"):
+    files = generate_elephant_files(config(), "test-project", provider=provider)
+    (manager.ROOT / "compose.json").write_text(files["knowledge/compose.json"])
+    settings = json.loads(files["knowledge/settings.json"])
+    return settings, {"JWT_SECRET": "s" * 48}
+
+
+def test_up_creates_the_space_and_grant_once_in_the_documented_order(manager, monkeypatch):
+    settings, values = provisioned_project(manager)
+    service = FakeKnowledgeService()
+    monkeypatch.setattr(manager, "api_request", service)
+    result = manager.provision(settings, values)
+    assert [(method, path) for method, path, *_ in service.calls] == [
+        ("GET", "/v1/spaces/test-project"), ("POST", "/v1/spaces"), ("GET", "/v1/spaces/test-project"),
+        ("GET", "/v1/spaces/test-project/grants/recall-extractor"),
+        ("PUT", "/v1/spaces/test-project/grants/recall-extractor"),
+        ("GET", "/v1/spaces/test-project/grants/recall-extractor")]
+    assert service.calls[4][3] == {"active": True, "scopes": manager.WORKER_SCOPES, "expected_generation": None}
+    assert all(claims_of(token)["bootstrap_space"] == "test-project" for _, _, token, _ in service.calls)
+    assert result["extractor_grant"] == {"subject": "recall-extractor", "generation": "grant-1", "scopes": sorted(manager.WORKER_SCOPES)}
+    # A later up only reads both back.
+    service.calls.clear()
+    manager.provision(settings, values)
+    assert [method for method, *_ in service.calls] == ["GET", "GET"]
+    # The bootstrap credential is never saved.
+    used = {token for _, _, token, _ in service.calls}
+    assert not any(token in path.read_text(errors="replace") for path in manager.ROOT.parent.rglob("*") if path.is_file() for token in used)
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+def test_space_request_approves_each_semantic_operation_with_named_credentials(manager, provider):
+    settings, _ = provisioned_project(manager, provider)
+    request = manager.space_request(settings)
+    processing = request["processing"]
+    assert request["name"] == "test-project" and request["security"] == {"policy_id": "default", "level": 0, "labels": [], "handling": []}
+    assert set(processing["bindings"]) == {"query_embedding", "document_embedding", "extraction", "support_verification"}
+    profiles = processing["profiles"]
+    for operation, binding in processing["bindings"].items():
+        profile = profiles[binding["profile_id"]]
+        assert binding["revoked"] is False and (profile["dimensions"] is not None) == operation.endswith("_embedding")
+    active = profiles[processing["active_embedding_profile_id"]]
+    connection = processing["connections"][active["connection_id"]]
+    assert (request["embedding_provider"], request["embedding_model"], request["embedding_dims"]) == (
+        connection["provider"], active["model"], active["dimensions"]) == ("openai", "text-embedding-3-large", 3072)
+    generation = profiles[processing["bindings"]["extraction"]["profile_id"]]
+    assert generation["model"] == settings["model"]
+    assert processing["connections"][generation["connection_id"]]["provider"] == provider
+    for connection in processing["connections"].values():
+        assert re.fullmatch(r"[A-Z_]+_API_KEY", connection["credential_ref"])
+        assert connection["endpoint"].startswith("https://") and connection["revoked"] is False
+
+
+def test_an_inactive_extractor_grant_is_reported_not_rewritten(manager, monkeypatch):
+    settings, values = provisioned_project(manager)
+    service = FakeKnowledgeService()
+    monkeypatch.setattr(manager, "api_request", service)
+    manager.provision(settings, values)
+    service.grant = {**service.grant, "active": False}
+    service.calls.clear()
+    with pytest.raises(ValueError, match="recall-extractor grant"):
+        manager.provision(settings, values)
+    assert [method for method, *_ in service.calls] == ["GET", "GET"]
+
+
+def test_space_status_waits_for_semantic_readiness(manager, monkeypatch):
+    settings, _ = provisioned_project(manager)
+    monkeypatch.setattr(manager, "environment", lambda: {"ELEPHANT_OPERATOR_TOKEN": "opaque-operator-token"})
+    answers = iter([(503, {"semantic_ingest_ready": False}), (200, {"semantic_ingest_ready": True, "providers_ready": True})])
+    calls = []
+    monkeypatch.setattr(manager, "api_request", lambda settings, method, path, token, **_: calls.append((method, path, token)) or next(answers))
+    monkeypatch.setattr(manager.time, "sleep", lambda _: None)
+    assert manager.space_status(settings, wait=60)["semantic_ingest_ready"] is True
+    assert calls == [("GET", "/v1/spaces/test-project/status", "opaque-operator-token")] * 2

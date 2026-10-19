@@ -53,7 +53,7 @@ pub(crate) fn stopping_client(
             meta: None,
         },
         LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success { stop_reason },
+            outcome: LlmDoneOutcome::success(stop_reason),
         },
     ])
 }
@@ -79,9 +79,7 @@ impl ObservationClient {
         ];
         events.extend(match case {
             CompletionCase::Success => Some(Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
             })),
             CompletionCase::TerminalError => Some(Ok(LlmEvent::Done {
                 outcome: LlmDoneOutcome::Error {
@@ -90,9 +88,7 @@ impl ObservationClient {
             })),
             CompletionCase::StreamError => Some(Err(LlmError::ConnectionReset)),
             CompletionCase::Truncated => Some(Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::MaxTokens,
-                },
+                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::MaxTokens),
             })),
             CompletionCase::Unterminated => None,
         });
@@ -163,6 +159,9 @@ pub(crate) async fn capture_warnings<T>(future: impl Future<Output = T>) -> (T, 
         .with_ansi(false)
         .without_time()
         .finish();
+    // A second registered Dispatch keeps callsite interest from being cached
+    // `never` by threads without a subscriber.
+    let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
     let result = future.with_subscriber(subscriber).await;
     let log = String::from_utf8_lossy(
         &writer
@@ -186,5 +185,39 @@ pub(crate) fn settlement_failure(
             meerkat_core::LiveBridgeEffectOutcome::Committed
         },
         failure_kind: meerkat_core::ops::ToolDispatchTerminalErrorKind::Unavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capture_warnings;
+
+    const PROBE: &str = "capture anchor probe";
+
+    fn warn_probe() {
+        tracing::warn!("{PROBE}");
+    }
+
+    /// While the capture's subscriber is registered, a thread without a
+    /// subscriber reaches the probe's callsite first and rebuilds the
+    /// interest cache. With the capture's subscriber as the only registered
+    /// one, tracing asks that thread's empty default instead and caches the
+    /// callsite as `never` for every thread, so the capture records nothing.
+    /// A second registered Dispatch makes the rebuild ask the registered
+    /// subscribers.
+    #[tokio::test]
+    async fn capture_records_a_callsite_another_thread_reached_first() {
+        let ((), log) = capture_warnings(async {
+            let probe = std::thread::spawn(|| {
+                tracing::dispatcher::with_default(&tracing::Dispatch::none(), || {
+                    warn_probe();
+                    tracing::callsite::rebuild_interest_cache();
+                });
+            });
+            assert!(probe.join().is_ok(), "probe thread panicked");
+            warn_probe();
+        })
+        .await;
+        assert_eq!(log.matches(PROBE).count(), 1, "{log}");
     }
 }

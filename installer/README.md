@@ -1389,7 +1389,7 @@ private journey record does not establish its review support.
   and timeouts. Validated DAGs compile into native Meerkat flow definitions. The
   native engine owns dispatch, predecessor outputs, parameters, and run outcomes.
 - **Knowledge:** connect an existing knowledge service `/mcp/agent` endpoint or export an
-  isolated local knowledge service deployment with persistent SurrealDB storage, scoped JWT
+  isolated local knowledge service deployment with embedded persistent storage, scoped JWT
   credentials, ingestion helpers, and verification commands.
 - **Deployments:** macOS, Linux user services, and GCP VM scripts with IAP access.
   Inspect every file before downloading the executable package.

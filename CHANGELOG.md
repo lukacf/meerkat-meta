@@ -23,14 +23,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   incident command center example parses its scenario with four of these
   rules: YAML 1.2 booleans, `<<` as an ordinary key, and refusal of
   duplicate keys and unknown tags.
+- Behaviour-only: the console's identity routes (`meta/status_identity`,
+  `meta/inspect_identity`, `meta/retire`, `meta/respawn`, `meta/reset` and
+  `meta/delete_identity` on `/console/rpc`) refuse a generated runtime id
+  that is no longer its identity's binding, such as the predecessor's
+  `rt:<identity>:<n>` after a reset, with `-32000` and `error.data.kind`
+  `stale_identity_runtime_binding`, naming the registered runtime id and
+  session, as the member routes refuse the same id. They answered `-32602`
+  `identity not found: <id>` once no live member carried the old id. A
+  runtime id of an identity the identity runtime does not know keeps
+  `-32602` `identity not found`, and a hidden identity's runtime id answers
+  `identity_hidden_by_policy`. `meta/console/inspect_identity` refuses the
+  same stale id the same way (`inspect_identity failed: ...`) before its
+  console aggregator lookup, which answered `-32001` `unknown identity:
+  <id>`.
+- Behaviour-only: the stdio JSON-RPC identity methods refuse the same stale
+  runtime id with the same `-32000` `stale_identity_runtime_binding` error:
+  `meta/send`, `meta/interact`, `meta/dispatch`, `meta/recover_delivery`,
+  `meta/turn_result`, `meta/wait_for_turn`, `meta/subscribe`,
+  `meta/wait_for_completion`, `meta/completion_cursor`,
+  `meta/status_identity`, `meta/inspect_identity`, `meta/retire`,
+  `meta/respawn`, `meta/reset`, `meta/delete_identity`, and the operator
+  member methods `meta/member_activate_instruction`,
+  `meta/member_instruction_activations`, `meta/compact_member` and
+  `meta/bound_member_transcript`. They answered `-32602` `invalid identity:
+  runtime identity not found: <id>`, which a runtime id of an identity the
+  identity runtime does not know keeps. A stale runtime id of an identity
+  the stdio surface hides (an implicit delegate member, by the rule its
+  live ids follow) answers `-32602` `invalid identity: identity hidden by
+  policy: <id>` and names no binding. The stdio member methods (for example
+  `meta/get_member`), which already refused a stale runtime id, now send
+  the same six-field `error.data`, adding `registered_session_id` and
+  `live_session_id`.
+- `ConsoleLiveSnapshot` is `#[non_exhaustive]`: build it with
+  `ConsoleLiveSnapshot::new`, so a later field is not a breaking change.
+- `ConsoleLiveSnapshot.running` is an `Option<bool>` (was `bool`), and
+  `ConsoleLiveSnapshot::new` takes the same. `None` means that nothing
+  observed whether the mob runs; it is never defaulted. The snapshot gains
+  `unobserved: Option<UnobservedFacts>`, which `new` sets when `running` is
+  `None` (serde default, skipped when `None`).
+- `BridgeError` and `BridgeAdmissionError` have two new variants, appended
+  last: `MobAdmissionClosed`, for a delivery Meerkat Core refused because the
+  mob's admission is closed (for any close reason), and
+  `MobShutdownInProgress`, for one it refused while a Shutdown of the mob was
+  still draining (retry later; the mob is not gone). Both carry the member
+  identity, the mob id and Core's message, and render as the `Mob` message
+  they replace. A `match` on either enum without a wildcard needs arms for
+  them. The deliver path hands both up typed and never repairs the member
+  for them (the substring repair classifier no longer sees their text); a
+  completion-bearing send still fails with
+  `IdentityRuntimeError::AdmissionFailed`, whose detail is now Core's message
+  without the `session bridge mob error:` prefix.
 
 ### Security
 
-- Meta's own YAML parsing no longer uses serde_yaml 0.9 (deprecated) and its
-  archived unsafe-libyaml (RUSTSEC-2024-0449, unmaintained). `deny.toml`
-  still ignores that advisory: Meerkat Core 0.9.3's meerkat-skills brings
-  serde_yaml in until Meta pins a Core release that parses SKILL.md with
-  serde-saphyr.
+- No crate in Meta's dependency graph uses serde_yaml 0.9 (deprecated) or its
+  archived unsafe-libyaml (RUSTSEC-2024-0449, unmaintained) any more. Meta's
+  own YAML parsing already used serde-saphyr, and the Meerkat Core 0.9.4
+  crates parse SKILL.md frontmatter with serde-saphyr as well, so `deny.toml`
+  no longer ignores that advisory.
 
 ### Added
 
@@ -43,9 +94,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Publication releases those exact bytes as a prerelease that never becomes the
   latest release. `forge.yml` can now be dispatched, and records each job's
   toolchain. `installer/RELEASING.md` has the steps.
+- `meerkat_meta::unobserved`: `UnobservedFacts` (built with
+  `UnobservedFacts::new`) and `UnobservedReason` (`RefreshPending`,
+  `NotObserved`), both `#[non_exhaustive]`. They are the shape of the
+  `"unobserved": {"reason": ..., "fields": [...]}` marker the console
+  experience puts on a fact it holds no observation for.
+- `UnifiedRuntime::take_bootstrap_completion` hands an embedding host a
+  one-use `RuntimeBootstrapCompleted`. The runtime mints it once, on its
+  bootstrap success path (the unheld identity bootstrap on `Ok`, the held one
+  on `Activated`, `activate_without_identity_context` on `Ok`), and never on
+  a failure. Its `publish(f)` runs `f` once, only while the runtime has not
+  begun to close and its mob still admits work: the runtime's shutdown begins
+  under the same gate, so a publication that has begun finishes first and a
+  later one is refused (`BootstrapCompletionRefused::RuntimeClosing`, or
+  `AdmissionClosed` once the mob's admission closed). On the stdio gateway
+  the driver takes the completion once the Ready's stdout capacity is
+  reserved, and the host gets it inside its publication boundary from
+  `GatewayBootstrapReady::take_runtime_completion`. A runtime from a legacy
+  constructor (`UnifiedRuntime::bootstrap` and the `bootstrap_with_*` family)
+  has no completion until `activate_without_identity_context` returns `Ok`.
+  Installing an identity context withdraws a completion not yet taken;
+  attaching one leaves it as it is.
 
 ### Changed
 
+- `/console/experience` takes an identity-first member's session from the
+  identity runtime, the owner `/console/identities` reads, and never serves
+  a fact walked under an earlier identity binding. The first read after a
+  reset, retire or delete used to answer from the console's cached roster
+  walk: after a reset the predecessor's session, progress, state and
+  labels; after a retire or delete an active row for a member the roster
+  had already dropped. The console's read model now records the identity
+  runtime's bindings (session and lifecycle state) it walked under, and a
+  read that finds them moved re-collects first. It waits at most 2 s, the
+  console's member-status read bound, and concurrent reads share the walk.
+  Past that deadline a changed row answers with the identity runtime's
+  session, the runtime machine's bounded run state and state `unknown`,
+  withholds its other walked facts with fail-closed affordances (no send,
+  no retire), and carries a new `unobserved` marker
+  (`{"reason": "refresh_pending", "fields": [...]}`) on every record the
+  experience builds for it: the sidebar row, the identity_status and
+  health_overview rows, and the topology node. The profile capability
+  hints leave its walked role out, and with no configured module ids
+  health's `loaded_modules` and `loaded_module_count` leave it out
+  whatever its walked state. Access and visibility still decide on
+  the last observed facts, so a label-scoped deny keeps a pending member
+  hidden. console-core mirrors the marker (`UnobservedFacts`,
+  `normalizeUnobservedFacts`, `IdentityStatusRow.unobserved`,
+  `ConsoleTopologyNode.unobserved`), and the console carries it on its
+  agent rows.
 - Meta Forge's Guide runs exactly Meta 0.9.3 with Core 0.9.3 instead of 0.9.0,
   and refuses any other version. Its Python client is the published
   `meerkat-meta` 0.9.3 wheel, pinned by release commit, `sdk/python` tree, size
@@ -53,6 +150,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `installer/release/inputs/forge-release-inputs.skeleton.json` holds the
   Guide's Linux release inputs; only the product owner's selection is still to
   be filled.
+- Adopts the Meerkat Core typed provider stop detail. Every place Meta builds
+  an `LlmDoneOutcome::Success` (test clients, the scenario client, the memory
+  pipeline fakes) builds it with `LlmDoneOutcome::success(stop_reason)`, and
+  every place it matches one (the memory distiller, hygienist and steward,
+  the console voice summary) matches `LlmDoneOutcome::Success { stop_reason,
+  .. }`. No behaviour change of Meta's own.
 
 - The console Access panel keeps edits available while it re-reads the
   access configuration in the background. Live run events, layout changes
@@ -64,9 +167,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   they land, and a failed read still disables them until a read succeeds. A
   save still carries the draft's edit token, which the owner checks, so a
   draft is never rebased onto a newer configuration.
+- `meta/reset` of one identity, on the SDK gateway and the console, no
+  longer reports a cleanup warning: its `cleanup_warning` is now always
+  `null`, in the response and in the `identity_reset` lifecycle frame. It
+  used to report `stale_member_cleanup_skipped_after_identity_reset`, saying
+  the reset published the new generation without retiring stale live
+  members, which is not true: the reset's successor transition is
+  meerkat's respawn, which retires the previous live member. The field
+  stays for wire compatibility, as `meta/respawn` keeps its retired
+  warnings; `meta/reset_all` dropped the same warning for the same reason.
+  Identity control calls still reject a stale runtime id.
 
 ### Fixed
 
+- Meta Forge's local knowledge service starts and becomes ready for semantic
+  ingestion. `knowledge/manage.py up` used to stop before the service started:
+  the pinned source commit could not be fetched, and every available revision
+  of the source refuses the stock SurrealDB server the stack ran. Forge now
+  pins commit `d0493b6e9ba6e61ecea24e50b5f8748e3ffe8f6c` of
+  `https://github.com/lukacf/meerkat-recall` and runs a single knowledge
+  service process with its store embedded (RocksDB files in the private
+  knowledge volume), with no database server or reader service. After the
+  service is healthy, `up` creates the project space with its security policy
+  and processing approvals through a short-lived bootstrap token that is never
+  saved, gives the service's extractor a dedicated read-only token and grant,
+  and waits for `semantic_ingest_ready`. A later `up` only reads the space and
+  grant back, and in a knowledge folder prepared before the extractor token
+  existed it adds only that token. The image lets its service user read the
+  bundled migrations and extraction skills even when the source was checked
+  out under a private umask, and the service's runtime status reports the
+  project space's budget instead of the budget of a space named `default`. A
+  project that still records the old default pin builds the new default; an
+  explicitly chosen pin is kept. The exported knowledge README states the
+  licences of the embedded storage engine and names the source's notes on its
+  patches to it.
+- `/console/experience` reports `health_overview.live_snapshot.running` as
+  the mob's owner answers when the experience is read, as `meta/status`
+  does. It came from the console's cached roster walk, and was `true` when
+  no walk had answered yet, so a mob stopped since the last walk read as
+  running. A console with no live runtime reports `running: null` and names
+  it unobserved (`"unobserved": {"reason": "not_observed", "fields":
+  ["running"]}` on the health snapshot); it reported `true` whenever a
+  module was configured.
+- A console served from the console aggregator reports `running` from its
+  registered runtimes' owners: `true` only while every registered runtime's
+  mob is creating or running, `false` when at least one is not, and `null`
+  with the `not_observed` marker when no runtime is registered. It reported
+  `true` whatever its runtimes did.
+- The console's topbar shows the mob as unknown, with an amber dot, when the
+  health snapshot does not say whether it runs; it showed running. A stopped
+  mob's dot is red; the dot was green whatever the status. console-core's
+  `consoleMobStatus` derives the status, and `ConsoleHealthSnapshot` carries
+  `running: boolean | null` and the `unobserved` marker.
 - The `complete_held_identity_members` documentation no longer says that
   resumed members are skipped. A held identity bootstrap holds fresh members
   only: a roster member that already has continuity refuses the whole pass
@@ -110,6 +262,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   changes the animation renderer: opening one reports that it uses another
   trusted bridge version. A publication that already used both review
   attempts needs a new animation version first.
+- A scope-bound delivery that meerkat refuses because the mob's admission
+  is closed (`MobError::AdmissionClosed`, whatever closed it: an idle close,
+  the last owner's release, a stand-down, a shutdown, a destroy or an actor
+  exit) or because the member is closed for identity convergence
+  (`MobError::IdentityConvergenceAdmissionClosed`) is reported as
+  `ScopedDeliveryError::Rejected` (wire kind `scoped_delivery_rejected`,
+  `admission_possible: false`). Before, it was reported as `Uncertain`
+  (`scoped_delivery_uncertain`), so a caller recovered a delivery that was
+  never admitted.
+- A `WeakPublicIdentityRuntime` (from `PublicIdentityRuntime::downgrade`)
+  no longer upgrades after the runtime's `shutdown`, even while the identity
+  runtime itself is still held, as D67 documents ("`None` once it closed"):
+  Meerkat 0.9.4 closes the mob's admission when it admits the Shutdown.
+  Against Meerkat 0.9.3 the weak link still upgraded after a shutdown.
+- Python and TypeScript SDKs: a request waiting on a gateway process that
+  exits while a process it started still holds the gateway's stdout now fails
+  with `GatewayChildEndedError` about a second after the exit, instead of
+  waiting out its request timeout (60 seconds by default) or, for the
+  shutdown handshake, the gateway's whole shutdown horizon. The transports
+  failed waiting requests only when that stdout closed, and a descendant that
+  inherited it keeps it open until it exits itself. A gateway whose stdout
+  closes with its exit is unaffected: its waiters still fail with
+  `TransportReaderFailedError` as the stdout closes. The TypeScript
+  `GatewayChildEndedError` is new: it extends `TransportReaderFailedError`
+  and carries the exit as `exitCode` and `signal`, and the transport then
+  lets go of the held stdout, so it no longer keeps the host's Node.js
+  process running. The Python error carries `exit_code`.
+- An OpenAI refusal is no longer stored as memory or returned as a console
+  voice summary. Core now ends an OpenAI response that carries a refusal (a
+  Responses `refusal` part or a Chat Completions `delta.refusal`) with
+  `StopReason::Refusal` instead of an ordinary end of turn with the refusal
+  text as its output. The memory distiller, hygienist and steward therefore
+  see a refusal, which their completion check (`completion_stop`) already
+  refuses as an incomplete reply, rather than refusal text to store, and the
+  console voice summary fails as incomplete instead of returning the refusal
+  text as the summary. That failure names the stop reason, so a refused
+  summary reads as refused rather than as a cancel or a truncation, and a
+  summary stream that ends without its terminal event is reported apart.
+
 
 ## [0.9.3] - 2026-10-18
 

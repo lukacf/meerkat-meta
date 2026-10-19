@@ -4,6 +4,14 @@ All notable changes to the Python SDK are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- A request waiting on a gateway process that exits while a process it
+  started still holds the gateway's stdout fails with
+  `GatewayChildEndedError` (its `exit_code` set) about a second after the
+  exit, instead of waiting out its request timeout (60 seconds by default)
+  or, for the shutdown handshake, the gateway's whole shutdown horizon.
+
 ## 0.9.3
 
 - Breaking: the draft results of `meta/mobpacks/list`, `create`, `save`,

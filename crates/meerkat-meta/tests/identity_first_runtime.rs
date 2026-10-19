@@ -11737,9 +11737,7 @@ impl meerkat_client::LlmClient for NoopDistillerLlm {
                 meta: None,
             }),
             Ok(meerkat_client::LlmEvent::Done {
-                outcome: meerkat_client::LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::EndTurn,
-                },
+                outcome: meerkat_client::LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
             }),
         ]))
     }
@@ -11916,9 +11914,7 @@ impl meerkat_client::LlmClient for OneOpDistillerLlm {
                 meta: None,
             }),
             Ok(meerkat_client::LlmEvent::Done {
-                outcome: meerkat_client::LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::EndTurn,
-                },
+                outcome: meerkat_client::LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
             }),
         ]))
     }

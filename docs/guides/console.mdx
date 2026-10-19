@@ -914,6 +914,16 @@ Primary RPC methods on `/console/rpc`:
   `meta/topology/operation/get`, and `meta/topology/audit/query` - optional,
   revisioned connection management and separately permissioned durable audit
 
+The identity routes take the durable identity or its current generated
+runtime id, `rt:<identity>:<generation>`. After a reset, the predecessor's
+runtime id is refused with `-32000` and `error.data.kind`
+`stale_identity_runtime_binding`, naming the current binding
+(`registered_runtime_member_id`, `registered_session_id`). A hidden identity's
+runtime id answers `identity_hidden_by_policy`, and a runtime id of an
+identity the runtime does not know answers `identity not found`.
+`meta/console/inspect_identity` refuses a stale runtime id the same way
+before it looks the identity up in the console aggregator.
+
 Topology management is opt-in at the runtime. With the default disabled
 policy, the stock console remains a passive topology viewer and does not show
 the Connections tab. Read-only mode exposes searchable connection state with

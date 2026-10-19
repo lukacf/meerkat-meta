@@ -420,3 +420,39 @@ async fn live_aliases(
     }
     aliases
 }
+
+/// The typed `stale_identity_runtime_binding` refusal: the requested
+/// `live_runtime_member_id` (with `live_session_id` when a live member
+/// carries it) is not `identity`'s registered binding (`status`; `None` when
+/// the identity runtime does not know the identity). Every surface builds it
+/// here, so the six-field data object is the same everywhere; each keeps its
+/// own `message_prefix` (for example `"reset failed: "`).
+pub(crate) fn stale_identity_runtime_binding_error(
+    message_prefix: &str,
+    identity: &AgentIdentity,
+    status: Option<&IdentityStatus>,
+    live_runtime_member_id: &str,
+    live_session_id: Option<&str>,
+) -> crate::rpc::JsonRpcError {
+    let registered_runtime_member_id = status
+        .and_then(|status| status.agent_runtime_id.as_ref())
+        .map(crate::identity_first::AgentRuntimeId::as_str);
+    crate::rpc::JsonRpcError {
+        code: -32000,
+        message: format!(
+            "{message_prefix}identity runtime binding for {} points at {}, but requested live member is {live_runtime_member_id}",
+            identity.as_str(),
+            registered_runtime_member_id.unwrap_or("<none>"),
+        ),
+        data: Some(serde_json::json!({
+            "kind": "stale_identity_runtime_binding",
+            "identity": identity.as_str(),
+            "registered_runtime_member_id": registered_runtime_member_id,
+            "live_runtime_member_id": live_runtime_member_id,
+            "registered_session_id": status
+                .and_then(|status| status.session_id.as_ref())
+                .map(ToString::to_string),
+            "live_session_id": live_session_id,
+        })),
+    }
+}

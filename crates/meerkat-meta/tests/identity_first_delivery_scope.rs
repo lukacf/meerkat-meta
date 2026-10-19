@@ -621,6 +621,79 @@ async fn a_session_moved_under_the_same_continuity_is_refused_by_native_admissio
     boot.shutdown().await;
 }
 
+/// A delivery during a parked mob Shutdown is a definite refusal. The admitted
+/// Shutdown closes the mob's admission before its teardown (held here on the
+/// member's session registration), so the scoped submit is refused with
+/// `AdmissionClosed`, which the bridge reports as `Rejected`: nothing was
+/// admitted, and nothing reaches the model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delivery_during_a_parked_shutdown_is_rejected() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let state_path = temp.path().join("state");
+    let (client, mut calls) = BarrierClient::new(true);
+    let boot = Boot::start(&state_path, &unique_mob_id(), &client).await;
+    let scope = DeliveryScope::from_json_value(boot.status_scope().await).unwrap();
+    let machine = boot
+        .unified
+        .mob_runtime()
+        .session_service()
+        .expect("the persistent runtime has a session service")
+        .acquire_runtime_adapter(None)
+        .expect("acquire the runtime adapter")
+        .expect("the persistent runtime has a runtime adapter");
+    let held = machine
+        .hold_session_registration_transaction_for_test(scope.session_id())
+        .await;
+
+    let mob = boot.unified.mob_handle();
+    let mut closed = mob.admission_closed();
+    let shutdown = tokio::spawn({
+        let mob = mob.clone();
+        async move { mob.shutdown().await }
+    });
+    tokio::time::timeout(WAIT, closed.wait_for(Option::is_some))
+        .await
+        .expect("the admitted Shutdown closes admission")
+        .expect("the mob's admission state outlives the wait");
+    assert_eq!(
+        *closed.borrow(),
+        Some(meerkat_mob::MobAdmissionCloseReason::Shutdown)
+    );
+
+    let error = tokio::time::timeout(
+        WAIT,
+        boot.identity_rt.dispatch_at_scope(
+            &identity(),
+            &scope,
+            &DispatchInput::system("during the shutdown")
+                .with_idempotency("parked-shutdown-key")
+                .with_correlation(uuid::Uuid::new_v4().to_string()),
+        ),
+    )
+    .await
+    .expect("the delivery is answered while the Shutdown is parked")
+    .expect_err("a shutting-down mob admits no delivery");
+    assert!(
+        matches!(&error, ScopedDeliveryError::Rejected { detail }
+            if detail.contains("admission is closed (shutdown)")),
+        "{error:?}"
+    );
+    assert!(!error.admission_possible());
+    assert!(
+        !shutdown.is_finished(),
+        "the Shutdown is still parked on the held registration"
+    );
+    assert_no_model_call(&mut calls, "a refused delivery submits nothing");
+
+    drop(held);
+    tokio::time::timeout(WAIT, shutdown)
+        .await
+        .expect("the Shutdown finishes once the registration is released")
+        .expect("the Shutdown task does not panic")
+        .expect("the Shutdown succeeds");
+    boot.shutdown().await;
+}
+
 /// The scoped path requires a full delivery identity pair, used verbatim,
 /// and refuses a scope of another identity, both before anything is
 /// submitted.

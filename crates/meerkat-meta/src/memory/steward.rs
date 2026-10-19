@@ -512,7 +512,7 @@ pub struct StewardConfig {
     /// The failure is not loud *here*, but the providers do report it. All
     /// three of meerkat's clients map a budget truncation onto a terminal
     /// `LlmEvent::Done { LlmDoneOutcome::Success { stop_reason:
-    /// StopReason::MaxTokens } }` (OpenAI from `response.incomplete` +
+    /// StopReason::MaxTokens, .. } }` (OpenAI from `response.incomplete` +
     /// `incomplete_details.reason == "max_output_tokens"`, Anthropic from
     /// `stop_reason: "max_tokens"`, Gemini from `finishReason: "MAX_TOKENS"`).
     /// [`complete_text`] fails that dream as [`StewardError::Truncated`],
@@ -3986,7 +3986,7 @@ pub async fn complete_text(
             }
             LlmEvent::TextDelta { delta, meta } => assembler.on_text_delta(&delta, meta),
             LlmEvent::Done { outcome } => match outcome {
-                LlmDoneOutcome::Success { stop_reason } => match completion_stop(stop_reason) {
+                LlmDoneOutcome::Success { stop_reason, .. } => match completion_stop(stop_reason) {
                     CompletionStop::Answered => {
                         answered = true;
                         break;
@@ -4275,9 +4275,7 @@ mod tests {
                 });
                 events.push(LlmEvent::AssistantOutput { blocks });
                 events.push(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 });
                 let client = meerkat_client::TestClient::new(events);
                 assert_eq!(
@@ -4330,9 +4328,7 @@ mod tests {
         let client = meerkat_client::TestClient::new(vec![
             LlmEvent::AssistantOutput { blocks: Vec::new() },
             LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::MaxTokens,
-                },
+                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::MaxTokens),
             },
         ]);
         let profile = StewardProfile::embedded_default();
@@ -4472,7 +4468,7 @@ mod tests {
                     meta: None,
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success { stop_reason },
+                    outcome: LlmDoneOutcome::success(stop_reason),
                 }),
             ]))
         }

@@ -12,6 +12,7 @@ import type {
   RoutingSectionView,
   SidebarWatchFields,
   ToolCallAccumulatorState,
+  UnobservedFacts,
 } from "./control-plane";
 import type { TopologyEndpointRef } from "./topology";
 
@@ -88,6 +89,7 @@ export interface ConsoleAgent extends SidebarWatchFields {
   addressable?: boolean;
   affordances?: ConsoleAgentAffordances;
   model_capabilities?: ConsoleModelCapabilities;
+  unobserved?: UnobservedFacts;
 }
 
 export interface ConsoleExperienceAgentSnapshotRow extends Partial<IdentityStatusRow>, SidebarWatchFields {
@@ -235,13 +237,16 @@ export interface ConsoleTopologyNode {
   group?: string;
   subgroup?: string;
   addressable?: boolean;
+  unobserved?: UnobservedFacts;
 }
 
 export interface ConsoleHealthSnapshot {
   loaded_modules?: unknown[];
   loaded_module_count?: number;
-  running?: boolean;
+  /** `null` when nothing observed whether the mob runs; `unobserved` names it. */
+  running?: boolean | null;
   identities?: IdentityStatusRow[];
+  unobserved?: UnobservedFacts;
 }
 
 type ConsoleExperienceSection<T> = T & Partial<ExperienceSectionMeta>;

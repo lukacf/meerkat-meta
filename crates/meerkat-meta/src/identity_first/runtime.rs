@@ -538,7 +538,9 @@ fn admission_phase_error(
         BridgeAdmissionError::Mob(detail)
         | BridgeAdmissionError::UnsupportedForMode { detail, .. }
         | BridgeAdmissionError::InvalidInput(detail)
-        | BridgeAdmissionError::InvariantViolation(detail) => {
+        | BridgeAdmissionError::InvariantViolation(detail)
+        | BridgeAdmissionError::MobAdmissionClosed { detail, .. }
+        | BridgeAdmissionError::MobShutdownInProgress { detail, .. } => {
             IdentityRuntimeError::AdmissionFailed { identity, detail }
         }
         BridgeAdmissionError::ActorLoopStalled {

@@ -35,7 +35,7 @@ def exported(tmp_path, monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("No Docker, source checkout, provider, native service or real child may run.")
 
-    for name in ("local_preflight", "source_checkout", "compose", "mcp_operation"):
+    for name in ("local_preflight", "source_checkout", "compose", "mcp_operation", "provision", "space_status"):
         monkeypatch.setattr(manager, name, forbidden)
     monkeypatch.setattr(manager.subprocess, "run", forbidden)
     monkeypatch.setattr(manager.subprocess, "Popen", forbidden)
@@ -162,6 +162,8 @@ def test_restored_original_secrets_allow_existing_terminal_action(exported, monk
         monkeypatch.setattr(manager, "local_preflight", lambda: operations.append("preflight"))
         monkeypatch.setattr(manager, "source_checkout", lambda selected: operations.append("source"))
         monkeypatch.setattr(manager, "compose", lambda *args: operations.append(args))
+        monkeypatch.setattr(manager, "provision", lambda selected, values: operations.append("provision") or {})
+        monkeypatch.setattr(manager, "space_status", lambda selected, wait=0: operations.append("status") or {})
         async def verify(selected, operation):
             operations.append(operation)
             return {"status": "inert-verified"}
@@ -171,7 +173,8 @@ def test_restored_original_secrets_allow_existing_terminal_action(exported, monk
     assert all(local[key] == value for key, value in SECRETS.items())
     unchanged(state)
     if command == "up":
-        assert operations == ["preflight", "source", ("up", "--build", "--detach", "--wait", "--wait-timeout", "180"), "verify"]
+        assert operations == ["preflight", "source", ("up", "--build", "--detach", "--wait", "--wait-timeout", "180"),
+                              "provision", "status", "verify"]
     else:
         assert operations == []
         assert local[TOKEN] != local["ELEPHANT_OPERATOR_TOKEN"]
@@ -217,13 +220,15 @@ def test_first_up_initializes_missing_fresh_secrets_before_service_entry(exporte
         operations.append("source")
     monkeypatch.setattr(manager, "source_checkout", source)
     monkeypatch.setattr(manager, "compose", lambda *args: operations.append("up"))
+    monkeypatch.setattr(manager, "provision", lambda selected, values: operations.append("provision") or {})
+    monkeypatch.setattr(manager, "space_status", lambda selected, wait=0: operations.append("status") or {})
     async def verify(selected, operation):
         assert operation == "verify"
         operations.append("verify")
         return {"status": "inert-verified"}
     monkeypatch.setattr(manager, "mcp_operation", verify)
     terminal(manager, monkeypatch, "up")
-    assert operations == ["preflight", "setup", "source", "up", "verify"]
+    assert operations == ["preflight", "setup", "source", "up", "provision", "status", "verify"]
     assert {key: manager.read_env(manager.ROOT / ".env")[key] for key in PROVIDERS} == PROVIDERS
 
 

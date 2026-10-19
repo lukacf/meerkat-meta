@@ -19,7 +19,9 @@ use crate::unified_runtime::UnifiedRuntime;
 
 use super::{JSONRPC_VERSION, JsonRpcError, JsonRpcResponse};
 
-fn identity_from_runtime_alias(alias: &str) -> Option<crate::identity_first::AgentIdentity> {
+pub(super) fn identity_from_runtime_alias(
+    alias: &str,
+) -> Option<crate::identity_first::AgentIdentity> {
     let alias = crate::member_comms_id::runtime_alias_str(alias);
     let rest = alias.strip_prefix("rt:")?;
     let (identity, generation) = rest.rsplit_once(':')?;
@@ -32,10 +34,16 @@ fn identity_from_runtime_alias(alias: &str) -> Option<crate::identity_first::Age
     crate::identity_first::AgentIdentity::parse(identity).ok()
 }
 
+/// The identity a stale runtime id names, with its registered status
+/// (`None` when the identity runtime does not know it); `None` when the id
+/// is no generated runtime id or is its identity's registered binding.
 async fn stale_runtime_alias_detail(
     identity_runtime: Option<&std::sync::Arc<crate::identity_first::IdentityRuntime>>,
     alias: &str,
-) -> Option<(String, Option<String>)> {
+) -> Option<(
+    crate::identity_first::AgentIdentity,
+    Option<crate::identity_first::IdentityStatus>,
+)> {
     let identity_runtime = identity_runtime?;
     let alias = crate::member_comms_id::runtime_alias_str(alias);
     let identity = identity_from_runtime_alias(alias.as_ref())?;
@@ -43,12 +51,11 @@ async fn stale_runtime_alias_detail(
     let registered = status
         .as_ref()
         .and_then(|status| status.agent_runtime_id.as_ref())
-        .map(crate::identity_first::AgentRuntimeId::as_str)
-        .map(str::to_string);
-    if registered.as_deref() == Some(alias.as_ref()) {
+        .map(crate::identity_first::AgentRuntimeId::as_str);
+    if registered == Some(alias.as_ref()) {
         return None;
     }
-    Some((identity.as_str().to_string(), registered))
+    Some((identity, status))
 }
 
 async fn stale_runtime_alias_error_response(
@@ -57,24 +64,20 @@ async fn stale_runtime_alias_error_response(
     response_id: Value,
 ) -> Option<JsonRpcResponse> {
     let alias = crate::member_comms_id::runtime_alias_str(alias).into_owned();
-    let (identity, registered) = stale_runtime_alias_detail(identity_runtime, &alias).await?;
+    let (identity, status) = stale_runtime_alias_detail(identity_runtime, &alias).await?;
     Some(JsonRpcResponse {
         jsonrpc: JSONRPC_VERSION.to_string(),
         id: response_id,
         result: None,
-        error: Some(JsonRpcError {
-            code: -32000,
-            message: format!(
-                "identity runtime binding for {identity} points at {}, but requested live member is {alias}",
-                registered.as_deref().unwrap_or("<none>")
+        error: Some(
+            crate::identity_control_target::stale_identity_runtime_binding_error(
+                "",
+                &identity,
+                status.as_ref(),
+                &alias,
+                None,
             ),
-            data: Some(serde_json::json!({
-                "kind": "stale_identity_runtime_binding",
-                "identity": identity,
-                "registered_runtime_member_id": registered,
-                "live_runtime_member_id": alias,
-            })),
-        }),
+        ),
     })
 }
 

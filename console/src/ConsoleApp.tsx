@@ -33,6 +33,7 @@ import type {
 } from "@console-core";
 import {
   collectConsoleDockPanelIds,
+  consoleMobStatus,
   createPendingApprovalResource,
   identityStateLabel,
   migrateConsoleWorkbenchTarget,
@@ -5167,10 +5168,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     experience?.console_config?.environment?.label || "dev";
   const railConfig = experience?.console_config?.rail;
   const railVisible = railConfig?.visible !== false;
-  const mobStatus =
-    experience?.health_overview?.live_snapshot?.running === false
-      ? "stopped"
-      : "running";
+  const mobStatus = consoleMobStatus(experience?.health_overview?.live_snapshot);
 
   function toggleTheme() {
     const next: ConsoleTheme = theme === "dark" ? "light" : "dark";

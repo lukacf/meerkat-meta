@@ -20673,8 +20673,40 @@ function normalizeIdentityStatusRow(value) {
     ...(() => {
       const session_repair = normalizeIdentitySessionRepair(record8.session_repair);
       return session_repair ? { session_repair } : {};
+    })(),
+    ...(() => {
+      const unobserved = normalizeUnobservedFacts(record8.unobserved);
+      return unobserved ? { unobserved } : {};
     })()
   };
+}
+function normalizeUnobservedFacts(value) {
+  const record8 = value && typeof value === "object" ? value : null;
+  if (!record8) {
+    return null;
+  }
+  const reason = trimString(record8.reason);
+  if (!reason) {
+    return null;
+  }
+  const fields = Array.isArray(record8.fields) ? record8.fields.map((field) => trimString(field)).filter((field) => Boolean(field)) : [];
+  return { reason, fields };
+}
+function consoleMobStatus(snapshot) {
+  const record8 = snapshot && typeof snapshot === "object" ? snapshot : null;
+  if (!record8) {
+    return "unknown";
+  }
+  if (normalizeUnobservedFacts(record8.unobserved)?.fields.includes("running")) {
+    return "unknown";
+  }
+  if (record8.running === true) {
+    return "running";
+  }
+  if (record8.running === false) {
+    return "stopped";
+  }
+  return "unknown";
 }
 function normalizeIdentityInspectViewState(value) {
   const record8 = value && typeof value === "object" ? value : null;
@@ -44040,7 +44072,11 @@ function normalizeAgents(experience, modules) {
         ...entry.addressable !== void 0 ? { addressable: Boolean(entry.addressable) } : statusRow?.addressability ? { addressable: statusRow.addressability === "addressable" } : {},
         ...entry.affordances !== void 0 && { affordances: entry.affordances },
         model_capabilities: modelCapabilities,
-        ...watchFields
+        ...watchFields,
+        ...(() => {
+          const unobserved = normalizeUnobservedFacts(entry.unobserved) ?? statusRow?.unobserved;
+          return unobserved ? { unobserved } : {};
+        })()
       };
     });
     const seen = new Set(
@@ -44067,7 +44103,8 @@ function normalizeAgents(experience, modules) {
         ...statusRow.labels?.console_subgroup ? { subgroup: statusRow.labels.console_subgroup } : statusRow.labels?.org ? { subgroup: statusRow.labels.org } : {},
         addressable,
         affordances: { can_send_message: addressable },
-        model_capabilities: { image_input: false }
+        model_capabilities: { image_input: false },
+        ...statusRow.unobserved ? { unobserved: statusRow.unobserved } : {}
       });
       seen.add(statusRow.identity.toLowerCase());
     }
@@ -44095,7 +44132,8 @@ function normalizeAgents(experience, modules) {
         ...statusRow?.labels && Object.keys(statusRow.labels).length > 0 ? { labels: statusRow.labels } : {},
         addressable: false,
         affordances: { can_send_message: false },
-        model_capabilities: modelCapabilities
+        model_capabilities: modelCapabilities,
+        ...statusRow?.unobserved ? { unobserved: statusRow.unobserved } : {}
       };
     });
   }
@@ -55329,7 +55367,7 @@ function Topbar({
       /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { children: brandLabel })
     ] }),
     /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("div", { className: "meta-topbar__mob", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "meta-topbar__mob-status", title: mobStatus }),
+      /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { className: "meta-topbar__mob-status", "data-status": mobStatus, title: mobStatus }),
       /* @__PURE__ */ (0, import_jsx_runtime54.jsx)("span", { children: mobName }),
       /* @__PURE__ */ (0, import_jsx_runtime54.jsxs)("span", { className: "dim", children: [
         "\xB7 ",
@@ -66241,7 +66279,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const environmentLabel = experience?.console_config?.environment?.label || "dev";
   const railConfig = experience?.console_config?.rail;
   const railVisible = railConfig?.visible !== false;
-  const mobStatus = experience?.health_overview?.live_snapshot?.running === false ? "stopped" : "running";
+  const mobStatus = consoleMobStatus(experience?.health_overview?.live_snapshot);
   function toggleTheme() {
     const next = theme === "dark" ? "light" : "dark";
     setTheme(next);

@@ -96,20 +96,9 @@ feature-depth = 1
 # carries the build fix - or vendor the CMake correction. Remove this waiver
 # then. Re-evaluate sooner if any build host adopts CMake 4, because at that
 # point this stops being informational and starts breaking builds.
-# RUSTSEC-2024-0449: unsafe-libyaml 0.2.11 is archived and unmaintained.
-# Meta's own YAML parsing (governance traceability, the incident example)
-# moved to serde-saphyr; serde_yaml 0.9.34+deprecated still arrives through
-# meerkat-skills in the pinned Meerkat Core 0.9.3 crates. The advisory lists
-# no patched release. This accepts the maintenance risk; it does not
-# establish parser safety or rule out security defects. Remove this entry
-# when Meta pins the Core release whose meerkat-skills parses SKILL.md with
-# serde-saphyr, after a resolved-graph audit shows unsafe-libyaml absent.
-# Reassess immediately if a concrete vulnerability is reported.
-# An ignore whose advisory no longer occurs in the graph fails the check, so
-# the change that pins that Core release cannot keep this entry.
+# An ignore whose advisory no longer occurs in the graph fails the check.
 unused-ignored-advisory = "deny"
 ignore = [
-    { id = "RUSTSEC-2024-0449", reason = "Temporary acceptance of archived unsafe-libyaml that Meerkat Core 0.9.3's meerkat-skills brings in through serde_yaml (Meta's own YAML parsing uses serde-saphyr); no patched release is listed. Remove this exception at the Core pin whose meerkat-skills uses serde-saphyr, once the audited graph no longer contains unsafe-libyaml; reassess immediately on a concrete vulnerability." },
     "RUSTSEC-2025-0141",
     "RUSTSEC-2026-0150",
 ]

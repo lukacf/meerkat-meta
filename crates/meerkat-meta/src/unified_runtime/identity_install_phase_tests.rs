@@ -28,7 +28,7 @@ impl RosterProvider for EmptyRoster {
     }
 }
 
-async fn runtime(temp: &tempfile::TempDir) -> UnifiedRuntime {
+pub(super) async fn runtime(temp: &tempfile::TempDir) -> UnifiedRuntime {
     // A distinct mob per test: parallel tests share the process-wide
     // participant name registry.
     let definition = meerkat_mob::MobDefinition::from_toml(&format!(
@@ -68,7 +68,7 @@ async fn runtime(temp: &tempfile::TempDir) -> UnifiedRuntime {
     .expect("bootstrap runtime")
 }
 
-fn context(runtime: &UnifiedRuntime) -> Arc<IdentityFirstRuntimeContext> {
+pub(super) fn context(runtime: &UnifiedRuntime) -> Arc<IdentityFirstRuntimeContext> {
     let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
         continuity_store: Arc::new(LocalContinuityStore::in_memory().expect("continuity store")),
         lease_provider: Arc::new(LocalLeaseProvider::new()),
