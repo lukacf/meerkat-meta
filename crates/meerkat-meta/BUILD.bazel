@@ -70,6 +70,7 @@ rust_library(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -135,6 +136,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -207,6 +209,7 @@ rust_binary(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -269,6 +272,7 @@ rust_binary(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -331,6 +335,7 @@ rust_binary(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -393,6 +398,7 @@ rust_binary(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -455,6 +461,7 @@ rust_binary(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -517,6 +524,7 @@ rust_binary(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -579,6 +587,7 @@ rust_binary(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -641,6 +650,7 @@ rust_binary(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -703,6 +713,7 @@ rust_binary(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -765,6 +776,7 @@ rust_binary(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -846,6 +858,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/access_control.rs",
@@ -941,6 +954,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/agent_events_identity_resolution.rs",
@@ -1035,6 +1049,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/agent_lifecycle.rs",
@@ -1132,6 +1147,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/bigquery_adapter.rs",
@@ -1226,6 +1242,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/bigquery_gc.rs",
@@ -1320,6 +1337,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/bridge_completion_seam.rs",
@@ -1414,6 +1432,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/builder_api.rs",
@@ -1507,6 +1526,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/capability_invariant_choke.rs",
@@ -1600,6 +1620,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/child_application_tool_policy.rs",
@@ -1694,6 +1715,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/classic_agent_memory.rs",
@@ -1787,6 +1809,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/console_customization_fixtures.rs",
@@ -1879,6 +1902,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/console_experience.rs",
@@ -1972,6 +1996,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/console_route_auth.rs",
@@ -2067,6 +2092,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/core_types_and_rpc.rs",
@@ -2160,6 +2186,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/cross_mob_control_grants.rs",
@@ -2253,6 +2280,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/cross_mob_control_round_trip.rs",
@@ -2346,6 +2374,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/cross_mob_signed.rs",
@@ -2439,6 +2468,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/cross_mob_tcp.rs",
@@ -2532,6 +2562,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/cross_mob_two_process.rs",
@@ -2626,6 +2657,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/cross_mob_uds.rs",
@@ -2719,6 +2751,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/discovery_bootstrap.rs",
@@ -2812,6 +2845,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/distiller_eval_harness.rs",
@@ -2908,6 +2942,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/e2e_sdk_wire.rs",
@@ -3000,6 +3035,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/e2e_target_contracts.rs",
@@ -3097,6 +3133,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/edge_wiring_reconcile.rs",
@@ -3190,6 +3227,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/event_log_recovery.rs",
@@ -3285,6 +3323,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/extension_state.rs",
@@ -3381,6 +3420,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/external_boundary.rs",
@@ -3474,6 +3514,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/fork_persistent_integration.rs",
@@ -3566,6 +3607,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/forker_owns_fork_child.rs",
@@ -3660,6 +3702,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/gateway_bootstrap_stack.rs",
@@ -3753,6 +3796,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/gateway_composition_root.rs",
@@ -3846,6 +3890,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/gateway_concurrent_dispatch.rs",
@@ -3942,6 +3987,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/gateway_exit_reason.rs",
@@ -4040,6 +4086,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/gateway_external.rs",
@@ -4133,6 +4180,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/gateway_identity_bind.rs",
@@ -4228,6 +4276,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/gateway_init_protocol.rs",
@@ -4322,6 +4371,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/gateway_live.rs",
@@ -4414,6 +4464,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/gateway_mcp_composition.rs",
@@ -4509,6 +4560,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/gateway_memory_config.rs",
@@ -4604,6 +4656,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/gateway_schedule_lease_release.rs",
@@ -4701,6 +4754,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/gating_policy.rs",
@@ -4798,6 +4852,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/governance_contracts.rs",
@@ -4891,6 +4946,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/held_identity_bootstrap.rs",
@@ -4984,6 +5040,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/hooks.rs",
@@ -5077,6 +5134,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/http_router.rs",
@@ -5170,6 +5228,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/hygienist_eval_harness.rs",
@@ -5266,6 +5325,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_boundary.rs",
@@ -5359,6 +5419,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_builder.rs",
@@ -5452,6 +5513,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_choke.rs",
@@ -5545,6 +5607,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_cold_restart_continuity.rs",
@@ -5639,6 +5702,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_completion_bearing_send.rs",
@@ -5732,6 +5796,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_completion_cursor.rs",
@@ -5825,6 +5890,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_contracts.rs",
@@ -5918,6 +5984,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_customizer_tools_restart.rs",
@@ -6012,6 +6079,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_delivery_scope.rs",
@@ -6105,6 +6173,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_e2e.rs",
@@ -6197,6 +6266,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_governed_ingress.rs",
@@ -6290,6 +6360,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_governed_ingress_mob.rs",
@@ -6384,6 +6455,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_head_canonical_resume.rs",
@@ -6480,6 +6552,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_inspect_sharing.rs",
@@ -6573,6 +6646,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_kitchen_sink.rs",
@@ -6669,6 +6743,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_lazy_recall_continuity.rs",
@@ -6765,6 +6840,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_operator_smoke.rs",
@@ -6861,6 +6937,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_repeated_compaction.rs",
@@ -6954,6 +7031,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_respawn_continuity.rs",
@@ -7048,6 +7126,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_restart_prunes_undesired_edges.rs",
@@ -7142,6 +7221,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_resume_pair_coherence.rs",
@@ -7236,6 +7316,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_role_migration_on_resume.rs",
@@ -7330,6 +7411,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_runtime.rs",
@@ -7426,6 +7508,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_session_repair_hold.rs",
@@ -7519,6 +7602,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_subprocess_reboot.rs",
@@ -7615,6 +7699,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_turn_tickets.rs",
@@ -7709,6 +7794,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/identity_first_types.rs",
@@ -7802,6 +7888,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/idle_cpu_gate.rs",
@@ -7895,6 +7982,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/incident_command_center_pack.rs",
@@ -7989,6 +8077,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/judgment_plane_deweld.rs",
@@ -8082,6 +8171,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/jwks_cache_and_auth.rs",
@@ -8175,6 +8265,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/jwt_oidc_auth.rs",
@@ -8268,6 +8359,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/jwt_rsa.rs",
@@ -8361,6 +8453,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/legacy_session_resume.rs",
@@ -8454,6 +8547,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/list_flows_run_flow.rs",
@@ -8548,6 +8642,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/list_runs.rs",
@@ -8641,6 +8736,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/live_contracts.rs",
@@ -8733,6 +8829,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/llm_fallback_decorators.rs",
@@ -8826,6 +8923,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/markdown_store_surface_retired.rs",
@@ -8919,6 +9017,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/mcp_boundary.rs",
@@ -9016,6 +9115,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/member_instruction_activation.rs",
@@ -9110,6 +9210,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/member_registration_hook.rs",
@@ -9203,6 +9304,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/member_run_stop.rs",
@@ -9296,6 +9398,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/memory_comms_taint_contract.rs",
@@ -9389,6 +9492,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/memory_dispatch_taint.rs",
@@ -9483,6 +9587,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/memory_store.rs",
@@ -9576,6 +9681,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/meta_gateway_bootstrap.rs",
@@ -9673,6 +9779,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/mob_announcements_delivery_process.rs",
@@ -9766,6 +9873,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/mob_announcements_remote_process.rs",
@@ -9860,6 +9968,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/mob_events_cursor_persistence.rs",
@@ -9953,6 +10062,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/mob_events_ingestion.rs",
@@ -10046,6 +10156,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/mob_events_query.rs",
@@ -10139,6 +10250,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/mob_events_query_ledger.rs",
@@ -10232,6 +10344,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/mob_events_streaming.rs",
@@ -10325,6 +10438,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/mob_run_labels.rs",
@@ -10418,6 +10532,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/mob_stop_flow_runs.rs",
@@ -10512,6 +10627,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/mob_storage_persistence.rs",
@@ -10607,6 +10723,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/model_fallback_wiring.rs",
@@ -10700,6 +10817,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/module_restart.rs",
@@ -10793,6 +10911,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/module_startup_cleanup.rs",
@@ -10888,6 +11007,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/native_grant_configuration.rs",
@@ -10983,6 +11103,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/never_executed_persistence.rs",
@@ -11076,6 +11197,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/profile_tool_deny.rs",
@@ -11170,6 +11292,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/public_roster_resolver.rs",
@@ -11263,6 +11386,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/reference_app.rs",
@@ -11359,6 +11483,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/released_0_8_26_store_adoption.rs",
@@ -11455,6 +11580,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/released_realm_upgrade_drive.rs",
@@ -11551,6 +11677,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/repair_queue_carry.rs",
@@ -11645,6 +11772,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/repair_tool_result_bounds.rs",
@@ -11738,6 +11866,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/resume_collision_inflight_spawn.rs",
@@ -11832,6 +11961,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/routing_delivery.rs",
@@ -11928,6 +12058,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/rpc_builtins.rs",
@@ -12021,6 +12152,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/rpc_envelope_golden_labels.rs",
@@ -12114,6 +12246,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/runtime_bootstrap.rs",
@@ -12207,6 +12340,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/schedule_store_text_carry.rs",
@@ -12300,6 +12434,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/sdk_enum_mirror_parity.rs",
@@ -12395,6 +12530,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/sdk_error_category_parity.rs",
@@ -12490,6 +12626,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/sdk_parity.rs",
@@ -12586,6 +12723,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/sdk_productization.rs",
@@ -12682,6 +12820,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/session_compaction_wiring.rs",
@@ -12776,6 +12915,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/session_store_jsonl.rs",
@@ -12870,6 +13010,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/shutdown_drain.rs",
@@ -12963,6 +13104,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/sse_auth_gate.rs",
@@ -13056,6 +13198,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/steward_eval_harness.rs",
@@ -13152,6 +13295,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/storage_doctor_gateway.rs",
@@ -13245,6 +13389,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/storage_gate.rs",
@@ -13340,6 +13485,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/storage_health_gateway.rs",
@@ -13433,6 +13579,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/storage_layout_boot.rs",
@@ -13530,6 +13677,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/storage_migrate_cli.rs",
@@ -13625,6 +13773,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/storage_wire.rs",
@@ -13718,6 +13867,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/studio_k_asks.rs",
@@ -13811,6 +13961,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/swarm_integration.rs",
@@ -13903,6 +14054,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/tool_bundle_forwarding.rs",
@@ -13996,6 +14148,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/tool_event_stream_contracts.rs",
@@ -14089,6 +14242,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/support/llm_usage.rs",
@@ -14185,6 +14339,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/turn_boundary_fork_forwarding.rs",
@@ -14278,6 +14433,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/support/llm_usage.rs",
@@ -14372,6 +14528,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/unified_runtime_builder_send.rs",
@@ -14465,6 +14622,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/wildcard_routes.rs",
@@ -14562,6 +14720,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/support/llm_usage.rs",
@@ -14655,6 +14814,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/workgraph_facts_sse.rs",
@@ -14748,6 +14908,7 @@ rust_test(
         "tests/fixtures/security_idempotency/security-head-evolution.json",
         "tests/fixtures/v0_8_10_released_session.json",
         "tests/fixtures/v0_8_10_zero_rewrite_supervisor_session.json",
+        "tests/mob_announcements_delivery_process.rs",
     ],
     srcs = [
         "tests/workgraph_rpc.rs",

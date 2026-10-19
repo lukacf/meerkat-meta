@@ -2,9 +2,9 @@
 //! subscriptions.
 //!
 //! A profile opts in by naming [`TOOL_BUNDLE`] in its `tools.rust_bundles`.
-//! The bundle is host-only unless the gateway sets
-//! `member_tools_in_child_mobs`, which gives it to every inline profile of
-//! every mob a member creates. Every call is attributed to exactly one
+//! The bundle is host-only: a child mob profile gets it only by opting in
+//! itself, which this build cannot offer yet, so the gateway-wide
+//! `member_tools_in_child_mobs` is refused. Every call is attributed to exactly one
 //! member: the member of this gateway's mob whose session the call comes
 //! from, as both the mob roster and the identity runtime record it, or, for
 //! a member of a mob a member created, as the session's persisted member

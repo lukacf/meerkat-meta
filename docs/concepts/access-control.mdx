@@ -467,9 +467,15 @@ own keys only. Both need:
 - a request issued within the serving gateway's freshness window of its own
   clock (`runtime_options.control_request_window_ms`, five minutes by
   default) and not before the serving process started;
-- an identity-first serving gateway, which composes the receiver with its
-  control listener whether or not it enables mob announcements itself.
-  Otherwise the verbs answer `keyed_inject_unavailable`.
+- an identity-first serving gateway that serves keyed injects. Every gateway
+  that binds a control listener (`rpc_gateway`, `meta_gateway`, and a
+  runtime the builder composes) seals what the plane serves once its runtime
+  is composed, whether or not it enables mob announcements itself. Until
+  then the verbs answer `keyed_inject_unavailable`: the gateway is starting.
+  A gateway that is not identity-first, or whose configuration turns serving
+  off (`runtime_options.serve_keyed_inject: false` on `rpc_gateway`),
+  answers `not_served` with its typed cause, `not_identity_first` or
+  `runtime_disabled`, in a field of the signed refusal.
 
 Every answer is signed with the serving gateway's key, and the caller treats
 only an answer its pinned key verifies as evidence. A signed `unknown_member`

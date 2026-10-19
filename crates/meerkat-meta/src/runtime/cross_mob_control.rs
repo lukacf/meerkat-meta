@@ -526,6 +526,12 @@ pub enum ControlResponse {
     InjectRefused {
         code: String,
         message: String,
+        /// The typed cause of a code that carries one, in its wire spelling
+        /// (see [`super::keyed_inject::KeyedInjectRefusalCause`]). Signed with
+        /// the code and the message; a caller reads it from here, never from
+        /// the message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sig_b64: Option<String>,
     },
@@ -633,9 +639,14 @@ pub fn control_response_signing_payload(
             "inject_status\n{}",
             super::keyed_inject::status_facts(status, input.as_ref())
         ),
-        ControlResponse::InjectRefused { code, message, .. } => format!(
+        ControlResponse::InjectRefused {
+            code,
+            message,
+            cause,
+            ..
+        } => format!(
             "inject_refused\n{}",
-            super::keyed_inject::refusal_facts(code, message)
+            super::keyed_inject::refusal_facts(code, cause.as_deref(), message)
         ),
         ControlResponse::Err { .. } => return None,
     };
@@ -1968,7 +1979,7 @@ impl MobHandleControlHandler {
             identity_authority: ControlIdentityAuthority::None,
             session_service: None,
             host_facts: empty_host_facts_provider(),
-            keyed_inject: super::keyed_inject::empty_keyed_inject_slot(),
+            keyed_inject: super::keyed_inject::pending_keyed_inject_slot(),
         }
     }
 
@@ -1983,7 +1994,7 @@ impl MobHandleControlHandler {
             identity_authority: ControlIdentityAuthority::Fixed(Box::new(identity_runtime)),
             session_service: None,
             host_facts: empty_host_facts_provider(),
-            keyed_inject: super::keyed_inject::empty_keyed_inject_slot(),
+            keyed_inject: super::keyed_inject::pending_keyed_inject_slot(),
         }
     }
 
@@ -2001,7 +2012,7 @@ impl MobHandleControlHandler {
             identity_authority: ControlIdentityAuthority::Shared(identity_slot),
             session_service: None,
             host_facts: empty_host_facts_provider(),
-            keyed_inject: super::keyed_inject::empty_keyed_inject_slot(),
+            keyed_inject: super::keyed_inject::pending_keyed_inject_slot(),
         }
     }
 
@@ -2924,7 +2935,7 @@ mod tests {
                     request @ (ControlRequest::InjectKeyed { .. }
                     | ControlRequest::InjectStatus { .. }) => {
                         crate::runtime::keyed_inject::answer_keyed_inject_request(
-                            &crate::runtime::keyed_inject::empty_keyed_inject_slot(),
+                            &crate::runtime::keyed_inject::pending_keyed_inject_slot(),
                             request,
                             None,
                         )

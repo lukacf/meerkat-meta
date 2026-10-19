@@ -90,8 +90,9 @@ pub struct AnnouncementConfig {
     /// Bounds on subscriptions for members of mobs hosted here other than
     /// this gateway's own.
     pub child_limits: ChildMemberLimits,
-    /// Whether every inline profile of every mob a member creates gets the
-    /// member tools, so the members of those mobs subscribe themselves.
+    /// Whether members of mobs members create may call the member tools.
+    /// Always false in this build: the gateway-wide grant is refused at
+    /// configuration, since each child mob profile must opt in itself.
     pub member_tools_in_child_mobs: bool,
 }
 

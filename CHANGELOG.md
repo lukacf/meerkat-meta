@@ -74,12 +74,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`runtime_options.mob_announcements.child_member_limits`); a put past a
   bound is refused with `child_member_limit`.
 
-- `runtime_options.mob_announcements.member_tools_in_child_mobs` (default
-  false) gives the mob announcement member tools to every inline profile of
-  every mob a member creates. Their members then subscribe themselves to the
-  announcements of the mobs above their own, attributed through the
-  session's persisted member binding and that mob's roster, role included.
-  Without it the host RPC subscribes them.
+- `runtime_options.mob_announcements.member_tools_in_child_mobs` is refused
+  when set: each child mob profile has to opt in to the member tools itself,
+  which this release cannot offer yet, and the gateway-wide grant to every
+  child profile is not handed out. The host RPC subscribes members of child
+  mobs instead.
 
 - Keyed cross-mob inject. Two new control verbs, `inject_keyed` and
   `inject_status`, deliver one keyed continuation to a member of the serving
@@ -87,11 +86,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   back. Requests and answers are signed, requests must be issued within
   `runtime_options.control_request_window_ms` (five minutes by default) of
   the serving gateway's clock, and a grant must name the verbs (`*` does not
-  cover them). An identity-first gateway with a control listener serves
-  them. Mob announcements use them to deliver to members of mobs on peer
-  gateways; a gateway that predates them ends such a subscription as
-  `peer_unsupported`. Every public enum of `runtime::keyed_inject` is
-  `#[non_exhaustive]`.
+  cover them). Every gateway that binds a control listener (`rpc_gateway`,
+  `meta_gateway`, and a runtime the builder composes) seals what the keyed
+  inject plane serves once its runtime is composed: an identity-first
+  gateway serves them, and until then both verbs answer
+  `keyed_inject_unavailable`. A gateway that is not identity-first, or that
+  turns serving off (`runtime_options.serve_keyed_inject: false`, or
+  `UnifiedRuntimeBuilder::keyed_inject_plane(KeyedInjectPlane::Disabled)`),
+  answers `not_served` with its typed cause (`not_identity_first`,
+  `runtime_disabled`) in a signed field of the refusal. Mob announcements
+  use them to deliver to members of mobs on peer gateways; a gateway that
+  predates them ends such a subscription as `peer_unsupported`. Every
+  public enum of `runtime::keyed_inject` is `#[non_exhaustive]`.
 
 - `.github/workflows/warm-deps.yml`, dispatched on a branch whose `Cargo.lock`
   changed, builds the dependency graph of each Rust CI job from that branch's

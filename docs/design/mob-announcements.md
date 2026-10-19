@@ -161,13 +161,12 @@ pace.
 ## Member tools
 
 A member profile opts into the `mob_announcements` tool bundle by listing it
-in `tools.rust_bundles`. By default the bundle is host-only: mobs members
-create never receive it, and the host RPC subscribes their members (see
-Members of mobs members created). With `member_tools_in_child_mobs` set,
-every inline profile of every mob a member creates gets the bundle, with a
-profile's deny list as the only narrowing: every member of those mobs can
-then subscribe itself to the announcements of every mob above its own and
-announce into its own. It has two tools:
+in `tools.rust_bundles`. The bundle is host-only: mobs members create never
+receive it, and the host RPC subscribes their members (see Members of mobs
+members created). Members of those mobs, which untrusted content can steer,
+may get the tools only through a per-profile opt-in that this release
+cannot offer yet, so `member_tools_in_child_mobs`, a grant to every inline
+profile of every child mob, is refused at launch. It has two tools:
 
 - `mob_announce` `{topics, body, key?, correlation_id?}`: announce into the
   caller's own mob, as `{"kind": "member", "identity": ...}`. A retry with
@@ -183,8 +182,8 @@ announce into its own. It has two tools:
 
 Every call is attributed to exactly one member: the member of this gateway's
 mob whose session the call comes from, as both the mob roster and the
-identity runtime record it, or, with `member_tools_in_child_mobs`, the
-member of a mob a member created that the session's persisted member
+identity runtime record it, or, for a member of a mob a member created
+once its profile can opt in, the member that the session's persisted member
 binding names and that mob's roster binds to the same session under the
 same role. A call that cannot be attributed so is refused and changes
 nothing. A member's keys and subscription names live in a

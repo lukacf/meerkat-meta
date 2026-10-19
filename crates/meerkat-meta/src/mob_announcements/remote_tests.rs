@@ -31,8 +31,8 @@ use crate::runtime::cross_mob_control::{
 };
 use crate::runtime::keyed_inject::{
     KeyedInject, KeyedInjectCallerScope, KeyedInjectFuture, KeyedInjectReceiver,
-    KeyedInjectRefusal, KeyedInjectRefusalCode, KeyedInjectSlot, KeyedInjectStatusAnswer,
-    NativeReceipt, answer_keyed_inject_request,
+    KeyedInjectRefusal, KeyedInjectRefusalCode, KeyedInjectServing, KeyedInjectSlot,
+    KeyedInjectStatusAnswer, NativeReceipt, answer_keyed_inject_request,
 };
 
 const PEER: &str = "mob-b";
@@ -207,9 +207,10 @@ struct Peer {
 /// `answer_keys` and admitting callers through `authorizer`.
 async fn serve(answer_keys: &Arc<GatewayPeerKeys>, authorizer: ControlAuthorizer) -> Peer {
     let receiver = ScriptedReceiver::new();
-    let slot: KeyedInjectSlot = Arc::new(RwLock::new(Some(
-        Arc::clone(&receiver) as Arc<dyn KeyedInjectReceiver>
-    )));
+    let slot: KeyedInjectSlot = Arc::new(RwLock::new(KeyedInjectServing::Serving(Arc::clone(
+        &receiver,
+    )
+        as Arc<dyn KeyedInjectReceiver>)));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("tcp://{}", listener.local_addr().unwrap());
     tokio::spawn(serve_tcp_control_with_authorizer(
@@ -763,7 +764,7 @@ async fn a_gateway_that_serves_no_keyed_inject_answers_a_signed_unavailable() {
     tokio::spawn(serve_tcp_control_with_authorizer(
         listener,
         Arc::new(KeyedInjectHandler {
-            slot: crate::runtime::keyed_inject::empty_keyed_inject_slot(),
+            slot: crate::runtime::keyed_inject::pending_keyed_inject_slot(),
         }),
         signer(&peer_keys),
         Arc::new(ControlAuthorizer::with_grants_for_audience(
@@ -905,9 +906,10 @@ async fn a_request_issued_before_the_serving_process_started_is_stale() {
 #[tokio::test]
 async fn a_keyed_inject_verb_without_an_admitting_caller_is_refused() {
     let receiver = ScriptedReceiver::new();
-    let slot: KeyedInjectSlot = Arc::new(RwLock::new(Some(
-        Arc::clone(&receiver) as Arc<dyn KeyedInjectReceiver>
-    )));
+    let slot: KeyedInjectSlot = Arc::new(RwLock::new(KeyedInjectServing::Serving(Arc::clone(
+        &receiver,
+    )
+        as Arc<dyn KeyedInjectReceiver>)));
     let body = "a body".to_string();
     let request = ControlRequest::InjectKeyed {
         remote_member: MEMBER.to_string(),

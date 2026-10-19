@@ -571,9 +571,16 @@ impl RemoteMobProxy {
             ControlResponse::InjectReceipt { receipt, .. } => {
                 Ok(KeyedInjectCallOutcome::Answered(receipt))
             }
-            ControlResponse::InjectRefused { code, message, .. } => {
-                Ok(KeyedInjectCallOutcome::Refused { code, message })
-            }
+            ControlResponse::InjectRefused {
+                code,
+                message,
+                cause,
+                ..
+            } => Ok(KeyedInjectCallOutcome::Refused {
+                code,
+                message,
+                cause,
+            }),
             ControlResponse::Err { code, message } => {
                 Err(KeyedInjectCallError::Rejected { code, message })
             }
@@ -614,9 +621,16 @@ impl RemoteMobProxy {
                     input,
                 }))
             }
-            ControlResponse::InjectRefused { code, message, .. } => {
-                Ok(KeyedInjectCallOutcome::Refused { code, message })
-            }
+            ControlResponse::InjectRefused {
+                code,
+                message,
+                cause,
+                ..
+            } => Ok(KeyedInjectCallOutcome::Refused {
+                code,
+                message,
+                cause,
+            }),
             ControlResponse::Err { code, message } => {
                 Err(KeyedInjectCallError::Rejected { code, message })
             }

@@ -590,8 +590,16 @@ class CiChangesTests(unittest.TestCase):
             # Sources the console and flow editor contract tests read.
             ("crates/meerkat-meta/src/rpc/topology_methods.rs", {"python", "console"}),
             ("crates/meerkat-meta/src/unified_runtime/http.rs", {"flow_editor"}),
-            ("crates/meerkat-meta/src/rpc_gateway.rs", {"python"}),
+            ("crates/meerkat-meta/src/rpc_gateway.rs", {"python", "extension_state"}),
             ("crates/meerkat-meta/src/bin/rpc_gateway.rs", {"python"}),
+            # The keyed inject plane the mob announcement process tests drive:
+            # its control channel, its composition and the identity runtime.
+            ("crates/meerkat-meta/src/runtime/keyed_inject.rs", {"extension_state"}),
+            ("crates/meerkat-meta/src/runtime/cross_mob_control.rs", {"extension_state"}),
+            ("crates/meerkat-meta/src/runtime/cross_mob_remote.rs", {"extension_state"}),
+            ("crates/meerkat-meta/src/unified_runtime/cross_mob.rs", {"extension_state"}),
+            ("crates/meerkat-meta/src/unified_runtime/builder.rs", {"extension_state"}),
+            ("crates/meerkat-meta/src/identity_first/runtime.rs", {"extension_state"}),
         ):
             with self.subTest(path=path):
                 self.assertEqual(self.lanes(path), RUST_PR_LANES | lanes)

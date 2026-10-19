@@ -222,6 +222,10 @@ struct GatewayRuntimeOptions {
     /// inject request's issue time may be from this gateway's clock, in
     /// either direction, before the control listener refuses it as stale.
     control_request_window_ms: u64,
+    /// `runtime_options.serve_keyed_inject`: whether the control listener
+    /// serves peers' keyed injects (default true). Off, both keyed inject
+    /// verbs answer `not_served` with the cause `runtime_disabled`.
+    serve_keyed_inject: bool,
 }
 
 /// `runtime_options.live` wire forms: `true` mounts the live WebSocket
@@ -411,6 +415,19 @@ impl GatewayRuntimeOptions {
         }
         false
     }
+
+    /// How the control listener serves peers' keyed injects:
+    /// `serve_keyed_inject` off disables it, and otherwise it serves within
+    /// `control_request_window_ms`.
+    fn keyed_inject_plane(&self) -> crate::mob_announcements::KeyedInjectPlane {
+        if self.serve_keyed_inject {
+            crate::mob_announcements::KeyedInjectPlane::Serve {
+                window_ms: self.control_request_window_ms,
+            }
+        } else {
+            crate::mob_announcements::KeyedInjectPlane::Disabled
+        }
+    }
 }
 
 impl Default for GatewayRuntimeOptions {
@@ -456,6 +473,7 @@ impl Default for GatewayRuntimeOptions {
             allow_remote: false,
             mob_announcements: None,
             control_request_window_ms: crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS,
+            serve_keyed_inject: true,
         }
     }
 }
@@ -4011,6 +4029,74 @@ actions = ["agent.view"]
         );
         assert!(declared.allow_remote);
         Ok(())
+    }
+
+    /// `runtime_options.serve_keyed_inject` turns keyed inject serving off;
+    /// it defaults on, and only a boolean is accepted.
+    #[test]
+    fn gateway_runtime_options_parse_serve_keyed_inject() -> Result<(), String> {
+        let defaulted = parse_gateway_runtime_options(&json!({ "runtime_options": {} }), None)?;
+        assert_eq!(
+            defaulted.keyed_inject_plane(),
+            crate::mob_announcements::KeyedInjectPlane::Serve {
+                window_ms: crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS
+            }
+        );
+        let windowed = parse_gateway_runtime_options(
+            &json!({ "runtime_options": { "control_request_window_ms": 60_000 } }),
+            None,
+        )?;
+        assert_eq!(
+            windowed.keyed_inject_plane(),
+            crate::mob_announcements::KeyedInjectPlane::Serve { window_ms: 60_000 }
+        );
+        let off = parse_gateway_runtime_options(
+            &json!({ "runtime_options": {
+                "serve_keyed_inject": false,
+                "control_request_window_ms": 60_000
+            } }),
+            None,
+        )?;
+        assert_eq!(
+            off.keyed_inject_plane(),
+            crate::mob_announcements::KeyedInjectPlane::Disabled
+        );
+        let malformed = parse_gateway_runtime_options(
+            &json!({ "runtime_options": { "serve_keyed_inject": "no" } }),
+            None,
+        )
+        .map(|_| ());
+        assert!(
+            matches!(&malformed, Err(error) if error.contains("runtime_options.serve_keyed_inject")),
+            "{malformed:?}"
+        );
+        Ok(())
+    }
+
+    /// `runtime_options.mob_announcements.member_tools_in_child_mobs` fails
+    /// gateway init: each child mob profile must opt in to the member tools
+    /// itself, so the gateway-wide grant is refused, naming the missing
+    /// per-profile opt-in.
+    #[test]
+    fn gateway_runtime_options_refuse_member_tools_in_child_mobs() {
+        let refused = parse_gateway_runtime_options(
+            &json!({ "runtime_options": { "mob_announcements": {
+                "enabled": true,
+                "member_tools_in_child_mobs": true
+            } } }),
+            None,
+        )
+        .map(|_| ());
+        assert_eq!(
+            refused,
+            Err(crate::mob_announcements::AnnouncementOptionsError::ChildMemberToolsNeedProfileOptIn
+                .to_string())
+        );
+        assert!(
+            matches!(&refused, Err(error) if error.contains("member_tools_in_child_mobs")
+                && error.contains("per-profile opt-in")),
+            "{refused:?}"
+        );
     }
 
     #[test]
@@ -8260,6 +8346,7 @@ fn parse_gateway_runtime_options(
         "allow_remote",
         "mob_announcements",
         "control_request_window_ms",
+        "serve_keyed_inject",
     ];
     let unsupported = runtime_options
         .keys()
@@ -8339,8 +8426,14 @@ fn parse_gateway_runtime_options(
             })?;
         parsed.control_request_window_ms = window;
     }
+    if let Some(value) = runtime_options.get("serve_keyed_inject") {
+        parsed.serve_keyed_inject = value
+            .as_bool()
+            .ok_or_else(|| "runtime_options.serve_keyed_inject must be a boolean".to_string())?;
+    }
     if let Some(value) = runtime_options.get("mob_announcements") {
-        parsed.mob_announcements = crate::mob_announcements::parse_runtime_options(value)?;
+        parsed.mob_announcements = crate::mob_announcements::parse_runtime_options(value)
+            .map_err(|error| error.to_string())?;
         if parsed.mob_announcements.is_some() && persistent_state.is_none() {
             return Err("runtime_options.mob_announcements needs a persistent launch".to_string());
         }
@@ -16616,20 +16709,16 @@ external_addressable = true
             });
         }
         slots.extend(crate::storage_health::scratch_ring_buffer_slots());
-        if let Some(config) = gateway_options.mob_announcements.as_ref() {
-            // With `member_tools_in_child_mobs`, every inline profile of
-            // every mob a member creates gets the bundle too.
-            let availability = if config.member_tools_in_child_mobs {
-                meerkat_mob_mcp::ChildToolBundleAvailability::ChildAvailable
-            } else {
-                meerkat_mob_mcp::ChildToolBundleAvailability::HostOnly
-            };
+        if gateway_options.mob_announcements.is_some() {
+            // The host's own profiles name the bundle. No child mob profile
+            // gets it: that takes a per-profile opt-in this build cannot
+            // offer yet, so the configuration that would grant it refuses.
             spec = spec.register_tool_bundle_with_availability(
                 crate::mob_announcements::tools::TOOL_BUNDLE,
                 Arc::new(crate::mob_announcements::tools::MobAnnouncementTools::new(
                     Arc::clone(&announcement_tools),
                 )),
-                availability,
+                meerkat_mob_mcp::ChildToolBundleAvailability::HostOnly,
             );
         }
         // The M4 census had no mob slot at all, which is why an in-memory mob
@@ -18424,12 +18513,12 @@ external_addressable = true
         )
         .map_err(|message| fail_init(&request_id, -32602, message))?;
     }
-    // A control listener on an identity-first gateway serves peers' keyed
-    // injects, whether or not this gateway enables mob announcements itself.
-    if control_listen_address.is_some() && runtime.identity_runtime_ref().is_some() {
-        crate::mob_announcements::compose_keyed_inject_receiver(
+    // The runtime is composed: seal what the control listener's keyed inject
+    // plane serves, through the one composition every surface shares.
+    if control_listen_address.is_some() {
+        crate::mob_announcements::compose_keyed_inject_plane(
             &runtime,
-            gateway_options.control_request_window_ms,
+            gateway_options.keyed_inject_plane(),
         )
         .map_err(|message| fail_init(&request_id, -32602, message))?;
     }

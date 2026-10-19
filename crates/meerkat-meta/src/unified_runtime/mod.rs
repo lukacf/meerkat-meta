@@ -914,7 +914,7 @@ impl UnifiedRuntime {
                 )),
                 console_identity_roster: std::sync::RwLock::new(None),
                 mob_announcements: std::sync::OnceLock::new(),
-                keyed_inject_slot: crate::runtime::keyed_inject::empty_keyed_inject_slot(),
+                keyed_inject_slot: crate::runtime::keyed_inject::pending_keyed_inject_slot(),
                 console_operator_resolver: std::sync::RwLock::new(None),
                 console_governed_ingress: Default::default(),
                 metadata_table,
@@ -2011,21 +2011,16 @@ impl UnifiedRuntime {
         self.mob_announcements.get().cloned()
     }
 
-    /// Serve the keyed inject plane of the cross-mob control channel from
-    /// `receiver`. Once per runtime: `false` when one is already installed.
-    pub fn install_keyed_inject_receiver(
+    /// Seal what the keyed inject plane of the cross-mob control channel
+    /// serves. Once per runtime, from pending: `false` when it is already
+    /// sealed. Gateways seal it through
+    /// [`crate::mob_announcements::compose_keyed_inject_plane`].
+    pub fn seal_keyed_inject(
         &self,
-        receiver: Arc<dyn crate::runtime::keyed_inject::KeyedInjectReceiver>,
+        serving: crate::runtime::keyed_inject::KeyedInjectServing,
     ) -> bool {
-        let mut slot = self
-            .keyed_inject_slot
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.is_some() {
-            return false;
-        }
-        *slot = Some(receiver);
-        true
+        crate::runtime::keyed_inject::seal_keyed_inject_slot(&self.keyed_inject_slot, serving)
+            .is_ok()
     }
 
     /// The contact directory and the signing-key slot that delivery to

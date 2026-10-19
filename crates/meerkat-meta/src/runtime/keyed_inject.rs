@@ -29,9 +29,12 @@
 //!   it pinned for the peer. An unsigned or unverifiable answer, and any
 //!   `Err` answer, is never evidence of anything.
 //!
-//! The serving side is a late-bound [`KeyedInjectReceiver`] that the
-//! gateway's mob announcement composition installs. Until it does, both
-//! verbs answer [`KeyedInjectRefusalCode::Unavailable`].
+//! The serving side is a [`KeyedInjectReceiver`] behind a slot that the
+//! gateway's composition seals exactly once, after its runtime is composed
+//! ([`KeyedInjectServing`]). Until then both verbs answer
+//! [`KeyedInjectRefusalCode::Unavailable`]; a gateway that does not serve
+//! keyed injects answers [`KeyedInjectRefusalCode::NotServed`] with its
+//! typed [`NotServedCause`].
 
 use std::future::Future;
 use std::pin::Pin;
@@ -98,7 +101,8 @@ pub enum NativeStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum KeyedInjectRefusalCode {
-    /// This gateway does not serve keyed injects.
+    /// This gateway's keyed inject plane is not composed yet: it is still
+    /// starting. Asking again later is right.
     Unavailable,
     /// The request was issued outside this gateway's freshness window.
     StaleRequest,
@@ -120,11 +124,16 @@ pub enum KeyedInjectRefusalCode {
     OwnerRetired,
     /// A native read or write could not be made now; nothing is implied.
     NativeUnavailable,
+    /// This gateway does not serve keyed injects. The refusal carries the
+    /// typed [`NotServedCause`].
+    NotServed,
+    /// The member left this gateway for good: its durable identity departed.
+    MemberDeparted,
 }
 
 impl KeyedInjectRefusalCode {
     /// Every code this gateway answers.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::Unavailable,
         Self::StaleRequest,
         Self::InvalidRequest,
@@ -134,6 +143,8 @@ impl KeyedInjectRefusalCode {
         Self::Conflict,
         Self::OwnerRetired,
         Self::NativeUnavailable,
+        Self::NotServed,
+        Self::MemberDeparted,
     ];
 
     /// Stable wire spelling.
@@ -148,6 +159,8 @@ impl KeyedInjectRefusalCode {
             Self::Conflict => "conflict",
             Self::OwnerRetired => "owner_retired",
             Self::NativeUnavailable => "native_unavailable",
+            Self::NotServed => "not_served",
+            Self::MemberDeparted => "member_departed",
         }
     }
 
@@ -164,11 +177,78 @@ impl std::fmt::Display for KeyedInjectRefusalCode {
     }
 }
 
+/// Why a gateway does not serve keyed injects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum NotServedCause {
+    /// The gateway is not identity-first, so it has no durable identities to
+    /// deliver to.
+    NotIdentityFirst,
+    /// The gateway's configuration turns keyed inject serving off.
+    RuntimeDisabled,
+}
+
+impl NotServedCause {
+    /// Every cause this gateway answers.
+    pub const ALL: [Self; 2] = [Self::NotIdentityFirst, Self::RuntimeDisabled];
+
+    /// Stable wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotIdentityFirst => "not_identity_first",
+            Self::RuntimeDisabled => "runtime_disabled",
+        }
+    }
+
+    /// Parse a wire spelling. `None` for a cause this gateway does not know.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|cause| cause.as_str() == value)
+    }
+}
+
+impl std::fmt::Display for NotServedCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The typed cause a refusal carries next to its code, inside the signed
+/// facts, for the codes that have one. A caller reads it from this field and
+/// never from the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum KeyedInjectRefusalCause {
+    /// Why a gateway answering [`KeyedInjectRefusalCode::NotServed`] does not
+    /// serve keyed injects.
+    NotServed(NotServedCause),
+}
+
+impl KeyedInjectRefusalCause {
+    /// Stable wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotServed(cause) => cause.as_str(),
+        }
+    }
+
+    /// Parse the cause of a refusal with `code` from its wire spelling.
+    /// `None` for a code without causes, or a cause this gateway does not
+    /// know.
+    pub fn parse(code: KeyedInjectRefusalCode, value: &str) -> Option<Self> {
+        match code {
+            KeyedInjectRefusalCode::NotServed => NotServedCause::parse(value).map(Self::NotServed),
+            _ => None,
+        }
+    }
+}
+
 /// A typed refusal from the serving side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyedInjectRefusal {
     pub code: KeyedInjectRefusalCode,
     pub message: String,
+    /// The typed cause, for the codes that carry one.
+    pub cause: Option<KeyedInjectRefusalCause>,
 }
 
 impl KeyedInjectRefusal {
@@ -176,6 +256,16 @@ impl KeyedInjectRefusal {
         Self {
             code,
             message: message.into(),
+            cause: None,
+        }
+    }
+
+    /// The refusal of a gateway that does not serve keyed injects.
+    pub fn not_served(cause: NotServedCause) -> Self {
+        Self {
+            code: KeyedInjectRefusalCode::NotServed,
+            message: format!("this gateway does not serve keyed injects ({cause})"),
+            cause: Some(KeyedInjectRefusalCause::NotServed(cause)),
         }
     }
 }
@@ -272,14 +362,83 @@ pub trait KeyedInjectReceiver: Send + Sync {
     ) -> KeyedInjectFuture<'a, Result<KeyedInjectStatusAnswer, KeyedInjectRefusal>>;
 }
 
-/// Late-bound serving side. Gateways start their control listener before
-/// they compose mob announcements, so the handler re-reads this per request.
-pub type KeyedInjectSlot = Arc<RwLock<Option<Arc<dyn KeyedInjectReceiver>>>>;
+/// What a gateway's keyed inject plane serves. A gateway binds its control
+/// listener after its identity roster pass but before its runtime is fully
+/// composed, so the plane starts [`Self::Pending`], and the gateway's
+/// composition seals it exactly once into [`Self::Serving`] or
+/// [`Self::NotServed`] ([`seal_keyed_inject_slot`]). A request therefore
+/// never meets an incomplete identity registry. The handler re-reads the
+/// plane per request.
+#[derive(Clone)]
+#[non_exhaustive]
+pub enum KeyedInjectServing {
+    /// Not composed yet: the gateway is starting. Both verbs answer
+    /// [`KeyedInjectRefusalCode::Unavailable`].
+    Pending,
+    /// Served from this receiver.
+    Serving(Arc<dyn KeyedInjectReceiver>),
+    /// Not served here, for this typed cause. Both verbs answer
+    /// [`KeyedInjectRefusalCode::NotServed`].
+    NotServed(NotServedCause),
+}
 
-/// A slot nothing serves from: both verbs answer
-/// [`KeyedInjectRefusalCode::Unavailable`].
-pub fn empty_keyed_inject_slot() -> KeyedInjectSlot {
-    Arc::new(RwLock::new(None))
+impl std::fmt::Debug for KeyedInjectServing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => f.write_str("Pending"),
+            Self::Serving(_) => f.write_str("Serving"),
+            Self::NotServed(cause) => f.debug_tuple("NotServed").field(cause).finish(),
+        }
+    }
+}
+
+/// The keyed inject plane of one gateway, shared by its control listener and
+/// its composition.
+pub type KeyedInjectSlot = Arc<RwLock<KeyedInjectServing>>;
+
+/// A plane the gateway has not composed yet.
+pub fn pending_keyed_inject_slot() -> KeyedInjectSlot {
+    Arc::new(RwLock::new(KeyedInjectServing::Pending))
+}
+
+/// Why a keyed inject plane was not sealed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyedInjectSealError {
+    /// The plane is already sealed: it is sealed exactly once.
+    AlreadySealed,
+    /// [`KeyedInjectServing::Pending`] is where a plane starts, never what it
+    /// is sealed into.
+    SealedPending,
+}
+
+impl std::fmt::Display for KeyedInjectSealError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::AlreadySealed => "the keyed inject plane is already sealed",
+            Self::SealedPending => "a keyed inject plane is never sealed into pending",
+        })
+    }
+}
+
+impl std::error::Error for KeyedInjectSealError {}
+
+/// Seal a pending plane into what it serves, exactly once.
+pub fn seal_keyed_inject_slot(
+    slot: &KeyedInjectSlot,
+    serving: KeyedInjectServing,
+) -> Result<(), KeyedInjectSealError> {
+    if matches!(serving, KeyedInjectServing::Pending) {
+        return Err(KeyedInjectSealError::SealedPending);
+    }
+    let mut current = slot
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !matches!(*current, KeyedInjectServing::Pending) {
+        return Err(KeyedInjectSealError::AlreadySealed);
+    }
+    *current = serving;
+    Ok(())
 }
 
 /// Refuse a request issued further than `window_ms` from `now_ms`, in either
@@ -327,7 +486,7 @@ fn check_member_form(member: &str) -> Result<(), KeyedInjectRefusal> {
     Ok(())
 }
 
-fn current_receiver(slot: &KeyedInjectSlot) -> Option<Arc<dyn KeyedInjectReceiver>> {
+fn current_serving(slot: &KeyedInjectSlot) -> KeyedInjectServing {
     slot.read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
@@ -347,11 +506,17 @@ fn admit(
             "keyed inject verbs are served only to a caller a grant admitted",
         ));
     };
-    let Some(receiver) = current_receiver(slot) else {
-        return Err(KeyedInjectRefusal::new(
-            KeyedInjectRefusalCode::Unavailable,
-            "this gateway does not serve keyed injects",
-        ));
+    let receiver = match current_serving(slot) {
+        KeyedInjectServing::Serving(receiver) => receiver,
+        KeyedInjectServing::Pending => {
+            return Err(KeyedInjectRefusal::new(
+                KeyedInjectRefusalCode::Unavailable,
+                "this gateway's keyed inject plane is not composed yet; ask again later",
+            ));
+        }
+        KeyedInjectServing::NotServed(cause) => {
+            return Err(KeyedInjectRefusal::not_served(cause));
+        }
     };
     check_freshness(issued_at_ms, receiver.now_ms(), receiver.window_ms())?;
     let started_at_ms = receiver.started_at_ms();
@@ -375,6 +540,7 @@ fn refused(refusal: KeyedInjectRefusal) -> ControlResponse {
     ControlResponse::InjectRefused {
         code: refusal.code.as_str().to_string(),
         message: refusal.message,
+        cause: refusal.cause.map(|cause| cause.as_str().to_string()),
         sig_b64: None,
     }
 }
@@ -544,10 +710,18 @@ pub(crate) fn status_facts(status: &NativeStatus, input: Option<&Value>) -> Stri
     out
 }
 
-/// The signed facts of a refusal.
-pub(crate) fn refusal_facts(code: &str, message: &str) -> String {
+/// The signed facts of a refusal: its code, whether it carries a typed cause
+/// and which, and its message, each length-prefixed.
+pub(crate) fn refusal_facts(code: &str, cause: Option<&str>, message: &str) -> String {
     let mut out = String::new();
     push_signed_field(&mut out, code);
+    match cause {
+        Some(cause) => {
+            push_signed_field(&mut out, "cause");
+            push_signed_field(&mut out, cause);
+        }
+        None => push_signed_field(&mut out, "no_cause"),
+    }
     push_signed_field(&mut out, message);
     out
 }
@@ -611,7 +785,13 @@ impl std::error::Error for KeyedInjectCallError {}
 #[non_exhaustive]
 pub enum KeyedInjectCallOutcome<T> {
     Answered(T),
-    Refused { code: String, message: String },
+    /// A signed refusal: its code, its message, and the wire spelling of its
+    /// typed cause when it carries one.
+    Refused {
+        code: String,
+        message: String,
+        cause: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -664,6 +844,158 @@ mod tests {
             assert_eq!(KeyedInjectRefusalCode::parse(code.as_str()), Some(code));
         }
         assert_eq!(KeyedInjectRefusalCode::parse("decode"), None);
+        for cause in NotServedCause::ALL {
+            assert_eq!(NotServedCause::parse(cause.as_str()), Some(cause));
+            assert_eq!(
+                KeyedInjectRefusalCause::parse(KeyedInjectRefusalCode::NotServed, cause.as_str()),
+                Some(KeyedInjectRefusalCause::NotServed(cause))
+            );
+            assert_eq!(
+                KeyedInjectRefusalCause::parse(KeyedInjectRefusalCode::Unavailable, cause.as_str()),
+                None,
+                "a cause belongs to its code"
+            );
+        }
+        assert_eq!(NotServedCause::parse("built_without_feature"), None);
+    }
+
+    fn keyed_request(nonce: &str) -> ControlRequest {
+        ControlRequest::InjectKeyed {
+            remote_member: "agent:specialist".to_string(),
+            delivery_key: "batch-1".to_string(),
+            content_digest: "digest".to_string(),
+            summary: "1 announcement".to_string(),
+            body: "a body".to_string(),
+            issued_at_ms: 1_000_000,
+            nonce: nonce.to_string(),
+            caller: None,
+        }
+    }
+
+    fn status_request(nonce: &str) -> ControlRequest {
+        ControlRequest::InjectStatus {
+            remote_member: "agent:specialist".to_string(),
+            delivery_key: "batch-1".to_string(),
+            with_input: false,
+            issued_at_ms: 1_000_000,
+            nonce: nonce.to_string(),
+            caller: None,
+        }
+    }
+
+    fn granted() -> AuthorizedCaller {
+        AuthorizedCaller {
+            label: "first-gateway".to_string(),
+            pubkey: [7; 32],
+        }
+    }
+
+    /// Before the gateway's composition seals the plane, both verbs answer
+    /// `keyed_inject_unavailable`: the gateway is starting, and nothing about
+    /// the member is implied.
+    #[tokio::test]
+    async fn a_pending_plane_answers_unavailable_until_it_is_sealed() {
+        let slot = pending_keyed_inject_slot();
+        for request in [keyed_request("n1"), status_request("n2")] {
+            match answer_keyed_inject_request(&slot, request, Some(&granted())).await {
+                ControlResponse::InjectRefused { code, cause, .. } => {
+                    assert_eq!(code, KeyedInjectRefusalCode::Unavailable.as_str());
+                    assert_eq!(cause, None);
+                }
+                other => panic!("expected keyed_inject_unavailable, got {other:?}"),
+            }
+        }
+        let receiver = Arc::new(CountingReceiver::default());
+        seal_keyed_inject_slot(
+            &slot,
+            KeyedInjectServing::Serving(Arc::clone(&receiver) as Arc<dyn KeyedInjectReceiver>),
+        )
+        .unwrap();
+        assert!(matches!(
+            answer_keyed_inject_request(&slot, keyed_request("n3"), Some(&granted())).await,
+            ControlResponse::InjectReceipt { .. }
+        ));
+        assert_eq!(receiver.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A gateway that does not serve keyed injects answers `not_served` with
+    /// its typed cause in the refusal's own field, for both verbs.
+    #[tokio::test]
+    async fn a_plane_not_served_answers_not_served_with_its_typed_cause() {
+        for cause in NotServedCause::ALL {
+            let slot = pending_keyed_inject_slot();
+            seal_keyed_inject_slot(&slot, KeyedInjectServing::NotServed(cause)).unwrap();
+            for request in [keyed_request("n1"), status_request("n2")] {
+                match answer_keyed_inject_request(&slot, request, Some(&granted())).await {
+                    ControlResponse::InjectRefused {
+                        code,
+                        cause: answered,
+                        ..
+                    } => {
+                        assert_eq!(code, KeyedInjectRefusalCode::NotServed.as_str());
+                        assert_eq!(answered.as_deref(), Some(cause.as_str()));
+                    }
+                    other => panic!("expected not_served, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// The plane is sealed exactly once, and never into pending.
+    #[test]
+    fn the_plane_is_sealed_exactly_once() {
+        let slot = pending_keyed_inject_slot();
+        assert_eq!(
+            seal_keyed_inject_slot(&slot, KeyedInjectServing::Pending),
+            Err(KeyedInjectSealError::SealedPending)
+        );
+        assert_eq!(
+            seal_keyed_inject_slot(
+                &slot,
+                KeyedInjectServing::NotServed(NotServedCause::RuntimeDisabled)
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            seal_keyed_inject_slot(
+                &slot,
+                KeyedInjectServing::Serving(
+                    Arc::new(CountingReceiver::default()) as Arc<dyn KeyedInjectReceiver>
+                )
+            ),
+            Err(KeyedInjectSealError::AlreadySealed)
+        );
+        assert_eq!(
+            seal_keyed_inject_slot(&slot, KeyedInjectServing::Pending),
+            Err(KeyedInjectSealError::SealedPending)
+        );
+        assert!(matches!(
+            *slot.read().unwrap(),
+            KeyedInjectServing::NotServed(NotServedCause::RuntimeDisabled)
+        ));
+    }
+
+    /// A refusal's cause is signed with its code and message: two refusals
+    /// that differ only in their cause never share a signature.
+    #[test]
+    fn a_refusals_cause_is_part_of_its_signed_facts() {
+        let facts = |cause: Option<&str>| refusal_facts("not_served", cause, "not served");
+        assert_ne!(
+            facts(Some("runtime_disabled")),
+            facts(Some("not_identity_first"))
+        );
+        assert_ne!(facts(Some("runtime_disabled")), facts(None));
+        assert_ne!(
+            facts(Some("")),
+            facts(None),
+            "an empty cause is still a cause"
+        );
+        assert_ne!(facts(Some("no_cause")), facts(None));
+        assert_ne!(
+            refusal_facts("not_served", Some("x"), "y"),
+            refusal_facts("not_served", None, "xy"),
+            "the fields are length-prefixed"
+        );
     }
 
     /// A receiver that serves anything and counts what reaches it.
@@ -713,9 +1045,10 @@ mod tests {
     #[tokio::test]
     async fn a_member_not_in_its_public_form_never_reaches_the_receiver() {
         let receiver = Arc::new(CountingReceiver::default());
-        let slot: KeyedInjectSlot = Arc::new(RwLock::new(Some(
-            Arc::clone(&receiver) as Arc<dyn KeyedInjectReceiver>
-        )));
+        let slot: KeyedInjectSlot = Arc::new(RwLock::new(KeyedInjectServing::Serving(Arc::clone(
+            &receiver,
+        )
+            as Arc<dyn KeyedInjectReceiver>)));
         let caller = AuthorizedCaller {
             label: "first-gateway".to_string(),
             pubkey: [7; 32],

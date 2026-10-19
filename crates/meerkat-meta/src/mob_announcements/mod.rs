@@ -130,11 +130,41 @@ struct BatchOptions {
     min_wake_interval_ms: Option<u64>,
 }
 
+/// Why `runtime_options.mob_announcements` is refused at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AnnouncementOptionsError {
+    /// An option is malformed or out of range; the message names it.
+    Invalid(String),
+    /// `member_tools_in_child_mobs` would hand the member tools to every
+    /// inline profile of every mob a member creates. Each child mob profile
+    /// has to opt in itself, and this build cannot offer that opt-in yet.
+    ChildMemberToolsNeedProfileOptIn,
+}
+
+impl From<String> for AnnouncementOptionsError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl std::fmt::Display for AnnouncementOptionsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) => f.write_str(message),
+            Self::ChildMemberToolsNeedProfileOptIn => f.write_str(
+                "runtime_options.mob_announcements.member_tools_in_child_mobs is refused: each \
+                 child mob profile must opt in to the member tools itself, and this build cannot \
+                 offer that per-profile opt-in yet",
+            ),
+        }
+    }
+}
+
 /// Parse `runtime_options.mob_announcements`. `Ok(None)` when it is
 /// disabled.
 pub(crate) fn parse_runtime_options(
     value: &serde_json::Value,
-) -> Result<Option<AnnouncementConfig>, String> {
+) -> Result<Option<AnnouncementConfig>, AnnouncementOptionsError> {
     let options: AnnouncementOptions = serde_json::from_value(value.clone())
         .map_err(|error| format!("runtime_options.mob_announcements: {error}"))?;
     if !options.enabled {
@@ -155,7 +185,8 @@ pub(crate) fn parse_runtime_options(
             return Err(format!(
                 "runtime_options.mob_announcements.retention_ms must be at least {}",
                 owner::MIN_RETENTION_MS
-            ));
+            )
+            .into());
         }
         config.retention_ms = retention_ms;
     }
@@ -175,7 +206,12 @@ pub(crate) fn parse_runtime_options(
             .validate()
             .map_err(|error| format!("runtime_options.mob_announcements.member_limits: {error}"))?;
     }
-    config.member_tools_in_child_mobs = options.member_tools_in_child_mobs;
+    // Child mob profiles get the member tools only by opting in, profile by
+    // profile, and this build cannot offer that yet: the gateway-wide grant
+    // is refused rather than handed to every child profile.
+    if options.member_tools_in_child_mobs {
+        return Err(AnnouncementOptionsError::ChildMemberToolsNeedProfileOptIn);
+    }
     if let Some(limits) = options.child_member_limits {
         let current = &mut config.child_limits;
         current.subscriptions = limits.subscriptions.unwrap_or(current.subscriptions);
@@ -277,18 +313,56 @@ fn local_delivery(
     ))
 }
 
-/// Serve peers' keyed injects on this gateway's control channel: what a peer
-/// delivers to one of this gateway's members is submitted to this gateway's
-/// own continuation owner. Composed with the control listener, whether or
-/// not this gateway enables mob announcements itself. `window_ms` is how far
-/// a request's issue time may be from this gateway's clock.
-pub(crate) fn compose_keyed_inject_receiver(
+/// How a gateway's configuration has its control channel serve the keyed
+/// inject plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyedInjectPlane {
+    /// Serve peers' keyed injects, refusing a request issued further than
+    /// `window_ms` from this gateway's clock.
+    Serve { window_ms: u64 },
+    /// Serve none: both verbs answer `not_served` with the cause
+    /// `runtime_disabled`.
+    Disabled,
+}
+
+impl Default for KeyedInjectPlane {
+    fn default() -> Self {
+        Self::Serve {
+            window_ms: crate::runtime::keyed_inject::DEFAULT_KEYED_INJECT_WINDOW_MS,
+        }
+    }
+}
+
+/// Seal the keyed inject plane of a gateway whose control listener is bound,
+/// once its runtime is composed: every surface (`rpc_gateway`,
+/// `meta_gateway` and the runtime builder) composes it here and nowhere
+/// else.
+///
+/// An identity-first gateway that serves keyed injects submits what a peer
+/// delivers to one of its members to its own continuation owner, whether or
+/// not it enables mob announcements itself. Any other gateway answers
+/// `not_served` with its typed cause. Until this runs, both verbs answer
+/// `keyed_inject_unavailable`: the gateway is starting.
+pub fn compose_keyed_inject_plane(
     runtime: &crate::unified_runtime::UnifiedRuntime,
-    window_ms: u64,
+    plane: KeyedInjectPlane,
 ) -> Result<(), String> {
-    let local = Arc::new(local_delivery(runtime)?);
-    if !runtime.install_keyed_inject_receiver(Arc::new(KeyedInjectServer::new(local, window_ms))) {
-        return Err("a keyed inject receiver is already installed on this runtime".to_string());
+    use crate::runtime::keyed_inject::{KeyedInjectServing, NotServedCause};
+    let serving = match plane {
+        KeyedInjectPlane::Disabled => {
+            KeyedInjectServing::NotServed(NotServedCause::RuntimeDisabled)
+        }
+        KeyedInjectPlane::Serve { .. } if runtime.identity_runtime_ref().is_none() => {
+            KeyedInjectServing::NotServed(NotServedCause::NotIdentityFirst)
+        }
+        KeyedInjectPlane::Serve { window_ms } => {
+            let local = Arc::new(local_delivery(runtime)?);
+            KeyedInjectServing::Serving(Arc::new(KeyedInjectServer::new(local, window_ms)))
+        }
+    };
+    if !runtime.seal_keyed_inject(serving) {
+        return Err("the keyed inject plane of this runtime is already sealed".to_string());
     }
     Ok(())
 }

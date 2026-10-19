@@ -6533,12 +6533,11 @@ fn child_members_are_attributed_only_through_their_binding_and_their_roster() {
 fn child_member_options_are_read_and_bounded() {
     let parsed = super::parse_runtime_options(&serde_json::json!({
         "enabled": true,
-        "member_tools_in_child_mobs": true,
         "child_member_limits": { "subscriptions": 10, "per_mob": 4 }
     }))
     .unwrap()
     .unwrap();
-    assert!(parsed.member_tools_in_child_mobs);
+    assert!(!parsed.member_tools_in_child_mobs);
     assert_eq!(
         parsed.child_limits,
         ChildMemberLimits {
@@ -6554,6 +6553,16 @@ fn child_member_options_are_read_and_bounded() {
         "the member tools are host-only by default"
     );
     assert_eq!(defaults.child_limits, ChildMemberLimits::default());
+    let refused = super::parse_runtime_options(&serde_json::json!({
+        "enabled": true,
+        "member_tools_in_child_mobs": true
+    }))
+    .map(|_| ());
+    assert_eq!(
+        refused,
+        Err(super::AnnouncementOptionsError::ChildMemberToolsNeedProfileOptIn),
+        "the gateway-wide grant of the member tools to child mobs is refused, typed"
+    );
     for limits in [
         serde_json::json!({ "subscriptions": 0 }),
         serde_json::json!({ "per_mob": 0 }),
@@ -7623,4 +7632,36 @@ async fn a_clock_step_back_clears_no_members_limit() {
         )
         .await;
     assert!(failed, "agent:b's limit still holds: {result}");
+}
+
+/// The process test of a child mob member subscribing itself is parked while
+/// child mob profiles cannot opt in to the member tools. It must run again
+/// before the release that ships mob announcements: from that version on,
+/// this fails while it is still parked.
+#[test]
+fn the_parked_self_subscription_process_test_runs_again_before_release() {
+    const SELF_SUBSCRIPTION: &str =
+        "fn a_member_of_a_mob_a_member_created_subscribes_itself_to_the_mob_above(";
+    let source = include_str!("../../tests/mob_announcements_delivery_process.rs");
+    let (before, _) = source
+        .split_once(SELF_SUBSCRIPTION)
+        .expect("the child mob self-subscription process test exists");
+    // The attribute and doc lines directly above the test.
+    let parked = before
+        .lines()
+        .rev()
+        .map(str::trim_start)
+        .take_while(|line| line.starts_with("#[") || line.starts_with("///"))
+        .any(|line| line.starts_with("#[ignore"));
+    let version: Vec<u64> = env!("CARGO_PKG_VERSION")
+        .split(['.', '-', '+'])
+        .take(3)
+        .map(|part| part.parse().unwrap())
+        .collect();
+    let releases_announcements = version >= vec![0, 9, 4];
+    assert!(
+        !(parked && releases_announcements),
+        "version {} would ship with the child mob self-subscription process test parked",
+        env!("CARGO_PKG_VERSION")
+    );
 }

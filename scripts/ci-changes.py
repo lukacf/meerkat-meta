@@ -198,7 +198,7 @@ LANE_INPUTS = (
     # The RPC gateway the Python SDK tests drive. The flow editor's source
     # contract test reads rpc.rs too.
     ("crates/meerkat-meta/src/bin/rpc_gateway.rs", {"python"}),
-    ("crates/meerkat-meta/src/rpc_gateway.rs", {"python"}),
+    ("crates/meerkat-meta/src/rpc_gateway.rs", {"python", "extension_state"}),
     ("crates/meerkat-meta/src/rpc.rs", {"python", "flow_editor"}),
     ("crates/meerkat-meta/src/rpc/", {"python"}),
     # Other sources the console and flow editor contract tests read.
@@ -220,6 +220,13 @@ LANE_INPUTS = (
     # drive the announcement module and keyed inject end to end.
     ("crates/meerkat-meta/src/mob_announcements/", {"extension_state"}),
     ("crates/meerkat-meta/src/runtime/keyed_inject.rs", {"extension_state"}),
+    # The control channel the keyed inject verbs ride, the runtime and builder
+    # that compose its plane, and the identity runtime it delivers to.
+    ("crates/meerkat-meta/src/runtime/cross_mob_control.rs", {"extension_state"}),
+    ("crates/meerkat-meta/src/runtime/cross_mob_remote.rs", {"extension_state"}),
+    ("crates/meerkat-meta/src/unified_runtime/cross_mob.rs", {"extension_state"}),
+    ("crates/meerkat-meta/src/unified_runtime/builder.rs", {"extension_state"}),
+    ("crates/meerkat-meta/src/identity_first/runtime.rs", {"extension_state"}),
     ("crates/meerkat-meta/tests/mob_announcements_delivery_process.rs", {"extension_state"}),
     ("crates/meerkat-meta/tests/mob_announcements_remote_process.rs", {"extension_state"}),
 )

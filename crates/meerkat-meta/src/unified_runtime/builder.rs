@@ -170,6 +170,7 @@ pub struct UnifiedRuntimeBuilder {
     contact_directory: Option<ContactDirectory>,
     control_listen: Option<String>,
     control_grants: Option<crate::runtime::cross_mob_control::ControlGrantTable>,
+    keyed_inject: Option<crate::mob_announcements::KeyedInjectPlane>,
     persistent_metadata: Option<Arc<dyn PersistentMetadataStore>>,
     access_controller: Option<crate::access::AccessController>,
     flow_editor_host_deploy: bool,
@@ -1037,6 +1038,14 @@ impl UnifiedRuntimeBuilder {
         grants: crate::runtime::cross_mob_control::ControlGrantTable,
     ) -> Self {
         self.control_grants = Some(grants);
+        self
+    }
+
+    /// How the configured cross-mob control listener serves peers' keyed
+    /// injects. Without it, an identity-first runtime serves them with the
+    /// default freshness window, and any other runtime answers `not_served`.
+    pub fn keyed_inject_plane(mut self, plane: crate::mob_announcements::KeyedInjectPlane) -> Self {
+        self.keyed_inject = Some(plane);
         self
     }
 
@@ -2046,6 +2055,17 @@ impl UnifiedRuntimeBuilder {
                 .start_control_listener_with_authorizer(addr, authorizer)
                 .await
             {
+                let build_error =
+                    UnifiedRuntimeBuilderError::Io(format!("control_listen(): {error}"));
+                runtime.shutdown().await;
+                return Err(build_error);
+            }
+            // The runtime is composed: seal what the listener's keyed inject
+            // plane serves, through the composition every surface shares.
+            if let Err(error) = crate::mob_announcements::compose_keyed_inject_plane(
+                &runtime,
+                self.keyed_inject.unwrap_or_default(),
+            ) {
                 let build_error =
                     UnifiedRuntimeBuilderError::Io(format!("control_listen(): {error}"));
                 runtime.shutdown().await;

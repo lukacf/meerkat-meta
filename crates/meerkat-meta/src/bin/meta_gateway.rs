@@ -2621,6 +2621,13 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
             .await
             .map_err(|error| anyhow!("--control-listen {addr}: {error}"))?;
         tracing::info!(%advertised, "cross-mob control listener bound");
+        // The runtime is composed: seal what the listener's keyed inject
+        // plane serves, through the composition every surface shares.
+        meerkat_meta::mob_announcements::compose_keyed_inject_plane(
+            runtime,
+            meerkat_meta::mob_announcements::KeyedInjectPlane::default(),
+        )
+        .map_err(|error| anyhow!("--control-listen {addr}: {error}"))?;
     }
 
     // Start schedule delivery only after identity-first attachment. The host

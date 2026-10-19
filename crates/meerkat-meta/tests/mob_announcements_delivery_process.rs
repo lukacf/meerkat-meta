@@ -1493,7 +1493,13 @@ fn wait_until_ended(gateway: &mut Gateway, id: &str) -> Value {
 /// P1: with `member_tools_in_child_mobs`, a member of a mob the lead
 /// created is offered the member tools, subscribes itself to the lead's
 /// mob from its own turn, and receives what is announced there.
+///
+/// Parked while that option is refused: a child mob profile must opt in to
+/// the member tools itself, which this build cannot offer yet. A lib test
+/// fails from the release that ships mob announcements on while this is
+/// still parked.
 #[test]
+#[ignore = "needs a per-profile opt-in for child mob profiles"]
 fn a_member_of_a_mob_a_member_created_subscribes_itself_to_the_mob_above() {
     let state = tempfile::tempdir().expect("state dir");
     let config_dir = tempfile::tempdir().expect("config dir");

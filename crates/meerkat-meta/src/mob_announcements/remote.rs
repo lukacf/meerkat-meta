@@ -182,7 +182,7 @@ impl RemoteMemberDelivery {
         match outcome {
             Ok(KeyedInjectCallOutcome::Answered(receipt)) => Ok(receipt),
             // A signed refusal is the peer's own word about its member.
-            Ok(KeyedInjectCallOutcome::Refused { code, message }) => {
+            Ok(KeyedInjectCallOutcome::Refused { code, message, .. }) => {
                 Err(match KeyedInjectRefusalCode::parse(&code) {
                     Some(KeyedInjectRefusalCode::Conflict) => NativeSubmitError::Conflict(message),
                     Some(KeyedInjectRefusalCode::InvalidRequest) => {
@@ -237,7 +237,7 @@ impl RemoteMemberDelivery {
         self.note(peer, &outcome);
         match outcome {
             Ok(KeyedInjectCallOutcome::Answered(answer)) => Ok(answer),
-            Ok(KeyedInjectCallOutcome::Refused { code, message }) => {
+            Ok(KeyedInjectCallOutcome::Refused { code, message, .. }) => {
                 Err(format!("{code}: {message}"))
             }
             Err(error) => Err(error.to_string()),
