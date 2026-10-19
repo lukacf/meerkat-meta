@@ -14304,7 +14304,11 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
     /// resume), is placed or externally bound, or has an initial message
     /// refuses the whole pass with
     /// [`crate::identity_first::HeldBootstrapRefusal`] before any member is
-    /// held, so this callback never sees such a roster. An `Ok` recorded
+    /// held. A member embodied outside the pass after that freshness read
+    /// refuses it with
+    /// [`crate::identity_first::HeldBootstrapRefusal::NotHeld`] once its
+    /// embodiment settles unheld. Either way this callback never sees such a
+    /// roster. An `Ok` recorded
     /// before the setup deadline is the pass's choice `Activate`; Core then
     /// accepts or expires each held member's activation on its own, so a
     /// member can end `Broken` while the others are published. Any other
