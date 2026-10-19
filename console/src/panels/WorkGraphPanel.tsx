@@ -7,6 +7,7 @@ import type {
 } from "../types";
 import { WORKGRAPH_GRAPH_NODE_CAP, workGraphItemOwnerLabel } from "../lib/workgraph-layout";
 import { formatWorkGraphTimestamp } from "../lib/workgraph-time";
+import { PanelStatusRow } from "./PanelStatusRow";
 import { WorkGraphGraphView } from "./WorkGraphGraphView";
 
 export type WorkGraphViewMode = "tree" | "graph";
@@ -405,10 +406,6 @@ export function WorkGraphPanel({
         {capturedAt ? (
           <span className="workgraph__captured">as of {capturedAt}</span>
         ) : null}
-        {/* A failed refresh keeps the last items on screen, and stream events
-            start refreshes at any moment. The error stays on this header line
-            so it never moves those items under a click in progress. */}
-        {data.error ? <span className="workgraph__error" role="alert" title={data.error}>{data.error}</span> : null}
         <span className="workgraph__spacer" />
         <div className="workgraph__view-toggle" role="group" aria-label="WorkGraph view mode">
           <button
@@ -439,6 +436,10 @@ export function WorkGraphPanel({
           Refresh
         </button>
       </div>
+      {/* A failed refresh keeps the last items on screen. Its error sits in a
+          reserved row below the header, so it never moves the header controls
+          or the items under a click in progress. */}
+      <PanelStatusRow error={data.error} />
       {data.denied ? (
         <div className="workgraph__empty" data-testid="workgraph-panel-denied">
           You do not have a grant to view WorkGraph state.

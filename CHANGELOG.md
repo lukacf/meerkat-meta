@@ -11,12 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - The console Memory and WorkGraph panels no longer move their controls when
   a refresh fails or recovers. Memory rendered the refresh error above its
-  tab row, and WorkGraph rendered it above the work items, which stay on
-  screen after a failed refresh. Stream events start refreshes at any
-  moment, so a tab or work item click whose press and release straddled one
-  released over another element and was lost. Memory now renders the error
-  below the tabs, and WorkGraph shows it on its header line without changing
-  the header's height.
+  tabs and body, and WorkGraph rendered it above the work items, which stay
+  on screen after a failed refresh. Stream events start refreshes at any
+  moment, so a click whose press and release straddled one released over
+  another element and was lost. Each panel now keeps a reserved one-line
+  status row for the error that holds its place whether or not an error
+  shows: Memory between its tabs and its body, WorkGraph below its header. A
+  long error stays on that line, shortened, with the full text in its
+  tooltip. A narrow WorkGraph panel now wraps its view toggle and Refresh onto
+  the next header line instead of pushing them out of view.
 
 ## [0.9.3] - 2026-10-18
 

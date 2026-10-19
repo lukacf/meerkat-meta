@@ -9279,6 +9279,27 @@ svg[data-svg=fit],
   font-size: 12.5px;
   font-family: var(--mono);
 }
+.panel-status-row {
+  flex: none;
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: 24px;
+  min-width: 0;
+  overflow: hidden;
+}
+.gating > .panel-status-row {
+  padding: 0 24px;
+}
+.panel-status-row__error {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--crit);
+  font-family: var(--mono);
+  font-size: 11px;
+}
 .gating__policies {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
@@ -12255,34 +12276,21 @@ svg[data-svg=fit],
 }
 .workgraph__head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 6px 10px;
 }
 .workgraph__head h3 {
   margin: 0;
   font-size: 13px;
 }
 .workgraph__captured {
-  flex: none;
-  white-space: nowrap;
   font-family: var(--mono);
   font-size: 10.5px;
   color: var(--ink-faint);
 }
 .workgraph__spacer {
   flex: 1 1 auto;
-}
-.workgraph__error {
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  padding: 2px 9px;
-  border: 1px solid var(--err, #d4564e);
-  border-radius: var(--r-sm);
-  color: var(--err, #d4564e);
-  font-size: 10.5px;
 }
 .workgraph__section {
   border: 1px solid var(--line);

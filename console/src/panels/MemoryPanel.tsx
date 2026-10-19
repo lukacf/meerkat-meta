@@ -26,6 +26,7 @@ import type {
   MemoryRecordStatus,
   MemoryTrust,
 } from "../types";
+import { PanelStatusRow } from "./PanelStatusRow";
 
 export interface MemoryRecordDetail {
   realm: string;
@@ -2286,14 +2287,9 @@ export function MemoryPanel({
           Refresh
         </button>
       </div>
-      {/* A failed refresh sets the error and the next good one clears it, and
-          stream events start refreshes at any moment. It renders below the
-          tabs so it never moves them under a click in progress. */}
-      {error ? (
-        <div className="gating__empty" data-testid="memory-error">
-          {error}
-        </div>
-      ) : null}
+      {/* The refresh error sits in a reserved row between the tabs and the
+          body, so it never moves either under a click in progress. */}
+      <PanelStatusRow error={error} testId="memory-error" />
 
       <div className="gating__list memory-panel__body">
         {tab === "holdings" ? (
