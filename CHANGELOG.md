@@ -119,6 +119,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rewrites behind: the repair proves the earliest rewrite whose parent the
   row is a prefix of and replays every rewrite from there to the sealed
   head.
+- The console Memory and WorkGraph panels no longer move their controls when
+  a refresh fails or recovers. Memory rendered the refresh error above its
+  tabs and body, and WorkGraph rendered it above the work items, which stay
+  on screen after a failed refresh. Stream events start refreshes at any
+  moment, so a click whose press and release straddled one released over
+  another element and was lost. Each panel now keeps a reserved one-line
+  status row for the error that holds its place whether or not an error
+  shows: Memory between its tabs and its body, WorkGraph below its header. A
+  long error stays on that line, shortened, with the full text in its
+  tooltip. A narrow WorkGraph panel now wraps its view toggle and Refresh onto
+  the next header line instead of pushing them out of view.
+- The console Memory lattice tile no longer walks the loaded records again on
+  every refresh that brings the same records, and shows a running re-check as
+  a marker over its corner instead of an extra line. The line grew the first
+  row of verdict tiles, so each refresh moved the tiles below it under a click
+  in progress.
 
 ## [0.9.3] - 2026-10-18
 
