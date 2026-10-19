@@ -12,7 +12,12 @@ pub(crate) enum SummaryError {
     Encoding,
     Provider,
     NonTextOutput,
-    Incomplete,
+    /// The provider stopped before a finished summary, for the stop reason
+    /// it carries: a refusal, a content filter, the output ceiling, or any
+    /// stop other than an ended turn or a matched stop sequence.
+    Incomplete(meerkat_core::StopReason),
+    /// The stream ended before its terminal event.
+    Unterminated,
     Oversized,
     Empty,
 }
@@ -115,8 +120,11 @@ async fn collect_summary(
                     LlmDoneOutcome::Success {
                         stop_reason:
                             meerkat_core::StopReason::EndTurn | meerkat_core::StopReason::StopSequence,
+                        ..
                     } => completed = true,
-                    LlmDoneOutcome::Success { .. } => return Err(SummaryError::Incomplete),
+                    LlmDoneOutcome::Success { stop_reason, .. } => {
+                        return Err(SummaryError::Incomplete(stop_reason));
+                    }
                     LlmDoneOutcome::Error { .. } => return Err(SummaryError::Provider),
                 }
                 break;
@@ -138,7 +146,7 @@ async fn collect_summary(
         }
     }
     if !completed {
-        return Err(SummaryError::Incomplete);
+        return Err(SummaryError::Unterminated);
     }
     let text = text.trim();
     if text.is_empty() {
@@ -297,7 +305,7 @@ mod tests {
 
     fn done(stop_reason: meerkat_core::StopReason) -> LlmEvent {
         LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success { stop_reason },
+            outcome: LlmDoneOutcome::success(stop_reason),
         }
     }
 
@@ -316,7 +324,15 @@ mod tests {
                 CompletionCase::TerminalError | CompletionCase::StreamError => {
                     assert_eq!(result, Err(SummaryError::Provider));
                 }
-                CompletionCase::Truncated => assert_eq!(result, Err(SummaryError::Incomplete)),
+                CompletionCase::Truncated => assert_eq!(
+                    result,
+                    Err(SummaryError::Incomplete(
+                        meerkat_core::StopReason::MaxTokens
+                    ))
+                ),
+                CompletionCase::Unterminated => {
+                    assert_eq!(result, Err(SummaryError::Unterminated));
+                }
             }
             client.assert_observed_once_without_retry(&log);
         }
@@ -374,11 +390,11 @@ mod tests {
                 64,
                 SummaryError::Empty,
             ),
-            (vec![delta("partial")], 64, SummaryError::Incomplete),
+            (vec![delta("partial")], 64, SummaryError::Unterminated),
             (
                 vec![delta("partial"), done(meerkat_core::StopReason::MaxTokens)],
                 64,
-                SummaryError::Incomplete,
+                SummaryError::Incomplete(meerkat_core::StopReason::MaxTokens),
             ),
             (
                 vec![delta("€"), done(meerkat_core::StopReason::EndTurn)],
@@ -390,6 +406,26 @@ mod tests {
             assert_eq!(
                 summarize_context(&client, "test-summary-model", &[], budget).await,
                 Err(expected)
+            );
+        }
+    }
+
+    /// A summary the provider stopped for any reason other than an ended
+    /// turn or a matched stop sequence is refused with that reason, so a
+    /// refusal reads as a refusal, not as a cancel or a truncation.
+    #[tokio::test]
+    async fn summary_rejection_names_the_stop_reason() {
+        use crate::test_diagnostics::INCOMPLETE_STOPS;
+
+        for stop_reason in INCOMPLETE_STOPS
+            .into_iter()
+            .chain([meerkat_core::StopReason::MaxTokens])
+        {
+            let client = ScriptedClient(Mutex::new(vec![delta("partial"), done(stop_reason)]));
+            assert_eq!(
+                summarize_context(&client, "test-summary-model", &[], 64).await,
+                Err(SummaryError::Incomplete(stop_reason)),
+                "{stop_reason:?}"
             );
         }
     }

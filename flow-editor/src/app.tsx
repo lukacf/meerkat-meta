@@ -1216,7 +1216,23 @@ function App() {
       hydrateMobpackDocument(selection.hydration.result, selection.hydration.options);
       return true;
     }
-    return false;
+    if (!selection?.fetch) return false;
+    // Library rows are draft summaries: open the draft with its document
+    // from meta/mobpacks/get.
+    const draftId = selection.fetch.id;
+    setApiBusy(true);
+    MetaFlowController.getDocument(draftId)
+      .then((result) => {
+        const fetched = MetaFlowController.flowRegistrySelectionState([result?.row], draftId);
+        if (!fetched.hydration) {
+          throw new Error(catalogs.errorView.authoringOperationMissingDocumentError);
+        }
+        setFlows((rows) => MetaFlowController.flowRegistryUpsertRowPatch(rows, result.row));
+        hydrateMobpackDocument(fetched.hydration.result, fetched.hydration.options);
+      })
+      .catch((error) => showAuthoringFailure(error, authoringFailureHead("draft_open")))
+      .finally(() => setApiBusy(false));
+    return true;
   };
 
   // Apply the deep-link boot intent once the authoring contract and the
@@ -1466,7 +1482,12 @@ function App() {
               const result = await MetaFlowController.createDocument(spec);
               const row = result?.row;
               if (!row?.document) return;
-              setFlows(Array.isArray(result?.rows) ? result.rows : MetaFlowController.flowRegistryUpsertRowPatch(flows, row));
+              // The reply lists the drafts as summaries and carries the
+              // created draft whole.
+              const listed = Array.isArray(result?.rows)
+                ? MetaFlowController.flowRegistryRowsFromBackend(result.rows)
+                : flows;
+              setFlows(MetaFlowController.flowRegistryUpsertRowPatch(listed, row));
               hydrateMobpackDocument(
                 { document: row.document, validation: row.validation || null },
                 {

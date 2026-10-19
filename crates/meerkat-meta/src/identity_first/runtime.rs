@@ -538,7 +538,9 @@ fn admission_phase_error(
         BridgeAdmissionError::Mob(detail)
         | BridgeAdmissionError::UnsupportedForMode { detail, .. }
         | BridgeAdmissionError::InvalidInput(detail)
-        | BridgeAdmissionError::InvariantViolation(detail) => {
+        | BridgeAdmissionError::InvariantViolation(detail)
+        | BridgeAdmissionError::MobAdmissionClosed { detail, .. }
+        | BridgeAdmissionError::MobShutdownInProgress { detail, .. } => {
             IdentityRuntimeError::AdmissionFailed { identity, detail }
         }
         BridgeAdmissionError::ActorLoopStalled {
@@ -11487,6 +11489,19 @@ impl IdentityRuntime {
             })
     }
 
+    /// Whether a Console human send to `identity` is admitted under its
+    /// delivery identity, pinned to the session the send recorded: a local
+    /// session-backed identity. An externally bound identity takes the
+    /// external delivery, which carries no delivery identity, so a send to it
+    /// must never be dispatched a second time.
+    pub(crate) async fn console_human_delivery_is_keyed(&self, identity: &AgentIdentity) -> bool {
+        self.entries
+            .read()
+            .await
+            .get(identity)
+            .is_some_and(|entry| !durable_spec_uses_external_binding(&entry.spec))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_console_human_input_tracked(
         self: &Arc<Self>,
@@ -14614,9 +14629,14 @@ impl IdentityRuntime {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             if let Some(observer) = observer {
+                // The observer keys the member by its roster row, the encoded
+                // DURABLE identity; the runtime alias names only this
+                // incarnation and no roster row.
                 observer
                     .member_session_rotated(
-                        &crate::member_comms_id::mob_member_id(record.agent_runtime_id.as_str()),
+                        &crate::member_comms_id::roster_member_id_for_identity(
+                            record.identity.as_str(),
+                        ),
                         &previous_session_id,
                         &record.session_id,
                     )

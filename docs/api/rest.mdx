@@ -87,6 +87,14 @@ Returns experience metadata describing the current runtime state. This is the pr
 
 When a Meerkat mob runtime is configured, the response includes live agent data from the mob. Without a mob runtime, only module-level information is returned. When console UI config is loaded, the response includes `console_config`, the view-level contract consumed by the bundled console.
 
+`health_overview.live_snapshot.running` is the mob owner's answer when the
+experience is read. A console served from the console aggregator answers for
+its registered runtimes: `true` only while every registered runtime's mob is
+creating or running, and `false` when at least one is not. Without a runtime
+that can answer (no live mob runtime, or an aggregator with no registered
+runtime), it is `null`, and the snapshot names it in an `unobserved` marker:
+`{"reason": "not_observed", "fields": ["running"]}`.
+
 ### `GET /console/modules`
 
 Returns the configured module IDs from `RuntimeDecisionState`. This response
@@ -166,6 +174,14 @@ Identity-filtered convenience route for the same console timeline stream. It set
 ### `POST /console/send`
 
 Legacy console send route backed by the console aggregator. New clients should prefer `POST /console/rpc` with `meta/console/send`.
+
+### `POST /console/send/recover`
+
+REST twin of [`meta/console/recover_send`](/api/rpc):
+the body is `{identity, origin, idempotency_key}` and the caller is the
+request's authenticated principal. It runs the same gate as `/console/send`
+(read-only and `agent.send` refusals). A send the caller does not own, or
+never made, answers HTTP **404** with `{"error":"send_not_found"}`.
 
 ### `POST /console/rpc`
 

@@ -103,7 +103,7 @@ fn member(identity: &str, role: &str, labels: &[(&str, &str)]) -> ConsoleMember 
 fn snapshot_with_members(members: Vec<ConsoleMember>) -> ConsoleLiveSnapshot {
     ConsoleLiveSnapshot::new(
         Some("access-test-runtime".to_string()),
-        true,
+        Some(true),
         Vec::new(),
         Vec::new(),
         members,
@@ -289,7 +289,7 @@ fn module_fallback_rows_are_filtered_for_denied_callers() {
     .expect("deny-all controller");
     let snapshot = ConsoleLiveSnapshot::new(
         Some("access-test-runtime".to_string()),
-        true,
+        Some(true),
         vec!["router".to_string()],
         Vec::new(),
         Vec::new(),
@@ -321,7 +321,7 @@ fn module_fallback_rows_are_filtered_for_denied_callers() {
     .expect("partial controller");
     let two_modules = ConsoleLiveSnapshot::new(
         Some("access-test-runtime".to_string()),
-        true,
+        Some(true),
         vec!["router".to_string(), "delivery".to_string()],
         Vec::new(),
         Vec::new(),
@@ -4153,9 +4153,7 @@ async fn open_loop_escalation_frames_carry_no_rationale() {
             meta: None,
         },
         LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success {
-                stop_reason: meerkat_core::StopReason::EndTurn,
-            },
+            outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
         },
     ]));
     let engine = Arc::new(

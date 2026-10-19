@@ -476,6 +476,95 @@ pub struct TopologyAuditPage {
 struct IdempotencyRecord {
     fingerprint: String,
     operation_id: String,
+    /// Filed under a scoped key. An unmarked entry whose key begins with the
+    /// reserved prefix was filed under a raw key before keys were scoped and
+    /// names no caller's apply.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    scoped: bool,
+}
+
+/// Versioned domain of the scoped apply idempotency digest.
+const SCOPED_APPLY_KEY_DOMAIN: &str = "meta-topology-apply-v1";
+
+/// Prefix of a scoped apply idempotency key, reserved: a host key may not
+/// begin with it.
+const SCOPED_APPLY_KEY_PREFIX: &str = "apply-scoped:";
+
+/// The caller a topology apply's idempotency key belongs to. The same key
+/// under two scopes names two different operations: a retry replays only its
+/// own caller's apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TopologyApplyScope {
+    /// The host's own Rust API without a principal. Its keys keep their
+    /// shape, so a key it used before keys were scoped still names its apply.
+    Host,
+    /// A principal the host names on its Rust API.
+    HostPrincipal { principal: String },
+    /// The gateway's JSON-RPC surface: the embedding application.
+    LocalHost,
+    /// An anonymous caller of an open Console: the shared local account.
+    Anonymous,
+    /// A verified Console human, by OIDC issuer and subject.
+    Human { issuer: String, subject: String },
+    /// An authenticated Console principal with no verified human behind it
+    /// (a service identity, or a token without a subject), by its trust
+    /// source too: the provider its token was classified as and the issuer
+    /// it verified against, so one name from two sources is two callers.
+    Principal {
+        principal: String,
+        provider: String,
+        issuer: String,
+    },
+}
+
+impl TopologyApplyScope {
+    /// The scope of the host's Rust API: the principal it names, else the
+    /// host itself.
+    pub(crate) fn for_host_principal(principal: Option<&str>) -> Self {
+        match principal {
+            Some(principal) => Self::HostPrincipal {
+                principal: principal.to_string(),
+            },
+            None => Self::Host,
+        }
+    }
+
+    /// Refuse a host key that would read as a scoped key.
+    fn validate_key(&self, key: &str) -> Result<(), TopologyControlError> {
+        if matches!(self, Self::Host) && key.starts_with(SCOPED_APPLY_KEY_PREFIX) {
+            return Err(TopologyControlError::InvalidRequest(format!(
+                "idempotency_key must not begin with the reserved prefix \
+                 {SCOPED_APPLY_KEY_PREFIX:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The key `key` is filed under at `authorities` in this scope.
+    ///
+    /// A scoped key is one digest over a typed JSON array of every
+    /// component, so it carries neither the scope nor the key in clear, a
+    /// component boundary cannot shift, and no principal's spelling can name
+    /// another scope. The host keeps `key` itself.
+    pub(crate) fn idempotency_key(&self, authorities: &[&str], key: &str) -> String {
+        let owner = match self {
+            Self::Host => return key.to_string(),
+            Self::HostPrincipal { principal } => serde_json::json!(["host_principal", principal]),
+            Self::LocalHost => serde_json::json!(["local_host"]),
+            Self::Anonymous => serde_json::json!(["anonymous"]),
+            Self::Human { issuer, subject } => serde_json::json!(["human", issuer, subject]),
+            Self::Principal {
+                principal,
+                provider,
+                issuer,
+            } => serde_json::json!(["principal", provider, issuer, principal]),
+        };
+        let input = serde_json::json!([SCOPED_APPLY_KEY_DOMAIN, authorities, key, owner]);
+        format!(
+            "{SCOPED_APPLY_KEY_PREFIX}{:x}",
+            Sha256::digest(input.to_string().as_bytes())
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -491,6 +580,11 @@ struct PendingTopologyOperation {
     #[serde(default)]
     audit_record_id: String,
     idempotency_key: String,
+    /// The key the apply is filed under, when its scope is not the host's
+    /// (absent for the host's keys and for journals from before keys were
+    /// scoped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scoped_idempotency_key: Option<String>,
     fingerprint: String,
     actor: String,
     base_revision: u64,
@@ -516,6 +610,40 @@ struct PendingTopologyOperation {
     last_recovery_error: Option<String>,
     #[serde(default)]
     recovery_attempts: u64,
+}
+
+impl PendingTopologyOperation {
+    /// The key this operation's idempotency entry is filed under, if any
+    /// (see [`filing_key`]).
+    fn idempotency_map_key(&self) -> Option<&str> {
+        filing_key(
+            self.scoped_idempotency_key.as_deref(),
+            &self.idempotency_key,
+        )
+    }
+
+    /// What an apply filed under `scoped_key` gets while this operation is
+    /// pending: for its own key and request, this operation's receipt; for
+    /// its own key and another request, a conflict; otherwise, that an
+    /// operation is in progress.
+    fn answer_apply(
+        &self,
+        scoped_key: &str,
+        fingerprint: &str,
+        idempotency_key: &str,
+    ) -> Result<TopologyOperationReceipt, TopologyControlError> {
+        if self.idempotency_map_key() != Some(scoped_key) {
+            return Err(TopologyControlError::OperationInProgress(
+                self.operation_id.clone(),
+            ));
+        }
+        if self.fingerprint != fingerprint {
+            return Err(TopologyControlError::IdempotencyConflict(
+                idempotency_key.to_string(),
+            ));
+        }
+        Ok(pending_receipt(self))
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -676,6 +804,7 @@ impl TopologyController {
                 state.schema_version, TOPOLOGY_STATE_SCHEMA_VERSION
             )));
         }
+        drop_unscoped_reserved_entries(&mut state.idempotency);
         normalize_operation_record_sequences(
             &mut state.operation_records,
             &mut state.last_operation_record_seq,
@@ -1071,25 +1200,33 @@ impl TopologyController {
         state: &mut TopologyIntentState,
         receipt: TopologyOperationReceipt,
         fingerprint: String,
+        idempotency_map_key: Option<&str>,
     ) -> Result<(), TopologyControlError> {
         let policy = self.policy();
-        state.idempotency.insert(
-            receipt.idempotency_key.clone(),
-            IdempotencyRecord {
-                fingerprint,
-                operation_id: receipt.operation_id.clone(),
-            },
-        );
+        if let Some(key) = idempotency_map_key {
+            state.idempotency.insert(
+                key.to_string(),
+                IdempotencyRecord {
+                    fingerprint,
+                    operation_id: receipt.operation_id.clone(),
+                    scoped: key != receipt.idempotency_key,
+                },
+            );
+        }
         state.receipts.push_back(receipt);
         while state.receipts.len() > policy.receipt_limit {
             let Some(evicted) = state.receipts.pop_front() else {
                 break;
             };
-            let compacted = idempotency_key_fingerprint(&evicted.idempotency_key);
+            // A receipt that no entry names compacts and removes nothing.
+            let Some(evicted_key) = filed_idempotency_key(&state.idempotency, &evicted) else {
+                continue;
+            };
+            let compacted = compacted_key_fingerprint(&evicted_key);
             if !state.compacted_idempotency.contains(&compacted) {
                 state.compacted_idempotency.push_back(compacted);
             }
-            state.idempotency.remove(&evicted.idempotency_key);
+            state.idempotency.remove(&evicted_key);
         }
         while state.compacted_idempotency.len() > policy.idempotency_history_limit {
             state.compacted_idempotency.pop_front();
@@ -1100,7 +1237,7 @@ impl TopologyController {
     fn compacted_idempotency_contains(&self, state: &TopologyIntentState, key: &str) -> bool {
         state
             .compacted_idempotency
-            .contains(&idempotency_key_fingerprint(key))
+            .contains(&compacted_key_fingerprint(key))
     }
 
     pub(crate) async fn mutation_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -1174,7 +1311,13 @@ impl TopologyController {
         }) {
             set_operation_record_status(record, TopologyOperationRecordStatus::RolledBack, None);
         }
-        self.record_receipt(&mut state, receipt, pending.fingerprint)?;
+        let idempotency_map_key = pending.idempotency_map_key().map(str::to_string);
+        self.record_receipt(
+            &mut state,
+            receipt,
+            pending.fingerprint,
+            idempotency_map_key.as_deref(),
+        )?;
         self.persist_candidate(&state)?;
         *self.inner.state.write().await = state;
         Ok(())
@@ -1771,9 +1914,30 @@ impl TopologyRuntimeHandle {
         self.apply_as(request, None, actor).await
     }
 
+    /// Apply as `principal`. Its idempotency keys are that principal's own:
+    /// the same key from another principal, or from the host's [`Self::apply`],
+    /// names a different operation.
     pub async fn apply_as(
         &self,
         request: TopologyApplyRequest,
+        principal: Option<&str>,
+        actor: impl Into<String>,
+    ) -> Result<TopologyOperationReceipt, TopologyControlError> {
+        self.apply_in_scope(
+            request,
+            &TopologyApplyScope::for_host_principal(principal),
+            principal,
+            actor,
+        )
+        .await
+    }
+
+    /// [`Self::apply_as`] for a caller whose surface derives its idempotency
+    /// scope.
+    pub(crate) async fn apply_in_scope(
+        &self,
+        request: TopologyApplyRequest,
+        scope: &TopologyApplyScope,
         principal: Option<&str>,
         actor: impl Into<String>,
     ) -> Result<TopologyOperationReceipt, TopologyControlError> {
@@ -1784,10 +1948,14 @@ impl TopologyRuntimeHandle {
         // failures. Every normalized mutation attempt below is durably
         // audited before policy/CAS/actuator admission.
         normalized.operations = self.normalize_for_authorization(normalized.operations)?;
-        let preflight = validate_local_apply_preflight(&self.policy(), &normalized);
+        let scoped_key =
+            scope.idempotency_key(&[self.authority().as_str()], &normalized.idempotency_key);
+        let preflight = validate_local_apply_preflight(&self.policy(), &normalized)
+            .and_then(|()| scope.validate_key(&normalized.idempotency_key));
         let mut record = operation_record_for_local_request(
             &self.authority(),
             &normalized,
+            &scoped_key,
             &actor,
             principal,
             &format!("mode:{:?}", self.policy().mode),
@@ -1804,19 +1972,24 @@ impl TopologyRuntimeHandle {
             return Err(error);
         }
         let _ = record_id;
-        self.apply_inner(normalized, actor, record).await
+        self.apply_inner(normalized, scoped_key, actor, record)
+            .await
     }
 
     pub(crate) async fn record_denied_apply(
         &self,
         request: &TopologyApplyRequest,
+        scope: &TopologyApplyScope,
         principal: Option<&str>,
         actor: &str,
         error: &TopologyControlError,
     ) -> Result<(), TopologyControlError> {
+        let scoped_key =
+            scope.idempotency_key(&[self.authority().as_str()], request.idempotency_key.trim());
         let mut record = operation_record_for_local_request(
             &self.authority(),
             request,
+            &scoped_key,
             actor,
             principal,
             &format!(
@@ -1831,9 +2004,12 @@ impl TopologyRuntimeHandle {
         self.controller.upsert_operation_record(record).await
     }
 
+    /// Apply `request`, keyed for idempotency by `scoped_key`, the key its
+    /// caller's scope files it under.
     async fn apply_inner(
         &self,
         mut request: TopologyApplyRequest,
+        scoped_key: String,
         actor: String,
         mut audit_record: TopologyOperationRecord,
     ) -> Result<TopologyOperationReceipt, TopologyControlError> {
@@ -1877,14 +2053,11 @@ impl TopologyRuntimeHandle {
             audited_error!(error);
         }
 
-        if let Some(pending) = current.pending.as_ref() {
-            if pending.idempotency_key == request.idempotency_key {
-                if pending.fingerprint != fingerprint {
-                    audited_error!(TopologyControlError::IdempotencyConflict(
-                        request.idempotency_key.clone(),
-                    ));
-                }
-                let receipt = pending_receipt(pending);
+        let pending_answer = current.pending.as_ref().map(|pending| {
+            pending.answer_apply(&scoped_key, &fingerprint, &request.idempotency_key)
+        });
+        match pending_answer {
+            Some(Ok(receipt)) => {
                 self.controller
                     .persist_operation_record_outcome_candidate(
                         current,
@@ -1895,11 +2068,10 @@ impl TopologyRuntimeHandle {
                     .await?;
                 return Ok(receipt);
             }
-            audited_error!(TopologyControlError::OperationInProgress(
-                pending.operation_id.clone(),
-            ));
+            Some(Err(error)) => audited_error!(error),
+            None => {}
         }
-        if let Some(record) = current.idempotency.get(&request.idempotency_key).cloned() {
+        if let Some(record) = current.idempotency.get(&scoped_key).cloned() {
             if record.fingerprint != fingerprint {
                 audited_error!(TopologyControlError::IdempotencyConflict(
                     request.idempotency_key.clone(),
@@ -1931,7 +2103,7 @@ impl TopologyRuntimeHandle {
         }
         if self
             .controller
-            .compacted_idempotency_contains(&current, &request.idempotency_key)
+            .compacted_idempotency_contains(&current, &scoped_key)
         {
             audited_error!(TopologyControlError::IdempotencyHistoryCompacted(
                 request.idempotency_key.clone(),
@@ -1960,7 +2132,7 @@ impl TopologyRuntimeHandle {
             audited_error!(error);
         }
         let plan = plan_from_snapshot(&snapshot, request.operations.clone());
-        let operation_id = operation_id(&request.idempotency_key, &fingerprint);
+        let operation_id = operation_id(&scoped_key, &fingerprint);
         let mut next = current.clone();
         let declared = snapshot
             .edges
@@ -2027,8 +2199,12 @@ impl TopologyRuntimeHandle {
             {
                 set_operation_record_status(record, TopologyOperationRecordStatus::Noop, None);
             }
-            self.controller
-                .record_receipt(&mut audited, receipt.clone(), fingerprint)?;
+            self.controller.record_receipt(
+                &mut audited,
+                receipt.clone(),
+                fingerprint,
+                Some(&scoped_key),
+            )?;
             self.controller.persist_candidate(&audited)?;
             *self.controller.inner.state.write().await = audited;
             return Ok(receipt);
@@ -2039,6 +2215,8 @@ impl TopologyRuntimeHandle {
             operation_id: operation_id.clone(),
             audit_record_id: audit_record_id.clone(),
             idempotency_key: request.idempotency_key.clone(),
+            scoped_idempotency_key: (scoped_key != request.idempotency_key)
+                .then(|| scoped_key.clone()),
             fingerprint: fingerprint.clone(),
             actor: actor.clone(),
             base_revision: current.revision,
@@ -2248,8 +2426,12 @@ impl TopologyRuntimeHandle {
                     Some("topology_apply_failed"),
                 );
             }
-            self.controller
-                .record_receipt(&mut rollback_state, receipt.clone(), fingerprint)?;
+            self.controller.record_receipt(
+                &mut rollback_state,
+                receipt.clone(),
+                fingerprint,
+                Some(&scoped_key),
+            )?;
             self.controller.persist_candidate(&rollback_state)?;
             *self.controller.inner.state.write().await = rollback_state;
             return Err(TopologyControlError::ApplyFailed {
@@ -2278,8 +2460,12 @@ impl TopologyRuntimeHandle {
         {
             set_operation_record_status(record, TopologyOperationRecordStatus::Applied, None);
         }
-        self.controller
-            .record_receipt(&mut next, receipt.clone(), fingerprint)?;
+        self.controller.record_receipt(
+            &mut next,
+            receipt.clone(),
+            fingerprint,
+            Some(&scoped_key),
+        )?;
         // If terminal receipt persistence fails, leave the already-persisted
         // applying journal in memory and on disk. Reconciliation can safely
         // close it later; never erase the recovery record after side effects.
@@ -2748,13 +2934,14 @@ fn request_fingerprint(request: &TopologyApplyRequest) -> Result<String, Topolog
 fn operation_record_for_local_request(
     authority: &str,
     request: &TopologyApplyRequest,
+    scoped_key: &str,
     actor: &str,
     principal: Option<&str>,
     admission_scope: &str,
     status: TopologyOperationRecordStatus,
 ) -> Result<TopologyOperationRecord, TopologyControlError> {
     let fingerprint = request_fingerprint(request)?;
-    let operation_id = operation_id(request.idempotency_key.trim(), &fingerprint);
+    let operation_id = operation_id(scoped_key, &fingerprint);
     let now = chrono::Utc::now().to_rfc3339();
     let _ = admission_scope;
     let record_id = new_audit_record_id();
@@ -2957,6 +3144,51 @@ fn audit_page(
         latest_seq,
         has_more,
     })
+}
+
+/// The idempotency map key `receipt`'s entry is filed under, found by the
+/// operation it names; none when no entry names it.
+fn filed_idempotency_key(
+    idempotency: &BTreeMap<String, IdempotencyRecord>,
+    receipt: &TopologyOperationReceipt,
+) -> Option<String> {
+    idempotency
+        .iter()
+        .find(|(_, record)| record.operation_id == receipt.operation_id)
+        .map(|(key, _)| key.clone())
+}
+
+/// The key an apply's idempotency entry is filed under: its scoped key, else
+/// its own key. An unscoped key that begins with the reserved prefix (filed
+/// before keys were scoped) names no caller's apply, so such an apply is
+/// filed under nothing.
+fn filing_key<'a>(scoped_key: Option<&'a str>, key: &'a str) -> Option<&'a str> {
+    match scoped_key {
+        Some(scoped) => Some(scoped),
+        None if key.starts_with(SCOPED_APPLY_KEY_PREFIX) => None,
+        None => Some(key),
+    }
+}
+
+/// Drop the entries filed under a raw key that begins with the reserved
+/// prefix, before keys were scoped. No caller presents such a key now (the
+/// host may not, and a scoped caller's key is a digest), so none names a
+/// caller's apply.
+fn drop_unscoped_reserved_entries(idempotency: &mut BTreeMap<String, IdempotencyRecord>) {
+    idempotency.retain(|key, record| record.scoped || !key.starts_with(SCOPED_APPLY_KEY_PREFIX));
+}
+
+/// The compacted-history entry of an idempotency map key. Only scoped keys
+/// are filed with the reserved prefix, and their entries are marked as such,
+/// so a bare fingerprint compacted from a raw key before keys were scoped
+/// never answers a scoped apply; a host key's entry keeps its bare form.
+fn compacted_key_fingerprint(map_key: &str) -> String {
+    let fingerprint = idempotency_key_fingerprint(map_key);
+    if map_key.starts_with(SCOPED_APPLY_KEY_PREFIX) {
+        format!("scoped:{fingerprint}")
+    } else {
+        fingerprint
+    }
 }
 
 fn idempotency_key_fingerprint(key: &str) -> String {
@@ -3476,6 +3708,7 @@ mod tests {
                 operation_id: format!("pending-{action:?}"),
                 audit_record_id: String::new(),
                 idempotency_key: format!("recovery-{action:?}"),
+                scoped_idempotency_key: None,
                 fingerprint: format!("fingerprint-{action:?}"),
                 actor: "recovery-test".to_string(),
                 base_revision: 0,
@@ -3637,6 +3870,374 @@ mod tests {
             error_kind: None,
             error_message: None,
         }
+    }
+
+    fn human(issuer: &str, subject: &str) -> TopologyApplyScope {
+        TopologyApplyScope::Human {
+            issuer: issuer.to_string(),
+            subject: subject.to_string(),
+        }
+    }
+
+    fn principal(principal: &str, provider: &str, issuer: &str) -> TopologyApplyScope {
+        TopologyApplyScope::Principal {
+            principal: principal.to_string(),
+            provider: provider.to_string(),
+            issuer: issuer.to_string(),
+        }
+    }
+
+    fn host_principal(principal: &str) -> TopologyApplyScope {
+        TopologyApplyScope::HostPrincipal {
+            principal: principal.to_string(),
+        }
+    }
+
+    #[test]
+    fn scoped_apply_keys_are_stable_and_separate_every_component() {
+        let key = |scope: &TopologyApplyScope| scope.idempotency_key(&["authority"], "k1");
+        let alice = human("https://issuer.example", "alice-sub");
+        assert_eq!(key(&alice), key(&alice));
+        assert!(key(&alice).starts_with(SCOPED_APPLY_KEY_PREFIX));
+        // Each scope differs from some other in exactly one component (the
+        // kind, a subject, an issuer, a principal name or a provider); no two
+        // share a key.
+        let scopes = [
+            alice.clone(),
+            human("https://issuer.example", "bob-sub"),
+            human("https://other.example", "alice-sub"),
+            principal("alice-sub", "generic_oidc", "https://issuer.example"),
+            principal("bob-sub", "generic_oidc", "https://issuer.example"),
+            principal("alice-sub", "service_identity", "https://issuer.example"),
+            principal("alice-sub", "generic_oidc", "https://other.example"),
+            host_principal("alice-sub"),
+            host_principal("bob-sub"),
+            TopologyApplyScope::Anonymous,
+            TopologyApplyScope::LocalHost,
+            TopologyApplyScope::Host,
+        ];
+        for (index, scope) in scopes.iter().enumerate() {
+            for other in &scopes[index + 1..] {
+                assert_ne!(key(scope), key(other), "{scope:?} and {other:?}");
+            }
+        }
+        assert_eq!(
+            TopologyApplyScope::for_host_principal(Some("alice-sub")),
+            host_principal("alice-sub")
+        );
+        assert_eq!(
+            TopologyApplyScope::for_host_principal(None),
+            TopologyApplyScope::Host
+        );
+        assert_ne!(key(&alice), alice.idempotency_key(&["authority"], "k2"));
+        assert_ne!(
+            key(&alice),
+            alice.idempotency_key(&["other-authority"], "k1")
+        );
+        assert_ne!(
+            key(&alice),
+            alice.idempotency_key(&["authority", "second-authority"], "k1")
+        );
+    }
+
+    #[test]
+    fn scoped_apply_keys_do_not_carry_the_scope_or_the_key_in_clear() {
+        let key = human("https://issuer.example", "alice-sub")
+            .idempotency_key(&["topology-authority"], "operator-key");
+        for clear in [
+            "alice-sub",
+            "issuer.example",
+            "topology-authority",
+            "operator-key",
+        ] {
+            assert!(!key.contains(clear), "{key} carries {clear}");
+        }
+    }
+
+    /// The scope is structural: a principal or human spelled like a reserved
+    /// scope, or like another scope's own encoding, is still that principal,
+    /// and a component boundary cannot shift; a host key never takes a scoped
+    /// key's shape.
+    #[test]
+    fn no_principal_spelling_lands_in_another_scope() {
+        let key = |scope: &TopologyApplyScope| scope.idempotency_key(&["authority"], "k");
+        let reserved = [
+            TopologyApplyScope::Host,
+            TopologyApplyScope::LocalHost,
+            TopologyApplyScope::Anonymous,
+        ];
+        for spelling in [
+            "local-host",
+            "local_host",
+            "anonymous",
+            "host",
+            "",
+            "k",
+            r#"["local_host"]"#,
+            r#"["anonymous"]"#,
+        ] {
+            let spelled = [
+                principal(spelling, spelling, spelling),
+                principal(spelling, "service_identity", "https://issuer.example"),
+                host_principal(spelling),
+                human(spelling, spelling),
+            ];
+            for scope in &spelled {
+                for reserved in &reserved {
+                    assert_ne!(key(scope), key(reserved), "{scope:?} vs {reserved:?}");
+                }
+            }
+        }
+        assert_ne!(
+            key(&host_principal("a:b")),
+            host_principal("a").idempotency_key(&["b:authority"], "k")
+        );
+        assert_ne!(
+            key(&principal("a", "b:c", "d")),
+            key(&principal("a", "b", "c:d"))
+        );
+        assert_ne!(key(&human("issuer", "a:b")), key(&human("issuer:a", "b")));
+        assert_eq!(key(&TopologyApplyScope::Host), "k");
+        assert!(
+            TopologyApplyScope::Host
+                .validate_key(&format!("{SCOPED_APPLY_KEY_PREFIX}anything"))
+                .is_err()
+        );
+        assert!(
+            TopologyApplyScope::Host
+                .validate_key("ordinary-key")
+                .is_ok()
+        );
+        assert!(
+            TopologyApplyScope::Anonymous
+                .validate_key(&format!("{SCOPED_APPLY_KEY_PREFIX}anything"))
+                .is_ok()
+        );
+    }
+
+    /// A pending apply under `key`, filed under no scoped key.
+    fn unscoped_pending(operation_id: &str, key: &str) -> PendingTopologyOperation {
+        PendingTopologyOperation {
+            operation_id: operation_id.to_string(),
+            audit_record_id: String::new(),
+            idempotency_key: key.to_string(),
+            scoped_idempotency_key: None,
+            fingerprint: format!("fingerprint-{operation_id}"),
+            actor: "pending-test".to_string(),
+            base_revision: 0,
+            target_revision: 1,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            reason: None,
+            operations: Vec::new(),
+            phase: PendingTopologyPhase::Applying,
+            rollback_additions: BTreeSet::new(),
+            rollback_suppressions: BTreeSet::new(),
+            rollback_cross_additions: BTreeSet::new(),
+            rollback_cross_suppressions: BTreeSet::new(),
+            rollback_revision: 0,
+            last_recovery_error: None,
+            recovery_attempts: 0,
+        }
+    }
+
+    /// While an apply is pending, its own caller's identical request gets its
+    /// pending receipt, and that caller's other request under the key a
+    /// conflict; any other caller's request under the same key, the host's
+    /// included, is told an operation is in progress. An unscoped pending key
+    /// that begins with the reserved prefix answers no caller's apply.
+    #[test]
+    fn a_pending_apply_answers_only_its_own_callers_key() {
+        let key = |scope: &TopologyApplyScope| scope.idempotency_key(&["authority"], "k");
+        let alice = human("https://issuer.example", "alice-sub");
+        let bob = human("https://issuer.example", "bob-sub");
+        let mut pending = unscoped_pending("alice-op", "k");
+        pending.scoped_idempotency_key = Some(key(&alice));
+        let fingerprint = pending.fingerprint.clone();
+
+        let own = pending
+            .answer_apply(&key(&alice), &fingerprint, "k")
+            .expect("its own pending apply");
+        assert_eq!(own.operation_id, "alice-op");
+        assert_eq!(own.status, TopologyOperationStatus::Pending);
+        assert!(matches!(
+            pending.answer_apply(&key(&alice), "another-request", "k"),
+            Err(TopologyControlError::IdempotencyConflict(_))
+        ));
+        for other in [
+            key(&bob),
+            key(&host_principal("alice-sub")),
+            key(&TopologyApplyScope::Anonymous),
+            key(&TopologyApplyScope::Host),
+        ] {
+            assert!(
+                matches!(
+                    pending.answer_apply(&other, &fingerprint, "k"),
+                    Err(TopologyControlError::OperationInProgress(ref id)) if id == "alice-op"
+                ),
+                "{other}"
+            );
+        }
+
+        // A host apply pending from before keys were scoped still answers
+        // the host, and no scoped caller.
+        let host = unscoped_pending("host-op", "k");
+        assert_eq!(host.idempotency_map_key(), Some("k"));
+        assert!(host.answer_apply("k", &host.fingerprint, "k").is_ok());
+        assert!(matches!(
+            host.answer_apply(&key(&alice), &host.fingerprint, "k"),
+            Err(TopologyControlError::OperationInProgress(_))
+        ));
+
+        // An unscoped key with the reserved prefix answers no caller, even
+        // the one whose scoped key it spells.
+        let reserved = unscoped_pending("earlier-op", &key(&bob));
+        assert_eq!(reserved.idempotency_map_key(), None);
+        assert!(matches!(
+            reserved.answer_apply(&key(&bob), &reserved.fingerprint, "k"),
+            Err(TopologyControlError::OperationInProgress(_))
+        ));
+    }
+
+    /// An idempotency entry filed before keys were scoped, under a key that
+    /// begins with the reserved prefix, names no caller's apply: loading the
+    /// state drops it and keeps every other entry.
+    #[tokio::test]
+    async fn loading_state_drops_reserved_prefix_entries_from_before_keys_were_scoped() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("topology.json");
+        let mut state = TopologyIntentState {
+            schema_version: TOPOLOGY_STATE_SCHEMA_VERSION,
+            ..TopologyIntentState::default()
+        };
+        for (key, record) in [
+            (
+                "apply-scoped:earlier",
+                serde_json::json!({"fingerprint": "f1", "operation_id": "o1"}),
+            ),
+            (
+                "host-key",
+                serde_json::json!({"fingerprint": "f2", "operation_id": "o2"}),
+            ),
+            (
+                "apply-scoped:filed",
+                serde_json::json!({"fingerprint": "f3", "operation_id": "o3", "scoped": true}),
+            ),
+        ] {
+            state.idempotency.insert(
+                key.to_string(),
+                serde_json::from_value(record).expect("idempotency record"),
+            );
+        }
+        persist_state(&path, &state).expect("persist");
+
+        let controller =
+            TopologyController::load_or_default(TopologyControlPolicy::default(), &path)
+                .expect("load");
+        let keys = controller
+            .inner
+            .state
+            .read()
+            .await
+            .idempotency
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["apply-scoped:filed", "host-key"]);
+    }
+
+    /// An apply pending since before keys were scoped, under a key that
+    /// begins with the reserved prefix, names no caller's apply: its recovery
+    /// records its receipt and files no idempotency entry.
+    #[tokio::test]
+    async fn a_reserved_prefix_pending_from_before_keys_were_scoped_files_no_entry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let controller = TopologyController::load_or_default(
+            TopologyControlPolicy::default(),
+            temp.path().join("topology.json"),
+        )
+        .expect("controller");
+        let reserved =
+            human("https://issuer.example", "alice-sub").idempotency_key(&["authority"], "k");
+        {
+            let mut state = controller.inner.state.write().await;
+            state.pending = Some(unscoped_pending("earlier-op", &reserved));
+            controller.persist_candidate(&state).expect("persist");
+        }
+        controller
+            .finalize_recovered_pending(true)
+            .await
+            .expect("recovery");
+
+        let state = controller.inner.state.read().await;
+        assert!(state.pending.is_none());
+        assert_eq!(state.receipts.len(), 1);
+        assert!(state.idempotency.is_empty(), "{:?}", state.idempotency);
+    }
+
+    /// An evicted receipt that no idempotency entry names compacts and
+    /// removes nothing.
+    #[tokio::test]
+    async fn an_evicted_receipt_that_no_entry_names_compacts_nothing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let controller = TopologyController::load_or_default(
+            TopologyControlPolicy {
+                receipt_limit: 1,
+                ..TopologyControlPolicy::default()
+            },
+            temp.path().join("topology.json"),
+        )
+        .expect("controller");
+        {
+            let mut state = controller.inner.state.write().await;
+            // A receipt recorded with no idempotency entry.
+            state.receipts.push_back(pending_receipt(&unscoped_pending(
+                "unfiled-op",
+                "unfiled-key",
+            )));
+            // Its recovery files this receipt and evicts the first.
+            state.pending = Some(unscoped_pending("pending-op", "pending-key"));
+            controller.persist_candidate(&state).expect("persist");
+        }
+        controller
+            .finalize_recovered_pending(true)
+            .await
+            .expect("recovery");
+
+        let state = controller.inner.state.read().await;
+        assert_eq!(state.receipts.len(), 1);
+        assert_eq!(
+            state.idempotency.keys().collect::<Vec<_>>(),
+            vec!["pending-key"]
+        );
+        assert!(
+            state.compacted_idempotency.is_empty(),
+            "{:?}",
+            state.compacted_idempotency
+        );
+    }
+
+    /// Compacted history from before keys were scoped holds the bare
+    /// fingerprints of raw keys: one equal to a scoped key's bare fingerprint
+    /// answers no apply of that scoped key, while a host key's still answers.
+    #[tokio::test]
+    async fn a_bare_compacted_fingerprint_answers_no_scoped_apply() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let controller = TopologyController::load_or_default(
+            TopologyControlPolicy::default(),
+            temp.path().join("topology.json"),
+        )
+        .expect("controller");
+        let scoped =
+            human("https://issuer.example", "alice-sub").idempotency_key(&["authority"], "k");
+        let mut state = TopologyIntentState::default();
+        state
+            .compacted_idempotency
+            .push_back(idempotency_key_fingerprint(&scoped));
+        state
+            .compacted_idempotency
+            .push_back(idempotency_key_fingerprint("host-key"));
+        assert!(!controller.compacted_idempotency_contains(&state, &scoped));
+        assert!(controller.compacted_idempotency_contains(&state, "host-key"));
     }
 
     #[test]

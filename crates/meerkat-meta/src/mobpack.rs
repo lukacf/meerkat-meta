@@ -17,7 +17,7 @@ use meerkat_mob::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
@@ -156,6 +156,58 @@ const EDITOR_SCHEMA_FIELD_TYPES: &[&str] = &[
 ];
 
 static MOBPACK_DRAFT_STORE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Hold the draft store lock, so draft methods wait for the test that holds
+/// it.
+#[cfg(test)]
+pub(crate) fn hold_draft_store_lock_for_test() -> std::sync::MutexGuard<'static, ()> {
+    MOBPACK_DRAFT_STORE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Hold the draft store lock for one read, check and write of the store.
+/// Every draft call from every caller waits for it.
+fn lock_draft_store() -> Result<DraftStoreLock, String> {
+    let guard = MOBPACK_DRAFT_STORE_LOCK
+        .lock()
+        .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
+    #[cfg(test)]
+    DRAFT_STORE_LOCK_HELD.with(|held| held.set(true));
+    Ok(DraftStoreLock { _guard: guard })
+}
+
+/// The held draft store lock.
+struct DraftStoreLock {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for DraftStoreLock {
+    fn drop(&mut self) {
+        DRAFT_STORE_LOCK_HELD.with(|held| held.set(false));
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Whether this thread holds the draft store lock.
+    static DRAFT_STORE_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The documents this thread validated: in all, and while it held the
+    /// draft store lock.
+    static VALIDATIONS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Counts one document validation for the tests. Outside tests it does
+/// nothing.
+fn count_validation() {
+    #[cfg(test)]
+    VALIDATIONS.with(|count| {
+        let (all, under_lock) = count.get();
+        let locked = DRAFT_STORE_LOCK_HELD.with(std::cell::Cell::get);
+        count.set((all + 1, under_lock + u64::from(locked)));
+    });
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MobpackRuntimeCatalogState {
@@ -590,17 +642,34 @@ fn default_schema_version() -> String {
 }
 
 fn discover_skill_realms(authoring_sources: &Value) -> Value {
+    let host = host_access();
     let mut realms = Vec::new();
     for (realm_id, label, dir) in skill_catalog_dirs() {
         let mut skills = discover_skills_in_dir(&dir);
         annotate_untrusted_skill_reads(&mut skills, &dir);
-        if !skills.is_empty() {
+        if skills.is_empty() {
+            continue;
+        }
+        let default = realms.is_empty();
+        if host {
             realms.push(json!({
                 "id": realm_id,
                 "label": label,
-                "default": realms.is_empty(),
+                "default": default,
                 "source": "filesystem",
                 "path": dir.to_string_lossy(),
+                "skills": skills,
+            }));
+        } else {
+            // A caller without host access is told no host path: each skill
+            // by its path within its realm, which a read joins to the realm's
+            // directory again (see `path_skill_host_path`).
+            name_skills_within_realm(&mut skills, &dir);
+            realms.push(json!({
+                "id": realm_id,
+                "label": label,
+                "default": default,
+                "source": "filesystem",
                 "skills": skills,
             }));
         }
@@ -609,6 +678,27 @@ fn discover_skill_realms(authoring_sources: &Value) -> Value {
         realms.push(authoring_realm);
     }
     Value::Array(realms)
+}
+
+/// Name each catalog skill by its path within its realm's directory `dir`,
+/// with `/` between components, in place of its host path.
+fn name_skills_within_realm(skills: &mut [Value], dir: &Path) {
+    for skill in skills {
+        let within = skill
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(|path| Path::new(path).strip_prefix(dir).ok())
+            .map(|within| {
+                within
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .unwrap_or_default();
+        skill["provenance"] = catalog_provenance("meta/skills/catalog", "filesystem", &within);
+        skill["path"] = json!(within);
+    }
 }
 
 /// Mark each discovered path skill with whether a caller without host
@@ -2145,7 +2235,8 @@ pub fn mobpack_schema_response_with_runtime(runtime: Option<&MobpackRuntimeCatal
             "graph_projection": "Meta graph projection failed",
             "graph_sync": "Meta graph sync failed",
             "graph_node_insert": "Meta graph node insert failed",
-            "draft_save": "Meta draft save failed"
+            "draft_save": "Meta draft save failed",
+            "draft_open": "Meta draft open failed"
         },
         "authoring_operation_stale_error": "stale authoring operation",
         "authoring_operation_missing_document_error": "Meta authoring operation did not return a document",
@@ -3942,7 +4033,7 @@ fn import_media_type(params: &Value, fallback: &str) -> String {
         .to_string()
 }
 
-fn mobpack_draft_store_path(params: &Value) -> Result<PathBuf, String> {
+fn mobpack_draft_store_path(params: &Value) -> Result<PathBuf, DraftStoreRefusal> {
     let explicit = params
         .get("store_path")
         .and_then(Value::as_str)
@@ -3962,70 +4053,486 @@ fn mobpack_draft_store_path(params: &Value) -> Result<PathBuf, String> {
     }
 }
 
-fn default_mobpack_draft_store_path() -> Result<PathBuf, String> {
+fn default_mobpack_draft_store_path() -> Result<PathBuf, DraftStoreRefusal> {
     // The draft store lives under the gateway home; the ambient
     // `$XDG_STATE_HOME`/`$HOME` derivation belongs to `storage_layout`
-    // (M5 gate), never re-read here. The OS temp directory stays the last
-    // resort when neither root exists — drafts are recoverable scratch,
-    // not a durable slot. An unadopted predecessor home is not "neither
-    // root": its drafts exist, so the store refuses instead of starting
-    // empty in the temp directory.
+    // (M5 gate), never re-read here. Without either root the store has no
+    // location and refuses: a file at a predictable path in the shared OS
+    // temp directory could be created, linked or read first by another local
+    // user. An unadopted predecessor home refuses too: its drafts exist, so
+    // the store does not start empty elsewhere.
     match crate::storage_layout::default_gateway_home() {
         Ok(home) => Ok(home.join(MOBPACK_DRAFT_STORE_FILENAME)),
-        Err(
-            error @ (crate::storage_layout::StorageLayoutError::PredecessorGatewayHome { .. }
-            | crate::storage_layout::StorageLayoutError::AdoptionIncomplete { .. }),
-        ) => Err(error.to_string()),
-        Err(_) => Ok(std::env::temp_dir().join(MOBPACK_DRAFT_STORE_FILENAME)),
+        Err(crate::storage_layout::StorageLayoutError::GatewayHomeUnavailable) => {
+            Err(DraftStoreRefusal::NoStateRoot)
+        }
+        Err(error) => Err(DraftStoreRefusal::GatewayHome(error)),
     }
+}
+
+/// Why the Flow Editor draft store refused a call. A JSON-RPC caller gets it
+/// as the error `data` ([`DraftStoreRefusal::data`]): a `kind` and the fields
+/// that kind names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DraftStoreRefusal {
+    /// No `META_FLOW_EDITOR_DRAFT_STORE`, and neither `$XDG_STATE_HOME` nor
+    /// `$HOME` to derive the gateway home from: the store has no location.
+    NoStateRoot,
+    /// The gateway home cannot hold the store yet: its predecessor (pre-0.9)
+    /// home waits for adoption.
+    GatewayHome(crate::storage_layout::StorageLayoutError),
+    /// The store holds [`MOBPACK_DRAFT_STORE_MAX_DRAFTS`] drafts: a new one
+    /// would pass the cap.
+    TooManyDrafts,
+    /// The store file would pass [`MOBPACK_DRAFT_STORE_MAX_BYTES`] even with
+    /// every undo and redo snapshot dropped: it would take `required_bytes`.
+    TooLarge { required_bytes: usize },
+    /// The store file holds `bytes`, past
+    /// [`MOBPACK_DRAFT_STORE_MAX_READ_BYTES`] (a store written before the
+    /// caps): it is refused before it is read.
+    Oversized { bytes: u64, path: PathBuf },
+}
+
+impl DraftStoreRefusal {
+    /// The JSON-RPC error `data`.
+    fn data(&self) -> Value {
+        match self {
+            Self::NoStateRoot => json!({
+                "kind": "draft_store_unavailable",
+                "reason": "gateway_home_unavailable",
+            }),
+            Self::GatewayHome(error) => json!({
+                "kind": "draft_store_unavailable",
+                "reason": match error {
+                    crate::storage_layout::StorageLayoutError::PredecessorGatewayHome { .. } => {
+                        "predecessor_gateway_home"
+                    }
+                    crate::storage_layout::StorageLayoutError::AdoptionIncomplete { .. } => {
+                        "adoption_incomplete"
+                    }
+                    _ => "gateway_home_refused",
+                },
+            }),
+            Self::TooManyDrafts => json!({
+                "kind": "draft_store_full",
+                "limit": "drafts",
+                "max_drafts": MOBPACK_DRAFT_STORE_MAX_DRAFTS,
+            }),
+            Self::TooLarge { required_bytes } => json!({
+                "kind": "draft_store_full",
+                "limit": "bytes",
+                "max_bytes": MOBPACK_DRAFT_STORE_MAX_BYTES,
+                "required_bytes": required_bytes,
+            }),
+            Self::Oversized { bytes, .. } => json!({
+                "kind": "draft_store_unavailable",
+                "reason": "store_too_large",
+                "max_read_bytes": MOBPACK_DRAFT_STORE_MAX_READ_BYTES,
+                "store_bytes": bytes,
+            }),
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::NoStateRoot => "the Flow Editor draft store has no location: neither \
+                                  XDG_STATE_HOME nor HOME is set, and drafts are never kept in \
+                                  the shared temp directory; set META_FLOW_EDITOR_DRAFT_STORE to \
+                                  a file in a directory only this user can write, or set \
+                                  XDG_STATE_HOME or HOME"
+                .to_string(),
+            Self::GatewayHome(error) if host_access() => error.to_string(),
+            Self::GatewayHome(_) => "the Flow Editor draft store is unavailable until the host \
+                                   finishes adopting its predecessor (pre-0.9) state"
+                .to_string(),
+            Self::TooManyDrafts => format!(
+                "the Flow Editor draft store holds at most {MOBPACK_DRAFT_STORE_MAX_DRAFTS} drafts; \
+                 delete a draft to save a new one"
+            ),
+            Self::TooLarge { required_bytes } => format!(
+                "the Flow Editor draft store holds at most {} MiB, and this save needs \
+                 {required_bytes} bytes even without undo history; delete drafts to make room",
+                MOBPACK_DRAFT_STORE_MAX_BYTES >> 20
+            ),
+            Self::Oversized { bytes, path } => format!(
+                "the {} holds {bytes} bytes, more than {} MiB, and is not read; move it aside \
+                 to start a new draft store",
+                draft_store_name(path),
+                MOBPACK_DRAFT_STORE_MAX_READ_BYTES >> 20
+            ),
+        }
+    }
+}
+
+/// A draft store method's failure, as its JSON-RPC error reports it: the
+/// message, and for a typed refusal the error `data`.
+#[derive(Debug, Clone)]
+pub(crate) struct DraftStoreFailure {
+    pub(crate) message: String,
+    pub(crate) data: Option<Value>,
+}
+
+impl From<String> for DraftStoreFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            data: None,
+        }
+    }
+}
+
+impl From<DraftStoreRefusal> for DraftStoreFailure {
+    fn from(refusal: DraftStoreRefusal) -> Self {
+        Self {
+            message: refusal.message(),
+            data: Some(refusal.data()),
+        }
+    }
+}
+
+/// The draft store methods for the JSON-RPC dispatch, reporting typed
+/// refusals; `None` for any other method.
+pub(crate) fn mobpack_draft_store_method(
+    method: &str,
+    params: &Value,
+    runtime: Option<&MobpackRuntimeCatalogState>,
+) -> Option<Result<Value, DraftStoreFailure>> {
+    Some(match method {
+        "meta/mobpacks/list" => list_drafts(params, runtime),
+        "meta/mobpacks/get" => get_draft(params, runtime),
+        "meta/mobpacks/create" => create_draft(params),
+        "meta/mobpacks/save" => save_draft(params),
+        "meta/mobpacks/delete" => delete_draft(params),
+        "meta/mobpacks/undo" => step_mobpack_draft_history(params, MobpackDraftHistoryStep::Undo),
+        "meta/mobpacks/redo" => step_mobpack_draft_history(params, MobpackDraftHistoryStep::Redo),
+        _ => return None,
+    })
+}
+
+/// A draft store reply: `reply`, naming the store's host path as `store_path`
+/// only to a caller with host access ([`host_access`]). Any other caller is
+/// not told where the host keeps it.
+fn draft_store_reply(mut reply: Value, path: &Path) -> Value {
+    if host_access() {
+        reply["store_path"] = json!(path);
+    }
+    reply
+}
+
+/// The reply of a draft store write ([`draft_store_reply`]). A write that
+/// replaced the store but could not sync its directory has taken effect, so
+/// its reply carries the written draft as any other does, with the warning
+/// as `durability_warning`.
+fn draft_store_write_reply(reply: Value, path: &Path, durability_warning: Option<String>) -> Value {
+    let mut reply = draft_store_reply(reply, path);
+    if let Some(warning) = durability_warning {
+        reply["durability_warning"] = json!(warning);
+    }
+    reply
+}
+
+/// The draft store as a message names it: by its host path for a caller with
+/// host access ([`host_access`]), without one for any other caller.
+fn draft_store_name(path: &Path) -> String {
+    if host_access() {
+        format!("mobpack draft store {}", path.display())
+    } else {
+        "mobpack draft store".to_string()
+    }
+}
+
+/// The most drafts the Flow Editor draft store holds.
+const MOBPACK_DRAFT_STORE_MAX_DRAFTS: usize = 256;
+
+/// The most bytes the draft store file holds. Every draft method reads and
+/// parses the whole store, so this bounds what one call holds in memory as
+/// well as the disk the store takes.
+const MOBPACK_DRAFT_STORE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// The most bytes of a draft store file the draft methods read: twice
+/// [`MOBPACK_DRAFT_STORE_MAX_BYTES`]. A store written before the caps can be
+/// past the cap and still works, but one past this is refused before it is
+/// read, since every draft method reads and parses the whole file.
+const MOBPACK_DRAFT_STORE_MAX_READ_BYTES: u64 = 2 * MOBPACK_DRAFT_STORE_MAX_BYTES as u64;
+
+/// How many drafts and bytes the draft store file held when it was read.
+#[derive(Clone, Copy)]
+struct DraftStoreSize {
+    drafts: usize,
+    bytes: usize,
 }
 
 fn read_mobpack_draft_store(path: &Path) -> Result<BTreeMap<String, Value>, String> {
-    if !path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let bytes = std::fs::read(path).map_err(|err| {
-        format!(
-            "failed to read mobpack draft store {}: {err}",
-            path.display()
-        )
-    })?;
-    if bytes.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    serde_json::from_slice(&bytes).map_err(|err| {
-        format!(
-            "failed to parse mobpack draft store {}: {err}",
-            path.display()
-        )
-    })
+    read_draft_store(path)
+        .map(|(rows, _)| rows)
+        .map_err(|failure| failure.message)
 }
 
-fn write_mobpack_draft_store(path: &Path, rows: &BTreeMap<String, Value>) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            format!(
-                "failed to create mobpack draft store directory {}: {err}",
-                parent.display()
-            )
-        })?;
+/// The draft store's rows, and its size as read. A missing or empty file is an
+/// empty store; a file past [`MOBPACK_DRAFT_STORE_MAX_READ_BYTES`] is refused
+/// before any of it is read.
+fn read_draft_store(
+    path: &Path,
+) -> Result<(BTreeMap<String, Value>, DraftStoreSize), DraftStoreFailure> {
+    let empty = DraftStoreSize {
+        drafts: 0,
+        bytes: 0,
+    };
+    let unreadable =
+        |err: std::io::Error| format!("failed to read {}: {err}", draft_store_name(path));
+    let oversized = |bytes: u64| DraftStoreRefusal::Oversized {
+        bytes,
+        path: path.to_path_buf(),
+    };
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((BTreeMap::new(), empty));
+        }
+        Err(err) => return Err(unreadable(err).into()),
+    };
+    let len = file.metadata().map_err(unreadable)?.len();
+    if len > MOBPACK_DRAFT_STORE_MAX_READ_BYTES {
+        return Err(oversized(len).into());
     }
-    let bytes = serde_json::to_vec_pretty(rows)
-        .map_err(|err| format!("failed to encode mobpack draft store: {err}"))?;
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, bytes).map_err(|err| {
+    let mut bytes = Vec::new();
+    file.take(MOBPACK_DRAFT_STORE_MAX_READ_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if read > MOBPACK_DRAFT_STORE_MAX_READ_BYTES {
+        return Err(oversized(read).into());
+    }
+    if bytes.is_empty() {
+        return Ok((BTreeMap::new(), empty));
+    }
+    let rows: BTreeMap<String, Value> = serde_json::from_slice(&bytes)
+        .map_err(|err| format!("failed to parse {}: {err}", draft_store_name(path)))?;
+    let size = DraftStoreSize {
+        drafts: rows.len(),
+        bytes: bytes.len(),
+    };
+    Ok((rows, size))
+}
+
+/// Write the draft store: streamed into a new file beside it, readable only
+/// by its user, synced to disk, then renamed over it, and the directory
+/// synced after the rename, so a crash leaves either the old store or the
+/// new one whole. Each write gets a file of its own, so writers that share a
+/// store never write into one temporary file, and the store is never encoded
+/// into memory first.
+///
+/// Once renamed, the store holds the write: a directory that cannot be
+/// synced then is returned as a durability warning for the write's reply
+/// ([`draft_store_write_reply`]), never as its failure. Undo and redo are
+/// not idempotent, so a client that retried a write reported failed would
+/// step the draft twice.
+fn write_mobpack_draft_store(
+    path: &Path,
+    rows: &BTreeMap<String, Value>,
+) -> Result<Option<String>, String> {
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    create_private_dir_all(dir).map_err(|err| {
         format!(
-            "failed to write mobpack draft store {}: {err}",
-            tmp_path.display()
+            "failed to create the directory of {}: {err}",
+            draft_store_name(path)
         )
     })?;
-    std::fs::rename(&tmp_path, path).map_err(|err| {
+    let unwritable =
+        |err: std::io::Error| format!("failed to write {}: {err}", draft_store_name(path));
+    let mut file = tempfile::Builder::new()
+        .prefix(".flow-editor-drafts-")
+        .suffix(".tmp")
+        .tempfile_in(dir)
+        .map_err(unwritable)?;
+    let mut writer = std::io::BufWriter::new(file.as_file_mut());
+    serde_json::to_writer_pretty(&mut writer, rows)
+        .map_err(|err| format!("failed to encode {}: {err}", draft_store_name(path)))?;
+    writer.flush().map_err(unwritable)?;
+    drop(writer);
+    file.as_file().sync_all().map_err(unwritable)?;
+    file.persist(path).map_err(|err| {
         format!(
-            "failed to replace mobpack draft store {}: {err}",
-            path.display()
+            "failed to replace {}: {}",
+            draft_store_name(path),
+            err.error
         )
-    })
+    })?;
+    Ok(sync_dir(dir).err().map(|err| {
+        tracing::warn!(
+            store = %path.display(),
+            error = %err,
+            "the Flow Editor draft store was replaced, but its directory could not be synced"
+        );
+        format!(
+            "{} was replaced, but its directory could not be synced, so the write may not survive a crash: {err}",
+            draft_store_name(path)
+        )
+    }))
 }
+
+#[cfg(test)]
+std::thread_local! {
+    /// Fails the next directory sync on this thread, for the tests of a
+    /// store write whose directory cannot be synced.
+    static FAIL_NEXT_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sync a directory's entries to disk, so a rename into it survives a crash.
+/// A directory this user cannot open, or one its filesystem cannot sync, is
+/// left as it is: the rename lasts as long as the filesystem keeps it.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    #[cfg(test)]
+    if FAIL_NEXT_DIR_SYNC.with(std::cell::Cell::take) {
+        return Err(std::io::Error::other("injected directory sync failure"));
+    }
+    match std::fs::File::open(dir).and_then(|dir| dir.sync_all()) {
+        Err(err)
+            if !matches!(
+                err.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::InvalidInput | ErrorKind::Unsupported
+            ) =>
+        {
+            Err(err)
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Create `dir` and any missing parent, readable only by this user; a
+/// directory that exists keeps its mode.
+#[cfg(unix)]
+fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
+/// Check `rows`, the store after a write to the draft `id`, against the store
+/// caps; `before` is the store as that write read it. Sizes are counted, not
+/// encoded, so checking a store near the byte cap builds no copy of it.
+///
+/// A write that adds a draft past [`MOBPACK_DRAFT_STORE_MAX_DRAFTS`] is
+/// refused. Past [`MOBPACK_DRAFT_STORE_MAX_BYTES`] undo and redo history yields
+/// first: the oldest snapshots go, of the drafts updated longest ago first and
+/// of the written draft last, until the store fits. With no snapshot left the
+/// write is refused and the store keeps what it held. A store already past a
+/// cap (written before the caps) still takes writes that leave it no larger.
+fn admit_draft_store_write(
+    rows: &mut BTreeMap<String, Value>,
+    id: &str,
+    before: DraftStoreSize,
+) -> Result<(), DraftStoreFailure> {
+    if rows.len() > MOBPACK_DRAFT_STORE_MAX_DRAFTS && rows.len() > before.drafts {
+        return Err(DraftStoreRefusal::TooManyDrafts.into());
+    }
+    let limit = MOBPACK_DRAFT_STORE_MAX_BYTES.max(before.bytes);
+    let size = draft_store_len(rows);
+    if size <= limit {
+        return Ok(());
+    }
+    // A snapshot's pretty-printed bytes are at least its compact JSON, so
+    // dropping snapshots whose compact JSON covers the excess shrinks the file
+    // to the limit.
+    let mut excess = size - limit;
+    for draft in draft_history_yield_order(rows, id) {
+        let Some(row) = rows.get_mut(&draft).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for key in ["history", "future"] {
+            let Some(snapshots) = row.get_mut(key).and_then(Value::as_array_mut) else {
+                continue;
+            };
+            while excess > 0 && !snapshots.is_empty() {
+                excess = excess.saturating_sub(compact_json_len(&snapshots.remove(0)));
+            }
+        }
+        if excess == 0 {
+            break;
+        }
+    }
+    let size = draft_store_len(rows);
+    if size <= limit {
+        Ok(())
+    } else {
+        Err(DraftStoreRefusal::TooLarge {
+            required_bytes: size,
+        }
+        .into())
+    }
+}
+
+/// The drafts in the order their undo and redo history yields to a write:
+/// the drafts updated longest ago first, the written draft `id` last.
+fn draft_history_yield_order(rows: &BTreeMap<String, Value>, id: &str) -> Vec<String> {
+    let mut others = rows
+        .iter()
+        .filter(|(draft, _)| draft.as_str() != id)
+        .map(|(draft, row)| {
+            (
+                row.get("updated_at_unix_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                draft.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    others.sort();
+    others
+        .into_iter()
+        .map(|(_, draft)| draft)
+        .chain(std::iter::once(id.to_string()))
+        .collect()
+}
+
+/// Counts the bytes written to it, so an encoding's size is known without
+/// building it.
+struct JsonByteCounter(usize);
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// How many bytes `value` takes as compact JSON, counted without building it.
+fn compact_json_len(value: &Value) -> usize {
+    let mut counter = JsonByteCounter(0);
+    serde_json::to_writer(&mut counter, value).map_or(0, |()| counter.0)
+}
+
+/// How many bytes the draft store takes as it is written (pretty JSON),
+/// counted without building it.
+fn draft_store_len(rows: &BTreeMap<String, Value>) -> usize {
+    let mut counter = JsonByteCounter(0);
+    serde_json::to_writer_pretty(&mut counter, rows).map_or(0, |()| counter.0)
+}
+
+/// The most characters of a draft's id. A draft summary carries its id
+/// whole.
+const MOBPACK_DRAFT_MAX_ID_CHARS: usize = 256;
 
 fn mobpack_draft_id_from_params(
     params: &Value,
@@ -4046,6 +4553,12 @@ fn mobpack_draft_id_from_params(
         })
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "meta/mobpacks/save requires id or document.mob_id".to_string())?;
+    let chars = id.chars().count();
+    if chars > MOBPACK_DRAFT_MAX_ID_CHARS {
+        return Err(format!(
+            "mobpack draft id has {chars} characters, more than {MOBPACK_DRAFT_MAX_ID_CHARS}"
+        ));
+    }
     Ok(id)
 }
 
@@ -4123,10 +4636,8 @@ fn enforce_mobpack_draft_expected_revision(params: &Value, source: &str) -> Resu
     }
     let id = mobpack_draft_guard_id(params)
         .ok_or_else(|| format!("{source} expected revision/etag requires draft id"))?;
-    let _guard = MOBPACK_DRAFT_STORE_LOCK
-        .lock()
-        .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
-    let path = mobpack_draft_store_path(params)?;
+    let _guard = lock_draft_store()?;
+    let path = mobpack_draft_store_path(params).map_err(|refusal| refusal.message())?;
     let rows = read_mobpack_draft_store(&path)?;
     let existing = rows.get(&id);
     let current_revision = mobpack_draft_revision_from_row(existing);
@@ -4146,6 +4657,16 @@ fn enforce_mobpack_draft_expected_revision(params: &Value, source: &str) -> Resu
         }
     }
     Ok(())
+}
+
+/// Stamp a draft row, built before the store was locked, with the revision
+/// it is stored at.
+fn set_draft_row_revision(row: &mut Value, id: &str, revision: u64) {
+    let etag = mobpack_draft_etag(id, revision);
+    row["revision"] = json!(revision);
+    row["draft_revision"] = json!(revision);
+    row["etag"] = json!(etag);
+    row["draft_etag"] = json!(etag);
 }
 
 fn mobpack_draft_row_from_params(params: &Value, revision: u64) -> Result<Value, String> {
@@ -4332,6 +4853,10 @@ fn mobpack_create_draft_id(
 }
 
 pub fn create_mobpack_draft(params: &Value) -> Result<Value, String> {
+    create_draft(params).map_err(|failure| failure.message)
+}
+
+fn create_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
     let template_id = params
         .get("template")
         .and_then(Value::as_str)
@@ -4350,6 +4875,7 @@ pub fn create_mobpack_draft(params: &Value) -> Result<Value, String> {
         .filter(|value| !value.is_empty())
         .unwrap_or(fallback_name);
     let document = clone_draft_template_document(&template, name)?;
+    let path = mobpack_draft_store_path(params)?;
     let validation = validate_document(&document);
     let trigger = params
         .get("trigger")
@@ -4362,18 +4888,20 @@ pub fn create_mobpack_draft(params: &Value) -> Result<Value, String> {
         .get("source")
         .and_then(Value::as_str)
         .unwrap_or("meta/mobpacks/create");
-    let _guard = MOBPACK_DRAFT_STORE_LOCK
-        .lock()
-        .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
-    let path = mobpack_draft_store_path(params)?;
-    let mut rows = read_mobpack_draft_store(&path)?;
-    let id = mobpack_create_draft_id(params, &document, &rows);
     let updated_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
     let validation_value = serde_json::to_value(&validation).unwrap_or(Value::Null);
+    // Exported before the store is locked: the lock covers only the store's
+    // read, checks and write.
     let artifact = mobpack_registry_artifact_for_document(&document, &validation_value);
+    let lock = lock_draft_store()?;
+    let (mut rows, before) = read_draft_store(&path)?;
+    let id = mobpack_create_draft_id(params, &document, &rows);
+    if !rows.contains_key(&id) && rows.len() >= MOBPACK_DRAFT_STORE_MAX_DRAFTS {
+        return Err(DraftStoreRefusal::TooManyDrafts.into());
+    }
     let revision = 1_u64;
     let draft_etag = mobpack_draft_etag(&id, revision);
     let row = json!({
@@ -4395,55 +4923,162 @@ pub fn create_mobpack_draft(params: &Value) -> Result<Value, String> {
         "etag": draft_etag,
         "draft_etag": draft_etag
     });
-    rows.insert(id, row.clone());
-    write_mobpack_draft_store(&path, &rows)?;
+    rows.insert(id.clone(), row.clone());
+    admit_draft_store_write(&mut rows, &id, before)?;
+    let durability_warning = write_mobpack_draft_store(&path, &rows)?;
+    drop(lock);
     // The create response keeps the freshly cloned editor document (no
     // artifact re-import); only the store-internal history fields are
     // projected to can_undo/can_redo.
-    let mut row = row;
-    strip_draft_history_fields(&mut row);
-    Ok(json!({
-        "source": "meta/mobpacks/create",
-        "store_path": path,
-        "row": row,
-        "rows": sorted_mobpack_draft_rows(&rows),
-    }))
+    let row = draft_row_without_history(&row);
+    Ok(draft_store_write_reply(
+        json!({
+            "source": "meta/mobpacks/create",
+            "row": row,
+            "rows": draft_summaries(&rows),
+        }),
+        &path,
+        durability_warning,
+    ))
 }
 
-fn sorted_mobpack_draft_rows(rows: &BTreeMap<String, Value>) -> Vec<Value> {
-    rows.values().map(normalize_mobpack_draft_row).collect()
+/// The most characters of a draft's name, description and other labels
+/// that its summary carries.
+const MOBPACK_DRAFT_SUMMARY_MAX_CHARS: usize = 256;
+
+/// Every stored draft as a summary ([`draft_summary`]).
+fn draft_summaries(rows: &BTreeMap<String, Value>) -> Vec<Value> {
+    rows.values().map(draft_summary).collect()
 }
 
-/// History snapshots stay in the store; outgoing rows only advertise
-/// whether Meta can step.
-fn strip_draft_history_fields(row: &mut Value) {
-    let Some(object) = row.as_object_mut() else {
-        return;
+/// A draft as replies list it: its id, revision and etag and what the
+/// library shows of it, without its document, archive, validation or
+/// history, so no reply grows with the drafts' documents. `get` returns a
+/// draft's document, and so does the reply of the write that changed it.
+fn draft_summary(row: &Value) -> Value {
+    let mut summary = serde_json::Map::new();
+    for key in [
+        "id",
+        "revision",
+        "draft_revision",
+        "etag",
+        "draft_etag",
+        "updated_at_unix_ms",
+        "runtime_projection",
+    ] {
+        if let Some(value) = row.get(key) {
+            summary.insert(key.to_string(), value.clone());
+        }
+    }
+    for key in [
+        "name",
+        "version",
+        "stage",
+        "trigger",
+        "source",
+        "registry_source",
+        "document_kind",
+    ] {
+        if let Some(text) = row.get(key).and_then(Value::as_str) {
+            summary.insert(key.to_string(), json!(draft_summary_text(text)));
+        }
+    }
+    if let Some(description) = draft_description(row) {
+        summary.insert(
+            "description".to_string(),
+            json!(draft_summary_text(description)),
+        );
+    }
+    let can_step = |key: &str, flag: &str| {
+        row.get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|entries| !entries.is_empty())
+            || row.get(flag).and_then(Value::as_bool).unwrap_or(false)
     };
-    let can_undo = object
-        .get("history")
-        .and_then(Value::as_array)
-        .is_some_and(|entries| !entries.is_empty());
-    let can_redo = object
-        .get("future")
-        .and_then(Value::as_array)
-        .is_some_and(|entries| !entries.is_empty());
-    object.remove("history");
-    object.remove("future");
-    object.insert("can_undo".to_string(), json!(can_undo));
-    object.insert("can_redo".to_string(), json!(can_redo));
+    summary.insert(
+        "can_undo".to_string(),
+        json!(can_step("history", "can_undo")),
+    );
+    summary.insert(
+        "can_redo".to_string(),
+        json!(can_step("future", "can_redo")),
+    );
+    let stored = row.get("document").map_or(0, value_skill_content_bytes);
+    if stored > MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES {
+        summary.insert("document_authority".to_string(), json!("refused"));
+        summary.insert(
+            "document_refusal".to_string(),
+            json!(document_skill_content_too_large(stored)),
+        );
+    }
+    Value::Object(summary)
 }
 
-fn normalize_mobpack_draft_row(row: &Value) -> Value {
-    // A stored document past the skill content cap is never returned (a
-    // store written before the cap, or by hand): list and get answer with a
-    // placeholder that says why.
+/// At most [`MOBPACK_DRAFT_SUMMARY_MAX_CHARS`] characters of a summary label.
+fn draft_summary_text(text: &str) -> String {
+    text.chars().take(MOBPACK_DRAFT_SUMMARY_MAX_CHARS).collect()
+}
+
+/// What the library shows as a draft's description: its flow's description,
+/// or else the task of its flow's input step.
+fn draft_description(row: &Value) -> Option<&str> {
+    fn nonempty(text: Option<&Value>) -> Option<&str> {
+        text.and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    }
+    let flow = row.get("document")?.get("flow")?;
+    nonempty(flow.get("description")).or_else(|| {
+        let input = flow
+            .get("steps")?
+            .as_array()?
+            .iter()
+            .find(|step| step.get("type").and_then(Value::as_str) == Some("input"))?;
+        nonempty(input.get("task"))
+    })
+}
+
+/// The draft a write's reply carries: without its undo and redo snapshots,
+/// or, for a document past the skill content cap (a store written before
+/// the cap, or by hand), a placeholder that says why.
+fn stored_draft_row(row: &Value) -> Value {
     let stored = row.get("document").map_or(0, value_skill_content_bytes);
     if stored > MOBPACK_DOCUMENT_MAX_SKILL_CONTENT_BYTES {
         return refused_draft_row(row, &document_skill_content_too_large(stored));
     }
-    let mut row = row.clone();
-    strip_draft_history_fields(&mut row);
+    draft_row_without_history(row)
+}
+
+/// History snapshots stay in the store; an outgoing row only advertises
+/// whether Meta can step. The row is copied without its snapshots, which are
+/// most of a store's bytes.
+fn draft_row_without_history(row: &Value) -> Value {
+    let Some(object) = row.as_object() else {
+        return row.clone();
+    };
+    let can_step = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|entries| !entries.is_empty())
+    };
+    let mut stripped = object
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "history" | "future"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    stripped.insert("can_undo".to_string(), json!(can_step("history")));
+    stripped.insert("can_redo".to_string(), json!(can_step("future")));
+    Value::Object(stripped)
+}
+
+/// The draft `get` returns: the stored draft ([`stored_draft_row`]) with its
+/// document re-imported from the draft's archive once it validated, so the
+/// archive is the draft's authority. Only `get` re-imports, one draft per
+/// call and outside the draft store lock; every other reply carries its
+/// drafts as stored.
+fn normalize_mobpack_draft_row(row: &Value) -> Value {
+    let mut row = stored_draft_row(row);
     let Some(artifact) = row.get("artifact") else {
         return row;
     };
@@ -4519,19 +5154,31 @@ pub fn list_mobpack_drafts_with_runtime(
     params: &Value,
     runtime: Option<&MobpackRuntimeCatalogState>,
 ) -> Result<Value, String> {
-    let _guard = MOBPACK_DRAFT_STORE_LOCK
-        .lock()
-        .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
+    list_drafts(params, runtime).map_err(|failure| failure.message)
+}
+
+fn list_drafts(
+    params: &Value,
+    runtime: Option<&MobpackRuntimeCatalogState>,
+) -> Result<Value, DraftStoreFailure> {
     let path = mobpack_draft_store_path(params)?;
-    let rows = read_mobpack_draft_store(&path)?;
+    let lock = lock_draft_store()?;
+    let (rows, _) = read_draft_store(&path)?;
+    drop(lock);
     let runtime_rows = runtime
-        .map(|state| state.runtime_flow_rows.clone())
+        .map(|state| {
+            state
+                .runtime_flow_rows
+                .iter()
+                .map(draft_summary)
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let runtime_ids = runtime_rows
         .iter()
         .filter_map(|row| row.get("id").and_then(Value::as_str).map(str::to_string))
         .collect::<BTreeSet<_>>();
-    let draft_rows = sorted_mobpack_draft_rows(&rows).into_iter().filter(|row| {
+    let draft_rows = draft_summaries(&rows).into_iter().filter(|row| {
         row.get("id")
             .and_then(Value::as_str)
             .map(|id| !runtime_ids.contains(id))
@@ -4541,12 +5188,14 @@ pub fn list_mobpack_drafts_with_runtime(
         .into_iter()
         .chain(draft_rows)
         .collect::<Vec<_>>();
-    Ok(json!({
-        "source": "meta/mobpacks/list",
-        "store_path": path,
-        "runtime_backed": runtime.is_some(),
-        "rows": merged_rows,
-    }))
+    Ok(draft_store_reply(
+        json!({
+            "source": "meta/mobpacks/list",
+            "runtime_backed": runtime.is_some(),
+            "rows": merged_rows,
+        }),
+        &path,
+    ))
 }
 
 pub fn get_mobpack_draft(params: &Value) -> Result<Value, String> {
@@ -4557,6 +5206,13 @@ pub fn get_mobpack_draft_with_runtime(
     params: &Value,
     runtime: Option<&MobpackRuntimeCatalogState>,
 ) -> Result<Value, String> {
+    get_draft(params, runtime).map_err(|failure| failure.message)
+}
+
+fn get_draft(
+    params: &Value,
+    runtime: Option<&MobpackRuntimeCatalogState>,
+) -> Result<Value, DraftStoreFailure> {
     let id = params
         .get("id")
         .and_then(Value::as_str)
@@ -4574,35 +5230,42 @@ pub fn get_mobpack_draft_with_runtime(
             "row": row,
         }));
     }
-    let _guard = MOBPACK_DRAFT_STORE_LOCK
-        .lock()
-        .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
     let path = mobpack_draft_store_path(params)?;
-    let rows = read_mobpack_draft_store(&path)?;
+    let lock = lock_draft_store()?;
+    let (rows, _) = read_draft_store(&path)?;
+    drop(lock);
     let row = rows
         .get(id)
-        .cloned()
         .ok_or_else(|| format!("mobpack draft not found: {id}"))?;
-    let row = normalize_mobpack_draft_row(&row);
-    Ok(json!({
-        "source": "meta/mobpacks/get",
-        "store_path": path,
-        "runtime_backed": runtime.is_some(),
-        "row": row,
-    }))
+    let row = normalize_mobpack_draft_row(row);
+    Ok(draft_store_reply(
+        json!({
+            "source": "meta/mobpacks/get",
+            "runtime_backed": runtime.is_some(),
+            "row": row,
+        }),
+        &path,
+    ))
 }
 
 pub fn save_mobpack_draft(params: &Value) -> Result<Value, String> {
-    let candidate = mobpack_draft_row_from_params(params, 0)?;
-    let id = candidate["id"]
+    save_draft(params).map_err(|failure| failure.message)
+}
+
+fn save_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
+    let path = mobpack_draft_store_path(params)?;
+    // The row is built (validated and exported) before the store is locked:
+    // the lock covers only the store's read, checks and write.
+    let mut row = mobpack_draft_row_from_params(params, 0)?;
+    let id = row["id"]
         .as_str()
         .ok_or_else(|| "mobpack draft row missing id".to_string())?
         .to_string();
-    let _guard = MOBPACK_DRAFT_STORE_LOCK
-        .lock()
-        .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
-    let path = mobpack_draft_store_path(params)?;
-    let mut rows = read_mobpack_draft_store(&path)?;
+    let lock = lock_draft_store()?;
+    let (mut rows, before) = read_draft_store(&path)?;
+    if !rows.contains_key(&id) && rows.len() >= MOBPACK_DRAFT_STORE_MAX_DRAFTS {
+        return Err(DraftStoreRefusal::TooManyDrafts.into());
+    }
     let existing = rows.get(&id);
     let current_revision = mobpack_draft_revision_from_row(existing);
     if let Some(expected_revision) = mobpack_draft_expected_revision(params)
@@ -4610,27 +5273,32 @@ pub fn save_mobpack_draft(params: &Value) -> Result<Value, String> {
     {
         return Err(format!(
             "mobpack draft revision conflict for {id}: expected {expected_revision}, found {current_revision}"
-        ));
+        ).into());
     }
     if let Some(expected_etag) = mobpack_draft_expected_etag(params) {
         let current_etag = mobpack_draft_etag(&id, current_revision);
         if expected_etag != current_etag {
             return Err(format!(
                 "mobpack draft etag conflict for {id}: expected {expected_etag}, found {current_etag}"
-            ));
+            ).into());
         }
     }
-    let mut row = mobpack_draft_row_from_params(params, current_revision.saturating_add(1))?;
+    set_draft_row_revision(&mut row, &id, current_revision.saturating_add(1));
     attach_draft_history_on_save(existing, &mut row);
-    rows.insert(id, row.clone());
-    write_mobpack_draft_store(&path, &rows)?;
-    let row = normalize_mobpack_draft_row(&row);
-    Ok(json!({
-        "source": "meta/mobpacks/save",
-        "store_path": path,
-        "row": row,
-        "rows": sorted_mobpack_draft_rows(&rows),
-    }))
+    rows.insert(id.clone(), row);
+    admit_draft_store_write(&mut rows, &id, before)?;
+    let durability_warning = write_mobpack_draft_store(&path, &rows)?;
+    drop(lock);
+    let row = rows.get(&id).map(stored_draft_row).unwrap_or_default();
+    Ok(draft_store_write_reply(
+        json!({
+            "source": "meta/mobpacks/save",
+            "row": row,
+            "rows": draft_summaries(&rows),
+        }),
+        &path,
+        durability_warning,
+    ))
 }
 
 /// Maximum number of undo steps retained per draft in the store.
@@ -4676,10 +5344,30 @@ enum MobpackDraftHistoryStep {
 
 pub fn undo_mobpack_draft(params: &Value) -> Result<Value, String> {
     step_mobpack_draft_history(params, MobpackDraftHistoryStep::Undo)
+        .map_err(|failure| failure.message)
 }
 
 pub fn redo_mobpack_draft(params: &Value) -> Result<Value, String> {
     step_mobpack_draft_history(params, MobpackDraftHistoryStep::Redo)
+        .map_err(|failure| failure.message)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Runs once on this thread between an undo's or a redo's read of the
+    /// draft store and its write, for the tests of a draft that changes in
+    /// between.
+    static DRAFT_STEP_BETWEEN_READ_AND_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run the hook set on this thread, if any, between an undo's or a redo's
+/// read of the draft store and its write.
+#[cfg(test)]
+fn run_draft_step_between_read_and_write() {
+    if let Some(between) = DRAFT_STEP_BETWEEN_READ_AND_WRITE.with(|hook| hook.borrow_mut().take()) {
+        between();
+    }
 }
 
 /// Meta-owned undo/redo over the draft store. The history lives with the
@@ -4690,7 +5378,7 @@ pub fn redo_mobpack_draft(params: &Value) -> Result<Value, String> {
 fn step_mobpack_draft_history(
     params: &Value,
     step: MobpackDraftHistoryStep,
-) -> Result<Value, String> {
+) -> Result<Value, DraftStoreFailure> {
     let (source, head) = match step {
         MobpackDraftHistoryStep::Undo => ("meta/mobpacks/undo", "undo"),
         MobpackDraftHistoryStep::Redo => ("meta/mobpacks/redo", "redo"),
@@ -4702,11 +5390,12 @@ fn step_mobpack_draft_history(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("{source} requires id"))?
         .to_string();
-    let _guard = MOBPACK_DRAFT_STORE_LOCK
-        .lock()
-        .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
     let path = mobpack_draft_store_path(params)?;
-    let mut rows = read_mobpack_draft_store(&path)?;
+    // The draft is read under the lock and its restored row built without
+    // it; the write below checks the draft is still the one read.
+    let lock = lock_draft_store()?;
+    let (rows, _) = read_draft_store(&path)?;
+    drop(lock);
     let existing = rows
         .get(&id)
         .cloned()
@@ -4717,14 +5406,14 @@ fn step_mobpack_draft_history(
     {
         return Err(format!(
             "{source} draft revision conflict for {id}: expected {expected_revision}, found {current_revision}"
-        ));
+        ).into());
     }
     if let Some(expected_etag) = mobpack_draft_expected_etag(params) {
         let current_etag = mobpack_draft_etag(&id, current_revision);
         if expected_etag != current_etag {
             return Err(format!(
                 "{source} draft etag conflict for {id}: expected {expected_etag}, found {current_etag}"
-            ));
+            ).into());
         }
     }
     let mut history = existing
@@ -4741,28 +5430,32 @@ fn step_mobpack_draft_history(
     let restored = match step {
         MobpackDraftHistoryStep::Undo => {
             let Some(document) = history.pop() else {
-                return Ok(json!({
-                    "source": source,
-                    "store_path": path,
-                    "stepped": false,
-                    "reason": format!("nothing to {head}"),
-                    "row": normalize_mobpack_draft_row(&existing),
-                    "rows": sorted_mobpack_draft_rows(&rows),
-                }));
+                return Ok(draft_store_reply(
+                    json!({
+                        "source": source,
+                        "stepped": false,
+                        "reason": format!("nothing to {head}"),
+                        "row": stored_draft_row(&existing),
+                        "rows": draft_summaries(&rows),
+                    }),
+                    &path,
+                ));
             };
             future.push(current_document);
             document
         }
         MobpackDraftHistoryStep::Redo => {
             let Some(document) = future.pop() else {
-                return Ok(json!({
-                    "source": source,
-                    "store_path": path,
-                    "stepped": false,
-                    "reason": format!("nothing to {head}"),
-                    "row": normalize_mobpack_draft_row(&existing),
-                    "rows": sorted_mobpack_draft_rows(&rows),
-                }));
+                return Ok(draft_store_reply(
+                    json!({
+                        "source": source,
+                        "stepped": false,
+                        "reason": format!("nothing to {head}"),
+                        "row": stored_draft_row(&existing),
+                        "rows": draft_summaries(&rows),
+                    }),
+                    &path,
+                ));
             };
             history.push(current_document);
             document
@@ -4783,19 +5476,51 @@ fn step_mobpack_draft_history(
     )?;
     row["history"] = Value::Array(history);
     row["future"] = Value::Array(future);
-    rows.insert(id, row.clone());
-    write_mobpack_draft_store(&path, &rows)?;
-    let row = normalize_mobpack_draft_row(&row);
-    Ok(json!({
-        "source": source,
-        "store_path": path,
-        "stepped": true,
-        "row": row,
-        "rows": sorted_mobpack_draft_rows(&rows),
-    }))
+    #[cfg(test)]
+    run_draft_step_between_read_and_write();
+    let lock = lock_draft_store()?;
+    let (mut rows, before) = read_draft_store(&path)?;
+    let stored_revision = rows
+        .get(&id)
+        .map_or(0, |stored| mobpack_draft_revision_from_row(Some(stored)));
+    if !rows.contains_key(&id) || stored_revision != current_revision {
+        return Err(format!(
+            "{source} draft revision conflict for {id}: expected {current_revision}, found {stored_revision}"
+        )
+        .into());
+    }
+    // The same revision need not be the same draft: one deleted, created
+    // again and saved back to it has it too. Only the draft as read is
+    // overwritten; any other is a revision conflict, which the editor
+    // retries like any other.
+    if rows.get(&id) != Some(&existing) {
+        return Err(format!(
+            "{source} draft revision conflict for {id}: the draft at revision {current_revision} changed after it was read"
+        )
+        .into());
+    }
+    rows.insert(id.clone(), row);
+    admit_draft_store_write(&mut rows, &id, before)?;
+    let durability_warning = write_mobpack_draft_store(&path, &rows)?;
+    drop(lock);
+    let row = rows.get(&id).map(stored_draft_row).unwrap_or_default();
+    Ok(draft_store_write_reply(
+        json!({
+            "source": source,
+            "stepped": true,
+            "row": row,
+            "rows": draft_summaries(&rows),
+        }),
+        &path,
+        durability_warning,
+    ))
 }
 
 pub fn delete_mobpack_draft(params: &Value) -> Result<Value, String> {
+    delete_draft(params).map_err(|failure| failure.message)
+}
+
+fn delete_draft(params: &Value) -> Result<Value, DraftStoreFailure> {
     let id = params
         .get("id")
         .and_then(Value::as_str)
@@ -4803,36 +5528,38 @@ pub fn delete_mobpack_draft(params: &Value) -> Result<Value, String> {
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "meta/mobpacks/delete requires id".to_string())?
         .to_string();
-    let _guard = MOBPACK_DRAFT_STORE_LOCK
-        .lock()
-        .map_err(|_| "mobpack draft store lock poisoned".to_string())?;
     let path = mobpack_draft_store_path(params)?;
-    let mut rows = read_mobpack_draft_store(&path)?;
+    let lock = lock_draft_store()?;
+    let (mut rows, _) = read_draft_store(&path)?;
     let current_revision = mobpack_draft_revision_from_row(rows.get(&id));
     if let Some(expected_revision) = mobpack_draft_expected_revision(params)
         && expected_revision != current_revision
     {
         return Err(format!(
             "meta/mobpacks/delete draft revision conflict for {id}: expected {expected_revision}, found {current_revision}"
-        ));
+        ).into());
     }
     if let Some(expected_etag) = mobpack_draft_expected_etag(params) {
         let current_etag = mobpack_draft_etag(&id, current_revision);
         if expected_etag != current_etag {
             return Err(format!(
                 "meta/mobpacks/delete draft etag conflict for {id}: expected {expected_etag}, found {current_etag}"
-            ));
+            ).into());
         }
     }
     let deleted = rows.remove(&id).is_some();
-    write_mobpack_draft_store(&path, &rows)?;
-    Ok(json!({
-        "source": "meta/mobpacks/delete",
-        "store_path": path,
-        "id": id,
-        "deleted": deleted,
-        "rows": sorted_mobpack_draft_rows(&rows),
-    }))
+    let durability_warning = write_mobpack_draft_store(&path, &rows)?;
+    drop(lock);
+    Ok(draft_store_write_reply(
+        json!({
+            "source": "meta/mobpacks/delete",
+            "id": id,
+            "deleted": deleted,
+            "rows": draft_summaries(&rows),
+        }),
+        &path,
+        durability_warning,
+    ))
 }
 
 pub fn apply_mobpack_authoring_operation(params: &Value) -> Result<Value, String> {
@@ -4856,6 +5583,13 @@ pub fn apply_mobpack_authoring_operation_with_runtime(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "meta/mobpacks/apply_operation requires operation.type".to_string())?;
+    // No operation but a delete reads a graph past the structure caps, so a
+    // document past them can be brought back under them; every operation is
+    // checked again after its edit.
+    let graph_before = graph_structure_sizes(&document);
+    if !operation_only_removes(operation_type) {
+        refuse_graph_past_structure_caps(&document)?;
+    }
     if operation.get("document").is_some() {
         return Err(format!(
             "{operation_type} does not accept operation.document; use meta/mobpacks/import or create/save for document replacement"
@@ -4922,6 +5656,7 @@ pub fn apply_mobpack_authoring_operation_with_runtime(
             ));
         }
     };
+    refuse_graph_grown_past_structure_caps(&document, graph_before)?;
     // An authoring edit never runs `rkat` or writes an archive, whatever its
     // params ask: `meta/mobpacks/validate` is the one method with an `rkat`
     // phase, and the one the host-mutation advertisement names for it.
@@ -5030,7 +5765,7 @@ fn apply_sync_graph_to_flow_operation(
     // the flow is derived from it. Validation accepts the gate-less graph
     // because `validate_graph_projection` proves the equivalence by
     // re-deriving the flow from the graph.
-    document.flow = graph_to_flow_from_document(document);
+    document.flow = graph_to_flow_within_caps(document)?;
     reconcile_flow_step_launch_modes(document);
     Ok(operation_selection_or_clear(operation))
 }
@@ -10043,7 +10778,7 @@ fn apply_insert_graph_node_operation(
         document.edges = Value::Array(edges);
     }
     reject_raw_graph_operation_sections(operation, &["frames"])?;
-    document.flow = graph_to_flow_from_document(document);
+    document.flow = graph_to_flow_within_caps(document)?;
     reconcile_flow_step_launch_modes(document);
     let selected_id = semantic_selection.unwrap_or(selected_id);
     Ok(json!({ "kind": "instance", "id": selected_id, "inserted_ids": inserted_ids }))
@@ -10422,7 +11157,7 @@ fn apply_graph_node_edit_operation(
     )?;
     instances[index] = next_instance;
     document.instances = Value::Array(instances);
-    document.flow = graph_to_flow_from_document(document);
+    document.flow = graph_to_flow_within_caps(document)?;
     reconcile_flow_step_launch_modes(document);
     Ok(json!({ "kind": "instance", "id": instance_id }))
 }
@@ -10489,7 +11224,7 @@ fn apply_move_graph_node_operation(
         }
     }
     document.instances = Value::Array(instances);
-    document.flow = graph_to_flow_from_document(document);
+    document.flow = graph_to_flow_within_caps(document)?;
     reconcile_flow_step_launch_modes(document);
     Ok(json!({ "kind": "instance", "id": instance_id }))
 }
@@ -10586,8 +11321,7 @@ fn apply_delete_graph_node_operation(
     document.instances = Value::Array(instances);
     document.edges = Value::Array(edges);
     reject_raw_graph_operation_sections(operation, &["frames"])?;
-    document.flow = graph_to_flow_from_document(document);
-    reconcile_flow_step_launch_modes(document);
+    derive_flow_from_shrunk_graph(document);
     Ok(json!({ "kind": null, "id": null }))
 }
 
@@ -10610,7 +11344,7 @@ fn apply_connect_graph_nodes_operation(
     let id = validate_graph_edge(&edge, &edges, &instances, None)?;
     edges.push(edge);
     document.edges = Value::Array(edges);
-    document.flow = graph_to_flow_from_document(document);
+    document.flow = graph_to_flow_within_caps(document)?;
     reconcile_flow_step_launch_modes(document);
     reject_raw_graph_operation_sections(operation, &["frames"])?;
     Ok(json!({ "kind": "edge", "id": id }))
@@ -10978,7 +11712,7 @@ fn apply_graph_edge_edit_operation(
     validate_graph_edge(&next_edge, &edges, &instances, Some(&edge_id))?;
     edges[index] = next_edge;
     document.edges = Value::Array(edges);
-    document.flow = graph_to_flow_from_document(document);
+    document.flow = graph_to_flow_within_caps(document)?;
     reconcile_flow_step_launch_modes(document);
     Ok(json!({ "kind": "edge", "id": edge_id }))
 }
@@ -11001,8 +11735,7 @@ fn apply_delete_graph_edge_operation(
     }
     document.edges = Value::Array(edges);
     reject_raw_graph_operation_sections(operation, &["frames"])?;
-    document.flow = graph_to_flow_from_document(document);
-    reconcile_flow_step_launch_modes(document);
+    derive_flow_from_shrunk_graph(document);
     Ok(json!({ "kind": null, "id": null }))
 }
 
@@ -11455,8 +12188,9 @@ fn reconcile_document_after_member_change(document: &mut MobpackDocument) {
         .filter_map(|member| member.get("id").and_then(Value::as_str))
         .map(ToString::to_string)
         .collect::<BTreeSet<_>>();
-    prune_flow_steps_for_members(&mut document.flow, &members, &member_ids);
-    prune_graph_instances_for_members(&mut document.instances, &members, &member_ids);
+    let member_tools = MemberTools::of(&members);
+    prune_flow_steps_for_members(&mut document.flow, &member_tools, &member_ids);
+    prune_graph_instances_for_members(&mut document.instances, &member_tools, &member_ids);
     prune_graph_edges_for_instances(&mut document.edges, &document.instances);
     reconcile_flow_step_launch_modes(document);
 }
@@ -11596,13 +12330,51 @@ fn member_tool_set(members: &[Value], member_id: &str) -> BTreeSet<String> {
     members
         .iter()
         .find(|member| {
+            count_mobpack_work();
             member
                 .get("id")
                 .and_then(Value::as_str)
                 .is_some_and(|id| id == member_id)
         })
-        .map(|member| string_vec(member.get("tools")).into_iter().collect())
+        .map(member_tools)
         .unwrap_or_default()
+}
+
+/// A member's tools, each read as one unit of work.
+fn member_tools(member: &Value) -> BTreeSet<String> {
+    string_vec(member.get("tools"))
+        .into_iter()
+        .inspect(|_| count_mobpack_work())
+        .collect()
+}
+
+/// The tools of a document's members by id, collected once: for each id the
+/// tools of the first member with it. Reconciling a document with its
+/// members looks each member step's and member instance's tools up here;
+/// each of them used to scan the members and collect its member's tools
+/// again.
+struct MemberTools<'a> {
+    by_id: BTreeMap<&'a str, BTreeSet<String>>,
+}
+
+impl<'a> MemberTools<'a> {
+    fn of(members: &'a [Value]) -> Self {
+        let mut by_id = BTreeMap::new();
+        for member in members {
+            count_mobpack_work();
+            if let Some(id) = member.get("id").and_then(Value::as_str) {
+                by_id.entry(id).or_insert_with(|| member_tools(member));
+            }
+        }
+        Self { by_id }
+    }
+
+    /// The tools of the member with this id; none for an id no member has.
+    fn tools_of(&self, member_id: &str) -> &BTreeSet<String> {
+        static NO_TOOLS: BTreeSet<String> = BTreeSet::new();
+        count_mobpack_work();
+        self.by_id.get(member_id).unwrap_or(&NO_TOOLS)
+    }
 }
 
 fn prune_tool_scope_fields(value: &mut Value, allowed_tools: &BTreeSet<String>) {
@@ -11627,18 +12399,18 @@ fn prune_tool_scope_fields(value: &mut Value, allowed_tools: &BTreeSet<String>) 
 
 fn prune_flow_steps_for_members(
     flow: &mut Value,
-    members: &[Value],
+    member_tools: &MemberTools<'_>,
     member_ids: &BTreeSet<String>,
 ) {
     let Some(steps) = flow.get_mut("steps").and_then(Value::as_array_mut) else {
         return;
     };
-    prune_step_array_for_members(steps, members, member_ids);
+    prune_step_array_for_members(steps, member_tools, member_ids);
 }
 
 fn prune_step_array_for_members(
     steps: &mut Vec<Value>,
-    members: &[Value],
+    member_tools: &MemberTools<'_>,
     member_ids: &BTreeSet<String>,
 ) {
     steps.retain(|step| {
@@ -11652,15 +12424,15 @@ fn prune_step_array_for_members(
         match step.get("type").and_then(Value::as_str) {
             Some("member") => {
                 let role = step.get("role").and_then(Value::as_str).unwrap_or_default();
-                let allowed_tools = member_tool_set(members, role);
-                prune_tool_scope_fields(step, &allowed_tools);
+                let allowed_tools = member_tools.tools_of(role);
+                prune_tool_scope_fields(step, allowed_tools);
             }
             Some("adaptive") => {
                 prune_adaptive_step_member_refs(step, member_ids);
             }
             Some("repeat") => {
                 if let Some(nested) = step.get_mut("steps").and_then(Value::as_array_mut) {
-                    prune_step_array_for_members(nested, members, member_ids);
+                    prune_step_array_for_members(nested, member_tools, member_ids);
                 }
             }
             Some("branch" | "parallel") => {
@@ -11669,12 +12441,12 @@ fn prune_step_array_for_members(
                         if let Some(branch_steps) =
                             branch.get_mut("steps").and_then(Value::as_array_mut)
                         {
-                            prune_step_array_for_members(branch_steps, members, member_ids);
+                            prune_step_array_for_members(branch_steps, member_tools, member_ids);
                         }
                     }
                 }
                 if let Some(fallback) = step.get_mut("fallback").and_then(Value::as_array_mut) {
-                    prune_step_array_for_members(fallback, members, member_ids);
+                    prune_step_array_for_members(fallback, member_tools, member_ids);
                 }
             }
             _ => {}
@@ -11684,7 +12456,7 @@ fn prune_step_array_for_members(
 
 fn prune_graph_instances_for_members(
     instances: &mut Value,
-    members: &[Value],
+    member_tools: &MemberTools<'_>,
     member_ids: &BTreeSet<String>,
 ) {
     let Some(instances) = instances.as_array_mut() else {
@@ -11709,8 +12481,8 @@ fn prune_graph_instances_for_members(
         let Some(member_id) = instance.get("memberId").and_then(Value::as_str) else {
             continue;
         };
-        let allowed_tools = member_tool_set(members, member_id);
-        prune_tool_scope_fields(instance, &allowed_tools);
+        let allowed_tools = member_tools.tools_of(member_id);
+        prune_tool_scope_fields(instance, allowed_tools);
     }
 }
 
@@ -11991,7 +12763,7 @@ pub fn graph_projection_mobpack(params: &Value) -> Result<Value, String> {
 pub fn graph_to_flow_mobpack(params: &Value) -> Result<Value, String> {
     enforce_mobpack_draft_expected_revision(params, "meta/mobpacks/graph_to_flow")?;
     let mut document = document_from_params(params)?;
-    let flow = graph_to_flow_from_document(&document);
+    let flow = graph_to_flow_within_caps(&document)?;
     document.flow = flow;
     let validation = validate_document(&document);
     Ok(json!({
@@ -12019,7 +12791,7 @@ fn graph_to_flow_from_document(document: &MobpackDocument) -> Value {
         .find(|step| step.get("type").and_then(Value::as_str) == Some("input"))
         .cloned()
         .unwrap_or_else(|| editor_input_step_draft_contract()["default_step"].clone());
-    let instances = document.instances.as_array().cloned().unwrap_or_default();
+    let instances = graph_to_flow_unique_instances(&document.instances);
     let edges = document.edges.as_array().cloned().unwrap_or_default();
     let members = document.members.as_array().cloned().unwrap_or_default();
     let prior_by_id = graph_to_flow_prior_steps_by_id(&prior_steps);
@@ -12115,11 +12887,39 @@ fn graph_to_flow_with_steps(mut prior: Value, steps: Vec<Value>) -> Value {
     }
 }
 
-fn graph_to_flow_prior_steps_by_id(steps: &[Value]) -> BTreeMap<String, Value> {
-    fn visit(step: &Value, out: &mut BTreeMap<String, Value>) {
+/// The graph's instances, each id once: its first instance, the one
+/// [`GraphToFlowGraph::node`] reads. Instances repeating an id are one node,
+/// so they make at most one step (each copy used to become a step of its own,
+/// copying the prior step the id names).
+fn graph_to_flow_unique_instances(instances: &Value) -> Vec<Value> {
+    let mut ids = BTreeSet::new();
+    instances
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|instance| ids.insert(graph_to_flow_string(instance, "id")))
+        .cloned()
+        .collect()
+}
+
+/// No prior step: reads like an empty step.
+static GRAPH_TO_FLOW_NO_PRIOR_STEP: Value = Value::Null;
+
+/// The prior flow step an id names, or [`GRAPH_TO_FLOW_NO_PRIOR_STEP`].
+fn graph_to_flow_prior<'a>(prior_by_id: &BTreeMap<String, &'a Value>, id: &str) -> &'a Value {
+    prior_by_id
+        .get(id)
+        .copied()
+        .unwrap_or(&GRAPH_TO_FLOW_NO_PRIOR_STEP)
+}
+
+/// The prior flow's steps by id, nested steps included. The map borrows them:
+/// a cloned step carried every step nested in it, once per enclosing step.
+fn graph_to_flow_prior_steps_by_id(steps: &[Value]) -> BTreeMap<String, &Value> {
+    fn visit<'a>(step: &'a Value, out: &mut BTreeMap<String, &'a Value>) {
         let id = graph_to_flow_string(step, "id");
         if !id.is_empty() {
-            out.insert(id, step.clone());
+            out.insert(id, step);
         }
         for key in ["steps", "fallback"] {
             if let Some(steps) = step.get(key).and_then(Value::as_array) {
@@ -12145,12 +12945,222 @@ fn graph_to_flow_prior_steps_by_id(steps: &[Value]) -> BTreeMap<String, Value> {
     out
 }
 
+/// The graph that one flow derivation reads, indexed once. Every lookup
+/// scanned all instances, edges or members, and finding a fork's join walked
+/// the graph again, scanning, for each join it tried, so deriving a flow took
+/// work that grew quadratically, and faster, with the graph.
+struct GraphToFlowGraph<'a> {
+    nodes: &'a [Value],
+    /// Each node's position by id. An instance without an id is the node that
+    /// an edge without an endpoint names, as the scans found it.
+    positions: BTreeMap<String, usize>,
+    /// Each node's edges out and in, in document order.
+    outgoing: BTreeMap<String, Vec<&'a Value>>,
+    incoming: BTreeMap<String, Vec<&'a Value>>,
+    /// Each member id's first member.
+    members: BTreeMap<String, &'a Value>,
+    /// The join gates' positions, in node order.
+    joins: Vec<usize>,
+    /// Each node's place in `joins`, when it is a join.
+    join_ranks: Vec<Option<usize>>,
+    /// For each node, the first join (its place in `joins`) that a lane from
+    /// the node reaches.
+    first_joins: Vec<Option<usize>>,
+}
+
+impl<'a> GraphToFlowGraph<'a> {
+    fn new(nodes: &'a [Value], edges: &'a [Value], members: &'a [Value]) -> Self {
+        let mut positions = BTreeMap::new();
+        for (position, node) in nodes.iter().enumerate() {
+            positions
+                .entry(graph_to_flow_string(node, "id"))
+                .or_insert(position);
+        }
+        let mut outgoing = BTreeMap::<String, Vec<&Value>>::new();
+        let mut incoming = BTreeMap::<String, Vec<&Value>>::new();
+        for edge in edges {
+            outgoing
+                .entry(graph_to_flow_string(edge, "from"))
+                .or_default()
+                .push(edge);
+            incoming
+                .entry(graph_to_flow_string(edge, "to"))
+                .or_default()
+                .push(edge);
+        }
+        let mut member_ids = BTreeMap::new();
+        for member in members {
+            member_ids
+                .entry(graph_to_flow_string(member, "id"))
+                .or_insert(member);
+        }
+        let mut joins: Vec<usize> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| graph_to_flow_string(node, "gateKind") == "join")
+            .map(|(position, _)| position)
+            .collect();
+        joins.sort_by(|&a, &b| graph_to_flow_compare_nodes(&nodes[a], &nodes[b]));
+        let mut join_ranks = vec![None; nodes.len()];
+        for (rank, &position) in joins.iter().enumerate() {
+            join_ranks[position] = Some(rank);
+        }
+        let mut graph = Self {
+            nodes,
+            positions,
+            outgoing,
+            incoming,
+            members: member_ids,
+            joins,
+            join_ranks,
+            first_joins: Vec::new(),
+        };
+        graph.first_joins = graph.reach_first_joins();
+        graph
+    }
+
+    /// The node an id names.
+    fn node(&self, id: &str) -> Option<&'a Value> {
+        count_mobpack_work();
+        let nodes = self.nodes;
+        self.positions.get(id).map(|&position| &nodes[position])
+    }
+
+    /// The edges out of the node an id names, in document order.
+    fn outgoing(&self, id: &str) -> &[&'a Value] {
+        count_mobpack_work();
+        self.outgoing.get(id).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    /// The edges into the node an id names, in document order.
+    fn incoming(&self, id: &str) -> &[&'a Value] {
+        count_mobpack_work();
+        self.incoming.get(id).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    /// The first member with an id.
+    fn member(&self, id: &str) -> Option<&'a Value> {
+        count_mobpack_work();
+        self.members.get(id).copied()
+    }
+
+    /// For each node, the first join (its place in `joins`) that a lane from
+    /// the node reaches: the node itself, or a join it reaches through edges
+    /// to nodes that are not terminal. One pass over the graph's strongly
+    /// connected components answers every fork: a component closes after
+    /// every component it reaches, whose answers are then known.
+    fn reach_first_joins(&self) -> Vec<Option<usize>> {
+        const UNVISITED: usize = usize::MAX;
+        let count = self.nodes.len();
+        // The edges a lane follows from each node: to nodes that are not
+        // terminal.
+        let successors: Vec<Vec<usize>> = self
+            .nodes
+            .iter()
+            .map(|node| {
+                self.outgoing(&graph_to_flow_string(node, "id"))
+                    .iter()
+                    .filter_map(|edge| {
+                        self.positions
+                            .get(&graph_to_flow_string(edge, "to"))
+                            .copied()
+                    })
+                    .filter(|&next| !graph_to_flow_bool(&self.nodes[next], "isTerminal"))
+                    .collect()
+            })
+            .collect();
+        let mut order = vec![UNVISITED; count];
+        let mut low = vec![0; count];
+        let mut on_stack = vec![false; count];
+        let mut stack = Vec::new();
+        let mut first_joins = vec![None; count];
+        let mut next_order = 0;
+        for root in 0..count {
+            if order[root] != UNVISITED {
+                continue;
+            }
+            order[root] = next_order;
+            low[root] = next_order;
+            next_order += 1;
+            stack.push(root);
+            on_stack[root] = true;
+            // The depth-first path: each node with how many successors it
+            // has tried.
+            let mut path = vec![(root, 0_usize)];
+            while let Some(&(node, tried)) = path.last() {
+                count_mobpack_work();
+                if let Some(&next) = successors[node].get(tried) {
+                    if let Some(top) = path.last_mut() {
+                        top.1 += 1;
+                    }
+                    if order[next] == UNVISITED {
+                        order[next] = next_order;
+                        low[next] = next_order;
+                        next_order += 1;
+                        stack.push(next);
+                        on_stack[next] = true;
+                        path.push((next, 0));
+                    } else if on_stack[next] {
+                        low[node] = low[node].min(order[next]);
+                    }
+                    continue;
+                }
+                path.pop();
+                if let Some(&(parent, _)) = path.last() {
+                    low[parent] = low[parent].min(low[node]);
+                }
+                if low[node] != order[node] {
+                    continue;
+                }
+                // `node` closes a component: itself and every node above it
+                // on the stack.
+                let Some(start) = stack.iter().rposition(|&member| member == node) else {
+                    continue;
+                };
+                let component = stack.split_off(start);
+                let mut first = None;
+                for &member in &component {
+                    on_stack[member] = false;
+                    first = first.into_iter().chain(self.join_ranks[member]).min();
+                    for &next in &successors[member] {
+                        first = first.into_iter().chain(first_joins[next]).min();
+                    }
+                }
+                for &member in &component {
+                    first_joins[member] = first;
+                }
+            }
+        }
+        first_joins
+    }
+
+    /// The join that closes a fork whose lanes start at `start_ids`: the
+    /// first join, in node order, that a lane start reaches or has an edge
+    /// to. An edge to a terminal join counts, though no lane walks into one.
+    fn find_join(&self, start_ids: &[String]) -> Option<Value> {
+        let mut first = None;
+        for id in start_ids {
+            count_mobpack_work();
+            if let Some(&start) = self.positions.get(id) {
+                first = first.into_iter().chain(self.first_joins[start]).min();
+            }
+            for edge in self.outgoing(id) {
+                if let Some(&next) = self.positions.get(&graph_to_flow_string(edge, "to")) {
+                    first = first.into_iter().chain(self.join_ranks[next]).min();
+                }
+            }
+        }
+        first.map(|rank| self.nodes[self.joins[rank]].clone())
+    }
+}
+
 fn graph_to_flow_segments_to_steps(
     instances: &[Value],
     edges: &[Value],
     members: &[Value],
-    prior_by_id: &BTreeMap<String, Value>,
+    prior_by_id: &BTreeMap<String, &Value>,
 ) -> Vec<GraphToFlowSegment> {
+    let graph = GraphToFlowGraph::new(instances, edges, members);
     let mut member_nodes: Vec<Value> = instances
         .iter()
         .filter(|instance| graph_to_flow_is_flow_node(instance))
@@ -12170,6 +13180,9 @@ fn graph_to_flow_segments_to_steps(
         .collect();
     gate_nodes.sort_by(graph_to_flow_compare_nodes);
     let mut consumed = BTreeSet::new();
+    // The nodes the lanes to each join walked: a lane that reaches a node an
+    // earlier lane to the same join walked stops there.
+    let mut walked: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
     let mut segments = Vec::new();
 
     for gate in gate_nodes {
@@ -12177,21 +13190,27 @@ fn graph_to_flow_segments_to_steps(
         if gate_kind != "fork" && gate_kind != "branch" {
             continue;
         }
-        let branch_starts: Vec<(Value, Value)> =
-            graph_to_flow_outgoing_edges(edges, &graph_to_flow_string(&gate, "id"))
-                .into_iter()
-                .filter_map(|edge| {
-                    let node =
-                        graph_to_flow_node_by_id(instances, &graph_to_flow_string(&edge, "to"))?;
-                    graph_to_flow_is_flow_node(&node).then_some((edge, node))
-                })
-                .collect();
-        if branch_starts.len() < 2 {
+        // A node becomes one step: a second edge to it, or a node another
+        // lane already took, starts no lane of its own.
+        let mut start_ids = BTreeSet::new();
+        let branch_starts: Vec<(&Value, &Value)> = graph
+            .outgoing(&graph_to_flow_string(&gate, "id"))
+            .iter()
+            .filter_map(|&edge| {
+                let node = graph.node(&graph_to_flow_string(edge, "to"))?;
+                let id = graph_to_flow_string(node, "id");
+                (graph_to_flow_is_flow_node(node)
+                    && !consumed.contains(&id)
+                    && start_ids.insert(id))
+                .then_some((edge, node))
+            })
+            .collect();
+        // A parallel step needs two lanes; a branch of one lane is a step
+        // that runs only when its condition holds.
+        if branch_starts.len() < 2 && (gate_kind != "branch" || branch_starts.is_empty()) {
             continue;
         }
-        let join = graph_to_flow_find_join(
-            instances,
-            edges,
+        let join = graph.find_join(
             &branch_starts
                 .iter()
                 .map(|(_, node)| graph_to_flow_string(node, "id"))
@@ -12201,10 +13220,11 @@ fn graph_to_flow_segments_to_steps(
         for (index, (edge, node)) in branch_starts.iter().enumerate() {
             let join_id = join.as_ref().map(|join| graph_to_flow_string(join, "id"));
             let lane_nodes = graph_to_flow_collect_lane_to_join(
-                instances,
-                edges,
+                &graph,
                 &graph_to_flow_string(node, "id"),
                 join_id.as_deref(),
+                &consumed,
+                walked.entry(join_id.clone()).or_default(),
             );
             for lane_node in &lane_nodes {
                 consumed.insert(graph_to_flow_string(lane_node, "id"));
@@ -12213,7 +13233,7 @@ fn graph_to_flow_segments_to_steps(
                 gate_kind == "branch" && graph_to_flow_is_fallback_branch_lane(edge, node);
             lanes.push(json!({
                 "id": format!("br_{}", graph_to_flow_string(node, "id")),
-                "label": graph_to_flow_lane_label(node, members, index),
+                "label": graph_to_flow_lane_label(node, &graph, index),
                 "isFallback": is_fallback,
                 "condition": if gate_kind == "branch" { graph_to_flow_condition_text_from_edge(edge, "") } else { String::new() },
                 "cond": if gate_kind == "branch" { graph_to_flow_edge_condition_to_editor_cond(edge).unwrap_or(Value::Null) } else { Value::Null },
@@ -12228,12 +13248,12 @@ fn graph_to_flow_segments_to_steps(
                 "parallel"
             },
         );
-        let prior = prior_by_id.get(&id).cloned().unwrap_or_else(|| json!({}));
+        let prior = graph_to_flow_prior(prior_by_id, &id);
         let depends_mode = graph_to_flow_first_string(&[
             graph_to_flow_string(&gate, "dependsMode"),
             graph_to_flow_string(&gate, "depends_mode"),
-            graph_to_flow_string(&prior, "dependsMode"),
-            graph_to_flow_string(&prior, "depends_mode"),
+            graph_to_flow_string(prior, "dependsMode"),
+            graph_to_flow_string(prior, "depends_mode"),
         ]);
         let step = if gate_kind == "branch" {
             let branches: Vec<Value> = lanes
@@ -12271,7 +13291,7 @@ fn graph_to_flow_segments_to_steps(
             let mut step = json!({
                 "id": id,
                 "type": "branch",
-                "controllerRole": graph_to_flow_control_role(&gate, join.as_ref(), &prior),
+                "controllerRole": graph_to_flow_control_role(&gate, join.as_ref(), prior),
                 "branches": branches,
                 "fallback": fallback,
             });
@@ -12287,14 +13307,14 @@ fn graph_to_flow_segments_to_steps(
             let mut step = json!({
                 "id": id,
                 "type": "parallel",
-                "controllerRole": graph_to_flow_control_role(&gate, join.as_ref(), &prior),
+                "controllerRole": graph_to_flow_control_role(&gate, join.as_ref(), prior),
                 "dispatch": graph_to_flow_first_string(&[
                     graph_to_flow_string(&gate, "dispatch"),
                     graph_to_flow_string(&gate, "dispatchMode"),
                     graph_to_flow_string(&gate, "dispatch_mode"),
-                    graph_to_flow_string(&prior, "dispatch"),
-                    graph_to_flow_string(&prior, "dispatchMode"),
-                    graph_to_flow_string(&prior, "dispatch_mode"),
+                    graph_to_flow_string(prior, "dispatch"),
+                    graph_to_flow_string(prior, "dispatchMode"),
+                    graph_to_flow_string(prior, "dispatch_mode"),
                     "fan_out".to_string(),
                 ]),
                 "collection": graph_to_flow_first_string(&[
@@ -12327,28 +13347,25 @@ fn graph_to_flow_segments_to_steps(
         });
     }
 
+    // The columns the forks span, merged: a node no lane took in one of them
+    // makes no step.
+    let spans = graph_to_flow_merged_spans(&segments);
     let mut groups: BTreeMap<i64, Vec<Value>> = BTreeMap::new();
     for node in member_nodes {
-        let node_id = graph_to_flow_string(&node, "id");
-        if consumed.contains(&node_id)
-            || segments.iter().any(|segment| {
-                graph_to_flow_col(&node) >= segment.col
-                    && graph_to_flow_col(&node) <= segment.span_end
-            })
+        let col = graph_to_flow_col(&node);
+        if consumed.contains(&graph_to_flow_string(&node, "id"))
+            || graph_to_flow_spans_contain(&spans, col)
         {
             continue;
         }
-        groups
-            .entry(graph_to_flow_col(&node))
-            .or_default()
-            .push(node);
+        groups.entry(col).or_default().push(node);
     }
     for (col, mut nodes) in groups {
         nodes.sort_by(graph_to_flow_compare_nodes);
         segments.push(GraphToFlowSegment {
             col,
             span_end: col,
-            step: graph_to_flow_step_for_group(&nodes, edges, members, prior_by_id),
+            step: graph_to_flow_step_for_group(&nodes, &graph, members, prior_by_id),
         });
     }
     segments.sort_by(|a, b| a.col.cmp(&b.col).then(a.span_end.cmp(&b.span_end)));
@@ -12357,17 +13374,18 @@ fn graph_to_flow_segments_to_steps(
 
 fn graph_to_flow_step_for_group(
     nodes: &[Value],
-    edges: &[Value],
+    graph: &GraphToFlowGraph<'_>,
     members: &[Value],
-    prior_by_id: &BTreeMap<String, Value>,
+    prior_by_id: &BTreeMap<String, &Value>,
 ) -> Value {
     if nodes.len() == 1 {
         return graph_to_flow_step_from_instance(&nodes[0], members, prior_by_id);
     }
     let has_conditional_fan_in = nodes.iter().any(|node| {
-        graph_to_flow_incoming_edges(edges, &graph_to_flow_string(node, "id"))
+        graph
+            .incoming(&graph_to_flow_string(node, "id"))
             .iter()
-            .any(graph_to_flow_is_condition_edge)
+            .any(|edge| graph_to_flow_is_condition_edge(edge))
     });
     let prefix = if has_conditional_fan_in {
         "branch"
@@ -12382,21 +13400,23 @@ fn graph_to_flow_step_for_group(
             .collect::<Vec<_>>()
             .join("_")
     );
-    let prior = prior_by_id.get(&id).cloned().unwrap_or_else(|| json!({}));
+    let prior = graph_to_flow_prior(prior_by_id, &id);
     if has_conditional_fan_in {
         json!({
             "id": id,
             "type": "branch",
-            "controllerRole": graph_to_flow_control_role(&Value::Null, None, &prior),
+            "controllerRole": graph_to_flow_control_role(&Value::Null, None, prior),
             "branches": nodes.iter().enumerate().map(|(index, node)| {
-                let edge = graph_to_flow_incoming_edges(edges, &graph_to_flow_string(node, "id"))
-                    .into_iter()
-                    .find(graph_to_flow_is_condition_edge);
+                let edge = graph
+                    .incoming(&graph_to_flow_string(node, "id"))
+                    .iter()
+                    .copied()
+                    .find(|edge| graph_to_flow_is_condition_edge(edge));
                 json!({
                     "id": format!("br_{}", graph_to_flow_string(node, "id")),
-                    "label": graph_to_flow_lane_label(node, members, index),
-                    "condition": edge.as_ref().map(|edge| graph_to_flow_condition_text_from_edge(edge, "")).unwrap_or_default(),
-                    "cond": edge.as_ref().and_then(graph_to_flow_edge_condition_to_editor_cond).unwrap_or(Value::Null),
+                    "label": graph_to_flow_lane_label(node, graph, index),
+                    "condition": edge.map(|edge| graph_to_flow_condition_text_from_edge(edge, "")).unwrap_or_default(),
+                    "cond": edge.and_then(graph_to_flow_edge_condition_to_editor_cond).unwrap_or(Value::Null),
                     "steps": [graph_to_flow_step_from_instance(node, members, prior_by_id)],
                 })
             }).collect::<Vec<_>>(),
@@ -12406,19 +13426,19 @@ fn graph_to_flow_step_for_group(
         json!({
             "id": id,
             "type": "parallel",
-            "controllerRole": graph_to_flow_control_role(&Value::Null, None, &prior),
+            "controllerRole": graph_to_flow_control_role(&Value::Null, None, prior),
             "dispatch": graph_to_flow_first_string(&[
-                graph_to_flow_string(&prior, "dispatch"),
+                graph_to_flow_string(prior, "dispatch"),
                 "fan_out".to_string(),
             ]),
             "collection": graph_to_flow_first_string(&[
-                graph_to_flow_string(&prior, "collection"),
+                graph_to_flow_string(prior, "collection"),
                 "all".to_string(),
             ]),
             "branches": nodes.iter().enumerate().map(|(index, node)| {
                 json!({
                     "id": format!("br_{}", graph_to_flow_string(node, "id")),
-                    "label": graph_to_flow_lane_label(node, members, index),
+                    "label": graph_to_flow_lane_label(node, graph, index),
                     "steps": [graph_to_flow_step_from_instance(node, members, prior_by_id)],
                 })
             }).collect::<Vec<_>>(),
@@ -12429,20 +13449,20 @@ fn graph_to_flow_step_for_group(
 fn graph_to_flow_member_step_from_instance(
     instance: &Value,
     _members: &[Value],
-    prior_by_id: &BTreeMap<String, Value>,
+    prior_by_id: &BTreeMap<String, &Value>,
 ) -> Value {
     let id = graph_to_flow_string(instance, "id");
-    let prior = prior_by_id.get(&id).cloned().unwrap_or_else(|| json!({}));
+    let prior = graph_to_flow_prior(prior_by_id, &id);
     let mut step = json!({
         "id": id,
         "type": "member",
         "role": graph_to_flow_string(instance, "memberId"),
-        "instruction": graph_to_flow_string(&prior, "instruction"),
-        "launchMode": graph_to_flow_value_with_alias(instance, &prior, &["launchMode", "launch_mode"]).unwrap_or(Value::Null),
-        "quorum": graph_to_flow_value_with_alias(instance, &prior, &["quorum", "collectionQuorum"]).unwrap_or(Value::Null),
-        "timeoutMs": graph_to_flow_value_with_alias(instance, &prior, &["timeoutMs", "timeout_ms"]).unwrap_or(Value::Null),
-        "allowedTools": graph_to_flow_value_with_alias(instance, &prior, &["allowedTools", "allowed_tools"]).unwrap_or_else(|| json!([])),
-        "blockedTools": graph_to_flow_value_with_alias(instance, &prior, &["blockedTools", "blocked_tools"]).unwrap_or_else(|| json!([])),
+        "instruction": graph_to_flow_string(prior, "instruction"),
+        "launchMode": graph_to_flow_value_with_alias(instance, prior, &["launchMode", "launch_mode"]).unwrap_or(Value::Null),
+        "quorum": graph_to_flow_value_with_alias(instance, prior, &["quorum", "collectionQuorum"]).unwrap_or(Value::Null),
+        "timeoutMs": graph_to_flow_value_with_alias(instance, prior, &["timeoutMs", "timeout_ms"]).unwrap_or(Value::Null),
+        "allowedTools": graph_to_flow_value_with_alias(instance, prior, &["allowedTools", "allowed_tools"]).unwrap_or_else(|| json!([])),
+        "blockedTools": graph_to_flow_value_with_alias(instance, prior, &["blockedTools", "blocked_tools"]).unwrap_or_else(|| json!([])),
     });
     for (out_key, keys) in [
         ("dispatchMode", ["dispatchMode", "dispatch_mode", ""]),
@@ -12461,7 +13481,7 @@ fn graph_to_flow_member_step_from_instance(
                 .chain(
                     keys.iter()
                         .filter(|key| !key.is_empty())
-                        .map(|key| graph_to_flow_string(&prior, key)),
+                        .map(|key| graph_to_flow_string(prior, key)),
                 )
                 .collect::<Vec<_>>(),
         );
@@ -12544,7 +13564,7 @@ fn graph_to_flow_is_flow_node(instance: &Value) -> bool {
 fn graph_to_flow_step_from_instance(
     instance: &Value,
     members: &[Value],
-    prior_by_id: &BTreeMap<String, Value>,
+    prior_by_id: &BTreeMap<String, &Value>,
 ) -> Value {
     if graph_to_flow_is_adaptive_node(instance) {
         return graph_to_flow_adaptive_step_from_instance(instance, prior_by_id);
@@ -12554,7 +13574,7 @@ fn graph_to_flow_step_from_instance(
 
 fn graph_to_flow_adaptive_step_from_instance(
     instance: &Value,
-    prior_by_id: &BTreeMap<String, Value>,
+    prior_by_id: &BTreeMap<String, &Value>,
 ) -> Value {
     if let Some(payload) = instance
         .get("adaptive")
@@ -12565,6 +13585,7 @@ fn graph_to_flow_adaptive_step_from_instance(
     let id = graph_to_flow_string(instance, "id");
     if let Some(prior) = prior_by_id
         .get(&id)
+        .copied()
         .filter(|prior| prior.get("type").and_then(Value::as_str) == Some("adaptive"))
     {
         return prior.clone();
@@ -12698,85 +13719,44 @@ fn graph_to_flow_normalized_edge_condition(edge: &Value) -> Option<(String, Stri
     None
 }
 
-fn graph_to_flow_find_join(
-    instances: &[Value],
-    edges: &[Value],
-    branch_start_ids: &[String],
-) -> Option<Value> {
-    let mut joins: Vec<Value> = instances
-        .iter()
-        .filter(|instance| graph_to_flow_string(instance, "gateKind") == "join")
-        .cloned()
-        .collect();
-    joins.sort_by(graph_to_flow_compare_nodes);
-    joins.into_iter().find(|join| {
-        let join_id = graph_to_flow_string(join, "id");
-        let incoming: BTreeSet<String> = graph_to_flow_incoming_edges(edges, &join_id)
-            .iter()
-            .map(|edge| graph_to_flow_string(edge, "from"))
-            .collect();
-        branch_start_ids.iter().any(|id| {
-            incoming.contains(id) || graph_to_flow_lane_reaches(instances, edges, id, &join_id)
-        })
-    })
-}
-
+/// The lane from `start_id` up to its join. It stops at a node another lane
+/// already took (`consumed`), so lanes that run into one shared chain without
+/// a join do not each copy the whole chain.
+/// The flow nodes of the lane from `start_id` to its join: the walk follows
+/// each node's first edge on, and stops at the join, at a node an earlier
+/// lane took, or at a node it or an earlier lane to the same join already
+/// walked (`walked`). From such a node the walk would go where that lane went,
+/// and that lane took every flow node there, so stopping changes no lane;
+/// lanes that run through one chain of nodes walk it once, not once each.
 fn graph_to_flow_collect_lane_to_join(
-    instances: &[Value],
-    edges: &[Value],
+    graph: &GraphToFlowGraph<'_>,
     start_id: &str,
     join_id: Option<&str>,
+    consumed: &BTreeSet<String>,
+    walked: &mut BTreeSet<String>,
 ) -> Vec<Value> {
     let mut out = Vec::new();
-    let mut current = graph_to_flow_node_by_id(instances, start_id);
-    let mut seen = BTreeSet::new();
+    let mut current = graph.node(start_id);
     while let Some(node) = current {
-        let node_id = graph_to_flow_string(&node, "id");
-        if join_id == Some(node_id.as_str()) || !seen.insert(node_id.clone()) {
+        let node_id = graph_to_flow_string(node, "id");
+        if join_id == Some(node_id.as_str())
+            || consumed.contains(&node_id)
+            || !walked.insert(node_id.clone())
+        {
             break;
         }
-        if graph_to_flow_is_flow_node(&node) {
+        if graph_to_flow_is_flow_node(node) {
             out.push(node.clone());
         }
-        let mut next_nodes: Vec<Value> = graph_to_flow_outgoing_edges(edges, &node_id)
+        current = graph
+            .outgoing(&node_id)
             .iter()
             .filter(|edge| join_id != Some(graph_to_flow_string(edge, "to").as_str()))
-            .filter_map(|edge| {
-                graph_to_flow_node_by_id(instances, &graph_to_flow_string(edge, "to"))
-            })
+            .filter_map(|edge| graph.node(&graph_to_flow_string(edge, "to")))
             .filter(|node| !graph_to_flow_bool(node, "isTerminal"))
-            .collect();
-        next_nodes.sort_by(graph_to_flow_compare_nodes);
-        current = next_nodes.into_iter().next();
+            .min_by(|a, b| graph_to_flow_compare_nodes(a, b));
     }
     out
-}
-
-fn graph_to_flow_lane_reaches(
-    instances: &[Value],
-    edges: &[Value],
-    start_id: &str,
-    target_id: &str,
-) -> bool {
-    let mut queue = VecDeque::from([start_id.to_string()]);
-    let mut seen = BTreeSet::new();
-    while let Some(id) = queue.pop_front() {
-        if id == target_id {
-            return true;
-        }
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-        for edge in graph_to_flow_outgoing_edges(edges, &id) {
-            if let Some(node) =
-                graph_to_flow_node_by_id(instances, &graph_to_flow_string(&edge, "to"))
-                && !graph_to_flow_bool(&node, "isTerminal")
-            {
-                queue.push_back(graph_to_flow_string(&node, "id"));
-            }
-        }
-    }
-    false
 }
 
 fn graph_to_flow_collection_from_join(join: &Value) -> String {
@@ -12820,15 +13800,14 @@ fn graph_to_flow_primitive_id_from_gate(gate: &Value, kind: &str) -> String {
     }
 }
 
-fn graph_to_flow_lane_label(node: &Value, members: &[Value], index: usize) -> String {
+fn graph_to_flow_lane_label(node: &Value, graph: &GraphToFlowGraph<'_>, index: usize) -> String {
     let lane = graph_to_flow_string(node, "lane");
     if !lane.is_empty() {
         return lane;
     }
     let member_id = graph_to_flow_string(node, "memberId");
-    members
-        .iter()
-        .find(|member| graph_to_flow_string(member, "id") == member_id)
+    graph
+        .member(&member_id)
         .map(|member| graph_to_flow_string(member, "name"))
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| {
@@ -12840,27 +13819,46 @@ fn graph_to_flow_lane_label(node: &Value, members: &[Value], index: usize) -> St
         })
 }
 
-fn graph_to_flow_node_by_id(instances: &[Value], id: &str) -> Option<Value> {
-    instances
+/// The columns that `segments` span, as sorted, disjoint ranges.
+fn graph_to_flow_merged_spans(segments: &[GraphToFlowSegment]) -> Vec<(i64, i64)> {
+    let mut spans: Vec<(i64, i64)> = segments
         .iter()
-        .find(|instance| graph_to_flow_string(instance, "id") == id)
-        .cloned()
+        .filter(|segment| segment.col <= segment.span_end)
+        .map(|segment| (segment.col, segment.span_end))
+        .collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
 }
 
-fn graph_to_flow_outgoing_edges(edges: &[Value], id: &str) -> Vec<Value> {
-    edges
-        .iter()
-        .filter(|edge| graph_to_flow_string(edge, "from") == id)
-        .cloned()
-        .collect()
+/// Whether `col` lies in one of `spans`, which are sorted and disjoint.
+fn graph_to_flow_spans_contain(spans: &[(i64, i64)], col: i64) -> bool {
+    count_mobpack_work();
+    let after = spans.partition_point(|&(start, _)| start <= col);
+    after > 0 && col <= spans[after - 1].1
 }
 
-fn graph_to_flow_incoming_edges(edges: &[Value], id: &str) -> Vec<Value> {
-    edges
-        .iter()
-        .filter(|edge| graph_to_flow_string(edge, "to") == id)
-        .cloned()
-        .collect()
+#[cfg(test)]
+std::thread_local! {
+    /// The work the Flow Editor's derivations did on this thread, in
+    /// [`count_mobpack_work`] units: graph fields and index entries read,
+    /// frame nodes visited, realm skills compared. The complexity tests
+    /// compare it across input sizes, so they measure how the work grows, not
+    /// how long it takes.
+    static MOBPACK_WORK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one unit of work for the complexity tests. Outside tests it does
+/// nothing.
+fn count_mobpack_work() {
+    #[cfg(test)]
+    MOBPACK_WORK.with(|work| work.set(work.get().saturating_add(1)));
 }
 
 fn graph_to_flow_compare_nodes(a: &Value, b: &Value) -> std::cmp::Ordering {
@@ -12871,18 +13869,22 @@ fn graph_to_flow_compare_nodes(a: &Value, b: &Value) -> std::cmp::Ordering {
 }
 
 fn graph_to_flow_col(value: &Value) -> i64 {
+    count_mobpack_work();
     value.get("col").and_then(Value::as_i64).unwrap_or(0)
 }
 
 fn graph_to_flow_row(value: &Value) -> i64 {
+    count_mobpack_work();
     value.get("row").and_then(Value::as_i64).unwrap_or(0)
 }
 
 fn graph_to_flow_bool(value: &Value, key: &str) -> bool {
+    count_mobpack_work();
     value.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
 fn graph_to_flow_string(value: &Value, key: &str) -> String {
+    count_mobpack_work();
     value
         .get(key)
         .and_then(Value::as_str)
@@ -13093,7 +14095,13 @@ pub fn deploy_command_preview(params: &Value) -> Result<MobpackDeployCommandResu
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(|| rendered.filename.clone());
-    let rkat_bin = deploy_rkat_bin(params);
+    // A preview for a caller without host access runs `rkat`, never a
+    // binary the host configured.
+    let rkat_bin = if host_access() {
+        deploy_rkat_bin(params)
+    } else {
+        "rkat".to_string()
+    };
     let argv = deploy_argv(
         &rkat_bin,
         &deploy,
@@ -13199,7 +14207,16 @@ pub fn deploy_mobpack(params: &Value) -> Result<MobpackDeployResult, String> {
         .decode(export.content_base64.as_bytes())
         .map_err(|err| format!("failed to decode exported mobpack: {err}"))?;
     let pack_sha256 = source_file_sha256(&bytes);
-    let pack_path = deploy_pack_path(params, &export.filename)?;
+    let execute = params
+        .get("execute")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // A plan for a caller without host access names no host path: its pack
+    // path is the caller's own or the bare file name, and its command runs
+    // `rkat`, never a binary the host configured. A deploy that runs reports
+    // what it ran.
+    let host_view = execute || host_access();
+    let pack_path = deploy_pack_path(params, &export.filename, host_view)?;
 
     let document = document_from_params(params)?;
     let input_bindings = deploy_input_bindings(&document, params);
@@ -13217,17 +14234,17 @@ pub fn deploy_mobpack(params: &Value) -> Result<MobpackDeployResult, String> {
                 .filter(|value| !value.is_empty())
         })
         .unwrap_or("Reply with exactly OK.");
-    let rkat_bin = deploy_rkat_bin(params);
+    let rkat_bin = if host_view {
+        deploy_rkat_bin(params)
+    } else {
+        "rkat".to_string()
+    };
     let argv = deploy_argv(&rkat_bin, &deploy, &pack_path, prompt, &input_bindings);
     let command = shell_command(&argv);
     let definition = MobDefinition::from_toml(&export.mob_toml)
         .map_err(|err| format!("failed to parse exported mob.toml for deploy plan: {err}"))?;
     let plan_trace =
         deploy_plan_trace_from_definition(&definition, &export.validation, &command, &pack_path);
-    let execute = params
-        .get("execute")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
 
     let (status_code, stdout, stderr) = if execute {
         if let Some(parent) = pack_path.parent() {
@@ -13383,18 +14400,22 @@ fn deploy_display_rows(
     rows
 }
 
-fn deploy_pack_path(params: &Value, filename: &str) -> Result<PathBuf, String> {
+/// The deploy pack's path: the caller's `pack_path`, or a stamped file in the
+/// caller's `output_dir`, or, without either, in the temp directory. A plan
+/// shown without host access (`host_view` false) names no temp directory, so
+/// it gets the bare file name.
+fn deploy_pack_path(params: &Value, filename: &str, host_view: bool) -> Result<PathBuf, String> {
     if let Some(path) = params.get("pack_path").and_then(Value::as_str) {
         let path = path.trim();
         if !path.is_empty() {
             return Ok(PathBuf::from(path));
         }
     }
-    let output_dir = params
-        .get("output_dir")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+    let output_dir = match params.get("output_dir").and_then(Value::as_str) {
+        Some(dir) => PathBuf::from(dir),
+        None if !host_view => return Ok(PathBuf::from(filename)),
+        None => std::env::temp_dir(),
+    };
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|err| format!("system clock before unix epoch: {err}"))?
@@ -14571,6 +15592,15 @@ fn path_skill_reads_set() -> bool {
     PATH_SKILL_READS.with(|reads| reads.borrow().is_some())
 }
 
+/// Whether the mobpack operation running on this thread runs for a caller
+/// with host access: [`with_host_path_skill_reads`] set its policy (the
+/// host's own channels, and a Flow Editor caller with the `mobpack.deploy`
+/// grant or the host deploy opt-in). Only such a caller reads any host path a
+/// document names, and only to such a caller do replies name host paths.
+fn host_access() -> bool {
+    PATH_SKILL_READS.with(|reads| matches!(reads.borrow().as_ref(), Some(PathSkillReads::Host)))
+}
+
 fn with_path_skill_reads<R>(reads: PathSkillReads, f: impl FnOnce() -> R) -> R {
     struct Restore(Option<PathSkillReads>);
     impl Drop for Restore {
@@ -14925,6 +15955,60 @@ enum PathSkillReadError {
     /// The request has read its whole skill file budget.
     OverBudget,
     Unreadable(std::io::Error),
+    /// A path within a skill realm with a component that could step out of
+    /// the realm.
+    LeavesRealm,
+    /// A path within a skill realm the skills catalog does not list, named by
+    /// a caller without host access.
+    RealmNotListed(String),
+}
+
+/// The file a path skill names. A skill of a skills catalog realm
+/// (`realm_source` is `filesystem`) whose path is relative, as the catalogs
+/// name skills to a caller without host access, is in the directory of the
+/// realm its `realm_id` names. Such a path with a component that could step
+/// out of the realm (`..`, `.`, empty, a drive, a backslash) is refused, to a
+/// caller without host access before anything is read. A realm the catalog
+/// does not list is refused to such a caller; a host caller's document reads
+/// it as named, as before. Any other path is read as named, under the
+/// caller's read policy.
+fn path_skill_host_path(source: &Value, path: &str) -> Result<String, PathSkillReadError> {
+    let catalog_skill = source
+        .get("realm_source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        == Some("filesystem");
+    if !catalog_skill || Path::new(path).is_absolute() || is_refused_windows_path(path) {
+        return Ok(path.to_string());
+    }
+    let host = host_access();
+    let parts = path.split('/').collect::<Vec<_>>();
+    let leaves_realm = parts.iter().any(|part| {
+        part.is_empty() || matches!(*part, "." | "..") || part.contains(['\\', ':', '\0'])
+    });
+    if leaves_realm && !host {
+        return Err(PathSkillReadError::LeavesRealm);
+    }
+    let realm_id = source
+        .get("realm_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let Some((_, _, mut joined)) = skill_catalog_dirs()
+        .into_iter()
+        .find(|(id, _, _)| id == realm_id)
+    else {
+        return if host {
+            Ok(path.to_string())
+        } else {
+            Err(PathSkillReadError::RealmNotListed(realm_id.to_string()))
+        };
+    };
+    if leaves_realm {
+        return Err(PathSkillReadError::LeavesRealm);
+    }
+    joined.extend(parts);
+    Ok(joined.to_string_lossy().into_owned())
 }
 
 /// Read the path skill file `path` under this thread's read policy.
@@ -14980,6 +16064,21 @@ fn path_skill_refused(skill_id: &str, path: &str, reason: &str) -> String {
     )
 }
 
+fn path_skill_leaves_realm(skill_id: &str, path: &str) -> String {
+    format!(
+        "selected path skill '{skill_id}' names {path} within its skill realm, a path that \
+         could step out of the realm ('..', '.', or an empty, drive or backslash component); \
+         refusing to read it"
+    )
+}
+
+fn path_skill_realm_not_listed(skill_id: &str, realm_id: &str) -> String {
+    format!(
+        "selected path skill '{skill_id}' names a file within the skill realm '{realm_id}', \
+         which the skills catalog does not list; refusing to read it"
+    )
+}
+
 fn path_skill_not_permitted(skill_id: &str, path: &str) -> String {
     format!(
         "selected path skill '{skill_id}' names {path}, which is not a skill file this server \
@@ -15014,7 +16113,9 @@ fn selected_path_skill_files(
                 .ok_or_else(|| {
                     format!("selected path skill '{skill_id}' has no filesystem path")
                 })?;
-            match read_path_skill_file(path) {
+            match path_skill_host_path(&source, path)
+                .and_then(|host_path| read_path_skill_file(&host_path))
+            {
                 Ok(bytes) => bytes,
                 Err(PathSkillReadError::NotListed) => {
                     return Err(path_skill_not_permitted(&skill_id, path));
@@ -15029,6 +16130,12 @@ fn selected_path_skill_files(
                     return Err(format!(
                         "failed to read selected path skill '{skill_id}' at {path}: {err}"
                     ));
+                }
+                Err(PathSkillReadError::LeavesRealm) => {
+                    return Err(path_skill_leaves_realm(&skill_id, path));
+                }
+                Err(PathSkillReadError::RealmNotListed(realm_id)) => {
+                    return Err(path_skill_realm_not_listed(&skill_id, &realm_id));
                 }
             }
         };
@@ -15046,6 +16153,7 @@ fn selected_path_skill_files(
 }
 
 fn selected_skill_sources(document: &MobpackDocument) -> BTreeMap<String, Value> {
+    let realm_skills = RealmSkills::of(&document.skill_realms);
     let mut selected = BTreeMap::<String, Value>::new();
     if let Some(members) = document.members.as_array() {
         for member in members {
@@ -15060,7 +16168,7 @@ fn selected_skill_sources(document: &MobpackDocument) -> BTreeMap<String, Value>
                 if selected.contains_key(&skill) {
                     continue;
                 }
-                if let Some(source) = skill_source_from_realms(&skill, &document.skill_realms) {
+                if let Some(source) = realm_skills.source(&skill) {
                     selected.insert(skill, source);
                 }
             }
@@ -15070,11 +16178,19 @@ fn selected_skill_sources(document: &MobpackDocument) -> BTreeMap<String, Value>
 }
 
 fn packed_skill_archive_path(skill_id: &str, source: &Value) -> String {
-    if let Some(path) = source
-        .get("path")
+    // A catalog skill's path, absolute or within its realm, names a host
+    // file, not a place in the archive.
+    let catalog_skill = source
+        .get("realm_source")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|path| is_safe_relative_archive_path(path))
+        == Some("filesystem");
+    if !catalog_skill
+        && let Some(path) = source
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| is_safe_relative_archive_path(path))
     {
         return path.to_string();
     }
@@ -16407,69 +17523,108 @@ fn input_param_summary(params: &[Value]) -> String {
         .join(", ")
 }
 
+/// A frame's nodes in dependency order: each after the nodes of the frame it
+/// depends on, and in id order where the dependencies leave the order open.
+/// Each visit counts as one unit of work. A definition's steps are parsed in
+/// id order, and import showed them in that order, so a step whose id sorts
+/// before a step it depends on came first, and exporting the imported flow
+/// ran it first.
+fn frame_nodes(
+    frame: &FrameSpec,
+) -> impl Iterator<Item = (&meerkat_mob::FlowNodeId, &FlowNodeSpec)> {
+    let mut waiting = BTreeMap::new();
+    let mut dependents: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for (id, node) in &frame.nodes {
+        let depends_on = match node {
+            FlowNodeSpec::Step(step) => &step.depends_on,
+            FlowNodeSpec::RepeatUntil(loop_spec) => &loop_spec.depends_on,
+        };
+        let within_frame = depends_on
+            .iter()
+            .filter(|dependency| *dependency != id && frame.nodes.contains_key(*dependency))
+            .collect::<BTreeSet<_>>();
+        waiting.insert(id, within_frame.len());
+        for dependency in within_frame {
+            dependents.entry(dependency).or_default().push(id);
+        }
+    }
+    let mut ready = waiting
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(id, _)| *id)
+        .collect::<BTreeSet<_>>();
+    let mut order = Vec::with_capacity(frame.nodes.len());
+    while let Some(id) = ready.pop_first() {
+        order.push(id);
+        for dependent in dependents.get(id).into_iter().flatten() {
+            if let Some(count) = waiting.get_mut(dependent) {
+                *count -= 1;
+                if *count == 0 {
+                    ready.insert(*dependent);
+                }
+            }
+        }
+    }
+    // Nodes on a dependency cycle, which validation refuses, and the nodes
+    // after them follow in id order.
+    order.extend(
+        waiting
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(id, _)| id),
+    );
+    order
+        .into_iter()
+        .filter_map(move |id| frame.nodes.get_key_value(id))
+        .inspect(|_| count_mobpack_work())
+}
+
 fn visual_steps_from_frame(frame: &FrameSpec, flow: &FlowSpec) -> Vec<Value> {
+    let groups = FrameStepGroups::of(frame, flow);
     let mut out = Vec::new();
     let mut consumed = BTreeSet::new();
-    for (node_id, node) in &frame.nodes {
+    for (node_id, node) in frame_nodes(frame) {
         if consumed.contains(node_id) {
             continue;
         }
         match node {
             FlowNodeSpec::Step(frame_step) => {
                 if let Some(step) = flow.steps.get(&frame_step.step_id) {
-                    if step.branch.is_none() {
-                        let parallel_nodes = parallel_sibling_nodes(frame, flow, frame_step);
-                        if parallel_nodes.len() > 1 {
-                            for (candidate_node_id, _, _) in &parallel_nodes {
-                                consumed.insert((*candidate_node_id).clone());
-                            }
-                            let id = parallel_nodes
-                                .iter()
-                                .map(|(_, candidate_frame_step, _)| {
-                                    sanitize_identifier(candidate_frame_step.step_id.as_ref())
-                                })
-                                .collect::<Vec<_>>()
-                                .join("_");
-                            out.push(json!({
-                                "id": format!("parallel_{id}"),
-                                "type": "parallel",
-                                "dispatch": "fan_out",
-                                "collection": "all",
-                                "dependsMode": dependency_mode_string(&frame_step.depends_on_mode),
-                                "branches": parallel_nodes.iter().enumerate().map(|(index, (_, candidate_frame_step, candidate_step))| json!({
-                                    "id": format!("br_{}", sanitize_identifier(candidate_frame_step.step_id.as_ref())),
-                                    "label": candidate_frame_step.step_id.to_string(),
-                                    "steps": [visual_step_from_step(candidate_frame_step.step_id.as_ref(), candidate_step)],
-                                    "order": index,
-                                })).collect::<Vec<_>>(),
-                            }));
-                            continue;
+                    let parallel_nodes = groups.parallel_siblings(frame_step, step);
+                    if parallel_nodes.len() > 1 {
+                        for (candidate_node_id, _, _) in parallel_nodes {
+                            consumed.insert((*candidate_node_id).clone());
                         }
+                        let id = parallel_nodes
+                            .iter()
+                            .map(|(_, candidate_frame_step, _)| {
+                                sanitize_identifier(candidate_frame_step.step_id.as_ref())
+                            })
+                            .collect::<Vec<_>>()
+                            .join("_");
+                        out.push(json!({
+                            "id": format!("parallel_{id}"),
+                            "type": "parallel",
+                            "dispatch": "fan_out",
+                            "collection": "all",
+                            "dependsMode": dependency_mode_string(&frame_step.depends_on_mode),
+                            "branches": parallel_nodes.iter().enumerate().map(|(index, (_, candidate_frame_step, candidate_step))| json!({
+                                "id": format!("br_{}", sanitize_identifier(candidate_frame_step.step_id.as_ref())),
+                                "label": candidate_frame_step.step_id.to_string(),
+                                "steps": [visual_step_from_step(candidate_frame_step.step_id.as_ref(), candidate_step)],
+                                "order": index,
+                            })).collect::<Vec<_>>(),
+                        }));
+                        continue;
                     }
                     if let Some(branch_id) = &step.branch {
-                        let branch_nodes = frame
-                            .nodes
-                            .iter()
-                            .filter_map(|(candidate_node_id, candidate_node)| {
-                                let FlowNodeSpec::Step(candidate_frame_step) = candidate_node
-                                else {
-                                    return None;
-                                };
-                                let candidate_step =
-                                    flow.steps.get(&candidate_frame_step.step_id)?;
-                                (candidate_step.branch.as_ref() == Some(branch_id)).then_some((
-                                    candidate_node_id,
-                                    candidate_frame_step,
-                                    candidate_step,
-                                ))
-                            })
-                            .collect::<Vec<_>>();
+                        let branch_nodes = groups.branch(branch_id);
                         if branch_nodes.len() > 1 {
-                            for (candidate_node_id, _, _) in &branch_nodes {
+                            for (candidate_node_id, _, _) in branch_nodes {
                                 consumed.insert((*candidate_node_id).clone());
                             }
                             let controller_role =
-                                branch_controller_role_from_depends_on(frame, flow, &branch_nodes);
+                                branch_controller_role_from_depends_on(frame, flow, branch_nodes);
                             out.push(json!({
                                 "id": format!("branch_{}", sanitize_identifier(branch_id.as_ref())),
                                 "type": "branch",
@@ -16486,6 +17641,14 @@ fn visual_steps_from_frame(frame: &FrameSpec, flow: &FlowSpec) -> Vec<Value> {
                             }));
                             continue;
                         }
+                    }
+                    if let Some(condition) = &step.condition {
+                        out.push(conditioned_step_as_branch(
+                            frame_step.step_id.as_ref(),
+                            step,
+                            condition,
+                        ));
+                        continue;
                     }
                     out.push(visual_step_from_step(frame_step.step_id.as_ref(), step));
                 }
@@ -16506,6 +17669,32 @@ fn visual_steps_from_frame(frame: &FrameSpec, flow: &FlowSpec) -> Vec<Value> {
         }
     }
     out
+}
+
+/// A step with a condition, shown as a branch step of one lane: the editor's
+/// member steps carry no condition, and a branch lane does. Without a
+/// controller the lane's step itself carries the condition, so an export
+/// writes the step back with it and adds no step.
+fn conditioned_step_as_branch(
+    step_id: &str,
+    step: &FlowStepSpec,
+    condition: &ConditionExpr,
+) -> Value {
+    let id = sanitize_identifier(step_id);
+    json!({
+        "id": format!("branch_{id}"),
+        "type": "branch",
+        "controllerRole": "",
+        "dependsMode": dependency_mode_string(&step.depends_on_mode),
+        "branches": [{
+            "id": format!("br_{id}"),
+            "label": step_id,
+            "condition": condition_to_label(condition),
+            "cond": condition_to_editor_cond_json(condition),
+            "steps": [visual_step_from_step(step_id, step)],
+        }],
+        "fallback": [],
+    })
 }
 
 fn branch_controller_role_from_depends_on(
@@ -16532,35 +17721,92 @@ fn branch_controller_role_from_depends_on(
     None
 }
 
-fn parallel_sibling_nodes<'a>(
-    frame: &'a FrameSpec,
-    flow: &'a FlowSpec,
-    frame_step: &meerkat_mob::definition::FrameStepSpec,
-) -> Vec<(
+/// A step node of a frame: its id, its frame step and the flow step it runs.
+type FrameStepNode<'a> = (
     &'a meerkat_mob::FlowNodeId,
     &'a meerkat_mob::definition::FrameStepSpec,
     &'a FlowStepSpec,
-)> {
-    frame
-        .nodes
-        .iter()
-        .filter_map(|(candidate_node_id, candidate_node)| {
-            let FlowNodeSpec::Step(candidate_frame_step) = candidate_node else {
-                return None;
+);
+
+/// The steps of a frame that import shows together, found in one pass over
+/// the frame: each set of parallel siblings and each branch's steps, in frame
+/// order. Every step used to search the whole frame for them.
+struct FrameStepGroups<'a> {
+    parallel: BTreeMap<(&'a [meerkat_mob::FlowNodeId], &'static str), Vec<FrameStepNode<'a>>>,
+    branches: BTreeMap<&'a meerkat_mob::BranchId, Vec<FrameStepNode<'a>>>,
+}
+
+impl<'a> FrameStepGroups<'a> {
+    fn of(frame: &'a FrameSpec, flow: &'a FlowSpec) -> Self {
+        let mut groups = Self {
+            parallel: BTreeMap::new(),
+            branches: BTreeMap::new(),
+        };
+        for (node_id, node) in frame_nodes(frame) {
+            let FlowNodeSpec::Step(frame_step) = node else {
+                continue;
             };
-            if candidate_frame_step.depends_on != frame_step.depends_on
-                || candidate_frame_step.depends_on_mode != frame_step.depends_on_mode
-                || candidate_frame_step.branch.is_some()
-            {
-                return None;
+            let Some(step) = flow.steps.get(&frame_step.step_id) else {
+                continue;
+            };
+            if let Some(key) = parallel_sibling_key(frame_step, step) {
+                groups
+                    .parallel
+                    .entry(key)
+                    .or_default()
+                    .push((node_id, frame_step, step));
             }
-            let candidate_step = flow.steps.get(&candidate_frame_step.step_id)?;
-            if candidate_step.branch.is_some() || candidate_step.condition.is_some() {
-                return None;
+            if let Some(branch_id) = &step.branch {
+                groups
+                    .branches
+                    .entry(branch_id)
+                    .or_default()
+                    .push((node_id, frame_step, step));
             }
-            Some((candidate_node_id, candidate_frame_step, candidate_step))
-        })
-        .collect()
+        }
+        groups
+    }
+
+    /// The parallel siblings of a step, itself included. A step with a
+    /// branch or a condition has none.
+    fn parallel_siblings(
+        &self,
+        frame_step: &'a meerkat_mob::definition::FrameStepSpec,
+        step: &FlowStepSpec,
+    ) -> &[FrameStepNode<'a>] {
+        count_mobpack_work();
+        parallel_sibling_key(frame_step, step)
+            .and_then(|key| self.parallel.get(&key))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// The steps of a branch.
+    fn branch(&self, branch_id: &meerkat_mob::BranchId) -> &[FrameStepNode<'a>] {
+        count_mobpack_work();
+        self.branches
+            .get(branch_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+/// The steps that run in parallel with a step: those with its dependencies
+/// and their mode. A step with a branch, in the frame or the flow, or a
+/// condition runs with none. Such a step used to take the parallel siblings
+/// of its dependencies anyway, which dropped it from the import and showed
+/// their parallel step once more.
+fn parallel_sibling_key<'a>(
+    frame_step: &'a meerkat_mob::definition::FrameStepSpec,
+    step: &FlowStepSpec,
+) -> Option<(&'a [meerkat_mob::FlowNodeId], &'static str)> {
+    if frame_step.branch.is_some() || step.branch.is_some() || step.condition.is_some() {
+        return None;
+    }
+    Some((
+        frame_step.depends_on.as_slice(),
+        dependency_mode_string(&frame_step.depends_on_mode),
+    ))
 }
 
 fn visual_step_from_step(id: &str, step: &FlowStepSpec) -> Value {
@@ -16664,7 +17910,7 @@ fn launch_modes_from_instances(instances: &[Value]) -> Value {
 
 fn last_step_id_in_frame(frame: &FrameSpec) -> Option<String> {
     let mut out = None;
-    for node in frame.nodes.values() {
+    for (_, node) in frame_nodes(frame) {
         match node {
             FlowNodeSpec::Step(step) => out = Some(step.step_id.to_string()),
             FlowNodeSpec::RepeatUntil(loop_spec) => {
@@ -17032,10 +18278,9 @@ struct RenderState<'a> {
 fn render_editor_document_mob_toml(document: &MobpackDocument) -> Result<String, String> {
     // The structure caps bound what compiling the flow builds; the bounded
     // sink bounds what rendering writes, whatever the document's shape.
-    if let Some(refusal) = validate_document_structure_caps(document)
-        .into_iter()
-        .next()
-    {
+    let mut caps = MobpackDiagnostics::default();
+    validate_document_structure_caps(document, &mut caps);
+    if let Some(refusal) = caps.finish().into_iter().next() {
         return Err(refusal.message);
     }
     let mut lines = RenderedLines::new();
@@ -17094,6 +18339,7 @@ fn render_editor_document_mob_toml(document: &MobpackDocument) -> Result<String,
     emit_rendered_backend(&mut lines, &settings);
     emit_rendered_advanced_mob_settings(&mut lines, &settings);
 
+    let realm_skills = RealmSkills::of(&document.skill_realms);
     let mut selected_skills = BTreeMap::<String, Value>::new();
     for member in &members {
         if lines.full() {
@@ -17103,7 +18349,7 @@ fn render_editor_document_mob_toml(document: &MobpackDocument) -> Result<String,
             if selected_skills.contains_key(&skill) {
                 continue;
             }
-            if let Some(source) = skill_source_from_realms(&skill, &document.skill_realms) {
+            if let Some(source) = realm_skills.source(&skill) {
                 selected_skills.insert(skill, source);
             }
         }
@@ -17220,18 +18466,28 @@ impl RenderedLines {
 
 /// The most members one document may have.
 const MOBPACK_MAX_MEMBERS: usize = 1000;
+/// The most tools one member may list.
+const MOBPACK_MAX_MEMBER_TOOLS: usize = 1024;
 /// The most branches one parallel or branch step may have.
 const MOBPACK_MAX_STEP_BRANCHES: usize = 256;
 /// The most branches one flow may have, nested steps included. Branches
 /// after a parallel step without a join each depend on every branch before
 /// them, so the branch counts bound what compiling the flow builds.
 const MOBPACK_MAX_FLOW_BRANCHES: usize = 1024;
+/// The most instances one document's graph may have.
+const MOBPACK_MAX_GRAPH_INSTANCES: usize = 2048;
+/// The most edges one document's graph may have.
+const MOBPACK_MAX_GRAPH_EDGES: usize = 8192;
 
 /// Structure caps checked before a document is rendered: at most
-/// [`MOBPACK_MAX_MEMBERS`] members, [`MOBPACK_MAX_STEP_BRANCHES`] branches in
-/// one step and [`MOBPACK_MAX_FLOW_BRANCHES`] in the flow.
-fn validate_document_structure_caps(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+/// [`MOBPACK_MAX_MEMBERS`] members, [`MOBPACK_MAX_MEMBER_TOOLS`] tools listed
+/// by one member, [`MOBPACK_MAX_STEP_BRANCHES`] branches in one step and
+/// [`MOBPACK_MAX_FLOW_BRANCHES`] in the flow, and the graph caps of
+/// [`graph_structure_refusals`].
+fn validate_document_structure_caps(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let members = document.members.as_array().map_or(0, Vec::len);
     if members > MOBPACK_MAX_MEMBERS {
         diagnostics.push(MobpackDiagnostic {
@@ -17243,6 +18499,27 @@ fn validate_document_structure_caps(document: &MobpackDocument) -> Vec<MobpackDi
             ),
             path: Some("members".to_string()),
         });
+    }
+    for (member_index, member) in document
+        .members
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let tools = member_tool_count(member);
+        if tools > MOBPACK_MAX_MEMBER_TOOLS {
+            let id = member.get("id").and_then(Value::as_str).unwrap_or("member");
+            diagnostics.push(MobpackDiagnostic {
+                severity: "error".to_string(),
+                code: "too_many_member_tools".to_string(),
+                message: format!(
+                    "member '{id}' lists {tools} tools, more than \
+                     {MOBPACK_MAX_MEMBER_TOOLS}; refusing to render it"
+                ),
+                path: Some(format!("members[{member_index}].tools")),
+            });
+        }
     }
     let mut flow_branches = 0_usize;
     let mut pending = vec![document.flow.get("steps")];
@@ -17281,7 +18558,119 @@ fn validate_document_structure_caps(document: &MobpackDocument) -> Vec<MobpackDi
             path: Some("flow.steps".to_string()),
         });
     }
-    diagnostics
+    diagnostics.extend(graph_structure_refusals(document));
+}
+
+/// How many tools a member lists: the entries of its `tools` list, or of its
+/// comma-separated `tools` string.
+fn member_tool_count(member: &Value) -> usize {
+    match member.get("tools") {
+        Some(Value::Array(tools)) => tools.len(),
+        Some(Value::String(tools)) => tools
+            .split(',')
+            .filter(|tool| !tool.trim().is_empty())
+            .count(),
+        _ => 0,
+    }
+}
+
+/// The graph structure caps a document does not pass, each as a refusal: at
+/// most [`MOBPACK_MAX_GRAPH_INSTANCES`] instances and
+/// [`MOBPACK_MAX_GRAPH_EDGES`] edges. Deriving a flow indexes the graph once,
+/// but walks a node once for each join whose lanes run through it, so a
+/// graph past the caps is refused before anything derives a flow from it or
+/// checks it further, and only a delete edits it.
+fn graph_structure_refusals(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+    let mut refusals = Vec::new();
+    let (instances, edges) = graph_structure_sizes(document);
+    if instances > MOBPACK_MAX_GRAPH_INSTANCES {
+        refusals.push(MobpackDiagnostic {
+            severity: "error".to_string(),
+            code: "too_many_graph_instances".to_string(),
+            message: format!(
+                "mobpack graph has {instances} instances, more than \
+                 {MOBPACK_MAX_GRAPH_INSTANCES}; refusing the document"
+            ),
+            path: Some("instances".to_string()),
+        });
+    }
+    if edges > MOBPACK_MAX_GRAPH_EDGES {
+        refusals.push(MobpackDiagnostic {
+            severity: "error".to_string(),
+            code: "too_many_graph_edges".to_string(),
+            message: format!(
+                "mobpack graph has {edges} edges, more than {MOBPACK_MAX_GRAPH_EDGES}; \
+                 refusing the document"
+            ),
+            path: Some("edges".to_string()),
+        });
+    }
+    refusals
+}
+
+/// Refuses a document whose graph is past the structure caps.
+fn refuse_graph_past_structure_caps(document: &MobpackDocument) -> Result<(), String> {
+    match graph_structure_refusals(document).into_iter().next() {
+        Some(refusal) => Err(refusal.message),
+        None => Ok(()),
+    }
+}
+
+/// The sizes of a document's graph that the structure caps bound: its
+/// instances and its edges.
+fn graph_structure_sizes(document: &MobpackDocument) -> (usize, usize) {
+    (
+        document.instances.as_array().map_or(0, Vec::len),
+        document.edges.as_array().map_or(0, Vec::len),
+    )
+}
+
+/// Whether graph sizes are past the structure caps.
+fn graph_sizes_past_caps((instances, edges): (usize, usize)) -> bool {
+    instances > MOBPACK_MAX_GRAPH_INSTANCES || edges > MOBPACK_MAX_GRAPH_EDGES
+}
+
+/// Refuses an operation that left the graph past the structure caps, unless
+/// the graph was past them before and the operation grew neither its
+/// instances nor its edges: no edit pushes a graph past the caps, and on a
+/// graph past them an edit may only shrink it.
+fn refuse_graph_grown_past_structure_caps(
+    document: &MobpackDocument,
+    before: (usize, usize),
+) -> Result<(), String> {
+    let after = graph_structure_sizes(document);
+    if graph_sizes_past_caps(before) && after.0 <= before.0 && after.1 <= before.1 {
+        return Ok(());
+    }
+    refuse_graph_past_structure_caps(document)
+}
+
+/// The operations that only remove: a flow step, a graph node or edge, or a
+/// member, with what refers to it. They are the operations let through on a
+/// document whose graph is past the structure caps, so it can always be
+/// brought back under them.
+fn operation_only_removes(operation_type: &str) -> bool {
+    matches!(
+        operation_type,
+        "delete_flow_step" | "delete_graph_node" | "delete_graph_edge" | "delete_member"
+    )
+}
+
+/// Derives the flow from a graph a delete shrank. A graph still past the
+/// structure caps keeps the flow it had: nothing derives a flow from a graph
+/// past the caps, and the delete that brings it under them derives the flow.
+fn derive_flow_from_shrunk_graph(document: &mut MobpackDocument) {
+    if !graph_sizes_past_caps(graph_structure_sizes(document)) {
+        document.flow = graph_to_flow_from_document(document);
+        reconcile_flow_step_launch_modes(document);
+    }
+}
+
+/// [`graph_to_flow_from_document`], refused for a graph past the structure
+/// caps.
+fn graph_to_flow_within_caps(document: &MobpackDocument) -> Result<Value, String> {
+    refuse_graph_past_structure_caps(document)?;
+    Ok(graph_to_flow_from_document(document))
 }
 
 fn compile_editor_flow(steps: &[Value], members: &[&Value]) -> RenderedFlow {
@@ -18268,28 +19657,56 @@ fn string_vec(value: Option<&Value>) -> Vec<String> {
     }
 }
 
-fn skill_source_from_realms(skill_id: &str, realms: &Value) -> Option<Value> {
-    for realm in realms.as_array()? {
-        for skill in realm.get("skills").and_then(Value::as_array)? {
-            if skill.get("id").and_then(Value::as_str).map(str::trim) == Some(skill_id) {
-                let mut source = skill.clone();
-                if let Some(map) = source.as_object_mut() {
-                    if !map.contains_key("realm_id")
-                        && let Some(realm_id) = realm.get("id").and_then(Value::as_str)
-                    {
-                        map.insert("realm_id".to_string(), json!(realm_id));
-                    }
-                    if !map.contains_key("realm_source")
-                        && let Some(realm_source) = realm.get("source").and_then(Value::as_str)
-                    {
-                        map.insert("realm_source".to_string(), json!(realm_source));
-                    }
+/// A realm skill's trimmed id, read as one unit of work.
+fn realm_skill_id(skill: &Value) -> Option<&str> {
+    count_mobpack_work();
+    skill.get("id").and_then(Value::as_str).map(str::trim)
+}
+
+/// The skills of a document's realms by id, indexed once: for each id the
+/// first skill with it, in realm order, with its realm. A realm without a
+/// skills array ends the realms looked in. Each selected skill used to scan
+/// the realms again.
+struct RealmSkills<'a> {
+    skills: BTreeMap<&'a str, (&'a Value, &'a Value)>,
+}
+
+impl<'a> RealmSkills<'a> {
+    fn of(realms: &'a Value) -> Self {
+        let mut skills = BTreeMap::new();
+        for realm in realms.as_array().into_iter().flatten() {
+            let Some(realm_skills) = realm.get("skills").and_then(Value::as_array) else {
+                break;
+            };
+            for skill in realm_skills {
+                if let Some(id) = realm_skill_id(skill) {
+                    skills.entry(id).or_insert((realm, skill));
                 }
-                return Some(source);
             }
         }
+        Self { skills }
     }
-    None
+
+    /// The source of the skill with an id: the skill, naming its realm's id
+    /// and source unless it names its own.
+    fn source(&self, skill_id: &str) -> Option<Value> {
+        count_mobpack_work();
+        let (realm, skill) = self.skills.get(skill_id)?;
+        let mut source = Value::clone(skill);
+        if let Some(map) = source.as_object_mut() {
+            if !map.contains_key("realm_id")
+                && let Some(realm_id) = realm.get("id").and_then(Value::as_str)
+            {
+                map.insert("realm_id".to_string(), json!(realm_id));
+            }
+            if !map.contains_key("realm_source")
+                && let Some(realm_source) = realm.get("source").and_then(Value::as_str)
+            {
+                map.insert("realm_source".to_string(), json!(realm_source));
+            }
+        }
+        Some(source)
+    }
 }
 
 fn editor_tool_config(value: Option<&Value>) -> RenderedToolConfig {
@@ -18564,7 +19981,8 @@ fn emit_json_toml(lines: &mut RenderedLines, table: &str, value: &Value) {
 }
 
 fn validate_document(document: &MobpackDocument) -> MobpackValidationResult {
-    let mut diagnostics = Vec::new();
+    count_validation();
+    let mut diagnostics = MobpackDiagnostics::default();
     if document.schema_version.trim() != MOBPACK_SCHEMA_VERSION {
         diagnostics.push(MobpackDiagnostic {
             severity: "warning".to_string(),
@@ -18584,33 +20002,35 @@ fn validate_document(document: &MobpackDocument) -> MobpackValidationResult {
             path: Some("name".to_string()),
         });
     }
-    diagnostics.extend(validate_document_structure_caps(document));
-    diagnostics.extend(validate_removed_budget_split_policies(document));
-    diagnostics.extend(validate_launch_modes(document));
-    diagnostics.extend(validate_deploy_settings(&document.deploy));
-    diagnostics.extend(validate_deploy_runtime_modes(document));
-    diagnostics.extend(validate_editor_schemas(&document.schemas));
-    diagnostics.extend(validate_editor_input_params(&document.flow));
-    diagnostics.extend(validate_editor_flow_step_identities(&document.flow));
-    diagnostics.extend(validate_editor_flow_step_types(&document.flow));
-    diagnostics.extend(validate_editor_flow_step_metadata(&document.flow));
-    diagnostics.extend(validate_editor_adaptive_steps(document));
-    diagnostics.extend(validate_editor_flow_member_roles(document));
-    diagnostics.extend(validate_editor_flow_control_members(document));
-    diagnostics.extend(validate_editor_flow_conditions(&document.flow));
-    diagnostics.extend(validate_graph_projection(document));
-    diagnostics.extend(validate_editor_member_identities(document));
-    diagnostics.extend(validate_member_profile_bindings(document));
-    diagnostics.extend(validate_skill_realms(document));
-    diagnostics.extend(validate_member_catalog_references(document));
-    diagnostics.extend(validate_editor_flow_step_tool_references(document));
-    diagnostics.extend(validate_selected_skill_sources(document));
-    diagnostics.extend(validate_selected_path_skill_files(document));
+    validate_document_structure_caps(document, &mut diagnostics);
+    // A document past a structure cap is refused with the cap: the checks
+    // after the caps do the work the caps exist to bound.
+    if diagnostics.has_error() {
+        return invalid_validation_result(diagnostics);
+    }
+    validate_removed_budget_split_policies(document, &mut diagnostics);
+    validate_launch_modes(document, &mut diagnostics);
+    validate_deploy_settings(&document.deploy, &mut diagnostics);
+    validate_deploy_runtime_modes(document, &mut diagnostics);
+    validate_editor_schemas(&document.schemas, &mut diagnostics);
+    validate_editor_input_params(&document.flow, &mut diagnostics);
+    validate_editor_flow_step_identities(&document.flow, &mut diagnostics);
+    validate_editor_flow_step_types(&document.flow, &mut diagnostics);
+    validate_editor_flow_step_metadata(&document.flow, &mut diagnostics);
+    validate_editor_adaptive_steps(document, &mut diagnostics);
+    validate_editor_flow_member_roles(document, &mut diagnostics);
+    validate_editor_flow_control_members(document, &mut diagnostics);
+    validate_editor_flow_conditions(&document.flow, &mut diagnostics);
+    validate_graph_projection(document, &mut diagnostics);
+    validate_editor_member_identities(document, &mut diagnostics);
+    validate_member_profile_bindings(document, &mut diagnostics);
+    validate_skill_realms(document, &mut diagnostics);
+    validate_member_catalog_references(document, &mut diagnostics);
+    validate_editor_flow_step_tool_references(document, &mut diagnostics);
+    validate_selected_skill_sources(document, &mut diagnostics);
+    validate_selected_path_skill_files(document, &mut diagnostics);
 
-    if diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.severity == "error")
-    {
+    if diagnostics.has_error() {
         return invalid_validation_result(diagnostics);
     }
 
@@ -18640,30 +20060,20 @@ fn validate_document(document: &MobpackDocument) -> MobpackValidationResult {
                         path: diagnostic.location,
                     }),
             );
-            diagnostics.extend(validate_editor_projection_matches_definition(
+            validate_editor_projection_matches_definition(document, &definition, &mut diagnostics);
+            validate_mob_settings_match_definition(document, &definition, &mut diagnostics);
+            validate_editor_flow_members_match_definition(document, &definition, &mut diagnostics);
+            validate_editor_flow_step_metadata_matches_definition(
                 document,
                 &definition,
-            ));
-            diagnostics.extend(validate_mob_settings_match_definition(
-                document,
-                &definition,
-            ));
-            diagnostics.extend(validate_editor_flow_members_match_definition(
-                document,
-                &definition,
-            ));
-            diagnostics.extend(validate_editor_flow_step_metadata_matches_definition(
-                document,
-                &definition,
-            ));
+                &mut diagnostics,
+            );
             if let Err(schema_diagnostics) = expected_schema_files_from_definition(&definition) {
                 diagnostics.extend(schema_diagnostics);
             }
             let flow_ids = definition.flows.keys().map(ToString::to_string).collect();
-            let ok = !diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.severity == "error");
-            let diagnostics = cap_validation_diagnostics(diagnostics);
+            let ok = !diagnostics.has_error();
+            let diagnostics = diagnostics.finish();
             MobpackValidationResult {
                 ok,
                 display_rows: validation_display_rows(ok, &diagnostics, MOBPACK_VALIDATION_SOURCE),
@@ -18690,33 +20100,69 @@ fn validate_document(document: &MobpackDocument) -> MobpackValidationResult {
 /// it the result ends with one `diagnostics_truncated` diagnostic.
 const MOBPACK_MAX_VALIDATION_DIAGNOSTICS: usize = 1000;
 
-fn cap_validation_diagnostics(mut diagnostics: Vec<MobpackDiagnostic>) -> Vec<MobpackDiagnostic> {
-    if diagnostics.len() <= MOBPACK_MAX_VALIDATION_DIAGNOSTICS {
-        return diagnostics;
-    }
-    let dropped = diagnostics.split_off(MOBPACK_MAX_VALIDATION_DIAGNOSTICS);
-    let severity = if dropped
-        .iter()
-        .any(|diagnostic| diagnostic.severity == "error")
-    {
-        "error"
-    } else {
-        "warning"
-    };
-    diagnostics.push(MobpackDiagnostic {
-        severity: severity.to_string(),
-        code: "diagnostics_truncated".to_string(),
-        message: format!(
-            "validation reports at most {MOBPACK_MAX_VALIDATION_DIAGNOSTICS} diagnostics; more \
-             were found and not reported, so fix these and validate again"
-        ),
-        path: None,
-    });
-    diagnostics
+/// The diagnostics of one validation, as its checks find them. It keeps the
+/// first [`MOBPACK_MAX_VALIDATION_DIAGNOSTICS`] and only notes the rest, so a
+/// validation holds at most that many in memory however many problems its
+/// document has. An error past the cap still fails the validation.
+#[derive(Default)]
+struct MobpackDiagnostics {
+    kept: Vec<MobpackDiagnostic>,
+    /// Whether any diagnostic, kept or not, is an error.
+    error: bool,
+    /// Whether a diagnostic past the cap was dropped.
+    truncated: bool,
+    /// Whether a dropped diagnostic was an error.
+    truncated_error: bool,
 }
 
-fn invalid_validation_result(diagnostics: Vec<MobpackDiagnostic>) -> MobpackValidationResult {
-    let diagnostics = cap_validation_diagnostics(diagnostics);
+impl MobpackDiagnostics {
+    fn push(&mut self, diagnostic: MobpackDiagnostic) {
+        let error = diagnostic.severity == "error";
+        self.error |= error;
+        if self.kept.len() < MOBPACK_MAX_VALIDATION_DIAGNOSTICS {
+            self.kept.push(diagnostic);
+        } else {
+            self.truncated = true;
+            self.truncated_error |= error;
+        }
+    }
+
+    fn extend(&mut self, diagnostics: impl IntoIterator<Item = MobpackDiagnostic>) {
+        for diagnostic in diagnostics {
+            self.push(diagnostic);
+        }
+    }
+
+    fn has_error(&self) -> bool {
+        self.error
+    }
+
+    /// The kept diagnostics, ending with one `diagnostics_truncated`
+    /// diagnostic when any were dropped: an error when a dropped one was.
+    fn finish(self) -> Vec<MobpackDiagnostic> {
+        let mut diagnostics = self.kept;
+        if self.truncated {
+            diagnostics.push(MobpackDiagnostic {
+                severity: if self.truncated_error {
+                    "error"
+                } else {
+                    "warning"
+                }
+                .to_string(),
+                code: "diagnostics_truncated".to_string(),
+                message: format!(
+                    "validation reports at most {MOBPACK_MAX_VALIDATION_DIAGNOSTICS} diagnostics; \
+                     more were found and not reported, so fix these and validate again"
+                ),
+                path: None,
+            });
+        }
+        diagnostics
+    }
+}
+
+fn invalid_validation_result(diagnostics: MobpackDiagnostics) -> MobpackValidationResult {
+    let diagnostics = diagnostics.finish();
     MobpackValidationResult {
         ok: false,
         display_rows: validation_display_rows(false, &diagnostics, MOBPACK_VALIDATION_SOURCE),
@@ -18770,7 +20216,10 @@ fn validation_display_rows(
     rows
 }
 
-fn validate_removed_budget_split_policies(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_removed_budget_split_policies(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let mut paths = BTreeSet::new();
     collect_removed_budget_split_policy_paths(
         &document.launch_modes,
@@ -18790,24 +20239,27 @@ fn validate_removed_budget_split_policies(document: &MobpackDocument) -> Vec<Mob
             );
         }
     }
-    paths
-        .into_iter()
-        .map(|path| MobpackDiagnostic {
-            severity: "error".to_string(),
-            code: "unsupported_budget_split_policy".to_string(),
-            message: "budget split policies are no longer supported because Meerkat has no enforceable split-policy runtime seam; use explicit per-member budget limits instead"
-                .to_string(),
-            path: Some(path),
-        })
-        .collect()
+    diagnostics.extend(paths.into_iter().map(|path| MobpackDiagnostic {
+        severity: "error".to_string(),
+        code: "unsupported_budget_split_policy".to_string(),
+        message: "budget split policies are no longer supported because Meerkat has no enforceable split-policy runtime seam; use explicit per-member budget limits instead"
+            .to_string(),
+        path: Some(path),
+    }));
 }
 
+/// Collect the paths of removed budget split policies under `value`. Every
+/// one is an error, so past one more than the diagnostic cap the rest would
+/// only be dropped: collecting stops there.
 fn collect_removed_budget_split_policy_paths(
     value: &Value,
     path: &str,
     accepts_budget_alias: bool,
     paths: &mut BTreeSet<String>,
 ) {
+    if paths.len() > MOBPACK_MAX_VALIDATION_DIAGNOSTICS {
+        return;
+    }
     match value {
         Value::Object(object) => {
             for (key, child) in object {
@@ -18839,17 +20291,18 @@ fn collect_removed_budget_split_policy_paths(
     }
 }
 
-fn validate_launch_modes(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_launch_modes(document: &MobpackDocument, diagnostics: &mut MobpackDiagnostics) {
     if document.launch_modes.is_null() {
-        return Vec::new();
+        return;
     }
     let Some(items) = document.launch_modes.as_array() else {
-        return vec![MobpackDiagnostic {
+        diagnostics.push(MobpackDiagnostic {
             severity: "error".to_string(),
             code: "invalid_launch_modes".to_string(),
             message: "document.launch_modes must be an array".to_string(),
             path: Some("launch_modes".to_string()),
-        }];
+        });
+        return;
     };
     let member_ids = editor_member_ids(document);
     let step_ids = editor_flow_member_step_ids(&document.flow);
@@ -18863,7 +20316,6 @@ fn validate_launch_modes(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
     let profile_by_member = editor_profile_by_member_id(document);
     let flow_launch_modes = editor_flow_member_launch_modes(&document.flow);
     let mut launch_step_ids = BTreeSet::new();
-    let mut diagnostics = Vec::new();
     for (index, item) in items.iter().enumerate() {
         let path = format!("launch_modes[{index}].launch_mode");
         let step_id = item
@@ -19076,23 +20528,20 @@ fn validate_launch_modes(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
             });
         }
     }
-    diagnostics
 }
 
-fn validate_editor_flow_step_types(flow: &Value) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_editor_flow_step_types(flow: &Value, diagnostics: &mut MobpackDiagnostics) {
     collect_editor_flow_step_type_diagnostics(
         flow.get("steps").and_then(Value::as_array),
         "flow.steps",
-        &mut diagnostics,
+        diagnostics,
     );
-    diagnostics
 }
 
 fn collect_editor_flow_step_type_diagnostics(
     steps: Option<&Vec<Value>>,
     path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(steps) = steps else {
         return;
@@ -19140,25 +20589,25 @@ fn collect_editor_flow_step_type_diagnostics(
     }
 }
 
-fn validate_editor_flow_step_metadata(flow: &Value) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_editor_flow_step_metadata(flow: &Value, diagnostics: &mut MobpackDiagnostics) {
     collect_editor_flow_step_metadata_diagnostics(
         flow.get("steps").and_then(Value::as_array),
         "flow.steps",
-        &mut diagnostics,
+        diagnostics,
     );
-    diagnostics
 }
 
 /// Adaptive-layer diagnostics. The "empty" gaps (prompt, objectiveClass,
 /// profileTemplateIds) are draft gates: like a member step without an
 /// instruction they keep the document at stage "draft" until filled in.
-fn validate_editor_adaptive_steps(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_editor_adaptive_steps(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let steps = adaptive_flow_steps(&document.flow);
     if steps.is_empty() {
-        return Vec::new();
+        return;
     }
-    let mut diagnostics = Vec::new();
     let member_ids = editor_member_ids(document);
     let schema_ids = editor_schema_map(&document.schemas);
     for (index, (path, step)) in steps.iter().enumerate() {
@@ -19308,13 +20757,12 @@ fn validate_editor_adaptive_steps(document: &MobpackDocument) -> Vec<MobpackDiag
             }
         }
     }
-    diagnostics
 }
 
 fn collect_editor_flow_step_metadata_diagnostics(
     steps: Option<&Vec<Value>>,
     path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(steps) = steps else {
         return;
@@ -19405,7 +20853,7 @@ fn collect_editor_flow_step_metadata_diagnostics(
 fn validate_required_parallel_dispatch_field(
     step: &Value,
     step_path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(value) = step
         .get("dispatch")
@@ -19446,7 +20894,7 @@ fn validate_required_parallel_dispatch_field(
 fn validate_required_parallel_collection_field(
     step: &Value,
     step_path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     if step
         .get("collection")
@@ -19468,7 +20916,7 @@ fn validate_required_parallel_collection_field(
 fn validate_required_repeat_loop_id_field(
     step: &Value,
     step_path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     if step_string(step, "loopId").is_some() {
         return;
@@ -19484,7 +20932,7 @@ fn validate_required_repeat_loop_id_field(
 fn validate_required_repeat_max_iterations_field(
     step: &Value,
     step_path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(value) = step
         .get("maxIterations")
@@ -19518,7 +20966,7 @@ fn validate_optional_enum_field(
     code: &str,
     label: &str,
     path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(value) = object.get(camel_key).or_else(|| object.get(snake_key)) else {
         return;
@@ -19556,7 +21004,7 @@ fn validate_optional_positive_integer_field(
     code: &str,
     label: &str,
     path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(value) = object.get(camel_key).or_else(|| object.get(snake_key)) else {
         return;
@@ -19578,7 +21026,7 @@ fn validate_optional_positive_integer_field(
 fn validate_collection_policy_field(
     step: &Value,
     step_path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(value) = step
         .get("collection")
@@ -19629,35 +21077,34 @@ fn validate_collection_policy_field(
     }
 }
 
-fn validate_editor_flow_member_roles(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_editor_flow_member_roles(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let member_ids = editor_member_ids(document);
     collect_editor_flow_member_role_diagnostics(
         document.flow.get("steps").and_then(Value::as_array),
         "flow.steps",
         &member_ids,
-        &mut diagnostics,
+        diagnostics,
     );
-    diagnostics
 }
 
-fn validate_editor_flow_step_identities(flow: &Value) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_editor_flow_step_identities(flow: &Value, diagnostics: &mut MobpackDiagnostics) {
     let mut seen = BTreeSet::new();
     collect_editor_flow_step_identity_diagnostics(
         flow.get("steps").and_then(Value::as_array),
         "flow.steps",
         &mut seen,
-        &mut diagnostics,
+        diagnostics,
     );
-    diagnostics
 }
 
 fn collect_editor_flow_step_identity_diagnostics(
     steps: Option<&Vec<Value>>,
     path: &str,
     seen: &mut BTreeSet<String>,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(steps) = steps else {
         return;
@@ -19715,7 +21162,7 @@ fn collect_editor_flow_member_role_diagnostics(
     steps: Option<&Vec<Value>>,
     path: &str,
     member_ids: &BTreeSet<String>,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(steps) = steps else {
         return;
@@ -19784,23 +21231,24 @@ fn collect_editor_flow_member_role_diagnostics(
     }
 }
 
-fn validate_editor_flow_control_members(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_editor_flow_control_members(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let member_ids = editor_member_ids(document);
     collect_editor_flow_control_member_diagnostics(
         document.flow.get("steps").and_then(Value::as_array),
         "flow.steps",
         &member_ids,
-        &mut diagnostics,
+        diagnostics,
     );
-    diagnostics
 }
 
 fn collect_editor_flow_control_member_diagnostics(
     steps: Option<&Vec<Value>>,
     path: &str,
     member_ids: &BTreeSet<String>,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(steps) = steps else {
         return;
@@ -19906,23 +21354,21 @@ fn editor_branch_requires_join_member(step: &Value) -> bool {
     branch_count + usize::from(has_fallback) > 1
 }
 
-fn validate_editor_flow_conditions(flow: &Value) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_editor_flow_conditions(flow: &Value, diagnostics: &mut MobpackDiagnostics) {
     let input_params = editor_input_param_names(flow);
     collect_editor_flow_condition_diagnostics(
         flow.get("steps").and_then(Value::as_array),
         "flow.steps",
         &input_params,
-        &mut diagnostics,
+        diagnostics,
     );
-    diagnostics
 }
 
 fn collect_editor_flow_condition_diagnostics(
     steps: Option<&Vec<Value>>,
     path: &str,
     input_params: &BTreeSet<String>,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(steps) = steps else {
         return;
@@ -20094,7 +21540,7 @@ fn validate_required_repeat_condition_fields(
     step: &Value,
     step_path: &str,
     input_params: &BTreeSet<String>,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(cond) = step.get("cond").and_then(Value::as_object) else {
         diagnostics.push(MobpackDiagnostic {
@@ -20164,7 +21610,7 @@ fn validate_editor_param_ref(
     field: &str,
     input_params: &BTreeSet<String>,
     path: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let field = field.trim();
     if field.is_empty() || !input_params.contains(field) {
@@ -20196,19 +21642,19 @@ fn editor_condition_operator_supported(op: &str) -> bool {
     matches!(op, "==" | ">" | "<")
 }
 
-fn validate_deploy_settings(deploy: &Value) -> Vec<MobpackDiagnostic> {
+fn validate_deploy_settings(deploy: &Value, diagnostics: &mut MobpackDiagnostics) {
     if deploy.is_null() {
-        return Vec::new();
+        return;
     }
     let Some(object) = deploy.as_object() else {
-        return vec![MobpackDiagnostic {
+        diagnostics.push(MobpackDiagnostic {
             severity: "error".to_string(),
             code: "invalid_deploy_settings".to_string(),
             message: "document.deploy must be an object".to_string(),
             path: Some("deploy".to_string()),
-        }];
+        });
+        return;
     };
-    let mut diagnostics = Vec::new();
     if let Some(command) = object
         .get("command")
         .and_then(Value::as_str)
@@ -20228,21 +21674,21 @@ fn validate_deploy_settings(deploy: &Value) -> Vec<MobpackDiagnostic> {
         "surface",
         &["cli", "rpc"],
         "invalid_deploy_surface",
-        &mut diagnostics,
+        diagnostics,
     );
     validate_deploy_string_enum(
         object,
         "trust_policy",
         &["permissive", "strict"],
         "invalid_deploy_trust_policy",
-        &mut diagnostics,
+        diagnostics,
     );
     validate_deploy_string_enum(
         object,
         "realm_backend",
         &["jsonl", "sqlite"],
         "invalid_deploy_realm_backend",
-        &mut diagnostics,
+        diagnostics,
     );
     if let Some(model) = object
         .get("model")
@@ -20263,8 +21709,8 @@ fn validate_deploy_settings(deploy: &Value) -> Vec<MobpackDiagnostic> {
             });
         }
     }
-    validate_deploy_non_negative_number(object, "max_total_tokens", &mut diagnostics);
-    validate_deploy_non_negative_number(object, "max_tool_calls", &mut diagnostics);
+    validate_deploy_non_negative_number(object, "max_total_tokens", diagnostics);
+    validate_deploy_non_negative_number(object, "max_tool_calls", diagnostics);
     // `rkat mob run` (meerkat 0.7) carries no model/token/tool-call/surface
     // override flags — runtime budgets and model are pack-policy concerns.
     // Surface an explicit warning instead of silently dropping overrides
@@ -20346,10 +21792,9 @@ fn validate_deploy_settings(deploy: &Value) -> Vec<MobpackDiagnostic> {
             }),
         }
     }
-    diagnostics
 }
 
-fn validate_deploy_runtime_modes(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_deploy_runtime_modes(document: &MobpackDocument, diagnostics: &mut MobpackDiagnostics) {
     let deploy_surface = document
         .deploy
         .get("surface")
@@ -20358,9 +21803,8 @@ fn validate_deploy_runtime_modes(document: &MobpackDocument) -> Vec<MobpackDiagn
         .filter(|value| !value.is_empty())
         .unwrap_or("cli");
     let Some(members) = document.members.as_array() else {
-        return Vec::new();
+        return;
     };
-    let mut diagnostics = Vec::new();
     for (member_index, member) in members.iter().enumerate() {
         let runtime_mode = member
             .get("runtimeMode")
@@ -20402,7 +21846,6 @@ fn validate_deploy_runtime_modes(document: &MobpackDocument) -> Vec<MobpackDiagn
             });
         }
     }
-    diagnostics
 }
 
 fn deploy_runtime_mode_compatibility() -> Value {
@@ -20458,20 +21901,20 @@ fn runtime_mode_labels() -> Value {
     })
 }
 
-fn validate_editor_schemas(schemas: &Value) -> Vec<MobpackDiagnostic> {
+fn validate_editor_schemas(schemas: &Value, diagnostics: &mut MobpackDiagnostics) {
     if schemas.is_null() {
-        return Vec::new();
+        return;
     }
     let Some(items) = schemas.as_array() else {
-        return vec![MobpackDiagnostic {
+        diagnostics.push(MobpackDiagnostic {
             severity: "error".to_string(),
             code: "invalid_editor_schemas".to_string(),
             message: "document.schemas must be an array".to_string(),
             path: Some("schemas".to_string()),
-        }];
+        });
+        return;
     };
 
-    let mut diagnostics = Vec::new();
     let mut schema_ids = BTreeSet::new();
     for (schema_index, schema) in items.iter().enumerate() {
         let schema_path = format!("schemas[{schema_index}]");
@@ -20595,13 +22038,11 @@ fn validate_editor_schemas(schemas: &Value) -> Vec<MobpackDiagnostic> {
             }
         }
     }
-    diagnostics
 }
 
-fn validate_editor_input_params(flow: &Value) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_editor_input_params(flow: &Value, diagnostics: &mut MobpackDiagnostics) {
     let Some(steps) = flow.get("steps").and_then(Value::as_array) else {
-        return diagnostics;
+        return;
     };
     for (step_index, step) in steps.iter().enumerate() {
         if step.get("type").and_then(Value::as_str) != Some("input") {
@@ -20688,12 +22129,16 @@ fn validate_editor_input_params(flow: &Value) -> Vec<MobpackDiagnostic> {
             }
         }
     }
-    diagnostics
 }
 
-fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_graph_projection(document: &MobpackDocument, diagnostics: &mut MobpackDiagnostics) {
     if document.instances.is_null() && document.edges.is_null() && document.frames.is_null() {
-        return Vec::new();
+        return;
+    }
+    // `validate_document_structure_caps` refuses a graph past the caps, and
+    // nothing reads it further.
+    if !graph_structure_refusals(document).is_empty() {
+        return;
     }
     // Advanced-mode graphs carry the user's plain nodes and edges without
     // materialized fan-out/join gates or frames. When re-deriving the flow
@@ -20706,7 +22151,6 @@ fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnosti
     // them.
     let graph_derives_flow =
         document.flow.is_object() && graph_to_flow_from_document(document) == document.flow;
-    let mut diagnostics = Vec::new();
     let Some(instances) = document.instances.as_array() else {
         if !document.instances.is_null() {
             diagnostics.push(MobpackDiagnostic {
@@ -20716,7 +22160,7 @@ fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnosti
                 path: Some("instances".to_string()),
             });
         }
-        return diagnostics;
+        return;
     };
     let edges = match document.edges.as_array() {
         Some(edges) => edges,
@@ -20729,7 +22173,7 @@ fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnosti
                     path: Some("edges".to_string()),
                 });
             }
-            return diagnostics;
+            return;
         }
     };
     let flow_members = editor_flow_member_step_roles(&document.flow);
@@ -20805,12 +22249,12 @@ fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnosti
                 if gate_kind == "fork"
                     && let Some(expected) = graph_controls.fork_controls.get(id)
                 {
-                    validate_graph_fork_control(instance, &path, expected, &mut diagnostics);
+                    validate_graph_fork_control(instance, &path, expected, diagnostics);
                 }
                 if gate_kind == "join"
                     && let Some(expected) = graph_controls.join_controls.get(id)
                 {
-                    validate_graph_join_control(instance, &path, expected, &mut diagnostics);
+                    validate_graph_join_control(instance, &path, expected, diagnostics);
                 }
             }
             continue;
@@ -20893,20 +22337,10 @@ fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnosti
         }
         if !graph_derives_flow {
             if let Some(expected_metadata) = flow_member_metadata.get(id) {
-                validate_graph_member_metadata(
-                    instance,
-                    &path,
-                    expected_metadata,
-                    &mut diagnostics,
-                );
+                validate_graph_member_metadata(instance, &path, expected_metadata, diagnostics);
             }
             if let Some(expected_launch) = flow_launch_modes.get(id) {
-                validate_graph_member_launch_mode(
-                    instance,
-                    &path,
-                    expected_launch,
-                    &mut diagnostics,
-                );
+                validate_graph_member_launch_mode(instance, &path, expected_launch, diagnostics);
             }
         }
     }
@@ -21049,7 +22483,7 @@ fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnosti
                         parts[1],
                         &input_params,
                         &format!("{path}.cond.var"),
-                        &mut diagnostics,
+                        diagnostics,
                     );
                 } else if parts.len() != 3 || parts[0] != "steps" {
                     diagnostics.push(MobpackDiagnostic {
@@ -21108,7 +22542,7 @@ fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnosti
         }
     }
     if !graph_derives_flow {
-        validate_expected_graph_edges(edges, &graph_controls.expected_edges, &mut diagnostics);
+        validate_expected_graph_edges(edges, &graph_controls.expected_edges, diagnostics);
     }
 
     let mut frame_ids = BTreeSet::new();
@@ -21180,8 +22614,6 @@ fn validate_graph_projection(document: &MobpackDocument) -> Vec<MobpackDiagnosti
             }
         }
     }
-
-    diagnostics
 }
 
 #[derive(Debug, Default)]
@@ -21498,7 +22930,7 @@ fn graph_step_id(step: &Value) -> String {
 fn validate_expected_graph_edges(
     edges: &[Value],
     expected_edges: &[EditorGraphExpectedEdge],
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let actual = edges
         .iter()
@@ -21602,7 +23034,7 @@ fn validate_graph_fork_control(
     instance: &Value,
     path: &str,
     expected: &EditorGraphForkControl,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let actual_dispatch = graph_dispatch_mode_from_value(
         instance
@@ -21636,7 +23068,7 @@ fn validate_graph_join_control(
     instance: &Value,
     path: &str,
     expected: &EditorGraphJoinControl,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let actual_collection = graph_join_collection(instance);
     if actual_collection != expected.collection {
@@ -21728,7 +23160,7 @@ fn validate_graph_member_metadata(
     instance: &Value,
     path: &str,
     expected: &EditorGraphMemberMetadata,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let actual = editor_graph_member_metadata(instance);
     if actual.timeout_ms != expected.timeout_ms {
@@ -21829,7 +23261,7 @@ fn validate_graph_member_launch_mode(
     instance: &Value,
     path: &str,
     expected: &EditorGraphLaunchMode,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let actual = editor_graph_launch_mode(
         instance
@@ -21910,7 +23342,7 @@ fn validate_deploy_string_enum(
     key: &str,
     allowed: &[&str],
     code: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     if let Some(value) = object.get(key) {
         let Some(text) = value
@@ -21945,7 +23377,7 @@ fn validate_deploy_string_enum(
 fn validate_deploy_non_negative_number(
     object: &serde_json::Map<String, Value>,
     key: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(value) = object.get(key) else {
         return;
@@ -22287,9 +23719,12 @@ fn collect_editor_flow_member_step_roles(steps: &[Value], roles: &mut BTreeMap<S
     }
 }
 
-fn validate_member_catalog_references(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_member_catalog_references(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let Some(members) = document.members.as_array() else {
-        return Vec::new();
+        return;
     };
     let tool_ids = tool_catalog_response()
         .into_iter()
@@ -22307,16 +23742,8 @@ fn validate_member_catalog_references(document: &MobpackDocument) -> Vec<Mobpack
         .iter()
         .map(|entry| entry.id.to_string())
         .collect::<BTreeSet<_>>();
-    let mut diagnostics = Vec::new();
 
-    // Past the report cap more diagnostics are dropped anyway; stop building
-    // them (one per reference in a document of many references).
-    let full =
-        |diagnostics: &[MobpackDiagnostic]| diagnostics.len() > MOBPACK_MAX_VALIDATION_DIAGNOSTICS;
     for (member_index, member) in members.iter().enumerate() {
-        if full(&diagnostics) {
-            break;
-        }
         if let Some(model) = member.get("model").filter(|value| !value.is_null()) {
             match model.as_str().map(str::trim) {
                 Some("") => {}
@@ -22345,9 +23772,6 @@ fn validate_member_catalog_references(document: &MobpackDocument) -> Vec<Mobpack
 
         if let Some(tools) = member.get("tools").and_then(Value::as_array) {
             for (tool_index, tool) in tools.iter().enumerate() {
-                if full(&diagnostics) {
-                    break;
-                }
                 let Some(tool_id) = tool
                     .as_str()
                     .map(str::trim)
@@ -22376,9 +23800,6 @@ fn validate_member_catalog_references(document: &MobpackDocument) -> Vec<Mobpack
 
         if let Some(skills) = member.get("skills").and_then(Value::as_array) {
             for (skill_index, skill) in skills.iter().enumerate() {
-                if full(&diagnostics) {
-                    break;
-                }
                 let Some(skill_id) = skill
                     .as_str()
                     .map(str::trim)
@@ -22455,15 +23876,15 @@ fn validate_member_catalog_references(document: &MobpackDocument) -> Vec<Mobpack
             }
         }
     }
-
-    diagnostics
 }
 
-fn validate_editor_member_identities(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_editor_member_identities(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let Some(members) = document.members.as_array() else {
-        return Vec::new();
+        return;
     };
-    let mut diagnostics = Vec::new();
     let mut seen = BTreeSet::new();
     for (member_index, member) in members.iter().enumerate() {
         let Some(member_id) = member
@@ -22489,14 +23910,15 @@ fn validate_editor_member_identities(document: &MobpackDocument) -> Vec<MobpackD
             });
         }
     }
-    diagnostics
 }
 
-fn validate_member_profile_bindings(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_member_profile_bindings(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let Some(members) = document.members.as_array() else {
-        return Vec::new();
+        return;
     };
-    let mut diagnostics = Vec::new();
     for (member_index, member) in members.iter().enumerate() {
         let binding_value = member
             .get("profileBinding")
@@ -22596,23 +24018,22 @@ fn validate_member_profile_bindings(document: &MobpackDocument) -> Vec<MobpackDi
             });
         }
     }
-    diagnostics
 }
 
-fn validate_skill_realms(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_skill_realms(document: &MobpackDocument, diagnostics: &mut MobpackDiagnostics) {
     if document.skill_realms.is_null() {
-        return Vec::new();
+        return;
     }
     let Some(realms) = document.skill_realms.as_array() else {
-        return vec![MobpackDiagnostic {
+        diagnostics.push(MobpackDiagnostic {
             severity: "error".to_string(),
             code: "invalid_skill_realms".to_string(),
             message: "document.skill_realms must be an array".to_string(),
             path: Some("skill_realms".to_string()),
-        }];
+        });
+        return;
     };
 
-    let mut diagnostics = Vec::new();
     let mut seen_skill_ids = BTreeMap::<String, String>::new();
     for (realm_index, realm) in realms.iter().enumerate() {
         let realm_path = format!("skill_realms[{realm_index}]");
@@ -22720,7 +24141,6 @@ fn validate_skill_realms(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
             }
         }
     }
-    diagnostics
 }
 
 fn is_starter_skill_marker(value: &str) -> bool {
@@ -22737,8 +24157,10 @@ fn is_starter_provenance_diagnostic(code: &str) -> bool {
     )
 }
 
-fn validate_selected_skill_sources(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_selected_skill_sources(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     for (skill_id, source) in selected_skill_sources(document) {
         let source_path = format!("skill_realms.skills[{skill_id}].source");
         let source_kind = match source.get("source") {
@@ -22790,11 +24212,12 @@ fn validate_selected_skill_sources(document: &MobpackDocument) -> Vec<MobpackDia
             }),
         }
     }
-    diagnostics
 }
 
-fn validate_selected_path_skill_files(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
-    let mut diagnostics = Vec::new();
+fn validate_selected_path_skill_files(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     // A digest per archive path is enough to find conflicting content, so
     // validation keeps a digest, not a second copy of each skill's bytes.
     // (`selected_skill_sources` still clones each selected source once; the
@@ -22838,7 +24261,9 @@ fn validate_selected_path_skill_files(document: &MobpackDocument) -> Vec<Mobpack
             {
                 continue;
             }
-            match read_path_skill_file(path) {
+            match path_skill_host_path(&source, path)
+                .and_then(|host_path| read_path_skill_file(&host_path))
+            {
                 Ok(bytes) => Sha256::digest(&bytes).into(),
                 Err(PathSkillReadError::OverBudget) => {
                     diagnostics.push(MobpackDiagnostic {
@@ -22880,6 +24305,24 @@ fn validate_selected_path_skill_files(document: &MobpackDocument) -> Vec<Mobpack
                     });
                     continue;
                 }
+                Err(PathSkillReadError::LeavesRealm) => {
+                    diagnostics.push(MobpackDiagnostic {
+                        severity: "error".to_string(),
+                        code: "selected_skill_path_leaves_realm".to_string(),
+                        message: path_skill_leaves_realm(&skill_id, path),
+                        path: Some(format!("skill_realms.skills[{skill_id}].path")),
+                    });
+                    continue;
+                }
+                Err(PathSkillReadError::RealmNotListed(realm_id)) => {
+                    diagnostics.push(MobpackDiagnostic {
+                        severity: "error".to_string(),
+                        code: "selected_skill_realm_not_listed".to_string(),
+                        message: path_skill_realm_not_listed(&skill_id, &realm_id),
+                        path: Some(format!("skill_realms.skills[{skill_id}].realm_id")),
+                    });
+                    continue;
+                }
             }
         };
         if let Some(existing) = archive_paths.get(&archive_path) {
@@ -22897,10 +24340,12 @@ fn validate_selected_path_skill_files(document: &MobpackDocument) -> Vec<Mobpack
             archive_paths.insert(archive_path, digest);
         }
     }
-    diagnostics
 }
 
-fn validate_editor_flow_step_tool_references(document: &MobpackDocument) -> Vec<MobpackDiagnostic> {
+fn validate_editor_flow_step_tool_references(
+    document: &MobpackDocument,
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let tool_ids = tool_catalog_response()
         .into_iter()
         .filter_map(|tool| {
@@ -22910,15 +24355,13 @@ fn validate_editor_flow_step_tool_references(document: &MobpackDocument) -> Vec<
         })
         .collect::<BTreeSet<_>>();
     let member_tools = editor_member_tools_by_id(document);
-    let mut diagnostics = Vec::new();
     collect_editor_flow_step_tool_reference_diagnostics(
         document.flow.get("steps").and_then(Value::as_array),
         "flow.steps",
         &tool_ids,
         &member_tools,
-        &mut diagnostics,
+        diagnostics,
     );
-    diagnostics
 }
 
 fn editor_member_tools_by_id(document: &MobpackDocument) -> BTreeMap<String, BTreeSet<String>> {
@@ -22944,7 +24387,7 @@ fn collect_editor_flow_step_tool_reference_diagnostics(
     path: &str,
     tool_ids: &BTreeSet<String>,
     member_tools: &BTreeMap<String, BTreeSet<String>>,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(steps) = steps else {
         return;
@@ -23013,7 +24456,7 @@ fn validate_editor_flow_step_tool_list(
     tool_ids: &BTreeSet<String>,
     member_tools: &BTreeMap<String, BTreeSet<String>>,
     require_member_tool: bool,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     match value {
         Value::Array(items) => {
@@ -23078,7 +24521,7 @@ fn validate_editor_flow_step_tool_ref(
     tool_ids: &BTreeSet<String>,
     member_tools: &BTreeMap<String, BTreeSet<String>>,
     require_member_tool: bool,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     if !tool_ids.contains(tool_id) {
         diagnostics.push(MobpackDiagnostic {
@@ -23148,27 +24591,29 @@ fn editor_max_inline_peer_notifications(member: &Value) -> Option<i32> {
 fn validate_mob_settings_match_definition(
     document: &MobpackDocument,
     definition: &MobDefinition,
-) -> Vec<MobpackDiagnostic> {
+    diagnostics: &mut MobpackDiagnostics,
+) {
     if document.mob_settings.is_null() {
-        return Vec::new();
+        return;
     }
     let Some(settings) = document.mob_settings.as_object() else {
-        return vec![MobpackDiagnostic {
+        diagnostics.push(MobpackDiagnostic {
             severity: "error".to_string(),
             code: "invalid_mob_settings".to_string(),
             message: "mob_settings must be an object".to_string(),
             path: Some("mob_settings".to_string()),
-        }];
+        });
+        return;
     };
-    let mut diagnostics = Vec::new();
     let expected = mob_settings_from_definition(definition);
     let Some(expected) = expected.as_object() else {
-        return vec![MobpackDiagnostic {
+        diagnostics.push(MobpackDiagnostic {
             severity: "error".to_string(),
             code: "invalid_mob_settings".to_string(),
             message: "mob settings derived from mob.toml must be an object".to_string(),
             path: Some("mob_settings".to_string()),
-        }];
+        });
+        return;
     };
 
     compare_mob_setting_string(
@@ -23176,28 +24621,28 @@ fn validate_mob_settings_match_definition(
         expected,
         "orchestrator",
         "editor_mob_orchestrator_mismatch",
-        &mut diagnostics,
+        diagnostics,
     );
     compare_mob_setting_bool(
         settings,
         expected,
         "autoWireOrchestrator",
         "editor_mob_auto_wire_mismatch",
-        &mut diagnostics,
+        diagnostics,
     );
     compare_mob_setting_string(
         settings,
         expected,
         "backendDefault",
         "editor_mob_backend_default_mismatch",
-        &mut diagnostics,
+        diagnostics,
     );
     compare_mob_setting_string(
         settings,
         expected,
         "externalAddressBase",
         "editor_mob_external_address_base_mismatch",
-        &mut diagnostics,
+        diagnostics,
     );
     let editor_wiring = normalized_role_wiring(settings.get("roleWiring"));
     let definition_wiring = normalized_role_wiring(expected.get("roleWiring"));
@@ -23209,14 +24654,13 @@ fn validate_mob_settings_match_definition(
             path: Some("mob_settings.roleWiring".to_string()),
         });
     }
-    compare_advanced_mob_settings(settings, expected, &mut diagnostics);
-    diagnostics
+    compare_advanced_mob_settings(settings, expected, diagnostics);
 }
 
 fn compare_advanced_mob_settings(
     settings: &serde_json::Map<String, Value>,
     expected: &serde_json::Map<String, Value>,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let actual_advanced = match settings.get("advanced").filter(|value| !value.is_null()) {
         Some(value) => match value.as_object() {
@@ -23280,7 +24724,7 @@ fn compare_mob_setting_string(
     expected: &serde_json::Map<String, Value>,
     key: &str,
     code: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(value) = settings.get(key).filter(|value| !value.is_null()) else {
         return;
@@ -23313,7 +24757,7 @@ fn compare_mob_setting_bool(
     expected: &serde_json::Map<String, Value>,
     key: &str,
     code: &str,
-    diagnostics: &mut Vec<MobpackDiagnostic>,
+    diagnostics: &mut MobpackDiagnostics,
 ) {
     let Some(value) = settings.get(key).filter(|value| !value.is_null()) else {
         return;
@@ -23359,9 +24803,10 @@ fn normalized_role_wiring(value: Option<&Value>) -> Option<Vec<(String, String)>
 fn validate_editor_projection_matches_definition(
     document: &MobpackDocument,
     definition: &MobDefinition,
-) -> Vec<MobpackDiagnostic> {
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let Some(members) = document.members.as_array() else {
-        return Vec::new();
+        return;
     };
     let schemas = editor_schema_map(&document.schemas);
     let profiles = definition
@@ -23369,7 +24814,6 @@ fn validate_editor_projection_matches_definition(
         .iter()
         .map(|(name, binding)| (name.to_string(), binding))
         .collect::<BTreeMap<_, _>>();
-    let mut diagnostics = Vec::new();
     let mut seen_profiles = BTreeSet::new();
 
     for (member_index, member) in members.iter().enumerate() {
@@ -23590,14 +25034,13 @@ fn validate_editor_projection_matches_definition(
             (None, None) => {}
         }
     }
-
-    diagnostics
 }
 
 fn validate_editor_flow_members_match_definition(
     document: &MobpackDocument,
     definition: &MobDefinition,
-) -> Vec<MobpackDiagnostic> {
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let profile_by_member = editor_profile_by_member_id(document);
     let mut expected = BTreeMap::<(String, String), usize>::new();
     collect_editor_flow_member_turns(
@@ -23606,11 +25049,10 @@ fn validate_editor_flow_members_match_definition(
         &mut expected,
     );
     if expected.is_empty() {
-        return Vec::new();
+        return;
     }
 
     let actual = definition_flow_step_turns(document, definition);
-    let mut diagnostics = Vec::new();
     for ((profile, message), expected_count) in expected {
         let actual_count = actual
             .get(&(profile.clone(), message.clone()))
@@ -23627,7 +25069,6 @@ fn validate_editor_flow_members_match_definition(
             });
         }
     }
-    diagnostics
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -23645,7 +25086,8 @@ struct FlowStepMetadataKey {
 fn validate_editor_flow_step_metadata_matches_definition(
     document: &MobpackDocument,
     definition: &MobDefinition,
-) -> Vec<MobpackDiagnostic> {
+    diagnostics: &mut MobpackDiagnostics,
+) {
     let profile_by_member = editor_profile_by_member_id(document);
     // meerkat 0.7 parses an omitted step `output_format` as `None` and
     // resolves it schema-aware (`FlowStepSpec::effective_output_format`:
@@ -23662,10 +25104,9 @@ fn validate_editor_flow_step_metadata_matches_definition(
         &mut expected,
     );
     if expected.is_empty() {
-        return Vec::new();
+        return;
     }
     let actual = definition_flow_step_metadata(document, definition);
-    let mut diagnostics = Vec::new();
     for (key, expected_count) in expected {
         let actual_count = actual.get(&key).copied().unwrap_or_default();
         if actual_count < expected_count {
@@ -23680,7 +25121,6 @@ fn validate_editor_flow_step_metadata_matches_definition(
             });
         }
     }
-    diagnostics
 }
 
 fn collect_editor_flow_step_metadata(
@@ -30533,12 +31973,19 @@ model = "gpt-5.5"
             "{deployed}"
         );
 
+        // The editor document the draft opens with: `get` re-imports its
+        // archive; the save reply carries the draft as stored.
+        let opened = get_mobpack_draft(&json!({
+            "store_path": store_path,
+            "id": "action_guard"
+        }))
+        .expect("get guarded draft");
         let fresh_params = json!({
             "store_path": store_path,
             "id": "action_guard",
             "expected_revision": 1,
             "expected_etag": "action_guard:1",
-            "document": saved["row"]["document"].clone(),
+            "document": opened["row"]["document"].clone(),
             "output_dir": dir.path().join("fresh-deploy"),
             "prompt": "Reply with exactly OK.",
             "execute": false,
@@ -30586,8 +32033,7 @@ model = "gpt-5.5"
     fn mobpack_draft_registry_defaults_to_durable_state_path() {
         // The layered `$XDG_STATE_HOME`/`$HOME` rules are storage_layout's
         // (tested there); mobpack only appends its feature-owned file name
-        // under the gateway home, falling back to the OS temp directory
-        // when neither root exists.
+        // under the gateway home, and refuses when neither root exists.
         let Ok(path) = default_mobpack_draft_store_path() else {
             // Only an unadopted predecessor home in the ambient environment
             // refuses; that refusal is covered by the storage_predecessor
@@ -30635,8 +32081,9 @@ model = "gpt-5.5"
         assert_eq!(saved["row"]["draft_etag"], json!("registry_draft:1"));
         assert_eq!(saved["row"]["document"]["name"], json!("Registry Draft"));
         assert_eq!(saved["row"]["document_kind"], json!("editor_projection"));
-        assert_eq!(saved["row"]["document_source"], json!("mobpack_archive"));
-        assert_eq!(saved["row"]["document_authority"], json!("artifact"));
+        // Only `get` re-imports the archive; the save reply carries the
+        // draft as stored.
+        assert_eq!(saved["row"]["document_authority"], Value::Null);
         assert_eq!(saved["row"]["stage"], json!("valid"));
         assert_eq!(saved["row"]["artifact"]["kind"], json!("mobpack_archive"));
         assert_eq!(saved["row"]["artifact"]["deployable"], json!(true));
@@ -30662,12 +32109,9 @@ model = "gpt-5.5"
         assert_eq!(listed["rows"][0]["id"], json!("registry_draft"));
         assert_eq!(listed["rows"][0]["revision"], json!(1));
         assert_eq!(listed["rows"][0]["draft_etag"], json!("registry_draft:1"));
-        assert_eq!(
-            listed["rows"][0]["document_source"],
-            json!("mobpack_archive")
-        );
-        assert_eq!(listed["rows"][0]["document_authority"], json!("artifact"));
-        assert_eq!(listed["rows"][0]["artifact"]["deployable"], json!(true));
+        assert_eq!(listed["rows"][0]["document_authority"], Value::Null);
+        // A list carries summaries; the archive comes with the draft.
+        assert_eq!(listed["rows"][0].get("artifact"), None);
 
         let fetched = get_mobpack_draft(&json!({
             "store_path": store_path,
@@ -30809,21 +32253,23 @@ model = "gpt-5.5"
         });
         write_mobpack_draft_store(&store_path, &rows).expect("write stale draft store");
 
+        // A list carries summaries; only `get` returns a draft's document,
+        // re-imported from its archive.
         let listed =
             list_mobpack_drafts(&json!({ "store_path": store_path })).expect("list drafts");
         let listed_row = &listed["rows"][0];
-        assert_eq!(listed_row["document_source"], json!("mobpack_archive"));
-        assert_eq!(listed_row["document_authority"], json!("artifact"));
-        assert_eq!(listed_row["document"]["mob_id"], json!("review-pack"));
-        assert_eq!(listed_row["document"]["name"], json!("Artifact Authority"));
-        assert_eq!(listed_row["validation"]["ok"], json!(true));
-        assert_eq!(listed_row["artifact"]["pack_sha256"], pack_sha256);
+        assert_eq!(listed_row["document_authority"], Value::Null);
+        assert_eq!(
+            (listed_row.get("document"), listed_row.get("artifact")),
+            (None, None)
+        );
 
         let fetched = get_mobpack_draft(&json!({
             "store_path": store_path,
             "id": "artifact_authority"
         }))
         .expect("get draft");
+        assert_eq!(fetched["row"]["artifact"]["pack_sha256"], pack_sha256);
         assert_eq!(fetched["row"]["document_source"], json!("mobpack_archive"));
         assert_eq!(fetched["row"]["document_authority"], json!("artifact"));
         assert_eq!(fetched["row"]["document"]["mob_id"], json!("review-pack"));
@@ -37333,31 +38779,50 @@ branch = "choice"
 
     /// Validation compares a digest per archive path, not a copy of each
     /// skill's bytes, and still reports two selected skills that pack
-    /// different content to one archive path.
+    /// different content to one archive path: two path skills that name one
+    /// archive path, and two filesystem skills, whose paths name host files
+    /// and which pack under their ids, with ids that name one archive file.
     #[test]
     fn validation_reports_different_skill_content_packed_to_one_archive_path() {
-        let mut document = document_with_expected_schema_ref();
-        document.mob_toml = None;
-        document.members.as_array_mut().unwrap()[0]["skills"] = json!(["one", "two"]);
-        document.skill_realms = json!([{
+        let path_realm = json!({
             "id": "local/clash",
             "label": "Clash",
-            "source": "filesystem",
             "skills": [
                 { "id": "one", "label": "One", "source": "path", "path": "skills/same.md", "content": "first" },
                 { "id": "two", "label": "Two", "source": "path", "path": "skills/same.md", "content": "second" }
             ]
-        }]);
+        });
+        let filesystem_realm = json!({
+            "id": "local/clash",
+            "label": "Clash",
+            "source": "filesystem",
+            "skills": [
+                { "id": "same.skill", "label": "One", "source": "path", "path": "one/SKILL.md", "content": "first" },
+                { "id": "same-skill", "label": "Two", "source": "path", "path": "two/SKILL.md", "content": "second" }
+            ]
+        });
+        for realm in [path_realm, filesystem_realm] {
+            let mut document = document_with_expected_schema_ref();
+            document.mob_toml = None;
+            let selected: Vec<Value> = realm["skills"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|skill| skill["id"].clone())
+                .collect();
+            document.members.as_array_mut().unwrap()[0]["skills"] = Value::Array(selected);
+            document.skill_realms = json!([realm]);
 
-        let validation = validate_document(&document);
+            let validation = validate_document(&document);
 
-        assert!(
-            validation
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "selected_skill_archive_path_conflict"),
-            "{validation:#?}"
-        );
+            assert!(
+                validation
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "selected_skill_archive_path_conflict"),
+                "{validation:#?}"
+            );
+        }
     }
 
     /// Every sample and template document is far under the `meta/editor.json`
@@ -37747,6 +39212,2347 @@ branch = "choice"
                     .iter()
                     .any(|diagnostic| diagnostic.code == "rendered_output_too_large")),
             Err(true)
+        );
+    }
+
+    /// Run the test `name` alone in a child process of this test binary with
+    /// `vars` set (`None` removes one), so it runs with an ambient environment
+    /// and a memory high-water mark of its own, and require it to pass.
+    #[cfg(unix)]
+    fn run_test_in_child(name: &str, vars: &[(&str, Option<&std::ffi::OsStr>)]) {
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        child.args([name, "--exact", "--nocapture", "--test-threads", "1"]);
+        for (key, value) in vars {
+            match value {
+                Some(value) => child.env(key, value),
+                None => child.env_remove(key),
+            };
+        }
+        let output = child.output().expect("run the test child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{name} child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Set in the child process of the validation peak memory test.
+    #[cfg(target_os = "linux")]
+    const VALIDATION_PEAK_CHILD: &str = "META_TEST_VALIDATION_PEAK_CHILD";
+
+    /// This process's peak resident set (`VmHWM`), in KiB.
+    #[cfg(target_os = "linux")]
+    fn peak_resident_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("process status")
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok())
+            .expect("VmHWM in the process status")
+    }
+
+    /// Validation holds at most the diagnostic cap while it runs, so its peak
+    /// memory is bounded by the cap, not by how many problems a document has:
+    /// a flow of 100000 steps without an id or a type (two errors each)
+    /// validates within 24 MiB of peak resident memory. It runs in a child
+    /// process, whose high-water mark is its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validation_peak_memory_is_bounded_by_the_diagnostic_cap() {
+        if std::env::var_os(VALIDATION_PEAK_CHILD).is_none() {
+            run_test_in_child(
+                "mobpack::tests::validation_peak_memory_is_bounded_by_the_diagnostic_cap",
+                &[(VALIDATION_PEAK_CHILD, Some(std::ffi::OsStr::new("1")))],
+            );
+            return;
+        }
+        let mut document = valid_document();
+        document.mob_toml = None;
+        // Validate once first, past the diagnostic cap, so the pages of
+        // validation's code are resident before the measurement: they count
+        // toward the resident set, and grow with the code, not the document.
+        document.flow = json!({ "steps": vec![json!({}); 1_000] });
+        let warm = validate_document(&document);
+        assert_eq!(
+            warm.diagnostics.len(),
+            MOBPACK_MAX_VALIDATION_DIAGNOSTICS + 1
+        );
+        document.flow = json!({ "steps": vec![json!({}); 100_000] });
+        // Measure validation alone: reset the high-water mark to the resident
+        // set it starts from, where the kernel allows it.
+        let _ = std::fs::write("/proc/self/clear_refs", "5");
+        let before = peak_resident_kib();
+
+        let validation = validate_document(&document);
+
+        let grown_kib = peak_resident_kib().saturating_sub(before);
+        assert_eq!(
+            (
+                validation.ok,
+                validation.diagnostics.len(),
+                validation
+                    .diagnostics
+                    .last()
+                    .map(|diagnostic| diagnostic.code.clone()),
+                grown_kib < 24 << 10,
+            ),
+            (
+                false,
+                MOBPACK_MAX_VALIDATION_DIAGNOSTICS + 1,
+                Some("diagnostics_truncated".to_string()),
+                true
+            ),
+            "validation grew the peak resident set by {grown_kib} KiB"
+        );
+    }
+
+    /// The member step ids of `steps`, nested steps included.
+    fn member_step_ids(steps: &Value, ids: &mut Vec<String>) {
+        for step in steps.as_array().into_iter().flatten() {
+            if step["type"] == "member" {
+                ids.push(step["id"].as_str().unwrap_or_default().to_string());
+            }
+            member_step_ids(&step["steps"], ids);
+            member_step_ids(&step["fallback"], ids);
+            for branch in step["branches"].as_array().into_iter().flatten() {
+                member_step_ids(&branch["steps"], ids);
+            }
+        }
+    }
+
+    /// Graph-to-flow turns each graph node into at most one step. Lanes of a
+    /// fork that run into one shared chain without a join each copied the
+    /// whole chain (B lanes into a chain of T nodes made B x T steps), and
+    /// instances repeating one id each became a step copying that id's prior
+    /// step: both grew with the references, not with the graph.
+    #[test]
+    fn graph_to_flow_turns_each_graph_node_into_at_most_one_step() {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.members = json!([{ "id": "worker", "name": "Worker" }]);
+        document.flow = json!({ "steps": [{
+            "id": "dup",
+            "type": "member",
+            "role": "worker",
+            "instruction": "i".repeat(4096)
+        }] });
+        let member = |id: String, col: i64, row: i64| json!({ "id": id, "memberId": "worker", "col": col, "row": row });
+        let mut instances =
+            vec![json!({ "id": "g", "isGate": true, "gateKind": "fork", "col": 1 })];
+        let mut edges = Vec::new();
+        for row in 0..3 {
+            instances.push(member(format!("a{row}"), 2, row));
+            edges.push(json!({ "from": "g", "to": format!("a{row}") }));
+            edges.push(json!({ "from": format!("a{row}"), "to": "t1" }));
+        }
+        instances.push(member("t1".to_string(), 3, 0));
+        instances.push(member("t2".to_string(), 4, 0));
+        edges.push(json!({ "from": "t1", "to": "t2" }));
+        instances.extend((0..5).map(|_| member("dup".to_string(), 6, 0)));
+        document.instances = Value::Array(instances);
+        document.edges = Value::Array(edges);
+
+        let flow = graph_to_flow_from_document(&document);
+
+        let mut ids = Vec::new();
+        member_step_ids(&flow["steps"], &mut ids);
+        ids.sort();
+        assert_eq!(ids, ["a0", "a1", "a2", "dup", "t1", "t2"], "{flow:#}");
+    }
+
+    /// One draft store method through the JSON-RPC dispatch that the Flow
+    /// Editor routes and the gateways' RPC reach.
+    fn draft_store_rpc(method: &str, params: Value) -> crate::rpc::JsonRpcResponse {
+        crate::rpc::handle_mobpack_authoring_rpc_with_runtime(method, &params, json!(1), None)
+            .expect("a draft store method")
+    }
+
+    /// A JSON-RPC error's code and data.
+    fn rpc_refusal(response: &crate::rpc::JsonRpcResponse) -> Option<(i64, Option<Value>)> {
+        response
+            .error
+            .as_ref()
+            .map(|error| (error.code, error.data.clone()))
+    }
+
+    /// Set in the child process of a draft store test that needs an ambient
+    /// environment of its own, to the test's scratch directory.
+    #[cfg(unix)]
+    const DRAFT_STORE_CHILD: &str = "META_TEST_DRAFT_STORE_CHILD";
+
+    /// With neither `$XDG_STATE_HOME` nor `$HOME` set (and no
+    /// `META_FLOW_EDITOR_DRAFT_STORE`), the draft store has no location of
+    /// its own. It refuses with a typed `draft_store_unavailable` refusal
+    /// instead of using a predictable file in the shared OS temp directory,
+    /// which another local user could create, link or read first.
+    #[cfg(unix)]
+    #[test]
+    fn draft_store_without_a_state_root_refuses_instead_of_using_the_temp_dir() {
+        let Some(scratch) = std::env::var_os(DRAFT_STORE_CHILD) else {
+            let scratch = tempfile::tempdir().expect("tempdir");
+            run_test_in_child(
+                "mobpack::tests::draft_store_without_a_state_root_refuses_instead_of_using_the_temp_dir",
+                &[
+                    (DRAFT_STORE_CHILD, Some(scratch.path().as_os_str())),
+                    ("TMPDIR", Some(scratch.path().as_os_str())),
+                    ("HOME", None),
+                    ("XDG_STATE_HOME", None),
+                    ("META_FLOW_EDITOR_DRAFT_STORE", None),
+                ],
+            );
+            return;
+        };
+        let created = draft_store_rpc("meta/mobpacks/create", json!({ "name": "No Root" }));
+        let listed = draft_store_rpc("meta/mobpacks/list", json!({}));
+        let written = std::fs::read_dir(&scratch)
+            .expect("scratch directory")
+            .map(|entry| entry.expect("scratch entry").file_name())
+            .collect::<Vec<_>>();
+
+        let unavailable = Some((
+            -32602,
+            Some(json!({
+                "kind": "draft_store_unavailable",
+                "reason": "gateway_home_unavailable"
+            })),
+        ));
+        assert_eq!(
+            (rpc_refusal(&created), rpc_refusal(&listed), written),
+            (unavailable.clone(), unavailable, Vec::new())
+        );
+    }
+
+    /// The draft store's host path is named only to a caller with host
+    /// access. Every reply to any other caller (a Flow Editor HTTP caller
+    /// without the deploy grant or opt-in, or a Rust caller that set no host
+    /// read policy) carries no `store_path` and no path of the store.
+    #[test]
+    fn draft_store_replies_name_the_store_path_only_to_host_callers() {
+        let store = tempfile::tempdir().expect("tempdir");
+        let store_path = store.path().join("drafts.json");
+        let store_text = store.path().to_string_lossy().into_owned();
+        let draft = |extra: Value| {
+            let mut params = json!({ "store_path": store_path, "id": "named" });
+            if let (Some(params), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+                params.extend(extra.clone());
+            }
+            params
+        };
+
+        let replies = with_untrusted_path_skill_reads(None, || {
+            [
+                create_mobpack_draft(&draft(json!({ "name": "Named" }))),
+                save_mobpack_draft(&draft(json!({ "document": valid_document() }))),
+                list_mobpack_drafts(&draft(json!({}))),
+                get_mobpack_draft(&draft(json!({}))),
+                undo_mobpack_draft(&draft(json!({}))),
+                redo_mobpack_draft(&draft(json!({}))),
+                delete_mobpack_draft(&draft(json!({}))),
+            ]
+        });
+        let host_list = with_host_path_skill_reads(|| list_mobpack_drafts(&draft(json!({}))));
+
+        let named = replies
+            .iter()
+            .map(|reply| {
+                let reply = reply.as_ref().expect("draft reply");
+                (
+                    reply.get("store_path").is_some(),
+                    reply.to_string().contains(&store_text),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (named, host_list.expect("host list")["store_path"].clone()),
+            (vec![(false, false); 7], json!(store_path))
+        );
+    }
+
+    /// A draft store failure names the store's host path to the host only.
+    #[test]
+    fn draft_store_errors_name_the_store_path_only_to_host_callers() {
+        let store = tempfile::tempdir().expect("tempdir");
+        let store_path = store.path().join("drafts.json");
+        std::fs::write(&store_path, b"{ not json").expect("corrupt store");
+        let store_text = store.path().to_string_lossy().into_owned();
+        let params = json!({ "store_path": store_path });
+
+        let untrusted = with_untrusted_path_skill_reads(None, || list_mobpack_drafts(&params));
+        let host = with_host_path_skill_reads(|| list_mobpack_drafts(&params));
+
+        assert_eq!(
+            (
+                untrusted
+                    .map_err(|error| (error.contains("draft store"), error.contains(&store_text))),
+                host.map_err(|error| error.contains(&store_text)),
+            ),
+            (Err((true, false)), Err(true))
+        );
+    }
+
+    /// While a predecessor gateway home waits for adoption the draft store
+    /// refuses, and names the homes' host paths to the host only.
+    #[cfg(unix)]
+    #[test]
+    fn draft_store_predecessor_refusal_names_host_paths_only_to_the_host() {
+        let Some(scratch) = std::env::var_os(DRAFT_STORE_CHILD) else {
+            let scratch = tempfile::tempdir().expect("tempdir");
+            let state = scratch.path().join("state");
+            std::fs::create_dir_all(
+                state.join(crate::storage_predecessor::PREDECESSOR_GATEWAY_HOME_DIR_NAME),
+            )
+            .expect("predecessor gateway home");
+            run_test_in_child(
+                "mobpack::tests::draft_store_predecessor_refusal_names_host_paths_only_to_the_host",
+                &[
+                    (DRAFT_STORE_CHILD, Some(scratch.path().as_os_str())),
+                    ("XDG_STATE_HOME", Some(state.as_os_str())),
+                    ("META_FLOW_EDITOR_DRAFT_STORE", None),
+                ],
+            );
+            return;
+        };
+        let scratch_text = std::path::PathBuf::from(scratch)
+            .to_string_lossy()
+            .into_owned();
+
+        let untrusted = draft_store_rpc("meta/mobpacks/list", json!({}));
+        let host = with_host_path_skill_reads(|| list_mobpack_drafts(&json!({})));
+
+        assert_eq!(
+            (
+                untrusted
+                    .error
+                    .map(|error| error.message.contains(&scratch_text)),
+                host.map_err(|error| error.contains(&scratch_text)),
+            ),
+            (Some(false), Err(true))
+        );
+    }
+
+    /// Seed `store_path` with `count` minimal draft rows, as earlier sessions
+    /// left them.
+    fn seed_draft_rows(store_path: &Path, count: usize) {
+        let rows = (0..count)
+            .map(|index| {
+                let id = format!("seed_{index:03}");
+                let row = json!({ "id": id, "name": id, "stage": "draft", "revision": 1 });
+                (id, row)
+            })
+            .collect::<serde_json::Map<_, _>>();
+        std::fs::write(store_path, serde_json::to_vec_pretty(&rows).expect("rows"))
+            .expect("seed the draft store");
+    }
+
+    /// Write `rows` to `store_path`, pretty-printed as the draft store writes
+    /// it, padding `rows[id].trigger` so the file ends 2 KiB under the 64 MiB
+    /// store cap. Returns the padding length.
+    fn seed_draft_store_near_the_byte_cap(store_path: &Path, mut rows: Value, id: &str) -> usize {
+        rows[id]["trigger"] = json!("");
+        let unpadded = serde_json::to_vec_pretty(&rows).expect("rows").len();
+        let padding = (64 << 20) - 2048 - unpadded;
+        rows[id]["trigger"] = json!("t".repeat(padding));
+        std::fs::write(store_path, serde_json::to_vec_pretty(&rows).expect("rows"))
+            .expect("seed the draft store");
+        padding
+    }
+
+    /// The draft store holds at most 256 drafts. A new draft past that,
+    /// created or saved, is refused with a typed `draft_store_full` refusal
+    /// and writes nothing; a save to a draft it holds and a delete still run.
+    #[test]
+    fn a_new_draft_past_the_draft_count_cap_is_refused_typed() {
+        let store = tempfile::tempdir().expect("tempdir");
+        let store_path = store.path().join("drafts.json");
+        seed_draft_rows(&store_path, 256);
+        let seeded = std::fs::read(&store_path).expect("seeded store");
+
+        let created = draft_store_rpc(
+            "meta/mobpacks/create",
+            json!({ "store_path": store_path, "name": "One Too Many" }),
+        );
+        let saved = draft_store_rpc(
+            "meta/mobpacks/save",
+            json!({ "store_path": store_path, "id": "one_too_many", "document": valid_document() }),
+        );
+        let untouched = std::fs::read(&store_path).expect("store after the refusals") == seeded;
+        let resaved = draft_store_rpc(
+            "meta/mobpacks/save",
+            json!({ "store_path": store_path, "id": "seed_000", "document": valid_document() }),
+        );
+        let deleted = draft_store_rpc(
+            "meta/mobpacks/delete",
+            json!({ "store_path": store_path, "id": "seed_001" }),
+        );
+
+        let full = Some((
+            -32602,
+            Some(json!({ "kind": "draft_store_full", "limit": "drafts", "max_drafts": 256 })),
+        ));
+        assert_eq!(
+            (
+                rpc_refusal(&created),
+                rpc_refusal(&saved),
+                untouched,
+                rpc_refusal(&resaved),
+                rpc_refusal(&deleted),
+            ),
+            (full.clone(), full, true, None, None)
+        );
+    }
+
+    /// The draft store file holds at most 64 MiB. A save that would pass it,
+    /// with no undo or redo snapshot left to give up, is refused with a typed
+    /// `draft_store_full` refusal and writes nothing.
+    #[test]
+    fn a_save_past_the_store_byte_cap_is_refused_typed() {
+        let store = tempfile::tempdir().expect("tempdir");
+        let store_path = store.path().join("drafts.json");
+        seed_draft_store_near_the_byte_cap(
+            &store_path,
+            json!({ "filler": { "id": "filler", "name": "Filler", "stage": "draft", "revision": 1 } }),
+            "filler",
+        );
+        let seeded = std::fs::read(&store_path).expect("seeded store");
+
+        let saved = draft_store_rpc(
+            "meta/mobpacks/save",
+            json!({ "store_path": store_path, "id": "fresh", "document": valid_document() }),
+        );
+
+        let untouched = std::fs::read(&store_path).expect("store after the refusal") == seeded;
+        let data = saved
+            .error
+            .as_ref()
+            .and_then(|error| error.data.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            (
+                saved.error.as_ref().map(|error| error.code),
+                data["kind"].clone(),
+                data["limit"].clone(),
+                data["max_bytes"].clone(),
+                data["required_bytes"]
+                    .as_u64()
+                    .is_some_and(|bytes| bytes > 64 << 20),
+                untouched,
+            ),
+            (
+                Some(-32602),
+                json!("draft_store_full"),
+                json!("bytes"),
+                json!(64 << 20),
+                true,
+                true
+            ),
+            "{:?}",
+            saved.error
+        );
+    }
+
+    /// Undo history yields to drafts: a save that would pass the byte cap
+    /// first drops undo snapshots, the oldest first, of the drafts updated
+    /// longest ago, and goes through within the cap. No draft is dropped.
+    #[test]
+    fn undo_history_yields_before_a_save_passes_the_store_byte_cap() {
+        let store = tempfile::tempdir().expect("tempdir");
+        let store_path = store.path().join("drafts.json");
+        let history = (0..15)
+            .map(|index| json!({ "name": format!("snapshot {index}"), "padding": "h".repeat(4 << 20) }))
+            .collect::<Vec<_>>();
+        let padding = seed_draft_store_near_the_byte_cap(
+            &store_path,
+            json!({ "old": {
+                "id": "old",
+                "name": "Old",
+                "stage": "draft",
+                "revision": 16,
+                "updated_at_unix_ms": 1,
+                "history": history
+            } }),
+            "old",
+        );
+
+        let saved = draft_store_rpc(
+            "meta/mobpacks/save",
+            json!({ "store_path": store_path, "id": "fresh", "document": valid_document() }),
+        );
+
+        let stored_bytes = std::fs::metadata(&store_path).expect("store").len();
+        let stored = read_mobpack_draft_store(&store_path).expect("read the store");
+        let kept = stored["old"]["history"]
+            .as_array()
+            .map(|history| {
+                history
+                    .iter()
+                    .map(|snapshot| snapshot["name"].clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            (
+                saved.error,
+                stored_bytes <= 64 << 20,
+                stored.contains_key("fresh"),
+                stored["old"]["trigger"].as_str().map(str::len),
+                kept.first().cloned(),
+                kept.len() < 15,
+            ),
+            (
+                None,
+                true,
+                true,
+                Some(padding),
+                Some(json!("snapshot 1")),
+                true
+            )
+        );
+    }
+
+    /// A store already past the draft count, written before the cap, still
+    /// takes saves to the drafts it holds and deletes, but no new draft.
+    #[test]
+    fn a_store_past_the_draft_count_cap_shrinks_but_does_not_grow() {
+        let store = tempfile::tempdir().expect("tempdir");
+        let store_path = store.path().join("drafts.json");
+        seed_draft_rows(&store_path, 300);
+
+        let resaved = draft_store_rpc(
+            "meta/mobpacks/save",
+            json!({ "store_path": store_path, "id": "seed_000", "document": valid_document() }),
+        );
+        let created = draft_store_rpc(
+            "meta/mobpacks/create",
+            json!({ "store_path": store_path, "name": "Three Hundred And One" }),
+        );
+        let deleted = draft_store_rpc(
+            "meta/mobpacks/delete",
+            json!({ "store_path": store_path, "id": "seed_299" }),
+        );
+
+        assert_eq!(
+            (
+                rpc_refusal(&resaved),
+                rpc_refusal(&created)
+                    .and_then(|(_, data)| data)
+                    .map(|data| data["limit"].clone()),
+                rpc_refusal(&deleted),
+                read_mobpack_draft_store(&store_path)
+                    .expect("read the store")
+                    .len(),
+            ),
+            (None, Some(json!("drafts")), None, 299)
+        );
+    }
+
+    /// Runs `f`, returning its result and the work it did on this thread, in
+    /// [`count_mobpack_work`] units.
+    fn with_mobpack_work<R>(f: impl FnOnce() -> R) -> (R, u64) {
+        let before = MOBPACK_WORK.with(std::cell::Cell::get);
+        let result = f();
+        (result, MOBPACK_WORK.with(std::cell::Cell::get) - before)
+    }
+
+    /// Requires `work(n)` to grow about linearly with `n`. From 100 to 400
+    /// items, linear work grows about 4 times (5 with an n log n sort) and
+    /// quadratic work about 16 times. The units count reads, not time, so the
+    /// check is the same on any machine and under any load.
+    fn assert_work_grows_linearly(what: &str, work: impl Fn(usize) -> u64) {
+        let (small, large) = (work(100), work(400));
+        eprintln!("{what}: {small} units of work for 100 items, {large} for 400");
+        assert!(
+            large < small.saturating_mul(8),
+            "{what}: {small} units of work for 100 items, {large} for 400"
+        );
+    }
+
+    /// A document whose graph is a fork of `lanes` lanes of `length` member
+    /// nodes each, all closed by one join.
+    fn forked_graph_document(lanes: usize, length: usize) -> MobpackDocument {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.members = json!([{ "id": "worker", "name": "Worker" }]);
+        let mut instances =
+            vec![json!({ "id": "fork", "isGate": true, "gateKind": "fork", "col": 0 })];
+        let mut edges = Vec::new();
+        for lane in 0..lanes {
+            let mut previous = "fork".to_string();
+            for step in 0..length {
+                let id = format!("n{lane}_{step}");
+                instances
+                    .push(json!({ "id": id, "memberId": "worker", "col": step + 1, "row": lane }));
+                edges.push(json!({ "from": previous, "to": id, "kind": "next" }));
+                previous = id;
+            }
+            edges.push(json!({ "from": previous, "to": "join", "kind": "next" }));
+        }
+        instances
+            .push(json!({ "id": "join", "isGate": true, "gateKind": "join", "col": length + 1 }));
+        document.instances = Value::Array(instances);
+        document.edges = Value::Array(edges);
+        document
+    }
+
+    /// Deriving a flow from a graph reads each node and edge a bounded number
+    /// of times, so its work grows about linearly with the graph. Each lookup
+    /// scanned every instance or edge, and finding a fork's join walked the
+    /// graph again, scanning, for each join it tried: a fork of two lanes took
+    /// work quadratic in their length.
+    #[test]
+    fn graph_to_flow_work_grows_linearly_with_lane_length() {
+        let flow = graph_to_flow_from_document(&forked_graph_document(2, 3));
+        assert_eq!(
+            (
+                flow["steps"][1]["type"].as_str(),
+                flow["steps"][1]["branches"][1]["steps"]
+                    .as_array()
+                    .map(Vec::len),
+            ),
+            (Some("parallel"), Some(3)),
+            "{flow:#}"
+        );
+        assert_work_grows_linearly("a fork of two lanes of n nodes", |length| {
+            let document = forked_graph_document(2, length);
+            with_mobpack_work(|| graph_to_flow_from_document(&document)).1
+        });
+    }
+
+    /// A document whose graph has `width` members, a fork of `width` one-node
+    /// lanes closed by a join, and after the join a column of `width` nodes,
+    /// each behind a conditional edge.
+    fn wide_graph_document(width: usize) -> MobpackDocument {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.members = Value::Array(
+            (0..width)
+                .map(
+                    |index| json!({ "id": format!("m{index}"), "name": format!("Member {index}") }),
+                )
+                .collect(),
+        );
+        let mut instances = vec![
+            json!({ "id": "fork", "isGate": true, "gateKind": "fork", "col": 0 }),
+            json!({ "id": "join", "isGate": true, "gateKind": "join", "col": 2 }),
+        ];
+        let mut edges = Vec::new();
+        for index in 0..width {
+            let (lane, member, after) = (
+                format!("a{index}"),
+                format!("m{index}"),
+                format!("c{index}"),
+            );
+            instances.push(json!({ "id": lane, "memberId": member, "col": 1, "row": index }));
+            instances.push(json!({ "id": after, "memberId": member, "col": 3, "row": index }));
+            edges.push(json!({ "from": "fork", "to": lane, "kind": "fanout" }));
+            edges.push(json!({ "from": lane, "to": "join", "kind": "next" }));
+            edges.push(json!({
+                "from": "join",
+                "to": after,
+                "kind": "cond",
+                "cond": { "var": "params.lane", "op": "==", "val": index.to_string() },
+            }));
+        }
+        document.instances = Value::Array(instances);
+        document.edges = Value::Array(edges);
+        document
+    }
+
+    /// Lane labels and a column's conditional edges are looked up by id. Each
+    /// lookup scanned every member or edge, so a wide fork and a wide column
+    /// took work quadratic in their width.
+    #[test]
+    fn graph_to_flow_work_grows_linearly_with_fork_width() {
+        let flow = graph_to_flow_from_document(&wide_graph_document(2));
+        assert_eq!(
+            (
+                flow["steps"][1]["branches"][1]["label"].as_str(),
+                flow["steps"][2]["type"].as_str(),
+                flow["steps"][2]["branches"][1]["label"].as_str(),
+            ),
+            (Some("Member 1"), Some("branch"), Some("Member 1")),
+            "{flow:#}"
+        );
+        assert_work_grows_linearly("a fork and a column n nodes wide", |width| {
+            let document = wide_graph_document(width);
+            with_mobpack_work(|| graph_to_flow_from_document(&document)).1
+        });
+    }
+
+    /// A document whose graph has `count` forks of two one-node lanes that
+    /// end at a terminal, a join that no lane reaches, and `count` nodes
+    /// outside every fork.
+    fn many_forks_document(count: usize) -> MobpackDocument {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.members = json!([{ "id": "worker", "name": "Worker" }]);
+        let mut instances = vec![
+            json!({ "id": "join", "isGate": true, "gateKind": "join", "col": 3 * count }),
+            json!({ "id": "end", "isTerminal": true, "kind": "end", "col": 3 * count + 1 }),
+        ];
+        let mut edges = Vec::new();
+        for index in 0..count {
+            let (fork, col) = (format!("f{index}"), 3 * index);
+            instances.push(json!({ "id": fork, "isGate": true, "gateKind": "fork", "col": col }));
+            for (row, lane) in [format!("a{index}"), format!("b{index}")]
+                .into_iter()
+                .enumerate()
+            {
+                instances
+                    .push(json!({ "id": lane, "memberId": "worker", "col": col + 1, "row": row }));
+                edges.push(json!({ "from": fork, "to": lane, "kind": "fanout" }));
+                edges.push(json!({ "from": lane, "to": "end", "kind": "next" }));
+            }
+            instances
+                .push(json!({ "id": format!("c{index}"), "memberId": "worker", "col": col + 2 }));
+        }
+        document.instances = Value::Array(instances);
+        document.edges = Value::Array(edges);
+        document
+    }
+
+    /// A fork's join is read from where each node's lanes lead, worked out
+    /// once for the whole graph, and the nodes outside the forks are told
+    /// apart from the forks' columns by a sorted search. Every fork listed and
+    /// sorted the joins again and walked the graph from each lane start, and
+    /// every node outside the forks was compared with every fork, so a graph
+    /// of many forks took work quadratic in their number.
+    #[test]
+    fn graph_to_flow_work_grows_linearly_with_fork_count() {
+        let flow = graph_to_flow_from_document(&many_forks_document(2));
+        let types: Vec<_> = flow["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|step| step["type"].as_str())
+            .collect();
+        assert_eq!(
+            types,
+            ["input", "parallel", "member", "parallel", "member"],
+            "{flow:#}"
+        );
+        assert_work_grows_linearly("n forks", |count| {
+            let document = many_forks_document(count);
+            with_mobpack_work(|| graph_to_flow_from_document(&document)).1
+        });
+    }
+
+    /// A small deterministic generator (xorshift), so a failing case
+    /// reproduces.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+    }
+
+    /// The join search the derivation ran before it indexed the graph: for
+    /// each join in node order, a scan for an edge from a lane start and a
+    /// breadth-first walk from every lane start, scanning for each step.
+    fn scanned_find_join(
+        instances: &[Value],
+        edges: &[Value],
+        start_ids: &[String],
+    ) -> Option<Value> {
+        let node_by_id = |id: &str| {
+            instances
+                .iter()
+                .find(|instance| graph_to_flow_string(instance, "id") == id)
+                .cloned()
+        };
+        let reaches = |start_id: &str, target_id: &str| {
+            let mut queue = std::collections::VecDeque::from([start_id.to_string()]);
+            let mut seen = BTreeSet::new();
+            while let Some(id) = queue.pop_front() {
+                if id == target_id {
+                    return true;
+                }
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                for edge in edges
+                    .iter()
+                    .filter(|edge| graph_to_flow_string(edge, "from") == id)
+                {
+                    if let Some(node) = node_by_id(&graph_to_flow_string(edge, "to"))
+                        && !graph_to_flow_bool(&node, "isTerminal")
+                    {
+                        queue.push_back(graph_to_flow_string(&node, "id"));
+                    }
+                }
+            }
+            false
+        };
+        let mut joins: Vec<Value> = instances
+            .iter()
+            .filter(|instance| graph_to_flow_string(instance, "gateKind") == "join")
+            .cloned()
+            .collect();
+        joins.sort_by(graph_to_flow_compare_nodes);
+        joins.into_iter().find(|join| {
+            let join_id = graph_to_flow_string(join, "id");
+            start_ids.iter().any(|id| {
+                edges.iter().any(|edge| {
+                    graph_to_flow_string(edge, "from") == id.as_str()
+                        && graph_to_flow_string(edge, "to") == join_id
+                }) || reaches(id, &join_id)
+            })
+        })
+    }
+
+    /// The indexed join search finds the join the scanning one found, on
+    /// graphs with cycles, terminals, terminal joins, a node without an id,
+    /// ids that need trimming, and edges to unknown nodes or without
+    /// endpoints.
+    #[test]
+    fn indexed_join_search_matches_the_scanning_one() {
+        let mut random = Xorshift(0x2545_f491_4f6c_dd1d);
+        let mut found = 0;
+        for case in 0..500 {
+            let count = 2 + random.below(12);
+            let id = |index: usize| {
+                if index == 0 {
+                    String::new()
+                } else {
+                    format!("n{index}")
+                }
+            };
+            let instances: Vec<Value> = (0..count)
+                .map(|index| {
+                    let mut node = json!({
+                        "id": format!(" {} ", id(index)),
+                        "memberId": "worker",
+                        "col": random.below(5),
+                        "row": random.below(3),
+                    });
+                    if random.below(3) == 0 {
+                        node["gateKind"] = json!("join");
+                    }
+                    if random.below(5) == 0 {
+                        node["isTerminal"] = json!(true);
+                    }
+                    node
+                })
+                .collect();
+            let instances = graph_to_flow_unique_instances(&Value::Array(instances));
+            let endpoint = |random: &mut Xorshift| match random.below(count + 2) {
+                pick if pick < count => json!(id(pick)),
+                pick if pick == count => json!("unknown"),
+                _ => Value::Null,
+            };
+            let edges: Vec<Value> = (0..random.below(3 * count))
+                .map(|_| {
+                    let from = endpoint(&mut random);
+                    let to = endpoint(&mut random);
+                    json!({ "from": from, "to": to, "kind": "next" })
+                })
+                .collect();
+            let start_ids: Vec<String> = (0..=random.below(3))
+                .map(|_| graph_to_flow_string(&instances[random.below(instances.len())], "id"))
+                .collect();
+
+            let graph = GraphToFlowGraph::new(&instances, &edges, &[]);
+            let indexed = graph
+                .find_join(&start_ids)
+                .map(|join| graph_to_flow_string(&join, "id"));
+            let scanned = scanned_find_join(&instances, &edges, &start_ids)
+                .map(|join| graph_to_flow_string(&join, "id"));
+            assert_eq!(
+                indexed, scanned,
+                "case {case}: {instances:?} {edges:?} {start_ids:?}"
+            );
+            found += usize::from(indexed.is_some());
+        }
+        assert!(found > 100, "only {found} of 500 cases had a join");
+    }
+
+    /// The merged column ranges hold exactly the columns that some segment
+    /// spans.
+    #[test]
+    fn merged_spans_hold_the_columns_the_segments_span() {
+        let mut random = Xorshift(0x9e37_79b9_7f4a_7c15);
+        for case in 0..500 {
+            let segments: Vec<GraphToFlowSegment> = (0..random.below(6))
+                .map(|_| GraphToFlowSegment {
+                    col: random.below(12) as i64 - 2,
+                    span_end: random.below(12) as i64 - 2,
+                    step: Value::Null,
+                })
+                .collect();
+            let spans = graph_to_flow_merged_spans(&segments);
+            for col in -3..12 {
+                assert_eq!(
+                    graph_to_flow_spans_contain(&spans, col),
+                    segments
+                        .iter()
+                        .any(|segment| col >= segment.col && col <= segment.span_end),
+                    "case {case}, column {col}: {spans:?}"
+                );
+            }
+        }
+    }
+
+    /// A graph with more instances or edges than the structure caps is
+    /// refused before anything derives a flow from it, edits it or checks it
+    /// further: validation reports `too_many_graph_instances` or
+    /// `too_many_graph_edges` and none of the graph's own problems, and
+    /// graph-to-flow, every operation but the deletes, and rendering refuse
+    /// it.
+    #[test]
+    fn graphs_past_the_structure_caps_are_refused() {
+        let over_caps = |instances: usize, edges: usize| {
+            let mut document = valid_document();
+            document.mob_toml = None;
+            document.flow = json!({ "steps": [] });
+            // Instances without an id and edges without endpoints: problems
+            // that checking the graph reports, one for each.
+            document.instances = Value::Array(vec![json!({}); instances]);
+            document.edges = Value::Array(vec![json!({ "kind": "next" }); edges]);
+            document
+        };
+        for (document, code) in [
+            (
+                over_caps(MOBPACK_MAX_GRAPH_INSTANCES + 1, 0),
+                "too_many_graph_instances",
+            ),
+            (
+                over_caps(1, MOBPACK_MAX_GRAPH_EDGES + 1),
+                "too_many_graph_edges",
+            ),
+        ] {
+            let validation = validate_document(&document);
+            let codes: BTreeSet<&str> = validation
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect();
+            assert!(
+                codes.contains(code)
+                    && !codes.contains("invalid_graph_instance_id")
+                    && !codes.contains("invalid_graph_edge_endpoint"),
+                "{code}: {codes:?}"
+            );
+            let operation = |kind: &str| {
+                apply_mobpack_authoring_operation(&json!({
+                    "document": document,
+                    "operation": { "type": kind },
+                }))
+                .err()
+            };
+            let refusals = [
+                graph_to_flow_mobpack(&json!({ "document": document })).err(),
+                operation("sync_graph_to_flow"),
+                operation("reconcile_members"),
+                render_editor_document_mob_toml(&document).err(),
+            ];
+            assert!(
+                refusals.iter().all(|refusal| {
+                    refusal
+                        .as_deref()
+                        .is_some_and(|message| message.contains("refusing the document"))
+                }),
+                "{code}: {refusals:?}"
+            );
+        }
+    }
+
+    /// Every operation but the deletes is refused on a document whose graph
+    /// is past the structure caps, an operation that never edits the graph
+    /// included: operations that do not edit it can still walk it
+    /// (reconciling members prunes its instances), so none reads a graph past
+    /// the caps.
+    #[test]
+    fn an_operation_that_does_not_edit_the_graph_is_refused_past_the_caps() {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.instances = Value::Array(vec![json!({}); MOBPACK_MAX_GRAPH_INSTANCES + 1]);
+        let refusal = apply_mobpack_authoring_operation(&json!({
+            "document": document,
+            "operation": {
+                "type": "update_mob_settings",
+                "field": "orchestrator",
+                "value": "worker",
+            },
+        }))
+        .expect_err("an operation on a document past the graph caps is refused");
+        assert!(refusal.contains("refusing the document"), "{refusal}");
+    }
+
+    /// A mob definition whose one flow runs `length` steps, each after the
+    /// one before.
+    fn chained_flow_definition(length: usize) -> MobDefinition {
+        let mut toml = String::from(
+            "[mob]\nid = \"chain\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+             peer_description = \"Worker\"\n\n[flows.main]\ndescription = \"Chain\"\n",
+        );
+        for step in 0..length {
+            toml.push_str(&format!(
+                "\n[flows.main.steps.s{step}]\nrole = \"worker\"\nmessage = \"Step {step}.\"\n"
+            ));
+            if step > 0 {
+                toml.push_str(&format!("depends_on = [\"s{}\"]\n", step - 1));
+            }
+        }
+        MobDefinition::from_toml(&toml).expect("a chained flow")
+    }
+
+    /// A mob definition whose one flow routes, then runs `count` branches of
+    /// two conditional steps each.
+    fn branched_flow_definition(count: usize) -> MobDefinition {
+        let mut toml = String::from(
+            "[mob]\nid = \"branches\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+             peer_description = \"Worker\"\n\n[flows.main]\ndescription = \"Branches\"\n\n\
+             [flows.main.steps.route]\nrole = \"worker\"\nmessage = \"Route.\"\n",
+        );
+        for branch in 0..count {
+            for kind in ["x", "y"] {
+                toml.push_str(&format!(
+                    "\n[flows.main.steps.b{branch}_{kind}]\nrole = \"worker\"\n\
+                     message = \"Branch {branch}.\"\ndepends_on = [\"route\"]\n\
+                     branch = \"lane{branch}\"\n\
+                     condition = {{ op = \"eq\", path = \"params.kind\", value = \"{kind}\" }}\n"
+                ));
+            }
+        }
+        MobDefinition::from_toml(&toml).expect("a branched flow")
+    }
+
+    /// Importing a definition groups each frame's steps in one pass over the
+    /// frame. Every step searched the whole frame for its parallel siblings,
+    /// and every branched step for the rest of its branch, so importing a
+    /// chain of steps, or many branches, took work quadratic in the steps.
+    #[test]
+    fn import_work_grows_linearly_with_the_steps() {
+        let definition = branched_flow_definition(2);
+        let flow = definition.flows.values().next().expect("the branched flow");
+        let steps = visual_steps_from_frame(&flow.root, flow);
+        let mut types: Vec<_> = steps
+            .iter()
+            .filter_map(|step| step["type"].as_str())
+            .collect();
+        types.sort_unstable();
+        assert_eq!(types, ["branch", "branch", "member"], "{steps:#?}");
+        assert_work_grows_linearly("a chain of n steps", |length| {
+            let definition = chained_flow_definition(length);
+            let flow = definition.flows.values().next().expect("the chained flow");
+            with_mobpack_work(|| visual_steps_from_frame(&flow.root, flow)).1
+        });
+        assert_work_grows_linearly("n branches of two steps", |count| {
+            let definition = branched_flow_definition(count);
+            let flow = definition.flows.values().next().expect("the branched flow");
+            with_mobpack_work(|| visual_steps_from_frame(&flow.root, flow)).1
+        });
+    }
+
+    /// Importing a definition shows each of its steps once. A step with a
+    /// condition but no branch that shares its dependencies with steps
+    /// without one was dropped, and the parallel step of those steps was
+    /// shown again for each such step.
+    #[test]
+    fn import_shows_a_conditioned_step_beside_its_parallel_siblings_once() {
+        let definition = MobDefinition::from_toml(
+            r#"
+[mob]
+id = "siblings"
+
+[profiles.worker]
+model = "gpt-5.5"
+peer_description = "Worker"
+
+[flows.main]
+description = "Siblings"
+
+[flows.main.steps.start]
+role = "worker"
+message = "Start."
+
+[flows.main.steps.a]
+role = "worker"
+message = "A."
+depends_on = ["start"]
+
+[flows.main.steps.b]
+role = "worker"
+message = "B."
+depends_on = ["start"]
+
+[flows.main.steps.c]
+role = "worker"
+message = "C."
+depends_on = ["start"]
+condition = { op = "eq", path = "params.kind", value = "c" }
+
+[flows.main.steps.d]
+role = "worker"
+message = "D."
+depends_on = ["start"]
+condition = { op = "eq", path = "params.kind", value = "d" }
+"#,
+        )
+        .expect("the definition");
+        let flow = definition.flows.values().next().expect("the flow");
+        let steps = Value::Array(visual_steps_from_frame(&flow.root, flow));
+        let mut ids = Vec::new();
+        member_step_ids(&steps, &mut ids);
+        ids.sort();
+        assert_eq!(ids, ["a", "b", "c", "d", "start"], "{steps:#}");
+    }
+
+    /// A document with one realm of `count` inline skills, and one member
+    /// that selects each of them and `count` skills no realm defines.
+    fn many_skills_document(count: usize) -> MobpackDocument {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        let skills: Vec<Value> = (0..count)
+            .map(|index| {
+                json!({ "id": format!("skill_{index}"), "source": "inline", "content": "Use it." })
+            })
+            .collect();
+        let selected: Vec<String> = (0..count)
+            .map(|index| format!("skill_{index}"))
+            .chain((0..count).map(|index| format!("missing_{index}")))
+            .collect();
+        document.skill_realms = json!([{ "id": "realm", "skills": skills }]);
+        document.members = json!([{ "id": "worker", "name": "Worker", "skills": selected }]);
+        document
+    }
+
+    /// The skills a document's members select are looked up in an index of
+    /// the realms' skills, built once. Each selection scanned the realms
+    /// again, so selecting many skills, or naming many that no realm defines,
+    /// took work quadratic in their number, when validating, exporting and
+    /// rendering.
+    #[test]
+    fn selected_skill_lookup_work_grows_linearly() {
+        let selected = selected_skill_sources(&many_skills_document(2));
+        assert_eq!(
+            (
+                selected.keys().map(String::as_str).collect::<Vec<_>>(),
+                selected["skill_1"]["realm_id"].as_str(),
+            ),
+            (vec!["skill_0", "skill_1"], Some("realm")),
+        );
+        assert_work_grows_linearly("n selected skills", |count| {
+            let document = many_skills_document(count);
+            with_mobpack_work(|| selected_skill_sources(&document)).1
+        });
+        assert_work_grows_linearly("n rendered skills", |count| {
+            let document = many_skills_document(count);
+            with_mobpack_work(|| render_editor_document_mob_toml(&document)).1
+        });
+    }
+
+    /// Runs `f`, returning its result and the documents validated on this
+    /// thread meanwhile: in all, and while it held the draft store lock.
+    fn with_validations<R>(f: impl FnOnce() -> R) -> (R, (u64, u64)) {
+        let before = VALIDATIONS.with(std::cell::Cell::get);
+        let result = f();
+        let after = VALIDATIONS.with(std::cell::Cell::get);
+        (result, (after.0 - before.0, after.1 - before.1))
+    }
+
+    /// A draft store holding `count` valid drafts.
+    fn draft_store_with_valid_drafts(count: usize) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("drafts.json");
+        for index in 0..count {
+            save_mobpack_draft(&json!({
+                "store_path": store_path,
+                "id": format!("draft_{index}"),
+                "document": valid_document(),
+            }))
+            .expect("save a valid draft");
+        }
+        (dir, store_path)
+    }
+
+    /// A draft reply validates no draft but the one its call writes: every
+    /// reply re-imported and re-validated the archive of each valid draft in
+    /// the store, so its work grew with the store.
+    #[test]
+    fn draft_replies_validate_no_other_draft() {
+        let validations = |count: usize| {
+            let (_dir, store_path) = draft_store_with_valid_drafts(count);
+            let (_, listed) = with_validations(|| {
+                list_mobpack_drafts(&json!({ "store_path": store_path })).expect("list drafts")
+            });
+            let (_, saved) = with_validations(|| {
+                save_mobpack_draft(&json!({
+                    "store_path": store_path,
+                    "id": "probe",
+                    "document": valid_document(),
+                }))
+                .expect("save a draft")
+            });
+            (listed.0, saved.0)
+        };
+        assert_eq!(validations(1), validations(6));
+    }
+
+    /// No draft method validates a document while it holds the draft store
+    /// lock, which every draft call from every caller waits for: save, undo
+    /// and redo rebuilt their row under it, create exported its archive under
+    /// it, and every reply re-validated each stored draft under it.
+    #[test]
+    fn draft_methods_validate_nothing_under_the_store_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("drafts.json");
+        let mut renamed = valid_document();
+        renamed.name = "Renamed Draft".to_string();
+        let under_lock = |name: &'static str, call: &dyn Fn() -> Value| {
+            let (_, (_, under_lock)) = with_validations(call);
+            (name, under_lock)
+        };
+        let counts = [
+            under_lock("create", &|| {
+                create_mobpack_draft(&json!({ "store_path": store_path, "name": "Created" }))
+                    .expect("create a draft")
+            }),
+            under_lock("save", &|| {
+                save_mobpack_draft(&json!({
+                    "store_path": store_path,
+                    "id": "stepped",
+                    "document": valid_document(),
+                }))
+                .expect("save a draft")
+            }),
+            under_lock("save again", &|| {
+                save_mobpack_draft(&json!({
+                    "store_path": store_path,
+                    "id": "stepped",
+                    "document": renamed,
+                }))
+                .expect("save the draft again")
+            }),
+            under_lock("undo", &|| {
+                undo_mobpack_draft(&json!({ "store_path": store_path, "id": "stepped" }))
+                    .expect("undo")
+            }),
+            under_lock("redo", &|| {
+                redo_mobpack_draft(&json!({ "store_path": store_path, "id": "stepped" }))
+                    .expect("redo")
+            }),
+            under_lock("list", &|| {
+                list_mobpack_drafts(&json!({ "store_path": store_path })).expect("list drafts")
+            }),
+            under_lock("get", &|| {
+                get_mobpack_draft(&json!({ "store_path": store_path, "id": "stepped" }))
+                    .expect("get a draft")
+            }),
+        ];
+        assert_eq!(
+            counts,
+            [
+                ("create", 0),
+                ("save", 0),
+                ("save again", 0),
+                ("undo", 0),
+                ("redo", 0),
+                ("list", 0),
+                ("get", 0),
+            ]
+        );
+    }
+
+    /// Validation stops at the structure caps: a document past one is refused
+    /// with that cap alone, and none of the checks after the caps, whose work
+    /// the caps bound, reads it.
+    #[test]
+    fn validation_stops_at_the_structure_caps() {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.members = Value::Array(
+            (0..=MOBPACK_MAX_MEMBERS)
+                .map(|index| json!({ "id": format!("m{index}"), "name": format!("M{index}") }))
+                .collect(),
+        );
+        // Steps without an id or a type: each is an error a full validation
+        // reports.
+        document.flow = json!({ "steps": [{}, {}, {}] });
+        let errors: BTreeSet<String> = validate_document(&document)
+            .diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.severity == "error")
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert_eq!(errors, BTreeSet::from(["too_many_members".to_string()]));
+    }
+
+    /// A draft store file far past the byte cap (one written before the caps)
+    /// is refused, typed, before any of it is read: every draft method read
+    /// and parsed the whole file.
+    #[test]
+    fn a_draft_store_far_past_the_byte_cap_is_refused_unread() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("drafts.json");
+        std::fs::File::create(&store_path)
+            .and_then(|file| file.set_len(MOBPACK_DRAFT_STORE_MAX_READ_BYTES + 1))
+            .expect("a sparse store file past the read cap");
+        let listed = draft_store_rpc("meta/mobpacks/list", json!({ "store_path": store_path }));
+        assert_eq!(
+            rpc_refusal(&listed).and_then(|(_, data)| data),
+            Some(json!({
+                "kind": "draft_store_unavailable",
+                "reason": "store_too_large",
+                "max_read_bytes": MOBPACK_DRAFT_STORE_MAX_READ_BYTES,
+                "store_bytes": MOBPACK_DRAFT_STORE_MAX_READ_BYTES + 1,
+            }))
+        );
+    }
+
+    /// The draft store is written readable only by its user, into directories
+    /// created readable only by that user: wherever the state directory can
+    /// be traversed, other local users could read every draft.
+    #[cfg(unix)]
+    #[test]
+    fn the_draft_store_is_private_to_its_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        let store_path = state.join("drafts.json");
+        save_mobpack_draft(&json!({
+            "store_path": store_path,
+            "id": "private",
+            "document": valid_document(),
+        }))
+        .expect("save a draft");
+        let mode = |path: &Path| {
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!((mode(&state), mode(&store_path)), (0o700, 0o600));
+    }
+
+    /// A document whose one member lists `size` tools, with `size` member
+    /// steps and `size` member instances, each scoped to one of its tools.
+    fn document_with_a_member_of_many_tools(size: usize) -> MobpackDocument {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        let tools: Vec<String> = (0..size).map(|index| format!("tool_{index}")).collect();
+        document.members = json!([{ "id": "worker", "name": "Worker", "tools": tools }]);
+        let steps: Vec<Value> = (0..size)
+            .map(|index| {
+                json!({
+                    "id": format!("s{index}"),
+                    "type": "member",
+                    "role": "worker",
+                    "allowedTools": [format!("tool_{index}")],
+                })
+            })
+            .collect();
+        document.flow = json!({ "steps": steps });
+        let instances: Vec<Value> = (0..size)
+            .map(|index| {
+                json!({
+                    "id": format!("n{index}"),
+                    "memberId": "worker",
+                    "col": index,
+                    "allowedTools": [format!("tool_{index}")],
+                })
+            })
+            .collect();
+        document.instances = Value::Array(instances);
+        document
+    }
+
+    /// Reconciling a document with its members looks each member step's and
+    /// member instance's tools up in an index of the members' tools, built
+    /// once. Each step and instance scanned the members and collected all of
+    /// its member's tools again, so a member of many tools in many steps took
+    /// work quadratic in their number.
+    #[test]
+    fn member_reconciliation_work_grows_linearly_with_steps_and_tools() {
+        let mut document = document_with_a_member_of_many_tools(3);
+        document.members[0]["tools"] = json!(["tool_0", "tool_2"]);
+        reconcile_document_after_member_change(&mut document);
+        assert_eq!(
+            (
+                &document.flow["steps"][1]["allowedTools"],
+                &document.flow["steps"][2]["allowedTools"],
+                &document.instances[1]["allowedTools"],
+                &document.instances[2]["allowedTools"],
+            ),
+            (
+                &json!([]),
+                &json!(["tool_2"]),
+                &json!([]),
+                &json!(["tool_2"])
+            ),
+        );
+        assert_work_grows_linearly("a member of n tools in n steps and n instances", |size| {
+            let mut document = document_with_a_member_of_many_tools(size);
+            with_mobpack_work(|| reconcile_document_after_member_change(&mut document)).1
+        });
+    }
+
+    /// A member lists at most [`MOBPACK_MAX_MEMBER_TOOLS`] tools: past that,
+    /// validation fails with `too_many_member_tools` alone, and rendering
+    /// refuses the document.
+    #[test]
+    fn a_member_past_the_tool_cap_is_refused() {
+        let with_tools = |count: usize| {
+            let mut document = valid_document();
+            document.mob_toml = None;
+            let tools: Vec<String> = (0..count).map(|index| format!("tool_{index}")).collect();
+            document.members = json!([{ "id": "worker", "name": "Worker", "tools": tools }]);
+            document
+        };
+        let codes = |document: &MobpackDocument| {
+            validate_document(document)
+                .diagnostics
+                .into_iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<BTreeSet<_>>()
+        };
+        let past = with_tools(MOBPACK_MAX_MEMBER_TOOLS + 1);
+        assert_eq!(
+            codes(&past),
+            BTreeSet::from(["too_many_member_tools".to_string()])
+        );
+        let refusal = render_editor_document_mob_toml(&past)
+            .expect_err("rendering a member past the tool cap is refused");
+        assert!(refusal.contains("refusing to render it"), "{refusal}");
+        assert!(!codes(&with_tools(MOBPACK_MAX_MEMBER_TOOLS)).contains("too_many_member_tools"));
+    }
+
+    /// A document whose flow runs `count` member steps, one after another,
+    /// with the graph they project to: `count` instances and `count - 1`
+    /// edges.
+    fn chained_member_steps_document(count: usize) -> MobpackDocument {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.members = json!([{ "id": "worker", "name": "Worker" }]);
+        let steps: Vec<Value> = (0..count)
+            .map(|index| json!({ "id": format!("s{index}"), "type": "member", "role": "worker" }))
+            .collect();
+        let (instances, edges, frames) = graph_projection_from_visual_steps(&steps);
+        document.flow = json!({ "steps": steps });
+        document.instances = Value::Array(instances);
+        document.edges = Value::Array(edges);
+        document.frames = Value::Array(frames);
+        document
+    }
+
+    /// Runs one authoring operation on a document.
+    fn apply_operation_to(document: &Value, operation: Value) -> Result<Value, String> {
+        apply_mobpack_authoring_operation(&json!({
+            "document": document,
+            "operation": operation,
+        }))
+    }
+
+    /// A flow operation derives the graph again from the flow, and is refused
+    /// when that graph would be past the structure caps, as a graph operation
+    /// is.
+    #[test]
+    fn a_flow_operation_cannot_push_the_graph_past_the_caps() {
+        let insert = json!({
+            "type": "insert_flow_step",
+            "step": { "id": "extra", "type": "member", "role": "worker" },
+            "lane_ref": { "lane": "main", "index": 0 },
+        });
+        let at_caps = json!(chained_member_steps_document(MOBPACK_MAX_GRAPH_INSTANCES));
+        let refusal = apply_operation_to(&at_caps, insert.clone())
+            .expect_err("a step that pushes the graph past the caps is refused");
+        assert!(refusal.contains("refusing the document"), "{refusal}");
+        let under_caps = json!(chained_member_steps_document(
+            MOBPACK_MAX_GRAPH_INSTANCES - 1
+        ));
+        let inserted = apply_operation_to(&under_caps, insert)
+            .expect("a step that keeps the graph within the caps");
+        assert_eq!(
+            inserted["document"]["instances"].as_array().map(Vec::len),
+            Some(MOBPACK_MAX_GRAPH_INSTANCES)
+        );
+    }
+
+    /// On a document whose graph is past the structure caps the deletes are
+    /// let through, so it can be brought back under the caps. A node delete
+    /// that leaves the graph past them keeps the document's flow, and the one
+    /// that brings it under them derives the flow again. Every other
+    /// operation is still refused.
+    #[test]
+    fn deletes_bring_a_graph_past_the_caps_back_under_them() {
+        let past = json!(chained_member_steps_document(
+            MOBPACK_MAX_GRAPH_INSTANCES + 2
+        ));
+        let refusal = apply_operation_to(
+            &past,
+            json!({
+                "type": "insert_flow_step",
+                "step": { "id": "extra", "type": "member", "role": "worker" },
+                "lane_ref": { "lane": "main" },
+            }),
+        )
+        .expect_err("an insert on a graph past the caps is refused");
+        assert!(refusal.contains("refusing the document"), "{refusal}");
+
+        let step_deleted = |document: &Value, id: &str| {
+            apply_operation_to(
+                document,
+                json!({ "type": "delete_flow_step", "step_id": id }),
+            )
+            .expect("a step delete on a graph past the caps is let through")["document"]
+                .clone()
+        };
+        let under = step_deleted(&step_deleted(&past, "s0"), "s1");
+        assert_eq!(
+            under["instances"].as_array().map(Vec::len),
+            Some(MOBPACK_MAX_GRAPH_INSTANCES)
+        );
+
+        let node_deleted = |document: &Value, id: &str| {
+            apply_operation_to(
+                document,
+                json!({ "type": "delete_graph_node", "instance_id": id }),
+            )
+            .expect("a node delete on a graph past the caps is let through")["document"]
+                .clone()
+        };
+        let still_past = node_deleted(&past, "s0");
+        assert_eq!(still_past["flow"], past["flow"]);
+        let under = node_deleted(&still_past, "s1");
+        let derived: Vec<&str> = under["flow"]["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|step| step["type"] == "member")
+            .filter_map(|step| step["id"].as_str())
+            .collect();
+        assert_eq!(derived.len(), MOBPACK_MAX_GRAPH_INSTANCES);
+        assert!(
+            !derived.contains(&"s0") && !derived.contains(&"s1"),
+            "{derived:?}"
+        );
+    }
+
+    /// A document whose graph is a fork of `lanes` one-node lanes that all
+    /// run on through one chain of `length` plain nodes to the join.
+    fn shared_chain_graph_document(lanes: usize, length: usize) -> MobpackDocument {
+        let mut document = valid_document();
+        document.mob_toml = None;
+        document.members = json!([{ "id": "worker", "name": "Worker" }]);
+        let mut instances = vec![
+            json!({ "id": "fork", "isGate": true, "gateKind": "fork", "col": 0 }),
+            json!({ "id": "join", "isGate": true, "gateKind": "join", "col": length + 2 }),
+        ];
+        let mut edges = Vec::new();
+        for lane in 0..lanes {
+            let id = format!("a{lane}");
+            instances.push(json!({ "id": id, "memberId": "worker", "col": 1, "row": lane }));
+            edges.push(json!({ "from": "fork", "to": id, "kind": "fanout" }));
+            edges.push(json!({ "from": id, "to": "p0", "kind": "next" }));
+        }
+        for step in 0..length {
+            instances.push(json!({ "id": format!("p{step}"), "col": step + 2 }));
+            let next = if step + 1 < length {
+                format!("p{}", step + 1)
+            } else {
+                "join".to_string()
+            };
+            edges.push(json!({ "from": format!("p{step}"), "to": next, "kind": "next" }));
+        }
+        document.instances = Value::Array(instances);
+        document.edges = Value::Array(edges);
+        document
+    }
+
+    /// Lanes to one join that run through one chain of nodes walk it once:
+    /// a lane stops at a node an earlier lane to the same join walked. Each
+    /// lane walked the whole chain again, so a fork of many lanes into one
+    /// long chain took work quadratic in its size.
+    #[test]
+    fn lanes_through_one_chain_walk_it_once() {
+        let flow = graph_to_flow_from_document(&shared_chain_graph_document(2, 2));
+        let lanes: Vec<_> = flow["steps"][1]["branches"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|branch| branch["steps"].as_array().map(Vec::len))
+            .collect();
+        assert_eq!(
+            (flow["steps"][1]["type"].as_str(), lanes),
+            (Some("parallel"), vec![Some(1), Some(1)]),
+            "{flow:#}"
+        );
+        assert_work_grows_linearly("n lanes through one chain of n nodes", |size| {
+            let document = shared_chain_graph_document(size, size);
+            with_mobpack_work(|| graph_to_flow_from_document(&document)).1
+        });
+    }
+
+    /// The lane walk before lanes to one join shared what they walked: it
+    /// stopped only at the join, at a node an earlier lane took, or at a node
+    /// it had walked itself.
+    fn unshared_lane_to_join(
+        graph: &GraphToFlowGraph<'_>,
+        start_id: &str,
+        join_id: Option<&str>,
+        consumed: &BTreeSet<String>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = graph.node(start_id);
+        let mut seen = BTreeSet::new();
+        while let Some(node) = current {
+            let node_id = graph_to_flow_string(node, "id");
+            if join_id == Some(node_id.as_str())
+                || consumed.contains(&node_id)
+                || !seen.insert(node_id.clone())
+            {
+                break;
+            }
+            if graph_to_flow_is_flow_node(node) {
+                out.push(node_id.clone());
+            }
+            current = graph
+                .outgoing(&node_id)
+                .iter()
+                .filter(|edge| join_id != Some(graph_to_flow_string(edge, "to").as_str()))
+                .filter_map(|edge| graph.node(&graph_to_flow_string(edge, "to")))
+                .filter(|node| !graph_to_flow_bool(node, "isTerminal"))
+                .min_by(|a, b| graph_to_flow_compare_nodes(a, b));
+        }
+        out
+    }
+
+    /// Lanes that stop where an earlier lane to their join walked take the
+    /// nodes they took when each lane walked on alone, lane after lane as the
+    /// derivation runs them, on graphs with cycles, terminals, plain nodes,
+    /// shared chains and lanes to several joins or none.
+    #[test]
+    fn lanes_that_share_what_they_walked_take_the_same_nodes() {
+        let mut random = Xorshift(0x5851_f42d_4c95_7f2d);
+        let mut taken = 0;
+        for case in 0..500 {
+            let count = 2 + random.below(14);
+            let instances: Vec<Value> = (0..count)
+                .map(|index| {
+                    let mut node = json!({
+                        "id": format!("n{index}"),
+                        "col": random.below(6),
+                        "row": random.below(3),
+                    });
+                    match random.below(4) {
+                        0 => node["gateKind"] = json!("join"),
+                        1 => {}
+                        _ => node["memberId"] = json!("worker"),
+                    }
+                    if random.below(6) == 0 {
+                        node["isTerminal"] = json!(true);
+                    }
+                    node
+                })
+                .collect();
+            let edges: Vec<Value> = (0..random.below(3 * count))
+                .map(|_| {
+                    json!({
+                        "from": format!("n{}", random.below(count)),
+                        "to": format!("n{}", random.below(count)),
+                        "kind": "next",
+                    })
+                })
+                .collect();
+            let graph = GraphToFlowGraph::new(&instances, &edges, &[]);
+            let mut consumed = BTreeSet::new();
+            let mut walked: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
+            for lane in 0..=random.below(7) {
+                let start = format!("n{}", random.below(count));
+                let join = (random.below(3) > 0).then(|| format!("n{}", random.below(count)));
+                let alone = unshared_lane_to_join(&graph, &start, join.as_deref(), &consumed);
+                let shared: Vec<String> = graph_to_flow_collect_lane_to_join(
+                    &graph,
+                    &start,
+                    join.as_deref(),
+                    &consumed,
+                    walked.entry(join.clone()).or_default(),
+                )
+                .iter()
+                .map(|node| graph_to_flow_string(node, "id"))
+                .collect();
+                assert_eq!(
+                    shared, alone,
+                    "case {case}, lane {lane} from {start} to {join:?}: {instances:?} {edges:?}"
+                );
+                taken += shared.len();
+                consumed.extend(shared);
+            }
+        }
+        assert!(taken > 250, "only {taken} nodes taken in 500 cases");
+    }
+
+    /// A step with a condition but no branch is imported as a branch step of
+    /// one lane, after the parallel step of the steps it shares its
+    /// dependencies with, so exporting the imported flow writes it with its
+    /// condition. It runs after those steps, not beside them (see the
+    /// changelog's Known limitations).
+    #[test]
+    fn a_conditioned_step_without_a_branch_keeps_its_condition_through_the_editor() {
+        let mob_toml = r#"
+[mob]
+id = "siblings"
+
+[profiles.worker]
+model = "gpt-5.5"
+peer_description = "Worker"
+
+[flows.main]
+description = "Siblings"
+
+[flows.main.steps.plan]
+role = "worker"
+message = "Plan."
+
+[flows.main.steps.review_a]
+role = "worker"
+message = "A."
+depends_on = ["plan"]
+
+[flows.main.steps.review_b]
+role = "worker"
+message = "B."
+depends_on = ["plan"]
+
+[flows.main.steps.review_c]
+role = "worker"
+message = "C."
+depends_on = ["plan"]
+condition = { op = "eq", path = "params.kind", value = "c" }
+"#;
+        let imported = import_mobpack(&json!({ "mob_toml": mob_toml })).expect("import");
+        let mut document: MobpackDocument =
+            serde_json::from_value(imported["document"].clone()).expect("document");
+        let shown: Vec<(&str, &str)> = document.flow["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|step| step["type"] != "input")
+            .filter_map(|step| Some((step["type"].as_str()?, step["id"].as_str()?)))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("member", "plan"),
+                ("parallel", "parallel_review_a_review_b"),
+                ("branch", "branch_review_c")
+            ]
+        );
+
+        document.mob_toml = None;
+        let exported = render_editor_document_mob_toml(&document).expect("export the import");
+        let definition = MobDefinition::from_toml(&exported).expect("the exported definition");
+        let flow = definition.flows.values().next().expect("the exported flow");
+        let message_of = |id: &str| flow.steps.get(id).map(|step| step.message.text_content());
+        let c = flow
+            .steps
+            .values()
+            .find(|step| step.message.text_content() == "C.")
+            .expect("step C");
+        let mut after: Vec<String> = c
+            .depends_on
+            .iter()
+            .filter_map(|id| message_of(id.as_str()))
+            .collect();
+        after.sort();
+        let authored = step_conditions(&MobDefinition::from_toml(mob_toml).expect("definition"));
+        assert!(authored["C."].is_some(), "{authored:?}");
+        assert_eq!(
+            (after, &c.condition),
+            (vec!["A.".to_string(), "B.".to_string()], &authored["C."])
+        );
+    }
+
+    /// The definition `mob_toml` describes, after a round trip through the
+    /// Flow Editor: imported, then exported from the editor document.
+    fn round_tripped_definition(mob_toml: &str) -> MobDefinition {
+        let imported = import_mobpack(&json!({ "mob_toml": mob_toml })).expect("import");
+        let mut document: MobpackDocument =
+            serde_json::from_value(imported["document"].clone()).expect("document");
+        document.mob_toml = None;
+        let exported = render_editor_document_mob_toml(&document).expect("export the import");
+        MobDefinition::from_toml(&exported).expect("the exported definition")
+    }
+
+    /// Each step of a definition's one flow, by its message, with the
+    /// messages of the steps it depends on.
+    fn step_wiring(definition: &MobDefinition) -> BTreeMap<String, BTreeSet<String>> {
+        let flow = definition.flows.values().next().expect("the flow");
+        let message = |id: &str| {
+            flow.steps
+                .get(id)
+                .map(|step| step.message.text_content())
+                .unwrap_or_default()
+        };
+        flow.steps
+            .values()
+            .map(|step| {
+                let depends_on = step
+                    .depends_on
+                    .iter()
+                    .map(|id| message(id.as_str()))
+                    .collect();
+                (step.message.text_content(), depends_on)
+            })
+            .collect()
+    }
+
+    /// Import shows a definition's steps in dependency order, so the flow
+    /// exported from the imported document wires its steps as the
+    /// definition did. Steps are parsed in id order, and import showed them
+    /// in that order: steps whose ids sort before a step they depend on came
+    /// first, and the export ran them first.
+    #[test]
+    fn a_round_trip_through_the_editor_keeps_the_step_wiring() {
+        let header = "[mob]\nid = \"order\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+                      peer_description = \"Worker\"\n\n[flows.main]\ndescription = \"Order\"\n";
+        let step = |id: &str, depends_on: &[&str]| {
+            let depends_on = depends_on
+                .iter()
+                .map(|dependency| format!("\"{dependency}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "\n[flows.main.steps.{id}]\nrole = \"worker\"\nmessage = \"Step {id}.\"\n\
+                 depends_on = [{depends_on}]\n"
+            )
+        };
+        let fan_out = [
+            step("start", &[]),
+            step("a", &["start"]),
+            step("b", &["start"]),
+            step("c", &["start"]),
+        ];
+        let diamond = [
+            step("zeta", &[]),
+            step("alpha", &["zeta"]),
+            step("beta", &["zeta"]),
+            step("gamma", &["alpha", "beta"]),
+        ];
+        for steps in [fan_out, diamond] {
+            let mob_toml = format!("{header}{}", steps.concat());
+            let definition = MobDefinition::from_toml(&mob_toml).expect("the definition");
+            assert_eq!(
+                step_wiring(&round_tripped_definition(&mob_toml)),
+                step_wiring(&definition),
+                "{mob_toml}"
+            );
+        }
+    }
+
+    /// Each step of a definition's one flow, by its message, with its
+    /// condition.
+    fn step_conditions(definition: &MobDefinition) -> BTreeMap<String, Option<ConditionExpr>> {
+        let flow = definition.flows.values().next().expect("the flow");
+        flow.steps
+            .values()
+            .map(|step| (step.message.text_content(), step.condition.clone()))
+            .collect()
+    }
+
+    /// A step with a condition but no branch keeps its condition and its
+    /// wiring through the editor: in the flow exported from the imported
+    /// document, and in the flow derived again from the graph the import
+    /// projects. Import showed it as a plain member step, which carries no
+    /// condition, so the round trip ran it whatever its condition.
+    #[test]
+    fn a_conditioned_step_round_trips_with_its_condition() {
+        let mob_toml = "[mob]\nid = \"conditioned\"\n\n[profiles.worker]\nmodel = \"gpt-5.5\"\n\
+                        peer_description = \"Worker\"\n\n[flows.main]\ndescription = \"One\"\n\n\
+                        [flows.main.steps.start]\nrole = \"worker\"\nmessage = \"Start.\"\n\n\
+                        [flows.main.steps.check]\nrole = \"worker\"\nmessage = \"Check.\"\n\
+                        depends_on = [\"start\"]\n\
+                        condition = { op = \"eq\", path = \"params.kind\", value = \"c\" }\n";
+        let definition = MobDefinition::from_toml(mob_toml).expect("the definition");
+        assert!(step_conditions(&definition)["Check."].is_some());
+        let exported = round_tripped_definition(mob_toml);
+        assert_eq!(
+            (step_wiring(&exported), step_conditions(&exported)),
+            (step_wiring(&definition), step_conditions(&definition))
+        );
+
+        let imported = import_mobpack(&json!({ "mob_toml": mob_toml })).expect("import");
+        let mut document: MobpackDocument =
+            serde_json::from_value(imported["document"].clone()).expect("document");
+        document.flow = graph_to_flow_from_document(&document);
+        document.mob_toml = None;
+        let from_graph = MobDefinition::from_toml(
+            &render_editor_document_mob_toml(&document).expect("export the derived flow"),
+        )
+        .expect("the definition exported from the graph");
+        assert_eq!(
+            (step_wiring(&from_graph), step_conditions(&from_graph)),
+            (step_wiring(&definition), step_conditions(&definition))
+        );
+    }
+
+    /// A document whose member selects one path skill of the skills catalog
+    /// realm `realm_id`, named by `path`.
+    fn document_selecting_catalog_skill(realm_id: &str, path: &str) -> MobpackDocument {
+        let mut document = document_with_expected_schema_ref();
+        document.mob_toml = None;
+        document.members.as_array_mut().expect("members")[0]["skills"] = json!(["catalog.skill"]);
+        document.skill_realms = json!([{
+            "id": realm_id,
+            "label": "Catalog realm",
+            "source": "filesystem",
+            "skills": [{
+                "id": "catalog.skill",
+                "label": "Catalog skill",
+                "source": "path",
+                "path": path,
+            }]
+        }]);
+        document
+    }
+
+    /// The skill realm with `id` in a catalog response.
+    fn catalog_realm<'a>(response: &'a Value, id: &str) -> &'a Value {
+        response["skill_realms"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|realm| realm["id"] == id)
+            .unwrap_or_else(|| panic!("no skill realm {id} in {response:#}"))
+    }
+
+    /// The catalogs name no host path to a caller without host access: each
+    /// catalog skill's path is relative to its realm's directory, and neither
+    /// that directory nor an absolute provenance path is named.
+    #[test]
+    fn catalogs_name_no_host_path_to_a_caller_without_host_access() {
+        fn host_paths(value: &Value, key: Option<&str>, found: &mut Vec<String>) {
+            match value {
+                Value::Object(map) => {
+                    for (key, value) in map {
+                        host_paths(value, Some(key), found);
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        host_paths(item, key, found);
+                    }
+                }
+                Value::String(text) if key == Some("path") => {
+                    let bytes = text.as_bytes();
+                    let drive =
+                        bytes.len() > 1 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic();
+                    if text.starts_with('/') || text.starts_with('\\') || drive {
+                        found.push(text.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let responses = with_untrusted_path_skill_reads(None, || {
+            [
+                mobpack_catalogs_response(),
+                mobpack_skills_catalog_response(),
+                mobpack_agent_definitions_response(),
+            ]
+        });
+        let mut found = Vec::new();
+        for response in &responses {
+            host_paths(response, None, &mut found);
+        }
+        assert_eq!(found, Vec::<String>::new());
+        let repo = catalog_realm(&responses[1], "meta/repo");
+        assert!(
+            repo["skills"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|skill| skill["path"] == "meerkat-meta/SKILL.md"),
+            "{repo:#}"
+        );
+    }
+
+    /// A host caller's catalogs still name each catalog skill by its absolute
+    /// host path, and each realm by its directory.
+    #[test]
+    fn catalogs_still_name_host_paths_to_the_host() {
+        let skills = with_host_path_skill_reads(mobpack_skills_catalog_response);
+        let repo = catalog_realm(&skills, "meta/repo");
+        assert!(
+            repo["path"]
+                .as_str()
+                .is_some_and(|path| Path::new(path).is_absolute()),
+            "{repo:#}"
+        );
+        assert!(
+            repo["skills"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|skill| {
+                    skill["path"].as_str().is_some_and(|path| {
+                        Path::new(path).is_absolute() && path.ends_with("meerkat-meta/SKILL.md")
+                    })
+                }),
+            "{repo:#}"
+        );
+    }
+
+    /// A caller without host access names a catalog skill by its path within
+    /// its realm, as its catalogs name it, and the export packs the file the
+    /// catalog lists, where a host-named skill is packed.
+    #[test]
+    fn a_catalog_skill_named_within_its_realm_packs_without_host_access() {
+        let listed = std::fs::read(catalog_listed_skill_file()).expect("the listed skill file");
+        let document = document_selecting_catalog_skill("meta/repo", "meerkat-meta/SKILL.md");
+        let files = with_untrusted_path_skill_reads(None, || selected_path_skill_files(&document))
+            .expect("the catalog skill packs");
+        assert_eq!(
+            files.into_iter().collect::<Vec<_>>(),
+            [("skills/catalog-skill.md".to_string(), listed)]
+        );
+    }
+
+    /// A document naming a catalog skill by its absolute host path, as the
+    /// host's catalogs and documents from before name it, still packs it.
+    #[test]
+    fn a_catalog_skill_named_by_its_host_path_still_packs() {
+        let listed = std::fs::read(catalog_listed_skill_file()).expect("the listed skill file");
+        let document = document_selecting_path_skill(&catalog_listed_skill_file());
+        let files = with_untrusted_path_skill_reads(None, || selected_path_skill_files(&document))
+            .expect("the catalog skill packs");
+        assert!(files.values().any(|bytes| *bytes == listed), "{files:?}");
+    }
+
+    /// The codes of the diagnostics validating `document` reports.
+    fn diagnostic_codes(document: &MobpackDocument) -> BTreeSet<String> {
+        validate_document(document)
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect()
+    }
+
+    /// A path within a realm with a component that could step out of the
+    /// realm (`..`, `.`, empty, drive or backslash) is refused, typed, before
+    /// anything is read, for any caller. An encoded `..` is a name, not a
+    /// step, and names no listed file.
+    #[cfg(unix)]
+    #[test]
+    fn realm_skill_paths_that_could_leave_their_realm_are_refused() {
+        for path in [
+            "../skills/meerkat-meta/SKILL.md",
+            "meerkat-meta/../meerkat-meta/SKILL.md",
+            "./meerkat-meta/SKILL.md",
+            "meerkat-meta//SKILL.md",
+            "..\\skills\\meerkat-meta\\SKILL.md",
+            "C:\\skills\\meerkat-meta\\SKILL.md",
+            "C:meerkat-meta/SKILL.md",
+        ] {
+            let document = document_selecting_catalog_skill("meta/repo", path);
+            let expected = Err(path_skill_leaves_realm("catalog.skill", path));
+            let untrusted =
+                with_untrusted_path_skill_reads(None, || selected_path_skill_files(&document));
+            let host = with_host_path_skill_reads(|| selected_path_skill_files(&document));
+            assert_eq!(
+                (untrusted.map(|_| ()), host.map(|_| ())),
+                (expected.clone(), expected),
+                "{path}"
+            );
+            let codes = with_untrusted_path_skill_reads(None, || diagnostic_codes(&document));
+            assert!(
+                codes.contains("selected_skill_path_leaves_realm"),
+                "{path}: {codes:?}"
+            );
+        }
+        let encoded =
+            document_selecting_catalog_skill("meta/repo", "%2e%2e/skills/meerkat-meta/SKILL.md");
+        assert!(
+            with_untrusted_path_skill_reads(None, || selected_path_skill_files(&encoded)).is_err()
+        );
+    }
+
+    /// A path within a skill realm the catalog does not list (an unknown realm,
+    /// or one that is not a skills directory) is refused to a caller without
+    /// host access with its own typed error. A host caller's document is read
+    /// as named, as before.
+    #[test]
+    fn a_realm_the_catalog_does_not_list_is_refused_without_host_access() {
+        for realm_id in ["nowhere/realm", "meta/authoring-agent-definitions"] {
+            let document = document_selecting_catalog_skill(realm_id, "meerkat-meta/SKILL.md");
+            let untrusted =
+                with_untrusted_path_skill_reads(None, || selected_path_skill_files(&document));
+            assert_eq!(
+                untrusted.map(|_| ()),
+                Err(path_skill_realm_not_listed("catalog.skill", realm_id))
+            );
+            let codes = with_untrusted_path_skill_reads(None, || diagnostic_codes(&document));
+            assert!(
+                codes.contains("selected_skill_realm_not_listed"),
+                "{realm_id}: {codes:?}"
+            );
+            let host = with_host_path_skill_reads(|| selected_path_skill_files(&document));
+            assert!(
+                host.as_ref()
+                    .is_err_and(|error| error.starts_with("failed to read selected path skill")),
+                "{realm_id}: {host:?}"
+            );
+        }
+    }
+
+    /// Set in the child process of the realm link test, to its scratch
+    /// directory.
+    #[cfg(unix)]
+    const REALM_LINK_CHILD: &str = "META_TEST_REALM_LINK_CHILD";
+
+    /// A path within a realm that resolves through a link out of the realm's
+    /// directory is refused to a caller without host access, as the catalog
+    /// refuses the link it lists.
+    #[cfg(unix)]
+    #[test]
+    fn a_realm_skill_path_through_a_link_out_of_its_realm_is_refused() {
+        if std::env::var_os(REALM_LINK_CHILD).is_none() {
+            let scratch = tempfile::tempdir().expect("tempdir");
+            let skills = scratch.path().join("skills");
+            std::fs::create_dir_all(skills.join("escape")).expect("skill directory");
+            let outside = scratch.path().join("outside.md");
+            std::fs::write(&outside, "---\nname: escape\n---\nOUTSIDE-THE-REALM-5f2a")
+                .expect("outside file");
+            std::os::unix::fs::symlink(&outside, skills.join("escape").join("SKILL.md"))
+                .expect("link out of the realm");
+            run_test_in_child(
+                "mobpack::tests::a_realm_skill_path_through_a_link_out_of_its_realm_is_refused",
+                &[
+                    (REALM_LINK_CHILD, Some(scratch.path().as_os_str())),
+                    ("META_SKILL_DIRS", Some(skills.as_os_str())),
+                ],
+            );
+            return;
+        }
+        let document = document_selecting_catalog_skill("env/skills-0", "escape/SKILL.md");
+        let packed = with_untrusted_path_skill_reads(None, || selected_path_skill_files(&document));
+        assert!(
+            packed
+                .as_ref()
+                .is_err_and(|error| error.contains("leaves the skill directory")),
+            "{packed:?}"
+        );
+    }
+
+    /// Set in the child process of the deploy plan test.
+    #[cfg(unix)]
+    const DEPLOY_PLAN_CHILD: &str = "META_TEST_DEPLOY_PLAN_CHILD";
+
+    /// A deploy plan or command preview for a caller without host access
+    /// names no host path: the pack path is the caller's own or the bare file
+    /// name, never one in the temp directory, and the command runs `rkat`,
+    /// never the binary `RKAT_BIN` names. A host caller's plan is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn deploy_plans_name_no_host_path_to_a_caller_without_host_access() {
+        if std::env::var_os(DEPLOY_PLAN_CHILD).is_none() {
+            run_test_in_child(
+                "mobpack::tests::deploy_plans_name_no_host_path_to_a_caller_without_host_access",
+                &[
+                    (DEPLOY_PLAN_CHILD, Some(std::ffi::OsStr::new("1"))),
+                    (
+                        "RKAT_BIN",
+                        Some(std::ffi::OsStr::new("/opt/host-only/bin/rkat")),
+                    ),
+                ],
+            );
+            return;
+        }
+        let params = json!({ "document": valid_document() });
+        let plan = with_untrusted_path_skill_reads(None, || deploy_mobpack(&params))
+            .expect("a deploy plan");
+        let preview = with_untrusted_path_skill_reads(None, || deploy_command_preview(&params))
+            .expect("a deploy command preview");
+        let reply = json!({ "plan": plan, "preview": preview }).to_string();
+        let temp = std::env::temp_dir().to_string_lossy().into_owned();
+        assert!(
+            !reply.contains("/opt/host-only") && !reply.contains(&temp),
+            "{reply}"
+        );
+        assert_eq!(
+            (plan.argv.first(), preview.argv.first()),
+            (Some(&"rkat".to_string()), Some(&"rkat".to_string()))
+        );
+        let host = with_host_path_skill_reads(|| deploy_mobpack(&params)).expect("a host plan");
+        assert!(
+            host.pack_path.starts_with(&temp)
+                && host.argv.first().map(String::as_str) == Some("/opt/host-only/bin/rkat"),
+            "{host:?}"
+        );
+    }
+
+    /// An undo writes only over the draft it read. A draft deleted, created
+    /// again and saved back to the revision the undo read, between the
+    /// undo's read and its write, is not overwritten by a step built from the
+    /// old draft: the revision alone matched it. The undo fails with a draft
+    /// revision conflict, which the editor retries.
+    #[test]
+    fn an_undo_does_not_overwrite_a_draft_created_again_at_the_revision_it_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("drafts.json");
+        let save = |store_path: &Path, name: &str| {
+            let mut document = valid_document();
+            document.name = name.to_string();
+            save_mobpack_draft(&json!({
+                "store_path": store_path,
+                "id": "aba",
+                "document": document,
+            }))
+            .expect("save")
+        };
+        save(&store_path, "First");
+        save(&store_path, "Second");
+        let again = store_path.clone();
+        DRAFT_STEP_BETWEEN_READ_AND_WRITE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                delete_mobpack_draft(&json!({ "store_path": again, "id": "aba" })).expect("delete");
+                save(&again, "Third");
+                save(&again, "Fourth");
+            }));
+        });
+        let undone = undo_mobpack_draft(&json!({ "store_path": store_path, "id": "aba" }));
+        let fetched =
+            get_mobpack_draft(&json!({ "store_path": store_path, "id": "aba" })).expect("get");
+        assert_eq!(
+            (
+                undone.err().is_some_and(|error| {
+                    error.contains("draft revision conflict")
+                        && error.contains("changed after it was read")
+                }),
+                fetched["row"]["revision"].clone(),
+                fetched["row"]["name"].clone(),
+            ),
+            (true, json!(2), json!("Fourth"))
+        );
+    }
+
+    /// A store of six drafts whose `mob.toml` each ends in a comment of
+    /// `padding` bytes.
+    fn draft_store_with_padded_drafts(padding: usize) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("drafts.json");
+        for index in 0..6 {
+            let mut document = valid_document();
+            let mob_toml = document.mob_toml.take().unwrap_or_default();
+            document.mob_toml = Some(format!("{mob_toml}\n# {}\n", "x".repeat(padding)));
+            save_mobpack_draft(&json!({
+                "store_path": store_path,
+                "id": format!("draft_{index}"),
+                "document": document,
+            }))
+            .expect("save a padded draft");
+        }
+        (dir, store_path)
+    }
+
+    /// Draft replies list the drafts as summaries, without their documents,
+    /// archives or validations, so no reply but `get` grows with the
+    /// documents in the store: each listed every draft whole.
+    #[test]
+    fn draft_replies_do_not_grow_with_the_stored_documents() {
+        let sizes = |padding: usize| {
+            let (_dir, store_path) = draft_store_with_padded_drafts(padding);
+            let size = |reply: Value| serde_json::to_vec(&reply).map_or(0, |bytes| bytes.len());
+            let listed =
+                size(list_mobpack_drafts(&json!({ "store_path": store_path })).expect("list"));
+            let saved = size(
+                save_mobpack_draft(&json!({
+                    "store_path": store_path,
+                    "id": "probe",
+                    "document": valid_document(),
+                }))
+                .expect("save"),
+            );
+            let deleted = size(
+                delete_mobpack_draft(&json!({ "store_path": store_path, "id": "probe" }))
+                    .expect("delete"),
+            );
+            let fetched = size(
+                get_mobpack_draft(&json!({ "store_path": store_path, "id": "draft_0" }))
+                    .expect("get"),
+            );
+            (listed, saved, deleted, fetched)
+        };
+        let (small, large) = (sizes(0), sizes(256 * 1024));
+        assert!(
+            large.0 <= small.0 + 64 && large.1 <= small.1 + 64 && large.2 <= small.2 + 64,
+            "reply bytes with small documents {small:?}, with 256 KiB more each {large:?}"
+        );
+        assert!(
+            large.3 > small.3 + 256 * 1024,
+            "get returns the document: {small:?} {large:?}"
+        );
+    }
+
+    /// A draft id has at most [`MOBPACK_DRAFT_MAX_ID_CHARS`] characters, so a
+    /// summary, which carries its draft's id whole, stays small.
+    #[test]
+    fn a_draft_id_past_the_cap_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("drafts.json");
+        let save = |id: String| {
+            save_mobpack_draft(&json!({
+                "store_path": store_path,
+                "id": id,
+                "document": valid_document(),
+            }))
+        };
+        let refusal = save("d".repeat(MOBPACK_DRAFT_MAX_ID_CHARS + 1))
+            .expect_err("an id past the cap is refused");
+        assert!(refusal.contains("more than 256"), "{refusal}");
+        assert!(save("d".repeat(MOBPACK_DRAFT_MAX_ID_CHARS)).is_ok());
+    }
+
+    /// A store write that replaced the store but could not sync its directory
+    /// has taken effect, so it is reported done, with a `durability_warning`
+    /// and the written draft, not as a failure: undo and redo are not
+    /// idempotent, and a client that retried a failed undo stepped twice.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_whose_directory_cannot_be_synced_is_reported_done_with_a_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("drafts.json");
+        let save = |name: &str| {
+            let mut document = valid_document();
+            document.name = name.to_string();
+            save_mobpack_draft(&json!({
+                "store_path": store_path,
+                "id": "synced",
+                "document": document,
+            }))
+        };
+        save("First").expect("save");
+        save("Second").expect("save");
+        let warned = |reply: &Result<Value, String>| {
+            reply
+                .as_ref()
+                .ok()
+                .and_then(|reply| reply["durability_warning"].as_str())
+                .is_some_and(|warning| warning.contains("could not be synced"))
+        };
+        FAIL_NEXT_DIR_SYNC.with(|fail| fail.set(true));
+        let undone = undo_mobpack_draft(&json!({ "store_path": store_path, "id": "synced" }));
+        FAIL_NEXT_DIR_SYNC.with(|fail| fail.set(true));
+        let saved = save("Third");
+        let fetched =
+            get_mobpack_draft(&json!({ "store_path": store_path, "id": "synced" })).expect("get");
+        assert_eq!(
+            (
+                warned(&undone),
+                undone
+                    .as_ref()
+                    .ok()
+                    .map(|reply| reply["row"]["revision"].clone()),
+                warned(&saved),
+                fetched["row"]["revision"].clone(),
+                fetched["row"]["name"].clone(),
+            ),
+            (true, Some(json!(3)), true, json!(4), json!("Third"))
         );
     }
 }

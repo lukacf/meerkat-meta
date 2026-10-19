@@ -96,6 +96,7 @@ pub mod tool_compose;
 pub mod topology_control;
 pub mod types;
 pub mod unified_runtime;
+pub mod unobserved;
 pub mod workgraph_admission;
 pub mod workgraph_events;
 pub mod workgraph_realm;
@@ -323,13 +324,14 @@ pub use types::{
     ModuleConfig, ModuleEvent, PreSpawnData, RestartPolicy, UnifiedEvent,
 };
 pub use unified_runtime::{
-    CompactionPreservedHistoryFit, DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS, DesiredPeerEdge,
-    DesiredPeerEdgeError, Discovery, EdgeDiscovery, EdgeReconcileFailure, ErrorEvent, ErrorHook,
-    EventLogConfig, EventLogStore, EventQuery, HeldIdentityCompletion,
-    IdentityAuthorityReleaseOutcome, IdentityBootstrapMode, MOB_STOP_FLOW_SETTLE_BUDGET,
-    McpCloseUnsettledClass, MemberMcpSettlement, MemberMcpUnsettled, MemberTurnAdmission,
-    MobStopFlowRunsUnsettled, MobStopOutcome, MobTerminalShutdownOutcome, PersistedEvent,
-    PostReconcileHook, PostSpawnHook, PreSpawnContext, PreSpawnHook, RediscoverReport,
+    BootstrapCompletionRefused, BootstrapCompletionUnavailable, CompactionPreservedHistoryFit,
+    DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS, DesiredPeerEdge, DesiredPeerEdgeError,
+    Discovery, EdgeDiscovery, EdgeReconcileFailure, ErrorEvent, ErrorHook, EventLogConfig,
+    EventLogStore, EventQuery, HeldIdentityCompletion, IdentityAuthorityReleaseOutcome,
+    IdentityBootstrapMode, MOB_STOP_FLOW_SETTLE_BUDGET, McpCloseUnsettledClass,
+    MemberMcpSettlement, MemberMcpUnsettled, MemberTurnAdmission, MobStopFlowRunsUnsettled,
+    MobStopOutcome, MobTerminalShutdownOutcome, PersistedEvent, PostReconcileHook, PostSpawnHook,
+    PreSpawnContext, PreSpawnHook, RediscoverReport, RuntimeBootstrapCompleted,
     ShutdownDrainReport, UnifiedRuntime, UnifiedRuntimeBootstrapError,
     UnifiedRuntimeBootstrapPhase, UnifiedRuntimeBootstrapPhaseObserver, UnifiedRuntimeBuilder,
     UnifiedRuntimeBuilderError, UnifiedRuntimeBuilderField, UnifiedRuntimeError,
@@ -337,6 +339,7 @@ pub use unified_runtime::{
     UnifiedRuntimeReconcileReport, UnifiedRuntimeReconcileRoutingReport, UnifiedRuntimeRunReport,
     UnifiedRuntimeShutdownReport, discovery_spec_to_spawn_spec,
 };
+pub use unobserved::{UnobservedFacts, UnobservedReason};
 pub use workgraph_realm::{
     AttentionTargetRealm, MigratedMemberBinding, WorkGraphRealmMigrationMode,
     WorkGraphRealmMigrationOutcome, WorkGraphRealmMigrationReport,

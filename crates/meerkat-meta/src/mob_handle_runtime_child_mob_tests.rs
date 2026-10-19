@@ -223,7 +223,7 @@ impl LlmClient for ScriptedModel {
                 Provider::OpenAI,
             )),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { stop_reason },
+                outcome: LlmDoneOutcome::success(stop_reason),
             }),
         ];
         Box::pin(futures::stream::iter(events))
@@ -532,6 +532,12 @@ fn lifetime_driver() {
     let Ok(lifetime) = std::env::var(LIFETIME_ENV) else {
         return;
     };
+    // A lifetime is a process of its own: its warnings (a stand-down that did
+    // not settle names the unsettled work) reach the parent's failure message.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
+        .with_writer(std::io::stderr)
+        .try_init();
     let dir = PathBuf::from(std::env::var(LIFETIME_DIR_ENV).expect("lifetime state dir"));
     std::thread::Builder::new()
         .name("child-mob-lifetime".into())
@@ -739,6 +745,18 @@ async fn lifetime_under_policy(
     .expect("bootstrap the lifetime")
 }
 
+/// The deadline of a stand-down a test expects to release the child root.
+///
+/// `stand_down_child_mobs` returns as soon as every child and the state's own
+/// work settle; its deadline only caps the wait. These tests assert the
+/// release after a proven stand-down, so the cap is a hang guard (inside a
+/// lifetime's two-minute one) rather than a budget a loaded host can miss: on
+/// a host at load ~50 the state's work took more than 15 s to settle, and the
+/// stand-down reported `HeldUntilProcessExit`.
+fn release_deadline() -> std::time::Instant {
+    std::time::Instant::now() + Duration::from_secs(90)
+}
+
 /// Stand down a durable lifetime: every child and the state's own work
 /// settle, and the child root is released.
 async fn stand_down_released(runtime: MobRuntime, child_mobs: usize) {
@@ -748,9 +766,7 @@ async fn stand_down_released(runtime: MobRuntime, child_mobs: usize) {
         .await
         .expect("root mob shutdown");
     assert_eq!(
-        runtime
-            .stand_down_child_mobs(std::time::Instant::now() + Duration::from_secs(15))
-            .await,
+        runtime.stand_down_child_mobs(release_deadline()).await,
         crate::child_mob_storage::ChildMobStandDownOutcome::Released { child_mobs }
     );
 }
@@ -874,9 +890,7 @@ async fn a_stood_down_child_root_is_released_for_a_successor_in_the_same_process
         .shutdown()
         .await
         .expect("root mob shutdown");
-    let released = runtime
-        .stand_down_child_mobs(std::time::Instant::now() + Duration::from_secs(15))
-        .await;
+    let released = runtime.stand_down_child_mobs(release_deadline()).await;
     assert_eq!(
         released,
         crate::child_mob_storage::ChildMobStandDownOutcome::Released { child_mobs: 1 }
@@ -972,7 +986,7 @@ async fn a_release_is_reported_only_after_the_last_claim_holder_is_gone() {
     assert_root_owned(dir.path());
 
     drop(holder);
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let deadline = release_deadline();
     let (first, retry) = tokio::join!(
         runtime.stand_down_child_mobs(deadline),
         runtime_clone.stand_down_child_mobs(deadline),
@@ -1049,9 +1063,7 @@ async fn a_child_created_during_the_stand_down_is_counted_or_refused() {
             panic!("the state never refused a create during its stand-down");
         })
     };
-    let outcome = runtime
-        .stand_down_child_mobs(std::time::Instant::now() + Duration::from_secs(15))
-        .await;
+    let outcome = runtime.stand_down_child_mobs(release_deadline()).await;
     let during = tokio::time::timeout(Duration::from_secs(15), creator)
         .await
         .expect("the creator stops once refused")
@@ -1155,9 +1167,7 @@ async fn a_stand_down_waits_for_a_running_one_only_until_its_deadline() {
     assert_root_owned(dir.path());
 
     drop(running);
-    let released = runtime
-        .stand_down_child_mobs(std::time::Instant::now() + Duration::from_secs(15))
-        .await;
+    let released = runtime.stand_down_child_mobs(release_deadline()).await;
     assert_eq!(
         released,
         crate::child_mob_storage::ChildMobStandDownOutcome::Released { child_mobs: 1 }
@@ -1190,9 +1200,7 @@ async fn a_child_root_with_no_children_is_released_for_a_successor() {
         .shutdown()
         .await
         .expect("root mob shutdown");
-    let released = runtime
-        .stand_down_child_mobs(std::time::Instant::now() + Duration::from_secs(15))
-        .await;
+    let released = runtime.stand_down_child_mobs(release_deadline()).await;
     assert_eq!(
         released,
         crate::child_mob_storage::ChildMobStandDownOutcome::Released { child_mobs: 0 }
@@ -1206,6 +1214,64 @@ async fn a_child_root_with_no_children_is_released_for_a_successor() {
     assert_root_owned(dir.path());
     drop(runtime);
     stand_down_released(successor, 0).await;
+}
+
+/// A stand-down is terminal for the runtime's delivery owner as well: a
+/// runtime torn down without `UnifiedRuntime` (the root mob shut down, then
+/// the child stand-down) stops it, as `UnifiedRuntime`'s shutdown does. The
+/// owner kept running after the root was released, held by the composition
+/// the dropped runtime left behind, and an owner pass in flight when the
+/// state directory was removed recreated it with an empty runtime store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stand_down_stops_the_runtime_delivery_owner() {
+    let dir = tempfile::tempdir().expect("state dir");
+    let host = Host::new();
+    let mob_id = unique("delivery-stop");
+    let runtime = lifetime(dir.path(), &mob_id, &host, |spec| {
+        spec.with_child_mob_storage(durable(dir.path()))
+    })
+    .await
+    .expect("first lifetime");
+    runtime
+        .handle()
+        .shutdown()
+        .await
+        .expect("root mob shutdown");
+    let released = runtime.stand_down_child_mobs(release_deadline()).await;
+    // Stopped, and joined: the owner's task ended before the stand-down
+    // returned, so no pass of it can run past the release.
+    let stopped = runtime
+        .runtime_delivery
+        .as_ref()
+        .map(|delivery| (delivery.is_stopped(), delivery.owner_task_ended()));
+    drop(runtime);
+    // Work the dropped runtime still finishes may close files in the
+    // directory while it goes: remove it again until it is gone.
+    let removal_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::fs::remove_dir_all(dir.path()) {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => assert!(
+                std::time::Instant::now() < removal_deadline,
+                "remove the state dir: {error}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The delivery owner sweeps its store every 5 s by default.
+    let deadline = std::time::Instant::now() + Duration::from_secs(7);
+    while !dir.path().exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        (released, stopped, dir.path().exists()),
+        (
+            crate::child_mob_storage::ChildMobStandDownOutcome::Released { child_mobs: 0 },
+            Some((true, true)),
+            false
+        )
+    );
 }
 
 /// A child that shut down cleanly keeps that receipt for its incarnation: a
@@ -1233,7 +1299,7 @@ async fn a_retry_keeps_the_clean_receipt_of_a_stopped_child() {
         .await
         .expect("root mob shutdown");
     let state = runtime.agent_mob_mcp_state().expect("agent mob-tool state");
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let deadline = release_deadline();
     // The first attempt shuts the child down cleanly.
     let (mut seen, mut child_mobs) = (std::collections::BTreeSet::new(), 0);
     runtime
@@ -1254,9 +1320,7 @@ async fn a_retry_keeps_the_clean_receipt_of_a_stopped_child() {
     );
     drop(child);
     assert_eq!(
-        runtime
-            .stand_down_child_mobs(std::time::Instant::now() + Duration::from_secs(15))
-            .await,
+        runtime.stand_down_child_mobs(release_deadline()).await,
         crate::child_mob_storage::ChildMobStandDownOutcome::Released { child_mobs: 1 }
     );
 }

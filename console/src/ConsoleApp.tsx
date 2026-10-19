@@ -33,6 +33,7 @@ import type {
 } from "@console-core";
 import {
   collectConsoleDockPanelIds,
+  consoleMobStatus,
   createPendingApprovalResource,
   identityStateLabel,
   migrateConsoleWorkbenchTarget,
@@ -2697,44 +2698,65 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
   const accessScopeRef = React.useRef(accessScope);
   accessScopeRef.current = accessScope;
   const accessRefreshVersion = React.useRef(0);
+  // The scope whose access read has completed at least once (success,
+  // refusal or failure). Until then every read blocks edits.
+  const accessSettledScope = React.useRef<string | null>(null);
   const visibleAccessData = accessData.scope === accessScope ? accessData : null;
   React.useEffect(() => {
     accessRefreshVersion.current += 1;
+    accessSettledScope.current = null;
     setAccessData({ scope: accessScope, loading: false, status: null, config: null, error: null });
   }, [accessScope, experience?.access?.can_administer]);
-  const refreshAccessData = React.useCallback(() => panelRefreshFlight("access", async () => {
-    if (accessScope !== accessScopeRef.current) return;
-    const version = ++accessRefreshVersion.current;
-    const isCurrent = () => version === accessRefreshVersion.current && accessScope === accessScopeRef.current;
-    const accessTarget = controlWorkbenchTarget("access");
-    setAccessData(current => ({
-      scope: accessScope, loading: true, error: null,
-      status: current.scope === accessScope ? current.status : null,
-      config: current.scope === accessScope ? current.config : null,
-    }));
-    let status: ConsoleAccessStatus | null = null;
-    try {
-      status = ((await executeHeadlessCommand(CONSOLE_COMMAND_NAMES.accessStatus, accessTarget)) as ConsoleAccessStatus | null) || null;
-      if (!isCurrent()) return;
-      let config: ConsoleAccessConfig | null = null;
-      if (status?.available && status?.can_administer) {
-        const result = (await executeHeadlessCommand(CONSOLE_COMMAND_NAMES.getAccessConfig, accessTarget)) as { config?: ConsoleAccessConfig; revision?: number; owner_instance?: string; conditional_mutations?: string } | null;
-        config = result?.config || null;
-        // Config and its edit token must come from the same protected read.
-        status = { ...status, revision: result?.revision, owner_instance: result?.owner_instance,
-          conditional_mutations: status.conditional_mutations === "checked_v1" ? result?.conditional_mutations : undefined };
-      }
-      if (isCurrent()) setAccessData({ scope: accessScope, loading: false, status, config, error: null });
-    } catch (err) {
-      if (!isCurrent()) return;
-      const failure = classifyConsoleSendFailure(err);
-      const forbidden = failure.kind === "access_denied" || failure.kind === "unauthenticated";
-      setAccessData(current => ({ ...current, loading: false, error: errorMessage(err),
-        ...(forbidden ? { status: null, config: null } : {}),
+  // An explicit read (Refresh, the read after a save) disables edits from the
+  // moment it is requested and drops any read already in flight, so nothing
+  // older lands after it. The first read of a scope disables edits from its
+  // request too. A background read in a settled scope changes nothing until
+  // it lands; the owner still checks the draft's edit token on every save.
+  // The single flight keeps only the latest task for its trailing run, so a
+  // background trigger can replace an explicit request's trailing read. That
+  // is safe because both modes complete the same way and the explicit request
+  // applied its effects when it was made.
+  const refreshAccessData = React.useCallback((mode: "explicit" | "background" = "explicit") => {
+    if (accessScope === accessScopeRef.current && (mode === "explicit" || accessSettledScope.current !== accessScope)) {
+      if (mode === "explicit") accessRefreshVersion.current += 1;
+      setAccessData(current => ({
+        scope: accessScope, loading: true, error: null,
+        status: current.scope === accessScope ? current.status : null,
+        config: current.scope === accessScope ? current.config : null,
       }));
     }
+    return panelRefreshFlight("access", async () => {
+      if (accessScope !== accessScopeRef.current) return;
+      const version = ++accessRefreshVersion.current;
+      const isCurrent = () => version === accessRefreshVersion.current && accessScope === accessScopeRef.current;
+      const accessTarget = controlWorkbenchTarget("access");
+      let status: ConsoleAccessStatus | null = null;
+      try {
+        status = ((await executeHeadlessCommand(CONSOLE_COMMAND_NAMES.accessStatus, accessTarget)) as ConsoleAccessStatus | null) || null;
+        if (!isCurrent()) return;
+        let config: ConsoleAccessConfig | null = null;
+        if (status?.available && status?.can_administer) {
+          const result = (await executeHeadlessCommand(CONSOLE_COMMAND_NAMES.getAccessConfig, accessTarget)) as { config?: ConsoleAccessConfig; revision?: number; owner_instance?: string; conditional_mutations?: string } | null;
+          config = result?.config || null;
+          // Config and its edit token must come from the same protected read.
+          status = { ...status, revision: result?.revision, owner_instance: result?.owner_instance,
+            conditional_mutations: status.conditional_mutations === "checked_v1" ? result?.conditional_mutations : undefined };
+        }
+        if (!isCurrent()) return;
+        accessSettledScope.current = accessScope;
+        setAccessData({ scope: accessScope, loading: false, status, config, error: null });
+      } catch (err) {
+        if (!isCurrent()) return;
+        accessSettledScope.current = accessScope;
+        const failure = classifyConsoleSendFailure(err);
+        const forbidden = failure.kind === "access_denied" || failure.kind === "unauthenticated";
+        setAccessData(current => ({ ...current, loading: false, error: errorMessage(err),
+          ...(forbidden ? { status: null, config: null } : {}),
+        }));
+      }
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [panelRefreshFlight, baseUrl, accessScope]);
+  }, [panelRefreshFlight, baseUrl, accessScope]);
 
   const refreshMemoryData = React.useCallback(() => panelRefreshFlight("memory", async () => {
     const memoryTarget = controlWorkbenchTarget("memory");
@@ -3196,7 +3218,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
         );
       }));
     }
-    if (openPanels.some((t) => t.kind === "access")) refreshes.push(refreshAccessData());
+    if (openPanels.some((t) => t.kind === "access")) refreshes.push(refreshAccessData("background"));
     if (openPanels.some((t) => t.kind === "memory")) refreshes.push(refreshMemoryData());
     if (openPanels.some((t) => t.kind === "workgraph")) refreshes.push(refreshWorkGraphData());
     if (openPanels.some((t) => t.kind === "topology")) refreshes.push(refreshTopologyData());
@@ -5146,10 +5168,7 @@ function ConsoleAppInstance({ baseUrl, transport, storageNamespace, markdownUrlP
     experience?.console_config?.environment?.label || "dev";
   const railConfig = experience?.console_config?.rail;
   const railVisible = railConfig?.visible !== false;
-  const mobStatus =
-    experience?.health_overview?.live_snapshot?.running === false
-      ? "stopped"
-      : "running";
+  const mobStatus = consoleMobStatus(experience?.health_overview?.live_snapshot);
 
   function toggleTheme() {
     const next: ConsoleTheme = theme === "dark" ? "light" : "dark";

@@ -60,6 +60,26 @@ export function identityStateLabel(row: { state: string; session_repair?: Identi
   return row.session_repair ? IDENTITY_STATE_NEEDS_REPAIR_LABEL : row.state;
 }
 
+/**
+ * Why facts of a console record are unobserved. The vocabulary is open:
+ * tolerate values you don't recognize. `refresh_pending`: the identity
+ * binding behind the record moved and the projection had not re-collected
+ * it yet, so the record withholds the facts it walked before.
+ * `not_observed`: nothing has observed the fact yet, so there is no answer
+ * to report.
+ */
+export type UnobservedReason = "refresh_pending" | "not_observed" | (string & {});
+
+/**
+ * Facts a console record holds no current observation of. `fields` names
+ * them; a named field is absent, empty, or the vocabulary's "unknown", never
+ * a guessed value.
+ */
+export interface UnobservedFacts {
+  reason: UnobservedReason;
+  fields: string[];
+}
+
 export interface IdentityStatusRow {
   identity: string;
   display_name?: string;
@@ -72,6 +92,7 @@ export interface IdentityStatusRow {
   lease_healthy?: boolean;
   progress?: MemberProgress;
   session_repair?: IdentitySessionRepair | null;
+  unobserved?: UnobservedFacts;
 }
 
 export interface IdentityInspectViewState extends IdentityStatusRow {
@@ -401,7 +422,54 @@ export function normalizeIdentityStatusRow(value: unknown): IdentityStatusRow | 
       const session_repair = normalizeIdentitySessionRepair(record.session_repair);
       return session_repair ? { session_repair } : {};
     })(),
+    ...((): { unobserved?: UnobservedFacts } => {
+      const unobserved = normalizeUnobservedFacts(record.unobserved);
+      return unobserved ? { unobserved } : {};
+    })(),
   };
+}
+
+export function normalizeUnobservedFacts(value: unknown): UnobservedFacts | null {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : null;
+  if (!record) {
+    return null;
+  }
+  const reason = trimString(record.reason);
+  if (!reason) {
+    return null;
+  }
+  const fields = Array.isArray(record.fields)
+    ? record.fields
+      .map((field) => trimString(field))
+      .filter((field): field is string => Boolean(field))
+    : [];
+  return { reason, fields };
+}
+
+/** The mob's run state as the console shows it. */
+export type ConsoleMobStatus = "running" | "stopped" | "unknown";
+
+/**
+ * Whether the mob runs, as a health snapshot reports it. Only an observed
+ * `true` is running and only an observed `false` is stopped: `null`, an
+ * absent value, or an `unobserved` marker that names `running` is unknown,
+ * never one of the two.
+ */
+export function consoleMobStatus(snapshot: unknown): ConsoleMobStatus {
+  const record = snapshot && typeof snapshot === "object" ? snapshot as Record<string, unknown> : null;
+  if (!record) {
+    return "unknown";
+  }
+  if (normalizeUnobservedFacts(record.unobserved)?.fields.includes("running")) {
+    return "unknown";
+  }
+  if (record.running === true) {
+    return "running";
+  }
+  if (record.running === false) {
+    return "stopped";
+  }
+  return "unknown";
 }
 
 export function normalizeIdentityInspectViewState(value: unknown): IdentityInspectViewState | null {

@@ -1753,7 +1753,7 @@ async fn member_status_accepts_the_runtime_alias_its_own_surfaces_hand_out()
 async fn member_declarations_round_trip_public_aliases_over_the_http_console()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut fixture = build_runtime_fixture().await;
-    let alias = "rt:gate:main:0";
+    let alias = "gate:main:0";
     let encoded = meerkat_meta::member_comms_id::mob_member_id(alias);
     assert!(
         encoded.as_str().starts_with("mk--"),

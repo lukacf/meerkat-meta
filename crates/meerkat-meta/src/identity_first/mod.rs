@@ -167,6 +167,13 @@ impl PublicIdentityRuntime {
     /// one deadline; `observe` has no deadline and can wait behind a writer
     /// of the identity table or the router. It is a local observation, never a permit: it extends no
     /// authority and proves no cleanup.
+    ///
+    /// The attempt's stdio setup diagnostics
+    /// (`McpAttachmentAttempt::setup_failure` and the SENSITIVE
+    /// `stderr_tail`) are read under the same checks as `observe` and answer
+    /// `None` once the identity is no longer on the attached session. They
+    /// are for the host and its operator only: Meta does not log them or put
+    /// them in any event or payload.
     pub async fn attach_live_mcp_server(
         &self,
         identity: &AgentIdentity,
@@ -209,10 +216,10 @@ impl PublicIdentityRuntime {
 /// session it was attached to: the identity's current session is checked
 /// before and after every read. Each check reads the identity's status (the
 /// identity table's read lock, which can wait behind a writer); `wait`
-/// bounds those reads by its deadline, `observe` does not. It holds the
-/// identity runtime weakly: a retained attempt adds no strong owner of the
-/// runtime (a read upgrades it only for that read). That is an ownership
-/// limit, not proof of teardown.
+/// bounds those reads by its deadline, `observe` and the setup diagnostics
+/// do not. It holds the identity runtime weakly: a retained attempt adds no
+/// strong owner of the runtime (a read upgrades it only for that read). That
+/// is an ownership limit, not proof of teardown.
 pub(crate) struct IdentityBoundAttempt {
     runtime: std::sync::Weak<IdentityRuntime>,
     identity: AgentIdentity,
@@ -245,27 +252,25 @@ impl IdentityBoundAttempt {
             .is_ok_and(|status| status.session_id.as_ref() == Some(&self.session_id))
     }
 
-    async fn checked(
-        &self,
-        read: impl std::future::Future<Output = meerkat_core::mcp_attachment::McpAttachmentReadiness>,
-    ) -> meerkat_core::mcp_attachment::McpAttachmentReadiness {
-        use meerkat_core::mcp_attachment::McpAttachmentReadiness;
+    /// `read`'s answer while the identity is still on the attached session,
+    /// checked before and after the read; `stale` otherwise.
+    async fn checked<T>(&self, read: impl std::future::Future<Output = T>, stale: T) -> T {
         if !self.current().await {
-            return McpAttachmentReadiness::NotCurrent;
+            return stale;
         }
-        let readiness = read.await;
-        if self.current().await {
-            readiness
-        } else {
-            McpAttachmentReadiness::NotCurrent
-        }
+        let answer = read.await;
+        if self.current().await { answer } else { stale }
     }
 }
 
 #[async_trait::async_trait]
 impl meerkat_core::mcp_attachment::McpAttachmentAttemptObserver for IdentityBoundAttempt {
     async fn observe(&self, tool: &str) -> meerkat_core::mcp_attachment::McpAttachmentReadiness {
-        self.checked(self.inner.observe(tool)).await
+        self.checked(
+            self.inner.observe(tool),
+            meerkat_core::mcp_attachment::McpAttachmentReadiness::NotCurrent,
+        )
+        .await
     }
 
     /// One absolute deadline bounds the whole wait: the identity check
@@ -297,6 +302,21 @@ impl meerkat_core::mcp_attachment::McpAttachmentAttemptObserver for IdentityBoun
                 other => other,
             },
         }
+    }
+
+    /// The attempt's typed stdio setup failure, under the same identity
+    /// checks as `observe`: `None` once the identity left the attached
+    /// session.
+    async fn setup_failure(&self) -> Option<meerkat_core::mcp_attachment::McpStdioSetupFailure> {
+        self.checked(self.inner.setup_failure(), None).await
+    }
+
+    /// The attempt's stderr tail, under the same identity checks as
+    /// `observe`: `None` once the identity left the attached session.
+    /// SENSITIVE: for the host and its operator only, never model context
+    /// (`McpStdioStderrTail`); it is passed through, never logged or kept.
+    async fn stderr_tail(&self) -> Option<meerkat_core::mcp_attachment::McpStdioStderrTail> {
+        self.checked(self.inner.stderr_tail(), None).await
     }
 }
 

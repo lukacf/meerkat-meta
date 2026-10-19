@@ -19,7 +19,9 @@ use crate::unified_runtime::UnifiedRuntime;
 
 use super::{JSONRPC_VERSION, JsonRpcError, JsonRpcResponse};
 
-fn identity_from_runtime_alias(alias: &str) -> Option<crate::identity_first::AgentIdentity> {
+pub(super) fn identity_from_runtime_alias(
+    alias: &str,
+) -> Option<crate::identity_first::AgentIdentity> {
     let alias = crate::member_comms_id::runtime_alias_str(alias);
     let rest = alias.strip_prefix("rt:")?;
     let (identity, generation) = rest.rsplit_once(':')?;
@@ -32,10 +34,16 @@ fn identity_from_runtime_alias(alias: &str) -> Option<crate::identity_first::Age
     crate::identity_first::AgentIdentity::parse(identity).ok()
 }
 
+/// The identity a stale runtime id names, with its registered status
+/// (`None` when the identity runtime does not know it); `None` when the id
+/// is no generated runtime id or is its identity's registered binding.
 async fn stale_runtime_alias_detail(
     identity_runtime: Option<&std::sync::Arc<crate::identity_first::IdentityRuntime>>,
     alias: &str,
-) -> Option<(String, Option<String>)> {
+) -> Option<(
+    crate::identity_first::AgentIdentity,
+    Option<crate::identity_first::IdentityStatus>,
+)> {
     let identity_runtime = identity_runtime?;
     let alias = crate::member_comms_id::runtime_alias_str(alias);
     let identity = identity_from_runtime_alias(alias.as_ref())?;
@@ -43,12 +51,11 @@ async fn stale_runtime_alias_detail(
     let registered = status
         .as_ref()
         .and_then(|status| status.agent_runtime_id.as_ref())
-        .map(crate::identity_first::AgentRuntimeId::as_str)
-        .map(str::to_string);
-    if registered.as_deref() == Some(alias.as_ref()) {
+        .map(crate::identity_first::AgentRuntimeId::as_str);
+    if registered == Some(alias.as_ref()) {
         return None;
     }
-    Some((identity.as_str().to_string(), registered))
+    Some((identity, status))
 }
 
 async fn stale_runtime_alias_error_response(
@@ -57,24 +64,20 @@ async fn stale_runtime_alias_error_response(
     response_id: Value,
 ) -> Option<JsonRpcResponse> {
     let alias = crate::member_comms_id::runtime_alias_str(alias).into_owned();
-    let (identity, registered) = stale_runtime_alias_detail(identity_runtime, &alias).await?;
+    let (identity, status) = stale_runtime_alias_detail(identity_runtime, &alias).await?;
     Some(JsonRpcResponse {
         jsonrpc: JSONRPC_VERSION.to_string(),
         id: response_id,
         result: None,
-        error: Some(JsonRpcError {
-            code: -32000,
-            message: format!(
-                "identity runtime binding for {identity} points at {}, but requested live member is {alias}",
-                registered.as_deref().unwrap_or("<none>")
+        error: Some(
+            crate::identity_control_target::stale_identity_runtime_binding_error(
+                "",
+                &identity,
+                status.as_ref(),
+                &alias,
+                None,
             ),
-            data: Some(serde_json::json!({
-                "kind": "stale_identity_runtime_binding",
-                "identity": identity,
-                "registered_runtime_member_id": registered,
-                "live_runtime_member_id": alias,
-            })),
-        }),
+        ),
     })
 }
 
@@ -2161,9 +2164,14 @@ pub(super) async fn handle_member_status(
             {
                 return response;
             }
+            // Decode before encoding, as `handle_get_member` does: the current
+            // runtime alias `status_identity` returns names the durable roster
+            // row, and encoding it directly reads a member that does not exist.
             match runtime
                 .mob_handle()
-                .member_status(&crate::member_comms_id::mob_member_id(&mid))
+                .member_status(&crate::member_comms_id::roster_member_id_for_supplied_id(
+                    &mid,
+                ))
                 .await
             {
                 Ok(snapshot) => {
@@ -2878,7 +2886,6 @@ pub(super) async fn handle_fork_helper(
                 }
             };
             let handle = runtime.mob_handle();
-            let source_member_id = crate::member_comms_id::mob_member_id(&source);
             let helper_alias = mid.to_string();
             let task = task_str.to_string();
             let identity_runtime_owned = identity_runtime.cloned();
@@ -2888,6 +2895,16 @@ pub(super) async fn handle_fork_helper(
                     .await
             } else {
                 Ok(None)
+            };
+            // A source the identity authority owns resolves to its durable
+            // roster row: the lifecycle target already checked that a
+            // generated alias is the current incarnation, and the tracked
+            // operation checks it again under the lock. A classic source keeps
+            // its own roster spelling.
+            let source_member_id = if matches!(authority_target, Ok(Some(_))) {
+                crate::member_comms_id::roster_member_id_for_supplied_id(&source)
+            } else {
+                crate::member_comms_id::mob_member_id(&source)
             };
             let fork_result = match authority_target {
                 Err(error) => Err(error.to_string()),
@@ -4822,6 +4839,7 @@ fn refuse_adoption_from_non_authoritative_launch(response_id: Value) -> JsonRpcR
 
 pub(crate) async fn handle_member_declaration_rpc(
     handle: &meerkat_mob::MobHandle,
+    identity_runtime: Option<&std::sync::Arc<crate::identity_first::IdentityRuntime>>,
     speaks_for_composition: bool,
     method: &str,
     response_id: Value,
@@ -4846,9 +4864,9 @@ pub(crate) async fn handle_member_declaration_rpc(
         APPLY_MEMBER_TOOL_DECLARATION => {
             Some(handle_apply_member_tool_declaration(handle, response_id, params).await)
         }
-        MEMBER_TOOL_DECLARATION => {
-            Some(handle_member_tool_declaration(handle, response_id, params).await)
-        }
+        MEMBER_TOOL_DECLARATION => Some(
+            handle_member_tool_declaration(handle, identity_runtime, response_id, params).await,
+        ),
         _ => None,
     }
 }
@@ -4925,6 +4943,25 @@ pub(crate) fn mob_declaration_error(
             data,
         }),
     }
+}
+
+/// Declaration writes have no identity authority to pin a generated runtime
+/// alias to its current incarnation. They take the durable identity and refuse
+/// a generated alias instead of collapsing its generation onto whichever
+/// incarnation holds the durable row now (#366).
+fn refuse_generated_member_alias(
+    response_id: &Value,
+    agent_identity: &str,
+) -> Option<JsonRpcResponse> {
+    let decoded = crate::member_comms_id::runtime_alias_str(agent_identity);
+    crate::member_comms_id::is_reserved_generated_alias(&decoded).then(|| {
+        declaration_invalid_params(
+            response_id.clone(),
+            format!(
+                "generated member alias requires identity authority; address the member by its durable identity: {decoded}"
+            ),
+        )
+    })
 }
 
 fn declaration_invalid_params(response_id: Value, message: String) -> JsonRpcResponse {
@@ -5004,6 +5041,9 @@ pub(super) async fn handle_adopt_member_identity_declaration(
     // whole-params conversion, because that conversion takes the field as given -
     // pre-translating keeps one boundary rule for all three methods instead of
     // needing an upstream change.
+    if let Some(rejection) = refuse_generated_member_alias(&response_id, &params.agent_identity) {
+        return rejection;
+    }
     let mut params = params;
     params.agent_identity =
         crate::member_comms_id::mob_member_id_str(&params.agent_identity).into_owned();
@@ -5047,6 +5087,7 @@ pub(super) async fn handle_adopt_member_identity_declaration(
 /// convergence yet reports the desired revision rather than failing.
 pub(super) async fn handle_member_tool_declaration(
     handle: &meerkat_mob::MobHandle,
+    identity_runtime: Option<&std::sync::Arc<crate::identity_first::IdentityRuntime>>,
     response_id: Value,
     params: &Value,
 ) -> JsonRpcResponse {
@@ -5058,6 +5099,18 @@ pub(super) async fn handle_member_tool_declaration(
     if let Some(rejection) = reject_foreign_mob(handle, &response_id, &params.mob_id) {
         return rejection;
     }
+    // A read under the member-id alias rule: where an identity runtime is
+    // present, a stale runtime alias is refused first, as `meta/get_member`
+    // refuses it, before the supplied id maps to the durable row below.
+    if let Some(response) = stale_runtime_alias_error_response(
+        identity_runtime,
+        &params.agent_identity,
+        response_id.clone(),
+    )
+    .await
+    {
+        return response;
+    }
     // The wire carries a public member ALIAS; the roster is keyed by the comms-safe
     // ENCODED id. `member_comms_id::mob_member_id` is the public translation and
     // exists precisely for this boundary. #343 skipped it and used
@@ -5065,8 +5118,10 @@ pub(super) async fn handle_member_tool_declaration(
     // call answered "mob member not found": the alias missed, the runtime alias
     // missed, and the encoded spelling is refused outright by
     // `validate_public_rpc_member_aliases` so ABAC cannot be bypassed by it. The
-    // methods were reachable and unable to name anything.
-    let identity = crate::member_comms_id::mob_member_id(&params.agent_identity);
+    // methods were reachable and unable to name anything. A read also takes the
+    // current runtime alias `status_identity` returns: it names the durable row
+    // (#366).
+    let identity = crate::member_comms_id::roster_member_id_for_supplied_id(&params.agent_identity);
     let record = match handle.identity_intent(&identity).await {
         Ok(meerkat_mob::identity::IdentityStoredObservation::Valid(record)) => record,
         Ok(meerkat_mob::identity::IdentityStoredObservation::Missing) => {
@@ -5180,6 +5235,9 @@ pub(super) async fn handle_apply_member_tool_declaration(
             Err(error) => return declaration_invalid_params(response_id, error.to_string()),
         };
     if let Some(rejection) = reject_foreign_mob(handle, &response_id, &params.mob_id) {
+        return rejection;
+    }
+    if let Some(rejection) = refuse_generated_member_alias(&response_id, &params.agent_identity) {
         return rejection;
     }
     let declaration: meerkat_mob::MemberToolDeclaration = match params.declaration.try_into() {

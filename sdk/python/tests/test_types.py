@@ -35,6 +35,7 @@ from meerkat_meta.types import (
     MobpackDraftListResult,
     MobpackDraftRow,
     MobpackDraftSaveResult,
+    MobpackDraftSummary,
     MobpackExportResult,
     MobpackImportResult,
     MobpackSkillsCatalogResult,
@@ -370,6 +371,21 @@ class TestMobpackAuthoringResults:
         assert listed.store_path == "/tmp/drafts.json"
         assert listed.runtime_backed is True
         assert listed.rows[0].id == "f_demo"
+        # Draft results list drafts as summaries: no document.
+        assert listed.rows[0] == MobpackDraftSummary(
+            id="f_demo",
+            name="Demo",
+            version="mobpack.editor.v1",
+            stage="draft",
+            trigger="Meta authoring draft",
+            source="meta/mobpacks/create",
+            description="",
+            revision=3,
+            etag="f_demo:3",
+            updated_at_unix_ms=1700000000000,
+            can_undo=True,
+            can_redo=False,
+        )
 
         got = MobpackDraftGetResult.from_dict({
             "source": "meta/mobpacks/get",
@@ -387,6 +403,16 @@ class TestMobpackAuthoringResults:
         })
         assert saved.row.id == "f_demo"
         assert len(saved.rows) == 1
+        assert saved.durability_warning is None
+        warned = MobpackDraftSaveResult.from_dict({
+            "source": "meta/mobpacks/save",
+            "row": row_payload,
+            "rows": [],
+            "durability_warning": "mobpack draft store was replaced, but its directory could not be synced",
+        })
+        assert warned.durability_warning == (
+            "mobpack draft store was replaced, but its directory could not be synced"
+        )
 
         deleted = MobpackDraftDeleteResult.from_dict({
             "source": "meta/mobpacks/delete",
@@ -438,6 +464,20 @@ class TestMobpackAuthoringResults:
         assert blocked.stepped is False
         assert blocked.reason == "nothing to redo"
         assert blocked.row.etag == "f_demo:4"
+        assert blocked.durability_warning is None
+        warned = MobpackDraftHistoryResult.from_dict({
+            "source": "meta/mobpacks/undo",
+            "stepped": True,
+            "row": row_payload,
+            "rows": [],
+            "durability_warning": "not synced",
+        })
+        assert warned.durability_warning == "not synced"
+        assert MobpackDraftDeleteResult.from_dict({
+            "id": "f_demo",
+            "deleted": True,
+            "durability_warning": "not synced",
+        }).durability_warning == "not synced"
 
     def test_apply_operation_result_from_dict(self):
         applied = MobpackApplyOperationResult.from_dict({

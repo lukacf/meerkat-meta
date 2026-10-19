@@ -36,7 +36,7 @@ make test-python   # Python tests
 make test-all      # Rust + Python + Flow Editor
 
 # Or directly
-./scripts/repo-cargo nextest run --workspace -E 'not test(governance_contracts)' --no-fail-fast
+./scripts/repo-cargo nextest run --workspace --no-fail-fast
 
 # Python
 PYTHONPATH=sdk/python python3 -m pytest sdk/python/tests/ -v
@@ -160,11 +160,19 @@ reproducible without changing dependency bytes, features or recursion limits.
 All required gates still run; upgrading the pin requires qualifying CI and the
 complete candidate matrix together.
 
+Container images are pinned by digest: the release build container in
+`release.yml` and the Bazel platform images in
+`tools/bazel/platforms/BUILD.bazel`. `renovate.json` proposes new digests for
+review and never automerges them. At each release, compare Meta's pinned
+container digests with Core's.
+
 **Tag pushes validate only. They do not build or publish.** Publication requires
 an explicit selection of accepted, immutable candidate artifacts. `make release`
 still means a local optimized build; it is not a publication command.
 
-Prepare the release-version/dependency changes in a PR and merge it. Candidate
+Prepare the release-version/dependency changes in a PR and merge it
+(`./scripts/repo-cargo release <version>` previews the version cut and changes
+nothing; `--execute --no-tag --no-push` makes the release commit). Candidate
 production must run from that final merged commit, not a PR head or an earlier
 build. Candidate runs may start as soon as the commit is on main: their build
 legs run beside the commit's `ci.yml` **push-to-main** run, and collection
@@ -261,6 +269,12 @@ make release-promote RELEASE_TAG=vX.Y.Z \
   ARTIFACT_SELECTION=/absolute/path/accepted-candidate.json \
   REGISTRY_DRY_RUN=true
 ```
+
+`TIER` is for `release-candidate` only. `release-promote`,
+`release-assets-recover` and `release-registry-retry` take the tier from the
+selection (or the published release) and refuse `TIER` with "TIER is only valid
+for candidate". Leave it off, and unset it if your shell still exports it from
+the candidate step: make reads `TIER` from the environment too.
 
 Promotion verifies the original signed provenance, including the certificate's
 source digest and workflow identity, run/attempt, artifact ZIP digests, archive

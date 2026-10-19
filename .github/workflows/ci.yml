@@ -149,6 +149,7 @@ jobs:
       - run: python3 scripts/test_release_version_scripts.py
       - run: python3 scripts/test_release_workflow.py
       - run: python3 scripts/test_release_candidate.py
+      - run: python3 scripts/test_forge_release.py
       - run: python3 scripts/test_verify_published_registries.py
       - run: python3 scripts/test_verify_release_assets.py
       - run: python3 scripts/verify-crate-publication.py
@@ -238,13 +239,13 @@ jobs:
       # runner class is not a valid measurement environment for the assertion.
       # The gate stays armed in local full-suite runs (exclusively scheduled
       # via .config/nextest.toml) and in the release-gate protocol.
-      # Both of the filter's tests are integration tests. This job is the only
+      # The filter's one test is an integration test. This job is the only
       # automatic run of the lib and bin tests (the pre-push unit gate is
       # manual), so its filter may leave none of those out: the listing
       # builds what the run reuses, and the check fails on any it drops.
-      - run: scripts/repo-cargo nextest list --workspace --lib --bins -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu)' --message-format json > "${RUNNER_TEMP}/unit-tests.json"
+      - run: scripts/repo-cargo nextest list --workspace --lib --bins -E 'not test(converged_idle_gateway_consumes_near_zero_cpu)' --message-format json > "${RUNNER_TEMP}/unit-tests.json"
       - run: python3 scripts/verify-unit-test-filter.py "${RUNNER_TEMP}/unit-tests.json"
-      - run: scripts/repo-cargo nextest run --workspace --lib --bins -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu)' --no-fail-fast
+      - run: scripts/repo-cargo nextest run --workspace --lib --bins -E 'not test(converged_idle_gateway_consumes_near_zero_cpu)' --no-fail-fast
       - name: Report runner disk
         if: always()
         run: df -h /
@@ -315,7 +316,7 @@ jobs:
       # runner class is not a valid measurement environment for the assertion.
       # The gate stays armed in local full-suite runs (exclusively scheduled
       # via .config/nextest.toml) and in the release-gate protocol.
-      - run: scripts/repo-cargo nextest run --workspace --test '${{ matrix.tests }}' -E 'not test(governance_contracts) and not test(converged_idle_gateway_consumes_near_zero_cpu)' --no-fail-fast
+      - run: scripts/repo-cargo nextest run --workspace --test '${{ matrix.tests }}' -E 'not test(converged_idle_gateway_consumes_near_zero_cpu)' --no-fail-fast
       # cargo's default test selection also builds every example, to prove
       # it compiles and links; one integration half does that here.
       - if: matrix.examples
@@ -336,7 +337,7 @@ jobs:
     name: test-extension-state
     needs: changes
     if: needs.changes.outputs.extension_state == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_INCREMENTAL: "0"
@@ -353,10 +354,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/fetch-warm-deps
       - run: scripts/repo-cargo test -p meta-extension-state --locked
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state,announcement-test-faults --lib --test extension_state --test mob_announcements_delivery_process --test mob_announcements_remote_process --no-run
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state,announcement-test-faults --test extension_state
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state,announcement-test-faults --test mob_announcements_delivery_process --test mob_announcements_remote_process
-      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state,announcement-test-faults --lib -- extension_ document_mcp_child_supply
+      # console-test-faults only adds the console send process test's abort
+      # points, so it shares the extension-state build.
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state,announcement-test-faults,console-test-faults --lib --test extension_state --test mob_announcements_delivery_process --test mob_announcements_remote_process --test console_send_recovery_process --no-run
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state,announcement-test-faults,console-test-faults --test extension_state
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state,announcement-test-faults,console-test-faults --test mob_announcements_delivery_process --test mob_announcements_remote_process --test console_send_recovery_process
+      - run: scripts/repo-cargo test -p meerkat-meta --locked --features extension-state,announcement-test-faults,console-test-faults --lib -- extension_ document_mcp_child_supply
 
   # test-extension-state's check and clippy, split out: both only emit
   # metadata, so they share little with the two full test builds, which
@@ -366,7 +369,7 @@ jobs:
     name: extension-state-lint
     needs: changes
     if: needs.changes.outputs.extension_state == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_INCREMENTAL: "0"
@@ -385,7 +388,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/fetch-warm-deps
       - run: scripts/repo-cargo check -p meerkat-meta --locked --no-default-features
-      - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features extension-state,announcement-test-faults --lib --test extension_state --test mob_announcements_delivery_process --test mob_announcements_remote_process -- -D warnings
+      - run: scripts/repo-cargo clippy -p meerkat-meta --locked --features extension-state,announcement-test-faults,console-test-faults --lib --test extension_state --test mob_announcements_delivery_process --test mob_announcements_remote_process --test console_send_recovery_process -- -D warnings
 
   test-voice:
     name: test-voice

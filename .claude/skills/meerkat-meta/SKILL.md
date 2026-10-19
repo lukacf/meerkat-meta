@@ -148,6 +148,7 @@ Other 0.9 contract changes to keep in mind:
 | `docs/` | Mintlify documentation sources (mirrored to the Meerkat docs site). |
 | `examples/001-incident-command-center-pack/` | Self-contained Incident Commander example pack. Keep example-specific source here. |
 | `examples/002-foresight-studio-pack/` | TypeScript SDK example with identity-first providers, callback tools, and a heavily customized console. |
+| `installer/` | Meta Forge: the `meta-forge` Python package (`launchkit`), its web UI (`installer/web`), templates and release inputs. It releases on its own tags; see `installer/RELEASING.md`. |
 | `scripts/repo-cargo` | Preferred Cargo wrapper for this repo. |
 
 Do not put example-specific support code under `crates/meerkat-meta/src`. Same repo is fine; the core crate source tree is not.
@@ -168,6 +169,12 @@ Current HTTP routes to remember:
 
 Console projection is contract-boundary code. Prefer changing `console_aggregator`, `http_console`, `console/src/lib/adapters.ts`, or `packages/console-core` rather than leaking raw runtime text into React components.
 
+Identity binding facts the console contract keeps:
+
+- The identity routes on `/console/rpc` (`meta/status_identity`, `meta/inspect_identity`, `meta/retire`, `meta/respawn`, `meta/reset`, `meta/delete_identity`) and the stdio identity methods refuse a generated runtime id that is no longer its identity's binding, such as the predecessor's `rt:<identity>:<n>` after a reset. The refusal is `-32000` with `error.data.kind = "stale_identity_runtime_binding"`, naming the registered runtime id and session. A runtime id of an identity the identity runtime does not know keeps `-32602`.
+- `/console/experience` takes an identity-first member's session from the identity runtime and never serves a fact walked under an earlier binding. A record it holds no observation for carries `"unobserved": {"reason": "refresh_pending" | "not_observed", "fields": [...]}` (`meerkat_meta::unobserved`; console-core `UnobservedFacts`), with fail-closed affordances. `health_overview.live_snapshot.running` is `true`, `false` or `null`; `null` means unobserved and is never defaulted to running.
+- `meta/reset` of one identity, on the SDK gateway and the console, answers `cleanup_warning: null`, in the response and in the `identity_reset` lifecycle frame. The reset's successor transition is Meerkat's respawn, which retires the previous live member; the field stays for wire compatibility, as `meta/respawn` keeps its retired warnings.
+
 Agent-tool spawns (`mob_spawn_member`, `delegate`, `spawn_member`/`spawn_many_members`) project into the console through `crates/meerkat-meta/src/console_spawn.rs`: the unified runtime installs a `ConsoleSpawnSink` on the mob runtime at bootstrap, and the `AutoWireParentMobToolDispatcher` (in `mob_handle_runtime.rs`) registers each spawned member's identity + labels (`spawned_by`, `via_tool`, spawn labels) and appends the `initial_message` as a deduped `spawn-kickoff:*` `user_input` console event. Live runtime events resolve to the same chat identity. No console sink → spawn behavior unchanged.
 
 ## Access Control (ABAC)
@@ -183,7 +190,7 @@ Key facts:
 - Spawn-lineage inheritance: agent-spawned members carry a `spawned_by` console label (recorded by `src/console_spawn.rs`); agent checks walk the member plus its spawn ancestors (`evaluate_access_lineage`, depth 8, cycle-safe), so rules matching the parent also match its spawned members, with deny-overrides preserved across the chain. Lineage is runtime-derived ONLY: `spawned_by`/`via_tool` claims in caller-controlled labels (spawn specs, roster) are stripped at every enforcement seam (`sanitize_unverified_lineage_labels`) - only the in-memory spawn registry may assert them.
 - `/blobs/{id}` is a capability surface (content-addressed `sha256:` ids, deduped across agents, no per-agent ACL) — authn + hash-unguessability, not an `agent.view` boundary.
 - Live config: successful `AccessController` config mutations validate and advance the revision. They persist TOML only when a persistence path is configured through `load` (an existing, valid file; a missing or invalid one is an error) or `with_persist_path`; `AccessController::new` and `disabled` remain in-memory unless a path is attached. A configuration that names no admin grants administration to nobody. Per-request `AccessView` snapshots and cached agent label/role attributes from roster projections let label selectors work on identity-only surfaces.
-- Console UI: `console/src/panels/AccessPanel.tsx`, nav kind `access` appears only when `experience.access.can_administer`.
+- Console UI: `console/src/panels/AccessPanel.tsx`, nav kind `access` appears only when `experience.access.can_administer`. The panel re-reads the access configuration in the background without disabling edits: a background read changes the panel only when it lands. The first read after opening Access or changing connection or subject, a Refresh, and the read after a save still disable edits until they land, and a save still carries the draft's edit token, which the owner checks.
 - Denials: JSON-RPC `-32030` with `data.kind = "access_denied"`, HTTP 403 on REST/SSE.
 - Anti-lockout invariant: enabling requires non-empty `admins`; validation lives in `access/model.rs`.
 - Tests: `crates/meerkat-meta/tests/access_control.rs`, unit tests in `src/access/*`, console helper tests in `console/src/panels/AccessPanel.test.ts`. Docs: `docs/concepts/access-control.mdx`.
@@ -347,6 +354,23 @@ Key files:
 
 Avoid manual runtime ID extraction for ordinary identity-scoped work. Do not assume a continuity record means an active mob member; retired/stale records can exist.
 
+## Embedding Hooks
+
+Hooks an embedding host uses around the runtime:
+
+- `UnifiedRuntime::take_bootstrap_completion` hands the host a one-use `RuntimeBootstrapCompleted` (`unified_runtime/bootstrap_completion.rs`). The runtime mints it once, on its bootstrap success path, never on a failure. `publish(f)` runs `f` once, only while the runtime has not begun to close and its mob still admits work; later it is refused with `BootstrapCompletionRefused::RuntimeClosing` or `AdmissionClosed`. On the stdio gateway the host gets it from `GatewayBootstrapReady::take_runtime_completion` inside its publication boundary. A runtime from a legacy constructor (`UnifiedRuntime::bootstrap` and the `bootstrap_with_*` family) has none until `activate_without_identity_context` returns `Ok`.
+- `UnifiedRuntimeBuilder::operation_refusal_observer` installs Meerkat's operation refusal observer on every agent factory the builder owns (persistent, scratch and temp-dir launches). A builder given an already-built `mob_spec()` refuses it with `ConflictingConfiguration`, and the `MobBootstrapSpec` constructors take none.
+- A gateway host answers `GatewayHostComposition::operation_refusal_observer`. The gateway asks it once per member factory, with the same construction it offers `compose_member_factory`, before either answer is installed: `Ok(None)` (the default) installs nothing and `Err` refuses init. An installed observer sees every agent its factory builds, including spawned helpers, forks, and the child mobs and councils agents create.
+
+Delivery and ownership facts an embedding host meets:
+
+- A scope-bound delivery that Meerkat refuses because the mob's admission is closed (`MobError::AdmissionClosed`, whatever closed it: an idle close, the last owner's release, a stand-down, a shutdown, a destroy or an actor exit), or because the member is closed for identity convergence, is `ScopedDeliveryError::Rejected` (wire kind `scoped_delivery_rejected`, `admission_possible: false`), not `Uncertain`: nothing was admitted, so there is nothing to recover.
+- A `WeakPublicIdentityRuntime` (from `PublicIdentityRuntime::downgrade`) no longer upgrades after the runtime's `shutdown`, even while the identity runtime itself is still held: Meerkat 0.9.4 closes the mob's admission when it admits the Shutdown.
+
+## SDK Gateway Transports
+
+The Python and TypeScript SDKs run the gateway as a child process and read its stdout (`sdk/python/meerkat_meta/_transport.py`, `sdk/typescript/src/transport.ts`). A request waiting on a gateway that exits while a process it started still holds that stdout fails with `GatewayChildEndedError` about a second after the exit, instead of waiting out its timeout. It is a `TransportReaderFailedError`; the TypeScript error carries `exitCode` and `signal`, the Python one `exit_code`. A gateway whose stdout closes with its exit still fails its waiters with `TransportReaderFailedError`. The TypeScript transport then lets go of the held stdout, so it no longer keeps the host's Node.js process running.
+
 ## Incident Commander Example
 
 The Incident Commander example is self-contained:
@@ -402,6 +426,8 @@ npm --prefix sdk/typescript run validate
 
 For UI behavior, use the Browser plugin against a live console after code changes.
 
+Governance checks (`validate_traceability_statuses`, `validate_governance_contracts` and the `governance_check` binary) parse the traceability YAML with serde-saphyr under YAML 1.2 rules: `yes`, `on` and `off` stay text and `<<` is an ordinary key. A custom tag, a key given twice, a null where text is expected, a `...` document end marker, nesting deeper than 64 levels, or alias-heavy input (100 or more aliases that outnumber their anchors more than ten to one) is refused as a malformed row (`InvalidTraceabilityRow`).
+
 ## Release Workflow
 
 Inspect a release first with the repository wrapper:
@@ -409,6 +435,10 @@ Inspect a release first with the repository wrapper:
 ```bash
 ./scripts/repo-cargo release <version>
 ```
+
+This dry run changes nothing. cargo-release runs the release hook
+(`scripts/release-hook.sh`) in a dry run too, with `DRY_RUN=true`, and the hook
+then only reports what an execute would bump and stage.
 
 `--execute` creates the release commit and normally tags and pushes it. The
 release hook moves Cargo, Python, TypeScript, Bazel-module, generated BUILD,
@@ -450,6 +480,9 @@ selections outside the repo and obtain consumer acceptance against those bytes.
 
 The release owner then tags the same source as `vX.Y.Z` and invokes
 `make release-promote RELEASE_TAG=vX.Y.Z ARTIFACT_SELECTION=<core json-file>`.
+`TIER` is for `release-candidate` only: `release-promote`,
+`release-assets-recover` and `release-registry-retry` refuse it (unset it if
+the shell still exports it from the candidate step).
 Promotion accepts only the core selection and verifies and publishes the
 original bytes without rebuilding or signing again. The trailing tier is added
 afterwards, add-only, with
@@ -481,6 +514,8 @@ python -m pip index versions meerkat-meta
 
 Registry versions are immutable. If a version already published from the wrong commit, roll forward to the next patch version.
 
+Meta Forge (`installer/`) releases on its own `forge-v<version>` tags through `.github/workflows/forge-release.yml`, beside Meta's releases. A candidate builds each target's package from the public inputs pinned in `installer/release/forge-release-inputs.json` and binds them, with a green dispatched `forge.yml` run that tested the same Forge inputs, in an attested candidate manifest; publication releases those bytes as a prerelease that never becomes the latest release. `installer/RELEASING.md` has the steps.
+
 ## Tests To Remember
 
 Rust:
@@ -498,6 +533,7 @@ Rust:
 - `crates/meerkat-meta/tests/mob_events_*.rs`
 - `crates/meerkat-meta/tests/routing_delivery.rs`
 - `crates/meerkat-meta/tests/sse_auth_gate.rs`
+- `crates/meerkat-meta/tests/operation_refusal_observer.rs`
 - `catalogs_response_exposes_filesystem_skill_catalog` in `crates/meerkat-meta/src/mobpack.rs` pins this skill: the repo's `.claude/skills/meerkat-meta/` is the expected filesystem skill (id `meerkat-meta`). Rename both together.
 
 Console:

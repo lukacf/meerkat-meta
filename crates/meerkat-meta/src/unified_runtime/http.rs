@@ -23,7 +23,8 @@ use crate::http_sse::{
     mob_structural_events_sse_router_with_access_and_priming, workgraph_facts_sse_router,
 };
 use crate::runtime::RuntimeDecisionState;
-use tower::limit::ConcurrencyLimitLayer;
+use tokio::sync::Semaphore;
+use tower::limit::GlobalConcurrencyLimitLayer;
 
 use super::UnifiedRuntime;
 
@@ -69,14 +70,81 @@ async fn healthz_response(
     Json(public_projection).into_response()
 }
 
-/// Default cap for the stock reference app router.
+/// Default cap on the requests the stock reference app router serves at once.
 ///
-/// SSE routes keep HTTP requests open for the lifetime of the subscription, so
-/// a demo-scale cap such as 20 can make the console look frozen while streams
-/// occupy all slots. Hosts that wrap Meta in their own axum service may still
-/// choose a different outer limit, but the reference router itself defaults to
-/// a ceiling high enough for real console usage.
+/// The cap counts handlers in flight. A request holds its permit until its
+/// response is produced, so an SSE stream runs without one once its headers
+/// are sent, and a WebSocket upgrade holds one only until its 101 response. A
+/// request over the cap waits for a permit, and nothing bounds how many
+/// requests wait. The cap limits neither connections nor open SSE or
+/// WebSocket streams, so a flood of connections still needs an outer limit or
+/// timeout.
+///
+/// One set of permits covers every route and connection of a router the
+/// public builders return, including the live WebSocket door that
+/// `build_reference_app_router_with_live` mounts. The stock `rpc_gateway` puts
+/// the host's routes and its live door under the same permits. Each built
+/// router has its own permits, and routes an embedding host merges into a
+/// returned router are outside them. Hosts that wrap Meta in their own axum
+/// service may still choose a different outer limit, but the reference router
+/// itself defaults to a ceiling high enough for real console usage.
 pub const DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS: usize = 1024;
+
+/// The reference app's bound on requests in flight: one set of permits for
+/// every group of routes the app serves.
+///
+/// axum applies a `Router::layer` to every route on its own, and again for
+/// every connection a handler route is served on. tower's
+/// `ConcurrencyLimitLayer` makes new permits each time, so its bound held per
+/// route and per connection; this bound shares its permits with every
+/// application. Apply it to each group of routes before merging the group
+/// into the app.
+#[derive(Clone, Debug)]
+pub(crate) struct ReferenceAppRequestBound {
+    permits: Arc<Semaphore>,
+}
+
+impl ReferenceAppRequestBound {
+    pub(crate) fn new(max_concurrent_requests: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(max_concurrent_requests)),
+        }
+    }
+
+    /// Put `routes` under this bound.
+    pub(crate) fn apply(&self, routes: Router) -> Router {
+        routes.layer(GlobalConcurrencyLimitLayer::with_semaphore(Arc::clone(
+            &self.permits,
+        )))
+    }
+}
+
+impl Default for ReferenceAppRequestBound {
+    fn default() -> Self {
+        Self::new(DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS)
+    }
+}
+
+/// A runtime alias that is stale, or names no identity, has no member
+/// stream to open: it answers as a missing member, not an internal error.
+fn agent_event_target_error(
+    agent_id: &str,
+    error: crate::identity_first::IdentityRuntimeError,
+) -> crate::MobRuntimeError {
+    use crate::identity_first::IdentityRuntimeError;
+    let missing = matches!(
+        error,
+        IdentityRuntimeError::StaleRuntimeAlias { .. } | IdentityRuntimeError::UnknownIdentity(_)
+    ) || (crate::member_comms_id::is_reserved_generated_alias(agent_id)
+        && matches!(error, IdentityRuntimeError::Internal(_)));
+    if missing {
+        crate::MobRuntimeError::Mob(meerkat_mob::MobError::MemberNotFound(
+            meerkat_mob::AgentIdentity::from(agent_id),
+        ))
+    } else {
+        crate::MobRuntimeError::InvalidConfig(error.to_string())
+    }
+}
 
 async fn resolve_agent_event_member_id(
     handle: &meerkat_mob::MobHandle,
@@ -240,6 +308,26 @@ impl UnifiedRuntime {
         aggregator
     }
 
+    /// Settle, from native admission evidence, the console sends a previous
+    /// process accepted but did not see settle. Bounded and evidence only: a
+    /// send whose input the runtime admitted is settled delivered; nothing
+    /// is dispatched or failed. Gateways run it once at startup, after
+    /// building the console router and before serving it. A runtime whose
+    /// console projection was never built has nothing to settle.
+    pub async fn reconcile_interrupted_console_sends(&self) {
+        let Some(projection) = self.console_projection.get() else {
+            return;
+        };
+        let outcome = projection.reconcile_interrupted_sends().await;
+        if outcome.examined > 0 {
+            tracing::info!(
+                examined = outcome.examined,
+                delivered = outcome.delivered,
+                "reconciled interrupted console sends"
+            );
+        }
+    }
+
     pub fn build_console_json_router(&self, decisions: RuntimeDecisionState) -> Router {
         self.build_console_json_router_with_policy(
             decisions,
@@ -318,10 +406,20 @@ impl UnifiedRuntime {
     }
 
     pub fn build_reference_app_router(&self, decisions: RuntimeDecisionState) -> Router {
-        self.build_reference_app_router_with_console_visibility_policy(
+        self.reference_app_router_under(decisions, &ReferenceAppRequestBound::default())
+    }
+
+    /// [`Self::build_reference_app_router`] under `bound`, for a caller that
+    /// merges more routes into the same app (see [`ReferenceAppRequestBound`]).
+    pub(crate) fn reference_app_router_under(
+        &self,
+        decisions: RuntimeDecisionState,
+        bound: &ReferenceAppRequestBound,
+    ) -> Router {
+        bound.apply(self.reference_app_routes(
             decisions,
             Arc::new(HideImplicitDelegateMembersConsoleVisibilityPolicy),
-        )
+        ))
     }
 
     /// The reference router plus the live doors the builder registered.
@@ -337,7 +435,8 @@ impl UnifiedRuntime {
     /// `decisions.console.require_app_auth` is false: the controller serves
     /// only authenticated principals, and an open console would report voice
     /// as unavailable with no diagnostic. Without a registered live door the
-    /// result equals [`Self::build_reference_app_router`].
+    /// result equals [`Self::build_reference_app_router`]. The live door
+    /// shares the console's request bound.
     pub async fn build_reference_app_router_with_live(
         self: &Arc<Self>,
         decisions: RuntimeDecisionState,
@@ -351,14 +450,15 @@ impl UnifiedRuntime {
         {
             return Err(super::live_compose::LiveComposeError::ConsoleVoiceRequiresAppAuth);
         }
-        let router = self.build_reference_app_router(decisions);
+        let bound = ReferenceAppRequestBound::default();
+        let router = self.reference_app_router_under(decisions, &bound);
         let Some(composition) = composition else {
             return Ok(router);
         };
         let router = if composition.external_handler().is_some() {
-            router.merge(meerkat_live::live_ws_router(Arc::clone(
+            router.merge(bound.apply(meerkat_live::live_ws_router(Arc::clone(
                 &composition.context().ws_state,
-            )))
+            ))))
         } else {
             router
         };
@@ -371,6 +471,16 @@ impl UnifiedRuntime {
     }
 
     pub fn build_reference_app_router_with_console_visibility_policy(
+        &self,
+        decisions: RuntimeDecisionState,
+        visibility_policy: Arc<dyn ConsoleVisibilityPolicy>,
+    ) -> Router {
+        ReferenceAppRequestBound::default()
+            .apply(self.reference_app_routes(decisions, visibility_policy))
+    }
+
+    /// The reference app's routes, before its request bound.
+    fn reference_app_routes(
         &self,
         decisions: RuntimeDecisionState,
         visibility_policy: Arc<dyn ConsoleVisibilityPolicy>,
@@ -425,9 +535,7 @@ impl UnifiedRuntime {
                                 .runtime()
                                 .member_alias_lifecycle_target(&agent_id)
                                 .await
-                                .map_err(|error| {
-                                    crate::MobRuntimeError::InvalidConfig(error.to_string())
-                                })?
+                                .map_err(|error| agent_event_target_error(&agent_id, error))?
                         } else {
                             None
                         };
@@ -505,6 +613,7 @@ impl UnifiedRuntime {
                 Some(sse_decisions_a),
                 access.clone(),
                 Some(self.mob_runtime().clone()),
+                self.identity_runtime_ref().cloned(),
                 agent_sse_visibility_policy,
             ))
             .merge(mob_events_sse_router_with_access_and_priming(
@@ -528,9 +637,6 @@ impl UnifiedRuntime {
             .merge(self.workgraph_fact_hub().map_or_else(Router::new, |hub| {
                 workgraph_facts_sse_router(hub, Some(sse_decisions_d), access)
             }))
-            .layer(ConcurrencyLimitLayer::new(
-                DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS,
-            ))
     }
 }
 
@@ -557,6 +663,130 @@ async fn subscribe_agent_events_resuming(
                 .await
         }
         result => result,
+    }
+}
+
+/// Test support for the reference app's request bound: routes whose handlers
+/// stay in flight until released, and requests that each open their own
+/// connection to an app served the way the gateways serve it.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+pub(crate) mod request_bound_test_support {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use axum::Router;
+    use axum::extract::State;
+    use axum::routing::get;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::watch;
+
+    /// Counts the hold routes' handlers in flight and the most seen at once;
+    /// every handler waits until [`Self::release`].
+    #[derive(Clone)]
+    pub(crate) struct HeldRequests {
+        in_flight: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        release: Arc<watch::Sender<bool>>,
+    }
+
+    struct InFlight(Arc<AtomicUsize>);
+
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl HeldRequests {
+        pub(crate) fn new() -> Self {
+            Self {
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                peak: Arc::new(AtomicUsize::new(0)),
+                release: Arc::new(watch::channel(false).0),
+            }
+        }
+
+        pub(crate) fn peak(&self) -> usize {
+            self.peak.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn release(&self) {
+            self.release.send_replace(true);
+        }
+
+        async fn hold(self) -> &'static str {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            let _in_flight = InFlight(Arc::clone(&self.in_flight));
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            let mut released = self.release.subscribe();
+            let _ = released.wait_for(|released| *released).await;
+            "held"
+        }
+
+        /// `GET plain` is a handler route of a router without state, which
+        /// axum layers again for every connection; `GET with_state` belongs
+        /// to a router that already has its state, layered once per route.
+        pub(crate) fn routes(&self, plain: &str, with_state: &str) -> Router {
+            let held = self.clone();
+            Router::new()
+                .route(plain, get(move || held.clone().hold()))
+                .merge(
+                    Router::new()
+                        .route(with_state, get(|State(held): State<Self>| held.hold()))
+                        .with_state(self.clone()),
+                )
+        }
+
+        /// Wait until at least `count` handlers are in flight.
+        pub(crate) async fn wait_in_flight(&self, count: usize) {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while self.in_flight.load(Ordering::SeqCst) < count {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the hold routes never had this many handlers in flight");
+        }
+    }
+
+    /// Serve `app` on a loopback listener with `axum::serve`, as the
+    /// gateways do.
+    pub(crate) async fn serve(app: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (address, server)
+    }
+
+    /// `GET path` on a connection of its own; returns the response status.
+    pub(crate) async fn get_on_own_connection(address: SocketAddr, path: String) -> u16 {
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        String::from_utf8_lossy(&response)
+            .split(' ')
+            .nth(1)
+            .and_then(|status| status.parse().ok())
+            .unwrap_or_else(|| panic!("no status line in the response to {path}"))
     }
 }
 
@@ -775,6 +1005,76 @@ model = "gpt-5.5"
         assert_eq!(DEFAULT_REFERENCE_APP_MAX_CONCURRENT_REQUESTS, 1024);
     }
 
+    /// The reference app's request bound is app-wide: no more handlers run at
+    /// once than it allows, across routes and connections, and a route merged
+    /// in later under the same bound (as the live door and the gateway's host
+    /// routes are) shares it. axum applies a `Router::layer` to every route on
+    /// its own, and again for every connection a handler route is served on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reference_app_request_bound_holds_across_routes_and_connections() {
+        use super::ReferenceAppRequestBound;
+        use super::request_bound_test_support::{HeldRequests, get_on_own_connection, serve};
+
+        const LIMIT: usize = 2;
+        let definition = MobDefinition::from_toml(
+            "[mob]\nid = \"reference-app-request-bound\"\n[profiles.worker]\nmodel = \"gpt-5.5\"\n",
+        )
+        .expect("definition");
+        let runtime = UnifiedRuntimeBuilder::default()
+            .definition(definition)
+            .default_llm_client(Arc::new(TestClient::default()))
+            .build()
+            .await
+            .expect("runtime");
+        let decisions = crate::RuntimeDecisionState::local_console(
+            crate::ConsolePolicy {
+                require_app_auth: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let bound = ReferenceAppRequestBound::new(LIMIT);
+        let held = HeldRequests::new();
+        let app = runtime
+            .reference_app_router_under(decisions, &bound)
+            .merge(bound.apply(held.routes("/test/held/plain", "/test/held/with-state")));
+        let (address, server) = serve(app).await;
+
+        let requests = (0..6)
+            .map(|index| {
+                let path = if index % 2 == 0 {
+                    "/test/held/plain"
+                } else {
+                    "/test/held/with-state"
+                };
+                tokio::spawn(get_on_own_connection(address, path.to_string()))
+            })
+            .collect::<Vec<_>>();
+        held.wait_in_flight(LIMIT).await;
+        // A route of the reference app itself, on yet another connection.
+        let healthz = tokio::spawn(get_on_own_connection(address, "/healthz".to_string()));
+        // Time for every outstanding request to start, if the bound let it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            held.peak(),
+            LIMIT,
+            "more handlers ran at once than the bound allows"
+        );
+        assert!(
+            !healthz.is_finished(),
+            "/healthz was served while the bound was full"
+        );
+
+        held.release();
+        for request in requests {
+            assert_eq!(request.await.expect("held request"), 200);
+        }
+        assert_eq!(healthz.await.expect("healthz request"), 200);
+        assert_eq!(held.peak(), LIMIT);
+        server.abort();
+        runtime.shutdown().await;
+    }
+
     #[tokio::test]
     async fn healthz_preserves_text_probe_and_negotiates_structured_jobs() {
         let projection = Arc::new(std::sync::RwLock::new(Some(serde_json::json!({
@@ -893,6 +1193,101 @@ comms = true
             "stream opened on the prior generation must terminate after reset"
         );
 
+        let _ = runtime.mob_handle().stop().await;
+    }
+
+    /// The per-agent event stream answers member_not_found for a runtime alias
+    /// that is not the identity's current incarnation, as for any member it
+    /// cannot find, rather than an internal error.
+    #[tokio::test]
+    async fn a_stale_runtime_alias_has_no_member_event_stream() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let definition = MobDefinition::from_toml(
+            r#"
+[mob]
+id = "stale-alias-agent-events"
+
+[profiles.worker]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+
+[profiles.worker.tools]
+comms = true
+"#,
+        )
+        .expect("definition parses");
+        let identity = AgentIdentity::parse("lead").expect("identity parses");
+        let roster = Arc::new(MutableRosterProvider::new(vec![DurableAgentSpec {
+            identity: identity.clone(),
+            profile: ProfileName::from("worker"),
+            addressability: AgentAddressability::Addressable,
+            display_name: None,
+            labels: BTreeMap::new(),
+            context: None,
+            additional_instructions: Vec::new(),
+            initial_message: None,
+            runtime_mode_override: Some(MobRuntimeMode::TurnDriven),
+            backend: None,
+            binding: None,
+            placement: None,
+        }]));
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let runtime = UnifiedRuntimeBuilder::default()
+            .definition(definition)
+            .continuity_store(Arc::new(
+                LocalContinuityStore::in_memory().expect("continuity store"),
+            ))
+            .lease_provider(Arc::new(LocalLeaseProvider::new()))
+            .roster_provider(roster)
+            .scratch_dir(scratch.path())
+            .identity_runtime_instance_id("stale-alias-agent-events")
+            .default_llm_client(Arc::new(TestClient::default()))
+            .build()
+            .await
+            .expect("identity-first runtime builds");
+        let current = runtime
+            .identity_runtime()
+            .expect("identity runtime installed")
+            .status(&identity)
+            .await
+            .expect("identity active")
+            .agent_runtime_id
+            .expect("active runtime alias")
+            .as_str()
+            .to_string();
+        let decisions = crate::runtime::RuntimeDecisionState::local_console(
+            crate::ConsolePolicy {
+                require_app_auth: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let app = runtime.build_reference_app_router(decisions);
+        let status = async |agent_id: &str| {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/agents/{agent_id}/events"))
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response")
+                .status()
+        };
+
+        assert_eq!(
+            (
+                status(&current).await,
+                status("rt:lead:7").await,
+                status("rt:nobody:0").await,
+            ),
+            (StatusCode::OK, StatusCode::NOT_FOUND, StatusCode::NOT_FOUND),
+            "(current alias {current}, stale alias, alias of no identity)"
+        );
         let _ = runtime.mob_handle().stop().await;
     }
 }

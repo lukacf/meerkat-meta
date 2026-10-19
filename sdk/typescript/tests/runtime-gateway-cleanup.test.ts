@@ -63,10 +63,13 @@ function writeGateway(
 /** A short bounded wait for a child's exit, scaling the stop's waits. */
 async function quickWait(child: ChildProcess): Promise<boolean> {
   if (child.exitCode !== null || child.signalCode !== null) return true;
+  let handle: NodeJS.Timeout | undefined;
   const timer = new Promise<boolean>((resolve) => {
-    setTimeout(() => resolve(child.exitCode !== null || child.signalCode !== null), 100);
+    handle = setTimeout(() => resolve(child.exitCode !== null || child.signalCode !== null), 100);
   });
-  return Promise.race([once(child, "exit").then(() => true), timer]);
+  return Promise.race([once(child, "exit").then(() => true), timer]).finally(() =>
+    clearTimeout(handle),
+  );
 }
 
 /**

@@ -1736,12 +1736,49 @@ class MobpackDraftRow:
 
 
 @dataclass(frozen=True)
+class MobpackDraftSummary:
+    """A draft as draft results list it: its id, revision and etag and what
+    the Flow Editor library shows of it, without its document, archive or
+    validation. ``meta/mobpacks/get`` returns a draft's document.
+    """
+    id: str
+    name: str
+    version: str
+    stage: str
+    trigger: str
+    source: str
+    description: str
+    revision: int
+    etag: str
+    updated_at_unix_ms: int
+    can_undo: bool
+    can_redo: bool
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MobpackDraftSummary:
+        return cls(
+            id=str(data.get("id", "")),
+            name=str(data.get("name", "")),
+            version=str(data.get("version", "")),
+            stage=str(data.get("stage", "")),
+            trigger=str(data.get("trigger", "")),
+            source=str(data.get("source", "")),
+            description=str(data.get("description", "")),
+            revision=_coerce_int(data.get("revision")),
+            etag=str(data.get("etag", "")),
+            updated_at_unix_ms=_coerce_int(data.get("updated_at_unix_ms")),
+            can_undo=bool(data.get("can_undo", False)),
+            can_redo=bool(data.get("can_redo", False)),
+        )
+
+
+@dataclass(frozen=True)
 class MobpackDraftListResult:
     """Result of a meta/mobpacks/list RPC call."""
     source: str
     store_path: str | None
     runtime_backed: bool
-    rows: list[MobpackDraftRow]
+    rows: list[MobpackDraftSummary]
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MobpackDraftListResult:
@@ -1749,7 +1786,7 @@ class MobpackDraftListResult:
             source=str(data.get("source", "")),
             store_path=data.get("store_path"),
             runtime_backed=bool(data.get("runtime_backed", False)),
-            rows=[MobpackDraftRow.from_dict(r) for r in data.get("rows", [])],
+            rows=[MobpackDraftSummary.from_dict(r) for r in data.get("rows", [])],
         )
 
 
@@ -1777,7 +1814,10 @@ class MobpackDraftSaveResult:
     source: str
     store_path: str | None
     row: MobpackDraftRow
-    rows: list[MobpackDraftRow]
+    rows: list[MobpackDraftSummary]
+    durability_warning: str | None = None
+    """Set when Meta wrote the draft but could not sync the draft store's
+    directory: the write took effect and may not survive a crash."""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MobpackDraftSaveResult:
@@ -1785,7 +1825,8 @@ class MobpackDraftSaveResult:
             source=str(data.get("source", "")),
             store_path=data.get("store_path"),
             row=MobpackDraftRow.from_dict(data.get("row", {})),
-            rows=[MobpackDraftRow.from_dict(r) for r in data.get("rows", [])],
+            rows=[MobpackDraftSummary.from_dict(r) for r in data.get("rows", [])],
+            durability_warning=data.get("durability_warning"),
         )
 
 
@@ -1800,8 +1841,11 @@ class MobpackDraftHistoryResult:
     store_path: str | None
     stepped: bool
     row: MobpackDraftRow
-    rows: list[MobpackDraftRow]
+    rows: list[MobpackDraftSummary]
     reason: str | None = None
+    durability_warning: str | None = None
+    """Set when Meta stepped the draft but could not sync the draft store's
+    directory: the step took effect and may not survive a crash."""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MobpackDraftHistoryResult:
@@ -1810,8 +1854,9 @@ class MobpackDraftHistoryResult:
             store_path=data.get("store_path"),
             stepped=bool(data.get("stepped", False)),
             row=MobpackDraftRow.from_dict(data.get("row", {})),
-            rows=[MobpackDraftRow.from_dict(r) for r in data.get("rows", [])],
+            rows=[MobpackDraftSummary.from_dict(r) for r in data.get("rows", [])],
             reason=data.get("reason"),
+            durability_warning=data.get("durability_warning"),
         )
 
 
@@ -1822,7 +1867,10 @@ class MobpackDraftDeleteResult:
     store_path: str | None
     id: str
     deleted: bool
-    rows: list[MobpackDraftRow]
+    rows: list[MobpackDraftSummary]
+    durability_warning: str | None = None
+    """Set when Meta deleted the draft but could not sync the draft store's
+    directory: the delete took effect and may not survive a crash."""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MobpackDraftDeleteResult:
@@ -1831,7 +1879,8 @@ class MobpackDraftDeleteResult:
             store_path=data.get("store_path"),
             id=str(data.get("id", "")),
             deleted=bool(data.get("deleted", False)),
-            rows=[MobpackDraftRow.from_dict(r) for r in data.get("rows", [])],
+            rows=[MobpackDraftSummary.from_dict(r) for r in data.get("rows", [])],
+            durability_warning=data.get("durability_warning"),
         )
 
 

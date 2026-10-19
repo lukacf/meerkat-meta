@@ -1878,4 +1878,263 @@ describe("checked access saves", () => {
     expect(screen.queryByTestId("access-error")).toBeNull();
     expect(document.body).not.toHaveTextContent("PRIVATE_RULE_PAYLOAD_ERROR");
   });
+
+  // Reads the console starts on its own (stream events, layout changes)
+  // revalidate a settled Access without taking it away from the user; the
+  // owner's checked_v1 token, not a disabled form, protects a save.
+  describe("background revalidation", () => {
+    type HeldRead = { method: string; release: () => void; fail: (response: Response) => void };
+    /// Each matching protected read is answered from the owner state when it
+    /// was sent, then held until the test releases or fails it.
+    function holdReads(methods: string[]) {
+      const originalFetch = globalThis.fetch;
+      const control = { holding: true, held: [] as HeldRead[] };
+      vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body || "{}")) as { method: string };
+        const answer = await originalFetch(url, init);
+        if (!control.holding || !methods.includes(body.method)) return answer;
+        return new Promise<Response>(resolve => {
+          control.held.push({ method: body.method, release: () => resolve(answer), fail: response => resolve(response) });
+        });
+      }));
+      return control;
+    }
+    /// A tool_call frame on the timeline, which schedules a background refresh.
+    function toolCalls(fake: MetaConsoleTransport) {
+      let receive: ((frame: never) => void) | undefined;
+      fake.subscribeTimeline = (_input, next) => { receive = next; return () => {}; };
+      let sequence = 0;
+      return async () => {
+        sequence += 1;
+        await act(async () => {
+          receive?.({ id: `tool-${sequence}`, event: "tool_call", identity, interactionId: `tool-${sequence}`, timestampMs: sequence, data: {} } as never);
+        });
+      };
+    }
+    const refreshNotice = () => screen.queryByText("Refreshing owner state. Changes are temporarily unavailable.");
+    const markerRule = (id: string) => ({ id, effect: "allow" as const, subjects: ["marker@example.test"], actions: ["agent.view"], agents: ["worker"] });
+
+    it("keeps a settled Access editable while a background read is in flight", async () => {
+      const { fake } = await fixture("checked_v1");
+      const toolCall = toolCalls(fake);
+      await openAccess(fake);
+      const reads = holdReads(["meta/access/get"]);
+      await toolCall();
+      await waitFor(() => expect(reads.held).toHaveLength(1));
+      expect(refreshNotice()).toBeNull();
+      expect(screen.getByTestId("access-edit-admins")).toBeEnabled();
+      fireEvent.click(screen.getByTestId("access-edit-admins"));
+      expect(screen.getByTestId("access-admins-input")).toBeEnabled();
+      await act(async () => { reads.held.forEach(read => read.release()); });
+    });
+
+    it("saves during a background read, whose older answer never lands after the save", async () => {
+      const { fake, state, writes } = await fixture("checked_v1");
+      const toolCall = toolCalls(fake);
+      await openAccess(fake);
+      fireEvent.click(screen.getByTestId("access-edit-admins"));
+      fireEvent.change(screen.getByTestId("access-admins-input"), { target: { value: draftText } });
+      // The background read answers with a marker no later read carries.
+      state.config = { ...originalConfig, rules: [markerRule("held-answer")] };
+      const reads = holdReads(["meta/access/get"]);
+      await toolCall();
+      await waitFor(() => expect(reads.held).toHaveLength(1));
+      state.config = { ...originalConfig };
+      expect(screen.getByTestId("access-save-admins")).toBeEnabled();
+      await act(async () => { fireEvent.click(screen.getByTestId("access-save-admins")); });
+      await waitFor(() => expect(writes).toHaveLength(1));
+      expect(writes[0]).toEqual({
+        url: "http://console.test/console/rpc", method: "meta/access/set",
+        params: { checked_v1: { owner_instance: state.ownerInstance, expected_revision: 10, config: { ...originalConfig, admins: editedAdmins } } },
+      });
+      // The read after the save waits behind the held one; the save's
+      // refresh notice shows meanwhile.
+      await waitFor(() => expect(refreshNotice()).not.toBeNull());
+      await act(async () => { reads.held[0].release(); });
+      await waitFor(() => expect(reads.held).toHaveLength(2));
+      expect(refreshNotice()).not.toBeNull();
+      fireEvent.click(screen.getByTestId("access-tab:rules"));
+      expect(screen.queryByTestId("access-rule:held-answer")).toBeNull();
+      await act(async () => { reads.held[1].release(); });
+      await waitFor(() => expect(refreshNotice()).toBeNull());
+      expect(screen.queryByTestId("access-rule:held-answer")).toBeNull();
+      fireEvent.click(screen.getByTestId("access-tab:overview"));
+      expect(screen.getByText("carol@example.test", { exact: true })).toBeVisible();
+      expect(state.revision).toBe(11);
+      expect(state.applied).toBe(1);
+    });
+
+    it("keeps the draft's own base when a background read brings a newer revision", async () => {
+      const { fake, state, writes } = await fixture("checked_v1");
+      const toolCall = toolCalls(fake);
+      await openAccess(fake);
+      fireEvent.click(screen.getByTestId("access-edit-admins"));
+      fireEvent.change(screen.getByTestId("access-admins-input"), { target: { value: draftText } });
+      state.revision = 11;
+      state.config = { ...originalConfig, rules: [newerRule] };
+      await toolCall();
+      fireEvent.click(screen.getByTestId("access-tab:rules"));
+      expect(await screen.findByTestId("access-rule:b-newer-rule")).toBeVisible();
+      fireEvent.click(screen.getByTestId("access-tab:overview"));
+      expect(screen.getByTestId("access-admins-input")).toHaveValue(draftText);
+      await act(async () => { fireEvent.click(screen.getByTestId("access-save-admins")); });
+      await waitFor(() => expect(writes).toHaveLength(1));
+      expect(writes[0]).toEqual({
+        url: "http://console.test/console/rpc", method: "meta/access/set",
+        params: { checked_v1: { owner_instance: state.ownerInstance, expected_revision: 10, config: { ...originalConfig, admins: editedAdmins } } },
+      });
+      expect(await screen.findByTestId("access-error")).toHaveTextContent("Access configuration changed. Review the latest settings before saving again.");
+      expect(screen.getByRole("button", { name: "Review and reapply", exact: true })).toBeVisible();
+      expect(screen.getByTestId("access-admins-input")).toHaveValue(draftText);
+      expect(state.applied).toBe(0);
+    });
+
+    it("drops the view and the draft when a background read is refused", async () => {
+      const { fake } = await fixture("checked_v1");
+      const toolCall = toolCalls(fake);
+      await openAccess(fake);
+      fireEvent.click(screen.getByTestId("access-edit-admins"));
+      fireEvent.change(screen.getByTestId("access-admins-input"), { target: { value: draftText } });
+      const originalFetch = globalThis.fetch;
+      vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body || "{}")) as { id: string; method: string };
+        if (body.method !== "meta/access/status") return originalFetch(url, init);
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error: { code: -32030, message: "PRIVATE_DENIED", data: { kind: "access_denied" } } }), { status: 200 });
+      }));
+      await toolCall();
+      expect(await screen.findByText("Current administrator access is required to view this configuration.")).toBeVisible();
+      expect(screen.queryByText("alice@example.test", { exact: true })).toBeNull();
+      expect(screen.queryByTestId("access-admins-input")).toBeNull();
+    });
+
+    it("fails closed on a background failure without dropping the alert, until a read succeeds", async () => {
+      const { fake } = await fixture("checked_v1");
+      const toolCall = toolCalls(fake);
+      await openAccess(fake);
+      const reads = holdReads(["meta/access/get"]);
+      await toolCall();
+      await waitFor(() => expect(reads.held).toHaveLength(1));
+      await act(async () => { reads.held[0].fail(new Response("upstream unavailable", { status: 500 })); });
+      expect(await screen.findByTestId("access-error")).toBeVisible();
+      expect(screen.getByText("alice@example.test", { exact: true })).toBeVisible();
+      expect(screen.queryByTestId("access-edit-admins")).toBeNull();
+      await toolCall();
+      await waitFor(() => expect(reads.held).toHaveLength(2));
+      expect(screen.getByTestId("access-error")).toBeVisible();
+      expect(screen.queryByTestId("access-edit-admins")).toBeNull();
+      expect(refreshNotice()).toBeNull();
+      await act(async () => { reads.held[1].release(); });
+      await waitFor(() => expect(screen.queryByTestId("access-error")).toBeNull());
+      expect(screen.getByTestId("access-edit-admins")).toBeEnabled();
+    });
+
+    it("blocks from an explicit Refresh until a read issued after it lands", async () => {
+      const { fake, state } = await fixture("checked_v1");
+      const toolCall = toolCalls(fake);
+      await openAccess(fake);
+      state.config = { ...originalConfig, rules: [markerRule("held-answer")] };
+      const reads = holdReads(["meta/access/get"]);
+      await toolCall();
+      await waitFor(() => expect(reads.held).toHaveLength(1));
+      state.revision = 11;
+      state.config = { ...originalConfig, rules: [markerRule("trailing-answer")] };
+      fireEvent.click(screen.getByTestId("access-tab:rules"));
+      await act(async () => { fireEvent.click(screen.getByTestId("access-refresh")); });
+      expect(refreshNotice()).not.toBeNull();
+      // A background trigger after the Refresh replaces its trailing run, so
+      // the read that ends the notice is a background one. The trigger has
+      // run once the experience load it starts with has been asked for.
+      let experienceLoads = 0;
+      const loadExperience = fake.loadExperience;
+      fake.loadExperience = async () => { experienceLoads += 1; return loadExperience(); };
+      await toolCall();
+      await waitFor(() => expect(experienceLoads).toBeGreaterThan(0));
+      await act(async () => { reads.held[0].release(); });
+      await waitFor(() => expect(reads.held).toHaveLength(2));
+      expect(refreshNotice()).not.toBeNull();
+      expect(screen.queryByTestId("access-rule:held-answer")).toBeNull();
+      await act(async () => { reads.held[1].release(); });
+      await waitFor(() => expect(refreshNotice()).toBeNull());
+      expect(screen.getByTestId("access-rule:trailing-answer")).toBeVisible();
+      expect(screen.queryByTestId("access-rule:held-answer")).toBeNull();
+    });
+
+    it("still blocks edits during the first read of a scope", async () => {
+      const { fake } = await fixture("checked_v1");
+      const toolCall = toolCalls(fake);
+      render(<ConsoleApp baseUrl="" storageNamespace="runtime/realm/principal" transport={fake} />);
+      const accessNav = await screen.findByText("Access", { exact: true });
+      // The first read after opening Access.
+      const reads = holdReads(["meta/access/get"]);
+      fireEvent.click(accessNav);
+      await waitFor(() => expect(reads.held).toHaveLength(1));
+      expect(screen.getByText("Loading Console access...")).toBeVisible();
+      expect(screen.queryByTestId("access-edit-admins")).toBeNull();
+      reads.holding = false;
+      await act(async () => { reads.held[0].release(); });
+      expect(await screen.findByText("alice@example.test", { exact: true })).toBeVisible();
+      expect(screen.getByTestId("access-edit-admins")).toBeEnabled();
+      // Another subject is another scope. Its first read blocks at once, even
+      // while it waits behind the old scope's read, which is held here. The
+      // new experience is held too, so the old scope's read is sent first.
+      const statuses = holdReads(["meta/access/status"]);
+      const experience = await fake.loadExperience();
+      const nextExperience = { ...experience, access: { ...(experience as { access: object }).access, subject: "alice@example.test" } };
+      const experienceLoads: Array<() => void> = [];
+      fake.loadExperience = () => new Promise(resolve => { experienceLoads.push(() => resolve(nextExperience as never)); });
+      await toolCall();
+      await waitFor(() => expect(statuses.held).toHaveLength(1));
+      await waitFor(() => expect(experienceLoads.length).toBeGreaterThan(0));
+      await act(async () => { experienceLoads.forEach(load => load()); });
+      expect(screen.getByText("Loading Console access...")).toBeVisible();
+      expect(screen.queryByTestId("access-edit-admins")).toBeNull();
+      statuses.holding = false;
+      await act(async () => { statuses.held.forEach(read => read.release()); });
+      expect(await screen.findByText("alice@example.test", { exact: true })).toBeVisible();
+      expect(screen.getByTestId("access-edit-admins")).toBeEnabled();
+    });
+
+    it("lands the first read of a scope while stream events queue more reads behind it", async () => {
+      const { fake } = await fixture("checked_v1");
+      const toolCall = toolCalls(fake);
+      const loadExperience = fake.loadExperience.bind(fake);
+      let experienceLoads = 0;
+      fake.loadExperience = () => { experienceLoads += 1; return loadExperience(); };
+      render(<ConsoleApp baseUrl="" storageNamespace="runtime/realm/principal" transport={fake} />);
+      const accessNav = await screen.findByText("Access", { exact: true });
+      const reads = holdReads(["meta/access/get"]);
+      fireEvent.click(accessNav);
+      await waitFor(() => expect(reads.held).toHaveLength(1));
+      // The event's read is requested while the first one is in flight.
+      const loadsBefore = experienceLoads;
+      await toolCall();
+      await waitFor(() => expect(experienceLoads).toBeGreaterThan(loadsBefore));
+      expect(screen.getByText("Loading Console access...")).toBeVisible();
+      await act(async () => { reads.held[0].release(); });
+      await waitFor(() => expect(reads.held).toHaveLength(2));
+      expect(screen.getByText("alice@example.test", { exact: true })).toBeVisible();
+      expect(screen.getByTestId("access-edit-admins")).toBeEnabled();
+      expect(refreshNotice()).toBeNull();
+      await act(async () => { reads.held[1].release(); });
+    });
+
+    it("settles a scope on a failed first read, so stream events do not return it to loading", async () => {
+      const { fake } = await fixture("checked_v1");
+      const toolCall = toolCalls(fake);
+      render(<ConsoleApp baseUrl="" storageNamespace="runtime/realm/principal" transport={fake} />);
+      const accessNav = await screen.findByText("Access", { exact: true });
+      const reads = holdReads(["meta/access/status"]);
+      fireEvent.click(accessNav);
+      await waitFor(() => expect(reads.held).toHaveLength(1));
+      expect(screen.getByText("Loading Console access...")).toBeVisible();
+      await act(async () => { reads.held[0].fail(new Response("upstream unavailable", { status: 500 })); });
+      await waitFor(() => expect(screen.queryByText("Loading Console access...")).toBeNull());
+      await toolCall();
+      await waitFor(() => expect(reads.held).toHaveLength(2));
+      expect(screen.queryByText("Loading Console access...")).toBeNull();
+      await act(async () => { reads.held[1].release(); });
+      expect(await screen.findByText("alice@example.test", { exact: true })).toBeVisible();
+      expect(screen.getByTestId("access-edit-admins")).toBeEnabled();
+    });
+  });
 });

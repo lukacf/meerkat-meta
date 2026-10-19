@@ -2789,6 +2789,9 @@ async fn run(launch: GatewayLaunchArgs) -> anyhow::Result<()> {
     let app = runtime
         .build_reference_app_router(decisions)
         .layer(axum::Extension(controller.clone()));
+    // Before anything is served: console sends a previous process accepted
+    // and did not see settle are settled from the runtime's evidence.
+    runtime.reconcile_interrupted_console_sends().await;
     print_json_line(&init_response(
         request_id,
         &runtime_id,
@@ -3008,6 +3011,9 @@ mod tests {
             meerkat_meta::gateway_composition::default_tracing_filter(GATEWAY_TRACING_TARGET),
         )?;
         let subscriber = tracing_subscriber::registry().with(filter);
+        // A second registered Dispatch keeps callsite interest from being
+        // cached `never` by threads without a subscriber.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
         tracing::subscriber::with_default(subscriber, || {
             assert!(
                 tracing::enabled!(

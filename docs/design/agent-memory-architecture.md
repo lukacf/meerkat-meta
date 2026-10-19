@@ -155,7 +155,7 @@ These are code-verified behaviors of the shipped system, not hypotheticals
 | D2 | **Unbounded re-injection**: a stable top-8 (~18.5 KB rendered) is re-selected deterministically and re-injected verbatim into *every* non-Steer user message, plus a build-time system-prompt copy; no per-turn aggregate cap, no session budget, no cross-turn dedup (the injector cannot even see a session id) | `agent_memory.rs:367-421`, contrast CC's 4 KB/20 KB/60 KB ladder |
 | D3 | **Lifecycle orphaning**: respawn (always mob-level retire+spawn), reset, and resume-fallback rotate the SessionId; meerkat memory has no delete API, so the old session's rows are unreachable forever — and `HnswMemoryStore::open` re-embeds *every* row (orphans included) on *every* agent build in the realm | meerkat `factory.rs:5411-5472`, `hnsw.rs:300-355`, meta `rpc.rs:2937-2972` |
 | D4 | **Append-only store**: no update/supersede at the `AgentMemoryProvider` trait level; identical remembers duplicate (codified in tests as correct); a correction and its stale predecessor co-inject as siblings with no preference rule even in the prompt | `agent_memory.rs:552-582, 1090-1099` |
-| D5 | **Misleading "elephant" backend**: `MemoryBackendConfig::Elephant` health-checks `GET /v1/health` and persists local JSON; no data ever reaches the memory hub — but it is a public config surface, so it is deprecated and renamed honestly, not deleted (migration path in §15 P0) | `runtime/memory.rs:27-125` |
+| D5 | **Misleading `elephant` backend**: `MemoryBackendConfig::Elephant` health-checks `GET /v1/health` and persists local JSON; no data ever reaches the memory hub - but it is a public config surface, so it is deprecated and renamed honestly, not deleted (migration path in §15 P0) | `runtime/memory.rs:27-125` |
 
 D1–D4 are production behavior today. Fixing them is Phase 0 and is worth doing
 even if nothing else in this document ships. Note the D1 fix strategy: the
@@ -1269,7 +1269,7 @@ Selector.
   `agent-memory/<realm>.sqlite3` with Markdown import (one-shot migration when
   the realm is first accessed and its SQLite connection opens; export has not
   shipped — §7.3 as-built note); content-hash write
-  guard (D4); deprecate + honestly rename the "elephant" ledger backend with
+  guard (D4); deprecate + honestly rename the `elephant` ledger backend with
   config compat (D5); re-verify and fix the SDK/docs drift list (§7.3); file
   upstream asks 1–3; land the bright-line CI ratchet (§12).
 - **P1 — Recorder + Selector + coordinator.** `memory` tool + protocol skill;

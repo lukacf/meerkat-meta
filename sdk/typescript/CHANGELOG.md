@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- `GatewayChildEndedError` (extends `TransportReaderFailedError`, with
+  `exitCode` and `signal`): a request waiting on a gateway process that
+  exits while a process it started still holds the gateway's stdout fails
+  with it about a second after the exit, instead of waiting out its request
+  timeout (60 seconds by default) or, for the shutdown handshake, the
+  gateway's whole shutdown horizon. The transport then lets go of that
+  stdout, so it no longer keeps the host process running.
+
+## 0.9.3
+
+- Breaking: the draft results of `meta/mobpacks/list`, `create`, `save`,
+  `undo`, `redo` and `delete` type `rows` as the new `MobpackDraftSummary`
+  (parsed by `parseMobpackDraftSummary`): Meta lists drafts without their
+  documents. A write's `row` is still a whole `MobpackDraftRow`;
+  `meta/mobpacks/get` returns a draft's document.
+- `MobpackDraftSaveResult`, `MobpackDraftHistoryResult` and
+  `MobpackDraftDeleteResult` carry `durabilityWarning`, set when Meta wrote
+  the draft store but could not sync its directory: the write took effect
+  and may not survive a crash.
+
 ## 0.9.2
 
 - No SDK API changes; released with Meta 0.9.2 on Meerkat 0.9.2.

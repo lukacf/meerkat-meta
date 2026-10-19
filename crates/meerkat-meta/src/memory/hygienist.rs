@@ -44,6 +44,7 @@ use meerkat_core::{Message, Provider, SystemNoticeKind, SystemNoticeMessage, Use
 
 use crate::identity_first::agent_memory::{compact_whitespace, truncate_utf8_boundary};
 use crate::memory::capabilities::StewardStore;
+use crate::memory::completion::{CompletionStop, UNTERMINATED_STREAM, completion_stop};
 use crate::memory::distiller::{CompactionFollowUp, DistillOutcome, DistillerEngine};
 use crate::memory::events::{MemoryEventSink, MemoryTimelineEvent};
 use crate::memory::factory_handle::FactoryModelClientHandle;
@@ -103,6 +104,13 @@ pub enum HygienistError {
     Truncated {
         max_output_tokens: u32,
     },
+    /// The model stopped before a complete answer for a reason other than
+    /// the output ceiling: a content filter, a cancelled response, a tool
+    /// call the stage never offers, or a stop reason Meerkat adds later.
+    /// No revision is applied from the partial body, however well it parses.
+    Incomplete {
+        stop_reason: meerkat_core::StopReason,
+    },
     Parse(String),
     Seam(String),
     Spans(String),
@@ -119,6 +127,11 @@ impl std::fmt::Display for HygienistError {
                 "hygienist response hit the output ceiling of {max_output_tokens} tokens and was \
                  truncated; raise it via the hygienist config's max_output_tokens (models spend this \
                  same budget on thinking/reasoning tokens as well as the answer)"
+            ),
+            Self::Incomplete { stop_reason } => write!(
+                f,
+                "hygienist response stopped with {stop_reason:?} before a complete answer; \
+                 no revision is applied from it"
             ),
             Self::Parse(msg) => write!(f, "hygienist parse error: {msg}"),
             Self::Seam(msg) => write!(f, "hygienist revision seam error: {msg}"),
@@ -1627,6 +1640,7 @@ pub async fn complete_text(
     .with_temperature(profile.params.temperature);
     let mut stream = client.stream(&request);
     let mut assembler = BlockAssembler::new();
+    let mut answered = false;
     while let Some(event) = stream.next().await {
         match event.map_err(classify_llm_error)? {
             LlmEvent::AssistantOutput { blocks } => {
@@ -1634,17 +1648,25 @@ pub async fn complete_text(
             }
             LlmEvent::TextDelta { delta, meta } => assembler.on_text_delta(&delta, meta),
             LlmEvent::Done { outcome } => match outcome {
-                LlmDoneOutcome::Success { stop_reason } => {
+                LlmDoneOutcome::Success { stop_reason, .. } => match completion_stop(stop_reason) {
+                    CompletionStop::Answered => {
+                        answered = true;
+                        break;
+                    }
                     // Do NOT discard stop_reason. A MaxTokens stop arrives with a
                     // partial or empty body; returning it as a short answer sends a
                     // truncation into a strict parse, which then blames the model.
-                    if matches!(stop_reason, meerkat_core::StopReason::MaxTokens) {
+                    CompletionStop::Truncated => {
                         return Err(HygienistError::Truncated {
                             max_output_tokens: profile.params.max_output_tokens,
                         });
                     }
-                    break;
-                }
+                    // Nor is any other unfinished body an answer, however well
+                    // it parses: no revision is applied from a filtered reply.
+                    CompletionStop::Incomplete(stop_reason) => {
+                        return Err(HygienistError::Incomplete { stop_reason });
+                    }
+                },
                 LlmDoneOutcome::Error { error } => return Err(classify_llm_error(error)),
             },
             LlmEvent::OperationObservationFailed {
@@ -1662,6 +1684,10 @@ pub async fn complete_text(
             | LlmEvent::UsageUpdate { .. }
             | LlmEvent::WireLiveness => {}
         }
+    }
+    // A stream that ends before its terminal event has no answer either.
+    if !answered {
+        return Err(HygienistError::Client(UNTERMINATED_STREAM.to_string()));
     }
     Ok(meerkat_core::types::BlockAssistantMessage::new(
         assembler.finalize(),
@@ -1730,9 +1756,7 @@ mod tests {
                 });
                 events.push(LlmEvent::AssistantOutput { blocks });
                 events.push(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                 });
                 let client = meerkat_client::TestClient::new(events);
                 assert_eq!(
@@ -1774,6 +1798,11 @@ mod tests {
                     Err(HygienistError::Truncated { max_output_tokens })
                         if max_output_tokens == profile.params.max_output_tokens
                 )),
+                CompletionCase::Unterminated => assert!(
+                    matches!(result, Err(HygienistError::Client(message))
+                        if message == UNTERMINATED_STREAM),
+                    "a stream with no terminal event is not an answer",
+                ),
             }
             client.assert_observed_once_without_retry(&log);
         }
@@ -1784,9 +1813,7 @@ mod tests {
         let client = meerkat_client::TestClient::new(vec![
             LlmEvent::AssistantOutput { blocks: Vec::new() },
             LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: StopReason::MaxTokens,
-                },
+                outcome: LlmDoneOutcome::success(StopReason::MaxTokens),
             },
         ]);
         let profile = HygienistProfile::embedded_default();
@@ -1795,6 +1822,26 @@ mod tests {
             Err(HygienistError::Truncated { max_output_tokens })
                 if max_output_tokens == profile.params.max_output_tokens
         ));
+    }
+
+    /// A body the model did not finish is not an answer, however well it
+    /// parses: every stop before a complete answer is typed.
+    #[tokio::test]
+    async fn complete_text_refuses_an_incomplete_stop() {
+        use crate::test_diagnostics::{INCOMPLETE_STOPS, stopping_client};
+
+        let profile = HygienistProfile::embedded_default();
+        for stop in INCOMPLETE_STOPS {
+            let client = stopping_client(PRUNE_REPLY, stop);
+            let result = complete_text(&client, &profile, "test".into()).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(HygienistError::Incomplete { stop_reason }) if stop_reason == stop
+                ),
+                "{stop:?}: {result:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2372,6 +2419,7 @@ mod tests {
 
     struct ScriptedLlm {
         reply: String,
+        stop_reason: StopReason,
     }
 
     #[async_trait]
@@ -2384,9 +2432,7 @@ mod tests {
                     meta: None,
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(self.stop_reason),
                 }),
             ]))
         }
@@ -2402,6 +2448,7 @@ mod tests {
 
     struct ScriptedHandle {
         reply: String,
+        stop_reason: StopReason,
     }
 
     #[async_trait]
@@ -2409,6 +2456,7 @@ mod tests {
         async fn client(&self) -> Result<Arc<dyn LlmClient>, HygienistError> {
             Ok(Arc::new(ScriptedLlm {
                 reply: self.reply.clone(),
+                stop_reason: self.stop_reason,
             }))
         }
     }
@@ -2428,6 +2476,19 @@ mod tests {
         gate: Option<Arc<dyn DistillationGate>>,
         runs_per_day: u32,
     ) -> Arc<HygienistEngine> {
+        engine_stopping_with(reply, StopReason::EndTurn, seam, spans, gate, runs_per_day)
+    }
+
+    /// An engine whose every completion streams `reply` and then stops with
+    /// `stop_reason`.
+    fn engine_stopping_with(
+        reply: &str,
+        stop_reason: StopReason,
+        seam: Arc<ScriptedSeam>,
+        spans: Vec<SpanReference>,
+        gate: Option<Arc<dyn DistillationGate>>,
+        runs_per_day: u32,
+    ) -> Arc<HygienistEngine> {
         Arc::new(HygienistEngine::new(
             HygienistProfile::embedded_default(),
             HygienistConfig {
@@ -2437,6 +2498,7 @@ mod tests {
             },
             Arc::new(ScriptedHandle {
                 reply: reply.to_string(),
+                stop_reason,
             }),
             seam,
             Arc::new(ScriptedSpans(spans)),
@@ -2525,6 +2587,49 @@ mod tests {
             "blocked revision must not reach the seam"
         );
         assert_eq!(sink.types(), vec!["memory.hygiene.blocked"]);
+    }
+
+    /// A reply the model did not finish applies no revision, even one that
+    /// validates: the pass is skipped, and its reason and timeline event name
+    /// the stop.
+    #[tokio::test]
+    async fn engine_applies_nothing_from_an_incomplete_reply() {
+        use crate::test_diagnostics::INCOMPLETE_STOPS;
+
+        for stop in INCOMPLETE_STOPS {
+            let scripted = seam();
+            let engine =
+                engine_stopping_with(PRUNE_REPLY, stop, scripted.clone(), Vec::new(), None, 2);
+            let sink = Arc::new(crate::memory::events::CollectingEventSink::new());
+            engine.set_event_sink(sink.clone());
+            let outcome = engine
+                .hygiene_now("identity:luka", "sess-1", HygieneCause::PostCompaction)
+                .await;
+            let named = format!("{stop:?}");
+            assert!(
+                matches!(&outcome, HygieneOutcome::Skipped { reason } if reason.contains(&named)),
+                "{stop:?}: {outcome:?}"
+            );
+            assert!(
+                scripted
+                    .rewrites
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty(),
+                "{stop:?}: an unfinished reply must not reach the seam"
+            );
+            let events = sink
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [MemoryTimelineEvent::HygieneSkipped { reason, .. }] if reason.contains(&named)
+                ),
+                "{stop:?}: {events:?}"
+            );
+        }
     }
 
     #[tokio::test]

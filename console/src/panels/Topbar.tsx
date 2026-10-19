@@ -76,7 +76,7 @@ export function Topbar({
         <span>{brandLabel}</span>
       </div>
       <div className="meta-topbar__mob">
-        <span className="meta-topbar__mob-status" title={mobStatus} />
+        <span className="meta-topbar__mob-status" data-status={mobStatus} title={mobStatus} />
         <span>{mobName}</span>
         <span className="dim">· {mobStatus}</span>
       </div>

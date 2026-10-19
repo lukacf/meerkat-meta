@@ -69,7 +69,8 @@ pub use console_ingress::{
     handle_console_rest_json_route_with_snapshot_and_access, validate_console_token,
 };
 pub(crate) use console_ingress::{
-    resolve_authorized_console_auth_from_token, resolve_authorized_console_human_from_token,
+    ResolvedConsoleCaller, handle_console_rest_json_route_with_pending_rows,
+    resolve_authorized_console_auth_from_token, resolve_authorized_console_caller_from_token,
 };
 pub use event_transport::normalize_event_line;
 pub(crate) use gating::is_legacy_sequential_pending_id;

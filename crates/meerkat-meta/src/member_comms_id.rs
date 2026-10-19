@@ -33,6 +33,30 @@
 //! using exactly this codec — there is no separate "correct" encoding. Use
 //! [`mob_member_id`]/[`mob_member_id_str`] at the meta→meerkat-mob boundary
 //! and [`runtime_alias_str`]/[`runtime_event_alias`] at projection boundaries.
+//!
+//! # The member-id alias rule
+//!
+//! Every caller-supplied member id crosses into the roster by one rule:
+//!
+//! 1. Decode first ([`runtime_alias_str`]): an encoded roster id is never
+//!    encoded a second time. Public JSON-RPC ingress still refuses the
+//!    encoded spelling before any access check, so decoding never widens
+//!    what a policy sees.
+//! 2. An id the identity runtime owns names that identity's durable roster
+//!    row ([`roster_member_id_for_supplied_id`]): a durable identity, or a
+//!    generated alias the identity authority confirms is the current
+//!    incarnation. A lifecycle operation confirms that under the
+//!    identity's lifecycle lock, so the generation cannot change between
+//!    the check and the act.
+//! 3. A read maps a supplied id the same way. Where its path has an
+//!    identity runtime, it first refuses a stale alias
+//!    (`stale_identity_runtime_binding`).
+//! 4. An action with no identity authority never collapses a generated
+//!    alias onto the current incarnation: it refuses the alias, or, in a
+//!    fallback that only matches names, keeps its exact spelling.
+//! 5. [`mob_member_id`] stays only where the input is already canonical: a
+//!    roster row, a decoded resolver result, a durable identity from an
+//!    identity record, or a spawn reservation.
 
 use std::borrow::Cow;
 

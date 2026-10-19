@@ -276,6 +276,25 @@ fn mobpack_authoring_response(
     response_id: Value,
     runtime: Option<&crate::mobpack::MobpackRuntimeCatalogState>,
 ) -> Option<JsonRpcResponse> {
+    if let Some(result) = crate::mobpack::mobpack_draft_store_method(method, params, runtime) {
+        let (result, error) = match result {
+            Ok(result) => (Some(result), None),
+            Err(failure) => (
+                None,
+                Some(JsonRpcError {
+                    code: -32602,
+                    message: failure.message,
+                    data: failure.data,
+                }),
+            ),
+        };
+        return Some(JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: response_id,
+            result,
+            error,
+        });
+    }
     let result = match method {
         "meta/mobpacks/schema" => Ok(crate::mobpack::mobpack_schema_response_with_runtime(
             runtime,
@@ -302,13 +321,6 @@ fn mobpack_authoring_response(
         "meta/mobpacks/export" => crate::mobpack::export_mobpack(params)
             .and_then(|result| serde_json::to_value(result).map_err(|err| err.to_string())),
         "meta/mobpacks/import" => crate::mobpack::import_mobpack(params),
-        "meta/mobpacks/list" => crate::mobpack::list_mobpack_drafts_with_runtime(params, runtime),
-        "meta/mobpacks/get" => crate::mobpack::get_mobpack_draft_with_runtime(params, runtime),
-        "meta/mobpacks/create" => crate::mobpack::create_mobpack_draft(params),
-        "meta/mobpacks/save" => crate::mobpack::save_mobpack_draft(params),
-        "meta/mobpacks/delete" => crate::mobpack::delete_mobpack_draft(params),
-        "meta/mobpacks/undo" => crate::mobpack::undo_mobpack_draft(params),
-        "meta/mobpacks/redo" => crate::mobpack::redo_mobpack_draft(params),
         "meta/mobpacks/apply_operation" => {
             crate::mobpack::apply_mobpack_authoring_operation_with_runtime(params, runtime)
         }
@@ -2335,6 +2347,7 @@ async fn handle_unified_rpc_json_inner(
                 &request.params,
                 None,
                 Some("local-host"),
+                &crate::topology_control::TopologyApplyScope::LocalHost,
             )
             .await
         }
@@ -3356,6 +3369,9 @@ async fn handle_unified_rpc_json_inner(
             let handle = runtime.mob_handle();
             match mob_methods::handle_member_declaration_rpc(
                 &handle,
+                identity_ctx
+                    .map(|ctx| ctx.runtime.runtime())
+                    .or_else(|| runtime.identity_runtime_ref()),
                 runtime.speaks_for_composition(),
                 method,
                 response_id.clone(),
@@ -3701,13 +3717,8 @@ async fn handle_unified_rpc_json_inner(
                 match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
                 {
                     Ok(target) => target,
-                    Err(e) => {
-                        return maybe_error_response(
-                            is_notification,
-                            response_id,
-                            -32602,
-                            format!("invalid identity: {e}"),
-                        );
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
                     }
                 };
             let identity = target.identity.clone();
@@ -3866,13 +3877,8 @@ async fn handle_unified_rpc_json_inner(
                 match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
                 {
                     Ok(target) => target,
-                    Err(e) => {
-                        return maybe_error_response(
-                            is_notification,
-                            response_id,
-                            -32602,
-                            format!("invalid identity: {e}"),
-                        );
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
                     }
                 };
             let identity = target.identity.clone();
@@ -4061,13 +4067,8 @@ async fn handle_unified_rpc_json_inner(
                 match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
                 {
                     Ok(target) => target,
-                    Err(e) => {
-                        return maybe_error_response(
-                            is_notification,
-                            response_id,
-                            -32602,
-                            format!("invalid identity: {e}"),
-                        );
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
                     }
                 };
             let identity = target.identity.clone();
@@ -4221,13 +4222,8 @@ async fn handle_unified_rpc_json_inner(
                 match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
                 {
                     Ok(target) => target,
-                    Err(e) => {
-                        return maybe_error_response(
-                            is_notification,
-                            response_id,
-                            -32602,
-                            format!("invalid identity: {e}"),
-                        );
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
                     }
                 };
             let identity = target.identity.clone();
@@ -4322,13 +4318,8 @@ async fn handle_unified_rpc_json_inner(
                 match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
                 {
                     Ok(target) => target,
-                    Err(e) => {
-                        return maybe_error_response(
-                            is_notification,
-                            response_id,
-                            -32602,
-                            format!("invalid identity: {e}"),
-                        );
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
                     }
                 };
             let identity = target.identity.clone();
@@ -4407,13 +4398,8 @@ async fn handle_unified_rpc_json_inner(
                 match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
                 {
                     Ok(target) => target,
-                    Err(e) => {
-                        return maybe_error_response(
-                            is_notification,
-                            response_id,
-                            -32602,
-                            format!("invalid identity: {e}"),
-                        );
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
                     }
                 };
             let identity = target.identity.clone();
@@ -4576,13 +4562,8 @@ async fn handle_unified_rpc_json_inner(
                 match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
                 {
                     Ok(target) => target,
-                    Err(e) => {
-                        return maybe_error_response(
-                            is_notification,
-                            response_id,
-                            -32602,
-                            format!("invalid identity: {e}"),
-                        );
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
                     }
                 };
             let identity = target.identity.clone();
@@ -4660,13 +4641,8 @@ async fn handle_unified_rpc_json_inner(
                 match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
                 {
                     Ok(target) => target,
-                    Err(e) => {
-                        return maybe_error_response(
-                            is_notification,
-                            response_id,
-                            -32602,
-                            format!("invalid identity: {e}"),
-                        );
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
                     }
                 };
             let identity = target.identity.clone();
@@ -4772,13 +4748,8 @@ async fn handle_unified_rpc_json_inner(
                 match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
                 {
                     Ok(target) => target,
-                    Err(e) => {
-                        return maybe_error_response(
-                            is_notification,
-                            response_id,
-                            -32602,
-                            format!("invalid identity: {e}"),
-                        );
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
                     }
                 };
             let identity = target.identity.clone();
@@ -4900,13 +4871,8 @@ async fn handle_unified_rpc_json_inner(
                 match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
                 {
                     Ok(target) => target,
-                    Err(e) => {
-                        return maybe_error_response(
-                            is_notification,
-                            response_id,
-                            -32602,
-                            format!("invalid identity: {e}"),
-                        );
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
                     }
                 };
             let identity = target.identity.clone();
@@ -4999,12 +4965,11 @@ async fn handle_unified_rpc_json_inner(
             };
             match reset_result {
                 Ok(record) => {
-                    let cleanup_warning = Some(serde_json::json!({
-                        "kind": "stale_member_cleanup_skipped_after_identity_reset",
-                        "message": "reset published the new generation without retiring stale live mob members; identity control calls reject stale runtime ids",
-                        "identity": identity.as_str(),
-                        "agent_runtime_id": record.agent_runtime_id.as_str(),
-                    }));
+                    // The reset's successor transition retired the previous
+                    // live member, so there is no cleanup to report (as for
+                    // reset_all). Keep the legacy warning field, always null,
+                    // for wire compatibility, as respawn does.
+                    let cleanup_warning: Option<Value> = None;
                     runtime
                         .record_console_lifecycle(
                             identity.as_str(),
@@ -5082,13 +5047,8 @@ async fn handle_unified_rpc_json_inner(
                 match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
                 {
                     Ok(target) => target,
-                    Err(e) => {
-                        return maybe_error_response(
-                            is_notification,
-                            response_id,
-                            -32602,
-                            format!("invalid identity: {e}"),
-                        );
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
                     }
                 };
             let identity = target.identity.clone();
@@ -5243,13 +5203,8 @@ async fn handle_unified_rpc_json_inner(
                 match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
                 {
                     Ok(target) => target,
-                    Err(e) => {
-                        return maybe_error_response(
-                            is_notification,
-                            response_id,
-                            -32602,
-                            format!("invalid identity: {e}"),
-                        );
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
                     }
                 };
             let identity = target.identity.clone();
@@ -5331,13 +5286,8 @@ async fn handle_unified_rpc_json_inner(
                 match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
                 {
                     Ok(target) => target,
-                    Err(e) => {
-                        return maybe_error_response(
-                            is_notification,
-                            response_id,
-                            -32602,
-                            format!("invalid identity: {e}"),
-                        );
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
                     }
                 };
             let identity = target.identity.clone();
@@ -5397,13 +5347,8 @@ async fn handle_unified_rpc_json_inner(
                 match resolve_rpc_identity_control_target(runtime, identity_rt, identity_str).await
                 {
                     Ok(target) => target,
-                    Err(e) => {
-                        return maybe_error_response(
-                            is_notification,
-                            response_id,
-                            -32602,
-                            format!("invalid identity: {e}"),
-                        );
+                    Err(error) => {
+                        return identity_target_error_response(is_notification, response_id, error);
                     }
                 };
             let identity = target.identity.clone();
@@ -5991,11 +5936,125 @@ impl TryFrom<crate::identity_control_target::LiveIdentityMember> for RpcLiveIden
     }
 }
 
+/// Why a stdio identity-control target did not resolve.
+#[derive(Debug)]
+pub(crate) enum RpcIdentityTargetError {
+    /// The request names no valid target. Answered `-32602 invalid
+    /// identity: <detail>`, with the typed data `error_response` derives
+    /// from the detail.
+    Invalid(String),
+    /// A generated runtime id of an identity the identity runtime still
+    /// knows, but not its binding: answered with the typed stale-binding
+    /// refusal (see [`rpc_stale_generated_alias_error`]).
+    StaleRuntimeBinding(Box<JsonRpcError>),
+}
+
+impl std::fmt::Display for RpcIdentityTargetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(detail) => formatter.write_str(detail),
+            Self::StaleRuntimeBinding(error) => formatter.write_str(&error.message),
+        }
+    }
+}
+
+impl std::error::Error for RpcIdentityTargetError {}
+
+impl RpcIdentityTargetError {
+    fn into_response(self, response_id: Value) -> JsonRpcResponse {
+        match self {
+            Self::Invalid(detail) => JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: response_id,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32602,
+                    message: format!("invalid identity: {detail}"),
+                    data: None,
+                }),
+            },
+            Self::StaleRuntimeBinding(error) => JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: response_id,
+                result: None,
+                error: Some(*error),
+            },
+        }
+    }
+}
+
+/// The response to a stdio identity-control target that did not resolve.
+fn identity_target_error_response(
+    is_notification: bool,
+    response_id: Value,
+    error: RpcIdentityTargetError,
+) -> String {
+    match error {
+        RpcIdentityTargetError::Invalid(detail) => maybe_error_response(
+            is_notification,
+            response_id,
+            -32602,
+            format!("invalid identity: {detail}"),
+        ),
+        stale @ RpcIdentityTargetError::StaleRuntimeBinding(_) => {
+            if is_notification {
+                String::new()
+            } else {
+                serialize_response(&stale.into_response(response_id))
+            }
+        }
+    }
+}
+
+/// The refusal of a generated runtime id the shared resolver left
+/// unresolved: no identity is bound to it and no live member carries it.
+/// When it names an identity the identity runtime still knows, that
+/// identity's binding moved on (a reset published a new generation and
+/// rebound its one roster row), so it answers the typed stale-binding
+/// refusal the member methods give for the same id, naming the registered
+/// binding. An identity the identity runtime does not know keeps "runtime
+/// identity not found" (`None`).
+async fn rpc_stale_generated_alias_error(
+    identity_rt: &crate::identity_first::IdentityRuntime,
+    alias: &str,
+) -> Option<RpcIdentityTargetError> {
+    let identity = mob_methods::identity_from_runtime_alias(alias)?;
+    let status = identity_rt.status(&identity).await.ok()?;
+    // A stale id names the registered binding only of an identity the
+    // stdio surface shows, by the rule its live aliases follow.
+    let profile = status
+        .profile
+        .as_ref()
+        .map(meerkat_mob::ProfileName::as_str)
+        .unwrap_or_default();
+    if !rpc_live_identity_alias_visible(profile, &status.labels) {
+        return Some(RpcIdentityTargetError::Invalid(format!(
+            "identity hidden by policy: {alias}"
+        )));
+    }
+    let registered = status
+        .agent_runtime_id
+        .as_ref()
+        .map(crate::identity_first::AgentRuntimeId::as_str);
+    if registered == Some(alias) {
+        return None;
+    }
+    Some(RpcIdentityTargetError::StaleRuntimeBinding(Box::new(
+        crate::identity_control_target::stale_identity_runtime_binding_error(
+            "",
+            &identity,
+            Some(&status),
+            alias,
+            None,
+        ),
+    )))
+}
+
 async fn resolve_rpc_identity_control_target(
     runtime: &UnifiedRuntime,
     identity_rt: &crate::identity_first::IdentityRuntime,
     requested_identity: &str,
-) -> Result<RpcIdentityControlTarget, String> {
+) -> Result<RpcIdentityControlTarget, RpcIdentityTargetError> {
     resolve_rpc_identity_control_target_with_handle(
         &runtime.mob_handle(),
         identity_rt,
@@ -6008,7 +6067,7 @@ pub(crate) async fn resolve_rpc_identity_control_target_with_handle(
     handle: &meerkat_mob::MobHandle,
     identity_rt: &crate::identity_first::IdentityRuntime,
     requested_identity: &str,
-) -> Result<RpcIdentityControlTarget, String> {
+) -> Result<RpcIdentityControlTarget, RpcIdentityTargetError> {
     use crate::identity_control_target::IdentityControlResolution;
 
     let resolution = crate::identity_control_target::resolve_identity_control_target(
@@ -6018,7 +6077,7 @@ pub(crate) async fn resolve_rpc_identity_control_target_with_handle(
         |live| rpc_live_identity_alias_member_visible(&live.member),
     )
     .await
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| RpcIdentityTargetError::Invalid(error.to_string()))?;
 
     match resolution {
         IdentityControlResolution::Resolved(target) => {
@@ -6028,7 +6087,8 @@ pub(crate) async fn resolve_rpc_identity_control_target_with_handle(
                 live: target
                     .live
                     .map(RpcLiveIdentityAlias::try_from)
-                    .transpose()?,
+                    .transpose()
+                    .map_err(RpcIdentityTargetError::Invalid)?,
                 was_registered: target.was_registered,
             })
         }
@@ -6038,10 +6098,17 @@ pub(crate) async fn resolve_rpc_identity_control_target_with_handle(
             generated_runtime_alias,
         } => {
             if generated_runtime_alias {
-                return Err(format!("runtime identity not found: {requested_identity}"));
+                if let Some(error) =
+                    rpc_stale_generated_alias_error(identity_rt, &requested_identity).await
+                {
+                    return Err(error);
+                }
+                return Err(RpcIdentityTargetError::Invalid(format!(
+                    "runtime identity not found: {requested_identity}"
+                )));
             }
             Ok(RpcIdentityControlTarget {
-                identity: parsed_identity?,
+                identity: parsed_identity.map_err(RpcIdentityTargetError::Invalid)?,
                 live: None,
                 was_registered: false,
             })
@@ -6109,27 +6176,15 @@ async fn rpc_stale_live_alias_error_response(
         jsonrpc: JSONRPC_VERSION.to_string(),
         id: response_id,
         result: None,
-        error: Some(JsonRpcError {
-            code: -32000,
-            message: format!(
-                "identity runtime binding for {} points at {}, but requested live member is {}",
-                target.identity.as_str(),
-                status
-                    .agent_runtime_id
-                    .as_ref()
-                    .map(crate::identity_first::AgentRuntimeId::as_str)
-                    .unwrap_or("<none>"),
-                live.runtime_member_id
+        error: Some(
+            crate::identity_control_target::stale_identity_runtime_binding_error(
+                "",
+                &target.identity,
+                Some(&status),
+                &live.runtime_member_id,
+                live.session_id.as_deref(),
             ),
-            data: Some(serde_json::json!({
-                "kind": "stale_identity_runtime_binding",
-                "identity": target.identity.as_str(),
-                "registered_runtime_member_id": status.agent_runtime_id.as_ref().map(crate::identity_first::AgentRuntimeId::as_str),
-                "live_runtime_member_id": live.runtime_member_id,
-                "registered_session_id": status.session_id.as_ref().map(ToString::to_string),
-                "live_session_id": live.session_id,
-            })),
-        }),
+        ),
     })
 }
 
@@ -8833,6 +8888,51 @@ shell = true
             0,
             "meta/reset must preserve mob_definition when installing the reset roster provider"
         );
+        // The reset's successor transition retired the previous live member:
+        // the reset reports no cleanup warning. The field stays, always null.
+        let mut fields = response["result"]
+            .as_object()
+            .expect("reset result")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "agent_runtime_id",
+                "checkpoint_version",
+                "cleanup_warning",
+                "generation",
+                "identity",
+                "session_id"
+            ],
+            "{response:#?}"
+        );
+        assert_eq!(
+            response["result"]["cleanup_warning"],
+            Value::Null,
+            "{response:#?}"
+        );
+        // The identity_reset lifecycle frame carries the same null field.
+        let lifecycle = runtime
+            .console_events()
+            .replay_all(None)
+            .await
+            .map_err(|err| format!("replay_all: {}", err.error))?;
+        let frame = lifecycle
+            .iter()
+            .find(|event| event.event_type == "identity_reset")
+            .ok_or("the reset records an identity_reset frame")?;
+        assert_eq!(
+            frame.data,
+            json!({
+                "generation": response["result"]["generation"],
+                "checkpoint_version": response["result"]["checkpoint_version"],
+                "cleanup_warning": null,
+            }),
+            "{lifecycle:#?}"
+        );
         assert_eq!(
             bridge
                 .create_calls
@@ -10058,10 +10158,272 @@ shell = true
                 .await
                 .expect_err("runtime-id live-only fallback should reject duplicate durable alias");
         assert!(
-            err.contains("ambiguous live identity alias review:singleton"),
+            err.to_string()
+                .contains("ambiguous live identity alias review:singleton"),
             "unexpected error: {err}"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stdio_identity_methods_refuse_a_stale_runtime_id_with_the_typed_binding_refusal()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // After a reset the predecessor's generated id is no identity's binding
+        // and no live member carries it: the reset rebinds the identity's one
+        // roster row. Here no member is live at all.
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = Box::pin(
+            UnifiedRuntime::builder()
+                .mob_spec(rpc_test_mob_spec(&temp_dir)?)
+                .module_config(MetaConfig {
+                    modules: Vec::new(),
+                    discovery: DiscoverySpec {
+                        namespace: "rpc-stale-runtime-id-test".to_string(),
+                        modules: Vec::new(),
+                    },
+                    pre_spawn: Vec::new(),
+                })
+                .timeout(Duration::from_secs(1))
+                .build(),
+        )
+        .await?;
+        let identity_runtime = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "rpc-stale-runtime-id-test".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        // An implicit delegate member the stdio surface hides, bound at
+        // generation 1 like the singleton.
+        let hidden_identity = AgentIdentity::parse("review:delegate")?;
+        identity_runtime
+            .register(
+                DurableAgentSpec {
+                    identity: hidden_identity.clone(),
+                    profile: meerkat_mob::ProfileName::from("delegate"),
+                    addressability: AgentAddressability::Addressable,
+                    display_name: None,
+                    labels: BTreeMap::from([(
+                        "source_mob_id".to_string(),
+                        "child-mob".to_string(),
+                    )]),
+                    context: None,
+                    additional_instructions: Vec::new(),
+                    initial_message: None,
+                    runtime_mode_override: None,
+                    backend: None,
+                    binding: None,
+                    placement: None,
+                },
+                IdentityLifecycleState::Active,
+                Some(ContinuityRecord {
+                    identity: hidden_identity.clone(),
+                    agent_runtime_id: AgentRuntimeId::parse("rt:review:delegate:1")?,
+                    session_id: meerkat_core::types::SessionId::new(),
+                    generation: ContinuityGeneration::new(1),
+                    checkpoint_version: CheckpointVersion::new(0),
+                }),
+                None,
+            )
+            .await;
+        let identity = AgentIdentity::parse("review:singleton")?;
+        let session_id = meerkat_core::types::SessionId::new();
+        identity_runtime
+            .register(
+                DurableAgentSpec {
+                    identity: identity.clone(),
+                    profile: meerkat_mob::ProfileName::from("worker"),
+                    addressability: AgentAddressability::Addressable,
+                    display_name: None,
+                    labels: BTreeMap::new(),
+                    context: None,
+                    additional_instructions: Vec::new(),
+                    initial_message: None,
+                    runtime_mode_override: None,
+                    backend: None,
+                    binding: None,
+                    placement: None,
+                },
+                IdentityLifecycleState::Active,
+                Some(ContinuityRecord {
+                    identity: identity.clone(),
+                    agent_runtime_id: AgentRuntimeId::parse("rt:review:singleton:1")?,
+                    session_id: session_id.clone(),
+                    generation: ContinuityGeneration::new(1),
+                    checkpoint_version: CheckpointVersion::new(0),
+                }),
+                None,
+            )
+            .await;
+        let identity_ctx = IdentityFirstContext {
+            runtime: crate::identity_first::PublicIdentityRuntime::new(
+                identity_runtime.clone(),
+                runtime.mob_runtime().clone(),
+            ),
+            roster_provider: Arc::new(EmptyRosterProvider),
+            topology_provider: None,
+            customizer: None,
+            agent_memory_provider: None,
+            mob_definition: Some(runtime.mob_handle().definition().clone()),
+            transcript_edit_service: None,
+            // Wired, so meta/compact_member reaches its identity target.
+            compaction_floors: Some(Arc::new(
+                crate::identity_first::CompactionFloorRegistry::default(),
+            )),
+        };
+        let call = |method: &'static str, requested: &'static str| {
+            let runtime = &runtime;
+            let identity_ctx = &identity_ctx;
+            async move {
+                let params = if method == "meta/get_member" {
+                    json!({ "member_id": requested })
+                } else {
+                    json!({ "identity": requested })
+                };
+                let request = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": method,
+                    "params": params,
+                })
+                .to_string();
+                let response = handle_unified_rpc_json(
+                    runtime,
+                    &request,
+                    Duration::from_secs(1),
+                    None,
+                    Some(identity_ctx),
+                )
+                .await;
+                serde_json::from_str::<Value>(&response)
+            }
+        };
+
+        // Every identity method the stale-binding refusal covers: the identity
+        // status, inspect and lifecycle methods, the delivery methods, and two
+        // operator member verbs (the operator path answers through its own
+        // response conversion). meta/member_activate_instruction and
+        // meta/bound_member_transcript need an activation and a wired
+        // transcript service before they resolve; the operator verb harness
+        // covers them (operator_verbs_with_preconditions_refuse_a_stale_runtime_id).
+        let operator_methods = ["meta/member_instruction_activations", "meta/compact_member"];
+        for method in [
+            "meta/status_identity",
+            "meta/inspect_identity",
+            "meta/retire",
+            "meta/respawn",
+            "meta/reset",
+            "meta/delete_identity",
+            "meta/send",
+            "meta/interact",
+            "meta/dispatch",
+            "meta/recover_delivery",
+            "meta/turn_result",
+            "meta/wait_for_turn",
+            "meta/subscribe",
+            "meta/wait_for_completion",
+            "meta/completion_cursor",
+            "meta/member_instruction_activations",
+            "meta/compact_member",
+        ] {
+            let response = Box::pin(call(method, "rt:review:singleton:0")).await?;
+            assert_eq!(
+                response["error"],
+                json!({
+                    "code": -32000,
+                    "message": "identity runtime binding for review:singleton points at \
+                                rt:review:singleton:1, but requested live member is \
+                                rt:review:singleton:0",
+                    "data": {
+                        "kind": "stale_identity_runtime_binding",
+                        "identity": "review:singleton",
+                        "registered_runtime_member_id": "rt:review:singleton:1",
+                        "live_runtime_member_id": "rt:review:singleton:0",
+                        "registered_session_id": session_id.to_string(),
+                        "live_session_id": null,
+                    },
+                }),
+                "{method} answers a stale runtime id with the typed refusal: {response:#?}"
+            );
+
+            // A runtime id of an identity the identity runtime does not know
+            // stays not found.
+            let unknown = Box::pin(call(method, "rt:review:nobody:0")).await?;
+            assert_eq!(
+                (&unknown["error"]["code"], &unknown["error"]["message"]),
+                (
+                    &json!(-32602),
+                    &json!("invalid identity: runtime identity not found: rt:review:nobody:0")
+                ),
+                "{method}: {unknown:#?}"
+            );
+
+            // A stale runtime id of an identity the stdio surface hides
+            // answers hidden by policy and names no binding.
+            let hidden = Box::pin(call(method, "rt:review:delegate:0")).await?;
+            assert_eq!(
+                (&hidden["error"]["code"], &hidden["error"]["message"]),
+                (
+                    &json!(-32602),
+                    &json!("invalid identity: identity hidden by policy: rt:review:delegate:0")
+                ),
+                "{method}: {hidden:#?}"
+            );
+            if !operator_methods.contains(&method) {
+                assert_eq!(
+                    hidden["error"]["data"],
+                    json!({"kind": "identity_hidden_by_policy", "identity": "rt:review:delegate:0"}),
+                    "{method}: {hidden:#?}"
+                );
+            }
+            assert!(
+                !hidden.to_string().contains("rt:review:delegate:1"),
+                "{method} names no binding of a hidden identity: {hidden}"
+            );
+        }
+
+        // The stdio member methods send the same six-field data object.
+        let member = Box::pin(call("meta/get_member", "rt:review:singleton:0")).await?;
+        assert_eq!(
+            member["error"],
+            json!({
+                "code": -32000,
+                "message": "identity runtime binding for review:singleton points at \
+                            rt:review:singleton:1, but requested live member is \
+                            rt:review:singleton:0",
+                "data": {
+                    "kind": "stale_identity_runtime_binding",
+                    "identity": "review:singleton",
+                    "registered_runtime_member_id": "rt:review:singleton:1",
+                    "live_runtime_member_id": "rt:review:singleton:0",
+                    "registered_session_id": session_id.to_string(),
+                    "live_session_id": null,
+                },
+            }),
+            "{member:#?}"
+        );
+        let status = identity_runtime.status(&identity).await?;
+        assert_eq!(
+            (
+                status.state,
+                status
+                    .agent_runtime_id
+                    .as_ref()
+                    .map(|runtime_id| runtime_id.as_str().to_string()),
+                status.session_id,
+            ),
+            (
+                IdentityLifecycleState::Active,
+                Some("rt:review:singleton:1".to_string()),
+                Some(session_id),
+            ),
+            "refusing a stale runtime id changes nothing"
+        );
+        let _ = runtime.mob_handle().stop().await;
         Ok(())
     }
 
@@ -10484,7 +10846,7 @@ shell = true
                     .await
                     .expect_err("hidden registered live binding must not resolve");
             assert!(
-                err.contains("identity hidden by policy"),
+                err.to_string().contains("identity hidden by policy"),
                 "unexpected error for {requested_identity}: {err}"
             );
         }
@@ -10543,7 +10905,7 @@ shell = true
                     .await
                     .expect_err("hidden live-only alias must not collapse into unknown identity");
             assert!(
-                err.contains("identity hidden by policy"),
+                err.to_string().contains("identity hidden by policy"),
                 "unexpected error for {requested_identity}: {err}"
             );
         }
@@ -10669,7 +11031,8 @@ shell = true
             .await
             .expect_err("wrong-projected live alias must not resolve as live-only");
         assert!(
-            err.contains("identity runtime binding belongs to review:singleton"),
+            err.to_string()
+                .contains("identity runtime binding belongs to review:singleton"),
             "unexpected error: {err}"
         );
 
@@ -11864,7 +12227,729 @@ comms = true
             "{get:#?}"
         );
 
+        // #366: resolved tools decode a supplied runtime alias to its durable
+        // member, so the stale-alias refusal must still come first here too.
+        let resolved_tools: Value = serde_json::from_str(
+            &super::handle_unified_rpc_json_arc(
+                &runtime,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "meta/identity/resolved_tools",
+                    "params": {"identity": stale_alias},
+                })
+                .to_string(),
+                Duration::from_secs(5),
+                None,
+                None,
+            )
+            .await,
+        )?;
+        assert_eq!(
+            resolved_tools["error"]["data"]["kind"],
+            json!("stale_identity_runtime_binding"),
+            "{resolved_tools:#?}"
+        );
+
+        // The member-declaration read maps a current runtime alias to the
+        // durable row, so it refuses a stale one first, as `meta/get_member`
+        // does.
+        let declaration: Value = serde_json::from_str(
+            &super::handle_unified_rpc_json_arc(
+                &runtime,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": crate::rpc::mob_methods::MEMBER_TOOL_DECLARATION,
+                    "params": {
+                        "mob_id": runtime.mob_handle().mob_id().to_string(),
+                        "agent_identity": stale_alias,
+                    },
+                })
+                .to_string(),
+                Duration::from_secs(5),
+                None,
+                None,
+            )
+            .await,
+        )?;
+        assert_eq!(
+            declaration["error"]["data"]["kind"],
+            json!("stale_identity_runtime_binding"),
+            "{declaration:#?}"
+        );
+
         runtime.shutdown().await;
+        Ok(())
+    }
+
+    /// The stdio `meta/member_status` decodes a supplied id the way
+    /// `meta/get_member` and the console's `meta/member_status` do: the
+    /// current runtime alias reads the member its durable identity names.
+    /// Before, it read a member that does not exist and answered a snapshot
+    /// with no session.
+    #[tokio::test]
+    async fn stdio_member_status_reads_every_spelling_of_one_member()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const DURABLE: &str = "review:status-alias";
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = Box::pin(
+            UnifiedRuntime::builder()
+                .mob_spec(rpc_test_mob_spec(&temp_dir)?)
+                .module_config(MetaConfig {
+                    modules: Vec::new(),
+                    discovery: DiscoverySpec {
+                        namespace: "rpc-member-status-alias-test".to_string(),
+                        modules: Vec::new(),
+                    },
+                    pre_spawn: Vec::new(),
+                })
+                .timeout(Duration::from_secs(5))
+                .build(),
+        )
+        .await?;
+        spawn_identity_projection_fixture(
+            &runtime,
+            SpawnMemberSpec::from_wire("worker".to_string(), DURABLE.to_string(), None, None, None),
+        )
+        .await?;
+        let runtime = Arc::new(runtime);
+        let session_of =
+            async |member_id: &str| -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+                let response: Value = serde_json::from_str(
+                    &super::handle_unified_rpc_json_arc(
+                        &runtime,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "meta/member_status",
+                            "params": {"member_id": member_id},
+                        })
+                        .to_string(),
+                        Duration::from_secs(5),
+                        None,
+                        None,
+                    )
+                    .await,
+                )?;
+                Ok(response["result"]["current_session_id"].clone())
+            };
+
+        let durable = session_of(DURABLE).await?;
+        assert!(
+            durable.is_string(),
+            "the durable identity reads its member: {durable}"
+        );
+        let alias = format!("rt:{DURABLE}:0");
+        assert_eq!(
+            session_of(&alias).await?,
+            durable,
+            "{alias} must read the member {DURABLE} names"
+        );
+
+        runtime.shutdown().await;
+        Ok(())
+    }
+
+    /// `meta/fork_helper` with the CURRENT runtime alias as its source forks
+    /// the member the identity authority owns. The lifecycle target accepts
+    /// the alias; the fork then has to name the durable roster row, not the
+    /// alias's own encoding, which no row has ("mob member not found").
+    #[tokio::test]
+    async fn fork_helper_forks_the_source_its_current_runtime_alias_names()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const DURABLE: &str = "review:fork-current";
+        let current_alias = "rt:review:fork-current:1";
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = Arc::new(
+            Box::pin(
+                UnifiedRuntime::builder()
+                    .mob_spec(rpc_test_mob_spec(&temp_dir)?)
+                    .module_config(MetaConfig {
+                        modules: Vec::new(),
+                        discovery: DiscoverySpec {
+                            namespace: "rpc-fork-current-alias-test".to_string(),
+                            modules: Vec::new(),
+                        },
+                        pre_spawn: Vec::new(),
+                    })
+                    .timeout(Duration::from_secs(5))
+                    .build(),
+            )
+            .await?,
+        );
+        spawn_identity_projection_fixture(
+            &runtime,
+            SpawnMemberSpec::from_wire("worker".to_string(), DURABLE.to_string(), None, None, None),
+        )
+        .await?;
+        let identity_rt = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "rpc-fork-current-alias-test".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        let identity = AgentIdentity::parse(DURABLE)?;
+        identity_rt
+            .register(
+                rpc_durable_spec(identity.as_str(), "worker"),
+                IdentityLifecycleState::Active,
+                Some(ContinuityRecord {
+                    identity: identity.clone(),
+                    agent_runtime_id: AgentRuntimeId::parse(current_alias)?,
+                    session_id: meerkat_core::types::SessionId::new(),
+                    generation: ContinuityGeneration::new(1),
+                    checkpoint_version: CheckpointVersion::new(0),
+                }),
+                Some(LeaseGrant {
+                    identity,
+                    fencing_token: FencingToken::new(1),
+                    ttl: Duration::from_mins(1),
+                }),
+            )
+            .await;
+        let identity_ctx = IdentityFirstContext {
+            runtime: crate::identity_first::PublicIdentityRuntime::new(
+                identity_rt,
+                runtime.mob_runtime().clone(),
+            ),
+            roster_provider: Arc::new(EmptyRosterProvider),
+            topology_provider: None,
+            customizer: None,
+            agent_memory_provider: None,
+            mob_definition: None,
+            transcript_edit_service: None,
+            compaction_floors: None,
+        };
+
+        let response: Value = serde_json::from_str(
+            &super::handle_unified_rpc_json_arc(
+                &runtime,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "meta/fork_helper",
+                    "params": {
+                        "source_member_id": current_alias,
+                        "agent_identity": "fork-current-probe",
+                        "task": "answer briefly",
+                        "result_label": "fork-current-probe",
+                        "max_text_bytes": 4096,
+                    },
+                })
+                .to_string(),
+                Duration::from_secs(5),
+                None,
+                Some(&identity_ctx),
+            )
+            .await,
+        )?;
+        assert!(
+            !response.to_string().contains("mob member not found"),
+            "a current runtime alias must fork its durable source member: {response:#?}"
+        );
+
+        runtime.shutdown().await;
+        Ok(())
+    }
+
+    /// The member-declaration family follows the alias rule. The read takes a
+    /// runtime alias to the durable row, like `meta/member_status`. The two
+    /// writes have no identity authority to pin a generation, so they refuse
+    /// a generated alias instead of collapsing it onto the durable row (or
+    /// missing, as they did: the read answered "no durable identity intent"
+    /// and apply reported a commit for an absent member).
+    #[tokio::test]
+    async fn member_declarations_read_a_runtime_alias_and_refuse_it_for_writes()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const DURABLE: &str = "review:declarations";
+        let alias = "rt:review:declarations:0";
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = Box::pin(
+            UnifiedRuntime::builder()
+                .mob_spec(rpc_test_mob_spec(&temp_dir)?)
+                .module_config(MetaConfig {
+                    modules: Vec::new(),
+                    discovery: DiscoverySpec {
+                        namespace: "rpc-declaration-alias-test".to_string(),
+                        modules: Vec::new(),
+                    },
+                    pre_spawn: Vec::new(),
+                })
+                .timeout(Duration::from_secs(5))
+                .build(),
+        )
+        .await?;
+        let mut spec = SpawnMemberSpec::from_wire(
+            "worker".to_string(),
+            DURABLE.to_string(),
+            Some("Declaration alias fixture.".into()),
+            None,
+            None,
+        );
+        spec.runtime_mode = Some(meerkat_mob::MobRuntimeMode::TurnDriven);
+        spawn_identity_projection_fixture(&runtime, spec).await?;
+        let runtime = Arc::new(runtime);
+        let handle = runtime.mob_handle();
+        let mob_id = handle.mob_id().to_string();
+        let session_id = handle
+            .resolve_bridge_session_id(&crate::member_comms_id::mob_member_id(DURABLE))
+            .await
+            .ok_or("the spawned member must have a bridge session")?;
+        let call = async |method: &str,
+                          params: Value|
+               -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(serde_json::from_str(
+                &super::handle_unified_rpc_json_arc(
+                    &runtime,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": method,
+                        "method": method,
+                        "params": params,
+                    })
+                    .to_string(),
+                    Duration::from_secs(5),
+                    None,
+                    None,
+                )
+                .await,
+            )?)
+        };
+        let adoption = |agent_identity: &str, request_id: &str| {
+            json!({
+                "mob_id": mob_id,
+                "agent_identity": agent_identity,
+                "request_id": request_id,
+                "precondition": "expected_absent",
+                "declaration_scope": "rpc-declaration-alias-test",
+                "declaration_revision": 1,
+                "session": {
+                    "session_id": session_id.to_string(),
+                    "lineage_id": format!("session:{session_id}"),
+                    "lineage_generation": 0,
+                    "authority_policy": "require_existing"
+                },
+                "member": {
+                    "profile_name": "worker",
+                    "runtime_mode": "turn_driven",
+                    "execution": { "execution": "controlling_session" }
+                },
+                "owned_wiring": [],
+                "convergence": { "kind": "drain", "max_wait_ms": 5000 }
+            })
+        };
+        let refused = |response: &Value| {
+            response["error"]["code"] == json!(-32602)
+                && response["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| {
+                        message.contains("generated member alias requires identity authority")
+                    })
+        };
+
+        // Each of the three outcomes is recorded first and asserted together,
+        // so one run shows all three: the adoption and the apply through the
+        // alias, and the read through the alias against the durable read.
+        let refused_adoption = call(
+            crate::rpc::mob_methods::ADOPT_MEMBER_IDENTITY_DECLARATION,
+            adoption(alias, "adopt-alias-1"),
+        )
+        .await?;
+        let adopted = call(
+            crate::rpc::mob_methods::ADOPT_MEMBER_IDENTITY_DECLARATION,
+            adoption(DURABLE, "adopt-durable-1"),
+        )
+        .await?;
+        assert_eq!(adopted["error"], Value::Null, "{adopted:#?}");
+
+        let direct = call(
+            crate::rpc::mob_methods::MEMBER_TOOL_DECLARATION,
+            json!({ "mob_id": mob_id, "agent_identity": DURABLE }),
+        )
+        .await?;
+        assert_eq!(
+            direct["result"]["desired_intent_revision"],
+            json!(1),
+            "{direct:#?}"
+        );
+        let aliased = call(
+            crate::rpc::mob_methods::MEMBER_TOOL_DECLARATION,
+            json!({ "mob_id": mob_id, "agent_identity": alias }),
+        )
+        .await?;
+        let refused_apply = call(
+            crate::rpc::mob_methods::APPLY_MEMBER_TOOL_DECLARATION,
+            json!({
+                "mob_id": mob_id,
+                "agent_identity": alias,
+                "request_id": "apply-alias-1",
+                "expected_intent_revision": 1,
+                "declaration": direct["result"]["declaration"].clone(),
+                "convergence": { "kind": "drain", "max_wait_ms": 5000 }
+            }),
+        )
+        .await?;
+        let read_matches = (
+            &aliased["result"]["desired_intent_revision"],
+            &aliased["result"]["declaration"],
+        ) == (
+            &direct["result"]["desired_intent_revision"],
+            &direct["result"]["declaration"],
+        );
+        assert_eq!(
+            (
+                refused(&refused_adoption),
+                read_matches,
+                refused(&refused_apply)
+            ),
+            (true, true, true),
+            "(adoption refused, alias read matches, apply refused) through {alias}:\n  \
+             adoption: {refused_adoption:#?}\n  read: {aliased:#?}\n  apply: {refused_apply:#?}"
+        );
+
+        runtime.shutdown().await;
+        Ok(())
+    }
+
+    async fn alias_rule_test_runtime(
+        temp_dir: &tempfile::TempDir,
+        namespace: &str,
+    ) -> Result<UnifiedRuntime, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Box::pin(
+            UnifiedRuntime::builder()
+                .mob_spec(rpc_test_mob_spec(temp_dir)?)
+                .module_config(MetaConfig {
+                    modules: Vec::new(),
+                    discovery: DiscoverySpec {
+                        namespace: namespace.to_string(),
+                        modules: Vec::new(),
+                    },
+                    pre_spawn: Vec::new(),
+                })
+                .timeout(Duration::from_secs(5))
+                .build(),
+        )
+        .await?)
+    }
+
+    /// `UnifiedRuntime::start_member_turn` follows the alias rule for a direct
+    /// action without an identity gate: an encoded roster id is decoded, not
+    /// encoded twice, and a generated runtime alias is refused instead of
+    /// being collapsed onto the durable row.
+    #[tokio::test]
+    async fn start_member_turn_decodes_roster_ids_and_refuses_generated_aliases()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const DURABLE: &str = "review:turn-alias";
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = alias_rule_test_runtime(&temp_dir, "rpc-start-turn-alias-test").await?;
+        // Turn-driven: an autonomous host member takes no completion-bearing
+        // turn whatever its id is spelled.
+        spawn_identity_projection_fixture(
+            &runtime,
+            SpawnMemberSpec::from_wire(
+                "worker".to_string(),
+                DURABLE.to_string(),
+                None,
+                Some(meerkat_mob::MobRuntimeMode::TurnDriven),
+                None,
+            ),
+        )
+        .await?;
+        let start = async |member: &str| {
+            runtime
+                .start_member_turn(
+                    member,
+                    meerkat_core::types::ContentInput::from("hello"),
+                    meerkat_core::types::HandlingMode::Queue,
+                    meerkat_mob::MemberTurnOptions::default(),
+                    None,
+                )
+                .await
+                .map(|admission| admission.session_id)
+                .map_err(|error| error.to_string())
+        };
+
+        let durable = start(DURABLE).await;
+        assert!(
+            durable.is_ok(),
+            "the durable identity starts a turn: {durable:?}"
+        );
+        let encoded = crate::member_comms_id::mob_member_id_str(DURABLE).into_owned();
+        let encoded_turn = start(&encoded).await;
+        let alias_turn = start(&format!("rt:{DURABLE}:0")).await;
+        assert_eq!(
+            (encoded_turn, alias_turn),
+            (
+                durable,
+                Err(crate::mob_handle_runtime::MobRuntimeError::InvalidInput(
+                    "generated member alias requires identity authority"
+                )
+                .to_string())
+            ),
+            "(encoded roster id, generated alias)"
+        );
+
+        runtime.shutdown().await;
+        Ok(())
+    }
+
+    /// `UnifiedRuntime::reconcile` decodes an encoded roster id instead of
+    /// seating a twice-encoded phantom member, and refuses a generated runtime
+    /// alias, which only the identity authority can own, as spawn does.
+    #[tokio::test]
+    async fn reconcile_decodes_roster_ids_and_refuses_generated_aliases()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const DURABLE: &str = "review:reconcile-alias";
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = alias_rule_test_runtime(&temp_dir, "rpc-reconcile-alias-test").await?;
+        let worker = |identity: &str| {
+            SpawnMemberSpec::from_wire("worker".to_string(), identity.to_string(), None, None, None)
+        };
+
+        let refused = runtime
+            .reconcile(vec![worker(&format!("rt:{DURABLE}:0"))])
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        let encoded = crate::member_comms_id::mob_member_id_str(DURABLE).into_owned();
+        let seated = runtime
+            .reconcile(vec![worker(&encoded)])
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        let rows = runtime
+            .mob_handle()
+            .list_members_including_retiring()
+            .await
+            .into_iter()
+            .map(|row| row.agent_identity.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (
+                refused
+                    .as_ref()
+                    .is_err_and(|error| error
+                        .contains("generated member alias requires identity authority")),
+                seated,
+                rows
+            ),
+            (true, Ok(()), vec![encoded.clone()]),
+            "(generated alias refused, encoded id reconciled, roster rows); refusal: {refused:?}"
+        );
+
+        runtime.shutdown().await;
+        Ok(())
+    }
+
+    /// `UnifiedRuntime::fork_member_with_identity_runtime` follows the alias
+    /// rule for its source: a CURRENT runtime alias the identity authority owns
+    /// forks the durable roster row it names, and without an identity runtime
+    /// a generated source alias is refused instead of being encoded as a row
+    /// nobody has.
+    #[tokio::test]
+    async fn fork_member_resolves_a_current_source_alias_and_refuses_an_unowned_one()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const DURABLE: &str = "review:fork-api";
+        let current_alias = "rt:review:fork-api:1";
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = alias_rule_test_runtime(&temp_dir, "rpc-fork-api-alias-test").await?;
+        // Turn-driven, so the source session is idle: a fork refuses a source
+        // whose session is running.
+        spawn_identity_projection_fixture(
+            &runtime,
+            SpawnMemberSpec::from_wire(
+                "worker".to_string(),
+                DURABLE.to_string(),
+                None,
+                Some(meerkat_mob::MobRuntimeMode::TurnDriven),
+                None,
+            ),
+        )
+        .await?;
+        let identity_rt = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+            continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+            lease_provider: Arc::new(LocalLeaseProvider::new()),
+            runtime_instance_id: "rpc-fork-api-alias-test".to_string(),
+            has_runtime_store: true,
+            durability_policy: DurabilityPolicy::SyncWriteThrough,
+            bridge: None,
+            default_timeout: None,
+        }));
+        let identity = AgentIdentity::parse(DURABLE)?;
+        identity_rt
+            .register(
+                rpc_durable_spec(identity.as_str(), "worker"),
+                IdentityLifecycleState::Active,
+                Some(ContinuityRecord {
+                    identity: identity.clone(),
+                    agent_runtime_id: AgentRuntimeId::parse(current_alias)?,
+                    session_id: meerkat_core::types::SessionId::new(),
+                    generation: ContinuityGeneration::new(1),
+                    checkpoint_version: CheckpointVersion::new(0),
+                }),
+                Some(LeaseGrant {
+                    identity,
+                    fencing_token: FencingToken::new(1),
+                    ttl: Duration::from_mins(1),
+                }),
+            )
+            .await;
+        let child = |identity: &str| {
+            SpawnMemberSpec::from_wire("worker".to_string(), identity.to_string(), None, None, None)
+        };
+
+        let owned = runtime
+            .fork_member_with_identity_runtime(
+                Some(&identity_rt),
+                current_alias,
+                child("fork-api-child"),
+                None,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        let unowned = runtime
+            .fork_member_with_identity_runtime(
+                None,
+                "rt:review:fork-api-unowned:0",
+                child("fork-api-orphan"),
+                None,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        // The test session service is ephemeral, so a fork that reached its
+        // source member stops at the session service's durable transcript
+        // fork authority. That refusal is the evidence the source resolved:
+        // without the alias rule the fork stopped earlier, at "source member
+        // has no session" for the row keyed by the alias's own encoding.
+        assert_eq!(
+            (
+                owned
+                    .as_ref()
+                    .is_err_and(|error| error.contains("durable transcript fork authority")),
+                unowned
+                    .as_ref()
+                    .is_err_and(|error| error.contains("requires identity authority")),
+            ),
+            (true, true),
+            "(fork through the current alias reached its source, unowned alias refused): \
+             owned {owned:?}, unowned {unowned:?}"
+        );
+
+        runtime.shutdown().await;
+        Ok(())
+    }
+
+    /// The same-process topology primitives follow the member-id alias rule.
+    /// Identity-first topology names each end by its durable identity; the
+    /// primitives pin the identity's current runtime alias under its
+    /// lifecycle lock and act on the durable roster row that alias names.
+    /// Before, they handed the runtime alias itself to the mob, which no row
+    /// has, so wiring an identity-first pair failed with MemberNotFound.
+    #[tokio::test]
+    async fn same_process_topology_reaches_identity_first_members_by_their_durable_rows()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn identity_first_runtime(
+            temp_dir: &tempfile::TempDir,
+            namespace: &str,
+            durable: &str,
+        ) -> Result<UnifiedRuntime, Box<dyn std::error::Error + Send + Sync>> {
+            let mut runtime = alias_rule_test_runtime(temp_dir, namespace).await?;
+            spawn_identity_projection_fixture(
+                &runtime,
+                SpawnMemberSpec::from_wire(
+                    "worker".to_string(),
+                    durable.to_string(),
+                    None,
+                    Some(meerkat_mob::MobRuntimeMode::TurnDriven),
+                    None,
+                )
+                .with_labels(BTreeMap::from([(
+                    "agent_identity".to_string(),
+                    durable.to_string(),
+                )])),
+            )
+            .await?;
+            let session_id = runtime
+                .mob_handle()
+                .resolve_bridge_session_id(&crate::member_comms_id::mob_member_id(durable))
+                .await
+                .ok_or("the spawned member must have a bridge session")?;
+            let identity_rt = Arc::new(IdentityRuntime::new(IdentityRuntimeConfig {
+                continuity_store: Arc::new(LocalContinuityStore::in_memory()?),
+                lease_provider: Arc::new(LocalLeaseProvider::new()),
+                runtime_instance_id: namespace.to_string(),
+                has_runtime_store: true,
+                durability_policy: DurabilityPolicy::SyncWriteThrough,
+                bridge: None,
+                default_timeout: None,
+            }));
+            let identity = AgentIdentity::parse(durable)?;
+            identity_rt
+                .register(
+                    rpc_durable_spec(identity.as_str(), "worker"),
+                    IdentityLifecycleState::Active,
+                    Some(ContinuityRecord {
+                        identity: identity.clone(),
+                        agent_runtime_id: AgentRuntimeId::parse(&format!("rt:{durable}:0"))?,
+                        session_id,
+                        generation: ContinuityGeneration::new(0),
+                        checkpoint_version: CheckpointVersion::new(0),
+                    }),
+                    Some(LeaseGrant {
+                        identity,
+                        fencing_token: FencingToken::new(1),
+                        ttl: Duration::from_mins(1),
+                    }),
+                )
+                .await;
+            runtime.attach_identity_first_context(Arc::new(
+                crate::identity_first::IdentityFirstRuntimeContext::new(
+                    identity_rt,
+                    Arc::new(EmptyRosterProvider),
+                    None,
+                    None,
+                    None,
+                ),
+            ));
+            Ok(runtime)
+        }
+
+        let left_dir = tempfile::tempdir()?;
+        let right_dir = tempfile::tempdir()?;
+        let left = identity_first_runtime(&left_dir, "rpc-topology-left", "review:left").await?;
+        let right =
+            identity_first_runtime(&right_dir, "rpc-topology-right", "review:right").await?;
+
+        let wired = left
+            .wire_bilateral_same_process(&right, "review:left", "review:right")
+            .await
+            .map_err(|error| error.to_string());
+        let after_wire = left
+            .bilateral_same_process_state(&right, "review:left", "review:right")
+            .await
+            .map_err(|error| error.to_string());
+        let unwired = left
+            .unwire_bilateral_same_process(&right, "review:left", "review:right")
+            .await
+            .map_err(|error| error.to_string());
+        let after_unwire = left
+            .bilateral_same_process_state(&right, "review:left", "review:right")
+            .await
+            .map_err(|error| error.to_string());
+        assert_eq!(
+            (wired, after_wire, unwired, after_unwire),
+            (Ok(()), Ok((true, true)), Ok(()), Ok((false, false))),
+            "(wire, state after wire, unwire, state after unwire)"
+        );
+
+        left.shutdown().await;
+        right.shutdown().await;
         Ok(())
     }
 

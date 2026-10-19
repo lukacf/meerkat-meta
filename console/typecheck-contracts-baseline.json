@@ -30,12 +30,6 @@
     },
     {
       "file": "console/src/lib/agents.ts",
-      "code": 2345,
-      "message": "Argument of type '{ addressable: boolean; affordances: { can_send_message: boolean; }; model_capabilities: { image_input: false; }; subgroup?: string; group?: string; labels?: Record<string, string>; progress?: MemberProgress; ... 10 more ...; kind: string; }' is not assignable to parameter of type '{ watched?: boolean; alertLevel?: \"elevated\" | \"critical\" | null; degraded?: boolean; degradedReason?: string; model_capabilities: { image_input: boolean; }; affordances: ConsoleAgentAffordances; ... 18 more ...; identity?: string; }'.\n  Type '{ addressable: boolean; affordances: { can_send_message: boolean; }; model_capabilities: { image_input: false; }; subgroup?: string; group?: string; labels?: Record<string, string>; progress?: MemberProgress; ... 10 more ...; kind: string; }' is missing the following properties from type '{ watched?: boolean; alertLevel?: \"elevated\" | \"critical\"; degraded?: boolean; degradedReason?: string; model_capabilities: { image_input: boolean; }; affordances: ConsoleAgentAffordances; ... 18 more ...; identity?: string; }': wired_to, response_phase",
-      "count": 1
-    },
-    {
-      "file": "console/src/lib/agents.ts",
       "code": 2339,
       "message": "Property 'session_id' does not exist on type 'IdentityStatusRow'.",
       "count": 3

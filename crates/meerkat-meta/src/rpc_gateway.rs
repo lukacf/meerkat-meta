@@ -37,6 +37,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::contact_directory::ContactDirectory;
+use crate::identity_first::gateway_bridges::SDK_CALLBACK_SOURCE_ID;
 use crate::runtime::cross_mob_control::{ControlAuthorizer, ControlGrantTable, ControlListenAddr};
 use crate::shutdown_signal::ShutdownSignal;
 use crate::unified_runtime::EventLogError;
@@ -967,6 +968,9 @@ mod tests {
         )
         .expect("default filter must parse");
         let subscriber = tracing_subscriber::registry().with(filter);
+        // A second registered Dispatch keeps callsite interest from being
+        // cached `never` by threads without a subscriber.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
         tracing::subscriber::with_default(subscriber, || {
             assert!(
                 tracing::enabled!(
@@ -2183,7 +2187,7 @@ default_binding = "local"
     }
 
     /// A callback tool's artifact reference crosses the `callback/build_agent`
-    /// wire and lands on its provenance beside the per-build source; a
+    /// wire and lands on its provenance beside the SDK host's source; a
     /// malformed reference refuses the spec.
     #[test]
     fn callback_tool_artifact_crosses_the_wire_onto_provenance() {
@@ -2213,7 +2217,7 @@ default_binding = "local"
             defs[0].provenance,
             Some(ToolProvenance {
                 kind: ToolSourceKind::Callback,
-                source_id: "meta-callback:build-7".into(),
+                source_id: SDK_CALLBACK_SOURCE_ID.into(),
                 artifact: Some(artifact),
             })
         );
@@ -2316,7 +2320,7 @@ default_binding = "local"
             defs[0].provenance,
             Some(ToolProvenance {
                 kind: ToolSourceKind::Callback,
-                source_id: "meta-callback:build-1".into(),
+                source_id: SDK_CALLBACK_SOURCE_ID.into(),
                 artifact: None,
             })
         );
@@ -2974,6 +2978,9 @@ default_binding = "local"
             .with_writer(writer.clone())
             .with_max_level(tracing::Level::WARN)
             .finish();
+        // A second registered Dispatch keeps callsite interest from being
+        // cached `never` by threads without a subscriber.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
         let _guard = tracing::subscriber::set_default(subscriber);
 
         for tick in 0..5 {
@@ -3512,6 +3519,184 @@ default_binding = "local"
             }))
             .await;
         request["params"].clone()
+    }
+
+    /// A detached `security_scan` callback tool on `runner_version` of the runner
+    /// every detached test call here uses.
+    fn detached_security_scan(runner_version: &str) -> Value {
+        json!({
+            "name": "security_scan",
+            "description": "Scan a target for known issues.",
+            "input_schema": {"type": "object", "properties": {"target": {"type": "string"}}},
+            "execution": {
+                "mode": "detached",
+                "runner": {"name": "example.security_scan", "version": runner_version},
+                "restart_class": "adoptable",
+                "idempotency_scope": "tool_call",
+                "submission_timeout_ms": 30000
+            }
+        })
+    }
+
+    fn detached_callback_test_dispatcher_declaring(
+        store: Arc<dyn meerkat::DetachedJobStore>,
+        blobs: Arc<dyn meerkat_core::BlobStore>,
+        tool: Value,
+    ) -> (
+        Arc<CallbackToolDispatcher>,
+        StdioCallbackBridge,
+        mpsc::Receiver<GatewayStdoutLine>,
+    ) {
+        let (stdout_tx, stdout_rx) = mpsc::channel::<GatewayStdoutLine>(4);
+        let bridge = StdioCallbackBridge::new(stdout_tx);
+        let dispatcher = CallbackToolDispatcher::new(
+            bridge.clone(),
+            "build-1".to_string(),
+            vec![CallbackToolSpec::parse(&tool).expect("tool spec")],
+            Some(DetachedCallbackJobRuntime::new(
+                crate::storage_provider::DEFAULT_MEERKAT_LEVEL_REALM_ID,
+                store,
+                blobs,
+            )),
+        );
+        (Arc::new(dispatcher), bridge, stdout_rx)
+    }
+
+    /// A gateway on the stores under `root` submits a detached `security_scan`
+    /// call under `tool`, and its host accepts the start. Returns the job id.
+    async fn submit_and_start_detached_under(root: &std::path::Path, tool: Value) -> String {
+        let args = serde_json::value::RawValue::from_string(r#"{"target":"build-7"}"#.to_string())
+            .expect("raw arguments");
+        let call = ToolCallView {
+            id: "tc-runner-version",
+            name: "security_scan",
+            args: &args,
+        };
+        let (store, _binary, blobs) = open_detached_callback_test_stores(root);
+        let (dispatcher, bridge, mut stdout_rx) =
+            detached_callback_test_dispatcher_declaring(store, blobs, tool);
+        let receipt = submit_detached_callback_test_call(&dispatcher, call)
+            .await
+            .expect("detached submit");
+        accept_detached_callback_start(&bridge, &mut stdout_rx).await;
+        receipt.job_id
+    }
+
+    /// A detached `security_scan` job on runner `runner_version`, admitted to the
+    /// stores under `root` and never claimed: queued, as a gateway that exits
+    /// between a submit and its first start leaves it. Returns the job id.
+    async fn queue_detached_job_on_runner(root: &std::path::Path, runner_version: &str) -> String {
+        use base64::Engine as _;
+        let (store, _binary, blobs) = open_detached_callback_test_stores(root);
+        let specification = blobs
+            .put_artifact(
+                CALLBACK_ARGUMENTS_MEDIA_TYPE,
+                &base64::engine::general_purpose::STANDARD.encode(br#"{"target":"build-8"}"#),
+            )
+            .await
+            .expect("callback arguments");
+        let spec = meerkat::JobSpec::new(
+            crate::storage_provider::DEFAULT_MEERKAT_LEVEL_REALM_ID,
+            meerkat_core::SessionId::parse("019f74fb-1907-7b21-932d-ab22c4d1f532")
+                .expect("session id"),
+            meerkat::ExecutionIntentId::from_string("intent:queued").expect("intent"),
+            meerkat::InteractionLineageId::from_string("lineage:queued").expect("lineage"),
+            meerkat::ToolIdentity::new("security_scan", runner_version).expect("tool"),
+            meerkat::RunnerIdentity::new("example.security_scan", runner_version).expect("runner"),
+            meerkat::RestartClass::Adoptable,
+            meerkat::CanonicalArgumentsHash::new(format!("sha256:{}", "b".repeat(64)))
+                .expect("arguments hash"),
+            meerkat::JobSubmissionKey::new("callback:queued").expect("submission key"),
+        )
+        .with_runner_specification_ref(
+            meerkat::RunnerSpecificationRef::new(specification.blob_id.to_string())
+                .expect("specification ref"),
+        );
+        meerkat::DetachedJobService::new(store)
+            .submit(spec)
+            .await
+            .expect("submit")
+            .job_id
+            .to_string()
+    }
+
+    /// The first callback request a gateway restarted on the stores under `root`,
+    /// declaring `tool`, sends while it reconciles and starts the detached jobs it
+    /// owns, if one comes within `wait`.
+    async fn first_callback_after_restart(
+        root: &std::path::Path,
+        tool: Value,
+        wait: Duration,
+    ) -> Option<Value> {
+        let (store, _binary, blobs) = open_detached_callback_test_stores(root);
+        let (dispatcher, _bridge, mut stdout_rx) =
+            detached_callback_test_dispatcher_declaring(store, blobs, tool);
+        let _reconcile = tokio::spawn(async move { dispatcher.reconcile_detached_jobs().await });
+        let line = tokio::time::timeout(wait, stdout_rx.recv()).await.ok()??;
+        Some(serde_json::from_str(&line).expect("callback json"))
+    }
+
+    /// A gateway takes over only the detached jobs of the runner versions it
+    /// registers, which is what lets a host change a tool safely: give it a new
+    /// runner version (the 0.9.3 Known limitation). Restarted on runner version 2,
+    /// a gateway is not offered the running attempt of a job runner version 1
+    /// started; restarted on version 1 again, it is.
+    #[tokio::test]
+    async fn a_gateway_on_another_runner_version_is_not_offered_a_running_job() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let job_id =
+            submit_and_start_detached_under(root.path(), detached_security_scan("1")).await;
+        let offer = first_callback_after_restart(
+            root.path(),
+            detached_security_scan("2"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            offer.is_none(),
+            "a gateway on runner version 2 was offered version 1's job {job_id}: {offer:?}"
+        );
+        let offer = first_callback_after_restart(
+            root.path(),
+            detached_security_scan("1"),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a gateway back on runner version 1 is offered its running job");
+        assert_eq!(offer["method"], "callback/job/reconcile");
+        assert_eq!(
+            offer["params"]["attempts"][0]["authority"]["job_id"],
+            job_id
+        );
+    }
+
+    /// The start path keeps the same rule: restarted on runner version 2, a gateway
+    /// does not start a queued job of runner version 1; restarted on version 1
+    /// again, it does.
+    #[tokio::test]
+    async fn a_gateway_on_another_runner_version_does_not_start_a_queued_job() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let job_id = queue_detached_job_on_runner(root.path(), "1").await;
+        let start = first_callback_after_restart(
+            root.path(),
+            detached_security_scan("2"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            start.is_none(),
+            "a gateway on runner version 2 started version 1's queued job {job_id}: {start:?}"
+        );
+        let start = first_callback_after_restart(
+            root.path(),
+            detached_security_scan("1"),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a gateway back on runner version 1 starts its queued job");
+        assert_eq!(start["method"], "callback/job/start");
+        assert_eq!(start["params"]["authority"]["job_id"], job_id);
+        assert_eq!(start["params"]["arguments"], json!({"target": "build-8"}));
     }
 
     #[tokio::test]
@@ -5894,6 +6079,8 @@ comms = true
             summary_tokens: 10,
             messages_before: 20,
             messages_after: 2,
+            summary_source: None,
+            estimated_history_tokens_after: None,
         };
 
         use crate::MemberAgentEventSink as _;
@@ -11965,7 +12152,6 @@ impl CallbackToolDispatcher {
         tools: Vec<CallbackToolSpec>,
         detached_jobs: Option<DetachedCallbackJobRuntime>,
     ) -> Self {
-        let provenance_source_id = format!("meta-callback:{scope_id}");
         let entries: Vec<(Arc<ToolDef>, ToolExecutionContract)> = tools
             .into_iter()
             .map(|tool| {
@@ -11981,7 +12167,9 @@ impl CallbackToolDispatcher {
                             .unwrap_or_else(|| json!({"type": "object"})),
                         provenance: Some(ToolProvenance {
                             kind: ToolSourceKind::Callback,
-                            source_id: provenance_source_id.as_str().into(),
+                            // The SDK host, not this build's routing scope:
+                            // see `SDK_CALLBACK_SOURCE_ID`.
+                            source_id: SDK_CALLBACK_SOURCE_ID.into(),
                             // Verified by the builder before this dispatcher
                             // is built.
                             artifact: tool.artifact,
@@ -14149,21 +14337,43 @@ pub use crate::gateway_mcp_composition::{
 /// served.
 pub const HOST_APP_ROUTES_PREFIX: &str = "/host";
 
-/// Nest the host's read-only routes, if any, under [`HOST_APP_ROUTES_PREFIX`].
+/// Nest the host's read-only routes, if any, under [`HOST_APP_ROUTES_PREFIX`],
+/// under the app's `request_bound`.
 fn mount_host_app_routes(
     app: axum::Router,
     host: Option<&Arc<dyn GatewayHostComposition>>,
     viewer: crate::http_console::ConsoleViewerResolver,
     send_precheck: crate::http_console::ConsoleSendPrecheck,
+    request_bound: &crate::unified_runtime::http::ReferenceAppRequestBound,
 ) -> Result<axum::Router, GatewayHostError> {
     let Some(host) = host else {
         return Ok(app);
     };
     Ok(
         match host.host_app_routes_with_send_precheck(viewer, send_precheck)? {
-            Some(routes) => app.nest(HOST_APP_ROUTES_PREFIX, routes),
+            Some(routes) => app.nest(HOST_APP_ROUTES_PREFIX, request_bound.apply(routes)),
             None => app,
         },
+    )
+}
+
+/// The console app this gateway serves: the runtime's reference router and
+/// the host's routes, if any, under [`HOST_APP_ROUTES_PREFIX`], all under one
+/// `request_bound`.
+fn gateway_console_app(
+    runtime: &UnifiedRuntime,
+    decisions: RuntimeDecisionState,
+    host: Option<&Arc<dyn GatewayHostComposition>>,
+    viewer: crate::http_console::ConsoleViewerResolver,
+    send_precheck: crate::http_console::ConsoleSendPrecheck,
+    request_bound: &crate::unified_runtime::http::ReferenceAppRequestBound,
+) -> Result<axum::Router, GatewayHostError> {
+    mount_host_app_routes(
+        runtime.reference_app_router_under(decisions, request_bound),
+        host,
+        viewer,
+        send_precheck,
+        request_bound,
     )
 }
 
@@ -14217,19 +14427,27 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
         None
     }
     /// Complete the application from the held members' finished surfaces.
-    /// Called once, after every roster identity is held (resumed members are
-    /// not held), with the pass's
-    /// [`crate::identity_first::HeldCompletion`]. An `Ok` recorded before the
-    /// setup deadline is the pass's choice `Activate`; Core then accepts or
-    /// expires each held member's activation on its own, so a member can end
-    /// `Broken` while the others are published. Any other outcome, or the
-    /// deadline or the caller's loss first, is the pass's terminal `Abort`:
-    /// the gateway then calls [`Self::begin_close`] before it waits for this
-    /// callback's settlement, the members' aborts or the runtime's shutdown,
-    /// and init fails. [`crate::identity_first::HeldCompletion::aborted`]
-    /// wakes the callback at that `Abort`; the callback is still joined,
-    /// whatever it does. Only called when [`Self::identity_bootstrap_hold`]
-    /// returns a hold.
+    /// Called once, after every roster identity is held, with the pass's
+    /// [`crate::identity_first::HeldCompletion`]. A held pass holds fresh
+    /// members only: a roster member that already has continuity (it would
+    /// resume), is placed or externally bound, or has an initial message
+    /// refuses the whole pass with
+    /// [`crate::identity_first::HeldBootstrapRefusal`] before any member is
+    /// held. A member embodied outside the pass after that freshness read
+    /// refuses it with
+    /// [`crate::identity_first::HeldBootstrapRefusal::NotHeld`] once its
+    /// embodiment settles unheld. Either way this callback never sees such a
+    /// roster. An `Ok` recorded
+    /// before the setup deadline is the pass's choice `Activate`; Core then
+    /// accepts or expires each held member's activation on its own, so a
+    /// member can end `Broken` while the others are published. Any other
+    /// outcome, or the deadline or the caller's loss first, is the pass's
+    /// terminal `Abort`: the gateway then calls [`Self::begin_close`] before
+    /// it waits for this callback's settlement, the members' aborts or the
+    /// runtime's shutdown, and init fails.
+    /// [`crate::identity_first::HeldCompletion::aborted`] wakes the callback
+    /// at that `Abort`; the callback is still joined, whatever it does. Only
+    /// called when [`Self::identity_bootstrap_hold`] returns a hold.
     async fn complete_held_identity_members(
         &self,
         members: Vec<crate::identity_first::HeldIdentityMember>,
@@ -14241,6 +14459,9 @@ pub trait GatewayHostComposition: Send + Sync + 'static {
     /// Publish the exact SDK Ready response and start its HTTP surface while
     /// serialized against the native owner's actual close transition. The
     /// one-use publication is synchronous and cannot wait for queue capacity.
+    /// It also carries the runtime's bootstrap completion
+    /// ([`GatewayBootstrapReady::take_runtime_completion`]), to publish
+    /// inside this same boundary.
     fn publish_bootstrap_ready(
         &self,
         publication: GatewayBootstrapReady<'_>,
@@ -14616,9 +14837,23 @@ pub struct GatewayBootstrapReady<'a> {
     http_binding: crate::gateway_composition::GatewayHttpBinding,
     app: axum::Router,
     server: &'a mut Option<crate::gateway_composition::GatewayHttpServer>,
+    runtime_completion: Option<crate::unified_runtime::RuntimeBootstrapCompleted>,
 }
 
 impl GatewayBootstrapReady<'_> {
+    /// The runtime's bootstrap completion this Ready carries, once. The
+    /// driver took it from the runtime
+    /// ([`UnifiedRuntime::take_bootstrap_completion`]) after reserving this
+    /// Ready's stdout capacity, so an in-process host's
+    /// `take_bootstrap_completion` answers `AlreadyTaken`. Publish it here,
+    /// inside the same close boundary, with the same publication the host's
+    /// in-process path uses. A Ready published without taking it drops it.
+    pub fn take_runtime_completion(
+        &mut self,
+    ) -> Option<crate::unified_runtime::RuntimeBootstrapCompleted> {
+        self.runtime_completion.take()
+    }
+
     /// Called synchronously inside the actual host close owner's publication
     /// boundary. Capacity was reserved before entry; this never waits or calls
     /// model/tool code and cannot reenter host ownership.
@@ -14628,6 +14863,12 @@ impl GatewayBootstrapReady<'_> {
     }
 }
 
+/// `runtime` gives up its bootstrap completion to the Ready only once the
+/// Ready's stdout capacity is reserved: an earlier close leaves it untaken.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the driver's one Ready publication step and its inputs"
+)]
 async fn publish_native_bootstrap_ready(
     host: &Arc<dyn GatewayHostComposition>,
     stdout: mpsc::Sender<GatewayStdoutLine>,
@@ -14636,6 +14877,7 @@ async fn publish_native_bootstrap_ready(
     app: axum::Router,
     server: &mut Option<crate::gateway_composition::GatewayHttpServer>,
     stdio: &mut Option<GatewayStdioObservation>,
+    runtime: Option<&UnifiedRuntime>,
 ) -> Result<(), GatewayRunError> {
     let stdout = tokio::select! {
         biased;
@@ -14643,12 +14885,14 @@ async fn publish_native_bootstrap_ready(
         _ = host.wait_closed() => return Err(GatewayRunError::HostClosed),
         permit = stdout.reserve_owned() => permit.map_err(|_| GatewayRunError::Input("stdout closed before Ready".into()))?,
     };
+    let runtime_completion = runtime.and_then(|runtime| runtime.take_bootstrap_completion().ok());
     host.publish_bootstrap_ready(GatewayBootstrapReady {
         stdout,
         line,
         http_binding,
         app,
         server,
+        runtime_completion,
     })
     .map_err(GatewayRunError::Host)
 }
@@ -18235,15 +18479,26 @@ external_addressable = true
     }
     let viewer_resolver = runtime.console_viewer_resolver(&decision_state);
     let send_precheck = runtime.console_send_precheck(&decision_state);
-    let app = runtime.build_reference_app_router(decision_state);
-    let app =
-        mount_host_app_routes(app, host, viewer_resolver, send_precheck).map_err(|error| {
-            fail_init(
-                &request_id,
-                -32603,
-                format!("host app routes refused: {error}"),
-            )
-        })?;
+    let request_bound = crate::unified_runtime::http::ReferenceAppRequestBound::default();
+    let app = gateway_console_app(
+        &runtime,
+        decision_state,
+        host,
+        viewer_resolver,
+        send_precheck,
+        &request_bound,
+    )
+    .map_err(|error| {
+        fail_init(
+            &request_id,
+            -32603,
+            format!("host app routes refused: {error}"),
+        )
+    })?;
+    // Before anything is served: console sends a previous process accepted
+    // and did not see settle are settled from the runtime's evidence. The
+    // router built above created the console projection this reads.
+    runtime.reconcile_interrupted_console_sends().await;
     // Live (realtime) transport: ONE live context per gateway (one adapter
     // host, one WS state, one provider registration) serves every live door.
     // Console voice and the external `meta/live/*` surface share it and
@@ -18341,7 +18596,12 @@ external_addressable = true
             #[cfg(not(feature = "openai-live"))]
             let _ = &live_agent_factory;
             let app = if matches!(gateway_options.live, GatewayLiveOption::Enabled { .. }) {
-                app.merge(meerkat_live::live_ws_router(Arc::clone(&live_ctx.ws_state)))
+                // The live door shares the console's request bound: an upgrade
+                // holds a permit only until its 101 response.
+                app.merge(
+                    request_bound
+                        .apply(meerkat_live::live_ws_router(Arc::clone(&live_ctx.ws_state))),
+                )
             } else {
                 app
             };
@@ -18619,6 +18879,7 @@ external_addressable = true
                 app,
                 &mut resources.http_server,
                 &mut resources.stdio,
+                Some(runtime.as_ref()),
             )
             .await?;
         }
@@ -19044,7 +19305,7 @@ mod native_host_cleanup_tests {
         }
         fn publish_bootstrap_ready(
             &self,
-            publication: GatewayBootstrapReady<'_>,
+            mut publication: GatewayBootstrapReady<'_>,
         ) -> Result<(), GatewayHostError> {
             let mut events = self.events.lock().unwrap();
             if events.iter().any(|event| {
@@ -19054,6 +19315,13 @@ mod native_host_cleanup_tests {
                 )
             }) {
                 return Err(GatewayHostError::Denied);
+            }
+            // The runtime's completion, published inside the same boundary.
+            if let Some(completion) = publication.take_runtime_completion() {
+                events.push(match completion.publish(|| ()) {
+                    Ok(()) => "completion_published",
+                    Err(_) => "completion_refused",
+                });
             }
             publication.publish();
             events.push("ready");
@@ -19587,6 +19855,67 @@ mod native_host_cleanup_tests {
             ["caller_cancelled", "disconnected", "join"]
         );
     }
+    /// The driver takes the runtime's bootstrap completion only once the
+    /// Ready's stdout capacity is reserved, so a close before that leaves it
+    /// with the runtime. The Ready then carries it, and the host publishes it
+    /// inside its own publication boundary.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_ready_carries_the_runtime_bootstrap_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = crate::unified_runtime::held_identity_test_support::governed_runtime(
+            &dir,
+            "ready-completion",
+        )
+        .await;
+        let owner = probe(Ok(()), Ok(()));
+        let host: Arc<dyn GatewayHostComposition> = owner.clone();
+        let mut server = None;
+
+        let (stdout, output) = mpsc::channel(1);
+        drop(output);
+        let early = publish_native_bootstrap_ready(
+            &host,
+            stdout,
+            GatewayStdoutLine::plain("Ready".into()),
+            crate::gateway_composition::GatewayHttpBinding::bind_loopback()
+                .await
+                .unwrap(),
+            axum::Router::new(),
+            &mut server,
+            &mut None,
+            Some(&runtime),
+        )
+        .await;
+        assert!(matches!(early, Err(GatewayRunError::Input(_))), "{early:?}");
+        assert!(owner.events.lock().unwrap().is_empty());
+
+        let (stdout, mut output) = mpsc::channel(1);
+        publish_native_bootstrap_ready(
+            &host,
+            stdout,
+            GatewayStdoutLine::plain("Ready".into()),
+            crate::gateway_composition::GatewayHttpBinding::bind_loopback()
+                .await
+                .unwrap(),
+            axum::Router::new(),
+            &mut server,
+            &mut None,
+            Some(&runtime),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *owner.events.lock().unwrap(),
+            ["completion_published", "ready"]
+        );
+        assert!(output.try_recv().is_ok(), "the Ready line was sent");
+        assert_eq!(
+            runtime.take_bootstrap_completion().err(),
+            Some(crate::BootstrapCompletionUnavailable::AlreadyTaken)
+        );
+        server.take().unwrap().shutdown().await;
+        runtime.shutdown().await;
+    }
     #[tokio::test]
     async fn constructor_completing_after_host_loss_publishes_no_ready_or_http_server() {
         let owner = probe(Ok(()), Ok(()));
@@ -19609,6 +19938,7 @@ mod native_host_cleanup_tests {
                 axum::Router::new(),
                 &mut server,
                 &mut None,
+                None,
             )
             .await;
             assert!(server.is_none());
@@ -19678,6 +20008,7 @@ mod native_host_cleanup_tests {
                         axum::Router::new(),
                         &mut resources.http_server,
                         &mut resources.stdio,
+                        None,
                     )
                     .await;
                     assert!(resources.http_server.is_none());
@@ -19871,7 +20202,7 @@ mod native_host_cleanup_tests {
             };
             let ready = publish_native_bootstrap_ready(
                 &host, stdout, GatewayStdoutLine::plain("Ready".into()), binding,
-                axum::Router::new(), &mut resources.http_server, &mut resources.stdio,
+                axum::Router::new(), &mut resources.http_server, &mut resources.stdio, None,
             ).await;
             assert!(resources.http_server.is_none());
             assert!(resources.finish(Some(&host), ready).await.is_err());
@@ -19936,6 +20267,7 @@ mod native_host_cleanup_tests {
                 axum::Router::new(),
                 &mut resources.http_server,
                 &mut resources.stdio,
+                None,
             )
             .await;
             assert!(resources.http_server.is_none());
@@ -19976,6 +20308,7 @@ mod native_host_cleanup_tests {
                     axum::Router::new(),
                     &mut resources.http_server,
                     &mut resources.stdio,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -20634,6 +20967,11 @@ mod host_app_routes_tests {
         crate::http_console::ConsoleSendPrecheck::new(minimal_decision_state(), None, None)
     }
 
+    /// One request bound per mounted app, as the gateway composes it.
+    fn request_bound() -> crate::unified_runtime::http::ReferenceAppRequestBound {
+        crate::unified_runtime::http::ReferenceAppRequestBound::default()
+    }
+
     /// A host whose route runs the Console's send precheck for the viewer it
     /// resolves.
     struct PrecheckHost;
@@ -20706,8 +21044,14 @@ mod host_app_routes_tests {
     #[tokio::test]
     async fn a_host_route_runs_the_consoles_send_precheck() {
         let host: Arc<dyn GatewayHostComposition> = Arc::new(PrecheckHost);
-        let app = mount_host_app_routes(console_app(), Some(&host), resolver(), precheck())
-            .expect("the host's routes mount");
+        let app = mount_host_app_routes(
+            console_app(),
+            Some(&host),
+            resolver(),
+            precheck(),
+            &request_bound(),
+        )
+        .expect("the host's routes mount");
         assert_eq!(
             get(&app, "/host/precheck").await,
             (StatusCode::OK, "pass".to_string())
@@ -20720,6 +21064,7 @@ mod host_app_routes_tests {
             Some(&host),
             resolver(),
             crate::http_console::ConsoleSendPrecheck::new(read_only, None, None),
+            &request_bound(),
         )
         .expect("the host's routes mount");
         assert_eq!(
@@ -20732,8 +21077,14 @@ mod host_app_routes_tests {
     #[tokio::test]
     async fn host_routes_are_served_beside_the_console_under_the_host_prefix() {
         let host: Arc<dyn GatewayHostComposition> = Arc::new(RouteHost { routes: Ok(true) });
-        let app = mount_host_app_routes(console_app(), Some(&host), resolver(), precheck())
-            .expect("the host's routes mount");
+        let app = mount_host_app_routes(
+            console_app(),
+            Some(&host),
+            resolver(),
+            precheck(),
+            &request_bound(),
+        )
+        .expect("the host's routes mount");
 
         let (status, body) = get(&app, "/host/status").await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -20761,6 +21112,7 @@ mod host_app_routes_tests {
             Some(&host),
             crate::http_console::ConsoleViewerResolver::new(decisions, None),
             precheck(),
+            &request_bound(),
         )
         .expect("the host's routes mount");
         assert_eq!(get(&app, "/host/status").await.0, StatusCode::UNAUTHORIZED);
@@ -20768,21 +21120,168 @@ mod host_app_routes_tests {
 
     #[tokio::test]
     async fn no_host_or_no_routes_leaves_the_app_unchanged_and_a_refusal_fails_init() {
-        let app = mount_host_app_routes(console_app(), None, resolver(), precheck()).unwrap();
+        let app = mount_host_app_routes(
+            console_app(),
+            None,
+            resolver(),
+            precheck(),
+            &request_bound(),
+        )
+        .unwrap();
         assert_eq!(get(&app, "/host/status").await.0, StatusCode::NOT_FOUND);
 
         let host: Arc<dyn GatewayHostComposition> = Arc::new(RouteHost { routes: Ok(false) });
-        let app =
-            mount_host_app_routes(console_app(), Some(&host), resolver(), precheck()).unwrap();
+        let app = mount_host_app_routes(
+            console_app(),
+            Some(&host),
+            resolver(),
+            precheck(),
+            &request_bound(),
+        )
+        .unwrap();
         assert_eq!(get(&app, "/host/status").await.0, StatusCode::NOT_FOUND);
 
         let host: Arc<dyn GatewayHostComposition> = Arc::new(RouteHost {
             routes: Err(GatewayHostError::Denied),
         });
         assert_eq!(
-            mount_host_app_routes(console_app(), Some(&host), resolver(), precheck()).err(),
+            mount_host_app_routes(
+                console_app(),
+                Some(&host),
+                resolver(),
+                precheck(),
+                &request_bound()
+            )
+            .err(),
             Some(GatewayHostError::Denied)
         );
+    }
+
+    /// A host whose routes stay in flight until the test releases them.
+    struct HeldRouteHost {
+        held: crate::unified_runtime::http::request_bound_test_support::HeldRequests,
+    }
+
+    #[async_trait]
+    impl GatewayHostComposition for HeldRouteHost {
+        async fn prepare_bootstrap(
+            &self,
+            spec: MobBootstrapSpec,
+        ) -> Result<MobBootstrapSpec, GatewayHostError> {
+            Ok(spec)
+        }
+        fn native_grant_work_configuration(
+            &self,
+        ) -> Result<
+            Option<meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration>,
+            GatewayHostError,
+        > {
+            Ok(None)
+        }
+        async fn bind_runtime(
+            &self,
+            _runtime: &mut UnifiedRuntime,
+        ) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        fn publish_bootstrap_ready(
+            &self,
+            publication: GatewayBootstrapReady<'_>,
+        ) -> Result<(), GatewayHostError> {
+            publication.publish();
+            Ok(())
+        }
+        fn begin_close(&self, _reason: GatewayHostCloseReason) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        async fn join_close(&self) -> Result<(), GatewayHostError> {
+            Ok(())
+        }
+        async fn wait_closed(&self) {
+            std::future::pending::<()>().await;
+        }
+        fn host_app_routes(
+            &self,
+            _viewer: crate::http_console::ConsoleViewerResolver,
+        ) -> Result<Option<axum::Router>, GatewayHostError> {
+            Ok(Some(self.held.routes("/held/plain", "/held/with-state")))
+        }
+    }
+
+    /// The host's routes share the gateway's request bound with the Console:
+    /// no more of their handlers run at once than it allows, across
+    /// connections, and a Console route waits while they hold every permit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::expect_used)]
+    async fn host_app_routes_share_the_gateway_request_bound() {
+        use crate::unified_runtime::http::ReferenceAppRequestBound;
+        use crate::unified_runtime::http::request_bound_test_support::{
+            HeldRequests, get_on_own_connection, serve,
+        };
+
+        const LIMIT: usize = 2;
+        let definition = MobDefinition::from_toml(
+            "[mob]\nid = \"gateway-request-bound\"\n[profiles.worker]\nmodel = \"gpt-5.5\"\n",
+        )
+        .expect("definition");
+        let runtime = crate::unified_runtime::UnifiedRuntimeBuilder::default()
+            .definition(definition)
+            .default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+            .build()
+            .await
+            .expect("runtime");
+        let decisions = RuntimeDecisionState::local_console(
+            ConsolePolicy {
+                require_app_auth: false,
+                ..Default::default()
+            },
+            None,
+        );
+        let held = HeldRequests::new();
+        let host: Arc<dyn GatewayHostComposition> = Arc::new(HeldRouteHost { held: held.clone() });
+        let app = gateway_console_app(
+            &runtime,
+            decisions.clone(),
+            Some(&host),
+            runtime.console_viewer_resolver(&decisions),
+            runtime.console_send_precheck(&decisions),
+            &ReferenceAppRequestBound::new(LIMIT),
+        )
+        .expect("console app");
+        let (address, server) = serve(app).await;
+
+        let requests = (0..4)
+            .map(|index| {
+                let path = if index % 2 == 0 {
+                    "/host/held/plain"
+                } else {
+                    "/host/held/with-state"
+                };
+                tokio::spawn(get_on_own_connection(address, path.to_string()))
+            })
+            .collect::<Vec<_>>();
+        held.wait_in_flight(LIMIT).await;
+        let healthz = tokio::spawn(get_on_own_connection(address, "/healthz".to_string()));
+        // Time for every outstanding request to start, if the bound let it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            held.peak(),
+            LIMIT,
+            "host routes ran beyond the gateway's bound"
+        );
+        assert!(
+            !healthz.is_finished(),
+            "/healthz was served while host routes held every permit"
+        );
+
+        held.release();
+        for request in requests {
+            assert_eq!(request.await.expect("held request"), 200);
+        }
+        assert_eq!(healthz.await.expect("healthz request"), 200);
+        assert_eq!(held.peak(), LIMIT);
+        server.abort();
+        runtime.shutdown().await;
     }
 }
 
@@ -21324,5 +21823,632 @@ mod held_bootstrap_close_tests {
         let _report = tokio::time::timeout(Duration::from_mins(1), runtime.shutdown())
             .await
             .expect("the runtime shuts down once the setup has settled");
+    }
+}
+
+/// Host callback tools reach a delegate helper whose tooling inherits its
+/// parent's visible tools.
+///
+/// Every SDK build mints its own routing scope, and every callback tool the
+/// build registered carried that scope as its provenance source. A helper's
+/// copy of a host tool therefore never matched the witness its parent's
+/// visibility pinned, and the inherited ceiling dropped it. These tests drive
+/// a delegating member through the gateway's own composition: a
+/// `StdioCallbackAgentBuilder` inside a persistent session service, the agent
+/// mob tools installed the way the gateway installs them, a scripted SDK host
+/// and a scripted model.
+#[cfg(test)]
+mod callback_tool_inheritance_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// The host tool the delegator's build and every helper's build register.
+    const HOST_TOOL: &str = "date_info";
+    /// A host tool only helper builds register: the parent never saw it.
+    const CHILD_ONLY_TOOL: &str = "child_only";
+    /// A native comms tool the delegator sees: the positive control.
+    const NATIVE_TOOL: &str = "peers";
+    const DELEGATOR: &str = "delegator";
+    const PROBE: &str = "CALLBACK-INHERITANCE-PROBE";
+    const HELPER_TASK: &str = "CALLBACK-INHERITANCE-HELPER-TASK";
+    /// Bound for every wait below; a correct run takes milliseconds.
+    const BOUND: Duration = Duration::from_mins(1);
+
+    static NEXT_MOB: AtomicUsize = AtomicUsize::new(0);
+
+    fn definition() -> MobDefinition {
+        MobDefinition::from_toml(&format!(
+            r#"
+[mob]
+id = "callback-inheritance-{}-{}"
+
+[profiles.delegator]
+model = "gpt-5.5"
+runtime_mode = "turn_driven"
+
+[profiles.delegator.tools]
+comms = true
+mob = true
+"#,
+            std::process::id(),
+            NEXT_MOB.fetch_add(1, Ordering::SeqCst)
+        ))
+        .expect("mob definition")
+    }
+
+    fn host_tool(name: &str) -> Value {
+        json!({
+            "name": name,
+            "description": format!("host tool {name}"),
+            "input_schema": {"type": "object"}
+        })
+    }
+
+    /// What the scripted SDK host saw, in order: the options of every build
+    /// and the params of every tool call.
+    #[derive(Default)]
+    struct SdkHostLog {
+        builds: std::sync::Mutex<Vec<Value>>,
+        calls: std::sync::Mutex<Vec<Value>>,
+        call_seen: tokio::sync::Notify,
+    }
+
+    /// The scripted SDK host: every `callback/build_agent` registers the host
+    /// tool, and every build other than the delegator's also registers the
+    /// child-only tool. Every `callback/call_tool` gets an answer.
+    fn answer_sdk_host(
+        mut stdout_rx: mpsc::Receiver<GatewayStdoutLine>,
+        bridge: StdioCallbackBridge,
+    ) -> (Arc<SdkHostLog>, tokio::task::JoinHandle<()>) {
+        let log = Arc::new(SdkHostLog::default());
+        let sink = Arc::clone(&log);
+        let task = tokio::spawn(async move {
+            while let Some(mut line) = stdout_rx.recv().await {
+                let request: Value = serde_json::from_str(&line).expect("callback JSON");
+                line.settle_delivery(true).await;
+                let result = match request["method"].as_str() {
+                    Some("callback/build_agent") => {
+                        let options = request["params"]["options"].clone();
+                        let mut tools = vec![host_tool(HOST_TOOL)];
+                        if options["profile_name"] != DELEGATOR {
+                            tools.push(host_tool(CHILD_ONLY_TOOL));
+                        }
+                        sink.builds.lock().expect("build log").push(options);
+                        json!({"tools": tools})
+                    }
+                    Some("callback/call_tool") => {
+                        sink.calls
+                            .lock()
+                            .expect("call log")
+                            .push(request["params"].clone());
+                        sink.call_seen.notify_one();
+                        json!({"content": "answered by the SDK host"})
+                    }
+                    _ => continue,
+                };
+                bridge
+                    .route_callback_response(json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": result,
+                    }))
+                    .await;
+            }
+        });
+        (log, task)
+    }
+
+    /// The helper the delegator's probe turn starts.
+    #[derive(Clone)]
+    enum HelperCall {
+        /// `delegate`, with this `tooling` (left out when `None`).
+        Delegate(Option<Value>),
+        /// `fork_off`: a durable fork of the delegator itself.
+        ForkOff,
+    }
+
+    const HELPER_CALL_ID: &str = "call-helper";
+    const HOST_TOOL_CALL_ID: &str = "call-host-tool";
+
+    /// The scripted model. The delegator's probe turn starts the helper; the
+    /// helper's first request records the tool names it was offered, and a
+    /// helper offered the host tool calls it once; every other turn answers.
+    /// A probe turn is the one whose newest message is the probe: a forked
+    /// helper carries its source's earlier transcript, probe included, and
+    /// only the delegator ever sees the helper call's result.
+    #[derive(Clone)]
+    struct DelegatingModel {
+        call: HelperCall,
+        helper_tools: Arc<std::sync::Mutex<Option<Vec<String>>>>,
+        helper_seen: Arc<tokio::sync::Notify>,
+        delegated: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl meerkat_client::LlmClient for DelegatingModel {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a meerkat_client::LlmRequest,
+        ) -> meerkat_client::types::LlmStream<'a> {
+            // The probe and the task reach a member wrapped as its runtime
+            // delivers them, so look for their text in the serialized messages.
+            let last = request
+                .messages
+                .last()
+                .and_then(|message| serde_json::to_string(message).ok())
+                .unwrap_or_default();
+            let transcript = serde_json::to_string(&request.messages).unwrap_or_default();
+            let helper_result = request
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    meerkat_core::Message::ToolResults { results, .. } => Some(results),
+                    _ => None,
+                })
+                .flatten()
+                .find(|result| result.tool_use_id == HELPER_CALL_ID)
+                .map(meerkat_core::ToolResult::text_content);
+            if let Some(result) = &helper_result {
+                *self.delegated.lock().expect("delegated") = Some(result.clone());
+            }
+            let call_helper = helper_result.is_none() && last.contains(PROBE);
+            let helper_turn =
+                helper_result.is_none() && !call_helper && transcript.contains(HELPER_TASK);
+            let offered = request
+                .tools
+                .iter()
+                .map(|tool| tool.name.to_string())
+                .collect::<Vec<_>>();
+            if helper_turn {
+                let mut helper_tools = self.helper_tools.lock().expect("helper tools");
+                if helper_tools.is_none() {
+                    *helper_tools = Some(offered.clone());
+                    self.helper_seen.notify_one();
+                }
+            }
+            let call_host_tool = helper_turn
+                && !transcript.contains(HOST_TOOL_CALL_ID)
+                && offered.iter().any(|name| name == HOST_TOOL);
+            let stop = if call_helper || call_host_tool {
+                meerkat_core::StopReason::ToolUse
+            } else {
+                meerkat_core::StopReason::EndTurn
+            };
+            let [usage, done] = crate::mob_handle_runtime::test_llm_usage::usage_then_done(
+                request,
+                meerkat_core::Provider::OpenAI,
+                stop,
+            );
+            let lead = if call_helper {
+                let mut args = json!({
+                    "task": HELPER_TASK,
+                    "member_id": "helper",
+                    "result_label": "helper_result",
+                    "max_text_bytes": 4096,
+                });
+                let name = match &self.call {
+                    HelperCall::Delegate(tooling) => {
+                        if let Some(tooling) = tooling {
+                            args["tooling"] = tooling.clone();
+                        }
+                        "delegate"
+                    }
+                    HelperCall::ForkOff => "fork_off",
+                };
+                meerkat_client::LlmEvent::ToolCallComplete {
+                    id: HELPER_CALL_ID.to_string(),
+                    name: name.to_string(),
+                    args,
+                    meta: None,
+                }
+            } else if call_host_tool {
+                meerkat_client::LlmEvent::ToolCallComplete {
+                    id: HOST_TOOL_CALL_ID.to_string(),
+                    name: HOST_TOOL.to_string(),
+                    args: json!({}),
+                    meta: None,
+                }
+            } else {
+                meerkat_client::LlmEvent::TextDelta {
+                    delta: "done".to_string(),
+                    meta: None,
+                }
+            };
+            Box::pin(futures::stream::iter(vec![Ok(lead), Ok(usage), Ok(done)]))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::OpenAI
+        }
+
+        async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
+            Ok(())
+        }
+    }
+
+    /// What one delegation showed: the tool names the helper's model was
+    /// offered, the delegate result the delegator saw, the options of every
+    /// SDK build and the params of every SDK tool call, in order.
+    struct Delegation {
+        helper_tools: Vec<String>,
+        delegated: Value,
+        builds: Vec<Value>,
+        calls: Vec<Value>,
+    }
+
+    /// One delegator turn through the gateway composition: the delegator
+    /// starts the helper `call` names, and the helper's first request shows
+    /// which tools reached it.
+    async fn run_helper(call: HelperCall) -> Delegation {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state = temp.path();
+        let blob_store: Arc<dyn meerkat_core::BlobStore> =
+            Arc::new(meerkat_store::MemoryBlobStore::new());
+        let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(
+            meerkat_store::SqliteSessionStore::open(state.join("session-store.sqlite3"))
+                .expect("session store"),
+        );
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new(state.join("runtime-store.sqlite3"))
+                .expect("runtime store"),
+        );
+        let (runtime_store, epochs) =
+            crate::mob_handle_runtime::epoch_tracking_runtime_store_with_durable_projection(
+                runtime_store,
+                session_store.clone(),
+            );
+        let adapter = Arc::new(
+            meerkat_runtime::MeerkatMachine::persistent(
+                Arc::clone(&runtime_store),
+                Arc::clone(&blob_store),
+            )
+            .expect("runtime machine"),
+        );
+        let factory = AgentFactory::new(state).builtins(false).comms(true);
+        let mut inner = FactoryAgentBuilder::new(factory, Config::default());
+        inner.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(
+            session_store.clone(),
+        )));
+        inner.default_blob_store = Some(Arc::clone(&blob_store));
+        let job_store: Arc<dyn meerkat::DetachedJobStore> =
+            Arc::new(meerkat::MemoryDetachedJobStore::new());
+        inner.default_detached_job_store = Some(Arc::clone(&job_store));
+        let mob_tools_slot = Arc::clone(&inner.default_mob_tools);
+        // A helper's default tools include WorkGraph's, as the gateway's do.
+        let (workgraph_service, workgraph_admission_slot) =
+            crate::workgraph_wiring::attach_workgraph_tools_ephemeral(
+                &inner,
+                "callback-inheritance",
+            );
+        let (stdout_tx, stdout_rx) = mpsc::channel(16);
+        let bridge = StdioCallbackBridge::new(stdout_tx);
+        let (sdk_host, responder) = answer_sdk_host(stdout_rx, bridge.clone());
+        let service = Arc::new(meerkat_session::PersistentSessionService::new(
+            StdioCallbackAgentBuilder {
+                inner,
+                bridge,
+                has_session_builder: true,
+                session_store: Some(session_store.clone()),
+                detached_jobs: None,
+                installed_artifacts: None,
+            },
+            16,
+            session_store,
+            Arc::clone(&runtime_store),
+            blob_store,
+        ));
+        let (mob_storage, provenance) =
+            crate::mob_composition_manifest::persistent_mob_storage(state.join("mob.sqlite3"))
+                .expect("mob storage");
+        let model = DelegatingModel {
+            call,
+            helper_tools: Arc::default(),
+            helper_seen: Arc::default(),
+            delegated: Arc::default(),
+        };
+        let spec = MobBootstrapSpec::new(definition(), mob_storage, service)
+            .with_mob_storage_provenance(provenance)
+            // The helpers' implicit child mobs live with this process.
+            .with_child_mob_storage(crate::ChildMobStorage::ProcessBound)
+            .with_session_write_epochs(&epochs)
+            .with_runtime_authority_prewarm(&runtime_store)
+            .with_runtime_archived_terminal_authority(Arc::clone(&runtime_store))
+            .with_session_runtime_adapter(adapter)
+            .expect("session runtime owner")
+            .with_workgraph_service(Some(workgraph_service))
+            .with_workgraph_admission_slot(workgraph_admission_slot)
+            .with_runtime_delivery(crate::MobRuntimeDelivery::new(
+                Arc::clone(&runtime_store),
+                job_store,
+            ))
+            .with_agent_mob_tools(mob_tools_slot)
+            .expect("install the agent mob tools")
+            .with_options(MobBootstrapOptions {
+                allow_ephemeral_sessions: true,
+                notify_orchestrator_on_resume: true,
+                default_llm_client: Some(Arc::new(model.clone())),
+            });
+        let runtime = crate::MobRuntime::bootstrap(spec)
+            .await
+            .expect("bootstrap the mob runtime");
+        let handle = runtime.handle();
+        let delegator = meerkat_mob::AgentIdentity::from(DELEGATOR);
+        handle
+            .ensure_member(meerkat_mob::SpawnMemberSpec::new(
+                meerkat_mob::ProfileName::from(DELEGATOR),
+                delegator.clone(),
+            ))
+            .await
+            .expect("seat the delegator");
+        let bounded = meerkat_mob::BoundedResultSpec::new("turn", 4096).expect("bounded result");
+        let work = handle
+            .start_work_for_identity_bounded(
+                delegator,
+                meerkat_mob::WorkSpec::new(
+                    meerkat_core::types::ContentInput::Text(PROBE.to_string()),
+                    meerkat_mob::WorkOrigin::Internal,
+                ),
+                meerkat_core::types::HandlingMode::Queue,
+                bounded.clone(),
+            )
+            .await
+            .expect("start the delegator's turn");
+        tokio::time::timeout(BOUND, work.wait_bounded(bounded))
+            .await
+            .expect("the delegator's turn completes within the bound")
+            .expect("the delegator's turn succeeds");
+        let delegated = model
+            .delegated
+            .lock()
+            .expect("delegated")
+            .clone()
+            .expect("the delegator saw its helper call's result");
+        // A `fork_off` helper runs in the background after the delegator's
+        // turn ends.
+        tokio::time::timeout(BOUND, model.helper_seen.notified())
+            .await
+            .expect("the helper's model is asked within the bound");
+        let helper_tools = model
+            .helper_tools
+            .lock()
+            .expect("helper tools")
+            .clone()
+            .expect("the helper's model was asked");
+        if helper_tools.iter().any(|name| name == HOST_TOOL) {
+            tokio::time::timeout(BOUND, sdk_host.call_seen.notified())
+                .await
+                .expect("the helper calls the host tool within the bound");
+        }
+        let builds = sdk_host.builds.lock().expect("build log").clone();
+        let calls = sdk_host.calls.lock().expect("call log").clone();
+        let _ = tokio::time::timeout(BOUND, handle.shutdown()).await;
+        responder.abort();
+        Delegation {
+            helper_tools,
+            delegated: serde_json::from_str(&delegated).expect("json delegate result"),
+            builds,
+            calls,
+        }
+    }
+
+    /// The delegate helper completed, and the delegator's build and the
+    /// helper's build each minted their own routing scope.
+    fn assert_completed_with_distinct_scopes(delegation: &Delegation) {
+        assert_eq!(
+            delegation.delegated["bounded_result"]["status"], "completed",
+            "{}",
+            delegation.delegated
+        );
+        assert_distinct_scopes(delegation);
+    }
+
+    /// The delegator's build and the helper's build each minted their own
+    /// routing scope.
+    fn assert_distinct_scopes(delegation: &Delegation) {
+        eprintln!(
+            "helper tools {:?}; builds {:?}; calls {:?}",
+            delegation.helper_tools, delegation.builds, delegation.calls
+        );
+        let scopes = delegation
+            .builds
+            .iter()
+            .map(|options| options["scope_id"].as_str().expect("scope id").to_string())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            scopes.len() >= 2 && scopes.len() == delegation.builds.len(),
+            "every build keeps its own routing scope: {:?}",
+            delegation.builds
+        );
+    }
+
+    /// The helper's one call of the host tool reached the SDK host under the
+    /// routing scope of the helper's own build, not its parent's: the shared
+    /// callback source leaves routing per build.
+    fn assert_host_tool_call_routed_to_the_helpers_build(delegation: &Delegation) {
+        let helper_scopes = delegation
+            .builds
+            .iter()
+            .filter(|options| options["labels"]["agent_identity"] == "helper")
+            .map(|options| options["scope_id"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            helper_scopes.len(),
+            1,
+            "one helper build: {:?}",
+            delegation.builds
+        );
+        assert_eq!(
+            delegation.calls,
+            vec![json!({
+                "scope_id": helper_scopes[0],
+                "tool": HOST_TOOL,
+                "arguments": {},
+            })],
+            "builds: {:?}",
+            delegation.builds
+        );
+    }
+
+    fn offered(delegation: &Delegation, tool: &str) -> bool {
+        delegation.helper_tools.iter().any(|name| name == tool)
+    }
+
+    /// (a) `inherit_parent`: the helper sees the host tool its parent sees,
+    /// and never one only its own build registered. Its call of the host
+    /// tool routes through its own build.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_inheriting_delegate_helper_sees_its_parents_host_callback_tool() {
+        let delegation = run_helper(HelperCall::Delegate(Some(
+            json!({"mode": "inherit_parent"}),
+        )))
+        .await;
+        assert_completed_with_distinct_scopes(&delegation);
+        assert!(
+            offered(&delegation, NATIVE_TOOL),
+            "{:?}",
+            delegation.helper_tools
+        );
+        assert!(
+            offered(&delegation, HOST_TOOL),
+            "the parent's host tool is inherited: {:?}",
+            delegation.helper_tools
+        );
+        assert!(
+            !offered(&delegation, CHILD_ONLY_TOOL),
+            "a host tool the parent never saw stays hidden: {:?}",
+            delegation.helper_tools
+        );
+        assert_host_tool_call_routed_to_the_helpers_build(&delegation);
+    }
+
+    /// (b) Omitted tooling is `inherit_parent`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delegate_helper_without_tooling_inherits_its_parents_host_callback_tool() {
+        let delegation = run_helper(HelperCall::Delegate(None)).await;
+        assert_completed_with_distinct_scopes(&delegation);
+        assert!(
+            offered(&delegation, NATIVE_TOOL),
+            "{:?}",
+            delegation.helper_tools
+        );
+        assert!(
+            offered(&delegation, HOST_TOOL),
+            "omitted tooling inherits the parent's host tool: {:?}",
+            delegation.helper_tools
+        );
+        assert!(
+            !offered(&delegation, CHILD_ONLY_TOOL),
+            "{:?}",
+            delegation.helper_tools
+        );
+        assert_host_tool_call_routed_to_the_helpers_build(&delegation);
+    }
+
+    /// (c) `minimal` hands the helper only the comms tools.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_minimal_delegate_helper_gets_no_host_callback_tool() {
+        let delegation = run_helper(HelperCall::Delegate(Some(json!({"mode": "minimal"})))).await;
+        assert_completed_with_distinct_scopes(&delegation);
+        assert!(
+            offered(&delegation, NATIVE_TOOL),
+            "{:?}",
+            delegation.helper_tools
+        );
+        assert!(
+            !offered(&delegation, HOST_TOOL) && !offered(&delegation, CHILD_ONLY_TOOL),
+            "{:?}",
+            delegation.helper_tools
+        );
+    }
+
+    /// (d) An empty allow overlay inherits nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_empty_allow_overlay_hides_the_host_callback_tool() {
+        let delegation = run_helper(HelperCall::Delegate(Some(json!({
+            "mode": "inherit_parent",
+            "allow_overlay": []
+        }))))
+        .await;
+        assert_completed_with_distinct_scopes(&delegation);
+        assert!(
+            !offered(&delegation, NATIVE_TOOL)
+                && !offered(&delegation, HOST_TOOL)
+                && !offered(&delegation, CHILD_ONLY_TOOL),
+            "{:?}",
+            delegation.helper_tools
+        );
+    }
+
+    /// (e) A name the delegation denies stays hidden.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_denied_host_callback_tool_stays_hidden_from_an_inheriting_helper() {
+        let delegation = run_helper(HelperCall::Delegate(Some(json!({
+            "mode": "inherit_parent",
+            "deny_overlay": [HOST_TOOL]
+        }))))
+        .await;
+        assert_completed_with_distinct_scopes(&delegation);
+        assert!(
+            offered(&delegation, NATIVE_TOOL),
+            "{:?}",
+            delegation.helper_tools
+        );
+        assert!(
+            !offered(&delegation, HOST_TOOL) && !offered(&delegation, CHILD_ONLY_TOOL),
+            "{:?}",
+            delegation.helper_tools
+        );
+    }
+
+    /// A `fork_off` helper, a durable fork of the delegator, sees its
+    /// source's host tool too, and calls it through its own build.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fork_off_helper_sees_its_sources_host_callback_tool() {
+        let delegation = run_helper(HelperCall::ForkOff).await;
+        assert!(
+            delegation.delegated["job_id"].is_string(),
+            "the fork runs as a background job: {}",
+            delegation.delegated
+        );
+        assert_distinct_scopes(&delegation);
+        assert!(
+            offered(&delegation, HOST_TOOL),
+            "the source's host tool reaches its fork: {:?}",
+            delegation.helper_tools
+        );
+        assert_host_tool_call_routed_to_the_helpers_build(&delegation);
+    }
+
+    /// Two builds for one SDK host keep their own routing scopes and stamp
+    /// one callback source, so a witness recorded against either matches the
+    /// other.
+    #[test]
+    fn two_builds_of_one_sdk_host_stamp_one_callback_source() {
+        let spec = || CallbackToolSpec::parse(&json!({"name": HOST_TOOL})).expect("tool spec");
+        let bridge = || StdioCallbackBridge::new(mpsc::channel(1).0);
+        let first =
+            CallbackToolDispatcher::new(bridge(), "build-1".to_string(), vec![spec()], None);
+        let second =
+            CallbackToolDispatcher::new(bridge(), "build-2".to_string(), vec![spec()], None);
+        assert_ne!(first.scope_id, second.scope_id, "routing stays per build");
+        let source = |dispatcher: &CallbackToolDispatcher| {
+            AgentToolDispatcher::tools(dispatcher)[0]
+                .provenance
+                .clone()
+                .expect("callback provenance")
+        };
+        assert!(
+            source(&first).same_source(&source(&second)),
+            "one SDK host, one callback source: {:?} vs {:?}",
+            source(&first),
+            source(&second)
+        );
     }
 }

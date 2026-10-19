@@ -552,9 +552,7 @@ impl LlmClient for StubClient {
                 meta: None,
             });
             yield Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(StopReason::EndTurn),
             });
         })
     }

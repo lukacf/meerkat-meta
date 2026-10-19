@@ -19,20 +19,44 @@ fn occurrences(haystack: &str, needle: &str) -> usize {
     haystack.match_indices(needle).count()
 }
 
-/// `source` without its `#[cfg(test)] mod tests { .. }` blocks, so a count
-/// sees production composition roots only, not test fixtures that compose a
-/// spec the same way. A rustfmt-formatted module indents its whole body, so
-/// its closing brace is the first later line that is exactly `}`. Taking the
-/// FIRST such line can only end a cut early (a column-0 `}` inside a raw
-/// string), which leaves test code in and fails an exact count loudly; it can
-/// never swallow production code.
+/// `source` without its test modules, so a count sees production composition
+/// roots only, not test fixtures that compose a spec the same way. A test
+/// module is a `#[cfg(test)]` line, any further one-line attributes, and
+/// `mod <name> {`, all at column 0 and whatever the name. A rustfmt-formatted
+/// module indents its whole body, so its closing brace is the first later
+/// line that is exactly `}`. Taking the FIRST such line can only end a cut
+/// early (a column-0 `}` inside a raw string), which leaves test code in and
+/// fails an exact count loudly; it can never swallow production code. An
+/// out-of-line `mod name;`, or an attribute this does not recognise, keeps
+/// the text, which can only over-count.
 fn production_source(source: &str) -> String {
-    const TEST_MODULE: &str = "#[cfg(test)]\nmod tests {\n";
+    const CFG_TEST: &str = "#[cfg(test)]\n";
     let mut production = String::with_capacity(source.len());
     let mut rest = source;
-    while let Some(start) = rest.find(TEST_MODULE) {
+    while let Some(start) = rest.find(CFG_TEST) {
+        let at_line_start = start == 0 || rest[..start].ends_with('\n');
+        let mut item = &rest[start + CFG_TEST.len()..];
+        while item.starts_with("#[") {
+            match item.find('\n') {
+                Some(end) if item[..end].ends_with(']') => item = &item[end + 1..],
+                _ => break,
+            }
+        }
+        let name_len = item.strip_prefix("mod ").map_or(0, |name| {
+            name.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(name.len())
+        });
+        let header_len = "mod ".len() + name_len + " {".len();
+        if !at_line_start || name_len == 0 || !item["mod ".len() + name_len..].starts_with(" {\n") {
+            // Not an inline test module: keep it and look further.
+            let kept = start + CFG_TEST.len();
+            production.push_str(&rest[..kept]);
+            rest = &rest[kept..];
+            continue;
+        }
         production.push_str(&rest[..start]);
-        let body = &rest[start + TEST_MODULE.len()..];
+        // From the newline that opens the body, so an empty body closes too.
+        let body = &item[header_len..];
         let end = body.find("\n}\n").expect("test module closes") + "\n}\n".len();
         rest = &body[end..];
     }
@@ -100,6 +124,29 @@ fn production_source_strips_only_the_test_module() {
     assert_eq!(occurrences(&production, "MobBootstrapSpec::new("), 2);
     assert!(production.contains("new(a)") && production.contains("new(c)"));
     assert!(!production.contains("fixture"));
+}
+
+/// Every test module is stripped whatever its name, also behind further
+/// attributes, while the production roots before, between and after them
+/// survive. An out-of-line `mod name;` has no body and strips nothing.
+#[test]
+fn production_source_strips_every_test_module() {
+    let source = concat!(
+        "fn root() { MobBootstrapSpec::new(a) }\n",
+        "#[cfg(test)]\nmod tests {\n    fn fixture() {\n        MobBootstrapSpec::new(b);\n    }\n}\n",
+        "fn middle_root() { MobBootstrapSpec::new(c) }\n",
+        "#[cfg(test)]\nmod callback_tests {\n    fn other_fixture() {\n        MobBootstrapSpec::new(d);\n    }\n}\n",
+        "#[cfg(test)]\n#[allow(clippy::expect_used)]\nmod allowed_tests {\n    fn allowed_fixture() {\n        MobBootstrapSpec::new(e);\n    }\n}\n",
+        "#[cfg(test)]\nmod declared_elsewhere;\n",
+        "fn later_root() { MobBootstrapSpec::new(f) }\n",
+    );
+    let production = production_source(source);
+    assert_eq!(occurrences(&production, "MobBootstrapSpec::new("), 3);
+    for root in ["new(a)", "new(c)", "new(f)"] {
+        assert!(production.contains(root), "production root {root} survives");
+    }
+    assert!(!production.contains("fixture"));
+    assert!(production.contains("mod declared_elsewhere;"));
 }
 
 #[test]

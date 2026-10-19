@@ -748,6 +748,66 @@ async fn a_refused_or_unsubmitted_governed_input_withdraws_its_custody() {
     );
 }
 
+/// A contributor whose admission its source owner has not settled yet
+/// (retained custody `AdmissionPending`) is not admissible yet: native
+/// admission answers the governed send with the typed
+/// `OriginalAdmissionPending` readiness failure and settles it
+/// `NotAdmitted`, so the host custody is withdrawn and no model is called.
+/// Once the owner retains the contributor, the same send is admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_contributor_refuses_the_governed_send_until_it_is_retained() {
+    let fixture = Arc::new(Fixture::new().await);
+    let (runtime, identity) = governed_runtime(&fixture, None).await;
+    let registered = runtime
+        .registered_spec(&identity)
+        .await
+        .expect("registered row");
+
+    fixture
+        .adapter
+        .sources_pending
+        .store(true, Ordering::SeqCst);
+    let pending = FixtureBinder::authored_from(&fixture, registered.spec.clone());
+    let error = runtime
+        .send_governed_with_turn_ticket(&identity, None, raw_prompt(), pending.clone())
+        .await
+        .expect_err("a contributor whose admission is pending is not admissible yet");
+    assert!(
+        matches!(
+            &error,
+            IdentityRuntimeError::GovernedInput(GovernedInputError::Mob(mob))
+                if matches!(
+                    &**mob,
+                    MobError::MemberInputRefused {
+                        error: meerkat_runtime::RuntimeDriverError::ControllerReadinessUnavailable {
+                            reason: meerkat_core::authorization::ControllerReadinessFailure::OriginalAdmissionPending,
+                        },
+                        ..
+                    }
+                )
+        ),
+        "{error}"
+    );
+    assert!(pending.admitted().is_empty());
+    assert_eq!(pending.withdrawn(), 1);
+    assert!(
+        fixture.provider.requests().is_empty(),
+        "no model call while a contributor's admission is pending"
+    );
+
+    fixture
+        .adapter
+        .sources_pending
+        .store(false, Ordering::SeqCst);
+    let retained = FixtureBinder::authored_from(&fixture, registered.spec);
+    let sent = runtime
+        .send_governed_with_turn_ticket(&identity, None, raw_prompt(), retained.clone())
+        .await
+        .expect("the send is admitted once the contributors are retained");
+    assert_eq!(retained.admitted(), vec![sent.admission.clone()]);
+    assert_eq!(retained.withdrawn(), 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_departed_caller_and_an_elapsed_deadline_never_lose_an_entered_admission() {
     let fixture = Arc::new(Fixture::new().await);

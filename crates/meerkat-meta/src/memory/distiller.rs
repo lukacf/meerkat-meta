@@ -69,6 +69,7 @@ use crate::identity_first::agent_memory::{
     AgentMemoryError, AgentMemoryProvider, MEMORY_TOOL_NAME, compact_whitespace,
     truncate_utf8_boundary,
 };
+use crate::memory::completion::{CompletionStop, UNTERMINATED_STREAM, completion_stop};
 use crate::memory::factory_handle::FactoryModelClientHandle;
 use crate::memory::guards::{BackgroundBudget, BackgroundBudgetConfig};
 use crate::memory::records::{
@@ -133,6 +134,13 @@ pub enum DistillerError {
     Truncated {
         max_output_tokens: u32,
     },
+    /// The model stopped before a complete answer for a reason other than
+    /// the output ceiling: a content filter, a cancelled response, a tool
+    /// call the stage never offers, or a stop reason Meerkat adds later.
+    /// Nothing is distilled from the partial body, however well it parses.
+    Incomplete {
+        stop_reason: meerkat_core::StopReason,
+    },
     Parse(String),
     Store(String),
     Transcript(String),
@@ -149,6 +157,11 @@ impl std::fmt::Display for DistillerError {
                 "distiller response hit the output ceiling of {max_output_tokens} tokens and was \
                  truncated; raise it via the distiller config's max_output_tokens (models spend this \
                  same budget on thinking/reasoning tokens as well as the answer)"
+            ),
+            Self::Incomplete { stop_reason } => write!(
+                f,
+                "distiller response stopped with {stop_reason:?} before a complete answer; \
+                 nothing is distilled from it"
             ),
             Self::Parse(msg) => write!(f, "distiller parse error: {msg}"),
             Self::Store(msg) => write!(f, "distiller store error: {msg}"),
@@ -1031,6 +1044,7 @@ async fn complete_text(
     .with_temperature(profile.params.temperature);
     let mut stream = client.stream(&request);
     let mut assembler = BlockAssembler::new();
+    let mut answered = false;
     while let Some(event) = stream.next().await {
         match event.map_err(classify_llm_error)? {
             LlmEvent::AssistantOutput { blocks } => {
@@ -1038,17 +1052,25 @@ async fn complete_text(
             }
             LlmEvent::TextDelta { delta, meta } => assembler.on_text_delta(&delta, meta),
             LlmEvent::Done { outcome } => match outcome {
-                LlmDoneOutcome::Success { stop_reason } => {
+                LlmDoneOutcome::Success { stop_reason, .. } => match completion_stop(stop_reason) {
+                    CompletionStop::Answered => {
+                        answered = true;
+                        break;
+                    }
                     // Do NOT discard stop_reason. A MaxTokens stop arrives with a
                     // partial or empty body; returning it as a short answer sends a
                     // truncation into a strict parse, which then blames the model.
-                    if matches!(stop_reason, meerkat_core::StopReason::MaxTokens) {
+                    CompletionStop::Truncated => {
                         return Err(DistillerError::Truncated {
                             max_output_tokens: profile.params.max_output_tokens,
                         });
                     }
-                    break;
-                }
+                    // Nor is any other unfinished body an answer, however well
+                    // it parses: nothing is distilled from a filtered reply.
+                    CompletionStop::Incomplete(stop_reason) => {
+                        return Err(DistillerError::Incomplete { stop_reason });
+                    }
+                },
                 LlmDoneOutcome::Error { error } => return Err(classify_llm_error(error)),
             },
             LlmEvent::OperationObservationFailed {
@@ -1066,6 +1088,10 @@ async fn complete_text(
             | LlmEvent::UsageUpdate { .. }
             | LlmEvent::WireLiveness => {}
         }
+    }
+    // A stream that ends before its terminal event has no answer either.
+    if !answered {
+        return Err(DistillerError::Client(UNTERMINATED_STREAM.to_string()));
     }
     Ok(meerkat_core::types::BlockAssistantMessage::new(
         assembler.finalize(),
@@ -2033,9 +2059,7 @@ mod tests {
                 });
                 events.push(LlmEvent::AssistantOutput { blocks });
                 events.push(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 });
                 let client = meerkat_client::TestClient::new(events);
                 assert_eq!(
@@ -2077,6 +2101,11 @@ mod tests {
                     Err(DistillerError::Truncated { max_output_tokens })
                         if max_output_tokens == profile.params.max_output_tokens
                 )),
+                CompletionCase::Unterminated => assert!(
+                    matches!(result, Err(DistillerError::Client(message))
+                        if message == UNTERMINATED_STREAM),
+                    "a stream with no terminal event is not an answer",
+                ),
             }
             client.assert_observed_once_without_retry(&log);
         }
@@ -2087,9 +2116,7 @@ mod tests {
         let client = meerkat_client::TestClient::new(vec![
             LlmEvent::AssistantOutput { blocks: Vec::new() },
             LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::MaxTokens,
-                },
+                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::MaxTokens),
             },
         ]);
         let profile = DistillerProfile::embedded_default();
@@ -2098,6 +2125,26 @@ mod tests {
             Err(DistillerError::Truncated { max_output_tokens })
                 if max_output_tokens == profile.params.max_output_tokens
         ));
+    }
+
+    /// A body the model did not finish is not an answer, however well it
+    /// parses: every stop before a complete answer is typed.
+    #[tokio::test]
+    async fn complete_text_refuses_an_incomplete_stop() {
+        use crate::test_diagnostics::{INCOMPLETE_STOPS, stopping_client};
+
+        let profile = DistillerProfile::embedded_default();
+        for stop in INCOMPLETE_STOPS {
+            let client = stopping_client(ONE_OP_REPLY, stop);
+            let result = complete_text(&client, &profile, "test".into()).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(DistillerError::Incomplete { stop_reason }) if stop_reason == stop
+                ),
+                "{stop:?}: {result:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2204,6 +2251,7 @@ mod tests {
     struct ScriptedLlm {
         replies: StdMutex<Vec<String>>,
         prompts: StdMutex<Vec<String>>,
+        stop_reason: meerkat_core::StopReason,
     }
 
     impl ScriptedLlm {
@@ -2211,7 +2259,14 @@ mod tests {
             Self {
                 replies: StdMutex::new(replies.into_iter().map(str::to_string).collect()),
                 prompts: StdMutex::new(Vec::new()),
+                stop_reason: meerkat_core::StopReason::EndTurn,
             }
+        }
+
+        /// Every reply ends with `stop_reason` instead of an ended turn.
+        fn stopping_with(mut self, stop_reason: meerkat_core::StopReason) -> Self {
+            self.stop_reason = stop_reason;
+            self
         }
 
         fn prompts(&self) -> Vec<String> {
@@ -2255,9 +2310,7 @@ mod tests {
                     meta: None,
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(self.stop_reason),
                 }),
             ]))
         }
@@ -2431,7 +2484,25 @@ mod tests {
         tracker: Option<SessionTaintTracker>,
         config: DistillerConfig,
     ) -> (Arc<DistillerEngine>, Arc<ScriptedLlm>) {
-        let client = Arc::new(ScriptedLlm::new(replies));
+        engine_with_llm(
+            ScriptedLlm::new(replies),
+            provider,
+            transcript,
+            tombstones,
+            tracker,
+            config,
+        )
+    }
+
+    fn engine_with_llm(
+        llm: ScriptedLlm,
+        provider: Arc<CapturingProvider>,
+        transcript: Option<TranscriptSlice>,
+        tombstones: Vec<TombstoneMeta>,
+        tracker: Option<SessionTaintTracker>,
+        config: DistillerConfig,
+    ) -> (Arc<DistillerEngine>, Arc<ScriptedLlm>) {
+        let client = Arc::new(llm);
         let engine = Arc::new(DistillerEngine::new(
             DistillerProfile::embedded_default(),
             config,
@@ -2630,6 +2701,44 @@ mod tests {
             "model-cited range within window"
         );
         assert!(record.tags.contains(&"epistemic:operator_said".to_string()));
+    }
+
+    /// A reply the model did not finish writes nothing, even one that parses
+    /// into an op: the run is skipped, and its reason and warn line name the
+    /// stop.
+    #[tokio::test]
+    async fn distill_writes_nothing_from_an_incomplete_reply() {
+        use crate::test_diagnostics::{INCOMPLETE_STOPS, capture_warnings};
+
+        for stop in INCOMPLETE_STOPS {
+            let provider = Arc::new(CapturingProvider::default());
+            let (engine, _client) = engine_with_llm(
+                ScriptedLlm::new(vec![ONE_OP_REPLY]).stopping_with(stop),
+                provider.clone(),
+                Some(slice(&[
+                    ("user", "use the wrapper"),
+                    ("assistant", "noted"),
+                    ("user", "always ./scripts/repo-cargo, never raw cargo"),
+                ])),
+                Vec::new(),
+                None,
+                enabled_config(),
+            );
+            engine.note_session_generation("identity:a", "sess-1", 3);
+            let (outcome, log) =
+                capture_warnings(engine.distill_now("identity:a", "sess-1", DistillCause::Retire))
+                    .await;
+            let named = format!("{stop:?}");
+            assert!(
+                matches!(&outcome, DistillOutcome::Skipped { reason } if reason.contains(&named)),
+                "{stop:?}: {outcome:?}"
+            );
+            assert!(
+                provider.remembers.lock().unwrap().is_empty(),
+                "{stop:?}: nothing is remembered"
+            );
+            assert!(log.contains(&named), "{stop:?}: {log}");
+        }
     }
 
     #[tokio::test]
@@ -3195,6 +3304,8 @@ mod tests {
                         summary_tokens: 10,
                         messages_before: 20,
                         messages_after: 2,
+                        summary_source: None,
+                        estimated_history_tokens_after: None,
                     },
                 ),
             );
@@ -3245,6 +3356,8 @@ mod tests {
                     summary_tokens: 10,
                     messages_before: 20,
                     messages_after: 2,
+                    summary_source: None,
+                    estimated_history_tokens_after: None,
                 },
             ),
         );

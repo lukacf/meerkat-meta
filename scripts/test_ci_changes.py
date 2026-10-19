@@ -108,9 +108,11 @@ PATH_REFERENCE = re.compile(
 # a path joined part by part ("scripts", "repo-cargo" or "crates" / "x" /
 # "fixture.json") counts as the joined path. A quoted name that is an object
 # key or value (id: "docs", "scripts": {...}) is an identifier, not a path.
-QUOTED_LIST = re.compile(r"[\[(]((?:\s*[\"'`][^\"'`\n]*[\"'`]\s*,?)+)\s*[\])]")
+LIST_START = re.compile(r"[\[(]")
+QUOTED_ITEM = re.compile(r"\s*[\"'`]([^\"'`\n]*)[\"'`]")
 QUOTED = re.compile(r"[\"'`]([^\"'`\n]*)[\"'`]")
 JOINED = re.compile(rf"[\"'`]({_NAMES})[\"'`]((?:\s*[,/]\s*[\"'`][\w.-]+[\"'`])+)")
+
 COMMENT_LINE = re.compile(r"^\s*(?://|#|/\*|\*|--|<!--)")
 OBJECT_VALUE = re.compile(r"\w+[\"']?\s*:\s*[\"'`]$")
 BLOCKS = (re.compile(r'"""[\s\S]*?"""'), re.compile(r"'''[\s\S]*?'''"), re.compile(r"/\*[\s\S]*?\*/"))
@@ -191,6 +193,8 @@ CROSS_AREA_READS = {
     (".github/", "scripts/"): set(),
     (".github/", "scripts/memory-evals"): set(),
     (".github/", "docs/"): set(),
+    (".github/", "skippable"): set(),
+    (".github/", "packages/"): set(),
     # make test-python reads sdk/python; the release targets and local
     # hooks are not CI lanes.
     ("Makefile", "sdk/python/"): {"python"},
@@ -210,6 +214,16 @@ CROSS_AREA_READS = {
     ("scripts/", "scripts/memory-evals"): set(),
     ("scripts/", "docs/"): set(),
     ("scripts/", "skippable"): set(),
+    # Forge's separate workflow exercises these reads. Its path filters include
+    # installer, Console/packages, the Python SDK and root README/licenses.
+    # They do not require an additional lane in this workflow's classifier.
+    ("installer/", "console/"): set(),
+    ("installer/", "packages/"): set(),
+    ("installer/", "sdk/python/"): set(),
+    ("installer/", "skippable"): set(),
+    # A dependency's examples/* workspace metadata in Forge's lockfile names
+    # examples but does not load this repository's example applications.
+    ("installer/", "examples/"): set(),
     ("scripts/", "Makefile"): set(),
     ("scripts/", ".config/nextest.toml"): set(),
     ("scripts/", "examples/"): set(),
@@ -231,6 +245,7 @@ CROSS_AREA_READS = {
     ("scripts/", "crates/"): set(),
     (".pre-commit-config.yaml", "crates/"): set(),
     ("Cargo.toml", "crates/"): set(),
+
 }
 
 
@@ -288,6 +303,33 @@ def target_lanes(root: Path, target: str) -> frozenset | None:
     return lanes
 
 
+def quoted_lists(text: str):
+    """Scan quoted pathspec lists without ambiguous repeated whitespace.
+
+    A failed candidate still allows a later or nested list to be inspected.
+    As with the previous recognizer, commas are optional and a trailing comma
+    is accepted. Contents are names only, never evaluated as source code.
+    """
+    search = 0
+    while start := LIST_START.search(text, search):
+        cursor, values = start.end(), []
+        while item := QUOTED_ITEM.match(text, cursor):
+            values.append(item.group(1))
+            cursor = item.end()
+            while cursor < len(text) and text[cursor].isspace():
+                cursor += 1
+            if cursor < len(text) and text[cursor] == ",":
+                cursor += 1
+            while cursor < len(text) and text[cursor].isspace():
+                cursor += 1
+            if cursor < len(text) and text[cursor] in "])":
+                yield values
+                search = cursor + 1
+                break
+        else:
+            search = start.end()
+
+
 def references(text: str, *, bare: bool) -> list[str]:
     found = []
     for match in PATH_REFERENCE.finditer(text):
@@ -298,8 +340,8 @@ def references(text: str, *, bare: bool) -> list[str]:
         elif not OBJECT_VALUE.search(text, max(0, match.start() - 40), match.start()):
             found.append(match.group(5))
     if bare:
-        for match in QUOTED_LIST.finditer(text):
-            names = [name for name in QUOTED.findall(match.group(1)) if name in AREA_NAMES]
+        for values in quoted_lists(text):
+            names = [name for name in values if name in AREA_NAMES]
             if len(names) >= 2:
                 found += names
         found += ["/".join([match.group(1), *QUOTED.findall(match.group(2))]) for match in JOINED.finditer(text)]
@@ -438,6 +480,15 @@ class CiChangesTests(unittest.TestCase):
 
     def deferred(self, *paths, read=no_gates):
         return set(ci_changes.classify("pull_request", list(paths), read)[1])
+
+    def test_quoted_pathspecs_survive_long_unclosed_whitespace_and_keep_later_reads(self):
+        malformed = '["console"' + " " * 20_000 + 'unexpected'
+        valid = '["console" "sdk" "scripts", ]'
+        self.assertEqual(references(malformed + valid, bare=True), ["console", "sdk", "scripts"])
+        self.assertEqual(references('["console" "sdk"' + " " * 20_000 + ']', bare=True),
+                         ["console", "sdk"])
+        self.assertEqual(list(quoted_lists('(["console" "sdk"]) ["scripts"]')),
+                         [["console", "sdk"], ["scripts"]])
 
     def test_docs_and_top_level_markdown_skip_the_heavy_jobs(self):
         self.assertEqual(self.lanes("docs/concepts/events.mdx", "README.md", "CHANGELOG.md"), set())

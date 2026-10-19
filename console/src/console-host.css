@@ -189,6 +189,14 @@ svg[data-svg="fit"],
   background: var(--ok);
   box-shadow: 0 0 0 2px color-mix(in oklch, var(--ok) 18%, transparent);
 }
+.meta-topbar__mob-status[data-status="stopped"] {
+  background: var(--crit);
+  box-shadow: 0 0 0 2px color-mix(in oklch, var(--crit) 18%, transparent);
+}
+.meta-topbar__mob-status[data-status="unknown"] {
+  background: var(--warn);
+  box-shadow: 0 0 0 2px color-mix(in oklch, var(--warn) 18%, transparent);
+}
 [data-cc-variant="terminal"] .meta-topbar__mob-status { border-radius: 0; }
 .meta-topbar__spacer { flex: 1; }
 .meta-topbar__util {
@@ -1352,6 +1360,28 @@ svg[data-svg="fit"],
   color: var(--ink-dim);
   font-size: 12.5px;
   font-family: var(--mono);
+}
+/* PanelStatusRow: a reserved line for a panel's refresh error. It keeps the
+   same height whether or not an error shows, so a failed refresh or the
+   recovery never moves the controls around it. */
+.panel-status-row {
+  flex: none;
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  height: 24px;
+  min-width: 0;
+  overflow: hidden;
+}
+.gating > .panel-status-row { padding: 0 24px; }
+.panel-status-row__error {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--crit);
+  font-family: var(--mono);
+  font-size: 11px;
 }
 .gating__policies {
   display: grid;
@@ -3706,6 +3736,7 @@ svg[data-svg="fit"],
   gap: 8px;
 }
 .memory-tile {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -3720,6 +3751,18 @@ svg[data-svg="fit"],
   font: inherit;
 }
 .memory-tile:hover { border-color: var(--accent); }
+/* A re-check runs on every refresh with changed records. It sits over the
+   tile's corner, out of the line flow, so the tile row keeps its height and
+   the tiles below never move under a click. */
+.memory-tile__recheck {
+  position: absolute;
+  top: 9px;
+  right: 10px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-faint);
+  pointer-events: none;
+}
 .memory-tile__label {
   font-family: var(--disp);
   font-size: 10.5px;
@@ -3894,8 +3937,11 @@ svg[data-svg="fit"],
 }
 .workgraph__head {
   display: flex;
+  /* A narrow panel wraps the view toggle and Refresh onto another line
+     instead of pushing them out of sight. */
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 6px 10px;
 }
 .workgraph__head h3 { margin: 0; font-size: 13px; }
 .workgraph__captured {
@@ -3904,13 +3950,6 @@ svg[data-svg="fit"],
   color: var(--ink-faint);
 }
 .workgraph__spacer { flex: 1 1 auto; }
-.workgraph__error {
-  padding: 6px 10px;
-  border: 1px solid var(--err, #d4564e);
-  border-radius: var(--r-sm);
-  color: var(--err, #d4564e);
-  font-size: 11.5px;
-}
 .workgraph__section {
   border: 1px solid var(--line);
   border-radius: var(--r-md);

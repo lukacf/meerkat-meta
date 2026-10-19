@@ -36,6 +36,12 @@ _GATEWAY_SHUTDOWN_GRACE_SECONDS = 337.0
 _MAX_GATEWAY_SHUTDOWN_HORIZON_MS = 2_147_483_647
 _PROCESS_TERMINATE_GRACE_SECONDS = 5.0
 _PROCESS_KILL_GRACE_SECONDS = 5.0
+# How long a gateway that exited gets for its stdout to close before its
+# waiters fail anyway: a process it started can hold that pipe open.
+_CHILD_EXIT_STDOUT_GRACE_SECONDS = 1.0
+# The exit watcher blocks in ``Popen.wait()``, so it watches only real
+# child processes.
+_Popen = subprocess.Popen
 _GATEWAY_SHUTDOWN_METHOD = "meta/shutdown"
 
 # meta/init: accepted, then settled (#550). The SDK opts in with these
@@ -52,7 +58,8 @@ class InitWatch:
     Registered before the init request is written, so a progress or
     settlement notification can never arrive unclaimed. The reader thread
     delivers into an asyncio future on the host loop, so waiting for the
-    settlement is cancellable and holds no thread.
+    settlement is cancellable and holds no thread. Closing the watch retires
+    that future, so a failure nobody awaited is never reported by asyncio.
     """
 
     def __init__(self, init_id: str, loop: asyncio.AbstractEventLoop):
@@ -87,10 +94,48 @@ class InitWatch:
     async def settlement(self, deadline: float | None = None) -> dict[str, Any]:
         """Wait for ``meta/init_settled``. ``deadline`` is the caller's own
         cap in seconds (``None``: wait until the gateway settles, exits, or
-        the reader fails); exceeding it raises ``asyncio.TimeoutError``."""
+        the reader fails); exceeding it raises ``asyncio.TimeoutError``.
+        Neither the deadline nor a cancelled caller ends the settlement."""
+        # asyncio.wait only watches the future. A cancelled shield detaches
+        # from it instead, which left a later failure unretrieved (or, on
+        # Python 3.14, reported as an exception in a shielded future) before
+        # close_init_watch() could retire it.
+        waiting = asyncio.wait((self._settlement,))
         if deadline is None:
-            return await asyncio.shield(self._settlement)
-        return await asyncio.wait_for(asyncio.shield(self._settlement), deadline)
+            await waiting
+        else:
+            await asyncio.wait_for(waiting, deadline)
+        return self._settlement.result()
+
+    def _retire(self) -> None:
+        """Retire the settlement future on its owning loop.
+
+        A failure the reader already delivered is read, so asyncio counts it
+        as retrieved; a pending future is cancelled, so a delivery still
+        queued (the reader's EOF) finds it done and does nothing. Called off
+        the loop, it is queued behind every delivery already queued there.
+        """
+        try:
+            on_loop = asyncio.get_running_loop() is self._loop
+        except RuntimeError:
+            on_loop = False
+        if on_loop:
+            self._drain()
+            return
+        try:
+            self._loop.call_soon_threadsafe(self._drain)
+        except RuntimeError:
+            # The loop is closed: no delivery runs any more, and asyncio never
+            # reports a pending future. Read a failure already delivered.
+            if self._settlement.done() and not self._settlement.cancelled():
+                self._settlement.exception()
+
+    def _drain(self) -> None:
+        settlement = self._settlement
+        if not settlement.done():
+            settlement.cancel()
+        elif not settlement.cancelled():
+            settlement.exception()
 
 
 class _ChildLifetime:
@@ -377,9 +422,16 @@ class PersistentTransport:
         return watch
 
     def close_init_watch(self, watch: InitWatch) -> None:
+        """Stop watching ``watch`` and retire its settlement future.
+
+        The init caller may have stopped waiting first (its request failed,
+        was refused, or timed out) while the reader still failed the watch.
+        That exact watch is retired even if a restart already detached it.
+        """
         with self._pending_lock:
             if self._init_watch is watch:
                 self._init_watch = None
+        watch._retire()
 
     @property
     def request_timeout(self) -> float:
@@ -506,10 +558,18 @@ class PersistentTransport:
         if retired is not None:
             retired.observe_exit()
             retired.end("the gateway process was replaced")
-        self._reader_thread = threading.Thread(
+        reader = threading.Thread(
             target=self._reader_loop, args=(process,), daemon=True, name="meta-reader"
         )
-        self._reader_thread.start()
+        self._reader_thread = reader
+        reader.start()
+        if isinstance(process, _Popen):
+            threading.Thread(
+                target=self._watch_child_exit,
+                args=(process, reader),
+                daemon=True,
+                name="meta-exit-watch",
+            ).start()
 
     def _publish_child(self, process, stderr_file, loop, failure):
         """Make ``process`` the current child. Caller holds the lifecycle lock."""
@@ -690,7 +750,46 @@ class PersistentTransport:
             return
         watch._deliver(method, params)
 
-    def _fail_pending_after_reader_exit(self, reason: str, *, process=_CURRENT_TRANSPORT) -> None:
+    def _watch_child_exit(self, process, reader: threading.Thread) -> None:
+        """Fail the waiters of a child that exited while its stdout stays open.
+
+        The reader fails them once stdout reaches EOF, which normally follows
+        the exit at once. A process the gateway started can inherit its
+        stdout and hold it open; its waiters would then wait out their
+        timeouts, the shutdown handshake its whole horizon. After a short
+        grace they fail with the child's ``GatewayChildEndedError`` instead.
+        If the reader thread does not run for that whole second (a loaded
+        host), a reply already in the pipe fails with the exit instead of
+        being delivered: as with any reader failure, that request's outcome
+        is then unknown.
+        """
+        try:
+            process.wait()
+        except Exception:  # noqa: BLE001 - the watcher must never raise
+            return
+        reader.join(_CHILD_EXIT_STDOUT_GRACE_SECONDS)
+        if not reader.is_alive():
+            return
+        reason = "the gateway process exited while a process it started still held its stdout"
+        lifetime = self._lifetime_of(process)
+        failure = None
+        if lifetime is not None:
+            lifetime.end(reason)
+            lifetime.observe_exit()
+            failure = lifetime.refusal()
+        self._fail_pending_after_reader_exit(
+            reason,
+            process=process,
+            failure=failure or GatewayChildEndedError(reason, exit_code=process.returncode),
+        )
+
+    def _fail_pending_after_reader_exit(
+        self,
+        reason: str,
+        *,
+        process=_CURRENT_TRANSPORT,
+        failure: TransportReaderFailedError | None = None,
+    ) -> None:
         """No response can arrive any more: fail every waiter, typed.
 
         A response that arrived before the reader stopped (for example a
@@ -705,7 +804,8 @@ class PersistentTransport:
         if lifetime is not None:
             lifetime.end(reason)
             lifetime.observe_exit()
-        failure = TransportReaderFailedError(reason)
+        if failure is None:
+            failure = TransportReaderFailedError(reason)
         with self._pending_lock:
             if process is not self._process:
                 return
@@ -944,14 +1044,19 @@ class PersistentTransport:
     ) -> Any:
         """Send on the current child without starting a replacement process."""
         request_timeout = self._timeout if timeout is None else timeout
+        # ``Event.wait`` refuses a timeout past ``threading.TIMEOUT_MAX`` with
+        # OverflowError, which would surface only after the request is written:
+        # the gateway would run it with nobody waiting. Refuse it here instead.
         if (
             isinstance(request_timeout, bool)
             or not isinstance(request_timeout, (int, float))
             or not math.isfinite(request_timeout)
             or request_timeout <= 0
+            or request_timeout > threading.TIMEOUT_MAX
         ):
             raise ValueError(
-                "persistent transport: timeout must be a positive finite number"
+                "persistent transport: timeout must be a positive finite number "
+                f"of seconds, at most threading.TIMEOUT_MAX ({threading.TIMEOUT_MAX:g})"
             )
         # Pre-fix, requests with no `id` (or two callers using the
         # same id) collided on `self._pending[""]`: the second

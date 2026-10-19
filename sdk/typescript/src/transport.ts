@@ -13,7 +13,11 @@ import { createInterface } from "node:readline";
 import type { ChildProcess } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
 import type { ProviderCallbackContext } from "./types.js";
-import { GatewayRestartRefusedError, TransportReaderFailedError } from "./errors.js";
+import {
+  GatewayChildEndedError,
+  GatewayRestartRefusedError,
+  TransportReaderFailedError,
+} from "./errors.js";
 
 // -- Types ----------------------------------------------------------------
 
@@ -89,6 +93,9 @@ export const PROVIDER_CALLBACK_COMPLETION_MS = 125_000;
 
 const PERSISTENT_TRANSPORT_SIGTERM_GRACE_MS = 5_000;
 const PERSISTENT_TRANSPORT_SIGKILL_GRACE_MS = 5_000;
+// How long a gateway that exited gets for its stdout to close before its
+// waiters fail anyway: a process it started can hold that pipe open.
+const CHILD_EXIT_STDOUT_GRACE_MS = 1_000;
 const MAX_GATEWAY_SHUTDOWN_HORIZON_MS = 2_147_483_647;
 const GATEWAY_SHUTDOWN_METHOD = "meta/shutdown";
 
@@ -613,11 +620,43 @@ export class PersistentTransport {
     const child = this._process;
 
     // Background reader on stdout
+    let readerClosed = child.stdout == null;
+    let exitFailed = false;
+    let exitGrace: ReturnType<typeof setTimeout> | undefined;
     if (child.stdout) {
       const rl = createInterface({ input: child.stdout });
       rl.on("line", (line: string) => this._handleLine(line, child));
-      rl.on("close", () => this._onReaderClosed("the gateway closed its stdout", child));
+      rl.on("close", () => {
+        readerClosed = true;
+        clearTimeout(exitGrace);
+        // The exit grace below already failed this child with its exit and
+        // let go of stdout: keep that failure.
+        if (exitFailed) return;
+        this._onReaderClosed("the gateway closed its stdout", child);
+      });
     }
+    // A gateway that exits while a process it started still holds its
+    // stdout never closes the reader. After a short grace, fail its waiters
+    // with the exit instead of leaving them to their request timeouts, and
+    // let go of the pipe so it cannot keep this process alive.
+    child.once("exit", (code, signal) => {
+      if (readerClosed) return;
+      exitGrace = setTimeout(() => {
+        exitFailed = true;
+        this._failExitedChildWaiters(
+          child,
+          new GatewayChildEndedError(
+            `the gateway exited (code ${code ?? "null"}, signal ${signal ?? "null"}) ` +
+              "while a process it started still held its stdout",
+            code,
+            signal,
+          ),
+        );
+        // A reply still unread here (the event loop was blocked for the whole
+        // grace) is dropped; its waiter already has the exit.
+        child.stdout?.destroy();
+      }, CHILD_EXIT_STDOUT_GRACE_MS);
+    });
 
     child.on("error", () => {
       if (this._process !== child) return;
@@ -673,6 +712,22 @@ export class PersistentTransport {
     if (this._process !== child) return;
     const failure = new TransportReaderFailedError(reason);
     this._readerFailure = failure;
+    for (const [id, pending] of this._pending) {
+      this._pending.delete(id);
+      pending.reject(failure);
+    }
+    this._initWatch?.fail(failure);
+  }
+
+  /**
+   * The gateway exited and its stdout outlived the grace, held by a process
+   * it started: fail its waiters as a closed reader would, with the exit. A
+   * replacement child's waiters are never touched; once a stop let go of the
+   * child, no other child's waiter can be pending.
+   */
+  private _failExitedChildWaiters(child: ChildProcess, failure: GatewayChildEndedError): void {
+    if (this._process !== null && this._process !== child) return;
+    if (this._process === child) this._readerFailure = failure;
     for (const [id, pending] of this._pending) {
       this._pending.delete(id);
       pending.reject(failure);

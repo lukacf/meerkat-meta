@@ -331,7 +331,15 @@ Validate a side-effect-free, revision-pinned set of explicit operations.
 ### `meta/topology/apply`
 
 Apply a previously valid shape of request. `expected_revision` provides
-compare-and-swap protection and `idempotency_key` is mandatory. Exact replay
+compare-and-swap protection and `idempotency_key` is mandatory. Keys are
+scoped to the caller: a Console caller (its verified human; else its
+authenticated principal, with the provider and issuer that verified it; else
+the open Console's anonymous account) and the gateway's JSON-RPC surface each
+have their own keys, so the same key from two callers names two operations
+and a retry replays only its own caller's apply. An open Console without an
+access controller never resolves tokens, so there every caller, even one
+presenting a valid token, is that shared anonymous account; isolating callers
+needs `require_app_auth` or an access controller. Exact replay
 is durable only across the configured retention horizon: `receipt_limit`
 keeps full operation receipts, then `idempotency_history_limit` keeps bounded
 key fingerprints that reject ambiguous reuse after a receipt ages out.
@@ -474,6 +482,11 @@ not establish that no identities are registered.
 | `meta/reconcile_identity` (SDK/stdin only) | none | `{outcomes: {identity: {outcome, ...}}, managed_edges, continuity_repair}` (identity-first runtimes only). A `broken` outcome carries its typed `kind`. The settled pass triggers the continuity repair supervisor; `continuity_repair` says what that reached: `scheduled`, `nothing_to_repair` or `no_supervisor` |
 | `meta/request_continuity_repair` (SDK/stdin only) | none | `{continuity_repair}`: the explicit continuity repair trigger, answering `scheduled`, `nothing_to_repair` or `no_supervisor` (identity-first runtimes only) |
 | `meta/reconcile` (SDK/stdin only) | `{modules: string[]}` | module reconcile report; this reconciles modules, not the roster |
+
+`meta/spawn_helper` and `meta/fork_helper` reply only after the helper's turn
+has finished and its retirement has been attempted, and the gateway applies no
+deadline to that, so a client should give these requests a reply timeout that
+covers the whole helper run.
 
 ### `meta/ensure_member`
 
@@ -758,7 +771,17 @@ turn from typed data.
 The response includes `interaction_id` and `identity`. The multipart JSON-RPC endpoint also accepts this method when `content` contains `image_upload` placeholders.
 
 `origin` and `idempotency_key` are required, non-empty strings after trimming.
-Deduplication is scoped by `(runtime, identity, origin, idempotency_key)`.
+Deduplication is scoped by `(caller, runtime, identity, origin,
+idempotency_key)`. The caller is the authenticated console principal, taken
+from the request's auth and never from a parameter: a verified human by OIDC
+issuer and subject, otherwise the authenticated principal (a service identity,
+or a token without a subject) together with its provider and the issuer its
+token verified against. Anonymous callers of an open console share one local
+account. An open console without an access controller never resolves tokens,
+so there every caller, even one presenting a valid token, is that shared
+account; per-principal isolation needs `require_app_auth` or an access
+controller. The same key from two callers names two different sends: neither
+replays nor observes the other's.
 Mint a new key for a new send; to replay an ambiguous send, retain the same
 scope, content, and effective `handling_mode` (omission means `queue`).
 A matching replay returns the earlier interaction's acceptance whether or not
@@ -767,6 +790,58 @@ the turn has finished. Changed content or mode (for example `queue` to
 HTTP 409 on the REST form). Changing the target or origin can create a
 distinct send. Member respawn does not clear the key, but this does not
 promise replay after the deduplication records or runtime are lost.
+
+A send is accepted (its `user_input` frame) before it is submitted for native
+admission, and settled (`delivered` or `delivery_failed`) after. When the
+gateway stops in between, a replay of the same send decides from the
+runtime's admission evidence in the session the send recorded. An admitted
+input settles the send `delivered`. For a send to a durable identity's local
+session, an absent one is dispatched again under the send's own delivery
+identity and pinned to that session, so the runtime keeps one input; if the
+session has moved, the send ends `delivery_failed` and is never retargeted.
+A governed send, or any other member's, is settled from evidence only and
+never dispatched again. At
+startup the gateway settles, from evidence only, the unsettled sends among
+the newest console frames whose input was admitted.
+
+### `meta/console/recover_send`
+
+Recover the caller's own console send: its acceptance as it is now and what
+the runtime holds for it. Mutating (it can settle a send) and gated like
+`meta/console/send` (ABAC action `agent.send` on the identity).
+
+```json
+{
+  "identity": "identity:alice",
+  "origin": "console:panel-1",
+  "idempotency_key": "panel-1:turn-1"
+}
+```
+
+The three fields are required and nothing else is accepted: interaction and
+frame ids are not lookup keys. The result is the send's acceptance plus
+`native`:
+
+```json
+{
+  "interaction_id": "...",
+  "identity": "identity:alice",
+  "session_id": "...",
+  "input_frame_id": "console-frame-...",
+  "cursor": "console:241",
+  "status": "delivered",
+  "native": { "state": "admitted", "input_id": "...", "phase": "consumed" }
+}
+```
+
+`native.state` is `admitted` (with the input id and its lifecycle `phase`),
+`absent` (no input under the send's delivery keys in its recorded session; a
+member reached through an external binding carries no delivery key, so for it
+this is not evidence that nothing was delivered), or `unknown` (with a
+`cause`). A send the evidence shows admitted but not yet settled is settled
+`delivered`; nothing is ever dispatched. A key the caller never used, and a
+key another caller used, both answer `-32001` with `data.kind =
+"send_not_found"`. The REST twin is `POST /console/send/recover`.
 
 `skill_refs` is optional: typed, source-pinned skills selected for this exact
 turn, in the same shape as meerkat `turn/start`:
@@ -868,8 +943,8 @@ target set and are neither reset nor retired.
 |-------|-------------|
 | `reset` | Identities reset or respawned, in order |
 | `retired_delegates` | `{identity, mob_id?}` per retired delegate |
-| `reset_details` / `retired_delegate_details` | Per-row detail, including any `topology_restore_warning` or `cleanup_warning` |
-| `warnings` | Non-fatal per-identity notes (for example a stale live member left for identity control to reject) |
+| `reset_details` / `retired_delegate_details` | Per-row detail, including any `topology_restore_warning` |
+| `warnings` | Always empty; kept for shape stability. A registered identity resets through its successor transition, which retires the previous live member, so no stale live member is left to warn about |
 | `failed` | `{identity, error, kind?}` rows. When non-empty the response is `-32000` `reset_all failed for one or more identities` with this whole body as `error.data` |
 | `startup_history` | `{timeout, ready, pending}` from the 10 s wait; `null` when preflight failed or no console aggregator is attached |
 </Accordion>
@@ -1226,6 +1301,23 @@ change alone never refuses a send.
 ---
 
 ## Identity delivery and turn tickets
+
+Identity-addressed methods (these, the identity status, inspect and
+lifecycle methods, and the operator member methods
+`meta/member_activate_instruction`, `meta/member_instruction_activations`,
+`meta/compact_member` and `meta/bound_member_transcript`) take the durable
+identity or its current generated runtime id,
+`rt:<identity>:<generation>`. A runtime id that is no longer the
+identity's binding, such as the predecessor's after a reset, is refused with
+`-32000` and `error.data.kind` `stale_identity_runtime_binding`, naming the
+current binding in `registered_runtime_member_id` and
+`registered_session_id`; the member methods and the console's identity
+routes, `meta/console/inspect_identity` included, answer the same. A
+runtime id of an identity the runtime does not know answers `-32602`
+`invalid identity: runtime identity not found: <id>`, and a stale runtime
+id of an identity this surface hides (an implicit delegate member) answers
+`-32602` `invalid identity: identity hidden by policy: <id>` and names no
+binding.
 
 `meta/send`, `meta/interact` and `meta/dispatch` deliver to an identity
 and return `completion_baseline`, the identity's completion cursor read before

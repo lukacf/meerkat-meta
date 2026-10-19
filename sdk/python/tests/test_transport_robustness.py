@@ -14,17 +14,29 @@ One test per defect:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import gc
 import json
+import os
 import queue
+import signal
 import subprocess
+import sys
+import textwrap
 import threading
 import time
+import weakref
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from meerkat_meta import TransportError, TransportReaderFailedError
-from meerkat_meta._transport import PersistentTransport, TransportTermination
+from meerkat_meta import GatewayChildEndedError, TransportError, TransportReaderFailedError
+from meerkat_meta._transport import (
+    _INIT_SETTLED_METHOD,
+    InitWatch,
+    PersistentTransport,
+    TransportTermination,
+)
 
 
 def _reader_transport(lines: list[bytes]) -> PersistentTransport:
@@ -686,6 +698,151 @@ async def test_first_start_keeps_preinstalled_init_watch(monkeypatch):
         await asyncio.to_thread(transport._reader_thread.join, 2)
 
 
+@contextlib.contextmanager
+def _loop_exception_reports():
+    """Record what asyncio reports to the running loop's exception handler.
+
+    A future whose exception nobody retrieved is reported there when it is
+    collected ("Future exception was never retrieved"); Python 3.14 also
+    reports a failure that lands in a future after its shield was cancelled
+    ("... exception in shielded future"). Only the message and the
+    exception's repr are kept, so a report never keeps its future alive.
+    """
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    reports: list[tuple[object, str]] = []
+    loop.set_exception_handler(
+        lambda _loop, context: reports.append(
+            (context.get("message"), repr(context.get("exception")))
+        )
+    )
+    try:
+        yield reports
+    finally:
+        loop.set_exception_handler(previous)
+
+
+async def _assert_settlements_retired(
+    settlements: list[weakref.ref], reports: list[tuple[object, str]]
+) -> None:
+    """Run what is queued on the loop, collect garbage, then check that no
+    settlement future was reported and that each one was really collected
+    (otherwise the empty report list would prove nothing)."""
+    for _ in range(5):
+        await asyncio.sleep(0)
+    gc.collect()
+    await asyncio.sleep(0)
+    assert reports == []
+    assert settlements, "no init settlement future was observed"
+    assert all(ref() is None for ref in settlements), (
+        "a settlement future is still referenced"
+    )
+
+
+def _fail_as_the_reader(watch: InitWatch) -> None:
+    """Fail ``watch`` as the reader thread does at EOF: from another thread,
+    with a delivery queued on the loop. The loop is blocked meanwhile, so the
+    delivery is still queued when this returns."""
+    reader = threading.Thread(
+        target=watch._fail,
+        args=(TransportReaderFailedError("the gateway closed its stdout"),),
+    )
+    reader.start()
+    reader.join(5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "order",
+    [
+        "delivered_before_close",
+        "queued_behind_close",
+        "delivered_after_a_timed_out_wait",
+        "delivered_after_a_cancelled_wait",
+        "closed_off_loop",
+        "closed_off_loop_behind_a_queued_delivery",
+    ],
+)
+async def test_closing_an_init_watch_retires_its_settlement(order):
+    """#251: at EOF the reader fails the init watch with a delivery queued on
+    the host loop. Whatever the order of that delivery, the caller's wait and
+    the close, closing the watch retires its settlement future on that loop,
+    so asyncio never reports the failure as unretrieved."""
+    transport = PersistentTransport("unused")
+    with _loop_exception_reports() as reports:
+        watch = transport.open_init_watch("init-retired")
+        settlements = [weakref.ref(watch._settlement)]
+        if order == "delivered_after_a_timed_out_wait":
+            with pytest.raises(asyncio.TimeoutError):
+                await watch.settlement(deadline=0.01)
+        elif order == "delivered_after_a_cancelled_wait":
+            waiter = asyncio.ensure_future(watch.settlement())
+            await asyncio.sleep(0)
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            del waiter
+        _fail_as_the_reader(watch)
+        if order not in (
+            "queued_behind_close",
+            "closed_off_loop_behind_a_queued_delivery",
+        ):
+            await asyncio.sleep(0)
+            assert watch._settlement.done(), "the queued delivery did not run"
+        if order.startswith("closed_off_loop"):
+            closer = threading.Thread(target=transport.close_init_watch, args=(watch,))
+            closer.start()
+            closer.join(5)
+        else:
+            transport.close_init_watch(watch)
+        assert transport._init_watch is None
+        del watch
+        await _assert_settlements_retired(settlements, reports)
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_settlement_wait_raises_asyncio_timeout_and_keeps_the_settlement():
+    transport = PersistentTransport("unused")
+    with _loop_exception_reports() as reports:
+        watch = transport.open_init_watch("init-deadline")
+        settlements = [weakref.ref(watch._settlement)]
+        with pytest.raises(asyncio.TimeoutError) as raised:
+            await watch.settlement(deadline=0.01)
+        assert type(raised.value) is asyncio.TimeoutError
+        del raised
+        assert not watch._settlement.done(), "the deadline ended the settlement itself"
+        settled = {"init_id": "init-deadline", "outcome": "ready"}
+        watch._deliver(_INIT_SETTLED_METHOD, settled)
+        assert await watch.settlement(deadline=1) == settled
+        transport.close_init_watch(watch)
+        del watch
+        await _assert_settlements_retired(settlements, reports)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deadline", [None, 30.0])
+async def test_a_cancelled_settlement_waiter_leaves_the_settlement_pending(deadline):
+    transport = PersistentTransport("unused")
+    with _loop_exception_reports() as reports:
+        watch = transport.open_init_watch("init-cancelled")
+        settlements = [weakref.ref(watch._settlement)]
+        waiter = asyncio.ensure_future(watch.settlement(deadline))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        del waiter
+        assert not watch._settlement.done(), (
+            "cancelling the caller ended the settlement itself"
+        )
+        settled = {"init_id": "init-cancelled", "outcome": "ready"}
+        watch._deliver(_INIT_SETTLED_METHOD, settled)
+        assert await watch.settlement(deadline=1) == settled
+        transport.close_init_watch(watch)
+        del watch
+        await _assert_settlements_retired(settlements, reports)
+
+
 @pytest.mark.asyncio
 async def test_a_stop_during_a_replacement_start_publishes_no_child(monkeypatch):
     """A stop recorded while a replacement is being created wins: the start
@@ -1316,3 +1473,58 @@ def test_a_failing_stderr_close_does_not_drop_an_unreapable_child(monkeypatch):
         )
     finally:
         spawner.release.set()
+
+
+# --- A gateway that exits while a process it started holds its stdout ---
+
+
+def test_waiters_fail_when_the_gateway_exits_while_a_descendant_holds_stdout(tmp_path):
+    """The gateway exits by itself while a process it started holds its
+    stdout, so the reader never reaches EOF. The waiting request fails with
+    the child's GatewayChildEndedError about a second after the exit instead
+    of waiting out its whole timeout."""
+    holder_pid = tmp_path / "holder.pid"
+    gateway = tmp_path / "gateway"
+    gateway.write_text(
+        f"#!{sys.executable}\n"
+        + textwrap.dedent(
+            f"""\
+            import json
+            import subprocess
+            import sys
+
+            for line in sys.stdin:
+                if json.loads(line).get("method") != "test/exit":
+                    continue
+                holder = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=sys.stdout,
+                    stderr=subprocess.DEVNULL,
+                )
+                with open({str(holder_pid)!r}, "w") as pid_file:
+                    pid_file.write(str(holder.pid))
+                sys.exit(7)
+            """
+        )
+    )
+    gateway.chmod(0o755)
+    transport = PersistentTransport(str(gateway), timeout=20.0)
+    transport.start()
+    try:
+        started = time.monotonic()
+        with pytest.raises(GatewayChildEndedError) as excinfo:
+            transport.send_sync(
+                {"jsonrpc": "2.0", "id": "exit-request", "method": "test/exit", "params": {}}
+            )
+        elapsed = time.monotonic() - started
+    finally:
+        if holder_pid.exists():
+            try:
+                os.kill(int(holder_pid.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        transport.stop()
+    # Failed by the exit after its grace, not by the 20 s request timeout.
+    assert elapsed < 10, f"the waiter failed {elapsed:.1f} s after the request"
+    assert excinfo.value.exit_code == 7

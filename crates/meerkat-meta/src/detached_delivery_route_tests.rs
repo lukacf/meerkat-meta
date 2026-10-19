@@ -454,9 +454,9 @@ mod completion_delivery {
                             ),
                         },
                         LlmEvent::Done {
-                            outcome: meerkat_client::LlmDoneOutcome::Success {
-                                stop_reason: meerkat_core::StopReason::EndTurn,
-                            },
+                            outcome: meerkat_client::LlmDoneOutcome::success(
+                                meerkat_core::StopReason::EndTurn,
+                            ),
                         },
                     ]
                 })
@@ -611,6 +611,7 @@ mod completion_delivery {
                 meerkat_runtime::mob_operator_authority::grant_manage_mob(
                     &authority,
                     handle.mob_id().as_str(),
+                    handle.incarnation(),
                 )
                 .expect("council may use the source mob")
             } else {
@@ -621,6 +622,7 @@ mod completion_delivery {
                 meerkat_runtime::mob_operator_authority::grant_spawn_profile_in_mob(
                     &authority,
                     handle.mob_id().as_str(),
+                    handle.incarnation(),
                     "general",
                 )
                 .expect("fork may spawn only its source profile")
