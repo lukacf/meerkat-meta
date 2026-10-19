@@ -53,7 +53,7 @@ pub(crate) fn stopping_client(
             meta: None,
         },
         LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success { stop_reason },
+            outcome: LlmDoneOutcome::success(stop_reason),
         },
     ])
 }
@@ -79,9 +79,7 @@ impl ObservationClient {
         ];
         events.extend(match case {
             CompletionCase::Success => Some(Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
             })),
             CompletionCase::TerminalError => Some(Ok(LlmEvent::Done {
                 outcome: LlmDoneOutcome::Error {
@@ -90,9 +88,7 @@ impl ObservationClient {
             })),
             CompletionCase::StreamError => Some(Err(LlmError::ConnectionReset)),
             CompletionCase::Truncated => Some(Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::MaxTokens,
-                },
+                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::MaxTokens),
             })),
             CompletionCase::Unterminated => None,
         });

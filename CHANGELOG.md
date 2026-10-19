@@ -26,11 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
-- Meta's own YAML parsing no longer uses serde_yaml 0.9 (deprecated) and its
-  archived unsafe-libyaml (RUSTSEC-2024-0449, unmaintained). `deny.toml`
-  still ignores that advisory: Meerkat Core 0.9.3's meerkat-skills brings
-  serde_yaml in until Meta pins a Core release that parses SKILL.md with
-  serde-saphyr.
+- No crate in Meta's dependency graph uses serde_yaml 0.9 (deprecated) or its
+  archived unsafe-libyaml (RUSTSEC-2024-0449, unmaintained) any more. Meta's
+  own YAML parsing already used serde-saphyr, and the Meerkat Core 0.9.4
+  crates parse SKILL.md frontmatter with serde-saphyr as well, so `deny.toml`
+  no longer ignores that advisory.
 
 ### Added
 
@@ -53,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `installer/release/inputs/forge-release-inputs.skeleton.json` holds the
   Guide's Linux release inputs; only the product owner's selection is still to
   be filled.
+- Adopts the Meerkat Core typed provider stop detail. Every place Meta builds
+  an `LlmDoneOutcome::Success` (test clients, the scenario client, the memory
+  pipeline fakes) builds it with `LlmDoneOutcome::success(stop_reason)`, and
+  every place it matches one (the memory distiller, hygienist and steward,
+  the console voice summary) matches `LlmDoneOutcome::Success { stop_reason,
+  .. }`. No behaviour change of Meta's own.
 
 ### Fixed
 
@@ -87,6 +93,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a marker over its corner instead of an extra line. The line grew the first
   row of verdict tiles, so each refresh moved the tiles below it under a click
   in progress.
+- An OpenAI refusal is no longer stored as memory or returned as a console
+  voice summary. Core now ends an OpenAI response that carries a refusal (a
+  Responses `refusal` part or a Chat Completions `delta.refusal`) with
+  `StopReason::Refusal` instead of an ordinary end of turn with the refusal
+  text as its output. The memory distiller, hygienist and steward therefore
+  see a refusal, which their completion check (`completion_stop`) already
+  refuses as an incomplete reply, rather than refusal text to store, and the
+  console voice summary fails as incomplete instead of returning the refusal
+  text as the summary. That failure names the stop reason, so a refused
+  summary reads as refused rather than as a cancel or a truncation, and a
+  summary stream that ends without its terminal event is reported apart.
+
 
 ## [0.9.3] - 2026-10-18
 

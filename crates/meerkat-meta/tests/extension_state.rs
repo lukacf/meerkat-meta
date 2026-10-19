@@ -156,13 +156,11 @@ impl LlmClient for ScriptClient {
             ),
         }));
         events.push(Ok(LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success {
-                stop_reason: if first {
-                    StopReason::ToolUse
-                } else {
-                    StopReason::EndTurn
-                },
-            },
+            outcome: LlmDoneOutcome::success(if first {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            }),
         }));
         Box::pin(futures::stream::iter(events))
     }

@@ -144,7 +144,7 @@ impl meerkat_client::LlmClient for CaptureClient {
         Box::pin(async_stream::stream! {
             yield Ok(LlmEvent::TextDelta { delta: "ok".to_string(), meta: None });
             yield Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { stop_reason: StopReason::EndTurn },
+                outcome: LlmDoneOutcome::success(StopReason::EndTurn),
             });
         })
     }

@@ -103,9 +103,7 @@ fn usage_reporting_client(input_tokens: u64) -> Arc<TestClient> {
             ),
         },
         LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success {
-                stop_reason: StopReason::EndTurn,
-            },
+            outcome: LlmDoneOutcome::success(StopReason::EndTurn),
         },
     ]))
 }
