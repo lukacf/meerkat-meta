@@ -59,6 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   every place it matches one (the memory distiller, hygienist and steward,
   the console voice summary) matches `LlmDoneOutcome::Success { stop_reason,
   .. }`. No behaviour change of Meta's own.
+- The console reads the lifecycle bit of tool configuration and MCP notices
+  under either name: `settled`, which Core 0.9.4 writes, or `persisted`, which
+  rows stored by Core 0.9.3 and earlier keep when they are served back. A bit
+  that is not a boolean, or a tool configuration notice without one, is still
+  refused as malformed.
 
 ### Fixed
 
