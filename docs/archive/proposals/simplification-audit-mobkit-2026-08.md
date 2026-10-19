@@ -105,19 +105,19 @@ Runner-up asks worth batching into the same round trips: the downstream app's ac
 Survivor #5 (cut the ~4,300-line cross_mob remote control plane) is WITHDRAWN and moves
 to the rejected table. The audit's survey universe was the two known fleets (the downstream app
 gateway-mode, the operator deployment library-mode) plus the mobkit tree's own compositions; the owner
-identified a third production consumer the audit never surveyed:
-`~/src/remotabot/meerkat-app`. Verified in that tree: the desktop gateway routes the FULL
+identified a third production consumer the audit never surveyed: a desktop
+application. Verified in that application's source: its desktop gateway routes the FULL
 cross_mob method set including the remote verbs (`mobkit/cross_mob/{directory,wire,
-unwire,send}` and `mobkit/peer_pubkey`, core/meerkat-desktop-gateway/src/lib.rs:311-318),
-and remote mobs are a first-class product concept (`mobs.v1.registerRemoteTcp`,
-`MobPlacement::RemoteTcp` in mobkit_registry.rs:74/319/752, plus thread/domain/sub-mob
+unwire,send}` and `mobkit/peer_pubkey`, in the gateway's method routing table),
+and remote mobs are a first-class product concept (remote TCP mob registration and
+placement in the application's mob registry, plus thread/domain/sub-mob
 creation and topology pairing).
 
 Disposition under the directive's OTHER arm ("in some cases it might just be a simple
 meta level solution that ENABLES the X capability"): cross_mob remote graduates from
 cut-candidate to COMPLETE-THE-CAPABILITY. The audit's underlying defects remain real and
 now read as blockers on a live consumer instead of theatre: the control-listener binding
-path must be exercised end-to-end in a composition remotabot's shape can use, the
+path must be exercised end-to-end in a composition that desktop application can use, the
 promised remote round-trip test must exist, and the "Phase 1" docs must be finished.
 Cross-mob comms and remote mobs must work.
 

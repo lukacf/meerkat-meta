@@ -271,13 +271,13 @@ CAPABILITIES = {
 }
 
 SOURCES = [
-    {"project": "home-automation host", "path": "src/homecore/discovery.py", "lines": "144-187,239+", "lesson": "Durable conversation ownership, bounded helpers, explicit peer replies and per-person roster context."},
+    {"project": "home-automation host", "path": "discovery module", "lines": "144-187,239+", "lesson": "Durable conversation ownership, bounded helpers, explicit peer replies and per-person roster context."},
     {"project": "home-automation host", "path": "skills/identity/SKILL.md", "lines": "101-122", "lesson": "Personal context stays with its owner; domain experts receive context for domain actions and return results."},
-    {"project": "home-automation host", "path": "src/homecore/plugins/registry.py", "lines": "1631+", "lesson": "Role-specific callback tool grants and effect classification."},
+    {"project": "home-automation host", "path": "plugin registry", "lines": "1631+", "lesson": "Role-specific callback tool grants and effect classification."},
     {"project": "console application validator", "path": "src/meerkat/roster.rs", "lines": "32-174", "lesson": "Desired entity/person/channel identities are application data."},
     {"project": "console application validator", "path": "src/meerkat/topology.rs", "lines": "38-116", "lesson": "Subscription-based relationship edges, not universal mesh."},
-    {"project": "console application validator", "path": "config/ob3-mob.toml", "lines": "6-28,119-267", "lesson": "Chatter suppression and separate durable versus ephemeral profiles."},
-    {"project": "console application validator", "path": "skills/ob3-review/SKILL.md", "lines": "151-187", "lesson": "Initiative owners retain history and deliver to subscribers; bounded review workers apply an explicit evidence rubric."},
+    {"project": "console application validator", "path": "mob configuration", "lines": "6-28,119-267", "lesson": "Chatter suppression and separate durable versus ephemeral profiles."},
+    {"project": "console application validator", "path": "review skill", "lines": "151-187", "lesson": "Initiative owners retain history and deliver to subscribers; bounded review workers apply an explicit evidence rubric."},
     {"project": "MobKit", "path": "installer/launchkit/compiler.py", "lesson": "Exact generated profile, roster, topology and flow semantics."},
     {"project": "MobKit", "path": "installer/launchkit/templates_v2/app.py", "lesson": "Shipping host adapters, persistent runtime and lifecycle."},
     {"project": "MobKit v0.8.42", "path": "crates/meerkat-mobkit/src/schedule_wiring.rs", "lines": "573-649,784-807,867-930", "lesson": "Native persistent schedule store, current-session authoring rewritten to stable mob-member delivery, and native occurrence delivery identity."},
