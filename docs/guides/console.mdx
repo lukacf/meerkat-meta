@@ -27,7 +27,7 @@ Both gateway binaries bind an available loopback port and report the exact
 address. `http://localhost:8080/console` is correct only when your host or
 reverse proxy explicitly publishes Meta there.
 
-The HTML, JavaScript, and CSS are compiled into the binary via `include_str!`, so no build step is required at deployment time. The stock CSS requests optional Google Fonts; when those requests are unavailable or blocked, it uses the configured local/system fallback fonts.
+The HTML, JavaScript, and CSS are compiled into the binary via `include_str!`, so no build step is required at deployment time. The stock CSS carries its fonts, Inter Tight and IBM Plex Mono (SIL Open Font License 1.1), inline as `data:` URLs, so the console requests no font from another origin and looks the same on a host without internet access. A Content-Security-Policy in front of the console that restricts fonts must allow `font-src data:`.
 
 For development with instant hot-reload, see the [development workflow](#development-workflow), including the current Vite proxy limitations:
 

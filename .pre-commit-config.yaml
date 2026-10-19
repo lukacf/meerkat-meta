@@ -29,11 +29,13 @@ repos:
       - id: trailing-whitespace
         stages: [pre-push]
         # Byte-lossless corpus fixtures (release-minted realms, forensic
-        # bundles with checksum manifests) must never be text-normalized.
-        exclude: ^(crates/meerkat-meta/tests/fixtures/|installer/tests/fixtures/|installer/launchkit/templates_v2/toolkit-ui/vendor/)
+        # bundles with checksum manifests) and vendored upstream files (each
+        # console font family's files and license text) must never be
+        # text-normalized.
+        exclude: ^(crates/meerkat-meta/tests/fixtures/|installer/tests/fixtures/|installer/launchkit/templates_v2/toolkit-ui/vendor/|console/src/fonts/[^/]+/)
       - id: end-of-file-fixer
         stages: [pre-push]
-        exclude: ^(crates/meerkat-meta/tests/fixtures/|installer/tests/fixtures/|installer/launchkit/templates_v2/toolkit-ui/vendor/)
+        exclude: ^(crates/meerkat-meta/tests/fixtures/|installer/tests/fixtures/|installer/launchkit/templates_v2/toolkit-ui/vendor/|console/src/fonts/[^/]+/)
       - id: check-yaml
         stages: [pre-push]
       - id: check-toml

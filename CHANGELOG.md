@@ -82,6 +82,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   own YAML parsing already used serde-saphyr, and the Meerkat Core 0.9.4
   crates parse SKILL.md frontmatter with serde-saphyr as well, so `deny.toml`
   no longer ignores that advisory.
+- The console no longer fetches its fonts from Google Fonts. Its stylesheet
+  imported Inter Tight and IBM Plex Mono from `fonts.googleapis.com`, so
+  every console load sent a request to a third party, and a host without
+  internet access drew the console in fallback fonts. The console now
+  carries the same woff2 files Google Fonts served (Inter Tight 3.004 and
+  IBM Plex Mono 2.3, under the SIL Open Font License 1.1, with their license
+  texts in `console/src/fonts/`), inlined as `data:` URLs into
+  `/console/assets/console-app.css`, which grows from about 260 KB to about
+  1.7 MB. A Content-Security-Policy in front of the console that restricts
+  fonts must allow `font-src data:`.
 
 ### Added
 
