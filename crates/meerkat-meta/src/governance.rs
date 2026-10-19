@@ -193,9 +193,9 @@ fn traceability_yaml_options() -> serde_saphyr::Options {
 /// <https://github.com/bourumir-wyngs/serde-saphyr/pull/230>. Remove this
 /// guard at the bump to a release with that fix, and decide then whether a
 /// marker with nothing after it stays refused (the traceability_yaml tests
-/// pin both).
+/// pin both). Lines break where YAML breaks them: at LF, CRLF and a lone CR.
 fn has_document_end_marker(yaml: &str) -> bool {
-    yaml.lines().any(|line| {
+    yaml.split(['\n', '\r']).any(|line| {
         line.strip_prefix("...")
             .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
     })

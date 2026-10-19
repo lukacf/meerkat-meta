@@ -205,8 +205,9 @@ fn traceability_yaml_refuses_merges_documents_and_duplicate_fields() {
 /// the tag and kept the text), a key given twice in a row or at the top level
 /// (it kept the last), a null evidence entry (stored as "~", which passed as
 /// evidence), a `...` document end marker, and nesting deeper than 64 levels.
-/// It refused the other two differently: a null status as the status "~", and
-/// an empty evidence entry as missing evidence.
+/// It refused the other three differently: a null status as the status "~",
+/// an empty evidence entry as missing evidence, and a `...` after a lone CR
+/// (YAML breaks lines there) like any second document.
 #[test]
 fn traceability_yaml_refuses_tags_duplicates_nulls_end_markers_and_depth() {
     let deep = format!(
@@ -246,6 +247,10 @@ fn traceability_yaml_refuses_tags_duplicates_nulls_end_markers_and_depth() {
         (
             "document end marker",
             "rows:\n  - status: TYPED\n    evidence: [x]\n... # end\n".to_string(),
+        ),
+        (
+            "document end marker after a lone CR",
+            "rows:\n  - status: TYPED\n    evidence: [x]\r...\r]]] not yaml\n".to_string(),
         ),
         ("nesting past the budget", deep),
     ];
