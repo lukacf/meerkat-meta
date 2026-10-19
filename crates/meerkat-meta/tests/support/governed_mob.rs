@@ -62,8 +62,8 @@ pub use meerkat_runtime::identifiers::LogicalRuntimeId;
 pub use meerkat_runtime::input::{Input, PromptInput};
 pub use meerkat_runtime::input_authority::{NativeAdmissionError, NativeIngressContext};
 pub use meerkat_runtime::meerkat_machine::{
-    AuthenticatedOriginal, AuthenticatedOriginalSource, MeerkatMachine, ScopedGrantComposition,
-    ScopedInvocation, ScopedMandateOwner,
+    AuthenticatedOriginal, AuthenticatedOriginalSource, MeerkatMachine, RetainedCustody,
+    ScopedGrantComposition, ScopedInvocation, ScopedMandateOwner,
 };
 pub use meerkat_runtime::service_ext::SessionServiceRuntimeExt;
 
@@ -411,17 +411,18 @@ impl AuthenticatedOriginalSource for Adapter {
             }))
     }
 
-    fn retained_original(
+    fn retained_custody(
         &self,
         _namespace: &QualifiedIngressNamespace,
         original: &OriginalWorkRef,
-    ) -> Result<Option<WorkAuthorityBasis>, meerkat_core::authorization::ControllerReadinessFailure>
-    {
-        Ok(sources()
-            .contains(original)
-            .then(|| WorkAuthorityBasis::HostPolicy {
+    ) -> Result<RetainedCustody, meerkat_core::authorization::ControllerReadinessFailure> {
+        Ok(if sources().contains(original) {
+            RetainedCustody::Retained(WorkAuthorityBasis::HostPolicy {
                 policy: evidence("source-policy"),
-            }))
+            })
+        } else {
+            RetainedCustody::NotRetained
+        })
     }
 }
 
