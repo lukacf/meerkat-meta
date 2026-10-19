@@ -17,8 +17,12 @@ import asyncio
 import contextlib
 import gc
 import json
+import os
 import queue
+import signal
 import subprocess
+import sys
+import textwrap
 import threading
 import time
 import weakref
@@ -26,7 +30,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from meerkat_meta import TransportError, TransportReaderFailedError
+from meerkat_meta import GatewayChildEndedError, TransportError, TransportReaderFailedError
 from meerkat_meta._transport import (
     _INIT_SETTLED_METHOD,
     InitWatch,
@@ -1469,3 +1473,58 @@ def test_a_failing_stderr_close_does_not_drop_an_unreapable_child(monkeypatch):
         )
     finally:
         spawner.release.set()
+
+
+# --- A gateway that exits while a process it started holds its stdout ---
+
+
+def test_waiters_fail_when_the_gateway_exits_while_a_descendant_holds_stdout(tmp_path):
+    """The gateway exits by itself while a process it started holds its
+    stdout, so the reader never reaches EOF. The waiting request fails with
+    the child's GatewayChildEndedError about a second after the exit instead
+    of waiting out its whole timeout."""
+    holder_pid = tmp_path / "holder.pid"
+    gateway = tmp_path / "gateway"
+    gateway.write_text(
+        f"#!{sys.executable}\n"
+        + textwrap.dedent(
+            f"""\
+            import json
+            import subprocess
+            import sys
+
+            for line in sys.stdin:
+                if json.loads(line).get("method") != "test/exit":
+                    continue
+                holder = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=sys.stdout,
+                    stderr=subprocess.DEVNULL,
+                )
+                with open({str(holder_pid)!r}, "w") as pid_file:
+                    pid_file.write(str(holder.pid))
+                sys.exit(7)
+            """
+        )
+    )
+    gateway.chmod(0o755)
+    transport = PersistentTransport(str(gateway), timeout=20.0)
+    transport.start()
+    try:
+        started = time.monotonic()
+        with pytest.raises(GatewayChildEndedError) as excinfo:
+            transport.send_sync(
+                {"jsonrpc": "2.0", "id": "exit-request", "method": "test/exit", "params": {}}
+            )
+        elapsed = time.monotonic() - started
+    finally:
+        if holder_pid.exists():
+            try:
+                os.kill(int(holder_pid.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        transport.stop()
+    # Failed by the exit after its grace, not by the 20 s request timeout.
+    assert elapsed < 10, f"the waiter failed {elapsed:.1f} s after the request"
+    assert excinfo.value.exit_code == 7

@@ -17,7 +17,11 @@ import os from "node:os";
 import path from "node:path";
 
 import { PersistentTransport } from "../dist/transport.js";
-import { TransportError, TransportReaderFailedError } from "../dist/index.js";
+import {
+  GatewayChildEndedError,
+  TransportError,
+  TransportReaderFailedError,
+} from "../dist/index.js";
 
 function withWrites(transport: PersistentTransport): Array<Record<string, unknown>> {
   const writes: Array<Record<string, unknown>> = [];
@@ -188,6 +192,57 @@ if (process.argv.includes("--hold-stdout")) {
       try { process.kill(Number(readFileSync(holderPid, "utf8")), "SIGTERM"); } catch {}
       await transport.stop();
       await closed;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails a waiting request with the exit when the gateway exits while a process it started holds its stdout", { timeout: 10_000 }, async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "meta-ts-exit-held-stdout-"));
+    const bin = path.join(root, "gateway.cjs");
+    const holderPid = path.join(root, "holder.pid");
+    writeFileSync(bin, `#!/usr/bin/env node
+if (process.argv.includes("--hold-stdout")) {
+  setTimeout(() => {}, 30000);
+} else {
+  const rl = require("node:readline").createInterface({ input: process.stdin });
+  rl.on("line", (line) => {
+    if (JSON.parse(line).method !== "test/exit") return;
+    const holder = require("node:child_process").spawn(process.execPath,
+      [__filename, "--hold-stdout"], { stdio: ["ignore", 1, "ignore"] });
+    require("node:fs").writeFileSync(${JSON.stringify(holderPid)}, String(holder.pid));
+    holder.unref();
+    process.exit(7);
+  });
+}
+`);
+    chmodSync(bin, 0o755);
+    const transport = new PersistentTransport(bin);
+    transport.start();
+    const child = (transport as any)._process;
+    const closed = once(child, "close");
+    try {
+      const started = performance.now();
+      const request = { jsonrpc: "2.0", id: "exit-request", method: "test/exit" };
+      const error = await transport.sendAsync(request, { timeoutMs: 8000 }).then(
+        () => null,
+        (failure: unknown) => failure,
+      );
+      const settledMs = performance.now() - started;
+      // Settled by the exit after its grace, not by the 8 s request timeout.
+      assert.ok(
+        settledMs < 4000,
+        `settled ${Math.round(settledMs)} ms after the request: ${String(error)}`,
+      );
+      assert.ok(error instanceof GatewayChildEndedError, String(error));
+      assert.ok(error instanceof TransportReaderFailedError);
+      assert.equal(error.exitCode, 7);
+      assert.equal(error.signal, null);
+      // The transport let go of the stdout the holder keeps, so the child's
+      // streams close while the holder still runs.
+      await closed;
+    } finally {
+      try { process.kill(Number(readFileSync(holderPid, "utf8")), "SIGTERM"); } catch {}
+      await transport.stop();
       rmSync(root, { recursive: true, force: true });
     }
   });

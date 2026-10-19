@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `GatewayChildEndedError` (extends `TransportReaderFailedError`, with
+  `exitCode` and `signal`): a request waiting on a gateway process that
+  exits while a process it started still holds the gateway's stdout fails
+  with it about a second after the exit, instead of waiting out its request
+  timeout (60 seconds by default) or, for the shutdown handshake, the
+  gateway's whole shutdown horizon. The transport then lets go of that
+  stdout, so it no longer keeps the host process running.
+
 ## 0.9.3
 
 - Breaking: the draft results of `meta/mobpacks/list`, `create`, `save`,
