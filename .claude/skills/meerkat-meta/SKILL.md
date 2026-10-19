@@ -135,6 +135,8 @@ Other 0.9 contract changes to keep in mind:
 | `crates/meerkat-meta/src/http_sse.rs` | Agent events, mob events, structural mob-events SSE. |
 | `crates/meerkat-meta/src/rpc.rs` and `src/rpc/` | JSON-RPC dispatcher and method groups for console ingress, mob ops/events, routing/delivery, gating, memory, scheduling, session store, subscriptions. |
 | `crates/meerkat-meta/src/identity_first/` | Identity-first continuity, local store/lease, bridge, orchestrator, gateway bridges, contracts. |
+| `crates/meerkat-meta/src/mob_announcements/` | Mob announcements: owner, SQLite store, batch delivery as Meerkat host continuations, member tools, delivery to members on peer gateways, RPC. |
+| `crates/meerkat-meta/src/runtime/keyed_inject.rs` | The keyed inject plane that serves the signed `inject_keyed` / `inject_status` control verbs. |
 | `crates/meerkat-meta/src/contact_directory.rs`, `src/auth/peer_keys.rs` | Cross-mob contacts and signed peer-key handling. |
 | `crates/meta-extension-state/` | Provider-owned extension documents with atomic access control and retries (`ExtensionDocumentStore`). |
 | `crates/meta-store-conformance/` | Workspace-only storage conformance harness for Meta store backends (per-trait chapters, extending Meerkat's `meerkat-store-conformance`). |
@@ -324,6 +326,32 @@ Useful files:
 - `crates/meerkat-meta/tests/cross_mob_uds.rs`
 
 Image forwarding gotcha: the old failure was `image_ref_unavailable: current_turn image 0 did not resolve to a current-turn image`. Same-turn generate-and-send worked because the image was still in current-turn scope. Durable forwarding should use current upstream Meerkat behavior, not a vendored patch.
+
+Keyed inject: the control verbs `inject_keyed` and `inject_status` deliver one keyed continuation to a member of the serving gateway's mob, once per key and scoped to the calling grant, and read it back.
+
+- A grant must name them explicitly; `verbs = ["*"]` (`ControlVerb::member_plane()`) does not cover them.
+- Requests and answers are signed. A request must be issued within `runtime_options.control_request_window_ms` (default 300000, five minutes) of the serving gateway's clock, or it is refused as `stale_request`.
+- Every gateway that binds a control listener seals what the plane serves once its runtime is composed; until then both verbs answer `keyed_inject_unavailable`.
+- A gateway that is not identity-first, or that turns serving off (`runtime_options.serve_keyed_inject: false`, or `UnifiedRuntimeBuilder::keyed_inject_plane(KeyedInjectPlane::Disabled)`), answers `not_served` with the typed cause `not_identity_first` or `runtime_disabled` in a signed field.
+- Only an answer the caller's pinned key verifies is evidence. A gateway that predates the verbs answers an unsigned decode error, and mob announcements end such a subscription as `peer_unsupported`.
+- `ControlRequest`, `ControlVerb` and `ControlResponse` are `#[non_exhaustive]`, so a match outside the crate needs a wildcard arm. `ControlVerb::all()` returns a slice.
+
+See `docs/concepts/access-control.mdx` (Keyed inject) and `crates/meerkat-meta/src/runtime/keyed_inject.rs`.
+
+## Mob Announcements
+
+Mob announcements carry developments to subscribed members (`crates/meerkat-meta/src/mob_announcements/`; design in `docs/design/mob-announcements.md`, which the docs site does not publish).
+
+- The host announces a development to a mob hosted on the gateway, once per mob and source key. Member subscriptions, keyed by `{mob_id, identity}`, take the topics they name from the mobs they name (the gateway's own mob by default).
+- An announcement is captured for every matching subscription in its own transaction. Each subscriber receives what it is owed in bounded batches, and each batch is one Meerkat host continuation keyed by batch id (namespace `meta.mob_announcements`).
+- A lost acknowledgment is reconciled from native status, never submitted twice. A delivery stranded on a retired incarnation moves to a successor batch that names its predecessor.
+- A subscription ends, typed, when its member is no longer registered or every mob it named was destroyed. Retention removes ended subscriptions and the logs of destroyed mobs; what waited past retention expires and is reported to the member as a gap.
+- Methods: `meta/mob_announcements/{announce, get, subscriptions/{put,pause,resume,cancel,get,list}, deliveries/{list,observe,reconcile}}`. Typed errors are `-32044` to `-32048`; `docs/api/rpc.mdx` has the table.
+- Enable it on a persistent, identity-first `rpc_gateway` with `runtime_options.mob_announcements` (batch, retention and limit options are in `docs/reference/configuration.mdx`). Without it, nothing opens `mob_announcements.sqlite3`, and the methods answer `mob_announcements_unavailable`.
+- Member tools: a profile that lists the `mob_announcements` bundle in `tools.rust_bundles` gives its members `mob_announce` and `mob_subscription`. A member announces into its own mob as itself and manages its own subscriptions. It may name its own mob and the mobs above and below it among the mobs members created, never a sibling's (`unrelated_mob`). Each call is attributed to exactly one member or refused; limits come from `member_limits`.
+- The host can subscribe a member of any mob the gateway hosts, such as a child mob, by its plain roster id. Its subscriptions end with `member_mob_ended` when that mob is destroyed, created again, completed or reset. A mob id that names both a hosted mob and a peer is refused with `ambiguous_mob`. These subscriptions are bounded by `child_member_limits` (`child_member_limit`). `member_tools_in_child_mobs` is refused when set.
+- Members on peer gateways are reached through keyed inject (above).
+- Every public enum of the Rust surface is `#[non_exhaustive]`.
 
 ## Identity-First Continuity
 
@@ -534,6 +562,7 @@ Rust:
 - `crates/meerkat-meta/tests/routing_delivery.rs`
 - `crates/meerkat-meta/tests/sse_auth_gate.rs`
 - `crates/meerkat-meta/tests/operation_refusal_observer.rs`
+- `crates/meerkat-meta/tests/mob_announcements_delivery_process.rs` and `mob_announcements_remote_process.rs` (process tests), plus the unit tests in `src/mob_announcements/`
 - `catalogs_response_exposes_filesystem_skill_catalog` in `crates/meerkat-meta/src/mobpack.rs` pins this skill: the repo's `.claude/skills/meerkat-meta/` is the expected filesystem skill (id `meerkat-meta`). Rename both together.
 
 Console:
