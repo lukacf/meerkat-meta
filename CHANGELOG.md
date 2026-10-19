@@ -17,9 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   twice in a row or at the top level (serde_yaml kept the last), a null where
   text is expected (serde_yaml stored `~` or an empty string, and `~` counted
   as evidence), a `...` document end marker (serde-saphyr 2.0.0 ignores what
-  follows one), or nesting deeper than 64 levels. `yes`, `on` and `off` stay
-  text, and `<<` stays an ordinary key. The incident command center example
-  reads its scenario under the same rules.
+  follows one), nesting deeper than 64 levels, or 100 or more aliases that
+  outnumber their anchors more than ten to one (the parser's default budget).
+  `yes`, `on` and `off` stay text, and `<<` stays an ordinary key. The
+  incident command center example reads its scenario under the same rules.
 
 ### Security
 

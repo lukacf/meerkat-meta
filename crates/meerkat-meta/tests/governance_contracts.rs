@@ -201,15 +201,17 @@ fn traceability_yaml_refuses_merges_documents_and_duplicate_fields() {
 }
 
 /// Traceability YAML refused as a malformed row since the parser moved to
-/// serde-saphyr. serde_yaml accepted seven of these: a custom tag (it dropped
+/// serde-saphyr. serde_yaml accepted eight of these: a custom tag (it dropped
 /// the tag and kept the text), a key given twice in a row or at the top level
 /// (it kept the last), a null evidence entry (stored as "~", which passed as
-/// evidence), a `...` document end marker, and nesting deeper than 64 levels.
-/// It refused the other three differently: a null status as the status "~",
-/// an empty evidence entry as missing evidence, and a `...` after a lone CR
-/// (YAML breaks lines there) like any second document.
+/// evidence), a `...` document end marker, nesting deeper than 64 levels, and
+/// 101 aliases of one anchor (the parser budget refuses 100 or more aliases
+/// that outnumber their anchors more than ten to one).
+/// It refused two differently: a null status as the status "~", and an empty
+/// evidence entry as missing evidence. It refused a `...` after a lone CR
+/// (YAML breaks lines there) as a malformed row too; the guard must see it.
 #[test]
-fn traceability_yaml_refuses_tags_duplicates_nulls_end_markers_and_depth() {
+fn traceability_yaml_refuses_tags_duplicates_nulls_end_markers_and_budget() {
     let deep = format!(
         "rows:\n  - status: TYPED\n    evidence: [x]\n    deep: {}{}\n",
         "[".repeat(70),
@@ -253,6 +255,7 @@ fn traceability_yaml_refuses_tags_duplicates_nulls_end_markers_and_depth() {
             "rows:\n  - status: TYPED\n    evidence: [x]\r...\r]]] not yaml\n".to_string(),
         ),
         ("nesting past the budget", deep),
+        ("101 aliases of one anchor", aliased_evidence(101)),
     ];
     let mismatched: Vec<(&str, Result<(), GovernanceValidationError>)> = cases
         .iter()
@@ -265,6 +268,22 @@ fn traceability_yaml_refuses_tags_duplicates_nulls_end_markers_and_depth() {
         mismatched.is_empty(),
         "not refused as a malformed row: {mismatched:?}"
     );
+}
+
+/// 99 aliases of one anchor stay within the parser budget's alias ratio.
+#[test]
+fn traceability_yaml_accepts_aliases_within_the_budget_ratio() {
+    validate_traceability_statuses(&aliased_evidence(99))
+        .expect("99 aliases of one anchor are accepted");
+}
+
+/// One traceability row whose evidence is an anchored `x` and `aliases`
+/// aliases of it.
+fn aliased_evidence(aliases: usize) -> String {
+    format!(
+        "rows:\n  - status: TYPED\n    evidence: [&a x{}]\n",
+        ", *a".repeat(aliases)
+    )
 }
 
 /// Text after a `...` document end marker is refused, malformed or not.
