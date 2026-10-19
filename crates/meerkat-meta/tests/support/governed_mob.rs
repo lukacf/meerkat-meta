@@ -305,6 +305,9 @@ pub struct Adapter {
     /// inside the admission attempt, so the third read fails with the
     /// outcome unknown.
     pub panic_at_custody_read: std::sync::atomic::AtomicUsize,
+    /// Answer the retained custody of both sources as `AdmissionPending`: the
+    /// source owner has not settled their admission yet.
+    pub sources_pending: std::sync::atomic::AtomicBool,
 }
 
 /// Holds the native admission of original `work-7` inside the adapter's
@@ -417,9 +420,16 @@ impl AuthenticatedOriginalSource for Adapter {
         original: &OriginalWorkRef,
     ) -> Result<RetainedCustody, meerkat_core::authorization::ControllerReadinessFailure> {
         Ok(if sources().contains(original) {
-            RetainedCustody::Retained(WorkAuthorityBasis::HostPolicy {
-                policy: evidence("source-policy"),
-            })
+            if self
+                .sources_pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                RetainedCustody::AdmissionPending
+            } else {
+                RetainedCustody::Retained(WorkAuthorityBasis::HostPolicy {
+                    policy: evidence("source-policy"),
+                })
+            }
         } else {
             RetainedCustody::NotRetained
         })
@@ -672,6 +682,7 @@ impl Fixture {
             basis: Mutex::new(None),
             gate: AdmissionGate::default(),
             panic_at_custody_read: Default::default(),
+            sources_pending: Default::default(),
         });
         let configuration = ScopedGrantComposition {
             grants: Arc::clone(&grants),
