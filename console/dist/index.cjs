@@ -20673,8 +20673,24 @@ function normalizeIdentityStatusRow(value) {
     ...(() => {
       const session_repair = normalizeIdentitySessionRepair(record8.session_repair);
       return session_repair ? { session_repair } : {};
+    })(),
+    ...(() => {
+      const unobserved = normalizeUnobservedFacts(record8.unobserved);
+      return unobserved ? { unobserved } : {};
     })()
   };
+}
+function normalizeUnobservedFacts(value) {
+  const record8 = value && typeof value === "object" ? value : null;
+  if (!record8) {
+    return null;
+  }
+  const reason = trimString(record8.reason);
+  if (!reason) {
+    return null;
+  }
+  const fields = Array.isArray(record8.fields) ? record8.fields.map((field) => trimString(field)).filter((field) => Boolean(field)) : [];
+  return { reason, fields };
 }
 function normalizeIdentityInspectViewState(value) {
   const record8 = value && typeof value === "object" ? value : null;
@@ -44040,7 +44056,11 @@ function normalizeAgents(experience, modules) {
         ...entry.addressable !== void 0 ? { addressable: Boolean(entry.addressable) } : statusRow?.addressability ? { addressable: statusRow.addressability === "addressable" } : {},
         ...entry.affordances !== void 0 && { affordances: entry.affordances },
         model_capabilities: modelCapabilities,
-        ...watchFields
+        ...watchFields,
+        ...(() => {
+          const unobserved = normalizeUnobservedFacts(entry.unobserved) ?? statusRow?.unobserved;
+          return unobserved ? { unobserved } : {};
+        })()
       };
     });
     const seen = new Set(
@@ -44067,7 +44087,8 @@ function normalizeAgents(experience, modules) {
         ...statusRow.labels?.console_subgroup ? { subgroup: statusRow.labels.console_subgroup } : statusRow.labels?.org ? { subgroup: statusRow.labels.org } : {},
         addressable,
         affordances: { can_send_message: addressable },
-        model_capabilities: { image_input: false }
+        model_capabilities: { image_input: false },
+        ...statusRow.unobserved ? { unobserved: statusRow.unobserved } : {}
       });
       seen.add(statusRow.identity.toLowerCase());
     }
@@ -44095,7 +44116,8 @@ function normalizeAgents(experience, modules) {
         ...statusRow?.labels && Object.keys(statusRow.labels).length > 0 ? { labels: statusRow.labels } : {},
         addressable: false,
         affordances: { can_send_message: false },
-        model_capabilities: modelCapabilities
+        model_capabilities: modelCapabilities,
+        ...statusRow?.unobserved ? { unobserved: statusRow.unobserved } : {}
       };
     });
   }

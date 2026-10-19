@@ -16,6 +16,7 @@ import {
   normalizeRoutingSectionView,
   normalizeSidebarWatchFields,
   normalizeToolCallAccumulatorState,
+  normalizeUnobservedFacts,
 } from "./control-plane";
 import { normalizeConsoleSidebarViewState } from "./sidebar";
 
@@ -525,4 +526,41 @@ test("session_repair hold rides the status row and the inspect view and wins the
   );
   assert.equal(normalizeIdentitySessionRepair({ ...hold, apply_command: "" }), null);
   assert.equal(normalizeIdentitySessionRepair(null), null);
+});
+
+test("normalizeIdentityStatusRow carries the unobserved marker of a pending row", () => {
+  const row = normalizeIdentityStatusRow({
+    identity: "voice-keeper",
+    state: "unknown",
+    addressability: "internal_only",
+    labels: { agent_identity: "voice-keeper" },
+    session_id: "successor-session",
+    unobserved: {
+      reason: "refresh_pending",
+      fields: ["state", " role ", "", 7, "labels"],
+    },
+  });
+  assert.deepEqual(row?.unobserved, {
+    reason: "refresh_pending",
+    fields: ["state", "role", "labels"],
+  });
+  assert.equal(row?.state, "unknown");
+
+  assert.equal(normalizeUnobservedFacts(null), null);
+  assert.equal(normalizeUnobservedFacts({ fields: ["state"] }), null, "a reason is required");
+  assert.deepEqual(
+    normalizeUnobservedFacts({ reason: "not_observed" }),
+    { reason: "not_observed", fields: [] },
+    "an unrecognized reason is kept, not dropped",
+  );
+  assert.equal(
+    normalizeIdentityStatusRow({
+      identity: "voice-keeper",
+      state: "active",
+      addressability: "addressable",
+      labels: {},
+    })?.unobserved,
+    undefined,
+    "an observed row carries no marker",
+  );
 });

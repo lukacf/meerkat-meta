@@ -2,6 +2,7 @@ import {
   normalizeIdentityStatusRow,
   normalizeResponsePhase,
   normalizeSidebarWatchFields,
+  normalizeUnobservedFacts,
 } from "@console-core";
 import type { ConsoleAgent, ConsoleExperience, ConsoleExperienceAgentSnapshotRow } from "../types";
 
@@ -86,7 +87,7 @@ export function normalizeAgents(
 
   const snapshotAgents = experience?.agent_sidebar?.live_snapshot?.agents;
   if (Array.isArray(snapshotAgents) && snapshotAgents.length > 0) {
-    const agents = snapshotAgents.map((entry: ConsoleExperienceAgentSnapshotRow) => {
+    const agents: ConsoleAgent[] = snapshotAgents.map((entry: ConsoleExperienceAgentSnapshotRow) => {
       const entryIdentity = typeof entry.identity === "string" ? entry.identity.trim() : "";
       const entryMemberId = typeof entry.member_id === "string" ? entry.member_id.trim() : "";
       const entryLabels =
@@ -156,6 +157,10 @@ export function normalizeAgents(
         ...(entry.affordances !== undefined && { affordances: entry.affordances }),
         model_capabilities: modelCapabilities,
         ...watchFields,
+        ...((): Pick<ConsoleAgent, "unobserved"> => {
+          const unobserved = normalizeUnobservedFacts(entry.unobserved) ?? statusRow?.unobserved;
+          return unobserved ? { unobserved } : {};
+        })(),
       };
     });
     const seen = new Set(
@@ -189,6 +194,7 @@ export function normalizeAgents(
         addressable,
         affordances: { can_send_message: addressable },
         model_capabilities: { image_input: false },
+        ...(statusRow.unobserved ? { unobserved: statusRow.unobserved } : {}),
       });
       seen.add(statusRow.identity.toLowerCase());
     }
@@ -219,6 +225,7 @@ export function normalizeAgents(
         addressable: false,
         affordances: { can_send_message: false },
         model_capabilities: modelCapabilities,
+        ...(statusRow?.unobserved ? { unobserved: statusRow.unobserved } : {}),
       };
     });
   }

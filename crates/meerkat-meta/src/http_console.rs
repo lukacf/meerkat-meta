@@ -175,11 +175,21 @@ pub(crate) struct ConsoleSnapshotReadModel {
     /// real data. Snapshot reads gate on this so a cold cache never
     /// returns an empty member list to the first request.
     primed: Arc<std::sync::atomic::AtomicBool>,
+    /// Woken after every walk lands. Requests that wait for a walk to
+    /// answer for their identity cut share the walks in flight instead of
+    /// starting one each (see `snapshot_for_cut`).
+    walked: Arc<tokio::sync::Notify>,
+    /// Test hook: while set, every walk waits for a permit before it reads.
+    #[cfg(test)]
+    walk_gate: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
 }
 
 #[derive(Clone, Default)]
 struct ConsoleSnapshotReadModelState {
     running: Option<bool>,
+    /// The identity runtime's cut this walk read just before it walked the
+    /// roster: every fact below was collected under these bindings.
+    identity_cut: IdentityBindingCut,
     session_id_by_identity: BTreeMap<String, String>,
     session_owner_by_id: BTreeMap<String, String>,
     /// Pre-projected primary-mob console members. The background refresh
@@ -194,6 +204,76 @@ struct ConsoleSnapshotReadModelState {
     delegate_member_groups: Vec<Vec<ConsoleMember>>,
 }
 
+/// One read of the identity runtime for every identity it knows: the
+/// session it binds and the lifecycle state it is in. The identity runtime
+/// owns both facts, and `/console/identities` reads them from it too; the
+/// console only reads them.
+#[derive(Clone, Debug)]
+struct IdentityBindingCut {
+    bindings: BTreeMap<String, IdentityBinding>,
+    read_started_at: tokio::time::Instant,
+    read_completed_at: tokio::time::Instant,
+}
+
+/// What a cut records for one identity. A retire moves no session, so the
+/// lifecycle state is part of the binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IdentityBinding {
+    session_id: Option<String>,
+    state: crate::identity_first::IdentityLifecycleState,
+}
+
+impl Default for IdentityBindingCut {
+    fn default() -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            bindings: BTreeMap::new(),
+            read_started_at: now,
+            read_completed_at: now,
+        }
+    }
+}
+
+impl IdentityBindingCut {
+    async fn read(identity_runtime: Option<&crate::identity_first::IdentityRuntime>) -> Self {
+        let read_started_at = tokio::time::Instant::now();
+        let mut bindings = BTreeMap::new();
+        if let Some(identity_runtime) = identity_runtime {
+            for status in identity_runtime.statuses().await {
+                bindings.insert(
+                    status.identity.as_str().to_string(),
+                    IdentityBinding {
+                        session_id: status.session_id.as_ref().map(ToString::to_string),
+                        state: status.state,
+                    },
+                );
+            }
+        }
+        Self {
+            bindings,
+            read_started_at,
+            read_completed_at: tokio::time::Instant::now(),
+        }
+    }
+
+    /// Whether a walk that recorded this cut may answer a request that read
+    /// `request`: the bindings are the same, or this cut was read after the
+    /// request's, so no fact it walked can belong to an earlier binding.
+    fn answers_for(&self, request: &Self) -> bool {
+        self.bindings == request.bindings || self.read_started_at >= request.read_completed_at
+    }
+
+    /// The newer of two cuts. A request joins with it, so a row never pairs
+    /// an older session with facts walked under a newer binding.
+    fn newer<'a>(&'a self, other: &'a Self) -> &'a Self {
+        if self.read_started_at >= other.read_completed_at {
+            self
+        } else {
+            other
+        }
+    }
+}
+
 impl ConsoleSnapshotReadModel {
     /// Returns the current cached snapshot. On a cold cache (no
     /// refresh has completed yet) the request thread drives the
@@ -201,11 +281,46 @@ impl ConsoleSnapshotReadModel {
     /// holds the lock, waits for it to finish before reading.
     /// Either way, snapshot endpoints never see an empty member
     /// list before the read model has been populated.
-    async fn snapshot(&self, runtime: &MobRuntime) -> ConsoleSnapshotReadModelState {
+    async fn snapshot(
+        &self,
+        runtime: &MobRuntime,
+        identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+    ) -> ConsoleSnapshotReadModelState {
         if !self.primed.load(std::sync::atomic::Ordering::Acquire) {
-            Box::pin(self.prime_now(runtime)).await;
+            Box::pin(self.prime_now(runtime, identity_runtime)).await;
         }
         self.inner.read().await.clone()
+    }
+
+    /// The cached walk when it may answer for the identity cut `cut` (see
+    /// [`IdentityBindingCut::answers_for`]); otherwise the walk that may,
+    /// waited for at most [`CONSOLE_BINDING_REFRESH_DEADLINE`] in total,
+    /// in-flight walk and fresh walk alike. Walks stay one at a time on
+    /// `refresh_lock`, and every waiter re-checks after each one lands, so
+    /// concurrent requests after one binding change share the walk in
+    /// flight and at most one fresh walk. The flag is false when the
+    /// deadline passed first: the state is then the latest walk, which does
+    /// not answer for `cut`, and the walk keeps running in the background.
+    async fn snapshot_for_cut(
+        &self,
+        runtime: &MobRuntime,
+        identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+        cut: &IdentityBindingCut,
+    ) -> (ConsoleSnapshotReadModelState, bool) {
+        let deadline = tokio::time::Instant::now() + CONSOLE_BINDING_REFRESH_DEADLINE;
+        loop {
+            let walked = self.walked.notified();
+            tokio::pin!(walked);
+            walked.as_mut().enable();
+            let state = Box::pin(self.snapshot(runtime, identity_runtime)).await;
+            if state.identity_cut.answers_for(cut) {
+                return (state, true);
+            }
+            self.refresh_soon(runtime.clone(), identity_runtime.cloned());
+            if tokio::time::timeout_at(deadline, walked).await.is_err() {
+                return (self.inner.read().await.clone(), false);
+            }
+        }
     }
 
     /// Cold-cache priming. Acquires `refresh_lock` via the awaiting
@@ -223,11 +338,15 @@ impl ConsoleSnapshotReadModel {
     ///   populated and the second `primed` check returns early
     ///   without redoing the work.
     ///
-    /// No `Notify` is involved, so there's no lost-wake race to
-    /// reason about: the lock release is the signal, and `tokio`'s
-    /// Mutex enforces FIFO acquisition fairness so a `try_lock`
-    /// caller can't barge past a queued `lock_owned` waiter.
-    async fn prime_now(&self, runtime: &MobRuntime) {
+    /// The lock release is the signal here, and `tokio`'s Mutex
+    /// enforces FIFO acquisition fairness so a `try_lock` caller can't
+    /// barge past a queued `lock_owned` waiter. (`walked` only wakes
+    /// requests waiting in `snapshot_for_cut`.)
+    async fn prime_now(
+        &self,
+        runtime: &MobRuntime,
+        identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+    ) {
         if self.primed.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
@@ -235,10 +354,17 @@ impl ConsoleSnapshotReadModel {
         if self.primed.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        let refreshed = Box::pin(collect_console_snapshot_read_model(runtime)).await;
+        #[cfg(test)]
+        pass_console_walk_gate(&self.walk_gate).await;
+        let refreshed = Box::pin(collect_console_snapshot_read_model(
+            runtime,
+            identity_runtime.map(Arc::as_ref),
+        ))
+        .await;
         *self.inner.write().await = refreshed;
         self.primed
             .store(true, std::sync::atomic::Ordering::Release);
+        self.walked.notify_waiters();
         // _guard drops here, releasing the lock and waking the next
         // queued cold-cache waiter (if any). They'll see `primed`
         // true after acquiring and return early.
@@ -250,7 +376,11 @@ impl ConsoleSnapshotReadModel {
     /// through `prime_now` on cold cache so it always gets a
     /// populated snapshot. `refresh_soon` exists to keep a hot
     /// cache fresh over time without blocking response requests.
-    fn refresh_soon(&self, runtime: MobRuntime) {
+    fn refresh_soon(
+        &self,
+        runtime: MobRuntime,
+        identity_runtime: Option<Arc<crate::identity_first::IdentityRuntime>>,
+    ) {
         let Ok(runtime_handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -259,17 +389,53 @@ impl ConsoleSnapshotReadModel {
         };
         let inner = Arc::clone(&self.inner);
         let primed = Arc::clone(&self.primed);
+        let walked = Arc::clone(&self.walked);
+        #[cfg(test)]
+        let walk_gate = Arc::clone(&self.walk_gate);
         runtime_handle.spawn(async move {
             let _guard = guard;
-            let refreshed = Box::pin(collect_console_snapshot_read_model(&runtime)).await;
+            #[cfg(test)]
+            pass_console_walk_gate(&walk_gate).await;
+            let refreshed = Box::pin(collect_console_snapshot_read_model(
+                &runtime,
+                identity_runtime.as_deref(),
+            ))
+            .await;
             *inner.write().await = refreshed;
             primed.store(true, std::sync::atomic::Ordering::Release);
+            walked.notify_waiters();
             // _guard drops; cold-cache waiters parked on
             // `lock_owned().await` in `prime_now` wake here and
             // observe `primed = true` after acquiring.
         });
     }
+
+    #[cfg(test)]
+    fn set_walk_gate(&self, gate: Option<Arc<tokio::sync::Semaphore>>) {
+        *self
+            .walk_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = gate;
+    }
 }
+
+/// Test hook: hold a walk until the gate has a permit.
+#[cfg(test)]
+async fn pass_console_walk_gate(gate: &std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>) {
+    let gate = gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(gate) = gate {
+        let _permit = gate.acquire().await;
+    }
+}
+
+/// How long an experience read waits for the read model to catch up with
+/// an identity binding change (a reset, retire, delete or rebind) before it
+/// answers the changed rows pending. The console's own member-status read
+/// bound, well inside the sidebar's 5 s poll.
+const CONSOLE_BINDING_REFRESH_DEADLINE: Duration = CONSOLE_MEMBER_STATUS_TIMEOUT;
 
 const CONSOLE_FRONTEND_INDEX_HTML: &str = include_str!("../console-dist/index.html");
 const CONSOLE_FRONTEND_APP_JS: &str = include_str!("../console-dist/console-app.js");
@@ -454,7 +620,12 @@ pub(crate) fn console_json_router_with_runtime_events_and_policy(
         })
     });
     let snapshot_read_model = ConsoleSnapshotReadModel::default();
-    snapshot_read_model.refresh_soon(runtime.clone());
+    snapshot_read_model.refresh_soon(
+        runtime.clone(),
+        identity_runtime
+            .as_ref()
+            .map(|identity_runtime| Arc::clone(identity_runtime.runtime())),
+    );
     // Fall back to the mob runtime's bootstrap-time service so routers built
     // through the thinner constructors still expose workgraph.
     let workgraph = workgraph.or_else(|| runtime.workgraph_service());
@@ -747,19 +918,29 @@ pub async fn console_json_handler(
         .iter()
         .map(|m| m.id.clone())
         .collect();
+    // Identities whose rows this read answers pending: their binding moved
+    // and the read model had not re-collected them by the refresh deadline.
+    let mut pending_identities = BTreeSet::new();
     let live_snapshot = match &state.runtime {
         Some(runtime) => {
-            state.snapshot_read_model.refresh_soon(runtime.clone());
-            Some(
-                Box::pin(build_live_snapshot(
-                    runtime,
-                    &config_module_ids,
-                    state.console_events.as_ref(),
-                    state.visibility_policy.as_ref(),
-                    &state.snapshot_read_model,
-                ))
-                .await,
-            )
+            let identity_runtime = state
+                .identity_runtime
+                .as_ref()
+                .map(crate::identity_first::PublicIdentityRuntime::runtime);
+            state
+                .snapshot_read_model
+                .refresh_soon(runtime.clone(), identity_runtime.cloned());
+            let (snapshot, pending) = Box::pin(build_live_snapshot(
+                runtime,
+                &config_module_ids,
+                state.console_events.as_ref(),
+                state.visibility_policy.as_ref(),
+                &state.snapshot_read_model,
+                identity_runtime,
+            ))
+            .await;
+            pending_identities = pending;
+            Some(snapshot)
         }
         None => match &state.console_aggregator {
             Some(aggregator) => Box::pin(build_aggregator_live_snapshot(
@@ -796,6 +977,7 @@ pub async fn console_json_handler(
     }
     if response.status == 200 && uri.path() == "/console/experience" {
         attach_console_send_dedupe(&mut response.body, state.console_aggregator.as_ref());
+        withhold_pending_experience_rows(&mut response.body, &pending_identities);
     }
     if response.status == 200
         && uri.path() == "/console/experience"
@@ -828,6 +1010,173 @@ fn attach_console_send_dedupe(experience: &mut Value, aggregator: Option<&MetaCo
             "send_dedupe".to_string(),
             json!({ "durable": aggregator.send_dedupe_durability().is_durable() }),
         );
+    }
+}
+
+/// Why facts of a console record are unobserved: one wire shape for every
+/// record that names facts the console holds no current observation of,
+/// `"unobserved": {"reason": ..., "fields": [...]}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum UnobservedReason {
+    /// The identity binding behind the record moved, and the read model had
+    /// not re-collected it by [`CONSOLE_BINDING_REFRESH_DEADLINE`].
+    RefreshPending,
+}
+
+fn unobserved_marker(reason: UnobservedReason, fields: &[&str]) -> Value {
+    json!({ "reason": reason, "fields": fields })
+}
+
+/// Sidebar facts a pending row withholds.
+const PENDING_SIDEBAR_WITHHELD_FIELDS: &[&str] = &[
+    "state",
+    "role",
+    "label",
+    "group",
+    "labels",
+    "wired_to",
+    "model_capabilities",
+    "addressable",
+    "watched",
+    "alertLevel",
+    "degraded",
+    "degradedReason",
+];
+
+/// identity_status facts a pending row withholds.
+const PENDING_IDENTITY_STATUS_WITHHELD_FIELDS: &[&str] = &[
+    "state",
+    "role",
+    "display_name",
+    "labels",
+    "addressability",
+    "model_capabilities",
+];
+
+/// Withhold, on the wire, every walked fact of the rows this read answers
+/// pending: their identity binding moved and the read model had not
+/// re-collected them by [`CONSOLE_BINDING_REFRESH_DEADLINE`]. Visibility and
+/// access already decided on the last observed facts, so a policy that
+/// matches them still applies; the client sees only what the owners answer
+/// now (the identity runtime's session and the runtime machine's bounded run
+/// state), the identity, and the typed marker. State is "unknown", and the
+/// affordances fail closed: no send, no retire (a respawn resolves its
+/// target live). Profile capability hints are recounted without the pending
+/// rows' walked roles.
+fn withhold_pending_experience_rows(experience: &mut Value, pending: &BTreeSet<String>) {
+    if pending.is_empty() {
+        return;
+    }
+    if let Some(agents) = experience
+        .pointer_mut("/agent_sidebar/live_snapshot/agents")
+        .and_then(Value::as_array_mut)
+    {
+        let mut profiles: BTreeMap<String, (usize, bool, bool)> = BTreeMap::new();
+        let mut recount = false;
+        for agent in agents.iter_mut() {
+            let identity = agent
+                .get("identity")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let Some(identity) = identity.filter(|identity| pending.contains(identity)) else {
+                if let Some(role) = agent.get("role").and_then(Value::as_str) {
+                    let entry = profiles.entry(role.to_string()).or_insert((0, true, false));
+                    entry.0 += 1;
+                    entry.1 = entry.1
+                        && agent
+                            .pointer("/labels/addressable")
+                            .and_then(Value::as_str)
+                            .is_none_or(|value| value != "false");
+                    entry.2 = entry.2
+                        || agent
+                            .get("wired_to")
+                            .and_then(Value::as_array)
+                            .is_some_and(|peers| !peers.is_empty());
+                }
+                continue;
+            };
+            recount = true;
+            let Some(record) = agent.as_object_mut() else {
+                continue;
+            };
+            for field in [
+                "role",
+                "group",
+                "model_capabilities",
+                "watched",
+                "alertLevel",
+                "degraded",
+                "degradedReason",
+            ] {
+                record.remove(field);
+            }
+            record.insert("state".to_string(), json!("unknown"));
+            record.insert("label".to_string(), json!(identity));
+            record.insert("labels".to_string(), json!({ "agent_identity": identity }));
+            record.insert("wired_to".to_string(), json!([]));
+            record.insert("addressable".to_string(), json!(false));
+            if let Some(affordances) = record.get_mut("affordances").and_then(Value::as_object_mut)
+            {
+                affordances.insert("addressable".to_string(), json!(false));
+                affordances.insert("can_send_message".to_string(), json!(false));
+                affordances.insert("can_retire".to_string(), json!(false));
+            }
+            record.insert(
+                "unobserved".to_string(),
+                unobserved_marker(
+                    UnobservedReason::RefreshPending,
+                    PENDING_SIDEBAR_WITHHELD_FIELDS,
+                ),
+            );
+        }
+        if recount
+            && let Some(capabilities) = experience
+                .pointer_mut("/runtime_capabilities/profile_capabilities")
+                .and_then(Value::as_object_mut)
+        {
+            capabilities.clear();
+            for (profile, (count, addressable, has_wiring)) in profiles {
+                capabilities.insert(
+                    profile,
+                    json!({
+                        "instance_count": count,
+                        "addressable": addressable,
+                        "has_wiring": has_wiring,
+                    }),
+                );
+            }
+        }
+    }
+    if let Some(rows) = experience
+        .pointer_mut("/identity_status/rows")
+        .and_then(Value::as_array_mut)
+    {
+        for row in rows.iter_mut() {
+            let identity = row
+                .get("identity")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let Some(identity) = identity.filter(|identity| pending.contains(identity)) else {
+                continue;
+            };
+            let Some(record) = row.as_object_mut() else {
+                continue;
+            };
+            for field in ["role", "display_name", "model_capabilities"] {
+                record.remove(field);
+            }
+            record.insert("state".to_string(), json!("unknown"));
+            record.insert("addressability".to_string(), json!("internal_only"));
+            record.insert("labels".to_string(), json!({ "agent_identity": identity }));
+            record.insert(
+                "unobserved".to_string(),
+                unobserved_marker(
+                    UnobservedReason::RefreshPending,
+                    PENDING_IDENTITY_STATUS_WITHHELD_FIELDS,
+                ),
+            );
+        }
     }
 }
 
@@ -2264,6 +2613,10 @@ mod console_human_input_tests;
 #[cfg(test)]
 #[path = "console_human_governed_bind_tests.rs"]
 mod console_human_governed_bind_tests;
+
+#[cfg(test)]
+#[path = "console_experience_binding_tests.rs"]
+mod console_experience_binding_tests;
 
 #[cfg(test)]
 async fn console_send_identity_first(
@@ -11715,14 +12068,29 @@ async fn handle_console_wire_local(
     }
 }
 
+/// The console's live snapshot, and the identities whose rows it answers
+/// pending (see [`withhold_pending_experience_rows`]).
+///
+/// With an identity runtime, the snapshot reads it once per request
+/// ([`IdentityBindingCut`]) and never serves a fact walked under an earlier
+/// binding: an identity-first row takes its session from the identity
+/// runtime, and a walk recorded before the identity runtime moved is
+/// re-collected first, waited for at most
+/// [`CONSOLE_BINDING_REFRESH_DEADLINE`]. Without one (plain runtimes, and
+/// reset_all's own one-shot read model, which compares the roster with the
+/// registered bindings itself) the snapshot is the walk as it was.
 async fn build_live_snapshot(
     runtime: &MobRuntime,
     config_module_ids: &[String],
     console_events: Option<&ConsoleEventStore>,
     visibility_policy: &dyn ConsoleVisibilityPolicy,
     read_model: &ConsoleSnapshotReadModel,
-) -> ConsoleLiveSnapshot {
-    let read_model_state = Box::pin(read_model.snapshot(runtime)).await;
+    identity_runtime: Option<&Arc<crate::identity_first::IdentityRuntime>>,
+) -> (ConsoleLiveSnapshot, BTreeSet<String>) {
+    let request_cut = IdentityBindingCut::read(identity_runtime.map(Arc::as_ref)).await;
+    let (read_model_state, walk_answers) =
+        Box::pin(read_model.snapshot_for_cut(runtime, identity_runtime, &request_cut)).await;
+    let cut = read_model_state.identity_cut.newer(&request_cut);
     let running = read_model_state.running.unwrap_or(true);
     // Hot path: clone the pre-projected members from the cached read
     // model. NO `handle.*` async calls happen here — the background
@@ -11731,9 +12099,32 @@ async fn build_live_snapshot(
     // First request on a cold cache pays one synchronous refresh via
     // `snapshot(runtime).await` above; subsequent requests just clone.
     let mut members = read_model_state.primary_members.clone();
+    let runtime_machine = runtime
+        .session_service()
+        .and_then(|service| crate::mob_handle_runtime::observed_runtime_adapter(service.as_ref()));
+    let pending = join_identity_bindings(
+        &mut members,
+        &read_model_state.identity_cut,
+        cut,
+        walk_answers,
+        runtime_machine.as_deref(),
+    )
+    .await;
     if visibility_policy.include_implicit_delegate_members() {
         for group in &read_model_state.delegate_member_groups {
-            members.extend(group.iter().cloned());
+            // A pending identity's implicit delegates were walked under its
+            // superseded binding: they are withheld until the walk lands.
+            members.extend(
+                group
+                    .iter()
+                    .filter(|member| {
+                        !member
+                            .labels
+                            .get("delegate_host_identity")
+                            .is_some_and(|host| pending.contains(host))
+                    })
+                    .cloned(),
+            );
         }
     }
     dedupe_console_members_by_identity(&mut members);
@@ -11809,25 +12200,109 @@ async fn build_live_snapshot(
         })
         .collect::<Vec<_>>();
     agents.sort_by(|left, right| left.label.cmp(&right.label));
-    ConsoleLiveSnapshot::new(
-        Some(runtime.handle().mob_id().to_string()),
-        running,
-        loaded_modules,
-        agents,
-        members,
-        true,
+    (
+        ConsoleLiveSnapshot::new(
+            Some(runtime.handle().mob_id().to_string()),
+            running,
+            loaded_modules,
+            agents,
+            members,
+            true,
+        ),
+        pending,
     )
+}
+
+/// Join every identity-first row of the primary mob to its identity's
+/// binding in `cut`, the identity runtime's answer: the row's session is
+/// never the walk's copy. Returns the identities whose rows are pending: the
+/// walk does not answer for the request (`walk_answers` false) and the
+/// identity's binding moved since the walk.
+///
+/// A row is identity-first when the walk's own cut held its identity (the
+/// identity runtime knew it when the row was walked) and its decoded roster
+/// id is that identity (`member_comms_id::live_member_is_identity`, the
+/// predicate the identity records use). A plain mob member is never in the
+/// identity runtime's cut, so it is never touched. An identity the identity
+/// runtime no longer knows has no session. Both sides are this runtime's
+/// own un-namespaced identities; aggregator namespaces only prefix records
+/// listed across runtimes.
+///
+/// A row whose progress was observed for another session, or that is
+/// pending, carries the runtime machine's bounded run state for the session
+/// it now names instead (one wave, [`CONSOLE_PROGRESS_READ_CONCURRENCY`] at a
+/// time) until the walk lands. Its other facts stay as walked: visibility
+/// and access decide on them, and the experience withholds a pending row's
+/// facts on the wire.
+async fn join_identity_bindings(
+    members: &mut [ConsoleMember],
+    walked_cut: &IdentityBindingCut,
+    cut: &IdentityBindingCut,
+    walk_answers: bool,
+    runtime_machine: Option<&meerkat_runtime::MeerkatMachine>,
+) -> BTreeSet<String> {
+    use futures::StreamExt as _;
+
+    let mut pending = BTreeSet::new();
+    let mut rereads = Vec::new();
+    for (index, member) in members.iter_mut().enumerate() {
+        let identity = console_member_console_identity(member).to_string();
+        let Some(walked) = walked_cut.bindings.get(&identity) else {
+            continue;
+        };
+        if !crate::member_comms_id::live_member_is_identity(&member.agent_identity, &identity) {
+            continue;
+        }
+        let current = cut.bindings.get(&identity);
+        let session_id = current.and_then(|binding| binding.session_id.clone());
+        let is_pending = !walk_answers && current != Some(walked);
+        if is_pending || member.session_id != session_id {
+            rereads.push((
+                index,
+                session_id
+                    .as_deref()
+                    .and_then(|session| meerkat_core::types::SessionId::parse(session).ok()),
+            ));
+        }
+        if is_pending {
+            pending.insert(identity);
+        }
+        member.session_id = session_id;
+    }
+    let run_states: Vec<(usize, meerkat_mob::MemberRunState)> =
+        futures::stream::iter(rereads.into_iter().map(|(index, session)| async move {
+            (
+                index,
+                console_member_run_state(runtime_machine, session.as_ref()).await,
+            )
+        }))
+        .buffer_unordered(CONSOLE_PROGRESS_READ_CONCURRENCY)
+        .collect()
+        .await;
+    for (index, run_state) in run_states {
+        if let Some(member) = members.get_mut(index) {
+            member.progress =
+                serde_json::to_value(ConsoleMemberProgress::from_run_state(run_state)).ok();
+        }
+    }
+    pending
 }
 
 async fn collect_console_snapshot_read_model(
     runtime: &MobRuntime,
+    identity_runtime: Option<&crate::identity_first::IdentityRuntime>,
 ) -> ConsoleSnapshotReadModelState {
+    // The identity runtime's cut is read BEFORE the roster walk, so a binding
+    // change that lands during the walk shows as a moved cut on the next
+    // read, and that read re-collects instead of serving this walk for it.
+    let identity_cut = IdentityBindingCut::read(identity_runtime).await;
     let handle = runtime.handle();
     let mut state = ConsoleSnapshotReadModelState {
         running: Some(matches!(
             handle.status_observation_snapshot(),
             MobState::Creating | MobState::Running
         )),
+        identity_cut,
         ..ConsoleSnapshotReadModelState::default()
     };
     collect_console_session_index_for_handle(&handle, &mut state).await;
@@ -11996,26 +12471,32 @@ async fn reset_all_live_console_agents(
     visibility_policy: &dyn ConsoleVisibilityPolicy,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let read_model = ConsoleSnapshotReadModel::default();
-    *read_model.inner.write().await = Box::pin(collect_console_snapshot_read_model(runtime)).await;
+    // No identity runtime for this read model: reset_all compares the roster
+    // it walks with the registered bindings itself, so its snapshot must stay
+    // the walk as it was.
+    *read_model.inner.write().await =
+        Box::pin(collect_console_snapshot_read_model(runtime, None)).await;
     // Mark the freshly-built model primed so `build_live_snapshot` doesn't
     // try to re-prime; this is a one-shot read for the reset path.
     read_model
         .primed
         .store(true, std::sync::atomic::Ordering::Release);
-    let snapshot = Box::pin(build_live_snapshot(
+    let (snapshot, _) = Box::pin(build_live_snapshot(
         runtime,
         &[],
         console_events,
         visibility_policy,
         &read_model,
+        None,
     ))
     .await;
-    let raw_snapshot = Box::pin(build_live_snapshot(
+    let (raw_snapshot, _) = Box::pin(build_live_snapshot(
         runtime,
         &[],
         console_events,
         &crate::console_aggregator::AllowAllConsoleVisibilityPolicy,
         &read_model,
+        None,
     ))
     .await;
     let identity_runtime_statuses = if let Some(identity_runtime) = identity_runtime {
@@ -21769,7 +22250,7 @@ comms = true
         assert_eq!(members[0].session_id, None);
         assert!(session_owner_by_id.is_empty());
 
-        let refreshed_read_model = collect_console_snapshot_read_model(&runtime).await;
+        let refreshed_read_model = collect_console_snapshot_read_model(&runtime, None).await;
         let (members, session_owner_by_id) = project_console_members_from_handle(
             &runtime.handle(),
             None,

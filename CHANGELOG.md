@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- `/console/experience` takes an identity-first member's session from the
+  identity runtime, the owner `/console/identities` reads, and never serves
+  a fact walked under an earlier identity binding. The first read after a
+  reset, retire or delete used to answer from the console's cached roster
+  walk: after a reset the predecessor's session, progress, state and
+  labels; after a retire or delete an active row for a member the roster
+  had already dropped. The console's read model now records the identity
+  runtime's bindings (session and lifecycle state) it walked under, and a
+  read that finds them moved re-collects first. It waits at most 2 s, the
+  console's member-status read bound, and concurrent reads share the walk.
+  Past that deadline a changed row answers with the identity runtime's
+  session, the runtime machine's bounded run state and state `unknown`,
+  withholds its other walked facts with fail-closed affordances (no send,
+  no retire), and carries a new `unobserved` marker
+  (`{"reason": "refresh_pending", "fields": [...]}`) on the sidebar row and
+  the identity_status row. Access and visibility still decide on the last
+  observed facts, so a label-scoped deny keeps a pending member hidden.
+  console-core mirrors the marker (`UnobservedFacts`,
+  `normalizeUnobservedFacts`, `IdentityStatusRow.unobserved`), and the
+  console carries it on its agent rows.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking

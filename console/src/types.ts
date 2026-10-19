@@ -87,6 +87,7 @@ export interface ConsoleAgent extends SidebarWatchFields {
   addressable?: boolean;
   affordances?: ConsoleAgentAffordances;
   model_capabilities?: ConsoleModelCapabilities;
+  unobserved?: IdentityStatusRow["unobserved"];
 }
 
 export interface ConsoleExperienceAgentSnapshotRow extends Partial<IdentityStatusRow>, SidebarWatchFields {

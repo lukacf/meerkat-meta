@@ -28,6 +28,8 @@ export type {
   RoutingSectionView,
   SidebarWatchFields,
   ToolCallAccumulatorState,
+  UnobservedFacts,
+  UnobservedReason,
 } from "./control-plane";
 export {
   normalizeActivityFilterPreset,
@@ -47,6 +49,7 @@ export {
   normalizeRoutingSectionView,
   normalizeSidebarWatchFields,
   normalizeToolCallAccumulatorState,
+  normalizeUnobservedFacts,
 } from "./control-plane";
 
 export type {
