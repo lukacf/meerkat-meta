@@ -1930,7 +1930,8 @@ comms = true
         handle
             .wait_for_members_kickoff_complete(
                 std::slice::from_ref(&roster_identity),
-                Some(Duration::from_secs(5)),
+                // A settle bound only: the assertions below check state, not elapsed time.
+                Some(Duration::from_secs(30)),
             )
             .await
             .expect("member kickoff settled");

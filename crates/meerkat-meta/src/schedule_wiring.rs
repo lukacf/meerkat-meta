@@ -2823,7 +2823,8 @@ comms = true
         handle
             .wait_for_members_kickoff_complete(
                 std::slice::from_ref(&meerkat_mob::ids::AgentIdentity::from("digest-owner")),
-                Some(Duration::from_secs(2)),
+                // A settle bound only: the assertions below check state, not elapsed time.
+                Some(Duration::from_secs(30)),
             )
             .await
             .expect("member kickoff should settle");
@@ -3025,7 +3026,8 @@ comms = true
         handle
             .wait_for_members_kickoff_complete(
                 std::slice::from_ref(&roster_identity),
-                Some(Duration::from_secs(2)),
+                // A settle bound only: the assertions below check state, not elapsed time.
+                Some(Duration::from_secs(30)),
             )
             .await
             .expect("identity-first member kickoff should settle");

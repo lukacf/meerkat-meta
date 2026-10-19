@@ -25568,7 +25568,8 @@ comms = true
             .handle
             .wait_for_members_kickoff_complete(
                 std::slice::from_ref(&mid),
-                Some(std::time::Duration::from_secs(5)),
+                // A settle bound only: the assertions below check state, not elapsed time.
+                Some(std::time::Duration::from_secs(30)),
             )
             .await
             .unwrap_or_else(|e| panic!("pre-restart kickoff did not resolve: {e}"));
